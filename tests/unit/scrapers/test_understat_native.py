@@ -163,7 +163,7 @@ def test_catalog_has_six_canonical_leagues_and_no_post_rollover_extra_probe():
 
     rolling = catalog.rolling_scopes(window=2, probe_next=True)
     assert len(rolling) == 12
-    assert {scope.season for scope in rolling} == {"2526", "2627"}
+    assert {scope.season for scope in rolling} == {"2425", "2526"}
     assert "2728" not in {scope.season for scope in rolling}
 
 
@@ -453,7 +453,7 @@ def test_history_mode_can_reuse_valid_match_cache():
     assert client.match_refreshes == [False]
 
 
-def test_match_shape_drift_fails_closed():
+def test_match_extra_field_warns():
     payload = {
         **MATCH_PAYLOAD,
         "shots": {
@@ -461,8 +461,9 @@ def test_match_shape_drift_fails_closed():
             "a": [],
         },
     }
-    with pytest.raises(UnderstatSchemaDrift, match="new_metric"):
-        validate_match_payload(payload)
+    warnings = []
+    validate_match_payload(payload, warnings=warnings)
+    assert warnings == [{"path": "getMatchData.shots.h[0]", "fields": ["new_metric"]}]
 
 
 @pytest.mark.parametrize(

@@ -390,9 +390,9 @@ class _StatClient:
 @pytest.mark.parametrize(
     "today, expected",
     [
-        (date(2027, 1, 15), {2025: True, 2026: True, 2027: False}),
+        (date(2027, 1, 15), {2025: True, 2026: True}),
         (date(2027, 6, 30), {2025: True, 2026: True, 2027: False}),
-        (date(2027, 7, 1), {2026: True, 2027: False}),
+        (date(2027, 7, 1), {2025: True, 2026: True}),
     ],
 )
 def test_rolling_window_around_the_july_rollover(today, expected):
@@ -523,9 +523,10 @@ def _assert_drift_status(exc: BaseException) -> None:
 def test_league_drift_payload_is_saved(tmp_path):
     league = _league({match["id"] for match in _results(_base_league())[:5]})
     league["surprise"] = {"new": 1}
+    del league["players"]
     client = _Client(league, cache_dir=tmp_path)
 
-    with pytest.raises(UnderstatSchemaDrift, match="unknown fields") as caught:
+    with pytest.raises(UnderstatSchemaDrift, match="missing required fields") as caught:
         UnderstatSource(client, today=date(2026, 7, 26)).scrape_scope(LEAGUE, "2627", 2026)
 
     _assert_drift_status(caught.value)
@@ -537,6 +538,7 @@ def test_league_drift_payload_is_saved(tmp_path):
 def test_league_snapshot_drift_payload_is_saved(tmp_path):
     league = _league({match["id"] for match in _results(_base_league())[:5]})
     league["surprise"] = {"new": 1}
+    del league["players"]
     client = _Client(league, cache_dir=tmp_path)
 
     with pytest.raises(UnderstatSchemaDrift):
@@ -554,9 +556,10 @@ def test_match_drift_payload_is_saved(tmp_path):
     client = _Client(league, cache_dir=tmp_path)
     broken = _match_payload(first)
     broken["shots"]["h"][0]["new_metric"] = "surprise"
+    del broken["shots"]["h"][0]["xG"]
     client.match_overrides[first["id"]] = broken
 
-    with pytest.raises(UnderstatSchemaDrift, match="unknown fields") as caught:
+    with pytest.raises(UnderstatSchemaDrift, match="missing required fields") as caught:
         UnderstatSource(client, today=date(2026, 7, 26)).scrape_scope(LEAGUE, "2627", 2026)
 
     _assert_drift_status(caught.value)
@@ -584,8 +587,9 @@ def test_team_drift_payload_is_saved(tmp_path):
 def test_drift_is_raised_unchanged_without_cache_or_when_saving_fails(tmp_path):
     league = _league(set())
     league["surprise"] = 1
+    del league["players"]
 
-    with pytest.raises(UnderstatSchemaDrift, match="unknown fields"):
+    with pytest.raises(UnderstatSchemaDrift, match="missing required fields"):
         UnderstatSource(_Client(league), today=date(2026, 7, 26)).scrape_scope(
             LEAGUE, "2627", 2026
         )
@@ -593,7 +597,7 @@ def test_drift_is_raised_unchanged_without_cache_or_when_saving_fails(tmp_path):
     blocked = tmp_path / "cache"
     blocked.mkdir()
     (blocked / "schema_drift").write_text("not a directory", encoding="utf-8")
-    with pytest.raises(UnderstatSchemaDrift, match="unknown fields"):
+    with pytest.raises(UnderstatSchemaDrift, match="missing required fields"):
         UnderstatSource(
             _Client(league, cache_dir=blocked), today=date(2026, 7, 26)
         ).scrape_scope(LEAGUE, "2627", 2026)

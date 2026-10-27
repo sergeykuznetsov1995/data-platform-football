@@ -22,18 +22,16 @@ from scrapers.fbref.daily_report_reader import collect_snapshot  # noqa: E402
 
 def host_postgres(query: str):
     result = subprocess.run([
-        "docker", "exec", "postgres", "psql", "-U", "airflow", "-d", "airflow", "-qAt",
-        "-v", "ON_ERROR_STOP=1", "-c",
-        "BEGIN READ ONLY; SET LOCAL statement_timeout='30s'; " + query + "; COMMIT;",
-    ], capture_output=True, text=True, timeout=40, check=True)
+        "docker", "exec", "-i", "postgres", "psql", "-U", "airflow", "-d", "airflow", "-qAt",
+        "-v", "ON_ERROR_STOP=1",
+    ], input="BEGIN READ ONLY; SET LOCAL statement_timeout='30s'; " + query + "; COMMIT;",
+        capture_output=True, text=True, timeout=40, check=True)
     return json.loads(result.stdout)
 
 
 def host_trino(query: str):
-    result = subprocess.run(["/root/.claude/bin/trino-ro.sh", query.strip()],
-                            capture_output=True, text=True, timeout=90, check=True)
-    rows = list(csv.reader(io.StringIO(result.stdout)))
-    # The established host wrapper emits CSV without a header.
+    # The host wrapper greps CSV lines and exits 1 on an empty result. A
+    # tagged row keeps successful empty SELECTs observable without hiding errors.
     columns = {
         "fbref_table_inventory": ["target_id", "content_hash"],
         "fbref_schedule": ["source_competition_id", "source_season_id", "date", "time", "home", "away", "score", "notes", "match_url"],
@@ -42,10 +40,23 @@ def host_trino(query: str):
         "fotmob_matches_current": ["competition_id", "season_key", "match_id", "utc_time", "timezone", "finished", "cancelled", "postponed", "awarded"],
     }
     selected = next(fields for table, fields in columns.items() if table in query)
+    fields = ",".join(f"CAST(report_result.{field} AS varchar)" for field in selected)
+    markers_sql = ",".join("'fbref_report_end'" for _ in selected)
+    marked_query = (f"SELECT 'fbref_report_data', {fields} FROM ({query.strip().rstrip(';')}) report_result "
+                    f"UNION ALL SELECT 'fbref_report_end', {markers_sql}")
+    result = subprocess.run(["/root/.claude/bin/trino-ro.sh", marked_query],
+                            capture_output=True, text=True, timeout=90, check=True)
+    rows = list(csv.reader(io.StringIO(result.stdout), strict=True))
+    markers = [row for row in rows if row and row[0] == "fbref_report_end"]
+    if len(markers) != 1 or markers[0] != ["fbref_report_end"] * (len(selected) + 1):
+        raise ValueError("Missing or malformed Trino result marker")
     output = []
     for row in rows:
-        if len(row) != len(selected):
+        if row and row[0] == "fbref_report_end":
+            continue
+        if len(row) != len(selected) + 1 or row[0] != "fbref_report_data":
             raise ValueError("Malformed Trino result")
+        row = row[1:]
         parsed = {key: None if value == "NULL" else value for key, value in zip(selected, row)}
         for key in ("finished", "cancelled", "awarded"):
             if key in parsed:

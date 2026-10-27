@@ -5086,13 +5086,12 @@ PROXY_407 = RuntimeError(
 )
 
 
-def _pool_transport(monkeypatch, tmp_path, *sessions, http_attempts=1):
+def _pool_transport(monkeypatch, tmp_path, *sessions, http_attempts=1, pool_size=2):
     from scrapers.whoscored.transport import ProxyUnavailable  # noqa: F401
 
     pool = tmp_path / "pool.txt"
     pool.write_text(
-        "pool.example.io:10000:poolu:poolpw\n"
-        "pool.example.io:10001:poolu:poolpw\n"
+        "".join(f"pool.example.io:{10000 + i}:poolu:poolpw\n" for i in range(pool_size))
     )
     monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
     queue = list(sessions)
@@ -5181,65 +5180,72 @@ def test_non_proxy_curl_failure_keeps_retryable_timeout_without_swap(
 
 
 @pytest.mark.unit
-def test_schedule_tls_connect_error_renews_session_on_same_member(monkeypatch, tmp_path):
-    from curl_cffi.requests.cookies import Cookies
+@pytest.mark.parametrize("failure", ["tls", "http502"])
+@pytest.mark.parametrize("http_attempts", [1, 3])
+def test_schedule_pool_failure_probes_replacement_before_single_replay(
+    monkeypatch, tmp_path, failure, http_attempts
+):
     from curl_cffi.requests.exceptions import SSLError
 
-    first = FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35))
-    second = FakeHTTPSession(FakeHTTPResponse(content=b'{"tournaments":[]}'))
-    first.cookies = Cookies()
-    first.cookies.set("clearance", "cookie", domain="www.whoscored.com", path="/")
-    first.headers = {"X-Existing": "value"}
-    second.cookies = Cookies()
-    second.headers = {}
+    first = FakeHTTPSession(
+        SSLError("curl: (35) TLS connect error", code=35)
+        if failure == "tls" else FakeHTTPResponse(status_code=502)
+    )
+    second = FakeHTTPSession(FakeHTTPResponse(), FakeHTTPResponse(content=b'{"tournaments":[]}'))
     transport, seen = _pool_transport(
-        monkeypatch, tmp_path, first, second, http_attempts=3
+        monkeypatch, tmp_path, first, second, http_attempts=http_attempts
     )
     original_proxy = transport._pool_proxy_url
     transport._stage_http_context = ("bootstrap", "token", first, original_proxy)
-    ledger = []
-    transport.request_ledger = types.SimpleNamespace(append=ledger.append)
     tokens = []
+    source = "https://www.whoscored.com/tournaments/25590/data/?d=202610"
 
-    result = transport.fetch(
-        "https://www.whoscored.com/tournaments/25590/data/?d=202610",
-        entity="schedule_month",
-        before_network=lambda: tokens.append(1),
-    )
+    result = transport.fetch(source, before_network=lambda: tokens.append(1))
 
-    assert result.route is TransportRoute.DIRECT_HTTP
-    assert len(first.calls) == len(second.calls) == 1
-    assert seen == [original_proxy, original_proxy]
+    assert result.status_code == 200
+    assert [call[0] for call in first.calls + second.calls] == [
+        source, transport_module.EGRESS_PROBE_URL, source,
+    ]
+    assert len(seen) == 2 and seen[0] != seen[1]
     assert first.closed
-    assert second.cookies.get("clearance") == "cookie"
-    assert second.headers["X-Existing"] == "value"
     assert transport._stage_http_context is None
     assert len(tokens) == 2
-    assert [(e["status"], e["error_type"]) for e in ledger] == [
-        ("error", "SSLError"), ("success", "")
-    ]
+    assert transport.get_traffic_stats()["route_successes"] == {"direct_http": 1}
     assert not transport._direct_fs.get_calls
 
 
 @pytest.mark.unit
-def test_schedule_tls_session_recovery_stops_at_existing_attempt_budget(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure", ["tls", "http502", "timeout", "http500", "http503"])
+def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
+    monkeypatch, tmp_path, failure
+):
     from curl_cffi.requests.exceptions import SSLError
 
-    sessions = [
-        FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35))
-        for _ in range(3)
-    ]
-    transport, seen = _pool_transport(
-        monkeypatch, tmp_path, *sessions, http_attempts=3
-    )
-    with pytest.raises(WhoScoredTransportError) as caught:
-        transport.fetch("https://www.whoscored.com/tournaments/25590/data/?d=202610")
+    def failed():
+        return (SSLError("curl: (35) TLS connect error", code=35)
+                if failure == "tls" else FakeHTTPResponse(status_code=502))
 
-    assert caught.value.kind is FailureKind.TIMEOUT
-    assert caught.value.retryable
-    assert len(seen) == 3 and len(set(seen)) == 1
-    assert [len(s.calls) for s in sessions] == [1, 1, 1]
-    assert [s.closed for s in sessions] == [True, True, False]
+    first = FakeHTTPSession(failed())
+    replay_failure = {
+        "timeout": RuntimeError("curl: (28) timed out"),
+        "http500": FakeHTTPResponse(status_code=500),
+        "http503": FakeHTTPResponse(status_code=503),
+    }.get(failure, failed())
+    second = FakeHTTPSession(FakeHTTPResponse(), replay_failure)
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second, http_attempts=3)
+    tokens = []
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch(
+            "https://www.whoscored.com/tournaments/25590/data/?d=202610",
+            before_network=lambda: tokens.append(1),
+        )
+    assert caught.value.kind is (
+        FailureKind.TIMEOUT if failure in {"tls", "timeout"} else FailureKind.HTTP_STATUS
+    )
+    assert caught.value.retryable is False
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert [len(s.calls) for s in (first, second)] == [1, 2]
+    assert len(tokens) == 2
     assert not transport._direct_fs.get_calls
 
 
@@ -5270,20 +5276,22 @@ def test_schedule_other_curl_errors_do_not_renew_session(monkeypatch, tmp_path, 
     "https://www.whoscored.com:443/tournaments/25590/data/?d=202610",
     "https://www.whoscored.com/tournaments/25590/data/?d=202610#fragment",
 ])
-def test_non_schedule_tls_error_keeps_existing_session(monkeypatch, tmp_path, url):
+def test_pool_tls_error_recovers_for_other_urls(monkeypatch, tmp_path, url):
     from curl_cffi.requests.exceptions import SSLError
 
-    first = FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35), FakeHTTPResponse())
-    transport, seen = _pool_transport(monkeypatch, tmp_path, first, http_attempts=3)
+    first = FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35))
+    second = FakeHTTPSession(FakeHTTPResponse(), FakeHTTPResponse())
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second, http_attempts=3)
     transport.fetch(url)
-    assert len(seen) == 1 and len(first.calls) == 2
-    assert not first.closed
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert len(first.calls) == 1 and len(second.calls) == 2
+    assert first.closed
 
 
 @pytest.mark.unit
 def test_pool_5xx_swaps_member_once_and_keeps_retry_policy(monkeypatch, tmp_path):
     first = FakeHTTPSession(FakeHTTPResponse(status_code=502, content=b"bad gateway"))
-    second = FakeHTTPSession(FakeHTTPResponse())
+    second = FakeHTTPSession(FakeHTTPResponse(), FakeHTTPResponse())
     transport, seen = _pool_transport(
         monkeypatch, tmp_path, first, second, http_attempts=2
     )
@@ -5359,12 +5367,12 @@ def _ordered_pool_transport(monkeypatch, tmp_path, sessions, *, choices=None):
         )
 
     monkeypatch.setattr(ProxyManager, "get_http_proxy_url", select_member)
-    transport, seen = _pool_transport(monkeypatch, tmp_path, *sessions)
+    transport, seen = _pool_transport(monkeypatch, tmp_path, *sessions, pool_size=len(sessions))
     return transport, seen, urls
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failures", [0, 1, 2])
+@pytest.mark.parametrize("failures", [0, 1, 2, 3, 9])
 def test_egress_recovery_reaches_first_healthy_member(monkeypatch, tmp_path, failures):
     sessions = [FakeHTTPSession(PROXY_502) for _ in range(failures)]
     sessions.append(FakeHTTPSession(FakeHTTPResponse()))
@@ -5387,14 +5395,14 @@ def test_egress_recovery_reaches_first_healthy_member(monkeypatch, tmp_path, fai
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("members", [1, 2, 3, 4])
+@pytest.mark.parametrize("members", [1, 2, 3, 4, 10, 11])
 def test_egress_recovery_exhausts_distinct_members_only(monkeypatch, tmp_path, members):
     sessions = [FakeHTTPSession(PROXY_502) for _ in range(members)]
     transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
     with pytest.raises(transport_module.ProxyUnavailable, match="access check exhausted"):
         transport.probe_egress()
-    assert seen == urls[:3]
-    assert sum(len(session.calls) for session in sessions) == min(members, 3)
+    assert seen == urls[:10]
+    assert sum(len(session.calls) for session in sessions) == min(members, 10)
 
 
 @pytest.mark.unit
@@ -5443,15 +5451,16 @@ def test_pool_recovery_probes_before_single_source_replay(monkeypatch, tmp_path,
 
 
 @pytest.mark.unit
-def test_pool_recovery_failed_validation_never_replays_source(monkeypatch, tmp_path):
-    sessions = [FakeHTTPSession(PROXY_502) for _ in range(4)]
+@pytest.mark.parametrize("members", [4, 11])
+def test_pool_recovery_failed_validation_never_replays_source(monkeypatch, tmp_path, members):
+    sessions = [FakeHTTPSession(PROXY_502) for _ in range(members)]
     transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
     source = "https://www.whoscored.com/Matches/1/Live"
     with pytest.raises(transport_module.ProxyUnavailable):
         transport.fetch(source)
-    assert seen == urls[:3]
+    assert seen == urls[:10]
     assert [call[0] for session in sessions for call in session.calls] == [
-        source, transport_module.EGRESS_PROBE_URL, transport_module.EGRESS_PROBE_URL]
+        source, *([transport_module.EGRESS_PROBE_URL] * (min(members, 10) - 1))]
 
 
 @pytest.mark.unit
@@ -5479,9 +5488,9 @@ def test_egress_recovery_stops_when_no_distinct_replacement_remains(monkeypatch,
         return select(excluded_http_urls=excluded_http_urls)
 
     monkeypatch.setattr(transport._pool_manager, "get_http_proxy_url", record_choice)
-    with pytest.raises(transport_module.ProxyUnavailable, match="replacement_unavailable"):
+    with pytest.raises(transport_module.ProxyUnavailable, match="budget_exhausted"):
         transport.probe_egress()
-    assert calls == [{urls[0]}]
+    assert calls == []
     assert seen == urls[:1]
     assert len(sessions[0].calls) == 1
     assert sessions[0].closed is False
@@ -5549,6 +5558,36 @@ def test_source_curl_timeout_keeps_timeout_policy_without_pool_rotation(monkeypa
     assert caught.value.retryable is True
     assert seen == urls[:1]
     assert sessions[1].calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("authorized_at", [0, 1, 3])
+def test_late_407_never_restarts_extended_egress_budget(monkeypatch, tmp_path, authorized_at):
+    sessions = [FakeHTTPSession(PROXY_502) for _ in range(10)]
+    sessions[authorized_at] = FakeHTTPSession(PROXY_407)
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    with pytest.raises(transport_module.ProxyUnavailable):
+        transport.probe_egress()
+    assert seen == urls[:max(2, authorized_at + 1)]
+    assert all(not session.calls for session in sessions[len(seen):])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["tls", "http502"])
+def test_pool_recovery_preserves_single_half_open_source_probe(monkeypatch, tmp_path, failure):
+    first = FakeHTTPSession(
+        RuntimeError("curl: (35) TLS connect error")
+        if failure == "tls" else FakeHTTPResponse(status_code=502)
+    )
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, http_attempts=3)
+    circuit = FakeSourceCircuit(probe=True)
+    transport._source_circuit = circuit
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch(TEAM_STATS_URL)
+    assert caught.value.kind is (FailureKind.TIMEOUT if failure == "tls" else FailureKind.HTTP_STATUS)
+    assert len(seen) == 1
+    assert len(first.calls) == 1
+    assert circuit.calls == [("admit", False), ("inconclusive", True)]
 
 
 # --- #1478: source-issued statistics token, same pooled session only ----------

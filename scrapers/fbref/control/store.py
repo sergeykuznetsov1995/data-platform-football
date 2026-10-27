@@ -12,9 +12,11 @@ import hashlib
 import json
 import math
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -22,6 +24,8 @@ from scrapers.base.sql_validator import validate_identifier
 from scrapers.fbref.control.migrations import (
     MIGRATION_LOCK_KEY,
     MIGRATIONS,
+    SCOPE_CTE_V13 as _FRONTIER_SCOPE_CTE_TEMPLATE,
+    SCOPE_SUMMARY_LOCK_KEY,
     bootstrap_statements,
 )
 from scrapers.fbref.control.models import (
@@ -79,6 +83,25 @@ class StateConflict(ControlStoreError):
     """An idempotency key already exists with different immutable data."""
 
 
+class _ScopeBackfillCursor:
+    """Keep every statement inside the remaining batch time budget."""
+
+    def __init__(self, cursor: Any, seconds: float = 25):
+        self._cursor = cursor
+        self._deadline = monotonic() + seconds
+
+    def execute(self, sql, params=None):
+        remaining_ms = math.ceil((self._deadline - monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise TimeoutError("page scope backfill batch exceeded its time budget")
+        self._cursor.execute("SELECT set_config('statement_timeout', %s, true)",
+                             (f"{remaining_ms}ms",))
+        self._cursor.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 ConnectionFactory = Callable[[str], Any]
 _CONTROL_URI_ENV = "FBREF_CONTROL_DB_URI"
 _AIRFLOW_URI_ENV = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"
@@ -133,100 +156,6 @@ _PUBLICATION_PHASES = {
     "abandoned",
     "failed",
 }
-_FRONTIER_SCOPE_CTE_TEMPLATE = """
-    {with_clause}declared_scope AS (
-        SELECT frontier.target_id, frontier.source,
-               frontier.source_ids ->> 'competition_id' AS competition_id,
-               frontier.source_ids ->> 'season_id' AS season_id
-        FROM fbref_control.page_frontier AS frontier{declared_candidate_join}
-        WHERE frontier.source_ids ? 'competition_id'
-        UNION
-        SELECT edge.child_target_id AS target_id, child.source,
-               edge.carried_competition_id AS competition_id,
-               edge.carried_season_id AS season_id
-        FROM fbref_control.frontier_provenance AS edge
-        JOIN fbref_control.page_frontier AS child
-          ON child.target_id = edge.child_target_id{edge_candidate_join}
-        WHERE edge.carried_competition_id IS NOT NULL
-    ),
-    canonical_scope AS (
-        SELECT declared.target_id, declared.source,
-               declared.competition_id,
-               COALESCE(alias.season_id, declared.season_id) AS season_id
-        FROM declared_scope AS declared
-        LEFT JOIN fbref_control.season_alias AS alias
-          ON alias.source = declared.source
-         AND alias.competition_id = declared.competition_id
-         AND alias.alias = declared.season_id
-    ),
-    scope_rollup AS (
-        SELECT scoped.target_id,
-               count(DISTINCT (
-                   scoped.competition_id, scoped.season_id
-               )) AS scope_count,
-               bool_or(competition.competition_id IS NULL)
-                   AS competition_missing,
-               bool_or(competition.gender = 'female') AS has_female,
-               bool_or(competition.gender = 'unknown') AS has_unknown,
-               bool_or(
-                   competition.gender = 'male'
-                   AND competition.crawl_state = 'active'
-                   AND competition.lifecycle_state IN ('present', 'missing_once')
-                   AND competition.present
-                   AND (
-                       scope_frontier.page_kind = 'competition'
-                       OR (
-                           scoped.season_id IS NOT NULL
-                           AND season.lifecycle_state = 'present'
-                           AND season.present
-                           AND season.is_current
-                       )
-                   )
-               ) AS has_current_ownership,
-               bool_or(
-                   competition.competition_id IS NOT NULL
-                   AND (
-                       competition.gender <> 'male'
-                       OR (competition.crawl_state <> 'active' AND NOT (
-                           scope_frontier.refresh_policy='historical_once'
-                           AND competition.crawl_state='skipped'
-                           AND competition.metadata->>'current_scope_lifecycle'='discontinued'
-                           AND competition.metadata->>'current_scope_reason' IS NOT NULL
-                       ))
-                       OR competition.lifecycle_state NOT IN (
-                           'present', 'missing_once'
-                       )
-                       OR NOT competition.present
-                   )
-               ) AS inactive_competition,
-               bool_or(
-                   scoped.season_id IS NOT NULL
-                   AND (
-                       season.season_id IS NULL
-                       OR season.lifecycle_state <> 'present'
-                       OR NOT season.present
-                   )
-               ) AS invalid_season,
-               bool_or(
-                   scoped.season_id IS NOT NULL
-                   AND season.lifecycle_state = 'present'
-                   AND season.present
-                   AND season.is_current
-               ) AS has_current_season,
-               bool_or(scoped.season_id IS NULL)
-                   AS has_competition_scope
-        FROM canonical_scope AS scoped
-        JOIN fbref_control.page_frontier scope_frontier ON scope_frontier.target_id=scoped.target_id
-        LEFT JOIN fbref_control.competition_registry AS competition
-          ON competition.source = scoped.source
-         AND competition.competition_id = scoped.competition_id
-        LEFT JOIN fbref_control.season_registry AS season
-          ON season.source = scoped.source
-         AND season.competition_id = scoped.competition_id
-         AND season.season_id = scoped.season_id
-        GROUP BY scoped.target_id
-    )
-"""
 
 
 _FRONTIER_SCOPE_CTE = _FRONTIER_SCOPE_CTE_TEMPLATE.format(
@@ -1050,6 +979,136 @@ class ControlStore:
         finally:
             cursor.close()
             connection.close()
+
+    @staticmethod
+    def _lock_scope_targets(cursor: Any, target_ids: Sequence[str],
+                            canonical_urls: Sequence[str] = ()) -> None:
+        # Match frontier writer order before taking summary locks. No provenance
+        # scan and no change to lease fields or append-only evidence.
+        cursor.execute(
+            "SELECT target_id FROM fbref_control.page_frontier "
+            "WHERE target_id = ANY(%s::text[]) OR canonical_url = ANY(%s::text[]) "
+            "ORDER BY target_id FOR NO KEY UPDATE",
+            (list(target_ids), list(canonical_urls)),
+        )
+        cursor.fetchall()
+
+    @staticmethod
+    def _refresh_scope_summaries(cursor: Any, target_ids: Sequence[str]) -> None:
+        if target_ids:
+            cursor.execute("SELECT pg_advisory_xact_lock_shared(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
+            # Lock before the computation's command snapshot: a waiter must see
+            # both a preceding writer's scopes and its committed registry edits.
+            cursor.execute("SELECT target_id FROM fbref_control.page_scope_summary "
+                           "WHERE target_id = ANY(%s::text[]) ORDER BY target_id FOR UPDATE",
+                           (list(target_ids),))
+            cursor.fetchall()
+            cursor.execute("SELECT fbref_control.refresh_page_scope_summary(%s::text[])",
+                           (list(target_ids),))
+
+    @contextmanager
+    def _registry_scope_transaction(self):
+        with self._transaction() as cursor:
+            yield cursor
+            self._refresh_registry_scopes(cursor)
+
+    def _refresh_registry_scopes(self, cursor: Any) -> int:
+        # Lock the captured invalidations until commit. An edit of the same
+        # competition waits, then enqueues a fresh invalidation after our DELETE;
+        # skip rows held by other registry edits to avoid a queue-lock deadlock.
+        # Only captured rows are acknowledged; skipped invalidations stay queued.
+        cursor.execute("""SELECT source, competition_id
+            FROM fbref_control.page_scope_registry_dirty
+            ORDER BY source, competition_id FOR UPDATE SKIP LOCKED""")
+        dirty = _fetchall(cursor)
+        if not dirty:
+            return 0
+        # All registry/frontier mutations are finished before this exclusive
+        # gate. A writer takes its shared gate after locking its full frontier
+        # set, before changing summary rows. Thus enumeration cannot miss a
+        # committed new scope, nor publish flags from an old registry snapshot.
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
+        affected = json.dumps(dirty, sort_keys=True, separators=(",", ":"))
+        after = ""
+        refreshed = 0
+        while True:
+            cursor.execute("""
+                SELECT summary.target_id
+                FROM fbref_control.page_scope_summary summary
+                JOIN fbref_control.page_frontier frontier USING (target_id)
+                WHERE summary.target_id > %s AND EXISTS (
+                    SELECT 1 FROM jsonb_to_recordset(%s::jsonb)
+                        AS dirty(source text, competition_id text)
+                    WHERE dirty.source = frontier.source AND (
+                        dirty.competition_id = frontier.source_ids->>'competition_id'
+                        OR summary.provenance_scopes @> jsonb_build_array(
+                            jsonb_build_object('competition_id', dirty.competition_id))))
+                ORDER BY summary.target_id LIMIT 250
+            """, (after, affected))
+            target_ids = [row["target_id"] for row in _fetchall(cursor)]
+            if not target_ids:
+                break
+            self._refresh_scope_summaries(cursor, target_ids)
+            after = target_ids[-1]
+            refreshed += len(target_ids)
+        cursor.execute("""DELETE FROM fbref_control.page_scope_registry_dirty queued
+            USING jsonb_to_recordset(%s::jsonb) AS dirty(source text, competition_id text)
+            WHERE queued.source = dirty.source AND queued.competition_id = dirty.competition_id""",
+            (affected,))
+        return refreshed
+
+    def refresh_page_scopes(self) -> int:
+        """Repair registry invalidations from direct SQL, without provenance."""
+        with self._transaction() as cursor:
+            return self._refresh_registry_scopes(cursor)
+
+    def backfill_page_scopes(self, *, batch_size: int = 100) -> dict:
+        """Commit one resumable, bounded primary-key batch of old targets."""
+        size = int(batch_size)
+        if not 1 <= size <= 1000:
+            raise ValueError("batch_size must be between 1 and 1000")
+        with self._transaction() as raw_cursor:
+            cursor = _ScopeBackfillCursor(raw_cursor)
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            # Bounded per-target sorts, never a sort of all provenance edges.
+            cursor.execute("SET LOCAL work_mem = '4MB'")
+            cursor.execute("SET LOCAL enable_seqscan = off")
+            cursor.execute("""SELECT after_target_id FROM fbref_control.page_scope_backfill
+                              WHERE singleton FOR UPDATE""")
+            after = _fetchone(cursor)["after_target_id"]
+            cursor.execute("""SELECT target_id FROM fbref_control.page_frontier
+                WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE""",
+                (after, size))
+            target_ids = [row["target_id"] for row in _fetchall(cursor)]
+            cursor.execute("SELECT pg_advisory_xact_lock_shared(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
+            for target_id in target_ids:
+                cursor.execute("""INSERT INTO fbref_control.page_scope_summary(target_id)
+                    VALUES (%s) ON CONFLICT DO NOTHING""", (target_id,))
+                cursor.execute("""SELECT target_id FROM fbref_control.page_scope_summary
+                    WHERE target_id = %s FOR UPDATE""", (target_id,))
+                # A separate command after the row lock sees committed edges
+                # from any preceding writer. Later writers merge incrementally.
+                update_sql = """UPDATE fbref_control.page_scope_summary SET
+                    provenance_scopes = coalesce((SELECT jsonb_agg(scope) FROM (
+                        SELECT DISTINCT jsonb_build_object(
+                            'competition_id', carried_competition_id,
+                            'season_id', carried_season_id) AS scope
+                        FROM fbref_control.frontier_provenance
+                        WHERE child_target_id = %s AND carried_competition_id IS NOT NULL
+                    ) scopes), '[]'::jsonb), is_complete = true, pending = true
+                    WHERE target_id = %s"""
+                cursor.execute("EXPLAIN (FORMAT JSON) " + update_sql, (target_id, target_id))
+                plan = _fetchone(cursor)["QUERY PLAN"]
+                if '"Node Type": "Seq Scan"' in json.dumps(plan):
+                    raise ControlStoreError("page scope backfill requires indexed provenance lookup")
+                cursor.execute(update_sql, (target_id, target_id))
+            self._refresh_scope_summaries(cursor, target_ids)
+            if target_ids:
+                after = target_ids[-1]
+                cursor.execute("""UPDATE fbref_control.page_scope_backfill
+                    SET after_target_id = %s WHERE singleton""", (after,))
+            return {"processed": len(target_ids), "after_target_id": after,
+                    "done": len(target_ids) < size}
 
     def migrate(self) -> tuple[int, ...]:
         """Apply all pending migrations under one transaction advisory lock."""
@@ -2308,6 +2367,7 @@ class ControlStore:
                         f"Competition {item.competition_id} history raw changed"
                     )
             yield _CursorBoundControlStore(base=self, cursor=cursor)
+            self._refresh_registry_scopes(cursor)
 
     def assert_no_active_publication_generation(
         self,
@@ -3429,6 +3489,10 @@ class ControlStore:
                         f"acceptance-replay-control://{replay_refresh}",
                     ),
                 )
+            self._refresh_scope_summaries(cursor, [
+                make_replay_control_target_id(replay_run, target["target_id"])
+                for target in normalized_targets
+            ])
             replay_control = _CursorBoundReplayControlStore(
                 base=self,
                 cursor=cursor,
@@ -4252,7 +4316,7 @@ class ControlStore:
             if shrink_override_reason is None
             else _text(shrink_override_reason, "shrink_override_reason")
         )
-        with self._transaction() as cursor:
+        with self._registry_scope_transaction() as cursor:
             cursor.execute(
                 """
                 SELECT * FROM fbref_control.registry_snapshot
@@ -4620,7 +4684,7 @@ class ControlStore:
         snapshot = _uuid(snapshot_id, "snapshot_id")
         competition = _text(competition_id, "competition_id")
         seasons = self._validated_seasons(competition, entries)
-        with self._transaction() as cursor:
+        with self._registry_scope_transaction() as cursor:
             cursor.execute(
                 """
                 SELECT * FROM fbref_control.registry_snapshot
@@ -4860,7 +4924,7 @@ class ControlStore:
             if snapshot_id is None
             else _uuid(snapshot_id, "snapshot_id")
         )
-        with self._transaction() as cursor:
+        with self._registry_scope_transaction() as cursor:
             cursor.execute(
                 """
                 INSERT INTO fbref_control.season_alias (
@@ -5414,6 +5478,9 @@ class ControlStore:
                 ),
             )
 
+            if _cursor is None:
+                self._refresh_scope_summaries(cursor, [target_id])
+
     def record_frontier_provenance(
         self,
         provenance: FrontierProvenance,
@@ -5461,6 +5528,8 @@ class ControlStore:
         )
         expected_metadata = dict(provenance.metadata)
         with self._transaction(_cursor) as cursor:
+            if _cursor is None:
+                self._lock_scope_targets(cursor, [child])
             cursor.execute(
                 """
                 INSERT INTO fbref_control.frontier_provenance (
@@ -5527,6 +5596,8 @@ class ControlStore:
                     f"Frontier provenance {parent} -> {child} already has "
                     "different immutable evidence"
                 )
+            if _cursor is None:
+                self._refresh_scope_summaries(cursor, [child])
             return str(row["provenance_id"])
 
     def upsert_frontier_discovery_batch(
@@ -5586,10 +5657,15 @@ class ControlStore:
             return {"target_count": 0, "provenance_count": 0}
 
         with self._transaction() as cursor:
+            target_ids = sorted({target.target_id for target in ordered_targets}
+                                | {edge.child_target_id for edge in ordered_provenance})
+            self._lock_scope_targets(cursor, target_ids,
+                                     [target.canonical_url for target in ordered_targets])
             for target in ordered_targets:
                 self.upsert_frontier_target(target, _cursor=cursor)
             for edge in ordered_provenance:
                 self.record_frontier_provenance(edge, _cursor=cursor)
+            self._refresh_scope_summaries(cursor, target_ids)
         return {
             "target_count": len(ordered_targets),
             "provenance_count": len(ordered_provenance),
@@ -6716,7 +6792,7 @@ class ControlStore:
                 scope_sql + """
                 SELECT frontier.target_id FROM fbref_control.page_frontier AS frontier,
                   desired, scope_rollup AS scope
-                """ + predicate + " FOR UPDATE OF frontier SKIP LOCKED"
+                """ + predicate + " ORDER BY frontier.target_id FOR UPDATE OF frontier SKIP LOCKED"
             )
             target_ids = [row["target_id"] for row in _fetchall(cursor)]
             if not target_ids:
@@ -6733,7 +6809,9 @@ class ControlStore:
                 """ + predicate + " AND frontier.target_id = ANY(%s::text[])",
                 (target_ids,),
             )
-            return cursor.rowcount
+            updated = cursor.rowcount
+            self._refresh_scope_summaries(cursor, target_ids)
+            return updated
 
     def create_due_run_cohort(
         self,
@@ -9182,9 +9260,16 @@ class ControlStore:
         *,
         typed_status: str,
         stateful_status: str,
+        processing_work_ms: Optional[int] = None,
     ) -> None:
         """Close an observation only after all stateful effects succeeded."""
 
+        started = time.monotonic()
+        work_ms = (
+            None
+            if processing_work_ms is None
+            else _non_negative(processing_work_ms, "processing_work_ms")
+        )
         typed = str(typed_status).strip().lower()
         stateful = str(stateful_status).strip().lower()
         if typed not in {"succeeded", "skipped"}:
@@ -9216,6 +9301,20 @@ class ControlStore:
                 (typed, stateful, *identity, lease.claim_token),
             )
             if cursor.rowcount:
+                if work_ms is not None:
+                    # The fenced UPDATE holds the row until commit. Include its
+                    # work in the same transaction; telemetry/commit is excluded.
+                    cursor.execute(
+                        """UPDATE fbref_control.observation_processing
+                        SET processing_work_ms = %s
+                        WHERE logical_refresh_id = %s AND parser_version = %s
+                          AND typed_parser_version = %s
+                          AND stateful_parser_version = %s""",
+                        (
+                            work_ms + math.ceil((time.monotonic() - started) * 1000),
+                            *identity,
+                        ),
+                    )
                 return
             cursor.execute(
                 """
@@ -11780,6 +11879,10 @@ class _CursorBoundControlStore(ControlStore):
             raise ControlStoreError(
                 "bound control transaction cannot change its cursor"
             )
+        yield self._bound_cursor
+
+    @contextmanager
+    def _registry_scope_transaction(self):
         yield self._bound_cursor
 
 

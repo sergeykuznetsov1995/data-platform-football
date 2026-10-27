@@ -15,7 +15,16 @@ def main() -> int:
         "migrate",
         help="apply versioned PostgreSQL migrations under an advisory lock",
     )
+    backfill = subparsers.add_parser("backfill-page-scopes", help="commit one resumable ownership batch")
+    backfill.add_argument("--batch-size", type=int, default=100)
+    subparsers.add_parser("refresh-page-scopes", help="repair registry invalidations without provenance")
     arguments = parser.parse_args()
+    if arguments.command == "backfill-page-scopes":
+        print(json.dumps(ControlStore.from_env().backfill_page_scopes(batch_size=arguments.batch_size)))
+        return 0
+    if arguments.command == "refresh-page-scopes":
+        print(json.dumps({"refreshed": ControlStore.from_env().refresh_page_scopes()}))
+        return 0
     if arguments.command == "migrate":
         versions = ControlStore.from_env().migrate()
         print(json.dumps({"applied_migrations": list(versions)}))

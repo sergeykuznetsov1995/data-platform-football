@@ -167,6 +167,38 @@ def test_restart_retains_identity_baseline_but_records_gap_and_restarts_window(c
     assert len(c.store.rows('lifecycle', 0, c.clock().timestamp())) >= 2
 
 
+def test_restart_after_eight_days_preserves_s1_and_requires_new_full_s2_window(controller):
+    c = controller
+    for _ in range(2):
+        fill_window(c)
+        c.decide()
+    fill_window(c, 86400)
+    c.state['cursor'] = 2
+    c.state['benchmarks'] = {'1': {'isolated': True, 'p95_seconds': 1}}
+    c.store.save(c.state)
+    previous = c.store.get()
+    c.clock.now += timedelta(days=8)
+    c.observation = None
+    c.initialize()
+    for key in ('measurement_id', 'accepted_step', 'baseline_p95_ms',
+                'completed', 'cursor', 'benchmarks'):
+        assert c.state[key] == previous[key]
+    assert c.state['accepted_step'] == 1
+    assert c.state['step'] == 2
+    assert c.state['start'] == c.clock().timestamp()
+    assert c.evidence()[-1]['metrics']['attempts'] == 0
+    fill_window(c, 300)
+    assert c.decide()['reason'] == 'window_too_short'
+    assert c.state['status'] == 'running'
+    assert c.state['accepted_step'] == 1
+    # Start another covered window so the helper supplies unique attempts.
+    c.clock.now += timedelta(seconds=31)
+    c.observe(force=True)
+    fill_window(c, 86400)
+    assert c.decide()['reason'] == 'accepted_s2'
+    assert c.state['accepted_step'] == 2
+
+
 def test_second_process_lock_cannot_touch_first_controller(tmp_path):
     import subprocess
     import sys
@@ -505,14 +537,71 @@ def test_supervisor_failure_restart_runs_without_creating_operator_stop(tmp_path
     assert not (tmp_path / 'measurement.off').exists()
 
 
-def test_documented_supervisor_never_installs_persistent_stop_as_execstop():
+def test_documented_supervisor_survives_reboot_without_clearing_operator_stop():
+    from configparser import ConfigParser
     from pathlib import Path
-    text = (Path(__file__).resolve().parents[3] / 'deploy' / 'espn' / 'README.md').read_text()
-    command = next(line for line in text.splitlines() if line.startswith('systemd-run --unit=espn-1510-measure'))
-    assert 'Restart=on-failure' in command
-    assert '--benchmark-at-boundaries' in command
-    assert 'ExecStop=' not in command
-    assert '--allow-s3' not in command
+    import shlex
+    root = Path(__file__).resolve().parents[3]
+    unit = ConfigParser(interpolation=None)
+    unit.read_string((root / 'deploy/espn/systemd/espn-1510-measure.service').read_text())
+    assert 'docker.service' in unit['Unit']['Requires'].split()
+    assert 'docker.service' in unit['Unit']['After'].split()
+    assert unit['Unit']['StartLimitIntervalSec'] == '0'
+    assert unit['Install']['WantedBy'] == 'multi-user.target'
+    service = unit['Service']
+    assert service['Type'] == 'simple'
+    assert service['Restart'] == 'on-failure'
+    assert service['RestartSec'] == '15s'
+    assert service['TimeoutStopSec'] == 'infinity'
+    assert 'ExecStop' not in service
+    assert shlex.split(service['ExecStart']) == [
+        '/usr/bin/docker', 'exec', 'espn-live-airflow-scheduler-1', 'python', '-m',
+        'scrapers.espn.measure_pace', 'run', '--benchmark-at-boundaries',
+        '--expected-ids-sha256',
+        'eedc73cf4e3748fd589cd8a9aae0209c87bf5f0a0299628dd69ac40e0e864133',
+    ]
+    text = (root / 'deploy/espn/README.md').read_text()
+    assert 'install -m 0644 deploy/espn/systemd/espn-1510-measure.service /etc/systemd/system/espn-1510-measure.service' in text
+    assert 'systemctl daemon-reload' in text
+    assert 'systemctl enable --now espn-1510-measure.service' in text
+    assert 'systemd-run --unit=espn-1510-measure' not in text
+
+
+def test_documented_service_replacement_resumes_after_operator_stop(tmp_path, monkeypatch):
+    from pathlib import Path
+    import shlex
+    from scrapers.espn import trino_manager
+    root = Path(__file__).resolve().parents[3]
+    text = (root / 'deploy/espn/README.md').read_text()
+    override = '/run/systemd/system/espn-1510-measure.service.d/resume.conf'
+    setup = text.index(f'sudo tee {override}')
+    enable = text.index('sudo systemctl enable --now espn-1510-measure.service', setup)
+    cleanup = text.index(f'sudo rm {override}', enable)
+    block = text[setup:enable]
+    assert 'Restart=no\nExecStart=\nExecStart=' in block
+    command = shlex.split(block.split('ExecStart=\nExecStart=', 1)[1].splitlines()[0])
+    permanent = (root / 'deploy/espn/systemd/espn-1510-measure.service').read_text()
+    expected = shlex.split(permanent.split('ExecStart=', 1)[1].splitlines()[0])
+    expected[6] = 'resume'
+    assert command == expected
+    verification = text[enable:cleanup]
+    assert 'measure_pace status --format json' in verification
+    assert all(field in verification for field in ('status=running', 'heartbeat', 'stale=false'))
+    assert 'sudo systemctl daemon-reload' in text[cleanup:]
+
+    store = PaceStore(tmp_path / 'pace.sqlite3')
+    store.save({'status': 'stopped', 'accepted_step': 1})
+    assert main(['stop', '--state-dir', str(tmp_path)]) == 0
+    stop_file = tmp_path / 'measurement.off'
+    assert stop_file.exists()
+    calls = []
+    monkeypatch.setattr(trino_manager, 'EspnTrinoTableManager', lambda: Trino())
+    monkeypatch.setattr('scrapers.espn.measure_pace.accepted_ids', lambda _: list(range(380)))
+    monkeypatch.setattr('scrapers.espn.measure_pace.digest', lambda _: command[-1])
+    monkeypatch.setattr(Controller, 'run_locked', lambda self: calls.append(stop_file.exists()))
+    assert main(command[6:] + ['--state-dir', str(tmp_path)]) == 0
+    assert calls == [False]
+    assert store.get()['accepted_step'] == 1
 
 
 def test_full_s3_opt_in_progression_expires_to_previously_accepted_s2(controller):

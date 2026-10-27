@@ -1071,6 +1071,7 @@ def test_schedule_collects_observed_stages_when_source_drops_one(
         "source_stage_count": 1,
         "source_stage_absent": [699],
     }
+    assert repository.scope_snapshots[-1]["checked_stage_ids"] == [700, 699]
     assert fetched_stage_ids == ["700"]
     assert result.counts["schedule"] == 1
     assert len(repository.scope_snapshots) == 1
@@ -3975,6 +3976,7 @@ def _xg_service(tmp_path, *, final=False, stages=(700,)):
         today=now.date(),
         active=True,
         source_season_id=9001,
+        source_stage_absent=[],
         stage_rows=[{"stage_id": stage} for stage in stages],
         schedule_by_id={
             stage * 10 + i: {"stage_id": stage, "date": now + timedelta(days=offset)}
@@ -4344,3 +4346,27 @@ def test_xg_check_timestamp_uses_oldest_cached_json_not_new_bootstrap(tmp_path):
         repo.scope_snapshots[-1]["feed_checks"]["700"]["checked_at"]
         == oldest.isoformat()
     )
+
+
+def test_xg_absent_catalog_stage_has_final_evidence_and_is_not_repeated(tmp_path):
+    from dataclasses import replace
+    from scrapers.whoscored.history import final_feeds
+
+    service, repo, now, prepared, fetched, _, version = _xg_service(tmp_path, final=True)
+    collected = service._collect_season_schedule()
+    collected.source_stage_absent = [699]
+    collected.active = False
+    service._collect_season_schedule = lambda: collected
+    _xg_previous(repo, now, version, final=True)
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    snapshot = repo.scope_snapshots[-1]
+    assert snapshot["feed_checks"]["699"]["final"] is True
+    assert datetime.fromisoformat(snapshot["feed_checks"]["699"]["checked_at"]) >= now
+    assert snapshot["feed_states"]["699:team:xg-teamstats:summary"] == "not_available"
+    repo.stage_snapshot.update({k: snapshot[k] for k in ("feed_checks", "feed_states")})
+    assert final_feeds(repo, replace(service.catalog_season, stage_ids=(699, 700)),
+                       moment=datetime.now(timezone.utc))
+    repo.scope_snapshots.clear()
+    assert service.sync_stage_feeds().skipped == 1
+    assert not prepared and not fetched and not repo.scope_snapshots
