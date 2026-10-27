@@ -841,8 +841,8 @@ def initial_season_chunk(tournament_id, season_id, freshness_key, *, max_pages=5
     """Conservative initial window for legacy signed season identities."""
     tournament, season = _source_ids(tournament_id, season_id)
     limit = min(max_pages, 50)
-    last = max(1, limit - 1)
-    other = 1 if limit > 1 else 0
+    other = limit // 2
+    last = limit - other
     return SeasonScheduleChunk(tournament, season, (0, last), (0, other),
         _schedule_prefix_digest(tournament, season, freshness_key, {"last": [], "next": []}))
 
@@ -1049,7 +1049,7 @@ def plan_season_partition(
         for name in ("last", "next"):
             start = frontiers[name] if frontiers[name] is not None else len(page_evidence[name])
             if len(open_directions) == 2:
-                length = max(1, limit - 1) if name == "last" else (1 if limit > 1 else 0)
+                length = limit - limit // 2 if name == "last" else limit // 2
             else:
                 length = limit if name in open_directions else 0
             windows[name] = (start, start + length)
