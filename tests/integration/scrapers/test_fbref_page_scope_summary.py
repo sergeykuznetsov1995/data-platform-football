@@ -4,20 +4,66 @@ import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from scrapers.fbref.control import ControlStore, FrontierProvenance, FrontierTarget, SeasonAlias
 from scrapers.fbref.control.migrations import MIGRATIONS, bootstrap_statements
 from scrapers.fbref.control.store import _FRONTIER_SCOPE_CTE
-from scrapers.fbref.daily_report import page_age_metrics
-from scrapers.fbref.daily_report_reader import PAGE_AGES_SQL
+from scrapers.fbref.daily_report import page_age_line, page_age_metrics
+from scrapers.fbref.daily_report_reader import PAGE_AGE_EXCLUSIONS_SQL, REGISTRY_SQL, page_ages_query
 
 pytestmark = pytest.mark.integration
 FLAGS = ("has_current_ownership", "competition_missing", "has_female", "has_unknown",
          "inactive_competition", "invalid_season")
 CUTOFF = "2026-10-26T11:00:00+00:00"
+
+
+# Frozen row contract: the oracle still runs the pre-aggregation SQL and Python path.
+LEGACY_PAGE_AGES_SQL = """
+SELECT CASE WHEN coalesce(bool_or(NOT coalesce(p.scope_summary_ready,false)),false)
+  OR EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+ THEN jsonb_build_object('error','scope_summary_incomplete')::text
+ ELSE coalesce(jsonb_agg(to_jsonb(p) - 'scope_summary_ready'), '[]'::jsonb)::text END
+FROM (
+ SELECT f.target_id,f.page_kind,f.canonical_url,f.state,f.refresh_policy,
+        scope.is_complete AND NOT scope.pending AS scope_summary_ready,
+        f.last_fetched_at, f.last_content_hash,
+        EXISTS (SELECT 1 FROM fbref_control.dataset_manifest m
+          WHERE m.target_id=f.target_id AND m.content_hash=f.last_content_hash
+            AND m.dataset='__page__' AND m.parse_status='succeeded'
+            AND m.persistence_status='succeeded' AND m.validation_status='succeeded'
+            AND m.completed_at <= '{cutoff}'::timestamptz) AS processed,
+        coalesce(scope.has_current_ownership,false)
+          AND NOT coalesce(scope.competition_missing,true)
+          AND NOT coalesce(scope.has_female,false)
+          AND NOT coalesce(scope.has_unknown,true)
+          AND NOT coalesce(scope.inactive_competition,true)
+          AND NOT coalesce(scope.invalid_season,true) AS current_ownership,
+        coalesce(scope.scopes, '[]'::jsonb) AS scopes
+ FROM fbref_control.page_frontier f
+ LEFT JOIN fbref_control.page_scope_summary scope USING (target_id)
+ WHERE f.source='fbref' AND f.refresh_policy <> 'historical_once'
+   AND f.state NOT IN ('dead','skipped','quarantined') AND f.created_at <= '{cutoff}'::timestamptz
+) p
+"""
+
+
+def json_result(cursor):
+    row = cursor.fetchone()
+    return json.loads(next(iter(row.values())) if isinstance(row, dict) else row[0])
+
+
+def report_snapshot(cursor):
+    cursor.execute(REGISTRY_SQL.format(cutoff=CUTOFF))
+    snapshot = json_result(cursor)
+    snapshot["standings_inventory"] = []
+    return snapshot
+
+
+def aggregate_sql(cursor):
+    return page_ages_query(report_snapshot(cursor), datetime.fromisoformat(CUTOFF))
 
 
 @pytest.fixture
@@ -72,6 +118,7 @@ def scope_db():
                     ("i-null", "competition", {"competition_id": None}),
                     ("j-empty", "season", {"competition_id": "", "season_id": ""}),
                     ("k-mixed", "squad", {"competition_id": "9", "season_id": "2026"}),
+                    ("l-youth", "season", {"competition_id": "10", "season_id": "2026"}),
                     ("z-future", "season", {"competition_id": "9", "season_id": "2026"}),
                 ):
                     cursor.execute("""INSERT INTO fbref_control.page_frontier
@@ -123,12 +170,10 @@ def assert_equivalent(connection, cursor_class):
             for row in stored:
                 key = lambda scope: json.dumps(scope, sort_keys=True)
                 assert sorted(row["scopes"], key=key) == sorted(scopes.get(row["target_id"], []), key=key)
-            cursor.execute(PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
-            report_rows = json.loads(next(iter(cursor.fetchone().values())))
-            assert isinstance(report_rows, list)
+            cursor.execute(LEGACY_PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+            report_rows = json_result(cursor)
             assert "z-future" not in {row["target_id"] for row in report_rows}
-            # Compare the final metrics as well, replacing stored ownership/scopes
-            # with the reference rollup rather than reproducing its SQL.
+            # Also retain the original reference-rollup comparison for v13.
             baseline = []
             for row in report_rows:
                 flags = reference.get(row["target_id"], {})
@@ -140,21 +185,24 @@ def assert_equivalent(connection, cursor_class):
                              and flags.get("invalid_season") is False)
                 baseline.append(dict(row, current_ownership=ownership,
                                      scopes=scopes.get(row["target_id"], [])))
-            cursor.execute("SELECT * FROM fbref_control.competition_registry")
-            competitions = cursor.fetchall()
-            cursor.execute("SELECT * FROM fbref_control.season_registry WHERE is_current")
-            seasons = cursor.fetchall()
-            snapshot = {"competitions": competitions, "seasons": seasons}
+            snapshot = report_snapshot(cursor)
             now = datetime.fromisoformat(CUTOFF)
-            assert page_age_metrics(dict(snapshot, page_ages=report_rows), now) == page_age_metrics(
-                dict(snapshot, page_ages=baseline), now)
+            expected = page_age_metrics(dict(snapshot, page_ages=baseline), now)
+            assert page_age_metrics(dict(snapshot, page_ages=report_rows), now) == expected
+            cursor.execute(page_ages_query(snapshot, now))
+            aggregate = json_result(cursor)
+            actual = page_age_metrics(dict(snapshot, page_ages=aggregate), now)
+            assert actual == expected
+            assert page_age_line({"page_ages": actual}) == page_age_line({"page_ages": expected})
+            assert set(aggregate) == {"cutoff", "by_kind", "excluded", "standings_confirmed_seasons"}
+            assert "scopes" not in json.dumps(aggregate) and "target_id" not in json.dumps(aggregate)
 
 
 def test_summary_backfill_is_resumable_and_equivalent_to_old_rollup(scope_db):
     connection, store, cursor_class = scope_db
     with connection:
         with connection.cursor() as cursor:
-            cursor.execute(PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+            cursor.execute(aggregate_sql(cursor))
             assert json.loads(cursor.fetchone()[0]) == {"error": "scope_summary_incomplete"}
     first = store.backfill_page_scopes(batch_size=2)
     second = ControlStore(store.db_uri).backfill_page_scopes(batch_size=2)
@@ -170,7 +218,7 @@ def test_summary_backfill_is_resumable_and_equivalent_to_old_rollup(scope_db):
                 FROM fbref_control.frontier_provenance WHERE child_target_id='c-shared'""")
             plan = json.dumps(cursor.fetchone()[0])
             assert "frontier_provenance_child_idx" in plan and "Seq Scan" not in plan
-            cursor.execute("EXPLAIN (FORMAT JSON) " + PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+            cursor.execute("EXPLAIN (FORMAT JSON) " + aggregate_sql(cursor))
             assert "frontier_provenance" not in json.dumps(cursor.fetchone()[0])
 
 
@@ -190,7 +238,7 @@ def test_alias_registry_and_source_id_changes_keep_summary_exact(scope_db):
         with connection:
             with connection.cursor() as cursor:
                 cursor.execute(sql)
-                cursor.execute(PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+                cursor.execute(aggregate_sql(cursor))
                 assert json.loads(cursor.fetchone()[0]) == {"error": "scope_summary_incomplete"}
         store.refresh_page_scopes()
         assert_equivalent(connection, cursor_class)
@@ -358,7 +406,120 @@ def test_concurrent_alias_updates_skip_locked_registry_invalidations(scope_db):
             assert cursor.fetchall() == [("10", "2025"), ("9", "2025")]
             cursor.execute("SELECT competition_id FROM fbref_control.page_scope_registry_dirty")
             assert cursor.fetchall() == [("99",)]
-            cursor.execute(PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+            cursor.execute(aggregate_sql(cursor))
             assert json.loads(cursor.fetchone()[0]) == {"error": "scope_summary_incomplete"}
     store.refresh_page_scopes()
     assert_equivalent(connection, cursor_class)
+
+
+def test_page_age_aggregate_matches_rows_at_age_scope_and_standings_boundaries(scope_db):
+    connection, store, cursor_class = scope_db
+    now = datetime.fromisoformat(CUTOFF)
+    with connection:
+        with connection.cursor() as cursor:
+            # Python's adult rules must remain authoritative even for male registries.
+            cursor.execute("UPDATE fbref_control.competition_registry SET name='U21 League' WHERE competition_id='10'")
+            for number, (kind, age, state, policy, suffix) in enumerate([
+                ("season", None, "queued", "weekly", ""),
+                ("season", -1, "queued", "weekly", ""),
+                ("season", 0, "queued", "weekly", ""),
+                ("season", 168, "queued", "weekly", ""),
+                ("season", 168-1/3600, "queued", "weekly", ""),
+                ("season", 168+1/3600, "queued", "weekly", ""),
+                ("season", 10, "queued", "weekly", ""),
+                ("season", 40, "queued", "weekly", ""),
+                ("season", 100, "queued", "weekly", ""),
+                ("squad", 672, "queued", "monthly", ""),
+                ("squad", 0, "queued", "monthly", "/matchlogs/x"),
+                ("squad", 0, "queued", "monthly", "/history?x=matchlogs"),
+                ("squad", 0, "queued", "monthly", "?x=matchlogs"),
+                ("player", 720, "queued", "weekly", ""),
+                ("matchlog", 720-1/3600, "queued", "weekly", ""),
+                ("schedule", 24, "queued", "daily", ""),
+                ("season_stats", 168, "queued", "weekly", ""),
+                ("season", 0, "dead", "historical_once", ""),
+                ("season", 0, "skipped", "weekly", ""),
+                ("season", 0, "quarantined", "weekly", ""),
+                ("season", 0, "queued", "historical_once", ""),
+            ]):
+                target = f"metric-{number}"
+                cursor.execute("""INSERT INTO fbref_control.page_frontier
+                    (target_id,page_kind,canonical_url,source_ids,refresh_policy,state,created_at,
+                     last_fetched_at,last_content_hash)
+                    VALUES (%s,%s,%s,%s::jsonb,%s,%s,'2026-10-01',%s,'current')""",
+                    (target, kind, f"https://example.invalid/en/squads/{target}{suffix}",
+                     json.dumps({"competition_id": "11" if number == 11 else "9",
+                                 "season_id": "current" if number != 11 else "2026"}), policy, state,
+                     None if age is None else now-timedelta(hours=age)))
+            # Competition pages need only an active competition; index needs no ownership.
+            cursor.execute("""UPDATE fbref_control.page_frontier SET page_kind='competition',
+                source_ids='{"competition_id":"9"}' WHERE target_id='i-null'""")
+            for number, status, completed in ((2, "succeeded", now), (3, "failed", now),
+                                               (4, "succeeded", now+timedelta(seconds=1)),
+                                               (5, "succeeded", now)):
+                cursor.execute("""INSERT INTO fbref_control.dataset_manifest
+                    (target_id,content_hash,parser_version,dataset,availability,
+                     parse_status,persistence_status,validation_status,completed_at)
+                    VALUES (%s,'current','fixture','__page__','available',%s,'succeeded','succeeded',%s)""",
+                    (f"metric-{number}", status, completed))
+            # Duplicate successful parser versions must not multiply confirmed seasons.
+            cursor.execute("""INSERT INTO fbref_control.dataset_manifest
+                (target_id,content_hash,parser_version,dataset,availability,
+                 parse_status,persistence_status,validation_status,completed_at)
+                VALUES ('metric-2','current','second','__page__','available',
+                        'succeeded','succeeded','succeeded',%s)""", (now,))
+            for number, persistence, validation in ((6, "failed", "succeeded"), (7, "succeeded", "failed")):
+                cursor.execute("""INSERT INTO fbref_control.dataset_manifest
+                    (target_id,content_hash,parser_version,dataset,availability,
+                     parse_status,persistence_status,validation_status,completed_at)
+                    VALUES (%s,'current','fixture','__page__','available','succeeded',%s,%s,%s)""",
+                    (f"metric-{number}", persistence, validation, now))
+    finish_backfill(store)
+    store.refresh_page_scopes()
+    with connection:
+        with connection.cursor(cursor_factory=cursor_class) as cursor:
+            snapshot = report_snapshot(cursor)
+            snapshot["standings_inventory"] = [
+                {"target_id": f"metric-{number}", "content_hash": "old" if number == 5 else "current"}
+                for number in (2, 2, 3, 4, 5, 6, 7)]
+            cursor.execute(PAGE_AGE_EXCLUSIONS_SQL.replace("{cutoff}", CUTOFF))
+            snapshot["page_age_exclusions"] = json_result(cursor)
+            cursor.execute(LEGACY_PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+            rows = json_result(cursor)
+            expected = page_age_metrics(dict(snapshot, page_ages=rows), now)
+            cursor.execute(page_ages_query(snapshot, now))
+            aggregate = json_result(cursor)
+            actual = page_age_metrics(dict(snapshot, page_ages=aggregate), now)
+            # Percentile algorithms may differ by the last floating point bit.
+            assert actual.keys() == expected.keys()
+            for key in actual.keys() - {"by_kind"}:
+                assert actual[key] == expected[key]
+            assert actual["by_kind"].keys() == expected["by_kind"].keys()
+            for kind in actual["by_kind"]:
+                assert actual["by_kind"][kind] == pytest.approx(expected["by_kind"][kind])
+            assert actual["standings_confirmed_seasons"] == 1
+            assert actual["by_kind"]["standings"]["total"] == 0
+            assert actual["excluded"]["non_roster"] == 2
+            # The old SELECT has no row order, hence no defined exclusion order.
+            # Counts were compared above; align only their display order here.
+            expected_line = dict(expected, excluded=dict(actual["excluded"]))
+            assert page_age_line({"page_ages": actual}) == page_age_line({"page_ages": expected_line})
+            assert set(aggregate) == {"cutoff", "by_kind", "excluded", "standings_confirmed_seasons"}
+            assert len(aggregate["by_kind"]) < len(rows)
+            assert "target_id" not in json.dumps(aggregate) and "scopes" not in json.dumps(aggregate)
+
+
+@pytest.mark.parametrize("mutation", [
+    "DELETE FROM fbref_control.page_scope_summary WHERE target_id='g-orphan'",
+    "UPDATE fbref_control.page_scope_summary SET pending=true WHERE target_id='g-orphan'",
+    "UPDATE fbref_control.page_scope_summary SET is_complete=false WHERE target_id='g-orphan'",
+    "UPDATE fbref_control.competition_registry SET name='Edited' WHERE competition_id='9'",
+])
+def test_aggregate_guard_checks_even_pages_outside_report_scope(scope_db, mutation):
+    connection, store, cursor_class = scope_db
+    finish_backfill(store)
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute(mutation)
+            cursor.execute(aggregate_sql(cursor))
+            assert json_result(cursor) == {"error": "scope_summary_incomplete"}

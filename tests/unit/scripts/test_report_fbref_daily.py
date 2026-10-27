@@ -31,6 +31,27 @@ def test_cli_writes_dated_auditable_provisional_report(tmp_path, capsys):
     assert len(bundle["days"]) == 3
 
 
+def test_1805_cli_reuses_saved_page_age_aggregate_for_lookback(tmp_path, capsys):
+    from datetime import datetime
+    from scrapers.fbref.daily_report import page_age_line, page_age_metrics
+    cutoff = "2026-10-08T07:00:00+00:00"
+    snapshot = {"competitions": [], "seasons": [], "schedules": [], "page_ages": [
+        {"target_id": "index", "page_kind": "competition_index", "state": "queued",
+         "refresh_policy": "daily", "last_fetched_at": cutoff}]}
+    expected = page_age_metrics(snapshot, datetime.fromisoformat(cutoff))
+    snapshot["page_ages"] = {"cutoff": cutoff, "by_kind": expected["by_kind"],
+                            "excluded": {}, "standings_confirmed_seasons": 0}
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps(snapshot))
+    assert main(["--input", str(input_path), "--date", "2026-10-07", "--as-of", cutoff,
+                 "--lookback", "3", "--output-dir", str(tmp_path / "out")]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 4 and lines[3] == page_age_line({"page_ages": expected})
+    bundle_path = next(p for p in (tmp_path / "out").glob("*.json") if "snapshot" not in p.name)
+    bundle = json.loads(bundle_path.read_text())
+    assert all(report["page_ages"] == expected for report in bundle["days"])
+
+
 def test_host_readers_only_select_and_keep_credentials_out_of_results(monkeypatch):
     calls = []
     def run(argv, **kwargs):
