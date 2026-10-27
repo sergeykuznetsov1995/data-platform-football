@@ -5,12 +5,18 @@ services:
     image: ${CLUBELO_GATEWAY_IMAGE:?set image pinned by sha256 digest}
     restart: unless-stopped
     working_dir: /opt/clubelo-repo
+    # Как у общего proxy_filter: без whoscored-entrypoint и без ожидания БД Airflow.
+    entrypoint:
+      - /usr/bin/dumb-init
+      - --
+      - /entrypoint
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     environment:
       PYTHONPATH: /opt/clubelo-repo
+      CONNECTION_CHECK_MAX_COUNT: "0"
       PROXY_POOL_JSON: ${PROXY_POOL_JSON:?set the working residential proxy pool}
       PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:?set a distinct control token}
       CLUBELO_PROXY_CONTROL_TOKEN: ${CLUBELO_PROXY_CONTROL_TOKEN:?set the ClubElo control token}
