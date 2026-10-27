@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from scrapers.transfermarkt.client import (
-    CurrentPortionDeadlineExceeded, ProxyFilterLeaseProvider, TransfermarktHttpClient,
+    CurrentPortionDeadlineExceeded, ProxyFilterLeaseProvider, SourceStreamPaused,
+    TransfermarktHttpClient,
 )
 from scrapers.transfermarkt.models import LeaseTrafficSnapshot, ProxyLease, SharedTrafficLedger, TrafficMeterError
 from scrapers.transfermarkt.raw_store import RawResponseStore
@@ -103,6 +104,111 @@ def test_permit_short_remaining_budget():
     assert provider.waits == [15]
     instance.close()
     assert provider.closed == ['lease-1']
+
+
+class PausingProvider(Provider):
+    def __init__(self, clock, pauses):
+        super().__init__(clock)
+        self.pauses = iter(pauses)
+        self.request_ids = []
+
+    def acquire_request_permit(self, *, metadata, request_id, max_wait_seconds=65):
+        super().acquire_request_permit(
+            metadata=metadata, request_id=request_id, max_wait_seconds=max_wait_seconds,
+        )
+        self.request_ids.append(request_id)
+        pause = next(self.pauses, None)
+        if pause is not None:
+            raise SourceStreamPaused(pause)
+        return 'permit'
+
+
+def test_stream_pause_waits_then_fetches_same_request_once():
+    clock = Clock()
+    provider = PausingProvider(clock, [10])
+    instance, factory = client(clock, [_FakeResp(b'ok')], provider=provider)
+    assert instance.fetch(URL, as_json=False).value == 'ok'
+    assert clock.sleeps == [10.1]
+    assert provider.request_ids == [provider.request_ids[0]] * 2
+    assert provider.waits == [65, pytest.approx(54.9)]
+    assert len(factory.clients[0].get_calls) == 1
+    assert instance.get_traffic_stats()['requests'] == 1
+    instance.close()
+    assert provider.closed == ['lease-1']
+
+
+@pytest.mark.parametrize('deadline,pauses,sleeps', [
+    (100, [100], []),
+    (100, [65], []),
+    (100, [10, 100], [10.1]),
+    (None, [10], []),
+])
+def test_stream_pause_outside_deadline_has_no_http(deadline, pauses, sleeps):
+    clock = Clock()
+    provider = PausingProvider(clock, pauses)
+    instance, factory = client(clock, [], deadline=deadline, provider=provider)
+    with pytest.raises(SourceStreamPaused):
+        instance.fetch(URL, as_json=False)
+    assert clock.sleeps == sleeps
+    assert all(not item.get_calls for item in factory.clients)
+    assert instance.get_traffic_stats()['requests'] == 0
+    assert instance.get_raw_attempt_records() == ()
+    assert provider.closed == ['lease-1']
+
+
+def test_stream_pause_rechecks_deadline_after_sleep():
+    clock = Clock()
+    provider = PausingProvider(clock, [10])
+    instance, factory = client(clock, [], provider=provider)
+    def oversleep(seconds):
+        clock.sleep(seconds)
+        clock.now = 65
+    instance._sleep = oversleep
+    with pytest.raises(SourceStreamPaused):
+        instance.fetch(URL, as_json=False)
+    assert len(provider.request_ids) == 1
+    assert factory.clients[0].get_calls == []
+    assert provider.closed == ['lease-1']
+
+
+@pytest.mark.parametrize('expires_at', [120, 90])
+def test_stream_pause_rotates_expiring_lease_before_http(expires_at):
+    from dataclasses import replace
+    clock = Clock()
+    provider = PausingProvider(clock, [100])
+    acquire = provider.acquire
+    def acquire_short_first(**kwargs):
+        lease = acquire(**kwargs)
+        if len(provider.acquired) == 1:
+            lease = replace(lease, expires_at=expires_at)
+            provider.acquired[-1] = (lease, *provider.acquired[-1][1:])
+        return lease
+    provider.acquire = acquire_short_first
+    acquire_permit = provider.acquire_request_permit
+    def require_live_lease(**kwargs):
+        assert provider.acquired[-1][0].expires_at > clock.now
+        return acquire_permit(**kwargs)
+    provider.acquire_request_permit = require_live_lease
+    instance, factory = client(clock, [_FakeResp(b'ok')], deadline=200, provider=provider)
+    assert instance.fetch(URL, as_json=False).value == 'ok'
+    assert clock.sleeps == [100.1]
+    assert factory.clients[0].closed
+    assert factory.clients[0].get_calls == []
+    assert len(factory.clients[1].get_calls) == 1
+    assert provider.closed == ['lease-1']
+    instance.close()
+    assert provider.closed == ['lease-1', 'lease-2']
+
+
+def test_history_stream_pause_still_does_not_sleep(monkeypatch):
+    monkeypatch.setattr('scrapers.transfermarkt.history_portion.enabled', lambda: True)
+    clock = Clock()
+    provider = PausingProvider(clock, [10])
+    instance, _ = client(clock, [], provider=provider)
+    with pytest.raises(SourceStreamPaused):
+        instance._consume_source_request_permit(url=URL, label='listing', context={})
+    assert clock.sleeps == []
+    assert len(provider.request_ids) == 1
 
 
 def test_backoff_cannot_start_next_attempt_into_tail():

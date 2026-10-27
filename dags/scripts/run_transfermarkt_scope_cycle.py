@@ -934,8 +934,15 @@ def _runner_environment(
     parser_entity: str,
     retry_budget: int,
     listing_authoritative_empty: bool = False,
+    request_deadline_monotonic: float | None = None,
 ) -> Mapping[str, str]:
     env = dict(os.environ)
+    if request_deadline_monotonic is not None:
+        existing = env.get('TM_REQUEST_DEADLINE_MONOTONIC')
+        env['TM_REQUEST_DEADLINE_MONOTONIC'] = str(
+            min(float(existing), request_deadline_monotonic)
+            if existing is not None else request_deadline_monotonic
+        )
     if listing_authoritative_empty:
         # #1025: the players entity proved the participant listing is
         # authoritatively empty; the entities that follow in this cycle
@@ -2699,6 +2706,10 @@ def _run_scope_cycle(
                 command,
                 env=_runner_environment(
                     identity, args, packets, parser_entity, child_retry_budget,
+                    request_deadline_monotonic=(
+                        None if history_portion.enabled()
+                        else time.monotonic() + entity_timeout
+                    ),
                     listing_authoritative_empty=any(
                         run.parser_entity == 'players'
                         and isinstance(

@@ -1,0 +1,15 @@
+[Unit]
+Description=ESPN #1510 pace measurement
+Requires=docker.service
+After=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace run --benchmark-at-boundaries --expected-ids-sha256 eedc73cf4e3748fd589cd8a9aae0209c87bf5f0a0299628dd69ac40e0e864133
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=infinity
+
+[Install]
+WantedBy=multi-user.target

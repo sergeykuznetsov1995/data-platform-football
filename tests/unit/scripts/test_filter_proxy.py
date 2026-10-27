@@ -11563,3 +11563,137 @@ def test_history_pressure_reclaims_small_wal_and_archives_old_daily_sums(shared_
     registry.compact(str(path), shared_mod._REGISTRY_LOCK, kind="paid", now=now + timedelta(days=1))
     assert restore() == expected
     assert totals(registry.iter_events(path)) == totals(rows)
+
+
+# --- #1788: discovery must count a provably complete CONNECT 502 refusal ---
+
+
+def _make_discovery_lease(mod, manager):
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 8192
+    return mod._create_lease(
+        manager, max_bytes=4096, ttl_seconds=30,
+        metadata=_discovery_context(), require_context=True,
+    )
+
+
+def _close_discovery_control(mod, lease, manager):
+    writer = _ClientWriter()
+    asyncio.run(mod._handle_control(
+        "DELETE", f"/v1/leases/{lease.lease_id}/close",
+        {"x-proxy-control-token": mod.CONTROL_TOKEN,
+         "authorization": f"Bearer {lease.token}"},
+        _FakeUpstreamReader(), writer, manager,
+    ))
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+    return int(head.split()[1]), json.loads(body)
+
+
+@pytest.mark.parametrize("framing", ["length", "eof"])
+@pytest.mark.parametrize("previous_tunnel", [False, True])
+def test_discovery_connect_502_complete_closes_exactly(
+    shared_mod, monkeypatch, framing, previous_tunnel
+):
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_discovery_lease(shared_mod, manager)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    writers = []
+    body = b"provider refused"
+    head = b"HTTP/1.1 502 Bad Gateway\r\n"
+    if framing == "length":
+        head += f"Content-Length: {len(body)}\r\n".encode()
+    response = head + b"\r\n" + body
+    responses = deque()
+    if previous_tunnel:
+        responses.append(_LIVE_CONNECT_HEAD + b"earlier tunnel payload")
+    responses.append(response)
+
+    async def fake_open(host, port):
+        writer = _FakeUpstreamWriter()
+        writers.append(writer)
+        return _FakeUpstreamReader(
+            responses.popleft(), block_when_empty=framing == "length" and len(writers) > int(previous_tunnel)
+        ), writer
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    if previous_tunnel:
+        earlier = _dead_exit_handle(shared_mod, lease, manager)
+        assert b"earlier tunnel payload" in earlier.payload
+        assert lease.tunnels_total == 1
+    prior_up, prior_down = lease.up_bytes, lease.down_bytes
+    client = _dead_exit_handle(shared_mod, lease, manager)
+    status, report = _close_discovery_control(shared_mod, lease, manager)
+
+    assert status == 200, report
+    assert report["close_complete"] is True
+    assert lease.accounting_uncertain is False
+    assert lease.accounting_uncertain_reason == ""
+    assert bytes(client.payload).startswith(b"HTTP/1.1 502 Bad Gateway (upstream=502)\r\n")
+    assert bytes(client.payload).split(b"\r\n\r\n", 1)[1] == b"502"
+    assert lease.up_bytes == prior_up + len(_expected_connect_head())
+    assert lease.down_bytes == prior_down + len(response)
+    assert bytes(writers[-1].data) == _expected_connect_head()
+    assert lease.provider_rejected_connects == 1
+    assert lease.upstream_repins == 0
+    assert len(writers) == 1 + int(previous_tunnel)
+    assert all(writer.closed for writer in writers)
+    assert lease.active_tunnels == lease.reserved_bytes == 0
+    assert not lease.tunnel_writers
+    events = _ledger_events(shared_mod)
+    assert any(e["event_type"] == "connect_rejected" and e["classification"] == "provider_rejected" for e in events)
+    expected = (lease.up_bytes, lease.down_bytes)
+    for compact in (False, True):
+        if compact:
+            shared_mod._compact_registry(shared_mod.LEDGER_PATH, shared_mod._REGISTRY_LOCK, kind="paid", force=True)
+        shared_mod._run_up_bytes.clear()
+        shared_mod._run_down_bytes.clear()
+        shared_mod._restore_budget_ledger(shared_mod.LEDGER_PATH)
+        assert (shared_mod._run_up_bytes[lease.dagrun_key], shared_mod._run_down_bytes[lease.dagrun_key]) == expected
+
+
+@pytest.mark.parametrize("failure", ["no_eof", "timeout", "reset", "over_cap", "ambiguous", "tunnel_reset", "other_status"])
+def test_discovery_connect_unproven_response_keeps_latch(shared_mod, monkeypatch, failure):
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_discovery_lease(shared_mod, manager)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    monkeypatch.setattr(shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02)
+    head = b"HTTP/1.1 502 Bad Gateway\r\n"
+    if failure == "ambiguous":
+        head += b"Content-Length: 7\r\nContent-Length: 8\r\n"
+    if failure == "other_status":
+        head = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 7\r\n"
+    response = head + b"\r\npartial"
+    if failure == "over_cap":
+        monkeypatch.setattr(shared_mod, "DEAD_EXIT_RESPONSE_MAX_BYTES", len(response) - 1)
+    if failure == "tunnel_reset":
+        response = _LIVE_CONNECT_HEAD + b"partial"
+
+    class Reader(_FakeUpstreamReader):
+        async def read(self, size):
+            if not self.buf:
+                if failure in {"reset", "tunnel_reset"}:
+                    raise ConnectionResetError("provider reset")
+                if failure == "timeout":
+                    raise asyncio.TimeoutError()
+            return await super().read(size)
+
+    writer = _FakeUpstreamWriter()
+
+    async def fake_open(host, port):
+        return Reader(response, block_when_empty=True), writer
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    try:
+        client = _dead_exit_handle(shared_mod, lease, manager)
+    except ConnectionResetError:
+        assert failure == "tunnel_reset"
+    assert lease.accounting_uncertain is True
+    assert lease.provider_rejected_connects == 0
+    assert lease.upstream_repins == 0
+    assert writer.closed
+    assert lease.active_tunnels == 0
+    status, report = _close_discovery_control(shared_mod, lease, manager)
+    assert status == 409 and report["code"] == "lease_close_pending"
+    reason = lease.accounting_uncertain_reason
+    _dead_exit_handle(shared_mod, lease, manager)
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == reason

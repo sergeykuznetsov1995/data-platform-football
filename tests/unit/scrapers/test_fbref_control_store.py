@@ -48,7 +48,15 @@ class FakeCursor:
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split())
         self.executions.append((normalized, params))
-        self.rows, self.rowcount = self.handler(normalized, params)
+        if normalized.startswith((
+            "SELECT pg_advisory_xact_lock_shared(%s)",
+            "SELECT target_id FROM fbref_control.page_scope_summary ",
+            "SELECT fbref_control.refresh_page_scope_summary(",
+            "SELECT target_id FROM fbref_control.page_frontier WHERE target_id = ANY(",
+        )):
+            self.rows, self.rowcount = [], 0
+        else:
+            self.rows, self.rowcount = self.handler(normalized, params)
 
     def fetchone(self):
         return self.rows.pop(0) if self.rows else None
@@ -2761,3 +2769,50 @@ def test_1325_urgent_handback_excludes_all_existing_run_members():
     )
     assert store.claim_targets(run_id, "current", limit=25) == []
     assert seen["handback"]
+
+
+@pytest.mark.parametrize('outcome', ['completed', 'already_succeeded', 'lost'])
+def test_processing_measurement_is_atomic_with_fenced_completion(monkeypatch, outcome):
+    from scrapers.fbref.control import LeaseLost
+    from scrapers.fbref.control.models import ObservationLease
+    from scrapers.fbref.control import store as module
+
+    now = [10.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    lease = ObservationLease(
+        logical_refresh_id=str(uuid.uuid4()), target_id='target', content_hash='hash',
+        parser_version='page', typed_parser_version='typed', stateful_parser_version='stateful',
+        claim_token=str(uuid.uuid4()), lease_expires_at=datetime.now(timezone.utc),
+    )
+
+    def handler(sql, params):
+        if "SET status = 'succeeded'" in sql:
+            assert "status = 'processing' AND claim_token = %s" in sql
+            assert params[-1] == lease.claim_token
+            now[0] += 0.125
+            return [], int(outcome == 'completed')
+        if 'SET processing_work_ms' in sql:
+            assert params == (30125, lease.logical_refresh_id, 'page', 'typed', 'stateful')
+            return [], 1
+        return [{'status': 'succeeded' if outcome == 'already_succeeded' else 'processing'}], 1
+
+    factory = FakeFactory(handler)
+    store = ControlStore('postgresql://unused/db', connection_factory=factory)
+    if outcome == 'lost':
+        with pytest.raises(LeaseLost):
+            store.complete_observation_processing(lease, typed_status='skipped', stateful_status='succeeded', processing_work_ms=30000)
+    else:
+        store.complete_observation_processing(lease, typed_status='skipped', stateful_status='succeeded', processing_work_ms=30000)
+    connection = factory.connections[0]
+    assert connection.committed == (outcome != 'lost')
+    assert sum('SET processing_work_ms' in sql for sql, _ in connection.fake_cursor.executions) == (outcome == 'completed')
+
+
+def test_processing_work_migration_preserves_unknown_old_measurements():
+    migration = MIGRATIONS[-1]
+    assert migration.version == 14
+    assert migration.name == 'observation_processing_work'
+    sql = ' '.join(migration.statements)
+    assert 'ADD COLUMN processing_work_ms bigint' in sql
+    assert 'CHECK (processing_work_ms >= 0)' in sql
+    assert 'DEFAULT' not in sql and 'UPDATE' not in sql and 'NOT NULL' not in sql

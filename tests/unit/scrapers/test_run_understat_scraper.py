@@ -1095,10 +1095,13 @@ def test_closed_check_unchanged_leaves_manifest_untouched_and_reports_latest():
     assert repository.verified[-1] is baseline
     assert payload == {
         **runner._result_payload(baseline),
+        "request_count": 2,
+        "retry_count": None,
         "closed_check": {
             "unchanged": True,
             "hashes": _LEAGUE_HASHES,
             "request_count": 2,
+            "retry_count": None,
         },
     }
 

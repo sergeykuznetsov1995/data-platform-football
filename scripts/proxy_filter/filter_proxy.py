@@ -7084,7 +7084,11 @@ async def _open_lease_upstream_tunnel(
                 )
                 observed_down_bytes += head_bytes + drained
                 raise _DeadExitResponse(code)
-            if code != 200 and (lease.source in TRANSFERMARKT_ONLY_SOURCES or lease.source == "sofascore"):
+            if code != 200 and (
+                lease.source in TRANSFERMARKT_ONLY_SOURCES
+                or lease.source == "sofascore"
+                or (lease.source == "sofascore_discovery" and code == 502)
+            ):
                 # #1388: the tunnel was never established.  Meter the whole
                 # rejection (Decodo bills request + response as seen at its
                 # gateway) and, once it is provably complete, report a counted

@@ -2430,11 +2430,16 @@ def test_a_slice_of_seasons_that_have_not_started_is_not_a_failure(
 
 @pytest.mark.unit
 def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
+    from types import SimpleNamespace
+
     events = []
 
     class _Scraper:
         def __init__(self, **kwargs):
             events.append(("scraper", kwargs))
+            self._iceberg_writer = SimpleNamespace(
+                trino_host="trino", trino_port=8080, catalog="iceberg",
+            )
 
         def __enter__(self):
             return self
@@ -2450,6 +2455,12 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
         def save_to_iceberg(self, **kwargs):
             events.append(("save", kwargs["table_name"], kwargs["natural_keys"],
                            kwargs["partition_cols"], len(kwargs["df"])))
+            assert "merge_partition_cols" not in kwargs
+            manager = self._iceberg_writer._trino_manager
+            manager.insert_dataframe_atomic(
+                "bronze", kwargs["table_name"], kwargs["df"],
+                merge_keys=kwargs["natural_keys"],
+            )
             return "bronze.sofascore_schedule"
 
     @contextmanager
@@ -2461,6 +2472,13 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
     import scrapers.sofascore.scraper as scraper_module
     import scrapers.sofascore.writer_lock as writer_lock
 
+    from scrapers.base.trino_manager import TrinoTableManager
+
+    def insert(manager, schema, table, frame, **kwargs):
+        events.append(("merge", schema, table, kwargs))
+        return len(frame)
+
+    monkeypatch.setattr(TrinoTableManager, "insert_dataframe_atomic", insert)
     monkeypatch.setattr(scraper_module, "SofaScoreScraper", _Scraper)
     monkeypatch.setattr(writer_lock, "bronze_writer_lock", lock)
 
@@ -2476,9 +2494,120 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
         ("metadata", "schedule", 2),
         ("save", "sofascore_schedule", ["league", "season", "game_id"],
          ["league", "season"], 2),
+        ("merge", "bronze", "sofascore_schedule", {
+            "merge_keys": ["league", "season", "game_id"],
+            "merge_partition_cols": ["league", "season"],
+        }),
         "lock:exit",
         "scraper:exit",
     ]
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_schedule_merge_batches_bound_scope_and_stop_on_failure(monkeypatch, fail_second):
+    from types import SimpleNamespace
+
+    from scrapers.base.trino_manager import TrinoTableManager
+    import scrapers.sofascore.scraper as scraper_module
+    import scrapers.sofascore.writer_lock as writer_lock
+
+    locked = False
+    merges, batches, metadata = [], [], []
+    staged_count = 0
+
+    @contextmanager
+    def lock():
+        nonlocal locked
+        assert not locked
+        locked = True
+        try:
+            yield True
+        finally:
+            locked = False
+
+    class Scraper:
+        def __init__(self):
+            self._iceberg_writer = SimpleNamespace(
+                trino_host="trino", trino_port=8080, catalog="iceberg",
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def _add_metadata(self, frame, entity_type):
+            metadata.append((entity_type, len(frame)))
+            return frame
+
+        def save_to_iceberg(self, **kwargs):
+            assert locked
+            batches.append(kwargs["df"])
+            self._iceberg_writer._trino_manager.insert_dataframe_atomic(
+                "bronze", kwargs["table_name"], kwargs["df"],
+                merge_keys=kwargs["natural_keys"],
+                target_column_types={
+                    "league": "varchar", "season": "varchar", "game_id": "bigint",
+                    "score": "bigint",
+                },
+            )
+            return "bronze.sofascore_schedule"
+
+    def stage(manager, schema, table, frame, batch_size, **kwargs):
+        nonlocal staged_count
+        assert locked
+        staged_count = len(frame)
+        return staged_count
+
+    def execute(manager, sql, fetch=False):
+        assert locked
+        if sql.startswith("MERGE INTO"):
+            merges.append(sql)
+            if fail_second and len(merges) == 2:
+                raise RuntimeError("second batch failed")
+        if fetch:
+            return [[staged_count]]
+
+    monkeypatch.setattr(scraper_module, "SofaScoreScraper", Scraper)
+    monkeypatch.setattr(writer_lock, "bronze_writer_lock", lock)
+    monkeypatch.setattr(TrinoTableManager, "_execute", execute)
+    monkeypatch.setattr(TrinoTableManager, "insert_dataframe", stage)
+
+    pairs = [(f"SS-{i // 2}", str(2025 + i % 2)) for i in range(250)]
+    rows = [
+        {"league": league, "season": season, "game_id": i + offset, "score": 1}
+        for offset in (0, 250)
+        for i, (league, season) in enumerate(pairs)
+    ]
+    if fail_second:
+        with pytest.raises(RuntimeError, match="second batch failed"):
+            refresh.write_schedule_rows(rows)
+    else:
+        assert refresh.write_schedule_rows(rows) == "bronze.sofascore_schedule"
+    assert not locked
+    assert metadata == [("schedule", 500)]
+    assert len(merges) == (2 if fail_second else 3)
+    assert [len(batch) for batch in batches] == ([200, 200] if fail_second else [200, 200, 100])
+    for index, (sql, batch) in enumerate(zip(merges, batches)):
+        expected_pairs = pairs[index * 100:(index + 1) * 100]
+        assert list(batch[["league", "season"]].drop_duplicates().itertuples(
+            index=False, name=None,
+        )) == expected_pairs
+        scope = " OR ".join(
+            f'(t."league" = \'{league}\' AND t."season" = \'{season}\')'
+            for league, season in expected_pairs
+        )
+        keys = " AND ".join(
+            f't."{key}" = s."{key}"' for key in ("league", "season", "game_id")
+        )
+        assert sql.split(" ON ")[1].split(" WHEN MATCHED")[0] == f"{keys} AND ({scope})"
+        assert "WHEN MATCHED THEN UPDATE" in sql
+        assert "WHEN NOT MATCHED THEN INSERT" in sql
+        assert "DELETE" not in sql
+    assert sorted(game for batch in batches for game in batch["game_id"]) == (
+        list(range(200)) + list(range(250, 450)) if fail_second else list(range(500))
+    )
 
 
 def _mute_everything(monkeypatch):

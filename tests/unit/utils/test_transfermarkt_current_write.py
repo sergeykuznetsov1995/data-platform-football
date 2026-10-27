@@ -2015,3 +2015,32 @@ def test_generic_empty_archive_retry_recovers_original_intent_without_http(scrap
     unit, = recovered[key]['rows']
     archive = write_intents.completed_capture('original-empty-child', 'market_value_points', unit['native_batch_id'])
     assert archive['journal'] == json.loads(original_bytes)
+
+
+def test_enriched_contract_carries_api_lineage_and_observation_stamp(scraper):
+    from tests.unit.scrapers.test_transfermarkt_contracts import scope_with_packet
+
+    scope, store = scope_with_packet()
+    scraper._http_client._raw_store = store
+    initial = snapshot(changed=('10', '20'), players=('110', '120'))
+    rows = [{**dict(row), 'contract_until': None, '_contract_status': 'not_rendered'}
+            for row in initial.clubs['10'].rows]
+    initial = replace(initial, clubs={**initial.clubs, '10': replace(initial.clubs['10'], rows=rows)})
+    enriched = scope.supplement_contracts(initial)
+    scraper._current_roster_write_at = NOW + timedelta(hours=2)
+    receipt = current.write_current_roster(scraper, enriched, PREFLIGHT, 'enriched')
+    assert receipt['verified']
+    before = _table(scraper, 'transfermarkt_player_contract_observations')
+    old = before.loc[before.team_id == '10'].iloc[0]
+    assert old['source_url'].endswith('/players?ids%5B%5D=110')
+    assert old['applicability_status'] == 'not_rendered'
+    assert old['contract_until'] == '2028-06-30'
+    retained = replace(enriched, changed_club_ids=('20',),
+                       clubs={key: replace(value, bronze_manifest=receipt['bronze_manifest'])
+                              for key, value in enriched.clubs.items()})
+    scraper._current_roster_write_at = NOW + timedelta(hours=3)
+    current.write_current_roster(scraper, retained, PREFLIGHT, 'carry-forward')
+    after = _table(scraper, 'transfermarkt_player_contract_observations')
+    new = after.loc[after.team_id == '10'].iloc[0]
+    for column in ('source_url', 'source_body_hash', 'fetched_at', 'observed_at', 'contract_until'):
+        assert new[column] == old[column], column

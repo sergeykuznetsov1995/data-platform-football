@@ -182,6 +182,7 @@ class UnderstatClient:
         )
         self._cookies_initialized = False
         self.request_count = 0
+        self.retry_count = 0
 
         headers = getattr(self.session, "headers", None)
         if headers is not None and hasattr(headers, "update"):
@@ -291,6 +292,8 @@ class UnderstatClient:
             self._pacer.acquire()
             CacheState(self.cache_dir).count_request(self.now().date())
             self.request_count += 1
+            if attempt > 1:
+                self.retry_count += 1
             try:
                 response = self.session.get(
                     url,
@@ -304,7 +307,10 @@ class UnderstatClient:
                 if status not in RETRYABLE_STATUSES or attempt == self.max_attempts:
                     raise error
                 last_error = error
-                self.sleep(self._retry_delay(response, attempt))
+                delay = self._retry_delay(response, attempt)
+                logger.warning("Understat retry: reason=HTTP %s attempt=%s/%s delay=%s",
+                               status, attempt + 1, self.max_attempts, delay)
+                self.sleep(delay)
             except UnderstatHTTPError:
                 raise
             except (KeyboardInterrupt, SystemExit):
@@ -313,7 +319,10 @@ class UnderstatClient:
                 last_error = exc
                 if attempt == self.max_attempts:
                     raise
-                self.sleep(self._backoff_delay(attempt))
+                delay = self._backoff_delay(attempt)
+                logger.warning("Understat retry: reason=%s attempt=%s/%s delay=%s",
+                               type(exc).__name__, attempt + 1, self.max_attempts, delay)
+                self.sleep(delay)
         if last_error is not None:  # defensive; loop always returns or raises
             raise last_error
         raise RuntimeError("Understat retry loop terminated unexpectedly")
@@ -332,14 +341,14 @@ class UnderstatClient:
         if value is None:
             return None
         try:
-            return max(0.0, float(value))
+            return min(120.0, max(0.0, float(value)))
         except (TypeError, ValueError):
             pass
         try:
             parsed = parsedate_to_datetime(str(value))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return max(0.0, (parsed - self.now()).total_seconds())
+            return min(120.0, max(0.0, (parsed - self.now()).total_seconds()))
         except (TypeError, ValueError, OverflowError):
             return None
 

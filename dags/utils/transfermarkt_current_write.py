@@ -20,7 +20,7 @@ import pandas as pd
 from dags.scripts import run_transfermarkt_scraper as run
 from scrapers.transfermarkt.writer import StaleTransfermarktWrite, writer_lock, writer_deadline, guard_frames
 from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
-from scrapers.transfermarkt.current_capture import FullRosterSnapshot
+from scrapers.transfermarkt.current_capture import FullRosterSnapshot, verify_contract_overrides
 from scrapers.transfermarkt import scraper as tm
 from scrapers.transfermarkt.season import season_to_saison_id
 
@@ -334,6 +334,8 @@ def _receipt_columns(proof_columns, frame):
 
 
 def _roster_frames(scraper, snapshot, scope, cycle_id):
+    if snapshot.contract_overrides:
+        verify_contract_overrides(snapshot, scraper._http_client._raw_store)
     now = _stamp(getattr(scraper, '_current_roster_write_at', None) or datetime.now(timezone.utc))
     retained_stamps = _retained_roster_stamps(scraper, snapshot, scope)
     memberships, observations, contracts = [], [], []
@@ -352,7 +354,7 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
         observed_at = now if changed else retained_stamps.get(('memberships', key), fetched_at)
         lineage = {'source_competition_id': scope['competition_id'], 'source_edition_id': scope['edition_id'],
             'source_url': row['_source_url'], 'source_body_hash': row['_source_body_hash'], 'fetched_at': fetched_at,
-            'parser_revision': tm.PARSER_REVISION, 'schema_revision': tm.SCHEMA_REVISION,
+            'parser_revision': tm.contract_parser_revision(row), 'schema_revision': tm.SCHEMA_REVISION,
             'cycle_id': cycle_id, 'scope_id': scope['scope_id']}
         common = {'competition_id': scope['competition_id'], 'edition_id': scope['edition_id'],
             'league': scope['compatibility_league'], 'season': scope['canonical_season'],
@@ -360,13 +362,19 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
         memberships.append({**common, 'club_slug': row.get('club_slug'), 'club_name': row.get('current_club_name'),
                             'player_slug': row['player_slug'], 'player_name': row['name'],
                             **{field: row.get(field) for field in tm.SQUAD_CONTEXT_FIELDS}})
-        observations.append({**row, **common, 'club_name': row.get('current_club_name')})
+        contract_source = row.get('_contract_source', {})
+        date_lineage = {key: (_stamp(value) if key == 'fetched_at' else value)
+                        for key, value in contract_source.items() if key in {'source_url', 'source_body_hash', 'fetched_at'}}
+        observations.append({**row, **common, **date_lineage, 'club_name': row.get('current_club_name')})
         if scope['record'].team_type.value == 'club':
             contracts.append({**lineage, 'competition_id': scope['competition_id'], 'edition_id': scope['edition_id'],
                 'team_id': str(row['club_id']), 'team_name': row.get('current_club_name'), 'player_id': str(row['player_id']),
                 'contract_until': row.get('contract_until'),
-                'observed_at': now if changed else retained_stamps.get(('contract_observations', key), fetched_at),
-                'applicability_status': 'ok'})
+                'observed_at': now if changed else retained_stamps.get(('contract_observations', (str(row['club_id']), str(row['player_id']),
+                    date_lineage.get('source_body_hash', row['_source_body_hash']),
+                    date_lineage.get('fetched_at', fetched_at).isoformat(timespec='microseconds'))),
+                    date_lineage.get('fetched_at', fetched_at)),
+                'applicability_status': tm.contract_status(row), **date_lineage})
     bundle = {}
     for key, rows, columns, entity in (
         ('memberships', memberships, tm.SQUAD_MEMBERSHIP_COLUMNS, 'squad_memberships'),

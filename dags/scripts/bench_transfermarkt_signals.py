@@ -26,6 +26,8 @@ team membership is guessed from a generic JSON field map.
 """
 from __future__ import annotations
 
+from collections import deque
+
 from contextlib import contextmanager
 import signal
 
@@ -517,7 +519,8 @@ def _restore_url_attempts(state, tasks):
         status = record.get('status_code')
         transport = (record.get('outcome_kind') == 'transport_error'
                      or status in (0, 407) or (isinstance(status, int) and status >= 500))
-        counts['transport' if transport else 'responses'] += 1
+        if not record.get('qualification_captcha'):
+            counts['transport' if transport else 'responses'] += 1
     previous = state.get('url_attempts', {})
     restored = {}
     for url, keys in keys_by_url.items():
@@ -575,12 +578,12 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         ledger_path = experiment / "signal-probe-ledger.json"
         ledger = _read(ledger_path) if ledger_path.exists() else {"version": 1, "active": False, "totals": dict.fromkeys(COUNTERS, 0)}
         pinned = ledger.get('qualification_guard_version')
-        if pinned is not None and (type(pinned) is not int or pinned != 1):
+        if pinned is not None and (type(pinned) is not int or pinned not in (1, 2)):
             raise ProbeGateError('unsupported pinned qualification guard')
         guard = (QualificationGuard(experiment, now, _write) if qualification_run or
                  pinned or (experiment / 'qualification-guard.json').exists() else None)
-        if guard and not pinned:
-            ledger['qualification_guard_version'] = 1
+        if guard and pinned != 2:
+            ledger['qualification_guard_version'] = 2
             _write(ledger_path, ledger)
         if guard and guard.data.get('stop'):
             _write(evidence / 'report.json', {'mode': args.mode, 'complete': False,
@@ -654,7 +657,9 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         guard_pending = False
         accounting_failed = False
         try:
-            for task in tasks:
+            pending = deque(tasks)
+            while pending:
+                task = pending.popleft()
                 if task["key"] in state["results"]:
                     continue
                 if monotonic() - started >= admitted_seconds - 120:
@@ -675,7 +680,11 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                 before = client.get_traffic_stats()
                 before_records = {attempt_id(r) for r in client.get_raw_attempt_records()} if guard else set()
                 outcome = None
+                captcha = False
                 request_remaining = remaining["request_attempts"] - before["request_attempts"]
+                if guard and (request_remaining <= 0 or any(
+                        remaining[key] - before[key] <= MIB for key in COUNTERS[1:])):
+                    break
                 # Reserve an unknown attempt conservatively before I/O. The active
                 # experiment marker still forbids unaccounted crash recovery.
                 state['tries'][task['key']] = state['tries'].get(task['key'], 0) + 1
@@ -691,6 +700,12 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                     outcome = client.fetch(task['url'], as_json=task['json'],
                                            max_attempts=min(1 if guard else 4, response_remaining, transport_remaining, request_remaining),
                                            label=task['kind'], context={'cycle_id': portion_id, 'scope_id': task['scope']})
+                except Exception as exc:
+                    from scrapers.transfermarkt.raw_store import RawStoreError
+                    from scrapers.transfermarkt.models import TrafficMeterError
+                    # observe() may raise its own stop while settling the attempt.
+                    accounting_failed |= isinstance(exc, (RawStoreError, TrafficMeterError))
+                    raise
                 finally:
                     after = client.get_traffic_stats()
                     attempts = after['request_attempts'] - before['request_attempts']
@@ -716,12 +731,22 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                             _write(state_path, state)
                         guard.now = (now_fn or _now_utc)()
                         try:
-                            guard.observe(task['url'], attempts, delta, new_records, client, outcome,
+                            captcha = guard.observe(task['url'], attempts, delta, new_records, client, outcome,
                                           proven_transport=state.get('qualification_transport_proofs', {}),
                                           transport_limit=getattr(args, 'transport_attempts', 4))
                         except GuardHalt:
                             guard_pending = False
                             raise
+                        finally:
+                            if getattr(guard, 'last_captcha', False):
+                                state['endpoint_tries'][task['key']] -= 1
+                                counts['responses'] -= 1
+                            observations = state.setdefault('qualification_observations', {})
+                            for record in new_records:
+                                observations[attempt_id(record)] = {
+                                    'qualification_captcha': guard.last_captcha,
+                                    'qualification_observed_at': guard.now.isoformat()}
+                            _write(state_path, state)
                         retry_after = guard.counts(task['url']).get('retry_after')
                         if retry_after:
                             from dags.scripts.transfermarkt_signal_guard import quota_key
@@ -730,6 +755,11 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                         guard_pending = False
                         if guard.now.astimezone(MSK).date().isoformat() != guard.day:
                             guard.halt('moscow_day_changed')
+                if captcha:
+                    # close() settles the lease; the next fetch opens a fresh one.
+                    client.close()
+                    pending.appendleft(task)
+                    continue
                 if not outcome.is_success or not outcome.raw_capture_id:
                     report["failure"] = {"key": task["key"], "status": outcome.status.value, "http_status": outcome.status_code}
                     state["failures"][task["key"]] = report["failure"]
@@ -777,7 +807,7 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
             report["error_type"] = type(exc).__name__
             from scrapers.transfermarkt.raw_store import RawStoreError
             from scrapers.transfermarkt.models import TrafficMeterError
-            accounting_failed = isinstance(exc, (RawStoreError, TrafficMeterError))
+            accounting_failed |= isinstance(exc, (RawStoreError, TrafficMeterError))
             if isinstance(exc, GuardHalt):
                 report['stop_reason'] = exc.reason
                 state['qualification_stop'] = dict(guard.data['stop'])
@@ -806,7 +836,10 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                 raise ProbeGateError('raw accounting failed; reconcile before resume')
             for key in COUNTERS:
                 ledger["totals"][key] += int(stats[key])
-            state["attempt_records"].extend(client.get_raw_attempt_records())
+            records = client.get_raw_attempt_records()
+            for record in records:
+                record.update(state.get('qualification_observations', {}).get(attempt_id(record), {}))
+            state["attempt_records"].extend(records)
             state.setdefault("portions", []).append({"portion_id": portion_id, "traffic": stats})
             _write(state_path, state)
             ledger["active"] = False
