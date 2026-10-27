@@ -16,6 +16,8 @@ from .domain import SeasonFormat
 
 CHUNK_SIZE = 25
 COOLDOWN_SECONDS = 3600
+# Schedule sync covers the entire season; historical lineups rarely change.
+DEFERRED_REFRESH_SECONDS = 24 * 3600
 # Longer than the task's eight-hour execution timeout, including kill grace.
 LEASE_SECONDS = 9 * 3600
 TOP_FIVE = {2, 3, 4, 5, 22}
@@ -87,9 +89,13 @@ class HistoryState:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             con.execute("CREATE TABLE IF NOT EXISTS scopes (scope TEXT PRIMARY KEY, "
                         "token TEXT, lease_until REAL NOT NULL, next_at REAL NOT NULL, "
                         "duration REAL NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0)")
+            columns = {row[1] for row in con.execute("PRAGMA table_info(scopes)")}
+            if "schedule_next_at" not in columns:
+                con.execute("ALTER TABLE scopes ADD COLUMN schedule_next_at REAL NOT NULL DEFAULT 0")
 
     @contextmanager
     def _connect(self):
@@ -120,6 +126,21 @@ class HistoryState:
                             (scope["key"], token, now + LEASE_SECONDS))
                 return scope, token
         return None
+
+    def reserve_deferred_refresh(self, key: str, token: str, *, now: float) -> bool:
+        """Persist the attempt before source calls, even if the worker crashes."""
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT schedule_next_at FROM scopes "
+                              "WHERE scope=? AND token=? AND lease_until>?",
+                              (key, token, now)).fetchone()
+            if row is None:
+                raise RuntimeError("history scope lease was lost")
+            if row[0] > now:
+                return False
+            con.execute("UPDATE scopes SET schedule_next_at=? WHERE scope=? AND token=?",
+                        (now + DEFERRED_REFRESH_SECONDS, key, token))
+            return True
 
     def release(self, key: str, token: str, *, now: float, failed: bool, duration: float, idle=False):
         with self._connect() as con:

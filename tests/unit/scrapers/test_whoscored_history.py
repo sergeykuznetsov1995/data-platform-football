@@ -1,5 +1,5 @@
 """Offline history queue, leases and bounded execution regressions (#1480)."""
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -287,6 +287,9 @@ def test_deferred_stage_refresh_is_cooled_down_without_blocking_wave_two(tmp_pat
     assert history.run_chunk(**kwargs)["scope"].endswith("2425")
     service.sync_matches.assert_called_once_with(limit=25, lane="history")
     kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 3601, timezone.utc)
+    assert history.run_chunk(**kwargs)["scope"].endswith("2425")
+    assert service.sync_schedule.call_count == 1
+    kwargs["now"] = NOW + timedelta(seconds=state.DEFERRED_REFRESH_SECONDS)
     assert history.run_chunk(**kwargs)["scope"].endswith("2627")
     assert service.sync_schedule.call_count == 2
 
@@ -369,3 +372,107 @@ def test_runner_records_each_scope_after_skipped_feeds(tmp_path, monkeypatch):
     assert report["history"]["attempted"] == 25
     assert kwargs["checkpoint"].parked(now=NOW.timestamp()) == 0
     assert service.sync_stage_feeds.call_count == 2
+
+
+def mixed_stage_coverage():
+    from tests.unit.scrapers.test_whoscored_repository_sql_semantics import (
+        LEAGUE, SEASON, _attempt, _connection, _game, _history_repository,
+    )
+
+    con = _connection()
+    try:
+        con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
+                    "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
+        con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
+                    "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+        _game(con, 1, 1, 30)
+        _attempt(con, 1, "success", 1)
+        _game(con, 2, 1, 20, lineup=False)
+        return _history_repository(con).history_coverage()[(LEAGUE, SEASON)]
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_mixed_stage_refresh_survives_restart_and_failure(tmp_path, failed):
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    row = mixed_stage_coverage()
+    assert row["deferred_stages"] == 1
+    assert row["closeable"] == row["closed"] == 1
+    assert row["unknown_stages"] == 0
+    repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id): row}
+    repo.list_match_candidates.return_value = []
+    service.sync_stage_feeds.return_value = SimpleNamespace(skipped=0)
+    # Useful work takes priority over refreshing the deferred schedule.
+    history.run_chunk(**kwargs)
+    service.sync_schedule.assert_not_called()
+    repo.latest_stage_feed_snapshot.return_value = {
+        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
+        "feed_states": {"1:team:xg-teamstats:summary": "present",
+                        "1:player:xg-stats:summary": "present"},
+    }
+    start = NOW + timedelta(seconds=31)
+    kwargs["now"] = start
+    if failed:
+        service.sync_schedule.side_effect = RuntimeError("schedule failed")
+        with pytest.raises(RuntimeError, match="schedule failed"):
+            history.run_chunk(**kwargs)
+        service.sync_schedule.side_effect = None
+    else:
+        history.run_chunk(**kwargs)
+    service.sync_schedule.assert_called_once_with()
+    kwargs["checkpoint"] = state.HistoryState(kwargs["checkpoint"].path)
+    kwargs["now"] = start + timedelta(hours=1, seconds=1)
+    assert history.run_chunk(**kwargs)["reason"] == "idle"
+    service.sync_schedule.assert_called_once_with()
+    # The daily schedule cooldown must not hold up newly available matches.
+    repo.list_match_candidates.return_value = [SimpleNamespace(game_id=2)]
+    kwargs["now"] = start + timedelta(hours=2, seconds=2)
+    history.run_chunk(**kwargs)
+    service.sync_matches.assert_called_once_with(limit=25, lane="history")
+    repo.list_match_candidates.return_value = []
+    kwargs["now"] = start + timedelta(seconds=state.DEFERRED_REFRESH_SECONDS - 1)
+    assert history.run_chunk(**kwargs)["reason"] == "idle"
+    service.sync_schedule.assert_called_once_with()
+    # The preceding idle scan still has the ordinary one-hour queue cooldown.
+    kwargs["now"] = start + timedelta(seconds=state.DEFERRED_REFRESH_SECONDS + 3600)
+    history.run_chunk(**kwargs)
+    assert service.sync_schedule.call_count == 2
+
+
+def test_schedule_refresh_migrates_checkpoint_and_isolates_seasons(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "history.sqlite"
+    with sqlite3.connect(path) as con:
+        con.execute("CREATE TABLE scopes (scope TEXT PRIMARY KEY, token TEXT, "
+                    "lease_until REAL NOT NULL, next_at REAL NOT NULL, "
+                    "duration REAL NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0)")
+        con.execute("INSERT INTO scopes VALUES ('A', NULL, 0, 0, 42, 1)")
+    state.HistoryState(path)
+    checkpoint = state.HistoryState(path)  # Migration is idempotent.
+    with sqlite3.connect(path) as con:
+        assert con.execute("SELECT duration, failed, schedule_next_at FROM scopes").fetchone() == (42, 1, 0)
+    scopes = [{"key": "A"}, {"key": "B"}]
+    _, token = checkpoint.reserve(scopes, now=0)
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        checkpoint.reserve_deferred_refresh("A", "wrong", now=0)
+    assert checkpoint.reserve_deferred_refresh("A", token, now=0)
+    assert not checkpoint.reserve_deferred_refresh("A", token, now=0)
+    _, other_token = checkpoint.reserve(scopes, now=0)
+    assert checkpoint.reserve_deferred_refresh("B", other_token, now=0)
+    # Simulate a crash without release; recovery must preserve the daily deadline.
+    checkpoint = state.HistoryState(path)
+    assert checkpoint.reserve(scopes, now=state.LEASE_SECONDS) is None
+    now = state.LEASE_SECONDS + state.COOLDOWN_SECONDS
+    _, new_token = checkpoint.reserve(scopes, now=now)
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        checkpoint.reserve_deferred_refresh("A", token, now=now)
+    assert not checkpoint.reserve_deferred_refresh("A", new_token, now=now)
+    checkpoint.release("A", new_token, now=now, failed=False, idle=True, duration=1)
+    _, new_token = checkpoint.reserve(scopes[:1], now=state.DEFERRED_REFRESH_SECONDS)
+    assert checkpoint.reserve_deferred_refresh("A", new_token, now=state.DEFERRED_REFRESH_SECONDS)
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        checkpoint.reserve_deferred_refresh("A", new_token,
+                                            now=state.DEFERRED_REFRESH_SECONDS + state.LEASE_SECONDS)
