@@ -2566,6 +2566,9 @@ class WhoScoredIngestService:
                         raw_uris=raw_uris,
                         source_empty=source_empty,
                         source_unavailable=source_unavailable,
+                        checked_stage_ids=(
+                            result.metadata["source_stage_ids"] + collected.source_stage_absent
+                        ),
                         **({"require_schedule_game_ids": True} if refresh_months else {}),
                     )
                 except ScheduleCompletenessError as exc:
@@ -2877,6 +2880,14 @@ class WhoScoredIngestService:
                 feed_checks[key] = {"checked_at": checked.isoformat(), "final": final}
                 result.metadata["stage_xg_checked"].append(stage_id)
                 changed = True
+            for stage_id in collected.source_stage_absent:
+                key = str(stage_id)
+                check = {"checked_at": now.isoformat(), "final": not collected.active}
+                if previous.get("feed_checks", {}).get(key, {}).get("final") is not True:
+                    changed = True
+                feed_checks[key] = check
+                for suffix in ("team:xg-teamstats:summary", "player:xg-stats:summary"):
+                    feed_states[f"{stage_id}:{suffix}"] = DatasetStatus.NOT_AVAILABLE.value
             if not changed:
                 if policy_current and previous:
                     self.repository.cleanup_stage_feed_snapshot(

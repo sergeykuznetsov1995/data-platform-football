@@ -254,3 +254,38 @@ def test_idle_cooldown_is_not_reported_as_a_failed_scope(tmp_path):
     checkpoint.release("A", token, now=1, failed=False, idle=True, duration=1)
     assert checkpoint.reserve([{"key": "A"}], now=2) is None
     assert checkpoint.parked(now=2) == 0
+
+
+@pytest.mark.parametrize("stage_ids", [(), (2,)])
+def test_checked_empty_or_absent_stage_does_not_repeat_schedule(tmp_path, stage_ids):
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id):
+                                         coverage(closed=100, stage_ids=stage_ids)}
+    repo.latest_schedule_stage_ids.return_value = (1, 2)
+    scopes = history.inventory(kwargs["catalog"], repo, today=NOW.date())
+    assert state.first_wave_ready(scopes) is True
+    history.run_chunk(**kwargs)
+    service.sync_schedule.assert_not_called()
+    service.sync_matches.assert_called_once_with(limit=25, lane="history")
+
+
+def test_deferred_stage_refresh_is_cooled_down_without_blocking_wave_two(tmp_path):
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    seasons = [season(label=label, source=source) for label, source in
+               [("2627", 300), ("2526", 200), ("2425", 100)]]
+    kwargs["catalog"] = catalog((s.scope.competition_id, 2, seasons))
+    repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id):
+        coverage(closed=100, deferred_stages=int(s.scope.season_id == "2627")) for s in seasons}
+    repo.list_match_candidates.side_effect = lambda league, slug, **k: [1] if slug == "2425" else []
+    repo.latest_stage_feed_snapshot.return_value = {
+        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
+        "feed_states": {"1:team:xg-teamstats:summary": "available",
+                        "1:player:xg-stats:summary": "available"}}
+    assert history.run_chunk(**kwargs)["scope"].endswith("2627")
+    service.sync_schedule.assert_called_once_with()
+    assert history.run_chunk(**kwargs)["scope"].endswith("2425")
+    service.sync_matches.assert_called_once_with(limit=25, lane="history")
+    kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 3601, timezone.utc)
+    assert history.run_chunk(**kwargs)["scope"].endswith("2627")
+    assert service.sync_schedule.call_count == 2

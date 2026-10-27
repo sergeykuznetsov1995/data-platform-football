@@ -4056,11 +4056,13 @@ class WhoScoredRepository:
                 GROUP BY league, season, game_id
             ), stages AS (
                 SELECT s.league, s.season, s.stage_id,
-                       COUNT_IF(s.status = 6 AND (
-                           s.date IS NULL OR s.date < CAST(
+                       COUNT_IF(s.status = 6 AND s.is_lineup_confirmed = TRUE AND (
+                           s.date < CAST(
                                CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP
                            )
                        )) AS historical_games,
+                       COUNT_IF(s.status = 6 AND COALESCE(s.is_lineup_confirmed, FALSE) = FALSE
+                           AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)) AS deferred_games,
                        COUNT_IF(COALESCE(m.state, '') = 'success') AS successes,
                        COUNT_IF(COALESCE(m.state, '') = 'not_available' AND s.is_lineup_confirmed = TRUE) AS absent
                 FROM schedule s
@@ -4087,6 +4089,8 @@ class WhoScoredRepository:
             ), stage_counts AS (
                 SELECT league, season,
                        COUNT_IF(successes = 0 AND absent < 2 AND historical_games > 0) AS unknown_stages,
+                       COUNT_IF(successes = 0 AND absent < 2 AND deferred_games > 0
+                                AND historical_games = 0) AS deferred_stages,
                        ARRAY_AGG(stage_id) AS stage_ids
                 FROM stages GROUP BY league, season
             ), counts AS (
@@ -4101,13 +4105,14 @@ class WhoScoredRepository:
                 GROUP BY league, season
             )
             SELECT s.league, s.season, COALESCE(c.closeable, 0), COALESCE(c.closed, 0),
-                   COALESCE(st.unknown_stages, 0), COALESCE(c.closed_day, 0), st.stage_ids
+                   COALESCE(st.unknown_stages, 0), COALESCE(c.closed_day, 0), st.stage_ids, COALESCE(st.deferred_stages, 0)
             FROM schedules s LEFT JOIN counts c ON s.league = c.league AND s.season = c.season
             LEFT JOIN stage_counts st ON st.league = s.league AND st.season = s.season
         """)
         return {(str(r[0]), str(r[1])): dict(schedule_ready=True, closeable=int(r[2]),
                  closed=int(r[3]), unknown_stages=int(r[4]), closed_day=int(r[5]),
-                 stage_ids=tuple(int(sid) for sid in (r[6] or ()) if sid is not None)) for r in rows}
+                 stage_ids=tuple(int(sid) for sid in (r[6] or ()) if sid is not None),
+                 deferred_stages=int(r[7])) for r in rows}
 
     def list_completed_match_candidates(
         self,
@@ -4196,6 +4201,17 @@ class WhoScoredRepository:
             self._published_schedule_game_ids(league, season)
             - {int(game_id) for game_id in observed_ids}
         ))
+
+    def latest_schedule_stage_ids(self, league: str, season: str) -> tuple[int, ...]:
+        """Stages checked (including empty/absent) by the latest published schedule."""
+        rows = self.trino.execute_query(
+            f"SELECT dataset_states_json FROM {self._scope_manifest} "
+            f"WHERE league = {_sql_string(league)} AND season = {_sql_string(season)} "
+            f"AND state = 'success' AND {_scope_published_table_sql('whoscored_schedule')} "
+            "ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
+        )
+        states = json.loads(str(rows[0][0])) if rows and rows[0][0] else {}
+        return tuple(int(sid) for sid in states.get("__checked_stage_ids__", ()))
 
     def latest_stage_feed_snapshot(
         self, league: str, season: str
@@ -4427,6 +4443,7 @@ class WhoScoredRepository:
         feed_checks: Optional[Mapping[str, Mapping[str, Any]]] = None,
         expected_previous_stage_batch_id: Optional[str] = None,
         require_schedule_game_ids: bool = False,
+        checked_stage_ids: Optional[Iterable[int]] = None,
     ) -> str:
         """Publish multiple scope datasets through one logical commit point."""
         if not datasets:
@@ -4506,6 +4523,12 @@ class WhoScoredRepository:
             dataset_states["__feed_checks__"] = dict(
                 sorted(normalized_feed_checks.items())
             )
+        if checked_stage_ids is not None:
+            checked_stage_ids = sorted({int(sid) for sid in checked_stage_ids})
+            if ("whoscored_schedule" not in datasets or not checked_stage_ids
+                    or any(sid <= 0 for sid in checked_stage_ids)):
+                raise ValueError("checked stages require a schedule and positive stage ids")
+            dataset_states["__checked_stage_ids__"] = checked_stage_ids
         row_sources: dict[str, Iterable[Mapping[str, Any]]] = {}
         counts: dict[str, int] = {}
         schema_fields: dict[str, list[str]] = {}
@@ -4599,6 +4622,8 @@ class WhoScoredRepository:
             identity_fields["feed_policy"] = feed_policy
         if feed_checks is not None:
             identity_fields["feed_checks"] = normalized_feed_checks
+        if checked_stage_ids is not None:
+            identity_fields["checked_stage_ids"] = checked_stage_ids
         identity = self._canonical_json(identity_fields)
         batch_id = "wss2-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
         already = self.trino.execute_query(

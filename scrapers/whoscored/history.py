@@ -18,7 +18,10 @@ def inventory(catalog, repository, *, today):
             (season.scope.competition_id, season.scope.season_id),
             dict(schedule_ready=False, closeable=0, closed=0, unknown_stages=0, closed_day=0),
         ).copy()
-        missing = set(season.stage_ids) - set(row.get("stage_ids", ()))
+        checked = repository.latest_schedule_stage_ids(
+            season.scope.competition_id, season.scope.season_id,
+        ) if row["schedule_ready"] else ()
+        missing = set(season.stage_ids) - set(row.get("stage_ids", ())) - set(checked)
         row["unknown_stages"] += len(missing) or int(not season.stage_ids)
         if missing:
             row["schedule_ready"] = False
@@ -76,6 +79,7 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
         league, slug = season.scope.competition_id, season.scope.season_id
         started = time.monotonic()
         failed, did_work, attempted = True, False, 0
+        refresh_deferred = False
         try:
             if current_running() or not enabled():
                 failed = False
@@ -93,6 +97,9 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                     )
                 ended = (season.end is not None and season.end < moment.date()) or season.is_active is False
                 feeds_due = ended and not final_feeds(repository, season, moment=moment)
+            refresh_deferred = (not schedule_due and not (matches or players or previews or feeds_due)
+                                and item["coverage"].get("deferred_stages", 0) > 0)
+            schedule_due = schedule_due or refresh_deferred
             if not (schedule_due or matches or players or previews or feeds_due):
                 failed = False
                 continue
@@ -136,6 +143,6 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
         finally:
             checkpoint.release(item["key"], token,
                                now=moment.timestamp() + time.monotonic() - started,
-                               failed=failed, idle=not did_work, duration=time.monotonic() - started)
+                               failed=failed, idle=not did_work or refresh_deferred, duration=time.monotonic() - started)
     return {"reason": "idle", "attempted": 0,
             "pace": state.pace(scopes, parked=checkpoint.parked(now=moment.timestamp()))}

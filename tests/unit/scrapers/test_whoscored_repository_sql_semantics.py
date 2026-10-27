@@ -376,7 +376,7 @@ def test_history_coverage_does_not_close_deferred_or_unknown_matches():
     _attempt(con, 1, "retryable", 1)
     con.execute("UPDATE iceberg.bronze.whoscored_match_ingest_manifest "
                 "SET retry_after = ? WHERE game_id=1", [NOW + timedelta(days=1)])
-    _game(con, 2, 20, 20, lineup=False)  # Played but no lineup: still unknown.
+    _game(con, 2, 20, 20, lineup=False)  # Played but no lineup: deferred, cannot block waves.
     _game(con, 5, 40, -10)  # A future-only stage cannot be probed yet.
     _game(con, 3, 30, 20)
     _game(con, 4, 30, 20)
@@ -386,7 +386,7 @@ def test_history_coverage_does_not_close_deferred_or_unknown_matches():
     result = repository.history_coverage()[(LEAGUE, SEASON)]
     result["stage_ids"] = tuple(sorted(result["stage_ids"]))
     assert result == dict(schedule_ready=True, closeable=2, closed=1,
-                          unknown_stages=1, closed_day=1, stage_ids=(10, 20, 30, 40))
+                          unknown_stages=0, closed_day=1, stage_ids=(10, 20, 30, 40), deferred_stages=1)
 
 
 def test_history_profiles_do_not_refresh_old_valid_success():
@@ -435,3 +435,27 @@ def test_historical_preview_uses_old_window_without_replaying_success():
     assert [r["game_id"] for r in repository.list_preview_candidates(LEAGUE, SEASON)] == [3]
     assert [r["game_id"] for r in repository.list_preview_candidates(
         LEAGUE, SEASON, historical=True, limit=25)] == [1]
+
+
+def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup():
+    from scrapers.whoscored.history_state import first_wave_ready
+
+    con = _connection()
+    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
+                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
+    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
+                "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+    _game(con, 1, 10, 20)
+    _attempt(con, 1, "success", 1)
+    _game(con, 2, 20, 20, lineup=False)
+    repository = _history_repository(con)
+    row = repository.history_coverage()[(LEAGUE, SEASON)]
+    assert first_wave_ready([{"wave": 1, "coverage": row}]) is True
+    assert row["deferred_stages"] == 1
+    assert _candidates(con, lane="history") == []
+    con.execute("UPDATE iceberg.bronze.whoscored_schedule_current "
+                "SET is_lineup_confirmed=TRUE WHERE game_id=2")
+    row = repository.history_coverage()[(LEAGUE, SEASON)]
+    assert first_wave_ready([{"wave": 1, "coverage": row}]) is False
+    assert row["deferred_stages"] == 0
+    assert _candidates(con, lane="history") == [2]
