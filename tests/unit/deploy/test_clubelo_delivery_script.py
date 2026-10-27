@@ -30,29 +30,16 @@ PATH_LINE = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 NIGHT = "2026-09-24 01:40:00"
 DAY = "20260924"
 MAIN = "scrapers/clubelo/daily.py"
-# Разрешённое отставание (#1465): в стенде alerts.py «до #1477» — этот текст; его blob
-# подставляется в ALLOWED_LAG установленной копии (и в копию в тестовом master).
-LAG_BODY = "def telegram_on_failure(ctx): pass  # до #1477\n"
-LAG_BLOB = subprocess.run(["git", "hash-object", "--stdin"], input=LAG_BODY, capture_output=True,
-                          text=True, check=True).stdout.strip()
-CONFIG_LAG_BODIES = {
-    "dags/utils/config.py": "SCHEDULES = {'dag_transform_fotmob_silver': None}\n",
-    "dags/utils/medallion_config.py": "def get_source_priority_exprs(): return 'COALESCE(x)'\n",
-}
-LAG_BLOBS = {
-    path: subprocess.run(["git", "hash-object", "--stdin"], input=body,
-                         capture_output=True, text=True, check=True).stdout.strip()
-    for path, body in {"dags/utils/alerts.py": LAG_BODY, **CONFIG_LAG_BODIES}.items()
-}
-
 BASE_FILES = {
     "scrapers/__init__.py": "",
     "scrapers/base/base_scraper.py": "BASE = 1\n",
+    "scrapers/base/iceberg_writer.py": "class IcebergWriter: pass\n",
+    "scrapers/clubelo/history.py": "HISTORY = 1\n",
     "scrapers/utils/__init__.py": "",
     "dags/utils/__init__.py": "",
     "dags/utils/config.py": "SCHEDULES = {}\n",
     "dags/utils/default_args.py": "DEFAULT_ARGS = {}\n",
-    "dags/utils/alerts.py": "def telegram_on_failure(ctx): pass\n",
+    "dags/utils/alerts.py": "def telegram_on_failure(ctx): pass\ndef send_telegram_message(text, level='info'): pass\n",
     "dags/utils/medallion_config.py": "FLOOR = 1\n",
     "scrapers/utils/retry_policy.py": "RETRY = 1\n",
     "scrapers/clubelo/__init__.py": "",
@@ -62,7 +49,9 @@ BASE_FILES = {
     "dags/scripts/run_clubelo_scraper.py": "RUN = 1\n",
     "dags/dag_ingest_clubelo.py": "INGEST = 1\n",
     "dags/dag_other.py": "OTHER = 1\n",
-    "tests/unit/scrapers/test_clubelo_scraper.py": "def test_old(): pass\n",
+    "tests/unit/scrapers/test_clubelo_scraper.py": "from scrapers.base.base_scraper import BASE\nfrom utils.config import SCHEDULES\n"
+        "from utils.alerts import send_telegram_message\n"
+        "def test_old():\n    assert BASE == 1 and isinstance(SCHEDULES, dict)\n    send_telegram_message('test')\n",
     "tests/unit/scrapers/test_other.py": "def test_other(): pass\n",
 }
 
@@ -90,14 +79,6 @@ class Stand:
         text = AUTO.read_text(encoding="utf-8")
         assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
         self.installed_text = text.replace(PATH_LINE, PATH_LINE.replace("export PATH=", f"export PATH={self.stubs}:"))
-        lag = [ln for ln in text.splitlines() if ln.startswith('ALLOWED_LAG="')]
-        assert len(lag) == 1, lag
-        # Substitute only entries present in the real script: a missing production
-        # allowance must make the new regression fail, not get added by the fixture.
-        entries = dict(item.split("=") for item in lag[0].split('"')[1].split())
-        assert entries.keys() <= LAG_BLOBS.keys(), entries
-        fixture_lag = " ".join(f"{path}={LAG_BLOBS[path]}" for path in entries)
-        self.installed_text = self.installed_text.replace(lag[0], f'ALLOWED_LAG="{fixture_lag}"')
         self.installed = tmp / "clubelo-auto-deliver.sh"
         self.installed.write_text(self.installed_text, encoding="utf-8")
         self.installed.chmod(0o755)
@@ -107,6 +88,8 @@ class Stand:
         for rel, body in BASE_FILES.items():
             self.write(rel, body)
         self.write("deploy/clubelo/auto_deliver.sh", self.installed_text)
+        self.write("deploy/clubelo/check_compatibility.py",
+                   (AUTO.parent / "check_compatibility.py").read_text())
         _git(self.source, "add", "-A")
         _git(self.source, "commit", "-q", "-m", "бой")
         self.base = _git(self.source, "rev-parse", "HEAD")
@@ -203,40 +186,35 @@ def test_nothing_to_deliver_moves_base_without_writes(stand: Stand) -> None:
     assert (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").exists()
 
 
-@pytest.mark.parametrize("shared", ["dags/utils/config.py", "dags/utils/alerts.py", "scrapers/base/base_scraper.py"])
-def test_shared_module_drift_cancels(stand: Stand, shared: str) -> None:
-    stand.master({MAIN: "VERSION = 2\n"})
-    (stand.tree / shared).write_text("# живая правка общего модуля\n", encoding="utf-8")
-    res = stand.run("--check")
-    assert res.returncode == 1
-    assert f"ОТМЕНА: общий модуль {shared} в бою ≠ master" in res.stdout
-    assert stand.tg() == ""
-    res = stand.run()
-    assert res.returncode == 1
-    assert f"ОТМЕНА: общий модуль {shared} в бою ≠ master" in stand.log()
-    assert f"общий модуль {shared}" in stand.tg()
+@pytest.mark.parametrize("kind", ["symbol", "call", "missing", "environment", "no_tests", "master_fallback", "writer_api", "unreadable"])
+def test_incompatible_shared_cancels_before_writes(stand: Stand, kind: str) -> None:
+    changes = {MAIN: "VERSION = 2\n"}
+    if kind == "symbol":
+        (stand.tree / "scrapers/base/base_scraper.py").write_text("OTHER = 1\n")
+    elif kind == "call":
+        (stand.tree / "dags/utils/alerts.py").write_text("def send_telegram_message(text, required): pass\ndef telegram_on_failure(ctx): pass\n")
+        changes[MAIN] = "from utils.alerts import send_telegram_message\ndef notify(text): send_telegram_message(text, level='error')\n"
+    elif kind == "missing":
+        (stand.tree / "scrapers/base/iceberg_writer.py").unlink()
+    elif kind == "environment":
+        (stand.tree / "scrapers/base/iceberg_writer.py").write_text("import missing_dependency_xyz\n")
+    elif kind == "writer_api":
+        changes[MAIN] = "class Store:\n    def read(self): return self.writer.read_table('db', 'table', columns=['slug'])\n"
+    elif kind == "unreadable":
+        (stand.tree / "scrapers/base/linked.py").symlink_to("base_scraper.py")
+    elif kind == "no_tests":
+        changes["tests/unit/scrapers/test_clubelo_scraper.py"] = None
+    else:
+        changes["scrapers/base/only_master.py"] = "VALUE = 1\n"
+        changes[MAIN] = "from scrapers.base.only_master import VALUE\n"
+    stand.master(changes)
+    for args in [("--check",), ()]:
+        res = stand.run(*args)
+        assert res.returncode == 1, res.stdout + res.stderr
+        assert "ОТМЕНА: совместимость" in res.stdout
     assert stand.tree_text(MAIN) == "VERSION = 1\n"
     assert stand.accepted() == stand.base
-
-
-@pytest.mark.parametrize("kind", ["extra_in_tree", "deleted_in_master"])
-def test_shared_module_composition_drift_cancels(stand: Stand, kind: str) -> None:
-    if kind == "extra_in_tree":
-        stand.master({MAIN: "VERSION = 2\n"})
-        (stand.tree / "scrapers/utils/stray.py").write_text("X = 1\n", encoding="utf-8")
-        name = "scrapers/utils/stray.py"
-    else:
-        stand.master({MAIN: "VERSION = 2\n", "scrapers/utils/retry_policy.py": None})
-        name = "scrapers/utils/retry_policy.py"
-    (stand.tree / "scrapers/utils/__pycache__").mkdir()
-    (stand.tree / "scrapers/utils/__pycache__/x.cpython-311.pyc").write_bytes(b"\0")
-    res = stand.run("--check")
-    assert res.returncode == 1
-    assert f"ОТМЕНА: общий модуль {name} в бою ≠ master" in res.stdout
-    res = stand.run()
-    assert res.returncode == 1
-    assert f"общий модуль {name}" in stand.tg()
-    assert stand.tree_text(MAIN) == "VERSION = 1\n"
+    assert not (stand.state / "clubelo-inflight").exists()
 
 
 def test_delivers_in_place_creates_new_module_and_rolls_back_by_hand(stand: Stand) -> None:
@@ -308,7 +286,7 @@ def test_deletion_in_own_dirs_is_delivered_and_rolled_back(stand: Stand) -> None
     res = stand.run("--rollback", DAY)
     assert res.returncode == 0, res.stdout + res.stderr
     assert stand.tree_text("scrapers/clubelo/scraper.py") == "OLD = 1\n"
-    assert stand.tree_text("tests/unit/scrapers/test_clubelo_scraper.py") == "def test_old(): pass\n"
+    assert stand.tree_text("tests/unit/scrapers/test_clubelo_scraper.py") == BASE_FILES["tests/unit/scrapers/test_clubelo_scraper.py"]
     assert stand.tree_text("scrapers/clubelo/__init__.py") == ""
     assert not (stand.tree / "tests/unit/scrapers/test_clubelo_daily.py").exists()
     assert not (stand.tree / "tests/fixtures/clubelo/20260924/Ranking.html.gz").exists()
@@ -348,11 +326,11 @@ def test_structural_change_needs_hands(stand: Stand, kind: str) -> None:
 
 
 def test_rename_in_own_dir_is_delete_plus_add(stand: Stand) -> None:
-    sha = stand.master({}, renames={MAIN: "scrapers/clubelo/daily2.py"})
+    sha = stand.master({}, renames={"scrapers/clubelo/scraper.py": "scrapers/clubelo/legacy.py"})
     res = stand.run()
     assert res.returncode == 0, res.stdout + res.stderr
-    assert not (stand.tree / MAIN).exists()
-    assert stand.tree_text("scrapers/clubelo/daily2.py") == "VERSION = 1\n"
+    assert not (stand.tree / "scrapers/clubelo/scraper.py").exists()
+    assert stand.tree_text("scrapers/clubelo/legacy.py") == "OLD = 1\n"
     assert stand.accepted() == sha
 
 
@@ -451,73 +429,86 @@ def test_check_writes_nothing(stand: Stand) -> None:
     assert stand.tg() == ""
 
 
-@pytest.mark.parametrize("tree_alerts, ok", [(LAG_BODY, True), ("def telegram_on_failure(ctx): 3\n", False)])
-def test_allowed_lag_of_a_shared_module(stand: Stand, tree_alerts: str, ok: bool) -> None:
-    # master ушёл вперёд по alerts.py; бой = разрешённая версия → доставка с записью в журнал,
-    # бой = третья версия → отмена, как раньше
-    (stand.tree / "dags/utils/alerts.py").write_text(tree_alerts, encoding="utf-8")
-    sha = stand.master({MAIN: "VERSION = 2\n",
-                        "dags/utils/alerts.py": "def telegram_on_failure(ctx): pass  # после #1477\n"})
-    res = stand.run()
-    if ok:
-        assert res.returncode == 0, res.stdout + res.stderr
-        assert stand.tree_text(MAIN) == "VERSION = 2\n" and stand.accepted() == sha
-        assert f"общий модуль отстаёт (разрешено): dags/utils/alerts.py={LAG_BLOB[:8]}" in stand.log()
-        assert f"общий модуль отстаёт (разрешено): dags/utils/alerts.py={LAG_BLOB[:8]}" in (
-            stand.out / "journal.log").read_text(encoding="utf-8")
-        assert stand.tree_text("dags/utils/alerts.py") == LAG_BODY   # общий модуль не тронут
-    else:
-        assert res.returncode == 1
-        assert "ОТМЕНА: общий модуль dags/utils/alerts.py в бою ≠ master" in stand.log()
-        assert stand.tree_text(MAIN) == "VERSION = 1\n" and stand.accepted() == stand.base
-
-
-def test_tree_equal_to_master_logs_no_lag(stand: Stand) -> None:
-    stand.master({MAIN: "VERSION = 2\n"})
-    assert stand.run().returncode == 0
-    assert "отстаёт" not in stand.log() and stand.tree_text(MAIN) == "VERSION = 2\n"
-
-
-def test_allowed_lag_does_not_cover_other_shared_files(stand: Stand) -> None:
-    # blob разрешён только для alerts.py: тот же текст в другом общем модуле — отмена
-    stand.master({MAIN: "VERSION = 2\n", "dags/utils/config.py": "SCHEDULES = {1: 1}\n"})
-    (stand.tree / "dags/utils/config.py").write_text(LAG_BODY, encoding="utf-8")
-    res = stand.run()
-    assert res.returncode == 1 and "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in stand.log()
-
-
-@pytest.mark.parametrize("lagged", [
-    tuple(CONFIG_LAG_BODIES), ("dags/utils/config.py",),
-    ("dags/utils/medallion_config.py",), (),
-])
-def test_fotmob_config_lag_delivers_without_changing_shared_files(stand: Stand, lagged) -> None:
-    for path in lagged:
-        (stand.tree / path).write_text(CONFIG_LAG_BODIES[path], encoding="utf-8")
-    (stand.tree / "dags/utils/alerts.py").write_text(LAG_BODY, encoding="utf-8")
-    before = {p: stand.tree_text(p) for p in LAG_BLOBS}
-    sha = stand.master({MAIN: "VERSION = 2\n"})
+def test_compatible_shared_drift_delivers_without_shared_writes(stand: Stand) -> None:
+    before = {}
+    for name in ["dags/utils/config.py", "dags/utils/alerts.py", "scrapers/base/base_scraper.py"]:
+        path = stand.tree / name
+        path.write_text(path.read_text() + "# arbitrary compatible version\n")
+        before[name] = path.read_bytes()
+    (stand.tree / "scrapers/base/unused.py").write_text("UNUSED = True\n")
+    sha = stand.master({MAIN: "VERSION = 2\n", "scrapers/utils/retry_policy.py": None})
     checked = stand.run("--check")
     assert checked.returncode == 0, checked.stdout + checked.stderr
-    assert stand.tree_text(MAIN) == "VERSION = 1\n"
-    assert stand.accepted() == stand.base
     res = stand.run()
     assert res.returncode == 0, res.stdout + res.stderr
-    assert stand.tree_text(MAIN) == "VERSION = 2\n"
     assert stand.accepted() == sha
-    assert {p: stand.tree_text(p) for p in LAG_BLOBS} == before
-    for path in lagged:
-        assert f"{path}={LAG_BLOBS[path][:8]}" in stand.log()
+    assert all((stand.tree / name).read_bytes() == body for name, body in before.items())
+    assert (stand.tree / "scrapers/base/unused.py").exists()
+    assert (stand.tree / "scrapers/utils/retry_policy.py").exists()
 
 
-@pytest.mark.parametrize("changed", CONFIG_LAG_BODIES)
-def test_fotmob_config_third_version_still_blocks(stand: Stand, changed: str) -> None:
-    for path, body in CONFIG_LAG_BODIES.items():
-        (stand.tree / path).write_text(body, encoding="utf-8")
-    with (stand.tree / changed).open("a", encoding="utf-8") as handle:
-        handle.write("# unreviewed production edit\n")
-    stand.master({MAIN: "VERSION = 2\n"})
+@pytest.mark.parametrize("rollback", [False, True])
+def test_mixed_base_target_delivers_and_restores_snapshot(stand: Stand, rollback: bool) -> None:
+    extra = "scrapers/clubelo/new.py"
+    sha = stand.master({MAIN: "VERSION = 2\n", extra: "NEW = 1\n",
+                        "dags/dag_ingest_clubelo.py": "INGEST = 2" + (" # BROKEN\n" if rollback else "\n")})
+    (stand.tree / MAIN).write_text("VERSION = 2\n")
+    (stand.tree / extra).write_text("NEW = 1\n")
     res = stand.run()
-    assert res.returncode == 1, res.stdout + res.stderr
-    assert f"ОТМЕНА: общий модуль {changed}" in stand.log()
+    assert res.returncode == (1 if rollback else 0), res.stdout + res.stderr
+    if rollback:
+        assert "откачено" in stand.tg()
+        assert not (stand.state / "clubelo-auto-deliver.off").exists()
+        assert stand.accepted() == stand.base
+    else:
+        assert stand.accepted() == sha
+        res = stand.run("--rollback", DAY)
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert stand.accepted() == stand.base
+    assert stand.tree_text(MAIN) == "VERSION = 2\n"
+    assert stand.tree_text(extra) == "NEW = 1\n"
+    assert stand.tree_text("dags/dag_ingest_clubelo.py") == "INGEST = 1\n"
+
+
+@pytest.mark.parametrize("name", [MAIN, "scrapers/clubelo/new.py"])
+def test_mixed_unrecognized_bytes_still_stop(stand: Stand, name: str) -> None:
+    stand.master({MAIN: "VERSION = 2\n", "scrapers/clubelo/new.py": "NEW = 1\n"})
+    (stand.tree / name).write_text("FOREIGN = 1\n")
+    res = stand.run()
+    assert res.returncode == 1 and "чужая живая правка" in res.stdout
+    assert stand.accepted() == stand.base
+
+
+@pytest.mark.parametrize("change", ["shared", "window", "busy"])
+def test_rechecks_after_compatibility(stand: Stand, change: str) -> None:
+    target = {"shared": stand.tree / "dags/utils/config.py", "window": stand.ss / "now",
+              "busy": stand.ss / "busy"}[change]
+    value = {"shared": "SCHEDULES = {} # changed", "window": "2026-09-24 02:25:00", "busy": "1"}[change]
+    stand.master({MAIN: "VERSION = 2\n", "tests/unit/scrapers/test_clubelo_scraper.py":
+                  f"from pathlib import Path\ndef test_mutate(): Path({str(target)!r}).write_text({value!r})\n"})
+    res = stand.run()
+    assert res.returncode == 1 and "ОТМЕНА:" in res.stdout
     assert stand.tree_text(MAIN) == "VERSION = 1\n"
     assert stand.accepted() == stand.base
+
+
+@pytest.mark.parametrize("day", ["2026-07-15", "2026-12-15", "2026-03-29", "2026-10-25"])
+def test_documented_cron_has_one_attempt_across_dst(stand: Stand, day: str) -> None:
+    from datetime import datetime, timedelta, timezone
+    import re
+    from zoneinfo import ZoneInfo
+    cron = re.findall(r"^40 ([23]) \* \* \* /root/clubelo-auto-deliver.sh", (AUTO.parent / "README.md").read_text(), re.M)
+    assert len(cron) == 2
+    stand.master({MAIN: "VERSION = 2\n"})
+    start = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+    # Enumerate UTC so both occurrences of the repeated autumn hour are tested.
+    for minute in range(240):
+        utc = start + timedelta(minutes=minute)
+        local = utc.astimezone(ZoneInfo("Europe/Berlin"))
+        if local.minute == 40 and str(local.hour) in cron:
+            (stand.ss / "now").write_text(utc.strftime("%Y-%m-%d %H:%M:%S"))
+            res = stand.run()
+            assert res.returncode == 0, res.stdout + res.stderr
+    assert stand.tree_text(MAIN) == "VERSION = 2\n"
+    assert len(list(stand.state.glob("clubelo-auto-deliver-attempted-*"))) == 1
+    assert stand.tg().count("sendMessage") == 1

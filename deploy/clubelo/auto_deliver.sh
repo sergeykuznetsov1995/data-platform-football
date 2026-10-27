@@ -26,16 +26,6 @@ CLUBELO_PATHS=(scrapers/clubelo dags/dag_ingest_clubelo.py dags/utils/clubelo_ta
 # Общие модули, которые импортируют файлы ClubElo (с транзитивными: default_args → alerts,
 # config → medallion_config, scrapers.base.iceberg_writer → scrapers/utils).
 SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__init__.py dags/utils/config.py dags/utils/default_args.py dags/utils/alerts.py dags/utils/medallion_config.py"
-# Разрешённое отставание общих модулей (решение владельца 29.09, #1465): «путь=git-blob» — бой может
-# побайтно равняться этому blob вместо master. Только файлы из SHARED_PATHS; состав не ослабляется.
-# alerts.py до #1477 (0caf6bca^): master отличается лишь telegram_dq_summary, которой ClubElo не
-# пользуется — тест tests/unit/deploy/test_clubelo_shared_lag.py падает, если разойдётся то, что
-# ClubElo зовёт. Удалить запись, когда #1477 доедет до боя (#1489) — README.
-# #1590 (решение владельца 01.10, #1465): config.py до удаления расписания FotMob Silver,
-# medallion_config.py до исправления SQL COALESCE. ClubElo не использует ни это расписание,
-# ни SQL emitter; test_clubelo_shared_lag.py фиксирует обе проверенные версии и импорты.
-# Удалять каждую пару после доставки соответствующего общего файла FotMob, не править бой.
-ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=697fe43d6eb46e49c4246780f2cba59fabf87e4d"
 # Порядок записи файлов вне scrapers/clubelo/ и tests/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/clubelo_tasks.py dags/scripts/run_clubelo_scraper.py dags/dag_ingest_clubelo.py"
 DAGS="dag_ingest_clubelo"
@@ -93,7 +83,7 @@ extra_files() {
 # CUT берётся ПОСЛЕ всех записей; +60 с — больше таймаута разбора файла (dag_file_processor_timeout
 # 50 с по умолчанию): разбор, начатый до окончания записи, приёмку не засчитает.
 accept() {
-  local cut="$1" base="$2" i d r ok f
+  local cut="$1" base="$2" snapshot="${3:-}" i d r ok f
   REASON="DAG не перечитаны за 7 мин"
   for i in $(seq 1 21); do
     ok=1
@@ -107,6 +97,14 @@ accept() {
     sleep 20
   done
   [ "$ok" = 1 ] || return 1
+  if [ -n "$snapshot" ] && [ -f "$snapshot/own-before.sha256" ]; then
+    (cd "$TREE" && sha256sum -c "$snapshot/own-before.sha256" >/dev/null) \
+      || { REASON="откат не равен исходному снимку"; return 1; }
+    cmp -s "$snapshot/own-before" <({ own_files "$base"; extra_files "$base"; } | sed '/^$/d' | LC_ALL=C sort -u) \
+      || { REASON="состав ClubElo после отката изменился"; return 1; }
+    log "приёмка отката пройдена (исходный снимок ClubElo)"
+    return 0
+  fi
   OWN=$(own_files "$base") || { REASON="нет списка файлов ClubElo в ${base:0:7}"; return 1; }
   for f in $OWN; do
     g show "$base:$f" | cmp -s - "$TREE/$f" || { REASON="после записи $f в бою ≠ ${base:0:7}"; return 1; }
@@ -154,9 +152,9 @@ if [ "$MODE" = "--rollback" ]; then
   echo "rollback $RB" > "$INFLIGHT" || stop "--rollback $RB: не записан $INFLIGHT — бой не тронут"
   REASON="возврат файлов не удался"
   if restore "$BK" "$RB" && { REASON="метабаза не отвечает"; CUT=$(q "select now()"); [ -n "$CUT" ]; } \
-     && accept "$CUT" "$BASE" && { REASON="не записан $ACCEPTED_F"; set_accepted "$BASE"; }; then
+     && accept "$CUT" "$BASE" "$BK" && { REASON="не записан $ACCEPTED_F"; set_accepted "$BASE"; }; then
     rm -f "$INFLIGHT"
-    journal "ручной откат $RB принят"; tg "↩️ ClubElo: ручной откат доставки $RB принят, бой = ${BASE:0:7}"; exit 0
+    journal "ручной откат $RB принят"; tg "↩️ ClubElo: ручной откат доставки $RB принят, база ${BASE:0:7}, исходные файлы восстановлены"; exit 0
   fi
   touch "$OFF"; journal "ручной откат $RB НЕ подтверждён ($REASON), выключатель поставлен"
   tg "🆘 ClubElo: ручной откат $RB НЕ подтверждён ($REASON) — НУЖНЫ РУКИ; автомат выключен ($OFF)"
@@ -195,29 +193,29 @@ ACC=$(cat "$ACCEPTED_F" 2>/dev/null)
   || stop "автомат не знает базы: $ACCEPTED_F пуст/не SHA/нет такого коммита — посей руками (README)"
 [ "$(md5sum < "$SELF" | cut -c1-32)" = "$(g show "$SHA:deploy/clubelo/auto_deliver.sh" 2>/dev/null | md5sum | cut -c1-32)" ] \
   || stop "копия автомата отстала от master ${SHA:0:7}, переустанови: cp из master (README)"
-LAGGED=""
-for f in $(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS); do
-  g show "$SHA:$f" | cmp -s - "$TREE/$f" && continue
-  blob=$(g hash-object --no-filters "$TREE/$f" 2>/dev/null)
-  if [ -n "$blob" ] && [[ " $ALLOWED_LAG " == *" $f=$blob "* ]]; then LAGGED="$LAGGED $f=${blob:0:8}"; continue; fi
-  stop "ОТМЕНА: общий модуль $f в бою ≠ master ${SHA:0:7}"
-done
-# Состав тоже: удалённый в master или лишний в бою общий модуль (без __pycache__/.pyc) — та же отмена.
-EXTRA=$(comm -13 <(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS | LC_ALL=C sort -u) \
-  <(cd "$TREE" && for p in $SHARED_PATHS; do [ -e "$p" ] && find "$p" -type f ! -path '*/__pycache__/*' ! -name '*.pyc'; done | LC_ALL=C sort -u))
-[ -z "$EXTRA" ] || stop "ОТМЕНА: общий модуль $(echo $EXTRA) в бою ≠ master ${SHA:0:7} (в master его нет)"
-if [ -n "$LAGGED" ]; then
-  log "общий модуль отстаёт (разрешено):$LAGGED; master ${SHA:0:7}"
-  journal "общий модуль отстаёт (разрешено):$LAGGED"
-fi
-log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бою = master${LAGGED:+ (кроме разрешённого отставания)}"
+# Кандидат фиксирован SHA; shared целиком заменяются снимком боя, включая удаления.
+COMPAT=$(mktemp -d) || stop "ОТМЕНА: временная копия"
+trap 'rm -rf "${COMPAT:?}"; [ -z "${CHECK_WORK:-}" ] || rm -rf "${CHECK_WORK:?}"' EXIT
+g archive "$SHA" | tar -x -C "$COMPAT" || stop "ОТМЕНА: git archive кандидата"
+CHECKER="$COMPAT/deploy/clubelo/check_compatibility.py"
+CHECK_PY=/root/.venvs/dpf-test/bin/python
+# Внешний timeout покрывает также чтение/копирование и ошибки тестового окружения.
+timeout 300 "$CHECK_PY" -I "$CHECKER" prepare "$COMPAT" "$TREE" $SHARED_PATHS \
+  || stop "ОТМЕНА: совместимость ClubElo с общими модулями не подтверждена"
+log "база ${ACC:0:7} → master ${SHA:0:7}; совместимость общих модулей проверена"
 
-# --- бой = принятая база по всем файлам ClubElo (иначе — чужая живая правка)
+# --- бой = база ИЛИ target: ранее вручную доставленные файлы допустимы.
 OWN=$(own_files "$ACC") || stop "нет списка файлов ClubElo в базе ${ACC:0:7}"
 for f in $OWN; do
-  g show "$ACC:$f" | cmp -s - "$TREE/$f" || stop "чужая живая правка: $f в бою ≠ принятой базе ${ACC:0:7}"
+  g show "$ACC:$f" | cmp -s - "$TREE/$f" && continue
+  g show "$SHA:$f" 2>/dev/null | cmp -s - "$TREE/$f" \
+    || stop "чужая живая правка: $f в бою ≠ базе и target"
 done
-EXTRA=$(extra_files "$ACC"); [ -z "$EXTRA" ] || stop "чужая живая правка: лишние файлы ClubElo в бою: $(echo $EXTRA)"
+EXTRA=$(extra_files "$ACC")
+for f in $EXTRA; do
+  g show "$SHA:$f" 2>/dev/null | cmp -s - "$TREE/$f" \
+    || stop "чужая живая правка: лишние файлы ClubElo в бою: $f"
+done
 
 # --- список изменений: M — доставить; A/D в scrapers/clubelo/ и тестах ClubElo — создать/удалить;
 # прочее — руками. --no-renames: переименование = D + A и проходит те же правила.
@@ -250,9 +248,10 @@ FILES_N=$(echo "$ORDERED" | wc -l)
 
 # --- предзапись: новые байты во временную папку, *.py компилируются (строкой, без .pyc)
 BK="$OUT/$DAY"; WORK="$BK"
-if [ "$MODE" = --check ]; then WORK=$(mktemp -d); trap 'rm -rf "${WORK:?}"' EXIT; fi
+if [ "$MODE" = --check ]; then WORK=$(mktemp -d); CHECK_WORK=$WORK; fi
 for f in $ORDERED; do
-  [ "${ST[$f]}" = A ] && [ -e "$TREE/$f" ] && stop "новый файл $f уже есть в бою — чужая правка"
+  # Новый относительно базы файл уже мог быть доставлен вручную. Сохранить .prev.
+  if [ "${ST[$f]}" = A ] && [ -e "$TREE/$f" ]; then ST[$f]=M; fi
   [ "${ST[$f]}" = D ] && continue
   mkdir -p "$WORK/$(dirname "$f")"
   g show "$SHA:$f" > "$WORK/$f.new" || stop "git show $f"
@@ -262,9 +261,18 @@ for f in $ORDERED; do
   esac
 done
 log "к доставке ($FILES_N): $(for f in $ORDERED; do printf '%s %s; ' "${ST[$f]}" "$f"; done)"
+"$CHECK_PY" -I "$CHECKER" verify "$COMPAT" "$TREE" $SHARED_PATHS \
+  || stop "ОТМЕНА: общие модули изменились после проверки"
+BUSY=$(busy_reason)
+[ -z "$BUSY" ] || stop "ОТМЕНА: перед записью $BUSY"
 if [ "$MODE" = --check ]; then log "проверки пройдены (--check, ничего не записано)"; journal "check: проверки пройдены"; exit 0; fi
 
 # --- запись
+# Снимок полного смешанного набора для проверки отката, база остаётся прежней.
+{ printf '%s\n' "$OWN"; [ -z "$EXTRA" ] || printf '%s\n' "$EXTRA"; } | LC_ALL=C sort -u > "$BK/own-before" \
+  || stop "не записан состав ClubElo до доставки"
+(cd "$TREE" && while read -r f; do sha256sum "$f" || exit 1; done < "$BK/own-before") > "$BK/own-before.sha256" \
+  || stop "не записан снимок ClubElo до доставки"
 # Состояние для отката пишется ДО первой записи в бой; не записалось — в бой не идём.
 { echo "$SHA $DAY" > "$INFLIGHT" && echo "$ACC" > "$BK/accepted-before" && : > "$BK/files"; } \
   || { rm -f "$INFLIGHT"; stop "не записано состояние доставки (inflight/accepted-before/files) — бой не тронут"; }
@@ -306,7 +314,7 @@ WHY="$REASON"
 ROK=0
 if restore "$BK" "$DAY"; then
   CUT=$(q "select now()")
-  if [ -z "$CUT" ]; then REASON="метабаза не отвечает"; elif accept "$CUT" "$ACC"; then ROK=1; fi
+  if [ -z "$CUT" ]; then REASON="метабаза не отвечает"; elif accept "$CUT" "$ACC" "$BK"; then ROK=1; fi
 else REASON="возврат файлов не удался"; fi
 if [ "$ROK" = 1 ]; then
   rm -f "$INFLIGHT"; journal "отклонено ($WHY), откачено"
