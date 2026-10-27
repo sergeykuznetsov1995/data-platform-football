@@ -488,5 +488,5 @@ def run_default(*, batch_size: int = DEFAULT_BATCH_SIZE) -> Dict[str, Any]:
 
     import requests
 
-    with requests.Session() as session:
-        return run_history(ClubEloTransport(session), IcebergHistoryStore(), batch_size=batch_size)
+    with requests.Session() as session, ClubEloTransport(session) as transport:
+        return run_history(transport, IcebergHistoryStore(), batch_size=batch_size)

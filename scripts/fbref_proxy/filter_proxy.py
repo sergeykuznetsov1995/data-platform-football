@@ -193,6 +193,11 @@ TRANSFERMARKT_DAG_IDS = frozenset(
 TRANSFERMARKT_BACKFILL_DAG_ID = "dag_backfill_transfermarkt"
 TRANSFERMARKT_BACKFILL_DAG_IDS = frozenset({TRANSFERMARKT_BACKFILL_DAG_ID})
 TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 0
+# ClubElo modes share durable DagRun/URL counters; zero disables admission.
+CLUBELO_DAG_IDS = frozenset({"dag_ingest_clubelo"})
+CLUBELO_DAGRUN_BUDGET_BYTES = 0
+CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES = 0
+CLUBELO_CONTROL_TOKEN = ""
 TRANSFERMARKT_REQUESTS_PER_MINUTE = 12
 TRANSFERMARKT_PERMIT_STATE_PATH = (
     "/opt/airflow/logs/proxy_filter/transfermarkt_request_permits.json"
@@ -459,8 +464,15 @@ async def _open_upstream_connection(
     )
 
 
-def _dagrun_budget_bytes(dag_id: str) -> int:
+def _dagrun_budget_bytes(dag_id: str, task_id: str = "") -> int:
     """Return the source-specific hard cap without weakening WhoScored."""
+    if dag_id in CLUBELO_DAG_IDS:
+        if task_id == "scrape_history":
+            return CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES
+        if task_id:
+            return CLUBELO_DAGRUN_BUDGET_BYTES
+        # Aggregate reports show the ceiling across the mutually exclusive modes.
+        return max(CLUBELO_DAGRUN_BUDGET_BYTES, CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES)
     if dag_id in SOFASCORE_CANARY_DAG_IDS:
         return SOFASCORE_CANARY_HARD_CAP_BYTES
     if dag_id in SOFASCORE_DISCOVERY_DAG_IDS:
@@ -477,6 +489,8 @@ def _dagrun_budget_bytes(dag_id: str) -> int:
 
 
 def _source_for_dag(dag_id: str) -> str:
+    if dag_id in CLUBELO_DAG_IDS:
+        return "clubelo"
     if dag_id in SOFASCORE_CANARY_DAG_IDS:
         return "sofascore_canary"
     if dag_id in SOFASCORE_DISCOVERY_DAG_IDS:
@@ -504,6 +518,7 @@ def _budget_namespace_for_source(source: str) -> str:
     """Describe the actual hard-budget authority used by a lease source."""
 
     return {
+        "clubelo": "clubelo_dagrun",
         "transfermarkt": "transfermarkt_production_utc_day",
         "transfermarkt_backfill": "transfermarkt_backfill_dagrun",
         "sofascore": "sofascore_signed_allocation",
@@ -1375,12 +1390,16 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
         "transfermarkt_backfill",
     }:
         return normalized in TRANSFERMARKT_PROXY_ALLOWED_HOSTS
+    if lease is not None and lease.source == "clubelo":
+        return normalized in {"clubelo.com", "challenges.cloudflare.com"}
     # Unknown lease sources never receive an unrestricted paid exit.  A
     # credential-less development listener is handled separately by ``handle``.
     return lease is None
 
 
 def _control_token_for_source(source: str) -> str:
+    if source == "clubelo":
+        return CLUBELO_CONTROL_TOKEN
     if source == "transfermarkt_backfill":
         return TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
     if source == "transfermarkt":
@@ -1401,6 +1420,7 @@ def _any_control_token_valid(headers: dict[str, str]) -> bool:
         expected and secrets.compare_digest(supplied, expected)
         for expected in (
             CONTROL_TOKEN,
+            CLUBELO_CONTROL_TOKEN,
             TRANSFERMARKT_CONTROL_TOKEN,
             TRANSFERMARKT_BACKFILL_CONTROL_TOKEN,
         )
@@ -1835,7 +1855,7 @@ def _lease_dagrun_budget_bytes(lease: Lease) -> int:
         if lease.proxy_campaign_approval is None:
             return DEFAULT_WHOSCORED_PAID_CAP_BYTES
         return lease.proxy_campaign_approval.caps.total_provider_bytes
-    return _dagrun_budget_bytes(lease.dag_id)
+    return _dagrun_budget_bytes(lease.dag_id, lease.task_id)
 
 
 def _lease_url_budget_bytes(lease: Lease) -> int:
@@ -3126,6 +3146,12 @@ def _create_lease(
     if requested_source and requested_source != inferred_source:
         raise ValueError("paid lease source does not match dag_id")
     source = inferred_source or requested_source
+    if source == "clubelo":
+        task_id = str(metadata.get("task_id") or "").strip()
+        if task_id not in {"scrape_daily", "scrape_history", "check_watch"}:
+            raise ValueError("ClubElo lease task_id is not in the closed allowlist")
+        if _dagrun_budget_bytes(dag_id, task_id) <= 0:
+            raise RuntimeError("ClubElo lease unavailable: explicit mode cap required")
     lease_manager = mgr
     if source == "transfermarkt_backfill":
         if TRANSFERMARKT_BACKFILL_PROXY_MANAGER is None:
@@ -3310,7 +3336,9 @@ def _create_lease(
         dagrun_budget = proxy_campaign_approval.caps.total_provider_bytes
     else:
         effective_expires_at = now + ttl_seconds
-        dagrun_budget = _dagrun_budget_bytes(dag_id)
+        dagrun_budget = _dagrun_budget_bytes(
+            dag_id, str(metadata.get("task_id") or "").strip()
+        )
     if source != "whoscored":
         effective_expires_at = now + ttl_seconds
     url_budget = (
@@ -6853,6 +6881,8 @@ class _SharedBudgetGuard:
 async def main() -> None:
     global BLOCKLIST, DAILY_BUDGET_BYTES, MAX_LEASE_BYTES, LEASE_PROXY_URL
     global MAX_LEASE_TTL_SECONDS, DAGRUN_BUDGET_BYTES
+    global CLUBELO_CONTROL_TOKEN, CLUBELO_DAGRUN_BUDGET_BYTES
+    global CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES
     global TRANSFERMARKT_DAGRUN_BUDGET_BYTES
     global TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES
     global SOFASCORE_DAGRUN_BUDGET_BYTES, SOFASCORE_BUDGET_ARTIFACT_ID
@@ -7171,6 +7201,31 @@ async def main() -> None:
         raise SystemExit(
             "PROXY_FILTER_CONTROL_TOKEN must contain at least 32 characters"
         )
+    CLUBELO_CONTROL_TOKEN = os.environ.get("CLUBELO_PROXY_CONTROL_TOKEN", "").strip()
+    CLUBELO_DAGRUN_BUDGET_BYTES = int(
+        os.environ.get("PROXY_FILTER_CLUBELO_DAGRUN_BUDGET_BYTES", "0")
+    )
+    CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES = int(
+        os.environ.get("PROXY_FILTER_CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES", "0")
+    )
+    if min(CLUBELO_DAGRUN_BUDGET_BYTES, CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES) < 0:
+        raise SystemExit("ClubElo mode caps must be non-negative")
+    if CLUBELO_CONTROL_TOKEN or max(
+        CLUBELO_DAGRUN_BUDGET_BYTES, CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES
+    ) > 0:
+        if len(CLUBELO_CONTROL_TOKEN) < 32:
+            raise SystemExit(
+                "CLUBELO_PROXY_CONTROL_TOKEN must contain at least 32 characters"
+            )
+        if any(
+            token and secrets.compare_digest(CLUBELO_CONTROL_TOKEN, token)
+            for token in (
+                CONTROL_TOKEN,
+                os.environ.get("TM_PROXY_CONTROL_TOKEN", "").strip(),
+                os.environ.get("TM_BACKFILL_PROXY_CONTROL_TOKEN", "").strip(),
+            )
+        ):
+            raise SystemExit("ClubElo proxy control token must be distinct")
     TRANSFERMARKT_CONTROL_TOKEN = str(
         os.environ.get("TM_PROXY_CONTROL_TOKEN", "")
     ).strip()
@@ -7285,7 +7340,9 @@ async def main() -> None:
             "provider/lease ceilings"
         )
     if SOURCE_MODE == "whoscored-only" and (
-        transfermarkt_budget_bytes != 0
+        CLUBELO_DAGRUN_BUDGET_BYTES != 0
+        or CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES != 0
+        or transfermarkt_budget_bytes != 0
         or transfermarkt_backfill_budget_bytes != 0
         or sofascore_canary_hard_cap_bytes != 0
         or sofascore_discovery_budget_bytes != 0

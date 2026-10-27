@@ -219,6 +219,6 @@ def run_default(*, state_file=STATE_FILE, source="html") -> dict:
     import requests
     from utils.alerts import send_telegram_message
 
-    with requests.Session() as session:
-        return run_watch(ClubEloTransport(session), state_file=state_file,
+    with requests.Session() as session, ClubEloTransport(session) as transport:
+        return run_watch(transport, state_file=state_file,
                          notifier=send_telegram_message, source=source)

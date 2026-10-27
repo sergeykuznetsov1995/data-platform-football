@@ -1,0 +1,68 @@
+# Isolated gateway: never run this file in the shared data-platform project.
+name: clubelo-gw
+services:
+  clubelo_proxy_filter:
+    image: ${CLUBELO_GATEWAY_IMAGE:?set image pinned by sha256 digest}
+    restart: unless-stopped
+    working_dir: /opt/clubelo-repo
+    # Как у общего proxy_filter: без whoscored-entrypoint и без ожидания БД Airflow.
+    entrypoint:
+      - /usr/bin/dumb-init
+      - --
+      - /entrypoint
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PYTHONPATH: /opt/clubelo-repo
+      CONNECTION_CHECK_MAX_COUNT: "0"
+      PROXY_POOL_JSON: ${PROXY_POOL_JSON:?set the working residential proxy pool}
+      PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:?set a distinct control token}
+      CLUBELO_PROXY_CONTROL_TOKEN: ${CLUBELO_PROXY_CONTROL_TOKEN:?set the ClubElo control token}
+      PROXY_FILTER_CLUBELO_DAGRUN_BUDGET_BYTES: ${PROXY_FILTER_CLUBELO_DAGRUN_BUDGET_BYTES:-33554432}
+      PROXY_FILTER_CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES: ${PROXY_FILTER_CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES:-134217728}
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
+    command:
+      - python
+      - /opt/clubelo-repo/scripts/fbref_proxy/filter_proxy.py
+      - --source-mode
+      - shared-no-whoscored
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://clubelo_proxy_filter:8900
+      - --daily-budget-mb
+      - ${PROXY_FILTER_DAILY_BUDGET_MB:-4096}
+      - --max-lease-mb
+      - ${CLUBELO_GATEWAY_MAX_LEASE_MB:-128}
+      - --url-budget-bytes
+      - ${CLUBELO_GATEWAY_URL_BUDGET_BYTES:-134217728}
+      - --max-lease-ttl-seconds
+      - ${CLUBELO_PROXY_TTL_SECONDS:-3600}
+      - --max-active-leases
+      - '1'
+      - --out
+      - /var/lib/clubelo-gw/bytes.json
+      - --ledger
+      - /var/lib/clubelo-gw/paid_requests.jsonl
+    volumes:
+      - type: bind
+        source: ${CLUBELO_RELEASE_ROOT:?set frozen repository outside /opt/airflow}
+        target: /opt/clubelo-repo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CLUBELO_GATEWAY_STATE_HOST_DIR:?set dedicated durable state directory}
+        target: /var/lib/clubelo-gw
+        bind:
+          create_host_path: false
+    networks:
+      - dp-backend
+networks:
+  dp-backend:
+    external: true
+    name: dp-backend
