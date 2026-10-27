@@ -81,16 +81,17 @@ flock /root/watchdog/state/clubelo-auto-deliver.lock sh -c 'printf "%s\n" "$1" >
 /root/clubelo-auto-deliver.sh --check
 ```
 
-Две постоянные строки crontab для Europe/Berlin (Debian cron без `CRON_TZ`):
+Постоянная строка crontab для Europe/Berlin (Debian cron без `CRON_TZ`):
 
 ```
-40 2 * * * /root/clubelo-auto-deliver.sh >> /root/watchdog/clubelo_auto_deliver_cron.log 2>&1
-40 3 * * * /root/clubelo-auto-deliver.sh >> /root/watchdog/clubelo_auto_deliver_cron.log 2>&1
+40 * * * * /root/clubelo-auto-deliver.sh >> /root/watchdog/clubelo_auto_deliver_cron.log 2>&1
 ```
 
-Летом 03:40, зимой 02:40 соответствуют 01:40 UTC. Другой запуск отсеивается
-UTC-окном 01:30–02:25; flock и суточная защёлка предотвращают повторную попытку,
-включая повторный осенний час. Менять cron при переходе времени не нужно.
+Летом 03:40, зимой 02:40 соответствуют 01:40 UTC. Wildcard в поле часов
+сохраняет запуск в повторном осеннем часе: Debian cron подавляет повтор только
+для заданий с фиксированным временем. Остальные ежечасные запуски отсеиваются
+UTC-окном 01:30–02:25; flock и суточная защёлка предотвращают повторную попытку.
+Менять cron при переходе времени не нужно.
 
 ## Ручные режимы
 

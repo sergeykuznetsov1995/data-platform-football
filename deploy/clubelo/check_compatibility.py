@@ -43,7 +43,7 @@ def no_network(event, args):
         raise RuntimeError("network disabled in ClubElo compatibility check")
 
 
-def check_calls(root, writer, send, failure):
+def check_calls(root, writer, send, failure, solver):
     # Bind the candidate's actual call shapes to real shared signatures. Unit
     # tests may mock IO methods without autospec, hiding incompatible APIs.
     for path in (root / "scrapers/clubelo").glob("*.py"):
@@ -53,18 +53,21 @@ def check_calls(root, writer, send, failure):
             function, prefix = None, []
             if isinstance(node.func, ast.Name):
                 function = {"IcebergWriter": writer, "send_telegram_message": send,
-                            "telegram_on_failure": failure}.get(node.func.id)
+                            "telegram_on_failure": failure, "FlareSolverrClient": solver}.get(node.func.id)
             elif (isinstance(node.func, ast.Attribute)
                   and isinstance(node.func.value, ast.Attribute)
                   and isinstance(node.func.value.value, ast.Name)
-                  and node.func.value.value.id == "self" and node.func.value.attr == "writer"):
-                function = getattr(writer, node.func.attr)
+                  and node.func.value.value.id == "self" and node.func.value.attr in {"writer", "_solver"}):
+                owner = writer if node.func.value.attr == "writer" else solver
+                function = getattr(owner, node.func.attr)
                 prefix = [None]  # unbound instance method
             if function is not None:
                 if any(isinstance(arg, ast.Starred) for arg in node.args) or any(k.arg is None for k in node.keywords):
                     raise RuntimeError(f"unverified dynamic shared call: {path}:{node.lineno}")
                 inspect.signature(function).bind(*prefix, *([None] * len(node.args)),
                                                  **{k.arg: None for k in node.keywords})
+    # Transport registers this bound method as a zero-argument cleanup callback.
+    inspect.signature(solver.close).bind(None)
 
 
 def run_tests(root):
@@ -73,10 +76,11 @@ def run_tests(root):
     sys.addaudithook(no_network)
     # Check real lazy dependencies before unit tests can install mocks.
     from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.base.flaresolverr_client import FlareSolverrClient
     from utils.alerts import send_telegram_message, telegram_on_failure
     from scrapers.clubelo import daily, history
     assert callable(IcebergWriter) and callable(send_telegram_message) and callable(telegram_on_failure)
-    check_calls(root, IcebergWriter, send_telegram_message, telegram_on_failure)
+    check_calls(root, IcebergWriter, send_telegram_message, telegram_on_failure, FlareSolverrClient)
     import pytest
     tests = sorted(str(p.relative_to(root)) for p in (root / "tests/unit").rglob("test_*clubelo*.py")
                    if "deploy" not in p.relative_to(root / "tests/unit").parts)

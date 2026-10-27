@@ -34,6 +34,12 @@ BASE_FILES = {
     "scrapers/__init__.py": "",
     "scrapers/base/base_scraper.py": "BASE = 1\n",
     "scrapers/base/iceberg_writer.py": "class IcebergWriter: pass\n",
+    "scrapers/base/flaresolverr_client.py": "class FlareSolverrClient:\n"
+        "    def __init__(self, url, default_timeout, default_max_timeout_ms): pass\n"
+        "    def create_session(self, session_id, proxy_url=None): pass\n"
+        "    def get(self, url, session_id): pass\n"
+        "    def destroy_session(self, session_id): pass\n"
+        "    def close(self): pass\n",
     "scrapers/clubelo/history.py": "HISTORY = 1\n",
     "scrapers/utils/__init__.py": "",
     "dags/utils/__init__.py": "",
@@ -214,6 +220,29 @@ def test_incompatible_shared_cancels_before_writes(stand: Stand, kind: str) -> N
         assert "ОТМЕНА: совместимость" in res.stdout
     assert stand.tree_text(MAIN) == "VERSION = 1\n"
     assert stand.accepted() == stand.base
+    assert not (stand.state / "clubelo-inflight").exists()
+
+
+@pytest.mark.parametrize("method", [None, "__init__", "create_session", "get", "destroy_session", "close"])
+def test_solver_api_checked_before_writes(stand: Stand, method: str | None) -> None:
+    path = "scrapers/base/flaresolverr_client.py"
+    body = BASE_FILES[path]
+    if method is not None:
+        import re
+        # create_session keeps its positional API but loses proxy_url.
+        signature = "self, session_id" if method == "create_session" else "self, *, incompatible"
+        body = re.sub(rf"def {method}\([^)]*\)", f"def {method}({signature})", body)
+    (stand.tree / path).write_text(body)
+    sha = stand.master({MAIN: "VERSION = 2\n", "scrapers/clubelo/transport.py":
+                        (ROOT / "scrapers/clubelo/transport.py").read_text()})
+    for args in [("--check",), ()]:
+        res = stand.run(*args)
+        assert res.returncode == (1 if method else 0), res.stdout + res.stderr
+        if method:
+            assert "ОТМЕНА: совместимость" in res.stdout
+    assert stand.tree_text(MAIN) == ("VERSION = 1\n" if method else "VERSION = 2\n")
+    assert stand.accepted() == (stand.base if method else sha)
+    assert stand.tree_text(path) == body
     assert not (stand.state / "clubelo-inflight").exists()
 
 
@@ -497,15 +526,17 @@ def test_documented_cron_has_one_attempt_across_dst(stand: Stand, day: str) -> N
     from datetime import datetime, timedelta, timezone
     import re
     from zoneinfo import ZoneInfo
-    cron = re.findall(r"^40 ([23]) \* \* \* /root/clubelo-auto-deliver.sh", (AUTO.parent / "README.md").read_text(), re.M)
-    assert len(cron) == 2
+    cron = re.findall(r"^40 (\*|[23]) \* \* \* /root/clubelo-auto-deliver.sh", (AUTO.parent / "README.md").read_text(), re.M)
+    assert cron
     stand.master({MAIN: "VERSION = 2\n"})
     start = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
-    # Enumerate UTC so both occurrences of the repeated autumn hour are tested.
+    # Debian cron suppresses fixed-hour jobs in the repeated autumn hour;
+    # wildcard-hour jobs follow the new wall clock, including that hour.
     for minute in range(240):
         utc = start + timedelta(minutes=minute)
         local = utc.astimezone(ZoneInfo("Europe/Berlin"))
-        if local.minute == 40 and str(local.hour) in cron:
+        scheduled = "*" in cron or (str(local.hour) in cron and not local.fold)
+        if local.minute == 40 and scheduled:
             (stand.ss / "now").write_text(utc.strftime("%Y-%m-%d %H:%M:%S"))
             res = stand.run()
             assert res.returncode == 0, res.stdout + res.stderr
