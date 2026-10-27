@@ -610,7 +610,7 @@ def test_failed_scope_retries_only_unconfirmed_responses(tmp_path, monkeypatch, 
     repository.append_attempt = append_attempt
     if failure == "write":
         scraper.save_to_iceberg.side_effect = ValueError("offline write failure")
-    for _ in range(2):
+    for attempt in range(2):
         session.calls.clear()
         payload, code = runner.run_scope(args, scraper_factory=factory, repository=repository)
         assert code == 2, payload
@@ -620,7 +620,10 @@ def test_failed_scope_retries_only_unconfirmed_responses(tmp_path, monkeypatch, 
             assert ("player_team_reference_gap" if failure == "players" else "invalid_xg") in codes
         assert f"/get{'MatchData/100' if failure == 'match' else 'TeamData/Home/2025'}" in session.calls
         if failure != "match":
-            assert session.calls == ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025"]
+            expected = ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025"]
+            if failure == "players" and attempt:
+                expected.append("/getTeamData/Away/2025")
+            assert session.calls == expected
     assert not path.exists()
 
     session.broken = False
@@ -649,3 +652,101 @@ def test_previous_cache_version_requires_publication_confirmation(tmp_path):
     assert not path.exists()
     src.confirm_cache()
     assert json.loads(path.read_text())["version"] == 2
+
+
+def test_broken_league_probe_keeps_other_five_scopes(tmp_path, monkeypatch):
+    from dags.scripts import run_understat_scraper as runner
+    from scrapers.understat.catalog import LEAGUES
+    from tests.unit.scrapers.test_understat_discovery_fallback import registry
+    from tests.unit.scrapers.test_run_understat_scraper import (
+        _Repository, _args, _freeze_runner_time, _scraper_factory,
+    )
+
+    class BrokenLeague(Session):
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if "/getLeagueData/EPL/" in url:
+                response._payload = {"dates": "broken"}
+            return response
+
+    _freeze_runner_time(monkeypatch, datetime(2025, 8, 10, tzinfo=timezone.utc))
+    src, session = source(tmp_path, BrokenLeague())
+    rows = registry()
+    for row in rows["stat"]:
+        row["year"] = 2025
+    monkeypatch.setattr(src.client, "get_stat_data", lambda **_: rows)
+    scopes = src.catalog.rolling_scopes(window=2)
+    current = [scope for scope in scopes if scope.source_season_id == 2025]
+    assert {scope.league for scope in current} == {item.league for item in LEAGUES}
+    failed = next(scope for scope in current if scope.league == LEAGUE)
+    assert failed.discovered and not failed.is_closed
+    assert all(f"/getLeagueData/{item.source_league}/2025" in session.calls for item in LEAGUES)
+
+    factory, scraper = _scraper_factory({})
+    scraper.scrape_scope.side_effect = src.scrape_scope
+    payload, code = runner.run_scope(_args(), scraper_factory=factory, repository=_Repository())
+    assert code == 2
+    assert payload["status"] == "schema_drift"
+    scraper.save_to_iceberg.assert_not_called()
+
+
+def test_dq_failure_refreshes_confirmed_teams_after_player_removed(tmp_path, monkeypatch):
+    from dags.scripts import run_understat_scraper as runner
+    from scrapers.understat.scraper import UnderstatScraper
+    from tests.unit.scrapers.test_run_understat_scraper import (
+        _Repository, _args, _freeze_runner_time, _scraper_factory,
+    )
+
+    class RemovedPlayer(Session):
+        removed = False
+
+        def __init__(self):
+            super().__init__()
+            for player_id in (8, 9, 10):
+                self.league["players"].extend(_team_payload(player_id)["players"])
+
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if "/getTeamData/" in url:
+                home = "/Home/" in url
+                response._payload = _team_payload(7 if home else 9)
+                if home:
+                    response._payload["players"].extend(_team_payload(8)["players"])
+                    if not self.removed:
+                        response._payload["players"].extend(_team_payload(10)["players"])
+            return response
+
+    _freeze_runner_time(monkeypatch, datetime(2025, 8, 10, tzinfo=timezone.utc))
+    src, session = source(tmp_path, RemovedPlayer())
+    wrapper = UnderstatScraper.__new__(UnderstatScraper)
+    wrapper.source = src
+    factory, scraper = _scraper_factory({})
+    scraper.scrape_scope.side_effect = wrapper.scrape_scope
+    scraper.confirm_cache.side_effect = wrapper.confirm_cache
+    scraper.note_quality.side_effect = wrapper.note_quality
+    repository = _Repository()
+    args = _args()
+    assert runner.run_scope(args, scraper_factory=factory, repository=repository)[1] == 0
+    confirmed_match = (tmp_path / "validated" / "match_100.json").read_bytes()
+    # Another scope's confirmation must survive this scope's DQ failure.
+    foreign = tmp_path / "validated" / "team_Other_2025.json"
+    atomic_json(foreign, {"identity": ["ESP-La Liga", 2025, 1]})
+    foreign_state = foreign.read_bytes()
+    session.removed = True
+    session.league["players"] = [row for row in session.league["players"] if row["id"] != "10"]
+    session.calls.clear()
+    payload, code = runner.run_scope(args, scraper_factory=factory, repository=repository)
+    assert code == 2
+    assert "player_reference_gap" in {issue["code"] for issue in payload["scope_attempt"]["quality"]["issues"]}
+    assert session.calls == ["/getLeagueData/EPL/2025"]
+    assert foreign.read_bytes() == foreign_state
+    assert (tmp_path / "validated" / "match_100.json").read_bytes() == confirmed_match
+
+    session.calls.clear()
+    payload, code = runner.run_scope(args, scraper_factory=factory, repository=repository)
+    assert session.calls == ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025", "/getTeamData/Away/2025"]
+    assert code == 0, payload
+    assert payload["status"] == "complete"
+    session.calls.clear()
+    assert runner.run_scope(args, scraper_factory=factory, repository=repository)[1] == 0
+    assert session.calls == ["/getLeagueData/EPL/2025"]

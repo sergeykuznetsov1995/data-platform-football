@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import date, timedelta
 import math
 import json
+import logging
 from pathlib import Path
 import uuid
 from types import MappingProxyType
@@ -13,6 +14,9 @@ from typing import Any, Mapping, Optional
 
 from .client import UnderstatHTTPError, UnderstatPayloadError, save_schema_drift_payload
 from .cache_state import atomic_json, digest, read_json
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -309,6 +313,18 @@ class UnderstatCatalog:
             latest = max(latest, current - 1)
             years = list(range(latest - window + 1, latest + 1))
             getter = getattr(self.client, "get_league_data", None) if live else None
+            failed_probes = set()
+
+            def probe(year: int, *, force: bool = False) -> None:
+                try:
+                    self._probe(definition, year, confirmed, force=force)
+                except Exception:
+                    # The scope task repeats the request and classifies the
+                    # error; a league probe must not block the other leagues.
+                    failed_probes.add(year)
+                    logger.warning("Understat probe failed: league=%s year=%s",
+                                   definition.league, year, exc_info=True)
+
             if callable(getter):
                 active = [int(y) for y, state in confirmed.items()
                           if state.get("published") and not state["is_closed"]]
@@ -319,15 +335,14 @@ class UnderstatCatalog:
                     # season. Confirm both candidates during cold bootstrap.
                     active.append(latest - 1)
                 for year in sorted(set(active)):
-                    self._probe(definition, year, confirmed,
-                                force=year in known and not confirmed.get(str(year), {}).get("published"))
+                    probe(year, force=year in known and not confirmed.get(str(year), {}).get("published"))
                 # Probe only around the actual end of the latest schedule.
                 # Negative responses are cached for seven days.
                 state = confirmed.get(str(latest), {})
                 end = state.get("last_match")
                 if (probe_next and end and
                         -14 <= (self.today - date.fromisoformat(end)).days <= 90):
-                    self._probe(definition, latest + 1, confirmed)
+                    probe(latest + 1)
                 published = [int(y) for y, state in confirmed.items() if state.get("published")]
                 if published:
                     if not confirmed.get(str(latest), {}).get("published") and latest == self.today.year:
@@ -343,6 +358,7 @@ class UnderstatCatalog:
             years.extend(int(y) for y, state in confirmed.items()
                          if state.get("published") and not state["is_closed"]
                          and int(y) not in years)
+            years.extend(year for year in failed_probes if year not in years)
             for source_year in sorted(years):
                 scope = discovered.get(
                     (definition.league, source_year),
@@ -359,6 +375,8 @@ class UnderstatCatalog:
                 state = confirmed.get(str(source_year))
                 if state is not None and state.get("published"):
                     scope = replace(scope, is_closed=state["is_closed"], discovered=True)
+                if source_year in failed_probes:
+                    scope = replace(scope, is_closed=False, discovered=True)
                 result.append(scope)
         return tuple(sorted(result))
 
@@ -406,6 +424,14 @@ class UnderstatCatalog:
     def note_quality(self, league: str, year: int, report: Any, *,
                      publication_ready: bool = True) -> None:
         definition = LEAGUE_BY_CANONICAL[league]
+        cache_dir = getattr(self.client, "cache_dir", None)
+        if not report.passed and cache_dir is not None:
+            # DQ can implicate an unchanged, previously confirmed team page.
+            # Keep confirmed matches; only teams of this scope need a reset.
+            for path in (Path(cache_dir) / "validated").glob("team_*.json"):
+                record = read_json(path)
+                if isinstance(record, dict) and record.get("identity", [])[:2] == [league, year]:
+                    path.unlink(missing_ok=True)
         state = self._confirmed(definition).get(str(year))
         if state is None:
             return
