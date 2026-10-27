@@ -253,12 +253,35 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
     return dict(counts), problems
 
 
-def page_age_metrics(snapshot: Mapping, as_of: datetime) -> dict:
+def page_age_scope(snapshot: Mapping) -> tuple[set, set]:
     adults, pairs, _ = _scope(snapshot)
     active = {cid for cid,c in adults.items() if c.get("crawl_state") == "active"
               and c.get("present") and c.get("lifecycle_state") in {"present", "missing_once"}}
-    buckets = {kind: [] for kind in PUBLICATION_FRESHNESS_PAGE_KINDS}
+    return active, pairs
+
+
+def _page_age_result(by_kind, excluded, standings, errors):
+    total = sum(by_kind[k]["total"] for k in CURRENT_ENRICHMENT)
+    fresh = sum(by_kind[k]["fresh"] for k in CURRENT_ENRICHMENT)
+    return {"by_kind": by_kind, "total": total, "fresh": fresh,
+            "fresh_percent": 100*fresh/total if total else None, "excluded": dict(excluded),
+            "standings_confirmed_seasons": standings, "errors": list(errors)}
+
+
+def page_age_metrics(snapshot: Mapping, as_of: datetime) -> dict:
+    aggregate = snapshot.get("page_ages")
     excluded = Counter(snapshot.get("page_age_exclusions") or {})
+    errors = list(snapshot.get("page_age_errors", []))
+    if isinstance(aggregate, Mapping) and "by_kind" in aggregate:
+        if instant(aggregate["cutoff"]) == instant(as_of):
+            excluded.update(aggregate["excluded"])
+            return _page_age_result(dict(sorted(aggregate["by_kind"].items())), excluded,
+                                    aggregate["standings_confirmed_seasons"], errors)
+        # A saved aggregate cannot be aged again, unlike a row snapshot.
+        errors.append({"source": "fbref_page_ages", "reason": "aggregate_cutoff_mismatch"})
+        snapshot = dict(snapshot, page_ages=[])
+    active, pairs = page_age_scope(snapshot)
+    buckets = {kind: [] for kind in PUBLICATION_FRESHNESS_PAGE_KINDS}
     seen = set()
     standings = {(r["target_id"], r["content_hash"]) for r in snapshot.get("standings_inventory", [])}
     standings_confirmed = 0
@@ -302,12 +325,7 @@ def page_age_metrics(snapshot: Mapping, as_of: datetime) -> dict:
                            24 if kind in {"match", "schedule", "competition_index"} else
                            720 if kind in {"player", "matchlog"} else 168)
                for kind, values in sorted(buckets.items())}
-    total = sum(by_kind[k]["total"] for k in CURRENT_ENRICHMENT)
-    fresh = sum(by_kind[k]["fresh"] for k in CURRENT_ENRICHMENT)
-    return {"by_kind": by_kind, "total": total, "fresh": fresh,
-            "fresh_percent": 100*fresh/total if total else None, "excluded": dict(excluded),
-            "standings_confirmed_seasons": standings_confirmed,
-            "errors": list(snapshot.get("page_age_errors", []))}
+    return _page_age_result(by_kind, excluded, standings_confirmed, errors)
 
 
 def page_age_line(report: Mapping) -> str:

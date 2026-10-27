@@ -1222,3 +1222,56 @@ def test_closed_check_without_baseline_hashes_reingests_without_probe():
     full.scrape_scope.assert_called_once()
     assert repository.appended[-1].quality["league_payload_hashes"] == _LEAGUE_HASHES
     assert repository.appended[-1].quality["request_count"] == 380
+
+
+@pytest.mark.parametrize("physical", [True, False])
+def test_catalog_quality_ready_requires_verified_manifest_publication(physical):
+    factory, scraper = _scraper_factory(_complete_frames())
+    repository = _Repository(physical=physical)
+    def note_quality(league, year, report, *, publication_ready=True):
+        if not publication_ready:
+            assert not repository.appended
+            return
+        assert repository.verified
+        assert repository.appended[-1].status is ManifestStatus.COMPLETE
+        assert report.passed
+    scraper.note_quality.side_effect = note_quality
+    _, code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+    assert code == (0 if physical else 2)
+    assert scraper.note_quality.call_count == (2 if physical else 1)
+
+
+@pytest.mark.parametrize("failure", ["write", "physical", "terminal", None])
+def test_previous_catalog_readiness_is_cleared_before_publication(tmp_path, failure):
+    from datetime import date
+    from types import SimpleNamespace
+    from scrapers.understat.catalog import LEAGUE_BY_CANONICAL, UnderstatCatalog
+    from tests.unit.scrapers.test_understat_native import LEAGUE_PAYLOAD
+
+    definition = LEAGUE_BY_CANONICAL[LEAGUE]
+    catalog = UnderstatCatalog(SimpleNamespace(cache_dir=tmp_path), today=date(2025, 8, 3))
+    catalog.record_league(definition, 2025, LEAGUE_PAYLOAD)
+    catalog.note_quality(LEAGUE, 2025, SimpleNamespace(passed=True, match_quarantine=[]))
+    assert catalog._confirmed(definition)["2025"]["quality_ready"]
+    factory, scraper = _scraper_factory(_complete_frames())
+    scraper.note_quality.side_effect = catalog.note_quality
+    repository = _Repository(physical=failure != "physical")
+    append = repository.append_attempt
+
+    def append_attempt(attempt):
+        if attempt.status is ManifestStatus.IN_PROGRESS:
+            assert not catalog._confirmed(definition)["2025"]["quality_ready"]
+        if failure == "terminal" and attempt.status is ManifestStatus.COMPLETE:
+            raise ValueError("terminal manifest failed")
+        return append(attempt)
+
+    repository.append_attempt = append_attempt
+    if failure == "write":
+        scraper.save_to_iceberg.side_effect = ValueError("write failed")
+    _, code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+    assert code == (0 if failure is None else 2)
+    # Once the last match leaves N, failed publication must remain daily.
+    catalog.today = date(2025, 8, 10)
+    state = catalog.record_league(definition, 2025, LEAGUE_PAYLOAD)
+    assert state["quality_ready"] is (failure is None)
+    assert state["is_closed"] is (failure is None)
