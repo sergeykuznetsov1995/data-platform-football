@@ -11565,7 +11565,7 @@ def test_history_pressure_reclaims_small_wal_and_archives_old_daily_sums(shared_
     assert totals(registry.iter_events(path)) == totals(rows)
 
 
-# --- #1788: discovery must count a provably complete CONNECT 502 refusal ---
+# --- #1788: discovery must count any provably complete CONNECT refusal ---
 
 
 def _make_discovery_lease(mod, manager):
@@ -11588,17 +11588,18 @@ def _close_discovery_control(mod, lease, manager):
     return int(head.split()[1]), json.loads(body)
 
 
+@pytest.mark.parametrize("code", [502, 522, 407, 403, 503])
 @pytest.mark.parametrize("framing", ["length", "eof"])
 @pytest.mark.parametrize("previous_tunnel", [False, True])
-def test_discovery_connect_502_complete_closes_exactly(
-    shared_mod, monkeypatch, framing, previous_tunnel
+def test_discovery_connect_refusal_complete_closes_exactly(
+    shared_mod, monkeypatch, code, framing, previous_tunnel
 ):
     manager = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_discovery_lease(shared_mod, manager)
     _relax_provider_head_timeout(shared_mod, monkeypatch)
     writers = []
     body = b"provider refused"
-    head = b"HTTP/1.1 502 Bad Gateway\r\n"
+    head = f"HTTP/1.1 {code} Provider Refusal\r\n".encode()
     if framing == "length":
         head += f"Content-Length: {len(body)}\r\n".encode()
     response = head + b"\r\n" + body
@@ -11627,8 +11628,8 @@ def test_discovery_connect_502_complete_closes_exactly(
     assert report["close_complete"] is True
     assert lease.accounting_uncertain is False
     assert lease.accounting_uncertain_reason == ""
-    assert bytes(client.payload).startswith(b"HTTP/1.1 502 Bad Gateway (upstream=502)\r\n")
-    assert bytes(client.payload).split(b"\r\n\r\n", 1)[1] == b"502"
+    assert bytes(client.payload).startswith(f"HTTP/1.1 502 Bad Gateway (upstream={code})\r\n".encode())
+    assert bytes(client.payload).split(b"\r\n\r\n", 1)[1] == str(code).encode()
     assert lease.up_bytes == prior_up + len(_expected_connect_head())
     assert lease.down_bytes == prior_down + len(response)
     assert bytes(writers[-1].data) == _expected_connect_head()
@@ -11650,17 +11651,18 @@ def test_discovery_connect_502_complete_closes_exactly(
         assert (shared_mod._run_up_bytes[lease.dagrun_key], shared_mod._run_down_bytes[lease.dagrun_key]) == expected
 
 
-@pytest.mark.parametrize("failure", ["no_eof", "timeout", "reset", "over_cap", "ambiguous", "tunnel_reset", "other_status"])
-def test_discovery_connect_unproven_response_keeps_latch(shared_mod, monkeypatch, failure):
+@pytest.mark.parametrize("code", [502, 522, 407, 403, 503])
+@pytest.mark.parametrize("failure", ["no_eof", "timeout", "reset", "over_cap", "ambiguous", "tunnel_reset", "truncated_length"])
+def test_discovery_connect_unproven_response_keeps_latch(shared_mod, monkeypatch, code, failure):
     manager = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_discovery_lease(shared_mod, manager)
     _relax_provider_head_timeout(shared_mod, monkeypatch)
     monkeypatch.setattr(shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02)
-    head = b"HTTP/1.1 502 Bad Gateway\r\n"
+    head = f"HTTP/1.1 {code} Provider Refusal\r\n".encode()
     if failure == "ambiguous":
         head += b"Content-Length: 7\r\nContent-Length: 8\r\n"
-    if failure == "other_status":
-        head = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 7\r\n"
+    if failure == "truncated_length":
+        head += b"Content-Length: 8\r\n"
     response = head + b"\r\npartial"
     if failure == "over_cap":
         monkeypatch.setattr(shared_mod, "DEAD_EXIT_RESPONSE_MAX_BYTES", len(response) - 1)
