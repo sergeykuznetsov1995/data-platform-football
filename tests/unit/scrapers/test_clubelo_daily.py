@@ -410,3 +410,41 @@ def test_snapshot_rows_build_the_arrow_batch():
     table = writer.replace_identity_partition_arrow_batches.call_args[0][0][0]
     assert table.column("is_provisional").to_pylist().count(True) == 53
     assert table.column("elo_precise").null_count == 1794 - 100
+
+
+@pytest.mark.parametrize("day", ["20261012", "20261021", "20261027"])
+def test_external_results_allow_snapshot_and_merge_on_own_dates(day):
+    from tests.unit.scrapers.clubelo_fakes import external_results_html
+
+    html = external_results_html(day)
+    store = MemoryDailyStore()
+    result, store, hist, *_ = _run(
+        _answers(**{"/Results": gzip_response(html)}), store=store, open_slugs=[])
+    assert result["written"] is True and daily.exit_code(result) == 0
+    assert list(store.snapshot) == [RATING_DATE]
+    results_date = date.fromisoformat(result["results_rating_date"])
+    assert results_date == datetime.strptime(day, "%Y%m%d").date()
+    assert {r["rating_date"] for r in store.results.values()} == {results_date}
+    assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking", "/Results"]
+    external = next(r for r in store.results.values() if r["home_key"].startswith("~:")
+                    or r["away_key"].startswith("~:"))
+    key = tuple(external[k] for k in daily.RESULT_KEYS)
+    count = len(store.results)
+    # Results is newer than Ranking, so the next run fetches and merges it again.
+    changed = html.replace('>2-3<', '>2-4<') if day == "20261027" else html
+    again, *_ = _run(_answers(**{"/Results": gzip_response(changed)}),
+                    store=store, open_slugs=[])
+    assert again["written"] is True and len(store.results) == count
+    assert tuple(store.results[key][k] for k in daily.RESULT_KEYS) == key
+    if day == "20261027":
+        assert store.results[key]["ft"] == "2-4"
+
+
+def test_external_results_unknown_markup_prevents_all_parsed_writes():
+    from tests.unit.scrapers.clubelo_fakes import external_results_html
+
+    html = external_results_html("20261027").replace('>CON<', '> <')
+    result, store, hist, *_ = _run(_answers(**{"/Results": gzip_response(html)}))
+    assert result["written"] is False and result["check"].startswith("C3 result team")
+    assert store.snapshot == {} and store.results == {}
+    assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking", "/Results"]
