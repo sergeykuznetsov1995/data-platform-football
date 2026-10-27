@@ -98,7 +98,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                 ended = (season.end is not None and season.end < moment.date()) or season.is_active is False
                 feeds_due = ended and not final_feeds(repository, season, moment=moment)
             refresh_deferred = (not schedule_due and not (matches or players or previews or feeds_due)
-                                and item["coverage"].get("deferred_stages", 0) > 0)
+                                and item["coverage"].get("deferred_stages", 0) > 0
+                                and checkpoint.reserve_deferred_refresh(
+                                    item["key"], token, now=moment.timestamp(),
+                                ))
             schedule_due = schedule_due or refresh_deferred
             if not (schedule_due or matches or players or previews or feeds_due):
                 failed = False

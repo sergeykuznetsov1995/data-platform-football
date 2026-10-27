@@ -4097,8 +4097,7 @@ class WhoScoredRepository:
             ), stage_counts AS (
                 SELECT league, season,
                        COUNT_IF(successes = 0 AND absent < 2 AND historical_games > 0) AS unknown_stages,
-                       COUNT_IF(successes = 0 AND absent < 2 AND deferred_games > 0
-                                AND historical_games = 0) AS deferred_stages,
+                       COUNT_IF(deferred_games > 0) AS deferred_stages,
                        ARRAY_AGG(stage_id) AS stage_ids
                 FROM stages GROUP BY league, season
             ), counts AS (
