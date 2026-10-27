@@ -3768,6 +3768,8 @@ class WhoScoredRepository:
         ``lane`` optionally partitions this same policy at seven days:
         history is strictly older; current includes the boundary. Other callers
         keep the unbounded default. Explicit replay cannot select a lane.
+        History probes another game after an unknown stage's first negative,
+        preserving the stage cooldown and the two-game evidence requirement.
 
         ``include_exact_count`` adds the exact pre-``LIMIT`` backlog size to
         every returned candidate (``exact_candidate_count``), so a bounded
@@ -3939,6 +3941,12 @@ class WhoScoredRepository:
             if daily
             else ""
         )
+        # History needs two distinct negative games to resolve an unknown
+        # stage. Keep the stage cooldown, but do not repeat its first negative.
+        probe_order = (
+            "CASE WHEN st.availability = 'unknown' AND m.state = 'not_available' "
+            "THEN 1 ELSE 0 END, " if lane == "history" else ""
+        )
         daily_projection = (
             f""",
                    COALESCE(st.availability, 'unknown') AS stage_availability,
@@ -3958,7 +3966,7 @@ class WhoScoredRepository:
                    st.last_attempt_at AS stage_last_attempt_at,
                    ROW_NUMBER() OVER (
                        PARTITION BY s.stage_id
-                       ORDER BY s.date DESC, s.game_id DESC
+                       ORDER BY {probe_order}s.date DESC, s.game_id DESC
                    ) AS stage_probe_rank"""
             if daily
             else ""

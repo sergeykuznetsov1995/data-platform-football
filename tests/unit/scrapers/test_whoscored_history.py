@@ -289,3 +289,39 @@ def test_deferred_stage_refresh_is_cooled_down_without_blocking_wave_two(tmp_pat
     kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 3601, timezone.utc)
     assert history.run_chunk(**kwargs)["scope"].endswith("2627")
     assert service.sync_schedule.call_count == 2
+
+
+@pytest.mark.parametrize("other_scope", [False, True])
+def test_skipped_feeds_defer_scope_and_continue_queue(tmp_path, other_scope):
+    from dataclasses import replace
+
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    recent = replace(s, end=NOW.date().replace(day=25), is_active=True)
+    older = season(label="2425", source=50)
+    seasons = [recent, older] if other_scope else [recent]
+    kwargs["catalog"] = catalog((s.scope.competition_id, 2, seasons))
+    repo.history_coverage.return_value = {
+        (s.scope.competition_id, s.scope.season_id): coverage(closed=100) for s in seasons}
+    repo.list_match_candidates.side_effect = lambda league, slug, **k: [1] if slug == "2425" else []
+    repo.latest_stage_feed_snapshot.return_value = {
+        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "feed_checks": {"1": {"final": False, "checked_at": NOW.isoformat()}},
+    }
+    service.sync_stage_feeds.return_value = SimpleNamespace(skipped=1)
+    result = history.run_chunk(**kwargs)
+    if other_scope:
+        assert result["scope"] == older.scope.spec
+        assert result["did_work"] is True
+        service.sync_matches.assert_called_once_with(limit=25, lane="history")
+    else:
+        assert result["reason"] == "idle"
+        service.sync_matches.assert_not_called()
+    calls = service.sync_stage_feeds.call_count
+    assert calls == (2 if other_scope else 1)
+    assert kwargs["checkpoint"].parked(now=NOW.timestamp()) == 0
+    kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 31, timezone.utc)
+    history.run_chunk(**kwargs)
+    assert service.sync_stage_feeds.call_count == calls + int(other_scope)
+    kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 3601, timezone.utc)
+    history.run_chunk(**kwargs)
+    assert service.sync_stage_feeds.call_count == calls + int(other_scope) + (2 if other_scope else 1)

@@ -108,6 +108,7 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                     service.probe_egress()
                     if schedule_due:
                         consume(service.sync_schedule())
+                        did_work = True
                     else:
                         # Previews have an independent backlog, so a successful
                         # match cannot hide a preview failure on the next run.
@@ -120,21 +121,28 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                             )
                             consume(result)
                             attempted = result.attempted
+                            did_work = True
                         elif previews:
                             consume(service.sync_previews(
                                 match_ids=[p["game_id"] for p in previews], historical=True,
                             ))
+                            did_work = True
                         if players:
                             consume(service.sync_profiles(
                                 player_ids=sorted(players), limit=state.CHUNK_SIZE,
                                 candidate_scopes=[season],
                             ))
+                            did_work = True
                         if feeds_due:
-                            consume(service.sync_stage_feeds())
-                    did_work = True
+                            result = service.sync_stage_feeds()
+                            consume(result)
+                            did_work = did_work or result.skipped == 0
                 finally:
                     if collect_traffic is not None:
                         collect_traffic(service, season.scope)
+            if not did_work:
+                failed = False
+                continue
             refreshed = inventory(catalog, repository, today=moment.date())
             failed = False
             return {"scope": item["key"], "wave": item["wave"], "attempted": attempted,
