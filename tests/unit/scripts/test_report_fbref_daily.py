@@ -55,13 +55,29 @@ def test_1805_cli_reuses_saved_page_age_aggregate_for_lookback(tmp_path, capsys)
 def test_host_readers_only_select_and_keep_credentials_out_of_results(monkeypatch):
     calls = []
     def run(argv, **kwargs):
-        calls.append(argv)
+        calls.append((argv, kwargs))
         output = '{"competitions":[]}' if argv[0] == "docker" else '"47","2026/2027","2026-10-07T20:00:00Z","2026-10-08T20:00:00Z"\n'
         return SimpleNamespace(stdout=output if argv[0] == "docker" else marked_csv(argv[1], output))
     monkeypatch.setattr("scripts.report_fbref_daily.subprocess.run", run)
     assert host_postgres("SELECT '{}'::jsonb") == {"competitions": []}
-    assert "BEGIN READ ONLY" in calls[0][-1] and "ON_ERROR_STOP=1" in calls[0]
+    assert "BEGIN READ ONLY" in calls[0][1]["input"] and "ON_ERROR_STOP=1" in calls[0][0]
     assert host_trino("SELECT competition_id FROM iceberg.bronze.fotmob_ingest_manifest")[0]["competition_id"] == "47"
+
+
+def test_1805_host_postgres_passes_large_query_through_stdin(monkeypatch):
+    query = "SELECT '" + "x" * (220 * 1024) + "'::jsonb"
+
+    def run(argv, **kwargs):
+        assert argv == ["docker", "exec", "-i", "postgres", "psql", "-U", "airflow",
+                        "-d", "airflow", "-qAt", "-v", "ON_ERROR_STOP=1"]
+        assert kwargs == {
+            "input": "BEGIN READ ONLY; SET LOCAL statement_timeout='30s'; " + query + "; COMMIT;",
+            "capture_output": True, "text": True, "timeout": 40, "check": True,
+        }
+        return SimpleNamespace(stdout='{"by_kind": {}}')
+
+    monkeypatch.setattr("scripts.report_fbref_daily.subprocess.run", run)
+    assert host_postgres(query) == {"by_kind": {}}
 
 
 def test_host_adapter_has_no_side_effects_until_called_and_surfaces_failure(tmp_path, monkeypatch):

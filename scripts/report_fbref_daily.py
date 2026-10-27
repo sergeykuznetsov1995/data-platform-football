@@ -22,10 +22,10 @@ from scrapers.fbref.daily_report_reader import collect_snapshot  # noqa: E402
 
 def host_postgres(query: str):
     result = subprocess.run([
-        "docker", "exec", "postgres", "psql", "-U", "airflow", "-d", "airflow", "-qAt",
-        "-v", "ON_ERROR_STOP=1", "-c",
-        "BEGIN READ ONLY; SET LOCAL statement_timeout='30s'; " + query + "; COMMIT;",
-    ], capture_output=True, text=True, timeout=40, check=True)
+        "docker", "exec", "-i", "postgres", "psql", "-U", "airflow", "-d", "airflow", "-qAt",
+        "-v", "ON_ERROR_STOP=1",
+    ], input="BEGIN READ ONLY; SET LOCAL statement_timeout='30s'; " + query + "; COMMIT;",
+        capture_output=True, text=True, timeout=40, check=True)
     return json.loads(result.stdout)
 
 
