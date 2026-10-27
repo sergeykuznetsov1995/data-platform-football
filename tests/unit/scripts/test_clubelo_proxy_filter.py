@@ -171,10 +171,38 @@ def test_clubelo_invalid_startup_config_fails_before_network(
 
 def test_clubelo_compose_environment_wiring():
     compose = yaml.safe_load(Path("compose.yaml").read_text())
-    env = compose["services"]["proxy_filter"]["environment"]
-    for name in ("CLUBELO_PROXY_CONTROL_TOKEN", "PROXY_FILTER_CLUBELO_DAGRUN_BUDGET_BYTES",
-                 "PROXY_FILTER_CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES"):
-        assert name in env
-    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
-    assert scheduler_env["CLUBELO_PROXY_CONTROL_TOKEN"] == env["CLUBELO_PROXY_CONTROL_TOKEN"]
-    assert "CLUBELO_PROXY_CONTROL_URL" in scheduler_env
+    for service in ("proxy_filter", "airflow-scheduler"):
+        assert "CLUBELO_PROXY_CONTROL_TOKEN" not in compose["services"][service]["environment"]
+    gateway = yaml.safe_load(Path("deploy/clubelo/gateway.compose.yaml").read_text())
+    assert gateway["name"] == "clubelo-gw"
+    service = gateway["services"]["clubelo_proxy_filter"]
+    assert service["environment"]["PROXY_FILTER_ALLOW_FILE_FALLBACK"] == "false"
+    assert "--allow-legacy-noauth" not in service["command"]
+    assert "--allow-proxy-file-fallback" not in service["command"]
+    assert service["working_dir"] == "/opt/clubelo-repo"
+    assert service["volumes"][0]["read_only"] is True
+    assert service["networks"] == ["dp-backend"]
+    assert gateway["networks"]["dp-backend"]["external"] is True
+
+
+def test_gateway_caps_cover_solver_and_history(mod):
+    gateway = yaml.safe_load(Path("deploy/clubelo/gateway.compose.yaml").read_text())
+    service = gateway["services"]["clubelo_proxy_filter"]
+    def default(value):
+        return int(value.rsplit(":-", 1)[1].rstrip("}"))
+    command = service["command"]
+    mod.MAX_LEASE_BYTES = default(command[command.index("--max-lease-mb") + 1]) * 1024 * 1024
+    mod.URL_BUDGET_BYTES = default(command[command.index("--url-budget-bytes") + 1])
+    mod.CLUBELO_DAGRUN_BUDGET_BYTES = default(service["environment"]["PROXY_FILTER_CLUBELO_DAGRUN_BUDGET_BYTES"])
+    mod.CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES = default(service["environment"]["PROXY_FILTER_CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES"])
+    lease = _lease(mod, task_id="scrape_history")
+    assert lease.max_bytes >= 100 * 1024 * 1024
+    solver_bytes = 2 * 1024 * 1024
+    http_bytes = 85 * 1024 * 1024
+    mod._account_lease_bytes(lease, "clubelo.com", "down", solver_bytes)
+    mod._account_lease_bytes(lease, "clubelo.com", "down", http_bytes)
+    assert lease.total_bytes == solver_bytes + http_bytes
+    mod._account_lease_bytes(lease, "clubelo.com", "down", lease.max_bytes - lease.total_bytes)
+    lease.closed = True
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        _lease(mod, task_id="scrape_history")

@@ -172,3 +172,47 @@ Offline-проверки: `tests/unit/scrapers/test_clubelo_watch.py`, допо�
 - Состояние: `/root/watchdog/state/clubelo-accepted`, `clubelo-inflight`, `clubelo-auto-deliver.off`,
   `clubelo-auto-deliver-attempted-<дата>`, `clubelo-inflight-reminded-<дата>`, замок `clubelo-auto-deliver.lock`.
 - Тест: `tests/unit/deploy/test_clubelo_delivery_script.py`.
+
+## Отдельный шлюз Cloudflare (#1841)
+
+`gateway.compose.yaml` — отдельный проект `clubelo-gw`, внешняя `dp-backend`.
+Фильтр запускается из целиком пинованной read-only копии репозитория вне
+`/opt/airflow`; образ должен быть закреплён digest. Ledger и логи принадлежат
+только этому шлюзу. Общий фильтр, scheduler и его runtime-пломбы не меняются.
+`PROXY_POOL_JSON` обязателен: fallback на `proxys.txt` выключен.
+
+Параметры для лида перечислены в `env.example`: отдельные токены
+`PROXY_FILTER_CONTROL_TOKEN` и `CLUBELO_PROXY_CONTROL_TOKEN` (разные, ≥32 символов),
+пул, образ, release/state paths, daily/history caps, дневной потолок, lease и URL
+caps, TTL. Daily cap 32 МиБ покрывает bootstrap и новые клубы; history cap и
+lease/URL cap 128 МиБ покрывают примерно 85 МБ истории плюс bootstrap. Это общий
+учёт всех туннельных байтов браузера и requests, а не размер DOM. Дневной потолок
+4096 МиБ — конфигурация отдельного шлюза; алгоритм учёта не меняется.
+TTL 3600 секунд покрывает таймауты задач (daily 45 мин, history 30 мин).
+
+Порядок доставки лидом после проверки условий хоста:
+
+1. Подготовить пинованную копию с `scripts/fbref_proxy/filter_proxy.py` и соответствующим
+   `scrapers/whoscored/runtime_contract.lock`, проверить образ, сеть, права и отдельный
+   каталог state, заполнить env вне git. Живые пломбы общего стека не менять.
+2. Запустить только шлюз из его release root:
+   `docker compose -p clubelo-gw -f deploy/clubelo/gateway.compose.yaml --env-file <gateway.env> up -d --no-deps clubelo_proxy_filter`.
+3. Проверить цепочку lease → FlareSolverr `/Ranking` → requests `/Results` через тот
+   же lease. Проверить строгий allowlist `clubelo.com:443`, стабильность выхода,
+   фактический расход и освобождение lease. Успешная проба напрямую через
+   резидентный прокси пока не доказывает работу через allowlist шлюза.
+4. Записать токен ClubElo в уже смонтированный ro-каталог: файл
+   `configs/proxy_filter/clubelo_control_token` (секрет вне git, читаемый пользователем
+   задачи). Коллектор использует env-токен, иначе `CLUBELO_PROXY_CONTROL_TOKEN_FILE`,
+   по умолчанию `/opt/airflow/configs/proxy_filter/clubelo_control_token`.
+   URL по умолчанию `http://clubelo_proxy_filter:8899`, solver — `http://flaresolverr:8191`.
+   Пересоздание общего scheduler и изменение его env не нужны. Для lease обязательны
+   настоящие `AIRFLOW_CTX_DAG_ID/RUN_ID/TASK_ID`; CLI без них при challenge остановится.
+5. Доставить только ClubElo штатным автоматом, дождаться естественного DAG и
+   снимка `clubelo_rank_snapshot` за дату рейтинга сайта. До этого приёмка #1841
+   не завершена. Общий фильтр перезапускать не требуется.
+
+Первый запрос прямой, без proxy из окружения. Только `403` вместе с
+`cf-mitigated: challenge` разрешает один bootstrap. Браузер передаёт cookies/UA,
+а raw по-прежнему сохраняется из HTTP-ответа requests. Повторная блокировка,
+невалидный clearance или ошибка lease/solver останавливают сбор.
