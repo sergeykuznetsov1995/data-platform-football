@@ -588,6 +588,25 @@ def check_ranking(
         )
 
 
+def _external_result_team(td) -> bool:
+    # Observed /Results clubs outside ClubElo: no link, flag or rank.
+    spans = list(td)
+    classes = ("min481", "max640", "min641", "min1081")
+    return (
+        td.attrib == {"class": "l"}
+        and len(spans) == len(classes)
+        and not (td.text or "").strip()
+        and all(
+            span.tag == "span" and span.attrib == {"class": cls}
+            and len(span) == 0 and not (span.tail or "").strip()
+            for span, cls in zip(spans, classes)
+        )
+        and not (spans[0].text or "").strip()
+        and bool((spans[1].text or "").strip())
+        and bool((spans[2].text or "").strip())
+    )
+
+
 def _team(td) -> Dict[str, Any]:
     slug = _first(td.xpath('.//a[span[@class="max640"]]/@href'))
     rank = _first(td.xpath(".//small/text()"))
@@ -600,7 +619,8 @@ def _team(td) -> Dict[str, Any]:
         "country": _first(td.xpath(".//img/@alt")),
         "rank": _integer(rank.strip(), "team rank") if rank and rank.strip() else None,
     }
-    if not team["slug"] and not (team["country"] and team["name"]):
+    if (not team["slug"] and not (team["country"] and team["name"])
+            and not _external_result_team(td)):
         raise LayoutChanged(f"C3 result team without link, country or name: {_text(td)!r}")
     team["key"] = team["slug"] or f"~{team['country'] or ''}:{team['name']}"
     return team
