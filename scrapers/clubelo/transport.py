@@ -175,7 +175,7 @@ class ClubEloTransport:
             self._lease.acquire()
             self._solver = FlareSolverrClient(
                 url=os.environ.get("CLUBELO_FLARESOLVERR_URL", "http://flaresolverr:8191"),
-                default_timeout=90, default_max_timeout_ms=60000,
+                default_timeout=120, default_max_timeout_ms=90000,
             )
             self._solver_session = "clubelo-" + uuid.uuid4().hex
             self._solver.create_session(self._solver_session, proxy_url=self._lease.proxy_url)

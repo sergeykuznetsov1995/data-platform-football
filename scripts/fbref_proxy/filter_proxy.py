@@ -1391,7 +1391,7 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
     }:
         return normalized in TRANSFERMARKT_PROXY_ALLOWED_HOSTS
     if lease is not None and lease.source == "clubelo":
-        return normalized == "clubelo.com"
+        return normalized in {"clubelo.com", "challenges.cloudflare.com"}
     # Unknown lease sources never receive an unrestricted paid exit.  A
     # credential-less development listener is handled separately by ``handle``.
     return lease is None

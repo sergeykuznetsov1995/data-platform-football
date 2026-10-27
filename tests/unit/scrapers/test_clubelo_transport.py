@@ -198,7 +198,7 @@ def bootstrap(monkeypatch):
                         {"name": "__cf_bm", "value": "bm"}]}
 
         def __init__(self, **kwargs):
-            pass
+            self.config = kwargs
 
         def create_session(self, session_id, proxy_url):
             events.append(("create", proxy_url))
@@ -316,3 +316,12 @@ def test_proxied_network_error_does_not_leak_credentials(bootstrap, caplog):
     with pytest.raises(ClubEloFetchError) as caught, _transport(session, retries=0) as transport:
         transport.get("/Ranking")
     assert "secret-lease" not in str(caught.value) + caplog.text
+
+
+def test_challenge_solver_has_ninety_seconds_with_http_margin(bootstrap):
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session) as transport:
+        transport.get("/Ranking")
+        config = transport._solver.config
+        assert config["default_max_timeout_ms"] == 90000
+        assert config["default_timeout"] >= config["default_max_timeout_ms"] / 1000 + 30

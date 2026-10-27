@@ -31,8 +31,11 @@ class ClubEloLease:
         if len(control_token) < 32:
             raise ValueError("ClubElo proxy control token must contain at least 32 characters")
         self.session.headers["X-Proxy-Control-Token"] = control_token
-        context = {name: os.environ.get("AIRFLOW_CTX_" + name.upper(), "")
-                   for name in ("dag_id", "run_id", "task_id")}
+        context = {
+            "dag_id": os.environ.get("AIRFLOW_CTX_DAG_ID", ""),
+            "run_id": os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", ""),
+            "task_id": os.environ.get("AIRFLOW_CTX_TASK_ID", ""),
+        }
         if (context["dag_id"] != "dag_ingest_clubelo" or not context["run_id"]
                 or context["task_id"] not in {"scrape_daily", "scrape_history", "check_watch"}):
             raise ValueError("ClubElo lease requires the real Airflow task context")

@@ -46,7 +46,8 @@ def control(monkeypatch):
     monkeypatch.setenv("CLUBELO_PROXY_CONTROL_TOKEN", "t" * 32)
     monkeypatch.delenv("CLUBELO_PROXY_CONTROL_URL", raising=False)
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_clubelo")
-    monkeypatch.setenv("AIRFLOW_CTX_RUN_ID", "scheduled__real_run")
+    monkeypatch.delenv("AIRFLOW_CTX_RUN_ID", raising=False)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled__real_run")
     monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "scrape_daily")
     return calls, Response
 
@@ -93,7 +94,8 @@ def test_missing_token_has_clear_reason_without_network(control, monkeypatch, tm
 
 def test_missing_real_context_fails_before_network(control, monkeypatch):
     calls, _ = control
-    monkeypatch.delenv("AIRFLOW_CTX_RUN_ID")
+    monkeypatch.delenv("AIRFLOW_CTX_DAG_RUN_ID")
+    monkeypatch.setenv("AIRFLOW_CTX_RUN_ID", "legacy__invalid")
     with pytest.raises(ValueError, match="real Airflow"):
         ClubEloLease().acquire()
     assert calls == []
