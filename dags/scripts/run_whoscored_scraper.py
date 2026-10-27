@@ -2159,8 +2159,8 @@ def _run_history(args, service_cls, report):
 
         def consume(result):
             scope = RunnerScope.parse(result.scope)
-            if not report["scopes"]:
-                report["scopes"] = _new_report("history", [scope])["scopes"]
+            if not any(item["scope"] == scope.spec for item in report["scopes"]):
+                report["scopes"].extend(_new_report("history", [scope])["scopes"])
             record = _scope_record(report, scope)
             _merge_result(report, result, scope_record=record)
             _record_result_state(report, record, scope, result.entity, result)

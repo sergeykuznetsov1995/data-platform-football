@@ -325,3 +325,47 @@ def test_skipped_feeds_defer_scope_and_continue_queue(tmp_path, other_scope):
     kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 3601, timezone.utc)
     history.run_chunk(**kwargs)
     assert service.sync_stage_feeds.call_count == calls + int(other_scope) + (2 if other_scope else 1)
+
+
+def test_runner_records_each_scope_after_skipped_feeds(tmp_path, monkeypatch):
+    from functools import partial
+
+    from dags.scripts import run_whoscored_scraper as runner
+
+    kwargs, recent, repo, service = setup_chunk(tmp_path)
+    older = season(label="2425", source=50)
+    cat = catalog((recent.scope.competition_id, 2, [recent, older]))
+    repo.load_catalog_generation_snapshot.return_value = ({"catalog_batch_id": "test"}, cat)
+    repo.history_coverage.return_value = {
+        (s.scope.competition_id, s.scope.season_id): coverage(closed=100)
+        for s in (recent, older)
+    }
+    repo.list_match_candidates.side_effect = lambda league, slug, **k: [1] if slug == "2425" else []
+
+    def result(entity, scope, **changes):
+        return SimpleNamespace(entity=entity, scope=scope.spec, counts={}, tables=[],
+                               errors=[], retryable=[], metadata={}, **changes)
+
+    service.sync_stage_feeds.side_effect = [
+        result("stages", recent.scope, skipped=1),
+        result("stages", older.scope, skipped=1),
+    ]
+    service.sync_matches.return_value = result("matches", older.scope, attempted=25)
+    service.traffic_stats.return_value = {}
+    monkeypatch.setattr(history, "run_chunk", partial(history.run_chunk, now=NOW))
+    monkeypatch.setattr(runner, "_new_repository", lambda: repo)
+    monkeypatch.setattr(state, "HistoryState", lambda path: kwargs["checkpoint"])
+    monkeypatch.setattr(state, "current_running", lambda: False)
+    monkeypatch.setenv("WHOSCORED_SCHEMA_READY", "0")
+    args = SimpleNamespace(split_lanes="true", output=str(tmp_path / "report.json"))
+    report = runner._new_report("history", [])
+
+    assert runner._run_history(args, kwargs["service_cls"], report) == 0
+    assert report["status"] == "success"
+    assert report["errors"] == []
+    assert [s["scope"] for s in report["scopes"]] == [recent.scope.spec, older.scope.spec]
+    assert all(s["status"] == "success" for s in report["scopes"])
+    assert report["history"]["scope"] == older.scope.spec
+    assert report["history"]["attempted"] == 25
+    assert kwargs["checkpoint"].parked(now=NOW.timestamp()) == 0
+    assert service.sync_stage_feeds.call_count == 2
