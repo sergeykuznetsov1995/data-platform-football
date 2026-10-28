@@ -1703,7 +1703,9 @@ class CamoufoxFbrefTransport:
             UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
         )
         self._network_policy_failed = True
-        self._network_policy_failure = reason
+        # A later upgrade must not hide a different transport-policy bypass.
+        if self._network_policy_failure in {None, "unrouted_websocket_upgrade"}:
+            self._network_policy_failure = reason
         self._last_solve_failure = "network_policy"
         self._blocked_count += 1
         self._budget_blocked_count += 1
@@ -2043,7 +2045,7 @@ class CamoufoxFbrefTransport:
             source is not None,
             self._normalized_https_url(url) == source,
             redirected_from is not None,
-            self._normalized_https_url(
+            source is not None and self._normalized_https_url(
                 self._request_url(redirected_from)
                 if redirected_from is not None
                 else None
@@ -2091,7 +2093,20 @@ class CamoufoxFbrefTransport:
                 )
                 return
             self._remember_unrouted_response(req)
-            self._reject_unrouted_request()
+            try:
+                navigation = req.is_navigation_request
+                navigation = navigation() if callable(navigation) else navigation
+                websocket_upgrade = (
+                    self._response_status(response) == 101
+                    and req.resource_type == "websocket"
+                    and navigation is False
+                )
+            except Exception:  # noqa: BLE001 — detached request is not proof
+                websocket_upgrade = False
+            if websocket_upgrade:
+                self._latch_unexpected_network("unrouted_websocket_upgrade")
+            else:
+                self._reject_unrouted_request()
             try:
                 self._log_unrouted_response(response, req)
             except Exception:  # noqa: BLE001 — policy latch must survive logs

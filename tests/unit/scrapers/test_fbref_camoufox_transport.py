@@ -3159,3 +3159,46 @@ def test_traffic_delta_never_bills_a_falling_reservation_gauge_negative():
     third = transport.traffic_delta()
     assert third["inflight_reserved_bytes"] == 250
     assert third["budget_unobserved_bytes"] == 250
+
+
+@pytest.mark.parametrize("status, resource, navigation, expected", [
+    (101, "websocket", False, "unrouted_websocket_upgrade"),
+    (200, "websocket", False, "unrouted_http_response"),
+    (101, "document", False, "unrouted_http_response"),
+    (101, "websocket", True, "unrouted_http_response"),
+])
+def test_unrouted_upgrade_is_distinct_but_still_blocked_and_charged(
+    status, resource, navigation, expected, caplog
+):
+    transport = CamoufoxFbrefTransport(geoip=False, max_network_bytes=4096)
+    request = MagicMock(resource_type=resource, url="wss://fbref.com/socket", redirected_from=None)
+    request.is_navigation_request.return_value = navigation
+    transport._on_response(_Response(request, {}, status=status))
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == expected
+    assert stats["unobserved_reserved_bytes"] == UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+    assert stats["real_requests_count"] == 1
+    assert "redirected_from_source=False" in caplog.text
+
+
+@pytest.mark.parametrize("upgrade_first", [False, True])
+def test_upgrade_does_not_mask_another_network_policy_failure(upgrade_first):
+    transport = CamoufoxFbrefTransport(geoip=False)
+    reasons = ["unrouted_websocket_upgrade", "unrouted_http_completion"]
+    if not upgrade_first:
+        reasons.reverse()
+    for reason in reasons:
+        transport._latch_unexpected_network(reason)
+    assert transport.traffic_stats()["network_policy_failure"] == "unrouted_http_completion"
+
+
+def test_detached_upgrade_request_keeps_fatal_policy_latch():
+    transport = CamoufoxFbrefTransport(geoip=False)
+    request = MagicMock(resource_type="websocket", url="wss://fbref.com/socket")
+    request.is_navigation_request.side_effect = RuntimeError("request detached")
+    transport._on_response(_Response(request, {}, status=101))
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+    assert stats["unobserved_reserved_bytes"] == UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES

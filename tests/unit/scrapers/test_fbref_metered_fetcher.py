@@ -943,3 +943,106 @@ def test_persistent_target_poison_strictly_closes_before_rollover(
     assert fetcher._provider_lease is None
     assert client.events.count("close_strict") == 1
     assert fetcher.finalize_metered_session().page_provider_bytes == 45
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("entry", ["ensure_clearance", "fetch"])
+@pytest.mark.parametrize("bootstrap_html", [None, "<html><table></table></html>"])
+@pytest.mark.parametrize("failure", [None, "strict_close", "finalization", "run_cap"])
+def test_unrouted_websocket_upgrade_requires_exact_paid_close(
+    persistent, entry, bootstrap_html, failure
+):
+    from types import SimpleNamespace
+    from scrapers.fbref.camoufox_fetch import (
+        UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
+    )
+
+    client = _LeaseClient([100, 100, 100])
+    fetcher = _fetcher(client)
+    fetcher.persistent_http_session = persistent
+    if persistent:
+        fetcher.begin_metered_session("upgrade-session")
+    transport = CamoufoxFbrefTransport(geoip=False, max_network_bytes=4096)
+    request = MagicMock(
+        resource_type="websocket", url="wss://fbref.com/socket",
+        redirected_from=None,
+    )
+    request.is_navigation_request.return_value = False
+
+    def bootstrap(_url):
+        transport._on_response(SimpleNamespace(request=request, status=101, headers={}))
+        return bootstrap_html
+
+    transport.fetch = MagicMock(side_effect=bootstrap)
+    transport.close = MagicMock()
+    fetcher._transport = transport
+    if failure == "strict_close":
+        client.close_strict = MagicMock(side_effect=FBrefProxyLeaseError("close HTTP 409"))
+    elif failure == "finalization":
+        transport.close.side_effect = RuntimeError("browser still running")
+    elif failure == "run_cap":
+        fetcher._provider_max_bytes = 99
+
+    with pytest.raises(FetchError) as raised:
+        if entry == "ensure_clearance":
+            fetcher.ensure_clearance()
+        else:
+            fetcher.fetch("https://fbref.com/en/", page_kind="match")
+
+    error = raised.value
+    assert error.error_class == "hard_transport_policy"
+    assert error.session_failure_reason == (
+        "unrouted_websocket_upgrade" if failure is None else None
+    )
+    assert error.browser_unobserved_bytes >= UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+    assert len(client.acquired) == 1
+    if failure is None:
+        assert error.provider_billed_bytes == 100
+        assert fetcher._provider_lease is None
+        assert client.events.count("close_strict") == 1
+        assert "close" not in client.events
+    elif failure == "strict_close":
+        # Accounting fallback may retain escrow, but must never grant deferral.
+        assert "uncertain" in str(error)
+        assert "close HTTP 409" in str(error)
+
+
+def test_terminal_drain_uncertain_accounting_remains_fatal(caplog):
+    from scrapers.fbref.proxy_lease import FBrefProxyLeaseClient
+
+    client = _LeaseClient([400, 400])
+    fetcher = _fetcher(client)
+    fetcher.persistent_http_session = True
+    fetcher.begin_metered_session("terminal-drain-session")
+    meter = FBrefProxyLeaseClient("http://unused.invalid", control_token="x" * 32)
+    meter.stats = MagicMock(return_value=replace(
+        _stats(400), accounting_uncertain=True,
+    ))
+    client.wait_drained = lambda lease, **kw: meter.wait_drained(lease, **kw)
+    client.close_strict = MagicMock(side_effect=FBrefProxyLeaseError("close HTTP 409"))
+    close = client.close
+    client.close = lambda lease, **kw: replace(
+        close(lease, **kw), accounting_uncertain=True, close_complete=False,
+    )
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "browser_bootstrap_attempts": 4, "real_bytes_downloaded": 400,
+        "real_requests_count": 4,
+    }
+    fetcher._transport = transport
+
+    with pytest.raises(FetchError) as raised:
+        fetcher.fetch("https://fbref.com/en/", page_kind="schedule")
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert raised.value.session_failure_reason is None
+    assert "browser_provider_drain_failed" in str(raised.value)
+    assert "accounting_uncertain" in str(raised.value)
+    assert "accounting_uncertain" in caplog.text
+    assert len(client.acquired) == 1
+    assert fetcher._provider_total_bytes == 400
+    assert raised.value.browser_bootstrap_attempts == 4
+    assert "close HTTP 409" in caplog.text
+    assert client.close_strict.called
+    assert "escrow-backed close" in caplog.text

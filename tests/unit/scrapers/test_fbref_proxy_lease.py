@@ -821,3 +821,23 @@ def test_meter_transport_reason_does_not_hide_daily_limit_rejection():
     with pytest.raises(FBrefProxyLeaseError) as raised:
         client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
     assert raised.value.session_failure_reason is None
+
+
+@pytest.mark.parametrize("flags", [
+    {"accounting_uncertain": True},
+    {"budget_exceeded": True},
+    {"closed": True},
+    {"accounting_uncertain": True, "budget_exceeded": True, "closed": True},
+])
+def test_terminal_drain_exposes_flags_without_session_deferral(flags):
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899", control_token=TOKEN,
+        session=_Session([_Response(201, _lease_body()), _Response(200, _stats_body(**flags))]),
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        client.wait_drained(lease, expected=CONTEXT)
+    assert set(raised.value.terminal_flags) == set(flags)
+    assert raised.value.session_failure_reason is None
+    for flag in flags:
+        assert flag in str(raised.value)
