@@ -106,3 +106,22 @@ def test_1805_control_imports_fit_existing_runtime_contract():
             and node.module.startswith("scrapers.fbref.control.")
         }
         assert dependencies <= shipped, f"{module} adds runtime dependencies: {dependencies - shipped}"
+
+
+def test_gender_migration_is_append_only_and_does_not_backfill_under_ddl_lock():
+    migration = next(m for m in MIGRATIONS if m.version == 15)
+    sql = '\n'.join(migration.statements)
+    assert "ADD COLUMN gender_class text NOT NULL DEFAULT 'unknown'" in sql
+    assert "FROM fbref_control.frontier_provenance" not in sql
+    assert "bool_or(competition.gender = 'male') AS has_male" in sql
+    assert "WHEN rollup.has_male AND rollup.has_female THEN 'mixed'" in sql
+    assert "WHEN NOT summary.is_complete" in sql
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    # No table-wide data updates: only the refresh function contains an UPDATE.
+    assert not any(statement.lstrip().startswith('UPDATE') for statement in migration.statements)
+
+
+def test_gender_backfill_rejects_invalid_batch_before_connecting():
+    store = ControlStore("postgresql://test.invalid/scope", connection_factory=lambda _: pytest.fail("connected"))
+    with pytest.raises(ValueError, match="batch_size"):
+        store.backfill_page_gender_classes(batch_size=0)

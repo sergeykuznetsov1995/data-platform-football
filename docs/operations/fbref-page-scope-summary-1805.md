@@ -76,3 +76,74 @@ Runtime-манифесты FotMob и WhoScored сохранены без изм�
 SELECT и строго проверяет маркированный CSV, поэтому успешный пустой результат
 становится `[]`; `check=True`, настоящие ошибки и повреждённый ответ не скрываются.
 Host wrapper вне репозитория не меняется.
+
+## Класс каждой цели и полнота матчей (#1335)
+
+v15 добавляет `gender_class` (`male`, `female`, `mixed`, `unknown`) и признак
+`gender_classified` в существующую сводку. Класс берётся из всех сохранённых
+областей provenance вместе с прямым ID; общие player/squad не получают случайный
+competition ID. Нет области, реестр не разрешён или ownership ещё неполон —
+`unknown`; мужская и женская области вместе — `mixed`. Состояние quarantine
+не меняет класс. Запись через ControlStore и обновления registry используют
+обновлённую функцию refresh; `pending` и dirty registry по-прежнему запрещают
+доверять старой сводке.
+
+DDL не заполняет старые строки и не читает provenance. Лид при согласованной
+доставке сначала применяет `migrate` (v13/v14 неизменны), завершает
+`backfill-page-scopes`, затем повторяет
+`python -m scrapers.fbref.control backfill-page-gender-classes --batch-size 100`
+до `done: true`. Новая команда фиксирует один keyset-пакет с checkpoint в одной
+транзакции, общим бюджетом 25 с и lock timeout 2 с. При откате checkpoint остаётся
+прежним; повтор безопасен, новые цели классифицируются обычным writer. Проверку
+нового CHECK добавили как NOT VALID, чтобы DDL не сканировал всю таблицу; новые
+и изменённые строки проверяются сразу. Проверки PostgreSQL выполняются отдельно
+в разрешённой пустой тестовой БД, здесь они не запускались.
+
+Гейт использует LEFT JOIN от всего frontier: `frontier_gender_counts` и
+`frontier_gender_total` включают также quarantined/skipped/dead;
+`frontier_gender_classified` считает только готовые сводки без dirty registry.
+Для подтверждения 100% покрытия эти два числа должны совпасть; иначе validation
+отказывает даже при отсутствии активных утечек. Активные female
+и mixed входят в `female_downstream_targets`, unknown — в
+`unknown_gender_downstream_targets`. Служебный `competition_index` остаётся
+в общем покрытии с классом unknown, но не считается downstream-утечкой: его
+назначение — обнаружение турниров, competition scope у него отсутствует.
+Orphan player/squad этим исключением не затронуты. Неизвестные области требуют разрешения
+provenance/registry, а не назначения male по умолчанию.
+
+Match parser v3 / typed Bronze v5 считает явные два числовых `.score` внутри
+scorebox сыгранным матчем, включая 0:0, счёт с отдельными пенальти и числовой
+технический результат. Текстовый технический результат без чисел не доказывает
+сыгранность. Для такой страницы events и lineups должны содержать строки:
+иначе диагностический manifest получает ERROR, прежние typed-данные сохраняются,
+успешный `typed:__complete__` не создаётся. Для страницы без счёта прежний контракт
+пустых контейнеров сохраняется. Acceptance replay использует тот же parser,
+а manifest-гейт проверяет availability и положительное число строк по пометке
+`scored_match_requires_rows` на completion.
+
+Неполная страница получает отдельную ошибку `IncompleteMatchPageError`:
+dead-letter для неё не применяется. Перечитывание требует нового fetch, очищает
+conditional validators, запрещает cross-run импорт прежнего исторического raw
+(даже после промежуточной сетевой ошибки) и назначается максимум три раза на цель с задержками
+5/10/20 минут. Повтор старого observation не расходует попытку. Уже диагностированный raw
+пропускается pre-fetch recovery с сохранением failed-состояния; сбой назначения
+refetch остаётся инфраструктурной ошибкой observation и повторяется recovery. Hash, последняя
+logical refresh и отсутствие новой lease проверяются под frontier lock; после
+исчерпания лимита ошибка остаётся видимой и требует разбора. Обычные бюджеты
+fetch и completeness не обходятся.
+
+Старые успешные completion v4 не подтверждают v5: смена typed parser version
+включает штатный replay сохранённого raw, без массовых запросов к источнику.
+Лишь неполные scored-страницы после replay назначаются на ограниченный fresh
+fetch. При доставке проверить backlog и готовность до возобновления приёмки;
+полный unit suite, CI и контроль PostgreSQL остаются шагами обвязки/лида.
+
+Legacy-fallback в `dags/utils/silver_tasks.py` оставлен сознательно: существующий
+Silver не развивается, новый проектируется отдельно. Ветка действует только
+при отсутствии обоих source ID, совпадении canonical league/season,
+`eligible_male` и фиксированном `control_run_id`. Ослабления фильтров или миграции
+старого Silver в #1335 нет.
+
+Текущий control acceptance SQL использует typed v5; датированный repair-script
+`fbref_20260825_repoint_current_season_redirect_aliases.sql` сохраняет v4 как
+контракт своих исторических evidence и не предназначен для текущей приёмки.

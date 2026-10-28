@@ -1127,7 +1127,7 @@ def test_match_parser_miss_preserves_all_live_match_tables(monkeypatch) -> None:
     manager.columns["fbref_match_player_stats"] = {"match_id": "VARCHAR"}
 
     assert parsed.datasets["lineups"].status == DatasetStatus.ERROR
-    assert parsed.datasets["lineups"].reason == "source_container_unparsed"
+    assert parsed.datasets["lineups"].reason == "scored_match_incomplete"
     with pytest.raises(MatchPageParseError):
         typed.FBrefTypedBronzeWriter(manager).persist_match(
             parsed,
@@ -1769,3 +1769,35 @@ def test_foreign_team_table_is_not_published_rather_than_schema_drift(
     assert not any(
         result.status == DatasetStatus.ERROR for result in parsed.values()
     )
+
+
+@pytest.mark.parametrize("score", [(2, 1), (0, 0)])
+@pytest.mark.parametrize("container", ["", '<div id="events_wrap"></div><div class="lineup"></div>'])
+def test_scored_match_requires_events_and_lineups_before_typed_write(score, container):
+    html = ('<div class="scorebox">'
+            f'<div class="score">{score[0]}</div><div class="score">{score[1]}</div>'
+            '</div>' + container)
+    parsed = match_parser.parse_match_html(
+        html, match_id="13351335", league="test", season=2026,
+        enabled_datasets={"match_events", "lineups"}, require_player_contract=False,
+    )
+    assert parsed.status == DatasetStatus.ERROR
+    for name in ("match_events", "lineups"):
+        assert parsed.datasets[name].error_type == "IncompleteMatchPageError"
+    manager = RecordingManager()
+    with pytest.raises(MatchPageParseError):
+        typed.FBrefTypedBronzeWriter(manager).persist_match(
+            parsed, match_id="13351335", context=typed.TypedSourceContext("9", "2025-2026"),
+            run_id="1335", target_identity="1335",
+        )
+    assert manager.writes == []
+
+
+def test_unscored_match_still_allows_absent_events_and_lineups():
+    parsed = match_parser.parse_match_html(
+        '<div class="scorebox"></div>', match_id="13351335", league="test", season=2026,
+        enabled_datasets={"match_events", "lineups"}, require_player_contract=False,
+    )
+    assert not parsed.has_errors
+    assert not parsed.has_score
+    assert all(d.status == DatasetStatus.NOT_APPLICABLE for d in parsed.datasets.values())

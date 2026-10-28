@@ -801,6 +801,10 @@ class FakeControl:
                     str(typed_parser_version),
                     str(stateful_parser_version),
                 ), {}).get("status") != "succeeded"
+                and self.observations.get((
+                    str(item["logical_refresh_id"]), str(parser_version),
+                    str(typed_parser_version), str(stateful_parser_version),
+                ), {}).get("error_class") != "IncompleteMatchPageError"
             ]
         return rows[:limit]
 
@@ -1134,6 +1138,8 @@ class FakeControl:
             "dataset_validation_counts": {"succeeded": 1},
             "sentinel_coverage": _complete_sentinel_coverage(),
             "unknown_gender_registry_count": 0,
+            "frontier_gender_total": 1,
+            "frontier_gender_classified": 1,
             "unvalidated_target_count": 0,
             "unprocessed_raw_count": 0,
             "lane_unprocessed_raw_count": 0,
@@ -4467,7 +4473,8 @@ def test_current_completed_transition_refreshes_instead_of_adopting_prior_raw(
     assert "http" in control.events
 
 
-def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
+@pytest.mark.parametrize("incomplete_match", [False, True])
+def test_historical_refetch_does_not_adopt_prior_logical_refresh_raw(tmp_path, incomplete_match):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     run_id = str(uuid.UUID(int=1))
@@ -4478,6 +4485,8 @@ def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
         "2024-2025",
         "https://fbref.com/en/comps/9/2024-2025/Premier-League-Stats",
     )
+    if incomplete_match:
+        target = match_page_target("a071faa8")
     stale = b"<html>prior-season-observation</html>"
     fresh = b"<html>fresh-season-observation</html>"
     raw.commit_fetch(
@@ -4504,6 +4513,9 @@ def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
     control.frontier[target.target_id] = {
         "refresh_policy": "historical_once",
         "state": "queued",
+        "requires_fresh_match_fetch": incomplete_match,
+        # A transient network failure must not re-enable old-raw adoption.
+        "last_error_class": "ReadTimeout" if incomplete_match else None,
     }
 
     pipeline = FBrefPipeline(
@@ -4517,7 +4529,7 @@ def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
     result = pipeline.fetch_wave(
         run_id,
         worker_id="worker-1",
-        page_kinds=["season"],
+        page_kinds=[target.page_kind],
         settings=_settings("backfill"),
     )
 
@@ -8059,6 +8071,7 @@ def test_canary_validation_does_not_require_global_publication_freshness(tmp_pat
 @pytest.mark.parametrize(
     ("mutation", "expected_error"),
     [
+        ({"frontier_gender_total": 2, "frontier_gender_classified": 1}, "frontier_gender_classification_incomplete"),
         ({"unprocessed_raw_count": 2}, "unprocessed_raw_count=2"),
         (
             {"dataset_validation_counts": {"failed": 1}},
@@ -15329,3 +15342,110 @@ def test_27_october_403_refresh_then_unrouted_upgrade(tmp_path, strict_close_fai
         assert control.failed[-1][1]["requeue"] is True
         assert control.failed[-1][1]["provider_billed_bytes"] == 100
     assert control.failed[0][1]["session_retry"] is True
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("scheduler_fails", [False, True])
+def test_scored_incomplete_match_fails_page_and_requests_refetch_without_dead_letter(tmp_path, monkeypatch, batched, scheduler_fails):
+    from scrapers.fbref import match_parser
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(tmp_path, ("0701e218",))
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    pipeline.batch_persist_enabled = batched
+    refetches = []
+    def refetch(target_id, **kwargs):
+        refetches.append((target_id, kwargs))
+        if scheduler_fails:
+            raise OSError("control unavailable")
+        control.frontier[target_id].update(state="retry", last_error_class="IncompleteMatchPageError")
+        return True
+    control.schedule_incomplete_match_refetch = refetch
+    with pytest.raises(ParseWaveError, match="IncompleteMatchPageError"):
+        pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    record = records[0]
+    assert refetches == [(record.target_id, {"content_hash": record.content_hash,
+                                          "logical_refresh_id": record.logical_refresh_id})]
+    assert control.frontier[record.target_id]["state"] == ("fetched" if scheduler_fails else "retry")
+    observation = next(iter(control.observations.values()))
+    assert observation["status"] == "failed"
+    assert observation["error_class"] == ("OSError" if scheduler_fails else "IncompleteMatchPageError")
+    if not scheduler_fails:
+        recovered = pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+        )
+        assert recovered.cohort_size == 0
+        assert len(refetches) == 1
+    manifests = [m for m in control.manifests if m["target_id"] == record.target_id]
+    assert not any(m["dataset"] == "typed:__complete__" for m in manifests)
+    assert any(m["dataset"] == "__page__" and m["validation_status"] == "failed" for m in manifests)
+    assert any(m["dataset"] == "typed:match_events" and m["availability"] == "error" for m in manifests)
+    assert typed.calls == []
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_scored_match_without_tables_refetches_with_real_generic_writer(tmp_path, monkeypatch, batched):
+    from scrapers.fbref.bronze import FBrefGenericBronzeWriter
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = PageTarget(
+        source="fbref", page_kind="match", target_id="fbref:match:13351335",
+        canonical_url="https://fbref.com/en/matches/13351335/test",
+        source_ids={"competition_id": "9", "season_id": "2025-2026", "match_id": "13351335"},
+    )
+    html = '<html><div class="scorebox"><div class="score">1</div><div class="score">0</div></div></html>'
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id, "page_kind": "match", "state": "fetched",
+        "last_content_hash": record.content_hash, "last_logical_refresh_id": refresh,
+    }
+    control.fetches = [{"target_id": target.target_id, "page_kind": "match", "logical_refresh_id": refresh}]
+    writer = FBrefGenericBronzeWriter(manager=object())
+    # Keep real writer validation; only database writes are stubbed.
+    monkeypatch.setattr(writer, "ensure_tables", lambda: None)
+    monkeypatch.setattr(writer, "_merge_dataframe", lambda _table, frame, **_kwargs: len(frame))
+    typed = FakeTypedWriter()
+    pipeline = FBrefPipeline(control, raw, generic_writer=writer, typed_adapter=FakeTypedAdapter(typed))
+    pipeline.batch_persist_enabled = batched
+    refetches = []
+
+    def refetch(target_id, **kwargs):
+        refetches.append((target_id, kwargs))
+        control.frontier[target_id]["state"] = "retry"
+        return True
+
+    control.schedule_incomplete_match_refetch = refetch
+    with pytest.raises(ParseWaveError, match="IncompleteMatchPageError"):
+        pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    assert refetches == [(target.target_id, {"content_hash": record.content_hash, "logical_refresh_id": refresh})]
+    assert control.frontier[target.target_id]["state"] == "retry"
+    observation = next(iter(control.observations.values()))
+    assert observation["status"] == "failed"
+    assert observation["error_class"] == "IncompleteMatchPageError"
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+    for dataset in ("typed:match_events", "typed:lineups", "__page__"):
+        assert any(m["dataset"] == dataset and m["validation_status"] == "failed" for m in control.manifests)
+
+
+@pytest.mark.parametrize("dataset", ["typed:match_events", "typed:lineups"])
+@pytest.mark.parametrize("availability,count,persistence", [("empty", 0, "skipped"), ("available", 0, "succeeded")])
+def test_acceptance_rejects_zero_rows_for_scored_match(dataset, availability, count, persistence):
+    from scrapers.fbref.pipeline import _acceptance_coverage_errors
+    target_id = "fbref:match:13351335"
+    manifests = []
+    for name in ("__page__", "typed:__complete__", "typed:shot_events", "typed:match_events",
+                 "typed:lineups", "typed:match_team_stats", "typed:match_managers",
+                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_player_stats"):
+        manifests.append(dict(target_id=target_id, dataset=name, availability="available",
+                              row_count=1, parse_status="succeeded", persistence_status="succeeded",
+                              validation_status="succeeded",
+                              error_message="scored_match_requires_rows" if name == "typed:__complete__" else None))
+    broken = next(m for m in manifests if m["dataset"] == dataset)
+    broken.update(availability=availability, row_count=count, persistence_status=persistence,
+                  validation_status=persistence, empty_reason="source_empty")
+    errors = _acceptance_coverage_errors({"target_ids": [target_id]}, {
+        "targets": [dict(target_id=target_id, page_kind="match", status="succeeded",
+                         http_status=200, raw_manifest_key="raw", content_hash="hash")],
+        "datasets": manifests,
+    })
+    assert any(f"{target_id}:{dataset}" in error for error in errors)

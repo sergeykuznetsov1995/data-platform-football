@@ -24,8 +24,8 @@ from scrapers.fbref.html_parser import (
 )
 
 
-MATCH_PARSER_VERSION = "fbref-match-parser-v2"
-MATCH_COMPLETION_CONTRACT_VERSION = "match-v2-two-team-marker-last"
+MATCH_PARSER_VERSION = "fbref-match-parser-v3"
+MATCH_COMPLETION_CONTRACT_VERSION = "match-v3-scored-page-marker-last"
 
 
 class DatasetStatus(str, Enum):
@@ -57,10 +57,15 @@ class MatchParseResult:
     parsed_at: str
     status: DatasetStatus
     datasets: Dict[str, DatasetParseResult]
+    has_score: bool = False
 
     @property
     def has_errors(self) -> bool:
         return self.status == DatasetStatus.ERROR
+
+
+class IncompleteMatchPageError(RuntimeError):
+    """A scored page needs a fresh fetch, not a replay of the same raw."""
 
 
 class MatchPageParseError(RuntimeError):
@@ -335,18 +340,33 @@ def parse_match_html(
         )
 
     source_evidence = _match_source_evidence(soup, comment_tables)
+    scorebox = soup.select_one(".scorebox, #scorebox")
+    # Explicit scores include 0:0 and shoot-outs. A technical result with
+    # numeric scores has the same contract; prose-only awards do not.
+    scored = bool(scorebox and len([
+        tag for tag in scorebox.select(".score")
+        if re.fullmatch(r"\d+", tag.get_text(strip=True))
+    ]) == 2)
 
     def run(name: str, callback: Callable, **kwargs) -> DatasetParseResult:
         if name not in enabled:
             return not_applicable(name, "dataset_not_requested")
         present, has_rows = source_evidence[name]
-        return _run_parser(
+        result = _run_parser(
             name,
             callback,
             source_present=present,
             source_has_rows=has_rows,
             **kwargs,
         )
+        if scored and name in {"match_events", "lineups"} and not result.row_count:
+            return DatasetParseResult(
+                dataset=name, status=DatasetStatus.ERROR,
+                reason="scored_match_incomplete",
+                error_type="IncompleteMatchPageError",
+                error_message=f"Scored match has no {name}",
+            )
+        return result
 
     shots_restricted = soup.find(id="all_shots") is not None
     datasets = {
@@ -423,4 +443,5 @@ def parse_match_html(
         parsed_at=datetime.now(timezone.utc).isoformat(),
         status=status,
         datasets=datasets,
+        has_score=scored,
     )
