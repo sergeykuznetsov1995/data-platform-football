@@ -57,6 +57,7 @@ HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
 MAINT=dag_sofascore_manifest_maintenance
+COMPACT=dag_sofascore_schedule_maintenance
 # Один источник имени пула на set_pool, предикат ожидания и ломатель: разъехавшись, они
 # осушали бы один пул, а ждали задачи в другом.
 HIST_POOL=sofascore_history_pool
@@ -253,7 +254,7 @@ wait_drained() {  # wait_drained <секунд>; 0 — контур осушён
     # прогона. Одним, а не пятью: рваное чтение показало бы контур свободным по числам из
     # разных моментов. Пустой ответ (метабаза недоступна / timeout) — это «не знаю», а не
     # «свободно».
-    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index>=0 AND pool='$HIST_POOL' AND state IN ('scheduled','up_for_retry'));" || true)
+    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT','$COMPACT') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index>=0 AND pool='$HIST_POOL' AND state IN ('scheduled','up_for_retry'));" || true)
     [ "${DRAIN_ROW:-x}" = "0|0|0|0|0" ] && return 0
     parked=${DRAIN_ROW##*|}
     case "$parked" in ''|*[!0-9]*) parked=0 ;; esac
@@ -396,7 +397,7 @@ pause_dag() {
 }
 # Любой аварийный выход после паузы: вернуть актуалку в прежнее состояние и сказать,
 # на каком шаге встали (история остаётся на паузе, как и при штатном выкате).
-REFRESH_WAS_PAUSED=""; HIST_WAS_PAUSED=""; MAINT_WAS_PAUSED=""; POOL_DRAINED=""
+REFRESH_WAS_PAUSED=""; HIST_WAS_PAUSED=""; MAINT_WAS_PAUSED=""; COMPACT_WAS_PAUSED=""; POOL_DRAINED=""
 # Паузу обслуживания манифеста возвращает тот, кто снял снимок: ручной запуск — здесь,
 # запуск из автомата (задан SOFASCORE_DEPLOY_LOCK_FD) — сам автомат, после приёмки или
 # отката. Иначе на разрушительном пути (откат вторым тиком) обслуживание оказалось бы
@@ -417,6 +418,20 @@ restore_maint_pause() {
   # log, выкат заканчивался DONE, и обслуживание манифеста молча оставалось под паузой
   # навсегда (Sol круг 2). В EXIT-trap отказ остаётся best effort — там уже падают.
   log "MANUAL ACTION REQUIRED: $MAINT is still paused — unpause it by hand"
+  return 1
+}
+restore_compact_pause() {
+  [ "$COMPACT_WAS_PAUSED" = "f" ] || return 0
+  if [ -n "${SOFASCORE_DEPLOY_LOCK_FD:-}" ]; then
+    log "$COMPACT остаётся на паузе — её вернёт автомат ночной доставки (was paused=$COMPACT_WAS_PAUSED)"
+    return 0
+  fi
+  docker exec sofascore-airflow-scheduler airflow dags unpause "$COMPACT" >> "$LOG" 2>&1
+  if [ "$(is_paused "$COMPACT")" = "f" ]; then
+    log "$COMPACT unpaused back"
+    return 0
+  fi
+  log "MANUAL ACTION REQUIRED: $COMPACT is still paused — unpause it by hand"
   return 1
 }
 STEP="start"
@@ -445,6 +460,7 @@ on_exit() {
       || log "MANUAL ACTION REQUIRED: $HIST is still paused — unpause it by hand"
   fi
   restore_maint_pause
+  restore_compact_pause
   if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
     # Сначала штатно через scheduler; если он сам лежит (упал recreate/health) —
     # напрямую в метабазе контура одной строкой (то же, что делает `airflow dags unpause`).
@@ -517,11 +533,14 @@ HIST_WAS_PAUSED=$(is_paused "$HIST")
 # случается, потому что DAG на паузе. Паузу снимает тот, кто снял снимок: при ручном
 # запуске — этот скрипт, из автомата ночной доставки — сам автомат после приёмки или отката.
 MAINT_WAS_PAUSED=$(is_paused "$MAINT")
+COMPACT_WAS_PAUSED=$(is_paused "$COMPACT")
+case "$COMPACT_WAS_PAUSED" in t|f|'') ;; *) log "cannot read $COMPACT pause"; exit 7 ;; esac
 log "drain: $HIST_POOL -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED) и $MAINT (was paused=$MAINT_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
 set_pool "$HIST_POOL" 0 'SofaScore history lane (drained for deploy)'
 POOL_DRAINED=1
 pause_dag "$REFRESH"
 pause_dag "$MAINT"
+[ -z "$COMPACT_WAS_PAUSED" ] || pause_dag "$COMPACT"
 # `|| true` внутри hist_scope_row обязателен: без него отказ метабазы под `set -e` вышел бы
 # кодом timeout (124), а для автомата 124 — это «таймаут доставки», то есть полный откат
 # боя, которого не было.
@@ -659,6 +678,7 @@ POOL_DRAINED=""   # слоты вернулись штатно — поздне�
 STEP="restore-pause"
 pause_dag "$HIST"
 restore_maint_pause || exit 7
+restore_compact_pause || exit 7
 if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
   docker exec sofascore-airflow-scheduler airflow dags unpause "$REFRESH" >> "$LOG" 2>&1
   [ "$(is_paused "$REFRESH")" = "f" ] || { log "$REFRESH did not unpause"; exit 7; }
