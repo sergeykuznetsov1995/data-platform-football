@@ -1319,6 +1319,19 @@ if [ "$delivered" = 0 ]; then
     exit 1
   fi
   warn_airflowignore_change
+  # С 00:00 orchestrator снова допускает волны. Поздняя попытка должна оставить
+  # 30 минут на kill-after (30 с), приёмку (480 с + запросы), остановку кампании,
+  # ожидание писателей (120 с), checkout и подтверждение отката (90 с + повторы).
+  # Считаем непосредственно перед B6: предполётные проверки тоже занимают время.
+  if [ "$IS_PROD" = 1 ]; then
+    hms=$(date -u +%H%M%S)
+    safe_left=$((86400 - 10#${hms:0:2} * 3600 - 10#${hms:2:2} * 60 - 10#${hms:4:2} - 1800))
+    if [ "$safe_left" -le 0 ]; then
+      log "НЕТ ВРЕМЕНИ на безопасную доставку и откат до 00:00 UTC — B6 не запускаю"
+      exit 1
+    fi
+    [ "$DELIVER_TIMEOUT" -le "$safe_left" ] || DELIVER_TIMEOUT=$safe_left
+  fi
   TREE="$TREE" FOTMOB_DELIVERY_LOCK=held FOTMOB_DELIVER_NONCE="$nonce" \
     FOTMOB_DELIVER_NONCE_FILE="$NONCE_FILE" \
     timeout -k 30 "$DELIVER_TIMEOUT" "$DELIVER" apply >> "$LOG" 2>&1
@@ -1342,13 +1355,16 @@ if [ "$delivered" = 0 ]; then
       # попытки 25.08, откатившейся при исправной доставке).
       seen=0
       accept_left=${ACCEPT_WAIT:-480}
+      # Запросы тоже расходуют бюджет: вычитание только sleep позволяло
+      # медленной метабазе растянуть позднюю приёмку за полночь.
+      accept_deadline=$(($(date -u +%s) + accept_left))
       while :; do
         seen=$(acceptance_seen 15)
         [ "$seen" = 1 ] && break
+        accept_left=$((accept_deadline - $(date -u +%s)))
         [ "$accept_left" -le 0 ] && break
         log "приёмки пока нет (ответ '$seen'), жду ещё ${accept_left}s"
         sleep "${ACCEPT_POLL:-20}"
-        accept_left=$((accept_left - ${ACCEPT_POLL:-20}))
       done
       if [ "$seen" != 1 ]; then
         log "НЕТ ДОКАЗАТЕЛЬСТВА ПРИЁМКИ: целевой md5 $NEW_CODE_FILE / перечитанные fotmob-даги без ошибок импорта не подтверждены (ответ '$seen', ждали ${ACCEPT_WAIT:-480}s)"

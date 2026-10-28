@@ -397,6 +397,7 @@ def _date_stub(stubs: Path, hhmm: str) -> None:
         stubs, "date",
         'case "$*" in\n'
         f'  *"+%H%M") echo {hhmm} ;;\n'
+        f'  *"+%H%M%S") echo {hhmm}00 ;;\n'
         '  *"+%F") echo 2026-01-01 ;;\n'
         '  *"+%H:%M") echo 20:00 ;;\n'
         '  *) exec /bin/date "$@" ;;\n'
@@ -1078,6 +1079,69 @@ def test_review_timeout_covers_b6_budget() -> None:
     seconds = int(re.search(r'DELIVER_TIMEOUT=\$\{DELIVER_TIMEOUT:-(\d+)\}', AUTO.read_text())[1])
     # 31 sha + 2 md5 + 16 parse polls + 3 other metadb calls, 19-file suite.
     assert seconds >= 90 + 300 + 52 * 10 + 900 + 300
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("hhmm", "configured", "expected"),
+    [("2000", "2400", 2400), ("2320", "2400", 600), ("2320", "300", 300)],
+)
+def test_late_delivery_timeout_leaves_time_for_rollback(
+    tmp_path: Path, hhmm: str, configured: str, expected: int,
+) -> None:
+    w = _phase2_world(tmp_path, "")
+    _git(w["repo"], "checkout", "-q", "--detach", w["one"])
+    (w["state"] / "fotmob-b6-accepted").unlink()
+    w["log"].write_text("")
+    _date_stub(w["stubs"], hhmm)
+    elapsed = tmp_path / "clock"
+    elapsed.write_text("0")
+    budget = tmp_path / "budget"
+    deliver = w["auto"].parent / "b6_deliver.sh"
+    start = int(hhmm[:2]) * 3600 + int(hhmm[2:]) * 60
+    # Зависание B6 после checkout: timeout съедает весь бюджет и kill-after.
+    # После полуночи появляется раннер новой волны, под ним откат запрещён.
+    _stub(
+        w["stubs"], "timeout",
+        f'if [ "$4" = "{deliver}" ]; then\n'
+        f'  echo "$3" > "{budget}"\n'
+        f'  git -C "{w["repo"]}" checkout -q --detach "{w["two"]}"\n'
+        f'  echo "$(({start} + $3 + 30))" > "{elapsed}"\n'
+        '  exit 124\nfi\nexec /usr/bin/timeout "$@"\n',
+    )
+    _stub(
+        w["stubs"], "pgrep",
+        f'case "$*" in *run_fotmob_scrape*) [ "$(cat "{elapsed}")" -ge 86400 ]; exit $? ;; esac\n'
+        'exit 1\n',
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"],
+                extra_env={"DELIVER_TIMEOUT": configured, "WRITER_WAIT": "0"})
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert int(budget.read_text()) == expected
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert "ОТКАТ ПОДТВЕРЖДЁН" in w["log"].read_text()
+    assert not (w["state"] / "fotmob-b6-inflight").exists()
+
+
+@pytest.mark.unit
+def test_acceptance_budget_includes_slow_queries(tmp_path: Path) -> None:
+    section = AUTO.read_text().split('      seen=0\n', 1)[1].split('      if [ "$seen" != 1 ]; then', 1)[0]
+    clock = tmp_path / "clock"
+    clock.write_text("0")
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _stub(stubs, "date", f'cat "{clock}"\n')
+    probe = tmp_path / "acceptance.sh"
+    probe.write_text(
+        f'clock="{clock}"\n'
+        'advance(){ echo "$(($(cat "$clock") + $1))" > "$clock"; }\n'
+        'acceptance_seen(){ advance 105; echo 0; }\n'
+        'sleep(){ advance "$1"; }\nlog(){ :; }\nseen=0\n' + section,
+    )
+    proc = _run(probe, env_file=tmp_path / "unused", stubs=stubs)
+    assert proc.returncode == 0, proc.stderr
+    # 480 с ожидания + последняя пауза (20 с) и проверка (3 × 35 с).
+    assert 480 <= int(clock.read_text()) <= 605
 
 
 @pytest.mark.unit
