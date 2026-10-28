@@ -2808,9 +2808,26 @@ class WhoScoredIngestService:
                 for spool in spools:
                     spool.begin_stage()
                 try:
-                    bootstrap, bootstrap_uri = self._prepare_stage_statistics(
-                        stage_id=stage_id, url=bootstrap_url, final=final
-                    )
+                    try:
+                        bootstrap, bootstrap_uri = self._prepare_stage_statistics(
+                            stage_id=stage_id, url=bootstrap_url, final=final
+                        )
+                    except WhoScoredTransportError as exc:
+                        if not (
+                            exc.kind is FailureKind.HTTP_STATUS
+                            and exc.status_code == 301
+                            and exc.url == bootstrap_url
+                        ):
+                            raise
+                        for spool in spools:
+                            spool.rollback_stage()
+                        logger.warning(
+                            "%s: stage=%s xG bootstrap HTTP 301; url=%r location=%r; deferred",
+                            self.scope.spec, stage_id, bootstrap_url, exc.redirect_location,
+                        )
+                        result.metadata["stage_xg_deferred"].append(stage_id)
+                        result.skipped = 1
+                        return result  # Preserve the complete previous scope snapshot.
                     structured = self._fetch_parsed_many(specs)
                     structured, paginated = self._complete_player_statistics_pages(
                         specs, structured

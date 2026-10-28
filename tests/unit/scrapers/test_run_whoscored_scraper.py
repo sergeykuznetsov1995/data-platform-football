@@ -2432,3 +2432,72 @@ def test_current_lane_is_opt_in_in_service_invocation():
     args.split_lanes = "true"
     runner._invoke(service, "matches", args)
     assert service.sync_matches.call_args.kwargs["lane"] == "current"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first_outcome", ["guard", "deferred"])
+def test_weekly_stages_continues_after_guard_or_deferred_scope(
+    monkeypatch, tmp_path, first_outcome
+):
+    from tests.unit.scrapers.test_whoscored_repository import (
+        _StageFeedStorage, _xg_row, _xg_scope_commit,
+    )
+    from scrapers.whoscored.repository import WhoScoredRepository
+    from tests.unit.scrapers.test_whoscored_service import _xg_service
+    from scrapers.whoscored.transport import FailureKind, WhoScoredTransportError
+
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("old-a", 1), _xg_row("old-b", 1)])
+    original_manifest = dict(storage.manifests[0])
+    original_rows = [dict(row) for row in storage.tables["whoscored_player_stage_stats"]]
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    results = []
+
+    def stages():
+        service, service_repo, _, _, _, _, _ = _xg_service(tmp_path / str(len(results)))
+        if not results and first_outcome == "deferred":
+            def redirect(**kwargs):
+                raise WhoScoredTransportError(
+                    "HTTP 301", kind=FailureKind.HTTP_STATUS,
+                    url=kwargs["url"], status_code=301,
+                )
+            service._prepare_stage_statistics = redirect
+        else:
+            def commit(**kwargs):
+                if not results:
+                    return _xg_scope_commit(repository, [_xg_row("new-a", 1)])
+                return repository.commit_scope_bundle(
+                    league="OTHER", season="S", entity_group="stages",
+                    datasets={"whoscored_player_stage_stats": [
+                        {**_xg_row("next", 2), "league": "OTHER"},
+                    ]},
+                    distinct_keys={"whoscored_player_stage_stats": "entity_key"},
+                    payload_sha256="c" * 64, raw_uris=["s3://next"],
+                    feed_policy="xg-only-v1",
+                )
+            service_repo.commit_scope_bundle = commit
+        result = service.sync_stage_feeds()
+        results.append(result)
+        return result
+
+    rc, report, services, _ = _run(
+        monkeypatch, tmp_path,
+        ["daily", "--split-lanes", "true", "--skip-profiles", "--daily-part", "stages",
+         "--weekly-gate", MONDAY_MORNING_SLOT, "--scope", "ENG-Premier League=2526",
+         "--scope", "INT-World Cup=2026"],
+        behaviors={"stages": stages},
+    )
+
+    assert len(results) == 2
+    assert [instance.calls for instance in services.instances] == [
+        [("stages", None)], [("stages", None)],
+    ]
+    assert rc == (1 if first_outcome == "guard" else 0)
+    assert report["status"] == ("failed" if first_outcome == "guard" else "success")
+    if first_outcome == "guard":
+        assert "published snapshot cannot shrink" in results[0].errors[0]
+    assert results[1].succeeded == 1
+    assert storage.manifests[0] == original_manifest
+    assert len(storage.manifests) == 2
+    assert [row for row in storage.tables["whoscored_player_stage_stats"]
+            if row["league"] == "L"] == original_rows

@@ -262,6 +262,7 @@ class WhoScoredTransportError(RuntimeError):
         route: Optional[TransportRoute] = None,
         status_code: Optional[int] = None,
         retryable: bool = False,
+        redirect_location: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -269,6 +270,7 @@ class WhoScoredTransportError(RuntimeError):
         self.route = route
         self.status_code = status_code
         self.retryable = retryable
+        self.redirect_location = redirect_location
 
 
 class CloudflareChallenge(WhoScoredTransportError):
@@ -5757,6 +5759,20 @@ class WhoScoredTransport:
                 ),
             )
         if not 200 <= response.status_code < 300:
+            redirect_location = None
+            if response.status_code == 301:
+                location = next(
+                    (v for k, v in response.headers.items() if k.lower() == "location"),
+                    "",
+                )
+                try:
+                    parts = urlsplit(location)
+                    # Diagnostics must not expose credentials, query tokens or fragments.
+                    redirect_location = parts._replace(
+                        netloc=parts.netloc.rsplit("@", 1)[-1], query="", fragment=""
+                    ).geturl()
+                except ValueError:
+                    redirect_location = "<invalid>"
             raise WhoScoredTransportError(
                 f"HTTP {response.status_code}",
                 kind=FailureKind.HTTP_STATUS,
@@ -5764,6 +5780,7 @@ class WhoScoredTransport:
                 route=response.route,
                 status_code=response.status_code,
                 retryable=response.status_code >= 500,
+                redirect_location=redirect_location,
             )
         if not response.content:
             raise WhoScoredTransportError(
