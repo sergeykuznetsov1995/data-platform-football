@@ -470,6 +470,42 @@ def test_fotmob_summary_counts_scores_unmatched_ambiguity_and_unavailable():
     assert 'played Understat=n/a, FotMob=n/a' in source_diagnostic_summary(unavailable, '2627')
 
 
+@pytest.mark.parametrize('changed_entity', [None, 'understat_player_match_stats', 'understat_shots'])
+def test_summary_does_not_combine_batches_published_between_selects(changed_entity):
+    import pandas as pd
+    from scrapers.understat.criterion import source_diagnostic_summary
+
+    scope = dict(league='ENG-Premier League', season='2627', game_id=1, _batch_id='A')
+    frames = {
+        'understat_schedule': pd.DataFrame([{**scope, 'is_result': True,
+            'home_team_id': 1, 'away_team_id': 2, 'home_goals': 0, 'away_goals': 0}]),
+        'understat_player_match_stats': pd.DataFrame([{**scope, 'player_id': 10, 'team_id': 1}]),
+        'understat_shots': pd.DataFrame([{**scope, 'player_id': 10, 'team_id': 1, 'result': 'Goal'}]),
+    }
+    # Publication after the schedule SELECT corrects the source score to 1-0.
+    # Reading the new shots against the old schedule would invent a mismatch.
+    if changed_entity:
+        frames[changed_entity]['_batch_id'] = 'B'
+    reads = []
+
+    def query(sql):
+        for entity, frame in frames.items():
+            if f'bronze.{entity} ' in sql:
+                reads.append(entity)
+                return frame
+        return pd.DataFrame()
+
+    line = source_diagnostic_summary(query, '2627')
+    assert reads == list(frames)
+    if changed_entity:
+        assert 'anomalies=n/a' in line
+        assert "inconsistent_batches=[('ENG-Premier League', '2627')]" in line
+        assert 'shot_goals_score_mismatch' not in line
+    else:
+        assert 'shot_goals_score_mismatch' in line
+        assert 'anomalies=n/a' not in line
+
+
 def test_diagnostic_queries_are_select_only_and_preserve_publication_fences():
     from scrapers.understat.criterion import render_anomaly_sql, render_fotmob_diagnostic_sql
     for entity in ('understat_schedule', 'understat_shots', 'understat_player_match_stats'):

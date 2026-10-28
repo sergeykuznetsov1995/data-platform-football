@@ -483,6 +483,7 @@ def source_diagnostic_summary(query_frame, season: str, *, team_aliases=None) ->
     Failed/unavailable reads produce n/a, never a fabricated zero. No writes,
     DDL or source HTTP requests. All-league clone detection runs once.
     """
+    import pandas as pd
     from scrapers.understat.anomalies import diagnose_matches
 
     render_completeness_sql(season)
@@ -497,6 +498,27 @@ def source_diagnostic_summary(query_frame, season: str, *, team_aliases=None) ->
         fotmob = query_frame(render_fotmob_diagnostic_sql(season))
     except Exception:
         fotmob = None
+    # Each SELECT resolves the manifest independently. Never diagnose mixed
+    # publications if a scope advances between reads (or metadata is absent).
+    batches = {}
+    for entity, frame in frames.items():
+        scopes = {}
+        if frame is not None and not frame.empty:
+            for row in frame.to_dict('records'):
+                scope = (str(row.get('league')), str(row.get('season')))
+                batch = row.get('_batch_id')
+                scopes.setdefault(scope, set()).add(None if pd.isna(batch) else str(batch))
+        batches[entity] = scopes
+    inconsistent = []
+    for scope in sorted({scope for scopes in batches.values() for scope in scopes}):
+        versions = [scopes.get(scope, set()) for scopes in batches.values()]
+        if (any(len(version) != 1 or None in version for version in versions)
+                or any(version != versions[0] for version in versions)):
+            inconsistent.append(scope)
+    if missing or inconsistent:
+        return (compare_fotmob(frames.get('understat_schedule'), fotmob, team_aliases=team_aliases)
+                + '; anomalies=n/a; inconsistent_batches=' + str(inconsistent)
+                + '; unavailable=' + (','.join(missing) or 'none'))
     signals = diagnose_matches(frames)
     from collections import Counter
     counts = dict(sorted(Counter(signal['code'] for signal in signals).items()))

@@ -12,7 +12,7 @@ from scrapers.understat.parsers import parse_match_payload
 pytestmark = pytest.mark.unit
 
 
-def test_production_cache_replay_reports_31948_participation_and_30804_rosters():
+def test_production_cache_replay_reports_30804_rosters_but_cannot_replay_31948_clone():
     root = Path(__file__).resolve().parents[2] / 'fixtures/understat/anomalies_1438'
     frames = {'understat_shots': [], 'understat_player_match_stats': []}
     for game_id, league in ((31948, 'FRA-Ligue 1'), (30539, 'RUS-Premier League'), (30804, 'ESP-La Liga')):
@@ -29,8 +29,8 @@ def test_production_cache_replay_reports_31948_participation_and_30804_rosters()
     signals = diagnose_matches(frames)
     # The supplied 28.10 cache no longer contains the 23.09 cross-league clone.
     assert not any(signal['code'].startswith('identical_match_') for signal in signals)
-    assert any(signal['code'] == 'single_match_participation' and
-               signal['details']['match'][2] == '31948' for signal in signals)
+    # One match per league cannot establish anomalous season participation.
+    # Singleton warnings here are not evidence for acceptance of 31948.
     assert any(signal['code'] == 'multiple_roster_entries' and
                signal['details']['match'][2] == '30804' for signal in signals)
     shuffled = {key: frame.sample(frac=1, random_state=42) for key, frame in frames.items()}
