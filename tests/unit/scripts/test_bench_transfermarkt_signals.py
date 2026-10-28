@@ -2,6 +2,7 @@
 from argparse import Namespace
 from datetime import date, datetime, timezone
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,10 @@ from types import SimpleNamespace
 import pytest
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from dags.scripts import bench_transfermarkt_signals as bench
+from scrapers.transfermarkt import raw_store
+
+
+NOW = datetime(2026, 10, 8, 12, tzinfo=timezone.utc)
 
 
 def qualification_args(tmp_path, **changes):
@@ -209,9 +214,11 @@ def test_qualification_imports_existing_daily_attempts_before_new_directory(tmp_
     for name in ['old1', 'old2']:
         client = FakeClient([FetchOutcome(status=FetchStatus.OK, raw_capture_id='raw', attempts=1)])
         assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/name)), client_factory=lambda *a: client) == 0
+        # Legacy attempts have no timestamp; the guard falls back to state mtime.
+        os.utime(tmp_path/name/'state.json', (NOW.timestamp(), NOW.timestamp()))
     build, factory = transport_factory(tmp_path)
     assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')), client_factory=build,
-        now_fn=lambda: datetime.now(timezone.utc).replace(hour=12)) == 2
+        now_fn=lambda: NOW) == 2
     assert factory.calls == []
 
 
@@ -266,7 +273,7 @@ def test_qualification_raw_storage_failure_after200_keeps_active(tmp_path):
 @pytest.mark.parametrize('upstream_class', ['407', 'timeout', 'dead_exit'])
 def test_qualification_gateway502_proof_survives_guard_rebuild(tmp_path, upstream_class):
     from datetime import timedelta
-    stamp = datetime.now(timezone.utc)
+    stamp = NOW
     original, factory = transport_factory(tmp_path, status=502,
                                          headers={'X-Proxy-Upstream-Status': upstream_class})
     assert bench.run(qualification_args(tmp_path), client_factory=original, now_fn=lambda: stamp) == 3
@@ -334,7 +341,8 @@ assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
 
 @pytest.fixture(autouse=True)
 def outside_delivery_window(monkeypatch):
-    monkeypatch.setattr(bench, "_now_utc", lambda: datetime(2026, 10, 8, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(bench, "_now_utc", lambda: NOW)
+    monkeypatch.setattr(raw_store, "utc_now_iso", lambda: NOW.isoformat())
 
 
 def test_player_batches_are_bounded_and_encoded():
