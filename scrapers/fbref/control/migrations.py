@@ -269,6 +269,25 @@ SCOPE_SUMMARY_V13_STATEMENTS = (
 )
 
 
+# v13 remains immutable. Recompute the new class when existing scope writers
+# refresh their summary; old rows are handled by a separate bounded backfill.
+_GENDER_REFRESH_SQL = _REFRESH_SQL.replace(
+    "count(DISTINCT (", "bool_or(competition.gender = 'male') AS has_male,\n               count(DISTINCT (", 1
+).replace(
+    "scopes = coalesce(scopes.scopes, '[]'::jsonb), pending = false",
+    """gender_class = CASE
+            WHEN NOT summary.is_complete OR coalesce(rollup.competition_missing, true)
+                THEN 'unknown'
+            WHEN rollup.has_male AND rollup.has_female THEN 'mixed'
+            WHEN coalesce(rollup.has_unknown, true) THEN 'unknown'
+            WHEN rollup.has_female THEN 'female'
+            WHEN rollup.has_male THEN 'male'
+            ELSE 'unknown' END,
+        gender_classified = summary.is_complete,
+        scopes = coalesce(scopes.scopes, '[]'::jsonb), pending = false"""
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     """One append-only control-schema migration."""
@@ -1187,6 +1206,29 @@ MIGRATIONS = (
             """ALTER TABLE fbref_control.observation_processing
                ADD COLUMN processing_work_ms bigint
                CHECK (processing_work_ms >= 0)""",
+        ),
+    ),
+    Migration(
+        version=15,
+        name="frontier_gender_and_incomplete_match_refetch",
+        statements=(
+            "SET LOCAL lock_timeout = '2s'",
+            "SET LOCAL statement_timeout = '25s'",
+            """ALTER TABLE fbref_control.page_scope_summary
+                ADD COLUMN gender_class text NOT NULL DEFAULT 'unknown',
+                ADD COLUMN gender_classified boolean NOT NULL DEFAULT false,
+                ADD CONSTRAINT page_scope_gender_class_check
+                    CHECK (gender_class IN ('male', 'female', 'mixed', 'unknown')) NOT VALID""",
+            """CREATE OR REPLACE FUNCTION fbref_control.refresh_page_scope_summary(targets text[])
+                RETURNS void LANGUAGE sql AS $scope$""" + _GENDER_REFRESH_SQL + "$scope$",
+            """CREATE TABLE fbref_control.page_gender_backfill (
+                singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+                after_target_id text NOT NULL DEFAULT '')""",
+            "INSERT INTO fbref_control.page_gender_backfill(singleton) VALUES (true)",
+            """CREATE TABLE fbref_control.incomplete_match_refetch (
+                target_id text PRIMARY KEY REFERENCES fbref_control.page_frontier(target_id),
+                attempts integer NOT NULL CHECK (attempts BETWEEN 1 AND 3),
+                logical_refresh_id uuid NOT NULL)""",
         ),
     ),
 )

@@ -181,6 +181,121 @@
         "season": "varchar"
       }
     },
+    "bronze.clubelo_api_snapshot_archive": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "club": "varchar",
+        "country": "varchar",
+        "elo": "double",
+        "level": "bigint",
+        "model_version": "varchar",
+        "rank": "bigint",
+        "rating_date": "varchar",
+        "source_file": "varchar",
+        "valid_from": "date",
+        "valid_to": "date"
+      }
+    },
+    "bronze.clubelo_club_elo_point": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "captured_rating_date": "date",
+        "elo": "double",
+        "fetched_at": "timestamp(6)",
+        "golo": "double",
+        "model_version": "varchar",
+        "point_date": "date",
+        "point_seq": "integer",
+        "segment_id": "integer",
+        "slug": "varchar"
+      }
+    },
+    "bronze.clubelo_club_match": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "captured_rating_date": "date",
+        "elo_change": "double",
+        "elo_pct": "double",
+        "et": "varchar",
+        "fetched_at": "timestamp(6)",
+        "ft": "varchar",
+        "game_delta": "double",
+        "game_delta_sigma": "double",
+        "has_result": "boolean",
+        "hfa": "double",
+        "match_date": "date",
+        "model_version": "varchar",
+        "new_elo": "integer",
+        "new_rank": "integer",
+        "opp_country": "varchar",
+        "opp_name": "varchar",
+        "opp_rank": "integer",
+        "opp_slug": "varchar",
+        "opp_tlc": "varchar",
+        "pen": "varchar",
+        "post_game_delta": "double",
+        "post_game_delta_sigma": "double",
+        "prior_delta": "double",
+        "prior_delta_sigma": "double",
+        "row_seq": "integer",
+        "slug": "varchar",
+        "venue": "varchar"
+      }
+    },
+    "bronze.clubelo_history_manifest": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "captured_rating_date": "date",
+        "club_name": "varchar",
+        "elo": "integer",
+        "elo_best": "integer",
+        "elo_best_reached_on": "date",
+        "error": "varchar",
+        "fetched_at": "timestamp(6)",
+        "first_point": "date",
+        "golo": "double",
+        "http_status": "integer",
+        "last_point": "date",
+        "matches": "integer",
+        "model_version": "varchar",
+        "points": "integer",
+        "rating_date": "date",
+        "slug": "varchar",
+        "status": "varchar"
+      }
+    },
+    "bronze.clubelo_rank_snapshot": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "club_key": "varchar",
+        "country": "varchar",
+        "elo": "integer",
+        "elo_delta_1d_raw": "varchar",
+        "elo_precise": "double",
+        "fetched_at": "timestamp(6)",
+        "golo": "double",
+        "is_provisional": "boolean",
+        "level": "integer",
+        "level_group": "varchar",
+        "level_section": "varchar",
+        "model_version": "varchar",
+        "name": "varchar",
+        "page_created_at": "timestamp(6)",
+        "rank": "integer",
+        "rating_date": "date",
+        "slug": "varchar"
+      }
+    },
     "bronze.clubelo_ratings": {
       "columns": {
         "_batch_id": "varchar",
@@ -213,6 +328,62 @@
         "rating_date": "varchar",
         "team": "varchar",
         "to": "timestamp(6)"
+      }
+    },
+    "bronze.clubelo_raw_page": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "body": "varbinary",
+        "content_encoding": "varchar",
+        "fetched_at": "timestamp(6)",
+        "gzip_by": "varchar",
+        "http_status": "integer",
+        "identity_bytes": "bigint",
+        "model_version": "varchar",
+        "page": "varchar",
+        "rating_date": "date",
+        "sha256": "varchar",
+        "wire_bytes": "bigint"
+      }
+    },
+    "bronze.clubelo_result": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "away_country": "varchar",
+        "away_key": "varchar",
+        "away_name": "varchar",
+        "away_rank": "integer",
+        "away_slug": "varchar",
+        "away_tlc": "varchar",
+        "elo_pct": "double",
+        "et": "varchar",
+        "fetched_at": "timestamp(6)",
+        "ft": "varchar",
+        "game_delta": "double",
+        "game_delta_sigma": "double",
+        "hfa": "double",
+        "home_country": "varchar",
+        "home_key": "varchar",
+        "home_name": "varchar",
+        "home_rank": "integer",
+        "home_slug": "varchar",
+        "home_tlc": "varchar",
+        "is_final": "boolean",
+        "match_date": "date",
+        "model_version": "varchar",
+        "page_created_at": "timestamp(6)",
+        "pen": "varchar",
+        "post_game_delta": "double",
+        "post_game_delta_sigma": "double",
+        "prior_delta": "double",
+        "prior_delta_raw": "varchar",
+        "prior_delta_sigma": "double",
+        "rating_date": "date",
+        "row_seq": "integer"
       }
     },
     "bronze.espn_lineup": {

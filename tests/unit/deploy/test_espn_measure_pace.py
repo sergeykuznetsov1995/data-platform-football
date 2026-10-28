@@ -936,14 +936,17 @@ def test_async_run_stop_drains_and_restart_preserves_completed_baseline(controll
         resumed.io.close()
 
 
-def test_query_start_age_gap_is_not_continuous_evidence(controller):
+@pytest.mark.parametrize('step,proven', [(0, False), (0, True), (2, False), (2, True)])
+def test_query_start_age_gap_is_not_continuous_evidence(controller, step, proven):
     c = controller
     start = c.state['start']
     rows = [dict(at=start + 14, observed_at=start, known=True, debt=0, protected=False, step=0),
             dict(at=start + 38, observed_at=start + 24, known=True, debt=0, protected=False, step=0)]
+    rows[-1]['sql_lag_safe'] = proven
     result = load_evidence([], rows, datetime.fromtimestamp(start + 14, timezone.utc),
-                           datetime.fromtimestamp(start + 38, timezone.utc), step=0, policy=c.gate.policy)
+                           datetime.fromtimestamp(start + 38, timezone.utc), step=step, policy=c.gate.policy)
     assert not result['continuous']
+    assert result['sql_gap_allowed'] is (step == 2 and proven)
 
 
 def test_async_evidence_write_failure_is_visible_and_fail_closed(controller):
@@ -1249,3 +1252,239 @@ def test_rejected_window_audit_and_state_are_atomic(controller):
     assert c.store.latest('rejected_window') is None
     assert 'restart_pending' not in c.store.get()
     assert 'restart_pending' not in c.state
+
+
+def s2_sql_lane(c):
+    """Run the real debt lane one query at a time with controlled wall time."""
+    from scrapers.espn.pace_io import PaceIO
+    for _ in range(2):
+        fill_window(c)
+        c.decide()
+    io = PaceIO(factory=lambda: None, gate=c.gate, journal=c.journal, store=c.store,
+                targets=c.targets, now=c.now, read_freshness=lambda *_: {})
+    c.io = io
+    io.values['debt'] = dict(c.observation, epoch=c.state['epoch'],
+                            observed_at=c.observation['at'], restart_at=c.state['start'],
+                            mandatory_restart_at=c.state['start'], sequence=1)
+    class OneQuery:
+        def set(self):
+            pass
+        def is_set(self):
+            return False
+        def clear(self):
+            pass
+        def wait(self, _):
+            io.stop.set()
+    io.wakes['debt'] = OneQuery()
+    def query(seconds, *, debt=0, error=None, change=None):
+        class SQL:
+            def execute_query(self, _sql):
+                c.clock.now += timedelta(seconds=seconds)
+                if change:
+                    change()
+                if error:
+                    raise error('offline')
+                return [[debt]]
+            def close(self):
+                pass
+        io.factory = SQL
+        io.stop.clear()
+        # Error retries use stop.wait; terminate after recording instead.
+        original = c.store.record
+        def record(kind, *args, **kwargs):
+            original(kind, *args, **kwargs)
+            if kind == 'observation':
+                io.stop.set()
+        c.store.record = record
+        try:
+            io._run('debt')
+        finally:
+            c.store.record = original
+        c.observe()
+        return io.snapshot('debt')
+    return query
+
+
+def test_s2_slow_trino_preserves_window_and_accepts_durable_sql_gaps(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    query(97)
+    assert c.state['start'] == start
+    with pytest.raises(LaneClosed, match='unknown'):
+        c.check()
+    c.clock.now += timedelta(seconds=1)
+    query(147)
+    c.clock.now += timedelta(seconds=1)
+    query(14)
+    c.clock.now += timedelta(seconds=10)
+    query(14)  # Each query <30s, but previous query-start age is 38s.
+    c.check()
+    assert c.state['start'] == start
+    sql = c.state['sql_unknown']
+    assert sql['count'] == 2
+    assert sql['seconds'] == 230 + 8
+    assert sql['longest_seconds'] == 230
+    assert sql['open_since'] is None
+    recovered_at = c.now().timestamp()
+    with c.store.db() as db:
+        last_id = db.execute('SELECT MAX(id) FROM evidence').fetchone()[0]
+    fill_window(c, 86400)
+    with c.store.db() as db:
+        db.execute("DELETE FROM evidence WHERE id > ? AND kind='observation' AND at <= ?",
+                   (last_id, recovered_at))
+    # Keep actual SQL evidence; fill_window adds normal observations after it.
+    c.io.values['debt'] = dict(c.observation, observed_at=c.observation['at'],
+                              restart_at=recovered_at, mandatory_restart_at=start,
+                              epoch=c.state['epoch'], sequence=99)
+    c.io.values['freshness'] = dict(c.freshness, observed_at=c.now().timestamp(), sequence=1)
+    def fresh():
+        c.io.values['freshness'].update(sequence=2, observed_at=c.now().timestamp())
+    c.io.wakes['freshness'] = SimpleNamespace(set=fresh)
+    report = c.decide()
+    assert report['reason'] == 'accepted_s2'
+    assert not report['load']['continuous']
+    assert report['load']['sql_gap_allowed']
+    assert report['load']['unknown_intervals'] > 0
+    assert report['load']['eligible_intervals'] == 288
+
+
+@pytest.mark.parametrize('seconds', [1500, 1501])
+def test_s2_open_sql_unknown_limit_checked_without_query_completion(controller, seconds):
+    c = controller
+    s2_sql_lane(c)
+    start = c.state['start']
+    c.io.debt_query = start
+    c.clock.now += timedelta(seconds=30 + seconds)
+    c.observe()
+    assert (c.state['start'] == start) is (seconds == 1500)
+    with pytest.raises(LaneClosed, match='stale|evidence boundary'):
+        c.check()
+
+
+def test_s2_total_sql_unknown_limit(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    for _ in range(4):
+        query(1200)
+        c.clock.now += timedelta(seconds=1)
+        query(0)
+    assert c.state['start'] > start  # 4 * (1201 - 30) > 72 minutes.
+
+
+@pytest.mark.parametrize('error', [RuntimeError, TimeoutError])
+def test_s2_sql_errors_are_not_hidden_by_stale_label(controller, error):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    result = query(97, error=error)
+    assert result['error'] == error.__name__
+    assert result['query_error'] == error.__name__
+    assert c.state['start'] > start
+
+
+def test_s2_known_debt_after_lag_remains_a_pause(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    query(97)
+    c.clock.now += timedelta(seconds=1)
+    query(0, debt=1)
+    assert c.state['start'] == start
+    with pytest.raises(LaneClosed, match='debt pauses'):
+        c.check()
+    assert not c._debt_valid(start)
+
+
+def test_s2_gate_change_inside_slow_query_is_mandatory_restart(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    result = query(97, change=lambda: c.gate.lower_ceiling(0, reason='test'))
+    assert result['error'] == 'gate_changed_during_debt'
+    assert not result['sql_lag_safe']
+    assert c.state['start'] > start
+
+
+def test_s2_unexplained_observer_stop_restarts_window(controller):
+    c = controller
+    s2_sql_lane(c)
+    start = c.state['start']
+    c.clock.now += timedelta(seconds=31)
+    c.observe()
+    assert c.state['start'] > start
+
+
+def test_s2_skipped_evidence_failure_cannot_be_hidden_by_recovery(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    # Emulate a failed durable observation missed by the owner, then recovery.
+    c.io.values['debt'].update(error='evidence_write_OSError', known=False,
+                              restart_at=start + 1, mandatory_restart_at=start + 1)
+    c.clock.now += timedelta(seconds=2)
+    query(0)
+    assert c.state['start'] > start
+
+
+def test_s2_stale_status_keeps_open_unknown_metrics(controller):
+    c = controller
+    s2_sql_lane(c)
+    c.io.debt_query = c.state['start']
+    c.clock.now += timedelta(seconds=130)
+    c.observe()
+    report = read_status(c.store.path, now=c.now())
+    assert report['stale']
+    sql = report['load']['sql_unknown']
+    assert sql['seconds'] == 100
+    assert sql['open_since'] == c.state['start'] + 30
+    text = '\n'.join(format_measurement(report))
+    assert 'SQL unknown (stale): 1' in text
+    assert '1500/4320' in text
+
+
+@pytest.mark.parametrize('after_limit', [False, True])
+def test_s2_new_covered_boundary_survives_owner_poll_delay(controller, after_limit):
+    c = controller
+    query = s2_sql_lane(c)
+    if after_limit:
+        c.io.debt_query = c.state['start']
+        c.clock.now += timedelta(seconds=1531)
+    else:
+        # Promotion can put start between the observer's durable rows.
+        c.clock.now += timedelta(seconds=1)
+        c.state['start'] = c.now().timestamp()
+    c.observe()
+    pending = c.state['start']
+    c.clock.now += timedelta(seconds=10)
+    # Suppress the owner poll until after the real lane has recorded its result.
+    observe = c.observe
+    c.observe = lambda: None
+    try:
+        result = query(1)
+    finally:
+        c.observe = observe
+    c.clock.now += timedelta(seconds=0.1)
+    c.observe()
+    assert c.state['start'] == result['at']
+    assert c.state['start'] > pending
+    assert 'sql_restart_pending' not in c.state
+    c.clock.now += timedelta(seconds=1)
+    c.observe()
+    assert c.state['start'] == result['at']
+
+
+def test_s2_pending_sql_boundary_does_not_block_recovery_on_s0(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    c.io.debt_query = c.state['start']
+    c.clock.now += timedelta(seconds=1531)
+    c.observe()
+    assert 'sql_restart_pending' in c.state
+    c.gate.lower_ceiling(0, reason='test')
+    query(1)
+    assert c.state['step'] == 0
+    assert 'sql_restart_pending' not in c.state
+    c.check()
+    assert c._debt_valid(c.state['start'])

@@ -106,7 +106,7 @@ def competition_entry(index, *, gender="male", crawl_state=None, metadata=None):
 
 def test_v8_is_append_only_schema_for_provenance_aliases_and_cancellation():
     assert tuple(migration.version for migration in MIGRATIONS) == tuple(
-        range(1, 15)
+        range(1, 16)
     )
     migration = next(item for item in MIGRATIONS if item.version == 8)
     assert migration.version == 8
@@ -2287,6 +2287,17 @@ def test_season_reconcile_releases_claimed_urls_before_it_upserts_them():
     assert params[2:] == ("fbref", "12")
 
 
+def test_incomplete_match_raw_is_not_replayed_before_its_fresh_fetch():
+    # Reuse the current-version failure fence; other failed raw still requires
+    # newer successful processing before it disappears from recovery.
+    recovery = ' '.join(inspect.getsource(ControlStore.list_unprocessed_fetches).split())
+    assert "AND (failed_observed.error_class = 'IncompleteMatchPageError' OR EXISTS (" in recovery
+    assert "failed_observed.typed_parser_version = %s" in recovery
+    replay = ' '.join(inspect.getsource(ControlStore.list_run_fetches).split())
+    assert "OR (observed.status = 'failed' AND observed.error_class = 'IncompleteMatchPageError')" in replay
+    frontier = inspect.getsource(ControlStore.get_frontier_target)
+    assert "requires_fresh_match_fetch" in frontier
+    assert "retry.logical_refresh_id" in frontier and "attempt.status = 'succeeded'" in frontier
 def _parse_carryover_evidence():
     return {
         "attempt_id": str(uuid.uuid4()),

@@ -88,6 +88,10 @@ def _scope_fbref_bronze_reads(
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("fbref_control_run_id must be a UUID") from exc
 
+    # #1335: retain the canonical league/season fallback deliberately for legacy
+    # Bronze rows missing BOTH source IDs. Existing Silver is retired; any new
+    # Silver identity contract belongs to its own migration. Keep the pinned run
+    # and eligible_male filter on both branches.
     def replacement(match: re.Match) -> str:
         table = match.group("table")
         return (
