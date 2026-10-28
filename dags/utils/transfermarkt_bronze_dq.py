@@ -86,6 +86,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Mapping, Sequence
 
+from scrapers.transfermarkt.revisions import CAREER_NULLABLE_ADDITIONS
+
 from utils.transfermarkt_scope_state import (
     REGISTRY_STATE_TABLE,
     SCOPE_COMPLETION_STATUS,
@@ -539,6 +541,7 @@ def build_intra_batch_duplicates_sql(
     *,
     pins: Mapping[str, Any] | None = None,
     scope_pairs: Sequence[Sequence[str]] | None = None,
+    available_columns: Iterable[str] | None = None,
 ) -> str:
     """Split intra-batch duplicates: conflicting groups vs identical repeats."""
 
@@ -552,9 +555,14 @@ def build_intra_batch_duplicates_sql(
         _scope_pairs_predicate(table, scope_pairs)
         if scope_pairs is not None else None
     )
-    return _duplicate_split_sql(
-        table, group, NATIVE_PAYLOAD_COLUMNS[table], pins, where=where,
-    )
+    payload = NATIVE_PAYLOAD_COLUMNS[table]
+    if available_columns is not None:
+        available = set(available_columns)
+        payload = tuple(
+            column for column in payload
+            if column in available or column not in CAREER_NULLABLE_ADDITIONS
+        )
+    return _duplicate_split_sql(table, group, payload, pins, where=where)
 
 
 def build_cross_batch_duplicates_sql(
@@ -1006,6 +1014,18 @@ def run_bronze_dq(
 
         display = _display(table)
         try:
+            if (prefix == 'tm_bronze'
+                    and table in _MEMBERSHIP_PLAYER_TABLES):
+                # Read the checked snapshot's schema, even before the first
+                # fresh write has added the nullable career fields.
+                cur.execute(f'SELECT * FROM {_pinned(table, pins)} LIMIT 0')
+                cur.fetchall()
+                available = [column[0] for column in cur.description]
+                sqls = entity_sqls(
+                    lambda table, **kwargs: build_intra_batch_duplicates_sql(
+                        table, available_columns=available, **kwargs,
+                    ), table,
+                )
             conflicts = identical = 0
             for sql in sqls:
                 cur.execute(sql)
