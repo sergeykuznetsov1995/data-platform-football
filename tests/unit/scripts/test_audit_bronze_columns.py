@@ -234,14 +234,7 @@ def test_fotmob_contract_lists_all_nine_tables(table):
 
 
 # --- ClubElo contract presence guard (#283) --------------------------------
-# Regression guard: both ClubElo bronze tables must stay in the contract so the
-# --source clubelo audit keeps verifying full coverage. Both materialise + are
-# non-empty live (verified 2026-06-04, #283): ratings 2068 and
-# ratings_historical (weekly snapshots) produced by the gated weekly branch of
-# dag_ingest_clubelo (folded in from dag_ingest_clubelo_full, #716) with
-# replace_partitions=['rating_date'] + weekly cadence, neutralizing the
-# daily-APPEND HDFS-overflow footgun (2026-05-04 incident). clubelo_team_history
-# was dropped in #604 (write-only, never read).
+# Keep the frozen legacy API schemas in the contract alongside HTML Bronze.
 @pytest.mark.parametrize('table', [
     'clubelo_ratings',
     'clubelo_ratings_historical',
@@ -322,3 +315,118 @@ def test_transfermarkt_contract_lists_transition_and_native_tables(table):
 ])
 def test_capology_contract_lists_all_four_tables(table):
     assert table in mod.EXPECTED_TABLES['capology']
+
+
+CLUBELO_TABLES = [
+    'clubelo_rank_snapshot',
+    'clubelo_result',
+    'clubelo_club_elo_point',
+    'clubelo_club_match',
+    'clubelo_history_manifest',
+    'clubelo_raw_page',
+    'clubelo_api_snapshot_archive',
+]
+
+
+@pytest.fixture(scope='module')
+def clubelo_schemas():
+    import re
+    from scrapers.clubelo import daily, history
+    from scripts import clubelo_freeze_archive
+
+    arrow_types = {
+        'string': 'varchar', 'int32': 'integer', 'int64': 'bigint',
+        'double': 'double', 'date32[day]': 'date', 'bool': 'boolean',
+        'timestamp[us]': 'timestamp(6)', 'binary': 'varbinary',
+    }
+    schemas = {
+        table: {field.name: arrow_types[str(field.type)] for field in schema}
+        for table, schema in {
+            daily.SNAPSHOT_TABLE: daily.SNAPSHOT_SCHEMA,
+            daily.RESULT_TABLE: daily.RESULT_SCHEMA,
+            **history.SCHEMAS,
+        }.items()
+    }
+    schemas['clubelo_api_snapshot_archive'] = dict(re.findall(
+        r'"(\w+)" ([\w()]+)', clubelo_freeze_archive.SNAPSHOT_DDL,
+    ))
+    return schemas
+
+
+@pytest.mark.parametrize('table', CLUBELO_TABLES)
+def test_clubelo_platform_column_contract(table, clubelo_schemas):
+    import json
+    import yaml
+
+    columns = clubelo_schemas[table]
+    assert mod.EXPECTED_TABLES['clubelo'][table] == set(columns)
+    assert '_entity_type' not in columns
+    fixture = json.loads((REPO_ROOT / 'tests/fixtures/bronze_schemas.json').read_text())
+    assert fixture['tables'][f'bronze.{table}']['columns'] == columns
+    description = yaml.safe_load((
+        REPO_ROOT / 'configs/openmetadata/descriptions' / f'bronze_{table}.yaml'
+    ).read_text())
+    assert description['table']['fullyQualifiedName'] == f'trino_iceberg.iceberg.bronze.{table}'
+    assert description['table']['description'].strip()
+    assert {column['name'] for column in description['columns']} == set(columns)
+    assert all(column['description'].strip() for column in description['columns'])
+
+
+@pytest.mark.parametrize('table', CLUBELO_TABLES)
+def test_clubelo_audit_detects_missing_table_and_column(table, clubelo_schemas):
+    schemas = {name: list(columns.items()) for name, columns in clubelo_schemas.items()}
+    live = set(schemas)
+    per_table = {name: (10, []) for name in live}
+    cur = _FakeCursor(schemas)
+    clean = mod.diff_contract(cur, 'clubelo', live, per_table)
+    assert not clean['missing_columns']
+    assert not [item for item in clean['missing_tables'] if item[0] in live]
+
+    missing = mod.diff_contract(cur, 'clubelo', live - {table}, per_table)
+    assert (table, 'absent from bronze') in missing['missing_tables']
+    for column in clubelo_schemas[table]:
+        schemas[table] = [(name, kind) for name, kind in clubelo_schemas[table].items()
+                          if name != column]
+        diff = mod.diff_contract(cur, 'clubelo', live, per_table)
+        assert (table, column) in diff['missing_columns']
+
+
+def test_snapshot_retains_clubelo_without_silver_references(monkeypatch, tmp_path, clubelo_schemas):
+    import json
+    from scripts import snapshot_bronze_schemas as snapshot
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    class FakeCursor:
+        def execute(self, sql):
+            self.table = sql.rsplit('.', 1)[-1]
+            assert sql == f'SHOW COLUMNS FROM iceberg.bronze.{self.table}'
+
+        def fetchall(self):
+            return [(name, kind, '', '') for name, kind in clubelo_schemas[self.table].items()]
+
+        def close(self):
+            pass
+
+    connection = FakeConnection()
+    target = tmp_path / 'bronze_schemas.json'
+    monkeypatch.setattr(snapshot, 'collect_all_bronze_tables', lambda: set())
+    monkeypatch.setattr(snapshot, '_connect', lambda: connection)
+    monkeypatch.setattr(snapshot, '_FIXTURE_PATH', target)
+    assert snapshot.main() == 0
+    result = json.loads(target.read_text())
+    assert result['tables'] == {
+        f'bronze.{table}': {'columns': columns} for table, columns in clubelo_schemas.items()
+    }
+    assert result['missing_tables'] == []
+    assert connection.closed
+    original = target.read_bytes()
+    assert snapshot.main() == 0
+    assert target.read_bytes() == original
