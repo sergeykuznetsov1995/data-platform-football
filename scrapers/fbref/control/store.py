@@ -1110,6 +1110,35 @@ class ControlStore:
             return {"processed": len(target_ids), "after_target_id": after,
                     "done": len(target_ids) < size}
 
+    def backfill_page_gender_classes(self, *, batch_size: int = 100) -> dict:
+        """Commit one resumable classification batch after ownership backfill."""
+        size = int(batch_size)
+        if not 1 <= size <= 1000:
+            raise ValueError("batch_size must be between 1 and 1000")
+        with self._transaction() as raw_cursor:
+            cursor = _ScopeBackfillCursor(raw_cursor)
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            cursor.execute("SET LOCAL work_mem = '4MB'")
+            cursor.execute("""SELECT after_target_id FROM fbref_control.page_gender_backfill
+                WHERE singleton FOR UPDATE""")
+            after = _fetchone(cursor)["after_target_id"]
+            cursor.execute("""SELECT target_id FROM fbref_control.page_frontier
+                WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE""",
+                (after, size))
+            targets = [row["target_id"] for row in _fetchall(cursor)]
+            cursor.execute("""SELECT frontier.target_id FROM fbref_control.page_frontier frontier
+                LEFT JOIN fbref_control.page_scope_summary scope USING (target_id)
+                WHERE frontier.target_id = ANY(%s::text[]) AND NOT coalesce(scope.is_complete, false)""", (targets,))
+            if _fetchall(cursor):
+                raise ControlStoreError("ownership backfill must finish before gender backfill")
+            self._refresh_scope_summaries(cursor, targets)
+            if targets:
+                after = targets[-1]
+                cursor.execute("""UPDATE fbref_control.page_gender_backfill
+                    SET after_target_id = %s WHERE singleton""", (after,))
+            return {"processed": len(targets), "after_target_id": after,
+                    "done": len(targets) < size}
+
     def migrate(self) -> tuple[int, ...]:
         """Apply all pending migrations under one transaction advisory lock."""
         applied_now = []
@@ -5967,6 +5996,40 @@ class ControlStore:
         """Compatibility alias for full frontier scope reconciliation."""
         return self.reconcile_frontier_scope(source=source)
 
+    def schedule_incomplete_match_refetch(
+        self, target_id: object, *, content_hash: object, logical_refresh_id: object,
+    ) -> bool:
+        """At most three fresh requests; stale raw replay cannot spend retries."""
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        with self._transaction() as cursor:
+            if self._latest_content_verdict(cursor, target, digest, refresh) is not True:
+                return False
+            cursor.execute("""INSERT INTO fbref_control.incomplete_match_refetch AS retry
+                    (target_id, attempts, logical_refresh_id)
+                SELECT target_id, 1, %s FROM fbref_control.page_frontier
+                WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')
+                ON CONFLICT (target_id) DO UPDATE SET attempts = retry.attempts + 1,
+                    logical_refresh_id = EXCLUDED.logical_refresh_id
+                WHERE retry.attempts < 3
+                    AND retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                RETURNING attempts""", (refresh, target))
+            row = _fetchone(cursor)
+            if row is None:
+                return False
+            cursor.execute("""UPDATE fbref_control.page_frontier
+                SET state = 'retry',
+                    next_fetch_at = clock_timestamp() + %s * interval '5 minutes',
+                    retry_after = clock_timestamp() + %s * interval '5 minutes',
+                    last_etag = NULL, last_modified = NULL,
+                    last_error_class = 'IncompleteMatchPageError',
+                    last_error_message = 'scored_match_incomplete',
+                    updated_at = clock_timestamp()
+                WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
+                (2 ** (row["attempts"] - 1), 2 ** (row["attempts"] - 1), target))
+            return bool(cursor.rowcount)
+
     def quarantine_contract_rejected_target(
         self,
         target_id: object,
@@ -8315,29 +8378,31 @@ class ControlStore:
             }
             cursor.execute(
                 """
-                SELECT competition.gender, count(DISTINCT frontier.target_id)
-                           AS count
+                SELECT CASE WHEN scope.is_complete AND NOT scope.pending
+                                 AND scope.gender_classified
+                                 AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+                            THEN scope.gender_class ELSE 'unknown' END AS gender,
+                       count(*) AS count,
+                       count(*) FILTER (WHERE frontier.state NOT IN
+                           ('skipped', 'quarantined', 'dead')
+                           AND frontier.page_kind <> 'competition_index') AS active_count,
+                       count(*) FILTER (WHERE scope.is_complete AND NOT scope.pending
+                           AND scope.gender_classified
+                           AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)) AS classified_count
                 FROM fbref_control.page_frontier AS frontier
-                JOIN fbref_control.competition_registry AS competition
-                  ON competition.source = frontier.source
-                 AND competition.competition_id =
-                     frontier.source_ids ->> 'competition_id'
-                WHERE competition.gender IN ('female', 'unknown')
-                  AND frontier.state NOT IN (
-                      'skipped', 'quarantined', 'dead'
-                  )
-                GROUP BY competition.gender
-                ORDER BY competition.gender
+                LEFT JOIN fbref_control.page_scope_summary AS scope USING (target_id)
+                GROUP BY 1 ORDER BY 1
                 """
             )
-            out_of_scope = {
-                str(row["gender"]): int(row["count"])
-                for row in _fetchall(cursor)
+            gender_rows = _fetchall(cursor)
+            summary["frontier_gender_counts"] = {
+                str(row["gender"]): int(row["count"]) for row in gender_rows
             }
-            summary["female_downstream_targets"] = out_of_scope.get("female", 0)
-            summary["unknown_gender_downstream_targets"] = out_of_scope.get(
-                "unknown", 0
-            )
+            summary["frontier_gender_total"] = sum(int(row["count"]) for row in gender_rows)
+            summary["frontier_gender_classified"] = sum(int(row["classified_count"]) for row in gender_rows)
+            out_of_scope = {str(row["gender"]): int(row["active_count"]) for row in gender_rows}
+            summary["female_downstream_targets"] = out_of_scope.get("female", 0) + out_of_scope.get("mixed", 0)
+            summary["unknown_gender_downstream_targets"] = out_of_scope.get("unknown", 0)
             cursor.execute(
                 """
                 SELECT metadata
@@ -8970,8 +9035,8 @@ class ControlStore:
                         AND failed_observed.typed_parser_version = %s
                         AND failed_observed.stateful_parser_version = %s
                         AND failed_observed.status = 'failed'
-                    )
-                    AND EXISTS (
+                        AND (failed_observed.error_class = 'IncompleteMatchPageError'
+                             OR EXISTS (
                       SELECT 1
                       FROM fbref_control.fetch_attempt AS newer_attempt
                       JOIN fbref_control.observation_processing
@@ -8993,6 +9058,7 @@ class ControlStore:
                             'succeeded', 'skipped'
                         )
                         AND newer_observed.validation_status = 'succeeded'
+                             ))
                     )
                   )
                 ORDER BY COALESCE(
@@ -9030,7 +9096,16 @@ class ControlStore:
                        refresh_policy, state, priority, next_fetch_at,
                        retry_after, last_fetched_at, last_http_status,
                        last_content_hash, last_etag, last_modified,
-                       last_error_class, last_error_message
+                       last_error_class, last_error_message,
+                       EXISTS (SELECT 1 FROM fbref_control.incomplete_match_refetch retry
+                           WHERE retry.target_id = page_frontier.target_id
+                             AND retry.logical_refresh_id = (
+                                 SELECT attempt.logical_refresh_id
+                                 FROM fbref_control.fetch_attempt attempt
+                                 WHERE attempt.target_id = page_frontier.target_id
+                                   AND attempt.status = 'succeeded'
+                                 ORDER BY attempt.lease_epoch DESC, attempt.attempt_number DESC
+                                 LIMIT 1)) AS requires_fresh_match_fetch
                 FROM fbref_control.page_frontier
                 WHERE target_id = %s
                 """,
@@ -9436,6 +9511,8 @@ class ControlStore:
                             AND observed.stateful_parser_version = %s
                             AND (
                                 observed.status = 'succeeded'
+                                OR (observed.status = 'failed'
+                                    AND observed.error_class = 'IncompleteMatchPageError')
                                 OR (
                                     observed.status = 'processing'
                                     AND observed.lease_expires_at >

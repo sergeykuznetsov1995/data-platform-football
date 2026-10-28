@@ -1958,7 +1958,9 @@ def run_recovery_wave(
                 aggregate[key] = int(aggregate.get(key, 0)) + value
         if history_slice:
             break
-        if parsed == 0 and retired == 0:
+        # A failed incomplete match leaves raw recovery for a fresh fetch.
+        refetches = int(result.get("incomplete_match_refetches") or 0)
+        if parsed == 0 and retired == 0 and refetches == 0:
             # Расчистка сырья идёт ПЕРЕД живыми волнами, поэтому её тупик
             # раньше убивал весь ран: 31.07 три мёртвые season-страницы
             # зациклили recovery и роняли и кампанию, и daily при нулевом

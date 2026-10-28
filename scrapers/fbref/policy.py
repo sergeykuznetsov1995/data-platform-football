@@ -40,7 +40,7 @@ OTHER_PUBLICATION_CRITICAL_PAGE_KINDS = (
 # import closure.  page_document / typed_bronze / discovery re-export these names;
 # see those modules for the per-version rationale.
 PAGE_DOCUMENT_VERSION = "fbref-page-document-v4"
-TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v4"
+TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v5"
 DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v6"
 
 # Current enrichment stays below the match/schedule drain. Eight hours leave
