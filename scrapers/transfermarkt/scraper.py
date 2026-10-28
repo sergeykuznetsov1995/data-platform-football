@@ -1000,7 +1000,7 @@ def _image_id(raw, path: str) -> Optional[str]:
     """Read a numeric source ID only from the observed image path."""
     if not isinstance(raw, str):
         return None
-    match = re.fullmatch(r'/' + re.escape(path) + r'/([0-9]+)\.png', urlsplit(raw).path)
+    match = re.fullmatch(r'/' + re.escape(path) + r'/([0-9]+)(?:_[0-9]+)?\.png', urlsplit(raw).path)
     return match.group(1) if match else None
 
 

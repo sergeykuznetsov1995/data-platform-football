@@ -37,6 +37,14 @@ def test_removed_value_and_point_context_survive_native_and_legacy(payload):
     assert list(legacy.columns) == tm.LEGACY_MV_COLUMNS + tm._METADATA_COLUMNS
 
 
+def test_market_value_club_ids_survive_suffixed_emblems():
+    # Both unmodified affected rows from ceapi-marketValue-844485.json.
+    path = Path(__file__).parents[2] / 'fixtures/transfermarkt/ceapi-marketValue-844485-suffixed-emblems.json'
+    rows = tm._parse_mv_history(json.loads(path.read_text()), '844485')
+    assert [row['mv_date'] for row in rows] == [date(2022, 1, 15), date(2024, 1, 5)]
+    assert [row['club_id'] for row in rows] == ['9370', '9370']
+
+
 def test_transfer_fee_and_club_context_survive_native_and_legacy(payload):
     rows = tm._parse_transfers(payload['transfers'], '1')
     assert rows[0]['fee_text'] == 'Loan fee: €500K'
