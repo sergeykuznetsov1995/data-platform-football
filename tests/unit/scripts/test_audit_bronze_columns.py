@@ -391,6 +391,51 @@ def test_clubelo_audit_detects_missing_table_and_column(table, clubelo_schemas):
         assert (table, column) in diff['missing_columns']
 
 
+@pytest.mark.parametrize('null_required', [None, 'slug', 'status', 'http_status', '_batch_id'])
+def test_clubelo_successful_manifest_null_audit(clubelo_schemas, null_required):
+    table = 'clubelo_history_manifest'
+    columns = clubelo_schemas[table]
+    # Aggregate results for ten successful pages: error is always NULL,
+    # status='done' and http_status=200 are constant; other fields are populated.
+    stats = {'_total': 10}
+    for column, kind in columns.items():
+        non_null = 0 if column in {'error', null_required} else 10
+        stats[f'{column}__nn'] = non_null
+        if not mod.is_skip_distinct(kind):
+            stats[f'{column}__d'] = min(non_null, 1) if column in {
+                'status', 'http_status',
+            } else non_null
+        if mod.is_varchar(kind):
+            stats[f'{column}__es'] = 0
+
+    class ManifestCursor(_FakeCursor):
+        def execute(self, sql):
+            self.sql = sql
+            if sql.startswith('SELECT '):
+                assert 'count("error") AS "error__nn"' in sql
+                self.description = [(name,) for name in stats]
+            else:
+                super().execute(sql)
+
+        def fetchall(self):
+            if self.sql.startswith('SHOW CREATE TABLE '):
+                return [('CREATE TABLE iceberg.bronze.clubelo_history_manifest (...)',)]
+            if self.sql.startswith('SELECT '):
+                return [tuple(stats.values())]
+            return super().fetchall()
+
+    total, findings = mod.audit_table(ManifestCursor({table: list(columns.items())}), table)
+    assert total == 10
+    assert {item['col'] for item in findings if item['sev'] == 'ERROR'} == (
+        {null_required} if null_required else set()
+    )
+    assert any(item['col'] == 'error' and item['sev'] == 'INFO'
+               and item['detail'].startswith('EXPECTED_NULL') for item in findings)
+    if null_required:
+        assert any(item['col'] == null_required and item['detail'].startswith('ALL_NULL')
+                   for item in findings)
+
+
 def test_snapshot_retains_clubelo_without_silver_references(monkeypatch, tmp_path, clubelo_schemas):
     import json
     from scripts import snapshot_bronze_schemas as snapshot

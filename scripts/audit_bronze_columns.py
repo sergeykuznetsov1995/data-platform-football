@@ -73,6 +73,9 @@ UNDERSTAT_CONTRACT = _load_understat_contract()
 # ---- Allowlist (verbatim from feedback_bronze_expected_null_columns.md) ----
 
 EXPECTED_NULL: dict[str, set[str]] = {
+    # HistoryCollector leaves error=None for successful (status='done') pages.
+    # A manifest containing only successful pages therefore has no errors.
+    "clubelo_history_manifest": {"error"},
     # fbref_keeper_keeper_adv removed in #606 — scrape stopped, table dropped.
     "fbref_team_misc": {"pkwon", "pkcon"},
     "fbref_player_misc": {"pkwon", "pkcon"},
