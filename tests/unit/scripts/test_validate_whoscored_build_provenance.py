@@ -356,8 +356,12 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
         revision=revision,
     )
 
-    assert discovery.report["status"] == "ready-v1"
-    assert discovery.issues == []
+    assert discovery.report["status"] == "blocked-v1"
+    assert any(
+        issue["category"] == "github_action_unpinned"
+        and "workflow is missing" in issue["detail"]
+        for issue in discovery.issues
+    )
     assert {
         record["service"] for record in discovery.records["local_images"]
     } == set(payload_ids)
