@@ -92,6 +92,7 @@ from .transport import (
     FetchRequest,
     CloudflareChallenge,
     StageStatisticsUnavailable,
+    StageBootstrapRedirect,
     ProxyUnavailable,
     TransportBudgets,
     TransportContext,
@@ -2683,6 +2684,7 @@ class WhoScoredIngestService:
                     "stage_xg_checked": [],
                     "stage_xg_retained": [],
                     "stage_xg_deferred": [],
+                    "stage_xg_redirected": [],
                 }
             )
             previous = (
@@ -2717,6 +2719,7 @@ class WhoScoredIngestService:
                 spools.append(spool)
                 rows[table] = spool
             retained: set[int] = set()
+            checked_stages: list[int] = []
             now = datetime.now(timezone.utc)
             changed = False
             for stage in collected.stage_rows:
@@ -2808,26 +2811,9 @@ class WhoScoredIngestService:
                 for spool in spools:
                     spool.begin_stage()
                 try:
-                    try:
-                        bootstrap, bootstrap_uri = self._prepare_stage_statistics(
-                            stage_id=stage_id, url=bootstrap_url, final=final
-                        )
-                    except WhoScoredTransportError as exc:
-                        if not (
-                            exc.kind is FailureKind.HTTP_STATUS
-                            and exc.status_code == 301
-                            and exc.url == bootstrap_url
-                        ):
-                            raise
-                        for spool in spools:
-                            spool.rollback_stage()
-                        logger.warning(
-                            "%s: stage=%s xG bootstrap HTTP 301; url=%r location=%r; deferred",
-                            self.scope.spec, stage_id, bootstrap_url, exc.redirect_location,
-                        )
-                        result.metadata["stage_xg_deferred"].append(stage_id)
-                        result.skipped = 1
-                        return result  # Preserve the complete previous scope snapshot.
+                    bootstrap, bootstrap_uri = self._prepare_stage_statistics(
+                        stage_id=stage_id, url=bootstrap_url, final=final
+                    )
                     structured = self._fetch_parsed_many(specs)
                     structured, paginated = self._complete_player_statistics_pages(
                         specs, structured
@@ -2860,6 +2846,18 @@ class WhoScoredIngestService:
                 except WhoScoredTransportError as exc:
                     for spool in spools:
                         spool.rollback_stage()
+                    if isinstance(exc, StageBootstrapRedirect):
+                        logger.warning(
+                            "%s: stage=%s xG bootstrap HTTP %s; url=%r location=%r; redirected",
+                            self.scope.spec, stage_id, exc.status_code, exc.url,
+                            exc.redirect_location,
+                        )
+                        result.metadata["stage_xg_redirected"].append({
+                            "stage_id": stage_id, "status_code": exc.status_code,
+                            "url": exc.url, "location": exc.redirect_location,
+                        })
+                        retained.add(stage_id)
+                        continue
                     cause = exc
                     cooldown = False
                     while cause is not None:
@@ -2895,7 +2893,7 @@ class WhoScoredIngestService:
                         raw_uris.append(uri)
                         payload_hashes.append(digest)
                 feed_checks[key] = {"checked_at": checked.isoformat(), "final": final}
-                result.metadata["stage_xg_checked"].append(stage_id)
+                checked_stages.append(stage_id)
                 changed = True
             for stage_id in collected.source_stage_absent:
                 key = str(stage_id)
@@ -2965,6 +2963,7 @@ class WhoScoredIngestService:
                 expected_previous_stage_batch_id=previous.get("batch_id", ""),
             )
             result.committed_batches["scope"].append(str(batch_id))
+            result.metadata["stage_xg_checked"] = checked_stages
             result.succeeded = 1
             for table, values in rows.items():
                 result.counts[table.removeprefix("whoscored_")] = len(values)

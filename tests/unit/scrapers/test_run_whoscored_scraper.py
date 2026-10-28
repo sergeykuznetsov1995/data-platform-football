@@ -682,7 +682,7 @@ def test_report_accumulates_match_backlog_across_scopes():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("outcome", ["checked", "deferred", "failed"])
+@pytest.mark.parametrize("outcome", ["checked", "deferred", "redirected", "failed"])
 def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outcome):
     scopes = (
         runner.RunnerScope.parse("ENG-Premier League=2526"),
@@ -699,6 +699,10 @@ def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outc
             "stage_xg_checked": [stage] if outcome == "checked" else [],
             "stage_xg_retained": [stage + 100],
             "stage_xg_deferred": [stage] if outcome == "deferred" else [],
+            "stage_xg_redirected": [{"stage_id": stage, "status_code": 308,
+                                      "url": "https://www.whoscored.com/source",
+                                      "location": "https://www.whoscored.com/destination"}]
+            if outcome == "redirected" else [],
         }
         expected.append(json.loads(json.dumps(evidence)))
         result = _result(
@@ -2444,7 +2448,7 @@ def test_weekly_stages_continues_after_guard_or_deferred_scope(
     )
     from scrapers.whoscored.repository import WhoScoredRepository
     from tests.unit.scrapers.test_whoscored_service import _xg_service
-    from scrapers.whoscored.transport import FailureKind, WhoScoredTransportError
+    from scrapers.whoscored.transport import FailureKind, StageBootstrapRedirect
 
     storage = _StageFeedStorage()
     storage.seed(rows=[_xg_row("old-a", 1), _xg_row("old-b", 1)])
@@ -2457,7 +2461,7 @@ def test_weekly_stages_continues_after_guard_or_deferred_scope(
         service, service_repo, _, _, _, _, _ = _xg_service(tmp_path / str(len(results)))
         if not results and first_outcome == "deferred":
             def redirect(**kwargs):
-                raise WhoScoredTransportError(
+                raise StageBootstrapRedirect(
                     "HTTP 301", kind=FailureKind.HTTP_STATUS,
                     url=kwargs["url"], status_code=301,
                 )
@@ -2501,3 +2505,20 @@ def test_weekly_stages_continues_after_guard_or_deferred_scope(
     assert len(storage.manifests) == 2
     assert [row for row in storage.tables["whoscored_player_stage_stats"]
             if row["league"] == "L"] == original_rows
+
+
+def test_weekly_redirect_count_visible_in_run_summary(tmp_path, caplog):
+    import logging
+
+    scopes = [runner.RunnerScope.parse("ENG-Premier League=2526"),
+              runner.RunnerScope.parse("ESP-La Liga=2526")]
+    report = runner._new_report("weekly", scopes)
+    for index, scope in enumerate(scopes):
+        result = _result("stages", scope=scope.spec, metadata={
+            "stage_xg_redirected": [{"stage_id": 700 + index, "status_code": 301}]
+        })
+        runner._merge_result(report, result, scope_record=report["scopes"][index])
+    with caplog.at_level(logging.INFO):
+        rc = runner._finish(report, str(tmp_path / "summary.json"))
+    assert rc == 0 and report["status"] == "success"
+    assert "stage_xg_redirected=2" in caplog.text

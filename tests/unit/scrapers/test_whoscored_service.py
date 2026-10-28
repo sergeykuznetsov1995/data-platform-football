@@ -4373,14 +4373,15 @@ def test_xg_absent_catalog_stage_has_final_evidence_and_is_not_repeated(tmp_path
 
 
 @pytest.mark.parametrize("final", [False, True])
-def test_xg_bootstrap_301_defers_entire_scope_without_publishing(tmp_path, caplog, final):
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_xg_bootstrap_redirect_retains_only_redirected_stage(tmp_path, caplog, final, status_code):
     from scrapers.whoscored.history import final_feeds
     from scrapers.whoscored.transport import WhoScoredTransport
 
     service, repo, now, _, fetched, _, version = _xg_service(
-        tmp_path, final=final, stages=(700, 701)
+        tmp_path, final=final, stages=(700, 701, 702)
     )
-    _xg_previous(repo, now, version, stages=(700, 701), days_ago=8)
+    _xg_previous(repo, now, version, stages=(700, 701, 702), days_ago=8)
     original = json.dumps(repo.stage_snapshot, sort_keys=True)
     original_rows = json.dumps(repo.stage_rows, sort_keys=True)
     prepare = service._prepare_stage_statistics
@@ -4389,10 +4390,10 @@ def test_xg_bootstrap_301_defers_entire_scope_without_publishing(tmp_path, caplo
     def get(url, **kwargs):
         calls.append((url, kwargs))
         return SimpleNamespace(
-            status_code=301,
+            status_code=status_code,
             content=b"redirect with a token that must never be used",
             headers={
-                "Location": "https://user:password@www.whoscored.com/canonical?token=secret#private"
+                "Location": "https://user:password@www.whoscored.com/canonical;jsessionid=pathsecret/next;token=othersecret?token=secret#private"
             },
         )
 
@@ -4405,7 +4406,7 @@ def test_xg_bootstrap_301_defers_entire_scope_without_publishing(tmp_path, caplo
     service.transport = transport
 
     def prepare_second(**kwargs):
-        if kwargs["stage_id"] == 700:
+        if kwargs["stage_id"] != 701:
             return prepare(**kwargs)
         return WhoScoredIngestService._prepare_stage_statistics(service, **kwargs)
 
@@ -4413,11 +4414,22 @@ def test_xg_bootstrap_301_defers_entire_scope_without_publishing(tmp_path, caplo
     result = service.sync_stage_feeds()
 
     assert result.status == "success", result.errors
-    assert result.skipped == 1
-    assert result.metadata["stage_xg_deferred"] == [701]
-    assert result.metadata["stage_xg_checked"] == [700]
-    assert len(fetched) == 2  # The first stage's collected rows must also be discarded.
-    assert not repo.scope_snapshots and not repo.stage_cleanups
+    assert result.succeeded == 1 and result.skipped == 0
+    assert result.metadata["stage_xg_deferred"] == []
+    assert result.metadata["stage_xg_redirected"] == [{
+        "stage_id": 701, "status_code": status_code,
+        "url": calls[0][0],
+        "location": "https://www.whoscored.com/canonical/next",
+    }]
+    assert result.metadata["stage_xg_checked"] == [700, 702]
+    assert len(fetched) == 4
+    snapshot = repo.scope_snapshots[-1]
+    assert snapshot["feed_checks"]["701"] == repo.stage_snapshot["feed_checks"]["701"]
+    assert snapshot["feed_states"] == repo.stage_snapshot["feed_states"]
+    for stage in (700, 702):
+        assert snapshot["feed_checks"][str(stage)]["checked_at"] == now.isoformat()
+    for rows in snapshot["datasets"].values():
+        assert {r["stage_id"]: r["value"] for r in rows} == {700: 1.0, 701: 0.5, 702: 1.0}
     assert json.dumps(repo.stage_snapshot, sort_keys=True) == original
     assert json.dumps(repo.stage_rows, sort_keys=True) == original_rows
     assert not final_feeds(
@@ -4426,7 +4438,7 @@ def test_xg_bootstrap_301_defers_entire_scope_without_publishing(tmp_path, caplo
     assert len(calls) == 1 and calls[0][1]["allow_redirects"] is False
     assert transport._stage_http_context is None
     assert calls[0][0] in caplog.text
-    assert "https://www.whoscored.com/canonical" in caplog.text
+    assert "https://www.whoscored.com/canonical/next" in caplog.text
     assert all(secret not in caplog.text for secret in ("password", "secret", "private"))
 
 
@@ -4444,4 +4456,34 @@ def test_xg_structured_http_redirect_remains_a_failure(tmp_path, status_code):
     result = service.sync_stage_feeds()
     assert result.status == "failed"
     assert result.metadata["stage_xg_deferred"] == []
+    assert not repo.scope_snapshots
+
+
+@pytest.mark.parametrize("failure", ["commit", "later_stage", "cooldown"])
+def test_xg_checked_excludes_unpublished_stages(tmp_path, failure):
+    from scrapers.whoscored.transport import CloudflareChallenge
+    from scrapers.whoscored.source_circuit import SourceCircuitOpen
+
+    service, repo, now, _, _, _, _ = _xg_service(tmp_path, stages=(700, 701))
+    prepare = service._prepare_stage_statistics
+
+    def fail(**kwargs):
+        if kwargs["stage_id"] == 700:
+            return prepare(**kwargs)
+        if failure == "cooldown":
+            try:
+                raise SourceCircuitOpen(state="open", retry_at=now.timestamp() + 900)
+            except SourceCircuitOpen as cause:
+                raise CloudflareChallenge("cooldown", url=kwargs["url"],
+                                          route=TransportRoute.DIRECT_FLARESOLVERR) from cause
+        raise ValueError("later stage failed")
+
+    if failure == "commit":
+        def reject(**kwargs):
+            raise ValueError("published snapshot cannot shrink")
+        repo.commit_scope_bundle = reject
+    else:
+        service._prepare_stage_statistics = fail
+    result = service.sync_stage_feeds()
+    assert result.metadata["stage_xg_checked"] == []
     assert not repo.scope_snapshots
