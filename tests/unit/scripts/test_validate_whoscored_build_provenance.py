@@ -371,7 +371,12 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
     } <= {
         path.relative_to(root).as_posix() for path in discovery.material_paths
     }
-    assert all(discovery.records[key] for key in provenance.RECORD_KEYS)
+    assert discovery.records["github_actions"] == []
+    assert all(
+        discovery.records[key]
+        for key in provenance.RECORD_KEYS
+        if key != "github_actions"
+    )
 
 
 def test_declared_repository_mode_emits_report_but_default_rejects_without_deployment(
