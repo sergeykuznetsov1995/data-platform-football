@@ -127,3 +127,16 @@ def test_clubelo_archive_never_droppable():
     # even if it is not an orphan today.
     _, blocked_all = mod.classify_orphans(CLUBELO_ARCHIVE)
     assert blocked_all == CLUBELO_ARCHIVE
+
+
+def test_clubelo_html_tables_never_droppable():
+    mod = _load_module()
+    live = [
+        'clubelo_rank_snapshot', 'clubelo_result', 'clubelo_club_elo_point',
+        'clubelo_club_match', 'clubelo_history_manifest', 'clubelo_raw_page',
+    ]
+    orphans = mod.find_orphans(live, mod.build_keep_set())
+    droppable, blocked = mod.classify_orphans(orphans)
+    assert droppable == []
+    assert blocked == []
+    assert orphans == []

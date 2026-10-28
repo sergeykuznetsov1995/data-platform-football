@@ -286,3 +286,24 @@ class TestWatchBranch:
         assert dag_module.finish_watch(str(report), dag_run=run)['errors'] == ['timeout']
         report.write_text('broken json')
         assert dag_module.finish_watch(str(report), dag_run=run)['status'] == 'error'
+
+
+def test_dag_smoke_accepts_clubelo_failure_policy(dag_module):
+    from pathlib import Path
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / 'integration/dag_smoke/test_dag_structure.py'
+    spec = importlib.util.spec_from_file_location('_clubelo_dag_smoke_structure', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    validate = _python_task('validate_data')
+    task = SimpleNamespace(
+        task_id=validate.task_id,
+        trigger_rule=validate._init_kwargs.get(
+            'trigger_rule', dag_module.dag._dag_kwargs['default_args'].get('trigger_rule', 'all_success'),
+        ),
+    )
+    bag = SimpleNamespace(dags={'dag_ingest_clubelo': SimpleNamespace(tasks=[task])})
+    module.TestDagStructure().test_validate_tasks_follow_declared_failure_policy(
+        bag, ['dag_ingest_clubelo'],
+    )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Queue a bounded catch-up pass in Airflow, or stop it using its shared marker."""
+"""Run bounded Bronze catch-up directly or via Airflow; dry-run by default."""
 
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--table", action="append")
     parser.add_argument("--apply", action="store_true", help="default: dry-run")
-    parser.add_argument("--seconds", type=int, default=1800)
+    parser.add_argument("--direct", action="store_true")
+    parser.add_argument("--state-file", type=Path)
+    parser.add_argument("--seconds", type=int)
     parser.add_argument("--portions", type=int, default=120)
     parser.add_argument("--bytes", type=int, default=8 * 1024**3)
     parser.add_argument("--journal", type=Path)
@@ -29,6 +31,10 @@ def main(argv=None):
         return 0
     if not args.table or not args.journal or not args.journal.is_absolute():
         parser.error("--table and absolute --journal are required")
+    if args.direct and (not args.state_file or not args.state_file.is_absolute()):
+        parser.error("--direct requires absolute --state-file")
+    if args.seconds is None:
+        args.seconds = 10800 if args.direct else 1800
     if (
         not 1 <= args.seconds <= 3 * 60 * 60
         or not 1 <= args.portions <= 120
@@ -42,6 +48,15 @@ def main(argv=None):
         now.replace(hour=5, minute=0, second=0, microsecond=0),
         now + timedelta(seconds=args.seconds),
     )
+    if args.direct:
+        # Support execution as a script from the host checkout, without Airflow.
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dags"))
+        from utils.bronze_compaction_direct import run_direct
+
+        return run_direct(args, deadline)
     conf = dict(
         tables=args.table,
         apply=args.apply,
@@ -52,8 +67,7 @@ def main(argv=None):
         stop_file=str(args.stop_file),
     )
     run_id = "catchup__" + uuid.uuid4().hex
-    # The scheduler owns admission to fbref_scraper_pool; a local CLI may not
-    # impersonate a pool slot or execute FBref rewrites directly.
+    # Airflow mode retains scheduler admission to fbref_scraper_pool.
     subprocess.run(
         [
             "airflow",

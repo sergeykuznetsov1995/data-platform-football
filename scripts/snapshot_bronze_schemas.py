@@ -1,7 +1,8 @@
-"""Snapshot Bronze column schemas referenced by Silver SQL.
+"""Snapshot Bronze column schemas for Silver SQL and the ClubElo contract.
 
 Walks every Silver SQL (`dags/sql/silver/*.sql` + `*.sql.j2`), collects every
-`iceberg.bronze.<table>` reference, then SHOW COLUMNS via Trino for each and
+`iceberg.bronze.<table>` reference, adds the ClubElo Bronze contract tables,
+then runs SHOW COLUMNS via Trino for each and
 writes the result to ``tests/fixtures/bronze_schemas.json`` with a stable
 (sorted) key order so re-runs produce no diff when Bronze hasn't changed.
 
@@ -33,6 +34,17 @@ from _bronze_alignment import collect_all_bronze_tables  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("snapshot_bronze_schemas")
+
+# ClubElo HTML Bronze has no Silver consumers yet; retain it on regeneration.
+CLUBELO_TABLES = frozenset({
+    "clubelo_rank_snapshot",
+    "clubelo_result",
+    "clubelo_raw_page",
+    "clubelo_club_elo_point",
+    "clubelo_club_match",
+    "clubelo_history_manifest",
+    "clubelo_api_snapshot_archive",
+})
 
 _FIXTURE_PATH = _REPO_ROOT / "tests" / "fixtures" / "bronze_schemas.json"
 
@@ -70,8 +82,8 @@ def _show_columns(conn, table: str) -> dict[str, str]:
 
 
 def main() -> int:
-    tables = sorted(collect_all_bronze_tables())
-    logger.info("Bronze tables referenced by Silver SQL: %d", len(tables))
+    tables = sorted(set(collect_all_bronze_tables()) | CLUBELO_TABLES)
+    logger.info("Bronze tables for Silver SQL and ClubElo: %d", len(tables))
 
     conn = _connect()
     missing: list[str] = []
