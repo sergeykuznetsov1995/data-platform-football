@@ -105,7 +105,7 @@ def test_isolated_owner_is_the_one_fair_active_schedule(monkeypatch):
     }
 
 
-def test_owner_wait_covers_ingest_critical_path_and_scheduling_reserve(monkeypatch):
+def test_owner_wait_covers_serialized_ingest_and_scheduling_reserve(monkeypatch):
     from airflow.operators.bash import BashOperator
     from airflow.operators.python import PythonOperator
 
@@ -122,25 +122,18 @@ def test_owner_wait_covers_ingest_critical_path_and_scheduling_reserve(monkeypat
         for task in [*PythonOperator._instances, *BashOperator._instances]
     }
     defaults = ingest.dag._dag_kwargs["default_args"]
-    path_budgets = {}
-
-    def path_budget(task_id):
-        if task_id not in path_budgets:
-            task = tasks[task_id]
-            # The stubs retain explicit kwargs but do not apply DAG defaults.
-            args = {**defaults, **task._init_kwargs}
-            retries = args["retries"]
-            task_budget = (
-                args["execution_timeout"] * (retries + 1)
-                + args["retry_delay"] * retries
-            )
-            path_budgets[task_id] = task_budget + max(
-                (path_budget(parent) for parent in task.upstream_task_ids),
-                default=timedelta(0),
-            )
-        return path_budgets[task_id]
-
-    child_budget = max(path_budget(task_id) for task_id in tasks)
+    # Service tasks share the single-slot ingest_scraper_pool, including the
+    # replay proof branch. Sum all task budgets conservatively: a longest DAG
+    # path assumes parallel branches and misses contention for that slot.
+    child_budget = timedelta(0)
+    for task in tasks.values():
+        # The stubs retain explicit kwargs but do not apply DAG defaults.
+        args = {**defaults, **task._init_kwargs}
+        retries = args["retries"]
+        child_budget += (
+            args["execution_timeout"] * (retries + 1)
+            + args["retry_delay"] * retries
+        )
     assert owner_timeout >= child_budget + timedelta(minutes=50)
 
 

@@ -721,10 +721,10 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
             allowed_states=["success"],
             failed_states=["failed"],
             reset_dag_run=False,
-            # Покрывает весь путь ingest: scraper 15 ч + служебные задачи
-            # и повторы 14 ч 10 мин + резерв планирования 50 мин. Иначе первым
-            # падает ожидание, а живой ребёнок продолжает писать в Bronze.
-            execution_timeout=timedelta(hours=30),
+            # Покрывает весь ingest: scraper 15 ч + служебные задачи в общем
+            # однослотовом пуле и повторы 16 ч 10 мин + резерв планирования
+            # 50 мин. Иначе ожидание падает раньше ребёнка, пишущего в Bronze.
+            execution_timeout=timedelta(hours=32),
             retries=0,
         )
 
