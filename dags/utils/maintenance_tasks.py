@@ -183,6 +183,7 @@ HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     "fotmob_player_details",
     "fotmob_player_stats",
     "sofascore_player_ratings",
+    "sofascore_schedule",
     "sofascore_player_universe",
     "sofascore_player_profile",
     "sofascore_player_season_stats",

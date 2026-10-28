@@ -45,6 +45,7 @@ GATEWAYS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
 SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
 MAINT = "dag_sofascore_manifest_maintenance"
+COMPACT = "dag_sofascore_schedule_maintenance"
 # Четверг 03:30 UTC — середина окна доставки; воскресенье того же формата — для сдвига.
 THU_0330 = "2026-09-03 03:30:00"
 SUN_0330 = "2026-09-06 03:30:00"
@@ -277,6 +278,7 @@ exec /usr/bin/flock "$@"
         # Обслуживание манифеста живёт на паузе и распаущивается только своим прогоном:
         # deploy.sh паузит его на выкат, автомат возвращает после приёмки или отката.
         self.put(f"paused_{MAINT}", "t")
+        self.put(f"paused_{COMPACT}", "t")
 
     # -- сторожа: настоящие процессы с настоящим /proc/<pid>/cmdline ------------
     def watchdog_pids(self) -> None:
@@ -446,6 +448,7 @@ exit 0
             "HIST_PAUSED": "f",
             "REFRESH_PAUSED": "f",
             "MAINT_PAUSED": "t",
+            "COMPACT_PAUSED": "t",
             **{f"POOL_{p}": POOL_SLOTS[p] for p in POOLS},
             "SCHED_CREATED": "created-old",
         }
@@ -1725,3 +1728,27 @@ def test_an_instance_loaded_before_the_self_install_does_not_deliver(stand: Stan
     proc = stand.run(keep_copy=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
     assert _window(stand, stand.today)["OUTCOME"] == "delivered"
+
+
+@pytest.mark.unit
+def test_snapshot_remembers_schedule_compaction_pause(stand: Stand) -> None:
+    stand.watchdog_pids()
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stderr + stand.log_text()
+    snapshot = (stand.state / "sofascore-rollback.env").read_text()
+    assert "COMPACT_PAUSED=t\n" in snapshot
+
+
+@pytest.mark.unit
+def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(COMPACT_PAUSED="f")
+    stand.put(f"paused_{COMPACT}", "t")
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stderr
+    assert (stand.stub_state / f"paused_{COMPACT}").read_text().strip() == "f", stand.log_text()
