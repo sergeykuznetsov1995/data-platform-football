@@ -227,11 +227,14 @@ NATIVE_PAYLOAD_COLUMNS = {
     ),
     'iceberg.bronze.transfermarkt_market_value_points': (
         'value_eur', 'club_name', 'age', 'mv_raw',
+        'is_value_removed', 'club_id', 'mv_last_change',
     ),
     'iceberg.bronze.transfermarkt_transfer_events': (
         'player_id', 'transfer_date', 'event_season', 'from_club_id',
         'from_club_name', 'to_club_id', 'to_club_name', 'fee_text',
         'fee_eur', 'market_value_eur', 'is_upcoming',
+        'from_is_special', 'to_is_special', 'from_country_flag', 'to_country_flag',
+        'from_country_id', 'to_country_id', 'is_loan_end',
     ),
     'iceberg.bronze.transfermarkt_coach_profiles': (
         'coach_slug', 'name', 'dob', 'nationality',

@@ -121,8 +121,8 @@ REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
 _MIN_REPLACE_RATIO = 0.9
 _WINDOW_STRIDE_DAYS = 7
 FETCH_STATE_TABLE = 'iceberg.ops.transfermarkt_fetch_state'
-PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', 'v2')
-SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', '2')
+PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', 'registry-v2')
+SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', '4')
 REFRESH_MODES = {'auto', 'current', 'historical', 'force'}
 WRITE_MODES = {'dual', 'native-only', 'legacy-only'}
 DUAL_WRITE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_dual_write_manifest_v2'
@@ -2021,6 +2021,7 @@ _CAREER_CACHE_COLUMNS = {
         'market_value_points',
         (
             'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
+            'is_value_removed', 'club_id', 'mv_last_change',
             '_source', '_entity_type', '_ingested_at', '_batch_id',
         ),
         ('player_id', 'mv_date'),
@@ -2033,6 +2034,8 @@ _CAREER_CACHE_COLUMNS = {
             'transfer_id', 'player_id', 'transfer_date', 'event_season',
             'from_club_id', 'from_club_name', 'to_club_id', 'to_club_name',
             'fee_text', 'fee_eur', 'market_value_eur', 'is_upcoming',
+            'from_is_special', 'to_is_special', 'from_country_flag', 'to_country_flag',
+            'from_country_id', 'to_country_id', 'is_loan_end',
             '_source', '_entity_type', '_ingested_at', '_batch_id',
         ),
         ('transfer_id',),
