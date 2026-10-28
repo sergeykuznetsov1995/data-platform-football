@@ -24,10 +24,32 @@ def captured_players(evidence):
             if state[0] in {'success', 'authoritative_empty', 'valid_empty'}]
 
 
+def _previous_parser_output(payload, player, entity):
+    """Replay the pre-#1408 business semantics, retaining unchanged row keys."""
+    from scrapers.transfermarkt import scraper as tm
+    if entity == 'market_value_points':
+        parsed = tm._parse_mv_history(payload, player)
+        entries = [entry for entry in payload['list'] if isinstance(entry, dict)
+                   and tm._market_value_date(entry) is not None]
+        for row, entry in zip(parsed, entries, strict=True):
+            # The old parser copied y even when the displayed value was '-'.
+            row['value_eur'] = tm._coerce_int(entry.get('y'))
+    else:
+        parsed = tm._parse_transfers(payload, player)
+        entries = [entry for entry in payload['transfers'] if isinstance(entry, dict)]
+        for row, entry in zip(parsed, entries, strict=True):
+            row['fee_text'] = entry.get('fee')
+            row['fee_eur'] = tm._parse_tm_money_eur(entry.get('fee'))
+    return parsed
+
+
 def _raw_player(scraper, journal, frame, player, entity):
     """Validate original successful raw envelope/body and full parser output."""
-    from scrapers.transfermarkt.scraper import _parse_mv_history, _parse_transfers, PARSER_REVISION, SCHEMA_REVISION, MARKET_VALUE_POINT_COLUMNS, TRANSFER_EVENT_COLUMNS, _SCOPE_LINEAGE_COLUMNS, _apply_nullable_dtypes
+    from scrapers.transfermarkt.scraper import _parse_mv_history, _parse_transfers, MARKET_VALUE_POINT_COLUMNS, TRANSFER_EVENT_COLUMNS, _SCOPE_LINEAGE_COLUMNS, _apply_nullable_dtypes
     from scrapers.transfermarkt.models import stable_payload_hash
+    from scrapers.transfermarkt.revisions import (
+        PARSER_REVISION, SCHEMA_REVISION, PREVIOUS_CAREER_REVISIONS, CAREER_NULLABLE_ADDITIONS,
+    )
     from dags.utils.transfermarkt_current_write import _rows
     evidence = journal['evidence']
     selected = evidence.get('processed', evidence.get('checkpoint_ids', []))
@@ -53,7 +75,18 @@ def _raw_player(scraper, journal, frame, player, entity):
         key = 'list' if entity == 'market_value_points' else 'transfers'
         if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
             raise RuntimeError('supersession raw body is not the full typed endpoint')
-        parsed = (_parse_mv_history if entity == 'market_value_points' else _parse_transfers)(payload, player)
+        previous = False
+        if not frame.empty:
+            revisions = ['parser_revision', 'schema_revision']
+            if (not set(revisions) <= set(frame.columns) or frame[revisions].isna().any().any()):
+                raise RuntimeError('supersession missing physical parser/schema revision')
+            pairs = set(frame[revisions].itertuples(index=False, name=None))
+            if pairs != {(PARSER_REVISION, SCHEMA_REVISION)}:
+                if len(pairs) != 1 or not pairs <= PREVIOUS_CAREER_REVISIONS:
+                    raise RuntimeError('supersession unsupported physical parser/schema revision')
+                previous = True
+        parsed = (_previous_parser_output(payload, player, entity) if previous else
+                  (_parse_mv_history if entity == 'market_value_points' else _parse_transfers)(payload, player))
         if state[0] in {'authoritative_empty', 'valid_empty'}:
             if parsed or payload[key] or state[1] != 0 or not frame.empty:
                 raise RuntimeError('supersession typed empty disagrees with raw or physical rows')
@@ -61,14 +94,18 @@ def _raw_player(scraper, journal, frame, player, entity):
             if len(parsed) != int(state[1]) or len(parsed) != len(frame) or not parsed:
                 raise RuntimeError('supersession full raw row count differs')
             columns = [column for column in (MARKET_VALUE_POINT_COLUMNS if entity == 'market_value_points' else TRANSFER_EVENT_COLUMNS) if column not in _SCOPE_LINEAGE_COLUMNS]
+            if previous:
+                # Old captures cannot prove newly added facts. Only absent or
+                # entirely NULL additive fields may be omitted; populated
+                # additions and every original business field still compare.
+                columns = [column for column in columns if column not in CAREER_NULLABLE_ADDITIONS
+                           or (column in frame and not frame[column].isna().all())]
             projected = _apply_nullable_dtypes(pd.DataFrame(parsed).reindex(columns=columns))
             if not set(projected.columns) <= set(frame.columns) or _rows(projected) != _rows(frame[list(projected.columns)]):
                 raise RuntimeError('supersession full raw business fields differ')
             if (set(frame.source_url.astype(str)) != {capture.url}
                 or set(frame.source_body_hash.astype(str)) != {stable_payload_hash(payload)}
-                or any(pd.to_datetime(frame.fetched_at, utc=True) < pd.to_datetime(capture.fetched_at, utc=True))
-                or set(frame.parser_revision.astype(str)) != {PARSER_REVISION}
-                or set(frame.schema_revision.astype(str)) != {SCHEMA_REVISION}):
+                or any(pd.to_datetime(frame.fetched_at, utc=True) < pd.to_datetime(capture.fetched_at, utc=True))):
                 raise RuntimeError('supersession raw lineage differs from physical capture')
         return {'capture_id': capture.capture_id, 'body_hash': capture.content_hash,
                 'fetched_at': capture.fetched_at, 'url': capture.url, 'envelope': item}
