@@ -2508,3 +2508,114 @@ def test_carryover_sql_matches_only_the_exact_still_failed_observation():
         connection.execute("UPDATE fbref_control.observation_processing SET status = ?", (status,))
         assert connection.execute(query, (json.dumps([evidence]),)).fetchone() == (0,)
     connection.close()
+
+
+def _count_deferred_match_manifests(run_id, control):
+    """Run the store's manifest aggregation over the replay's actual records."""
+    captured = {}
+    evidence = control.run["metadata"]["deferred_parse_observations"]
+    evidence = [{**row, "failed_updated_at": "1793197265.000000"} for row in evidence]
+
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_type": "current", "metadata": {
+                "deferred_parse_observations": evidence,
+            }}], 1
+        if "SELECT manifest.validation_status" in sql:
+            assert "%" not in sql.replace("%s", "").replace("%%", "")
+            captured.update(sql=sql, params=params)
+        return [], 0
+
+    store, _ = make_store(handler)
+    store.get_run_summary(
+        run_id, parser_version=evidence[0]["parser_version"],
+        typed_parser_version=evidence[0]["typed_parser_version"],
+        stateful_parser_version=evidence[0]["stateful_parser_version"],
+    )
+    with sqlite3.connect(":memory:") as db:
+        db.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+        db.create_function("json_contains", 2, lambda haystack, needle: int(any(
+            all(row.get(key) == value for key, value in json.loads(needle)[0].items())
+            for row in json.loads(haystack)
+        )))
+        tables = {
+            "fetch_attempt": [{**row, "status": "succeeded"} for row in evidence],
+            "page_frontier": [{"target_id": row["target_id"], "state": "fetched"}
+                              for row in evidence],
+            "observation_processing": [{
+                **evidence[0], **next(iter(control.observations.values())),
+                "updated_at": evidence[0]["failed_updated_at"],
+            }],
+            "dataset_manifest": control.manifests,
+        }
+        for name, rows in tables.items():
+            columns = sorted(set().union(*(row.keys() for row in rows)))
+            db.execute(f"CREATE TABLE fbref_control.{name} (" +
+                       ", ".join(column + " TEXT" for column in columns) + ")")
+            db.executemany(f"INSERT INTO fbref_control.{name} VALUES (" +
+                           ",".join("?" for _ in columns) + ")", [
+                               tuple(row.get(column) for column in columns) for row in rows
+                           ])
+        # Only PostgreSQL syntax is translated; joins, filters, fences and
+        # GROUP BY are the production query captured above.
+        sql = captured["sql"].replace(
+            "extract(epoch from carried.updated_at)", "carried.updated_at",
+        ).replace("::text", "").replace(
+            "%s::jsonb @> jsonb_build_array(jsonb_build_object(",
+            "json_contains(?, json_array(json_object(",
+        ).replace("jsonb_build", "json").replace(
+            "'failed_updated_at', carried.updated_at )) )",
+            "'failed_updated_at', carried.updated_at ))) )",
+        ).replace("left(manifest.error_message, 2000)",
+                  "substr(manifest.error_message, 1, 2000)").replace("%s", "?").replace("%%", "%")
+        return dict(db.execute(sql, captured["params"]).fetchall())
+
+
+@pytest.mark.parametrize("unrelated", [None, "error_message", "parse_status", "parser_version", "dataset"])
+@pytest.mark.parametrize("batch_persist_enabled", [False, True])
+def test_deadline_typed_writer_failure_uses_real_manifest_counts(
+    tmp_path, unrelated, batch_persist_enabled,
+):
+    from trino.exceptions import TrinoConnectionError
+    from tests.unit.scrapers.test_fbref_pipeline import (
+        _deadline_match_run, _settings, FakeWriter, RunValidationError,
+        PAGE_DOCUMENT_VERSION,
+    )
+
+    control, pipeline, run_id, _, _ = _deadline_match_run(tmp_path)
+    pipeline.generic_writer = FakeWriter()
+    pipeline.batch_persist_enabled = batch_persist_enabled
+
+    def fail(*_args, **_kwargs):
+        raise TrinoConnectionError("failed to cancel typed query")
+
+    pipeline.typed_adapter.writer.persist_match = fail
+    result = pipeline.run_live_waves(
+        run_id, worker_id="typed-worker", page_kinds=["match"],
+        settings=_settings(), deadline_monotonic=5.0,
+    )
+    assert result.deadline_reached
+    assert result.parse.deferred_parse_failures == [
+        "fbref:match:0d4d2370:TrinoConnectionError"
+    ]
+    failed = [row for row in control.manifests
+              if row["dataset"].startswith("typed:") and row["validation_status"] == "failed"]
+    assert failed
+    if unrelated:
+        other = {**failed[0], "dataset": "typed:independent"}
+        other[unrelated] = {
+            "error_message": "independent data failure", "parse_status": "failed",
+            "parser_version": PAGE_DOCUMENT_VERSION, "dataset": "independent",
+        }[unrelated]
+        control.manifests.append(other)
+    counts = _count_deferred_match_manifests(run_id, control)
+    assert counts.get("failed", 0) == (1 if unrelated else 0)
+    summary = control.get_run_summary
+    control.get_run_summary = lambda *a, **kw: {
+        **summary(*a, **kw), "dataset_validation_counts": counts,
+    }
+    if unrelated:
+        with pytest.raises(RunValidationError, match="failed_dataset_manifests"):
+            pipeline.validate_and_finish(run_id, publication_eligible=False)
+    else:
+        pipeline.validate_and_finish(run_id, publication_eligible=False)

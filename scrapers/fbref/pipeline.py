@@ -5722,9 +5722,9 @@ class FBrefPipeline:
                 run_id=run_id,
                 target_identity=record.logical_refresh_id,
             )
-        except Exception:
+        except Exception as exc:
             self._record_typed_results(
-                record, parsed.datasets, persisted=None
+                record, parsed.datasets, persisted=None, error=exc
             )
             raise
         self._record_typed_results(record, parsed.datasets, persisted=counts)
@@ -5736,6 +5736,7 @@ class FBrefPipeline:
         parsed: Mapping[str, object],
         *,
         persisted: Optional[Mapping[str, int]],
+        error: Optional[Exception] = None,
         control=None,
     ) -> None:
         control_store = self.control if control is None else control
@@ -5766,9 +5767,15 @@ class FBrefPipeline:
                     else "skipped"
                 ),
                 row_count=int(getattr(dataset, "row_count", 0) or 0),
-                error_class=getattr(dataset, "error_type", None),
+                error_class=(
+                    type(error).__name__
+                    if failed and status != "error" and error is not None
+                    else getattr(dataset, "error_type", None)
+                ),
                 error_message=(
-                    getattr(dataset, "error_message", None)
+                    str(error)
+                    if failed and status != "error" and error is not None
+                    else getattr(dataset, "error_message", None)
                     or getattr(dataset, "reason", None)
                 ),
             )
@@ -5863,10 +5870,10 @@ class FBrefPipeline:
                 )
             else:
                 return
-        except Exception:
+        except Exception as exc:
             if "parsed" in locals():
                 self._record_typed_results(
-                    record, parsed, persisted=None
+                    record, parsed, persisted=None, error=exc
                 )
             raise
         self._record_typed_results(record, parsed, persisted=counts)

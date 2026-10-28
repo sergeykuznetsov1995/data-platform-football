@@ -7351,7 +7351,13 @@ class ControlStore:
                 "carried.status = 'failed'",
                 "carried.status = 'failed' "
                 "AND carried.error_class = manifest.error_class "
-                "AND carried.error_message = left(manifest.error_message, 2000)",
+                "AND carried.error_message = left(manifest.error_message, 2000) "
+                "AND ((manifest.dataset = '__page__' "
+                "AND manifest.parser_version = carried.parser_version) "
+                "OR (manifest.dataset LIKE 'typed:%%' "
+                "AND manifest.parser_version = carried.typed_parser_version "
+                "AND manifest.parse_status = 'succeeded' "
+                "AND manifest.persistence_status = 'failed'))",
             )
             summary["deferred_parse_observation_count"] = len(deferred)
             summary["deferred_parse_observations"] = deferred
@@ -7538,8 +7544,7 @@ class ControlStore:
                 WHERE attempt.run_id = %s AND attempt.status = 'succeeded'
                   AND frontier.state <> 'quarantined'
                   AND NOT (
-                    manifest.dataset = '__page__'
-                    AND manifest.validation_status = 'failed'
+                    manifest.validation_status = 'failed'
                     AND ({deferred_manifest_sql})
                   )
                   AND (
