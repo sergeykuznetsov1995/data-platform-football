@@ -339,6 +339,7 @@ def run_compaction(
     reserve=None,
     window_budget=None,
     partition_offsets=None,
+    connection_factory=None,
 ):
     """Re-read metadata for each portion; never replay paths or run retention.
 
@@ -377,7 +378,7 @@ def run_compaction(
     }
     result["stop_reason"] = "exhausted"
     portions_at_start = result["portions"]
-    raw = maintenance._get_trino_connection()
+    raw = (connection_factory or maintenance._get_trino_connection)()
     conn = _DeadlineConnection(raw, deadline, stop, lambda: None)
     try:
         conn.check()
@@ -466,6 +467,7 @@ def run_compaction(
                     result["portions"] += 1
                     result["input_bytes"] += sum(size for _, size in paths)
                     result["selected_files"] += len(paths)
+                    before = after = None
                     if not dry_run:
                         before = maintenance._fetch_scalar(
                             conn,
@@ -508,6 +510,8 @@ def run_compaction(
                         "files": len(paths),
                         "bytes": sum(size for _, size in paths),
                         "stats": stats,
+                        "files_before": before,
+                        "files_after": after,
                     }
                     logger.info("Bronze compaction portion: %s", event)
                     if record:
