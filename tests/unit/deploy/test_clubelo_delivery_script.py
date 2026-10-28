@@ -20,6 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -159,6 +160,7 @@ exec /bin/date -u -d "$(cat {ss}/now)" "${{args[@]}}"
         env = {
             "HOME": str(self.tmp), "TREE": str(self.tree), "REPO": str(self.repo),
             "STATE": str(self.state), "OUT": str(self.out), "TG_ENV": str(self.tg_env),
+            "CHECK_PY": sys.executable,
         }
         return subprocess.run(
             ["bash", str(self.installed), *args], env=env, capture_output=True, text=True, timeout=120,

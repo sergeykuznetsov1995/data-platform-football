@@ -198,7 +198,7 @@ COMPAT=$(mktemp -d) || stop "ОТМЕНА: временная копия"
 trap 'rm -rf "${COMPAT:?}"; [ -z "${CHECK_WORK:-}" ] || rm -rf "${CHECK_WORK:?}"' EXIT
 g archive "$SHA" | tar -x -C "$COMPAT" || stop "ОТМЕНА: git archive кандидата"
 CHECKER="$COMPAT/deploy/clubelo/check_compatibility.py"
-CHECK_PY=/root/.venvs/dpf-test/bin/python
+CHECK_PY="${CHECK_PY:-/root/.venvs/dpf-test/bin/python}"
 # Внешний timeout покрывает также чтение/копирование и ошибки тестового окружения.
 timeout 300 "$CHECK_PY" -I "$CHECKER" prepare "$COMPAT" "$TREE" $SHARED_PATHS \
   || stop "ОТМЕНА: совместимость ClubElo с общими модулями не подтверждена"
