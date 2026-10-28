@@ -323,6 +323,10 @@ def summarize_days(days: Iterable[DayResult]) -> int:
 
 
 __all__ = [
+    "compare_fotmob",
+    "render_anomaly_sql",
+    "render_fotmob_diagnostic_sql",
+    "source_diagnostic_summary",
     "COMPLETENESS_SQL",
     "DAILY_CRITERION_SQL",
     "FAILURES_RELATION",
@@ -335,3 +339,171 @@ __all__ = [
     "render_quarantine_sql",
     "summarize_days",
 ]
+
+
+# Independent diagnostics: do not alter the daily deadline/completeness meter.
+FOTMOB_COMPETITIONS = {
+    'ENG-Premier League': 47, 'ESP-La Liga': 87, 'GER-Bundesliga': 54,
+    'ITA-Serie A': 55, 'FRA-Ligue 1': 53, 'RUS-Premier League': 63,
+}
+
+
+def render_anomaly_sql(entity: str, season: str) -> str:
+    """Published rows across all six leagues, fenced by the latest attempt."""
+    allowed = ('understat_schedule', 'understat_player_match_stats', 'understat_shots')
+    if entity not in allowed:
+        raise ValueError('unsupported diagnostic entity')
+    render_completeness_sql(season)  # shared season validation
+    return f"""WITH latest AS (
+        SELECT league, season, batch_id, status, completed_at,
+               row_number() OVER (PARTITION BY league, season
+                   ORDER BY completed_at DESC, attempt_id DESC) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2' AND season = '{season}'
+    )
+    SELECT s.*, m.completed_at AS diagnostic_snapshot_at
+    FROM iceberg.bronze.{entity} s
+    JOIN latest m ON s.league = m.league AND s.season = m.season
+        AND s._batch_id = m.batch_id
+    WHERE m.rn = 1 AND m.status = 'complete'
+      AND s.league IN ({', '.join(repr(league) for league in FOTMOB_COMPETITIONS)})"""
+
+
+def render_fotmob_diagnostic_sql(season: str) -> str:
+    """Read FotMob's published current view, including snapshot timestamps."""
+    render_completeness_sql(season)
+    year = 2000 + int(season[:2])
+    return f"""SELECT competition_id, source_season_key, match_id, utc_time,
+        finished, home_team_name, away_team_name, home_score, away_score,
+        _ingested_at AS diagnostic_snapshot_at
+    FROM iceberg.bronze.fotmob_matches_current
+    WHERE CAST(competition_id AS varchar) IN ('47', '87', '54', '55', '53', '63')
+      AND source_season_key = '{year}/{year + 1}'"""
+
+
+def compare_fotmob(schedule, fotmob, *, team_aliases=None) -> str:
+    """Format counts and scores from DataFrames; None means unavailable.
+
+    Match only unique league/season/UTC-date/home/away keys. Exact normalized
+    names are the default; reviewed aliases may map (league, source name) to
+    a shared team name. Unmatched or ambiguous rows remain visible.
+    """
+    from collections import defaultdict
+    import pandas as pd
+
+    aliases = team_aliases or {}
+
+    def name(league, value):
+        if pd.isna(value):
+            return None
+        return str(aliases.get((league, str(value)), value)).strip().casefold()
+
+    def key(row, other=False):
+        league = row.get('league')
+        if other:
+            league = next((key for key, value in FOTMOB_COMPETITIONS.items()
+                           if str(value) == str(row.get('competition_id'))), None)
+        stamp = pd.to_datetime(row.get('utc_time' if other else 'date'), utc=True, errors='coerce')
+        season = str(row.get('source_season_key')) if other else str(row.get('season'))
+        if other:
+            parts = season.split('/')
+            season = ''.join(part[-2:] for part in parts) if len(parts) == 2 else None
+        home = name(league, row.get('home_team_name' if other else 'home_team'))
+        away = name(league, row.get('away_team_name' if other else 'away_team'))
+        if league is None or pd.isna(stamp) or not home or not away or season is None:
+            return None
+        return league, season, str(stamp.date()), home, away
+
+    def played(frame, flag):
+        if frame is None or frame.empty:
+            return None
+        return [row for row in frame.to_dict('records')
+                if not pd.isna(row.get(flag)) and row.get(flag) == True]
+
+    under = played(schedule, 'is_result')
+    other = played(fotmob, 'finished')
+
+    def snapshot(frame):
+        if frame is None or frame.empty or 'diagnostic_snapshot_at' not in frame:
+            return 'n/a'
+        values = frame['diagnostic_snapshot_at'].dropna().astype(str)
+        return ','.join(sorted(set(values))) if len(values) else 'n/a'
+
+    expected = set(FOTMOB_COMPETITIONS)
+    u_scopes = set() if schedule is None or 'league' not in schedule else set(schedule['league'].dropna())
+    f_scopes = set() if fotmob is None or 'competition_id' not in fotmob else {
+        league for league, competition in FOTMOB_COMPETITIONS.items()
+        if str(competition) in set(fotmob['competition_id'].dropna().astype(str))}
+    missing_scopes = f"; missing_scopes U={sorted(expected - u_scopes)}, F={sorted(expected - f_scopes)}"
+    prefix = f"FotMob: played Understat={len(under) if under is not None else 'n/a'}, FotMob={len(other) if other is not None else 'n/a'}"
+    times = f"; snapshots U={snapshot(schedule)}, F={snapshot(fotmob)}"
+    if under is None or other is None or not under or not other:
+        return prefix + '; delta=n/a; scores=n/a; unmatched=n/a' + times + missing_scopes
+    indexes = []
+    for rows, is_other in ((under, False), (other, True)):
+        index = defaultdict(list)
+        for row in rows:
+            index[key(row, is_other)].append(row)
+        indexes.append(index)
+    left, right = indexes
+    matched = 0
+    mismatches = []
+    unavailable = 0
+    for identity, rows in left.items():
+        candidates = right.get(identity, [])
+        if identity is None or len(rows) != 1 or len(candidates) != 1:
+            continue
+        matched += 1
+        u, f = rows[0], candidates[0]
+        us = [pd.to_numeric(u.get(col), errors='coerce') for col in ('home_goals', 'away_goals')]
+        fs = [pd.to_numeric(f.get(col), errors='coerce') for col in ('home_score', 'away_score')]
+        if any(pd.isna(value) for value in (*us, *fs)):
+            unavailable += 1
+        elif [int(value) for value in us] != [int(value) for value in fs]:
+            mismatches.append(f"{u['game_id']}/{f['match_id']} {us}/{fs}")
+    complete = expected <= u_scopes and expected <= f_scopes
+    delta = f"{len(under) - len(other):+d}" if complete else 'n/a'
+    per_league = {}
+    for league, competition in FOTMOB_COMPETITIONS.items():
+        if league not in u_scopes or league not in f_scopes:
+            per_league[league] = 'n/a'
+        else:
+            uc = sum(row.get('league') == league for row in under)
+            fc = sum(str(row.get('competition_id')) == str(competition) for row in other)
+            per_league[league] = f"U={uc},F={fc},delta={uc - fc:+d}"
+    return (prefix + f'; delta={delta}; matched={matched}; '
+            f'scores={len(mismatches)} [{", ".join(mismatches)}]; scores_n/a={unavailable}; '
+            f'unmatched U={len(under) - matched}, F={len(other) - matched}' + times
+            + missing_scopes + f'; leagues={per_league}')
+
+
+def source_diagnostic_summary(query_frame, season: str, *, team_aliases=None) -> str:
+    """Morning-report entry point; query_frame(SELECT) returns a DataFrame.
+
+    Failed/unavailable reads produce n/a, never a fabricated zero. No writes,
+    DDL or source HTTP requests. All-league clone detection runs once.
+    """
+    from scrapers.understat.anomalies import diagnose_matches
+
+    render_completeness_sql(season)
+    frames = {}
+    missing = []
+    for entity in ('understat_schedule', 'understat_player_match_stats', 'understat_shots'):
+        try:
+            frames[entity] = query_frame(render_anomaly_sql(entity, season))
+        except Exception:
+            missing.append(entity)
+    try:
+        fotmob = query_frame(render_fotmob_diagnostic_sql(season))
+    except Exception:
+        fotmob = None
+    signals = diagnose_matches(frames)
+    from collections import Counter
+    counts = dict(sorted(Counter(signal['code'] for signal in signals).items()))
+    affected = sorted({tuple(match) for signal in signals
+                       for match in signal['details'].get('matches',
+                           [signal['details']['match']] if 'match' in signal['details'] else [])})
+    # Keep the morning line bounded; complete warnings remain in scope quality.
+    diagnostic = f"{counts}; affected={affected[:20]} ({len(affected)} total)"
+    return (compare_fotmob(frames.get('understat_schedule'), fotmob, team_aliases=team_aliases)
+            + '; anomalies=' + diagnostic + '; unavailable=' + (','.join(missing) or 'none'))

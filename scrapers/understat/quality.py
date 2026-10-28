@@ -1268,6 +1268,13 @@ def validate_understat_scope(
                         affected_team_count=len(dimension_gaps),
                     )
 
+    from scrapers.understat.anomalies import diagnose_matches
+
+    issues.extend(
+        QualityIssue(code=signal["code"], message="Source anomaly (diagnostic only)",
+                     details=signal["details"])
+        for signal in diagnose_matches(normalized_frames)
+    )
     hard_issues = [issue for issue in issues if issue.status is not None]
     if any(issue.status is ManifestStatus.SCHEMA_DRIFT for issue in hard_issues):
         status = ManifestStatus.SCHEMA_DRIFT

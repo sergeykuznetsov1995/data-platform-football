@@ -1,0 +1,4 @@
+/home/airflow/soccerdata/data/UnderstatNative/match_30804.json 2026-10-28 09:39:46.467827700 +0000
+/home/airflow/soccerdata/data/UnderstatNative/match_31948.json 2026-10-28 09:59:13.159232259 +0000
+/home/airflow/soccerdata/data/UnderstatNative/match_30539.json 2026-10-28 10:58:58.551568776 +0000
+источник: airflow-scheduler $HOME/soccerdata/data/UnderstatNative (боевой кэш), скопировано лидом 2026-10-28 21:17 МСК

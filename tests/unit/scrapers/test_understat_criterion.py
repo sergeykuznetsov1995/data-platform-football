@@ -434,3 +434,108 @@ def test_site_result_seen_by_a_journaled_failure_is_not_a_site_delay(synthetic):
     assert synthetic("2026-10-12") == DayResult(
         "2026-10-12", due=3, ok=1, site_late=0
     )
+
+
+def test_fotmob_summary_counts_scores_unmatched_ambiguity_and_unavailable():
+    import pandas as pd
+    from scrapers.understat.criterion import compare_fotmob, source_diagnostic_summary
+
+    u = pd.DataFrame([dict(league='ENG-Premier League', season='2627', game_id=1,
+        date='2026-10-01T12:00:00Z', is_result=True, home_team='A', away_team='B',
+        home_goals=0, away_goals=0, diagnostic_snapshot_at='2026-10-02')])
+    f = pd.DataFrame([dict(competition_id=47, source_season_key='2026/2027', match_id=2,
+        utc_time='2026-10-01T13:00:00Z', finished=True, home_team_name='a', away_team_name='B',
+        home_score=2, away_score=2, diagnostic_snapshot_at='2026-10-03')])
+    line = compare_fotmob(u, f)
+    assert 'delta=n/a; matched=1; scores=1' in line
+    assert 'U=1,F=1,delta=+0' in line
+    assert 'missing_scopes U=' in line and 'RUS-Premier League' in line
+    assert '1/2' in line and 'unmatched U=0, F=0' in line
+    assert 'snapshots U=2026-10-02, F=2026-10-03' in line
+    assert 'scores=n/a' in compare_fotmob(u, None)
+    ambiguous = pd.concat([f, f.assign(match_id=3)])
+    line = compare_fotmob(u, ambiguous)
+    assert 'delta=n/a; matched=0' in line
+    assert 'U=1,F=2,delta=-1' in line and 'unmatched U=1, F=2' in line
+    assert 'matched=0' in compare_fotmob(u, f.assign(competition_id=63))
+    def query(sql):
+        if 'fotmob_matches_current' in sql:
+            return f
+        if 'bronze.understat_schedule' in sql:
+            return u
+        return pd.DataFrame()
+    assert 'scores=1' in source_diagnostic_summary(query, '2627')
+    def unavailable(sql):
+        raise RuntimeError('offline')
+    assert 'played Understat=n/a, FotMob=n/a' in source_diagnostic_summary(unavailable, '2627')
+
+
+def test_diagnostic_queries_are_select_only_and_preserve_publication_fences():
+    from scrapers.understat.criterion import render_anomaly_sql, render_fotmob_diagnostic_sql
+    for entity in ('understat_schedule', 'understat_shots', 'understat_player_match_stats'):
+        sql = render_anomaly_sql(entity, '2627')
+        assert "m.rn = 1 AND m.status = 'complete'" in sql
+        assert 's._batch_id = m.batch_id' in sql
+        assert 'RUS-Premier League' in sql and 'FRA-Ligue 1' in sql
+    fotmob_sql = render_fotmob_diagnostic_sql('2627')
+    assert "source_season_key = '2026/2027'" in fotmob_sql
+    # Bronze FotMob IDs are VARCHAR; Trino rejects comparison to numeric IN literals.
+    assert "CAST(competition_id AS varchar) IN ('47', '87', '54', '55', '53', '63')" in fotmob_sql
+    with pytest.raises(ValueError):
+        render_anomaly_sql('oops', '2627')
+
+
+def test_diagnostic_snapshot_sql_executes_and_hides_failed_latest_batches(synthetic):
+    import sqlglot
+    from scrapers.understat.criterion import render_anomaly_sql
+    con = synthetic.con
+    # The fixture's generic league is outside the six supported leagues.
+    con.execute("UPDATE ops.understat_ingest_manifest_v1 SET league='FRA-Ligue 1'")
+    con.execute("UPDATE bronze.understat_schedule SET league='FRA-Ligue 1'")
+    sql = sqlglot.transpile(render_anomaly_sql('understat_schedule', '2627'),
+                           read='trino', write='duckdb')[0]
+    sql = sql.replace('iceberg.ops.', 'ops.').replace('iceberg.bronze.', 'bronze.')
+    assert len(con.execute(sql).fetchall()) == 6  # excludes old batch b2
+    con.execute("INSERT INTO ops.understat_ingest_manifest_v1 VALUES "
+                "('FRA-Ligue 1','2627','understat-bronze-v2','bad','a9',"
+                "'contract_failure','2026-10-14T09:00:00+00:00','{}')")
+    assert con.execute(sql).fetchall() == []
+
+
+def test_fotmob_totals_require_all_six_published_scopes_and_show_real_delta():
+    import pandas as pd
+    from scrapers.understat.criterion import compare_fotmob, FOTMOB_COMPETITIONS
+    under, other = [], []
+    for league, competition in FOTMOB_COMPETITIONS.items():
+        under.append(dict(league=league, season='2627', game_id=1, date='2026-10-01',
+                          is_result=True, home_team='A', away_team='B', home_goals=0, away_goals=0))
+        other.append(dict(competition_id=str(competition), source_season_key='2026/2027',
+                          match_id=2, utc_time='2026-10-01', finished=True,
+                          home_team_name='A', away_team_name='B', home_score=0, away_score=0))
+    other.append({**other[0], 'match_id': 3, 'utc_time': '2026-10-02'})
+    line = compare_fotmob(pd.DataFrame(under), pd.DataFrame(other))
+    assert 'delta=-1; matched=6; scores=0' in line
+    assert 'unmatched U=0, F=1' in line
+    # A failed Understat scope disappears behind its fence; it is unknown,
+    # not a zero-match league to subtract from FotMob.
+    line = compare_fotmob(pd.DataFrame(under[:-1]), pd.DataFrame(other))
+    assert 'delta=n/a' in line
+    assert "'RUS-Premier League': 'n/a'" in line
+
+
+def test_fotmob_diagnostic_sql_reads_only_selected_season_and_competitions(synthetic):
+    import sqlglot
+    from scrapers.understat.criterion import render_fotmob_diagnostic_sql
+    con = synthetic.con
+    con.execute('CREATE TABLE bronze.fotmob_matches_current ('
+                'competition_id varchar, source_season_key varchar, match_id varchar,'
+                'utc_time varchar, finished boolean, home_team_name varchar, away_team_name varchar,'
+                'home_score integer, away_score integer, _ingested_at timestamp)')
+    con.executemany('INSERT INTO bronze.fotmob_matches_current VALUES (?,?,?,?,?,?,?,?,?,?)', [
+        ('47', '2026/2027', '1', '2026-10-01', True, 'A', 'B', 1, 0, '2026-10-02'),
+        ('47', '2025/2026', '2', '2025-10-01', True, 'A', 'B', 1, 0, '2026-10-02'),
+        ('999', '2026/2027', '3', '2026-10-01', True, 'A', 'B', 1, 0, '2026-10-02'),
+    ])
+    sql = sqlglot.transpile(render_fotmob_diagnostic_sql('2627'), read='trino', write='duckdb')[0]
+    rows = con.execute(sql.replace('iceberg.bronze.', 'bronze.')).fetchall()
+    assert len(rows) == 1 and rows[0][2] == '1'
