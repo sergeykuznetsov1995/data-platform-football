@@ -55,6 +55,7 @@ EXPECTED_RUNTIME_FILES = (
     "dags/scripts/whoscored_rollout_acceptance.py",
     "dags/utils/__init__.py",
     "dags/utils/alerts.py",
+    "dags/utils/bronze_compaction.py",
     "dags/utils/config.py",
     "dags/utils/default_args.py",
     "dags/utils/maintenance_tasks.py",

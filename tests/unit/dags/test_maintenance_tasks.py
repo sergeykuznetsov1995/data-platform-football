@@ -432,7 +432,7 @@ class TestBoundedLiveFileCompaction:
         assert "count_if(content IS DISTINCT FROM 0) AS delete_files_count" in sql
         assert "small_data_files_count >= 2" in sql
         assert "delete_files_count = 0" in sql
-        assert "ORDER BY first_small_file_path" in sql
+        assert "ORDER BY partition" in sql
         assert "IS NOT DISTINCT FROM" in sql
         assert f"LIMIT {maintenance.COMPACTION_DISCOVERY_MAX_FILES}" in sql
         assert "row_number() OVER (ORDER BY file_path)" in sql

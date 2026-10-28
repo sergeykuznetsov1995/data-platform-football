@@ -4,11 +4,9 @@ Iceberg Maintenance — Daily (high-churn bronze)
 
 Daily `expire_snapshots` and `remove_orphan_files` for a curated allow-list of
 high-churn Bronze tables (delete-then-insert pattern from daily ingest DAGs).
-The same run performs one bounded compaction invocation, prioritizing
-WhoScored; the weekly all-table DAG compacts the other feeds. This keeps the
-whole daily DagRun within four tables / 2 GiB selected input. Other feeds
-retain 3d; WhoScored retains 14d so a bad publication has a practical Iceberg
-rollback window in addition to raw replay.
+A separate serial pass compacts physical Bronze tables at 02:00–05:00 UTC,
+with at most 120 portions / 8 GiB. Other feeds retain 3d; WhoScored retains
+14d for rollback. Compaction does not repeat retention.
 Any per-table failure fails its Airflow task and reaches the normal alerting
 callback instead of producing a false-green maintenance run.
 
@@ -31,13 +29,6 @@ from airflow.sensors.python import PythonSensor
 from utils.default_args import SILVER_ARGS
 
 
-def _compaction_rotation(context: Dict[str, Any]) -> int | None:
-    """Stable daily sequence: retries keep the same rotation key."""
-
-    logical_date = context.get("logical_date")
-    return logical_date.date().toordinal() if logical_date is not None else None
-
-
 def _fail_on_partial_maintenance(
     result: Dict[str, Any], *, group: str
 ) -> Dict[str, Any]:
@@ -52,6 +43,19 @@ def _fail_on_partial_maintenance(
     return result
 
 
+def _check_maintenance_run(**context):
+    from airflow.exceptions import AirflowFailException
+
+    failures = [
+        ti.task_id
+        for ti in context["dag_run"].get_task_instances()
+        if ti.task_id != context["task"].task_id
+        and ti.state in {"failed", "upstream_failed"}
+    ]
+    if failures:
+        raise AirflowFailException(f"Iceberg maintenance failed: {', '.join(failures)}")
+
+
 def _maintain_whoscored(**_ctx) -> Dict[str, Any]:
     from utils.maintenance_tasks import (
         WHOSCORED_DAILY_RETENTION,
@@ -63,8 +67,7 @@ def _maintain_whoscored(**_ctx) -> Dict[str, Any]:
         schemas=("bronze",),
         retention_threshold=WHOSCORED_DAILY_RETENTION,
         table_filter=WHOSCORED_HIGH_CHURN,
-        compact_live_files=True,
-        compaction_rotation=_compaction_rotation(_ctx),
+        compact_live_files=False,
     )
     return _fail_on_partial_maintenance(result, group="WhoScored")
 
@@ -91,6 +94,17 @@ def _maintain_other_high_churn(**_ctx) -> Dict[str, Any]:
     return _fail_on_partial_maintenance(result, group="other high-churn feeds")
 
 
+def _compact_bronze(**context):
+    from utils.bronze_compaction import compact_nightly
+
+    result = compact_nightly(reschedule_on_busy=True, **context)
+    if result is False:
+        return False
+    _fail_on_partial_maintenance(result, group="Bronze compaction")
+    from airflow.sensors.base import PokeReturnValue
+    return PokeReturnValue(is_done=True, xcom_value=result)
+
+
 def _maintain_fbref_stages(*, reschedule_on_busy=False, **_ctx):
     from utils.fbref_maintenance import maintain_fbref_stages_with_lock_wait
 
@@ -115,6 +129,19 @@ with DAG(
     tags=["maintenance", "iceberg", "cleanup", "daily"],
     doc_md=__doc__,
 ) as dag:
+    compact_bronze = PythonSensor(
+        task_id="compact_bronze",
+        retries=0,
+        python_callable=_compact_bronze,
+        mode="reschedule",
+        poke_interval=5,
+        timeout=3 * 60 * 60,
+        execution_timeout=timedelta(hours=3),
+        pool="fbref_scraper_pool",
+        priority_weight=10,
+        weight_rule="absolute",
+    )
+
     cleanup_whoscored_dq_stage = PythonOperator(
         task_id="cleanup_whoscored_dq_stage_partitions",
         python_callable=_cleanup_whoscored_dq_stage,
@@ -154,3 +181,19 @@ with DAG(
     fbref_stage_janitor >> cleanup_whoscored_dq_stage
     fbref_stage_janitor >> maintain_other_high_churn
     cleanup_whoscored_dq_stage >> maintain_whoscored
+
+    compact_bronze >> fbref_stage_janitor
+
+    check_maintenance_run = PythonOperator(
+        task_id="check_maintenance_run",
+        python_callable=_check_maintenance_run,
+        trigger_rule="all_done",
+    )
+    for task in (
+        compact_bronze,
+        fbref_stage_janitor,
+        cleanup_whoscored_dq_stage,
+        maintain_whoscored,
+        maintain_other_high_churn,
+    ):
+        task >> check_maintenance_run
