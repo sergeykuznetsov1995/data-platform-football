@@ -47,13 +47,13 @@ REQUIRED = {
 }
 
 
-RUNTIME_MODULES = (DEPLOY / "release-1292.env").read_text().split("FOTMOB_RUNTIME_HASHES=")[1].strip().split("|")
+RUNTIME_MODULES = (DEPLOY / "release-1292.env").read_text().split("FOTMOB_RUNTIME_HASHES=")[1].splitlines()[0].split("|")
 
 
 PACKAGE_KEYS = {
     "FOTMOB_TARGET", "FOTMOB_ROLLBACK_REF", "FOTMOB_ROLLBACK_SHA",
     "FOTMOB_NEW_CODE_FILE", "FOTMOB_NEW_CODE_MD5", "FOTMOB_REPOSITORY_MD5",
-    "FOTMOB_RUNTIME_HASHES",
+    "FOTMOB_RUNTIME_HASHES", "FOTMOB_REQUIRED_MODULES",
 }
 
 
@@ -93,6 +93,7 @@ def _layout(tmp_path: Path) -> dict[str, str]:
         "FOTMOB_VALIDATION_ROOT": str(tmp_path / "validation"),
         "FOTMOB_REPOSITORY_MD5": "0" * 32,
         "FOTMOB_RUNTIME_HASHES": "|".join("a" * 64 + " " + item.split(" ", 1)[1] for item in RUNTIME_MODULES),
+        "FOTMOB_REQUIRED_MODULES": "|".join(item.split(" ", 1)[1] for item in RUNTIME_MODULES),
         # Короткие SHA, как `git rev-parse --short`: автомат сравнивает пины с ним по префиксу.
         "FOTMOB_TARGET": "11111111",
         "FOTMOB_ROLLBACK_REF": "22222222",
@@ -215,12 +216,12 @@ def test_auto_deliver_fails_closed_on_a_missing_pin(tmp_path: Path) -> None:
     proc = _run(AUTO, env_file=env_file)
     assert proc.returncode != 0
     assert "FOTMOB_TARGET" in proc.stderr
-    assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
+    assert "пакет доставки" in (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-pending-alert").read_text()
     # Значение из окружения (cron-строка, забытый export) файл без ключа не заменяет.
     proc = _run(AUTO, env_file=env_file, extra_env={"FOTMOB_TARGET": "deadbee"})
     assert proc.returncode != 0
     assert "FOTMOB_TARGET" in proc.stderr
-    assert not Path(values["FOTMOB_LOG"]).exists(), "автомат не сделал ни шага"
+    assert "ПАКЕТ ДОСТАВКИ" in Path(values["FOTMOB_LOG"]).read_text()
 
 
 @pytest.mark.unit
@@ -240,7 +241,7 @@ def test_scripts_refuse_a_pin_that_is_not_a_short_sha(tmp_path: Path, key: str, 
         proc = _run(script, "check", env_file=env_file)
         assert proc.returncode == 2, (script.name, proc.stderr)
         assert key in proc.stderr and "короткий SHA" in proc.stderr, (script.name, proc.stderr)
-        assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
+        assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-b6-inflight").exists()
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -299,7 +300,8 @@ def test_b6_refuses_a_production_apply_outside_the_automaton(tmp_path: Path) -> 
 
 
 @pytest.mark.unit
-def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mutate_validation", [False, True])
+def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_path: Path, mutate_validation: bool) -> None:
     """Настоящий автомат против заглушек: окно — из date, живые раннеры — из pgrep, метабаза
     и контейнер — из docker. Автомат берёт замок в каталоге состояния из env-файла (по
     СЫРОМУ пути, с хвостовым `/`), выписывает одноразовый пропуск и зовёт СОСЕДНИЙ
@@ -333,6 +335,9 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     # `sleep 5` — ожидание старта драйвера кампании: заглушке драйвера нужно мгновение,
     # чтобы оставить след; остальные ожидания (приёмка, 90 с) — мгновенны.
     _stub(stubs, "sleep", '[ "$1" = 5 ] && exec /bin/sleep 1\nexit 0\n')
+    if mutate_validation:
+        _stub(stubs, "sleep", f'[ "$1" = 90 ] && touch "{validation}/changed"\n'
+              '[ "$1" = 5 ] && exec /bin/sleep 1\nexit 0\n')
     driver_started = campaign / "state" / "driver-started"
     _stub(campaign, "driver.sh", f'touch "{driver_started}"\nexit 0\n')
     _stub(
@@ -355,10 +360,17 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     )
     auto = _install(tmp_path, stubs)
     proc = _run(auto, env_file=env_file, stubs=stubs)
+    if mutate_validation:
+        assert proc.returncode == 1, proc.stderr + proc.stdout
+        assert _git(repo, "rev-parse", "HEAD") == one
+        assert "ОТКАЗ: validation tree грязное" in Path(values["FOTMOB_LOG"]).read_text()
+        assert "B6 ДОСТАВЛЕН" not in Path(values["FOTMOB_LOG"]).read_text()
+        return
     assert proc.returncode == 0, proc.stderr + proc.stdout
     log = Path(values["FOTMOB_LOG"]).read_text(encoding="utf-8")
     assert "ОКНО ОТКРЫТО" in log and f"{auto.parent}/b6_deliver.sh apply" in log, "b6 — сосед автомата"
     assert "окно открыто" in log and "B6 ДОСТАВЛЕН" in log, "вывод b6 уходит в лог автомата"
+    assert (state / "fotmob-recovery.env").read_bytes() == env_file.with_suffix(".release").read_bytes()
     assert "приёмка подтверждена" in log and f"ДОСТАВЛЕНО: HEAD={two_short}" in log
     assert "кампания истории запущена" in log
     assert _git(repo, "rev-parse", "HEAD") == two
@@ -961,7 +973,8 @@ def test_one_package_pointer_switches_both_scripts_and_pins_the_handoff(tmp_path
         "FOTMOB_NEW_CODE_MD5": "b" * 32, "FOTMOB_REPOSITORY_MD5": "c" * 32,
         "FOTMOB_RUNTIME_HASHES": "|".join("d" * 64 + " " + item.split(" ", 1)[1] for item in RUNTIME_MODULES),
     }
-    package = _write_env(tmp_path / "next.release", **second_values)
+    package = _write_env(tmp_path / "next.release", **second_values,
+                         FOTMOB_REQUIRED_MODULES=values["FOTMOB_REQUIRED_MODULES"])
     text = env_file.read_text(encoding="utf-8")
     env_file.write_text(text.replace(old[-2], str(package)), encoding="utf-8")
     for probe in (auto, b6):
@@ -990,7 +1003,7 @@ def test_incomplete_package_refuses_both_scripts_before_any_action(tmp_path: Pat
         proc = _run(script, env_file=env_file, extra_env={key: "stale"})
         assert proc.returncode == 2
         assert key in proc.stderr
-    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir())
+    assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-b6-inflight").exists()
 
 
 @pytest.mark.unit
@@ -1011,4 +1024,145 @@ def test_package_cannot_weaken_fingerprints_or_change_host_paths(tmp_path: Path,
     for script in (AUTO, B6):
         result = _run(script, env_file=env_file)
         assert result.returncode == 2, result.stderr
-    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir())
+    assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-b6-inflight").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["missing", "production", "wrong-head", "dirty"])
+def test_review_validation_preflight_refuses_before_checkout(tmp_path: Path, bad: str) -> None:
+    values = _layout(tmp_path)
+    repo = Path(values["FOTMOB_RELEASE_ROOT"])
+    one, two = _two_commits(repo)
+    validation = Path(values["FOTMOB_VALIDATION_ROOT"])
+    if bad != "missing":
+        _git(tmp_path, "clone", "-q", str(repo), str(validation))
+        _git(validation, "checkout", "-q", "--detach", one if bad == "wrong-head" else two)
+        if bad == "dirty":
+            (validation / "a.txt").write_text("dirty")
+    if bad == "production":
+        values["FOTMOB_VALIDATION_ROOT"] = str(repo)
+    values.update(FOTMOB_TARGET=two[:8], FOTMOB_ROLLBACK_SHA=one[:8], FOTMOB_ROLLBACK_REF=one[:8])
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    _stub(stubs, "pgrep", "exit 1\n")
+    _stub(stubs, "docker", "echo 0\n")
+    proc = _run(B6, "check", env_file=env_file, stubs=stubs)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ОТКАЗ:" in proc.stderr
+    assert _git(repo, "rev-parse", "HEAD") == one
+
+
+@pytest.mark.unit
+def test_review_repository_md5_exec_failure_has_a_refusal(tmp_path: Path) -> None:
+    # Реальная секция приёмки; lock/checkout не нужны для проверки set -e.
+    section = B6.read_text().split('say "4.', 1)[1].split('parse_left=', 1)[0]
+    probe = tmp_path / "probe.sh"
+    probe.write_text('set -euo pipefail\nsay(){ :; }; die(){ echo "ОТКАЗ: $*" >&2; exit 1; }\n'
+                     'SCHED=s; METADB=m; TREE=t; ROLLBACK_REF=r; NEW_CODE_FILE=/new; '
+                     'NEW_CODE_MD5=' + '0' * 32 + '; FOTMOB_REPOSITORY_MD5=' + '0' * 32 + '\n'
+                     'say "4.' + section)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _stub(stubs, "sleep", "exit 0\n")
+    _stub(stubs, "docker", 'case "$*" in *repository.py*) exit 42;; *md5sum*) echo ' + '0' * 32 + ';; *) echo 0;; esac\n')
+    proc = _run(probe, env_file=tmp_path / "unused", stubs=stubs)
+    assert proc.returncode == 1
+    assert "ОТКАЗ:" in proc.stderr and "repository.py" in proc.stderr
+
+
+@pytest.mark.unit
+def test_review_timeout_covers_b6_budget() -> None:
+    import re
+    seconds = int(re.search(r'DELIVER_TIMEOUT=\$\{DELIVER_TIMEOUT:-(\d+)\}', AUTO.read_text())[1])
+    # 31 sha + 2 md5 + 16 parse polls + 3 other metadb calls, 19-file suite.
+    assert seconds >= 90 + 300 + 52 * 10 + 900 + 300
+
+
+@pytest.mark.unit
+def test_review_runtime_composition_is_owned_by_package(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    values["FOTMOB_REQUIRED_MODULES"] = "/opt/airflow/new.py"
+    values["FOTMOB_RUNTIME_HASHES"] = "a" * 64 + " /opt/airflow/new.py"
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    probe = _pin_probe(B6, tmp_path)
+    result = _run(probe, env_file=env_file)
+    assert result.returncode == 0, result.stderr
+    # Новый состав — из пакета, но неполный manifest по-прежнему запрещён.
+    with env_file.with_suffix(".release").open("a") as file:
+        file.write("FOTMOB_REQUIRED_MODULES=/opt/airflow/new.py|/opt/airflow/other.py\n")
+    result = _run(probe, env_file=env_file)
+    assert result.returncode == 2 and "нет runtime fingerprint" in result.stderr
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["md5", "sha", "path", "duplicate"])
+def test_review_bad_package_explains_refusal(tmp_path: Path, bad: str) -> None:
+    values = _layout(tmp_path)
+    if bad == "md5":
+        values["FOTMOB_NEW_CODE_MD5"] = "bad"
+    elif bad == "sha":
+        values["FOTMOB_RUNTIME_HASHES"] = "bad /opt/airflow/x.py"
+    elif bad == "path":
+        values["FOTMOB_NEW_CODE_FILE"] = "/outside"
+    else:
+        values["FOTMOB_RUNTIME_HASHES"] += "|" + values["FOTMOB_RUNTIME_HASHES"].split("|")[0]
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    result = _run(B6, "check", env_file=env_file)
+    assert result.returncode == 2
+    assert result.stderr.strip(), "отказ пакета обязан объяснять причину"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("broken", ["missing", "corrupt"])
+def test_review_broken_package_does_not_prevent_inflight_rollback(tmp_path: Path, broken: str) -> None:
+    w = _phase2_world(tmp_path, "")
+    recovery = w["state"] / "fotmob-recovery.env"
+    shutil.copy(w["env_file"].with_suffix(".release"), recovery)
+    (w["state"] / "fotmob-b6-inflight").touch()
+    package = w["env_file"].with_suffix(".release")
+    if broken == "missing":
+        package.unlink()
+    else:
+        package.write_text("bad\n")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"], proc.stderr
+    assert not (w["state"] / "fotmob-b6-inflight").exists()
+    assert "восстановление подтверждено" in w["log"].read_text()
+
+
+@pytest.mark.unit
+def test_review_bad_package_without_recovery_alerts(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    env_file.with_suffix(".release").unlink()
+    (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-b6-inflight").touch()
+    proc = _run(AUTO, env_file=env_file)
+    assert proc.returncode == 2
+    assert "пакет доставки" in (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-pending-alert").read_text()
+
+
+@pytest.mark.unit
+def test_review_bad_package_preserves_first_wave_rollback(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__bad|failed|2026-09-08T00:00:10|refresh",
+                      runner_err="[ERROR] __main__: boom\n")
+    shutil.copy(w["env_file"].with_suffix(".release"), w["state"] / "fotmob-recovery.env")
+    w["env_file"].with_suffix(".release").write_text("bad\n")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert "ОТКАТ ПО КРАСНОЙ ВОЛНЕ ПОДТВЕРЖДЁН" in w["log"].read_text()
+
+
+@pytest.mark.unit
+def test_review_recovery_package_cannot_start_new_delivery(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "")
+    _git(w["repo"], "checkout", "-q", "--detach", w["one"])
+    shutil.copy(w["env_file"].with_suffix(".release"), w["state"] / "fotmob-recovery.env")
+    w["env_file"].with_suffix(".release").write_text("bad\n")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 2, proc.stderr
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert not list(w["state"].glob("fotmob-auto-deliver-attempted-*"))
+    assert not w["driver_started"].exists()

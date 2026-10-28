@@ -55,14 +55,32 @@ ENV_FILE="${FOTMOB_ENV_FILE:-/etc/data-platform/fotmob.env}"
 # shellcheck source=deploy/fotmob/env.sh
 . "$HERE/env.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
-fotmob_load_package "${FOTMOB_DELIVERY_PACKAGE:?FOTMOB_DELIVERY_PACKAGE не задан}" || exit 2
-export FOTMOB_PINNED_PACKAGE="$PACKAGE_FILE" FOTMOB_PINNED_DIGEST="$PACKAGE_DIGEST"
+# При оборванной доставке используем её сохранённые пины, даже если указатель
+# следующего пакета уже изменён. Без снимка неверный пакет требует рук и алерта.
+PACKAGE_FAILED=0
+PACKAGE_RECOVERED=0
+RECOVERY_PACKAGE=${FOTMOB_STATE_DIR:?FOTMOB_STATE_DIR не задан}/fotmob-recovery.env
+if [ ! -L "$FOTMOB_STATE_DIR" ] && [ -d "$FOTMOB_STATE_DIR" ] \
+   && [ -f "$FOTMOB_STATE_DIR/fotmob-b6-inflight" ] && [ ! -L "$FOTMOB_STATE_DIR/fotmob-b6-inflight" ] \
+   && [ -f "$RECOVERY_PACKAGE" ] && [ ! -L "$RECOVERY_PACKAGE" ]; then
+  fotmob_load_package "$RECOVERY_PACKAGE" || PACKAGE_FAILED=1
+else
+  fotmob_load_package "${FOTMOB_DELIVERY_PACKAGE:-}" || PACKAGE_FAILED=1
+fi
+if [ "$PACKAGE_FAILED" = 1 ] && [ ! -L "$FOTMOB_STATE_DIR" ] && [ -d "$FOTMOB_STATE_DIR" ] \
+   && [ -f "$RECOVERY_PACKAGE" ] && [ ! -L "$RECOVERY_PACKAGE" ]; then
+  fotmob_load_package "$RECOVERY_PACKAGE" && PACKAGE_RECOVERED=1
+fi
+if [ "$PACKAGE_FAILED" = 0 ] || [ "$PACKAGE_RECOVERED" = 1 ]; then
+  export FOTMOB_PINNED_PACKAGE="$PACKAGE_FILE" FOTMOB_PINNED_DIGEST="$PACKAGE_DIGEST"
+fi
 export FOTMOB_ENV_FILE="$ENV_FILE"   # тот же файл читает b6_deliver.sh, которого мы зовём
 
 PROD_TREE=${FOTMOB_RELEASE_ROOT:?FOTMOB_RELEASE_ROOT не задан в env-файле}
 TREE=$(realpath -m "${TREE:-$PROD_TREE}")
 IS_PROD=$([ "$TREE" = "$(realpath -m "$PROD_TREE")" ] && echo 1 || echo 0)
 
+if [ "$PACKAGE_FAILED" = 0 ] || [ "$PACKAGE_RECOVERED" = 1 ]; then
 TARGET=${FOTMOB_TARGET:?FOTMOB_TARGET не задан в env-файле}                   # цель выката
 ROLLBACK_REF=${FOTMOB_ROLLBACK_REF:?FOTMOB_ROLLBACK_REF не задан в env-файле} # прежний боевой HEAD; голый SHA:
 ROLLBACK_SHA=${FOTMOB_ROLLBACK_SHA:?FOTMOB_ROLLBACK_SHA не задан в env-файле} # ветка deploy/fotmob-b6-master при apply переезжает на цель
@@ -85,6 +103,7 @@ done
 # репетиции (обе ветки: доказательство есть / его нет).
 NEW_CODE_FILE=${NEW_CODE_FILE:-${FOTMOB_NEW_CODE_FILE:?FOTMOB_NEW_CODE_FILE не задан в env-файле}}
 NEW_CODE_MD5=${NEW_CODE_MD5:-${FOTMOB_NEW_CODE_MD5:?FOTMOB_NEW_CODE_MD5 не задан в env-файле}}
+fi
 DELIVER=${DELIVER:-$HERE/b6_deliver.sh}
 CAMPAIGN=${CAMPAIGN:-${FOTMOB_CAMPAIGN_DIR:?FOTMOB_CAMPAIGN_DIR не задан в env-файле}}
 LOG=${LOG:-${FOTMOB_LOG:?FOTMOB_LOG не задан в env-файле}}
@@ -99,7 +118,10 @@ START_FAILS_MAX=${START_FAILS_MAX:-3}          # после стольких п�
 ATTEMPTED=$STATE/fotmob-auto-deliver-attempted-$(date -u +%F)
 CAMPAIGN_HOLD=$STATE/fotmob-campaign.hold
 OFF=$STATE/fotmob-auto-deliver.off            # выключатель: ставит человек или сам автомат
-DELIVER_TIMEOUT=${DELIVER_TIMEOUT:-900}       # 90 с ожидания приёмки + сьют укладываются с запасом
+# Бюджет B6: 90 с settle + 300 с parse + 52 exec × 10 с + 900 с
+# на 19 файлов pytest + 590 с запаса = 2400 с. Exec/сьют могут зависнуть:
+# это бюджет ожидания, внешний timeout остаётся обязательным.
+DELIVER_TIMEOUT=${DELIVER_TIMEOUT:-2400}
 TG_ENV=${TG_ENV:-${FOTMOB_TG_ENV:?FOTMOB_TG_ENV не задан в env-файле}}   # файл с токеном/чатом Telegram
 METADB=${METADB:-${FOTMOB_METADB_CONTAINER:?FOTMOB_METADB_CONTAINER не задан в env-файле}}
 CAMPAIGN_CONTAINER=${CAMPAIGN_CONTAINER:-${FOTMOB_SCHEDULER_CONTAINER:?FOTMOB_SCHEDULER_CONTAINER не задан в env-файле}}
@@ -642,6 +664,11 @@ fi
 # ДО выключателя: заглушенный автомат тем более обязан договорить то, что не смог
 # сказать раньше.
 flush_pending
+if [ "$PACKAGE_FAILED" = 1 ]; then
+  log "ПАКЕТ ДОСТАВКИ НЕДОСТУПЕН/НЕВЕРЕН; recovery=$PACKAGE_RECOVERED"
+  tg_durable "🆘 FotMob: пакет доставки недоступен или неверен. Восстановление по сохранённым пинам: $PACKAGE_RECOVERED. Новую доставку не начинаю. НУЖНЫ РУКИ. Лог: $LOG"
+  [ "$PACKAGE_RECOVERED" = 1 ] || exit 2
+fi
 
 # ---- 0. Выключатель --------------------------------------------------------
 # Автомат сам ставит его, когда откат не подтверждён, а человек — когда откатил
@@ -1123,6 +1150,8 @@ fi
 # «жив ли процесс», и автомат доходил до конца и выходил нулём — без алерта и без
 # выключателя (ревью Sol, раунд 21). Кампания при этом остаётся неподнятой и
 # неоплаканной, а следующий тик повторит то же самое.
+[ "$PACKAGE_FAILED" = 0 ] || exit 2
+
 if [ "$delivered" = 1 ] && odd_path "$CAMPAIGN_STARTED"; then
   stop_campaign
   log "НА МЕСТЕ МАРКЕРА НАБЛЮДЕНИЯ ($CAMPAIGN_STARTED) НЕ ОБЫЧНЫЙ ФАЙЛ — наблюдение за кампанией не работает, глушу автомат"
@@ -1247,6 +1276,22 @@ if [ "$delivered" = 0 ]; then
   # Единственное сообщение, которое НЕ дожимается очередью: «начинаю» ценно только
   # вовремя, а исход доставки в любом случае придёт отдельным durable-алертом.
   tg "🚚 FotMob: окно открыто, начинаю доставку B6 (автомат)"
+
+  # Сохраняем проверенный пакет ДО INFLIGHT/checkout: восстановление не зависит
+  # от сохранности исходного файла и указателя следующего релиза.
+  snapshot=$(cat -- "$PACKAGE_FILE" && printf '.')
+  snapshot=${snapshot%.}
+  digest=$(printf '%s' "$snapshot" | sha256sum); digest=${digest%% *}
+  recovery_tmp=$(mktemp "$STATE/.fotmob-recovery.XXXXXX") || recovery_tmp=""
+  if [ "$digest" != "$PACKAGE_DIGEST" ] || [ -z "$recovery_tmp" ] \
+     || odd_path "$RECOVERY_PACKAGE" \
+     || ! printf '%s' "$snapshot" > "$recovery_tmp" \
+     || ! mv -T -- "$recovery_tmp" "$RECOVERY_PACKAGE"; then
+    [ -z "$recovery_tmp" ] || rm -f -- "$recovery_tmp"
+    tg_durable "🆘 FotMob: пакет изменён или recovery-пакет не записан; доставка отменена"
+    exit 1
+  fi
+  export FOTMOB_PINNED_PACKAGE="$RECOVERY_PACKAGE"
 
   # Без маркера намерения доставку начинать нельзя: смерть между checkout и
   # приёмкой стала бы неотличима от успеха.

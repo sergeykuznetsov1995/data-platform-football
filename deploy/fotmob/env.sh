@@ -53,7 +53,7 @@ fotmob_load_env() {
 # Пакет содержит только пины; пути хоста он менять не может.
 fotmob_package_key() {
   case "$1" in
-    FOTMOB_TARGET|FOTMOB_ROLLBACK_REF|FOTMOB_ROLLBACK_SHA|FOTMOB_NEW_CODE_FILE|FOTMOB_NEW_CODE_MD5|FOTMOB_REPOSITORY_MD5|FOTMOB_RUNTIME_HASHES) return 0 ;;
+    FOTMOB_TARGET|FOTMOB_ROLLBACK_REF|FOTMOB_ROLLBACK_SHA|FOTMOB_NEW_CODE_FILE|FOTMOB_NEW_CODE_MD5|FOTMOB_REPOSITORY_MD5|FOTMOB_RUNTIME_HASHES|FOTMOB_REQUIRED_MODULES) return 0 ;;
   esac
   return 1
 }
@@ -71,53 +71,32 @@ fotmob_load_package() {
   fi
   PACKAGE_DIGEST=$digest
   fotmob_load_env <(printf '%s' "$content") package || return 2
-  for key in FOTMOB_TARGET FOTMOB_ROLLBACK_REF FOTMOB_ROLLBACK_SHA FOTMOB_NEW_CODE_FILE FOTMOB_NEW_CODE_MD5 FOTMOB_REPOSITORY_MD5 FOTMOB_RUNTIME_HASHES; do
+  for key in FOTMOB_TARGET FOTMOB_ROLLBACK_REF FOTMOB_ROLLBACK_SHA FOTMOB_NEW_CODE_FILE FOTMOB_NEW_CODE_MD5 FOTMOB_REPOSITORY_MD5 FOTMOB_RUNTIME_HASHES FOTMOB_REQUIRED_MODULES; do
     [ -n "${!key:-}" ] || { echo "$key не задан в пакете" >&2; return 2; }
   done
-  [[ "$FOTMOB_NEW_CODE_FILE" = /opt/airflow/* ]] || return 2
-  [[ "$FOTMOB_NEW_CODE_MD5" =~ ^[a-f0-9]{32}$ && "$FOTMOB_REPOSITORY_MD5" =~ ^[a-f0-9]{32}$ ]] || return 2
+  for key in FOTMOB_TARGET FOTMOB_ROLLBACK_SHA; do
+    [[ "${!key}" =~ ^[a-f0-9]{7,8}$ ]] || { echo "$key: ожидается короткий SHA (7–8 hex)" >&2; return 2; }
+  done
+  [[ "$FOTMOB_NEW_CODE_FILE" = /opt/airflow/* ]] || { echo "недопустимый FOTMOB_NEW_CODE_FILE" >&2; return 2; }
+  [[ "$FOTMOB_NEW_CODE_MD5" =~ ^[a-f0-9]{32}$ && "$FOTMOB_REPOSITORY_MD5" =~ ^[a-f0-9]{32}$ ]] || { echo "недопустимый MD5 в пакете" >&2; return 2; }
   local -a fingerprints
   local -A modules=()
   IFS='|' read -r -a fingerprints <<< "$FOTMOB_RUNTIME_HASHES"
   for fingerprint in "${fingerprints[@]}"; do
     expected=${fingerprint%% *}; module=${fingerprint#* }
-    [[ "$expected" =~ ^[a-f0-9]{64}$ && "$module" = /opt/airflow/* && "$module" != *' '* ]] || return 2
-    [ -z "${modules[$module]:-}" ] || return 2
+    [[ "$expected" =~ ^[a-f0-9]{64}$ && "$module" = /opt/airflow/* && "$module" != *' '* ]] || { echo "недопустимый SHA256/путь runtime fingerprint: $module" >&2; return 2; }
+    [ -z "${modules[$module]:-}" ] || { echo "дубль runtime fingerprint: $module" >&2; return 2; }
     modules[$module]=1
   done
-  # Полный набор живого B6 обязателен: сокращённый manifest ослабил бы gate.
-  for module in \
-    /opt/airflow/dags/dag_ingest_fotmob.py \
-    /opt/airflow/dags/dag_orchestrate_fotmob.py \
-    /opt/airflow/dags/scripts/run_fotmob_scraper.py \
-    /opt/airflow/dags/utils/fotmob_orchestration.py \
-    /opt/airflow/dags/utils/fotmob_publication.py \
-    /opt/airflow/scrapers/base/iceberg_writer.py \
-    /opt/airflow/scrapers/base/trino_manager.py \
-    /opt/airflow/scrapers/fotmob/__init__.py \
-    /opt/airflow/scrapers/fotmob/catalog.py \
-    /opt/airflow/scrapers/fotmob/catalog_contract.py \
-    /opt/airflow/scrapers/fotmob/constants.py \
-    /opt/airflow/scrapers/fotmob/domain.py \
-    /opt/airflow/scrapers/fotmob/field_map.py \
-    /opt/airflow/scrapers/fotmob/interruption.py \
-    /opt/airflow/scrapers/fotmob/maintenance.py \
-    /opt/airflow/scrapers/fotmob/match_refresh.py \
-    /opt/airflow/scrapers/fotmob/parsers.py \
-    /opt/airflow/scrapers/fotmob/planner.py \
-    /opt/airflow/scrapers/fotmob/player_collector.py \
-    /opt/airflow/scrapers/fotmob/raw_store.py \
-    /opt/airflow/scrapers/fotmob/repository.py \
-    /opt/airflow/scrapers/fotmob/row_identity.py \
-    /opt/airflow/scrapers/fotmob/scope_codec.py \
-    /opt/airflow/scrapers/fotmob/service.py \
-    /opt/airflow/scrapers/fotmob/shared_rate_limiter.py \
-    /opt/airflow/scrapers/fotmob/source_refresh.py \
-    /opt/airflow/scrapers/fotmob/transfer_contract.py \
-    /opt/airflow/scrapers/fotmob/transfers.py \
-    /opt/airflow/scrapers/fotmob/transport.py \
-    /opt/airflow/scrapers/fotmob/trino_instrumentation.py \
-    /opt/airflow/scrapers/fotmob/writer_lock.py; do
+  # Состав релиза задаётся пакетом; HASHES обязан покрывать его целиком.
+  local -a required
+  local -A required_seen=()
+  IFS='|' read -r -a required <<< "$FOTMOB_REQUIRED_MODULES"
+  for module in "${required[@]}"; do
+    [[ "$module" = /opt/airflow/* && "$module" != *' '* ]] || { echo "недопустимый required module: $module" >&2; return 2; }
+    [ -z "${required_seen[$module]:-}" ] || { echo "дубль required module: $module" >&2; return 2; }
+    required_seen[$module]=1
     [ -n "${modules[$module]:-}" ] || { echo "нет runtime fingerprint: $module" >&2; return 2; }
   done
+  [ "${#modules[@]}" = "${#required_seen[@]}" ] || { echo "runtime manifest не соответствует required modules" >&2; return 2; }
 }

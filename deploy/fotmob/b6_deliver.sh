@@ -56,6 +56,18 @@ MODE=${1:-check}
 say() { printf '\n== %s ==\n' "$1"; }
 die() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 1; }
 
+validate_test_tree() {
+TEST_TREE=${FOTMOB_VALIDATION_ROOT:?FOTMOB_VALIDATION_ROOT не задан}
+TEST_TREE=$(realpath -e "$TEST_TREE") || die "validation tree отсутствует"
+prod_real=$(realpath -e "$PROD_TREE") || die "production tree отсутствует"
+test "$TEST_TREE" != "$prod_real" || die "проверки не могут выполняться в production-дереве"
+validation_sha=$(git -C "$TEST_TREE" rev-parse HEAD) || die "validation HEAD недоступен"
+target_sha=$(git -C "$TREE" rev-parse "${TARGET}^{commit}")
+[ "$validation_sha" = "$target_sha" ] || die "validation tree не соответствует цели"
+validation_status=$(git -C "$TEST_TREE" status --porcelain) || die "validation status недоступен"
+[ -z "$validation_status" ] || die "validation tree грязное"
+}
+
 # Ручной запуск обязан брать тот же замок, что и автомат: иначе оператор и cron
 # могут одновременно пройти предполётные проверки и переключать/откатывать дерево
 # друг под другом (ревью Sol, раунд 2). FOTMOB_DELIVERY_LOCK=held ставит автомат —
@@ -142,6 +154,11 @@ if git rev-parse -q --verify origin/master >/dev/null 2>&1; then
 fi
 echo "дерево чистое на $ROLLBACK_SHA, цель $TARGET доступна"
 
+if [ "$DRY" = 0 ]; then
+validate_test_tree
+
+fi
+
 if [ "$MODE" != apply ]; then say "check ПРОЙДЕН (apply не запрошен)"; exit 0; fi
 
 DELIVERY_STARTED_AT=$(date -u +%FT%TZ)
@@ -171,7 +188,8 @@ cmd5=$({ docker exec "$SCHED" md5sum "$NEW_CODE_FILE" | cut -d' ' -f1; } || true
 echo "md5 $NEW_CODE_FILE в контейнере целевой ($cmd5)"
 
 # Все runtime fingerprints принадлежат тому же пакету, что TARGET и ROLLBACK.
-cmd5=$(docker exec "$SCHED" md5sum /opt/airflow/scrapers/fotmob/repository.py | cut -d' ' -f1)
+cmd5=$(docker exec "$SCHED" md5sum /opt/airflow/scrapers/fotmob/repository.py | cut -d' ' -f1) \
+  || die "не удалось прочитать md5 repository.py"
 [ "$cmd5" = "$FOTMOB_REPOSITORY_MD5" ] || die "release fingerprint mismatch: repository.py md5"
 IFS='|' read -r -a fingerprints <<< "$FOTMOB_RUNTIME_HASHES"
 for fingerprint in "${fingerprints[@]}"; do
@@ -191,12 +209,8 @@ while :; do
 done
 
 say "5. Проверки exact-target в изолированной рабочей копии"
-TEST_TREE=${FOTMOB_VALIDATION_ROOT:?FOTMOB_VALIDATION_ROOT не задан}
-test "$(realpath -e "$TEST_TREE")" != "$(realpath -e "$PROD_TREE")" || die "проверки не могут выполняться в production-дереве"
-validation_sha=$(git -C "$TEST_TREE" rev-parse HEAD)
-target_sha=$(git -C "$TREE" rev-parse "${TARGET}^{commit}")
-[ "$validation_sha" = "$target_sha" ] || die "validation tree не соответствует цели"
-[ -z "$(git -C "$TEST_TREE" status --porcelain)" ] || die "validation tree грязное"
+# Пока шла приёмка, validation tree мог измениться.
+validate_test_tree
 (
   cd "$TEST_TREE"
   env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 "$PYTEST" -p no:cacheprovider tests/unit/scrapers/test_fotmob_calendar_contract.py \
