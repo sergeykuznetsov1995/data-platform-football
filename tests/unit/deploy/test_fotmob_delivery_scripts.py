@@ -1124,6 +1124,40 @@ def test_late_delivery_timeout_leaves_time_for_rollback(
 
 
 @pytest.mark.unit
+def test_late_preflight_without_time_left_clears_unstarted_delivery(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "")
+    _git(w["repo"], "checkout", "-q", "--detach", w["one"])
+    (w["state"] / "fotmob-b6-accepted").unlink()
+    w["log"].write_text("")
+    # Окно проверено в 23:20, а к запуску B6 предполётные проверки дотянули до 23:30.
+    _stub(
+        w["stubs"], "date",
+        'case "$*" in\n'
+        '  *"+%H%M") echo 2320 ;;\n'
+        '  *"+%H%M%S") echo 233000 ;;\n'
+        '  *"+%F") echo 2026-01-01 ;;\n'
+        '  *"+%H:%M") echo 23:30 ;;\n'
+        '  *) exec /bin/date "$@" ;;\n'
+        'esac\n',
+    )
+    called = tmp_path / "b6-called"
+    deliver = w["auto"].parent / "b6_deliver.sh"
+    _stub(
+        w["stubs"], "timeout",
+        f'if [ "$4" = "{deliver}" ]; then touch "{called}"; exit 0; fi\n'
+        'exec /usr/bin/timeout "$@"\n',
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"],
+                extra_env={"WRITER_WAIT": "0"})
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert not called.exists()
+    assert "НЕТ ВРЕМЕНИ" in w["log"].read_text()
+    assert not (w["state"] / "fotmob-b6-inflight").exists()
+    assert not (w["state"] / "fotmob-deliver-nonce").exists()
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+
+
+@pytest.mark.unit
 def test_acceptance_budget_includes_slow_queries(tmp_path: Path) -> None:
     section = AUTO.read_text().split('      seen=0\n', 1)[1].split('      if [ "$seen" != 1 ]; then', 1)[0]
     clock = tmp_path / "clock"
