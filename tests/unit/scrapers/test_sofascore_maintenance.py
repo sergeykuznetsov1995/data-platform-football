@@ -238,3 +238,105 @@ def test_client_bounds_requests_and_disables_spooling(monkeypatch):
     assert requests_seen == []
     queries.session.delete("http://offline.invalid")
     assert requests_seen == [("DELETE", m.HTTP_SECONDS)]
+
+
+@pytest.mark.parametrize("mode", ["cancel", "cancel_failed", "lost_id"])
+@pytest.mark.parametrize("stage", ["query", "cleanup"])
+def test_sigterm_keeps_writer_lock_until_query_stops(tmp_path, mode, stage):
+    import select
+    import signal
+    import subprocess
+    import sys
+    import textwrap
+
+    events = tmp_path / "events"
+    script = textwrap.dedent('''
+        import sys
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        from scrapers.sofascore import maintenance as m
+
+        mode, stage, path = sys.argv[1:]
+        def record(event):
+            with open(path, "a") as output:
+                output.write(event + "\\n")
+
+        def wait_for_parent():
+            print("cleanup", flush=True)
+            sys.stdin.readline()
+
+        query = SimpleNamespace(finished=False, cancelled=False)
+        class Cursor:
+            query_id = None if mode == "lost_id" else "q1"
+            _query = query
+            def execute(self, sql):
+                if stage == "cleanup":
+                    raise TimeoutError("lost response")
+                print("query", flush=True)
+                sys.stdin.readline()
+            def fetchall(self):
+                raise AssertionError("query must be interrupted")
+            def cancel(self):
+                record("cancel")
+                if mode == "cancel_failed":
+                    raise RuntimeError("cancel unavailable")
+                wait_for_parent()
+                query.cancelled = True
+                record("cancel_confirmed")
+
+        queries = m.Queries.__new__(m.Queries)
+        queries.connection = SimpleNamespace(cursor=Cursor)
+        queries.session = SimpleNamespace(deadline=0)
+        queries.deadline = float("inf")
+        queries.queries = []
+        def fallback(seconds):
+            assert seconds == m.QUERY_SECONDS + m.HTTP_SECONDS
+            record("fallback")
+            wait_for_parent()
+            record("server_lifetime_elapsed")
+        m.time.sleep = fallback
+
+        @contextmanager
+        def writer_lock():
+            record("locked")
+            try:
+                yield
+            finally:
+                record("unlocked")
+
+        def run():
+            with writer_lock():
+                queries.execute("OPTIMIZE")
+        m.run = run
+        raise SystemExit(m.main())
+    ''')
+    stderr_path = tmp_path / "stderr"
+    # Cancellation errors log chained tracebacks. Drain them to a file so pipe
+    # capacity cannot block cleanup before the parent receives its handshake.
+    with stderr_path.open("w") as stderr_file:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, mode, stage, str(events)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file,
+            text=True,
+        )
+    try:
+        assert select.select([proc.stdout], [], [], 10)[0], "child did not start"
+        if stage == "query":
+            assert proc.stdout.readline().strip() == "query"
+            proc.send_signal(signal.SIGTERM)
+            assert select.select([proc.stdout], [], [], 10)[0], "cleanup did not start"
+        assert proc.stdout.readline().strip() == "cleanup"
+        assert events.read_text().splitlines()[0] == "locked"
+        assert "unlocked" not in events.read_text()
+        # A repeated Airflow stop must not interrupt cancellation/fallback.
+        proc.send_signal(signal.SIGTERM)
+        stdout, _ = proc.communicate("continue\n", timeout=10)
+        expected = 128 + signal.SIGTERM if stage == "query" else 1
+        assert proc.returncode == expected, stdout + stderr_path.read_text()
+        stopped = "cancel_confirmed" if mode == "cancel" else "server_lifetime_elapsed"
+        recorded = events.read_text().splitlines()
+        assert recorded.index(stopped) < recorded.index("unlocked")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate()

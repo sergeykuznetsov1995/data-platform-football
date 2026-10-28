@@ -1752,3 +1752,54 @@ def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
     proc = stand.run()
     assert proc.returncode == 1, proc.stderr
     assert (stand.stub_state / f"paused_{COMPACT}").read_text().strip() == "f", stand.log_text()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("has_compaction,registered,expected", [
+    (True, 5, "0"), (True, 6, "1"), (False, 5, "1"),
+])
+def test_acceptance_requires_compaction_only_for_releases_containing_it(
+    tmp_path: Path, has_compaction: bool, registered: int, expected: str,
+) -> None:
+    """Execute the real acceptance function offline, including old-release rollback."""
+    tree = tmp_path / "release"
+    (tree / "dags").mkdir(parents=True)
+    if has_compaction:
+        (tree / "dags" / f"{COMPACT}.py").touch()
+    text = AUTO.read_text()
+    core = next(line for line in text.splitlines() if line.startswith("CORE_DAGS="))
+    acceptance = text.split("acceptance_seen(){", 1)[1].split("\n}", 1)[0]
+    sql_log = tmp_path / "sql"
+    script = core + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
+CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done)
+CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
+COMPACT=dag_sofascore_schedule_maintenance
+GATEWAY_CONTAINERS="gw1 gw2 gw3"
+WATCHDOG_UNITS=watchdog
+POOLS=""
+metadb(){
+  case "$1" in
+    *last_parsed_time*)
+      echo "$1" > "$SQL_LOG"
+      case "$1" in
+        *dag_sofascore_schedule_maintenance*) echo "$REGISTERED" ;;
+        *) echo 5 ;;
+      esac ;;
+    *) echo 0 ;;
+  esac
+}
+inspect(){ printf 'healthy 1073741824 sofascore-gw\n%.0s' {1..3}; }
+mounts_all_in(){ echo 1; }
+timeout(){
+  case "$*" in *ActiveState*) echo active ;; *MainPID*) echo $$ ;; esac
+}
+acceptance_seen "$2" "2026-10-28T03:00:00Z"
+'''
+    proc = subprocess.run(
+        ["bash", "-c", script, "test", "--expected-mount", str(tree)],
+        env={**os.environ, "SQL_LOG": str(sql_log), "REGISTERED": str(registered)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected, proc.stderr
+    assert (COMPACT in sql_log.read_text()) == has_compaction

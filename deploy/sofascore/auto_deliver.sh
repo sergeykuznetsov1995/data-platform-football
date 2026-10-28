@@ -102,7 +102,7 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
@@ -364,11 +364,18 @@ mounts_all_in(){  # mounts_all_in <дерево>
 }
 # 1 — принято, 0 — не принято, X — проверить нечем (вслепую не решаем).
 acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt scheduler'а>
-  local new="$1" started="$2" dags errs gw n c line want got
-  dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
+  local new="$1" started="$2" dags errs gw n c line want got dag_sql="" dag_count=0
+  for c in $CORE_DAGS; do
+    # Rollback may target a release predating schedule compaction.
+    [ "$c" != "$COMPACT" ] || [ -f "$new/dags/$COMPACT.py" ] || continue
+    dag_sql="$dag_sql'$c',"
+    dag_count=$(( dag_count + 1 ))
+  done
+  dag_sql=${dag_sql%,}
+  dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($dag_sql) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
   errs=$(metadb "SELECT count(*) FROM import_error;")
   case "$dags$errs" in *X*) echo X; return ;; esac
-  [ "$dags" = 5 ] || { echo 0; return; }
+  [ "$dags" = "$dag_count" ] || { echo 0; return; }
   [ "$errs" = 0 ] || { echo 0; return; }
   # Три шлюза ОДНИМ вызовом: `docker inspect a b c` при отсутствии имени печатает только
   # найденные и отдаёт rc=1 — «нет контейнера» иначе было бы неотличимо от «упал docker».
@@ -405,7 +412,6 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
   done <<< "$WATCHDOG_UNITS"
   echo 1
 }
-CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
 
 # Единственный источник истины о бое — env-файл контура; deploy.sh перепинывает его ДО
 # пересоздания контейнеров, поэтому обрыв между этими шагами оставляет env на новом дереве

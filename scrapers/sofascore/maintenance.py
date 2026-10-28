@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -147,15 +148,19 @@ class Queries:
         except BaseException:
             # Even a transport error can leave a live query. Never release the
             # writer lock merely because the client stopped receiving results.
-            confirmed = False
-            if cursor.query_id:
-                try:
-                    cursor.cancel()  # Trino client requires HTTP 204.
-                    confirmed = cursor._query.cancelled or cursor._query.finished
-                except Exception:
-                    logger.exception("compaction cancellation unconfirmed")
-            if not confirmed:
-                time.sleep(QUERY_SECONDS + HTTP_SECONDS)
+            previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                confirmed = False
+                if cursor.query_id:
+                    try:
+                        cursor.cancel()  # Trino client requires HTTP 204.
+                        confirmed = cursor._query.cancelled or cursor._query.finished
+                    except Exception:
+                        logger.exception("compaction cancellation unconfirmed")
+                if not confirmed:
+                    time.sleep(QUERY_SECONDS + HTTP_SECONDS)
+            finally:
+                signal.signal(signal.SIGTERM, previous)
             raise
         finally:
             self.queries.append({"query_id": cursor.query_id,
@@ -295,7 +300,18 @@ def run(*, query_factory=Queries, writer_lock=maintenance_lock,
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    result = run()
+
+    def terminate(signum, frame):
+        # Airflow signals the process group. Unwind through Queries.execute()
+        # before releasing the writer lock; repeated TERM must not cut cleanup.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        result = run()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
     print(json.dumps(result))
     return int(result["stopped"] == "error")
 
