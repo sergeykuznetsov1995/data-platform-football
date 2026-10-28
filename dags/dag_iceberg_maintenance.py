@@ -2,7 +2,7 @@
 Iceberg Maintenance DAG
 =======================
 
-Weekly bounded small-file compaction plus `expire_snapshots` and
+Weekly bounded Silver/Gold compaction plus `expire_snapshots` and
 `remove_orphan_files` over every table in `iceberg.{bronze,silver,gold}`.
 The high-churn `iceberg.ops.sofascore_capture_manifest` runs as an independent
 full-compaction + snapshot-expiry task and never performs orphan cleanup.
@@ -42,12 +42,11 @@ def _maintain(**_ctx) -> Dict[str, Any]:
     # Lazy import so DAG parse stays cheap and never pulls scrapers/__init__.
     from utils.maintenance_tasks import maintain_iceberg_tables
 
+    # Bronze rewrites belong to the bounded 02:00–05:00 UTC nightly pass.
     logical_date = _ctx.get("logical_date")
-    rotation = (
-        logical_date.date().toordinal() // 7 if logical_date is not None else None
-    )
+    rotation = logical_date.date().toordinal() // 7 if logical_date is not None else None
     result = maintain_iceberg_tables(
-        compact_live_files=True,
+        compact_live_files=True, compaction_schemas=("silver", "gold"),
         compaction_rotation=rotation,
     )
     if result["failures"]:

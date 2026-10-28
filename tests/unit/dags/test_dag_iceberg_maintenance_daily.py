@@ -31,9 +31,10 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert all(
         "execution_timeout" not in task._init_kwargs
         for task_id, task in tasks.items()
-        if task_id != "janitor_fbref_generic_stages"
+        if task_id not in {"janitor_fbref_generic_stages", "compact_bronze"}
     )
     assert set(tasks) == {
+        "compact_bronze",
         "janitor_fbref_generic_stages",
         "cleanup_whoscored_dq_stage_partitions",
         "maintain_whoscored_bronze",
@@ -78,13 +79,13 @@ def test_daily_maintenance_uses_distinct_effective_retention(monkeypatch) -> Non
 
     assert calls[0]["retention_threshold"] == "14d"
     assert calls[0]["table_filter"] == maintenance.WHOSCORED_HIGH_CHURN
-    assert calls[0]["compact_live_files"] is True
-    assert calls[0]["compaction_rotation"] == logical_date.date().toordinal()
+    assert calls[0]["compact_live_files"] is False
+    assert "compaction_rotation" not in calls[0]
     assert calls[1]["retention_threshold"] == "3d"
     assert calls[1]["table_filter"] == maintenance.NON_WHOSCORED_HIGH_CHURN
     assert calls[1]["compact_live_files"] is False
     assert "compaction_rotation" not in calls[1]
-    assert sum(call["compact_live_files"] is True for call in calls) == 1
+    assert sum(call["compact_live_files"] is True for call in calls) == 0
 
 
 def test_daily_maintenance_runs_logical_dq_retention(monkeypatch) -> None:
@@ -110,3 +111,15 @@ def test_daily_fbref_callable_uses_bounded_wait(monkeypatch) -> None:
         maintenance, "maintain_fbref_stages_with_lock_wait", lambda: expected
     )
     assert mod._maintain_fbref_stages() is expected
+
+
+def test_nightly_compaction_is_first_and_uses_fbref_pool():
+    from airflow.operators.python import PythonOperator
+    PythonOperator._instances.clear()
+    _load_module()
+    tasks = {task.task_id: task for task in PythonOperator._instances}
+    task = tasks["compact_bronze"]
+    assert task._init_kwargs["pool"] == "fbref_scraper_pool"
+    assert task._init_kwargs["mode"] == "reschedule"
+    assert task.downstream_task_ids == {"janitor_fbref_generic_stages"}
+    assert task._init_kwargs["execution_timeout"] == timedelta(hours=3)
