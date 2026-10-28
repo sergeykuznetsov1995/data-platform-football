@@ -105,6 +105,45 @@ def test_isolated_owner_is_the_one_fair_active_schedule(monkeypatch):
     }
 
 
+def test_owner_wait_covers_ingest_critical_path_and_scheduling_reserve(monkeypatch):
+    from airflow.operators.bash import BashOperator
+    from airflow.operators.python import PythonOperator
+
+    owner = _reload_owner(monkeypatch, isolated=True)
+    owner_timeout = _task(owner.TRIGGER_TASK_ID)._init_kwargs["execution_timeout"]
+
+    PythonOperator._instances.clear()
+    BashOperator._instances.clear()
+    sys.modules.pop("dag_ingest_fotmob", None)
+    sys.modules.pop("dags.dag_ingest_fotmob", None)
+    ingest = importlib.import_module("dag_ingest_fotmob")
+    tasks = {
+        task.task_id: task
+        for task in [*PythonOperator._instances, *BashOperator._instances]
+    }
+    defaults = ingest.dag._dag_kwargs["default_args"]
+    path_budgets = {}
+
+    def path_budget(task_id):
+        if task_id not in path_budgets:
+            task = tasks[task_id]
+            # The stubs retain explicit kwargs but do not apply DAG defaults.
+            args = {**defaults, **task._init_kwargs}
+            retries = args["retries"]
+            task_budget = (
+                args["execution_timeout"] * (retries + 1)
+                + args["retry_delay"] * retries
+            )
+            path_budgets[task_id] = task_budget + max(
+                (path_budget(parent) for parent in task.upstream_task_ids),
+                default=timedelta(0),
+            )
+        return path_budgets[task_id]
+
+    child_budget = max(path_budget(task_id) for task_id in tasks)
+    assert owner_timeout >= child_budget + timedelta(minutes=50)
+
+
 def test_only_automatic_owner_keeps_an_isolated_schedule(monkeypatch):
     monkeypatch.setenv("FOTMOB_ISOLATED_STACK", "1")
     modules = {}
