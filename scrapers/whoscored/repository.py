@@ -4070,7 +4070,8 @@ class WhoScoredRepository:
                            )
                        )) AS historical_games,
                        COUNT_IF(s.status = 6 AND COALESCE(s.is_lineup_confirmed, FALSE) = FALSE
-                           AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)) AS deferred_games,
+                           AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)
+                           AND s.date > CAST(CURRENT_TIMESTAMP - INTERVAL '30' DAY AS TIMESTAMP)) AS deferred_games,
                        COUNT_IF(COALESCE(m.state, '') = 'success') AS successes,
                        COUNT_IF(COALESCE(m.state, '') = 'not_available' AND s.is_lineup_confirmed = TRUE) AS absent
                 FROM schedule s

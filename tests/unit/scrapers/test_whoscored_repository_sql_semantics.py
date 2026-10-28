@@ -470,7 +470,8 @@ def test_historical_preview_uses_old_window_without_replaying_success():
         LEAGUE, SEASON, historical=True, limit=25)] == [1]
 
 
-def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup():
+@pytest.mark.parametrize("age", [20, 31])
+def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup(age):
     from scrapers.whoscored.history_state import first_wave_ready
 
     con = _connection()
@@ -480,11 +481,11 @@ def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup()
                 "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
     _game(con, 1, 10, 20)
     _attempt(con, 1, "success", 1)
-    _game(con, 2, 20, 20, lineup=False)
+    _game(con, 2, 20, age, lineup=False)
     repository = _history_repository(con)
     row = repository.history_coverage()[(LEAGUE, SEASON)]
     assert first_wave_ready([{"wave": 1, "coverage": row}]) is True
-    assert row["deferred_stages"] == 1
+    assert row["deferred_stages"] == int(age < 30)
     assert _candidates(con, lane="history") == []
     con.execute("UPDATE iceberg.bronze.whoscored_schedule_current "
                 "SET is_lineup_confirmed=TRUE WHERE game_id=2")
@@ -492,3 +493,30 @@ def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup()
     assert first_wave_ready([{"wave": 1, "coverage": row}]) is False
     assert row["deferred_stages"] == 0
     assert _candidates(con, lane="history") == [2]
+
+
+@pytest.mark.parametrize("lineup", [False, None])
+@pytest.mark.parametrize("age, deferred", [(6, 0), (7, 0), (7.001, 1), (29.999, 1), (30, 0), (31, 0)])
+def test_history_deferred_age_window_preserves_coverage(lineup, age, deferred):
+    con = _connection()
+    try:
+        con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
+                    "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
+        con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
+                    "(?, ?, 'success', '{\"whoscored_schedule\":4}')", [LEAGUE, SEASON])
+        _game(con, 1, 10, 40)
+        _attempt(con, 1, "success", 0.5)
+        _game(con, 2, 10, age, lineup=lineup)
+        _game(con, 3, 20, 40)  # Unknown stage must remain debt.
+        _game(con, 4, 10, 60, lineup=False)
+        repository = _history_repository(con)
+        row = repository.history_coverage()[(LEAGUE, SEASON)]
+        assert row["deferred_stages"] == deferred
+        assert (row["closeable"], row["closed"], row["unknown_stages"], row["closed_day"]) == (2, 1, 1, 1)
+        # An expired game in the same stage must not hide a younger deferred one.
+        _game(con, 5, 10, 10, lineup=lineup)
+        row = repository.history_coverage()[(LEAGUE, SEASON)]
+        assert row["deferred_stages"] == 1
+        assert (row["closeable"], row["closed"], row["unknown_stages"], row["closed_day"]) == (2, 1, 1, 1)
+    finally:
+        con.close()
