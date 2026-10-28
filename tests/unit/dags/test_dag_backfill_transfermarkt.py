@@ -378,7 +378,8 @@ def test_explicit_scope_platform_resume_maps_one_new_source_attempt(
 def test_legacy_batch_policy_rotation_requires_original_policy(module, monkeypatch):
     campaign = SimpleNamespace(campaign_id="a" * 64, registry_snapshot_id="original-registry",
                               policy_sha256="b" * 64, status=state.CampaignStatus.ACTIVE)
-    batch = SimpleNamespace(batch_id="d" * 64, registry_snapshot_id=None, standing_policy=None)
+    batch = SimpleNamespace(batch_id="d" * 64, registry_snapshot_id=None, standing_policy=None,
+                            policy_sha256=campaign.policy_sha256)
     held = SimpleNamespace(status=state.BatchStatus.WAITING_POLICY)
     batch.transition = lambda status, **_k: held
     suspended = []

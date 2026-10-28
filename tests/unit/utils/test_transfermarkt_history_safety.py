@@ -90,7 +90,7 @@ def test_batch_policy_version_moves_without_campaign_mutation_but_restrictions_h
     with pytest.raises(Exception, match='advance policy_version'):
         validate_batch_policy(policy, replace(updated, policy_version=policy.policy_version), **kwargs)
     with pytest.raises(Exception, match='expired'):
-        validate_batch_policy(policy, replace(updated, expires_at=NOW), **kwargs)
+        validate_batch_policy(policy, replace(updated, approved_at=NOW - timedelta(days=1), expires_at=NOW), **kwargs)
     with pytest.raises(Exception, match='omits write tables'):
         validate_batch_policy(policy, replace(updated, allowed_write_tables=('iceberg.ops.proxy_traffic_runs',)), **kwargs)
     parsed = state.batch_from_mapping(state.record_payload(batch))
@@ -315,7 +315,7 @@ def test_additive_ops_migration_keeps_exact_original_grants_and_restrictions(mig
         validate_batch_policy(original, restricted, **kwargs)
     assert not standing_policy_hash_compatible(replace(current, expires_at=current.expires_at + timedelta(days=1)), original.policy_hash)
     with pytest.raises(Exception, match='expired'):
-        validate_batch_policy(replace(original, expires_at=NOW), current, **kwargs)
+        validate_batch_policy(replace(original, approved_at=NOW - timedelta(days=1), expires_at=NOW), current, **kwargs)
 
 
 def test_historical_sql_mutation_rechecks_authority_before_cursor(monkeypatch):
@@ -384,3 +384,17 @@ def test_known_handoff_version_migration_preserves_original_grant(monkeypatch, t
     ):
         assert not cycle.standing_policy_hash_compatible(changed, original.policy_hash)
     assert not cycle.standing_policy_hash_compatible(current, replace(original, policy_version=original_version + 2).policy_hash)
+
+
+def test_renewal_does_not_extend_frozen_batch_policy():
+    current = load_standing_policy(POLICY_PATH)
+    original = replace(current, policy_version=3,
+                       approved_at=datetime(2026, 10, 18, tzinfo=timezone.utc),
+                       expires_at=datetime(2027, 7, 21, tzinfo=timezone.utc))
+    kwargs = dict(write_mode='native-only', cycle_budget_bytes=SCOPE_HARD_PROVIDER_BYTE_CAP,
+                  request_limit=SCOPE_REQUEST_LIMIT, retry_limit=SCOPE_RETRY_LIMIT)
+    assert validate_batch_policy(original, current, now=NOW, **kwargs) == original
+    with pytest.raises(Exception, match='expired'):
+        validate_batch_policy(original, current, now=original.expires_at, **kwargs)
+    from dags.scripts.run_transfermarkt_scope_cycle import standing_policy_for_hash
+    assert standing_policy_for_hash(current, original.policy_hash) is None

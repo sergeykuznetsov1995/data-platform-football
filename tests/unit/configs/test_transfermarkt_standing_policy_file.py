@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,9 +35,8 @@ def test_committed_policy_parses_into_a_standing_policy():
     assert policy.dag_id == STANDING_POLICY_DAG_ID
     assert policy.dag_id == 'dag_ingest_transfermarkt'
     assert len(policy.policy_hash) == 64
-    # v4 adds the season-close proof table; the existing per-scope caps stay
-    # unchanged. Standing authorizations key on standing-policy-v{version}.
-    assert policy.policy_version == 5
+    # Renewal keeps the existing per-scope caps and write tables.
+    assert policy.policy_version == 6
     assert 'iceberg.ops.transfermarkt_season_close_v1' in policy.allowed_write_tables
 
 
@@ -84,7 +85,7 @@ def test_backfill_policy_is_native_only_and_matches_the_same_scope_caps():
     policy = load_standing_policy(BACKFILL_POLICY_PATH)
 
     assert policy.dag_id == 'dag_backfill_transfermarkt'
-    assert policy.policy_version == 3
+    assert policy.policy_version == 4
     assert 'iceberg.ops.transfermarkt_season_close_v1' in policy.allowed_write_tables
     assert policy.paid_proxy.byte_cap_bytes == HARD_BYTE_CAP
     assert policy.paid_proxy.request_limit == 1_900
@@ -95,3 +96,11 @@ def test_backfill_policy_is_native_only_and_matches_the_same_scope_caps():
     assert not (
         required_write_tables('dual') - required_write_tables('native-only')
     ) & set(policy.allowed_write_tables)
+
+
+@pytest.mark.parametrize('path,version', [(POLICY_PATH, 6), (BACKFILL_POLICY_PATH, 4)])
+def test_committed_policy_renewal_has_twelve_calendar_months(path, version):
+    policy = load_standing_policy(path)
+    assert policy.policy_version == version
+    assert policy.approved_at == datetime(2026, 10, 28, tzinfo=timezone.utc)
+    assert policy.expires_at >= policy.approved_at.replace(year=policy.approved_at.year + 1)
