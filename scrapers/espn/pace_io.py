@@ -25,11 +25,15 @@ class PaceIO:
         self.values = {}
         self.threads = []
         self.publish_before = None
+        self.debt_query = None
         self.wakes = {name: threading.Event() for name in self.intervals}
 
     def snapshot(self, name):
         with self.lock:
-            return deepcopy(self.values.get(name))
+            value = deepcopy(self.values.get(name))
+            if name == 'debt' and value is not None:
+                value['query_started_at'] = self.debt_query
+            return value
 
     def start(self):
         for name in self.intervals:
@@ -60,6 +64,9 @@ class PaceIO:
                 previous = self.snapshot(name)
                 sequence = previous.get('sequence', 0) + 1 if previous else 1
                 started = self.now()
+                if name == 'debt':
+                    with self.lock:
+                        self.debt_query = started.timestamp()
                 timer = time.monotonic()
                 error, result = None, {}
                 try:
@@ -72,7 +79,8 @@ class PaceIO:
                         result = dict(debt=debt, protected=protected(after, self.now().timestamp()),
                                       step=after['step'], revision=after['revision'],
                                       epoch=after['measurement_started_at'])
-                        if before['revision'] != after['revision']:
+                        if (before['revision'] != after['revision']
+                                or before['measurement_started_at'] != after['measurement_started_at']):
                             error = 'gate_changed_during_debt'
                     elif name == 'freshness':
                         result = self.read_freshness(manager, self.targets, started)
@@ -86,7 +94,8 @@ class PaceIO:
                 result.update(at=at, sequence=sequence, observed_at=started.timestamp(), seconds=time.monotonic() - timer,
                               error=error)
                 if name == 'debt':
-                    if at - started.timestamp() > self.maximum_gap:
+                    result['query_error'] = error
+                    if error is None and at - started.timestamp() > self.maximum_gap:
                         result['error'] = 'debt_query_stale'
                     result['known'] = result['error'] is None
                     previous = self.snapshot(name)
@@ -94,6 +103,13 @@ class PaceIO:
                                or at - previous.get('observed_at', previous['at']) > self.maximum_gap
                                or result.get('revision') != previous.get('revision'))
                     result['restart_at'] = at if restart else previous['restart_at']
+                    same_gate = (previous is not None and result.get('revision') == previous.get('revision')
+                                 and result.get('epoch') == previous.get('epoch'))
+                    result['sql_lag_safe'] = bool(same_gate and error is None
+                        and previous.get('error') in (None, 'debt_query_stale')
+                        and 0 <= started.timestamp() - previous['at'] <= self.maximum_gap)
+                    result['mandatory_restart_at'] = (at if restart and not result['sql_lag_safe']
+                        else previous.get('mandatory_restart_at', previous['restart_at']))
                 else:
                     if error and name == 'freshness':
                         result['eligible'] = False
@@ -102,11 +118,13 @@ class PaceIO:
                 except Exception as exc:
                     result['error'] = 'evidence_write_' + type(exc).__name__
                     if name == 'debt':
-                        result.update(known=False, restart_at=at)
+                        result.update(known=False, restart_at=at, mandatory_restart_at=at, sql_lag_safe=False)
                     elif name == 'freshness':
                         result['eligible'] = False
                 with self.lock:
                     self.values[name] = result
+                    if name == 'debt':
+                        self.debt_query = None
                 # Observation cadence is measured from query start. Failed lanes
                 # retain a minimum retry delay even if their operation was slow.
                 delay = max(1 if result['error'] else 0, self.intervals[name] - result['seconds'])

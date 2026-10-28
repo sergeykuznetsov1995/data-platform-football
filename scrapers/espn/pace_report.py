@@ -109,6 +109,48 @@ def attempt_metrics(rows):
     }
 
 
+SQL_UNKNOWN_CONTINUOUS = 25 * 60
+SQL_UNKNOWN_TOTAL = 72 * 60
+
+
+def sql_unknown(observations, start, end, *, query_started_at=None, maximum_gap=30):
+    """Only a running/completed SQL query can explain a missing observation."""
+    observations = sorted(observations, key=lambda o: o['at'])
+    intervals = []
+    allowed = bool(observations) and observations[0]['at'] <= start
+    for a, b in zip(observations, observations[1:]):
+        begin = a.get('observed_at', a['at']) + maximum_gap
+        if not a.get('known') or b['at'] > begin or not b.get('known'):
+            allowed = allowed and b.get('sql_lag_safe') is True
+            intervals.append([max(start, min(begin, a['at']) if not a.get('known') else begin), b['at']])
+    open_since = None
+    if observations:
+        last = observations[-1]
+        begin = last.get('observed_at', last['at']) + maximum_gap
+        if end > begin or not last.get('known'):
+            active = (query_started_at is not None and
+                      0 <= query_started_at - last['at'] <= maximum_gap)
+            allowed = allowed and (active or (not last.get('known') and last.get('sql_lag_safe') is True))
+            open_since = max(start, min(begin, last['at']) if not last.get('known') else begin)
+            intervals.append([open_since, end])
+    merged = []
+    for begin, finish in intervals:
+        begin, finish = max(start, begin), min(end, finish)
+        if finish <= begin:
+            continue
+        if merged and begin <= merged[-1][1]:
+            merged[-1][1] = max(finish, merged[-1][1])
+        else:
+            merged.append([begin, finish])
+    total = sum(b - a for a, b in merged)
+    longest = max((b - a for a, b in merged), default=0)
+    return dict(allowed=bool(allowed and longest <= SQL_UNKNOWN_CONTINUOUS and total <= SQL_UNKNOWN_TOTAL),
+                count=len(merged), seconds=total, longest_seconds=longest,
+                open_since=merged[-1][0] if open_since is not None and merged else None,
+                continuous_limit_seconds=SQL_UNKNOWN_CONTINUOUS, total_limit_seconds=SQL_UNKNOWN_TOTAL,
+                intervals=merged)
+
+
 def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=30):
     """Known pauses are excluded; an observation gap never counts as a pause."""
     import math
@@ -149,7 +191,11 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
             loaded += count >= threshold
             status = 'loaded' if count >= threshold else 'underloaded'
         bins.append(dict(start=begin, attempts=count, status=status))
-    return dict(continuous=bool(continuous and unknown == 0), eligible_intervals=eligible,
+    sql = sql_unknown(observations, start, end, maximum_gap=maximum_gap)
+    if step == 2:
+        eligible += unknown  # Unknown bins remain in the denominator, never loaded.
+    return dict(continuous=bool(continuous and unknown == 0), sql_unknown=sql,
+                sql_gap_allowed=bool(step == 2 and sql['allowed']), eligible_intervals=eligible,
                 loaded_intervals=loaded, paused_intervals=paused, unknown_intervals=unknown,
                 load_fraction=loaded / eligible if eligible else None, bins=bins)
 
@@ -172,7 +218,10 @@ def format_measurement(report):
     publication_note = ([f"  публикация HTTP: {publication['error']} ⚠️; durable outbox сохранён"]
                         if publication.get('error') else [])
     if not report or report.get('stale'):
-        return ['• ESPN темп: нет свежих данных контроллера ⚠️'] + publication_note
+        sql = (report or {}).get('load', {}).get('sql_unknown', {})
+        unknown_note = ([f"  SQL unknown (stale): {sql['count']}; всего {sql['seconds']} с; максимум {sql['longest_seconds']} с; открыто {sql['open_since']}; лимиты {sql['continuous_limit_seconds']}/{sql['total_limit_seconds']} с"]
+                        if sql else [])
+        return ['• ESPN темп: нет свежих данных контроллера ⚠️'] + unknown_note + publication_note
     completed = report.get('completed')
     if completed:
         lines = []
@@ -186,6 +235,7 @@ def format_measurement(report):
         return 'нет данных ⚠️' if value is None else f'{value:.1f}{suffix}'
     m = report.get('metrics', {})
     load = report.get('load', {})
+    sql = load.get('sql_unknown', {})
     attempts = m.get('attempts', 0)
     share = 100 * m.get('server_timeout_attempts', 0) / attempts if attempts else None
     fresh = report.get('freshness', {})
@@ -199,6 +249,7 @@ def format_measurement(report):
         f"  попытки A/B {m.get('attempts_a', '?')}/{m.get('attempts_b', '?')}; 403 {m.get('count_403', '?')}; 429 {m.get('count_429', '?')}; 5xx/timeout {number(share, '%')}",
         f"  HTTP p95 {number(m.get('http_p95_ms'), ' мс')}; профиль {number(report.get('profile_p95_ms'), ' мс')}; S0 {number(report.get('baseline_p95_ms'), ' мс')}; сбросов {report.get('resets', '?')}",
         f"  нагрузка {load.get('loaded_intervals', 0)}/{load.get('eligible_intervals', 0)} интервалов; пауз {load.get('paused_intervals', 0)}, неизвестных {load.get('unknown_intervals', 0)}; квота истории {report.get('history_quota_per_minute', '?')}/мин",
+        f"  SQL unknown: {sql.get('count', 0)}; всего {sql.get('seconds', 0)} с; максимум {sql.get('longest_seconds', 0)} с; открыто {sql.get('open_since')}; лимиты {sql.get('continuous_limit_seconds', SQL_UNKNOWN_CONTINUOUS)}/{sql.get('total_limit_seconds', SQL_UNKNOWN_TOTAL)} с",
         f"  Iceberg: {write_text}; свежесть {fresh.get('ok', '?')}/{fresh.get('due', '?')} за {fresh.get('day', '?')} UTC",
         f"  изолированный стенд: p95 {isolated_text}; замер {isolated.get('measured_at', '?') if isolated else '?'}; массовая запись — проверка #1511",
         f"  повышение: {report.get('reason', 'нет данных ⚠️')}; измерительные чтения не увеличивают охват истории",
