@@ -357,6 +357,8 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
         for command, options in calls
     )
     assert manifest['status'] == 'complete'
+    assert manifest['parser_revision'] == 'registry-v2'
+    assert manifest['schema_revision'] == '4'
     assert manifest['dq']['silver_trigger_allowed'] is True
     assert manifest['dq_evidence']['silver_trigger_allowed'] is True
     assert manifest['dq']['participant_contract']['endpoint_coverage'] == 1.0

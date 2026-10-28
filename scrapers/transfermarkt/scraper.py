@@ -27,6 +27,11 @@ Source: https://www.transfermarkt.com
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 import hashlib
 import json
 import logging
@@ -111,8 +116,8 @@ _CLUB_COACH_HISTORY_PATH = (
 
 R0_2B_FALLBACK_MARKER = 'TM_FALLBACK'
 
-PARSER_REVISION = os.environ.get('TM_PARSER_VERSION', 'registry-v2')
-SCHEMA_REVISION = os.environ.get('TM_SCHEMA_VERSION', '4')
+PARSER_REVISION = os.environ.get('TM_PARSER_VERSION', DEFAULT_PARSER_REVISION)
+SCHEMA_REVISION = os.environ.get('TM_SCHEMA_VERSION', DEFAULT_SCHEMA_REVISION)
 
 # Per-player loops abort after this many fetch failures in a row (burned
 # proxies, CF lockout). Module-level so tests can monkeypatch it.

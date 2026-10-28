@@ -103,9 +103,17 @@ def pending_intents(identity):
                     if key not in payload['frames']:
                         continue
                     frame = unpack_frames({key: payload['frames'][key]})[key]
+                    refs = frame.attrs.get('tm_original_capture_refs', [])
+                    cached = {(str(ref['player_id']), str(ref['batch_id'])) for ref in refs}
+                    # Cached rows retain their original lineage. The writer
+                    # verifies their physical content before any mutation.
+                    fresh = frame.loc[[
+                        (str(player), str(batch)) not in cached
+                        for player, batch in frame[['player_id', '_batch_id']].itertuples(index=False, name=None)
+                    ]]
                     if not set(columns) <= set(frame.columns) or any(
-                        not frame.empty and (frame[column].isna().any()
-                            or set(frame[column].astype(str)) != {revision})
+                        not fresh.empty and (fresh[column].isna().any()
+                            or set(fresh[column].astype(str)) != {revision})
                         for column, revision in (('parser_revision', tm.PARSER_REVISION),
                                                  ('schema_revision', tm.SCHEMA_REVISION))
                     ):

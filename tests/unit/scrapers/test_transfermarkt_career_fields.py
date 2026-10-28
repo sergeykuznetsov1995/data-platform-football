@@ -141,3 +141,75 @@ def test_pending_replay_refuses_old_contract_and_preserves_journal(
     with pytest.raises(RuntimeError, match='career replay parser/schema contract differs'):
         pending_intents(identity)
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize('entity,key,columns', [
+    ('market_value_history', 'market_value_points', tm.MARKET_VALUE_POINT_COLUMNS),
+    ('transfers', 'transfer_events', tm.TRANSFER_EVENT_COLUMNS),
+])
+def test_mixed_pending_replay_keeps_cached_lineage(tmp_path, monkeypatch, entity, key, columns):
+    from dags.scripts import run_transfermarkt_scraper as run
+    from scrapers.transfermarkt.write_intents import save_intent, pending_intents, unpack_frames
+    monkeypatch.setenv('TM_WRITE_INTENT_DIR', str(tmp_path))
+    fresh = tm._with_metadata([{'player_id': 'new', 'parser_revision': tm.PARSER_REVISION,
+                               'schema_revision': tm.SCHEMA_REVISION}], columns,
+                              entity_type=key, batch_id='new-batch')
+    cached = tm._with_metadata([{'player_id': 'old', 'parser_revision': 'v2',
+                                'schema_revision': '2'}], columns,
+                               entity_type=key, batch_id='old-batch')
+    if entity == 'transfers':
+        fresh['transfer_id'] = 'new-transfer'
+        cached['transfer_id'] = 'old-transfer'
+    spec = run.ENTITY_SPECS[entity]
+    frames = run._merge_career_cache_frames(tm, spec, {key: fresh}, {key: cached}, 'GB1', 2026)
+    identity = {'kind': 'scope', 'entity': entity}
+    save_intent(identity, frames)
+    restored = unpack_frames(pending_intents(identity)[0][1]['frames'])[key]
+    assert restored.loc[restored.player_id == 'old', 'parser_revision'].item() == 'v2'
+    assert restored.attrs['tm_original_capture_refs'] == [{'player_id': 'old', 'batch_id': 'old-batch'}]
+    restored.loc[restored.player_id == 'new', 'parser_revision'] = 'old'
+    for path, _payload in pending_intents(identity):
+        path.unlink()
+    save_intent(identity, {key: restored})
+    with pytest.raises(RuntimeError, match='career replay parser/schema contract differs'):
+        pending_intents(identity)
+
+
+@pytest.mark.parametrize('changed', [None, 'existing', 'missing_nonnull', 'missing_required'])
+def test_cached_guard_checks_original_projection_before_schema_evolution(changed):
+    from unittest.mock import MagicMock
+    from dags.scripts import run_transfermarkt_scraper as run
+    from scrapers.transfermarkt import writer
+    from scrapers.transfermarkt.revisions import CAREER_NULLABLE_ADDITIONS
+    frame = tm._with_metadata([{'player_id': 'old', 'value_eur': 100,
+                               'parser_revision': 'v2', 'schema_revision': '2'}],
+                              tm.MARKET_VALUE_POINT_COLUMNS,
+                              entity_type='market_value_points', batch_id='old-batch')
+    frame.attrs['tm_original_capture_refs'] = [{'player_id': 'old', 'batch_id': 'old-batch'}]
+    # A fresh row brings new populated columns into the same write bundle.
+    fresh = frame.copy()
+    fresh['player_id'] = 'new'
+    fresh['club_id'] = '75'
+    physical = [column for column in frame.columns if column not in CAREER_NULLABLE_ADDITIONS]
+    if changed == 'missing_nonnull':
+        frame['club_id'] = '75'
+    if changed == 'missing_required':
+        physical.remove('value_eur')
+    rows = frame[physical].copy()
+    if changed == 'existing':
+        rows['value_eur'] = 999
+    scraper = MagicMock()
+    cursor = scraper._bronze_connection.return_value.cursor.return_value
+    def execute(sql, params=None):
+        assert sql.startswith('SELECT * FROM ')
+        cursor.description = [(column,) for column in physical]
+        cursor.fetchall.return_value = list(rows.itertuples(index=False, name=None))
+    cursor.execute.side_effect = execute
+    mixed = pd.concat([frame, fresh], ignore_index=True)
+    mixed.attrs.update(frame.attrs)
+    outputs = run.ENTITY_SPECS[run.ENTITY_MV_HISTORY].outputs
+    if changed:
+        with pytest.raises(writer.StaleTransfermarktWrite):
+            writer.guard_cached_frames(scraper, outputs, {'market_value_points': mixed})
+    else:
+        writer.guard_cached_frames(scraper, outputs, {'market_value_points': mixed})

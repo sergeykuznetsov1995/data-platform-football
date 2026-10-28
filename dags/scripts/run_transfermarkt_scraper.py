@@ -12,6 +12,11 @@ Exit codes: 0 success/no-op/dry-run, 1 hard failure, 2 genuine empty fallback,
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 from scrapers.transfermarkt.writer import execute_statement, writer_lock, guard_frames, guard_cached_frames, is_mutation, locked_write
 
 import argparse
@@ -121,8 +126,8 @@ REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
 _MIN_REPLACE_RATIO = 0.9
 _WINDOW_STRIDE_DAYS = 7
 FETCH_STATE_TABLE = 'iceberg.ops.transfermarkt_fetch_state'
-PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', 'registry-v2')
-SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', '4')
+PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', DEFAULT_PARSER_REVISION)
+SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', DEFAULT_SCHEMA_REVISION)
 REFRESH_MODES = {'auto', 'current', 'historical', 'force'}
 WRITE_MODES = {'dual', 'native-only', 'legacy-only'}
 DUAL_WRITE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_dual_write_manifest_v2'
