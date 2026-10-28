@@ -65,12 +65,6 @@ def test_single_data_file_with_delete_is_optimized_under_lock():
     assert queries.closed
 
 
-def test_schedule_has_daily_retention():
-    from utils.maintenance_tasks import NON_WHOSCORED_HIGH_CHURN
-
-    assert "sofascore_schedule" in NON_WHOSCORED_HIGH_CHURN
-
-
 @pytest.mark.parametrize("count,size", [(1001, 100), (2, m.MAX_BYTES + 1)])
 def test_oversized_whole_partition_is_reported(count, size):
     chunks, skipped = m.plan_chunks([(*PARTITION, count, size, count - 1, 1)])

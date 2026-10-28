@@ -978,8 +978,9 @@ Bronze и запускает по одному скоупу под отдель�
 размеры повторно читаются под `bronze_writer_lock`. OPTIMIZE использует
 явный порог 128MB. Одиночный data-файл с delete-файлами также кандидат.
 Превышающие предел партиции отражаются в JSON, по путям они не дробятся.
-Daily maintenance общего стека выполняет для расписаний только существующий
-cleanup с retention 3d; новый DAG его не дублирует.
+Снимки и осиротевшие файлы после OPTIMIZE убирает общий еженедельный
+`dag_iceberg_maintenance` (retention 7d); в daily `HIGH_CHURN_BRONZE` таблица
+не добавлена — `dags/utils/maintenance_tasks.py` входит в runtime-замок WhoScored.
 
 JSON в task log содержит snapshot, число и байты файлов по content до/после,
 обработанные/пропущенные партиции, остаток, query ID и длительности.
