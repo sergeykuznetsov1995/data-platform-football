@@ -383,3 +383,27 @@ def test_closed_check_validation_accepts_only_complete(dag_module, tmp_path):
         dag_module.validate_scope_result(
             **_validation_context(path, mode="closed_check")
         )
+
+
+def test_html_task_is_optional_and_after_json(dag_module):
+    task = _bash("enrich_matches")
+    assert "--enrich-matches" in task.bash_command
+    assert task._init_kwargs["trigger_rule"] == "all_done"
+    assert task.upstream_task_ids == {"run_current_scope"}
+    assert task.downstream_task_ids == {"enrichment_finished"}
+    assert _python("enrichment_finished")._init_kwargs["trigger_rule"] == "all_done"
+    assert task._init_kwargs["retries"] == 0
+    assert task._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert task._init_kwargs["priority_weight"] < dag_module.CURRENT_PRIORITY
+
+
+def test_optional_leaf_does_not_mask_json_failure(dag_module):
+    from airflow.exceptions import AirflowFailException
+
+    watcher = _python("json_collection_failed")
+    assert watcher._init_kwargs["trigger_rule"] == "one_failed"
+    assert watcher._init_kwargs["retries"] == 0
+    assert watcher.upstream_task_ids == {"run_current_scope"}
+    assert not watcher.downstream_task_ids
+    with pytest.raises(AirflowFailException, match="JSON collection failed"):
+        watcher.python_callable()

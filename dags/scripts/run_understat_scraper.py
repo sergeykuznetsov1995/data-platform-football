@@ -872,6 +872,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         UnderstatManifestRepository.from_env().bootstrap()
         return 0
+    if arguments == ["--enrich-matches"]:
+        try:
+            from scrapers.understat import UnderstatClient
+            from scrapers.understat.enrichment import run_enrichment
+            from scrapers.understat.manifest import UnderstatManifestRepository
+
+            with UnderstatClient(cache_dir=os.getenv(
+                "UNDERSTAT_CACHE_DIR", str(Path.home() / "soccerdata/data/UnderstatNative")
+            )) as client:
+                result = run_enrichment(client, UnderstatManifestRepository.from_env())
+        except Exception as exc:
+            logger.warning("Optional Understat HTML step failed", exc_info=True)
+            result = {"status": "deferred", "error": str(exc)}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     args = _argument_parser().parse_args(arguments)
     try:
         result, exit_code = run_scope(args)

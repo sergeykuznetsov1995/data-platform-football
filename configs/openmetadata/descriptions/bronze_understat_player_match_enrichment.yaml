@@ -1,0 +1,40 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_player_match_enrichment
+  description: >
+    Необязательное HTML-обогащение новых матчей. Независимо от семи JSON-таблиц.
+    Требуются is_valid=true и source_batch_id текущей JSON-публикации.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: "Лига; часть natural key."
+  - name: season
+    description: "Сезон slug; часть natural key."
+  - name: game_id
+    description: "Understat match ID; часть natural key."
+  - name: source_batch_id
+    description: "Идентификатор подтверждённой JSON-публикации; JOIN только с текущим _batch_id."
+  - name: json_hash
+    description: "SHA256 проверенных JSON-идентичностей и счётчиков карточек."
+  - name: parser_version
+    description: "Независимая версия HTML-парсера."
+  - name: is_valid
+    description: "Потребитель обязан фильтровать true; false инвалидирует обогащение после исправления JSON."
+  - name: _source
+    description: "Источник данных."
+  - name: _entity_type
+    description: "Таблица Bronze."
+  - name: _ingested_at
+    description: "Время записи."
+  - name: _batch_id
+    description: "Идентификатор записи обогащения."
+  - name: team_id
+    description: "Understat team ID; часть natural key."
+  - name: player_id
+    description: "Understat player ID; часть natural key."
+  - name: yellow_card_minutes
+    description: "JSON-массив (varchar) строк минут жёлтых карточек, включая добавленное время 90+4'."
+  - name: red_card_minutes
+    description: "JSON-массив (varchar) строк минут красных карточек, включая добавленное время."

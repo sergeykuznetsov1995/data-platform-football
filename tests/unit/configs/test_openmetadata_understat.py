@@ -29,3 +29,12 @@ def test_all_understat_contract_columns_are_documented() -> None:
             f"missing={sorted(expected - documented)}, "
             f"extra={sorted(documented - expected)}"
         )
+
+
+def test_optional_enrichment_contracts_are_documented_separately():
+    from scrapers.understat.enrichment import ENRICHMENT_CONTRACTS
+
+    assert len(TABLE_CONTRACTS) == 7
+    for contract in ENRICHMENT_CONTRACTS:
+        spec = yaml.safe_load((DESCRIPTIONS / f"bronze_{contract.table_name}.yaml").read_text())
+        assert {c["name"] for c in spec["columns"]} == set(contract.required_columns) | BRONZE_METADATA_COLUMNS
