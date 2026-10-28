@@ -187,3 +187,44 @@ def test_retired_api_has_no_definitions_or_references(filename, removed):
         elif isinstance(node, ast.keyword):
             names.add(node.arg)
     assert not names & removed
+
+
+@pytest.mark.parametrize("values", [[None, None], [0, 1, None], [0.125, 0.75, None]])
+def test_forecast_writer_types_survive_real_arrow_preparation(scraper, values):
+    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.understat.contracts import FORECAST_COLUMNS
+
+    facade, _ = scraper
+    writer = facade._iceberg_writer
+    writer._add_metadata_columns.side_effect = lambda df, source, batch_id: df.assign(_batch_id=batch_id)
+    frame = pd.DataFrame({column: values for column in FORECAST_COLUMNS}).convert_dtypes()
+    facade.save_to_iceberg(frame, "understat_schedule", batch_id="batch")
+    prepared = writer.write_dataframe.call_args.kwargs["df"]
+    arrow = IcebergWriter()._pandas_to_arrow(prepared)
+    types = TrinoTableManager.__new__(TrinoTableManager).arrow_schema_to_trino(arrow.schema)
+    for column in FORECAST_COLUMNS:
+        assert types[column] == "DOUBLE"
+        assert str(arrow.schema.field(column).type) == "double"
+        assert str(prepared[column].dtype) == "Float64"
+        assert arrow[column].to_pylist() == values
+    assert prepared["_batch_id"].tolist() == ["batch"] * len(values)
+
+
+@pytest.mark.parametrize("invalid", ["invalid", ""])
+def test_forecast_writer_rejects_invalid_numbers_before_write(scraper, invalid):
+    facade, _ = scraper
+    with pytest.raises(ValueError):
+        facade.save_to_iceberg(
+            pd.DataFrame({"forecast_draw": [invalid]}),
+            "understat_schedule", batch_id="batch",
+        )
+    facade._iceberg_writer.write_dataframe.assert_not_called()
+
+
+def test_contract_declares_all_columns_without_changing_batch_versions():
+    for contract in TABLE_CONTRACTS:
+        assert set(contract.column_types) == set(contract.required_columns)
+        assert contract.column_types["league_id"] == "varchar"
+        assert contract.column_types["season"] == "varchar"
+    assert TABLE_CONTRACTS[0].column_types["forecast_draw"] == "double"

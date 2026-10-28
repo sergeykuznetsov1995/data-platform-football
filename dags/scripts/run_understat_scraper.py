@@ -52,7 +52,8 @@ class LegacyCutoverBlocked(ValueError):
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Ingest one exact Understat league-season scope"
+        description="Ingest one exact Understat league-season scope",
+        epilog="One-time journal initialization: run with --bootstrap-manifest alone.",
     )
     parser.add_argument(
         "--mode",
@@ -313,6 +314,7 @@ def _journal_early_failure(
         )
         if repository is None:
             repository = UnderstatManifestRepository.from_env()
+        repository.validate_tables()
         latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
         batch_id = str(uuid.uuid4())
         attempt = build_failure_attempt(
@@ -411,14 +413,9 @@ def run_scope(
     if scraper_factory is None:
         scraper_factory = UnderstatScraper
 
+    repository.validate_tables()
+
     try:
-        repository.ensure_table()
-        # #1429: the failures journal exists before the first failure, so the
-        # daily meter can always read it; its outage never fails the scope.
-        try:
-            repository.ensure_failures_table()
-        except Exception:
-            logger.exception("Unable to ensure the Understat failures journal")
         latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
         attempt_no = (latest.attempt_no + 1) if latest else 1
         if (
@@ -869,7 +866,13 @@ def run_scope(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = _argument_parser().parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--bootstrap-manifest"]:
+        from scrapers.understat.manifest import UnderstatManifestRepository
+
+        UnderstatManifestRepository.from_env().bootstrap()
+        return 0
+    args = _argument_parser().parse_args(arguments)
     try:
         result, exit_code = run_scope(args)
     except Exception as exc:
