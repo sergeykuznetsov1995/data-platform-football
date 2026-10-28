@@ -468,3 +468,31 @@ def test_frozen_state_is_unchanged_and_only_pending_days_remeasured(reports):
     state = saves[0]
     new["fotmob_daily_criterion"]()
     assert len(queries) == 1 and len(saves) == 1
+
+
+def test_deleted_payload_without_own_input_invalidates_other_season(db, monkeypatch, reports):
+    _, report = reports
+    # Only season B has a candidate; its global fi comes from season A.
+    setup_scope(db, sk="B")
+    manifest(db, "cal", sk="B")
+    calendar(db, sk="B")
+    db.db.execute(f"INSERT INTO {c1.PAYLOADS} VALUES "
+                  "('1','A',10,'p',TIMESTAMP '2026-10-20 12:00:00',"
+                  "TIMESTAMP '2026-10-20 12:00:00')")
+    harness = SnapshotHarness(db, monkeypatch)
+    harness.capture()
+    c1.refresh(db, first_day="2026-10-20", last_day="2026-10-27")
+    query = (f"SELECT match_id, deadline, first_ingested, na_runs, na_spread_s, "
+             f"success_count, first_ft, saw_unfinished FROM {c1.TABLE} WHERE kind='input' "
+             "AND deadline_day=DATE '2026-10-21' AND complete")
+    now = datetime(2026, 10, 28)
+    assert report["_c1_classify"](db.execute_query(query), now)[1] == 1
+    assert db.db.execute("SELECT source_season_key FROM fotmob_c1_inputs WHERE kind='input'").fetchall() == [("B",)]
+
+    db.db.execute(f"DELETE FROM {c1.PAYLOADS}")
+    harness.capture()
+    c1.refresh(db)
+    assert db.db.execute("SELECT first_ingested FROM fotmob_c1_inputs WHERE kind='input'").fetchone() == (None,)
+    assert report["_c1_classify"](db.execute_query(query), now)[1] == 0
+    checkpoint = db.db.execute("SELECT checkpoint_json FROM fotmob_c1_inputs WHERE kind='checkpoint'").fetchone()[0]
+    assert json.loads(checkpoint)["snapshots"][c1.PAYLOADS] == harness.version

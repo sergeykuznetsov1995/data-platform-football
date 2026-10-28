@@ -44,6 +44,7 @@ PURGE_RAW_ENV_KEYS = (
     "S3_SECRET_KEY",
 )
 PROJECTION_SOURCES = {
+    "dag_refresh_fotmob_c1.py": "dags/dag_refresh_fotmob_c1.py",
     "dag_orchestrate_fotmob.py": "dags/dag_orchestrate_fotmob.py",
     "dag_ingest_fotmob.py": "dags/dag_ingest_fotmob.py",
     "dag_trigger_fotmob_daily.py": "dags/dag_trigger_fotmob_daily.py",
@@ -62,6 +63,7 @@ EXPECTED_DAGS = {
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
+    "dag_refresh_fotmob_c1",
 }
 SCHEDULE_BOUNDARY_FIELDS = (
     "logical_date",
@@ -100,6 +102,7 @@ ISOLATED_DAG_ROOT_PATHS = {
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
     "dags/dag_collect_fotmob_players.py",
+    "dags/dag_refresh_fotmob_c1.py",
 }
 ISOLATED_DAG_PREFIXES = (
     "dags/scripts/",
@@ -117,6 +120,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
     "dags/dag_collect_fotmob_players.py",
+    "dags/dag_refresh_fotmob_c1.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
     "dags/dag_trigger_fotmob_daily.py",
@@ -170,6 +174,7 @@ SHARED_STATE_DAGS = {
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
+    "dag_refresh_fotmob_c1",
     "dag_orchestrate_fotmob",
 }
 EXPECTED_SHARED_PAUSE_STATES = {
@@ -204,13 +209,16 @@ LEGACY_OWNER_DAGS = frozenset(
         "dag_collect_fotmob_players",
     }
 )
+# C1 requires separate approval after bootstrap; ordinary admission keeps it paused.
+PAUSED_SERVICE_DAGS = frozenset({"dag_refresh_fotmob_c1"})
+AUTOMATIC_PAUSED_DAGS = LEGACY_OWNER_DAGS | PAUSED_SERVICE_DAGS
 AUTOMATIC_ACTIVE_DAGS = frozenset(
     {
         "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
     }
 )
-AUTOMATIC_DAGBAG_DAGS = AUTOMATIC_ACTIVE_DAGS | LEGACY_OWNER_DAGS
+AUTOMATIC_DAGBAG_DAGS = AUTOMATIC_ACTIVE_DAGS | AUTOMATIC_PAUSED_DAGS
 AUTOMATIC_EXPECTED_SCHEDULES = {
     "dag_orchestrate_fotmob": "*/5 * * * *",
     "dag_ingest_fotmob": "None",
@@ -218,6 +226,7 @@ AUTOMATIC_EXPECTED_SCHEDULES = {
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
     "dag_collect_fotmob_players": "None",
+    "dag_refresh_fotmob_c1": "15 * * * *",
 }
 AUTOMATIC_LANES = frozenset({"daily", "refresh", "backfill"})
 AUTOMATIC_ADMISSION_MAX_AGE = timedelta(minutes=15)
@@ -343,7 +352,7 @@ def validate_automatic_catalog_admission(
         or writer_snapshot.get("active_runs") != {}
     ):
         raise RuntimeBindingError(
-            "automatic writer snapshot is not one atomic paused six-DAG view"
+            "automatic writer snapshot is not one atomic paused seven-DAG view"
         )
 
     legacy = value.get("legacy_owners")
@@ -1213,7 +1222,7 @@ def validate_automatic_rollout_activation(
         for dag_id in AUTOMATIC_DAGBAG_DAGS
     }
     active_paused = {
-        dag_id: dag_id in LEGACY_OWNER_DAGS for dag_id in AUTOMATIC_DAGBAG_DAGS
+        dag_id: dag_id in AUTOMATIC_PAUSED_DAGS for dag_id in AUTOMATIC_DAGBAG_DAGS
     }
 
     def isolated_tx(value: Any, *, phase: str, before: Mapping[str, bool], after: Mapping[str, bool]) -> datetime:
@@ -1827,7 +1836,7 @@ def load_deployment_context(
             or automatic_admission["current_contract_identity"] is None
             or payload.get("kept_paused") is not False
             or not isinstance(paused, list)
-            or set(paused) != LEGACY_OWNER_DAGS
+            or set(paused) != AUTOMATIC_PAUSED_DAGS
             or not isinstance(unpaused, list)
             or set(unpaused) != AUTOMATIC_ACTIVE_DAGS
         ):
@@ -1850,9 +1859,9 @@ def load_deployment_context(
     elif activation_state == "active":
         if (
             payload.get("kept_paused") is not False
-            or paused != []
+            or set(paused or ()) != PAUSED_SERVICE_DAGS
             or not isinstance(unpaused, list)
-            or set(unpaused) != EXPECTED_DAGS
+            or set(unpaused) != EXPECTED_DAGS - PAUSED_SERVICE_DAGS
         ):
             raise RuntimeBindingError("active deployment pause state is inconsistent")
     elif (

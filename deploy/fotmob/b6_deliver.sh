@@ -201,9 +201,9 @@ done
 
 parse_left=${PARSE_WAIT:-300}
 while :; do
-  parsed=$(docker exec "$METADB" psql -X -U airflow -d airflow -tA -c "SELECT count(*) FROM dag WHERE dag_id IN ('dag_ingest_fotmob','dag_orchestrate_fotmob','dag_collect_fotmob_players','dag_refresh_fotmob','dag_backfill_fotmob','dag_trigger_fotmob_daily') AND is_active AND last_parsed_time > '$DELIVERY_STARTED_AT'::timestamptz;")
-  [ "$parsed" = 6 ] && break
-  [ "$parse_left" -gt 0 ] || die "six DAGs not parsed after checkout: $parsed"
+  parsed=$(docker exec "$METADB" psql -X -U airflow -d airflow -tA -c "SELECT count(*) FROM dag WHERE dag_id IN ('dag_ingest_fotmob','dag_orchestrate_fotmob','dag_collect_fotmob_players','dag_refresh_fotmob','dag_backfill_fotmob','dag_trigger_fotmob_daily','dag_refresh_fotmob_c1') AND is_active AND last_parsed_time > '$DELIVERY_STARTED_AT'::timestamptz;")
+  [ "$parsed" = 7 ] && break
+  [ "$parse_left" -gt 0 ] || die "seven DAGs not parsed after checkout: $parsed"
   sleep 20
   parse_left=$((parse_left - 20))
 done

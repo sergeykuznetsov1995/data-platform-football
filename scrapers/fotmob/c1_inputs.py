@@ -335,15 +335,16 @@ def refresh(manager, *, first_day=None, last_day=None):
             )}
         affected |= {pair for pair in all_pairs if pair[0] in changed_competitions}
         # Pool legacy evidence across natural keys. Find IDs in changed physical
-        # seasons, then every season containing them; deleted keys are read back
-        # from the previously published inputs below as well.
+        # seasons in both snapshots, then every season containing them. Deleted
+        # evidence may have no published input in its own physical season.
         while True:
             known = set(affected)
             if affected:
                 for table in (MATCHES, PAYLOADS):
-                    ids |= {str(row[0]) for row in manager.execute_query(
-                        f"SELECT DISTINCT match_id FROM {source_sql(table, before, pairs_sql(affected, physical=True))}"
-                    )}
+                    for version in (previous["snapshots"], before):
+                        ids |= {str(row[0]) for row in manager.execute_query(
+                            f"SELECT DISTINCT match_id FROM {source_sql(table, version, pairs_sql(affected, physical=True))}"
+                        )}
                 ids |= {str(row[0]) for row in manager.execute_query(
                     f"SELECT DISTINCT match_id FROM {TABLE} WHERE kind='input' "
                     f"AND deadline_day >= DATE '{first_day}' "

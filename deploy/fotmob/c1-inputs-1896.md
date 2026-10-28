@@ -47,8 +47,10 @@ DAG `dag_refresh_fotmob_c1` виден только при `FOTMOB_ISOLATED_STAC
 `DEFAULT_ARGS.on_failure_callback` отправляет штатный алерт. Каждый запрос updater
 ограничен серверными query_max_run_time/query_max_execution_time=300s.
 Bootstrap через dag_run.conf запрещён. Parser version, batch identity и сборщик
-не изменены. Изменений Compose/cron/доставки нет. DAG придёт только штатной ночной
-доставкой (одна за ночь); до конца действующей приёмки источника не выкатывать.
+не изменены. В Compose добавлена только обязательная пауза C1; cron не меняется.
+Проверки доставки и остановки писателей учитывают семь DAG; admission оставляет C1 на паузе даже при активации сборщика.
+Активация C1 после bootstrap требует отдельного разрешения. DAG придёт штатной
+ночной доставкой (одна за ночь); до конца действующей приёмки источника не выкатывать.
 
 В отдельном утверждённом окне вызвать `refresh(manager, first_day='2026-10-20',
 last_day='2026-10-27')` под `maintenance.writer_lock()`, привязав полученный lease
@@ -56,7 +58,10 @@ last_day='2026-10-27')` под `maintenance.writer_lock()`, привязав п�
 `FotMobTrinoTableManager(source='fotmob:c1-inputs', session_properties={
 'query_max_run_time': '300s', 'query_max_execution_time': '300s'})`.
 Первичное чтение истории может быть тяжёлым; время updater здесь не измерено.
-После успешного bootstrap и проверки открыть расписание DAG.
+После успешного bootstrap и проверки отдельно согласовать активацию: текущая
+admission-модель допускает только paused C1. Одного ручного unpause недостаточно;
+активационный пакет должен согласовать pause shapes, deployment report и проверки
+runtime/publication/observe/recovery с включённым C1. Этот пакет их не переключает.
 
 `morning-report-c1-inputs.patch` накладывается на живой `morning_report.py`, меняет
 только `_c1_sql`. Классификатор, округление, pending и заморозка state остаются
