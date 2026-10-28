@@ -15359,8 +15359,14 @@ def test_scored_incomplete_match_fails_page_and_requests_refetch_without_dead_le
         control.frontier[target_id].update(state="retry", last_error_class="IncompleteMatchPageError")
         return True
     control.schedule_incomplete_match_refetch = refetch
-    with pytest.raises(ParseWaveError, match="IncompleteMatchPageError"):
-        pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    if scheduler_fails:
+        with pytest.raises(ParseWaveError, match="control unavailable"):
+            pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    else:
+        result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+        assert result.incomplete_match_refetches == 1
+        assert result.parsed == 0
+        assert result.failures == []
     record = records[0]
     assert refetches == [(record.target_id, {"content_hash": record.content_hash,
                                           "logical_refresh_id": record.logical_refresh_id})]
@@ -15414,8 +15420,9 @@ def test_scored_match_without_tables_refetches_with_real_generic_writer(tmp_path
         return True
 
     control.schedule_incomplete_match_refetch = refetch
-    with pytest.raises(ParseWaveError, match="IncompleteMatchPageError"):
-        pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    assert result.incomplete_match_refetches == 1
+    assert result.parsed == 0
     assert refetches == [(target.target_id, {"content_hash": record.content_hash, "logical_refresh_id": refresh})]
     assert control.frontier[target.target_id]["state"] == "retry"
     observation = next(iter(control.observations.values()))
@@ -15449,3 +15456,76 @@ def test_acceptance_rejects_zero_rows_for_scored_match(dataset, availability, co
         "datasets": manifests,
     })
     assert any(f"{target_id}:{dataset}" in error for error in errors)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("dag_id", ["dag_ingest_fbref", "dag_backfill_fbref"])
+def test_incomplete_match_recovery_drains_batches_before_fetch(tmp_path, monkeypatch, batched, dag_id):
+    from dags.utils import fbref_pipeline_tasks
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218", "a071faa8", "13351335", "13351336"),
+    )
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    pipeline.batch_persist_enabled = batched
+    refetches = []
+
+    def refetch(target_id, **_kwargs):
+        refetches.append(target_id)
+        control.frontier[target_id]["state"] = "retry"
+        return True
+
+    control.schedule_incomplete_match_refetch = refetch
+    monkeypatch.setattr(fbref_pipeline_tasks, "_pipeline", lambda: pipeline)
+    # Small shards force two all-incomplete cohorts before the empty cohort.
+    run_type = "backfill" if dag_id == "dag_backfill_fbref" else "current"
+    control.run["run_type"] = run_type
+    settings = replace(_settings(run_type), shard_size=2)
+    monkeypatch.setattr(fbref_pipeline_tasks, "_settings", lambda **_kwargs: settings)
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__incomplete-recovery", dag_id=dag_id,
+        page_kinds=["match"], run_type=run_type,
+    )
+    assert recovered["batches"] == 2
+    assert recovered["incomplete_match_refetches"] == 4
+    assert recovered["parsed"] == 0
+    assert recovered["recovery_stalled"] is False
+    assert refetches == [record.target_id for record in records]
+    assert len(control.observations) == 4
+    assert all(row["status"] == "failed" for row in control.observations.values())
+    assert all(row["state"] == "retry" for row in control.frontier.values())
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+
+    # The subsequent fetch step runs with an offline transport stub.
+    pipeline.fetcher_factory = lambda *_: FakeFetcher(control.events, b"<html></html>")
+    pipeline.sleep = lambda _: None
+    pipeline.clock = lambda: NOW
+    fetched = pipeline.fetch_wave(
+        str(uuid.uuid4()), worker_id="worker", page_kinds=["competition_index"],
+        settings=settings,
+    )
+    assert fetched.fetched == 1
+    assert "http" in control.events
+
+
+@pytest.mark.parametrize("stage", ["manifest", "observation_fence", "refetch_refused"])
+def test_incomplete_match_refetch_keeps_control_failures_fatal(tmp_path, monkeypatch, stage):
+    from scrapers.fbref import match_parser
+
+    pipeline, control, _records, _generic, typed = _pipeline_with_saved_matches(tmp_path, ("0701e218",))
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    control.schedule_incomplete_match_refetch = lambda *_args, **_kwargs: stage != "refetch_refused"
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("control unavailable")
+
+    if stage == "manifest":
+        monkeypatch.setattr(pipeline, "_record_page_completion", unavailable)
+    elif stage == "observation_fence":
+        monkeypatch.setattr(control, "fail_observation_processing", unavailable)
+    with pytest.raises(ParseWaveError, match="IncompleteMatchPageError"):
+        pipeline.recover_unprocessed_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)

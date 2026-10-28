@@ -826,6 +826,7 @@ class WaveResult:
     deferred_session_failures: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    incomplete_match_refetches: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -923,6 +924,7 @@ class _ProcessedObservation:
     skipped_ineligible: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    incomplete_match_refetches: int = 0
     deferred_parse_failures: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
@@ -6237,9 +6239,10 @@ class FBrefPipeline:
         # Record the retry decision before releasing the observation. If that
         # transaction fails, recovery must still retry scheduling this raw.
         refetch_error = None
+        refetch_scheduled = False
         if isinstance(exc, IncompleteMatchPageError):
             try:
-                self.control.schedule_incomplete_match_refetch(
+                refetch_scheduled = self.control.schedule_incomplete_match_refetch(
                     record.target_id, content_hash=record.content_hash,
                     logical_refresh_id=record.logical_refresh_id,
                 )
@@ -6259,6 +6262,14 @@ class FBrefPipeline:
             failures.append(
                 f"{record.target_id}:observation_fence:"
                 f"{type(fence_exc).__name__}:{fence_exc}"
+            )
+        if refetch_scheduled and not failures:
+            # The page stays failed and cannot publish, but a fresh request
+            # now owns its recovery. Let the drain reach the next raw batch.
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=stale_typed_observations_skipped,
+                incomplete_match_refetches=1,
             )
         if isinstance(exc, SourceContractRejected):
             retired = False
@@ -7131,6 +7142,7 @@ class FBrefPipeline:
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
         result.dead_lettered += outcome.dead_lettered
+        result.incomplete_match_refetches += outcome.incomplete_match_refetches
         result.deferred_parse_failures.extend(outcome.deferred_parse_failures)
         result.failures.extend(outcome.failures)
 
