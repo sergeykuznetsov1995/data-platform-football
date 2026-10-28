@@ -125,6 +125,85 @@ class _Response:
         self.status = status
 
 
+@pytest.mark.parametrize("setting,blocked", [(None, True), ("0", False), ("1", True)])
+def test_script_default_blocks_before_admission_and_allows_challenge(monkeypatch, setting, blocked):
+    monkeypatch.delenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", raising=False)
+    if setting is not None:
+        monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", setting)
+    transport = CamoufoxFbrefTransport(max_network_requests=10)
+    script = _Route("script", "https://fbref.com/static/site.js")
+    transport._maybe_block(script)
+    assert script.aborted == int(blocked)
+    assert transport.traffic_stats()["real_requests_count"] == int(not blocked)
+    if blocked:
+        assert transport._inflight_reserved_bytes == 0
+    challenge = _Route("script", "https://challenges.cloudflare.com/turnstile/x.js")
+    transport._maybe_block(challenge)
+    assert challenge.continued == 1
+    document = _Route()
+    transport._maybe_block(document)
+    assert document.continued == 1
+
+
+@pytest.mark.parametrize("fixture,kind,comment_table", [
+    ("matches/0701e218.html.gz", "match", False),
+    ("matches/0701e218.html.gz", "match", True),
+    ("report_observations/schedule-70.html", "schedule", False),
+    ("season_stats/acnq-2027-keepers-e9cfdc24.html.gz", "season_stats", False),
+])
+def test_script_blocking_preserves_saved_page_inventory(monkeypatch, fixture, kind, comment_table):
+    import gzip
+    from scrapers.fbref.page_document import parse_page_document
+
+    path = Path(__file__).parents[2] / "fixtures" / "fbref" / fixture
+    html = gzip.decompress(path.read_bytes()).decode() if path.suffix == ".gz" else path.read_text()
+    if comment_table:
+        from bs4 import BeautifulSoup, Comment
+
+        # Archived match snapshots already have uncommented DOM tables.
+        # Replay the same source table in FBref's comment-wrapped form too.
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table")
+        table.replace_with(Comment(str(table)))
+        html = str(soup)
+    canonical_url = (
+        "https://fbref.com/en/comps/657/keepers/"
+        "Africa-Cup-of-Nations-qualification-Stats"
+        if kind == "season_stats" else "https://fbref.com/en/"
+    )
+    baseline = parse_page_document(
+        html, target_id=fixture, page_kind=kind, canonical_url=canonical_url,
+    )
+    if comment_table:
+        assert any(table.source_location.startswith("comment") for table in baseline.tables)
+    inventories = []
+    for setting in ("0", "1"):
+        monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", setting)
+        transport = CamoufoxFbrefTransport()
+        transport._page = MagicMock()
+        transport._page.evaluate.return_value = True
+        transport._page.content.return_value = html
+        monkeypatch.setattr(transport, "POLL_INTERVAL_S", 0)
+        monkeypatch.setattr(transport, "_challenge_shell_present", lambda: False)
+        monkeypatch.setattr(transport, "_navigate_with_one_manual_redirect", lambda _url: None)
+        document = _Route()
+        transport._maybe_block(document)
+        assert document.continued == 1
+        fetched = transport.fetch(canonical_url)
+        assert fetched == html
+        page = parse_page_document(
+            fetched, target_id=fixture, page_kind=kind, canonical_url=canonical_url,
+        )
+        assert page == baseline
+        if kind != "season_stats":
+            assert page.tables
+        else:
+            assert page.tables == ()
+            assert page.errors == ()
+        inventories.append((page.inventory_records(), page.cell_records(), page.errors))
+    assert inventories[0] == inventories[1]
+
+
 class _StatusFailsResponse:
     def __init__(self, request, headers):
         self.request = request
@@ -891,11 +970,12 @@ def test_one_600kb_undeclared_response_keeps_a_4mib_session_alive():
 
 
 @pytest.mark.unit
-def test_replay_of_20260923_xhr_592492_does_not_abort():
+def test_replay_of_20260923_xhr_592492_does_not_abort(monkeypatch):
     """Replay of the 23.09 bootstrap: seven browser requests, one XHR of
     592 492 bytes against a 589 824-byte reservation, 16 MiB transport cap.
     Before #1385 this aborted with
     ``completed_size_exceeded_reservation:592492>589824`` and killed the run."""
+    monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", "0")
     cap = 16 * 1024 * 1024
     transport = CamoufoxFbrefTransport(max_network_bytes=cap)
     sizes = [
@@ -2570,6 +2650,7 @@ def test_managed_shell_is_counted_before_turnstile_iframe(monkeypatch):
 
 
 def test_popup_and_subresource_share_context_admission(monkeypatch):
+    monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", "0")
     page = MagicMock()
     page.evaluate.return_value = True
     context = MagicMock()

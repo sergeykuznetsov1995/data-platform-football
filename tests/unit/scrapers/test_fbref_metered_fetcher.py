@@ -670,6 +670,46 @@ def test_persistent_session_reuses_http_and_emits_idle_page_deltas():
     session.close.assert_called_once_with()
 
 
+def test_geoip_lookup_once_per_lease_through_working_provider(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    browser = MagicMock()
+    page = browser.new_context.return_value.new_page.return_value
+    page.evaluate.return_value = True
+    page.content.return_value = "<html><table id='sched'></table></html>"
+    page.title.return_value = "FBref"
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.return_value = browser
+    monkeypatch.setitem(sys.modules, "camoufox.sync_api", MagicMock(Camoufox=camoufox))
+    monkeypatch.setitem(sys.modules, "camoufox.addons", MagicMock(
+        DefaultAddons=(SimpleNamespace(name="UBO"),),
+    ))
+    client = _LeaseClient([10, 20])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+    )
+    transport = fetcher._transport
+    resolver = MagicMock(return_value="203.0.113.9")
+    transport._geoip_resolver = resolver
+    transport._geoip_database_check = lambda: None
+    monkeypatch.setattr(transport, "_navigate_with_one_manual_redirect", lambda _url: None)
+    monkeypatch.setattr(transport, "_solve_current_page", lambda: "<html>FBref</html>")
+    try:
+        for _ in range(2):
+            assert transport.fetch("https://fbref.com/en/")
+        assert len(client.acquired) == resolver.call_count == 1
+        transport._stop()
+        assert transport.fetch("https://fbref.com/en/")
+        assert len(client.acquired) == resolver.call_count == 2
+        assert client.events == ["acquire", "close", "acquire"]
+    finally:
+        fetcher.close()
+
+
 def test_persistent_clearance_reuses_the_existing_curl_session():
     client = _LeaseClient([])
     fetcher = FBrefFetcher(
