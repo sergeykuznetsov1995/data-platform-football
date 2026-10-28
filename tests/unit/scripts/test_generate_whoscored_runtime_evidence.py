@@ -201,6 +201,28 @@ def test_checked_in_runtime_evidence_matches_generator(protected_whoscored_check
     assert evidence.check_evidence(protected_whoscored_checkout, rendered)
 
 
+@pytest.mark.unit
+def test_checked_in_runtime_evidence_passes_ci_command(protected_whoscored_checkout):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(ROOT / "scripts/generate_whoscored_runtime_evidence.py"),
+            "--root",
+            str(protected_whoscored_checkout),
+            "--check",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["status"] == "current-v1"
+
+
 @pytest.mark.parametrize("member", (".", "payload.py", "dags"))
 def test_runtime_evidence_rejects_group_writable_material(tmp_path, member):
     _runtime_fixture(tmp_path)
