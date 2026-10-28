@@ -470,6 +470,23 @@ def test_fotmob_summary_counts_scores_unmatched_ambiguity_and_unavailable():
     assert 'played Understat=n/a, FotMob=n/a' in source_diagnostic_summary(unavailable, '2627')
 
 
+
+def test_summary_reports_unavailable_when_all_understat_selects_are_empty():
+    import pandas as pd
+    from scrapers.understat.criterion import source_diagnostic_summary
+
+    reads = []
+
+    def query(sql):
+        reads.append(sql)
+        return pd.DataFrame()
+
+    line = source_diagnostic_summary(query, '2627')
+    assert len(reads) == 4
+    assert 'anomalies=n/a' in line
+    assert 'unavailable=understat_schedule,understat_player_match_stats,understat_shots' in line
+    assert 'affected=[] (0 total)' not in line
+
 @pytest.mark.parametrize('changed_entity', [None, 'understat_player_match_stats', 'understat_shots'])
 def test_summary_does_not_combine_batches_published_between_selects(changed_entity):
     import pandas as pd

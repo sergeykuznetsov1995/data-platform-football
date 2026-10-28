@@ -492,6 +492,8 @@ def source_diagnostic_summary(query_frame, season: str, *, team_aliases=None) ->
     for entity in ('understat_schedule', 'understat_player_match_stats', 'understat_shots'):
         try:
             frames[entity] = query_frame(render_anomaly_sql(entity, season))
+            if frames[entity] is None or frames[entity].empty:
+                missing.append(entity)
         except Exception:
             missing.append(entity)
     try:
