@@ -2661,6 +2661,7 @@ class FBrefPipeline:
         # the one caller that guarantees a later parse wave in this process.
         # A single parse_fbref_wave or recovery drain stays loud.
         self._parse_deferrals: dict[str, int] = {}
+        self._parse_carryovers: dict[str, dict] = {}
         self._defer_transient_parse = False
         self._parse_deferrals_pending = False
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
@@ -4542,6 +4543,7 @@ class FBrefPipeline:
             finalization_guard=self.finalization_guard,
         )
         failed = True
+        self._parse_carryovers = {}
         self._defer_transient_parse = True
         try:
             # Each claim independently evaluates _FRONTIER_SCOPE_CTE while
@@ -4649,7 +4651,8 @@ class FBrefPipeline:
                     # the last wave deferred, and no later wave will retry it
                     # (#1759).  Parse once more: raw only, no request, no paid
                     # lease.  A deadline stop skips this -- the task timeout
-                    # is the harder limit -- and validation reports the raw.
+                    # is the harder limit -- and unfinished transient
+                    # observations carry over below.
                     with self._profiled_wave() as parse_ms:
                         parsed = self.parse_wave(
                             run_id,
@@ -4696,6 +4699,10 @@ class FBrefPipeline:
                         f"no page fetched; {deferred} target failure(s) "
                         "deferred"
                     )
+            if aggregate.deadline_reached and self._parse_carryovers:
+                self.control.record_deferred_parse_observations(
+                    run_id, list(self._parse_carryovers.values())
+                )
             failed = False
             return aggregate
         finally:
@@ -6344,6 +6351,21 @@ class FBrefPipeline:
             # The failure manifest and the released observation above both
             # landed, so the next parse wave re-lists this raw (#1759).
             self._parse_deferrals[record.target_id] = deferrals + 1
+            self._parse_carryovers[record.logical_refresh_id] = {
+                "attempt_id": record.attempt_id,
+                "logical_refresh_id": record.logical_refresh_id,
+                "target_id": record.target_id,
+                "content_hash": record.content_hash,
+                "raw_manifest_key": self.raw_store.fetch_manifest_key(
+                    record.logical_refresh_id
+                ),
+                "parser_version": observation_lease.parser_version,
+                "typed_parser_version": observation_lease.typed_parser_version,
+                "stateful_parser_version": observation_lease.stateful_parser_version,
+                "error_class": type(exc).__name__,
+                "error_message": str(exc)[:2000],
+                "reason": "deadline_after_transient_trino_failure",
+            }
             logger.warning(
                 "Deferred %s to a later parse wave after transient Trino "
                 "failure %d/%d: %s: %s",

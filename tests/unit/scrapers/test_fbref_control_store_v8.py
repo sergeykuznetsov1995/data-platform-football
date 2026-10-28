@@ -889,13 +889,15 @@ def test_publication_summary_has_no_recovery_lane_but_remains_queryable():
     assert summary["global_unprocessed_raw_count"] == 2
     assert summary["global_unprocessed_raw_sla_overdue_count"] == 1
     assert summary["unprocessed_raw_sla_overdue_count"] == 1
-    assert raw_query["params"][:7] == (
+    assert raw_query["params"][:9] == (
         run_id,
+        "[]",
         None,
         None,
         86_400,
         86_400,
         run_id,
+        "[]",
         None,
     )
 
@@ -1647,13 +1649,15 @@ def test_run_summary_separates_concurrent_raw_from_run_owned_raw():
     assert "attempt.run_id = %s" in captured["sql"]
     assert "source_run.run_type = %s" in captured["sql"]
     assert captured["sql"].count("%s") == len(captured["params"])
-    assert captured["params"][:7] == (
+    assert captured["params"][:9] == (
         run_id,
+        "[]",
         "current",
         "current",
         86_400,
         86_400,
         run_id,
+        "[]",
         "current",
     )
 
@@ -2281,3 +2285,226 @@ def test_season_reconcile_releases_claimed_urls_before_it_upserts_them():
     )
     assert params[0] == ["2026-2027", "2025-2026"]
     assert params[2:] == ("fbref", "12")
+
+
+def _parse_carryover_evidence():
+    return {
+        "attempt_id": str(uuid.uuid4()),
+        "logical_refresh_id": str(uuid.uuid4()),
+        "target_id": "fbref:match:0d4d2370", "content_hash": "a" * 64,
+        "raw_manifest_key": "fetches/match.json", "parser_version": "page-v2",
+        "typed_parser_version": "typed-v3", "stateful_parser_version": "stateful-v4",
+        "error_class": "TrinoConnectionError", "error_message": "failed to cancel query",
+        "reason": "deadline_after_transient_trino_failure",
+    }
+
+
+@pytest.mark.parametrize("status", ["failed", "succeeded", "processing", "missing"])
+def test_deferred_parse_record_is_atomic_fenced_and_idempotent(status):
+    run_id = str(uuid.uuid4())
+    evidence = _parse_carryover_evidence()
+    metadata = {}
+    writes = []
+
+    def handler(sql, params):
+        assert sql.count("%s") == len(params or ())
+        if "SELECT status, run_type, metadata" in sql:
+            assert "FOR UPDATE" in sql
+            return [{"status": "running", "run_type": "current", "metadata": metadata}], 1
+        if "FOR UPDATE OF observed" in sql:
+            assert "attempt.status = 'succeeded'" in sql
+            assert "extract(epoch from observed.updated_at)::text AS failed_updated_at" in sql
+            assert "attempt.raw_manifest_key = %s" in sql
+            assert "observed.content_hash = attempt.content_hash" in sql
+            assert params == (run_id, *(evidence[name] for name in (
+                "attempt_id", "logical_refresh_id", "target_id", "content_hash",
+                "raw_manifest_key", "parser_version", "typed_parser_version",
+                "stateful_parser_version",
+            )))
+            if status == "missing":
+                return [], 0
+            return [{
+                "status": status, "error_class": evidence["error_class"],
+                "error_message": evidence["error_message"],
+                "failed_updated_at": "2026-10-28 14:21:05+00",
+            }], 1
+        if "SET metadata = metadata ||" in sql:
+            metadata.update(json.loads(params[0]))
+            writes.append(params)
+            return [], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    if status in {"processing", "missing"}:
+        with pytest.raises(StateConflict, match="changed before carryover"):
+            store.record_deferred_parse_observations(run_id, [evidence])
+        assert factory.connections[0].rolled_back
+        assert writes == []
+    else:
+        store.record_deferred_parse_observations(run_id, [evidence])
+        store.record_deferred_parse_observations(run_id, [evidence])
+        assert len(writes) == (1 if status == "failed" else 0)
+        assert all(connection.committed for connection in factory.connections)
+        if status == "failed":
+            assert metadata["deferred_parse_observations"] == [{
+                **evidence, "run_id": run_id,
+                "failed_updated_at": "2026-10-28 14:21:05+00",
+            }]
+
+
+@pytest.mark.parametrize("retry_status", ["failed", "processing", "changed_error"])
+def test_deferred_parse_retry_rechecks_and_refreshes_existing_fence(retry_status):
+    run_id = str(uuid.uuid4())
+    evidence = _parse_carryover_evidence()
+    metadata = {}
+    observed = {
+        "status": "failed", "error_class": evidence["error_class"],
+        "error_message": evidence["error_message"],
+        "failed_updated_at": "1793197265.000000",
+    }
+    writes = []
+    locks = []
+
+    def handler(sql, params):
+        if "SELECT status, run_type, metadata" in sql:
+            assert "FOR UPDATE" in sql
+            return [{"status": "running", "run_type": "current", "metadata": metadata}], 1
+        if "FOR UPDATE OF observed" in sql:
+            locks.append(params)
+            return [dict(observed)], 1
+        if "SET metadata = metadata ||" in sql:
+            metadata.update(json.loads(params[0]))
+            writes.append(params)
+            return [], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    store.record_deferred_parse_observations(run_id, [evidence])
+    previous = metadata["deferred_parse_observations"]
+    observed["failed_updated_at"] = "1793197325.000000"
+    if retry_status == "changed_error":
+        observed["error_message"] = "another failure"
+    else:
+        observed["status"] = retry_status
+
+    if retry_status == "failed":
+        store.record_deferred_parse_observations(run_id, [evidence])
+        assert metadata["deferred_parse_observations"] == [{
+            **evidence, "run_id": run_id,
+            "failed_updated_at": observed["failed_updated_at"],
+        }]
+        assert metadata["deferred_parse_observations"] != previous
+        assert len(locks) == 2
+        assert len(writes) == 2
+        store.record_deferred_parse_observations(run_id, [evidence])
+        assert len(writes) == 2  # Repeating the same fence stays idempotent.
+    else:
+        with pytest.raises(StateConflict, match="changed before carryover"):
+            store.record_deferred_parse_observations(run_id, [evidence])
+        assert factory.connections[-1].rolled_back
+        assert metadata["deferred_parse_observations"] == previous
+        assert len(locks) == 2
+        assert len(writes) == 1
+
+
+@pytest.mark.parametrize("run_type,acceptance,version,expected", [
+    ("current", False, "page-v2", 1),
+    ("backfill", False, "page-v2", 1),
+    ("replay", False, "page-v2", 0),
+    ("publication", False, "page-v2", 0),
+    ("current", True, "page-v2", 0),
+    ("current", False, "page-v3", 0),
+    ("current", False, None, 0),
+])
+def test_summary_carryover_only_exempts_source_run_with_exact_versions(
+    run_type, acceptance, version, expected,
+):
+    run_id = str(uuid.uuid4())
+    evidence = {**_parse_carryover_evidence(), "run_id": run_id}
+    captured = {}
+
+    def handler(sql, params):
+        assert sql.count("%s") == len(params or ())
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": run_type, "metadata": {
+                "acceptance_profile": acceptance,
+                "deferred_parse_observations": [evidence],
+            }}], 1
+        if ") AS missing" in sql:
+            captured["missing"] = (sql, params)
+            return [{"count": 0}], 1
+        if "AS global_sla_overdue_count" in sql:
+            captured["raw"] = (sql, params)
+        if "SELECT manifest.validation_status" in sql:
+            captured["manifest"] = (sql, params)
+        return [], 0
+
+    store, _factory = make_store(handler)
+    summary = store.get_run_summary(
+        run_id, parser_version=version,
+        typed_parser_version=None if version is None else "typed-v3",
+        stateful_parser_version=None if version is None else "stateful-v4",
+    )
+    assert summary["deferred_parse_observation_count"] == expected
+    missing_sql, missing_params = captured["missing"]
+    assert len(json.loads(missing_params[1])) == expected
+    assert "AND NOT (EXISTS" in missing_sql
+    raw_sql, raw_params = captured["raw"]
+    assert raw_sql.count("AND NOT (EXISTS") == 2  # run count and oldest only
+    assert json.loads(raw_params[1]) == json.loads(missing_params[1])
+    manifest_sql, _ = captured["manifest"]
+    assert "manifest.dataset = '__page__'" in manifest_sql
+    assert "carried.error_class = manifest.error_class" in manifest_sql
+    assert "carried.error_message = left(manifest.error_message, 2000)" in manifest_sql
+
+
+def test_carryover_sql_matches_only_the_exact_still_failed_observation():
+    """Execute the PostgreSQL predicate with equivalent SQLite JSON functions."""
+    from scrapers.fbref.control.store import _DEFERRED_PARSE_ATTEMPT_SQL
+
+    run_id = str(uuid.uuid4())
+    evidence = {
+        **_parse_carryover_evidence(), "run_id": run_id,
+        "failed_updated_at": "2026-10-28 14:21:05+00",
+    }
+    connection = sqlite3.connect(":memory:")
+    connection.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    connection.create_function("json_contains", 2, lambda haystack, needle: int(any(
+        all(row.get(key) == value for key, value in json.loads(needle)[0].items())
+        for row in json.loads(haystack)
+    )))
+    observation_columns = [
+        "logical_refresh_id", "parser_version", "typed_parser_version",
+        "stateful_parser_version", "updated_at", "status",
+    ]
+    attempt_columns = [
+        "run_id", "attempt_id", "logical_refresh_id", "target_id", "content_hash",
+        "raw_manifest_key",
+    ]
+    connection.execute("CREATE TABLE fbref_control.observation_processing (" +
+                       ", ".join(name + " TEXT" for name in observation_columns) + ")")
+    connection.execute("CREATE TABLE attempt (" +
+                       ", ".join(name + " TEXT" for name in attempt_columns) + ")")
+    connection.execute("INSERT INTO fbref_control.observation_processing VALUES (?,?,?,?,?,?)", (
+        *(evidence[name] for name in observation_columns[:4]),
+        evidence["failed_updated_at"], "failed",
+    ))
+    connection.execute("INSERT INTO attempt VALUES (?,?,?,?,?,?)", tuple(
+        evidence[name] for name in attempt_columns
+    ))
+    assert "extract(epoch from carried.updated_at)::text" in _DEFERRED_PARSE_ATTEMPT_SQL
+    predicate = _DEFERRED_PARSE_ATTEMPT_SQL.replace(
+        "extract(epoch from carried.updated_at)", "carried.updated_at",
+    ).replace("::text", "").replace(
+        "%s::jsonb @> jsonb_build_array(jsonb_build_object(",
+        "json_contains(?, json_array(json_object(",
+    ).replace("jsonb_build", "json").replace("))\n)", ")))\n)")
+    query = "SELECT " + predicate + " FROM attempt"
+    assert connection.execute(query, (json.dumps([evidence]),)).fetchone() == (1,)
+    for key in evidence.keys() - {"error_class", "error_message", "reason"}:
+        altered = {**evidence, key: "other"}
+        assert connection.execute(query, (json.dumps([altered]),)).fetchone() == (0,), key
+    for status in ("processing", "succeeded"):
+        connection.execute("UPDATE fbref_control.observation_processing SET status = ?", (status,))
+        assert connection.execute(query, (json.dumps([evidence]),)).fetchone() == (0,)
+    connection.close()
