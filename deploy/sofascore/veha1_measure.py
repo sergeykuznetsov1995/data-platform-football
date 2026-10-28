@@ -189,7 +189,7 @@ WITH ranked AS (
     ) AS game_rn
     FROM ranked WHERE rn = 1
 )
-SELECT CAST(game_id AS varchar), CAST(start_timestamp AS varchar),
+SELECT CAST(game_id AS varchar), CAST(CAST(start_timestamp AS bigint) AS varchar),
        CASE WHEN league LIKE 'SS-%' THEN league END,
        CASE WHEN league LIKE 'SS-%' THEN CAST(season AS varchar) END,
        CASE WHEN league NOT LIKE 'SS-%' THEN league END,

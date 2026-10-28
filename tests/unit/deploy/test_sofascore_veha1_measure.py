@@ -104,3 +104,25 @@ def test_status_debt_query_deduplicates_before_status_filter(monkeypatch):
     population = measure.status_debt(now, include_finished=True)
     assert [row[0] for row in population] == ["1", "2", "3"]
     db.close()
+
+
+def test_status_debt_parses_double_start_timestamp(monkeypatch):
+    import sqlite3
+
+    # Bronze stores start_timestamp as double; a bare CAST AS varchar yields
+    # "1.7875044E9" on Trino ("1787504400.0" here) and int() would raise.
+    now = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+    start = int(now.timestamp()) - 20 * 86400
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE schedule (league, season, game_id, start_timestamp, status_type, _ingested_at, tournament_unique_tournament_id)")
+    db.execute("INSERT INTO schedule VALUES (?, ?, ?, ?, ?, ?, ?)",
+               ("SS-7", "2627", 2, float(start), "notstarted", 1, 7))
+
+    def query(sql, ncols):
+        return [row for row in db.execute(sql.replace("iceberg.bronze.sofascore_schedule", "schedule"))
+                if row[0] != "__sentinel__"]
+
+    monkeypatch.setattr(measure, "trino_rows", query)
+    rows = measure.status_debt(now)
+    assert int(rows[0][1]) == start
+    db.close()
