@@ -9,9 +9,15 @@ from deploy.sofascore import veha1_measure as measure
 
 
 @pytest.mark.parametrize("status", ["notstarted", "inprogress", "interrupted", "unknown"])
-def test_status_debt_counts_once_then_finished_keeps_identity(tmp_path, monkeypatch, status):
+@pytest.mark.parametrize("prev_observe_delay", [None, 2 * 86400])
+def test_status_debt_counts_once_then_finished_keeps_identity(
+    tmp_path, monkeypatch, status, prev_observe_delay,
+):
     now = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
     start = int(now.timestamp()) - 3 * 86400
+    monkeypatch.setattr(measure, "read_last_observe", lambda: (
+        start + prev_observe_delay if prev_observe_delay is not None else None
+    ))
     for name, path in (("STATE", tmp_path), ("JOURNAL", tmp_path / "journal.jsonl"),
                        ("DAILY", tmp_path / "daily.jsonl"),
                        ("OBSERVE_STATE", tmp_path / "observe.json")):
@@ -32,12 +38,15 @@ def test_status_debt_counts_once_then_finished_keeps_identity(tmp_path, monkeypa
     args = ({7: "core"}, Path("denominator.tsv"), now, day, cutoff, False)
     line = measure._report_locked(*args)
     assert "1/2 = 50,0" in line
+    expected_late = int(prev_observe_delay is not None)
+    assert f"finished увиден позже 24 ч после старта {expected_late} (в знаменателе)" in line
     assert measure._report_locked(*args) == line
     journal = measure.read_journal()
     assert len(journal) == 2
     assert journal["2"]["status_deadline_ts"] == start + 86400
     assert journal["1"]["deadline_ts"] == start + 7200 + 86400
     summary = measure.read_daily()[0]
+    assert summary["seen_finished_late_in_denominator"] == expected_late
     assert summary["status_debt_in_denominator"] == {status: 1}
     tomorrow = now + timedelta(days=1)
     measure._report_locked({7: "core"}, Path("denominator.tsv"), tomorrow,

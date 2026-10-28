@@ -283,7 +283,8 @@ def seen_late(rec: dict) -> bool:
     ОСТАЁТСЯ в знаменателе, а число печатается справочно (Astra #1355, круг 3). Исключать из критерия
     можно будет только по улике времени перехода статуса у источника — её в данных нет."""
     prev = rec.get("prev_observe_at")
-    return prev is not None and prev - rec["start_ts"] > 86400
+    return (rec.get("first_seen_finished_at") is not None
+            and prev is not None and prev - rec["start_ts"] > 86400)
 
 
 # ---------------------------------------------------------------- report
