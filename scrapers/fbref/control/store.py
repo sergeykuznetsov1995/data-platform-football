@@ -917,6 +917,26 @@ def _budget_from_row(row: Mapping[str, Any]) -> BudgetReservation:
     )
 
 
+_DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS carried
+    WHERE carried.logical_refresh_id = attempt.logical_refresh_id
+      AND carried.status = 'failed'
+      AND %s::jsonb @> jsonb_build_array(jsonb_build_object(
+        'run_id', attempt.run_id::text,
+        'attempt_id', attempt.attempt_id::text,
+        'logical_refresh_id', attempt.logical_refresh_id::text,
+        'target_id', attempt.target_id,
+        'content_hash', attempt.content_hash,
+        'raw_manifest_key', attempt.raw_manifest_key,
+        'parser_version', carried.parser_version,
+        'typed_parser_version', carried.typed_parser_version,
+        'stateful_parser_version', carried.stateful_parser_version,
+        'failed_updated_at', extract(epoch from carried.updated_at)::text
+      ))
+)"""
+
+
 class ControlStore:
     """Transactional API over the dedicated ``fbref_control`` schema."""
 
@@ -7202,6 +7222,114 @@ class ControlStore:
         with self._transaction() as cursor:
             return self._target_counts(cursor, run)
 
+    def record_deferred_parse_observations(
+        self, run_id: object, observations: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Carry bounded, still-failed live observations across a deadline.
+
+        Lock the source run and observations together. Raw and processing state
+        stay intact for lane recovery; only this run's validation is exempted.
+        """
+        run = _uuid(run_id, "run_id")
+        if not 1 <= len(observations) <= 25:
+            raise StateConflict(
+                "Deferred parse carryover must contain 1..25 observations"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT status, run_type, metadata FROM fbref_control.crawl_run "
+                "WHERE run_id = %s FOR UPDATE",
+                (run,),
+            )
+            source = _fetchone(cursor)
+            if source is None or source["run_type"] not in _RECOVERY_RUN_TYPES:
+                raise StateConflict("Only live runs can carry deferred parses")
+            metadata = _json_mapping(
+                source.get("metadata") or {}, "crawl run metadata"
+            )
+            if metadata.get("acceptance_profile") or metadata.get("acceptance_replay"):
+                raise StateConflict("Acceptance runs cannot carry deferred parses")
+            installed = list(metadata.get("deferred_parse_observations") or [])
+            carried = list(installed)
+            for item in sorted(
+                observations, key=lambda row: row["logical_refresh_id"]
+            ):
+                evidence = dict(item)
+                evidence["run_id"] = run
+                if evidence.get("reason") != "deadline_after_transient_trino_failure":
+                    raise StateConflict("Unknown deferred parse reason")
+                cursor.execute(
+                    """
+                    SELECT observed.status, observed.error_class,
+                           observed.error_message,
+                           extract(epoch from observed.updated_at)::text AS failed_updated_at
+                    FROM fbref_control.fetch_attempt AS attempt
+                    JOIN fbref_control.observation_processing AS observed
+                      ON observed.logical_refresh_id = attempt.logical_refresh_id
+                     AND observed.target_id = attempt.target_id
+                     AND observed.content_hash = attempt.content_hash
+                    WHERE attempt.run_id = %s AND attempt.attempt_id = %s
+                      AND attempt.logical_refresh_id = %s
+                      AND attempt.target_id = %s AND attempt.content_hash = %s
+                      AND attempt.raw_manifest_key = %s
+                      AND attempt.status = 'succeeded'
+                      AND observed.parser_version = %s
+                      AND observed.typed_parser_version = %s
+                      AND observed.stateful_parser_version = %s
+                    FOR UPDATE OF observed
+                    """,
+                    (
+                        run,
+                        evidence["attempt_id"],
+                        evidence["logical_refresh_id"],
+                        evidence["target_id"],
+                        evidence["content_hash"],
+                        evidence["raw_manifest_key"],
+                        evidence["parser_version"],
+                        evidence["typed_parser_version"],
+                        evidence["stateful_parser_version"],
+                    ),
+                )
+                observed = _fetchone(cursor)
+                if observed is not None and observed["status"] == "succeeded":
+                    continue  # A later wave/recovery already completed this raw.
+                if (
+                    observed is None
+                    or observed["status"] != "failed"
+                    or observed["error_class"] != evidence["error_class"]
+                    or observed["error_message"] != evidence["error_message"]
+                ):
+                    raise StateConflict("Deferred observation changed before carryover")
+                evidence["failed_updated_at"] = observed["failed_updated_at"]
+                if evidence in carried:
+                    continue
+                if source["status"] != "running":
+                    raise StateConflict("Deferred parses require a running source run")
+                # A retry can fail identically with a new observation timestamp.
+                # Replace its previous fence instead of accumulating exemptions.
+                carried = [
+                    row for row in carried
+                    if {
+                        key: value for key, value in row.items()
+                        if key != "failed_updated_at"
+                    } != {
+                        key: value for key, value in evidence.items()
+                        if key != "failed_updated_at"
+                    }
+                ]
+                carried.append(evidence)
+            if len(carried) > 25:
+                raise StateConflict("Too many deferred parse observations")
+            if carried != installed:
+                cursor.execute(
+                    "UPDATE fbref_control.crawl_run "
+                    "SET metadata = metadata || %s::jsonb, updated_at = clock_timestamp() "
+                    "WHERE run_id = %s",
+                    (_json({"deferred_parse_observations": carried}), run),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict("Deferred parse run disappeared")
+
     def get_run_summary(
         self,
         run_id: object,
@@ -7266,6 +7394,36 @@ class ControlStore:
                     "crawl run_type must be current, backfill, replay, or "
                     "publication"
                 )
+            metadata = _json_mapping(
+                summary.get("metadata") or {}, "crawl run metadata"
+            )
+            deferred = [
+                row
+                for row in metadata.get("deferred_parse_observations", [])
+                if recovery_lane_run_type is not None
+                and not metadata.get("acceptance_profile")
+                and not metadata.get("acceptance_replay")
+                and parser is not None
+                and row.get("run_id") == run
+                and row.get("parser_version") == parser
+                and row.get("typed_parser_version") == typed_parser
+                and row.get("stateful_parser_version") == stateful_parser
+            ]
+            deferred_json = json.dumps(deferred)
+            deferred_manifest_sql = _DEFERRED_PARSE_ATTEMPT_SQL.replace(
+                "carried.status = 'failed'",
+                "carried.status = 'failed' "
+                "AND carried.error_class = manifest.error_class "
+                "AND carried.error_message = left(manifest.error_message, 2000) "
+                "AND ((manifest.dataset = '__page__' "
+                "AND manifest.parser_version = carried.parser_version) "
+                "OR (manifest.dataset LIKE 'typed:%%' "
+                "AND manifest.parser_version = carried.typed_parser_version "
+                "AND manifest.parse_status = 'succeeded' "
+                "AND manifest.persistence_status = 'failed'))",
+            )
+            summary["deferred_parse_observation_count"] = len(deferred)
+            summary["deferred_parse_observations"] = deferred
             summary["target_counts"] = self._target_counts(cursor, run)
             cursor.execute(
                 """
@@ -7438,7 +7596,7 @@ class ControlStore:
                 for row in _fetchall(cursor)
             }
             cursor.execute(
-                """
+                f"""
                 SELECT manifest.validation_status AS status, count(*) AS count
                 FROM fbref_control.dataset_manifest AS manifest
                 JOIN fbref_control.fetch_attempt AS attempt
@@ -7448,6 +7606,10 @@ class ControlStore:
                   ON frontier.target_id = attempt.target_id
                 WHERE attempt.run_id = %s AND attempt.status = 'succeeded'
                   AND frontier.state <> 'quarantined'
+                  AND NOT (
+                    manifest.validation_status = 'failed'
+                    AND ({deferred_manifest_sql})
+                  )
                   AND (
                     %s::text IS NULL
                     OR (
@@ -7468,6 +7630,7 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     parser,
                     parser,
                     typed_parser,
@@ -7481,7 +7644,7 @@ class ControlStore:
                 for row in _fetchall(cursor)
             }
             cursor.execute(
-                """
+                f"""
                 SELECT count(*) AS count
                 FROM (
                     SELECT DISTINCT attempt.target_id, attempt.content_hash
@@ -7491,6 +7654,7 @@ class ControlStore:
                     WHERE attempt.run_id = %s
                       AND attempt.status = 'succeeded'
                       AND frontier.state <> 'quarantined'
+                      AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                       AND (
                         (
                           %s::text IS NULL
@@ -7531,6 +7695,7 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     parser,
                     parser,
                     parser,
@@ -8070,10 +8235,11 @@ class ControlStore:
             summary["publication_scope_freshness"] = publication_freshness
 
             cursor.execute(
-                """
+                f"""
                 SELECT frontier.page_kind,
                        count(*) FILTER (
                            WHERE attempt.run_id = %s
+                             AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                        ) AS run_count,
                        count(*) FILTER (
                            WHERE source_run.run_type = %s
@@ -8096,6 +8262,7 @@ class ControlStore:
                            attempt.finished_at, attempt.started_at
                        )) FILTER (
                            WHERE attempt.run_id = %s
+                             AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                        ) AS run_oldest_raw_at,
                        min(COALESCE(
                            attempt.finished_at, attempt.started_at
@@ -8195,11 +8362,13 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     recovery_lane_run_type,
                     recovery_lane_run_type,
                     raw_sla,
                     raw_sla,
                     run,
+                    deferred_json,
                     recovery_lane_run_type,
                     parser,
                     parser,

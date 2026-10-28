@@ -14528,6 +14528,10 @@ class _FlakyTrinoWriter(FakeWriter):
 
 def _transient_cohort(tmp_path, *, count, errors):
     control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=count)
+    for item in control.fetches:
+        item["attempt_id"] = pipeline.raw_store.read_fetch_record(
+            item["logical_refresh_id"]
+        ).attempt_id
     pipeline.generic_writer = _FlakyTrinoWriter(errors)
     # What run_live_waves switches on for its own waves.
     pipeline._defer_transient_parse = True
@@ -15529,3 +15533,186 @@ def test_incomplete_match_refetch_keeps_control_failures_fatal(tmp_path, monkeyp
         pipeline.recover_unprocessed_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
     assert typed.calls == []
     assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+class _DeadlineControl(FakeControl):
+    """Persist carryover in control state, never in the pipeline instance."""
+
+    def record_deferred_parse_observations(self, run_id, observations):
+        installed = self.run.setdefault("metadata", {}).setdefault(
+            "deferred_parse_observations", []
+        )
+        for item in observations:
+            assert any(
+                row["attempt_id"] == item["attempt_id"]
+                and row["logical_refresh_id"] == item["logical_refresh_id"]
+                for row in self.fetches
+            ), "carryover requires a successful control attempt"
+            key = tuple(item[name] for name in (
+                "logical_refresh_id", "parser_version", "typed_parser_version",
+                "stateful_parser_version",
+            ))
+            if self.observations[key]["status"] == "failed":
+                evidence = {"run_id": run_id, **item}
+                if evidence not in installed:
+                    installed.append(evidence)
+
+    def get_run_summary(self, run_id, **versions):
+        summary = super().get_run_summary(run_id, **versions)
+        pending = self.list_unprocessed_fetches(
+            run_type=self.run["run_type"], page_kinds=["match"], limit=25,
+            **versions,
+        )
+        deferred = self.run.get("metadata", {}).get("deferred_parse_observations", [])
+        exempt = {row["logical_refresh_id"] for row in deferred}
+        missing = sum(row["logical_refresh_id"] not in exempt for row in pending)
+        summary.update(
+            unvalidated_target_count=missing,
+            unprocessed_raw_count=missing,
+            lane_unprocessed_raw_count=len(pending),
+            global_unprocessed_raw_count=len(pending),
+            deferred_parse_observation_count=len(deferred),
+        )
+        return summary
+
+
+def _deadline_match_run(tmp_path, *, control_error=False):
+    from trino.exceptions import TrinoConnectionError
+
+    raw = _raw_store(tmp_path)
+    control = _DeadlineControl(raw)
+    control.run["status"] = "running"
+    run_id = str(uuid.uuid4())
+    target = PageTarget(
+        source="fbref", page_kind="match", target_id="fbref:match:0d4d2370",
+        canonical_url="https://fbref.com/en/matches/0d4d2370",
+        source_ids={"match_id": "0d4d2370", "competition_id": "9", "season_id": "2025-2026"},
+    )
+    html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode().replace("0701e218", "0d4d2370")
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.fetches.append({
+        "run_id": run_id, "target_id": target.target_id,
+        "page_kind": "match", "logical_refresh_id": refresh,
+        "attempt_id": record.attempt_id,
+    })
+    control.frontier[target.target_id] = {
+        "state": "fetched", "last_content_hash": record.content_hash,
+    }
+    pipeline = FBrefPipeline(
+        control, raw,
+        generic_writer=_FlakyTrinoWriter([TrinoConnectionError("failed to cancel query")]),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(claimed=1, fetched=1)
+    ticks = iter([0.0, 10.0])
+    pipeline.monotonic = lambda: next(ticks)
+    if control_error:
+        def fail(*_a, **_k):
+            raise StateConflict("carryover write failed")
+        control.record_deferred_parse_observations = fail
+    return control, pipeline, run_id, refresh, record
+
+
+@pytest.mark.parametrize("recovered_attempt", [False, True])
+@pytest.mark.parametrize("batch_persist_enabled", [False, True])
+def test_deadline_transient_match_carries_raw_to_next_run(
+    tmp_path, recovered_attempt, batch_persist_enabled,
+):
+    control, pipeline, run_id, refresh, record = _deadline_match_run(tmp_path)
+    pipeline.batch_persist_enabled = batch_persist_enabled
+    if batch_persist_enabled:
+        pipeline.generic_writer.batch_error = pipeline.generic_writer.errors[0]
+    if recovered_attempt:
+        # Raw survived a failed/expired attempt; complete_fetch succeeded on a
+        # later attempt without rewriting the immutable fetch manifest.
+        control.fetches[0]["attempt_id"] = str(uuid.uuid4())
+    result = pipeline.run_live_waves(
+        run_id, worker_id="match-worker", page_kinds=["match"],
+        settings=_settings(), deadline_monotonic=5.0,
+    )
+    assert result.deadline_reached
+    assert result.parse.deferred_parse_failures == [
+        "fbref:match:0d4d2370:TrinoConnectionError"
+    ]
+    # The Airflow validator is a fresh process; the in-memory deferral history
+    # cannot be its source of truth.
+    validator = FBrefPipeline(
+        control, pipeline.raw_store, generic_writer=FakeWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+        fetcher_factory=lambda *_: pytest.fail("recovery must not fetch HTTP"),
+    )
+    summary = validator.validate_and_finish(run_id, publication_eligible=False)
+    evidence = control.run["metadata"]["deferred_parse_observations"]
+    assert len(evidence) == 1
+    assert evidence[0]["attempt_id"] == control.fetches[0]["attempt_id"]
+    if recovered_attempt:
+        assert evidence[0]["attempt_id"] != record.attempt_id
+    assert evidence[0]["content_hash"] == record.content_hash
+    assert control.raw_store.read_fetch_record(refresh) == record
+    assert next(iter(control.observations.values()))["status"] == "failed"
+    assert any(row["validation_status"] == "failed" for row in control.manifests)
+    assert summary["unvalidated_target_count"] == 0
+    assert summary["unprocessed_raw_count"] == 0
+    assert summary["lane_unprocessed_raw_count"] == 1
+    assert summary["global_unprocessed_raw_count"] == 1
+    assert summary["deferred_parse_observation_count"] == 1
+    recovered = validator.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+    assert recovered.parsed == 1
+    summary = control.get_run_summary(
+        run_id, parser_version=PAGE_DOCUMENT_VERSION,
+        typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+        stateful_parser_version=DISCOVERY_PARSER_VERSION,
+    )
+    assert summary["global_unprocessed_raw_count"] == 0
+    assert control.raw_store.read_fetch_record(refresh) == record
+
+
+def test_deadline_carryover_write_failure_stays_loud(tmp_path):
+    control, pipeline, run_id, _refresh, _record = _deadline_match_run(
+        tmp_path, control_error=True,
+    )
+    with pytest.raises(StateConflict, match="carryover write failed"):
+        pipeline.run_live_waves(
+            run_id, worker_id="match-worker", page_kinds=["match"],
+            settings=_settings(), deadline_monotonic=5.0,
+        )
+    with pytest.raises(RunValidationError, match="unvalidated_target_count=1"):
+        pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+
+def test_deadline_carryover_does_not_exempt_unrelated_raw(tmp_path):
+    control, pipeline, run_id, _refresh, _record = _deadline_match_run(tmp_path)
+    pipeline.run_live_waves(
+        run_id, worker_id="match-worker", page_kinds=["match"],
+        settings=_settings(), deadline_monotonic=5.0,
+    )
+    target = PageTarget(
+        source="fbref", page_kind="match", target_id="fbref:match:ffffffff",
+        canonical_url="https://fbref.com/en/matches/ffffffff",
+        source_ids={"match_id": "ffffffff"},
+    )
+    refresh, _record = _commit_for_parse(pipeline.raw_store, target, "<html>other</html>")
+    control.fetches.append({
+        "run_id": run_id, "target_id": target.target_id,
+        "page_kind": "match", "logical_refresh_id": refresh,
+    })
+    with pytest.raises(
+        RunValidationError, match="unvalidated_target_count=1; unprocessed_raw_count=1",
+    ):
+        pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+
+@pytest.mark.parametrize("operation", ["record_dataset_manifest", "fail_observation_processing"])
+def test_deadline_does_not_carry_transient_failure_after_control_failure(tmp_path, operation):
+    control, pipeline, run_id, _refresh, _record = _deadline_match_run(tmp_path)
+
+    def fail(*_a, **_k):
+        raise RuntimeError("control unavailable")
+
+    setattr(control, operation, fail)
+    with pytest.raises(ParseWaveError, match="control unavailable"):
+        pipeline.run_live_waves(
+            run_id, worker_id="match-worker", page_kinds=["match"],
+            settings=_settings(), deadline_monotonic=5.0,
+        )
+    assert not control.run.get("metadata", {}).get("deferred_parse_observations")
