@@ -16,7 +16,7 @@ RUNNER_REQUIREMENTS = (
     REPO_ROOT / "docker/images/airflow/requirements-scraper-runner.txt"
 )
 CORE_REQUIREMENTS = REPO_ROOT / "docker/images/airflow/requirements.txt"
-CI_REQUIREMENTS = REPO_ROOT / ".github/workflows/whoscored-test.lock"
+CI_REQUIREMENTS = RUNNER_REQUIREMENTS
 COMPOSE_FILE = REPO_ROOT / "compose.yaml"
 
 EXPECTED_VERSION = "1.13.1"
@@ -100,7 +100,7 @@ def test_compose_cannot_clear_the_image_level_tls_library_path():
     assert compose.count("target: airflow-base") == 3
     assert compose.count("target: airflow-scheduler") == 1
     assert "WHOSCORED_SCRAPER_PYTHON: /usr/local/bin/python" in compose
-    workflow = (REPO_ROOT / ".github/workflows/whoscored-ci.yml").read_text(
+    workflow = (REPO_ROOT / ".github/workflows/scheduler-runtime-ci.yml").read_text(
         encoding="utf-8"
     )
     assert "import curl_cffi,tls_client,tls_requests" in workflow
@@ -211,12 +211,12 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
     assert "Camoufox(" not in scheduler_payload
     assert "BuildKit's RUN sandbox cannot provide" in scheduler_payload
 
-    workflow = (REPO_ROOT / ".github/workflows/whoscored-ci.yml").read_text(
+    workflow = (REPO_ROOT / ".github/workflows/scheduler-runtime-ci.yml").read_text(
         encoding="utf-8"
     )
     scheduler_smoke = workflow.split(
         "- name: Build and smoke the hardened scheduler test image", 1
-    )[1].split("- name: Build production targets", 1)[0]
+    )[1]
     assert "Camoufox(headless='virtual'" in scheduler_smoke
     assert f"executable_path='{install_dir}/camoufox-bin'" in scheduler_smoke
     assert "exclude_addons=list(DefaultAddons)" in scheduler_smoke

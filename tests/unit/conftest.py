@@ -30,12 +30,14 @@ def protected_whoscored_checkout():
     """
     source = Path(__file__).resolve().parents[2]
     names = subprocess.check_output(
-        ["git", "ls-files", "-z"], cwd=source
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=source
     ).decode().split("\0")
     with tempfile.TemporaryDirectory(prefix="whoscored-checkout-test-", dir="/tmp") as name:
         root = Path(name)
         for relative in filter(None, names):
             original = source / relative
+            if not original.is_file():
+                continue
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             # mkdir(parents=True) uses the umask for intermediate directories.

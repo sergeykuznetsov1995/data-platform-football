@@ -324,10 +324,12 @@ def test_current_repository_evidence_matches_its_declared_state(
     else:
         pytest.fail("repository attestation has an unsupported state")
     assert provenance.canonical_bytes(discovery.report).endswith(b"\n")
-    workflow = (root / ".github/workflows/whoscored-ci.yml").read_text(encoding="utf-8")
-    assert "scripts/validate_whoscored_build_provenance.py" in workflow
-    assert "--expect-blocked" in workflow
-    assert "--expect-ready-build" in workflow
+    assert not (root / ".github/workflows/whoscored-ci.yml").exists()
+    assert any(
+        issue["category"] == "github_action_unpinned"
+        and "workflow is missing" in issue["detail"]
+        for issue in discovery.issues
+    )
 
 
 def test_current_repository_generate_ready_discovers_all_split_project_services(

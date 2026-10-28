@@ -868,11 +868,6 @@ def cleanup_whoscored_dq_stage_partitions() -> dict:
     works even when no backfill has completed recently.
     """
 
-    from scrapers.whoscored.runtime_contract import (
-        require_production_runtime_class,
-    )
-
-    require_production_runtime_class(operation="WhoScored frozen DQ cleanup")
     from dags.scripts.whoscored_frozen_dq import (
         DQ_STAGE_RETENTION_DAYS,
         DQ_STAGE_TABLE,
@@ -1557,14 +1552,6 @@ def maintain_iceberg_tables(
     """
     compaction_schema_set = set(compaction_schemas) if compaction_schemas is not None else set(schemas)
     filter_set = set(table_filter) if table_filter is not None else None
-    if filter_set is None or filter_set.intersection(WHOSCORED_HIGH_CHURN):
-        from scrapers.whoscored.runtime_contract import (
-            require_production_runtime_class,
-        )
-
-        require_production_runtime_class(
-            operation="WhoScored Iceberg lifecycle maintenance"
-        )
     if type(compact_live_files) is not bool:
         raise ValueError("compact_live_files must be a boolean")
     if compaction_rotation is None:

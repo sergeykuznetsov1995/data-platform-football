@@ -26,47 +26,8 @@ credential-less route exists only behind the development-only
 ``--allow-legacy-noauth`` flag.
 """
 
-# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
+# ruff: noqa: E402 -- standalone entry point adds the repository import root
 
-import sys as _whoscored_bootstrap_sys
-
-_whoscored_source = __file__
-if not _whoscored_source.startswith("/"):
-    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
-_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
-_whoscored_root = (
-    "/opt/airflow"
-    if _whoscored_production
-    else _whoscored_source.rsplit("/scripts/", 1)[0]
-)
-if _whoscored_production:
-    if (
-        getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None)
-        != 2
-    ):
-        raise RuntimeError("image-baked WhoScored startup anchor is required")
-elif (
-    getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None)
-    != _whoscored_root
-):
-    _whoscored_anchor_path = (
-        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
-    )
-    _whoscored_anchor_globals = {
-        "__builtins__": __builtins__,
-        "sys": _whoscored_bootstrap_sys,
-        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
-        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
-    }
-    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
-        _whoscored_anchor_source = _whoscored_anchor_handle.read()
-    exec(
-        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
-        _whoscored_anchor_globals,
-    )
-_WHOSCORED_RUNTIME_CONTRACT = _whoscored_bootstrap_sys._load_whoscored_runtime_contract(
-    _whoscored_root
-)
 
 import argparse
 import asyncio
@@ -83,7 +44,6 @@ import os
 import re
 import secrets
 import signal
-import ssl
 import stat
 import sys
 import time
@@ -120,35 +80,13 @@ from scrapers.sofascore.workload_plan import (  # noqa: E402 - standalone entry 
     WORKLOAD_METER,
     load_verified_workload_policy,
 )
-from scrapers.whoscored.proxy_campaign import (  # noqa: E402 - standalone entry point
-    DEFAULT_WHOSCORED_PAID_CAP_BYTES,
-    WHOSCORED_CANARY_DAG_ID,
-    PROXY_CAMPAIGN_METER,
-    PROXY_CAMPAIGN_CONTROL_ARGUMENT_FIELDS,
-    PROXY_CAMPAIGN_CONTROL_RESULT_FIELDS,
-    PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION,
-    WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE,
-    WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE,
-    WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES,
-    WHOSCORED_FULL_PAID_CRAWL_AVAILABLE,
-    WHOSCORED_PAID_DAG_IDS,
-    WHOSCORED_PROXY_ALLOWED_HOSTS,
-    SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION,
-    ProxyCampaignApproval,
-    ProxyCampaignBudgetExceeded,
-    ProxyCampaignClaim,
-    ProxyCampaignConcurrencyLimited,
-    ProxyCampaignError,
-    ProxyCampaignLedger,
-    ProxyCampaignValidationError,
-    ProxyWorkAllocation,
-    approval_from_campaign_authority_context,
-    approval_from_context,
-    canonical_json_bytes,
-    daily_ingest_paid_crawl_allowed,
-    strict_json_loads,
-    whoscored_provider_spendable_cap_bytes,
-)
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s filter_proxy: %(message)s"
@@ -166,7 +104,6 @@ BLOCKLIST: set[str] = set()
 provider_budget_guard = None
 provider_budget_endpoint: str | None = None
 
-# The explicit lease path is shared by WhoScored, Transfermarkt and SofaScore.
 # A lease pins exactly one pool entry, has a one-time bearer token, and is
 # accounted independently. This replaces the unreliable ``_active == 0``
 # proxy selection heuristic for all
@@ -234,9 +171,7 @@ _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _ZERO_SHA256 = "0" * 64
 SOFASCORE_CANARY_HARD_CAP_BYTES = 0
 SOFASCORE_CANARY_POLICY_ID = ""
-# No environment/CLI scalar can enable WhoScored.  A valid signed campaign is
-# the only authority which replaces this zero at lease-creation time.
-WHOSCORED_DAGRUN_BUDGET_BYTES = DEFAULT_WHOSCORED_PAID_CAP_BYTES
+
 URL_BUDGET_BYTES = 2_000_000
 MAX_ACTIVE_LEASES = 4
 # How long a latched (accounting-uncertain) SofaScore lease keeps its
@@ -255,31 +190,18 @@ SOFASCORE_ALLOCATION_WAL_PATH = (
 SOFASCORE_PARENT_ENVELOPE_PATH = (
     "/opt/airflow/logs/proxy_filter/sofascore_parent_envelopes.json"
 )
-WHOSCORED_CAMPAIGN_LEDGER_PATH = (
-    "/opt/airflow/logs/proxy_filter/whoscored_campaigns.json"
-)
-WHOSCORED_STATE_MARKER_PATH = (
-    "/opt/airflow/state/whoscored-proxy-filter/.whoscored_state_initialized.json"
-)
-# Report/checkpoint payloads remain v1; the namespace marker itself is v3 and
-# binds that whole protected state tree to one exact provider order/policy/cap.
-WHOSCORED_STATE_SCHEMA_VERSION = 1
-WHOSCORED_STATE_MARKER_SCHEMA_VERSION = 3
-WHOSCORED_PAID_LEDGER_CHAIN_SCHEMA_VERSION = 1
-# The owner-approved provider policy caps this order at exact decimal bytes.
-# Neither MiB conversion nor CLI/environment may enlarge these outer ceilings.
-WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES = WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
-WHOSCORED_MAX_LEASE_SAFETY_CAP_BYTES = 2_000_000
+
+
 MAX_LEDGER_EVENT_BYTES = 256 * 1024
 MAX_ALLOCATION_WAL_EVENT_BYTES = 4 * 1024 * 1024
 MAX_CONTROL_BODY_BYTES = 4 * 1024 * 1024
 MAX_PROVIDER_RESPONSE_HEAD_BYTES = 64 * 1024
-# WhoScored leases escrow their complete byte ceiling (and fsync that escrow)
+
 # before the first provider dial.  Socket observations can therefore be
 # journalled in bounded batches without moving the hard-cap boundary after
 # I/O.  Four MiB keeps normal page-sized leases to one terminal flush while a
 # large measurement lease still emits regular durable checkpoints.
-WHOSCORED_METER_BATCH_BYTES = 4 * 1024 * 1024
+
 # Completed lease objects are only a short idempotency/debug cache.  Exact
 # forensic history lives in the authenticated campaign and paid-byte ledgers;
 # keeping every token and nested host map in RAM would make the 2-second status
@@ -297,17 +219,8 @@ MAX_CLIENT_HEADER_COUNT = 64
 CLIENT_HEAD_TIMEOUT_SECONDS = 5.0
 MAX_PREAUTH_CONNECTIONS = 32
 _CLIENT_HEAD_SLOTS = asyncio.BoundedSemaphore(MAX_PREAUTH_CONNECTIONS)
-# The WhoScored data plane accepts the local CONNECT before contacting the paid
-# provider, then buffers only the first plaintext TLS ClientHello.  This makes
-# the browser reveal its SNI while the provider dial count is still zero.
-WHOSCORED_CLIENT_HELLO_TIMEOUT_SECONDS = 5.0
-MAX_WHOSCORED_CLIENT_HELLO_BYTES = 64 * 1024
-MAX_TLS_PLAINTEXT_RECORD_BYTES = 16 * 1024
-MAX_PENDING_WHOSCORED_CLIENT_HELLOS = 4
-MAX_PENDING_WHOSCORED_CLIENT_HELLOS_PER_LEASE = 1
-_WHOSCORED_CLIENT_HELLO_SLOTS = asyncio.BoundedSemaphore(
-    MAX_PENDING_WHOSCORED_CLIENT_HELLOS
-)
+
+
 _TLS_HANDSHAKE_CONTENT_TYPE = 22
 _TLS_CLIENT_HELLO_HANDSHAKE_TYPE = 1
 _TLS_SERVER_NAME_EXTENSION = 0
@@ -325,23 +238,14 @@ CONTROL_TOKEN = ""
 TRANSFERMARKT_CONTROL_TOKEN = ""
 TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = ""
 TRANSFERMARKT_BACKFILL_PROXY_MANAGER = None
-WHOSCORED_PROXY_APPROVAL_HMAC_SECRET = ""
-WHOSCORED_PROXY_LEDGER_HMAC_SECRET = ""
+
+
 SOFASCORE_ALLOCATION_LEDGER: AllocationLedger | None = None
 _SOFASCORE_ALLOCATION_LEDGER_KEY: tuple[str, str] | None = None
 SOFASCORE_PARENT_ENVELOPE_LEDGER: "ParentRunEnvelopeLedger | None" = None
 _SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
-WHOSCORED_CAMPAIGN_LEDGER: ProxyCampaignLedger | None = None
-_WHOSCORED_CAMPAIGN_LEDGER_KEY: tuple[str, str, str, bool] | None = None
-WHOSCORED_PROXY_RUNTIME_SHA256 = ""
-WHOSCORED_STATE_ID = ""
-WHOSCORED_PROVIDER_ORDER_ID = ""
-WHOSCORED_PROVIDER_POLICY_SHA256 = ""
-WHOSCORED_PROVIDER_ORDER_CAP_BYTES = 0
-WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
-_PAID_LEDGER_CHAIN_COUNT = 0
-_PAID_LEDGER_CHAIN_OFFSET = 0
-_PAID_LEDGER_CHAIN_TAIL = ""
+
+
 SOURCE_MODE = "shared-no-whoscored"
 SOFASCORE_CHALLENGE_HOSTS = frozenset(
     {"challenges.cloudflare.com", "turnstile.cloudflare.com"}
@@ -380,15 +284,6 @@ _PROVIDER_HTTP_STATUS_LINE = re.compile(
 )
 _CANONICAL_TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _LOWER_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z", re.ASCII)
-# The dedicated WhoScored pool is reached through the PROXYS.IO dial name, but
-# the provider presents an Infatica certificate.  Keep both names code-owned:
-# using the dial name for ``server_hostname`` fails certificate verification,
-# while a configurable SNI value would turn hostname verification into an
-# operator-controlled downgrade.  This transport is enabled only for the
-# isolated ``whoscored-only`` service; the shared legacy pool is unchanged.
-WHOSCORED_UPSTREAM_DIAL_HOST = "pool.proxys.io"
-WHOSCORED_UPSTREAM_TLS_SERVER_NAME = "pool.infatica.io"
-
 
 class ProxyPoolConfigurationError(ValueError):
     """A redaction-safe proxy-pool configuration error."""
@@ -421,51 +316,17 @@ class _LeaseBudgetRefused(Exception):
     """
 
 
-class ClientHelloValidationError(ValueError):
-    """A pre-provider ClientHello which cannot authorize a WhoScored dial."""
-
-
-def _new_whoscored_upstream_tls_context() -> ssl.SSLContext:
-    """Return a system-CA context which cannot silently disable verification."""
-
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.verify_mode = ssl.CERT_REQUIRED
-    context.check_hostname = True
-    return context
-
-
-# Reuse one immutable-by-convention context so every paid connection gets the
-# same CA policy and TLS session setup does not repeatedly reload the CA store.
-_WHOSCORED_UPSTREAM_TLS_CONTEXT = _new_whoscored_upstream_tls_context()
-
-
 async def _open_upstream_connection(
     host: str,
     port: int,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Dial an upstream, using verified TLS for the isolated WhoScored pool.
+    """Dial the configured residential upstream over TCP."""
 
-    ``server_hostname`` supplies both SNI and the hostname checked against the
-    certificate.  There is deliberately no plaintext retry after a TLS error.
-    """
-
-    if SOURCE_MODE != "whoscored-only":
-        return await asyncio.open_connection(host, port)
-    if host != WHOSCORED_UPSTREAM_DIAL_HOST:
-        raise ProxyPoolConfigurationError(
-            "WhoScored upstream does not match the pinned provider dial host"
-        )
-    return await asyncio.open_connection(
-        host,
-        port,
-        ssl=_WHOSCORED_UPSTREAM_TLS_CONTEXT,
-        server_hostname=WHOSCORED_UPSTREAM_TLS_SERVER_NAME,
-    )
+    return await asyncio.open_connection(host, port)
 
 
 def _dagrun_budget_bytes(dag_id: str, task_id: str = "") -> int:
-    """Return the source-specific hard cap without weakening WhoScored."""
+    """Return the source-specific hard cap."""
     if dag_id in CLUBELO_DAG_IDS:
         if task_id == "scrape_history":
             return CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES
@@ -479,8 +340,7 @@ def _dagrun_budget_bytes(dag_id: str, task_id: str = "") -> int:
         return SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     if dag_id in SOFASCORE_DAG_IDS:
         return SOFASCORE_DAGRUN_BUDGET_BYTES
-    if dag_id in WHOSCORED_PAID_DAG_IDS:
-        return WHOSCORED_DAGRUN_BUDGET_BYTES
+
     if dag_id in TRANSFERMARKT_DAG_IDS:
         return TRANSFERMARKT_DAGRUN_BUDGET_BYTES
     if dag_id in TRANSFERMARKT_BACKFILL_DAG_IDS:
@@ -503,8 +363,7 @@ def _source_for_dag(dag_id: str) -> str:
         return "transfermarkt_backfill"
     if dag_id in FBREF_DAG_IDS:
         return "fbref"
-    if dag_id in WHOSCORED_PAID_DAG_IDS:
-        return "whoscored"
+
     return ""
 
 
@@ -524,7 +383,6 @@ def _budget_namespace_for_source(source: str) -> str:
         "sofascore": "sofascore_signed_allocation",
         "sofascore_canary": "sofascore_canary_explicit_cap",
         "sofascore_discovery": "sofascore_discovery_dagrun",
-        "whoscored": "whoscored_campaign_provider_order",
         "fbref": "fbref_service_utc_day",
     }.get(source, "shared_proxy_utc_day")
 
@@ -936,9 +794,77 @@ def _upstream_identity(
     )
 
 
+def _atomic_private_bytes(path: str, payload: bytes, *, replace: bool) -> None:
+    directory_path = os.path.dirname(path) or "."
+    os.makedirs(directory_path, exist_ok=True)
+    if (
+        os.path.islink(path)
+        or (not replace and os.path.exists(path))
+        or (replace and not os.path.isfile(path))
+    ):
+        raise RuntimeError("refusing to replace protected proxy state")
+    temporary = os.path.join(
+        directory_path,
+        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
+    )
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        pending = memoryview(payload)
+        while pending:
+            written = os.write(descriptor, pending)
+            if written <= 0:
+                raise OSError("protected state write made no progress")
+            pending = pending[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        if not replace and os.path.exists(path):
+            raise RuntimeError("protected proxy state appeared concurrently")
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _require_private_regular_file(
+    path: str,
+    *,
+    allow_empty: bool,
+    max_bytes: int | None = MAX_CONTROL_BODY_BYTES * 4,
+    read: bool = True,
+) -> bytes:
+    if os.path.islink(path):
+        raise RuntimeError("protected proxy state cannot be a symlink")
+    try:
+        metadata = os.stat(path)
+    except OSError as exc:
+        raise RuntimeError("protected proxy state is missing") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (not allow_empty and metadata.st_size <= 0)
+        or (max_bytes is not None and metadata.st_size > max_bytes)
+    ):
+        raise RuntimeError("protected proxy state file is invalid")
+    if not read:
+        return b""
+    with open(path, "rb") as stream:
+        return stream.read()
+
+
 def _lease_budget_policy_id(lease: "Lease") -> str:
-    if lease.proxy_campaign_approval is not None:
-        return lease.proxy_campaign_approval.approval_sha256
+
     if lease.source == "sofascore":
         return SOFASCORE_BUDGET_ARTIFACT_ID
     if lease.source == "sofascore_canary":
@@ -972,14 +898,8 @@ class Lease:
     source: str = ""
     workload_plan: SignedDagRunPlan | None = field(default=None, repr=False)
     allocation_claim: AllocationClaim | None = field(default=None, repr=False)
-    proxy_campaign_approval: ProxyCampaignApproval | None = field(
-        default=None, repr=False
-    )
-    proxy_campaign_claim: ProxyCampaignClaim | None = field(default=None, repr=False)
-    proxy_work_allocation: ProxyWorkAllocation | None = field(default=None, repr=False)
-    proxy_attempt_id: str = ""
-    proxy_work_item_id: str = ""
-    proxy_campaign_finished: bool = False
+
+
     provider_request_count: int = 0
     allocation_id: str = ""
     workload_class: str = ""
@@ -1017,7 +937,7 @@ class Lease:
     # monopolise the shared lease reservation and starve the provider reader.
     active_provider_readers: int = field(default=0, repr=False)
     provider_reserved_bytes: int = field(default=0, repr=False)
-    pending_client_hellos: int = field(default=0, repr=False)
+
     # Bytes already read from the local client but not yet fully handed to the
     # metered provider writer.  Idle checkpoints must see this otherwise a
     # page could be settled while an upload prefix is still waiting for budget.
@@ -1031,16 +951,7 @@ class Lease:
     # before fsync failed. Never retry or release that reservation in-process,
     # because doing so could durably charge the same provider bytes twice.
     paid_ledger_uncertain: bool = False
-    # Provider bytes are observed immediately for the in-process hard cap, but
-    # WhoScored persists them in bounded aggregates on top of the already
-    # durable full-lease escrow.  A failed flush is never retried because the
-    # campaign state may have committed before the proxy WAL append failed;
-    # that ambiguity revokes the campaign and retains the remaining escrow.
-    pending_whoscored_bytes: dict[tuple[str, str], int] = field(
-        default_factory=dict, repr=False
-    )
-    settled_whoscored_bytes: int = 0
-    metering_flush_failed: bool = False
+
     finalized_at: float = 0.0
     hosts: dict[str, dict[str, int]] = field(default_factory=dict)
     tunnel_writers: set[Any] = field(default_factory=set, repr=False)
@@ -1063,12 +974,8 @@ class Lease:
         )
 
     def report(self) -> dict[str, Any]:
-        pending_provider_bytes = sum(self.pending_whoscored_bytes.values())
-        settled_provider_bytes = (
-            self.settled_whoscored_bytes
-            if self.source == "whoscored"
-            else self.total_bytes
-        )
+
+        settled_provider_bytes = self.total_bytes
         report = {
             "meter": PROVIDER_METER_ID,
             "id": self.lease_id,
@@ -1082,7 +989,7 @@ class Lease:
             "reserved_bytes": self.reserved_bytes,
             "active_provider_readers": self.active_provider_readers,
             "provider_reserved_bytes": self.provider_reserved_bytes,
-            "pending_client_hellos": self.pending_client_hellos,
+            "pending_client_hellos": 0,
             "staged_client_bytes": self.staged_client_bytes,
             "global_budget_escrow_bytes": self.global_budget_escrow_bytes,
             "upstream_repins": self.upstream_repins,
@@ -1091,9 +998,9 @@ class Lease:
             "budget_exceeded": self.budget_exceeded,
             "accounting_uncertain": self.accounting_uncertain,
             "paid_ledger_uncertain": self.paid_ledger_uncertain,
-            "pending_provider_bytes": pending_provider_bytes,
+            "pending_provider_bytes": 0,
             "durably_settled_provider_bytes": settled_provider_bytes,
-            "metering_flush_failed": self.metering_flush_failed,
+            "metering_flush_failed": False,
             "hosts": self.hosts,
             "dag_id": self.dag_id,
             "run_id": self.run_id,
@@ -1128,52 +1035,17 @@ class Lease:
             "allocation_units": list(self.allocation_units),
             "allocation_budget_bytes": self.allocation_budget_bytes,
             "allocation_spent_provider_bytes": (
-                int(self.allocation_claim.spent_provider_bytes) + self.total_bytes
-                if self.allocation_claim
-                else (
-                    int(self.proxy_campaign_claim.allocation_spent_provider_bytes)
-                    + self.total_bytes
-                    if self.proxy_campaign_claim
-                    else 0
-                )
+                int(self.allocation_claim.spent_provider_bytes) + self.total_bytes if self.allocation_claim else 0
             ),
             "allocation_remaining_provider_bytes": (
-                max(
-                    0,
-                    int(self.allocation_claim.remaining_provider_bytes)
-                    - self.total_bytes,
-                )
-                if self.allocation_claim
-                else (
-                    max(
-                        0,
-                        int(self.proxy_campaign_claim.remaining_provider_bytes)
-                        - self.total_bytes,
-                    )
-                    if self.proxy_campaign_claim
-                    else 0
-                )
+                max(0, int(self.allocation_claim.remaining_provider_bytes) - self.total_bytes) if self.allocation_claim else 0
             ),
-            "proxy_campaign_id": (
-                self.proxy_campaign_approval.campaign_id
-                if self.proxy_campaign_approval
-                else ""
-            ),
-            "proxy_approval_id": (
-                self.proxy_campaign_approval.approval_id
-                if self.proxy_campaign_approval
-                else ""
-            ),
-            "proxy_approval_sha256": (
-                self.proxy_campaign_approval.approval_sha256
-                if self.proxy_campaign_approval
-                else ""
-            ),
+            "proxy_campaign_id": "",
+            "proxy_approval_id": "",
+            "proxy_approval_sha256": "",
             "provider_billed_bytes": self.total_bytes,
             "provider_request_count": self.provider_request_count,
-            "provider_meter": (
-                PROXY_CAMPAIGN_METER if self.proxy_campaign_approval else ""
-            ),
+            "provider_meter": "",
             "base_run_id": self.base_run_id,
             "workload_phase": self.workload_phase,
             "phase_plan_digest": (
@@ -1198,10 +1070,7 @@ class Lease:
 
     @property
     def dagrun_key(self) -> str:
-        if self.proxy_campaign_approval is not None:
-            # Continuations and retries intentionally share one in-memory key;
-            # the durable campaign ledger supplies the restart boundary.
-            return f"whoscored-campaign/{self.proxy_campaign_approval.campaign_id}"
+
         if self.dag_id and self.run_id:
             return f"{self.dag_id}/{self.run_id}"
         # Non-Airflow compatibility callers still receive an isolated hard
@@ -1238,7 +1107,6 @@ def _lease_has_active_operations(lease: Lease) -> bool:
     return bool(
         lease.active_tunnels
         or lease.active_provider_readers
-        or lease.pending_client_hellos
         or lease.staged_client_bytes
     )
 
@@ -1264,13 +1132,7 @@ def _lease_has_durable_terminal(lease: Lease) -> bool:
         return False
     if lease.source == "sofascore" and not lease.allocation_finished:
         return False
-    if lease.source == "whoscored" and (
-        not lease.proxy_campaign_finished
-        or lease.pending_whoscored_bytes
-        or lease.settled_whoscored_bytes != lease.total_bytes
-        or lease.metering_flush_failed
-    ):
-        return False
+
     return True
 
 
@@ -1381,10 +1243,7 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
             or normalized.endswith(".sofascore.com")
             or normalized in SOFASCORE_CHALLENGE_HOSTS
         )
-    if lease is not None and lease.source == "whoscored":
-        # Exact names only: neither arbitrary subdomains nor the apex can be
-        # CONNECTed through the paid provider.
-        return normalized in WHOSCORED_PROXY_ALLOWED_HOSTS
+
     if lease is not None and lease.source in {
         "transfermarkt",
         "transfermarkt_backfill",
@@ -1606,12 +1465,7 @@ def _residential_manager(
     mgr = ProxyManager(rotation_strategy="random")
     if proxy_pool_json is not None and proxy_pool_json.strip():
         records = _parse_proxy_pool_json(proxy_pool_json)
-        if SOURCE_MODE == "whoscored-only" and any(
-            record["host"] != WHOSCORED_UPSTREAM_DIAL_HOST for record in records
-        ):
-            raise ProxyPoolConfigurationError(
-                "WhoScored proxy pool must use the pinned provider dial host"
-            )
+
         for record in records:
             mgr.add_proxy(
                 host=record["host"],
@@ -1623,10 +1477,7 @@ def _residential_manager(
         n = len(records)
         source = PROXY_POOL_ENV
     elif allow_file_fallback:
-        if SOURCE_MODE == "whoscored-only":
-            raise ProxyPoolConfigurationError(
-                "WhoScored-only mode requires the validated PROXY_POOL_JSON pool"
-            )
+
         n = mgr.load_from_file_custom_format(proxy_file)
         source = "explicit file fallback"
     else:
@@ -1749,92 +1600,6 @@ def _daily_total_bytes() -> int:
     return _daily_up_bytes + _daily_down_bytes
 
 
-def _whoscored_provider_order_cap_bytes(
-    approval: ProxyCampaignApproval | None = None,
-) -> int:
-    """Return the receipt-bound provider cap after the mandatory 5% reserve."""
-
-    gross_cap = WHOSCORED_PROVIDER_ORDER_CAP_BYTES
-    authority = getattr(approval, "scheduled_authority", None)
-    if authority is not None and authority.provider_order_cap_bytes != gross_cap:
-        raise ProxyCampaignValidationError(
-            "scheduled WhoScored authority differs from provider order cap binding"
-        )
-    if (
-        isinstance(gross_cap, bool)
-        or not isinstance(gross_cap, int)
-        or not 1 <= gross_cap <= WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
-    ):
-        raise ProxyCampaignValidationError(
-            "WhoScored provider order cap binding is invalid"
-        )
-    return whoscored_provider_spendable_cap_bytes(gross_cap)
-
-
-def _whoscored_budget_availability(
-    ledger: ProxyCampaignLedger,
-    approval: ProxyCampaignApproval | None = None,
-) -> tuple[int, Mapping[str, int]]:
-    """Conjoin signed state, global daily spend and lifetime order exposure."""
-
-    accounting = ledger.provider_order_accounting()
-    order_remaining = max(
-        0,
-        _whoscored_provider_order_cap_bytes(approval)
-        - int(accounting["exposure_provider_bytes"]),
-    )
-    # The proxy WAL/report and campaign ledger are independent witnesses.  A
-    # crash between their fsyncs may make either one lead, so the larger proven
-    # spend is authoritative; durable whole-lease escrow covers every pending
-    # byte which has not yet become campaign spend.
-    proven_today = max(
-        _daily_total_bytes(),
-        int(accounting["current_day_spent_provider_bytes"]),
-    )
-    daily_remaining = max(
-        0,
-        DAILY_BUDGET_BYTES
-        - proven_today
-        - int(accounting["current_day_reserved_provider_bytes"]),
-    )
-    return min(order_remaining, daily_remaining), accounting
-
-
-def _assert_whoscored_provider_order_bound(
-    ledger: ProxyCampaignLedger,
-    approval: ProxyCampaignApproval | None = None,
-) -> None:
-    """Re-read the durable escrow after mutation and reject any cap drift."""
-
-    _, accounting = _whoscored_budget_availability(ledger, approval)
-    if int(accounting["exposure_provider_bytes"]) > (
-        _whoscored_provider_order_cap_bytes(approval)
-    ):
-        raise RuntimeError("WhoScored provider-order lifetime cap was exceeded")
-    proven_today = max(
-        _daily_total_bytes(),
-        int(accounting["current_day_spent_provider_bytes"]),
-    )
-    if proven_today + int(accounting["current_day_reserved_provider_bytes"]) > (
-        DAILY_BUDGET_BYTES
-    ):
-        raise RuntimeError("WhoScored global daily budget was exceeded")
-
-
-def _release_whoscored_global_escrow(lease: Lease, released: int) -> None:
-    """Clear the local mirror only after the durable escrow was released."""
-
-    if (
-        lease.source != "whoscored"
-        or isinstance(released, bool)
-        or not isinstance(released, int)
-        or released < 0
-        or released != lease.global_budget_escrow_bytes
-    ):
-        raise RuntimeError("WhoScored global escrow release differs from ledger")
-    lease.global_budget_escrow_bytes = 0
-
-
 def _run_total_bytes(run_key: str) -> int:
     return _run_up_bytes[run_key] + _run_down_bytes[run_key]
 
@@ -1851,28 +1616,18 @@ def _lease_dagrun_budget_bytes(lease: Lease) -> int:
         if lease.workload_plan is None or lease.run_cap_bytes <= 0:
             return 0
         return lease.run_cap_bytes
-    if lease.source == "whoscored":
-        if lease.proxy_campaign_approval is None:
-            return DEFAULT_WHOSCORED_PAID_CAP_BYTES
-        return lease.proxy_campaign_approval.caps.total_provider_bytes
+
     return _dagrun_budget_bytes(lease.dag_id, lease.task_id)
 
 
 def _lease_url_budget_bytes(lease: Lease) -> int:
     # A warmed SofaScore browser intentionally captures many API endpoints in
     # one lease.  The measured DagRun cap is its URL/session cap too, so the
-    # legacy per-page WhoScored ceiling cannot truncate the warmed session.
+
     # Registry discovery has the same shape: thousands of JSON reads against
     # one canonical API origin, so the 2 MB per-URL ceiling would strangle it.
-    if lease.source in (
-        "fbref",
-        "sofascore",
-        "sofascore_canary",
-        "sofascore_discovery",
-        "whoscored",
-    ):
-        if lease.source == "whoscored" and lease.proxy_work_allocation is not None:
-            return lease.proxy_work_allocation.budget_bytes
+    if lease.source in ('fbref', 'sofascore', 'sofascore_canary', 'sofascore_discovery'):
+
         return _lease_dagrun_budget_bytes(lease)
     return URL_BUDGET_BYTES
 
@@ -1902,486 +1657,10 @@ def _canonical_url(value: Any) -> str:
     return raw.split("#", 1)[0]
 
 
-def _whoscored_state_secret() -> bytes:
-    secret = WHOSCORED_PROXY_LEDGER_HMAC_SECRET.encode("utf-8")
-    if len(secret) < 32:
-        raise RuntimeError("WhoScored state has no ledger HMAC secret")
-    return secret
-
-
-def _state_path_sha256(path: str) -> str:
-    return hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()
-
-
-def _paid_ledger_checkpoint_path() -> str:
-    return LEDGER_PATH + ".checkpoint.json"
-
-
-def _atomic_private_bytes(path: str, payload: bytes, *, replace: bool) -> None:
-    directory_path = os.path.dirname(path) or "."
-    os.makedirs(directory_path, exist_ok=True)
-    if (
-        os.path.islink(path)
-        or (not replace and os.path.exists(path))
-        or (replace and not os.path.isfile(path))
-    ):
-        raise RuntimeError("refusing to replace protected WhoScored state")
-    temporary = os.path.join(
-        directory_path,
-        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
-    )
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        os.fchmod(descriptor, 0o600)
-        pending = memoryview(payload)
-        while pending:
-            written = os.write(descriptor, pending)
-            if written <= 0:
-                raise OSError("protected state write made no progress")
-            pending = pending[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
-        if not replace and os.path.exists(path):
-            raise RuntimeError("protected WhoScored state appeared concurrently")
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-
-def _require_private_regular_file(
-    path: str,
-    *,
-    allow_empty: bool,
-    max_bytes: int | None = MAX_CONTROL_BODY_BYTES * 4,
-    read: bool = True,
-) -> bytes:
-    if os.path.islink(path):
-        raise RuntimeError("protected WhoScored state cannot be a symlink")
-    try:
-        metadata = os.stat(path)
-    except OSError as exc:
-        raise RuntimeError("protected WhoScored state is missing") from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or (not allow_empty and metadata.st_size <= 0)
-        or (max_bytes is not None and metadata.st_size > max_bytes)
-    ):
-        raise RuntimeError("protected WhoScored state file is invalid")
-    if not read:
-        return b""
-    with open(path, "rb") as stream:
-        return stream.read()
-
-
-def _state_hmac(body: Mapping[str, object]) -> str:
-    return hmac.new(
-        _whoscored_state_secret(),
-        canonical_json_bytes(dict(body)),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _paid_ledger_seed(state_id: str) -> str:
-    return hmac.new(
-        _whoscored_state_secret(),
-        canonical_json_bytes(
-            {
-                "schema_version": WHOSCORED_PAID_LEDGER_CHAIN_SCHEMA_VERSION,
-                "state_id": state_id,
-                "kind": "whoscored_paid_ledger_seed",
-            }
-        ),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _checkpoint_body(
-    *, state_id: str, event_count: int, byte_length: int, tail_hmac: str
-) -> dict[str, object]:
-    return {
-        "schema_version": WHOSCORED_STATE_SCHEMA_VERSION,
-        "state_id": state_id,
-        "event_count": event_count,
-        "byte_length": byte_length,
-        "tail_hmac": tail_hmac,
-    }
-
-
-def _write_paid_ledger_checkpoint(
-    *, event_count: int, byte_length: int, tail_hmac: str, replace: bool = True
-) -> None:
-    body = _checkpoint_body(
-        state_id=WHOSCORED_STATE_ID,
-        event_count=event_count,
-        byte_length=byte_length,
-        tail_hmac=tail_hmac,
-    )
-    document = {**body, "signature": _state_hmac(body)}
-    _atomic_private_bytes(
-        _paid_ledger_checkpoint_path(),
-        canonical_json_bytes(document) + b"\n",
-        replace=replace,
-    )
-
-
-def _read_paid_ledger_checkpoint() -> Mapping[str, object]:
-    raw = _require_private_regular_file(
-        _paid_ledger_checkpoint_path(), allow_empty=False
-    )
-    try:
-        value = strict_json_loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, ProxyCampaignError) as exc:
-        raise RuntimeError("paid ledger checkpoint is corrupt") from exc
-    fields = {
-        "schema_version",
-        "state_id",
-        "event_count",
-        "byte_length",
-        "tail_hmac",
-        "signature",
-    }
-    if not isinstance(value, Mapping) or frozenset(value) != fields:
-        raise RuntimeError("paid ledger checkpoint fields are invalid")
-    body = {name: value[name] for name in fields if name != "signature"}
-    count = body.get("event_count")
-    offset = body.get("byte_length")
-    tail = body.get("tail_hmac")
-    if (
-        body.get("schema_version") != WHOSCORED_STATE_SCHEMA_VERSION
-        or body.get("state_id") != WHOSCORED_STATE_ID
-        or isinstance(count, bool)
-        or not isinstance(count, int)
-        or count < 0
-        or isinstance(offset, bool)
-        or not isinstance(offset, int)
-        or offset < 0
-        or not isinstance(tail, str)
-        or re.fullmatch(r"[0-9a-f]{64}", tail) is None
-        or not hmac.compare_digest(str(value.get("signature")), _state_hmac(body))
-    ):
-        raise RuntimeError("paid ledger checkpoint authentication failed")
-    return body
-
-
-def _signed_report(report: Mapping[str, object]) -> dict[str, object]:
-    body = {
-        **dict(report),
-        "state_schema_version": WHOSCORED_STATE_SCHEMA_VERSION,
-        "state_id": WHOSCORED_STATE_ID,
-    }
-    return {**body, "report_hmac": _state_hmac(body)}
-
-
-def _verify_signed_report(path: str) -> Mapping[str, object]:
-    raw = _require_private_regular_file(path, allow_empty=False)
-    try:
-        value = strict_json_loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, ProxyCampaignError) as exc:
-        raise RuntimeError("WhoScored byte report is corrupt") from exc
-    if not isinstance(value, Mapping) or set(value) != {
-        "total_mb",
-        "daily",
-        "leases",
-        "dagruns",
-        "allowed_hosts",
-        "blocked_hosts",
-        "state_schema_version",
-        "state_id",
-        "report_hmac",
-    }:
-        raise RuntimeError("WhoScored byte report fields are invalid")
-    body = {name: item for name, item in value.items() if name != "report_hmac"}
-    if (
-        body.get("state_schema_version") != WHOSCORED_STATE_SCHEMA_VERSION
-        or body.get("state_id") != WHOSCORED_STATE_ID
-        or not hmac.compare_digest(str(value.get("report_hmac")), _state_hmac(body))
-    ):
-        raise RuntimeError("WhoScored byte report authentication failed")
-    daily = body.get("daily")
-    if not isinstance(daily, Mapping) or set(daily) != {
-        "day",
-        "up_bytes",
-        "down_bytes",
-        "total_bytes",
-        "budget_bytes",
-    }:
-        raise RuntimeError("WhoScored byte report daily state is invalid")
-    for name in ("up_bytes", "down_bytes", "total_bytes", "budget_bytes"):
-        counter = daily.get(name)
-        if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
-            raise RuntimeError("WhoScored byte report counter is invalid")
-    if daily["total_bytes"] != daily["up_bytes"] + daily["down_bytes"]:
-        raise RuntimeError("WhoScored byte report counters differ")
-    return body
-
-
-def _whoscored_state_binding() -> tuple[str, str, int]:
-    """Return the exact provider namespace configured by protected startup."""
-
-    order_id = WHOSCORED_PROVIDER_ORDER_ID
-    policy_sha256 = WHOSCORED_PROVIDER_POLICY_SHA256
-    order_cap_bytes = WHOSCORED_PROVIDER_ORDER_CAP_BYTES
-    if (
-        type(order_id) is not str
-        or _CANONICAL_TOKEN_RE.fullmatch(order_id) is None
-        or type(policy_sha256) is not str
-        or _LOWER_SHA256_RE.fullmatch(policy_sha256) is None
-        or isinstance(order_cap_bytes, bool)
-        or not isinstance(order_cap_bytes, int)
-        or not 1 <= order_cap_bytes <= WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
-        or DAILY_BUDGET_BYTES
-        > whoscored_provider_spendable_cap_bytes(order_cap_bytes)
-    ):
-        raise RuntimeError("WhoScored provider state binding is invalid")
-    return order_id, policy_sha256, order_cap_bytes
-
-
-def _assert_whoscored_approval_state_binding(
-    approval: ProxyCampaignApproval,
-) -> None:
-    """Never let scheduled-v3 authority use another order's counters."""
-
-    order_id, policy_sha256, order_cap_bytes = _whoscored_state_binding()
-    if approval.schema_version != SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION:
-        return
-    authority = approval.scheduled_authority
-    if (
-        authority is None
-        or not hmac.compare_digest(authority.order_id, order_id)
-        or not hmac.compare_digest(authority.provider_policy_sha256, policy_sha256)
-        or authority.provider_order_cap_bytes != order_cap_bytes
-    ):
-        raise ProxyCampaignValidationError(
-            "scheduled WhoScored authority differs from provider state binding"
-        )
-
-
-def _initialize_whoscored_state(out_path: str) -> None:
-    global WHOSCORED_STATE_ID, WHOSCORED_LEGACY_STATE_MARKER_LOADED
-    order_id, policy_sha256, order_cap_bytes = _whoscored_state_binding()
-    checkpoint_path = _paid_ledger_checkpoint_path()
-    paths = (
-        out_path,
-        LEDGER_PATH,
-        WHOSCORED_CAMPAIGN_LEDGER_PATH,
-        checkpoint_path,
-        WHOSCORED_STATE_MARKER_PATH,
-    )
-    if any(os.path.exists(path) or os.path.islink(path) for path in paths):
-        raise RuntimeError("WhoScored state initialization requires an empty state")
-    WHOSCORED_STATE_ID = secrets.token_hex(32)
-    WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
-    empty_report = _signed_report(
-        {
-            "total_mb": 0.0,
-            "daily": {
-                "day": _utc_day(),
-                "up_bytes": 0,
-                "down_bytes": 0,
-                "total_bytes": 0,
-                "budget_bytes": DAILY_BUDGET_BYTES,
-            },
-            "leases": [],
-            "dagruns": [],
-            "allowed_hosts": [],
-            "blocked_hosts": [],
-        }
-    )
-    _atomic_private_bytes(LEDGER_PATH, b"", replace=False)
-    _whoscored_campaign_ledger().initialize_empty()
-    _write_paid_ledger_checkpoint(
-        event_count=0,
-        byte_length=0,
-        tail_hmac=_paid_ledger_seed(WHOSCORED_STATE_ID),
-        replace=False,
-    )
-    _atomic_private_bytes(
-        out_path, canonical_json_bytes(empty_report) + b"\n", replace=False
-    )
-    marker_body = {
-        "schema_version": WHOSCORED_STATE_MARKER_SCHEMA_VERSION,
-        "state_id": WHOSCORED_STATE_ID,
-        "order_id": order_id,
-        "provider_policy_sha256": policy_sha256,
-        "provider_order_cap_bytes": order_cap_bytes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "path_sha256": {
-            "byte_report": _state_path_sha256(out_path),
-            "paid_ledger": _state_path_sha256(LEDGER_PATH),
-            "campaign_ledger": _state_path_sha256(WHOSCORED_CAMPAIGN_LEDGER_PATH),
-            "paid_ledger_checkpoint": _state_path_sha256(checkpoint_path),
-        },
-    }
-    marker = {**marker_body, "signature": _state_hmac(marker_body)}
-    _atomic_private_bytes(
-        WHOSCORED_STATE_MARKER_PATH,
-        canonical_json_bytes(marker) + b"\n",
-        replace=False,
-    )
-
-
-def _load_whoscored_state_marker(
-    out_path: str, *, allow_legacy_marker: bool = False
-) -> None:
-    global WHOSCORED_STATE_ID, WHOSCORED_LEGACY_STATE_MARKER_LOADED
-    if allow_legacy_marker:
-        raise RuntimeError("legacy WhoScored state markers are no longer accepted")
-    raw = _require_private_regular_file(WHOSCORED_STATE_MARKER_PATH, allow_empty=False)
-    try:
-        value = strict_json_loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, ProxyCampaignError) as exc:
-        raise RuntimeError("WhoScored state marker is corrupt") from exc
-    if not isinstance(value, Mapping):
-        raise RuntimeError("WhoScored state marker fields are invalid")
-    schema_version = value.get("schema_version")
-    common_fields = {
-        "schema_version",
-        "state_id",
-        "created_at",
-        "path_sha256",
-        "signature",
-    }
-    current_fields = common_fields | {
-        "order_id",
-        "provider_policy_sha256",
-        "provider_order_cap_bytes",
-    }
-    if (
-        schema_version != WHOSCORED_STATE_MARKER_SCHEMA_VERSION
-        or frozenset(value) != current_fields
-    ):
-        raise RuntimeError("WhoScored state marker fields are invalid")
-    body = {name: item for name, item in value.items() if name != "signature"}
-    state_id = body.get("state_id")
-    expected_paths = {
-        "byte_report": _state_path_sha256(out_path),
-        "paid_ledger": _state_path_sha256(LEDGER_PATH),
-        "campaign_ledger": _state_path_sha256(WHOSCORED_CAMPAIGN_LEDGER_PATH),
-        "paid_ledger_checkpoint": _state_path_sha256(_paid_ledger_checkpoint_path()),
-    }
-    if (
-        not isinstance(state_id, str)
-        or re.fullmatch(r"[0-9a-f]{64}", state_id) is None
-        or body.get("path_sha256") != expected_paths
-        or not hmac.compare_digest(str(value.get("signature")), _state_hmac(body))
-    ):
-        raise RuntimeError("WhoScored state marker authentication failed")
-    order_id, policy_sha256, order_cap_bytes = _whoscored_state_binding()
-    if (
-        not hmac.compare_digest(str(body.get("order_id")), order_id)
-        or not hmac.compare_digest(
-            str(body.get("provider_policy_sha256")), policy_sha256
-        )
-        or body.get("provider_order_cap_bytes") != order_cap_bytes
-    ):
-        raise RuntimeError("WhoScored state marker provider binding differs")
-    WHOSCORED_STATE_ID = state_id
-    WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
-
-
-def _verify_paid_ledger_chain(path: str) -> None:
-    global _PAID_LEDGER_CHAIN_COUNT
-    global _PAID_LEDGER_CHAIN_OFFSET
-    global _PAID_LEDGER_CHAIN_TAIL
-    _require_private_regular_file(
-        path,
-        allow_empty=True,
-        max_bytes=None,
-        read=False,
-    )
-    checkpoint = _read_paid_ledger_checkpoint()
-    checkpoint_count = int(checkpoint["event_count"])
-    checkpoint_offset = int(checkpoint["byte_length"])
-    checkpoint_tail = str(checkpoint["tail_hmac"])
-    count = 0
-    offset = 0
-    tail = _paid_ledger_seed(WHOSCORED_STATE_ID)
-    checkpoint_observed = checkpoint_count == 0 and checkpoint_offset == 0
-    with open(path, "rb") as stream:
-        while True:
-            raw = stream.readline(MAX_LEDGER_EVENT_BYTES + 1)
-            if not raw:
-                break
-            if len(raw) > MAX_LEDGER_EVENT_BYTES or not raw.endswith(b"\n"):
-                raise RuntimeError("paid byte ledger chain record is truncated")
-            try:
-                event = strict_json_loads(raw)
-            except (
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-                ProxyCampaignError,
-            ) as exc:
-                raise RuntimeError("paid byte ledger chain is corrupt") from exc
-            if not isinstance(event, Mapping):
-                raise RuntimeError("paid byte ledger chain record is invalid")
-            body = dict(event)
-            supplied_hmac = body.pop("event_hmac", None)
-            count += 1
-            if (
-                body.get("chain_schema_version")
-                != WHOSCORED_PAID_LEDGER_CHAIN_SCHEMA_VERSION
-                or body.get("chain_sequence") != count
-                or body.get("previous_event_hmac") != tail
-                or not isinstance(supplied_hmac, str)
-            ):
-                raise RuntimeError("paid byte ledger chain identity differs")
-            expected_hmac = hmac.new(
-                _whoscored_state_secret(),
-                canonical_json_bytes(body),
-                hashlib.sha256,
-            ).hexdigest()
-            if not hmac.compare_digest(supplied_hmac, expected_hmac):
-                raise RuntimeError("paid byte ledger chain authentication failed")
-            tail = expected_hmac
-            offset += len(raw)
-            if count == checkpoint_count:
-                checkpoint_observed = (
-                    offset == checkpoint_offset and tail == checkpoint_tail
-                )
-    if count < checkpoint_count or not checkpoint_observed:
-        raise RuntimeError("paid byte ledger was truncated or differs from checkpoint")
-    if count == checkpoint_count and (
-        offset != checkpoint_offset or tail != checkpoint_tail
-    ):
-        raise RuntimeError("paid byte ledger tail differs from checkpoint")
-    if count > checkpoint_count:
-        _write_paid_ledger_checkpoint(
-            event_count=count,
-            byte_length=offset,
-            tail_hmac=tail,
-        )
-    _PAID_LEDGER_CHAIN_COUNT = count
-    _PAID_LEDGER_CHAIN_OFFSET = offset
-    _PAID_LEDGER_CHAIN_TAIL = tail
-
-
-def _verify_whoscored_state(
-    out_path: str, *, allow_legacy_marker: bool = False
-) -> None:
-    _load_whoscored_state_marker(out_path, allow_legacy_marker=allow_legacy_marker)
-    _verify_signed_report(out_path)
-    _verify_paid_ledger_chain(LEDGER_PATH)
-    _whoscored_campaign_ledger().verify_integrity()
-
-
 def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
     """Append and fsync exact paid accounting before another lease is served."""
-    global _PAID_LEDGER_CHAIN_COUNT
-    global _PAID_LEDGER_CHAIN_OFFSET
-    global _PAID_LEDGER_CHAIN_TAIL
+
+
     if not LEDGER_PATH:
         raise RuntimeError("paid request ledger path is not configured")
     event = {
@@ -2410,49 +1689,19 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
         "allocation_class": lease.workload_class,
         "allocation_batch_index": lease.allocation_batch_index,
         "allocation_budget_bytes": lease.allocation_budget_bytes,
-        "proxy_campaign_id": (
-            lease.proxy_campaign_approval.campaign_id
-            if lease.proxy_campaign_approval
-            else ""
-        ),
-        "proxy_approval_id": (
-            lease.proxy_campaign_approval.approval_id
-            if lease.proxy_campaign_approval
-            else ""
-        ),
-        "proxy_approval_sha256": (
-            lease.proxy_campaign_approval.approval_sha256
-            if lease.proxy_campaign_approval
-            else ""
-        ),
-        "proxy_attempt_id": lease.proxy_attempt_id,
-        "proxy_work_item_id": lease.proxy_work_item_id,
-        "provider_meter": (
-            PROXY_CAMPAIGN_METER if lease.proxy_campaign_approval else ""
-        ),
+        "proxy_campaign_id": "",
+        "proxy_approval_id": "",
+        "proxy_approval_sha256": "",
+        "proxy_attempt_id": "",
+        "proxy_work_item_id": "",
+        "provider_meter": "",
         "base_run_id": lease.base_run_id,
         "workload_phase": lease.workload_phase,
         "parent_run_cap_bytes": lease.parent_run_cap_bytes,
         "parent_run_spent_provider_bytes": (lease.parent_run_spent_provider_bytes),
         **values,
     }
-    if SOURCE_MODE == "whoscored-only":
-        if not WHOSCORED_STATE_ID or not _PAID_LEDGER_CHAIN_TAIL:
-            raise RuntimeError("WhoScored paid ledger chain is not initialized")
-        chain_body = {
-            **event,
-            "chain_schema_version": WHOSCORED_PAID_LEDGER_CHAIN_SCHEMA_VERSION,
-            "chain_sequence": _PAID_LEDGER_CHAIN_COUNT + 1,
-            "previous_event_hmac": _PAID_LEDGER_CHAIN_TAIL,
-        }
-        event = {
-            **chain_body,
-            "event_hmac": hmac.new(
-                _whoscored_state_secret(),
-                canonical_json_bytes(chain_body),
-                hashlib.sha256,
-            ).hexdigest(),
-        }
+
     os.makedirs(os.path.dirname(LEDGER_PATH) or ".", exist_ok=True)
     payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
@@ -2460,8 +1709,7 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
     if len(payload) > MAX_LEDGER_EVENT_BYTES:
         raise RuntimeError(f"paid byte event exceeds {MAX_LEDGER_EVENT_BYTES} bytes")
     flags = os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-    if SOURCE_MODE != "whoscored-only":
-        flags |= os.O_CREAT
+    flags |= os.O_CREAT
     descriptor = os.open(LEDGER_PATH, flags, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
@@ -2474,15 +1722,6 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    if SOURCE_MODE == "whoscored-only":
-        _PAID_LEDGER_CHAIN_COUNT += 1
-        _PAID_LEDGER_CHAIN_OFFSET += len(payload)
-        _PAID_LEDGER_CHAIN_TAIL = str(event["event_hmac"])
-        _write_paid_ledger_checkpoint(
-            event_count=_PAID_LEDGER_CHAIN_COUNT,
-            byte_length=_PAID_LEDGER_CHAIN_OFFSET,
-            tail_hmac=_PAID_LEDGER_CHAIN_TAIL,
-        )
 
 
 def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
@@ -2560,14 +1799,11 @@ def _restore_daily_counter(out_path: str) -> None:
     so accepting it as the checkpoint cannot read a half-written value.
     """
     global _daily_day, _daily_up_bytes, _daily_down_bytes, _daily_reserved_bytes
-    if SOURCE_MODE == "whoscored-only":
-        daily = dict(_verify_signed_report(out_path).get("daily") or {})
-    else:
-        try:
-            with open(out_path, encoding="utf-8") as fh:
-                daily = (json.load(fh) or {}).get("daily") or {}
-        except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
-            return
+    try:
+        with open(out_path, encoding='utf-8') as fh:
+            daily = (json.load(fh) or {}).get('daily') or {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
+        return
     if daily.get("day") != _utc_day():
         return
     _daily_day = str(daily["day"])
@@ -2854,31 +2090,6 @@ def _allocation_ledger() -> AllocationLedger:
     return SOFASCORE_ALLOCATION_LEDGER
 
 
-def _whoscored_campaign_ledger() -> ProxyCampaignLedger:
-    """Return the durable WhoScored ledger bound only to its ledger key."""
-
-    global WHOSCORED_CAMPAIGN_LEDGER, _WHOSCORED_CAMPAIGN_LEDGER_KEY
-    if len(WHOSCORED_PROXY_LEDGER_HMAC_SECRET.encode("utf-8")) < 32:
-        raise RuntimeError("WhoScored campaign ledger has no HMAC secret")
-    key = (
-        WHOSCORED_CAMPAIGN_LEDGER_PATH,
-        hashlib.sha256(WHOSCORED_PROXY_LEDGER_HMAC_SECRET.encode("utf-8")).hexdigest(),
-        hashlib.sha256(
-            WHOSCORED_PROXY_APPROVAL_HMAC_SECRET.encode("utf-8")
-        ).hexdigest(),
-        SOURCE_MODE == "whoscored-only",
-    )
-    if WHOSCORED_CAMPAIGN_LEDGER is None or key != _WHOSCORED_CAMPAIGN_LEDGER_KEY:
-        WHOSCORED_CAMPAIGN_LEDGER = ProxyCampaignLedger(
-            WHOSCORED_CAMPAIGN_LEDGER_PATH,
-            secret=WHOSCORED_PROXY_LEDGER_HMAC_SECRET,
-            approval_secret=WHOSCORED_PROXY_APPROVAL_HMAC_SECRET,
-            require_existing=SOURCE_MODE == "whoscored-only",
-        )
-        _WHOSCORED_CAMPAIGN_LEDGER_KEY = key
-    return WHOSCORED_CAMPAIGN_LEDGER
-
-
 def _append_allocation_wal(
     event_type: str,
     lease_id: str,
@@ -3140,6 +2351,8 @@ def _create_lease(
         )
     dag_id = str(metadata.get("dag_id") or "").strip()
     requested_source = str(metadata.get("source") or "").strip().lower()
+    if requested_source in {"whoscored"} or "whoscored" in dag_id.lower():
+        raise ValueError("WhoScored leases are not supported by this proxy")
     inferred_source = _source_for_dag(dag_id)
     if require_context and not inferred_source:
         raise ValueError("paid lease dag_id is not in the closed source allowlist")
@@ -3160,72 +2373,13 @@ def _create_lease(
                 "pool is not configured"
             )
         lease_manager = TRANSFERMARKT_BACKFILL_PROXY_MANAGER
-    if source == "whoscored" and SOURCE_MODE == "shared-no-whoscored":
-        raise ProxyCampaignValidationError(
-            "WhoScored leases require the dedicated provider service"
-        )
+
     if source != "fbref" and SOURCE_MODE == "fbref-only":
         raise ValueError("dedicated FBref service rejects every other source")
-    if source != "whoscored" and SOURCE_MODE == "whoscored-only":
-        raise ValueError("dedicated WhoScored service rejects every other source")
-    proxy_campaign_approval: ProxyCampaignApproval | None = None
-    proxy_work_allocation: ProxyWorkAllocation | None = None
-    proxy_attempt_id = ""
-    proxy_campaign_ledger: ProxyCampaignLedger | None = None
-    whoscored_global_available = 0
-    if source == "whoscored":
-        (
-            proxy_campaign_approval,
-            proxy_work_allocation,
-            proxy_attempt_id,
-        ) = approval_from_context(metadata, secret=WHOSCORED_PROXY_APPROVAL_HMAC_SECRET)
-        _assert_whoscored_approval_state_binding(proxy_campaign_approval)
-        if proxy_campaign_approval.allowed_dag_ids == (WHOSCORED_CANARY_DAG_ID,):
-            if not proxy_campaign_approval.is_exact_canary:
-                raise ProxyCampaignValidationError(
-                    "WhoScored canary approval must match the exact 1 GB contract"
-                )
-        elif not (
-            (
-                proxy_campaign_approval.allowed_dag_ids
-                and all(
-                    daily_ingest_paid_crawl_allowed(dag_id)
-                    for dag_id in proxy_campaign_approval.allowed_dag_ids
-                )
-            )
-            or WHOSCORED_FULL_PAID_CRAWL_AVAILABLE
-        ):
-            raise ProxyCampaignValidationError(
-                "WhoScored full paid crawl is disabled pending exact reconciliation"
-            )
-        if not WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE:
-            raise ProxyCampaignValidationError(
-                "WhoScored paid traffic has no provider-side invoice hard cap"
-            )
-        if not WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE:
-            raise ProxyCampaignValidationError(
-                "WhoScored paid traffic has no authenticated isolated "
-                "application gateway"
-            )
-        if not WHOSCORED_PROXY_RUNTIME_SHA256:
-            raise ProxyCampaignValidationError(
-                "WhoScored proxy startup runtime fingerprint is unavailable"
-            )
-        if proxy_campaign_approval.runtime_sha256 != WHOSCORED_PROXY_RUNTIME_SHA256:
-            raise ProxyCampaignValidationError(
-                "WhoScored approval runtime differs from the loaded proxy release"
-            )
-        proxy_campaign_ledger = _whoscored_campaign_ledger()
-        whoscored_global_available, _ = _whoscored_budget_availability(
-            proxy_campaign_ledger,
-            proxy_campaign_approval,
-        )
-        if whoscored_global_available <= 0:
-            raise RuntimeError("WhoScored global daily/provider-order budget exhausted")
-    elif _uses_shared_daily_budget(source) and (
-        _daily_total_bytes() >= DAILY_BUDGET_BYTES
-    ):
-        raise RuntimeError("daily paid-proxy budget exhausted")
+
+
+    if _uses_shared_daily_budget(source) and _daily_total_bytes() >= DAILY_BUDGET_BYTES:
+        raise RuntimeError('daily paid-proxy budget exhausted')
     if source == "sofascore" and SOFASCORE_DAGRUN_BUDGET_BYTES <= 0:
         raise RuntimeError(
             "SofaScore paid-proxy budget unavailable: verified canary required"
@@ -3301,8 +2455,8 @@ def _create_lease(
     workload_plan: SignedDagRunPlan | None = None
     allocation: WorkloadAllocation | None = None
     allocation_claim: AllocationClaim | None = None
-    proxy_campaign_claim: ProxyCampaignClaim | None = None
-    proxy_campaign_escrowed = False
+
+
     parent_envelope: ParentRunEnvelope | None = None
     if source == "sofascore":
         workload_plan, allocation = _signed_allocation_from_request(
@@ -3311,66 +2465,18 @@ def _create_lease(
         )
         parent_envelope = _parent_envelope_ledger().register(workload_plan)
         dagrun_budget = workload_plan.run_cap_bytes
-    elif source == "whoscored":
-        assert proxy_campaign_approval is not None
-        assert proxy_work_allocation is not None
-        approval_expires_at = datetime.fromisoformat(
-            proxy_campaign_approval.expires_at.replace("Z", "+00:00")
-        ).timestamp()
-        effective_expires_at = min(now + ttl_seconds, approval_expires_at)
-        assert proxy_campaign_ledger is not None
-        proxy_campaign_claim = proxy_campaign_ledger.claim(
-            proxy_campaign_approval,
-            proxy_work_allocation.allocation_id,
-            dag_id=dag_id,
-            run_id=run_id,
-            task_id=str(metadata.get("task_id") or "").strip(),
-            attempt_id=proxy_attempt_id,
-            lease_id=lease_id,
-            expires_at=datetime.fromtimestamp(effective_expires_at, timezone.utc),
-            canonical_url=canonical_url,
-            target_manifest_sha256=metadata.get("target_manifest_sha256"),
-            logical_target_units=metadata.get("logical_target_units", 1),
-            expected_endpoint_labels=metadata.get("expected_endpoint_labels", ()),
-        )
-        dagrun_budget = proxy_campaign_approval.caps.total_provider_bytes
     else:
-        effective_expires_at = now + ttl_seconds
-        dagrun_budget = _dagrun_budget_bytes(
-            dag_id, str(metadata.get("task_id") or "").strip()
-        )
-    if source != "whoscored":
-        effective_expires_at = now + ttl_seconds
+        dagrun_budget = _dagrun_budget_bytes(dag_id, str(metadata.get('task_id') or '').strip())
+    effective_expires_at = now + ttl_seconds
     url_budget = (
-        dagrun_budget
-        if source
-        in (
-            "fbref",
-            "sofascore",
-            "sofascore_canary",
-            "sofascore_discovery",
-            "whoscored",
-        )
-        else URL_BUDGET_BYTES
+        dagrun_budget if source in ('fbref', 'sofascore', 'sofascore_canary', 'sofascore_discovery') else URL_BUDGET_BYTES
     )
-    if proxy_campaign_claim is not None:
-        available = min(
-            proxy_campaign_claim.remaining_provider_bytes,
-            whoscored_global_available,
-        )
-    else:
-        available_components = [
-            dagrun_budget - _run_total_bytes(run_key),
-            url_budget - _url_total_bytes(run_key, canonical_url),
-        ]
-        if _uses_shared_daily_budget(source):
-            available_components.append(DAILY_BUDGET_BYTES - _daily_total_bytes())
-        if parent_envelope is not None:
-            available_components.append(
-                parent_envelope.parent_cap_bytes
-                - parent_envelope.parent_spent_provider_bytes
-            )
-        available = min(available_components)
+    available_components = [dagrun_budget - _run_total_bytes(run_key), url_budget - _url_total_bytes(run_key, canonical_url)]
+    if _uses_shared_daily_budget(source):
+        available_components.append(DAILY_BUDGET_BYTES - _daily_total_bytes())
+    if parent_envelope is not None:
+        available_components.append(parent_envelope.parent_cap_bytes - parent_envelope.parent_spent_provider_bytes)
+    available = min(available_components)
     if available <= 0:
         raise RuntimeError("paid-proxy DagRun or URL budget exhausted")
     if workload_plan is not None and allocation is not None:
@@ -3421,48 +2527,19 @@ def _create_lease(
             source=source,
             workload_plan=workload_plan,
             allocation_claim=allocation_claim,
-            proxy_campaign_approval=proxy_campaign_approval,
-            proxy_campaign_claim=proxy_campaign_claim,
-            proxy_work_allocation=proxy_work_allocation,
-            proxy_attempt_id=proxy_attempt_id,
-            proxy_work_item_id=(
-                proxy_work_allocation.work_item_id
-                if proxy_work_allocation is not None
-                else ""
-            ),
             allocation_id=(
-                allocation.allocation_id
-                if allocation
-                else (
-                    proxy_work_allocation.allocation_id if proxy_work_allocation else ""
-                )
+                allocation.allocation_id if allocation else ''
             ),
             workload_class=(
-                allocation.workload_class
-                if allocation
-                else (
-                    proxy_work_allocation.workload_class
-                    if proxy_work_allocation
-                    else ""
-                )
+                allocation.workload_class if allocation else ''
             ),
             allocation_batch_index=allocation.batch_index if allocation else -1,
             allocation_units=allocation.units if allocation else (),
             allocation_budget_bytes=(
-                allocation.budget_bytes
-                if allocation
-                else (
-                    proxy_work_allocation.budget_bytes if proxy_work_allocation else 0
-                )
+                allocation.budget_bytes if allocation else 0
             ),
             run_cap_bytes=(
-                workload_plan.run_cap_bytes
-                if workload_plan
-                else (
-                    proxy_campaign_approval.caps.total_provider_bytes
-                    if proxy_campaign_approval
-                    else 0
-                )
+                workload_plan.run_cap_bytes if workload_plan else 0
             ),
             base_run_id=(parent_envelope.base_run_id if parent_envelope else ""),
             workload_phase=(parent_envelope.phase if parent_envelope else ""),
@@ -3472,38 +2549,13 @@ def _create_lease(
             parent_run_spent_provider_bytes=(
                 parent_envelope.parent_spent_provider_bytes if parent_envelope else 0
             ),
-            target_manifest_sha256=(
-                proxy_campaign_claim.target_manifest_sha256
-                if proxy_campaign_claim is not None
-                else ""
-            ),
-            logical_target_units=(
-                proxy_campaign_claim.logical_target_units
-                if proxy_campaign_claim is not None
-                else 1
-            ),
+            target_manifest_sha256="",
+            logical_target_units=1,
             expected_endpoint_labels=(
-                proxy_campaign_claim.expected_endpoint_labels
-                if proxy_campaign_claim is not None
-                else ()
+                ()
             ),
         )
-        if proxy_campaign_approval is not None and proxy_campaign_claim is not None:
-            assert proxy_campaign_ledger is not None
-            proxy_campaign_ledger.reserve_provider_bytes(
-                proxy_campaign_approval,
-                proxy_campaign_claim,
-                lease.max_bytes,
-                provider_order_cap_bytes=_whoscored_provider_order_cap_bytes(
-                    proxy_campaign_approval
-                ),
-                global_daily_cap_bytes=DAILY_BUDGET_BYTES,
-            )
-            proxy_campaign_escrowed = True
-            lease.global_budget_escrow_bytes = lease.max_bytes
-            _assert_whoscored_provider_order_bound(
-                proxy_campaign_ledger, proxy_campaign_approval
-            )
+
     except BaseException:
         if workload_plan is not None and allocation_claim is not None:
             _allocation_ledger().finish(
@@ -3516,20 +2568,7 @@ def _create_lease(
             _append_allocation_wal(
                 "allocation_finished", lease_id, creation_failed=True
             )
-        if proxy_campaign_approval is not None and proxy_campaign_claim is not None:
-            assert proxy_campaign_ledger is not None
-            if proxy_campaign_escrowed:
-                released = proxy_campaign_ledger.release_provider_reservation(
-                    proxy_campaign_approval,
-                    proxy_campaign_claim,
-                )
-                _release_whoscored_global_escrow(lease, released)
-            proxy_campaign_ledger.finish(
-                proxy_campaign_approval,
-                proxy_campaign_claim,
-                provider_billed_bytes=0,
-                completed=False,
-            )
+
         raise
     LEASES[lease.lease_id] = lease
     LEASE_TOKENS[lease.token] = lease.lease_id
@@ -3556,20 +2595,7 @@ def _create_lease(
             _append_allocation_wal(
                 "allocation_finished", lease_id, creation_failed=True
             )
-        if proxy_campaign_approval is not None and proxy_campaign_claim is not None:
-            assert proxy_campaign_ledger is not None
-            if proxy_campaign_escrowed:
-                released = proxy_campaign_ledger.release_provider_reservation(
-                    proxy_campaign_approval,
-                    proxy_campaign_claim,
-                )
-                _release_whoscored_global_escrow(lease, released)
-            proxy_campaign_ledger.finish(
-                proxy_campaign_approval,
-                proxy_campaign_claim,
-                provider_billed_bytes=0,
-                completed=False,
-            )
+
         raise
     log.info(
         "lease %s created: source=%s upstream=%s max_bytes=%d ttl=%ds",
@@ -3672,7 +2698,6 @@ def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
         or lease.reserved_bytes != 0
         or lease.active_provider_readers != 0
         or lease.provider_reserved_bytes != 0
-        or lease.pending_client_hellos != 0
         or lease.staged_client_bytes != 0
         or bool(lease.current_request_id)
         or bool(lease.current_endpoint)
@@ -3713,21 +2738,7 @@ def _lease_budget_capacity(lease: Lease, *, include_reservations: bool) -> int:
     if not lease.usable:
         return 0
     lease_reserved = lease.reserved_bytes if include_reservations else 0
-    if (
-        lease.source == "whoscored"
-        and lease.proxy_campaign_approval is not None
-        and lease.proxy_campaign_claim is not None
-        and lease.proxy_work_allocation is not None
-    ):
-        # ``_create_lease`` fsyncs one escrow equal to ``lease.max_bytes`` only
-        # after taking the minimum of allocation/phase/day/campaign and the
-        # lifetime provider-order cap across *all* approvals.  The local mirror
-        # is reduced for every observed provider byte.  Socket concurrency is
-        # separately serialized by ``lease.reserved_bytes``.
-        return min(
-            max(0, lease.max_bytes - lease.total_bytes - lease_reserved),
-            max(0, lease.global_budget_escrow_bytes - lease_reserved),
-        )
+
     daily_reserved = _daily_reserved_bytes if include_reservations else 0
     daily_remaining = (
         max(0, DAILY_BUDGET_BYTES - _daily_total_bytes() - daily_reserved)
@@ -3811,19 +2822,7 @@ def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
         _daily_reserved_bytes += count
     _run_reserved_bytes[lease.dagrun_key] += count
     _url_reserved_bytes[(lease.dagrun_key, lease.canonical_url)] += count
-    if (
-        count
-        and lease.proxy_campaign_approval is not None
-        and lease.proxy_work_allocation is not None
-    ):
-        campaign_id = lease.proxy_campaign_approval.campaign_id
-        _campaign_reserved_bytes[campaign_id] += count
-        _campaign_phase_reserved_bytes[
-            (campaign_id, lease.proxy_work_allocation.phase)
-        ] += count
-        _campaign_allocation_reserved_bytes[
-            (campaign_id, lease.proxy_work_allocation.allocation_id)
-        ] += count
+
     return count
 
 
@@ -3836,103 +2835,9 @@ def _release_lease_reservation(lease: Lease, count: int) -> None:
     url_key = (run_key, lease.canonical_url)
     _run_reserved_bytes[run_key] = max(0, _run_reserved_bytes[run_key] - count)
     _url_reserved_bytes[url_key] = max(0, _url_reserved_bytes[url_key] - count)
-    if (
-        count
-        and lease.proxy_campaign_approval is not None
-        and lease.proxy_work_allocation is not None
-    ):
-        campaign_id = lease.proxy_campaign_approval.campaign_id
-        phase_key = (campaign_id, lease.proxy_work_allocation.phase)
-        allocation_key = (
-            campaign_id,
-            lease.proxy_work_allocation.allocation_id,
-        )
-        _campaign_reserved_bytes[campaign_id] = max(
-            0, _campaign_reserved_bytes[campaign_id] - count
-        )
-        _campaign_phase_reserved_bytes[phase_key] = max(
-            0, _campaign_phase_reserved_bytes[phase_key] - count
-        )
-        _campaign_allocation_reserved_bytes[allocation_key] = max(
-            0, _campaign_allocation_reserved_bytes[allocation_key] - count
-        )
+
     if count:
         _notify_reservation_turnover()
-
-
-def _pending_whoscored_provider_bytes(lease: Lease) -> int:
-    return sum(lease.pending_whoscored_bytes.values())
-
-
-def _flush_whoscored_metering(lease: Lease) -> int:
-    """Persist all exact observed WhoScored deltas as one bounded checkpoint.
-
-    The campaign escrow is the pre-I/O authority.  This function only converts
-    an observed prefix of that escrow to spend and mirrors the same prefix to
-    the append-only proxy ledger.  If either durable side is ambiguous, callers
-    must revoke the campaign and retain the remaining escrow; retrying the same
-    batch could double-charge a campaign whose state write actually completed.
-    """
-
-    if lease.source != "whoscored":
-        return 0
-    if lease.metering_flush_failed:
-        raise RuntimeError("WhoScored metering is already uncertain")
-    if (
-        lease.proxy_campaign_approval is None
-        or lease.proxy_campaign_claim is None
-        or lease.proxy_work_allocation is None
-    ):
-        raise RuntimeError(
-            "WhoScored provider bytes have no signed campaign allocation"
-        )
-    entries = [
-        (host, direction, count)
-        for (host, direction), count in sorted(lease.pending_whoscored_bytes.items())
-        if count
-    ]
-    amount = sum(count for _host, _direction, count in entries)
-    if amount == 0:
-        return 0
-    if (
-        any(
-            direction not in {"up", "down"} or count <= 0
-            for _host, direction, count in entries
-        )
-        or lease.settled_whoscored_bytes + amount != lease.total_bytes
-    ):
-        lease.metering_flush_failed = True
-        raise RuntimeError("WhoScored pending provider accounting is inconsistent")
-    try:
-        # One authenticated campaign transaction covers the entire exact
-        # prefix.  Proxy WAL events retain direction/host detail for the
-        # independent terminal reconciliation join.
-        _whoscored_campaign_ledger().consume(
-            lease.proxy_campaign_approval,
-            lease.proxy_campaign_claim,
-            amount,
-        )
-        emitted = 0
-        for host, direction, count in entries:
-            emitted += count
-            _append_budget_event(
-                "bytes",
-                lease,
-                host=host,
-                direction=direction,
-                endpoint=lease.current_endpoint,
-                bytes=count,
-                lease_total_bytes=lease.settled_whoscored_bytes + emitted,
-                dagrun_total_bytes=_run_total_bytes(lease.dagrun_key),
-                url_total_bytes=_url_total_bytes(lease.dagrun_key, lease.canonical_url),
-            )
-    except BaseException:
-        lease.metering_flush_failed = True
-        lease.budget_exceeded = True
-        raise
-    lease.settled_whoscored_bytes += amount
-    lease.pending_whoscored_bytes.clear()
-    return amount
 
 
 def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
@@ -3940,17 +2845,7 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
 
     if lease.accounting_uncertain:
         return
-    if lease.source == "whoscored" and not lease.metering_flush_failed:
-        try:
-            # The observed prefix is exact even when provider read-ahead is
-            # not.  Persist that prefix, then retain every unknown/unconsumed
-            # escrow byte under the terminal revocation below.
-            _flush_whoscored_metering(lease)
-        except Exception:  # noqa: BLE001 - ambiguity is handled by revocation
-            log.exception(
-                "could not flush exact provider prefix for lease %s",
-                lease.lease_id,
-            )
+
     lease.accounting_uncertain = True
     lease.latched_at = _wall_time()
     lease.closed = True
@@ -3961,20 +2856,7 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
             tunnel_writer.close()
         except Exception:  # noqa: BLE001 - uncertainty already revokes the lease
             pass
-    if lease.source == "whoscored" and lease.proxy_campaign_approval is not None:
-        try:
-            # Preserve the active claim and all of its remaining durable escrow.
-            # A ledger I/O failure may also make this write fail; in that case
-            # the pre-I/O escrow remains active and expiry revokes it on restart.
-            _whoscored_campaign_ledger().revoke(
-                lease.proxy_campaign_approval.campaign_id,
-                reason="provider byte accounting became uncertain",
-            )
-        except Exception:  # noqa: BLE001 - escrow is still fail-closed
-            log.exception(
-                "could not persist accounting-uncertainty revocation for lease %s",
-                lease.lease_id,
-            )
+
     log.critical(
         "provider byte accounting is uncertain; lease %s escrow is retained",
         lease.lease_id,
@@ -4051,30 +2933,7 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
             lease.allocation_claim,
             count,
         )
-    elif lease.source == "whoscored":
-        if (
-            lease.proxy_campaign_approval is None
-            or lease.proxy_campaign_claim is None
-            or lease.proxy_work_allocation is None
-        ):
-            raise RuntimeError(
-                "WhoScored provider bytes have no signed campaign allocation"
-            )
-        if SOURCE_MODE == "whoscored-only" and (
-            not lease.current_request_id or not lease.current_endpoint
-        ):
-            # Any background/browser byte without an active gateway-installed
-            # owner is unattributable. Retain the full escrow and durably revoke
-            # the campaign before refusing the chunk.
-            _latch_lease_accounting_uncertainty(lease)
-            raise RuntimeError("WhoScored provider bytes have no active endpoint owner")
-        if WHOSCORED_METER_BATCH_BYTES <= 0:
-            raise RuntimeError("WhoScored metering batch must be positive")
-        if count > lease.global_budget_escrow_bytes:
-            lease.budget_exceeded = True
-            raise RuntimeError(
-                "WhoScored provider bytes exceed global provider-order escrow"
-            )
+
     if _uses_shared_daily_budget(lease.source):
         _refresh_daily_counter()
     host_stats = lease.hosts.setdefault(host, {"up_bytes": 0, "down_bytes": 0})
@@ -4094,52 +2953,14 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
         _url_down_bytes[(lease.dagrun_key, lease.canonical_url)] += count
         host_stats["down_bytes"] += count
         down_bytes[host] += count
-    if lease.source == "whoscored":
-        lease.global_budget_escrow_bytes -= count
-        pending_key = (host, direction)
-        lease.pending_whoscored_bytes[pending_key] = (
-            lease.pending_whoscored_bytes.get(pending_key, 0) + count
-        )
-        if (
-            _pending_whoscored_provider_bytes(lease) >= WHOSCORED_METER_BATCH_BYTES
-            or lease.total_bytes >= lease.max_bytes
-        ):
-            _flush_whoscored_metering(lease)
-    else:
-        try:
-            _append_budget_event(
-                "bytes",
-                lease,
-                host=host,
-                direction=direction,
-                bytes=count,
-                lease_total_bytes=lease.total_bytes,
-                dagrun_total_bytes=_run_total_bytes(lease.dagrun_key),
-                url_total_bytes=_url_total_bytes(lease.dagrun_key, lease.canonical_url),
-            )
-        except Exception:
-            log.exception(
-                "paid byte ledger append failed; closing lease %s", lease.lease_id
-            )
-            lease.paid_ledger_uncertain = True
-            lease.budget_exceeded = True
-            raise RuntimeError("durable paid byte accounting failed")
-    if lease.total_bytes >= lease.max_bytes or (
-        lease.source != "whoscored"
-        and (
-            (
-                _uses_shared_daily_budget(lease.source)
-                and _daily_total_bytes() >= DAILY_BUDGET_BYTES
-            )
-            or _run_total_bytes(lease.dagrun_key) >= _lease_dagrun_budget_bytes(lease)
-            or _url_total_bytes(lease.dagrun_key, lease.canonical_url)
-            >= _lease_url_budget_bytes(lease)
-            or (
-                lease.source == "sofascore"
-                and lease.parent_run_spent_provider_bytes >= lease.parent_run_cap_bytes
-            )
-        )
-    ):
+    try:
+        _append_budget_event('bytes', lease, host=host, direction=direction, bytes=count, lease_total_bytes=lease.total_bytes, dagrun_total_bytes=_run_total_bytes(lease.dagrun_key), url_total_bytes=_url_total_bytes(lease.dagrun_key, lease.canonical_url))
+    except Exception:
+        log.exception('paid byte ledger append failed; closing lease %s', lease.lease_id)
+        lease.paid_ledger_uncertain = True
+        lease.budget_exceeded = True
+        raise RuntimeError('durable paid byte accounting failed')
+    if lease.total_bytes >= lease.max_bytes or (_uses_shared_daily_budget(lease.source) and _daily_total_bytes() >= DAILY_BUDGET_BYTES or _run_total_bytes(lease.dagrun_key) >= _lease_dagrun_budget_bytes(lease) or _url_total_bytes(lease.dagrun_key, lease.canonical_url) >= _lease_url_budget_bytes(lease) or (lease.source == 'sofascore' and lease.parent_run_spent_provider_bytes >= lease.parent_run_cap_bytes)):
         lease.budget_exceeded = True
 
 
@@ -4176,204 +2997,6 @@ def _lease_operation_timeout(
     if remaining <= 0:
         raise asyncio.TimeoutError("paid lease expired before provider operation")
     return remaining
-
-
-def _normalise_client_hello_hostname(value: bytes | str) -> str:
-    """Return one canonical DNS hostname, rejecting IP literals and ambiguity."""
-
-    try:
-        text = value.decode("ascii") if isinstance(value, bytes) else value
-        if (
-            not text
-            or text != text.strip()
-            or text.endswith(".")
-            or len(text) > 253
-            or _contains_control_character(text)
-        ):
-            raise ClientHelloValidationError("ClientHello SNI is not a DNS name")
-        ascii_host = text.encode("idna").decode("ascii").lower().rstrip(".")
-    except (UnicodeError, AttributeError) as exc:
-        raise ClientHelloValidationError("ClientHello SNI is not a DNS name") from exc
-    if not ascii_host or len(ascii_host) > 253:
-        raise ClientHelloValidationError("ClientHello SNI is not a DNS name")
-    try:
-        ipaddress.ip_address(ascii_host)
-    except ValueError:
-        pass
-    else:
-        raise ClientHelloValidationError("ClientHello SNI must not be an IP literal")
-    labels = ascii_host.split(".")
-    if any(not _DNS_LABEL.fullmatch(label) for label in labels):
-        raise ClientHelloValidationError("ClientHello SNI is not a DNS name")
-    return ascii_host
-
-
-def _parse_whoscored_client_hello_sni(handshake: bytes) -> str:
-    """Parse one complete plaintext ClientHello and return its sole SNI name."""
-
-    if len(handshake) < 4 or handshake[0] != _TLS_CLIENT_HELLO_HANDSHAKE_TYPE:
-        raise ClientHelloValidationError("first TLS handshake is not ClientHello")
-    declared_length = int.from_bytes(handshake[1:4], "big")
-    if declared_length != len(handshake) - 4:
-        raise ClientHelloValidationError("malformed ClientHello length")
-    body = memoryview(handshake)[4:]
-    cursor = 0
-
-    def take(size: int, label: str) -> memoryview:
-        nonlocal cursor
-        if size < 0 or cursor + size > len(body):
-            raise ClientHelloValidationError(f"malformed ClientHello {label}")
-        value = body[cursor : cursor + size]
-        cursor += size
-        return value
-
-    legacy_version = bytes(take(2, "legacy version"))
-    if legacy_version not in (b"\x03\x01", b"\x03\x02", b"\x03\x03"):
-        raise ClientHelloValidationError("unsupported ClientHello legacy version")
-    take(32, "random")
-    session_id_length = int(take(1, "session id length")[0])
-    if session_id_length > 32:
-        raise ClientHelloValidationError("malformed ClientHello session id")
-    take(session_id_length, "session id")
-    cipher_suites_length = int.from_bytes(take(2, "cipher suites length"), "big")
-    if cipher_suites_length < 2 or cipher_suites_length % 2:
-        raise ClientHelloValidationError("malformed ClientHello cipher suites")
-    take(cipher_suites_length, "cipher suites")
-    compression_length = int(take(1, "compression methods length")[0])
-    compression_methods = bytes(take(compression_length, "compression methods"))
-    if not compression_methods or 0 not in compression_methods:
-        raise ClientHelloValidationError("malformed ClientHello compression methods")
-    extensions_length = int.from_bytes(take(2, "extensions length"), "big")
-    if extensions_length != len(body) - cursor:
-        raise ClientHelloValidationError("malformed ClientHello extensions length")
-    extensions_end = cursor + extensions_length
-    seen_extensions: set[int] = set()
-    sni_extension: bytes | None = None
-    while cursor < extensions_end:
-        extension_type = int.from_bytes(take(2, "extension type"), "big")
-        extension_length = int.from_bytes(take(2, "extension length"), "big")
-        extension_data = bytes(take(extension_length, "extension data"))
-        if extension_type in seen_extensions:
-            raise ClientHelloValidationError("duplicate ClientHello extension")
-        seen_extensions.add(extension_type)
-        if extension_type in _TLS_ECH_EXTENSION_TYPES:
-            raise ClientHelloValidationError("encrypted ClientHello is not allowed")
-        if extension_type == _TLS_SERVER_NAME_EXTENSION:
-            sni_extension = extension_data
-    if cursor != extensions_end or sni_extension is None:
-        raise ClientHelloValidationError("ClientHello must contain one SNI extension")
-    if len(sni_extension) < 2:
-        raise ClientHelloValidationError("malformed ClientHello SNI list")
-    names_length = int.from_bytes(sni_extension[:2], "big")
-    if names_length != len(sni_extension) - 2:
-        raise ClientHelloValidationError("malformed ClientHello SNI list length")
-    names = memoryview(sni_extension)[2:]
-    names_cursor = 0
-    parsed_names: list[tuple[int, bytes]] = []
-    while names_cursor < len(names):
-        if names_cursor + 3 > len(names):
-            raise ClientHelloValidationError("malformed ClientHello SNI entry")
-        name_type = int(names[names_cursor])
-        name_length = int.from_bytes(names[names_cursor + 1 : names_cursor + 3], "big")
-        names_cursor += 3
-        if name_length <= 0 or names_cursor + name_length > len(names):
-            raise ClientHelloValidationError("malformed ClientHello SNI entry")
-        parsed_names.append(
-            (name_type, bytes(names[names_cursor : names_cursor + name_length]))
-        )
-        names_cursor += name_length
-    if names_cursor != len(names) or len(parsed_names) != 1:
-        raise ClientHelloValidationError(
-            "ClientHello must contain exactly one SNI name"
-        )
-    name_type, raw_name = parsed_names[0]
-    if name_type != 0:
-        raise ClientHelloValidationError("ClientHello SNI is not a host_name")
-    return _normalise_client_hello_hostname(raw_name)
-
-
-async def _read_and_validate_whoscored_client_hello(
-    reader: asyncio.StreamReader,
-    lease: Lease,
-    *,
-    connect_host: str,
-    connect_port: int,
-) -> bytes:
-    """Buffer a bounded ClientHello and authorize it before any provider dial."""
-
-    if connect_port != 443:
-        raise ClientHelloValidationError("WhoScored CONNECT must use port 443")
-    normalized_target = _normalise_client_hello_hostname(connect_host)
-    if normalized_target not in WHOSCORED_PROXY_ALLOWED_HOSTS:
-        raise ClientHelloValidationError("WhoScored CONNECT host is not allowed")
-    deadline = time.monotonic() + min(
-        WHOSCORED_CLIENT_HELLO_TIMEOUT_SECONDS,
-        _lease_operation_timeout(lease),
-    )
-
-    async def read_exact(size: int) -> bytes:
-        chunks: list[bytes] = []
-        remaining = size
-        while remaining:
-            timeout = min(
-                deadline - time.monotonic(),
-                _lease_operation_timeout(lease),
-            )
-            if timeout <= 0:
-                raise ClientHelloValidationError("ClientHello timed out")
-            try:
-                chunk = await asyncio.wait_for(reader.read(remaining), timeout=timeout)
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                raise ClientHelloValidationError("ClientHello timed out") from exc
-            if not chunk:
-                raise ClientHelloValidationError("ClientHello ended early")
-            if len(chunk) > remaining:
-                raise ClientHelloValidationError(
-                    "ClientHello reader exceeded its bound"
-                )
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    wire = bytearray()
-    handshake = bytearray()
-    expected_handshake_bytes: int | None = None
-    while True:
-        record_header = await read_exact(5)
-        wire.extend(record_header)
-        if (
-            record_header[0] != _TLS_HANDSHAKE_CONTENT_TYPE
-            or record_header[1] != 3
-            or record_header[2] not in (1, 2, 3)
-        ):
-            raise ClientHelloValidationError("ClientHello is not plaintext TLS")
-        record_length = int.from_bytes(record_header[3:5], "big")
-        if not 0 < record_length <= MAX_TLS_PLAINTEXT_RECORD_BYTES:
-            raise ClientHelloValidationError("TLS record length is invalid")
-        if len(wire) + record_length > MAX_WHOSCORED_CLIENT_HELLO_BYTES:
-            raise ClientHelloValidationError("ClientHello exceeds the buffer limit")
-        fragment = await read_exact(record_length)
-        wire.extend(fragment)
-        handshake.extend(fragment)
-        if expected_handshake_bytes is None and len(handshake) >= 4:
-            if handshake[0] != _TLS_CLIENT_HELLO_HANDSHAKE_TYPE:
-                raise ClientHelloValidationError(
-                    "first TLS handshake is not ClientHello"
-                )
-            expected_handshake_bytes = 4 + int.from_bytes(handshake[1:4], "big")
-            if not 4 < expected_handshake_bytes <= MAX_WHOSCORED_CLIENT_HELLO_BYTES:
-                raise ClientHelloValidationError("ClientHello length is invalid")
-        if expected_handshake_bytes is None:
-            continue
-        if len(handshake) > expected_handshake_bytes:
-            raise ClientHelloValidationError("ClientHello has trailing handshake data")
-        if len(handshake) == expected_handshake_bytes:
-            sni = _parse_whoscored_client_hello_sni(bytes(handshake))
-            if sni != normalized_target:
-                raise ClientHelloValidationError(
-                    "ClientHello SNI does not match CONNECT"
-                )
-            return bytes(wire)
 
 
 async def _pump(
@@ -4912,14 +3535,7 @@ def _begin_endpoint_request(lease: Lease, endpoint: str) -> str:
             request_id=request_id,
             endpoint=endpoint,
         )
-    elif lease.source == "whoscored" and SOURCE_MODE == "whoscored-only":
-        _append_budget_event(
-            "endpoint_started",
-            lease,
-            request_id=request_id,
-            endpoint=endpoint,
-            lease_total_bytes=lease.total_bytes,
-        )
+
     lease.current_request_id = request_id
     lease.current_endpoint = endpoint
     lease.current_request_start_bytes = lease.total_bytes
@@ -4943,35 +3559,13 @@ def _switch_endpoint_request(lease: Lease, request_id: str, endpoint: str) -> st
         or endpoint in lease.endpoint_request_provider_bytes
     ):
         raise ValueError("next endpoint is absent, duplicate, or stale for this lease")
-    if lease.source != "whoscored" or SOURCE_MODE != "whoscored-only":
-        _finish_endpoint_request(lease, request_id)
-        return _begin_endpoint_request(lease, endpoint)
+    _finish_endpoint_request(lease, request_id)
+    return _begin_endpoint_request(lease, endpoint)
 
-    _flush_whoscored_metering(lease)
-    amount = lease.total_bytes - lease.current_request_start_bytes
-    if amount < 0:
-        raise RuntimeError("lease provider counter moved backwards")
-    next_request_id = uuid_hex(24)
+
     # One fsync-protected transition is committed before either in-memory
     # owner changes. The async event loop cannot account a provider chunk in
     # the middle of this synchronous transition.
-    _append_budget_event(
-        "endpoint_switched",
-        lease,
-        request_id=lease.current_request_id,
-        endpoint=lease.current_endpoint,
-        provider_bytes=amount,
-        next_request_id=next_request_id,
-        next_endpoint=endpoint,
-        lease_total_bytes=lease.total_bytes,
-    )
-    lease.endpoint_request_provider_bytes.setdefault(lease.current_endpoint, []).append(
-        amount
-    )
-    lease.current_request_id = next_request_id
-    lease.current_endpoint = endpoint
-    lease.current_request_start_bytes = lease.total_bytes
-    return next_request_id
 
 
 def _finish_endpoint_request(lease: Lease, request_id: str) -> int:
@@ -4980,10 +3574,7 @@ def _finish_endpoint_request(lease: Lease, request_id: str) -> int:
     ):
         raise ValueError("endpoint request id is stale or invalid")
     endpoint = lease.current_endpoint
-    if lease.source == "whoscored":
-        # Convert every observed byte to durable campaign spend before sealing
-        # the endpoint boundary in the independent HMAC-chained proxy ledger.
-        _flush_whoscored_metering(lease)
+
     amount = lease.total_bytes - lease.current_request_start_bytes
     if amount < 0:
         raise RuntimeError("lease provider counter moved backwards")
@@ -4995,15 +3586,7 @@ def _finish_endpoint_request(lease: Lease, request_id: str) -> int:
             endpoint=endpoint,
             provider_bytes=amount,
         )
-    elif lease.source == "whoscored" and SOURCE_MODE == "whoscored-only":
-        _append_budget_event(
-            "endpoint_finished",
-            lease,
-            request_id=lease.current_request_id,
-            endpoint=endpoint,
-            provider_bytes=amount,
-            lease_total_bytes=lease.total_bytes,
-        )
+
     lease.endpoint_request_provider_bytes.setdefault(endpoint, []).append(amount)
     lease.current_request_id = ""
     lease.current_endpoint = ""
@@ -5039,11 +3622,7 @@ def _reap_expired_leases() -> int:
                 except Exception:  # noqa: BLE001 - lease is already revoked
                     pass
             if (
-                lease.source not in {"sofascore", "whoscored"}
-                and not _lease_has_active_operations(lease)
-                and lease.reserved_bytes > 0
-                and lease.provider_reserved_bytes <= lease.reserved_bytes
-                and not lease.paid_ledger_uncertain
+                lease.source not in {'sofascore'} and (not _lease_has_active_operations(lease)) and (lease.reserved_bytes > 0) and (lease.provider_reserved_bytes <= lease.reserved_bytes) and (not lease.paid_ledger_uncertain)
             ):
                 # The retained reservation is the in-process upper bound of
                 # unproven provider spend.  Charge it durably as spent, then
@@ -5138,7 +3717,7 @@ def _reap_expired_leases() -> int:
             # the next chunk. Force-close orphan browser/provider sockets now.
             # A provider StreamReader can contain unobservable read-ahead, so
             # production leases retain all remaining escrow and claims.
-            if lease.source in {"sofascore", "whoscored"}:
+            if lease.source in {'sofascore'}:
                 _latch_lease_accounting_uncertainty(lease)
             else:
                 lease.closed = True
@@ -5178,49 +3757,7 @@ def _reap_expired_leases() -> int:
             )
             lease.allocation_finished = True
             reaped += 1
-        elif lease.source == "whoscored" and not lease.proxy_campaign_finished:
-            if (
-                lease.proxy_campaign_approval is None
-                or lease.proxy_campaign_claim is None
-            ):
-                raise RuntimeError(
-                    "expired WhoScored lease has no signed campaign claim"
-                )
-            lease.closed = True
-            for tunnel_writer in tuple(lease.tunnel_writers):
-                try:
-                    tunnel_writer.close()
-                except Exception:  # noqa: BLE001 - lease is already revoked
-                    pass
-            if lease.current_request_id:
-                _finish_endpoint_request(lease, lease.current_request_id)
-            try:
-                _flush_whoscored_metering(lease)
-            except Exception:  # noqa: BLE001 - retain escrow and revoke
-                _latch_lease_accounting_uncertainty(lease)
-                continue
-            if (
-                _pending_whoscored_provider_bytes(lease)
-                or lease.settled_whoscored_bytes != lease.total_bytes
-            ):
-                _latch_lease_accounting_uncertainty(lease)
-                continue
-            released = _whoscored_campaign_ledger().release_provider_reservation(
-                lease.proxy_campaign_approval,
-                lease.proxy_campaign_claim,
-            )
-            _release_whoscored_global_escrow(lease, released)
-            _whoscored_campaign_ledger().finish(
-                lease.proxy_campaign_approval,
-                lease.proxy_campaign_claim,
-                provider_billed_bytes=lease.total_bytes,
-                completed=False,
-            )
-            lease.proxy_campaign_finished = True
-            reaped += 1
-        elif not lease.closed:
-            # Canary/legacy leases have no allocation claim, but their expired
-            # data plane should still be represented as closed in reports.
+        if not lease.closed:
             lease.closed = True
             reaped += 1
         if lease.closed and not lease.close_recorded:
@@ -5230,9 +3767,7 @@ def _reap_expired_leases() -> int:
                     lease,
                     total_bytes=lease.total_bytes,
                     endpoint_request_provider_bytes=(
-                        lease.endpoint_request_provider_bytes
-                        if lease.source == "whoscored"
-                        else {}
+                        {}
                     ),
                     expired=True,
                 )
@@ -5293,22 +3828,10 @@ async def _close_lease(
         and lease.reserved_bytes == 0
         and lease.active_provider_readers == 0
         and lease.provider_reserved_bytes == 0
-        and lease.pending_client_hellos == 0
         and lease.staged_client_bytes == 0
         and not lease.accounting_uncertain
     )
-    if drained and lease.source == "whoscored":
-        try:
-            _flush_whoscored_metering(lease)
-        except Exception:  # noqa: BLE001 - terminal response must stay red
-            _latch_lease_accounting_uncertainty(lease)
-            drained = False
-        if drained and (
-            _pending_whoscored_provider_bytes(lease)
-            or lease.settled_whoscored_bytes != lease.total_bytes
-        ):
-            _latch_lease_accounting_uncertainty(lease)
-            drained = False
+
     if drained and lease.current_request_id:
         _finish_endpoint_request(lease, lease.current_request_id)
     client_map_matches = True
@@ -5355,46 +3878,8 @@ async def _close_lease(
                 ),
             )
             lease.allocation_finished = True
-    elif lease.source == "whoscored" and SOURCE_MODE == "whoscored-only":
-        try:
-            normalized_internal_map = _normalize_endpoint_map(
-                lease.endpoint_request_provider_bytes
-            )
-        except ValueError:
-            normalized_internal_map = {}
-            client_map_matches = False
-        if (
-            not normalized_internal_map
-            or normalized_internal_map != lease.endpoint_request_provider_bytes
-            or sum(
-                sum(observations) for observations in normalized_internal_map.values()
-            )
-            != lease.total_bytes
-        ):
-            client_map_matches = False
-        if lease.expected_endpoint_labels and (
-            set(normalized_internal_map) != set(lease.expected_endpoint_labels)
-            or any(
-                len(normalized_internal_map.get(endpoint, ())) != 1
-                for endpoint in lease.expected_endpoint_labels
-            )
-        ):
-            client_map_matches = False
-    if lease.source == "whoscored" and drained and not lease.proxy_campaign_finished:
-        if lease.proxy_campaign_approval is None or lease.proxy_campaign_claim is None:
-            raise RuntimeError("WhoScored lease has no signed campaign claim")
-        released = _whoscored_campaign_ledger().release_provider_reservation(
-            lease.proxy_campaign_approval,
-            lease.proxy_campaign_claim,
-        )
-        _release_whoscored_global_escrow(lease, released)
-        _whoscored_campaign_ledger().finish(
-            lease.proxy_campaign_approval,
-            lease.proxy_campaign_claim,
-            provider_billed_bytes=lease.total_bytes,
-            completed=bool(completed and client_map_matches),
-        )
-        lease.proxy_campaign_finished = True
+
+
     if drained and not lease.close_recorded:
         try:
             _append_budget_event(
@@ -5402,9 +3887,7 @@ async def _close_lease(
                 lease,
                 total_bytes=lease.total_bytes,
                 endpoint_request_provider_bytes=(
-                    lease.endpoint_request_provider_bytes
-                    if lease.source == "whoscored"
-                    else {}
+                    {}
                 ),
             )
             lease.close_recorded = True
@@ -5415,20 +3898,7 @@ async def _close_lease(
     # stronger control-plane acknowledgement: every provider tunnel and byte
     # reservation is drained and the final counter was durably journalled.
     report["close_complete"] = bool(
-        drained
-        and lease.close_recorded
-        and (lease.source != "sofascore" or lease.allocation_finished)
-        and (lease.source != "whoscored" or lease.proxy_campaign_finished)
-        and (lease.source != "whoscored" or not lease.global_budget_escrow_bytes)
-        and (
-            lease.source != "whoscored"
-            or (
-                not lease.pending_whoscored_bytes
-                and lease.settled_whoscored_bytes == lease.total_bytes
-                and not lease.metering_flush_failed
-            )
-        )
-        and client_map_matches
+        drained and lease.close_recorded and (lease.source != 'sofascore' or lease.allocation_finished) and client_map_matches
     )
     if lease.accounting_uncertain:
         report["close_error"] = (
@@ -5513,19 +3983,6 @@ def _service_health_report(mgr) -> dict[str, Any]:
         ),
         "transfermarkt_request_permit_state_durable": bool(
             TRANSFERMARKT_REQUEST_PERMITS.state_path
-        ),
-        "whoscored_default_paid_cap_bytes": DEFAULT_WHOSCORED_PAID_CAP_BYTES,
-        "whoscored_signed_campaigns_required": True,
-        "whoscored_provider_invoice_hard_cap_available": (
-            WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE
-        ),
-        "whoscored_paid_application_gateway_available": (
-            WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE
-        ),
-        "whoscored_paid_enabled": (
-            WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE
-            and WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE
-            and SOURCE_MODE == "whoscored-only"
         ),
         "source_mode": SOURCE_MODE,
     }
@@ -5686,159 +4143,6 @@ async def _handle_control(
         await _send_json(writer, 200, response)
         return True
 
-    if path == "/v1/whoscored/campaign-control":
-        if SOURCE_MODE != "whoscored-only":
-            await _send_json(writer, 404, {"error": "unknown control endpoint"})
-            return True
-        if method != "POST":
-            await _send_json(writer, 404, {"error": "unknown control endpoint"})
-            return True
-        if not _control_token_valid(headers, source="whoscored"):
-            await _send_json(writer, 401, {"error": "invalid control token"})
-            return True
-        if headers.get("transfer-encoding"):
-            await _send_json(writer, 400, {"error": "invalid request framing"})
-            return True
-        try:
-            raw_length = headers.get("content-length", "")
-            if (
-                not raw_length.isascii()
-                or not raw_length.isdigit()
-                or raw_length != str(int(raw_length or "0"))
-            ):
-                raise ValueError("campaign control content length is invalid")
-            length = int(raw_length)
-            if not 0 < length <= MAX_CONTROL_BODY_BYTES:
-                raise ValueError("campaign control body size is invalid")
-            raw = await reader.readexactly(length)
-            request = strict_json_loads(raw)
-            if not isinstance(request, Mapping) or frozenset(request) != {
-                "schema_version",
-                "operation",
-                "context",
-                "arguments",
-            }:
-                raise ValueError("campaign control request fields are invalid")
-            if canonical_json_bytes(dict(request)) != raw:
-                raise ValueError("campaign control request is not canonical JSON")
-            if request.get("schema_version") != PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION:
-                raise ValueError("campaign control schema is invalid")
-            operation = request.get("operation")
-            arguments = request.get("arguments")
-            context = request.get("context")
-            expected_arguments = PROXY_CAMPAIGN_CONTROL_ARGUMENT_FIELDS.get(operation)
-            if (
-                expected_arguments is None
-                or not isinstance(arguments, Mapping)
-                or frozenset(arguments) != expected_arguments
-                or not isinstance(context, Mapping)
-            ):
-                raise ValueError("campaign control operation is invalid")
-            require_active = operation not in {
-                "seal_for_reconciliation",
-                "sealed_snapshot",
-            }
-            approval = approval_from_campaign_authority_context(
-                context,
-                secret=WHOSCORED_PROXY_APPROVAL_HMAC_SECRET,
-                require_active=require_active,
-            )
-            _assert_whoscored_approval_state_binding(approval)
-            if operation in {"complete_allocation", "seal_for_reconciliation"} and (
-                arguments.get("dag_id") != approval.allowed_dag_ids[0]
-                or arguments.get("run_id") != approval.run_id
-            ):
-                raise ProxyCampaignValidationError(
-                    "campaign control DAG/run differs from signed authority"
-                )
-            ledger = _whoscored_campaign_ledger()
-            if operation == "snapshot":
-                result = {"campaign": ledger.snapshot(approval)}
-            elif operation == "complete_allocation":
-                result = {
-                    "allocation": ledger.complete_allocation(
-                        approval,
-                        arguments["allocation_id"],
-                        dag_id=arguments["dag_id"],
-                        run_id=arguments["run_id"],
-                        task_id=arguments["task_id"],
-                        attempt_id=arguments["attempt_id"],
-                        report_sha256=arguments["report_sha256"],
-                        request_ledger_sha256=arguments["request_ledger_sha256"],
-                    )
-                }
-            elif operation == "assert_exact_accounting":
-                result = {
-                    "provider_billed_bytes": ledger.assert_exact_accounting(
-                        approval,
-                        task_report_provider_bytes=arguments[
-                            "task_report_provider_bytes"
-                        ],
-                        request_ledger_provider_bytes=arguments[
-                            "request_ledger_provider_bytes"
-                        ],
-                        proxy_ledger_provider_bytes=arguments[
-                            "proxy_ledger_provider_bytes"
-                        ],
-                        require_complete=arguments["require_complete"],
-                    )
-                }
-            elif operation == "seal_for_reconciliation":
-                result = {
-                    "campaign": ledger.seal_for_reconciliation(
-                        approval,
-                        dag_id=arguments["dag_id"],
-                        run_id=arguments["run_id"],
-                        provider_billed_bytes=arguments["provider_billed_bytes"],
-                        attempt_accounting_sha256=arguments[
-                            "attempt_accounting_sha256"
-                        ],
-                    )
-                }
-            else:
-                result = {"campaign": ledger.sealed_snapshot(approval)}
-            if frozenset(result) != PROXY_CAMPAIGN_CONTROL_RESULT_FIELDS[operation]:
-                raise RuntimeError("campaign control result schema mismatch")
-        except (
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-            ProxyCampaignError,
-        ):
-            await _send_json(
-                writer,
-                409,
-                {"code": "campaign_control_rejected", "error": "campaign rejected"},
-            )
-            return True
-        except (OSError, asyncio.IncompleteReadError, RuntimeError):
-            await _send_json(
-                writer,
-                503,
-                {
-                    "code": "campaign_control_unavailable",
-                    "error": "control unavailable",
-                },
-            )
-            return True
-        response_document = {
-            "schema_version": PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION,
-            "operation": operation,
-            "result": result,
-        }
-        if len(canonical_json_bytes(response_document)) > MAX_CONTROL_BODY_BYTES:
-            await _send_json(
-                writer,
-                503,
-                {
-                    "code": "campaign_control_unavailable",
-                    "error": "control response is oversized",
-                },
-            )
-            return True
-        await _send_json(writer, 200, response_document)
-        return True
 
     if path.startswith("/v1/leases") and not _any_control_token_valid(headers):
         await _send_json(writer, 401, {"error": "invalid control token"})
@@ -5867,27 +4171,8 @@ async def _handle_control(
                 metadata=request,
                 require_context=True,
             )
-        except ProxyCampaignConcurrencyLimited as exc:
-            await _send_json(
-                writer,
-                429,
-                {"code": "concurrency_limited", "error": str(exc)},
-            )
-            return True
-        except ProxyCampaignBudgetExceeded as exc:
-            await _send_json(
-                writer,
-                429,
-                {"code": "budget_exceeded", "error": str(exc)},
-            )
-            return True
-        except ProxyCampaignError as exc:
-            await _send_json(
-                writer,
-                409,
-                {"code": "campaign_rejected", "error": str(exc)},
-            )
-            return True
+
+
         except FBrefUpstreamUnavailable:
             await _send_json(
                 writer,
@@ -5928,24 +4213,10 @@ async def _handle_control(
                 ),
                 "allocation_id": lease.allocation_id,
                 "allocation_budget_bytes": lease.allocation_budget_bytes,
-                "proxy_campaign_id": (
-                    lease.proxy_campaign_approval.campaign_id
-                    if lease.proxy_campaign_approval
-                    else ""
-                ),
-                "proxy_approval_id": (
-                    lease.proxy_campaign_approval.approval_id
-                    if lease.proxy_campaign_approval
-                    else ""
-                ),
-                "proxy_approval_sha256": (
-                    lease.proxy_campaign_approval.approval_sha256
-                    if lease.proxy_campaign_approval
-                    else ""
-                ),
-                "provider_meter": (
-                    PROXY_CAMPAIGN_METER if lease.proxy_campaign_approval else ""
-                ),
+                "proxy_campaign_id": "",
+                "proxy_approval_id": "",
+                "proxy_approval_sha256": "",
+                "provider_meter": "",
             },
         )
         return True
@@ -6200,21 +4471,6 @@ async def _write_upstream(
     return True
 
 
-def _record_whoscored_provider_dial(lease: Lease) -> None:
-    """Charge one signed request slot before every provider TCP dial."""
-
-    if lease.source != "whoscored":
-        return
-    if lease.proxy_campaign_approval is None or lease.proxy_campaign_claim is None:
-        raise ProxyCampaignValidationError(
-            "WhoScored provider dial has no signed campaign claim"
-        )
-    lease.provider_request_count = _whoscored_campaign_ledger().record_request(
-        lease.proxy_campaign_approval,
-        lease.proxy_campaign_claim,
-    )
-
-
 async def _open_lease_upstream_tunnel(
     lease: Lease,
     mgr,
@@ -6243,7 +4499,7 @@ async def _open_lease_upstream_tunnel(
         try:
             # A failover is another provider-bound session, not a free retry.
             # Charge its signed request slot before the TCP dial performs I/O.
-            _record_whoscored_provider_dial(lease)
+
             srv_r, srv_w = await asyncio.wait_for(
                 _open_upstream_connection(up_host, up_port),
                 _lease_operation_timeout(
@@ -6414,12 +4670,7 @@ async def handle(
             client_w.close()
             return
         if (
-            lease is not None
-            and (
-                lease.source == "sofascore"
-                or (lease.source == "whoscored" and SOURCE_MODE == "whoscored-only")
-            )
-            and not lease.current_endpoint
+            lease is not None and lease.source == 'sofascore' and (not lease.current_endpoint)
         ):
             # A signed allocation is necessary but not sufficient: production
             # traffic also needs an active endpoint boundary so every billed
@@ -6434,20 +4685,7 @@ async def handle(
             await client_w.drain()
             client_w.close()
             return
-        if lease is not None and lease.source == "whoscored" and method != "CONNECT":
-            # A raw upstream HTTP proxy connection can carry additional
-            # keep-alive/pipelined absolute-form requests after the validated
-            # first head. Those bytes would bypass URL/host/request accounting.
-            # WhoScored authority is HTTPS-only: require one CONNECT tunnel and
-            # validate its plaintext ClientHello SNI before the provider dial.
-            # Exact URL-path enforcement still belongs to the disabled app gateway.
-            client_w.write(
-                b"HTTP/1.1 405 Method Not Allowed\r\n"
-                b"Allow: CONNECT\r\nConnection: close\r\n\r\n"
-            )
-            await client_w.drain()
-            client_w.close()
-            return
+
         # Explicit callers use the immutable lease upstream.  The no-lease
         # branch is reachable only when the process was deliberately started
         # with the development-only ``--allow-legacy-noauth`` flag.
@@ -6460,104 +4698,13 @@ async def handle(
             _active += 1
         auth = base64.b64encode(f"{up_user}:{up_pass}".encode()).decode()
         srv_w = None
-        local_connect_established = False
-        buffered_client_hello = b""
+
+
         provider_connect_target = target
         try:
             if method == "CONNECT":
                 conn_count[host] += 1
-                if lease is not None and lease.source == "whoscored":
-                    # A proxy client sends TLS only after receiving the local
-                    # CONNECT success.  Accept locally, validate a bounded
-                    # plaintext ClientHello, and only then spend a provider
-                    # request. Invalid/missing/ECH SNI therefore costs zero.
-                    if (
-                        lease.pending_client_hellos
-                        >= MAX_PENDING_WHOSCORED_CLIENT_HELLOS_PER_LEASE
-                    ):
-                        client_w.write(
-                            b"HTTP/1.1 429 Too Many Requests\r\n"
-                            b"Connection: close\r\n\r\n"
-                        )
-                        await client_w.drain()
-                        client_w.close()
-                        return
-                    if _WHOSCORED_CLIENT_HELLO_SLOTS.locked():
-                        client_w.write(
-                            b"HTTP/1.1 503 Service Unavailable\r\n"
-                            b"Connection: close\r\n\r\n"
-                        )
-                        await client_w.drain()
-                        client_w.close()
-                        return
-                    hello_slot_acquired = False
-                    lease_hello_slot_acquired = False
-                    try:
-                        try:
-                            await _WHOSCORED_CLIENT_HELLO_SLOTS.acquire()
-                        except asyncio.CancelledError:
-                            try:
-                                client_w.close()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            raise
-                        hello_slot_acquired = True
-                        # Recheck after acquisition so this remains strict if a
-                        # future semaphore implementation ever yields on its
-                        # uncontended fast path.
-                        if (
-                            lease.pending_client_hellos
-                            >= MAX_PENDING_WHOSCORED_CLIENT_HELLOS_PER_LEASE
-                        ):
-                            client_w.write(
-                                b"HTTP/1.1 429 Too Many Requests\r\n"
-                                b"Connection: close\r\n\r\n"
-                            )
-                            await client_w.drain()
-                            client_w.close()
-                            return
-                        lease.pending_client_hellos += 1
-                        lease_hello_slot_acquired = True
-                        client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                        await asyncio.wait_for(
-                            client_w.drain(),
-                            timeout=_lease_operation_timeout(lease),
-                        )
-                        local_connect_established = True
-                        buffered_client_hello = (
-                            await _read_and_validate_whoscored_client_hello(
-                                client_r,
-                                lease,
-                                connect_host=host,
-                                connect_port=port,
-                            )
-                        )
-                        # Never forward the caller's raw authority after parsing
-                        # it: userinfo, trailing dots, or other parser differences
-                        # must not make the provider connect anywhere except the
-                        # normalized host whose SNI was just authenticated.
-                        provider_connect_target = (
-                            f"{_normalise_client_hello_hostname(host)}:443"
-                        )
-                    except asyncio.CancelledError:
-                        try:
-                            client_w.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise
-                    except (
-                        ClientHelloValidationError,
-                        asyncio.TimeoutError,
-                        TimeoutError,
-                    ):
-                        blocked_count[host] += 1
-                        client_w.close()
-                        return
-                    finally:
-                        if lease_hello_slot_acquired:
-                            lease.pending_client_hellos -= 1
-                        if hello_slot_acquired:
-                            _WHOSCORED_CLIENT_HELLO_SLOTS.release()
+
                 if lease is not None:
                     # Bounded dial + metered head, failing a silent exit over to
                     # a fresh pool entry so one dead exit cannot latch the slot.
@@ -6574,19 +4721,10 @@ async def handle(
                             host=host,
                         )
                     except _LeaseBudgetRefused:
-                        if not local_connect_established:
-                            client_w.write(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
-                            await client_w.drain()
-                        else:
-                            client_w.close()
+                        client_w.write(b'HTTP/1.1 429 Too Many Requests\r\n\r\n')
+                        await client_w.drain()
                         return
-                    except ProxyCampaignError:
-                        if not local_connect_established:
-                            client_w.write(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
-                            await client_w.drain()
-                        else:
-                            client_w.close()
-                        return
+
                     except (
                         asyncio.TimeoutError,
                         TimeoutError,
@@ -6597,9 +4735,8 @@ async def handle(
                         # Timeout/accounting-uncertainty paths already revoke;
                         # a proven empty EOF/reset remains a normal 502 after
                         # bounded failover attempts. The finally drains the slot.
-                        if not local_connect_established:
-                            client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                            await client_w.drain()
+                        client_w.write(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                        await client_w.drain()
                         client_w.close()
                         return
                 else:
@@ -6621,10 +4758,9 @@ async def handle(
                         try:
                             # For other leases the HTTP tunnel is not established
                             # yet, so queue the local error before the uncertainty
-                            # latch closes every writer. WhoScored already sent
+
                             # its local 200 to obtain SNI and can only close.
-                            if not local_connect_established:
-                                client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            client_w.write(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
                         finally:
                             if lease.source == "fbref":
                                 _record_fbref_upstream_failure(lease.upstream)
@@ -6639,34 +4775,17 @@ async def handle(
                     client_w.close()
                     srv_w.close()
                     return
-                if not local_connect_established:
-                    try:
-                        client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                        if lease is None:
-                            await client_w.drain()
-                        else:
-                            await asyncio.wait_for(
-                                client_w.drain(),
-                                timeout=_lease_operation_timeout(lease),
-                            )
-                    except BaseException:
-                        if lease is not None:
-                            # The provider reader may hold tunnel bytes beyond its
-                            # accounted response head, but no down-pump owns it yet.
-                            _latch_lease_accounting_uncertainty(lease)
-                        raise
-                if buffered_client_hello and not await _write_upstream(
-                    srv_w,
-                    buffered_client_hello,
-                    lease=lease,
-                    host=host,
-                    direction="up",
-                ):
-                    # Provider CONNECT already succeeded. Retain the remaining
-                    # escrow because its reader has no pump owning read-ahead.
-                    _latch_lease_accounting_uncertainty(lease)
-                    client_w.close()
-                    return
+                try:
+                    client_w.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
+                    if lease is None:
+                        await client_w.drain()
+                    else:
+                        await asyncio.wait_for(client_w.drain(), timeout=_lease_operation_timeout(lease))
+                except BaseException:
+                    if lease is not None:
+                        _latch_lease_accounting_uncertainty(lease)
+                    raise
+
                 await _run_tunnel_pumps(
                     client_r,
                     client_w,
@@ -6679,7 +4798,7 @@ async def handle(
                 conn_count[host] += 1
                 try:
                     if lease is not None:
-                        _record_whoscored_provider_dial(lease)
+                        pass
                     srv_r, srv_w = await asyncio.wait_for(
                         _open_upstream_connection(up_host, up_port),
                         (
@@ -6691,11 +4810,7 @@ async def handle(
                             )
                         ),
                     )
-                except ProxyCampaignError:
-                    client_w.write(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
-                    await client_w.drain()
-                    client_w.close()
-                    return
+
                 except (asyncio.TimeoutError, TimeoutError, OSError):
                     if lease is not None and lease.source == "fbref":
                         _record_fbref_upstream_failure(lease.upstream)
@@ -6801,16 +4916,7 @@ def _dump(out_path: str, quiet: bool = False) -> None:
         report["total_provider_bytes"] = total
         report["endpoint_provider_bytes"] = {provider_budget_endpoint: total}
         report["endpoint_request_provider_bytes"] = {provider_budget_endpoint: [total]}
-    if SOURCE_MODE == "whoscored-only":
-        report = _signed_report(report)
-        _atomic_private_bytes(
-            out_path,
-            canonical_json_bytes(report) + b"\n",
-            replace=True,
-        )
-        if not quiet:
-            log.info("wrote protected WhoScored state report")
-        return
+
     tmp = out_path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(report, fh, indent=2)
@@ -6893,23 +4999,16 @@ async def main() -> None:
     global TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
     global TRANSFERMARKT_BACKFILL_PROXY_MANAGER
     global TRANSFERMARKT_PERMIT_STATE_PATH, TRANSFERMARKT_REQUEST_PERMITS
-    global WHOSCORED_PROXY_APPROVAL_HMAC_SECRET
-    global WHOSCORED_PROXY_LEDGER_HMAC_SECRET
+
+
     global LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS, LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS
     global LEASE_UPSTREAM_FAILOVER_ATTEMPTS
     global SOFASCORE_ALLOCATION_LEDGER_PATH, SOFASCORE_ALLOCATION_WAL_PATH
     global SOFASCORE_ALLOCATION_LEDGER, _SOFASCORE_ALLOCATION_LEDGER_KEY
     global SOFASCORE_PARENT_ENVELOPE_PATH, SOFASCORE_PARENT_ENVELOPE_LEDGER
     global _SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH
-    global WHOSCORED_CAMPAIGN_LEDGER_PATH, WHOSCORED_CAMPAIGN_LEDGER
-    global _WHOSCORED_CAMPAIGN_LEDGER_KEY
-    global WHOSCORED_PROXY_RUNTIME_SHA256
-    global WHOSCORED_STATE_MARKER_PATH, WHOSCORED_STATE_ID
-    global WHOSCORED_PROVIDER_ORDER_ID, WHOSCORED_PROVIDER_POLICY_SHA256
-    global WHOSCORED_PROVIDER_ORDER_CAP_BYTES
-    global WHOSCORED_LEGACY_STATE_MARKER_LOADED
-    global _PAID_LEDGER_CHAIN_COUNT, _PAID_LEDGER_CHAIN_OFFSET
-    global _PAID_LEDGER_CHAIN_TAIL
+
+
     global SOURCE_MODE
     global _daily_day, _daily_up_bytes, _daily_down_bytes
     global provider_budget_guard, provider_budget_endpoint
@@ -6917,7 +5016,7 @@ async def main() -> None:
     ap.add_argument("--listen", default="0.0.0.0:8899")
     ap.add_argument(
         "--source-mode",
-        choices=("shared-no-whoscored", "fbref-only", "whoscored-only"),
+        choices=('shared-no-whoscored', 'fbref-only'),
         default="shared-no-whoscored",
     )
     ap.add_argument(
@@ -6954,32 +5053,8 @@ async def main() -> None:
     ap.add_argument("--pidfile", default="/tmp/filter_proxy.pid")
     ap.add_argument("--daily-budget-mb", type=float, default=100.0)
     ap.add_argument("--max-lease-mb", type=float, default=24.0)
-    ap.add_argument(
-        "--daily-budget-bytes",
-        type=int,
-        default=(
-            int(os.environ["WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES"])
-            if os.environ.get("WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES")
-            else None
-        ),
-        help=(
-            "exact decimal-byte outer cap; required and authoritative in "
-            "whoscored-only mode"
-        ),
-    )
-    ap.add_argument(
-        "--max-lease-bytes",
-        type=int,
-        default=(
-            int(os.environ["WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES"])
-            if os.environ.get("WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES")
-            else None
-        ),
-        help=(
-            "exact decimal-byte lease cap; required and authoritative in "
-            "whoscored-only mode"
-        ),
-    )
+
+
     ap.add_argument(
         "--max-lease-ttl-seconds",
         type=int,
@@ -7088,56 +5163,8 @@ async def main() -> None:
         ),
         help=("atomic cap shared by SofaScore season/targets/players phase plans"),
     )
-    ap.add_argument(
-        "--whoscored-campaign-ledger",
-        default=os.environ.get(
-            "WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH",
-            WHOSCORED_CAMPAIGN_LEDGER_PATH,
-        ),
-        help="HMAC-protected WhoScored campaign/allocation state",
-    )
-    ap.add_argument(
-        "--whoscored-state-marker",
-        default=os.environ.get(
-            "WHOSCORED_PROXY_STATE_MARKER_PATH",
-            WHOSCORED_STATE_MARKER_PATH,
-        ),
-        help="filter-only authenticated state initialization marker",
-    )
-    ap.add_argument(
-        "--whoscored-provider-order-id",
-        default=os.environ.get("WHOSCORED_PROVIDER_ORDER_ID", ""),
-        help="exact provider order owning the protected WhoScored state",
-    )
-    ap.add_argument(
-        "--whoscored-provider-policy-sha256",
-        default=os.environ.get("WHOSCORED_PROVIDER_POLICY_SHA256", ""),
-        help="exact signed provider-policy digest owning the protected state",
-    )
-    ap.add_argument(
-        "--whoscored-provider-order-cap-bytes",
-        type=int,
-        default=(
-            int(os.environ["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"])
-            if os.environ.get("WHOSCORED_PROVIDER_ORDER_CAP_BYTES")
-            else None
-        ),
-        help=(
-            "exact signed provider gross order cap; required in whoscored-only mode"
-        ),
-    )
-    ap.add_argument(
-        "--allow-legacy-whoscored-state-marker-v1",
-        action="store_true",
-        help=(
-            "removed compatibility switch; legacy unbound markers fail closed"
-        ),
-    )
-    ap.add_argument(
-        "--initialize-whoscored-state",
-        action="store_true",
-        help="one-shot creation of a new empty protected WhoScored state",
-    )
+
+
     ap.add_argument(
         "--sofascore-canary-hard-cap-bytes",
         type=int,
@@ -7176,25 +5203,6 @@ async def main() -> None:
     if fbref_safety_circuit_mib < 0:
         raise SystemExit("FBREF_PROXY_SAFETY_CIRCUIT_MIB must be non-negative")
 
-    if str(args.source_mode) == "whoscored-only" and bool(
-        getattr(args, "allow_legacy_noauth", False)
-    ):
-        # Reject the unsafe combination before runtime validation, protected
-        # state initialization, pool loading, or any listener/network effect.
-        # Shared legacy sources retain their explicitly requested compatibility.
-        raise SystemExit(
-            "--allow-legacy-noauth is forbidden with --source-mode=whoscored-only"
-        )
-
-    if str(args.source_mode) == "whoscored-only":
-        try:
-            _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
-                operation="WhoScored-only filtering proxy",
-            )
-        except Exception as exc:
-            raise SystemExit(
-                f"WhoScored-only filtering proxy runtime class rejected: {exc}"
-            ) from exc
 
     CONTROL_TOKEN = os.environ.get("PROXY_FILTER_CONTROL_TOKEN", "")
     if len(CONTROL_TOKEN) < 32:
@@ -7232,41 +5240,14 @@ async def main() -> None:
     TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = str(
         os.environ.get("TM_BACKFILL_PROXY_CONTROL_TOKEN", "")
     ).strip()
-    WHOSCORED_PROXY_APPROVAL_HMAC_SECRET = str(
-        os.environ.get("WHOSCORED_PROXY_APPROVAL_HMAC_SECRET", "")
-    ).strip()
-    WHOSCORED_PROXY_LEDGER_HMAC_SECRET = str(
-        os.environ.get("WHOSCORED_PROXY_LEDGER_HMAC_SECRET", "")
-    ).strip()
-    if str(args.source_mode) == "whoscored-only":
-        if len(WHOSCORED_PROXY_APPROVAL_HMAC_SECRET.encode("utf-8")) < 32:
-            raise SystemExit(
-                "WHOSCORED_PROXY_APPROVAL_HMAC_SECRET must contain at least "
-                "32 bytes for the WhoScored filter"
-            )
-        if len(WHOSCORED_PROXY_LEDGER_HMAC_SECRET.encode("utf-8")) < 32:
-            raise SystemExit(
-                "WHOSCORED_PROXY_LEDGER_HMAC_SECRET must contain at least "
-                "32 bytes for the WhoScored filter"
-            )
-    try:
-        runtime = _WHOSCORED_RUNTIME_CONTRACT.validate_runtime_contract(
-            report_schema_version=3
-        )
-    except Exception as exc:
-        raise SystemExit(
-            f"WhoScored proxy runtime contract validation failed: {exc}"
-        ) from exc
-    WHOSCORED_PROXY_RUNTIME_SHA256 = str(runtime["code_tree_sha256"])
+
+
     SOURCE_MODE = str(args.source_mode)
 
     daily_budget_mb = float(getattr(args, "daily_budget_mb", 100.0))
     max_lease_mb = float(getattr(args, "max_lease_mb", 24.0))
-    exact_daily_budget_bytes = getattr(args, "daily_budget_bytes", None)
-    exact_max_lease_bytes = getattr(args, "max_lease_bytes", None)
-    provider_order_cap_bytes = getattr(
-        args, "whoscored_provider_order_cap_bytes", None
-    )
+
+
     max_lease_ttl_seconds = int(
         getattr(args, "max_lease_ttl_seconds", MAX_LEASE_TTL_SECONDS)
     )
@@ -7319,49 +5300,10 @@ async def main() -> None:
         getattr(args, "sofascore_discovery_dagrun_budget_bytes", 0)
     )
     sofascore_artifact = getattr(args, "sofascore_budget_artifact", None)
-    if SOURCE_MODE == "whoscored-only" and (
-        isinstance(exact_daily_budget_bytes, bool)
-        or not isinstance(exact_daily_budget_bytes, int)
-        or exact_daily_budget_bytes <= 0
-        or isinstance(provider_order_cap_bytes, bool)
-        or not isinstance(provider_order_cap_bytes, int)
-        or not 1
-        <= provider_order_cap_bytes
-        <= WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
-        or isinstance(exact_max_lease_bytes, bool)
-        or not isinstance(exact_max_lease_bytes, int)
-        or exact_max_lease_bytes <= 0
-        or exact_daily_budget_bytes
-        > whoscored_provider_spendable_cap_bytes(provider_order_cap_bytes)
-        or exact_max_lease_bytes > WHOSCORED_MAX_LEASE_SAFETY_CAP_BYTES
-    ):
-        raise SystemExit(
-            "whoscored-only exact byte caps are missing or exceed the protected "
-            "provider/lease ceilings"
-        )
-    if SOURCE_MODE == "whoscored-only" and (
-        CLUBELO_DAGRUN_BUDGET_BYTES != 0
-        or CLUBELO_HISTORY_DAGRUN_BUDGET_BYTES != 0
-        or transfermarkt_budget_bytes != 0
-        or transfermarkt_backfill_budget_bytes != 0
-        or sofascore_canary_hard_cap_bytes != 0
-        or sofascore_discovery_budget_bytes != 0
-        or sofascore_artifact
-    ):
-        raise SystemExit(
-            "whoscored-only rejects every cross-source paid budget or artifact"
-        )
+
+
     if (
-        (SOURCE_MODE != "whoscored-only" and daily_budget_mb <= 0)
-        or (SOURCE_MODE != "whoscored-only" and max_lease_mb <= 0)
-        or max_lease_ttl_seconds <= 0
-        or dagrun_budget_bytes <= 0
-        or transfermarkt_budget_bytes < 0
-        or transfermarkt_backfill_budget_bytes < 0
-        or url_budget_bytes <= 0
-        or max_active_leases <= 0
-        or sofascore_canary_hard_cap_bytes < 0
-        or sofascore_discovery_budget_bytes < 0
+        daily_budget_mb <= 0 or max_lease_mb <= 0 or max_lease_ttl_seconds <= 0 or (dagrun_budget_bytes <= 0) or (transfermarkt_budget_bytes < 0) or (transfermarkt_backfill_budget_bytes < 0) or (url_budget_bytes <= 0) or (max_active_leases <= 0) or (sofascore_canary_hard_cap_bytes < 0) or (sofascore_discovery_budget_bytes < 0)
     ):
         raise SystemExit(
             "proxy byte budgets must be positive; disabled source caps may be zero"
@@ -7424,14 +5366,10 @@ async def main() -> None:
             "failover attempts must be >= 0"
         )
     DAILY_BUDGET_BYTES = (
-        int(exact_daily_budget_bytes)
-        if SOURCE_MODE == "whoscored-only"
-        else int(daily_budget_mb * 1024 * 1024)
+        int(daily_budget_mb * 1024 * 1024)
     )
     MAX_LEASE_BYTES = (
-        int(exact_max_lease_bytes)
-        if SOURCE_MODE == "whoscored-only"
-        else int(max_lease_mb * 1024 * 1024)
+        int(max_lease_mb * 1024 * 1024)
     )
     MAX_LEASE_TTL_SECONDS = max_lease_ttl_seconds
     DAGRUN_BUDGET_BYTES = dagrun_budget_bytes
@@ -7453,7 +5391,7 @@ async def main() -> None:
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
     URL_BUDGET_BYTES = url_budget_bytes
-    if fbref_safety_circuit_mib and SOURCE_MODE != "whoscored-only":
+    if fbref_safety_circuit_mib:
         circuit_bytes = fbref_safety_circuit_mib * 1024 * 1024
         DAILY_BUDGET_BYTES = circuit_bytes
         MAX_LEASE_BYTES = circuit_bytes
@@ -7485,30 +5423,8 @@ async def main() -> None:
     )
     SOFASCORE_PARENT_ENVELOPE_LEDGER = None
     _SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
-    WHOSCORED_CAMPAIGN_LEDGER_PATH = str(
-        getattr(
-            args,
-            "whoscored_campaign_ledger",
-            WHOSCORED_CAMPAIGN_LEDGER_PATH,
-        )
-    )
-    WHOSCORED_CAMPAIGN_LEDGER = None
-    _WHOSCORED_CAMPAIGN_LEDGER_KEY = None
-    WHOSCORED_STATE_MARKER_PATH = str(
-        getattr(args, "whoscored_state_marker", WHOSCORED_STATE_MARKER_PATH)
-    )
-    WHOSCORED_PROVIDER_ORDER_ID = str(
-        getattr(args, "whoscored_provider_order_id", "") or ""
-    ).strip()
-    WHOSCORED_PROVIDER_POLICY_SHA256 = str(
-        getattr(args, "whoscored_provider_policy_sha256", "") or ""
-    ).strip()
-    WHOSCORED_PROVIDER_ORDER_CAP_BYTES = int(provider_order_cap_bytes or 0)
-    WHOSCORED_STATE_ID = ""
-    WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
-    _PAID_LEDGER_CHAIN_COUNT = 0
-    _PAID_LEDGER_CHAIN_OFFSET = 0
-    _PAID_LEDGER_CHAIN_TAIL = ""
+
+
     LEASE_PROXY_URL = str(getattr(args, "lease_proxy_url", LEASE_PROXY_URL)).rstrip("/")
 
     SOFASCORE_DAGRUN_BUDGET_BYTES = 0
@@ -7560,33 +5476,8 @@ async def main() -> None:
             )
 
     out_path = str(getattr(args, "out", "/tmp/filter_bytes.json"))
-    initialize_state = bool(getattr(args, "initialize_whoscored_state", False))
-    allow_legacy_state_marker = bool(
-        getattr(args, "allow_legacy_whoscored_state_marker_v1", False)
-    )
-    if allow_legacy_state_marker:
-        raise SystemExit("legacy WhoScored state markers are no longer accepted")
-    if SOURCE_MODE != "whoscored-only" and initialize_state:
-        raise SystemExit(
-            "--initialize-whoscored-state requires --source-mode=whoscored-only"
-        )
-    if SOURCE_MODE != "whoscored-only" and allow_legacy_state_marker:
-        raise SystemExit(
-            "--allow-legacy-whoscored-state-marker-v1 requires "
-            "--source-mode=whoscored-only"
-        )
-    if SOURCE_MODE == "whoscored-only":
-        try:
-            _whoscored_state_binding()
-            if initialize_state:
-                _initialize_whoscored_state(out_path)
-                log.info("initialized protected WhoScored filter state")
-                return
-            _verify_whoscored_state(
-                out_path, allow_legacy_marker=allow_legacy_state_marker
-            )
-        except (OSError, RuntimeError, ProxyCampaignError) as exc:
-            raise SystemExit(f"WhoScored protected state rejected: {exc}") from None
+
+
     _restore_daily_counter(out_path)
     report_daily = (_daily_up_bytes, _daily_down_bytes)
     _daily_day = ""
