@@ -620,3 +620,25 @@ def test_terminal_check_rejects_failed_downstream_publication():
     )
     with pytest.raises(AirflowException, match="dag_transform_e3=failed"):
         module.check_pipeline_success(dag_run=run)
+
+
+@pytest.mark.parametrize('slot', [
+    datetime(2026, 10, 12, 0, 30, tzinfo=timezone.utc),  # scheduled watch slot
+    datetime(2026, 10, 13, 12, 30, tzinfo=timezone.utc),
+])
+def test_master_clubelo_trigger_keeps_history_and_watch_off(slot):
+    from utils.clubelo_tasks import gate_daily, gate_history, gate_watch
+
+    _reload_master()
+    trigger = _task('ingestion_triggers.trigger_clubelo')
+    assert trigger._init_kwargs['trigger_dag_id'] == 'dag_ingest_clubelo'
+    assert trigger._init_kwargs['conf'] == {}
+    context = {
+        'params': trigger._init_kwargs['conf'],
+        'dag_run': SimpleNamespace(run_type='manual', external_trigger=True),
+        'data_interval_end': slot,
+        'logical_date': slot,
+    }
+    assert gate_daily(**context) is True
+    assert gate_history(**context) is False
+    assert gate_watch(**context) is False
