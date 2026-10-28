@@ -77,8 +77,8 @@ class Repository:
             key = tuple(row[k] for k in kwargs["merge_keys"])
             rows[key] = row
 
-    def add_match(self):
-        _, row, players, _ = recorded(31209)
+    def add_match(self, game=31209):
+        _, row, players, _ = recorded(game)
         self.schedule = [{**row, "league": "ENG-Premier League", "season": "2526",
                           "source_season_id": 2025, "_batch_id": self.batch,
                           "date": (NOW + timedelta(hours=12)).isoformat()}]
@@ -112,17 +112,24 @@ def setup(tmp_path):
     return repo, session, client, clock, sleeps
 
 
-def test_new_match_idempotence_rebind_and_arrays(tmp_path):
+@pytest.mark.parametrize("game,fid", [(31209, 1983568), (29049, 1903399)])
+def test_new_match_idempotence_rebind_and_arrays(tmp_path, game, fid):
     repo, session, client, clock, sleeps = setup(tmp_path)
-    repo.add_match()
+    repo.add_match(game)
+    session.html = recorded(game)[0]
     assert run_enrichment(client, repo, now=NOW)["published"] == 1
     run_enrichment(client, repo, now=NOW)
     assert len(session.calls) == 1
     match = next(iter(repo.writes["understat_match_enrichment"].values()))
-    assert match["whoscored_game_id"] == 1983568 and match["is_valid"]
+    assert match["whoscored_game_id"] == fid and match["is_valid"]
     assert match["parser_version"] == "understat-html-v2"
     cards = repo.writes["understat_player_match_enrichment"]
     assert any(json.loads(row["yellow_card_minutes"]) for row in cards.values())
+    if game == 29049:
+        neto = next(row for row in cards.values() if row["player_id"] == 6382)
+        assert json.loads(neto["yellow_card_minutes"]) == ["66'"]
+        assert json.loads(neto["red_card_minutes"]) == ["69'"]
+        assert neto["is_valid"]
     repo.batch = "batch-2"
     repo.schedule[0]["_batch_id"] = repo.batch
     run_enrichment(client, repo, now=NOW)

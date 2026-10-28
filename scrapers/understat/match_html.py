@@ -60,14 +60,16 @@ def parse_match_html(html: str, row: dict[str, Any], players: pd.DataFrame) -> d
 
 
 def validate_card_counts(parsed: dict[str, Any], players: pd.DataFrame) -> None:
-    """Refuse publication on either missing or surplus HTML events.
-
-    The recorded 29049 pair itself has a surplus yellow event (Pedro Neto).
-    Extraction remains testable independently; this mismatch cannot publish.
-    """
+    """Require matching events, allowing a yellow omitted by JSON on dismissal."""
     for player in players.to_dict(orient="records"):
         events = parsed["cards"].get((player["team_side"], int(player["player_id"])), {})
         for counter, column in zip(("yellow_cards", "red_cards"), CARD_COLUMNS):
             count = player[counter]
+            # Understat may omit the yellow preceding this player's red card.
+            if (counter == "yellow_cards" and not pd.isna(count)
+                    and not pd.isna(player["red_cards"]) and int(player["red_cards"]) == 1
+                    and len(events.get("red_card_minutes", [])) == 1
+                    and len(events.get(column, [])) == int(count) + 1):
+                continue
             if pd.isna(count) or int(count) != len(events.get(column, [])):
                 raise UnderstatSchemaDrift(f"match HTML: incomplete card timeline: {counter}")

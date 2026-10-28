@@ -82,10 +82,31 @@ def test_json_card_corrected_to_zero_rejects_stale_html():
         validate_card_counts(parsed, players)
 
 
-def test_recorded_29049_conflicting_json_cannot_publish():
+def test_recorded_29049_yellow_before_red_can_publish():
     html, row, players, _ = recorded()
+    parsed = parse_match_html(html, row, players)
+    validate_card_counts(parsed, players)
+    assert parsed["cards"][("a", 6382)] == {
+        "yellow_card_minutes": ["66'"], "red_card_minutes": ["69'"]}
+
+
+@pytest.mark.parametrize("change", ["no_red", "missing_red", "extra_red", "extra_yellow", "other_player"])
+def test_dismissal_exception_rejects_other_card_mismatches(change):
+    html, row, players, _ = recorded()
+    parsed = parse_match_html(html, row, players)
+    if change == "no_red":
+        players.loc[players.player_id == 6382, "red_cards"] = 0
+        parsed["cards"][("a", 6382)]["red_card_minutes"] = []
+    elif change == "missing_red":
+        parsed["cards"][("a", 6382)]["red_card_minutes"] = []
+    elif change == "extra_red":
+        parsed["cards"][("a", 6382)]["red_card_minutes"].append("70'")
+    elif change == "extra_yellow":
+        parsed["cards"][("a", 6382)]["yellow_card_minutes"].append("68'")
+    else:
+        players.loc[players.player_id == 8497, "yellow_cards"] = 0
     with pytest.raises(UnderstatSchemaDrift, match="incomplete card timeline"):
-        validate_card_counts(parse_match_html(html, row, players), players)
+        validate_card_counts(parsed, players)
 
 
 def test_empty_timeline_cannot_hide_roster_cards():
