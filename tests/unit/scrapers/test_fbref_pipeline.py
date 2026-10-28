@@ -14515,6 +14515,10 @@ class _FlakyTrinoWriter(FakeWriter):
 
 def _transient_cohort(tmp_path, *, count, errors):
     control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=count)
+    for item in control.fetches:
+        item["attempt_id"] = pipeline.raw_store.read_fetch_record(
+            item["logical_refresh_id"]
+        ).attempt_id
     pipeline.generic_writer = _FlakyTrinoWriter(errors)
     # What run_live_waves switches on for its own waves.
     pipeline._defer_transient_parse = True
@@ -15339,6 +15343,11 @@ class _DeadlineControl(FakeControl):
             "deferred_parse_observations", []
         )
         for item in observations:
+            assert any(
+                row["attempt_id"] == item["attempt_id"]
+                and row["logical_refresh_id"] == item["logical_refresh_id"]
+                for row in self.fetches
+            ), "carryover requires a successful control attempt"
             key = tuple(item[name] for name in (
                 "logical_refresh_id", "parser_version", "typed_parser_version",
                 "stateful_parser_version",
@@ -15384,6 +15393,7 @@ def _deadline_match_run(tmp_path, *, control_error=False):
     control.fetches.append({
         "run_id": run_id, "target_id": target.target_id,
         "page_kind": "match", "logical_refresh_id": refresh,
+        "attempt_id": record.attempt_id,
     })
     control.frontier[target.target_id] = {
         "state": "fetched", "last_content_hash": record.content_hash,
@@ -15403,8 +15413,19 @@ def _deadline_match_run(tmp_path, *, control_error=False):
     return control, pipeline, run_id, refresh, record
 
 
-def test_deadline_transient_match_carries_raw_to_next_run(tmp_path):
+@pytest.mark.parametrize("recovered_attempt", [False, True])
+@pytest.mark.parametrize("batch_persist_enabled", [False, True])
+def test_deadline_transient_match_carries_raw_to_next_run(
+    tmp_path, recovered_attempt, batch_persist_enabled,
+):
     control, pipeline, run_id, refresh, record = _deadline_match_run(tmp_path)
+    pipeline.batch_persist_enabled = batch_persist_enabled
+    if batch_persist_enabled:
+        pipeline.generic_writer.batch_error = pipeline.generic_writer.errors[0]
+    if recovered_attempt:
+        # Raw survived a failed/expired attempt; complete_fetch succeeded on a
+        # later attempt without rewriting the immutable fetch manifest.
+        control.fetches[0]["attempt_id"] = str(uuid.uuid4())
     result = pipeline.run_live_waves(
         run_id, worker_id="match-worker", page_kinds=["match"],
         settings=_settings(), deadline_monotonic=5.0,
@@ -15423,7 +15444,9 @@ def test_deadline_transient_match_carries_raw_to_next_run(tmp_path):
     summary = validator.validate_and_finish(run_id, publication_eligible=False)
     evidence = control.run["metadata"]["deferred_parse_observations"]
     assert len(evidence) == 1
-    assert evidence[0]["attempt_id"] == record.attempt_id
+    assert evidence[0]["attempt_id"] == control.fetches[0]["attempt_id"]
+    if recovered_attempt:
+        assert evidence[0]["attempt_id"] != record.attempt_id
     assert evidence[0]["content_hash"] == record.content_hash
     assert control.raw_store.read_fetch_record(refresh) == record
     assert next(iter(control.observations.values()))["status"] == "failed"

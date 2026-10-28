@@ -6352,7 +6352,6 @@ class FBrefPipeline:
             # landed, so the next parse wave re-lists this raw (#1759).
             self._parse_deferrals[record.target_id] = deferrals + 1
             self._parse_carryovers[record.logical_refresh_id] = {
-                "attempt_id": record.attempt_id,
                 "logical_refresh_id": record.logical_refresh_id,
                 "target_id": record.target_id,
                 "content_hash": record.content_hash,
@@ -7753,6 +7752,12 @@ class FBrefPipeline:
                 if len(generic_buffer) == self.batch_persist_matches:
                     flush_buffers(matches=False, generic=True)
             flush_buffers(matches=True, generic=True)
+        for item in fetches:
+            carryover = self._parse_carryovers.get(str(item["logical_refresh_id"]))
+            if carryover is not None:
+                # Raw may belong to a failed attempt recovered by this cohort's
+                # successful attempt. Carryover must fence the successful one.
+                carryover["attempt_id"] = str(item["attempt_id"])
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_deferred_parse_failures(result):
