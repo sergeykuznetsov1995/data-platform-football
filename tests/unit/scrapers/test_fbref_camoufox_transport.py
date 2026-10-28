@@ -145,63 +145,143 @@ def test_script_default_blocks_before_admission_and_allows_challenge(monkeypatch
     assert document.continued == 1
 
 
+class _ReplayPage:
+    """Small DOM model, not a JS engine: only explicit resource effects run."""
+
+    def __init__(self, html, resources=()):
+        from bs4 import BeautifulSoup
+
+        self.dom = BeautifulSoup(html, "html.parser")
+        self.resources = resources
+        self.routes = []
+
+    def navigate(self, transport, url):
+        document = _Route("document", url)
+        transport._maybe_block(document)
+        self.routes.append(document)
+        if not document.continued:
+            self.dom.clear()
+            return
+        for resource_url, effect in self.resources:
+            route = _Route("script", resource_url)
+            transport._maybe_block(route)
+            self.routes.append(route)
+            if route.continued:
+                effect(self.dom)
+
+    def evaluate(self, expression):
+        from bs4 import BeautifulSoup, Comment
+        from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
+
+        if expression == "!!document.querySelector('table')":
+            return self.dom.find("table") is not None
+        if expression == FBREF_UNCOMMENT_TABLES_JS:
+            for comment in list(self.dom.find_all(string=lambda node: isinstance(node, Comment))):
+                if "<table" in str(comment):
+                    fragment = BeautifulSoup(str(comment), "html.parser")
+                    comment.replace_with(*list(fragment.contents))
+            return None
+        raise AssertionError(f"Unsupported replay expression: {expression}")
+
+    def content(self):
+        return str(self.dom)
+
+
+def _replay_fetch(monkeypatch, html, setting, resources=()):
+    monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", setting)
+    transport = CamoufoxFbrefTransport()
+    page = _ReplayPage(html, resources)
+    transport._page = page
+    monkeypatch.setattr(transport, "POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(transport, "CF_SOLVE_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(transport, "MAX_PROXY_ROTATIONS", 0)
+    monkeypatch.setattr(transport, "_challenge_shell_present", lambda: False)
+    monkeypatch.setattr(transport, "_click_turnstile", lambda: False)
+    monkeypatch.setattr(
+        transport, "_navigate_with_one_manual_redirect",
+        lambda url: page.navigate(transport, url),
+    )
+    return transport.fetch("https://fbref.com/en/"), page, transport
+
+
+def _table_inventory(page):
+    # DOM serialization/uncommenting changes hashes and source locations.
+    # Compare the data contract, including every row and cell, instead.
+    return [(
+        table.table_id, table.availability, table.header_paths,
+        [(row.source_row_index, row.entity_ids, [(
+            cell.cell_index, cell.data_stat, cell.raw_header_path,
+            cell.raw_value, cell.entity_ids,
+        ) for cell in row.cells]) for row in table.rows],
+    ) for table in page.tables]
+
+
 @pytest.mark.parametrize("fixture,kind,comment_table", [
     ("matches/0701e218.html.gz", "match", False),
     ("matches/0701e218.html.gz", "match", True),
     ("report_observations/schedule-70.html", "schedule", False),
-    ("season_stats/acnq-2027-keepers-e9cfdc24.html.gz", "season_stats", False),
+    ("proxy_waste/season.html", "season_stats", False),
 ])
 def test_script_blocking_preserves_saved_page_inventory(monkeypatch, fixture, kind, comment_table):
     import gzip
+    from bs4 import BeautifulSoup, Comment
     from scrapers.fbref.page_document import parse_page_document
 
     path = Path(__file__).parents[2] / "fixtures" / "fbref" / fixture
     html = gzip.decompress(path.read_bytes()).decode() if path.suffix == ".gz" else path.read_text()
     if comment_table:
-        from bs4 import BeautifulSoup, Comment
-
-        # Archived match snapshots already have uncommented DOM tables.
-        # Replay the same source table in FBref's comment-wrapped form too.
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table")
-        table.replace_with(Comment(str(table)))
+        # Leave a real DOM table, as required by the solve contract.
+        tables = soup.find_all("table")
+        assert len(tables) > 1
+        assert tables[-1].get("id")
+        tables[-1].replace_with(Comment(str(tables[-1])))
         html = str(soup)
-    canonical_url = (
-        "https://fbref.com/en/comps/657/keepers/"
-        "Africa-Cup-of-Nations-qualification-Stats"
-        if kind == "season_stats" else "https://fbref.com/en/"
-    )
-    baseline = parse_page_document(
-        html, target_id=fixture, page_kind=kind, canonical_url=canonical_url,
-    )
+    baseline = parse_page_document(html, target_id=fixture, page_kind=kind)
+    assert baseline.tables
     if comment_table:
         assert any(table.source_location.startswith("comment") for table in baseline.tables)
+
+    def decorate(dom):
+        dom.append(BeautifulSoup('<span id="script-ran">loaded</span>', "html.parser"))
+
     inventories = []
     for setting in ("0", "1"):
-        monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", setting)
-        transport = CamoufoxFbrefTransport()
-        transport._page = MagicMock()
-        transport._page.evaluate.return_value = True
-        transport._page.content.return_value = html
-        monkeypatch.setattr(transport, "POLL_INTERVAL_S", 0)
-        monkeypatch.setattr(transport, "_challenge_shell_present", lambda: False)
-        monkeypatch.setattr(transport, "_navigate_with_one_manual_redirect", lambda _url: None)
-        document = _Route()
-        transport._maybe_block(document)
-        assert document.continued == 1
-        fetched = transport.fetch(canonical_url)
-        assert fetched == html
-        page = parse_page_document(
-            fetched, target_id=fixture, page_kind=kind, canonical_url=canonical_url,
-        )
-        assert page == baseline
-        if kind != "season_stats":
-            assert page.tables
-        else:
-            assert page.tables == ()
-            assert page.errors == ()
-        inventories.append((page.inventory_records(), page.cell_records(), page.errors))
+        fetched, replay, _ = _replay_fetch(monkeypatch, html, setting, [
+            ("https://fbref.com/static/site.js", decorate),
+        ])
+        assert fetched is not None
+        assert replay.routes[0].continued == 1
+        assert replay.routes[1].continued == int(setting == "0")
+        assert ('id="script-ran"' in fetched) == (setting == "0")
+        page = parse_page_document(fetched, target_id=fixture, page_kind=kind)
+        assert page.errors == baseline.errors == ()
+        assert _table_inventory(page) == _table_inventory(baseline)
+        inventories.append(_table_inventory(page))
     assert inventories[0] == inventories[1]
+
+
+@pytest.mark.parametrize("script_dependent", [False, True])
+def test_inventory_replay_rejects_missing_dom_tables(monkeypatch, script_dependent):
+    from bs4 import BeautifulSoup
+
+    def insert_table(dom):
+        dom.append(BeautifulSoup(
+            '<table id="stats_standard"><tr><td>required JS</td></tr></table>',
+            "html.parser",
+        ))
+
+    resources = [("https://fbref.com/static/site.js", insert_table)] if script_dependent else []
+    for setting in ("0", "1"):
+        fetched, replay, transport = _replay_fetch(
+            monkeypatch, "<html><body>no server tables</body></html>", setting, resources,
+        )
+        if script_dependent and setting == "0":
+            assert fetched is not None
+            assert replay.dom.find("table") is not None
+        else:
+            assert fetched is None
+            assert transport._last_solve_failure == "page_contract"
 
 
 class _StatusFailsResponse:
