@@ -14808,7 +14808,7 @@ def test_frontier_closed_run_does_not_reparse(tmp_path):
     assert waves == []
 
 
-def _session_abort_error(reason):
+def _session_abort_error(reason, *, strict_close_failed=False):
     """Replay real transport flags through the fetcher classifier (#1588)."""
     from unittest.mock import MagicMock
     from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
@@ -14820,6 +14820,15 @@ def _session_abort_error(reason):
         transport._abort_session_for_byte_budget("response_exceeded_reservation")
     elif reason == "request_budget_exhausted":
         transport._request_budget_exhausted = True
+    elif reason == "unrouted_websocket_upgrade":
+        request = MagicMock(
+            resource_type="websocket", url="wss://fbref.com/socket",
+            redirected_from=None,
+        )
+        request.is_navigation_request.return_value = False
+        transport._on_response(SimpleNamespace(
+            request=request, status=101, headers={},
+        ))
     stats = transport.traffic_stats()
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
     fetcher._http_session = None
@@ -14857,8 +14866,19 @@ def _session_abort_error(reason):
     fetcher._lease_client.close_strict.return_value = SimpleNamespace(
         total_bytes=0 if reason == "browser_provider_cap_exhausted" else 100
     )
+    if strict_close_failed:
+        fetcher._lease_client.close_strict.side_effect = FBrefProxyLeaseError(
+            "strict close rejected: uncertain accounting"
+        )
     with pytest.raises(FetchError) as raised:
         fetcher.ensure_clearance()
+    if reason == "unrouted_websocket_upgrade":
+        from scrapers.fbref.camoufox_fetch import (
+            UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
+        )
+        assert raised.value.browser_unobserved_bytes == (
+            UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+        )
     return raised.value
 
 
@@ -14913,6 +14933,7 @@ def _session_failure_wave(
         "request_budget_exhausted",
         "browser_provider_cap_exhausted",
         "browser_provider_drain_failed",
+        "unrouted_websocket_upgrade",
     ],
 )
 def test_session_abort_defers_once_and_continues_wave(tmp_path, reason):
@@ -15246,3 +15267,65 @@ def test_incomplete_preparation_does_not_publish_processing_measurement(tmp_path
     result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=['match'], settings=_settings())
     assert result.parsed == 2
     assert next(iter(control.observations.values()))['processing_work_ms'] is None
+
+
+@pytest.mark.parametrize("strict_close_failed", [False, True])
+def test_27_october_403_refresh_then_unrouted_upgrade(tmp_path, strict_close_failed):
+    run_id = str(uuid.UUID(int=1588))
+    first, following = [_match_fetch_lease(run_id, n) for n in (1, 2)]
+    retry = replace(first, attempt_id=str(uuid.UUID(int=9999)), attempt_number=2)
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [[first, following], [retry]])
+    control.run.update(request_limit=4000, byte_limit=2048 * 1024 * 1024)
+    opened = []
+    fetched = []
+
+    class Fetcher(FakeFetcher):
+        def __init__(self):
+            super().__init__(control.events, b"<html>ok</html>")
+            opened.append(self)
+
+        def ensure_clearance(self):
+            if len(opened) == 2:
+                # Real response callback -> real metered ensure_clearance.
+                raise _session_abort_error(
+                    "unrouted_websocket_upgrade",
+                    strict_close_failed=strict_close_failed,
+                )
+            return super().ensure_clearance()
+
+        def fetch(self, url, **kwargs):
+            fetched.append(url)
+            if len(opened) == 1:
+                raise FetchError(
+                    "HTTP 403", error_class="http_status", http_status=403,
+                    target_requests=1, http_status_history=(403,),
+                    provider_billed_bytes=50,
+                )
+            return super().fetch(url, **kwargs)
+
+    pipeline = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: Fetcher(), sleep=lambda _: None, clock=lambda: NOW,
+    )
+    kwargs = dict(
+        worker_id="w", page_kinds=["match"],
+        settings=replace(_settings(), shard_size=2, request_limit=4000,
+                         byte_limit=2048 * 1024 * 1024),
+    )
+    if strict_close_failed:
+        with pytest.raises(FetchWaveError, match="hard_transport_policy"):
+            pipeline.fetch_wave(run_id, **kwargs)
+        assert len(opened) == 2
+        assert fetched == [first.canonical_url]
+        assert control.failed[-1][1]["requeue"] is False
+    else:
+        result = pipeline.fetch_wave(run_id, **kwargs)
+        assert result.deferred_session_failures == 1
+        assert result.fetched == 1
+        assert result.failures == []
+        assert len(opened) == 3
+        assert fetched == [first.canonical_url, following.canonical_url]
+        assert control.failed[-1][1]["requeue"] is True
+        assert control.failed[-1][1]["provider_billed_bytes"] == 100
+    assert control.failed[0][1]["session_retry"] is True

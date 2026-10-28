@@ -1289,6 +1289,12 @@ class FBrefFetcher:
                 (
                     "Camoufox hard transport policy failed: "
                     f"{hard_policy}"
+                    + (
+                        "; provider_drain_terminal="
+                        + ",".join(drain_error.terminal_flags)
+                        if isinstance(drain_error, FBrefProxyLeaseError)
+                        and drain_error.terminal_flags else ""
+                    )
                     if hard_policy is not None
                     # `fetch_attempt.error_message` only ever stores
                     # `str(FetchError)` (#1107), so an exemption that says
@@ -1411,21 +1417,30 @@ class FBrefFetcher:
         self._bootstrap_stats = bootstrap_stats
         return True
 
-    @staticmethod
     def _local_session_failure_reason(
-        stats: Optional[dict], reason: Optional[str]
+        self, stats: Optional[dict], reason: Optional[str]
     ) -> Optional[str]:
-        """Only local admission stops may retire a session; policy wins."""
+        """Retire bounded admission stops and strictly metered upgrades."""
 
         source = stats or {}
         if (
-            source.get("network_policy_failed")
-            or source.get("redirect_blocked")
+            source.get("redirect_blocked")
             or (
                 source.get("geoip_lookup_failed")
                 and not source.get("geoip_transport_failure")
             )
         ):
+            return None
+        if source.get("network_policy_failed"):
+            if (
+                reason == "unrouted_websocket_upgrade"
+                and source.get("network_policy_failure") == reason
+                and getattr(self, "_lease_client", None) is not None
+                and getattr(self, "_provider_lease", None) is not None
+            ):
+                # Callers require browser finalization and strict paid close
+                # without escrow before exposing this marker to the pipeline.
+                return reason
             return None
         if reason == "request_budget_exhausted":
             return reason
