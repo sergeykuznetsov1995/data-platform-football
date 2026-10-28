@@ -352,7 +352,7 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
         '  *pgrep*) exit 1 ;;\n'                    # юнит кампании в контейнере не жив
         f'  *md5sum*) echo "{md5}  file" ;;\n'      # целевой модуль виден из контейнера
         '  *sha256sum*) echo "' + 'a' * 64 + '  file" ;;\n'
-        '  *"last_parsed_time >"*) echo 6 ;;\n'
+        '  *"last_parsed_time >"*) echo 7 ;;\n'
         '  *"FROM dag WHERE"*) echo 1 ;;\n'         # fotmob-даг перечитан планировщиком
         '  *"count(*)"*) echo 0 ;;\n'               # ни активных ранов, ни ошибок импорта
         '  *) echo "dag_x | f" ;;\n'
