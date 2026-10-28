@@ -56,11 +56,66 @@ HTML с таблицами в доступных фикстурах нет; tabl
 Это ограниченная модель, не выполнение реального JS в браузере и не проверка
 прохождения живого challenge или всех зависимостей сохранённых страниц от JS.
 
-**Приёмка #1339 заблокирована отсутствием сопоставимых замеров трафика.**
-Экономия ≥20% требует сопоставимых замеров всего контура до/после при одинаковых
-страницах и инвентаре, включая прогрев, ошибки и хвосты. Таких замеров в этом
-worktree нет; синтетические числа и размеры HTML не заменяют измерение трафика.
-Выкат и платная канарейка требуют отдельного решения владельца.
+Сравнение после доставки выполняет лид по боевому учёту: три полных дня до
+и три после, без окна доставки, по одинаковым видам страниц. Готовый запрос —
+[`scripts/compare_fbref_proxy_waste.sql`](../../scripts/compare_fbref_proxy_waste.sql).
+Он читает `fbref_control.fetch_attempt` и `page_frontier` из сохранённого снимка
+и четыре входные таблицы evidence bundle. Подготовка в отдельной локальной
+PostgreSQL-базе со снимком (не в production), CSV с заголовками:
+
+```sql
+CREATE TEMP TABLE proxy_waste_windows (
+    period text PRIMARY KEY CHECK (period IN ('before', 'after')),
+    started_at timestamptz NOT NULL, ended_at timestamptz NOT NULL,
+    CHECK (ended_at = started_at + interval '72 hours')
+);
+CREATE TEMP TABLE proxy_waste_runs (
+    period text REFERENCES proxy_waste_windows(period), run_id uuid PRIMARY KEY
+);
+CREATE TEMP TABLE proxy_waste_leases (
+    period text REFERENCES proxy_waste_windows(period),
+    page_kind text NOT NULL, lease_id text PRIMARY KEY
+);
+CREATE TEMP TABLE proxy_waste_ledger (
+    event_id text PRIMARY KEY, event_version text NOT NULL, source text NOT NULL,
+    event_type text NOT NULL, lease_id text NOT NULL,
+    bytes bigint NOT NULL CHECK (bytes >= 0)
+);
+\copy proxy_waste_windows FROM 'windows.csv' CSV HEADER
+\copy proxy_waste_runs FROM 'runs.csv' CSV HEADER
+\copy proxy_waste_leases FROM 'leases.csv' CSV HEADER
+\copy proxy_waste_ledger FROM 'ledger-bytes.csv' CSV HEADER
+\i scripts/compare_fbref_proxy_waste.sql
+```
+
+`windows.csv` содержит ровно две непересекающиеся строки `before`/`after` с
+UTC-границами. `runs.csv` — UUID control-ранов, целиком принадлежащих окнам;
+это не строковые Airflow run ID из proxy ledger. `leases.csv` — все аренды этих
+ранов, включая неуспешный прогрев и аренды без успешных страниц. Принадлежность
+аренды виду страницы устанавливается по сохранённым фазам/заданию рана;
+смешанную аренду нельзя целиком приписать каждому виду. Если достоверного
+разделения нет, сравнение по видам пока невозможно. Для `ledger-bytes.csv`
+из полного JSONL экспортируются одноимённые поля всех событий `bytes`, обоих
+направлений, включая события после конца окна до закрытия выбранных аренд.
+`event_id` исключает повторную загрузку события; `lease_id` — двойную атрибуцию.
+Полнота списка ранов/аренд, закрытие аренд, отсутствие обрезанных хвостов,
+соответствие видов страниц и одинаковый инвентарь проверяются по evidence bundle.
+SQL сам не доказывает эти предпосылки; неполный bundle нельзя принимать.
+
+Знаменатель — число логических загрузок (`DISTINCT logical_refresh_id`), включая
+неуспешные; retry не становится дополнительной страницей. Числитель — все байты
+выбранных аренд из ledger, включая прогрев, ошибки и хвосты. `wire_bytes` и
+`provider_billed_bytes` из попыток к ledger не прибавляются, чтобы избежать
+двойного учёта. Агрегации независимы: несколько попыток не размножают байты.
+Вывод по каждому виду содержит страницы, попытки, ошибки, байты, байты/страницу,
+снижение в процентах и признак достижения ≥20%. Отсутствующая сторона или
+нулевая база дают `NULL`, а не успех. Виды, встречающиеся только с одной стороны,
+остаются видимыми; общий процент с изменившейся смесью видов не вычисляется.
+
+Таких боевых замеров в worktree нет; синтетические числа и размеры HTML не
+заменяют измерение трафика. По актуальному брифу это последующая приёмка лида,
+а не блокер кода/PR; платная канарейка для неё не требуется. Выкат требует
+отдельного решения владельца.
 
 Parser version, batch identity и `FETCHER_VERSION` сохранены: применяется
 существующий переключатель ресурсов без изменения контракта парсера и учёта
