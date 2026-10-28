@@ -39,6 +39,7 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
         "cleanup_whoscored_dq_stage_partitions",
         "maintain_whoscored_bronze",
         "maintain_other_high_churn_bronze",
+        "check_maintenance_run",
     }
     assert tasks["maintain_whoscored_bronze"].upstream_task_ids == {
         "cleanup_whoscored_dq_stage_partitions"
@@ -46,6 +47,7 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert tasks["janitor_fbref_generic_stages"].downstream_task_ids == {
         "cleanup_whoscored_dq_stage_partitions",
         "maintain_other_high_churn_bronze",
+        "check_maintenance_run",
     }
     assert tasks["cleanup_whoscored_dq_stage_partitions"]._init_kwargs[
         "trigger_rule"
@@ -121,5 +123,34 @@ def test_nightly_compaction_is_first_and_uses_fbref_pool():
     task = tasks["compact_bronze"]
     assert task._init_kwargs["pool"] == "fbref_scraper_pool"
     assert task._init_kwargs["mode"] == "reschedule"
-    assert task.downstream_task_ids == {"janitor_fbref_generic_stages"}
+    assert task.downstream_task_ids == {"janitor_fbref_generic_stages", "check_maintenance_run"}
     assert task._init_kwargs["execution_timeout"] == timedelta(hours=3)
+
+
+def test_compaction_failure_cannot_be_hidden_by_successful_cleanup():
+    from types import SimpleNamespace
+    from airflow.operators.python import PythonOperator
+
+    PythonOperator._instances.clear()
+    mod = _load_module()
+    tasks = {task.task_id: task for task in PythonOperator._instances}
+    final = tasks["check_maintenance_run"]
+    assert final._init_kwargs["trigger_rule"] == "all_done"
+    assert final.upstream_task_ids == set(tasks) - {final.task_id}
+    assert not final.downstream_task_ids
+    assert tasks["cleanup_whoscored_dq_stage_partitions"]._init_kwargs[
+        "trigger_rule"
+    ] == "all_done"
+    instances = [
+        SimpleNamespace(task_id=task_id, state=(
+            "failed" if task_id == "compact_bronze" else
+            "upstream_failed" if task_id == "janitor_fbref_generic_stages" else "success"
+        ))
+        for task_id in tasks if task_id != final.task_id
+    ]
+    context = dict(task=final, dag_run=SimpleNamespace(get_task_instances=lambda: instances))
+    with pytest.raises(Exception, match="compact_bronze"):
+        mod._check_maintenance_run(**context)
+    for ti in instances:
+        ti.state = "success"
+    mod._check_maintenance_run(**context)

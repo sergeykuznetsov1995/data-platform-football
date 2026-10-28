@@ -387,7 +387,7 @@ def test_catchup_dag_uses_pool_and_preserves_original_deadline(monkeypatch, tmp_
     assert calls[0]["dry_run"] is True
 
 
-def test_checkpoints_keep_total_budget_and_release_per_portion(runner, monkeypatch):
+def test_checkpoints_keep_total_budget_and_release_per_portion(runner, monkeypatch, shared_db):
     from types import SimpleNamespace
 
     calls, locks = [], []
@@ -413,7 +413,7 @@ def test_checkpoints_keep_total_budget_and_release_per_portion(runner, monkeypat
 
     checkpoints = {}
 
-    class Variable:
+    class Variable(shared_db[2]):
         @staticmethod
         def get(key, **kwargs):
             return json.loads(checkpoints[key]) if key in checkpoints else None
@@ -540,3 +540,154 @@ def test_expired_deadline_still_releases_publication_ownership(monkeypatch):
     assert events[1][0] == "connect"
     assert events[1][1]["connect_timeout"] == 1
     assert events[-2:] == ["release", ("finish", False)]
+
+
+@pytest.fixture
+def shared_db(monkeypatch):
+    """Metadata DB stand-in; exercise the production state mutation/serialization."""
+    import sys
+    from types import ModuleType
+
+    rows, statements = {}, []
+
+    class Variable:
+        key = None
+
+        def __init__(self, *, key, val):
+            self.key, self.val = key, val
+
+        @staticmethod
+        def get(key, **kwargs):
+            import json
+            return json.loads(rows[key].val) if key in rows else None
+
+        @staticmethod
+        def set(key, value, **kwargs):
+            import json
+            rows[key] = Variable(key=key, val=json.dumps(value))
+
+    class Session:
+        def execute(self, statement):
+            statements.append(str(statement))
+
+        def query(self, model):
+            return self
+
+        def filter(self, predicate):
+            return self
+
+        def one_or_none(self):
+            return rows.get("bronze_compaction_shared_budget")
+
+        def add(self, row):
+            rows[row.key] = row
+
+    @contextmanager
+    def create_session():
+        yield Session()
+
+    module = ModuleType("airflow.utils.session")
+    module.create_session = create_session
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", module)
+    monkeypatch.setattr(sys.modules["airflow.models"], "Variable", Variable)
+    return rows, statements, Variable
+
+
+@pytest.mark.parametrize("limit", ["portions", "bytes"])
+def test_daily_catchup_and_repeated_cli_share_reserved_budget(
+    runner, monkeypatch, shared_db, limit
+):
+    calls = []
+    import json
+    from types import SimpleNamespace
+
+    state = {
+        "window": runner.date().isoformat(), "partition_offsets": {},
+    }
+    initial_portions = compaction.MAX_PORTIONS - 2 if limit == "portions" else 0
+    initial_bytes = compaction.MAX_INPUT_BYTES - 40 if limit == "bytes" else 0
+    state.update(portions=initial_portions, input_bytes=initial_bytes)
+    shared_db[0]["bronze_compaction_shared_budget"] = shared_db[2](
+        key="bronze_compaction_shared_budget", val=json.dumps(state)
+    )
+    monkeypatch.setattr(maintenance, "_compaction_candidates", lambda *a, **kw:
+        maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0))
+
+    def compact(*args, **kwargs):
+        # Reservation must already be durable when the rewrite starts.
+        state = json.loads(shared_db[0]["bronze_compaction_shared_budget"].val)
+        calls.append((state["portions"], state["input_bytes"]))
+        if len(calls) == 1:
+            raise RuntimeError("failed rewrite still spends budget")
+        return {}
+
+    monkeypatch.setattr(maintenance, "_compact_exact_files", compact)
+    for run in ("daily", "catchup_cli_1", "catchup_cli_2"):
+        result = compaction.compaction_step(
+            context={
+                "dag": SimpleNamespace(dag_id="daily" if run == "daily" else "catchup"),
+                "run_id": run,
+                "task": SimpleNamespace(task_id="compact_bronze"),
+            },
+            tables=("espn_match",), deadline=runner,
+        )
+    assert calls == [
+        (initial_portions + 1, initial_bytes + 20),
+        (initial_portions + 2, initial_bytes + 40),
+    ]
+    assert result["stop_reason"] == "budget"
+    assert any("pg_advisory_xact_lock" in sql for sql in shared_db[1])
+
+
+def test_atomic_reservation_rejects_competing_run(runner, monkeypatch, shared_db):
+    import json
+
+    state = compaction._shared_budget(runner)
+    state["portions"] = compaction.MAX_PORTIONS - 1
+    shared_db[0]["bronze_compaction_shared_budget"].val = json.dumps(state)
+    rewrites = []
+
+    def probe(*args, **kwargs):
+        # A different run spends the last slot after this run read the budget.
+        assert compaction._shared_budget(runner, reservation=("espn_match", 20, 1))
+        return maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0)
+
+    monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
+    monkeypatch.setattr(maintenance, "_compact_exact_files", lambda *a, **kw: rewrites.append(kw))
+    result = compaction.compaction_step(context={}, tables=("espn_match",), deadline=runner)
+    assert result["stop_reason"] == "budget"
+    assert not rewrites
+
+
+def test_partition_cursor_survives_nights_with_replenished_first_partition(
+    runner, monkeypatch, shared_db
+):
+    offsets = []
+    clock = [runner]
+    monkeypatch.setattr(compaction, "nightly_deadline", lambda: clock[0])
+
+    def probe(*args, partition_offset=0, **kwargs):
+        offsets.append(partition_offset)
+        # Each partition still has small files every night, including the first.
+        return maintenance._CompactionProbeResult(
+            ((f"s3://p{partition_offset}/a", 10), (f"s3://p{partition_offset}/b", 10)), 0
+        )
+
+    monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
+    monkeypatch.setattr(maintenance, "_compact_exact_files", lambda *a, **kw: {})
+    for _ in range(3):
+        compaction.compaction_step(
+            context={}, tables=("espn_match",), deadline=clock[0], max_portions=1
+        )
+        clock[0] += timedelta(days=1)
+    assert offsets == [0, 1, 2]
+    state = compaction._shared_budget(clock[0])
+    assert state["portions"] == state["input_bytes"] == 0
+    assert state["partition_offsets"]["espn_match"] == 3
+
+
+def test_expired_checkpoint_cannot_reset_current_window_budget(runner, shared_db):
+    state = compaction._shared_budget(runner, reservation=("espn_match", 20, 1))
+    with pytest.raises(TimeoutError, match="live nightly deadline"):
+        compaction._shared_budget(runner - timedelta(days=1))
+    assert compaction._shared_budget(runner) == state

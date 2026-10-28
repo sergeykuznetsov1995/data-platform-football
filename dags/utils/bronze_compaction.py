@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import json
 import logging
 import math
 from threading import Event, Thread
@@ -268,6 +269,61 @@ def _publication_fence(enabled, deadline=None):
             control.finish_run(run_id, succeeded=succeeded)
 
 
+def _shared_budget(deadline, *, reservation=None):
+    """Atomically reserve the UTC window budget; keep partition cursors across nights.
+
+    One metadata row serves daily and all catch-up runs. The transaction lock
+    also serializes first creation. A crashed/failed portion keeps its charge.
+    """
+    from airflow.models import Variable
+    from airflow.utils.session import create_session
+    from sqlalchemy import text
+
+    def check_window():
+        end = nightly_deadline()
+        if (
+            deadline.tzinfo is None
+            or deadline > end
+            or deadline.astimezone(timezone.utc).date() != end.date()
+            or deadline <= datetime.now(timezone.utc)
+        ):
+            raise TimeoutError("Shared compaction budget requires a live nightly deadline")
+
+    check_window()
+    key = "bronze_compaction_shared_budget"
+    with create_session() as session:
+        session.execute(text("SET LOCAL lock_timeout = '1s'"))
+        session.execute(text("SET LOCAL statement_timeout = '1s'"))
+        session.execute(text("SELECT pg_advisory_xact_lock(1892)"))
+        check_window()
+        row = session.query(Variable).filter(Variable.key == key).one_or_none()
+        state = json.loads(row.val) if row else {}
+        window = deadline.astimezone(timezone.utc).date().isoformat()
+        if state.get("window") != window:
+            state = {
+                "window": window,
+                "portions": 0,
+                "input_bytes": 0,
+                "partition_offsets": state.get("partition_offsets", {}),
+            }
+        if reservation is not None:
+            table, size, next_offset = reservation
+            if (
+                state["portions"] >= MAX_PORTIONS
+                or state["input_bytes"] + size > MAX_INPUT_BYTES
+            ):
+                return None
+            state["portions"] += 1
+            state["input_bytes"] += size
+            state["partition_offsets"][table] = next_offset
+        value = json.dumps(state)
+        if row is None:
+            session.add(Variable(key=key, val=value))
+        else:
+            row.val = value
+        return state
+
+
 def run_compaction(
     *,
     tables,
@@ -280,12 +336,16 @@ def run_compaction(
     record=None,
     checkpoint=None,
     portion_limit=None,
+    reserve=None,
+    window_budget=None,
+    partition_offsets=None,
 ):
     """Re-read metadata for each portion; never replay paths or run retention.
 
     The caller must hold fbref_scraper_pool when selecting FBref tables.
     Each FBref portion owns a generation, renewed/fenced during Trino queries.
-    A per-run Airflow Variable retains budgets/queue across reschedules, never paths.
+    A per-run Airflow Variable retains the queue across reschedules, never paths.
+    The caller reserves the shared nightly budget before any rewrite.
     """
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be boolean")
@@ -329,7 +389,11 @@ def run_compaction(
                 result["targets"][table] = "not_present"
         else:
             queue = deque(result["queue"])
-        partition_offsets = defaultdict(int, result.get("partition_offsets", {}))
+        partition_offsets = defaultdict(
+            int,
+            partition_offsets if partition_offsets is not None
+            else result.get("partition_offsets", {}),
+        )
         while queue:
             conn.check()
             if (
@@ -341,6 +405,13 @@ def run_compaction(
             if (
                 result["portions"] >= max_portions
                 or result["input_bytes"] >= max_input_bytes
+                or (
+                    window_budget is not None
+                    and (
+                        window_budget["portions"] >= MAX_PORTIONS
+                        or window_budget["input_bytes"] >= MAX_INPUT_BYTES
+                    )
+                )
             ):
                 result["stop_reason"] = "budget"
                 break
@@ -348,11 +419,16 @@ def run_compaction(
             try:
                 with _publication_fence(table in FBREF_TABLES, deadline) as fence:
                     conn = _DeadlineConnection(raw, deadline, stop, fence)
+                    input_budget = min(
+                        max_input_bytes - result["input_bytes"],
+                        MAX_INPUT_BYTES - window_budget["input_bytes"]
+                        if window_budget is not None else MAX_INPUT_BYTES,
+                    )
                     probe = maintenance._compaction_candidates(
                         conn,
                         schema="bronze",
                         table=table,
-                        max_input_bytes=max_input_bytes - result["input_bytes"],
+                        max_input_bytes=input_budget,
                         partition_offset=partition_offsets[table],
                         max_files=maintenance.COMPACTION_MAX_FILES_PER_PORTION,
                     )
@@ -362,7 +438,7 @@ def run_compaction(
                             conn,
                             schema="bronze",
                             table=table,
-                            max_input_bytes=max_input_bytes - result["input_bytes"],
+                            max_input_bytes=input_budget,
                             max_files=maintenance.COMPACTION_MAX_FILES_PER_PORTION,
                         )
                     result["delete_partitions"][table] = probe.skipped_delete_partitions
@@ -374,6 +450,12 @@ def run_compaction(
                         )
                         continue
                     paths = probe.candidates
+                    if not dry_run and reserve is not None and not reserve(
+                        table, sum(size for _, size in paths), partition_offsets[table] + 1
+                    ):
+                        queue.appendleft(table)
+                        result["stop_reason"] = "budget"
+                        break
                     if dry_run:
                         result["targets"][table] = "dry_run"
                         stats = {}
@@ -471,11 +553,21 @@ def compaction_step(*, context, tables, deadline, **kwargs):
         )
     if checkpoint:
         deadline = datetime.fromisoformat(checkpoint["deadline"])
+    shared = _shared_budget(deadline) if not kwargs.get("dry_run", False) else None
+
+    def reserve(table, size, next_offset):
+        return _shared_budget(
+            deadline, reservation=(table, size, next_offset)
+        ) is not None
+
     result = run_compaction(
         tables=tables,
         deadline=deadline,
         checkpoint=checkpoint,
         portion_limit=1,
+        reserve=reserve if shared is not None else None,
+        window_budget=shared,
+        partition_offsets=shared["partition_offsets"] if shared is not None else None,
         **kwargs,
     )
     result["deadline"] = deadline.isoformat()

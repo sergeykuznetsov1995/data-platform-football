@@ -43,6 +43,19 @@ def _fail_on_partial_maintenance(
     return result
 
 
+def _check_maintenance_run(**context):
+    from airflow.exceptions import AirflowFailException
+
+    failures = [
+        ti.task_id
+        for ti in context["dag_run"].get_task_instances()
+        if ti.task_id != context["task"].task_id
+        and ti.state in {"failed", "upstream_failed"}
+    ]
+    if failures:
+        raise AirflowFailException(f"Iceberg maintenance failed: {', '.join(failures)}")
+
+
 def _maintain_whoscored(**_ctx) -> Dict[str, Any]:
     from utils.maintenance_tasks import (
         WHOSCORED_DAILY_RETENTION,
@@ -170,3 +183,17 @@ with DAG(
     cleanup_whoscored_dq_stage >> maintain_whoscored
 
     compact_bronze >> fbref_stage_janitor
+
+    check_maintenance_run = PythonOperator(
+        task_id="check_maintenance_run",
+        python_callable=_check_maintenance_run,
+        trigger_rule="all_done",
+    )
+    for task in (
+        compact_bronze,
+        fbref_stage_janitor,
+        cleanup_whoscored_dq_stage,
+        maintain_whoscored,
+        maintain_other_high_churn,
+    ):
+        task >> check_maintenance_run
