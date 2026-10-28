@@ -74,27 +74,30 @@ init, v2 для scheduler'а), блок-лист, мёртвая копия ми
 - **Дерево** — `${FOTMOB_RELEASE_ROOT}`: git-worktree, которое автомат переставляет
   `git checkout -B deploy/fotmob-b6-master <FOTMOB_TARGET>` под живыми bind-mount'ами.
   Контейнеры при доставке не пересоздаются.
-- **Пины выката** — пять строк `FOTMOB_TARGET`, `FOTMOB_ROLLBACK_REF`, `FOTMOB_ROLLBACK_SHA`,
-  `FOTMOB_NEW_CODE_FILE`, `FOTMOB_NEW_CODE_MD5` в `/etc/data-platform/fotmob.env`.
-  `FOTMOB_TARGET` и `FOTMOB_ROLLBACK_SHA` — КОРОТКИЕ SHA (7–8 hex, как печатает
-  `git rev-parse --short`): автомат сравнивает их с `--short HEAD` по префиксу, полный SHA
-  не совпал бы никогда (скрипты с ним не стартуют). «Поднять пин» = переписать строки
-  атомарно и с сохранением прав, вне окна 19:45–23:20 UTC и не в момент тика cron:
+- **Пакет выката** — отдельный неизменяемый файл, образец
+  [`release-1292.env`](../../deploy/fotmob/release-1292.env) перенесён из копий живых
+  скриптов 28.10.2026. Это пины #1292, а не разрешение доставить их повторно.
+  В пакете вместе хранятся TARGET, ROLLBACK_REF/SHA, путь и md5 целевого модуля,
+  md5 repository.py и полный список runtime SHA256 из живого B6. SHA коммитов —
+  короткие, 7–8 hex. Для следующей доставки готовят новый файл со всеми хешами цели;
+  существующие файлы не переписывают. В `/etc/data-platform/fotmob.env` атомарно
+  меняют одну строку `FOTMOB_DELIVERY_PACKAGE=/.../новый-пакет.env` с сохранением прав.
+  Автомат читает снимок пакета и передаёт B6 его абсолютный путь и SHA256: смена
+  указателя между запусками не смешивает версии; изменение содержимого даёт отказ.
+  Пакет не может менять пути хоста. Старые пины в host env больше не используются.
+  `FOTMOB_VALIDATION_ROOT` указывает на отдельную чистую копию exact TARGET:
+  тесты B6 выполняются там с отключёнными внешними pytest-плагинами и записью pyc.
+  Production-дерево как validation root запрещено.
 
-  ```bash
-  umask 077
-  sed -e 's/^FOTMOB_TARGET=.*/FOTMOB_TARGET=<sha8 цели>/' \
-      -e 's/^FOTMOB_ROLLBACK_REF=.*/FOTMOB_ROLLBACK_REF=<sha8 прежней цели>/' \
-      -e 's/^FOTMOB_ROLLBACK_SHA=.*/FOTMOB_ROLLBACK_SHA=<sha8 прежней цели>/' \
-      -e 's|^FOTMOB_NEW_CODE_FILE=.*|FOTMOB_NEW_CODE_FILE=/opt/airflow/scrapers/fotmob/<модуль>.py|' \
-      -e 's/^FOTMOB_NEW_CODE_MD5=.*/FOTMOB_NEW_CODE_MD5=<md5>/' \
-      /etc/data-platform/fotmob.env > /etc/data-platform/fotmob.env.new
-  chown root:root /etc/data-platform/fotmob.env.new && chmod 0600 /etc/data-platform/fotmob.env.new
-  mv -f /etc/data-platform/fotmob.env.new /etc/data-platform/fotmob.env
-  ```
-
-  md5 цели — `git show <TARGET>:scrapers/fotmob/<модуль>.py | md5sum`. Скрипты не правятся и
-  не расходятся с репозиторием.
+  Установка — только по команде владельца, после доставки #1289 и утра 29.10,
+  под общим замком автомата: сохранить скрипты, env и state, поставить утверждённые
+  `auto_deliver.sh`, `b6_deliver.sh`, `window_alert.sh`, `env.sh` из одного релиза
+  побайтно, пакет и env. Проверить diff=0, пины и validation SHA, затем приёмку
+  автомата. Окно остаётся 19:45–23:20 UTC, одна попытка за ночь.
+  Откат установки — сохранённый комплект и прежний указатель; при inflight сначала
+  штатно завершить восстановление. State и маркеры не удалять.
+  Миграция production-клона и правила чужих scheduler — отдельные шаги #1301,
+  эта сборка их не выполняет.
 - **Блок-лист** — `deploy/fotmob/isolated.airflowignore`. Тест
   `tests/unit/deploy/test_fotmob_contour_recipe.py` требует, чтобы в нём был КАЖДЫЙ чужой
   `dags/dag_*.py` и ни один из семи своих: новый чужой DAG на master без строки здесь — красный

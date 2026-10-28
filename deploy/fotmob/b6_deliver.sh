@@ -1,9 +1,9 @@
 #!/bin/bash
 # B6: перевод боевого дерева FotMob (FOTMOB_RELEASE_ROOT) на цель FOTMOB_TARGET.
 # База механики — ревью 24.08 (/root/FOTMOB-REVIEW-2026-08-24.md, вопрос Q1).
-# Пути машины и пины выката — из env-файла контура (deploy/fotmob/fotmob.env.example,
-# #1155 этап 3): «поднять пин» = переписать FOTMOB_TARGET/FOTMOB_ROLLBACK_*/
-# FOTMOB_NEW_CODE_* в env-файле, скрипт не правится.
+# Пути машины — из env-файла контура (deploy/fotmob/fotmob.env.example).
+# Пины и runtime fingerprints — из неизменяемого пакета; следующая доставка
+# меняет одну строку FOTMOB_DELIVERY_PACKAGE в env-файле, скрипты не правятся.
 #
 #   b6_deliver.sh check   — только проверки (окно, дерево, цель)
 #   b6_deliver.sh apply   — проверки + переключение + приёмка метабазой
@@ -13,6 +13,8 @@
 # Ветки deploy/* НЕ удалять — прод исторически стоит на их коммитах.
 set -euo pipefail
 
+PACKAGE_FILE=${FOTMOB_PINNED_PACKAGE:-}
+PACKAGE_DIGEST=${FOTMOB_PINNED_DIGEST:-}
 ENV_FILE="${FOTMOB_ENV_FILE:-/etc/data-platform/fotmob.env}"
 # Эстафета автомата (одноразовый пропуск) приходит окружением, а не env-файлом;
 # загрузчик ниже сбрасывает ВСЕ FOTMOB_*, поэтому её значения снимаются до него.
@@ -21,6 +23,7 @@ DELIVER_NONCE_FILE=${FOTMOB_DELIVER_NONCE_FILE:-}
 # shellcheck source=deploy/fotmob/env.sh
 . "$(dirname "$(readlink -f "$0")")/env.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
+fotmob_load_package "${PACKAGE_FILE:-${FOTMOB_DELIVERY_PACKAGE:?FOTMOB_DELIVERY_PACKAGE не задан}}" "$PACKAGE_DIGEST" || exit 2
 
 TARGET=${FOTMOB_TARGET:?FOTMOB_TARGET не задан в env-файле}                   # цель выката
 ROLLBACK_REF=${FOTMOB_ROLLBACK_REF:?FOTMOB_ROLLBACK_REF не задан в env-файле} # текущий боевой HEAD; голый SHA —
@@ -141,6 +144,7 @@ echo "дерево чистое на $ROLLBACK_SHA, цель $TARGET досту�
 
 if [ "$MODE" != apply ]; then say "check ПРОЙДЕН (apply не запрошен)"; exit 0; fi
 
+DELIVERY_STARTED_AT=$(date -u +%FT%TZ)
 say "3. Переключение (git checkout -B deploy/fotmob-b6-master $TARGET)"
 git checkout -B deploy/fotmob-b6-master "$TARGET"
 git log --oneline -1
@@ -166,14 +170,49 @@ cmd5=$({ docker exec "$SCHED" md5sum "$NEW_CODE_FILE" | cut -d' ' -f1; } || true
   || die "md5 $NEW_CODE_FILE в контейнере '$cmd5' не целевой. ОТКАТ: git -C $TREE checkout $ROLLBACK_REF"
 echo "md5 $NEW_CODE_FILE в контейнере целевой ($cmd5)"
 
-say "5. Быстрый сьют на боевом дереве"
-"$PYTEST" tests/unit/scrapers/test_fotmob_service.py \
-  tests/unit/scrapers/test_fotmob_planner.py tests/unit/scrapers/test_fotmob_repository.py \
-  tests/unit/scripts/test_fotmob_backfill.py tests/unit/scrapers/test_run_fotmob_scraper.py -q \
-  || die "сьют на дереве красный. ОТКАТ: git -C $TREE checkout $ROLLBACK_REF"
+# Все runtime fingerprints принадлежат тому же пакету, что TARGET и ROLLBACK.
+cmd5=$(docker exec "$SCHED" md5sum /opt/airflow/scrapers/fotmob/repository.py | cut -d' ' -f1)
+[ "$cmd5" = "$FOTMOB_REPOSITORY_MD5" ] || die "release fingerprint mismatch: repository.py md5"
+IFS='|' read -r -a fingerprints <<< "$FOTMOB_RUNTIME_HASHES"
+for fingerprint in "${fingerprints[@]}"; do
+  expected=${fingerprint%% *}
+  module=${fingerprint#* }
+  observed=$(docker exec "$SCHED" sha256sum "$module" | cut -d' ' -f1)
+  [ "$observed" = "$expected" ] || die "release fingerprint mismatch: $module"
+done
+
+parse_left=${PARSE_WAIT:-300}
+while :; do
+  parsed=$(docker exec "$METADB" psql -X -U airflow -d airflow -tA -c "SELECT count(*) FROM dag WHERE dag_id IN ('dag_ingest_fotmob','dag_orchestrate_fotmob','dag_collect_fotmob_players','dag_refresh_fotmob','dag_backfill_fotmob','dag_trigger_fotmob_daily') AND is_active AND last_parsed_time > '$DELIVERY_STARTED_AT'::timestamptz;")
+  [ "$parsed" = 6 ] && break
+  [ "$parse_left" -gt 0 ] || die "six DAGs not parsed after checkout: $parsed"
+  sleep 20
+  parse_left=$((parse_left - 20))
+done
+
+say "5. Проверки exact-target в изолированной рабочей копии"
+TEST_TREE=${FOTMOB_VALIDATION_ROOT:?FOTMOB_VALIDATION_ROOT не задан}
+test "$(realpath -e "$TEST_TREE")" != "$(realpath -e "$PROD_TREE")" || die "проверки не могут выполняться в production-дереве"
+validation_sha=$(git -C "$TEST_TREE" rev-parse HEAD)
+target_sha=$(git -C "$TREE" rev-parse "${TARGET}^{commit}")
+[ "$validation_sha" = "$target_sha" ] || die "validation tree не соответствует цели"
+[ -z "$(git -C "$TEST_TREE" status --porcelain)" ] || die "validation tree грязное"
+(
+  cd "$TEST_TREE"
+  env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 "$PYTEST" -p no:cacheprovider tests/unit/scrapers/test_fotmob_calendar_contract.py \
+    tests/unit/scrapers/test_fotmob_calendar_availability.py tests/unit/scrapers/test_fotmob_field_map.py \
+    tests/unit/scrapers/test_fotmob_writer_lock.py tests/unit/scrapers/test_fotmob_bronze_interruption.py \
+    tests/unit/scrapers/test_fotmob_trino_instrumentation.py \
+    tests/unit/scrapers/test_fotmob_row_identity.py tests/unit/scrapers/test_fotmob_transfers.py \
+    tests/unit/dags/test_fotmob_transfer_contract.py tests/unit/dags/test_fotmob_orchestration.py \
+    tests/unit/dags/test_fotmob_publication.py \
+    tests/unit/scripts/test_fotmob_acceptance.py tests/unit/scrapers/test_fotmob_service.py tests/unit/scrapers/test_fotmob_transfer_page_identity.py \
+    tests/unit/scrapers/test_fotmob_planner.py tests/unit/scrapers/test_fotmob_repository.py \
+    tests/unit/scrapers/test_fotmob_infrastructure_retry.py \
+    tests/unit/scripts/test_fotmob_backfill.py tests/unit/scrapers/test_run_fotmob_scraper.py -q
+) || die "сьют isolated exact-target красный. ОТКАТ: git -C $TREE checkout $ROLLBACK_REF"
 
 say "B6 ДОСТАВЛЕН. Дальше по порядку:"
 echo "1) наблюдать рождение волны 23:55–00:05 UTC и первые ~30 мин;"
-echo "2) при желании до 23:20 — юниты кампании: touch $CAMPAIGN/state/campaign_enabled"
-echo "   и nohup $CAMPAIGN/driver.sh (сторожа драйвера сами уступят волне);"
+echo "2) историю удержать: hold/STOP сохраняются; current-first driver и запуск требуют отдельного разрешения;"
 echo "3) утром — замер первой закрытой волны нового кода (make: закрыла ли план до дедлайна, матчи/сутки)."

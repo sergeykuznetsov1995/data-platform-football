@@ -47,7 +47,22 @@ REQUIRED = {
 }
 
 
+RUNTIME_MODULES = (DEPLOY / "release-1292.env").read_text().split("FOTMOB_RUNTIME_HASHES=")[1].strip().split("|")
+
+
+PACKAGE_KEYS = {
+    "FOTMOB_TARGET", "FOTMOB_ROLLBACK_REF", "FOTMOB_ROLLBACK_SHA",
+    "FOTMOB_NEW_CODE_FILE", "FOTMOB_NEW_CODE_MD5", "FOTMOB_REPOSITORY_MD5",
+    "FOTMOB_RUNTIME_HASHES",
+}
+
+
 def _write_env(path: Path, **values: str) -> Path:
+    if "FOTMOB_RELEASE_ROOT" in values:
+        pins = {key: values.pop(key) for key in PACKAGE_KEYS if key in values}
+        package = path.with_suffix(".release")
+        _write_env(package, **pins)
+        values["FOTMOB_DELIVERY_PACKAGE"] = str(package)
     path.write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
     return path
 
@@ -75,6 +90,9 @@ def _layout(tmp_path: Path) -> dict[str, str]:
         "FOTMOB_SCHEDULER_CONTAINER": "stub-scheduler",
         "FOTMOB_TG_ENV": str(tmp_path / "telegram.env"),
         "FOTMOB_HOST_PYTEST": "/bin/true",
+        "FOTMOB_VALIDATION_ROOT": str(tmp_path / "validation"),
+        "FOTMOB_REPOSITORY_MD5": "0" * 32,
+        "FOTMOB_RUNTIME_HASHES": "|".join("a" * 64 + " " + item.split(" ", 1)[1] for item in RUNTIME_MODULES),
         # Короткие SHA, как `git rev-parse --short`: автомат сравнивает пины с ним по префиксу.
         "FOTMOB_TARGET": "11111111",
         "FOTMOB_ROLLBACK_REF": "22222222",
@@ -304,6 +322,10 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
         FOTMOB_TARGET=two_short, FOTMOB_ROLLBACK_REF=one_short, FOTMOB_ROLLBACK_SHA=one_short,
         FOTMOB_NEW_CODE_MD5=md5,
     )
+    validation = Path(values["FOTMOB_VALIDATION_ROOT"])
+    _git(tmp_path, "clone", "-q", str(repo), str(validation))
+    _git(validation, "checkout", "-q", "--detach", two)
+    values["FOTMOB_REPOSITORY_MD5"] = md5
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
     stubs.mkdir()
@@ -324,6 +346,8 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
         'case "$*" in\n'
         '  *pgrep*) exit 1 ;;\n'                    # юнит кампании в контейнере не жив
         f'  *md5sum*) echo "{md5}  file" ;;\n'      # целевой модуль виден из контейнера
+        '  *sha256sum*) echo "' + 'a' * 64 + '  file" ;;\n'
+        '  *"last_parsed_time >"*) echo 6 ;;\n'
         '  *"FROM dag WHERE"*) echo 1 ;;\n'         # fotmob-даг перечитан планировщиком
         '  *"count(*)"*) echo 0 ;;\n'               # ни активных ранов, ни ошибок импорта
         '  *) echo "dag_x | f" ;;\n'
@@ -900,3 +924,91 @@ def test_phase2_does_not_close_an_unconfirmed_rollback(tmp_path: Path) -> None:
         "незавершённый откат обязан пережить тик"
     assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
     assert "откат НЕ подтверждён" in w["sent"].read_text(encoding="utf-8")
+
+
+def _pin_probe(script: Path, tmp_path: Path) -> Path:
+    """Только настоящий startup скрипта: ни git, ни docker, ни писателей."""
+    text = script.read_text(encoding="utf-8")
+    boundary = "\nLOCK=" if script == AUTO else "\n# Ручной запуск"
+    probe = tmp_path / script.name
+    probe.write_text(
+        text.split(boundary, 1)[0]
+        + '\nprintf "%s\\n" "$TARGET" "$ROLLBACK_REF" "$ROLLBACK_SHA" '
+        '"$NEW_CODE_FILE" "$NEW_CODE_MD5" "$FOTMOB_REPOSITORY_MD5" '
+        '"$FOTMOB_RUNTIME_HASHES" "$PACKAGE_FILE" "$PACKAGE_DIGEST"\n',
+        encoding="utf-8",
+    )
+    shutil.copy(ENV_SH, tmp_path / "env.sh")
+    return probe
+
+
+@pytest.mark.unit
+def test_one_package_pointer_switches_both_scripts_and_pins_the_handoff(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    auto = _pin_probe(AUTO, tmp_path)
+    b6 = _pin_probe(B6, tmp_path)
+    first = _run(auto, env_file=env_file)
+    assert first.returncode == 0, first.stderr
+    old = first.stdout.splitlines()
+    assert _run(b6, env_file=env_file).stdout == first.stdout
+
+    # Новый неизменяемый пакет, одна строка указателя; изменяется весь набор пинов.
+    second_values = {
+        "FOTMOB_TARGET": "33333333", "FOTMOB_ROLLBACK_REF": "11111111",
+        "FOTMOB_ROLLBACK_SHA": "11111111",
+        "FOTMOB_NEW_CODE_FILE": "/opt/airflow/scrapers/fotmob/repository.py",
+        "FOTMOB_NEW_CODE_MD5": "b" * 32, "FOTMOB_REPOSITORY_MD5": "c" * 32,
+        "FOTMOB_RUNTIME_HASHES": "|".join("d" * 64 + " " + item.split(" ", 1)[1] for item in RUNTIME_MODULES),
+    }
+    package = _write_env(tmp_path / "next.release", **second_values)
+    text = env_file.read_text(encoding="utf-8")
+    env_file.write_text(text.replace(old[-2], str(package)), encoding="utf-8")
+    for probe in (auto, b6):
+        result = _run(probe, env_file=env_file)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines()[:7] == list(second_values.values())
+
+    # Автомат уже прочёл старый пакет: B6 игнорирует новый указатель в env.
+    handoff = {"FOTMOB_PINNED_PACKAGE": old[-2], "FOTMOB_PINNED_DIGEST": old[-1]}
+    result = _run(b6, env_file=env_file, extra_env=handoff)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == first.stdout
+    Path(old[-2]).write_text(package.read_text(encoding="utf-8"), encoding="utf-8")
+    result = _run(b6, env_file=env_file, extra_env=handoff)
+    assert result.returncode == 2
+    assert "пакет доставки изменён" in result.stderr
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", sorted(PACKAGE_KEYS))
+def test_incomplete_package_refuses_both_scripts_before_any_action(tmp_path: Path, key: str) -> None:
+    values = _layout(tmp_path)
+    del values[key]
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    for script in (AUTO, B6):
+        proc = _run(script, env_file=env_file, extra_env={key: "stale"})
+        assert proc.returncode == 2
+        assert key in proc.stderr
+    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["missing-module", "duplicate", "bad-sha", "host-key"])
+def test_package_cannot_weaken_fingerprints_or_change_host_paths(tmp_path: Path, bad: str) -> None:
+    values = _layout(tmp_path)
+    entries = values["FOTMOB_RUNTIME_HASHES"].split("|")
+    if bad == "missing-module":
+        values["FOTMOB_RUNTIME_HASHES"] = "|".join(entries[1:])
+    elif bad == "duplicate":
+        values["FOTMOB_RUNTIME_HASHES"] += "|" + entries[0]
+    elif bad == "bad-sha":
+        values["FOTMOB_RUNTIME_HASHES"] = values["FOTMOB_RUNTIME_HASHES"].replace("a" * 64, "short")
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    if bad == "host-key":
+        with env_file.with_suffix(".release").open("a", encoding="utf-8") as package:
+            package.write("FOTMOB_RELEASE_ROOT=/other/tree\n")
+    for script in (AUTO, B6):
+        result = _run(script, env_file=env_file)
+        assert result.returncode == 2, result.stderr
+    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir())

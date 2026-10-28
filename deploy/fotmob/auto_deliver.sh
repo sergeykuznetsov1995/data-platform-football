@@ -6,9 +6,9 @@
 # оба последних вечера — не работало нажатие кнопки.
 #
 # Cron: */5 * * * * <каталог установки>/auto_deliver.sh  (окно и одноразовость — внутри)
-# Пути машины и пины выката — из env-файла контура (deploy/fotmob/fotmob.env.example,
-# #1155 этап 3): «поднять пин» = переписать FOTMOB_TARGET/FOTMOB_ROLLBACK_*/
-# FOTMOB_NEW_CODE_* в env-файле атомарно (write + mv), скрипт не правится.
+# Пути машины — из env-файла контура (deploy/fotmob/fotmob.env.example).
+# Пины и runtime fingerprints — из неизменяемого пакета; следующая доставка
+# меняет одну строку FOTMOB_DELIVERY_PACKAGE в env-файле, скрипты не правятся.
 #
 # Обёртка НЕ дублирует логику доставки: всю работу делает отрепетированный
 # b6_deliver.sh apply из того же каталога (проверки окна/дерева, checkout, приёмка
@@ -55,6 +55,8 @@ ENV_FILE="${FOTMOB_ENV_FILE:-/etc/data-platform/fotmob.env}"
 # shellcheck source=deploy/fotmob/env.sh
 . "$HERE/env.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
+fotmob_load_package "${FOTMOB_DELIVERY_PACKAGE:?FOTMOB_DELIVERY_PACKAGE не задан}" || exit 2
+export FOTMOB_PINNED_PACKAGE="$PACKAGE_FILE" FOTMOB_PINNED_DIGEST="$PACKAGE_DIGEST"
 export FOTMOB_ENV_FILE="$ENV_FILE"   # тот же файл читает b6_deliver.sh, которого мы зовём
 
 PROD_TREE=${FOTMOB_RELEASE_ROOT:?FOTMOB_RELEASE_ROOT не задан в env-файле}
@@ -95,6 +97,7 @@ ACCEPTED=$STATE/fotmob-b6-accepted             # SHA кода, приёмку к
 STARTFAILS=$STATE/fotmob-campaign-start-fails  # подряд неудачных запусков драйвера
 START_FAILS_MAX=${START_FAILS_MAX:-3}          # после стольких попыток автомат глушится
 ATTEMPTED=$STATE/fotmob-auto-deliver-attempted-$(date -u +%F)
+CAMPAIGN_HOLD=$STATE/fotmob-campaign.hold
 OFF=$STATE/fotmob-auto-deliver.off            # выключатель: ставит человек или сам автомат
 DELIVER_TIMEOUT=${DELIVER_TIMEOUT:-900}       # 90 с ожидания приёмки + сьют укладываются с запасом
 TG_ENV=${TG_ENV:-${FOTMOB_TG_ENV:?FOTMOB_TG_ENV не задан в env-файле}}   # файл с токеном/чатом Telegram
@@ -290,6 +293,50 @@ lock_alert(){
   if tg "🆘 FotMob: автомат не может взять свой замок ($1) — доставки НЕ БУДЕТ. НУЖНЫ РУКИ. Лог: $LOG"; then
     mark_said "$mark"
   fi
+}
+# Checkout может отвязать вложенный file bind-mount ignore (#1576).
+warn_airflowignore_change(){
+  local stat rc
+  stat=$(git -C "$TREE" diff --exit-code --stat "HEAD..$TARGET" -- dags/.airflowignore 2>/dev/null)
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      log "AIRFLOWIGNORE: пин меняет dags/.airflowignore: $stat"
+      log "AIRFLOWIGNORE: после доставки нужен рестарт scheduler в паузе между волнами"
+      tg_durable "⚠️ FotMob: пин $TARGET меняет dags/.airflowignore; после доставки нужен рестарт scheduler в паузе между волнами. Лог: $LOG"
+      ;;
+    *) log "AIRFLOWIGNORE: изменение dags/.airflowignore не проверено (git diff rc=$rc, пин $TARGET); сверю mount после apply" ;;
+  esac
+}
+check_airflowignore(){
+  local source host_sum container_sum note="" limit="${METADB_TIMEOUT:-30}"
+  # Только единственный bind с точным Destination; ignore дерева НЕ эталон.
+  if ! source=$(timeout -k 5 "$limit" docker inspect --format \
+    '{{range .Mounts}}{{if and (eq .Type "bind") (eq .Destination "/opt/airflow/dags/.airflowignore")}}{{println .Source}}{{end}}{{end}}' \
+    "$CAMPAIGN_CONTAINER" 2>/dev/null); then
+    note="не проверено: docker inspect не ответил или завершился ошибкой"
+  elif [[ "$source" != /* || "$source" == *$'\n'* ]] || [ ! -f "$source" ]; then
+    note="не проверено: нет единственного читаемого bind Source для /opt/airflow/dags/.airflowignore"
+  elif ! host_sum=$(timeout -k 5 "$limit" sha256sum -- "$source" 2>/dev/null); then
+    note="не проверено: не прочитан хостовый эталон"
+  elif ! container_sum=$(timeout -k 5 "$limit" docker exec "$CAMPAIGN_CONTAINER" \
+    sha256sum /opt/airflow/dags/.airflowignore 2>/dev/null); then
+    note="не проверено: контейнерный ignore не прочитан (ошибка или таймаут)"
+  else
+    host_sum=${host_sum%% *}
+    container_sum=${container_sum%% *}
+    if [[ ! "$host_sum" =~ ^[[:xdigit:]]{64}$ || ! "$container_sum" =~ ^[[:xdigit:]]{64}$ ]]; then
+      note="не проверено: некорректный ответ SHA256"
+    elif [ "$host_sum" != "$container_sum" ]; then
+      note="РАСХОЖДЕНИЕ: контейнерный /opt/airflow/dags/.airflowignore отличается от bind Source $source; нужен рестарт scheduler в паузе между волнами"
+    else
+      log "AIRFLOWIGNORE: SHA256 контейнера и bind Source совпадают"
+      return 0
+    fi
+  fi
+  log "AIRFLOWIGNORE: $note"
+  tg_durable "⚠️ FotMob AIRFLOWIGNORE: $note. Лог: $LOG"
 }
 head_of(){ git -C "$TREE" rev-parse --short HEAD 2>/dev/null || echo "?"; }
 # Дерево стоит на принятом коде? Это единственное состояние, при котором автомат
@@ -1119,11 +1166,11 @@ if [ "$delivered" = 1 ] && is_plain "$CAMPAIGN_STARTED"; then
       fi
       log "кампания: драйвер в состоянии DISABLED — работы нет"
     fi
-    if [ -n "$(find "$hb" -mmin +25 2>/dev/null)" ] || [ ! -f "$hb" ]; then
+    if [ -n "$(find "$hb" -mmin +45 2>/dev/null)" ] || [ ! -f "$hb" ]; then
       if ! said_today "$STATE/fotmob-campaign-stale-$(date -u +%F)"; then
-        tg_durable "⚠️ FotMob: драйвер кампании жив, но пульс не обновлялся больше 25 минут (метабаза недоступна?). Смотреть $CAMPAIGN/state/driver.log"
+        tg_durable "⚠️ FotMob: драйвер кампании жив, но пульс не обновлялся больше 45 минут (метабаза недоступна?). Смотреть $CAMPAIGN/state/driver.log"
         mark_said "$STATE/fotmob-campaign-stale-$(date -u +%F)"
-        log "кампания: пульс просрочен (heartbeat старше 25 мин)"
+        log "кампания: пульс просрочен (heartbeat старше 45 мин)"
       fi
     fi
     exit 0
@@ -1226,10 +1273,12 @@ if [ "$delivered" = 0 ]; then
     set_off
     exit 1
   fi
+  warn_airflowignore_change
   TREE="$TREE" FOTMOB_DELIVERY_LOCK=held FOTMOB_DELIVER_NONCE="$nonce" \
     FOTMOB_DELIVER_NONCE_FILE="$NONCE_FILE" \
     timeout -k 30 "$DELIVER_TIMEOUT" "$DELIVER" apply >> "$LOG" 2>&1
   rc=$?
+  check_airflowignore
   rm -f "$NONCE_FILE"
   [ "$rc" = 124 ] && log "ТАЙМАУТ доставки (${DELIVER_TIMEOUT}s)"
   head_after=$(head_of)
@@ -1366,6 +1415,14 @@ if [ "$delivered" = 0 ]; then
 fi
 
 # ---- 4. Кампания истории (только после успешной доставки) --------------------
+# Отдельный запрет владельца на новые волны не должен блокировать доставку
+# исправлений и её приёмку/откат. Любой объект, включая битую ссылку, закрывает
+# допуск; его не читаем, не удаляем и не снимаем вместе с campaign/state/STOP.
+# Уже работающую кампанию этот маркер не останавливает.
+if [ -e "$CAMPAIGN_HOLD" ] || [ -L "$CAMPAIGN_HOLD" ]; then
+  log "кампания истории удержана: $CAMPAIGN_HOLD — новый драйвер не запускаю"
+  exit 0
+fi
 # До B6 в бою нет ни writer-lock (B7), ни ретрая коммита (#1199) — запускать
 # драйвер было нельзя. После доставки оба на месте.
 if pgrep -f "$CAMPAIGN/driver.sh" >/dev/null 2>&1; then
