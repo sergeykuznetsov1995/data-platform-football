@@ -195,6 +195,7 @@ with DAG(
         task_id="enrich_matches",
         bash_command=("cd /opt/airflow && exec /opt/legacy-scraper-venv/bin/python "
                       "dags/scripts/run_understat_scraper.py --enrich-matches"),
+        env={"PYTHONPATH": "/opt/airflow:/opt/airflow/dags"},
         append_env=True,
         cwd="/opt/airflow",
         trigger_rule="all_done",
