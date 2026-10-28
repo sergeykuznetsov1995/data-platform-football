@@ -184,9 +184,10 @@ def probe_refresh():
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT count(*) FROM dag_run WHERE dag_id = %s "
+                "SELECT count(*) FROM task_instance WHERE dag_id = %s "
+                "AND task_id = %s "
                 "AND state IN ('running', 'queued')",
-                ("dag_refresh_sofascore_all_mens",),
+                ("dag_refresh_sofascore_all_mens", "refresh_season_schedules"),
             )
             return bool(cursor.fetchone()[0])
     finally:

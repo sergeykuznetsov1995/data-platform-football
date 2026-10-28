@@ -147,6 +147,56 @@ def test_refresh_starts_while_waiting():
     assert queries.optimized == []
 
 
+@pytest.mark.parametrize("schedule_state", ["success", "running", "queued"])
+def test_refresh_probe_only_blocks_active_schedule_task(monkeypatch, schedule_state):
+    import sqlite3
+
+    import psycopg2
+    from scrapers.sofascore import writer_lock
+
+    database = sqlite3.connect(":memory:")
+    dag_id = "dag_refresh_sofascore_all_mens"
+    database.execute("CREATE TABLE dag_run (dag_id TEXT, state TEXT)")
+    database.execute("INSERT INTO dag_run VALUES (?, 'running')", (dag_id,))
+    database.execute(
+        "CREATE TABLE task_instance (dag_id TEXT, task_id TEXT, state TEXT)"
+    )
+    database.executemany("INSERT INTO task_instance VALUES (?, ?, ?)", [
+        (dag_id, "refresh_season_schedules", schedule_state),
+        (dag_id, "run_refresh_scope", "running"),
+        (dag_id, "refill_refresh_window", "running"),
+        (dag_id, "enrich_season_metadata", "running"),
+        ("other_dag", "refresh_season_schedules", "running"),
+    ])
+    closed = []
+
+    class Cursor:
+        def execute(self, sql, parameters):
+            self.result = database.execute(sql.replace("%s", "?"), parameters)
+
+        def fetchone(self):
+            return self.result.fetchone()
+
+    @contextmanager
+    def cursor():
+        yield Cursor()
+
+    monkeypatch.setattr(writer_lock, "_writer_lock_dsn", lambda env: "offline")
+    monkeypatch.setattr(psycopg2, "connect", lambda *args, **kwargs:
+                        SimpleNamespace(cursor=cursor, close=lambda: closed.append(True)))
+    queries = Queries()
+    try:
+        result = m.run(query_factory=lambda: queries, writer_lock=queries.lock,
+                       refresh_probe=m.probe_refresh, now=lambda: NOW)
+        assert result["stopped"] == (
+            "complete" if schedule_state == "success" else "refresh_running"
+        )
+        assert len(queries.optimized) == (1 if schedule_state == "success" else 0)
+        assert closed
+    finally:
+        database.close()
+
+
 def test_outside_window_does_not_connect():
     result = m.run(now=lambda: NOW + timedelta(hours=1),
                    query_factory=lambda: pytest.fail("must not connect"))
