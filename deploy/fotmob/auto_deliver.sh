@@ -6,9 +6,9 @@
 # оба последних вечера — не работало нажатие кнопки.
 #
 # Cron: */5 * * * * <каталог установки>/auto_deliver.sh  (окно и одноразовость — внутри)
-# Пути машины и пины выката — из env-файла контура (deploy/fotmob/fotmob.env.example,
-# #1155 этап 3): «поднять пин» = переписать FOTMOB_TARGET/FOTMOB_ROLLBACK_*/
-# FOTMOB_NEW_CODE_* в env-файле атомарно (write + mv), скрипт не правится.
+# Пути машины — из env-файла контура (deploy/fotmob/fotmob.env.example).
+# Пины и runtime fingerprints — из неизменяемого пакета; следующая доставка
+# меняет одну строку FOTMOB_DELIVERY_PACKAGE в env-файле, скрипты не правятся.
 #
 # Обёртка НЕ дублирует логику доставки: всю работу делает отрепетированный
 # b6_deliver.sh apply из того же каталога (проверки окна/дерева, checkout, приёмка
@@ -55,12 +55,32 @@ ENV_FILE="${FOTMOB_ENV_FILE:-/etc/data-platform/fotmob.env}"
 # shellcheck source=deploy/fotmob/env.sh
 . "$HERE/env.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
+# При оборванной доставке используем её сохранённые пины, даже если указатель
+# следующего пакета уже изменён. Без снимка неверный пакет требует рук и алерта.
+PACKAGE_FAILED=0
+PACKAGE_RECOVERED=0
+RECOVERY_PACKAGE=${FOTMOB_STATE_DIR:?FOTMOB_STATE_DIR не задан}/fotmob-recovery.env
+if [ ! -L "$FOTMOB_STATE_DIR" ] && [ -d "$FOTMOB_STATE_DIR" ] \
+   && [ -f "$FOTMOB_STATE_DIR/fotmob-b6-inflight" ] && [ ! -L "$FOTMOB_STATE_DIR/fotmob-b6-inflight" ] \
+   && [ -f "$RECOVERY_PACKAGE" ] && [ ! -L "$RECOVERY_PACKAGE" ]; then
+  fotmob_load_package "$RECOVERY_PACKAGE" || PACKAGE_FAILED=1
+else
+  fotmob_load_package "${FOTMOB_DELIVERY_PACKAGE:-}" || PACKAGE_FAILED=1
+fi
+if [ "$PACKAGE_FAILED" = 1 ] && [ ! -L "$FOTMOB_STATE_DIR" ] && [ -d "$FOTMOB_STATE_DIR" ] \
+   && [ -f "$RECOVERY_PACKAGE" ] && [ ! -L "$RECOVERY_PACKAGE" ]; then
+  fotmob_load_package "$RECOVERY_PACKAGE" && PACKAGE_RECOVERED=1
+fi
+if [ "$PACKAGE_FAILED" = 0 ] || [ "$PACKAGE_RECOVERED" = 1 ]; then
+  export FOTMOB_PINNED_PACKAGE="$PACKAGE_FILE" FOTMOB_PINNED_DIGEST="$PACKAGE_DIGEST"
+fi
 export FOTMOB_ENV_FILE="$ENV_FILE"   # тот же файл читает b6_deliver.sh, которого мы зовём
 
 PROD_TREE=${FOTMOB_RELEASE_ROOT:?FOTMOB_RELEASE_ROOT не задан в env-файле}
 TREE=$(realpath -m "${TREE:-$PROD_TREE}")
 IS_PROD=$([ "$TREE" = "$(realpath -m "$PROD_TREE")" ] && echo 1 || echo 0)
 
+if [ "$PACKAGE_FAILED" = 0 ] || [ "$PACKAGE_RECOVERED" = 1 ]; then
 TARGET=${FOTMOB_TARGET:?FOTMOB_TARGET не задан в env-файле}                   # цель выката
 ROLLBACK_REF=${FOTMOB_ROLLBACK_REF:?FOTMOB_ROLLBACK_REF не задан в env-файле} # прежний боевой HEAD; голый SHA:
 ROLLBACK_SHA=${FOTMOB_ROLLBACK_SHA:?FOTMOB_ROLLBACK_SHA не задан в env-файле} # ветка deploy/fotmob-b6-master при apply переезжает на цель
@@ -83,6 +103,7 @@ done
 # репетиции (обе ветки: доказательство есть / его нет).
 NEW_CODE_FILE=${NEW_CODE_FILE:-${FOTMOB_NEW_CODE_FILE:?FOTMOB_NEW_CODE_FILE не задан в env-файле}}
 NEW_CODE_MD5=${NEW_CODE_MD5:-${FOTMOB_NEW_CODE_MD5:?FOTMOB_NEW_CODE_MD5 не задан в env-файле}}
+fi
 DELIVER=${DELIVER:-$HERE/b6_deliver.sh}
 CAMPAIGN=${CAMPAIGN:-${FOTMOB_CAMPAIGN_DIR:?FOTMOB_CAMPAIGN_DIR не задан в env-файле}}
 LOG=${LOG:-${FOTMOB_LOG:?FOTMOB_LOG не задан в env-файле}}
@@ -95,8 +116,12 @@ ACCEPTED=$STATE/fotmob-b6-accepted             # SHA кода, приёмку к
 STARTFAILS=$STATE/fotmob-campaign-start-fails  # подряд неудачных запусков драйвера
 START_FAILS_MAX=${START_FAILS_MAX:-3}          # после стольких попыток автомат глушится
 ATTEMPTED=$STATE/fotmob-auto-deliver-attempted-$(date -u +%F)
+CAMPAIGN_HOLD=$STATE/fotmob-campaign.hold
 OFF=$STATE/fotmob-auto-deliver.off            # выключатель: ставит человек или сам автомат
-DELIVER_TIMEOUT=${DELIVER_TIMEOUT:-900}       # 90 с ожидания приёмки + сьют укладываются с запасом
+# Бюджет B6: 90 с settle + 300 с parse + 52 exec × 10 с + 900 с
+# на 19 файлов pytest + 590 с запаса = 2400 с. Exec/сьют могут зависнуть:
+# это бюджет ожидания, внешний timeout остаётся обязательным.
+DELIVER_TIMEOUT=${DELIVER_TIMEOUT:-2400}
 TG_ENV=${TG_ENV:-${FOTMOB_TG_ENV:?FOTMOB_TG_ENV не задан в env-файле}}   # файл с токеном/чатом Telegram
 METADB=${METADB:-${FOTMOB_METADB_CONTAINER:?FOTMOB_METADB_CONTAINER не задан в env-файле}}
 CAMPAIGN_CONTAINER=${CAMPAIGN_CONTAINER:-${FOTMOB_SCHEDULER_CONTAINER:?FOTMOB_SCHEDULER_CONTAINER не задан в env-файле}}
@@ -290,6 +315,50 @@ lock_alert(){
   if tg "🆘 FotMob: автомат не может взять свой замок ($1) — доставки НЕ БУДЕТ. НУЖНЫ РУКИ. Лог: $LOG"; then
     mark_said "$mark"
   fi
+}
+# Checkout может отвязать вложенный file bind-mount ignore (#1576).
+warn_airflowignore_change(){
+  local stat rc
+  stat=$(git -C "$TREE" diff --exit-code --stat "HEAD..$TARGET" -- dags/.airflowignore 2>/dev/null)
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      log "AIRFLOWIGNORE: пин меняет dags/.airflowignore: $stat"
+      log "AIRFLOWIGNORE: после доставки нужен рестарт scheduler в паузе между волнами"
+      tg_durable "⚠️ FotMob: пин $TARGET меняет dags/.airflowignore; после доставки нужен рестарт scheduler в паузе между волнами. Лог: $LOG"
+      ;;
+    *) log "AIRFLOWIGNORE: изменение dags/.airflowignore не проверено (git diff rc=$rc, пин $TARGET); сверю mount после apply" ;;
+  esac
+}
+check_airflowignore(){
+  local source host_sum container_sum note="" limit="${METADB_TIMEOUT:-30}"
+  # Только единственный bind с точным Destination; ignore дерева НЕ эталон.
+  if ! source=$(timeout -k 5 "$limit" docker inspect --format \
+    '{{range .Mounts}}{{if and (eq .Type "bind") (eq .Destination "/opt/airflow/dags/.airflowignore")}}{{println .Source}}{{end}}{{end}}' \
+    "$CAMPAIGN_CONTAINER" 2>/dev/null); then
+    note="не проверено: docker inspect не ответил или завершился ошибкой"
+  elif [[ "$source" != /* || "$source" == *$'\n'* ]] || [ ! -f "$source" ]; then
+    note="не проверено: нет единственного читаемого bind Source для /opt/airflow/dags/.airflowignore"
+  elif ! host_sum=$(timeout -k 5 "$limit" sha256sum -- "$source" 2>/dev/null); then
+    note="не проверено: не прочитан хостовый эталон"
+  elif ! container_sum=$(timeout -k 5 "$limit" docker exec "$CAMPAIGN_CONTAINER" \
+    sha256sum /opt/airflow/dags/.airflowignore 2>/dev/null); then
+    note="не проверено: контейнерный ignore не прочитан (ошибка или таймаут)"
+  else
+    host_sum=${host_sum%% *}
+    container_sum=${container_sum%% *}
+    if [[ ! "$host_sum" =~ ^[[:xdigit:]]{64}$ || ! "$container_sum" =~ ^[[:xdigit:]]{64}$ ]]; then
+      note="не проверено: некорректный ответ SHA256"
+    elif [ "$host_sum" != "$container_sum" ]; then
+      note="РАСХОЖДЕНИЕ: контейнерный /opt/airflow/dags/.airflowignore отличается от bind Source $source; нужен рестарт scheduler в паузе между волнами"
+    else
+      log "AIRFLOWIGNORE: SHA256 контейнера и bind Source совпадают"
+      return 0
+    fi
+  fi
+  log "AIRFLOWIGNORE: $note"
+  tg_durable "⚠️ FotMob AIRFLOWIGNORE: $note. Лог: $LOG"
 }
 head_of(){ git -C "$TREE" rev-parse --short HEAD 2>/dev/null || echo "?"; }
 # Дерево стоит на принятом коде? Это единственное состояние, при котором автомат
@@ -595,6 +664,11 @@ fi
 # ДО выключателя: заглушенный автомат тем более обязан договорить то, что не смог
 # сказать раньше.
 flush_pending
+if [ "$PACKAGE_FAILED" = 1 ]; then
+  log "ПАКЕТ ДОСТАВКИ НЕДОСТУПЕН/НЕВЕРЕН; recovery=$PACKAGE_RECOVERED"
+  tg_durable "🆘 FotMob: пакет доставки недоступен или неверен. Восстановление по сохранённым пинам: $PACKAGE_RECOVERED. Новую доставку не начинаю. НУЖНЫ РУКИ. Лог: $LOG"
+  [ "$PACKAGE_RECOVERED" = 1 ] || exit 2
+fi
 
 # ---- 0. Выключатель --------------------------------------------------------
 # Автомат сам ставит его, когда откат не подтверждён, а человек — когда откатил
@@ -1076,6 +1150,8 @@ fi
 # «жив ли процесс», и автомат доходил до конца и выходил нулём — без алерта и без
 # выключателя (ревью Sol, раунд 21). Кампания при этом остаётся неподнятой и
 # неоплаканной, а следующий тик повторит то же самое.
+[ "$PACKAGE_FAILED" = 0 ] || exit 2
+
 if [ "$delivered" = 1 ] && odd_path "$CAMPAIGN_STARTED"; then
   stop_campaign
   log "НА МЕСТЕ МАРКЕРА НАБЛЮДЕНИЯ ($CAMPAIGN_STARTED) НЕ ОБЫЧНЫЙ ФАЙЛ — наблюдение за кампанией не работает, глушу автомат"
@@ -1119,11 +1195,11 @@ if [ "$delivered" = 1 ] && is_plain "$CAMPAIGN_STARTED"; then
       fi
       log "кампания: драйвер в состоянии DISABLED — работы нет"
     fi
-    if [ -n "$(find "$hb" -mmin +25 2>/dev/null)" ] || [ ! -f "$hb" ]; then
+    if [ -n "$(find "$hb" -mmin +45 2>/dev/null)" ] || [ ! -f "$hb" ]; then
       if ! said_today "$STATE/fotmob-campaign-stale-$(date -u +%F)"; then
-        tg_durable "⚠️ FotMob: драйвер кампании жив, но пульс не обновлялся больше 25 минут (метабаза недоступна?). Смотреть $CAMPAIGN/state/driver.log"
+        tg_durable "⚠️ FotMob: драйвер кампании жив, но пульс не обновлялся больше 45 минут (метабаза недоступна?). Смотреть $CAMPAIGN/state/driver.log"
         mark_said "$STATE/fotmob-campaign-stale-$(date -u +%F)"
-        log "кампания: пульс просрочен (heartbeat старше 25 мин)"
+        log "кампания: пульс просрочен (heartbeat старше 45 мин)"
       fi
     fi
     exit 0
@@ -1201,6 +1277,22 @@ if [ "$delivered" = 0 ]; then
   # вовремя, а исход доставки в любом случае придёт отдельным durable-алертом.
   tg "🚚 FotMob: окно открыто, начинаю доставку B6 (автомат)"
 
+  # Сохраняем проверенный пакет ДО INFLIGHT/checkout: восстановление не зависит
+  # от сохранности исходного файла и указателя следующего релиза.
+  snapshot=$(cat -- "$PACKAGE_FILE" && printf '.')
+  snapshot=${snapshot%.}
+  digest=$(printf '%s' "$snapshot" | sha256sum); digest=${digest%% *}
+  recovery_tmp=$(mktemp "$STATE/.fotmob-recovery.XXXXXX") || recovery_tmp=""
+  if [ "$digest" != "$PACKAGE_DIGEST" ] || [ -z "$recovery_tmp" ] \
+     || odd_path "$RECOVERY_PACKAGE" \
+     || ! printf '%s' "$snapshot" > "$recovery_tmp" \
+     || ! mv -T -- "$recovery_tmp" "$RECOVERY_PACKAGE"; then
+    [ -z "$recovery_tmp" ] || rm -f -- "$recovery_tmp"
+    tg_durable "🆘 FotMob: пакет изменён или recovery-пакет не записан; доставка отменена"
+    exit 1
+  fi
+  export FOTMOB_PINNED_PACKAGE="$RECOVERY_PACKAGE"
+
   # Без маркера намерения доставку начинать нельзя: смерть между checkout и
   # приёмкой стала бы неотличима от успеха.
   if ! mk_marker "$INFLIGHT"; then
@@ -1226,10 +1318,29 @@ if [ "$delivered" = 0 ]; then
     set_off
     exit 1
   fi
+  warn_airflowignore_change
+  # С 00:00 orchestrator снова допускает волны. Поздняя попытка должна оставить
+  # 30 минут на kill-after (30 с), приёмку (480 с + запросы), остановку кампании,
+  # ожидание писателей (120 с), checkout и подтверждение отката (90 с + повторы).
+  # Считаем непосредственно перед B6: предполётные проверки тоже занимают время.
+  if [ "$IS_PROD" = 1 ]; then
+    hms=$(date -u +%H%M%S)
+    safe_left=$((86400 - 10#${hms:0:2} * 3600 - 10#${hms:2:2} * 60 - 10#${hms:4:2} - 1800))
+    if [ "$safe_left" -le 0 ]; then
+      # B6 не стартовал: маркеры незапущенной доставки снимаем, иначе следующий
+      # тик примет их за прерванную доставку и заглушит автомат. Защёлка суток остаётся.
+      rm -f "$NONCE_FILE" "$INFLIGHT"
+      log "НЕТ ВРЕМЕНИ на безопасную доставку и откат до 00:00 UTC — B6 не запускаю"
+      tg_durable "⚠️ FotMob: предполётные проверки затянулись — до 00:00 UTC не остаётся времени на доставку и откат, B6 не запускал. Дерево на $head_now; следующая попытка завтра."
+      exit 1
+    fi
+    [ "$DELIVER_TIMEOUT" -le "$safe_left" ] || DELIVER_TIMEOUT=$safe_left
+  fi
   TREE="$TREE" FOTMOB_DELIVERY_LOCK=held FOTMOB_DELIVER_NONCE="$nonce" \
     FOTMOB_DELIVER_NONCE_FILE="$NONCE_FILE" \
     timeout -k 30 "$DELIVER_TIMEOUT" "$DELIVER" apply >> "$LOG" 2>&1
   rc=$?
+  check_airflowignore
   rm -f "$NONCE_FILE"
   [ "$rc" = 124 ] && log "ТАЙМАУТ доставки (${DELIVER_TIMEOUT}s)"
   head_after=$(head_of)
@@ -1248,13 +1359,16 @@ if [ "$delivered" = 0 ]; then
       # попытки 25.08, откатившейся при исправной доставке).
       seen=0
       accept_left=${ACCEPT_WAIT:-480}
+      # Запросы тоже расходуют бюджет: вычитание только sleep позволяло
+      # медленной метабазе растянуть позднюю приёмку за полночь.
+      accept_deadline=$(($(date -u +%s) + accept_left))
       while :; do
         seen=$(acceptance_seen 15)
         [ "$seen" = 1 ] && break
+        accept_left=$((accept_deadline - $(date -u +%s)))
         [ "$accept_left" -le 0 ] && break
         log "приёмки пока нет (ответ '$seen'), жду ещё ${accept_left}s"
         sleep "${ACCEPT_POLL:-20}"
-        accept_left=$((accept_left - ${ACCEPT_POLL:-20}))
       done
       if [ "$seen" != 1 ]; then
         log "НЕТ ДОКАЗАТЕЛЬСТВА ПРИЁМКИ: целевой md5 $NEW_CODE_FILE / перечитанные fotmob-даги без ошибок импорта не подтверждены (ответ '$seen', ждали ${ACCEPT_WAIT:-480}s)"
@@ -1366,6 +1480,14 @@ if [ "$delivered" = 0 ]; then
 fi
 
 # ---- 4. Кампания истории (только после успешной доставки) --------------------
+# Отдельный запрет владельца на новые волны не должен блокировать доставку
+# исправлений и её приёмку/откат. Любой объект, включая битую ссылку, закрывает
+# допуск; его не читаем, не удаляем и не снимаем вместе с campaign/state/STOP.
+# Уже работающую кампанию этот маркер не останавливает.
+if [ -e "$CAMPAIGN_HOLD" ] || [ -L "$CAMPAIGN_HOLD" ]; then
+  log "кампания истории удержана: $CAMPAIGN_HOLD — новый драйвер не запускаю"
+  exit 0
+fi
 # До B6 в бою нет ни writer-lock (B7), ни ретрая коммита (#1199) — запускать
 # драйвер было нельзя. После доставки оба на месте.
 if pgrep -f "$CAMPAIGN/driver.sh" >/dev/null 2>&1; then

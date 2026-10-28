@@ -217,7 +217,7 @@ def test_blocklist_hides_every_foreign_dag_and_none_of_the_contour() -> None:
 
 @pytest.mark.unit
 def test_delivery_scripts_take_every_host_path_and_pin_from_the_env_file() -> None:
-    example_keys = _env_keys(ENV_EXAMPLE)
+    example_keys = _env_keys(ENV_EXAMPLE) | _env_keys(DEPLOY / "release-1292.env")
     for script in SCRIPTS:
         text = _code_lines(script)
         assert not HOST_PATH_LITERAL.search(text), f"{script.name}: host path literal"
@@ -229,7 +229,7 @@ def test_delivery_scripts_take_every_host_path_and_pin_from_the_env_file() -> No
         # окружения под этим именем, снимается ДО него — и только имена протокола процесса.
         before, after = text.split('fotmob_load_env "$ENV_FILE"', 1)
         early = set(re.findall(r"\$\{(FOTMOB_[A-Z0-9_]+)", before))
-        assert early <= PROCESS_PROTOCOL, f"{script.name}: {sorted(early - PROCESS_PROTOCOL)} read before the loader"
+        assert early <= PROCESS_PROTOCOL | {"FOTMOB_PINNED_PACKAGE", "FOTMOB_PINNED_DIGEST"}, f"{script.name}: {sorted(early - PROCESS_PROTOCOL)} read before the loader"
         assert "${FOTMOB_DELIVER_NONCE" not in after, f"{script.name}: handshake read after the loader wiped it"
         subprocess.run(["bash", "-n", str(script)], check=True)
         for key in re.findall(r"\$\{(FOTMOB_[A-Z0-9_]+):\?", text):
