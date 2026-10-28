@@ -24,7 +24,9 @@ def test_status_debt_counts_once_then_finished_keeps_identity(tmp_path, monkeypa
     monkeypatch.setattr(measure, "closures", lambda _: {"1": [start + 8000]})
     monkeypatch.setattr(measure, "unmarked", lambda *_: Counter({status: 1}))
     debt_rows = [["2", str(start), "SS-7", "2627", None, None, None, status, "2026-10-25"]]
-    monkeypatch.setattr(measure, "status_debt", lambda _: debt_rows, raising=False)
+    monkeypatch.setattr(measure, "status_debt", lambda _, **kwargs: debt_rows + (
+        [["1", str(start), "SS-7", "2627", None, None, None, "finished", "2026-10-25"]]
+        if kwargs.get("include_finished") else []), raising=False)
     day = now.date() - timedelta(days=1)
     cutoff = datetime(2026, 10, 28, tzinfo=timezone.utc).timestamp()
     args = ({7: "core"}, Path("denominator.tsv"), now, day, cutoff, False)
@@ -42,6 +44,9 @@ def test_status_debt_counts_once_then_finished_keeps_identity(tmp_path, monkeypa
                            day + timedelta(days=1), cutoff + 86400, False)
     assert measure.read_daily()[1]["core_total"] == 0
     assert measure.read_daily()[1]["status_debt_current"] == {status: 1}
+    assert measure.read_daily()[1].get("status_debt_current_total") == 2
+    assert measure.read_daily()[1].get("status_debt_current_share") == 50.0
+    assert "текущий долг 1/2 = 50.00 %" in measure.read_daily()[1]["line"]
     # Later the source confirms finished. Existing reported_day survives;
     # the capture deadline may change, the measured status deadline may not.
     finished.append(["2", str(start), str(start + 7200), "SS-7", "2627", None, None, None])
@@ -87,4 +92,6 @@ def test_status_debt_query_deduplicates_before_status_filter(monkeypatch):
     rows = measure.status_debt(now)
     assert [row[0] for row in rows] == ["2"]
     assert rows[0][7] == "interrupted"
+    population = measure.status_debt(now, include_finished=True)
+    assert [row[0] for row in population] == ["1", "2", "3"]
     db.close()

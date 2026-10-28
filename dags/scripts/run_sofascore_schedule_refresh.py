@@ -398,10 +398,11 @@ def read_idle_runs(path: Path) -> int:
 
 
 def read_incomplete(
-    path: Path,
+    path: Path, *, field: str = "seasons",
 ) -> tuple[dict[tuple[int, int], tuple[int, int, int]], Optional[tuple[int, int]]]:
     """Chains cut short, and where the retry queue stopped last run.
 
+    ``fresh_seasons`` stores head continuations independently of deep tails.
     The mapping is ``(tournament, season) -> (next page, anchor, attempts)``,
     the last being how many runs in a row have visited that chain without
     moving it forward — a fifth field an older state file does not have, which
@@ -429,7 +430,7 @@ def read_incomplete(
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"{path} is unreadable: {exc}") from exc
-    entries = value.get("seasons") if isinstance(value, Mapping) else None
+    entries = value.get(field, [] if field != "seasons" else None) if isinstance(value, Mapping) else None
     if not isinstance(entries, list):
         raise ValueError(f"{path} has no list of unfinished seasons")
     resume: dict[tuple[int, int], tuple[int, int, int]] = {}
@@ -1358,10 +1359,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The queue rotates on a cursor of its own — a head entry that keeps
         # failing must not hide the rest of the queue behind it.
         unfinished, retry_cursor = read_incomplete(Path(args.incomplete))
-        queued = [target for target in all_targets if target.pair in unfinished]
+        fresh_unfinished, _ = read_incomplete(Path(args.incomplete), field="fresh_seasons")
+        resume_queue = {**unfinished, **fresh_unfinished}
+        queued = [target for target in all_targets if target.pair in resume_queue]
         # #1358: the slices are cut to the page budget — due first, then the
         # seed share (resume queue included), then stale from what is left.
-        wanted_now = sweep_predicates(set(known), due, set(unfinished), overdue, backlog)
+        wanted_now = sweep_predicates(set(known), due, set(resume_queue), overdue, backlog)
         limits = budget_class_limits(
             {
                 name: sum(1 for target in all_targets if wanted_now[name](target))
@@ -1381,7 +1384,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan, next_cursors, members = plan_sweep(
             all_targets, set(known), due, cursors, limits["due"],
             limits["stale"], limits["seed"] - len(retry_targets),
-            pinned=set(unfinished),
+            pinned=set(resume_queue),
             overdue=overdue,
             max_overdue=limits["overdue"],
             backlog=backlog, max_backlog=limits["backlog"],
@@ -1439,13 +1442,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # MERGE no-op) while counting its bound from the owed page — doing the
         # step here made ``--seed-pages 1`` walk the same page forever.
         start_pages = {
-            target.pair: unfinished[target.pair][0]
+            target.pair: resume_queue[target.pair][0]
             for target in retry_targets
         }
         resume_anchors = {
-            target.pair: unfinished[target.pair][1]
+            target.pair: resume_queue[target.pair][1]
             for target in retry_targets
-            if unfinished[target.pair][1]
+            if resume_queue[target.pair][1]
         }
         # Only a partition Bronze already has can be chased: for the rest the
         # whole chain is new, and the seed bound is what stops it.
@@ -1458,7 +1461,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # only to its newest finished one: the stuck game may sit pages
         # deeper (Astra #1359 r3, finding 2).
         for target in plan["overdue"] + plan["backlog"]:
-            oldest = (recent_debt if target.pair in unfinished else overdue).get(target.partition)
+            oldest = (recent_debt if target.pair in resume_queue else overdue).get(target.partition)
             if oldest is not None:
                 chase_before[target.pair] = min(
                     chase_before.get(target.pair, oldest - 1), oldest - 1
@@ -1569,6 +1572,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # (Sol round 4, finding 4).
         rows_written = 0
         unfinished_now: list[tuple[int, int, int, int]] = []
+        fresh_now: list[tuple[int, int, int, int]] = []
         # Every class that finishes commits its own cursor and its own attempted
         # targets, whatever happens to the classes after it: a class that keeps
         # failing must not freeze the ones that work (Sol round 5, finding 1).
@@ -1597,12 +1601,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Verdicts about slices, gathered across classes: the sweep finishes,
         # then the run fails on the first of them.
         verdicts: list[Exception] = []
-        rolled_over = rolled_over_chains(set(unfinished), all_targets, snapshot)
+        rolled_over = rolled_over_chains(set(resume_queue), all_targets, snapshot)
         queued_seasons, abandoned = requeue_chains(
             unfinished, attempted, (), rolled_over
         )
         incomplete_state = {
             "seasons": queued_seasons,
+            "fresh_seasons": requeue_chains(fresh_unfinished, (), (), rolled_over)[0],
             "cursor": list(retry_cursor) if retry_cursor else None,
         }
         committed = False
@@ -1731,7 +1736,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # A fresh-head revisit must not reset a pinned deep continuation.
             # Only the seed visit below may advance that saved resume point.
             if name == "overdue":
-                cut_short = [entry for entry in cut_short if entry[:2] not in unfinished]
+                fresh_now.extend(entry for entry in cut_short
+                                 if entry[:2] in unfinished and entry[:2] not in fresh_unfinished)
+                cut_short = [entry for entry in cut_short if entry[:2] not in resume_queue]
+            elif name == "seed":
+                fresh_now.extend(entry for entry in cut_short if entry[:2] in fresh_unfinished)
+                cut_short = [entry for entry in cut_short if entry[:2] not in fresh_unfinished]
             unfinished_now.extend(cut_short)
             # What the source actually served this class, in EVENTS: an empty
             # 200 is a legitimate answer for a season that owes no page (the
@@ -1912,9 +1922,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             committed = True
             if queue_safe:
                 queued_seasons, abandoned = requeue_chains(
-                    unfinished, attempted, unfinished_now, rolled_over
+                    unfinished, attempted - set(fresh_unfinished), unfinished_now, rolled_over
                 )
+                fresh_seasons, fresh_abandoned = requeue_chains(
+                    fresh_unfinished, attempted & set(fresh_unfinished), fresh_now, rolled_over
+                )
+                abandoned.extend(fresh_abandoned)
                 incomplete_state["seasons"] = queued_seasons
+                incomplete_state["fresh_seasons"] = fresh_seasons
             # A chain the lane has stopped asking for: the rest of that season
             # stays unread, so it goes in the report by ``(tournament, season,
             # page)`` — an operator can put it back by hand, and nothing else
@@ -1924,7 +1939,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # disk while the report said nothing (Sol round 27).
             report["abandoned_chains"] = abandoned
             report["rows_written"] = rows_written
-            report["incomplete_seasons"] = len(incomplete_state["seasons"])
+            report["incomplete_seasons"] = len(incomplete_state["seasons"]) + len(incomplete_state["fresh_seasons"])
             # The emptiness alarm has to be honest on EVERY exit: a run that
             # MERGEd rows and then failed used to write the OLD counter back,
             # so a lane that was working could still trip the alarm, and one
@@ -1957,7 +1972,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # this slice again.
                 raise interrupted
         report["rows_written"] = rows_written
-        report["incomplete_seasons"] = len(incomplete_state["seasons"])
+        report["incomplete_seasons"] = len(incomplete_state["seasons"]) + len(incomplete_state["fresh_seasons"])
         report["abandoned_chains"] = abandoned
         if verdicts:
             raise verdicts[0]

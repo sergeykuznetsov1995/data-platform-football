@@ -1225,7 +1225,7 @@ def test_a_chain_cut_short_is_finished_by_the_next_run(offline):
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
 
     stored = json.loads(offline["incomplete"].read_text())
-    assert stored == {"seasons": [[23, 88001, 9, 1_700_000, 0]], "cursor": None}
+    assert stored == {"seasons": [[23, 88001, 9, 1_700_000, 0]], "fresh_seasons": [], "cursor": None}
     report = json.loads(offline["output"].read_text())
     assert report["incomplete_seasons"] == 1
 
@@ -3404,3 +3404,43 @@ def test_pinned_mixed_debt_refreshes_head_without_rewinding_queue(offline, monke
     # A successful head revisit cannot rewind page 7 to page 2, even when
     # the subsequent seed continuation fails before collecting anything.
     assert queue == [[7, 96518, 7, 500_000, 0]]
+
+
+def test_fresh_overdue_continuation_survives_beside_deep_queue(offline, monkeypatch):
+    pair = (7, 96518)
+    calls = offline["calls"]
+    calls.update(known={("SS-7", "2627")}, overdue={("SS-7", "2627"): 100},
+                 recent_debt={("SS-7", "2627"): 900_000}, truncate={pair},
+                 truncate_at=3)
+    offline["incomplete"].write_text(json.dumps({
+        "seasons": [[*pair, 7, 500_000, 0]],
+    }))
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        if kwargs.get("start_pages"):
+            raise RuntimeError("continuation transport failed")
+        return stub_fetch(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    saved = json.loads(offline["incomplete"].read_text())
+    assert saved["seasons"] == [[*pair, 7, 500_000, 0]]
+    assert saved.get("fresh_seasons") == [[*pair, 3, 1_700_000, 0]]
+
+    # The next run reaches page 3 through the fresh queue, before page 7.
+    calls["truncate"].clear()
+    calls["fetch"].clear()
+    monkeypatch.setattr(refresh, "fetch_season_schedules", stub_fetch)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
+    seed = next(call for call in calls["fetch"] if call["start_pages"])
+    assert seed["start_pages"] == {pair: 3}
+    saved = json.loads(offline["incomplete"].read_text())
+    assert saved["seasons"] == [[*pair, 7, 500_000, 0]]
+    assert saved["fresh_seasons"] == []
+    calls["fetch"].clear()
+    calls["overdue"].clear()
+    calls["recent_debt"].clear()
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
+    seed = next(call for call in calls["fetch"] if call["start_pages"])
+    assert seed["start_pages"] == {pair: 7}

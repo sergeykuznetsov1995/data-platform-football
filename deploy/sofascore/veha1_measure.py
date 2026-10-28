@@ -169,12 +169,13 @@ def read_last_observe() -> int | None:
         return None
 
 
-def status_debt(now: datetime) -> list[list[str | None]]:
+def status_debt(now: datetime, *, include_finished: bool = False) -> list[list[str | None]]:
     """Latest natural keys, then one lane per game; no seven-day expiry of debt."""
     year = now.year
     seasons = (str(year), f"{(year - 1) % 100:02d}{year % 100:02d}",
                f"{year % 100:02d}{(year + 1) % 100:02d}")
     slugs = ", ".join(f"'{season}'" for season in seasons)
+    excluded = "'postponed', 'canceled'" if include_finished else "'finished', 'postponed', 'canceled'"
     return trino_rows(f"""
 WITH ranked AS (
     SELECT *, row_number() OVER (
@@ -198,7 +199,7 @@ SELECT CAST(game_id AS varchar), CAST(start_timestamp AS varchar),
 FROM games
 WHERE game_rn = 1 AND CAST(season AS varchar) IN ({slugs})
   AND start_timestamp < {int(now.timestamp()) - 86400}
-  AND coalesce(status_type, 'unknown') NOT IN ('finished', 'postponed', 'canceled')
+  AND coalesce(status_type, 'unknown') NOT IN ({excluded})
 UNION ALL SELECT '__sentinel__', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 """, 9)
 
@@ -342,7 +343,10 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         if row["day"] == day.isoformat():
             return row["line"]
     journal = read_journal()
-    debt_rows = status_debt(now)
+    current_rows = status_debt(now, include_finished=True)
+    debt_rows = [row for row in current_rows if row[7] != "finished"]
+    current_total = sum(classes.get(game_tournament(row[2], row[4], row[6])[0]) == "core"
+                        for row in current_rows)
     added, latest = observe(journal, now, debt_rows=debt_rows)
     current_debt = []
     for gid, st, ss_league, _ss_season, reg_league, _reg_season, tut, status, ingested in debt_rows:
@@ -354,6 +358,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
                 "schedule_ingested_at": ingested,
             })
     current_statuses = Counter(rec["status"] for rec in current_debt)
+    current_share = 100.0 * len(current_debt) / current_total if current_total else None
+    current_share_txt = f"{current_share:.2f} %" if current_share is not None else "не наблюдается"
     # Обрыв после записи журнала и до daily.jsonl оставляет reported_day = X без итога X. Такие записи
     # (любого X, не только сегодняшнего) снова входят в due и отчитываются этим днём — не теряются.
     done_days = {row["day"] for row in daily}
@@ -406,7 +412,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         f"finished увиден позже 24 ч после старта {len(late)} (в знаменателе); не размечено: notstarted {un['notstarted']}, "
         f"inprogress {un['inprogress']}, postponed {un['postponed']}, "
         f"canceled {un['canceled']}; долг статусов в знаменателе {sum(debt.values())}: "
-        f"{dict(debt)}; текущий долг {len(current_debt)}: {dict(current_statuses)}; "
+        f"{dict(debt)}; текущий долг {len(current_debt)}/{current_total} = "
+        f"{current_share_txt}: {dict(current_statuses)}; "
         f"нарушители → {vfile}"
     )
     if dry_run:
@@ -426,6 +433,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         "seen_finished_late_in_denominator": len(late), "unmarked": dict(un),
         "top_misses": [[tid, cnt] for tid, cnt in misses.most_common(10)],
         "status_debt_current": dict(current_statuses),
+        "status_debt_current_total": current_total,
+        "status_debt_current_share": round(current_share, 2) if current_share is not None else None,
         "status_debt_current_details": current_debt,
         "status_debt_in_denominator": dict(debt),
         "status_debt_share": round(100.0 * sum(debt.values()) / n, 2) if n else None,
