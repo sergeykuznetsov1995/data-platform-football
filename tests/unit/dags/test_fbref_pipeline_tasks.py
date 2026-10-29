@@ -3955,3 +3955,58 @@ def test_1325_squad_freshness_is_optional_but_enforced_when_present(monkeypatch)
     squad.update(total_targets=1, stale_targets=1, aged_targets=1)
     with pytest.raises(AirflowFailException, match="squad"):
         fbref_pipeline_tasks.validate_fbref_current_scope_freshness(run_type="backfill", airflow_run_id="test1325", dag_id="dag_backfill_fbref")
+
+
+@pytest.mark.parametrize('campaign', [False, True])
+def test_backfill_seed_runs_schedule_recovery_outside_exact_campaign(monkeypatch, campaign):
+    metadata = {'history_campaign': 'saved', 'history_seasons': []} if campaign else {}
+    control = MagicMock()
+    control.get_run.return_value = {'metadata': metadata}
+    pipeline = MagicMock()
+    pipeline.recover_all_schedule_discovery.return_value = {'results': [{'reason': 'schedule_queued'}]}
+    pipeline.seed_historical_seasons.return_value = {'seeded': 1}
+    monkeypatch.setattr(fbref_pipeline_tasks, '_control_store', lambda: control)
+    monkeypatch.setattr(fbref_pipeline_tasks, '_pipeline', lambda: pipeline)
+    result = fbref_pipeline_tasks.seed_fbref_historical_seasons(
+        airflow_run_id='manual__recovery', dag_id='dag_backfill_fbref',
+    )
+    if campaign:
+        pipeline.recover_all_schedule_discovery.assert_not_called()
+        assert pipeline.seed_historical_seasons.call_args.kwargs['seasons'] == []
+    else:
+        assert [call[0] for call in pipeline.mock_calls] == [
+            'recover_all_schedule_discovery', 'seed_historical_seasons',
+        ]
+        assert result['schedule_recovery']['results'][0]['reason'] == 'schedule_queued'
+
+
+def test_history_campaign_repairs_schedules_before_completion_and_cohort_selection(monkeypatch):
+    from scrapers.fbref.history import HistoryCampaign
+
+    control = MagicMock()
+    pipeline = MagicMock()
+    events = []
+    selected = [{'competition_id': '9', 'season_id': '2024-2025'}]
+    pipeline.recover_all_schedule_discovery.side_effect = lambda: events.append('repair') or {'results': []}
+
+    def reconcile(self):
+        # A completed root must gain its missing schedule before closure is derived.
+        assert events == ['repair']
+        events.append('reconcile')
+
+    def select(self, run_id):
+        assert events == ['repair', 'reconcile']
+        events.append('select')
+        return selected
+
+    monkeypatch.setattr(fbref_pipeline_tasks, '_control_store', lambda: control)
+    monkeypatch.setattr(fbref_pipeline_tasks, '_pipeline', lambda: pipeline)
+    monkeypatch.setattr(HistoryCampaign, 'reconcile', reconcile)
+    monkeypatch.setattr(HistoryCampaign, 'select', select)
+    monkeypatch.setattr(HistoryCampaign, 'summary', lambda self: {'campaign_id': 'saved'})
+    result = fbref_pipeline_tasks.prepare_fbref_history_campaign(
+        airflow_run_id='manual__history', dag_id='dag_fbref_history_controller',
+    )
+    assert result['selected'] == selected
+    assert result['schedule_recovery'] == {'results': []}
+    pipeline.seed_historical_seasons.assert_not_called()

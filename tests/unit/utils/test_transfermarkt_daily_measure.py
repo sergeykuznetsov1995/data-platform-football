@@ -515,16 +515,21 @@ def test_cli_rejects_stale_or_mismatched_sql_result(tmp_path, fault):
 
 
 @pytest.mark.parametrize(
-    "completed,day,status,expected",
+    "completed,day,status,expected,override",
     [
-        (True, DAY, "GREEN", "GREEN"),
-        (False, DAY, "GREEN", "unknown"),
-        (True, "2026-10-07", "GREEN", "unknown"),
-        (True, DAY, "RED", "RED"),
+        (True, DAY, "GREEN", "GREEN", {}),
+        (False, DAY, "GREEN", "unknown", {}),
+        (True, "2026-10-07", "GREEN", "unknown", {}),
+        (True, DAY, "RED", "RED", {}),
+        (False, DAY, "RED", "RED (неполная проверка)", {}),
+        (False, "2026-10-07", "RED", "unknown", {}),
+        (False, DAY, "RED", "unknown", {"version": "old"}),
+        (False, DAY, "RED", "unknown", {"stale": True}),
+        (False, DAY, "RED", "unknown", {"cutoff_at": (AS_OF + timedelta(seconds=1)).isoformat()}),
     ],
 )
-def test_cli_reads_dq_status_only_from_completed_same_day_version(
-    tmp_path, capsys, completed, day, status, expected
+def test_cli_reads_dq_status_from_valid_same_day_evidence(
+    tmp_path, capsys, completed, day, status, expected, override
 ):
     from dags.utils.transfermarkt_daily_dq import VERSION
 
@@ -538,6 +543,7 @@ def test_cli_reads_dq_status_only_from_completed_same_day_version(
         "status": status,
         "cutoff_at": START.isoformat(),
     }
+    dq.update(override)
     dqpath = tmp_path / "dq.json"
     dqpath.write_text(json.dumps(dq))
     cli.main(
@@ -830,3 +836,115 @@ def test_cli_policy_read_error_is_visible(tmp_path, monkeypatch, capsys, fault):
     assert cli.main(['--day', DAY, '--as-of', AS_OF.isoformat(), '--report-json', str(report)]) == 0
     summary = json.loads(capsys.readouterr().out)['summary']
     assert f'ТРЕВОГА: {name}: ошибка чтения политики' in summary
+
+
+@pytest.mark.parametrize("dq_input", ["--dq-json", "--dq-state-root"])
+@pytest.mark.parametrize(
+    "completed,status,override,expected",
+    [
+        (True, "RED", {}, "RED"),
+        (False, "RED", {}, "RED (неполная проверка)"),
+        (False, "GREEN", {}, "unknown"),
+        (True, "RED", {"day_msk": "2026-10-07"}, "unknown"),
+        (True, "RED", {"version": "old"}, "unknown"),
+        (True, "RED", {"cutoff_at": (AS_OF + timedelta(seconds=1)).isoformat()}, "unknown"),
+    ],
+)
+def test_cli_sql_failure_preserves_independent_dq(
+    tmp_path, monkeypatch, capsys, dq_input, completed, status, override, expected
+):
+    from dags.utils.transfermarkt_daily_dq import VERSION
+
+    def fail(*args):
+        raise RuntimeError("query failed: private connection details")
+
+    monkeypatch.setattr(cli, "execute_measure", fail)
+    path = tmp_path / f"{DAY}.json"
+    dq = {"day_msk": DAY, "version": VERSION, "completed": completed,
+          "status": status, "cutoff_at": START.isoformat()}
+    dq.update(override)
+    path.write_text(json.dumps(dq))
+    result = cli.main(["--day", DAY, "--as-of", AS_OF.isoformat(), "--execute",
+                       dq_input, str(path if dq_input == "--dq-json" else tmp_path)])
+    output = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert output["report"] is None
+    assert output["status"] == "not_measured"
+    assert "не измерено" in output["summary"]
+    assert "охват 0/" not in output["summary"]
+    assert "private connection details" not in output["summary"]
+    assert output["summary"].endswith(f"Bronze DQ {expected}")
+
+
+@pytest.mark.parametrize("fault", [None, "journal", "sql", "zero", "two"])
+def test_cli_executes_promoted_registry_daily_select(tmp_path, monkeypatch, capsys, fault):
+    from dags.utils import transfermarkt_native_v2 as native
+    from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
+    from scrapers.transfermarkt.denominator import COLUMNS, load_denominator
+
+    path = tmp_path / "denominator.tsv"
+    path.write_text("\t".join(COLUMNS) + "\n" + "".join(
+        "\t".join([cid, "League", "England", "UEFA", "1", "core_club",
+                   "wettbewerb", "1", "2026", "", "", "", "", "rule:default"]) + "\n"
+        for cid in ("GB1", "MISSING")
+    ))
+    registry = [_joined_row(_competition("GB1"), _edition("GB1", "2026"))]
+    snapshot = measure.daily_denominator(
+        load_denominator(path).rows.values(), registry,
+        denominator_version=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    expected_sql, expected_params = measure.build_daily_measure_sql(snapshot, DAY, as_of=AS_OF)
+    report = execute(checks(snapshot), snapshot=snapshot)
+
+    class Cursor:
+        closed = False
+
+        def execute(self, sql, params=()):
+            statements.append((sql, params))
+            if len(statements) == 1:
+                assert sql == build_promoted_registry_query(current_only=True)
+                values = registry
+            else:
+                assert (sql, params) == (expected_sql, expected_params)
+                if fault in {"journal", "sql"}:
+                    raise RuntimeError("TABLE_NOT_FOUND" if fault == "journal" else "query failed")
+                values = [] if fault == "zero" else [report] * (2 if fault == "two" else 1)
+            self.description = [(key,) for key in (values[0] if values else report)]
+            self.rows = [tuple(value.values()) for value in values]
+
+        def fetchall(self):
+            return self.rows
+
+        def close(self):
+            self.closed = True
+
+    class Connection:
+        closed = False
+
+        def cursor(self):
+            return cursor
+
+        def close(self):
+            self.closed = True
+
+    statements = []
+    cursor, connection = Cursor(), Connection()
+    monkeypatch.setattr(native, "connect", lambda: connection)
+    result = cli.main(["--day", DAY, "--as-of", AS_OF.isoformat(),
+                       "--execute", "--denominator", str(path)])
+    output = json.loads(capsys.readouterr().out)
+    assert len(statements) == 2
+    assert cursor.closed and connection.closed
+    if fault:
+        assert result == 1
+        assert output["report"] is None
+        assert output["status"] == "not_measured"
+        assert "не измерено" in output["summary"]
+        assert "охват 0/" not in output["summary"]
+    else:
+        assert result == 0
+        assert output["report"]["denominator"] == 2
+        assert output["report"]["checked_editions"] == 1
+        assert output["report"]["coverage_pct"] == 50
+        assert snapshot.blocked_competitions[0][0] == "MISSING"
+        assert output["summary"] == measure.format_daily_summary(report)
