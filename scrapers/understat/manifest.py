@@ -801,24 +801,6 @@ class UnderstatManifestRepository:
             return False
         return not verify_physical or self.verify_physical_batch(attempt)
 
-    is_published = is_scope_complete
-
-    def next_incomplete(
-        self,
-        scopes: Iterable[ScopeKey],
-        *,
-        contract_version: str = CONTRACT_VERSION,
-        verify_physical: bool = True,
-    ) -> Optional[ScopeKey]:
-        for scope in scopes:
-            if not self.is_scope_complete(
-                scope,
-                contract_version=contract_version,
-                verify_physical=verify_physical,
-            ):
-                return scope
-        return None
-
     def incomplete_closed_scopes(
         self,
         *,
