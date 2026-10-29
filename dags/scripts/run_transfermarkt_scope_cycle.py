@@ -1419,13 +1419,17 @@ def _build_scope_manifest(
     # roster this scope actually holds: a manifest that only says 'complete'
     # cannot tell a scope covering every player from one covering a hundred.
     roster_coverage = {
-        run.parser_entity: {key: run.result['roster_coverage'][key] for key in ('roster_size', 'selected', 'pending')}
+        run.parser_entity: {key: value for key, value in run.result['roster_coverage'].items()
+                            if key not in {'roster_ids', 'remaining_ids'}}
         for run in runs
         if isinstance(run.result.get('roster_coverage'), Mapping)
     }
     pending_total = sum(
         int(item.get('pending', 0)) for item in roster_coverage.values()
     )
+    from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY
+    if roster_coverage and all(item.get('policy_version') == CAREER_DEBT_POLICY for item in roster_coverage.values()):
+        pending_total = len({pid for item in roster_coverage.values() for pid in item['debt_player_ids']})
     if pending_total:
         print(
             f'ROSTER COVERAGE: {pending_total} career fetches still pending '

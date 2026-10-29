@@ -122,17 +122,21 @@ def _approved_args(
     payload: dict,
     *,
     packet_suffix: str = '',
+    write_mode: str = 'dual',
+    refresh_mode: str = 'auto',
 ) -> tuple[list[str], Path]:
     journal_path = tmp_path / 'approvals.json'
     base = [
         '--payload-json', json.dumps(payload, sort_keys=True),
         '--reader-revision', '7',
         '--candidate-slot', 'b',
-        '--write-mode', 'dual',
+        '--write-mode', write_mode,
         '--approval-journal', str(journal_path),
     ]
+    if refresh_mode != 'auto':
+        base.extend(['--refresh-mode', refresh_mode])
     operation = cycle.approved_operation_argv(base)
-    tables = tuple(sorted(cycle.required_write_tables('dual')))
+    tables = tuple(sorted(cycle.required_write_tables(write_mode)))
     values = {
         'argv': operation,
         'concurrency': 1,

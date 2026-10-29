@@ -1440,10 +1440,28 @@ class _Scope:
         self.acknowledge(proof, expected_signatures=signatures)
         self.persist()
 
+    def queue_career_refreshes(self):
+        if self.snapshot is None or self.data.get('authoritative_empty_scope'):
+            return
+        from dags.scripts import run_transfermarkt_scraper as run
+        pending = self.resume.setdefault('careers', {})
+        for endpoint in ('market_value_points', 'transfer_events'):
+            committed = run._load_fetch_state(self.scraper, endpoint)
+            due = []
+            for player in {str(row['player_id']) for row in self.snapshot.rows}:
+                prior = committed.get(player, {})
+                stamp = run._as_utc(prior.get('last_success_at'))
+                if (prior.get('status') not in run.SUCCESS_STATUSES or stamp is None
+                    or not self.now() - run.CAREER_TTL < stamp <= self.now()):
+                    due.append(player)
+            pending[endpoint] = sorted(set(pending.get(endpoint, [])) | set(due), key=int)
+        self.persist()
+
     def careers(self):
         self._require_reconciled_signals()
         if self.data.get('authoritative_empty_scope'):
             return
+        self.queue_career_refreshes()
         pending = self.resume.setdefault('careers', {})
         for endpoint in ('market_value_points', 'transfer_events'):
             ids = sorted(set(pending.get(endpoint, [])), key=int)
@@ -1473,6 +1491,8 @@ class _Scope:
             self.scraper._current_career_signal_generations = {player_id:
                 self.scraper._cache_generation_by_url['https://www.transfermarkt.com' + path + player_id]
                 for player_id in ids}
+            self.scraper._current_career_force_ids = {player_id for player_id in ids
+                if self.data.get('career_generations', {}).get(f'{endpoint}:{player_id}')}
             proof = self.career_writer(
                 self.scraper, endpoint, ids, self.scope, self.preflight, self.cycle_id,
                 decoded_body_soft_stop_bytes=decoded_start + soft_remaining,
@@ -1800,9 +1820,11 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             scope.persist()
                     else:
                         scope.roster(weekly=item.kind == 'weekly_roster')
-                    # Weekly insurance discovers changes but does not repeat
-                    # careers. New/changed IDs continue in a subsequent portion.
-                    if item.kind != 'weekly_roster':
+                    # Weekly roster capture queues global debt/TTL jobs;
+                    # the next portion keeps their own endpoint byte budgets.
+                    if item.kind == 'weekly_roster':
+                        scope.queue_career_refreshes()
+                    else:
                         scope.careers()
                     coach_checked = data.get('coaches_checked_at')
                     if (not scope.cursor.cold_complete or scope.resume.get('coaches_pending')

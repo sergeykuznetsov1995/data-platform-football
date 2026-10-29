@@ -66,6 +66,7 @@ class Offline:
         self.root = tmp_path
         self.clock = Clock()
         self.calls, self.sql, self.writes, self.careers, self.clients = [], [], [], [], []
+        self.fetch_state = {}
         self.store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
         monkeypatch.setattr('scrapers.transfermarkt.raw_store.utc_now_iso', lambda: self.clock.wall.isoformat())
         self.club_ids = ('10', '20')
@@ -180,7 +181,11 @@ class Offline:
             def execute(self, statement, params=()):
                 outer.sql.append(statement)
                 self.statement = statement
+                self.params = params
             def fetchall(self):
+                if self.statement.startswith('SELECT source_id, status, run_key, last_success_at'):
+                    return [(player, *values) for (endpoint, player), values in outer.fetch_state.items()
+                            if endpoint == self.params[0]]
                 if outer.bronze_exists and self.statement.startswith('SELECT 1 FROM iceberg.bronze.transfermarkt_squad_memberships'):
                     return [(1,)]
                 return []
@@ -211,6 +216,8 @@ class Offline:
         reader(scope['competition_id'], int(scope['edition_id']), player_ids=chosen,
                decoded_body_soft_stop_bytes=decoded_body_soft_stop_bytes)
         window = scraper.get_career_window(endpoint)
+        for player in window['attempted_ids']:
+            self.fetch_state[(endpoint, player)] = ('success', cycle_id, self.clock.wall)
         return {**self.proof(), 'career_window': {'processed_player_ids': window['attempted_ids'],
                                                  'deferred_player_ids': ids[len(chosen):]}}
 
@@ -460,10 +467,12 @@ def test_weekly_new_player_is_queued_without_career_download_in_weekly_portion(o
     offline.run('weekly')
     assert offline.careers == []
     resume = json.loads(next(iter(offline.state()['scopes'].values()))['cursor']['resume_json'])
-    assert resume['careers'] == {'market_value_points': ['111'], 'transfer_events': ['111']}
+    assert resume['careers'] == {'market_value_points': ['110', '111', '120'],
+                                 'transfer_events': ['110', '111', '120']}
     offline.run('weekly-new-player-continue')
     assert [(endpoint, ids) for endpoint, ids, _ in offline.careers] == [
-        ('market_value_points', ('111',)), ('transfer_events', ('111',))]
+        ('market_value_points', ('110', '111', '120')),
+        ('transfer_events', ('110', '111', '120'))]
 
 
 def test_changed_listing_invalidates_unfinished_club_page_only(offline):
@@ -1627,3 +1636,26 @@ def test_season_close_retains_pending_careers_after_terminal_or_deferred_backend
     assert not offline.state()['season_closures']
     assert not any('/kader/' in url for _, url in offline.calls)
     assert any("'complete' status," in sql and 'transfermarkt_season_close_v1' in sql for sql in offline.sql)
+
+
+def test_unchanged_warm_roster_enqueues_expired_global_careers(offline):
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-apply')
+    assert offline.fetch_state
+    offline.calls.clear()
+    offline.careers.clear()
+    offline.clock.advance(8 * 86400)
+    offline.run('ttl-weekly')
+    resume = json.loads(next(iter(offline.state()['scopes'].values()))['cursor']['resume_json'])
+    assert resume['careers'] == {'market_value_points': ['110', '120'],
+                                 'transfer_events': ['110', '120']}
+    # Finish signal checks before the careers portion.
+    for index in range(4):
+        offline.run('ttl-' + str(index))
+    assert {endpoint for endpoint, _, _ in offline.careers} == {'market_value_points', 'transfer_events'}
+    assert all(set(ids) == {'110', '120'} for _, ids, _ in offline.careers)
+    count = len(offline.careers)
+    offline.run('ttl-unchanged')
+    assert len(offline.careers) == count
