@@ -3757,7 +3757,8 @@ class WhoScoredRepository:
         current parser, no final "not available" verdict, in a stage that is
         not unavailable.  Stage availability per (league, season, stage_id)
         from the latest manifest: available (>= 1 success), unavailable
-        (>= 2 "not available" with a confirmed lineup and 0 success), unknown.
+        (>= 2 "not available" with a confirmed lineup and 0 success; one is
+        enough when the stage has a single played game with a lineup), unknown.
         A "not available" with a lineup in an available stage is re-probed
         once after ``NOT_AVAILABLE_REPROBE_HOURS``; an unknown or unavailable
         stage offers one probe (its latest played game with a lineup) at most
@@ -3768,8 +3769,9 @@ class WhoScoredRepository:
         ``lane`` optionally partitions this same policy at seven days:
         history is strictly older; current includes the boundary. Other callers
         keep the unbounded default. Explicit replay cannot select a lane.
-        History probes another game after an unknown stage's first negative,
-        preserving the stage cooldown and the two-game evidence requirement.
+        History probes another game right after an unknown stage's first
+        negative: games older than seven days do not change, so the stage
+        cooldown would only delay the evidence. It never repeats that negative.
 
         ``include_exact_count`` adds the exact pre-``LIMIT`` backlog size to
         every returned candidate (``exact_candidate_count``), so a bounded
@@ -3911,7 +3913,9 @@ class WhoScoredRepository:
                            WHEN COUNT_IF(
                                m.state = 'not_available'
                                AND s.is_lineup_confirmed = TRUE
-                           ) >= 2
+                           ) >= CASE WHEN COUNT_IF(
+                               s.status = 6 AND s.is_lineup_confirmed = TRUE
+                           ) <= 1 THEN 1 ELSE 2 END
                            THEN 'unavailable'
                            ELSE 'unknown'
                        END AS availability,
@@ -3922,7 +3926,7 @@ class WhoScoredRepository:
                            END
                        ) AS last_attempt_at
                 FROM schedule s
-                JOIN {latest} m
+                LEFT JOIN {latest} m
                   ON m.league = s.league
                  AND m.season = s.season
                  AND m.game_id = CAST(s.game_id AS BIGINT)
@@ -3942,7 +3946,7 @@ class WhoScoredRepository:
             else ""
         )
         # History needs two distinct negative games to resolve an unknown
-        # stage. Keep the stage cooldown, but do not repeat its first negative.
+        # stage. It probes the second at once, but never repeats the first.
         probe_order = (
             "CASE WHEN st.availability = 'unknown' AND m.state = 'not_available' "
             "THEN 1 ELSE 0 END, " if lane == "history" else ""
@@ -3964,12 +3968,18 @@ class WhoScoredRepository:
                        )
                    ) AS game_reprobe_due,
                    st.last_attempt_at AS stage_last_attempt_at,
+                   m.state IS DISTINCT FROM 'not_available' AS game_unprobed,
                    ROW_NUMBER() OVER (
                        PARTITION BY s.stage_id
                        ORDER BY {probe_order}s.date DESC, s.game_id DESC
                    ) AS stage_probe_rank"""
             if daily
             else ""
+        )
+        history_unknown = (
+            """
+                        OR (stage_availability = 'unknown' AND game_unprobed)"""
+            if lane == "history" else ""
         )
         stage_filter = (
             f"""
@@ -3983,7 +3993,7 @@ class WhoScoredRepository:
                             CURRENT_TIMESTAMP
                             - INTERVAL '{int(STAGE_REPROBE_DAYS)}' DAY
                             AS TIMESTAMP
-                        )
+                        ){history_unknown}
                     )
                )"""
             if daily
@@ -4051,6 +4061,7 @@ class WhoScoredRepository:
         evidence can remove unavailable stages from the closeable denominator.
         """
         prefix = f"{self.catalog}.{self.schema}"
+        # A stage with a single played game is resolved by one negative.
         rows = self.trino.execute_query(f"""
             WITH schedule AS (
                 SELECT * FROM (
@@ -4073,14 +4084,16 @@ class WhoScoredRepository:
                            AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)
                            AND s.date > CAST(CURRENT_TIMESTAMP - INTERVAL '30' DAY AS TIMESTAMP)) AS deferred_games,
                        COUNT_IF(COALESCE(m.state, '') = 'success') AS successes,
-                       COUNT_IF(COALESCE(m.state, '') = 'not_available' AND s.is_lineup_confirmed = TRUE) AS absent
+                       COUNT_IF(COALESCE(m.state, '') = 'not_available' AND s.is_lineup_confirmed = TRUE) AS absent,
+                       CASE WHEN COUNT_IF(s.status = 6 AND s.is_lineup_confirmed = TRUE) <= 1
+                            THEN 1 ELSE 2 END AS absent_needed
                 FROM schedule s
                 LEFT JOIN {prefix}.whoscored_match_ingest_latest m
                   ON (m.league, m.season, m.game_id) = (s.league, s.season, s.game_id)
                 GROUP BY s.league, s.season, s.stage_id
             ), games AS (
                 SELECT s.*,
-                       (st.successes > 0 OR st.absent < 2) AS closeable,
+                       (st.successes > 0 OR st.absent < st.absent_needed) AS closeable,
                        (m.state = 'success' AND m.batch_id LIKE 'ws2-%'
                         AND m.raw_uri IS NOT NULL AND m.payload_sha256 IS NOT NULL
                         AND m.parser_version = {_sql_string(PARSER_VERSION)}) AS success,
@@ -4097,7 +4110,7 @@ class WhoScoredRepository:
                   AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)
             ), stage_counts AS (
                 SELECT league, season,
-                       COUNT_IF(successes = 0 AND absent < 2 AND historical_games > 0) AS unknown_stages,
+                       COUNT_IF(successes = 0 AND absent < absent_needed AND historical_games > 0) AS unknown_stages,
                        COUNT_IF(deferred_games > 0) AS deferred_stages,
                        ARRAY_AGG(stage_id) AS stage_ids
                 FROM stages GROUP BY league, season

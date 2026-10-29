@@ -3877,7 +3877,8 @@ def test_daily_match_candidates_gate_on_stage_availability():
     assert "WHEN COUNT_IF(m.state = 'success') > 0 THEN 'available'" in sql
     assert (
         "WHEN COUNT_IF( m.state = 'not_available' AND s.is_lineup_confirmed = TRUE"
-        " ) >= 2 THEN 'unavailable' ELSE 'unknown'"
+        " ) >= CASE WHEN COUNT_IF( s.status = 6 AND s.is_lineup_confirmed = TRUE"
+        " ) <= 1 THEN 1 ELSE 2 END THEN 'unavailable' ELSE 'unknown'"
     ) in sql
     # Unknown/unavailable stage: one probe, its latest played game, every 30 days.
     assert "PARTITION BY s.stage_id ORDER BY s.date DESC, s.game_id DESC" in sql
