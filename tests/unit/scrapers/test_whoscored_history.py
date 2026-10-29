@@ -8,6 +8,10 @@ import pytest
 from scrapers.whoscored import history, history_state as state
 from scrapers.whoscored.catalog import CatalogCompetition, CatalogSeason, WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
+from scrapers.whoscored.raw_store import profile_page_target
+from scrapers.whoscored.repository import WhoScoredRepository
+from scrapers.whoscored.service import WhoScoredIngestService
+from scrapers.whoscored.transport import TransportBudgets, TransportResponse, TransportRoute
 
 NOW = datetime(2026, 10, 27, tzinfo=timezone.utc)
 
@@ -101,6 +105,76 @@ def test_chunk_bound_and_reselection_from_journal(tmp_path):
     kwargs["now"] = datetime(2026, 10, 28, tzinfo=timezone.utc)
     history.run_chunk(**kwargs)
     assert service.sync_matches.call_count == 2
+
+
+@pytest.mark.parametrize("candidates, expected, from_repository", [
+    ([0, -1, 11, 7], [7, 11], True),
+    ([11, 7, 11, 7], [7, 11], False),
+    ([True, "9", None, 2.5, 0, -1, 11, 7], [7, 11], False),
+    ([0, -1, 50, 50, *range(49, 19, -1)], list(range(26, 51)), False),
+    ([0, -1, True, "9", None, 2.5], [], False),
+])
+def test_history_normalizes_profile_candidates(tmp_path, monkeypatch, candidates, expected,
+                                               from_repository):
+    kwargs, s, repo, _ = setup_chunk(tmp_path)
+    repo.list_match_candidates.return_value = []
+    monkeypatch.setattr(history, "final_feeds", lambda *a, **k: True)
+    if from_repository:
+        # Exercise the real conversion of Trino rows, including nonpositive IDs.
+        trino = MagicMock()
+        trino.execute_query.return_value = [(value,) for value in candidates]
+        candidate_repo = WhoScoredRepository(writer=MagicMock(), trino=trino)
+        repo.list_profile_candidates.side_effect = candidate_repo.list_profile_candidates
+    else:
+        # Defensive cases: SQL normally deduplicates and bounds the result.
+        repo.list_profile_candidates.return_value = candidates
+    repo.commit_profiles.side_effect = lambda commits: [commit.batch_id for commit in commits]
+    transport = MagicMock(budgets=TransportBudgets())
+    service = WhoScoredIngestService(
+        s, catalog=kwargs["catalog"], repository=repo, transport=transport, raw_store=MagicMock(),
+    )
+    response = TransportResponse(
+        url="offline", content=b"""
+        <div><span class="info-label">Name: </span>Test Player</div>
+        <div><span class="info-label">Positions: </span>Defender</div>
+        <script>var currentParticipations = [{
+          tournamentId:1,seasonId:2,stageId:3,teamId:1219,
+          teamName:'Test',position:{displayName:'DC'}
+        }];</script>
+        """, status_code=200, headers={}, route=TransportRoute.DIRECT_HTTP,
+        wire_bytes=100, sha256="a" * 64,
+    )
+
+    def fetch(target, *, validator, **options):
+        assert validator(response)
+        return response, "s3://offline/profile.html"
+
+    monkeypatch.setattr(service, "_fetch", MagicMock(side_effect=fetch))
+    kwargs["service_cls"] = MagicMock(return_value=service)
+    consumed = []
+    kwargs["consume"] = consumed.append
+
+    report = history.run_chunk(**kwargs)
+
+    repo.list_profile_candidates.assert_called_once_with(scopes=[s.scope], limit=25, once=True)
+    assert kwargs["checkpoint"].parked(now=NOW.timestamp()) == 0
+    if expected:
+        assert report["did_work"] is True
+        assert len(consumed) == 1
+        assert consumed[0].status == "success"
+        assert consumed[0].attempted == consumed[0].succeeded == len(expected)
+        commits = repo.commit_profiles.call_args.args[0]
+        assert [commit.player_id for commit in commits] == expected
+        assert [call.args[0] for call in service._fetch.call_args_list] == [
+            profile_page_target(player_id) for player_id in expected
+        ]
+        repo.record_profile_failure.assert_not_called()
+    else:
+        assert report["reason"] == "idle"
+        assert consumed == []
+        kwargs["service_cls"].assert_not_called()
+        repo.commit_profiles.assert_not_called()
+        service._fetch.assert_not_called()
 
 
 def test_missing_schedule_runs_only_schedule(tmp_path):
