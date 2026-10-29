@@ -6399,6 +6399,19 @@ class FBrefPipeline:
             # The failure manifest and the released observation above both
             # landed, so the next parse wave re-lists this raw (#1759).
             self._parse_deferrals[record.target_id] = deferrals + 1
+            # A later wave of the same raw can fail with another transient
+            # error; manifests written by the earlier one keep their error, so
+            # the card keeps every distinct pair, the latest last (#1915).
+            error = {
+                "error_class": type(exc).__name__,
+                "error_message": str(exc)[:2000],
+            }
+            previous = self._parse_carryovers.get(record.logical_refresh_id)
+            deferred_errors = [
+                row
+                for row in (previous or {}).get("deferred_errors", [])
+                if row != error
+            ][-MAX_PARSE_DEFERRALS_PER_TARGET:] + [error]
             self._parse_carryovers[record.logical_refresh_id] = {
                 "logical_refresh_id": record.logical_refresh_id,
                 "target_id": record.target_id,
@@ -6409,8 +6422,8 @@ class FBrefPipeline:
                 "parser_version": observation_lease.parser_version,
                 "typed_parser_version": observation_lease.typed_parser_version,
                 "stateful_parser_version": observation_lease.stateful_parser_version,
-                "error_class": type(exc).__name__,
-                "error_message": str(exc)[:2000],
+                **error,
+                "deferred_errors": deferred_errors,
                 "reason": "deadline_after_transient_trino_failure",
             }
             logger.warning(
