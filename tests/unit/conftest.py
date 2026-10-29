@@ -1,10 +1,45 @@
 """Private host resources for WhoScored tests; production defaults stay intact."""
 
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 
 import pytest
+
+# Host-seal checks of the dormant WhoScored ceremony: they assert root-owned
+# path chains of the production VM (or run as root), so they can only pass
+# when run as root. CI ignores these modules (.github/workflows/ci.yml); they
+# go away with the ceremony removal (#1487).
+HOST_SEAL_MODULES = frozenset({
+    "test_bench_whoscored_capacity.py",
+    "test_whoscored_production_admission.py",
+    "test_whoscored_go_decision.py",
+    "test_whoscored_capacity_container_runtime.py",
+})
+# Mostly portable modules: only these tests need a root-owned parent directory.
+HOST_SEAL_TESTS = frozenset({
+    "test_generate_whoscored_deployment_attestation.py::test_published_document_is_accepted_by_existing_validator",
+    "test_generate_whoscored_deployment_attestation.py::test_publish_is_create_once_and_never_follows_existing_symlink",
+    "test_generate_whoscored_deployment_attestation.py::test_cli_runtime_rejects_an_isolated_non_system_interpreter",
+    "test_generate_whoscored_deployment_attestation.py::test_generate_validates_twice_before_create_once_publish",
+    "test_generate_whoscored_deployment_attestation.py::test_generate_publishes_nothing_when_ready_evidence_changes",
+    "test_validate_whoscored_build_provenance.py::test_ready_manifest_and_external_deployment_binding_are_accepted",
+    "test_validate_whoscored_build_provenance.py::test_external_deployment_result_reuses_exact_fd_pinned_bytes",
+    "test_validate_whoscored_build_provenance.py::test_deployment_attestation_requires_named_registry_digest",
+})
+
+
+def pytest_collection_modifyitems(config, items):
+    if os.geteuid() == 0:
+        return
+    skip = pytest.mark.skip(
+        reason="WhoScored host-seal test needs root-owned production paths (#1487)"
+    )
+    for item in items:
+        name = item.path.name
+        if name in HOST_SEAL_MODULES or f"{name}::{item.originalname}" in HOST_SEAL_TESTS:
+            item.add_marker(skip)
 
 
 @pytest.fixture(autouse=True)
