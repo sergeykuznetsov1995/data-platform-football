@@ -2326,13 +2326,20 @@ class TransfermarktScraper(BaseScraper):
             return _validate_json
 
         if label not in {
-            'listing', 'teilnehmer', 'squad', 'coach_history', 'coach_profile',
+            'listing', 'teilnehmer', 'squad', 'coach_history', 'coach_profile', 'club_staff',
         }:
             return None
 
         def _validate_html(html):
             from bs4 import BeautifulSoup
 
+            if label == 'club_staff':
+                from scrapers.transfermarkt.staff import parse_staff
+                try:
+                    parse_staff(html, 'validator')
+                except ValueError as exc:
+                    return str(exc)
+                return None
             soup = BeautifulSoup(html, 'html.parser')
             if label == 'coach_profile':
                 if soup.find('h1', {'class': 'data-header__headline-wrapper'}) is None:
