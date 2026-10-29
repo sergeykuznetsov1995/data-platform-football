@@ -28,6 +28,14 @@ _TASK_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",
 }
+# #1444: season tables and the ops manifest are absent from the shared daily
+# sweep, whose list is locked to the scheduler image ceremony.
+SNAPSHOT_TABLES = (
+    "understat_player_team_season_stats",
+    "understat_team_season_breakdowns",
+)
+MANIFEST_TABLE = "iceberg.ops.understat_ingest_manifest_v1"
+SNAPSHOT_RETENTION = "3d"
 
 
 def validate_understat_leagues(configured: Iterable[str]) -> None:
@@ -263,4 +271,32 @@ class UnderstatScopeOperator(BashOperator):
         return validate_scope_result(report, **environment)
 
 
-__all__ = ["RUNNER", "UnderstatScopeOperator", "scope_environment", "validate_scope_result"]
+def maintain_understat_snapshots() -> dict[str, Any]:
+    """Expire Understat history the shared sweep misses; any error fails the task.
+
+    Only the already-pinned Trino manager is used: the shared maintenance module
+    lags master in the live tree and is outside the Understat delivery checks.
+    """
+    from scrapers.base.iceberg_writer import IcebergWriter
+
+    manager = IcebergWriter()._get_trino_manager()
+    query = manager.execute_query
+    try:
+        # Trino's default floor is 7d; lower it for this session only (#266).
+        for prop in ("expire_snapshots_min_retention", "remove_orphan_files_min_retention"):
+            query(f"SET SESSION iceberg.{prop} = '{SNAPSHOT_RETENTION}'")
+        retention = f"retention_threshold => '{SNAPSHOT_RETENTION}'"
+        result = {}
+        for table in SNAPSHOT_TABLES:
+            fq = f"iceberg.bronze.{table}"
+            query(f"ALTER TABLE {fq} EXECUTE expire_snapshots({retention})")
+            result[table] = query(f"ALTER TABLE {fq} EXECUTE remove_orphan_files({retention})")
+        # Manifest writers may still own uncommitted files: expire only, no orphans.
+        query(f"ALTER TABLE {MANIFEST_TABLE} EXECUTE expire_snapshots({retention})")
+    finally:
+        manager.close()
+    logger.info("Understat snapshot maintenance: %s", result)
+    return {"retention": SNAPSHOT_RETENTION, "orphans": repr(result)}
+
+
+__all__ = ["RUNNER", "maintain_understat_snapshots", "UnderstatScopeOperator", "scope_environment", "validate_scope_result"]

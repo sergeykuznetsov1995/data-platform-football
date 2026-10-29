@@ -444,3 +444,56 @@ def test_optional_leaf_does_not_mask_json_failure(dag_module):
     assert not watcher.downstream_task_ids
     with pytest.raises(AirflowFailException, match="JSON collection failed"):
         watcher.python_callable()
+
+
+def test_snapshot_maintenance_is_last_and_cannot_hide_json_failure(dag_module):
+    task = _python("maintain_snapshots")
+    assert task._init_kwargs["trigger_rule"] == "all_done"
+    assert task.upstream_task_ids == {"enrichment_finished"}
+    assert not task.downstream_task_ids
+    assert "pool" not in task._init_kwargs
+    assert _python("json_collection_failed").upstream_task_ids == {"run_current_scope"}
+
+
+def _maintenance(monkeypatch, fail_on=None):
+    from scrapers.base import iceberg_writer
+    from utils import understat_tasks
+
+    calls = []
+    manager = SimpleNamespace(close=lambda: calls.append("close"))
+
+    def query(sql):
+        calls.append(sql)
+        if fail_on and fail_on in sql:
+            raise RuntimeError("retention below minimum")
+        return [[0]]
+
+    manager.execute_query = query
+    monkeypatch.setattr(iceberg_writer.IcebergWriter, "__init__", lambda self: None)
+    monkeypatch.setattr(iceberg_writer.IcebergWriter, "_get_trino_manager", lambda self: manager)
+    return understat_tasks.maintain_understat_snapshots, calls
+
+
+def test_snapshot_maintenance_covers_season_tables_and_manifest(monkeypatch):
+    run, calls = _maintenance(monkeypatch)
+    run()
+    keep = "retention_threshold => '3d'"
+    assert calls == [
+        "SET SESSION iceberg.expire_snapshots_min_retention = '3d'",
+        "SET SESSION iceberg.remove_orphan_files_min_retention = '3d'",
+        f"ALTER TABLE iceberg.bronze.understat_player_team_season_stats EXECUTE expire_snapshots({keep})",
+        f"ALTER TABLE iceberg.bronze.understat_player_team_season_stats EXECUTE remove_orphan_files({keep})",
+        f"ALTER TABLE iceberg.bronze.understat_team_season_breakdowns EXECUTE expire_snapshots({keep})",
+        f"ALTER TABLE iceberg.bronze.understat_team_season_breakdowns EXECUTE remove_orphan_files({keep})",
+        # The manifest only expires snapshots: no orphan removal under live writers.
+        f"ALTER TABLE iceberg.ops.understat_ingest_manifest_v1 EXECUTE expire_snapshots({keep})",
+        "close",
+    ]
+
+
+def test_snapshot_maintenance_fails_loudly_and_closes(monkeypatch):
+    run, calls = _maintenance(monkeypatch, fail_on="breakdowns EXECUTE expire")
+    with pytest.raises(RuntimeError, match="below minimum"):
+        run()
+    assert calls[-1] == "close"
+    assert not any("understat_ingest_manifest_v1" in call for call in calls)
