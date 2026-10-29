@@ -34,6 +34,10 @@ class Repository:
         if "understat_player_match_stats" in sql:
             return deepcopy(self.players)
         rows = self.schedule
+        if "is_result = true" in sql:
+            rows = [r for r in rows if r.get("is_result", True)]
+        elif "is_result = false" in sql:
+            rows = [r for r in rows if not r.get("is_result", True)]
         if params:
             rows = [r for r in rows if (r["league"], r["season"], r["_batch_id"]) == params]
         return deepcopy(rows)
@@ -147,6 +151,61 @@ def test_baseline_history_activation_and_missing_journal(tmp_path):
     (tmp_path / "html_enrichment/queue.json").unlink()
     assert run_enrichment(client, repo, now=NOW)["status"] == "waiting"
     assert not session.calls
+
+
+def test_match_in_progress_at_activation_is_enriched_after_finish(tmp_path):
+    repo, session = Repository(), Session()
+    repo.add_match()
+    repo.schedule[0].update(date=(NOW - timedelta(hours=1)).isoformat(), is_result=False)
+    clock = [NOW]
+    client = UnderstatClient(session=session, cache_dir=tmp_path, now=lambda: clock[0])
+    CacheState(tmp_path).count_request(NOW.date())
+    assert run_enrichment(client, repo, now=NOW)["status"] == "activated"
+    run_enrichment(client, repo, now=NOW)
+    assert not session.calls
+    # Reload the journal and publish a new JSON batch after the final whistle.
+    clock[0] += timedelta(hours=2)
+    repo.batch = "batch-2"
+    repo.schedule[0].update(is_result=True, _batch_id=repo.batch)
+    assert run_enrichment(client, repo, now=clock[0])["published"] == 1
+    run_enrichment(client, repo, now=clock[0])
+    assert len(session.calls) == 1
+    match = next(iter(repo.writes["understat_match_enrichment"].values()))
+    assert match["source_batch_id"] == repo.batch
+    assert match["whoscored_game_id"] == 1983568
+
+
+@pytest.mark.parametrize("appears_later", [True, False])
+def test_missing_fid_retries_fresh_html_with_day_limit(tmp_path, appears_later):
+    repo, session, client, clock, _ = setup(tmp_path)
+    repo.add_match()
+    session.html = session.html.replace("1983568", "")
+    assert run_enrichment(client, repo, now=NOW)["failed"] == 1
+    assert not repo.writes
+    run_enrichment(client, repo, now=NOW)
+    assert len(session.calls) == 1
+    if appears_later:
+        session.html = recorded(31209)[0]
+    # A new JSON publication must not reuse the incomplete cached page.
+    repo.batch = "batch-2"
+    repo.schedule[0]["_batch_id"] = repo.batch
+    for day in range(1, 5):
+        clock[0] = NOW + timedelta(days=day)
+        CacheState(tmp_path).count_request(clock[0].date())
+        run_enrichment(client, repo, now=clock[0])
+    state = read_json(tmp_path / "html_enrichment/queue.json")
+    entry = next(iter(state["games"].values()))
+    if appears_later:
+        assert len(session.calls) == 2
+        assert entry["done"]
+        match = next(iter(repo.writes["understat_match_enrichment"].values()))
+        assert match["whoscored_game_id"] == 1983568
+        assert match["source_batch_id"] == repo.batch
+    else:
+        assert len(session.calls) == 3
+        assert entry["status"] == "unavailable"
+        assert not entry.get("done")
+        assert not repo.writes
 
 
 @pytest.mark.parametrize("failure", ["timeout", "html", "cache", "writer"])

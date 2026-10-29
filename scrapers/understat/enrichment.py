@@ -112,8 +112,10 @@ def run_enrichment(client: Any, repository: Any, *, now: datetime | None = None)
         if not marker.exists():
             if journal.exists():
                 return {"status": "waiting", "reason": "activation marker lost"}
+            pending = _rows(repository, "understat_schedule", SCHEDULE_COLUMNS, "is_result = false")
             atomic_json(marker, {"activated_at": now.isoformat()})
             state = {"activated_at": now.isoformat(), "baseline": [str(r["game_id"]) for r in schedule],
+                     "pending": [str(r["game_id"]) for r in pending],
                      "games": {}}
             atomic_json(journal, state)
             return {"status": "activated", "baseline": len(schedule)}
@@ -125,7 +127,8 @@ def run_enrichment(client: Any, repository: Any, *, now: datetime | None = None)
             if stamp.tzinfo is None:
                 stamp = stamp.tz_localize("UTC")
             return (str(row["game_id"]) not in state["baseline"]
-                    and stamp >= pd.Timestamp(state["activated_at"]))
+                    and (str(row["game_id"]) in state.get("pending", [])
+                         or stamp >= pd.Timestamp(state["activated_at"])))
 
         scopes = {(row["league"], row["season"], int(row["source_season_id"]))
                   for row in schedule if eligible(row)}
@@ -202,6 +205,8 @@ def run_enrichment(client: Any, repository: Any, *, now: datetime | None = None)
                             atomic_json(journal, state)
                         result = parse_match_html(html, row, pd.DataFrame(players))
                         validate_card_counts(result, pd.DataFrame(players))
+                        if result["whoscored_game_id"] is None:
+                            raise ValueError("match HTML: missing fid")
                         if (repository.latest_attempt(scope).batch_id != attempt.batch_id
                                 or not repository.verify_physical_batch(attempt)):
                             continue
