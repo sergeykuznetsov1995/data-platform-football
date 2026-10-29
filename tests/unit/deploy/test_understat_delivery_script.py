@@ -28,6 +28,11 @@ ROOT = Path(__file__).resolve().parents[3]
 AUTO = ROOT / "deploy" / "understat" / "auto_deliver.sh"
 PATH_LINE = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
 NIGHT = "2026-09-24 01:10:00"
+
+
+def epoch(stamp: str) -> int:
+    from datetime import datetime, timezone
+    return int(datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc).timestamp())
 DAY = "20260924"
 MAIN = "scrapers/understat/client.py"
 # Разрешённое отставание (#1594): в стенде alerts.py «до #1477» — этот текст; его blob
@@ -134,6 +139,7 @@ case "$sql" in
     elif grep -rqs BROKEN {tree}/scrapers/understat {tree}/dags; then echo "t|f"; else echo "f|t"; fi ;;
   *import_error*"like '%understat%'"*) grep -rqs IMPORTERR {tree}/scrapers/understat {tree}/dags && echo 1 || echo 0 ;;
   *import_error*) echo 6 ;;
+  *next_dagrun*) cat {ss}/next_run 2>/dev/null || echo 0 ;;
   *task_instance*) cat {ss}/busy 2>/dev/null || echo 0 ;;
   *"now()"*) cat {tree}/scrapers/understat/client.py >> {ss}/now_snapshots; echo "2026-09-24 01:10:05+00" ;;
   *) echo "неизвестный SQL: $sql" >&2; exit 1 ;;
@@ -183,7 +189,7 @@ def test_nothing_to_deliver_moves_base_without_writes(stand: Stand) -> None:
     assert "нечего доставлять" in stand.log()
     assert not (stand.out / DAY).exists()
     assert stand.tg() == ""
-    assert (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
+    assert not list(stand.state.glob("understat-auto-deliver-attempted-*"))
 
 
 @pytest.mark.parametrize("shared", ["dags/utils/config.py", "dags/utils/alerts.py", "scrapers/base/base_scraper.py"])
@@ -251,9 +257,10 @@ def test_delivers_in_place_creates_new_module_and_rolls_back_by_hand(stand: Stan
         "dag_id='dag_ingest_understat'", "dag_id='dag_backfill_understat'"}
     assert "interval '60 seconds'" in (stand.ss / "docker.log").read_text(encoding="utf-8")
 
-    (stand.ss / "now").write_text("2026-09-24 09:30:00", encoding="utf-8")
+    (stand.ss / "next_run").write_text(str(epoch(NIGHT) + 600), encoding="utf-8")   # прогон через 10 мин
     res = stand.run("--rollback", DAY)
-    assert res.returncode == 1 and "вне окна" in res.stdout
+    assert res.returncode == 1 and "до запуска сбора по расписанию" in res.stdout
+    (stand.ss / "next_run").unlink()
     assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 2\n"
 
     (stand.ss / "now").write_text(NIGHT, encoding="utf-8")
@@ -314,7 +321,7 @@ def test_failed_acceptance_rolls_back(stand: Stand, cause: str) -> None:
     assert stand.accepted() == stand.base
     assert not (stand.state / "understat-inflight").exists()
     assert not (stand.state / "understat-auto-deliver.off").exists()
-    assert (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
+    assert len(list(stand.state.glob("understat-auto-deliver-attempted-*"))) == 1
 
 
 def test_unconfirmed_rollback_switches_off(stand: Stand) -> None:
@@ -327,7 +334,8 @@ def test_unconfirmed_rollback_switches_off(stand: Stand) -> None:
     assert (stand.state / "understat-auto-deliver.off").exists()
     assert (stand.state / "understat-inflight").exists()
     assert stand.accepted() == stand.base
-    (stand.state / f"understat-auto-deliver-attempted-{DAY}").unlink()
+    for latch in stand.state.glob("understat-auto-deliver-attempted-*"):
+        latch.unlink()
     res = stand.run()
     assert res.returncode == 0 and "выключатель" in res.stdout
 
@@ -343,18 +351,20 @@ def test_unconfirmed_manual_rollback_switches_off(stand: Stand) -> None:
     assert (stand.state / "understat-inflight").read_text(encoding="utf-8").strip() == f"rollback {DAY}"
 
 
-@pytest.mark.parametrize("why", ["window", "busy"])
+@pytest.mark.parametrize("why", ["next_run", "busy"])
 def test_outside_window_or_busy_does_nothing(stand: Stand, why: str) -> None:
+    # Гриль 29.10: окна по часам нет — доставка в любой час; держит только занятость и запас до прогона.
     stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
-    if why == "window":
+    if why == "next_run":
         (stand.ss / "now").write_text("2026-09-24 09:30:00", encoding="utf-8")
+        (stand.ss / "next_run").write_text(str(epoch("2026-09-24 09:30:00") + 1799), encoding="utf-8")
     else:
         (stand.ss / "busy").write_text("1\n", encoding="utf-8")
     res = stand.run()
     assert res.returncode == 0
-    assert ("вне окна" if why == "window" else "Understat занят") in stand.log()
+    assert ("до запуска сбора по расписанию" if why == "next_run" else "Understat занят") in stand.log()
     assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
-    assert not (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
+    assert not list(stand.state.glob("understat-auto-deliver-attempted-*"))
     assert stand.tg() == ""
 
 
@@ -367,7 +377,7 @@ def test_check_writes_nothing(stand: Stand) -> None:
     assert not (stand.tree / "scrapers/understat/extra.py").exists()
     assert not (stand.out / DAY).exists()
     assert stand.accepted() == stand.base
-    assert not (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
+    assert not list(stand.state.glob("understat-auto-deliver-attempted-*"))
     assert not (stand.state / "understat-inflight").exists()
     assert stand.tg() == ""
 
