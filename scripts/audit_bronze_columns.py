@@ -37,9 +37,9 @@ def _load_whoscored_contract():
     25 business datasets and five commit manifests.
     """
 
-    path = Path(__file__).with_name("whoscored_v2_object_contract.py")
+    path = Path(__file__).with_name("whoscored_v2_inventory.py")
     spec = importlib.util.spec_from_file_location(
-        "_audit_whoscored_v2_object_contract",
+        "_audit_whoscored_v2_inventory",
         path,
     )
     if spec is None or spec.loader is None:
