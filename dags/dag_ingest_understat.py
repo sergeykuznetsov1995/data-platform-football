@@ -7,8 +7,8 @@ plus the next season when Understat starts publishing it.  Each discovered
 subprocess can therefore never hide another league's empty or partial result.
 
 Historical seasons are deliberately not accepted as a UI override here.  The
-paused, self-draining ``dag_backfill_understat`` owns history and resumes from
-the durable Understat publication manifest.
+self-draining ``dag_backfill_understat`` is created paused, owns history, and
+resumes from the durable Understat publication manifest.
 """
 
 from __future__ import annotations

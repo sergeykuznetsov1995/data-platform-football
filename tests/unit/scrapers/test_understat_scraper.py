@@ -1,5 +1,7 @@
 """Public facade tests for the source-native Understat scraper."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -87,12 +89,8 @@ def test_scrape_scope_preserves_explicit_canonical_signature(scraper):
     ]
 
 
-def test_read_wrappers_share_one_seven_table_scope_fetch(scraper):
-    facade, source = scraper
-    frames = [getattr(facade, contract.reader_method)() for contract in TABLE_CONTRACTS]
-    assert len(source.calls) == 1
-    assert all(frame is not None and len(frame) == 1 for frame in frames)
-    assert all("_batch_id" in frame.columns for frame in frames)
+def test_scope_discovery_is_forwarded(scraper):
+    facade, _source = scraper
     assert facade.discover_scopes() == ("discovered",)
     assert facade.rolling_scopes() == ("rolling",)
 
@@ -152,11 +150,40 @@ def test_scope_writer_requires_runner_owned_batch_id(scraper):
         )
 
 
-def test_table_specs_come_from_registry_and_legacy_writer_is_disabled(scraper):
+def test_legacy_writer_is_disabled(scraper):
     facade, _source = scraper
-    assert facade.TABLE_SPECS == [
-        (contract.reader_method, contract.table_name, contract.result_key)
-        for contract in TABLE_CONTRACTS
-    ]
     with pytest.raises(RuntimeError, match="scope-aware"):
         facade.scrape_all()
+
+
+@pytest.mark.parametrize(
+    "filename, removed",
+    [
+        (
+            "scraper.py",
+            {
+                "TABLE_SPECS", "_scope_cache", "_configured_scopes", "_read_table",
+                "_filter_match", "read_schedule", "read_shot_events",
+                "read_player_season_stats", "read_team_match_stats",
+                "read_player_match_stats", "read_player_team_season_stats",
+                "read_team_season_breakdowns",
+            },
+        ),
+        ("contracts.py", {"reader_method"}),
+        ("manifest.py", {"is_published", "next_incomplete"}),
+    ],
+)
+def test_retired_api_has_no_definitions_or_references(filename, removed):
+    source = Path(__file__).resolve().parents[3] / "scrapers" / "understat" / filename
+    tree = ast.parse(source.read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.keyword):
+            names.add(node.arg)
+    assert not names & removed

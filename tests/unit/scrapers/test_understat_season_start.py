@@ -13,6 +13,7 @@ from copy import deepcopy
 from datetime import date, timedelta
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -25,7 +26,7 @@ from scrapers.understat import (
     UnderstatSchemaDrift,
     UnderstatSource,
 )
-from scrapers.understat.catalog import UnderstatScope
+from scrapers.understat.catalog import LEAGUES, UnderstatScope, season_slug
 from scrapers.understat.coverage import coverage_exceptions_for_scope
 from scrapers.understat.manifest import ManifestStatus, ScopeKey
 from scrapers.understat.parsers import parse_team_payload, validate_league_payload
@@ -391,14 +392,17 @@ class _StatClient:
     "today, expected",
     [
         (date(2027, 1, 15), {2025: True, 2026: True}),
+        (date(2027, 5, 15), {2025: True, 2026: True}),
         (date(2027, 6, 30), {2025: True, 2026: True, 2027: False}),
         (date(2027, 7, 1), {2025: True, 2026: True}),
+        (date(2027, 8, 15), {2025: True, 2026: True}),
     ],
 )
-def test_rolling_window_around_the_july_rollover(today, expected):
+@pytest.mark.parametrize("definition", LEAGUES, ids=lambda item: item.source_league)
+def test_rolling_window_around_the_july_rollover(today, expected, definition):
     scopes = [
         scope for scope in UnderstatCatalog(_StatClient(), today=today).rolling_scopes()
-        if scope.league == LEAGUE
+        if scope.league == definition.league
     ]
 
     assert {scope.source_season_id: scope.discovered for scope in scopes} == expected
@@ -727,3 +731,57 @@ def test_discovery_drift_payload_is_saved(tmp_path):
 
     [saved] = _drift_files(tmp_path)
     assert saved.name.endswith("_stat.json")
+
+
+@pytest.mark.parametrize("today", [
+    date(2027, 1, 15), date(2027, 5, 15), date(2027, 7, 1), date(2027, 8, 15),
+])
+def test_calendar_window_without_registry_for_all_six_leagues(today, tmp_path):
+    # A client without HTTP methods proves that fallback needs no live registry.
+    client = SimpleNamespace(cache_dir=tmp_path)
+    scopes = UnderstatCatalog(client, today=today).calendar_scopes()
+    expected = {2025, 2026} if today.month < 7 else {2026, 2027}
+    assert {(scope.league, scope.source_season_id) for scope in scopes} == {
+        (definition.league, year) for definition in LEAGUES for year in expected
+    }
+    assert not any(scope.discovered for scope in scopes)
+    assert all(scope.season == season_slug(scope.source_season_id) for scope in scopes)
+
+
+@pytest.mark.parametrize("today", [
+    date(2027, 1, 15), date(2027, 5, 15), date(2027, 7, 1), date(2027, 8, 15),
+])
+@pytest.mark.parametrize("finished", [False, True], ids=["continuing", "finished"])
+def test_rolling_window_uses_each_leagues_schedule(today, finished, tmp_path):
+    class ScheduleClient(_StatClient):
+        cache_dir = tmp_path
+
+        def __init__(self):
+            self.calls = []
+
+        def get_league_data(self, source_league, year, *, force_refresh=False):
+            self.calls.append((source_league, year))
+            assert source_league in {item.source_league for item in LEAGUES}
+            if year == 2027:
+                return {"dates": [], "players": [], "teams": {}}
+            assert year == 2026
+            # Synthetic season end, independent of the calendar month.
+            match = deepcopy(_base_league()["dates"][0])
+            end = today + timedelta(days=-3 if finished else 30)
+            match["datetime"] = f"{end} 12:00:00"
+            match["isResult"] = finished
+            return {"dates": [match], "players": [], "teams": {}}
+
+    client = ScheduleClient()
+    scopes = UnderstatCatalog(client, today=today).rolling_scopes()
+    assert {(scope.league, scope.source_season_id) for scope in scopes} == {
+        (definition.league, year) for definition in LEAGUES for year in (2025, 2026)
+    }
+    assert set(client.calls) == {
+        (definition.source_league, year) for definition in LEAGUES
+        for year in ((2026, 2027) if finished else (2026,))
+    }
+    assert len(client.calls) == len(LEAGUES) * (2 if finished else 1)
+    assert all(scope.season == season_slug(scope.source_season_id) for scope in scopes)
+    # A finished schedule alone cannot bypass the quality gate for closure.
+    assert not any(scope.is_closed for scope in scopes if scope.source_season_id == 2026)
