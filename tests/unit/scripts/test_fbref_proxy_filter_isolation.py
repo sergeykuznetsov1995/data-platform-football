@@ -100,6 +100,7 @@ def test_fbref_task_switches_are_scheduler_only_and_explicitly_admitted():
         "FBREF_BATCH_PERSIST",
         "FBREF_BATCH_PERSIST_MATCHES",
         "FBREF_BATCH_PERSIST_MAX_CELLS",
+        "FBREF_HISTORY_CONTROLLER_ENABLED",
         "FBREF_PERSISTENT_HTTP_SESSION",
     }
     scheduler_environment = compose["services"]["airflow-scheduler"][

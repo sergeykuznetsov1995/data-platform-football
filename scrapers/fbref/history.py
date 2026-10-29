@@ -411,6 +411,15 @@ class HistoryCampaign:
                 )
             return max(HISTORY_PAGE_SECONDS_FLOOR, math.ceil(float(row["seconds"])))
 
+    def has_timing(self):
+        """True once a history run has recorded measured pages."""
+        with self.control._transaction() as cursor:
+            cursor.execute(
+                """SELECT EXISTS(SELECT 1 FROM fbref_control.history_timing
+                WHERE pages>0) AS present"""
+            )
+            return bool(_fetchone(cursor)["present"])
+
     def record_timing(self, run_id, result):
         fetch, parse = result.get("fetch", {}), result.get("parse", {})
         pages = max(int(fetch.get("claimed", 0)), int(parse.get("cohort_size", 0)))
