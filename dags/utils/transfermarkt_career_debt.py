@@ -3,6 +3,8 @@
 import os
 from datetime import timedelta
 
+from scrapers.transfermarkt.revisions import PARSER_REVISION, SCHEMA_REVISION
+
 CAREER_TTL = timedelta(days=7)
 CAREER_DEBT_POLICY = 'player-endpoint-v1'
 FETCH_STATE_TABLE = 'iceberg.ops.transfermarkt_fetch_state'
@@ -11,9 +13,9 @@ SUCCESS_STATUSES = frozenset({'success', 'valid_empty', 'authoritative_empty'})
 
 
 def career_debt_ctes() -> str:
-    # Keep the existing fetch-state identity, including environment overrides.
-    parser = os.environ.get('TM_PARSER_VERSION', 'v2').replace("'", "''")
-    schema = os.environ.get('TM_SCHEMA_VERSION', '2').replace("'", "''")
+    # Same fetch-state identity as run_transfermarkt_scraper, including environment overrides.
+    parser = os.environ.get('TM_PARSER_VERSION', PARSER_REVISION).replace("'", "''")
+    schema = os.environ.get('TM_SCHEMA_VERSION', SCHEMA_REVISION).replace("'", "''")
     return f"""career_roster AS (
     SELECT DISTINCT competition_id, edition_id, CAST(player_id AS varchar) AS player_id
     FROM {MEMBERSHIPS_TABLE}
