@@ -407,6 +407,87 @@ def _complete_manifest_records_for_projection(
     return records
 
 
+def _published_status_ids(league: str, season_short: str, match_ids) -> set:
+    """Those of ``match_ids`` whose compatibility status row is complete in Bronze."""
+    conn = _trino_connect()
+    if conn is None:
+        raise RuntimeError("Trino unavailable during capture-status probe")
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT CAST(match_id AS varchar) "
+            f"FROM iceberg.bronze.{_MATCH_CAPTURE_STATUS_TABLE} "
+            "WHERE league = ? AND CAST(season AS varchar) = ? "
+            "AND capture_complete = true",
+            (league, season_short),
+        )
+        published = {row[0] for row in cur.fetchall() if row and row[0]}
+        return {str(match_id) for match_id in match_ids} & published
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _repair_terminal_capture_status(
+    capture_runtime, endpoint_specs, skipped_ids, results, *, league, season, season_short,
+):
+    """Publish the lost status row of a terminal match the source never served (#1957).
+
+    Endpoint resume skips a match whose five endpoints are terminal, so a
+    status commit lost after the manifest closed was never retried and the
+    history inventory replanned the season forever. The row is projected from
+    the stored manifest with zero source traffic.
+    """
+    skipped = {str(match_id) for match_id in skipped_ids}
+    missing = sorted(skipped - _published_status_ids(league, season_short, skipped), key=int)
+    if not missing:
+        return
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.adapters import project_legacy_match_status
+    from scrapers.sofascore.writer_lock import bronze_writer_lock
+
+    endpoints = ("event", "lineups", "statistics", "shotmap", "incidents")
+    records = [
+        capture_runtime.manifest_store.get(endpoint_specs[(match_id, endpoint)].key)
+        for match_id in missing
+        for endpoint in endpoints
+    ]
+    rows = [
+        row
+        for row in project_legacy_match_status(
+            [record for record in records if record is not None],
+            league=league, season=season_short, endpoints=endpoints,
+        )
+        # Only a match without payload rows: its status is the whole
+        # publication. A served match that lost status may have lost its
+        # normalized rows too and must not be declared published here.
+        if row["capture_complete"]
+        and all(row[f"{endpoint}_status"] == "not_available" for endpoint in endpoints)
+    ]
+    if not rows:
+        return
+    import pandas as pd
+
+    with SofaScoreScraper(leagues=[league], seasons=[season]) as scraper:
+        frame = scraper._add_metadata(pd.DataFrame(rows), "match_capture_status")
+        with bronze_writer_lock():
+            path = _save_publication(scraper, results,
+                df=frame,
+                table_name=_MATCH_CAPTURE_STATUS_TABLE,
+                partition_cols=["league", "season"],
+                natural_keys=["league", "season", "match_id"],
+            )
+    results["tables"].append(path)
+    results["capture_status_rows"] += len(rows)
+    results["capture_status_repaired"] = len(rows)
+    logger.warning(
+        "Repaired %d lost capture-status rows of terminal matches: %s",
+        len(rows), [row["match_id"] for row in rows],
+    )
+
+
 def _incomplete_endpoint_summary(status_rows, *, limit: int = 20) -> str:
     """Name why a capture is nonterminal: how many matches and which states."""
     incomplete = [row for row in status_rows if not bool(row.get("capture_complete"))]
@@ -1431,6 +1512,7 @@ def _run_match_capture(
             and _held_before(capture_runtime.manifest_store.get(spec.key))
         )
         total = len(match_ids)
+        all_match_ids = list(match_ids)
         match_ids = [
             match_id for match_id in match_ids if str(match_id) in endpoint_plan
         ]
@@ -1446,6 +1528,13 @@ def _run_match_capture(
         if limit:
             match_ids = match_ids[: int(limit)]
         if not match_ids:
+            # Only a pass with nothing to capture probes for lost status rows:
+            # it is the pass a still-open season repeats (#1957).
+            if all_match_ids and not limit:
+                _repair_terminal_capture_status(
+                    capture_runtime, endpoint_specs, all_match_ids, results,
+                    league=league, season=season, season_short=season_short,
+                )
             results["traffic"] = {
                 "paid_proxy_bytes": 0,
                 "paid_proxy_mb": 0.0,
