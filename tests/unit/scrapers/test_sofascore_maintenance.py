@@ -284,6 +284,17 @@ def test_client_bounds_requests_and_disables_spooling(monkeypatch):
     assert requests_seen == [("DELETE", m.HTTP_SECONDS)]
 
 
+def test_https_client_session_skips_self_signed_verification(monkeypatch):
+    # trino.dbapi ignores verify= when http_session is supplied: the session's
+    # own verify flag is what reaches requests (prod 29.10: CERTIFICATE_VERIFY_FAILED).
+    import trino.dbapi
+
+    monkeypatch.setenv("TRINO_PASSWORD", "secret")
+    monkeypatch.setattr(trino.dbapi, "connect", lambda **kwargs: None)
+    queries = m.Queries()
+    assert queries.session.verify is False
+
+
 @pytest.mark.parametrize("mode", ["cancel", "cancel_failed", "lost_id"])
 @pytest.mark.parametrize("stage", ["query", "cleanup"])
 def test_sigterm_keeps_writer_lock_until_query_stops(tmp_path, mode, stage):

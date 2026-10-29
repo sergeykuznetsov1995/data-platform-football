@@ -86,7 +86,7 @@ def scope_db():
                 for statement in bootstrap_statements():
                     cursor.execute(statement)
                 for migration in MIGRATIONS:
-                    if migration.version == 13:
+                    if migration.version in (13, 15):
                         continue
                     for statement in migration.statements:
                         cursor.execute(statement)
@@ -136,6 +136,8 @@ def scope_db():
                         (str(uuid.uuid4()), child, cid))
                 for statement in next(m for m in MIGRATIONS if m.version == 13).statements:
                     cursor.execute(statement)
+                for statement in next(m for m in MIGRATIONS if m.version == 15).statements:
+                    cursor.execute(statement)
         store = ControlStore(dsn)
         yield connection, store, RealDictCursor
     finally:
@@ -170,6 +172,20 @@ def assert_equivalent(connection, cursor_class):
             for row in stored:
                 key = lambda scope: json.dumps(scope, sort_keys=True)
                 assert sorted(row["scopes"], key=key) == sorted(scopes.get(row["target_id"], []), key=key)
+            cursor.execute("SELECT competition_id, gender FROM fbref_control.competition_registry")
+            genders = {row['competition_id']: row['gender'] for row in cursor.fetchall()}
+            for row in stored:
+                classes = {genders.get(scope['competition_id']) for scope in row['scopes']}
+                if not classes or None in classes:
+                    expected_class = 'unknown'
+                elif {'male', 'female'} <= classes:
+                    expected_class = 'mixed'
+                elif 'unknown' in classes:
+                    expected_class = 'unknown'
+                else:
+                    expected_class = next(iter(classes))
+                assert row['gender_classified']
+                assert row['gender_class'] == expected_class
             cursor.execute(LEGACY_PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
             report_rows = json_result(cursor)
             assert "z-future" not in {row["target_id"] for row in report_rows}
@@ -523,3 +539,45 @@ def test_aggregate_guard_checks_even_pages_outside_report_scope(scope_db, mutati
             cursor.execute(mutation)
             cursor.execute(aggregate_sql(cursor))
             assert json_result(cursor) == {"error": "scope_summary_incomplete"}
+
+
+def test_gender_backfill_covers_inherited_mixed_orphan_and_quarantined(scope_db):
+    connection, store, cursor_class = scope_db
+    finish_backfill(store)
+    # Simulate the v15 upgrade over an already populated v13 summary.
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute("UPDATE fbref_control.page_scope_summary SET gender_class='unknown', gender_classified=false")
+    first = store.backfill_page_gender_classes(batch_size=2)
+    assert first["processed"] == 2 and not first["done"]
+    restarted = ControlStore(store.db_uri)
+    while not restarted.backfill_page_gender_classes(batch_size=2)["done"]:
+        pass
+    assert restarted.backfill_page_gender_classes()["processed"] == 0
+    with connection:
+        with connection.cursor(cursor_factory=cursor_class) as cursor:
+            cursor.execute("SELECT target_id, gender_class, gender_classified FROM fbref_control.page_scope_summary")
+            rows = {r['target_id']: r for r in cursor.fetchall()}
+            assert all(r['gender_classified'] for r in rows.values())
+            assert rows['b-provenance']['gender_class'] == 'male'
+            assert rows['c-shared']['gender_class'] == 'male'
+            assert rows['d-female']['gender_class'] == 'female'
+            assert rows['g-orphan']['gender_class'] == 'unknown'
+            assert rows['k-mixed']['gender_class'] == 'mixed'
+            cursor.execute("SELECT count(*) AS count FROM fbref_control.page_frontier")
+            assert len(rows) == cursor.fetchone()['count']
+    # New female-only provenance, without a direct ID, is classified at seeding.
+    store.upsert_frontier_target(FrontierTarget('new-female', 'player', 'https://example.invalid/new-female', {}, 'weekly'))
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""INSERT INTO fbref_control.frontier_provenance
+                (provenance_id,parent_target_id,child_target_id,relation,
+                 carried_competition_id,carried_season_id,parent_content_hash,parser_version)
+                VALUES (%s,'h-index','new-female','link','11','2026','hash','fixture')""", (str(uuid.uuid4()),))
+    # Direct SQL intentionally leaves pending; the normal writer's refresh resolves it.
+    store.upsert_frontier_target(FrontierTarget('new-female', 'player', 'https://example.invalid/new-female', {}, 'weekly'))
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute("UPDATE fbref_control.page_frontier SET state='quarantined' WHERE target_id='new-female'")
+            cursor.execute("SELECT gender_class FROM fbref_control.page_scope_summary WHERE target_id='new-female'")
+            assert cursor.fetchone()[0] == 'female'

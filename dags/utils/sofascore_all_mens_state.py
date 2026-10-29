@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Collection, Iterable, Mapping
 
 from scrapers.sofascore.denominator import Denominator, load_denominator
 from scrapers.sofascore.workload_plan import (
@@ -206,8 +206,10 @@ def current_season_targets(
     snapshot: Mapping[str, Any],
     exclude_tournament_ids: frozenset[int],
     denominator: Denominator | None = None,
+    *,
+    debt_partitions: Collection[tuple[str, str]] = (),
 ) -> list[SeasonTarget]:
-    """Newest non-excluded season of every ready tournament, by tournament id.
+    """Newest season plus explicitly requested debt seasons of ready tournaments.
 
     The order is stable so callers walk a fixed sequence.  An ``excluded``
     season is never a target; a tournament whose seasons are all excluded is
@@ -229,6 +231,11 @@ def current_season_targets(
         ):
             if start_year is None:  # Guard the dynamic helper contract.
                 continue
+            if (capture_key, canonical) in debt_partitions:
+                targets.append(SeasonTarget(
+                    tournament_id=tournament_id, season_id=season_id,
+                    league=capture_key, canonical_season=canonical,
+                ))
             if newest is None or start_year > newest[0]:
                 newest = (
                     start_year,
@@ -239,7 +246,7 @@ def current_season_targets(
                         canonical_season=canonical,
                     ),
                 )
-        if newest is not None:
+        if newest is not None and newest[1] not in targets:
             targets.append(newest[1])
     targets.sort(key=lambda target: target.pair)
     return targets

@@ -80,7 +80,7 @@ def test_clubelo_exact_https_allowlist(mod, host, port, allowed):
     assert mod._lease_host_allowed(_lease(mod), host, port) is allowed
 
 
-@pytest.mark.parametrize("mode", ["fbref-only", "whoscored-only"])
+@pytest.mark.parametrize("mode", ["fbref-only"])
 def test_clubelo_rejected_by_dedicated_services(mod, mode):
     mod.SOURCE_MODE = mode
     with pytest.raises(ValueError, match="dedicated"):

@@ -125,7 +125,7 @@ from scrapers.fbref.typed_bronze import (
     parse_season_stats_html as parse_typed_season_stats_html,
     typed_result_requires_persistence,
 )
-from scrapers.fbref.match_parser import MatchParseResult
+from scrapers.fbref.match_parser import IncompleteMatchPageError, MatchParseResult
 
 
 SENTINEL_COMPETITIONS = (
@@ -826,6 +826,7 @@ class WaveResult:
     deferred_session_failures: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    incomplete_match_refetches: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -923,6 +924,7 @@ class _ProcessedObservation:
     skipped_ineligible: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    incomplete_match_refetches: int = 0
     deferred_parse_failures: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
@@ -1848,12 +1850,19 @@ def _acceptance_coverage_errors(
                 "typed:match_officials", "typed:match_keeper_stats",
                 "typed:match_player_stats", "typed:__complete__",
             }
+        completion = manifests_by_target.get(target_id, {}).get("typed:__complete__", {})
+        scored_match = page_kind == "match" and completion.get("error_message") == "scored_match_requires_rows"
         for dataset_name in sorted(required_typed):
+            requires_rows = scored_match and dataset_name in {"typed:match_events", "typed:lineups"}
+            manifest = manifests_by_target.get(target_id, {}).get(dataset_name, {})
             if not _manifest_ok(
                 target_id,
                 dataset_name,
-                allow_skipped=dataset_name != "typed:__complete__",
-            ):
+                allow_skipped=dataset_name != "typed:__complete__" and not requires_rows,
+            ) or (requires_rows and (
+                manifest.get("availability") != "available"
+                or int(manifest.get("row_count") or 0) <= 0
+            )):
                 missing_target_manifests.append(f"{target_id}:{dataset_name}")
     if missing_target_manifests:
         errors.append(
@@ -2661,6 +2670,7 @@ class FBrefPipeline:
         # the one caller that guarantees a later parse wave in this process.
         # A single parse_fbref_wave or recovery drain stays loud.
         self._parse_deferrals: dict[str, int] = {}
+        self._parse_carryovers: dict[str, dict] = {}
         self._defer_transient_parse = False
         self._parse_deferrals_pending = False
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
@@ -3547,6 +3557,8 @@ class FBrefPipeline:
                     cross_run_historical_raw = (
                         frontier.get("refresh_policy") == "historical_once"
                         and lease.page_kind != "season"
+                        and not frontier.get("requires_fresh_match_fetch")
+                        and frontier.get("last_error_class") != "IncompleteMatchPageError"
                     )
                     recoverable = exact_refresh_raw or cross_run_historical_raw
                     if recoverable:
@@ -4542,6 +4554,7 @@ class FBrefPipeline:
             finalization_guard=self.finalization_guard,
         )
         failed = True
+        self._parse_carryovers = {}
         self._defer_transient_parse = True
         try:
             # Each claim independently evaluates _FRONTIER_SCOPE_CTE while
@@ -4649,7 +4662,8 @@ class FBrefPipeline:
                     # the last wave deferred, and no later wave will retry it
                     # (#1759).  Parse once more: raw only, no request, no paid
                     # lease.  A deadline stop skips this -- the task timeout
-                    # is the harder limit -- and validation reports the raw.
+                    # is the harder limit -- and unfinished transient
+                    # observations carry over below.
                     with self._profiled_wave() as parse_ms:
                         parsed = self.parse_wave(
                             run_id,
@@ -4696,6 +4710,10 @@ class FBrefPipeline:
                         f"no page fetched; {deferred} target failure(s) "
                         "deferred"
                     )
+            if aggregate.deadline_reached and self._parse_carryovers:
+                self.control.record_deferred_parse_observations(
+                    run_id, list(self._parse_carryovers.values())
+                )
             failed = False
             return aggregate
         finally:
@@ -5707,6 +5725,8 @@ class FBrefPipeline:
         counts: Optional[Mapping[str, int]] = None
         try:
             if parsed.has_errors:
+                if any(d.error_type == "IncompleteMatchPageError" for d in parsed.datasets.values()):
+                    raise IncompleteMatchPageError("Scored match has no events or lineups")
                 raise TypedBronzeError("Typed match parser failed")
             counts = self.typed_adapter.writer.persist_match(
                 parsed,
@@ -5715,13 +5735,13 @@ class FBrefPipeline:
                 run_id=run_id,
                 target_identity=record.logical_refresh_id,
             )
-        except Exception:
+        except Exception as exc:
             self._record_typed_results(
-                record, parsed.datasets, persisted=None
+                record, parsed.datasets, persisted=None, error=exc
             )
             raise
         self._record_typed_results(record, parsed.datasets, persisted=counts)
-        self._record_typed_completion(record)
+        self._record_typed_completion(record, has_score=parsed.has_score)
 
     def _record_typed_results(
         self,
@@ -5729,6 +5749,7 @@ class FBrefPipeline:
         parsed: Mapping[str, object],
         *,
         persisted: Optional[Mapping[str, int]],
+        error: Optional[Exception] = None,
         control=None,
     ) -> None:
         control_store = self.control if control is None else control
@@ -5759,9 +5780,15 @@ class FBrefPipeline:
                     else "skipped"
                 ),
                 row_count=int(getattr(dataset, "row_count", 0) or 0),
-                error_class=getattr(dataset, "error_type", None),
+                error_class=(
+                    type(error).__name__
+                    if failed and status != "error" and error is not None
+                    else getattr(dataset, "error_type", None)
+                ),
                 error_message=(
-                    getattr(dataset, "error_message", None)
+                    str(error)
+                    if failed and status != "error" and error is not None
+                    else getattr(dataset, "error_message", None)
                     or getattr(dataset, "reason", None)
                 ),
             )
@@ -5771,6 +5798,7 @@ class FBrefPipeline:
         record: RawFetchRecord,
         *,
         control=None,
+        has_score: bool = False,
     ) -> None:
         """Cache typed success only after every dataset result."""
 
@@ -5785,6 +5813,7 @@ class FBrefPipeline:
             persistence_status="succeeded",
             validation_status="succeeded",
             row_count=0,
+            error_message="scored_match_requires_rows" if has_score else None,
         )
 
     def _persist_typed(
@@ -5846,6 +5875,8 @@ class FBrefPipeline:
                 )
                 parsed = match.datasets
                 if match.has_errors:
+                    if any(d.error_type == "IncompleteMatchPageError" for d in match.datasets.values()):
+                        raise IncompleteMatchPageError("Scored match has no events or lineups")
                     raise TypedBronzeError("Typed match parser failed")
                 counts = self.typed_adapter.writer.persist_match(
                     match,
@@ -5856,16 +5887,16 @@ class FBrefPipeline:
                 )
             else:
                 return
-        except Exception:
+        except Exception as exc:
             if "parsed" in locals():
                 self._record_typed_results(
-                    record, parsed, persisted=None
+                    record, parsed, persisted=None, error=exc
                 )
             raise
         self._record_typed_results(record, parsed, persisted=counts)
         # This must remain the final typed manifest.  A crash while recording
         # any individual result therefore leaves replay work discoverable.
-        self._record_typed_completion(record)
+        self._record_typed_completion(record, has_score=record.page_kind == "match" and match.has_score)
 
     def _persist_guarded_typed(
         self,
@@ -6219,16 +6250,40 @@ class FBrefPipeline:
                     f"{record.target_id}:manifest:"
                     f"{type(manifest_exc).__name__}:{manifest_exc}"
                 )
+        # Record the retry decision before releasing the observation. If that
+        # transaction fails, recovery must still retry scheduling this raw.
+        refetch_error = None
+        refetch_scheduled = False
+        if isinstance(exc, IncompleteMatchPageError):
+            try:
+                refetch_scheduled = self.control.schedule_incomplete_match_refetch(
+                    record.target_id, content_hash=record.content_hash,
+                    logical_refresh_id=record.logical_refresh_id,
+                )
+            except Exception as refetch_exc:
+                refetch_error = refetch_exc
+                failures.append(
+                    f"{record.target_id}:refetch:"
+                    f"{type(refetch_exc).__name__}:{refetch_exc}"
+                )
         try:
             self.control.fail_observation_processing(
                 observation_lease,
-                error_class=type(exc).__name__,
-                error_message=str(exc),
+                error_class=type(refetch_error or exc).__name__,
+                error_message=str(refetch_error or exc),
             )
         except Exception as fence_exc:
             failures.append(
                 f"{record.target_id}:observation_fence:"
                 f"{type(fence_exc).__name__}:{fence_exc}"
+            )
+        if refetch_scheduled and not failures:
+            # The page stays failed and cannot publish, but a fresh request
+            # now owns its recovery. Let the drain reach the next raw batch.
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=stale_typed_observations_skipped,
+                incomplete_match_refetches=1,
             )
         if isinstance(exc, SourceContractRejected):
             retired = False
@@ -6257,7 +6312,7 @@ class FBrefPipeline:
                     contract_quarantined=1,
                     failures=tuple(failures),
                 )
-        elif not _is_infrastructure_failure(exc):
+        elif not isinstance(exc, IncompleteMatchPageError) and not _is_infrastructure_failure(exc):
             # Classification comes first, and every way of not reporting a
             # failure lives under it.  A failure of the world around the page
             # -- a dead gateway, a lost lease, a frontier fence that did not
@@ -6344,6 +6399,20 @@ class FBrefPipeline:
             # The failure manifest and the released observation above both
             # landed, so the next parse wave re-lists this raw (#1759).
             self._parse_deferrals[record.target_id] = deferrals + 1
+            self._parse_carryovers[record.logical_refresh_id] = {
+                "logical_refresh_id": record.logical_refresh_id,
+                "target_id": record.target_id,
+                "content_hash": record.content_hash,
+                "raw_manifest_key": self.raw_store.fetch_manifest_key(
+                    record.logical_refresh_id
+                ),
+                "parser_version": observation_lease.parser_version,
+                "typed_parser_version": observation_lease.typed_parser_version,
+                "stateful_parser_version": observation_lease.stateful_parser_version,
+                "error_class": type(exc).__name__,
+                "error_message": str(exc)[:2000],
+                "reason": "deadline_after_transient_trino_failure",
+            }
             logger.warning(
                 "Deferred %s to a later parse wave after transient Trino "
                 "failure %d/%d: %s: %s",
@@ -6435,7 +6504,7 @@ class FBrefPipeline:
                             typed_match.datasets,
                             persisted=typed_batch_counts,
                         )
-                        self._record_typed_completion(record)
+                        self._record_typed_completion(record, has_score=typed_match.has_score)
                 else:
                     if self._typed_context(record) is None:
                         raise TypedBronzeError(
@@ -6513,6 +6582,21 @@ class FBrefPipeline:
         try:
             if prepared_page is None:
                 prepared_page = self._parse_generic(html, record)
+            # A scored match shell must request fresh raw before generic
+            # contract rejection can send it to the dead-letter quarantine.
+            if record.page_kind == "match" and prepared_page.errors:
+                if typed_match is None:
+                    typed_match, match_id, typed_context = self._parse_typed_match(
+                        html, record
+                    )
+                if any(
+                    dataset.error_type == "IncompleteMatchPageError"
+                    for dataset in typed_match.datasets.values()
+                ):
+                    self._record_typed_results(
+                        record, typed_match.datasets, persisted=None
+                    )
+                    raise IncompleteMatchPageError("Scored match has no events or lineups")
         except Exception as exc:
             return self._failed_claimed_observation(
                 record=record,
@@ -7086,6 +7170,7 @@ class FBrefPipeline:
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
         result.dead_lettered += outcome.dead_lettered
+        result.incomplete_match_refetches += outcome.incomplete_match_refetches
         result.deferred_parse_failures.extend(outcome.deferred_parse_failures)
         result.failures.extend(outcome.failures)
 
@@ -7187,7 +7272,7 @@ class FBrefPipeline:
             control=replay_control,
         )
         self._record_typed_completion(
-            item.record, control=replay_control
+            item.record, control=replay_control, has_score=item.typed_match.has_score
         )
         self._record_page_completion(
             item.record,
@@ -7731,6 +7816,12 @@ class FBrefPipeline:
                 if len(generic_buffer) == self.batch_persist_matches:
                     flush_buffers(matches=False, generic=True)
             flush_buffers(matches=True, generic=True)
+        for item in fetches:
+            carryover = self._parse_carryovers.get(str(item["logical_refresh_id"]))
+            if carryover is not None:
+                # Raw may belong to a failed attempt recovered by this cohort's
+                # successful attempt. Carryover must fence the successful one.
+                carryover["attempt_id"] = str(item["attempt_id"])
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_deferred_parse_failures(result):
@@ -8064,6 +8155,10 @@ class FBrefPipeline:
             ):
                 errors.append("replay_candidates_remaining")
         if not isolated_acceptance:
+            if ("frontier_gender_total" not in summary
+                or "frontier_gender_classified" not in summary
+                or summary["frontier_gender_total"] != summary["frontier_gender_classified"]):
+                errors.append("frontier_gender_classification_incomplete")
             if int(summary.get("female_downstream_targets") or 0) != 0:
                 errors.append("female_downstream_targets_nonzero")
             if int(summary.get("unknown_gender_downstream_targets") or 0) != 0:

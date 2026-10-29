@@ -1,9 +1,9 @@
 {
-  "policy_version": 3,
+  "policy_version": 4,
   "dag_id": "dag_backfill_transfermarkt",
   "approved_by": "sergeykuznetsov1995",
-  "approved_at": "2026-10-18T00:00:00Z",
-  "expires_at": "2027-07-21T00:00:00Z",
+  "approved_at": "2026-10-28T00:00:00Z",
+  "expires_at": "2027-10-28T00:00:00Z",
   "paid_proxy": {
     "byte_cap_bytes": 25165824,
     "request_limit": 1900,

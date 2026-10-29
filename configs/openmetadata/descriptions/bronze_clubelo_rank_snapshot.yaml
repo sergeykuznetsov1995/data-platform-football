@@ -6,7 +6,8 @@ table:
   description: |
     Дневной снимок рейтинга ClubElo со страницы /Ranking (#1463): все клубы eloData
     (~1741) плюс провизорные клубы таблиц стран («1255p», «-29p»; в eloData их нет).
-    Пишет scrapers/clubelo/daily.py (dag_ingest_clubelo, 09:30 и 21:30 UTC).
+    Пишет scrapers/clubelo/daily.py (dag_ingest_clubelo, каждые четыре часа:
+    00:30, 04:30, 08:30, 12:30, 16:30 и 20:30 UTC).
     Партиция identity(rating_date) — дата рейтинга из h1 самой страницы, не дата
     прогона; партиция заменяется целиком одной транзакцией Iceberg, никогда APPEND
     (#314). Перед заменой — fail-closed-контракт страницы и guard полноты (≥ 95 % от

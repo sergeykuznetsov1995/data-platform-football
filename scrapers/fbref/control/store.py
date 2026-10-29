@@ -917,6 +917,26 @@ def _budget_from_row(row: Mapping[str, Any]) -> BudgetReservation:
     )
 
 
+_DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS carried
+    WHERE carried.logical_refresh_id = attempt.logical_refresh_id
+      AND carried.status = 'failed'
+      AND %s::jsonb @> jsonb_build_array(jsonb_build_object(
+        'run_id', attempt.run_id::text,
+        'attempt_id', attempt.attempt_id::text,
+        'logical_refresh_id', attempt.logical_refresh_id::text,
+        'target_id', attempt.target_id,
+        'content_hash', attempt.content_hash,
+        'raw_manifest_key', attempt.raw_manifest_key,
+        'parser_version', carried.parser_version,
+        'typed_parser_version', carried.typed_parser_version,
+        'stateful_parser_version', carried.stateful_parser_version,
+        'failed_updated_at', extract(epoch from carried.updated_at)::text
+      ))
+)"""
+
+
 class ControlStore:
     """Transactional API over the dedicated ``fbref_control`` schema."""
 
@@ -1109,6 +1129,35 @@ class ControlStore:
                     SET after_target_id = %s WHERE singleton""", (after,))
             return {"processed": len(target_ids), "after_target_id": after,
                     "done": len(target_ids) < size}
+
+    def backfill_page_gender_classes(self, *, batch_size: int = 100) -> dict:
+        """Commit one resumable classification batch after ownership backfill."""
+        size = int(batch_size)
+        if not 1 <= size <= 1000:
+            raise ValueError("batch_size must be between 1 and 1000")
+        with self._transaction() as raw_cursor:
+            cursor = _ScopeBackfillCursor(raw_cursor)
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            cursor.execute("SET LOCAL work_mem = '4MB'")
+            cursor.execute("""SELECT after_target_id FROM fbref_control.page_gender_backfill
+                WHERE singleton FOR UPDATE""")
+            after = _fetchone(cursor)["after_target_id"]
+            cursor.execute("""SELECT target_id FROM fbref_control.page_frontier
+                WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE""",
+                (after, size))
+            targets = [row["target_id"] for row in _fetchall(cursor)]
+            cursor.execute("""SELECT frontier.target_id FROM fbref_control.page_frontier frontier
+                LEFT JOIN fbref_control.page_scope_summary scope USING (target_id)
+                WHERE frontier.target_id = ANY(%s::text[]) AND NOT coalesce(scope.is_complete, false)""", (targets,))
+            if _fetchall(cursor):
+                raise ControlStoreError("ownership backfill must finish before gender backfill")
+            self._refresh_scope_summaries(cursor, targets)
+            if targets:
+                after = targets[-1]
+                cursor.execute("""UPDATE fbref_control.page_gender_backfill
+                    SET after_target_id = %s WHERE singleton""", (after,))
+            return {"processed": len(targets), "after_target_id": after,
+                    "done": len(targets) < size}
 
     def migrate(self) -> tuple[int, ...]:
         """Apply all pending migrations under one transaction advisory lock."""
@@ -5967,6 +6016,40 @@ class ControlStore:
         """Compatibility alias for full frontier scope reconciliation."""
         return self.reconcile_frontier_scope(source=source)
 
+    def schedule_incomplete_match_refetch(
+        self, target_id: object, *, content_hash: object, logical_refresh_id: object,
+    ) -> bool:
+        """At most three fresh requests; stale raw replay cannot spend retries."""
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        with self._transaction() as cursor:
+            if self._latest_content_verdict(cursor, target, digest, refresh) is not True:
+                return False
+            cursor.execute("""INSERT INTO fbref_control.incomplete_match_refetch AS retry
+                    (target_id, attempts, logical_refresh_id)
+                SELECT target_id, 1, %s FROM fbref_control.page_frontier
+                WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')
+                ON CONFLICT (target_id) DO UPDATE SET attempts = retry.attempts + 1,
+                    logical_refresh_id = EXCLUDED.logical_refresh_id
+                WHERE retry.attempts < 3
+                    AND retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                RETURNING attempts""", (refresh, target))
+            row = _fetchone(cursor)
+            if row is None:
+                return False
+            cursor.execute("""UPDATE fbref_control.page_frontier
+                SET state = 'retry',
+                    next_fetch_at = clock_timestamp() + %s * interval '5 minutes',
+                    retry_after = clock_timestamp() + %s * interval '5 minutes',
+                    last_etag = NULL, last_modified = NULL,
+                    last_error_class = 'IncompleteMatchPageError',
+                    last_error_message = 'scored_match_incomplete',
+                    updated_at = clock_timestamp()
+                WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
+                (2 ** (row["attempts"] - 1), 2 ** (row["attempts"] - 1), target))
+            return bool(cursor.rowcount)
+
     def quarantine_contract_rejected_target(
         self,
         target_id: object,
@@ -7139,6 +7222,114 @@ class ControlStore:
         with self._transaction() as cursor:
             return self._target_counts(cursor, run)
 
+    def record_deferred_parse_observations(
+        self, run_id: object, observations: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Carry bounded, still-failed live observations across a deadline.
+
+        Lock the source run and observations together. Raw and processing state
+        stay intact for lane recovery; only this run's validation is exempted.
+        """
+        run = _uuid(run_id, "run_id")
+        if not 1 <= len(observations) <= 25:
+            raise StateConflict(
+                "Deferred parse carryover must contain 1..25 observations"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT status, run_type, metadata FROM fbref_control.crawl_run "
+                "WHERE run_id = %s FOR UPDATE",
+                (run,),
+            )
+            source = _fetchone(cursor)
+            if source is None or source["run_type"] not in _RECOVERY_RUN_TYPES:
+                raise StateConflict("Only live runs can carry deferred parses")
+            metadata = _json_mapping(
+                source.get("metadata") or {}, "crawl run metadata"
+            )
+            if metadata.get("acceptance_profile") or metadata.get("acceptance_replay"):
+                raise StateConflict("Acceptance runs cannot carry deferred parses")
+            installed = list(metadata.get("deferred_parse_observations") or [])
+            carried = list(installed)
+            for item in sorted(
+                observations, key=lambda row: row["logical_refresh_id"]
+            ):
+                evidence = dict(item)
+                evidence["run_id"] = run
+                if evidence.get("reason") != "deadline_after_transient_trino_failure":
+                    raise StateConflict("Unknown deferred parse reason")
+                cursor.execute(
+                    """
+                    SELECT observed.status, observed.error_class,
+                           observed.error_message,
+                           extract(epoch from observed.updated_at)::text AS failed_updated_at
+                    FROM fbref_control.fetch_attempt AS attempt
+                    JOIN fbref_control.observation_processing AS observed
+                      ON observed.logical_refresh_id = attempt.logical_refresh_id
+                     AND observed.target_id = attempt.target_id
+                     AND observed.content_hash = attempt.content_hash
+                    WHERE attempt.run_id = %s AND attempt.attempt_id = %s
+                      AND attempt.logical_refresh_id = %s
+                      AND attempt.target_id = %s AND attempt.content_hash = %s
+                      AND attempt.raw_manifest_key = %s
+                      AND attempt.status = 'succeeded'
+                      AND observed.parser_version = %s
+                      AND observed.typed_parser_version = %s
+                      AND observed.stateful_parser_version = %s
+                    FOR UPDATE OF observed
+                    """,
+                    (
+                        run,
+                        evidence["attempt_id"],
+                        evidence["logical_refresh_id"],
+                        evidence["target_id"],
+                        evidence["content_hash"],
+                        evidence["raw_manifest_key"],
+                        evidence["parser_version"],
+                        evidence["typed_parser_version"],
+                        evidence["stateful_parser_version"],
+                    ),
+                )
+                observed = _fetchone(cursor)
+                if observed is not None and observed["status"] == "succeeded":
+                    continue  # A later wave/recovery already completed this raw.
+                if (
+                    observed is None
+                    or observed["status"] != "failed"
+                    or observed["error_class"] != evidence["error_class"]
+                    or observed["error_message"] != evidence["error_message"]
+                ):
+                    raise StateConflict("Deferred observation changed before carryover")
+                evidence["failed_updated_at"] = observed["failed_updated_at"]
+                if evidence in carried:
+                    continue
+                if source["status"] != "running":
+                    raise StateConflict("Deferred parses require a running source run")
+                # A retry can fail identically with a new observation timestamp.
+                # Replace its previous fence instead of accumulating exemptions.
+                carried = [
+                    row for row in carried
+                    if {
+                        key: value for key, value in row.items()
+                        if key != "failed_updated_at"
+                    } != {
+                        key: value for key, value in evidence.items()
+                        if key != "failed_updated_at"
+                    }
+                ]
+                carried.append(evidence)
+            if len(carried) > 25:
+                raise StateConflict("Too many deferred parse observations")
+            if carried != installed:
+                cursor.execute(
+                    "UPDATE fbref_control.crawl_run "
+                    "SET metadata = metadata || %s::jsonb, updated_at = clock_timestamp() "
+                    "WHERE run_id = %s",
+                    (_json({"deferred_parse_observations": carried}), run),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict("Deferred parse run disappeared")
+
     def get_run_summary(
         self,
         run_id: object,
@@ -7203,6 +7394,36 @@ class ControlStore:
                     "crawl run_type must be current, backfill, replay, or "
                     "publication"
                 )
+            metadata = _json_mapping(
+                summary.get("metadata") or {}, "crawl run metadata"
+            )
+            deferred = [
+                row
+                for row in metadata.get("deferred_parse_observations", [])
+                if recovery_lane_run_type is not None
+                and not metadata.get("acceptance_profile")
+                and not metadata.get("acceptance_replay")
+                and parser is not None
+                and row.get("run_id") == run
+                and row.get("parser_version") == parser
+                and row.get("typed_parser_version") == typed_parser
+                and row.get("stateful_parser_version") == stateful_parser
+            ]
+            deferred_json = json.dumps(deferred)
+            deferred_manifest_sql = _DEFERRED_PARSE_ATTEMPT_SQL.replace(
+                "carried.status = 'failed'",
+                "carried.status = 'failed' "
+                "AND carried.error_class = manifest.error_class "
+                "AND carried.error_message = left(manifest.error_message, 2000) "
+                "AND ((manifest.dataset = '__page__' "
+                "AND manifest.parser_version = carried.parser_version) "
+                "OR (manifest.dataset LIKE 'typed:%%' "
+                "AND manifest.parser_version = carried.typed_parser_version "
+                "AND manifest.parse_status = 'succeeded' "
+                "AND manifest.persistence_status = 'failed'))",
+            )
+            summary["deferred_parse_observation_count"] = len(deferred)
+            summary["deferred_parse_observations"] = deferred
             summary["target_counts"] = self._target_counts(cursor, run)
             cursor.execute(
                 """
@@ -7375,7 +7596,7 @@ class ControlStore:
                 for row in _fetchall(cursor)
             }
             cursor.execute(
-                """
+                f"""
                 SELECT manifest.validation_status AS status, count(*) AS count
                 FROM fbref_control.dataset_manifest AS manifest
                 JOIN fbref_control.fetch_attempt AS attempt
@@ -7385,6 +7606,10 @@ class ControlStore:
                   ON frontier.target_id = attempt.target_id
                 WHERE attempt.run_id = %s AND attempt.status = 'succeeded'
                   AND frontier.state <> 'quarantined'
+                  AND NOT (
+                    manifest.validation_status = 'failed'
+                    AND ({deferred_manifest_sql})
+                  )
                   AND (
                     %s::text IS NULL
                     OR (
@@ -7405,6 +7630,7 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     parser,
                     parser,
                     typed_parser,
@@ -7418,7 +7644,7 @@ class ControlStore:
                 for row in _fetchall(cursor)
             }
             cursor.execute(
-                """
+                f"""
                 SELECT count(*) AS count
                 FROM (
                     SELECT DISTINCT attempt.target_id, attempt.content_hash
@@ -7428,6 +7654,7 @@ class ControlStore:
                     WHERE attempt.run_id = %s
                       AND attempt.status = 'succeeded'
                       AND frontier.state <> 'quarantined'
+                      AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                       AND (
                         (
                           %s::text IS NULL
@@ -7468,6 +7695,7 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     parser,
                     parser,
                     parser,
@@ -8007,10 +8235,11 @@ class ControlStore:
             summary["publication_scope_freshness"] = publication_freshness
 
             cursor.execute(
-                """
+                f"""
                 SELECT frontier.page_kind,
                        count(*) FILTER (
                            WHERE attempt.run_id = %s
+                             AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                        ) AS run_count,
                        count(*) FILTER (
                            WHERE source_run.run_type = %s
@@ -8033,6 +8262,7 @@ class ControlStore:
                            attempt.finished_at, attempt.started_at
                        )) FILTER (
                            WHERE attempt.run_id = %s
+                             AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                        ) AS run_oldest_raw_at,
                        min(COALESCE(
                            attempt.finished_at, attempt.started_at
@@ -8132,11 +8362,13 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     recovery_lane_run_type,
                     recovery_lane_run_type,
                     raw_sla,
                     raw_sla,
                     run,
+                    deferred_json,
                     recovery_lane_run_type,
                     parser,
                     parser,
@@ -8315,29 +8547,31 @@ class ControlStore:
             }
             cursor.execute(
                 """
-                SELECT competition.gender, count(DISTINCT frontier.target_id)
-                           AS count
+                SELECT CASE WHEN scope.is_complete AND NOT scope.pending
+                                 AND scope.gender_classified
+                                 AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+                            THEN scope.gender_class ELSE 'unknown' END AS gender,
+                       count(*) AS count,
+                       count(*) FILTER (WHERE frontier.state NOT IN
+                           ('skipped', 'quarantined', 'dead')
+                           AND frontier.page_kind <> 'competition_index') AS active_count,
+                       count(*) FILTER (WHERE scope.is_complete AND NOT scope.pending
+                           AND scope.gender_classified
+                           AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)) AS classified_count
                 FROM fbref_control.page_frontier AS frontier
-                JOIN fbref_control.competition_registry AS competition
-                  ON competition.source = frontier.source
-                 AND competition.competition_id =
-                     frontier.source_ids ->> 'competition_id'
-                WHERE competition.gender IN ('female', 'unknown')
-                  AND frontier.state NOT IN (
-                      'skipped', 'quarantined', 'dead'
-                  )
-                GROUP BY competition.gender
-                ORDER BY competition.gender
+                LEFT JOIN fbref_control.page_scope_summary AS scope USING (target_id)
+                GROUP BY 1 ORDER BY 1
                 """
             )
-            out_of_scope = {
-                str(row["gender"]): int(row["count"])
-                for row in _fetchall(cursor)
+            gender_rows = _fetchall(cursor)
+            summary["frontier_gender_counts"] = {
+                str(row["gender"]): int(row["count"]) for row in gender_rows
             }
-            summary["female_downstream_targets"] = out_of_scope.get("female", 0)
-            summary["unknown_gender_downstream_targets"] = out_of_scope.get(
-                "unknown", 0
-            )
+            summary["frontier_gender_total"] = sum(int(row["count"]) for row in gender_rows)
+            summary["frontier_gender_classified"] = sum(int(row["classified_count"]) for row in gender_rows)
+            out_of_scope = {str(row["gender"]): int(row["active_count"]) for row in gender_rows}
+            summary["female_downstream_targets"] = out_of_scope.get("female", 0) + out_of_scope.get("mixed", 0)
+            summary["unknown_gender_downstream_targets"] = out_of_scope.get("unknown", 0)
             cursor.execute(
                 """
                 SELECT metadata
@@ -8970,8 +9204,8 @@ class ControlStore:
                         AND failed_observed.typed_parser_version = %s
                         AND failed_observed.stateful_parser_version = %s
                         AND failed_observed.status = 'failed'
-                    )
-                    AND EXISTS (
+                        AND (failed_observed.error_class = 'IncompleteMatchPageError'
+                             OR EXISTS (
                       SELECT 1
                       FROM fbref_control.fetch_attempt AS newer_attempt
                       JOIN fbref_control.observation_processing
@@ -8993,6 +9227,7 @@ class ControlStore:
                             'succeeded', 'skipped'
                         )
                         AND newer_observed.validation_status = 'succeeded'
+                             ))
                     )
                   )
                 ORDER BY COALESCE(
@@ -9030,7 +9265,16 @@ class ControlStore:
                        refresh_policy, state, priority, next_fetch_at,
                        retry_after, last_fetched_at, last_http_status,
                        last_content_hash, last_etag, last_modified,
-                       last_error_class, last_error_message
+                       last_error_class, last_error_message,
+                       EXISTS (SELECT 1 FROM fbref_control.incomplete_match_refetch retry
+                           WHERE retry.target_id = page_frontier.target_id
+                             AND retry.logical_refresh_id = (
+                                 SELECT attempt.logical_refresh_id
+                                 FROM fbref_control.fetch_attempt attempt
+                                 WHERE attempt.target_id = page_frontier.target_id
+                                   AND attempt.status = 'succeeded'
+                                 ORDER BY attempt.lease_epoch DESC, attempt.attempt_number DESC
+                                 LIMIT 1)) AS requires_fresh_match_fetch
                 FROM fbref_control.page_frontier
                 WHERE target_id = %s
                 """,
@@ -9436,6 +9680,8 @@ class ControlStore:
                             AND observed.stateful_parser_version = %s
                             AND (
                                 observed.status = 'succeeded'
+                                OR (observed.status = 'failed'
+                                    AND observed.error_class = 'IncompleteMatchPageError')
                                 OR (
                                     observed.status = 'processing'
                                     AND observed.lease_expires_at >

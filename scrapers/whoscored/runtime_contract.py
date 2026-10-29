@@ -134,6 +134,7 @@ EXPECTED_RUNTIME_FILES = (
     "scripts/whoscored_production_admission.py",
     "scripts/whoscored_proxy_campaign.py",
     "scripts/whoscored_raw_backup.py",
+    "scripts/whoscored_v2_inventory.py",
     "scripts/whoscored_v2_object_contract.py",
 )
 _EXPECTED_RUNTIME_FILE_SET = frozenset(EXPECTED_RUNTIME_FILES)

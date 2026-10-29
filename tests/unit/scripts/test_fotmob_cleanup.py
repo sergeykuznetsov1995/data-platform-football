@@ -58,7 +58,7 @@ def test_cleanup_pause_evidence_requires_atomic_shared_consumer_fence(tmp_path):
         )
 
 
-def test_cleanup_pause_evidence_covers_exact_six_writer_inventory(tmp_path):
+def test_cleanup_pause_evidence_covers_exact_seven_writer_inventory(tmp_path):
     expected = {
         "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
@@ -66,6 +66,7 @@ def test_cleanup_pause_evidence_covers_exact_six_writer_inventory(tmp_path):
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
         "dag_collect_fotmob_players",
+        "dag_refresh_fotmob_c1",
     }
     assert mod.PAUSED_DAGS == expected
 

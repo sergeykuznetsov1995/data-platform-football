@@ -426,7 +426,8 @@ def should_block_request(
 
     Never blocks document/xhr/fetch (FBref's page itself), nor any
     Cloudflare/Turnstile asset — the allow-guard runs before the type block.
-    ``block_scripts=True`` (FBREF_CAMOUFOX_BLOCK_SCRIPTS=1, experimental)
+    ``block_scripts=True`` (the transport default; disable with
+    FBREF_CAMOUFOX_BLOCK_SCRIPTS=0)
     additionally aborts script resources: the Python parser reads tables from
     HTML comments server-side, so FBref's own JS is not needed for content,
     and challenge JS is covered by the allow-list.
@@ -650,11 +651,11 @@ class CamoufoxFbrefTransport:
         self.cf_challenges_passed = 0
         self.cf_challenges_failed = 0
         self._last_solve_failure: Optional[str] = None
-        # Env-tunables: experimental script blocking + page-count restart
+        # Env-tunables: script blocking + page-count restart
         # (Firefox memory creep on 380+-page backfills). A restart costs a
         # full CF cold-start (~4 MB measured) — keep the limit high.
         self._block_scripts = os.environ.get(
-            "FBREF_CAMOUFOX_BLOCK_SCRIPTS", "").strip() == "1"
+            "FBREF_CAMOUFOX_BLOCK_SCRIPTS", "1").strip() != "0"
         try:
             self._max_pages_per_session = int(
                 os.environ.get("FBREF_CAMOUFOX_MAX_PAGES") or 200)

@@ -40,7 +40,7 @@ INGEST_DAG_ID = "dag_ingest_fotmob"
 SOFA_DAG_ID = "dag_sofascore_pipeline"
 SOFA_FINALIZER_TASK_ID = "finalize_fotmob_publication"
 PUBLICATION_CONF_KEY = "fotmob_publication"
-LEGACY_OWNER_DAGS = frozenset(runtime_binding.LEGACY_OWNER_DAGS)
+LEGACY_OWNER_DAGS = frozenset(runtime_binding.AUTOMATIC_PAUSED_DAGS)
 ACTIVE_AUTOMATIC_DAGS = frozenset(runtime_binding.AUTOMATIC_ACTIVE_DAGS)
 ACTIVE_TASK_STATES = (
     "queued",

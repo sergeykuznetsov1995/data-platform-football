@@ -50,6 +50,7 @@ ISOLATED_WRITER_DAG_IDS = (
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
+    "dag_refresh_fotmob_c1",
     "dag_ingest_fotmob",
 )
 WRITER_DAG_IDS = (
@@ -67,6 +68,7 @@ SHARED_PAUSE_STATES = {
 SHARED_STATE_DAGS = (
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
+    "dag_refresh_fotmob_c1",
     "dag_ingest_fotmob",
     "dag_master_pipeline",
     "dag_orchestrate_fotmob",

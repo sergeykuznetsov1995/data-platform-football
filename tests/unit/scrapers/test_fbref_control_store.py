@@ -2809,10 +2809,103 @@ def test_processing_measurement_is_atomic_with_fenced_completion(monkeypatch, ou
 
 
 def test_processing_work_migration_preserves_unknown_old_measurements():
-    migration = MIGRATIONS[-1]
+    migration = next(m for m in MIGRATIONS if m.version == 14)
     assert migration.version == 14
     assert migration.name == 'observation_processing_work'
     sql = ' '.join(migration.statements)
     assert 'ADD COLUMN processing_work_ms bigint' in sql
     assert 'CHECK (processing_work_ms >= 0)' in sql
     assert 'DEFAULT' not in sql and 'UPDATE' not in sql and 'NOT NULL' not in sql
+
+
+@pytest.mark.parametrize("state,newer,same_hash", [
+    ("fetched", False, True), ("leased", False, True),
+    ("fetched", True, True), ("fetched", False, False),
+])
+def test_incomplete_match_refetch_fences_refresh_hash_and_new_lease(state, newer, same_hash):
+    refresh = str(uuid.uuid4())
+    def handler(sql, params):
+        if "SELECT state, last_content_hash" in sql:
+            assert "FOR NO KEY UPDATE" in sql
+            return [{"state": state, "last_content_hash": "a" if same_hash else "b"}], 1
+        if "SELECT logical_refresh_id, content_hash" in sql:
+            assert "ORDER BY lease_epoch DESC, attempt_number DESC" in sql
+            return [{"logical_refresh_id": str(uuid.uuid4()) if newer else refresh,
+                     "content_hash": "a"}], 1
+        if "INSERT INTO fbref_control.incomplete_match_refetch" in sql:
+            assert "retry.attempts < 3" in sql
+            assert "retry.logical_refresh_id <> EXCLUDED.logical_refresh_id" in sql
+            return [{"attempts": 2}], 1
+        if "UPDATE fbref_control.page_frontier" in sql:
+            assert "last_etag = NULL, last_modified = NULL" in sql
+            assert params == (2, 2, "match")
+            return [], 1
+        pytest.fail(sql)
+    factory = FakeFactory(handler)
+    store = ControlStore("postgresql://unused/db", connection_factory=factory)
+    expected = state == "fetched" and not newer and same_hash
+    assert store.schedule_incomplete_match_refetch("match", content_hash="a", logical_refresh_id=refresh) == expected
+    statements = factory.connections[0].fake_cursor.executions
+    assert any("UPDATE fbref_control.page_frontier" in sql for sql, _ in statements) == expected
+
+
+def test_incomplete_match_replay_or_exhaustion_does_not_reschedule():
+    factory = FakeFactory(lambda sql, params: ([], 0))
+    store = ControlStore("postgresql://unused/db", connection_factory=factory)
+    store._latest_content_verdict = lambda *_: True
+    assert not store.schedule_incomplete_match_refetch("match", content_hash="a", logical_refresh_id=uuid.uuid4())
+    assert not any("UPDATE fbref_control.page_frontier" in sql for sql, _ in factory.connections[0].fake_cursor.executions)
+
+
+def test_gender_gate_counts_entire_frontier_including_inherited_and_quarantined_targets():
+    run_id = str(uuid.uuid4())
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if "AS classified_count" in sql:
+            assert "LEFT JOIN fbref_control.page_scope_summary" in sql
+            assert "competition_registry" not in sql
+            assert "WHERE frontier.state NOT IN" in sql  # FILTER only; all rows stay in count.
+            assert "scope.gender_classified" in sql and "scope.pending" in sql
+            assert "frontier.page_kind <> 'competition_index'" in sql
+            assert "page_scope_registry_dirty" in sql
+            return [
+                {"gender": "male", "count": 1, "active_count": 1, "classified_count": 1},
+                {"gender": "female", "count": 2, "active_count": 1, "classified_count": 2},
+                {"gender": "mixed", "count": 1, "active_count": 1, "classified_count": 1},
+                {"gender": "unknown", "count": 1, "active_count": 1, "classified_count": 1},
+            ], 4
+        return [], 0
+    store = ControlStore("postgresql://unused/db", connection_factory=FakeFactory(handler))
+    summary = store.get_run_summary(run_id)
+    assert summary["frontier_gender_total"] == summary["frontier_gender_classified"] == 5
+    assert summary["frontier_gender_counts"] == {"male": 1, "female": 2, "mixed": 1, "unknown": 1}
+    assert summary["female_downstream_targets"] == 2
+    assert summary["unknown_gender_downstream_targets"] == 1
+
+
+def test_gender_backfill_rolls_back_and_resumes_the_same_keyset_batch():
+    checkpoint = [""]
+    def handler(sql, params):
+        if "SELECT after_target_id FROM fbref_control.page_gender_backfill" in sql:
+            return [{"after_target_id": checkpoint[0]}], 1
+        if "WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE" in sql:
+            assert params == ("", 2)
+            return [{"target_id": "a"}, {"target_id": "b"}], 2
+        if "UPDATE fbref_control.page_gender_backfill" in sql:
+            checkpoint[0] = params[0]
+        return [], 0
+    factory = FakeFactory(handler)
+    store = ControlStore("postgresql://unused/db", connection_factory=factory)
+    def fail_refresh(*_):
+        raise TimeoutError("batch timeout")
+    store._refresh_scope_summaries = fail_refresh
+    with pytest.raises(TimeoutError):
+        store.backfill_page_gender_classes(batch_size=2)
+    assert factory.connections[0].rolled_back and checkpoint == [""]
+    refreshed = []
+    store._refresh_scope_summaries = lambda cursor, targets: refreshed.extend(targets)
+    result = store.backfill_page_gender_classes(batch_size=2)
+    assert refreshed == ["a", "b"] and checkpoint == ["b"]
+    assert result == {"processed": 2, "after_target_id": "b", "done": False}
+    assert factory.connections[1].committed

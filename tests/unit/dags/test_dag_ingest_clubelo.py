@@ -69,7 +69,7 @@ class TestDailyChain:
         assert _bash_task('scrape_current_ratings') is None
         assert _python_task('gate_full_ratings') is None
         assert _bash_task('scrape_full_ratings') is None
-        assert set(dag_module.dag._dag_kwargs['params']) == {'run_history', 'run_watch'}
+        assert set(dag_module.dag._dag_kwargs['params']) == {'run_history', 'run_watch', 'history_min_interval'}
         source = open(dag_module.__file__, encoding='utf-8').read()
         assert 'LEAGUES' not in source and 'SCHEDULES' not in source
 
@@ -100,8 +100,9 @@ class TestDailyChain:
         assert _bash_task('scrape_daily')._init_kwargs['retries'] == 0
 
     def test_every_task_is_in_the_default_pool(self, dag_module):
-        tasks = [_python_task(t) for t in ('gate_daily', 'validate_data', 'gate_history')]
-        tasks += [_bash_task(t) for t in ('scrape_daily', 'scrape_history')]
+        tasks = [_python_task(t) for t in ('gate_daily', 'validate_data', 'gate_history', 'gate_watch', 'finish_watch')]
+        tasks += [_bash_task(t) for t in ('scrape_daily', 'scrape_history', 'check_watch')]
+        assert len(tasks) == 8
         assert all(t._init_kwargs['pool'] == 'default_pool' for t in tasks)
 
 
@@ -172,6 +173,18 @@ class TestHistoryBranch:
 
     def test_default_param_off(self, dag_module):
         assert dag_module.dag._dag_kwargs['params']['run_history'] is False
+
+    def test_history_interval_is_passed_only_through_quoted_env(self, dag_module):
+        assert dag_module.dag._dag_kwargs['params']['history_min_interval'] == 1.0
+        assert dag_module.dag._dag_kwargs['max_active_runs'] == 1
+        scrape = _bash_task('scrape_history')
+        assert scrape._init_kwargs['env']['CLUBELO_HISTORY_MIN_INTERVAL'] == '{{ params.history_min_interval }}'
+        assert '--history-min-interval "$CLUBELO_HISTORY_MIN_INTERVAL"' in scrape.bash_command
+        assert 'params.history_min_interval' not in scrape.bash_command
+        for task_id in ('scrape_daily', 'check_watch'):
+            task = _bash_task(task_id)
+            assert '--history-min-interval' not in task.bash_command
+            assert 'CLUBELO_HISTORY_MIN_INTERVAL' not in task._init_kwargs['env']
 
     def test_history_branch_is_its_own_root(self, dag_module):
         gate = _python_task('gate_history')
@@ -286,3 +299,24 @@ class TestWatchBranch:
         assert dag_module.finish_watch(str(report), dag_run=run)['errors'] == ['timeout']
         report.write_text('broken json')
         assert dag_module.finish_watch(str(report), dag_run=run)['status'] == 'error'
+
+
+def test_dag_smoke_accepts_clubelo_failure_policy(dag_module):
+    from pathlib import Path
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / 'integration/dag_smoke/test_dag_structure.py'
+    spec = importlib.util.spec_from_file_location('_clubelo_dag_smoke_structure', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    validate = _python_task('validate_data')
+    task = SimpleNamespace(
+        task_id=validate.task_id,
+        trigger_rule=validate._init_kwargs.get(
+            'trigger_rule', dag_module.dag._dag_kwargs['default_args'].get('trigger_rule', 'all_success'),
+        ),
+    )
+    bag = SimpleNamespace(dags={'dag_ingest_clubelo': SimpleNamespace(tasks=[task])})
+    module.TestDagStructure().test_validate_tasks_follow_declared_failure_policy(
+        bag, ['dag_ingest_clubelo'],
+    )

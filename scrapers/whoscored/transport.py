@@ -262,6 +262,7 @@ class WhoScoredTransportError(RuntimeError):
         route: Optional[TransportRoute] = None,
         status_code: Optional[int] = None,
         retryable: bool = False,
+        redirect_location: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -269,6 +270,11 @@ class WhoScoredTransportError(RuntimeError):
         self.route = route
         self.status_code = status_code
         self.retryable = retryable
+        self.redirect_location = redirect_location
+
+
+class StageBootstrapRedirect(WhoScoredTransportError):
+    """A stage bootstrap moved; its destination has not been verified."""
 
 
 class CloudflareChallenge(WhoScoredTransportError):
@@ -3554,8 +3560,18 @@ class WhoScoredTransport:
                 scope=scope,
                 entity=entity,
             )
-        except BaseException:
+        except BaseException as exc:
             self._stage_http_context = None
+            if (
+                isinstance(exc, WhoScoredTransportError)
+                and exc.kind is FailureKind.HTTP_STATUS
+                and exc.status_code in {301, 302, 303, 307, 308}
+            ):
+                raise StageBootstrapRedirect(
+                    str(exc), kind=exc.kind, url=exc.url, route=exc.route,
+                    status_code=exc.status_code,
+                    redirect_location=exc.redirect_location,
+                ) from exc
             raise
         token = _stage_statistics_token(_stage_statistics_source(response))
         if token is None:
@@ -5757,6 +5773,24 @@ class WhoScoredTransport:
                 ),
             )
         if not 200 <= response.status_code < 300:
+            redirect_location = None
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = next(
+                    (v for k, v in response.headers.items() if k.lower() == "location"),
+                    "",
+                )
+                try:
+                    parts = urlsplit(urljoin(response.url, location) if location else "")
+                    # Strip credentials, per-segment path parameters, query and fragment.
+                    redirect_location = parts._replace(
+                        netloc=parts.netloc.rsplit("@", 1)[-1],
+                        path="/".join(
+                            segment.split(";", 1)[0] for segment in parts.path.split("/")
+                        ),
+                        query="", fragment=""
+                    ).geturl()
+                except ValueError:
+                    redirect_location = "<invalid>"
             raise WhoScoredTransportError(
                 f"HTTP {response.status_code}",
                 kind=FailureKind.HTTP_STATUS,
@@ -5764,6 +5798,7 @@ class WhoScoredTransport:
                 route=response.route,
                 status_code=response.status_code,
                 retryable=response.status_code >= 500,
+                redirect_location=redirect_location,
             )
         if not response.content:
             raise WhoScoredTransportError(
