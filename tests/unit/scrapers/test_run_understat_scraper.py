@@ -1284,6 +1284,33 @@ def test_explicit_bootstrap_cli_does_not_start_scope_ingestion(monkeypatch):
     repository.bootstrap.assert_called_once_with()
 
 
+def test_optional_html_failure_never_runs_or_fails_json(monkeypatch, capsys, tmp_path):
+    import scrapers.understat.enrichment as enrichment
+    from scrapers.understat.manifest import UnderstatManifestRepository
+
+    def fail(*args, **kwargs):
+        raise OSError("optional cache unavailable")
+    monkeypatch.setenv("UNDERSTAT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(enrichment, "run_enrichment", fail)
+    monkeypatch.setattr(UnderstatManifestRepository, "from_env", lambda: object())
+    monkeypatch.setattr(runner, "run_scope", lambda *args: pytest.fail("JSON path called"))
+    assert runner.main(["--enrich-matches"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "deferred"
+
+
+def test_optional_html_import_failure_is_contained(monkeypatch, capsys):
+    import builtins
+
+    original = builtins.__import__
+    def fail_html(name, *args, **kwargs):
+        if name == "scrapers.understat.enrichment":
+            raise ImportError("optional dependency unavailable")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", fail_html)
+    assert runner.main(["--enrich-matches"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "deferred"
+
+
 def test_source_diagnostics_survive_runner_quality_without_blocking_or_extra_calls():
     frames = _complete_frames()
     frames['understat_player_match_stats']['roster_entry_ids'] = '11,12'

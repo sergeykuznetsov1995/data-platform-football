@@ -231,6 +231,19 @@ class UnderstatClient:
             force_refresh=force_refresh,
         )
 
+    def get_match_html(self, match_id: int | str) -> str | None:
+        """One budgeted GET, without cookie bootstrap, redirects or retries."""
+        self._pacer.acquire()
+        if not CacheState(self.cache_dir).claim_html(self.now().astimezone(timezone.utc).date(), match_id):
+            return None
+        self.request_count += 1
+        url = self.base_url + f"/match/{quote(str(match_id), safe='')}"
+        response = self.session.get(url, headers={"Accept": "text/html"},
+                                    timeout=self.timeout_seconds, allow_redirects=False)
+        if int(response.status_code) != 200:
+            raise UnderstatHTTPError(url, int(response.status_code))
+        return response.text
+
     def get_team_data(
         self,
         team_name: str,

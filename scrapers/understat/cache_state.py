@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 CACHE_VERSION = 2
 DAILY_LIMIT = 500
 ROTATION_LIMIT = 72
+HTML_RESERVE = 60
 # Leave room for later leagues, weekly probes and retries. Mandatory work is
 # never dropped; the ledger warns if it alone exhausts the daily allowance.
 ROTATION_RESERVE = 178
@@ -100,7 +101,11 @@ class CacheState:
         with (self.root / "daily-http.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             target = self.root / f"daily-http-{today.isoformat()}.json"
-            state = read_json(target) or {"requests": 0, "rotated": []}
+            state = read_json(target)
+            if not isinstance(state, dict) or not state:
+                state = {"requests": 0, "rotated": []}
+                if target.exists():
+                    state["accounting_unreliable"] = True
             yield state
             atomic_json(target, state)
 
@@ -110,6 +115,33 @@ class CacheState:
             if state["requests"] > DAILY_LIMIT:
                 logger.warning("Understat daily HTTP budget exceeded: %s > %s; "
                                "mandatory data retained", state["requests"], DAILY_LIMIT)
+
+    def claim_html(self, today: date, match_id: int | str | None = None) -> bool:
+        """Reserve one optional GET atomically; untrustworthy accounting waits."""
+        if self.root is None:
+            return False
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / "daily-http.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            target = self.root / f"daily-http-{today.isoformat()}.json"
+            state = read_json(target)
+            if not isinstance(state, dict) or state.get("accounting_unreliable"):
+                return False
+            requests = state.get("requests")
+            html = state.get("html_requests", 0)
+            matches = state.get("html_matches", [])
+            if (not isinstance(matches, list) or (match_id is not None and str(match_id) in matches)):
+                return False
+            if (type(requests) is not int or type(html) is not int
+                    or requests < 0 or html < 0
+                    or requests >= DAILY_LIMIT or html >= HTML_RESERVE):
+                return False
+            state["requests"] += 1
+            state["html_requests"] = html + 1
+            if match_id is not None:
+                state["html_matches"] = [*matches, str(match_id)]
+            atomic_json(target, state)
+            return True
 
     def rotation(self, today: date, mandatory: int) -> set[str]:
         if self.root is None:
@@ -136,14 +168,14 @@ class CacheState:
                         continue
                     candidates.append((record["checked_on"], path.name))
                 state["rotation_candidates"] = [name for _, name in sorted(candidates)[:ROTATION_LIMIT]]
-            available = max(0, DAILY_LIMIT - state["requests"] - mandatory - ROTATION_RESERVE)
+            available = max(0, DAILY_LIMIT - state["requests"] - mandatory - ROTATION_RESERVE - HTML_RESERVE)
             names = [name for name in state["rotation_candidates"] if name not in state["rotated"]]
             return set(names[:available])
 
     def claim_rotation(self, name: str, today: date) -> bool:
         with self.ledger(today) as state:
             if (name in state["rotated"] or len(state["rotated"]) >= ROTATION_LIMIT
-                    or state["requests"] >= DAILY_LIMIT - ROTATION_RESERVE):
+                    or state["requests"] >= DAILY_LIMIT - ROTATION_RESERVE - HTML_RESERVE):
                 return False
             state["rotated"].append(name)
             return True

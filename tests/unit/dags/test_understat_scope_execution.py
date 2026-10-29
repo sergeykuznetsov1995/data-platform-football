@@ -122,7 +122,7 @@ def test_graph_has_no_cross_scope_validator_barrier(name):
     importlib.import_module(name)
     assert not any(op.task_id.startswith("validate_")
                    for op in PythonOperator._instances)
-    [op] = BashOperator._instances
+    [op] = [task for task in BashOperator._instances if task.task_id != "enrich_matches"]
     assert isinstance(op, tasks.UnderstatScopeOperator)
     assert op._init_kwargs["execution_timeout"] == timedelta(minutes=45)
 
