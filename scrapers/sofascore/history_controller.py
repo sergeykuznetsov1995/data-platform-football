@@ -217,7 +217,12 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
             scope["kind"] = _kind(scope, failures or {}, release, moment, max_scope_attempts)
         groups = coverage(scopes, inventory)
         snapshot_ids = {int(s["tournament"]["unique_tournament_id"]) for s in scopes}
-        missing_core = sum(denominator.is_core(tid) and tid not in snapshot_ids for tid in denominator.rows)
+        # Daily-registry tournaments (basis ``registry:``) are captured by the
+        # daily lane until #1370, never by this snapshot: they cannot block
+        # the history gates. Any other core id absent from it still does.
+        missing_core = sum(denominator.is_core(tid) and tid not in snapshot_ids
+                           and not denominator.rows[tid].basis.startswith("registry:")
+                           for tid in denominator.rows)
         for group in ("1", "2"):
             groups[group]["unknown_scopes"] += missing_core
             if missing_core:

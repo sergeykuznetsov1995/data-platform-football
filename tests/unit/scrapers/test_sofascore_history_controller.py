@@ -295,6 +295,20 @@ def test_future_metadata_missing_core_cannot_vanish_from_99_denominator(tmp_path
     assert report["groups"]["1"]["unknown_scopes"] == 1
 
 
+def test_daily_registry_core_absent_from_snapshot_does_not_block_history_gates(tmp_path):
+    """Top leagues the daily lane owns until #1370 must not freeze deep history forever."""
+    snap = snapshot(ids=(8,))
+    ev = evidence(snap, closed=100)
+    rows = dict(denominator().rows)
+    rows[17] = DenominatorRow(17, "ENG-Premier League", "Premier League", "core", 1,
+                              "registry:tournaments.json (дейли до #1370)")
+    run(tmp_path, snap, ev, denominator=Denominator(rows))
+    report = controller.read_summary(tmp_path / "controller.json", "history-test")
+    assert report["groups"]["1"]["unknown_scopes"] == 0
+    assert report["groups"]["1"]["gate_passed"]
+    assert report["groups"]["2"]["gate_passed"]
+
+
 @pytest.mark.parametrize("group2_closed", [0, 9900])
 def test_blocked_group1_without_ready_debt_yields_to_group2_not_deeper(tmp_path, group2_closed):
     snap = snapshot(ids=(8,))
