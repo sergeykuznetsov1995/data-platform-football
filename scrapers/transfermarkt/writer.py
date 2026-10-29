@@ -154,10 +154,13 @@ class TransfermarktTrinoManager(TrinoTableManager):
             # The ops registry uses UTC timestamp(6). Never let the generic
             # default TIMESTAMP precision round an immutable microsecond clock.
             types['first_seen_at'] = 'TIMESTAMP(6)'
-        from scrapers.transfermarkt.scraper import SQUAD_DATE_COLUMNS
+        from scrapers.transfermarkt.scraper import CAREER_DATE_COLUMNS, SQUAD_DATE_COLUMNS
         for column in SQUAD_DATE_COLUMNS:
             if types.get(column) == 'VARCHAR':
                 # An all-NULL first batch arrives as an Arrow null column.
+                types[column] = 'DATE'
+        for column in CAREER_DATE_COLUMNS:
+            if column in types:
                 types[column] = 'DATE'
         return types
 
@@ -275,16 +278,20 @@ def guard_cached_frames(scraper, outputs, frames):
             params = tuple(value for item in refs for value in (item['player_id'], item['batch_id']))
             cursor = connection.cursor()
             try:
-                projection = list(frame.columns)
-                if 'first_seen_at' in projection and expected.first_seen_at.isna().all():
-                    # Schema evolution happens at the write boundary AFTER
-                    # save_intent. An old cached cohort may precede the nullable
-                    # metadata column; its original physical projection stays
-                    # verifiable without mutating Bronze before the journal.
-                    projection.remove('first_seen_at')
-                execute_statement(cursor, 'SELECT ' + ', '.join(projection) + ' FROM iceberg.bronze.'
+                from scrapers.transfermarkt.revisions import CAREER_NULLABLE_ADDITIONS
+                # Discover the physical projection from the read itself, as in
+                # IcebergWriter.read_table. New nullable columns may not exist
+                # until the subsequent write evolves the table schema.
+                execute_statement(cursor, 'SELECT * FROM iceberg.bronze.'
                     + output.table_name + ' WHERE ' + predicate, params)
-                actual = pd.DataFrame(cursor.fetchall(), columns=projection)
+                physical = [column[0] for column in cursor.description]
+                actual = pd.DataFrame(cursor.fetchall(), columns=physical)
+                missing = set(frame.columns) - set(physical)
+                if (missing - CAREER_NULLABLE_ADDITIONS
+                    or any(not expected[column].isna().all() for column in missing)):
+                    raise StaleTransfermarktWrite('cached career physical projection differs: ' + output.table_name)
+                projection = [column for column in frame.columns if column in physical]
+                actual = actual[projection]
             finally:
                 cursor.close()
             from dags.utils.transfermarkt_current_write import _rows

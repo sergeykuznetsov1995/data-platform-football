@@ -8,6 +8,11 @@ manifest stay content-addressed under the planner-provided result directory.
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 from scrapers.transfermarkt.writer import execute_statement
 
 import argparse
@@ -1486,8 +1491,8 @@ def _build_scope_manifest(
         canonical_season=identity.canonical_season,
         registry_snapshot_id=identity.registry_snapshot_id,
         capture_revision=identity.capture_revision,
-        parser_revision=os.environ.get('TM_PARSER_VERSION', 'v2'),
-        schema_revision=os.environ.get('TM_SCHEMA_VERSION', '2'),
+        parser_revision=os.environ.get('TM_PARSER_VERSION', DEFAULT_PARSER_REVISION),
+        schema_revision=os.environ.get('TM_SCHEMA_VERSION', DEFAULT_SCHEMA_REVISION),
         reader_revision=int(args.reader_revision),
         entities=tuple(evidence),
         dq_evidence=dq_evidence,

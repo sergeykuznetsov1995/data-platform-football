@@ -127,6 +127,10 @@ class _PinnedCursor:
     def fetchall(self):
         return self.cursor.fetchall()
 
+    @property
+    def description(self):
+        return self.cursor.description
+
 
 def _placeholder(column: str) -> str:
     values = ', '.join(dq._sql_literal(item) for item in PLACEHOLDERS)

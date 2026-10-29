@@ -1,0 +1,153 @@
+{
+  "market_value": {
+    "list": [
+      {
+        "x": 1250632800000,
+        "y": 50000,
+        "mw": "€50K",
+        "datum_mw": "19/08/2009",
+        "verein": "Unknown",
+        "age": "20",
+        "wappen": "https://img.a.transfermarkt.technology/wappen/profil/75.png?lm=1789459169"
+      },
+      {
+        "x": 1307052000000,
+        "y": 0,
+        "mw": "-",
+        "datum_mw": "03/06/2011",
+        "verein": "Clube Náutico Capibaribe",
+        "age": "21",
+        "wappen": "https://img.a.transfermarkt.technology/wappen/profil/2646.png?lm=1789459306"
+      }
+    ],
+    "current": "-",
+    "highest": "€1.5M",
+    "highest_date": "07/12/2017",
+    "last_change": "08/01/2026",
+    "details_url": "/ronaldo-alves/marktwertverlauf/spieler/124543",
+    "thread": {
+      "url": "",
+      "thread_title": "",
+      "count_replies": ""
+    },
+    "translations": {
+      "market value": "Market value",
+      "team": "Club",
+      "age": "Age",
+      "resetZoom": "Vollansicht",
+      "current": "Current Market Value\n\n",
+      "highest": "Highest market value",
+      "thread": "View market value analysis",
+      "forum": "Forum",
+      "details": "Market value details",
+      "headline": "Market value over time",
+      "lastChange": "Last update"
+    }
+  },
+  "transfers": {
+    "transfers": [
+      {
+        "url": "/marcelo-cirino/transfers/spieler/114514/transfer_id/1866191",
+        "from": {
+          "isSpecial": false,
+          "href": "/atletico-pr/transfers/verein/679/saison_id/2017",
+          "clubEmblem-1x": "https://img.a.transfermarkt.technology/wappen/tiny/679_1548711018.png?lm=1789459206",
+          "clubEmblem-2x": "https://img.a.transfermarkt.technology/wappen/smallquad/679_1548711018.png?lm=1789459206",
+          "clubEmblemMobile": "https://img.a.transfermarkt.technology/wappen/homepageWappen70x70/679_1548711018.png?lm=1789459206",
+          "clubName": "Atlético-PR",
+          "countryFlag": "https://img.a.transfermarkt.technology/flagge/verysmall/26.png?lm=1791356387",
+          "latitude": "",
+          "longitude": ""
+        },
+        "to": {
+          "isSpecial": false,
+          "href": "/al-nasr/transfers/verein/5432/saison_id/2017",
+          "clubEmblem-1x": "https://img.a.transfermarkt.technology/wappen/tiny/5432_1662054588.png?lm=1789459449",
+          "clubEmblem-2x": "https://img.a.transfermarkt.technology/wappen/smallquad/5432_1662054588.png?lm=1789459449",
+          "clubEmblemMobile": "https://img.a.transfermarkt.technology/wappen/homepageWappen70x70/5432_1662054588.png?lm=1789459449",
+          "clubName": "Al-Nasr",
+          "countryFlag": "https://img.a.transfermarkt.technology/flagge/verysmall/183.png?lm=1791356396",
+          "latitude": "",
+          "longitude": ""
+        },
+        "futureTransfer": 0,
+        "date": "02/08/2017",
+        "dateUnformatted": "2017-08-02",
+        "upcoming": false,
+        "season": "17/18",
+        "marketValue": "€1.5M",
+        "fee": "Loan fee:<br /><i class=\"normaler-text\">€500K</i>",
+        "showUpcomingHeader": false,
+        "showResetHeader": false
+      },
+      {
+        "url": "/marcelo-cirino/transfers/spieler/114514/transfer_id/1754960",
+        "from": {
+          "isSpecial": false,
+          "href": "/flamengo/transfers/verein/614/saison_id/2016",
+          "clubEmblem-1x": "https://img.a.transfermarkt.technology/wappen/tiny/614.png?lm=1789459204",
+          "clubEmblem-2x": "https://img.a.transfermarkt.technology/wappen/smallquad/614.png?lm=1789459204",
+          "clubEmblemMobile": "https://img.a.transfermarkt.technology/wappen/homepageWappen70x70/614.png?lm=1789459204",
+          "clubName": "Flamengo",
+          "countryFlag": "https://img.a.transfermarkt.technology/flagge/verysmall/26.png?lm=1791356387",
+          "latitude": "",
+          "longitude": ""
+        },
+        "to": {
+          "isSpecial": false,
+          "href": "/atletico-pr/transfers/verein/679/saison_id/2016",
+          "clubEmblem-1x": "https://img.a.transfermarkt.technology/wappen/tiny/679_1548711018.png?lm=1789459206",
+          "clubEmblem-2x": "https://img.a.transfermarkt.technology/wappen/smallquad/679_1548711018.png?lm=1789459206",
+          "clubEmblemMobile": "https://img.a.transfermarkt.technology/wappen/homepageWappen70x70/679_1548711018.png?lm=1789459206",
+          "clubName": "Atlético-PR",
+          "countryFlag": "https://img.a.transfermarkt.technology/flagge/verysmall/26.png?lm=1791356387",
+          "latitude": "",
+          "longitude": ""
+        },
+        "futureTransfer": 0,
+        "date": "24/04/2017",
+        "dateUnformatted": "2017-04-24",
+        "upcoming": false,
+        "season": "16/17",
+        "marketValue": "€1.5M",
+        "fee": "End of loan<br /><i class=\"normaler-text\">€300K</i>",
+        "showUpcomingHeader": false,
+        "showResetHeader": false
+      },
+      {
+        "url": "/marcelo-cirino/transfers/spieler/114514/transfer_id/5910761",
+        "from": {
+          "isSpecial": false,
+          "href": "/pss-sleman/transfers/verein/38560/saison_id/2025",
+          "clubEmblem-1x": "https://img.a.transfermarkt.technology/wappen/tiny/38560.png?lm=1789461450",
+          "clubEmblem-2x": "https://img.a.transfermarkt.technology/wappen/smallquad/38560.png?lm=1789461450",
+          "clubEmblemMobile": "https://img.a.transfermarkt.technology/wappen/homepageWappen70x70/38560.png?lm=1789461450",
+          "clubName": "PSS Sleman",
+          "countryFlag": "https://img.a.transfermarkt.technology/flagge/verysmall/68.png?lm=1791356388",
+          "latitude": "",
+          "longitude": ""
+        },
+        "to": {
+          "isSpecial": true,
+          "href": "/without-club/transfers/verein/515/saison_id/2025",
+          "clubEmblem-1x": "https://img.a.transfermarkt.technology/wappen/tiny/515.png?lm=1789459197",
+          "clubEmblem-2x": "https://img.a.transfermarkt.technology/wappen/smallquad/515.png?lm=1789459197",
+          "clubEmblemMobile": "https://img.a.transfermarkt.technology/wappen/homepageWappen70x70/515.png?lm=1789459197",
+          "clubName": "Without Club",
+          "countryFlag": null,
+          "latitude": "",
+          "longitude": ""
+        },
+        "futureTransfer": 0,
+        "date": "01/07/2025",
+        "dateUnformatted": "2025-07-01",
+        "upcoming": false,
+        "season": "25/26",
+        "marketValue": "€300K",
+        "fee": "-",
+        "showUpcomingHeader": false,
+        "showResetHeader": false
+      }
+    ]
+  }
+}

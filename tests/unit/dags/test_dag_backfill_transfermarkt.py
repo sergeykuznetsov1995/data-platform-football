@@ -117,6 +117,8 @@ def test_mapped_environment_carries_frozen_campaign_not_proxy_secrets(module):
 
     assert environment["TM_DAG_ID"] == "dag_backfill_transfermarkt"
     assert environment["TM_WRITE_MODE"] == "native-only"
+    assert environment["TM_PARSER_VERSION"] == "registry-v2"
+    assert environment["TM_SCHEMA_VERSION"] == "4"
     assert environment["TM_REFRESH_MODE"] == "historical"
     assert environment["TRANSFERMARKT_REQUIRE_RAW_STORE"] == "true"
     assert environment["TM_BACKFILL_CLAIM_GENERATION"] == "1"

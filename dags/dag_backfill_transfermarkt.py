@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 import json
@@ -231,8 +236,8 @@ def _environment_for_scope(
         "TM_CANDIDATE_SLOT": str(preflight["candidate_slot"]),
         "TM_WRITE_MODE": "native-only",
         "TM_HISTORY_CURRENT_QUALIFICATION_SHA256": str(preflight.get("current_qualification_sha256", "")),
-        "TM_PARSER_VERSION": "v2",
-        "TM_SCHEMA_VERSION": "2",
+        "TM_PARSER_VERSION": DEFAULT_PARSER_REVISION,
+        "TM_SCHEMA_VERSION": DEFAULT_SCHEMA_REVISION,
         "TM_APPROVAL_MODE": "standing_policy",
         "TM_STANDING_POLICY_PATH": STANDING_BACKFILL_POLICY_PATH,
         "TM_STANDING_POLICY_SHA256": policy_hash,
