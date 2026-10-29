@@ -252,6 +252,9 @@ class _Repository:
         self.ensured = False
         self.verified: list[ScopeAttempt] = []
 
+    def validate_tables(self):
+        self.validated = True
+
     def ensure_table(self):
         self.ensured = True
 
@@ -842,28 +845,22 @@ def test_early_failure_before_attempt_is_journaled_with_next_attempt_no(
     assert journaled.error_message == result["errors"][0]
 
 
-def test_every_run_ensures_the_failures_journal_before_any_failure():
+def test_every_run_validates_both_journals_without_ddl():
     factory, _ = _scraper_factory(_complete_frames())
-    repository = _Repository()
-
-    _, exit_code = runner.run_scope(
-        _args(), scraper_factory=factory, repository=repository
-    )
-
-    assert exit_code == 0
-    assert repository.ensured and repository.failures_ensured
-    assert repository.failures == []
+    for _ in range(2):
+        repository = _Repository()
+        _, exit_code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+        assert exit_code == 0
+        assert repository.validated
+        assert not repository.ensured and not repository.failures_ensured
 
     broken = _Repository()
-
-    def journal_outage():
-        raise ConnectionError("trino unavailable")
-
-    broken.ensure_failures_table = journal_outage
-    _, broken_exit = runner.run_scope(
-        _args(), scraper_factory=factory, repository=broken
-    )
-    assert broken_exit == 0
+    def missing_schema():
+        raise RuntimeError("missing manifest schema")
+    broken.validate_tables = missing_schema
+    with pytest.raises(RuntimeError, match="missing manifest schema"):
+        runner.run_scope(_args(), scraper_factory=factory, repository=broken)
+    assert not broken.appended and not broken.failures
 
 
 def test_first_empty_match_attempt_publishes_complete_waiting_quarantine(monkeypatch):
@@ -1275,6 +1272,16 @@ def test_previous_catalog_readiness_is_cleared_before_publication(tmp_path, fail
     state = catalog.record_league(definition, 2025, LEAGUE_PAYLOAD)
     assert state["quality_ready"] is (failure is None)
     assert state["is_closed"] is (failure is None)
+
+
+def test_explicit_bootstrap_cli_does_not_start_scope_ingestion(monkeypatch):
+    from scrapers.understat.manifest import UnderstatManifestRepository
+
+    repository = MagicMock()
+    monkeypatch.setattr(UnderstatManifestRepository, "from_env", lambda: repository)
+    monkeypatch.setattr(runner, "run_scope", lambda *_: pytest.fail("bootstrap ingested a scope"))
+    assert runner.main(["--bootstrap-manifest"]) == 0
+    repository.bootstrap.assert_called_once_with()
 
 
 def test_source_diagnostics_survive_runner_quality_without_blocking_or_extra_calls():
