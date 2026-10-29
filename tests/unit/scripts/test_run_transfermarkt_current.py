@@ -340,7 +340,9 @@ def test_production_current_staff_policy_preserves_other_work(offline, productio
 
     offline.clock.advance(7 * 86400)
     weekly = production_current.run('weekly')
-    assert any(item['kind'] == 'weekly_roster' and item['status'] == 'complete' for item in weekly['scopes'])
+    # Since #1777 weekly roster capture queues career refreshes for the next portion -> 'pending'.
+    assert any(item['kind'] == 'weekly_roster' and item['status'] in {'complete', 'pending'}
+               for item in weekly['scopes'])
     assert len(offline.writes) == 2
 
     rows = [_joined_row(_competition('GB1'), _edition('GB1', '2026', current=False)),
