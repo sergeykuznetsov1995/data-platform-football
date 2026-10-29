@@ -92,7 +92,7 @@ measure() {
   [[ "$r" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]] && echo "${r//,/ }"
 }
 
-# Причина не трогать бой сейчас (пусто — можно): идёт прогон или жива история.
+# Причина не трогать бой сейчас (пусто — можно). Cooldown истории не считается работой.
 # Гриль 29.10: доставка в любой час, когда контур свободен. Вместо окна по часам — запас до ближайшего
 # запуска сбора по расписанию Airflow (dag.next_dagrun_create_after; DAG без расписания и на паузе не считаются).
 NEXT_RUN_MARGIN=${NEXT_RUN_MARGIN:-1800}   # секунд; хватает на доставку, перечитывание DAG и откат
@@ -105,10 +105,21 @@ next_run_reason() {
   [ "$left" -ge "$NEXT_RUN_MARGIN" ] || echo "до запуска сбора по расписанию $((left/60)) мин (< $((NEXT_RUN_MARGIN/60))) — доставка после прогона"
 }
 busy_reason() {
-  local n
-  n=$(q "select count(*) from dag_run where state in ('running','queued')")
-  if [ "$n" != "0" ]; then echo "контур занят: dag_run running/queued = '${n:-метабаза не ответила}'"
+  local counts other history
+  counts=$(q "select
+    count(*) filter (where dr.dag_id <> 'dag_backfill_whoscored'),
+    count(*) filter (where dr.dag_id = 'dag_backfill_whoscored' and exists (
+      select 1 from task_instance ti where ti.dag_id = dr.dag_id and ti.run_id = dr.run_id
+      and ti.task_id in ('run_backfill_chunk','finalize_chunk')
+      and ti.state in ('running','queued','scheduled','up_for_retry')))
+    from dag_run dr where dr.state in ('running','queued')") \
+    || { echo "контур занят: метабаза не ответила"; return; }
+  [[ "$counts" =~ ^[0-9]+\|[0-9]+$ ]] \
+    || { echo "контур занят: некорректный ответ метабазы '${counts}'"; return; }
+  other=${counts%|*}; history=${counts#*|}
+  if [ "$other" != 0 ]; then echo "контур занят: dag_run running/queued = '$other'"
   elif pgrep -f "$HISTORY_PAT" >/dev/null; then echo "контур занят: жив драйвер истории"
+  elif [ "$history" != 0 ]; then echo "контур занят: проход истории"
   else next_run_reason
   fi
 }
@@ -328,6 +339,14 @@ fi
 
 # --- доставка: в любой час, когда контур свободен (гриль 29.10); одна попытка на SHA master (защёлка ниже)
 BUSY=$(busy_reason)
+if [ "$CHECK" = 0 ] && [ "$BUSY" = "контур занят: проход истории" ]; then
+  log "жду окно между проходами истории (до 15 минут)"
+  for ((i=0; i<30; i++)); do
+    sleep 30
+    BUSY=$(busy_reason)
+    [ "$BUSY" = "контур занят: проход истории" ] || break
+  done
+fi
 if [ -n "$BUSY" ]; then
   [ "$CHECK" = 1 ] && log "заметка: $BUSY" || { log "$BUSY — выход"; exit 0; }
 fi
@@ -356,6 +375,9 @@ done
 log "к доставке: ${ACC:0:12} → ${SHA:0:12} ($(g diff --name-only "$ACC" "$SHA" -- $WS_PATHS | wc -l) файлов в путях WhoScored)"
 if [ "$CHECK" = 1 ]; then log "проверки пройдены (--check, ничего не записано)"; exit 0; fi
 
+# Проверка выше не блокирует scheduler: стартовавший во время подмены проход истории
+# может упасть (принятый владельцем риск #1923). DAG не ставим на паузу;
+# приёмка доставки остаётся по ежедневнику, а не по истории.
 # --- доставка. Состояние для отката пишется ДО checkout; не записалось — бой не трогаем.
 put "$INFLIGHT" "phase=deploying
 sha=$SHA
