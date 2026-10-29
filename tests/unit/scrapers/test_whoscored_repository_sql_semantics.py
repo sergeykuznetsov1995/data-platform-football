@@ -341,12 +341,17 @@ def test_history_keeps_retry_after_cap_and_parser_success():
 
 
 @pytest.mark.unit
-def test_history_unknown_stage_gets_only_one_probe():
+def test_history_unknown_stage_probes_second_game_at_once():
     con = _connection()
     _game(con, 1, 10, 20)
     _game(con, 2, 10, 10)
     assert _candidates(con, lane="history") == [2]
     _attempt(con, 2, "not_available", 1)
+    # Old games do not change: history takes the second evidence game now,
+    # never the first negative again; the daily lane keeps the stage cooldown.
+    assert _candidates(con, lane="history") == [1]
+    assert _candidates(con) == []
+    _attempt(con, 1, "not_available", 0)
     assert _candidates(con, lane="history") == []
 
 
@@ -364,7 +369,7 @@ def _history_repository(con):
     return WhoScoredRepository(writer=MagicMock(), trino=trino)
 
 
-def test_history_unknown_stage_probes_second_game_after_cooldown():
+def test_history_unknown_stage_resolves_without_cooldown():
     from scrapers.whoscored.history_state import first_wave_ready
 
     con = _connection()
@@ -374,11 +379,7 @@ def test_history_unknown_stage_probes_second_game_after_cooldown():
                 "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
     _game(con, 1, 10, 60)
     _game(con, 2, 10, 50)
-    _attempt(con, 2, "not_available", 29)
-    assert _candidates(con, lane="history") == []
-    con.execute("UPDATE iceberg.bronze.whoscored_match_ingest_manifest "
-                "SET fetched_at = ?, completed_at = ?",
-                [NOW - timedelta(days=31)] * 2)
+    _attempt(con, 2, "not_available", 1)
     repository = _history_repository(con)
     row = repository.history_coverage()[(LEAGUE, SEASON)]
     assert row["unknown_stages"] == 1
@@ -392,9 +393,30 @@ def test_history_unknown_stage_probes_second_game_after_cooldown():
     assert _candidates(con, lane="history") == []
     # Once unavailable, the stage still re-probes its newest game monthly.
     con.execute("UPDATE iceberg.bronze.whoscored_match_ingest_manifest "
-                "SET fetched_at = ?, completed_at = ? WHERE game_id=1",
+                "SET fetched_at = ?, completed_at = ?",
                 [NOW - timedelta(days=31)] * 2)
     assert _candidates(con, lane="history") == [2]
+
+
+def test_single_game_stage_is_resolved_by_one_negative():
+    from scrapers.whoscored.history_state import first_wave_ready
+
+    con = _connection()
+    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
+                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
+    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
+                "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+    _game(con, 1, 10, 60)  # the stage's only played game, e.g. a play-off final
+    _game(con, 2, 20, 50)
+    _attempt(con, 2, "success", 40)
+    assert _candidates(con, lane="history") == [1]
+    _attempt(con, 1, "not_available", 1)
+    row = _history_repository(con).history_coverage()[(LEAGUE, SEASON)]
+    # A second negative game cannot exist, so the stage must not stay unknown.
+    assert (row["closeable"], row["closed"], row["unknown_stages"]) == (1, 1, 0)
+    assert first_wave_ready([{"wave": 1, "coverage": row}])
+    assert _candidates(con, lane="history") == []
+    assert _candidates(con) == []
 
 
 def test_history_coverage_does_not_close_deferred_or_unknown_matches():
