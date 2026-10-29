@@ -5219,6 +5219,7 @@ class ControlStore:
             cursor.execute(
                 """
                 SELECT season.*, edition.sort_year,
+                       root.target_id AS root_target_id,
                        root.state AS root_state,
                        root.last_error_class AS root_error_class,
                        root.last_error_message AS root_error_message,
@@ -5298,6 +5299,42 @@ class ControlStore:
                 (sorted(EXCLUDED_IDS), adult_pattern, year, year, competition, season, normalized_limit),
             )
             return _fetchall(cursor)
+
+    def park_redirected_targets(self, target_ids: Sequence[object]) -> int:
+        """Park targets whose last answer was a permanent redirect.
+
+        Requeueing the same URL would pay for the same 301/308 again.  The
+        dedicated class keeps the target out of backfill selection, claims, and
+        scope reconciliation, which reopens only ``ScopeQuarantined``.  The
+        update is fenced to the current HTTP status; parser and contract
+        quarantines stay untouched.  Reopening is the redirect registry's job
+        (#1933), not this method's.
+        """
+        targets = sorted({_text(item, "target_id") for item in target_ids})
+        if not targets:
+            return 0
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE fbref_control.page_frontier
+                SET state = 'quarantined', next_fetch_at = NULL,
+                    retry_after = NULL,
+                    last_error_class = 'RedirectUnresolved',
+                    last_error_message =
+                        'HTTP ' || last_http_status || '; awaiting #1933',
+                    updated_at = clock_timestamp()
+                WHERE target_id = ANY(%s)
+                  AND last_http_status IN (301, 308)
+                  AND (
+                    state IN ('queued', 'retry')
+                    OR (state = 'quarantined'
+                        AND last_error_class = 'ScopeQuarantined')
+                  )
+                RETURNING target_id
+                """,
+                (targets,),
+            )
+            return len(_fetchall(cursor))
 
     def list_backfill_seasons(
         self,

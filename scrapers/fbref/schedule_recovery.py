@@ -21,8 +21,9 @@ from scrapers.fbref.raw_store import RawStoreError, season_page_target
 logger = logging.getLogger(__name__)
 
 # A permanent redirect cannot be followed without a reviewed registry (#1933);
-# requeueing the same URL would only loop.
+# requeueing the same URL would only loop, so such targets are parked.
 _REDIRECT_STATUSES = frozenset({301, 308})
+_PARKABLE_CLASSES = frozenset({None, "ScopeQuarantined", "RedirectUnresolved"})
 
 
 def recover_all_schedules(pipeline) -> dict:
@@ -39,6 +40,12 @@ def recover_all_schedules(pipeline) -> dict:
         if len(rows) < 25:
             break
         after_target_id = rows[-1]["target_id"]
+    # Park before reconciling: it would reopen a resolved scope verdict and
+    # requeue the redirected URL.
+    redirected = [row["target_id"] for row in inventory
+                  if row.get("last_http_status") in _REDIRECT_STATUSES]
+    if redirected:
+        pipeline.control.park_redirected_targets(redirected)
     for row in inventory:
         # The reconciler alone can clear a resolved scope verdict.
         if (
@@ -60,12 +67,11 @@ def recover_all_schedules(pipeline) -> dict:
             "reason": installed.get("last_error_message"),
             "error_class": installed.get("last_error_class"),
         }
-        if row.get("last_http_status") in _REDIRECT_STATUSES:
+        if installed.get("last_error_class") == "RedirectUnresolved":
             quarantine["detail"] = quarantine["reason"]
             quarantine["reason"] = "redirect_unresolved"
             logger.warning(
-                "FBref schedule recovery: quarantined %s answered HTTP %s; "
-                "not requeued until a reviewed redirect exists",
+                "FBref schedule recovery: %s parked on HTTP %s until #1933",
                 row["target_id"], row["last_http_status"],
             )
         quarantines.append(quarantine)
@@ -167,9 +173,16 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
             continue
         if row.get("root_state") == "quarantined":
             result["quarantine_reason"] = row.get("root_error_message")
-            if row.get("root_error_class") != "ScopeQuarantined":
+            if row.get("root_error_class") not in {
+                "ScopeQuarantined", "RedirectUnresolved",
+            }:
                 result["reason"] = "season_quarantined"
                 continue
+        if row.get("root_http_status") in _REDIRECT_STATUSES:
+            # Any target last answered 301/308 is parked; its saved raw, if
+            # any, still seeds the schedule below.
+            _park_redirect(pipeline, result, row["root_target_id"],
+                           row["root_http_status"])
         if row.get("schedule_target_id"):
             result["reason"] = (
                 "schedule_processed"
@@ -181,8 +194,12 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
             if (
                 not row.get("schedule_processed")
                 and row.get("schedule_http_status") in _REDIRECT_STATUSES
+                and row.get("schedule_error_class") in _PARKABLE_CLASSES
             ):
-                _redirect_unresolved(result, row["schedule_http_status"])
+                _park_redirect(pipeline, result, row["schedule_target_id"],
+                               row["schedule_http_status"])
+                result["reason"] = "redirect_unresolved"
+                result["detail"] = f"HTTP {row['schedule_http_status']}"
                 continue
             if row["schedule_state"] != "quarantined":
                 continue
@@ -192,7 +209,8 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
         if not refresh:
             result["reason"] = "raw_missing"
             if row.get("root_http_status") in _REDIRECT_STATUSES:
-                _redirect_unresolved(result, row["root_http_status"])
+                result["reason"] = "redirect_unresolved"
+                result["detail"] = f"HTTP {row['root_http_status']}"
                 continue
             # A never-fetched edition still needs a real season fetch. Queue
             # only its registry URL; no schedule URL can be invented from it.
@@ -311,11 +329,13 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
     }
 
 
-def _redirect_unresolved(result: dict, http_status) -> None:
-    result["reason"] = "redirect_unresolved"
-    result["detail"] = f"HTTP {http_status}"
+def _park_redirect(pipeline, result: dict, target_id, http_status) -> None:
+    """Park the redirected target in the control DB; repeat passes are no-ops."""
+    parked = pipeline.control.park_redirected_targets([target_id])
+    result.setdefault("parked_redirects", []).append(target_id)
     logger.warning(
-        "FBref schedule recovery: %s %s answered HTTP %s; not requeued "
-        "until a reviewed redirect exists",
-        result["competition_id"], result["season_id"], http_status,
+        "FBref schedule recovery: %s %s (%s) answered HTTP %s; parked=%s "
+        "until #1933",
+        result["competition_id"], result["season_id"], target_id,
+        http_status, parked,
     )

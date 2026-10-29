@@ -2993,3 +2993,37 @@ def test_schedule_recovery_index_requires_successful_saved_raw():
 
     store = ControlStore("postgresql://test/db", connection_factory=FakeFactory(handler))
     assert store.latest_schedule_recovery_index()["logical_refresh_id"] == "index"
+
+
+def test_schedule_recovery_parks_only_current_redirects_in_their_own_class():
+    seen = []
+
+    def handler(sql, params):
+        seen.append((sql, params))
+        assert "last_error_class = 'RedirectUnresolved'" in sql
+        assert "state = 'quarantined', next_fetch_at = NULL" in sql
+        assert "AND last_http_status IN (301, 308)" in sql
+        assert "state IN ('queued', 'retry')" in sql
+        assert "last_error_class = 'ScopeQuarantined')" in sql
+        assert "'; awaiting #1933'" in sql
+        assert params == (["a", "b"],)
+        return [{"target_id": "a"}], 1
+
+    store = ControlStore("postgresql://test/db", connection_factory=FakeFactory(handler))
+    assert store.park_redirected_targets(["b", "a", "a"]) == 1
+    assert store.park_redirected_targets([]) == 0
+    assert len(seen) == 1
+
+
+def test_schedule_recovery_parked_class_is_outside_reconcile_backfill_and_claim():
+    # Pins the SQL fences the RedirectUnresolved parking relies on.
+    import inspect as _inspect
+
+    reconcile = _inspect.getsource(ControlStore.reconcile_frontier_scope)
+    assert reconcile.count("AND frontier.last_error_class = 'ScopeQuarantined'") == 1
+    assert "frontier.state <> 'quarantined'" in reconcile
+    backfill = _inspect.getsource(ControlStore.list_backfill_seasons)
+    assert "frontier.state IN ('queued', 'retry', 'fetched')" in backfill
+    assert "AND frontier.last_error_class = 'ScopeQuarantined'" in backfill
+    claim = _inspect.getsource(ControlStore.claim_targets)
+    assert "quarantined" not in claim
