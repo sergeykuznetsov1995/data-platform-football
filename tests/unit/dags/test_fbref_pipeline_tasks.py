@@ -3518,7 +3518,9 @@ def test_initialize_backfill_records_nonpublishing_evidence(monkeypatch):
     from scrapers.fbref.history import HistoryCampaign
 
     monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
-    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", MagicMock())
+    store = MagicMock()
+    store.get_run.return_value = None
+    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", lambda: store)
     monkeypatch.setattr(HistoryCampaign, "has_timing", lambda self: True)
     pipeline = MagicMock()
     pipeline.initialize_run.return_value = (

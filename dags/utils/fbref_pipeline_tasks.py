@@ -140,15 +140,25 @@ FBREF_LIVE_BUDGET_PROFILES = {
 }
 
 
-def _history_run_limits(request_limit, byte_limit_mb) -> tuple[int, int, bool]:
+def _history_run_limits(
+    request_limit, byte_limit_mb, *, run_id
+) -> tuple[int, int, bool]:
     """The first history run is a canary by rule, whatever conf/params say.
 
     Until a history run has recorded measured pages, admission relies on the
     current lane's timings, so that run is capped at the canary profile (#1958).
+    Limits are pinned at creation: an existing control run (retry/clear) keeps
+    its stored limits even after its own finalizer recorded timing.
     """
     from scrapers.fbref.history import HistoryCampaign
 
-    if HistoryCampaign(_control_store()).has_timing():
+    control = _control_store()
+    run = control.get_run(run_id)
+    if run is not None:
+        limits = (int(run["request_limit"]), int(run["byte_limit"]) // MIB)
+        canary = limits == (FBREF_CANARY_REQUEST_LIMIT, FBREF_CANARY_BYTE_LIMIT_MB)
+        return limits[0], limits[1], canary
+    if HistoryCampaign(control).has_timing():
         return int(request_limit), int(byte_limit_mb), False
     return (
         min(int(request_limit), FBREF_CANARY_REQUEST_LIMIT),
@@ -1629,7 +1639,9 @@ def initialize_fbref_run(
         if _boolean_parameter(publishing, name="publishing"):
             raise ValueError("The history controller cannot publish downstream")
         request_limit, byte_limit_mb, canary = _history_run_limits(
-            request_limit, byte_limit_mb
+            request_limit,
+            byte_limit_mb,
+            run_id=_control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
         )
         logger.info(
             "FBref history run limits: request_limit=%s byte_limit_mb=%s "
@@ -2209,7 +2221,9 @@ def run_fbref_live_waves(
         ).total_seconds()
         deadline_seconds = min(float(deadline_seconds), max(remaining, 1.0))
         request_limit, byte_limit_mb, canary = _history_run_limits(
-            request_limit, byte_limit_mb
+            request_limit,
+            byte_limit_mb,
+            run_id=_control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
         )
     command = [
         _legacy_scraper_python(),

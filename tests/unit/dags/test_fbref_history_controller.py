@@ -390,6 +390,14 @@ def test_history_run_timing_remains_authoritative():
     assert cursor.execute.call_count == 1
 
 
+def _store(monkeypatch, run=None):
+    """Control store whose get_run returns ``run`` (None: run not created yet)."""
+    store = MagicMock()
+    store.get_run.return_value = run
+    monkeypatch.setattr(tasks, "_control_store", lambda: store)
+    return store
+
+
 def _slice_clock(monkeypatch, at, page_seconds=180):
     """Pin the admission clock and the measured page duration."""
     from scrapers.fbref.history import HistoryCampaign
@@ -403,7 +411,7 @@ def _slice_clock(monkeypatch, at, page_seconds=180):
     monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
     monkeypatch.setattr(HistoryCampaign, "page_seconds", lambda self: page_seconds)
     monkeypatch.setattr(HistoryCampaign, "has_timing", lambda self: True)
-    monkeypatch.setattr(tasks, "_control_store", MagicMock())
+    _store(monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -548,7 +556,7 @@ def _history_with_timing(monkeypatch, present):
 @pytest.mark.parametrize("present,limits", [(False, (100, 50)), (True, (4096, 2048))])
 def test_first_history_run_is_initialized_as_canary_by_rule(monkeypatch, present, limits):
     monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
-    monkeypatch.setattr(tasks, "_control_store", MagicMock())
+    _store(monkeypatch)
     _history_with_timing(monkeypatch, present)
     pipeline = MagicMock()
     monkeypatch.setattr(tasks, "_pipeline", lambda: pipeline)
@@ -633,3 +641,60 @@ def test_history_timing_presence_counts_only_measured_pages():
     assert campaign.has_timing() is False
     db.execute("INSERT INTO fbref_control.history_timing VALUES ('b', 3)")
     assert campaign.has_timing() is True
+
+
+def test_retried_canary_keeps_its_pinned_limits_after_timing_appears(monkeypatch):
+    """Canary ran waves, failed later, its finalizer recorded timing; clear retries it."""
+    _slice_clock(monkeypatch, datetime(2026, 10, 9, 22, 30, tzinfo=timezone.utc))
+    _history_with_timing(monkeypatch, True)
+    _store(monkeypatch, {"request_limit": 100, "byte_limit": 50 * 1024 * 1024})
+    monkeypatch.setenv(tasks.LEGACY_SCRAPER_PYTHON_ENV, sys.executable)
+    pipeline = MagicMock()
+    monkeypatch.setattr(tasks, "_pipeline", lambda: pipeline)
+    identity = {
+        "airflow_run_id": "scheduled__history",
+        "dag_id": "dag_fbref_history_controller",
+        "run_type": "backfill",
+        "request_limit": 4096,
+        "byte_limit_mb": 2048,
+        "shard_size": 1,
+    }
+    tasks.initialize_fbref_run(publishing=False, **identity)
+    settings = pipeline.initialize_run.call_args.kwargs["settings"]
+    assert (settings.request_limit, settings.byte_limit) == (100, 50 * 1024 * 1024)
+
+    captured = {}
+
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return ('FBREF_LIVE_WAVES_RESULT:{"batches": 1}\n', "")
+
+    monkeypatch.setattr(
+        tasks.subprocess,
+        "Popen",
+        lambda command, **_kwargs: captured.update(command=command) or Process(),
+    )
+    monkeypatch.setattr(tasks, "_process_group_exists", lambda _pgid: False)
+    result = tasks.run_fbref_live_waves(
+        worker_id="backfill-live",
+        page_kinds=["match"],
+        max_batches=12,
+        deadline_seconds=35 * 60,
+        **identity,
+    )
+    command = captured["command"]
+    assert command[command.index("--request-limit") + 1] == "100"
+    assert command[command.index("--byte-limit-mb") + 1] == "50"
+    assert result["canary_first_run"] is True
+
+
+def test_new_history_run_after_timing_uses_normal_limits(monkeypatch):
+    monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
+    _history_with_timing(monkeypatch, True)
+    _store(monkeypatch, None)
+    assert tasks._history_run_limits(4096, 2048, run_id="00000000-0000-4000-8000-000000000001") == (
+        4096, 2048, False,
+    )
