@@ -3831,3 +3831,34 @@ def test_match_runner_refusing_every_match_is_red_once_then_quarantined(
     assert rc == 0, again["errors"]
     assert transport.calls == 0
     assert "sofascore_events" not in saved
+
+
+@pytest.mark.unit
+def test_runner_scopes_all_partitioned_merges_except_rejected_rows():
+    import ast
+    import inspect
+    from dags.scripts import run_sofascore_scraper as runner
+
+    from scrapers.sofascore.iceberg_writer import PARTITION_SCOPED_TABLES
+
+    tree = ast.parse(inspect.getsource(runner))
+    tables = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        kwargs = {item.arg: item.value for item in node.keywords}
+        if "natural_keys" not in kwargs or "table_name" not in kwargs:
+            continue
+        table_node = kwargs["table_name"]
+        table = (getattr(runner, table_node.id) if isinstance(table_node, ast.Name)
+                 else ast.literal_eval(table_node))
+        if table == "sofascore_rejected_rows":
+            assert "merge_partition_cols" not in kwargs
+            continue
+        assert ast.literal_eval(kwargs["partition_cols"]) == ["league", "season"]
+        assert table in PARTITION_SCOPED_TABLES
+        assert {"league", "season"} <= set(ast.literal_eval(kwargs["natural_keys"]))
+        tables.append(table)
+    assert set(tables) == PARTITION_SCOPED_TABLES
+    assert len(set(tables)) == 15
+    assert tables.count("sofascore_match_capture_status") == 2

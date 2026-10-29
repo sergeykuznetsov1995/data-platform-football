@@ -1561,6 +1561,7 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
 ):
     from dags.scripts import run_sofascore_scraper as runner
 
+    monkeypatch.setattr("utils.proxy_traffic.record_traffic_run", lambda *args, **kwargs: False)
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     _complete_plan_with_expansion_raw(raw_store, manifest)
@@ -1593,8 +1594,37 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
         _entity_type=entity,
         _ingested_at="fixture",
     )
+    # Exercise the real runner -> BaseScraper -> writer -> MERGE SQL path.
+    # Only storage operations are replaced; no browser or Trino connection.
+    from scrapers.base.base_scraper import BaseScraper
+    from scrapers.sofascore import SofaScoreScraper
+
+    real_scraper = SofaScoreScraper(leagues=["ENG-Premier League"], seasons=[2025])
+    writer = real_scraper._iceberg_writer
+    manager = writer._get_trino_manager()
+    monkeypatch.setattr(manager, "table_exists", lambda *args: True)
+    monkeypatch.setattr(writer, "_evolve_schema", lambda *args: None)
+    staged = []
+    statements = []
+
+    def insert(schema, table, frame, *args, **kwargs):
+        staged[:] = [frame]
+        return len(frame)
+
+    def execute(sql, fetch=False):
+        statements.append(sql)
+        return [[len(staged[0])]] if fetch else None
+
+    monkeypatch.setattr(manager, "insert_dataframe", insert)
+    monkeypatch.setattr(manager, "_execute", execute)
+    monkeypatch.setattr(manager, "get_table_columns", lambda *args: {
+        "league": "varchar", "season": "varchar",
+    })
+    scraper._iceberg_writer = writer
+    scraper._stats = {"tables_written": []}
+    scraper.SOURCE_NAME = "sofascore"
     scraper.save_to_iceberg.side_effect = lambda **kwargs: (
-        "iceberg.bronze." + kwargs["table_name"]
+        BaseScraper.save_to_iceberg(scraper, **kwargs)
     )
     output = tmp_path / "season-offline.json"
 
@@ -1613,6 +1643,15 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     assert [
         call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
     ] == ["sofascore_schedule", "sofascore_league_table"]
+    merges = [sql for sql in statements if sql.startswith("MERGE INTO")]
+    assert len(merges) == 2
+    schedule_merge = next(sql for sql in merges
+                          if sql.startswith("MERGE INTO iceberg.bronze.sofascore_schedule "))
+    on_clause = schedule_merge.split(" ON ", 1)[1].split(" WHEN MATCHED", 1)[0]
+    assert '(t."league" = \'ENG-Premier League\' AND t."season" = \'2526\')' in on_clause
+    for key in ("league", "season", "game_id"):
+        assert f't."{key}" = s."{key}"' in on_clause
+    assert not any(sql.startswith("DELETE FROM") for sql in statements)
     committed_plan = plan_season_partition(
         raw_store,
         manifest,
