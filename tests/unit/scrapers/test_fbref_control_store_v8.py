@@ -2363,6 +2363,59 @@ def test_deferred_parse_record_is_atomic_fenced_and_idempotent(status):
             }]
 
 
+def _deferred_errors_store(evidence, metadata):
+    def handler(sql, params):
+        if "SELECT status, run_type, metadata" in sql:
+            return [{"status": "running", "run_type": "current", "metadata": metadata}], 1
+        if "FOR UPDATE OF observed" in sql:
+            return [{
+                "status": "failed", "error_class": evidence["error_class"],
+                "error_message": evidence["error_message"],
+                "failed_updated_at": "1793197265.000000",
+            }], 1
+        if "SET metadata = metadata ||" in sql:
+            metadata.update(json.loads(params[0]))
+            return [], 1
+        raise AssertionError(sql)
+
+    return make_store(handler)
+
+
+def test_deferred_parse_record_keeps_every_wave_error_fenced_by_the_last():
+    run_id = str(uuid.uuid4())
+    first = {"error_class": "TrinoConnectionError", "error_message": "typed cancel"}
+    last = {"error_class": "TrinoConnectionError", "error_message": "page cancel"}
+    evidence = {
+        **_parse_carryover_evidence(), **last, "deferred_errors": [first, last],
+    }
+    metadata = {}
+    store, _ = _deferred_errors_store(evidence, metadata)
+    store.record_deferred_parse_observations(run_id, [evidence])
+    assert metadata["deferred_parse_observations"] == [{
+        **evidence, "run_id": run_id, "failed_updated_at": "1793197265.000000",
+    }]
+
+
+@pytest.mark.parametrize("deferred_errors", [
+    [],
+    "TrinoConnectionError",
+    [{"error_class": "TrinoConnectionError", "error_message": "failed to cancel query"}] * 4,
+    [{"error_class": "TrinoConnectionError", "error_message": "failed to cancel query"},
+     {"error_class": "TrinoConnectionError", "error_message": "typed cancel"}],
+    [{"error_class": "TrinoConnectionError", "error_message": 1}],
+    [{"error_class": "TrinoConnectionError", "error_message": "failed to cancel query",
+      "extra": "x"}],
+], ids=["empty", "not-list", "too-many", "last-differs", "not-text", "extra-key"])
+def test_deferred_parse_record_rejects_inconsistent_wave_errors(deferred_errors):
+    evidence = {**_parse_carryover_evidence(), "deferred_errors": deferred_errors}
+    metadata = {}
+    store, factory = _deferred_errors_store(evidence, metadata)
+    with pytest.raises(StateConflict, match="Invalid deferred parse errors"):
+        store.record_deferred_parse_observations(str(uuid.uuid4()), [evidence])
+    assert factory.connections[0].rolled_back
+    assert metadata == {}
+
+
 @pytest.mark.parametrize("retry_status", ["failed", "processing", "changed_error"])
 def test_deferred_parse_retry_rechecks_and_refreshes_existing_fence(retry_status):
     run_id = str(uuid.uuid4())
@@ -2465,8 +2518,10 @@ def test_summary_carryover_only_exempts_source_run_with_exact_versions(
     assert json.loads(raw_params[1]) == json.loads(missing_params[1])
     manifest_sql, _ = captured["manifest"]
     assert "manifest.dataset = '__page__'" in manifest_sql
-    assert "carried.error_class = manifest.error_class" in manifest_sql
-    assert "carried.error_message = left(manifest.error_message, 2000)" in manifest_sql
+    assert "carried.error_message = left(" not in manifest_sql
+    assert "card.value -> 'deferred_errors'" in manifest_sql
+    assert "'error_class', card.value ->> 'error_class'" in manifest_sql
+    assert "deferred_error.value ->> 'error_class' = manifest.error_class" in manifest_sql
 
 
 def test_carryover_sql_matches_only_the_exact_still_failed_observation():
@@ -2565,7 +2620,10 @@ def _count_deferred_match_manifests(run_id, control):
                        ", ".join(column + " TEXT" for column in columns) + ")")
             db.executemany(f"INSERT INTO fbref_control.{name} VALUES (" +
                            ",".join("?" for _ in columns) + ")", [
-                               tuple(row.get(column) for column in columns) for row in rows
+                               tuple(
+                                   json.dumps(value) if isinstance(value, list) else value
+                                   for value in (row.get(column) for column in columns)
+                               ) for row in rows
                            ])
         # Only PostgreSQL syntax is translated; joins, filters, fences and
         # GROUP BY are the production query captured above.
@@ -2577,8 +2635,14 @@ def _count_deferred_match_manifests(run_id, control):
         ).replace("jsonb_build", "json").replace(
             "'failed_updated_at', carried.updated_at )) )",
             "'failed_updated_at', carried.updated_at ))) )",
-        ).replace("left(manifest.error_message, 2000)",
-                  "substr(manifest.error_message, 1, 2000)").replace("%s", "?").replace("%%", "%")
+        ).replace(
+            "jsonb_array_elements(%s::jsonb) AS card(value)", "json_each(%s) AS card",
+        ).replace(
+            "CROSS JOIN LATERAL jsonb_array_elements(", "CROSS JOIN json_each(",
+        ).replace(" AS deferred_error(value)", " AS deferred_error").replace(
+            "left(manifest.error_message, 2000)",
+            "substr(manifest.error_message, 1, 2000)",
+        ).replace("%s", "?").replace("%%", "%")
         return dict(db.execute(sql, captured["params"]).fetchall())
 
 
@@ -2627,6 +2691,69 @@ def test_deadline_typed_writer_failure_uses_real_manifest_counts(
     }
     if unrelated:
         with pytest.raises(RunValidationError, match="failed_dataset_manifests"):
+            pipeline.validate_and_finish(run_id, publication_eligible=False)
+    else:
+        pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+
+@pytest.mark.parametrize("unrelated", [False, True])
+def test_deadline_second_wave_error_keeps_first_wave_typed_manifests_exempt(
+    tmp_path, unrelated,
+):
+    """Wave 1 typed write fails A, wave 2 page write fails B, then deadline (#1915)."""
+    from trino.exceptions import TrinoConnectionError
+    from tests.unit.scrapers.test_fbref_pipeline import (
+        _deadline_match_run, _settings, _FlakyTrinoWriter, RunValidationError,
+    )
+
+    control, pipeline, run_id, _, _ = _deadline_match_run(tmp_path)
+    typed_error = TrinoConnectionError("failed to cancel typed query")
+    page_error = TrinoConnectionError("failed to cancel page query")
+    pipeline.generic_writer = _FlakyTrinoWriter([])
+    persist_match = pipeline.typed_adapter.writer.persist_match
+
+    def typed_fails_once(*args, **kwargs):
+        # The next wave fails earlier, on the page write, with another text.
+        pipeline.generic_writer.errors.append(page_error)
+        pipeline.typed_adapter.writer.persist_match = persist_match
+        raise typed_error
+
+    pipeline.typed_adapter.writer.persist_match = typed_fails_once
+    ticks = iter([0.0, 0.0, 10.0])
+    pipeline.monotonic = lambda: next(ticks)
+    result = pipeline.run_live_waves(
+        run_id, worker_id="typed-worker", page_kinds=["match"],
+        settings=_settings(), deadline_monotonic=5.0,
+    )
+    assert result.deadline_reached
+    assert result.batches == 2
+    assert result.parse.deferred_parse_failures == [
+        "fbref:match:0d4d2370:TrinoConnectionError"
+    ] * 2
+    evidence = control.run["metadata"]["deferred_parse_observations"]
+    assert len(evidence) == 1
+    assert evidence[0]["error_message"] == str(page_error)
+    assert evidence[0]["deferred_errors"] == [
+        {"error_class": "TrinoConnectionError", "error_message": str(typed_error)},
+        {"error_class": "TrinoConnectionError", "error_message": str(page_error)},
+    ]
+    failed = [row for row in control.manifests if row["validation_status"] == "failed"]
+    assert {row["error_message"] for row in failed} == {
+        str(typed_error), str(page_error),
+    }
+    if unrelated:
+        typed = next(row for row in failed if row["dataset"].startswith("typed:"))
+        control.manifests.append({
+            **typed, "dataset": "typed:independent", "error_class": "ValueError",
+        })
+    counts = _count_deferred_match_manifests(run_id, control)
+    assert counts.get("failed", 0) == (1 if unrelated else 0)
+    summary = control.get_run_summary
+    control.get_run_summary = lambda *a, **kw: {
+        **summary(*a, **kw), "dataset_validation_counts": counts,
+    }
+    if unrelated:
+        with pytest.raises(RunValidationError, match="failed_dataset_manifests=1"):
             pipeline.validate_and_finish(run_id, publication_eligible=False)
     else:
         pipeline.validate_and_finish(run_id, publication_eligible=False)

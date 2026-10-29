@@ -917,6 +917,10 @@ def _budget_from_row(row: Mapping[str, Any]) -> BudgetReservation:
     )
 
 
+# pipeline.MAX_PARSE_DEFERRALS_PER_TARGET + 1: every transient error one raw
+# can collect in a run before its deferrals run out (#1915).
+_MAX_DEFERRED_PARSE_ERRORS = 3
+
 _DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
     SELECT 1
     FROM fbref_control.observation_processing AS carried
@@ -7258,6 +7262,26 @@ class ControlStore:
                 evidence["run_id"] = run
                 if evidence.get("reason") != "deadline_after_transient_trino_failure":
                     raise StateConflict("Unknown deferred parse reason")
+                if "deferred_errors" in evidence:
+                    errors = evidence["deferred_errors"]
+                    if (
+                        not isinstance(errors, list)
+                        or not 1 <= len(errors) <= _MAX_DEFERRED_PARSE_ERRORS
+                        or any(
+                            not isinstance(error, Mapping)
+                            or set(error) != {"error_class", "error_message"}
+                            or not all(
+                                isinstance(value, str)
+                                for value in error.values()
+                            )
+                            for error in errors
+                        )
+                        or dict(errors[-1]) != {
+                            "error_class": evidence["error_class"],
+                            "error_message": evidence["error_message"],
+                        }
+                    ):
+                        raise StateConflict("Invalid deferred parse errors")
                 cursor.execute(
                     """
                     SELECT observed.status, observed.error_class,
@@ -7413,8 +7437,33 @@ class ControlStore:
             deferred_manifest_sql = _DEFERRED_PARSE_ATTEMPT_SQL.replace(
                 "carried.status = 'failed'",
                 "carried.status = 'failed' "
-                "AND carried.error_class = manifest.error_class "
-                "AND carried.error_message = left(manifest.error_message, 2000) "
+                # A manifest keeps the error of the wave that wrote it; the
+                # card lists every deferred error of this raw (#1915).
+                "AND EXISTS (SELECT 1 "
+                "FROM jsonb_array_elements(%s::jsonb) AS card(value) "
+                "CROSS JOIN LATERAL jsonb_array_elements(coalesce("
+                "card.value -> 'deferred_errors', "
+                "jsonb_build_array(jsonb_build_object("
+                "'error_class', card.value ->> 'error_class', "
+                "'error_message', card.value ->> 'error_message')))) "
+                "AS deferred_error(value) "
+                "WHERE card.value ->> 'run_id' = attempt.run_id::text "
+                "AND card.value ->> 'attempt_id' = attempt.attempt_id::text "
+                "AND card.value ->> 'logical_refresh_id' = "
+                "attempt.logical_refresh_id::text "
+                "AND card.value ->> 'target_id' = attempt.target_id "
+                "AND card.value ->> 'content_hash' = attempt.content_hash "
+                "AND card.value ->> 'raw_manifest_key' = attempt.raw_manifest_key "
+                "AND card.value ->> 'parser_version' = carried.parser_version "
+                "AND card.value ->> 'typed_parser_version' = "
+                "carried.typed_parser_version "
+                "AND card.value ->> 'stateful_parser_version' = "
+                "carried.stateful_parser_version "
+                "AND card.value ->> 'failed_updated_at' = "
+                "extract(epoch from carried.updated_at)::text "
+                "AND deferred_error.value ->> 'error_class' = manifest.error_class "
+                "AND deferred_error.value ->> 'error_message' = "
+                "left(manifest.error_message, 2000)) "
                 "AND ((manifest.dataset = '__page__' "
                 "AND manifest.parser_version = carried.parser_version) "
                 "OR (manifest.dataset LIKE 'typed:%%' "
@@ -7630,6 +7679,7 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     deferred_json,
                     parser,
                     parser,
