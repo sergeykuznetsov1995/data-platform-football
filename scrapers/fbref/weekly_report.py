@@ -16,14 +16,15 @@ def completed_week(as_of):
 
 
 def _weekly_identities(*groups):
-    """Count each competition/match once; check seasons across both sources.
+    """Count each competition/match once; check seasons within each source.
 
     Groups are the raw weekly rows of each source before played/finished/ready
     filters; ``eligible`` only decides counting, never conflict visibility.
+    match_id is a per-source namespace, so seasons are never compared across groups.
     """
-    seasons, identities = {}, []
+    conflict, identities = False, []
     for group in groups:
-        seen = set()
+        seen, seasons = set(), {}
         for cid, mid, season, eligible in group:
             if mid is None:
                 continue
@@ -32,7 +33,8 @@ def _weekly_identities(*groups):
             if eligible:
                 seen.add(key)
         identities.append(seen)
-    return identities, any(len(values) > 1 for values in seasons.values())
+        conflict = conflict or any(len(values) > 1 for values in seasons.values())
+    return identities, conflict
 
 
 def _in_week(value, start, end):

@@ -217,7 +217,8 @@ def test_weekly_match_identity_and_season_conflict_on_either_side(scenario):
         for key in ("schedules", "observations", "readiness", "fotmob_matches"):
             data[key] *= 2
     row = weekly(data)["competitions"][0]
-    if scenario in {"ordinary", "same_season"}:
+    # match_id is a per-source namespace: equal strings across sources are not one match.
+    if scenario in {"ordinary", "same_season", "cross_source"}:
         assert (row["fotmob"], row["bronze_ready"], row["difference"]) == (1, 1, 0)
         assert row["evidence"] == []
     else:
