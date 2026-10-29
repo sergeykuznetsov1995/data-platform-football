@@ -132,6 +132,7 @@ def _isolated_runtime_evidence(tmp_path: Path):
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
+                "dag_refresh_fotmob_c1",
             }
         ),
         "unpaused": sorted(
@@ -302,6 +303,7 @@ def _pending_automatic_shared_wait_report(tmp_path: Path, report: dict) -> dict:
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
+                "dag_refresh_fotmob_c1",
             }
         ),
         unpaused=["dag_ingest_fotmob"],
@@ -330,10 +332,10 @@ def _pending_consumer_report(report: dict) -> dict[str, str]:
     report.update(
         activation_state="pending_consumer",
         kept_paused=False,
-        paused=[publication.FOTMOB_ISOLATED_DAILY_DAG_ID],
+        paused=sorted({publication.FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"}),
         unpaused=sorted(
             publication.FOTMOB_EXPECTED_ISOLATED_DAGS
-            - {publication.FOTMOB_ISOLATED_DAILY_DAG_ID}
+            - {publication.FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"}
         ),
         schedule_boundary={
             "shared_dag_id": "dag_sofascore_pipeline",
@@ -1072,6 +1074,7 @@ def test_pending_automatic_sofa_sensor_waits_without_claim_then_active_claims(
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
+                "dag_refresh_fotmob_c1",
             }
         ),
         unpaused=sorted(

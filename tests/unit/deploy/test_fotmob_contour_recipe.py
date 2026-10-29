@@ -43,6 +43,7 @@ CONTOUR_DAGS = {
     "dag_backfill_fotmob.py",
     "dag_collect_fotmob_players.py",
     "dag_orchestrate_fotmob.py",
+    "dag_refresh_fotmob_c1.py",
 }
 
 # Host-side paths that must never be baked into the recipe; /home/airflow is the

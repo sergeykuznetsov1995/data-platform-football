@@ -451,8 +451,8 @@ def test_next_wave(now, wave):
 
 
 @pytest.mark.parametrize("clock, running, busy", [
-    (datetime(2026, 10, 1, 5, 51, tzinfo=timezone.utc), 0, True),    # до волны 06:00 9 мин
-    (datetime(2026, 10, 1, 5, 50, tzinfo=timezone.utc), 0, False),   # ровно 10 мин
+    (datetime(2026, 10, 1, 5, 31, tzinfo=timezone.utc), 0, True),    # до волны 06:00 29 мин
+    (datetime(2026, 10, 1, 5, 30, tzinfo=timezone.utc), 0, False),   # ровно 30 мин
     (datetime(2026, 10, 1, 3, 0, tzinfo=timezone.utc), 1, True),     # идёт волна
 ])
 def test_window_between_waves(env, clock, running, busy):

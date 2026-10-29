@@ -29,9 +29,8 @@ class TestDagStructure:
         """
         Legacy ingestion observers use ``all_done`` to report partial output.
 
-        The durable FBref producer is deliberately fail-closed: its validation
-        is also the only parent of Silver, so running it after a red fetch or
-        persistence task could promote partial data.
+        FBref and ClubElo producers are deliberately fail-closed: validation
+        must not run after a failed fetch or persistence task.
         """
         for dag_id in ingestion_dag_ids:
             if dag_id in dag_bag.dags:
@@ -41,7 +40,7 @@ class TestDagStructure:
                 for validate_task in validate_tasks:
                     expected = (
                         'all_success'
-                        if dag_id == 'dag_ingest_fbref'
+                        if dag_id in {'dag_ingest_fbref', 'dag_ingest_clubelo'}
                         else 'all_done'
                     )
                     assert validate_task.trigger_rule == expected, \

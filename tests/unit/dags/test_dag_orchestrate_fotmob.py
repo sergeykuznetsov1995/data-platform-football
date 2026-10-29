@@ -105,6 +105,38 @@ def test_isolated_owner_is_the_one_fair_active_schedule(monkeypatch):
     }
 
 
+def test_owner_wait_covers_serialized_ingest_and_scheduling_reserve(monkeypatch):
+    from airflow.operators.bash import BashOperator
+    from airflow.operators.python import PythonOperator
+
+    owner = _reload_owner(monkeypatch, isolated=True)
+    owner_timeout = _task(owner.TRIGGER_TASK_ID)._init_kwargs["execution_timeout"]
+
+    PythonOperator._instances.clear()
+    BashOperator._instances.clear()
+    sys.modules.pop("dag_ingest_fotmob", None)
+    sys.modules.pop("dags.dag_ingest_fotmob", None)
+    ingest = importlib.import_module("dag_ingest_fotmob")
+    tasks = {
+        task.task_id: task
+        for task in [*PythonOperator._instances, *BashOperator._instances]
+    }
+    defaults = ingest.dag._dag_kwargs["default_args"]
+    # Service tasks share the single-slot ingest_scraper_pool, including the
+    # replay proof branch. Sum all task budgets conservatively: a longest DAG
+    # path assumes parallel branches and misses contention for that slot.
+    child_budget = timedelta(0)
+    for task in tasks.values():
+        # The stubs retain explicit kwargs but do not apply DAG defaults.
+        args = {**defaults, **task._init_kwargs}
+        retries = args["retries"]
+        child_budget += (
+            args["execution_timeout"] * (retries + 1)
+            + args["retry_delay"] * retries
+        )
+    assert owner_timeout >= child_budget + timedelta(minutes=50)
+
+
 def test_only_automatic_owner_keeps_an_isolated_schedule(monkeypatch):
     monkeypatch.setenv("FOTMOB_ISOLATED_STACK", "1")
     modules = {}

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sys
@@ -18,6 +18,29 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(ROOT / 'dags') not in sys.path:
     sys.path.append(str(ROOT / 'dags'))
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def policy_expiry_warnings():
+    from dags.utils.transfermarkt_approval import ApprovalError, load_standing_policy
+
+    now = _utc_now()
+    warnings = []
+    for name in ('standing_approval_policy.json', 'standing_registry_policy.json',
+                 'standing_backfill_policy.json'):
+        path = ROOT / 'dags' / 'configs' / 'transfermarkt' / name
+        try:
+            policy = load_standing_policy(path)
+        except (ApprovalError, UnicodeError) as exc:
+            warnings.append(f'ТРЕВОГА: {name}: ошибка чтения политики ({type(exc).__name__})')
+            continue
+        if policy.expires_at - now < timedelta(days=30):
+            status = 'истекла' if policy.expires_at <= now else 'истекает менее чем через 30 дней'
+            warnings.append(f'ТРЕВОГА: {name}: {status}; expires_at={policy.expires_at.isoformat()}')
+    return warnings
+
 
 def main(argv=None) -> int:
     from dags.utils.transfermarkt_daily_measure import (
@@ -74,8 +97,10 @@ def main(argv=None) -> int:
             and dq.get('completed') is True and not dq.get('stale')
             and utc(dq['cutoff_at']) <= utc(args.as_of)):
             dq_status = dq.get('status', 'unknown')
+    summary = format_daily_summary(report, dq_status=dq_status, site_sample=samples)
+    summary = '\n'.join([summary, *policy_expiry_warnings()])
     print(json.dumps({'report': report, 'site_sample': samples,
-                      'summary': format_daily_summary(report, dq_status=dq_status, site_sample=samples)},
+                      'summary': summary},
                      default=str, ensure_ascii=False))
     return 0
 

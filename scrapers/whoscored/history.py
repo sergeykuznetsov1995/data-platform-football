@@ -92,6 +92,11 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                 players = repository.list_profile_candidates(
                     scopes=[season.scope], limit=state.CHUNK_SIZE, once=True,
                 )
+                # Keep the repository's priority before sorting for sync_profiles.
+                players = sorted(list(dict.fromkeys(
+                    player_id for player_id in players
+                    if type(player_id) is int and player_id > 0
+                ))[:state.CHUNK_SIZE])
                 if item["wave"] == 1:
                     previews = repository.list_preview_candidates(
                         league, slug, limit=state.CHUNK_SIZE, historical=True,
@@ -137,7 +142,7 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                             did_work = True
                         if players:
                             consume(service.sync_profiles(
-                                player_ids=sorted(players), limit=state.CHUNK_SIZE,
+                                player_ids=players, limit=state.CHUNK_SIZE,
                                 candidate_scopes=[season],
                             ))
                             did_work = True

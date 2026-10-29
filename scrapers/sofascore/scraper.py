@@ -120,6 +120,9 @@ class SofaScoreScraper(SoccerdataScraper):
                 'SofaScore proxy access is owned by the common capture engine'
             )
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
+        from scrapers.sofascore.iceberg_writer import SofaScoreIcebergWriter
+
+        self._iceberg_writer = SofaScoreIcebergWriter()
         # Every network-capable entrypoint, including direct library use, is
         # activation-gated.  Discovery may catalog women/youth/reserve rows,
         # but an unreviewed or disabled tournament can never reach a browser.

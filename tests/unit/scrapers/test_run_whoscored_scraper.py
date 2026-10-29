@@ -682,7 +682,7 @@ def test_report_accumulates_match_backlog_across_scopes():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("outcome", ["checked", "deferred", "failed"])
+@pytest.mark.parametrize("outcome", ["checked", "deferred", "redirected", "failed"])
 def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outcome):
     scopes = (
         runner.RunnerScope.parse("ENG-Premier League=2526"),
@@ -699,6 +699,10 @@ def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outc
             "stage_xg_checked": [stage] if outcome == "checked" else [],
             "stage_xg_retained": [stage + 100],
             "stage_xg_deferred": [stage] if outcome == "deferred" else [],
+            "stage_xg_redirected": [{"stage_id": stage, "status_code": 308,
+                                      "url": "https://www.whoscored.com/source",
+                                      "location": "https://www.whoscored.com/destination"}]
+            if outcome == "redirected" else [],
         }
         expected.append(json.loads(json.dumps(evidence)))
         result = _result(
@@ -2432,3 +2436,89 @@ def test_current_lane_is_opt_in_in_service_invocation():
     args.split_lanes = "true"
     runner._invoke(service, "matches", args)
     assert service.sync_matches.call_args.kwargs["lane"] == "current"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first_outcome", ["guard", "deferred"])
+def test_weekly_stages_continues_after_guard_or_deferred_scope(
+    monkeypatch, tmp_path, first_outcome
+):
+    from tests.unit.scrapers.test_whoscored_repository import (
+        _StageFeedStorage, _xg_row, _xg_scope_commit,
+    )
+    from scrapers.whoscored.repository import WhoScoredRepository
+    from tests.unit.scrapers.test_whoscored_service import _xg_service
+    from scrapers.whoscored.transport import FailureKind, StageBootstrapRedirect
+
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("old-a", 1), _xg_row("old-b", 1)])
+    original_manifest = dict(storage.manifests[0])
+    original_rows = [dict(row) for row in storage.tables["whoscored_player_stage_stats"]]
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    results = []
+
+    def stages():
+        service, service_repo, _, _, _, _, _ = _xg_service(tmp_path / str(len(results)))
+        if not results and first_outcome == "deferred":
+            def redirect(**kwargs):
+                raise StageBootstrapRedirect(
+                    "HTTP 301", kind=FailureKind.HTTP_STATUS,
+                    url=kwargs["url"], status_code=301,
+                )
+            service._prepare_stage_statistics = redirect
+        else:
+            def commit(**kwargs):
+                if not results:
+                    return _xg_scope_commit(repository, [_xg_row("new-a", 1)])
+                return repository.commit_scope_bundle(
+                    league="OTHER", season="S", entity_group="stages",
+                    datasets={"whoscored_player_stage_stats": [
+                        {**_xg_row("next", 2), "league": "OTHER"},
+                    ]},
+                    distinct_keys={"whoscored_player_stage_stats": "entity_key"},
+                    payload_sha256="c" * 64, raw_uris=["s3://next"],
+                    feed_policy="xg-only-v1",
+                )
+            service_repo.commit_scope_bundle = commit
+        result = service.sync_stage_feeds()
+        results.append(result)
+        return result
+
+    rc, report, services, _ = _run(
+        monkeypatch, tmp_path,
+        ["daily", "--split-lanes", "true", "--skip-profiles", "--daily-part", "stages",
+         "--weekly-gate", MONDAY_MORNING_SLOT, "--scope", "ENG-Premier League=2526",
+         "--scope", "INT-World Cup=2026"],
+        behaviors={"stages": stages},
+    )
+
+    assert len(results) == 2
+    assert [instance.calls for instance in services.instances] == [
+        [("stages", None)], [("stages", None)],
+    ]
+    assert rc == (1 if first_outcome == "guard" else 0)
+    assert report["status"] == ("failed" if first_outcome == "guard" else "success")
+    if first_outcome == "guard":
+        assert "published snapshot cannot shrink" in results[0].errors[0]
+    assert results[1].succeeded == 1
+    assert storage.manifests[0] == original_manifest
+    assert len(storage.manifests) == 2
+    assert [row for row in storage.tables["whoscored_player_stage_stats"]
+            if row["league"] == "L"] == original_rows
+
+
+def test_weekly_redirect_count_visible_in_run_summary(tmp_path, caplog):
+    import logging
+
+    scopes = [runner.RunnerScope.parse("ENG-Premier League=2526"),
+              runner.RunnerScope.parse("ESP-La Liga=2526")]
+    report = runner._new_report("weekly", scopes)
+    for index, scope in enumerate(scopes):
+        result = _result("stages", scope=scope.spec, metadata={
+            "stage_xg_redirected": [{"stage_id": 700 + index, "status_code": 301}]
+        })
+        runner._merge_result(report, result, scope_record=report["scopes"][index])
+    with caplog.at_level(logging.INFO):
+        rc = runner._finish(report, str(tmp_path / "summary.json"))
+    assert rc == 0 and report["status"] == "success"
+    assert "stage_xg_redirected=2" in caplog.text
