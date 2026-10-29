@@ -244,7 +244,9 @@ def offline(monkeypatch, tmp_path):
 
     monkeypatch.setattr(refresh, "bronze_partitions", partitions)
     monkeypatch.setattr(
-        refresh, "overdue_partitions", lambda: dict(calls.get("overdue", {}))
+        refresh, "overdue_partitions", lambda **kwargs: dict(calls.get(
+            "recent_debt" if kwargs.get("recent") and "recent_debt" in calls else "overdue", {}
+        ))
     )
     monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
     monkeypatch.setattr(refresh, "fetch_season_fixtures", fixtures)
@@ -300,7 +302,7 @@ def test_cold_schedule_is_discovered_within_two_budgeted_sweeps(offline, monkeyp
         refresh.SeasonTarget(i, i + 10000, f"SS-{i}", "2026")
         for i in range(1000, 2227)
     ]
-    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets)
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets)
     offline["calls"]["known"] = {target.partition for target in targets}
     _cursor_file(offline, {"stale": list(targets[1].pair)})
     seen = set()
@@ -340,7 +342,7 @@ def test_stale_discovery_respects_weighted_budget_and_reports_capacity(members, 
 
 def _large_stale_pool(offline, monkeypatch):
     targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(1000, 2227)]
-    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets)
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets)
     offline["calls"]["known"] = {target.partition for target in targets}
     _cursor_file(offline, {"stale": list(targets[0].pair)})
     return targets
@@ -353,7 +355,7 @@ def test_only_unselected_seed_reserve_funds_discovery(offline, monkeypatch, resu
     targets = _large_stale_pool(offline, monkeypatch)
     seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3000 + new_seed)]
     queued = [_target(i, i + 10000, f"SS-{i}", "2025") for i in range(4000, 4000 + resumed)]
-    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds + queued)
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets + seeds + queued)
     offline["calls"]["known"].update(target.partition for target in queued)
     offline["incomplete"].write_text(json.dumps({
         "seasons": [[*target.pair, 5, 1_700_000] for target in queued],
@@ -411,7 +413,7 @@ def test_unselected_seed_reserve_does_not_relax_byte_preflight(offline, monkeypa
 def test_seed_reserve_is_based_on_budgeted_slots(offline, monkeypatch, page_budget):
     targets = _large_stale_pool(offline, monkeypatch)
     seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3017)]
-    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds)
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets + seeds)
     assert refresh.main(_argv(
         offline, "--control-url", "http://local", "--page-budget", str(page_budget),
     )) == 0
@@ -494,7 +496,7 @@ def test_discovery_preserves_due_overdue_and_seed_allowances(offline, monkeypatc
 def test_discovery_capacity_deficit_is_explicit_without_borrowing_due_budget(offline, monkeypatch):
     targets = _large_stale_pool(offline, monkeypatch)
     seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3040)]
-    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds)
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets + seeds)
     # All 40 seed slots are selected: no reserve may be borrowed.
     # 400 pages cannot fund two-sweep discovery and preserve full visits.
     # Fall back to the original full rotation rather than lose all fixtures.
@@ -515,7 +517,7 @@ def test_full_rotation_serves_every_season_across_restart_and_snapshot_refresh(
 ):
     targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(1000, 1000 + population)]
     seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3000 + seed_count)]
-    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds)
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets + seeds)
     offline["calls"]["known"] = {target.partition for target in targets}
     _cursor_file(offline, {"stale": list(targets[0].pair)})
     full_seen = set()
@@ -564,7 +566,7 @@ def test_future_fixtures_stay_fresh_when_seed_reserve_changes(offline, monkeypat
     previous_full_cursor = None
     for sweep in range(18):
         seed_count = (17, 19, 19)[sweep % 3]
-        monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds[:seed_count])
+        monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets + seeds[:seed_count])
         offline["calls"]["fixtures"] = []
         assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
         report = json.loads(offline["output"].read_text())
@@ -629,7 +631,7 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
     # Only the classes that are not "playing right now" take the fixture page:
     # a due season is being refreshed for its result, not its calendar.  The
     # (empty here) overdue class takes it first (#1359).
-    assert calls["fixtures"] == [[], [], [(23, 88001)]]
+    assert calls["fixtures"] == [[], [], [], [(23, 88001)]]
     client = _FakeClient.created[0]
     assert client["control_url"] == "http://sofascore-gw:8899"
     assert client["budget_cap_bytes"] == 44_000_000
@@ -663,18 +665,18 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
         "idle_runs": 0,
         # Every class was WALKED, so none of them is holding its anchor after a
         # cut-short walk (audit after Sol r28).
-        "interrupted_runs": {"overdue": 0, "due": 0, "stale": 0, "seed": 0},
+        "interrupted_runs": {"backlog": 0, "overdue": 0, "due": 0, "stale": 0, "seed": 0},
         # #1358: the due slice is exactly its members, so the slice is FULL and
         # its anchor moves past the one taken (the whole class is still taken
         # on every run); the other classes are wider than their one member.
         "index": {
-            "overdue": [7, 96518],
+            "backlog": [7, 96518], "overdue": [7, 96518],
             "due": [23, 88001], "stale": [7, 96518], "seed": [7, 96518],
         },
     }
     # An anchor that stayed put means the class was walked whole — which is
     # only readable next to the size of the class itself.
-    assert report["class_members"] == {"overdue": 0, "due": 1, "stale": 0, "seed": 1}
+    assert report["class_members"] == {"backlog": 0, "overdue": 0, "due": 1, "stale": 0, "seed": 1}
     assert report["idle_runs"] == 0
 
 
@@ -718,7 +720,7 @@ def test_every_class_is_merged_before_the_next_one_is_fetched(offline, monkeypat
     # due fetched and written, stale fetched and written, seed exploded — and the due rows
     # are in Bronze all the same.
     # (#1359: the empty overdue slice is walked first and writes nothing.)
-    assert order == ["fetch:0", "fetch:1", "write", "fetch:1", "write", "fetch:1"]
+    assert order == ["fetch:0", "fetch:1", "write", "fetch:0", "fetch:1", "write", "fetch:1"]
     assert offline["calls"]["writes"][0] == [{"game_id": 0, "league": "SS-7"}]
     report = json.loads(offline["output"].read_text())
     assert report["status"] == "failed"
@@ -762,7 +764,7 @@ def test_a_lone_due_season_does_not_drag_the_other_cursors(offline):
     # The due class has fewer members than its cap, so its anchor stays at the
     # head; stale and seed stopped right behind their own slices.
     assert cursors == {
-        "overdue": (0, 0), "due": (0, 0), "stale": (2, 2), "seed": (8, 8),
+        "backlog": (0, 0), "overdue": (0, 0), "due": (0, 0), "stale": (2, 2), "seed": (8, 8),
     }
 
     plan, cursors, members = refresh.plan_sweep(
@@ -788,7 +790,7 @@ def test_a_failed_run_leaves_the_cursor_where_it_was(offline, monkeypatch):
     # The anchors are exactly where they were: the walk did not finish, so no
     # class may claim to have covered its slice.
     assert cursor["index"] == {
-        "overdue": None, "due": None, "stale": None, "seed": [23, 88001],
+        "backlog": None, "overdue": None, "due": None, "stale": None, "seed": [23, 88001],
     }
     # ...but the interruption is COUNTED now.  Escaping the class loop before
     # this line meant the anti-wedge counter never grew, so a target with a
@@ -1155,7 +1157,7 @@ def test_a_cursor_that_is_not_an_anchor_starts_from_the_head(tmp_path, payload):
         path.write_text(payload)
 
     assert refresh.read_cursor(path) == {
-        "overdue": None, "due": None, "stale": None, "seed": None,
+        "backlog": None, "overdue": None, "due": None, "stale": None, "seed": None,
     }
 
 
@@ -1173,7 +1175,7 @@ def test_the_cursor_outlives_a_reissued_snapshot(tmp_path):
     }))
 
     assert refresh.read_cursor(path) == {
-        "overdue": None, "due": (7, 96518), "stale": (23, 88001), "seed": None,
+        "backlog": None, "overdue": None, "due": (7, 96518), "stale": (23, 88001), "seed": None,
     }
 
 
@@ -1223,7 +1225,7 @@ def test_a_chain_cut_short_is_finished_by_the_next_run(offline):
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
 
     stored = json.loads(offline["incomplete"].read_text())
-    assert stored == {"seasons": [[23, 88001, 9, 1_700_000, 0]], "cursor": None}
+    assert stored == {"seasons": [[23, 88001, 9, 1_700_000, 0]], "fresh_seasons": [], "cursor": None}
     report = json.loads(offline["output"].read_text())
     assert report["incomplete_seasons"] == 1
 
@@ -1370,9 +1372,9 @@ def test_the_known_partitions_query_parses_as_trino_and_says_what_it_means():
     ]
     assert tree.args["group"] is not None
     assert isinstance(tree.find(exp.Table).this, exp.Identifier)
-    assert tree.find(exp.Table).sql(dialect="trino") == (
-        "iceberg.bronze.sofascore_schedule"
-    )
+    assert {table.sql(dialect="trino") for table in tree.find_all(exp.Table)} >= {
+        "latest", "iceberg.bronze.sofascore_schedule",
+    }
     # Sol r11 #3: substring checks pass for the wrong query too — ``IN
     # ('postponed')`` instead of the exclusion, or ``<> 'finished'`` instead of
     # the equality.  Every clause below is asserted from the parse tree.
@@ -1601,7 +1603,7 @@ def test_the_default_plan_fits_the_page_budget_and_its_derived_cap():
     )
 
     # 2 400 pages hold 800 due seasons at 3 pages each; nothing is left.
-    assert limits == {"overdue": 0, "due": 800, "seed": 0, "stale": 0}
+    assert limits == {"backlog": 0, "overdue": 0, "due": 800, "seed": 0, "stale": 0}
     assert refresh.worst_case_pages(*knobs) <= refresh.DEFAULT_PAGE_BUDGET
     cap = refresh.derive_budget_cap(*knobs)
     assert refresh.worst_case_bytes(*knobs, refresh.DISCOVERY_LEASE_MAX_BYTES, cap) < cap
@@ -1610,7 +1612,7 @@ def test_the_default_plan_fits_the_page_budget_and_its_derived_cap():
 @pytest.mark.unit
 def test_budget_limits_take_due_first_then_seed_then_shrink_stale():
     costs = refresh.class_page_costs(3, 12)
-    assert costs == {"overdue": 4, "due": 3, "stale": 4, "seed": 17}
+    assert costs == {"backlog": 4, "overdue": 4, "due": 3, "stale": 4, "seed": 17}
 
     limits = refresh.budget_class_limits(
         {"due": 205, "stale": 1200, "seed": 60},
@@ -1628,7 +1630,7 @@ def test_budget_limits_take_due_first_then_seed_then_shrink_stale():
         page_budget=2400, chase_pages=3, seed_pages=12,
         max_due=4096, max_stale=200, max_seed=40,
     )
-    assert heavy == {"overdue": 0, "due": 700, "seed": 17, "stale": 2}
+    assert heavy == {"backlog": 0, "overdue": 0, "due": 700, "seed": 17, "stale": 2}
     # The emergency bound still bounds due.
     capped = refresh.budget_class_limits(
         {"due": 700, "stale": 0, "seed": 0},
@@ -2317,8 +2319,8 @@ def test_an_empty_plan_over_a_non_empty_campaign_is_a_failure(offline, monkeypat
     monkeypatch.setattr(
         refresh, "plan_sweep",
         lambda *args, **kwargs: (
-            {"overdue": [], "due": [], "stale": [], "seed": []}, {},
-            {"overdue": 0, "due": 0, "stale": 0, "seed": 0},
+            {"backlog": [], "overdue": [], "due": [], "stale": [], "seed": []}, {},
+            {"backlog": 0, "overdue": 0, "due": 0, "stale": 0, "seed": 0},
         ),
     )
 
@@ -2823,7 +2825,7 @@ def test_the_estimate_counts_the_leases_that_shrink_with_the_budget(
     monkeypatch.setattr(
         refresh, "budget_class_limits",
         lambda members, **_: {
-            "overdue": 0, "due": max_due, "stale": max_stale, "seed": max_seed,
+            "backlog": 0, "overdue": 0, "due": max_due, "stale": max_stale, "seed": max_seed,
         },
     )
     output = offline["output"]
@@ -2921,7 +2923,7 @@ def test_a_lease_that_would_end_exactly_on_its_ceiling_is_refused(
     # they are cut — still before a single paid request.
     monkeypatch.setattr(
         refresh, "budget_class_limits",
-        lambda members, **_: {"overdue": 0, "due": 1, "stale": 1, "seed": 1},
+        lambda members, **_: {"backlog": 0, "overdue": 0, "due": 1, "stale": 1, "seed": 1},
     )
     argv = _argv(
         offline,
@@ -2998,7 +3000,9 @@ def test_the_overdue_query_shares_the_owed_predicate(monkeypatch):
     assert refresh.OWED_STATUS_SQL in refresh.KNOWN_PARTITIONS_SQL
     assert "<> 'finished'" in sql
     assert f"- {refresh.PLAYED_GRACE_HOURS} * 3600" in sql
-    assert f"- {refresh.OVERDUE_LOOKBACK_DAYS} * 86400" in sql
+    assert f"- {refresh.OVERDUE_LOOKBACK_DAYS} * 86400" not in sql
+    assert "PARTITION BY league, season, game_id ORDER BY _ingested_at DESC" in sql
+    assert sql.index("rn = 1") < sql.index("<> 'finished'")
     import sqlglot
 
     sqlglot.parse_one(sql, read="trino")
@@ -3256,3 +3260,187 @@ def test_refusal_streak_with_uncommitted_rows_keeps_all_retries(offline, monkeyp
     assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
     assert json.loads(offline["incomplete"].read_text())["seasons"] == initial
     assert offline["calls"]["writes"] == []
+
+
+@pytest.mark.parametrize("status", ["notstarted", "inprogress", "interrupted"])
+def test_old_status_debt_uses_latest_natural_key(monkeypatch, status):
+    import sqlite3
+    import time
+
+    now = int(time.time())
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE schedule (league, season, game_id, start_timestamp, status_type, _ingested_at)")
+    from datetime import datetime, timezone
+    season = str(datetime.now(timezone.utc).year)
+    rows = [
+        ("SS-7", season, 1, now - 20 * 86400, status, 1),
+        # A stale nonterminal version must not resurrect a finished game.
+        ("SS-8", season, 2, now - 20 * 86400, status, 1),
+        ("SS-8", season, 2, now - 20 * 86400, "finished", 2),
+        ("SS-9", season, 3, now - 20 * 86400, "canceled", 1),
+        ("SS-10", season, 4, now - 20 * 86400, "postponed", 1),
+        ("SS-11", "1920", 5, now - 20 * 86400, status, 1),
+    ]
+    db.executemany("INSERT INTO schedule VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+    def query(sql):
+        return db.execute(sql.replace("iceberg.bronze.sofascore_schedule", "schedule")
+                          .replace("to_unixtime(current_timestamp)", str(now))).fetchall()
+
+    monkeypatch.setattr(refresh, "_trino_rows", query)
+    assert refresh.overdue_partitions() == {("SS-7", season): now - 20 * 86400}
+    assert refresh.overdue_partitions(recent=True) == {}
+    db.close()
+
+
+def test_old_debt_second_season_chases_and_resumes_under_budget(offline, monkeypatch):
+    import re
+    from pathlib import Path
+    from scrapers.sofascore import schedule_refresh as real
+
+    calls = offline["calls"]
+    calls.update(known={("SS-7", "2526"), ("SS-23", "2627")},
+                 due={("SS-23", "2627")},
+                 overdue={("SS-7", "2526"): 100_000}, recent_debt={})
+    template = json.loads((Path("tests/fixtures") /
+                          "sofascore_season_76986_schedule_last_0.json").read_text())["events"][0]
+    visited = []
+
+    class Client(_FakeClient):
+        def get_json_bytes(self, path):
+            tid, sid = map(int, re.search(r"unique-tournament/(\d+)/season/(\d+)", path).groups())
+            page = int(path.rsplit("/", 1)[1])
+            visited.append((tid, sid, page))
+            event = json.loads(json.dumps(template))
+            event.update(id=tid * 1000 + sid + page,
+                         tournament={"uniqueTournament": {"id": tid}}, season={"id": sid},
+                         startTimestamp=1_000_000 - page * 500_000)
+            payload = {"events": [event], "hasNextPage": sid == 76953 and page < 2}
+            return json.dumps(payload).encode(), payload
+
+    monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", Client)
+    monkeypatch.setattr(refresh, "fetch_season_schedules", real.fetch_season_schedules)
+    for sweep in range(3):
+        visited.clear()
+        assert refresh.main(_argv(offline, "--control-url", "http://offline",
+                                  "--page-budget", "24", "--chase-pages", "1",
+                                  "--seed-pages", "1", "--max-seed", "1")) == 0
+        report = json.loads(offline["output"].read_text())
+        assert report["planned_pages"] <= 24
+        assert report["status_debt_uncovered_partitions"] == []
+        assert (23, 88001, 0) in visited  # Fresh traffic still runs every time.
+        if sweep == 0:
+            assert report["backlog_targets"] == 1
+            assert json.loads(offline["incomplete"].read_text())["seasons"][0][:3] == [7, 76953, 1]
+        if sweep == 2:
+            assert (7, 76953, 2) in visited
+            assert not json.loads(offline["incomplete"].read_text())["seasons"]
+
+
+def test_backlog_rotates_without_spending_fresh_or_resume_reserve():
+    targets = [_target(i, i, f"SS-{i}", "2627") for i in range(1, 6)]
+    debt = {target.partition for target in targets[1:]}
+    limits = refresh.budget_class_limits(
+        {"overdue": 1, "due": 1, "backlog": 4}, page_budget=30,
+        chase_pages=1, seed_pages=1, max_due=1, max_stale=1, max_seed=1,
+    )
+    assert limits["overdue"] == limits["due"] == limits["seed"] == limits["backlog"] == 1
+    cursors = {}
+    seen = set()
+    for _ in range(4):
+        plan, cursors, _ = refresh.plan_sweep(
+            targets, set(debt), set(), cursors, 1, 0, 0,
+            overdue=debt | {targets[0].partition}, max_overdue=1,
+            backlog=debt, max_backlog=limits["backlog"],
+        )
+        assert plan["overdue"] == [targets[0]]
+        seen.update(target.pair for target in plan["backlog"])
+    assert seen == {target.pair for target in targets[1:]}
+
+
+def test_queued_debt_retains_a_slot_when_fresh_traffic_fills_budget(offline, monkeypatch):
+    calls = offline["calls"]
+    targets = [_target(i, i, f"SS-{i}", "2627") for i in range(1, 20)]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_, **__: targets)
+    calls.update(known={target.partition for target in targets},
+                 overdue={targets[0].partition: 1}, recent_debt={},
+                 truncate={targets[0].pair}, truncate_at=2)
+    argv = _argv(offline, "--control-url", "http://offline", "--page-budget", "24",
+                 "--chase-pages", "1", "--seed-pages", "1", "--max-seed", "1")
+    assert refresh.main(argv) == 0
+    calls["overdue"].update({target.partition: 1_000_000 for target in targets[1:]})
+    calls["recent_debt"] = {target.partition: 1_000_000 for target in targets[1:]}
+    for page in (3, 4, 5):
+        calls["truncate_at"] = page
+        assert refresh.main(argv) == 0
+        report = json.loads(offline["output"].read_text())
+        assert report["class_members"]["backlog"] == 0  # All old debt is pinned.
+        assert report["retry_targets"] == 1
+        assert report["planned_pages"] <= 24
+        assert json.loads(offline["incomplete"].read_text())["seasons"][0][2] == page
+
+
+def test_pinned_mixed_debt_refreshes_head_without_rewinding_queue(offline, monkeypatch):
+    calls = offline["calls"]
+    calls.update(known={("SS-7", "2627")}, overdue={("SS-7", "2627"): 100},
+                 recent_debt={("SS-7", "2627"): 900_000}, truncate={(7, 96518)},
+                 truncate_at=2)
+    offline["incomplete"].write_text(json.dumps({
+        "seasons": [[7, 96518, 7, 500_000, 0]],
+    }))
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        if kwargs.get("start_pages"):
+            raise RuntimeError("continuation transport failed")
+        return stub_fetch(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    head = calls["fetch"][0]
+    assert head["targets"] == [(7, 96518)]
+    assert head["chase_before"] == {(7, 96518): 899_999}
+    queue = json.loads(offline["incomplete"].read_text())["seasons"]
+    # A successful head revisit cannot rewind page 7 to page 2, even when
+    # the subsequent seed continuation fails before collecting anything.
+    assert queue == [[7, 96518, 7, 500_000, 0]]
+
+
+def test_fresh_overdue_continuation_survives_beside_deep_queue(offline, monkeypatch):
+    pair = (7, 96518)
+    calls = offline["calls"]
+    calls.update(known={("SS-7", "2627")}, overdue={("SS-7", "2627"): 100},
+                 recent_debt={("SS-7", "2627"): 900_000}, truncate={pair},
+                 truncate_at=3)
+    offline["incomplete"].write_text(json.dumps({
+        "seasons": [[*pair, 7, 500_000, 0]],
+    }))
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        if kwargs.get("start_pages"):
+            raise RuntimeError("continuation transport failed")
+        return stub_fetch(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    saved = json.loads(offline["incomplete"].read_text())
+    assert saved["seasons"] == [[*pair, 7, 500_000, 0]]
+    assert saved.get("fresh_seasons") == [[*pair, 3, 1_700_000, 0]]
+
+    # The next run reaches page 3 through the fresh queue, before page 7.
+    calls["truncate"].clear()
+    calls["fetch"].clear()
+    monkeypatch.setattr(refresh, "fetch_season_schedules", stub_fetch)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
+    seed = next(call for call in calls["fetch"] if call["start_pages"])
+    assert seed["start_pages"] == {pair: 3}
+    saved = json.loads(offline["incomplete"].read_text())
+    assert saved["seasons"] == [[*pair, 7, 500_000, 0]]
+    assert saved["fresh_seasons"] == []
+    calls["fetch"].clear()
+    calls["overdue"].clear()
+    calls["recent_debt"].clear()
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
+    seed = next(call for call in calls["fetch"] if call["start_pages"])
+    assert seed["start_pages"] == {pair: 7}
