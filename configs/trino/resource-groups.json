@@ -7,6 +7,21 @@
       "maxQueued": 200
     },
     {
+      "name": "sources",
+      "softMemoryLimit": "90%",
+      "hardConcurrencyLimit": 60,
+      "maxQueued": 400,
+      "schedulingPolicy": "fair",
+      "subGroups": [
+        {
+          "name": "${USER}",
+          "softMemoryLimit": "40%",
+          "hardConcurrencyLimit": 12,
+          "maxQueued": 100
+        }
+      ]
+    },
+    {
       "name": "humans",
       "softMemoryLimit": "30%",
       "hardConcurrencyLimit": 8,
@@ -15,6 +30,7 @@
     }
   ],
   "selectors": [
+    { "user": "src_(fbref|fotmob|sofascore|whoscored|transfermarkt|espn|understat|clubelo)", "group": "sources.${USER}" },
     { "user": "airflow|superset|openmetadata", "group": "machine" },
     { "userGroup": "platform-admins", "group": "machine" },
     { "group": "humans" }
