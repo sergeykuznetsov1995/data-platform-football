@@ -29,6 +29,11 @@ ROOT = Path(__file__).resolve().parents[3]
 AUTO = ROOT / "deploy" / "clubelo" / "auto_deliver.sh"
 PATH_LINE = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
 NIGHT = "2026-09-24 01:40:00"
+
+
+def epoch(stamp: str) -> int:
+    from datetime import datetime, timezone
+    return int(datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc).timestamp())
 DAY = "20260924"
 MAIN = "scrapers/clubelo/daily.py"
 BASE_FILES = {
@@ -144,6 +149,7 @@ case "$sql" in
     elif grep -rqs BROKEN {tree}/scrapers/clubelo {tree}/dags; then echo "t|f"; else echo "f|t"; fi ;;
   *import_error*"like '%clubelo%'"*) grep -rqs IMPORTERR {tree}/scrapers/clubelo {tree}/dags && echo 1 || echo 0 ;;
   *import_error*) echo 6 ;;
+  *next_dagrun*) cat {ss}/next_run 2>/dev/null || echo 0 ;;
   *task_instance*) cat {ss}/busy 2>/dev/null || echo 0 ;;
   *"now()"*) cat {tree}/{MAIN} >> {ss}/now_snapshots; echo "2026-09-24 01:40:05+00" ;;
   *) echo "неизвестный SQL: $sql" >&2; exit 1 ;;
@@ -194,7 +200,7 @@ def test_nothing_to_deliver_moves_base_without_writes(stand: Stand) -> None:
     assert "нечего доставлять" in stand.log()
     assert not (stand.out / DAY).exists()
     assert stand.tg() == ""
-    assert (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").exists()
+    assert not list(stand.state.glob("clubelo-auto-deliver-attempted-*"))
 
 
 @pytest.mark.parametrize("kind", ["symbol", "call", "missing", "environment", "no_tests", "master_fallback", "writer_api", "unreadable"])
@@ -302,9 +308,10 @@ def test_delivers_in_place_creates_new_module_and_rolls_back_by_hand(stand: Stan
     assert set((stand.ss / "dags_queried").read_text(encoding="utf-8").split()) == {"dag_id='dag_ingest_clubelo'"}
     assert "interval '60 seconds'" in (stand.ss / "docker.log").read_text(encoding="utf-8")
 
-    (stand.ss / "now").write_text("2026-09-24 09:30:00", encoding="utf-8")
+    (stand.ss / "next_run").write_text(str(epoch(NIGHT) + 600), encoding="utf-8")   # прогон через 10 мин
     res = stand.run("--rollback", DAY)
-    assert res.returncode == 1 and "вне окна" in res.stdout
+    assert res.returncode == 1 and "до запуска сбора по расписанию" in res.stdout
+    (stand.ss / "next_run").unlink()
     assert stand.tree_text(MAIN) == "VERSION = 2\n"
 
     (stand.ss / "now").write_text(NIGHT, encoding="utf-8")
@@ -426,7 +433,7 @@ def test_failed_acceptance_rolls_back(stand: Stand, cause: str) -> None:
     assert stand.accepted() == stand.base
     assert not (stand.state / "clubelo-inflight").exists()
     assert not (stand.state / "clubelo-auto-deliver.off").exists()
-    assert (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").exists()
+    assert len(list(stand.state.glob("clubelo-auto-deliver-attempted-*"))) == 1
 
 
 def test_unconfirmed_rollback_switches_off(stand: Stand) -> None:
@@ -439,7 +446,8 @@ def test_unconfirmed_rollback_switches_off(stand: Stand) -> None:
     assert (stand.state / "clubelo-auto-deliver.off").exists()
     assert (stand.state / "clubelo-inflight").exists()
     assert stand.accepted() == stand.base
-    (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").unlink()
+    for latch in stand.state.glob("clubelo-auto-deliver-attempted-*"):
+        latch.unlink()
     res = stand.run()
     assert res.returncode == 0 and "выключатель" in res.stdout
 
@@ -455,18 +463,21 @@ def test_unconfirmed_manual_rollback_switches_off(stand: Stand) -> None:
     assert (stand.state / "clubelo-inflight").read_text(encoding="utf-8").strip() == f"rollback {DAY}"
 
 
-@pytest.mark.parametrize("why, now", [("window", "2026-09-24 09:30:00"), ("window", "2026-09-24 01:29:00"),
-                                      ("window", "2026-09-24 02:25:00"), ("busy", NIGHT)])
+@pytest.mark.parametrize("why, now", [("next_run", "2026-09-24 09:30:00"), ("next_run", "2026-09-24 01:29:00"),
+                                      ("next_run", NIGHT), ("busy", NIGHT)])
 def test_outside_window_or_busy_does_nothing(stand: Stand, why: str, now: str) -> None:
+    # Гриль 29.10: окна по часам нет — доставка в любой час; держит только занятость и запас до прогона.
     stand.master({MAIN: "VERSION = 2\n"})
     (stand.ss / "now").write_text(now, encoding="utf-8")
     if why == "busy":
         (stand.ss / "busy").write_text("1\n", encoding="utf-8")
+    else:
+        (stand.ss / "next_run").write_text(str(epoch(now) + 1799), encoding="utf-8")   # запас < 30 мин
     res = stand.run()
     assert res.returncode == 0
-    assert ("вне окна" if why == "window" else "ClubElo занят") in stand.log()
+    assert ("до запуска сбора по расписанию" if why == "next_run" else "ClubElo занят") in stand.log()
     assert stand.tree_text(MAIN) == "VERSION = 1\n"
-    assert not (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").exists()
+    assert not list(stand.state.glob("clubelo-auto-deliver-attempted-*"))
     assert stand.tg() == ""
 
 
@@ -481,7 +492,7 @@ def test_check_writes_nothing(stand: Stand) -> None:
     assert (stand.tree / "scrapers/clubelo/scraper.py").exists()
     assert not (stand.out / DAY).exists()
     assert stand.accepted() == stand.base
-    assert not (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").exists()
+    assert not list(stand.state.glob("clubelo-auto-deliver-attempted-*"))
     assert not (stand.state / "clubelo-inflight").exists()
     assert stand.tg() == ""
 
@@ -536,11 +547,11 @@ def test_mixed_unrecognized_bytes_still_stop(stand: Stand, name: str) -> None:
     assert stand.accepted() == stand.base
 
 
-@pytest.mark.parametrize("change", ["shared", "window", "busy"])
+@pytest.mark.parametrize("change", ["shared", "next_run", "busy"])
 def test_rechecks_after_compatibility(stand: Stand, change: str) -> None:
-    target = {"shared": stand.tree / "dags/utils/config.py", "window": stand.ss / "now",
+    target = {"shared": stand.tree / "dags/utils/config.py", "next_run": stand.ss / "next_run",
               "busy": stand.ss / "busy"}[change]
-    value = {"shared": "SCHEDULES = {} # changed", "window": "2026-09-24 02:25:00", "busy": "1"}[change]
+    value = {"shared": "SCHEDULES = {} # changed", "next_run": str(epoch(NIGHT) + 600), "busy": "1"}[change]
     stand.master({MAIN: "VERSION = 2\n", "tests/unit/scrapers/test_clubelo_scraper.py":
                   f"from pathlib import Path\ndef test_mutate(): Path({str(target)!r}).write_text({value!r})\n"})
     res = stand.run()

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Ночной автомат доставки ClubElo (#1465) в общее боевое дерево планировщика ($TREE).
+# Автомат доставки ClubElo (#1465) в общее боевое дерево планировщика ($TREE).
+# С 29.10 (гриль процесса) доставляет в любой час, когда контур свободен; раньше — окно 01:30–02:25 UTC.
 # Копия deploy/understat/auto_deliver.sh: доставляет из origin/master ТОЛЬКО файлы ClubElo
 # (включая тесты ClubElo в tests/), перезаписью на месте (`cat >`, инод сохраняется, ctime
 # каталогов dags/ и scrapers/ не меняется — сторож WhoScored молчит). Отличие от Understat:
@@ -128,15 +129,24 @@ restore() {
   return $rc
 }
 
-# Причина не трогать бой сейчас (пусто — можно): окно 01:30–02:25 UTC (между запусками DAG
-# в :30 каждые 4 ч, execution_timeout 45 мин) и занятость ClubElo.
+# Гриль 29.10: доставка в любой час, когда контур свободен. Вместо окна по часам — запас до ближайшего
+# запуска сбора по расписанию Airflow (dag.next_dagrun_create_after; DAG без расписания и на паузе не считаются).
+NEXT_RUN_MARGIN=${NEXT_RUN_MARGIN:-1800}   # секунд; хватает на доставку, перечитывание DAG и откат
+next_run_reason() {
+  local nxt left
+  nxt=$(q "select coalesce(min(extract(epoch from next_dagrun_create_after))::bigint, 0) from dag where dag_id in ('dag_ingest_clubelo') and not is_paused")
+  [ -n "$nxt" ] || { echo "метабаза не ответила (next_dagrun)"; return; }
+  [ "$nxt" = 0 ] && return
+  left=$(( nxt - $(date -u +%s) ))
+  [ "$left" -ge "$NEXT_RUN_MARGIN" ] || echo "до запуска сбора по расписанию $((left/60)) мин (< $((NEXT_RUN_MARGIN/60))) — доставка после прогона"
+}
+# Причина не трогать бой сейчас (пусто — можно): занятость ClubElo и запас до запуска DAG по расписанию.
 busy_reason() {
-  local hhmm n
-  hhmm=$(date -u +%H%M)
-  if (( 10#$hhmm < 130 || 10#$hhmm >= 225 )); then echo "вне окна ($hhmm UTC; окно 01:30–02:25)"; return; fi
+  local n
   n=$(q "select count(*) from task_instance where dag_id='dag_ingest_clubelo' and state in ('running','queued')")
   if [ "$n" != "0" ]; then echo "ClubElo занят: task_instance running/queued = '${n:-метабаза не ответила}'"
   elif pgrep -f 'run_clubelo_scrape[r]' >/dev/null; then echo "ClubElo занят: живой процесс run_clubelo_scraper"
+  else next_run_reason
   fi
 }
 set_accepted() { echo "$1" > "$ACCEPTED_F.tmp" && mv "$ACCEPTED_F.tmp" "$ACCEPTED_F"; }
@@ -175,15 +185,11 @@ if [ -f "$INFLIGHT" ]; then
     exit 0
   fi
 fi
-LATCH="$STATE/clubelo-auto-deliver-attempted-$DAY"
-if [ "$MODE" = night ] && [ -f "$LATCH" ]; then log "сегодня ($DAY) попытка уже была — выход"; exit 0; fi
-
-# --- окно и занятость ClubElo
+# --- занятость ClubElo и запас до прогона; защёлка «одна попытка на SHA» — ниже, после сверки с базой
 BUSY=$(busy_reason)
 if [ -n "$BUSY" ]; then
   [ "$MODE" = --check ] && log "заметка: $BUSY" || { log "$BUSY — выход"; exit 0; }
 fi
-[ "$MODE" = night ] && touch "$LATCH"
 
 # --- база, самопроверка, общие модули
 g fetch -q origin || stop "git fetch origin не удался"
@@ -231,10 +237,14 @@ while IFS=$'\t' read -r st p1 p2; do
   esac
 done < <(g diff --no-renames --name-status "$ACC" "$SHA" -- "${CLUBELO_PATHS[@]}")
 if [ "${#ST[@]}" = 0 ]; then
+  [ "$ACC" = "$SHA" ] && [ "$MODE" = night ] && exit 0   # тик каждый час: без шума в логе и журнале
   log "нечего доставлять: файлы ClubElo ${ACC:0:7} = ${SHA:0:7}"
   [ "$MODE" = night ] && { set_accepted "$SHA" || stop "не записан $ACCEPTED_F"; journal "нечего доставлять, база сдвинута"; }
   exit 0
 fi
+LATCH="$STATE/clubelo-auto-deliver-attempted-${SHA:0:12}"   # одна попытка на SHA, не на сутки (гриль 29.10)
+if [ "$MODE" = night ] && [ -f "$LATCH" ]; then log "попытка доставки ${SHA:0:12} уже была — жду нового коммита master"; exit 0; fi
+[ "$MODE" = night ] && touch "$LATCH"
 # Порядок: модули ClubElo (__init__ последним), DAG-файлы, тесты, удаления — в самом конце.
 live() { for f in "${!ST[@]}"; do [ "${ST[$f]}" != D ] && echo "$f"; done; }
 ORDERED=$(
