@@ -1243,7 +1243,7 @@ def _run_multi_partition_probe(conn, *, schema_sql, files_sql, budget, max_files
             summary AS (
                 SELECT (SELECT coalesce(count_if(delete_count > 0), 0)
                         FROM partition_inventory) AS skipped,
-                       (SELECT partition_key FROM within_budget
+                       (SELECT partition_key FROM selected_files
                         ORDER BY file_rank DESC LIMIT 1) AS next_cursor
             )
             SELECT f.file_path, f.file_size_in_bytes, s.skipped,

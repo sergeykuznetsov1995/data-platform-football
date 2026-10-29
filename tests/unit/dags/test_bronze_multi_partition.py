@@ -100,8 +100,33 @@ def test_bounds_remove_partition_singletons(limits):
     probe = metadata.probe(**limits)
     assert len(probe.candidates) == 4
     assert set(Counter(path.split('/')[2] for path, _ in probe.candidates).values()) == {2}
-    # Even the visited singleton advances the traversal to avoid starvation.
-    assert probe.next_partition_cursor == 'p002'
+    # The excluded singleton must remain ahead of the cursor for the next turn.
+    assert probe.next_partition_cursor == 'p001'
+
+
+@pytest.mark.parametrize('limits', [dict(max_files=1024), dict(budget=10240)])
+def test_excluded_singleton_is_selected_after_restart_next_night(tmp_path, limits):
+    metadata = Metadata(partitions=1, files=1023)
+    metadata.db.execute("INSERT INTO files VALUES ('p001', 's3://p001/a', 10, 0), "
+                        "('p001', 's3://p001/b', 10, 0)")
+    path = tmp_path / 'state'
+    state = direct._load(path, ['espn_match'], '2026-10-29')
+    first = metadata.probe(**limits)
+    assert len(first.candidates) == 1023
+    assert all('/p000/' in name for name, _ in first.candidates)
+    state['partition_cursors']['espn_match'] = first.next_partition_cursor
+    direct._save(path, state)
+
+    # Compact A, then replenish it before restarting on the following night.
+    metadata.db.execute("DELETE FROM files WHERE partition = 'p000'")
+    metadata.db.executemany('INSERT INTO files VALUES (?, ?, ?, ?)', [
+        ('p000', f's3://p000/new{f:04}', 10, 0) for f in range(1023)
+    ])
+    restarted = direct._load(path, ['espn_match'], '2026-10-30')
+    second = metadata.probe(
+        partition_cursor=restarted['partition_cursors']['espn_match'], **limits,
+    )
+    assert {'s3://p001/a', 's3://p001/b'} <= {name for name, _ in second.candidates}
 
 
 def test_cursor_wraps_after_disappearing_partitions_and_replenishment():
