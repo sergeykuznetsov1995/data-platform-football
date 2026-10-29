@@ -1326,7 +1326,7 @@ def _trace_barrier(w: dict, tmp_path: Path, failure: str = "") -> Path:
     text = docker.read_text()
     cases = (
         '  *"UPDATE dag SET is_paused=true"*)\n'
-        f'    echo pause >> "{events}"\n'
+        f'    if [ -e "{live}" ]; then echo pause >> "{events}"; else echo drain-open >> "{events}"; fi\n'
         + ('    exit 42 ;;\n' if failure == "pause" else
            '    echo 1 ;;\n' if failure == "unconfirmed" else '    echo 0 ;;\n')
         + '  *"FROM task_instance"*)\n'
@@ -1378,7 +1378,7 @@ def test_checkout_barrier_drains_a_wave_born_after_the_zero_snapshot(tmp_path: P
     events = _trace_barrier(w, tmp_path)
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"BARRIER_WAIT": "10"})
     rows = events.read_text().splitlines()
-    assert rows[:4] == ["pause", "live", "drained", "checkout"], proc.stderr + w["log"].read_text()
+    assert rows[:5] == ["drain-open", "live", "pause", "drained", "checkout"], proc.stderr + w["log"].read_text()
     if route == "failed-apply":
         # Import error deliberately also blocks confirmation: keep pauses for the owner.
         assert rows.count("checkout") == 2
@@ -1471,7 +1471,8 @@ def test_checkout_barrier_rechecks_window_and_external_ignore(tmp_path: Path, fa
 
 
 @pytest.mark.unit
-def test_checkout_barrier_rolls_back_when_c1_appears_after_apply(tmp_path: Path) -> None:
+@pytest.mark.parametrize("live_parent", [False, True])
+def test_checkout_barrier_rolls_back_when_c1_appears_after_apply(tmp_path: Path, live_parent: bool) -> None:
     """Execute barrier SQL: the target adds c1 after a five-producer snapshot."""
     import sqlite3
     import sys
@@ -1486,6 +1487,10 @@ def test_checkout_barrier_rolls_back_when_c1_appears_after_apply(tmp_path: Path)
         ])
         db.execute("CREATE TABLE dag_run (dag_id TEXT, state TEXT)")
         db.execute("CREATE TABLE task_instance (dag_id TEXT, state TEXT)")
+        if live_parent:
+            db.execute("INSERT INTO dag_run VALUES ('dag_orchestrate_fotmob', 'running')")
+            db.executemany("INSERT INTO task_instance VALUES ('dag_orchestrate_fotmob', ?)",
+                           [("scheduled",), (None,)])
     sql_runner = tmp_path / "metadata.py"
     sql_runner.write_text('''import sqlite3
 import sys
@@ -1503,10 +1508,18 @@ db.create_aggregate("bool_and", 1, BoolAnd)
 if sys.argv[2] == "add-c1":
     db.execute("INSERT INTO dag VALUES ('dag_refresh_fotmob_c1', true)")
 else:
+    # Model Airflow: a paused parent cannot schedule finalize/advance after ingest.
+    # Each drain poll schedules one remaining task only while its DAG is unpaused.
+    if "FROM task_instance" in sys.argv[-1]:
+        paused = db.execute("SELECT is_paused FROM dag WHERE dag_id='dag_orchestrate_fotmob'").fetchone()[0]
+        if not paused:
+            db.execute("UPDATE task_instance SET state='success' WHERE rowid=(SELECT min(rowid) FROM task_instance WHERE state IS NULL OR state='scheduled')")
+            if not db.execute("SELECT count(*) FROM task_instance WHERE state IS NULL OR state='scheduled'").fetchone()[0]:
+                db.execute("UPDATE dag_run SET state='success'")
     for statement in sys.argv[-1].split(";"):
         if not statement.strip():
             continue
-        cursor = db.execute(statement)
+        cursor = db.execute(statement.replace(" FOR UPDATE", ""))
         if cursor.description:
             for row in cursor:
                 print("|".join("t" if value == 1 else "f" if value == 0 else str(value)
@@ -1525,7 +1538,7 @@ else:
                       f'barrier_checkout -f "{w["one"]}" || exit 13\n'
                       'barrier_release || exit 14\n')
     proc = _run(script, env_file=w["env_file"], stubs=w["stubs"],
-                extra_env={**w["values"], "TREE": str(w["repo"])})
+                extra_env={**w["values"], "TREE": str(w["repo"]), "BARRIER_WAIT": "2"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
     with sqlite3.connect(db_path) as db:
