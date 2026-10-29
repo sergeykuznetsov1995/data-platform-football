@@ -402,6 +402,8 @@ FROM iceberg.ops.espn_history_queue_v1 ORDER BY updated_at DESC LIMIT 20;
 
 ### Автомат `auto_deliver.py`
 
+Cron ждёт конца живого замера темпа #1510 (при недоступном статусе тоже ждёт); ручные `--target` и `--rollback` замером не блокируются.
+
 Хост-копия `/root/espn-deploy/auto_deliver.py` (= master, иначе «обнови автомат» в Telegram и
 стоп), cron `*/5`, лог — `/root/watchdog/espn_auto_deliver_cron.log`. Каталог проекта compose —
 `/root/espn-deploy` (метка `working_dir` не держит дерево кода). Посеян 26.09.2026 (master e2f5ba59).

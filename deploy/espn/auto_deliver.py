@@ -4,7 +4,7 @@
 Хост-копия /root/espn-deploy/auto_deliver.py, cron */5. Шаг:
   самопроверка (хост-копия = master) → fetch → цель: master, потомок принятого SHA, не
   отклонённый, diff задевает пути контура → окно (нет running/queued dag_espn_current и
-  dag_espn_history, до волны
+  dag_espn_history, в cron нет живого замера #1510, до волны
   00/06/12/18 UTC ≥ 10 мин) → git archive → /root/espn-release-<sha> (ro) → [airflow-init при
   смене pools.json] → up -d --no-deps --force-recreate scheduler/webserver → приёмка по metadb,
   байтам в контейнере, пулам и env → успех: пин; провал: тот же up на принятом, SHA → rejected.
@@ -292,6 +292,22 @@ def busy_reason(h: Host) -> str | None:
             return f"metadb {METADB} не отвечает"
         if n != "0":
             return f"идёт {what}: {dag_id} running/queued = {n}"
+    return None
+
+
+def measurement_reason(h: Host) -> str | None:
+    rc, out, err = h.run(["docker", "exec", SCHEDULER, "python", "-m",
+                          "scrapers.espn.measure_pace", "status", "--format", "json"], timeout=60)
+    if rc != 0:
+        return f"статус замера #1510 недоступен: rc={rc}: {err.strip()[:200]}"
+    try:
+        report = json.loads(out)
+    except ValueError:
+        return "статус замера #1510 недоступен: невалидный JSON"
+    if not isinstance(report, dict):
+        return "статус замера #1510 недоступен: JSON не объект"
+    if report.get("status") in ("starting", "running", "draining") and report.get("stale") is not True:
+        return f"идёт замер темпа #1510 (status={report['status']}, step={report.get('step')})"
     return None
 
 
@@ -602,6 +618,11 @@ def run(h: Host, args) -> int:
         if args.target or args.rollback:
             raise Stop(f"{label} {target[:12]} не выполнен: {busy}")
         return 0
+    if not args.target and not args.rollback:
+        reason = measurement_reason(h)
+        if reason:
+            h.log(f"{label} {target[:12]}: не в окне — {reason}")
+            return 0
     check_env_file(h)
 
     def promote():
