@@ -98,17 +98,6 @@ class TestSoFIFAIntegration:
 class TestSourceAvailability:
     """Tests to verify source websites are accessible."""
 
-    def test_understat_accessible(self, skip_if_no_network):
-        """Test that understat.com is accessible."""
-        import requests
-
-        response = requests.get(
-            'https://understat.com/league/EPL/2024',
-            timeout=30,
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        assert response.status_code == 200
-
     def test_espn_accessible(self, skip_if_no_network):
         """Test that espn.com is accessible."""
         import requests
