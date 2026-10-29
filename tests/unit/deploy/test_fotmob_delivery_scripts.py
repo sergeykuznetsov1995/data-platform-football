@@ -1056,6 +1056,33 @@ def test_review_validation_preflight_refuses_before_checkout(tmp_path: Path, bad
 
 
 @pytest.mark.unit
+def test_validation_tree_of_another_owner_passes_preflight(tmp_path: Path) -> None:
+    # 28.10: root из cron (без SUDO_UID) читал validation tree claude-am — git отверг
+    # «dubious ownership», rc=128, доставка откатилась. Чужого владельца имитирует
+    # GIT_TEST_ASSUME_DIFFERENT_OWNER, но только для validation tree (бой принадлежит root).
+    values = _layout(tmp_path)
+    repo = Path(values["FOTMOB_RELEASE_ROOT"])
+    one, two = _two_commits(repo)
+    validation = Path(values["FOTMOB_VALIDATION_ROOT"])
+    _git(tmp_path, "clone", "-q", str(repo), str(validation))
+    _git(validation, "checkout", "-q", "--detach", two)
+    values.update(FOTMOB_TARGET=two[:8], FOTMOB_ROLLBACK_SHA=one[:8], FOTMOB_ROLLBACK_REF=one[:8])
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    _stub(stubs, "pgrep", "exit 1\n")
+    _stub(stubs, "docker", "echo 0\n")
+    real_git = shutil.which("git")
+    _stub(stubs, "git", f'case " $* " in *" {validation} "*) export GIT_TEST_ASSUME_DIFFERENT_OWNER=1;; esac\n'
+                        f'exec {real_git} "$@"\n')
+    proc = _run(B6, "check", env_file=env_file, stubs=stubs)
+    assert "dubious ownership" not in proc.stderr, proc.stderr
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "check ПРОЙДЕН" in proc.stdout
+
+
+@pytest.mark.unit
 def test_review_repository_md5_exec_failure_has_a_refusal(tmp_path: Path) -> None:
     # Реальная секция приёмки; lock/checkout не нужны для проверки set -e.
     section = B6.read_text().split('say "4.', 1)[1].split('parse_left=', 1)[0]
