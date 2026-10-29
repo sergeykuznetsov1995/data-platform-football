@@ -6,6 +6,9 @@
 # Trino's file authenticator re-reads password.db (file.refresh-period, 5s
 # default) — no restart. Resource-group membership does need a restart.
 #
+# Strict: a missing or placeholder password is an error (exit 1) and nothing is
+# written — all eight accounts exist or none change.
+#
 # Usage: scripts/trino/sync_source_users.sh <path/to/password.db> [path/to/.env]
 set -euo pipefail
 
@@ -16,16 +19,22 @@ sources=(fbref fotmob sofascore whoscored transfermarkt espn understat clubelo)
 # shellcheck disable=SC1090
 set -a; . "$env_file"; set +a
 command -v htpasswd >/dev/null || { echo "htpasswd (apache2-utils) is required" >&2; exit 1; }
-[ -f "$db" ] || touch "$db"
 
+missing=()
 for src in "${sources[@]}"; do
   var="TRINO_SRC_$(echo "$src" | tr '[:lower:]' '[:upper:]')_PASSWORD"
   pw="${!var:-}"
-  if [ -z "$pw" ] || [ "$pw" = "change-me" ]; then
-    echo "skip src_$src: $var not set" >&2
-    continue
-  fi
+  if [ -z "$pw" ] || [ "$pw" = "change-me" ]; then missing+=("$var"); fi
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "refusing to render: not set in $env_file: ${missing[*]}" >&2
+  exit 1
+fi
+
+[ -f "$db" ] || touch "$db"
+for src in "${sources[@]}"; do
+  var="TRINO_SRC_$(echo "$src" | tr '[:lower:]' '[:upper:]')_PASSWORD"
   # -i: password from stdin (not argv), -B: bcrypt (Trino needs cost >= 8).
-  printf '%s' "$pw" | htpasswd -i -B -C 10 "$db" "src_$src" 2>/dev/null
+  printf '%s' "${!var}" | htpasswd -i -B -C 10 "$db" "src_$src" 2>/dev/null
   echo "ok src_$src"
 done
