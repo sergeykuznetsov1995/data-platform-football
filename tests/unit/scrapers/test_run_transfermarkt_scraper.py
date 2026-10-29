@@ -2392,7 +2392,10 @@ class TestProviderByteGrant:
 
         assert len(selected) == 500
         assert coverage == {
-            'roster_size': 2199, 'selected': 500, 'pending': 1699,
+            'roster_size': 2199, 'selected': 500, 'pending': 2199,
+            'policy_version': 'player-endpoint-v1',
+            'debt_player_ids': [str(value) for value in range(1, 2200)],
+            'refresh_pending': 0,
         }
 
 
@@ -3242,6 +3245,42 @@ class TestObservedAtCarryForward:
             / 'transfermarkt_player_attribute_observations_v2.sql'
         ).read_text()
         assert f"PARTITION BY {', '.join(key)}" in silver
+
+
+def test_players_stream_pause_is_classified_and_receives_deadline(tmp_path, monkeypatch):
+    from scrapers.transfermarkt.client import SourceStreamPaused
+    mod = _import_runner()
+    scraper = _build_scraper(df=_players_df(0))
+    scraper.read_players.side_effect = SourceStreamPaused(99999)
+    stub_pkg = MagicMock()
+    stub_pkg.TransfermarktScraper.return_value = scraper
+    stub_scraper_mod = MagicMock(
+        R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+    )
+    monkeypatch.setenv('TM_REQUEST_DEADLINE_MONOTONIC', '12345.0')
+    output = tmp_path / 'players.json'
+    with (
+        patch.dict(sys.modules, {
+            'scrapers.transfermarkt': stub_pkg,
+            'scrapers.transfermarkt.scraper': stub_scraper_mod,
+            'scrapers.transfermarkt.registry': REAL_TM_REGISTRY,
+        }),
+        patch.object(mod, '_load_response_cache', return_value=({}, None, 0)),
+        patch.object(mod, '_reconcile_pending_fetch_state'),
+        patch.object(mod, '_persist_response_cache'),
+        patch.object(_REAL_TM_OPS_TRAFFIC, 'record_traffic_run', return_value=True),
+    ):
+        rc = mod._run_entity(
+            mod.ENTITY_SPECS['players'], ['ENG-Premier League'], 2025,
+            None, str(output), dry_run=True,
+        )
+    result = _load_results(str(output))
+    assert rc == 1
+    assert result['failure_stage'] == 'source'
+    assert result['failure_kind'] == 'source_paused'
+    assert not result.get('continuation')
+    stub_pkg.TransfermarktScraper.assert_called_once()
+    assert stub_pkg.TransfermarktScraper.call_args.kwargs['request_deadline_monotonic'] == 12345.0
 
 
 class TestHardFetchStatuses:

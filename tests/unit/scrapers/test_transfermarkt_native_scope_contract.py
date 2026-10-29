@@ -55,6 +55,7 @@ def _patch_one_squad(monkeypatch, scraper: TransfermarktScraper):
                 "foot": "right",
                 "nationality": "Example",
                 "contract_until": None,
+                "_contract_status": "unknown",
                 "market_value_eur": 1_000_000,
             }
         ],
@@ -148,7 +149,7 @@ def test_one_squad_response_materializes_three_stable_native_entities(
         assert row["source_body_hash"] == resolve_competition("GB1").source_body_hash
     assert memberships.iloc[0]["source_competition_id"] == "GB1"
     assert observations.iloc[0]["source_edition_id"] == "2025"
-    assert contracts.iloc[0]["applicability_status"] == "ok"
+    assert contracts.iloc[0]["applicability_status"] == "unknown"
     capture = scraper.get_scope_capture()
     assert capture["listing_status"] == "ok"
     assert capture["expected_team_ids"] == ["10"]

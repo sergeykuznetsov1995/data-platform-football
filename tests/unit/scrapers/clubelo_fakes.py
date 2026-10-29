@@ -112,3 +112,7 @@ def no_sleep(_seconds: float) -> None:
 
 def network_error() -> Exception:
     return requests.ConnectionError("connection reset")
+
+
+def external_results_html(day: str) -> str:
+    return (FIXTURE_DIR.parent / "external_results" / f"{day}.html").read_text(encoding="utf-8")

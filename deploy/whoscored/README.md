@@ -80,9 +80,18 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
      отказаться — `--rollback`. `validate_data` в приёмку не входит до #1476 (сейчас красный всегда).
    - Нет прогона 30 ч — напоминание раз в сутки. Trino не ответил — приёмка повторится следующим тиком.
    - Откат ждёт, пока контур занят.
-4. **Доставка** — только если висящей нет, в окне **02:00–05:00 UTC**, раз в сутки, в метабазе контура
-   нет `dag_run` в `running/queued` (это же покрывает идущий `dag_backfill_whoscored`) и нет живого
-   драйвера истории `/root/whoscored_history_backfill/driver.sh`:
+4. **Доставка** — только если висящей нет, в любой час (гриль 29.10; до ближайшего прогона по расписанию
+   ≥ `NEXT_RUN_MARGIN` 30 мин), одна попытка на SHA master, в метабазе контура
+   нет `dag_run` в `running/queued`, кроме `dag_backfill_whoscored`, и нет живого
+   драйвера истории `/root/whoscored_history_backfill/driver.sh`. История занята, если в её
+   активном запуске `run_backfill_chunk` или `finalize_chunk` имеет статус
+   `running/queued/scheduled/up_for_retry`; один cooldown-сенсор доставку не блокирует.
+   Если занята только история, автомат опрашивает контур каждые 30 секунд до 15 минут.
+   Таймаут — выход без расхода попытки на SHA. DAG не
+   ставится на паузу: проход, начавшийся после проверки во время подмены кода, может
+   упасть (принятый владельцем риск #1923); приёмка остаётся по ежедневнику.
+   Ошибка или некорректный ответ метабазы запрещает доставку.
+   Порядок доставки:
    1. `git fetch`, пин = `origin/master`; пин = `rejected` → ждём новый коммит; в путях WhoScored
       (`scrapers/{whoscored,base,utils,__init__.py} dags/utils dags/dag_{ingest,backfill}_whoscored.py
       dags/scripts configs/medallion deploy/whoscored`) нет изменений → «без изменений», выход;
@@ -107,7 +116,7 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
 
 - `--check` — все проверки без единой записи (ни лога, ни замка, ни `git fetch`, ни Telegram;
   `GIT_OPTIONAL_LOCKS=0`): пин — по локальному `origin/master`; окно, занятость, выключатель — только
-  заметки. Печатает «к доставке: …» и «проверки пройдены» либо причину стопа (exit 1).
+  заметки, ожидания окна между проходами нет. Печатает «к доставке: …» и «проверки пройдены» либо причину стопа (exit 1).
 - `--rollback [sha]` — на указанный SHA, без аргумента — на прежний (`whoscored-accepted-prev`, при
   висящей доставке — её `prev`); тем же порядком (checkout → копии → пересоздание/рестарт при нужде → import-check →
   перечитывание). Окно не нужно, но контур должен быть свободен. Успех → `accepted` = цель,
@@ -120,6 +129,8 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
 RT=/root/whoscored-1017-runtime
 git -C $RT/src fetch -q origin && git -C $RT/src checkout --detach <sha-мержа>
 cp $RT/src/dags/dag_ingest_whoscored.py $RT/src/dags/dag_backfill_whoscored.py $RT/src/deploy/whoscored/.airflowignore $RT/dags/
+# Перед заменой установленной копии сохранить rollback-копию рядом:
+[ ! -f /root/whoscored-auto-deliver.sh ] || cp -p /root/whoscored-auto-deliver.sh /root/whoscored-auto-deliver.sh.prev-$(date -u +%Y%m%dT%H%M%SZ)
 git -C $RT/src show origin/master:deploy/whoscored/auto_deliver.sh > /root/whoscored-auto-deliver.sh
 chmod +x /root/whoscored-auto-deliver.sh
 mkdir -p /root/watchdog/state /root/whoscored-deliveries

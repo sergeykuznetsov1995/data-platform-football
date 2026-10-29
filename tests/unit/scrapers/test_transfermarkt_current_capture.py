@@ -25,6 +25,12 @@ def player(pid='1', club='10', **changes):
     }
 
 
+@pytest.mark.parametrize('empty', [None, '-'])
+def test_player_changes_normalizes_unpriced_values(empty):
+    assert current.player_changes([player(market_value_eur=empty)], [player(market_value_eur=0)]) == {}
+    assert current.player_changes([player(market_value_eur=0)], [player(market_value_eur=100000)])['1'].endpoints == frozenset({'market_value_points'})
+
+
 def club(club_id='10', rows=None, *, at=NOW, committed=True, **changes):
     return {
         'rows': rows if rows is not None else [player(club=club_id)],

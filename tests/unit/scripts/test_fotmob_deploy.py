@@ -370,7 +370,7 @@ def _automatic_rollout_certificate(admission, *, evidence_dir, handoff):
         for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS
     }
     active_paused = {
-        dag_id: dag_id in fotmob_runtime.LEGACY_OWNER_DAGS
+        dag_id: dag_id in fotmob_runtime.AUTOMATIC_PAUSED_DAGS
         for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS
     }
 
@@ -1255,6 +1255,7 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
         "dags/dag_collect_fotmob_players.py",
+        "dags/dag_refresh_fotmob_c1.py",
         "dags/dag_trigger_fotmob_daily.py",
         "deploy/fotmob/.airflowignore",
     ):
@@ -1269,6 +1270,7 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
         "dag_refresh_fotmob.py",
         "dag_backfill_fotmob.py",
         "dag_collect_fotmob_players.py",
+        "dag_refresh_fotmob_c1.py",
         ".airflowignore",
         "utils",
         "sql",
@@ -2214,9 +2216,9 @@ def test_trigger_activation_commits_pending_then_proves_both_runs(
     def unpause(container, dag_id, **_kwargs):
         persisted = json.loads(report_path.read_text(encoding="utf-8"))
         assert persisted["activation_state"] == "pending_consumer"
-        assert persisted["paused"] == [mod.ISOLATED_DAILY_DAG_ID]
+        assert persisted["paused"] == sorted(mod.PAUSED_SERVICE_DAGS | {mod.ISOLATED_DAILY_DAG_ID})
         assert set(persisted["unpaused"]) == (
-            mod.EXPECTED_DAGS - {mod.ISOLATED_DAILY_DAG_ID}
+            mod.EXPECTED_DAGS - mod.PAUSED_SERVICE_DAGS - {mod.ISOLATED_DAILY_DAG_ID}
         )
         calls.append((container, dag_id))
 
@@ -2242,8 +2244,8 @@ def test_trigger_activation_commits_pending_then_proves_both_runs(
         ("2" * 64, mod.SHARED_CONSUMER_DAG_ID),
     ]
     assert result["activation_state"] == "active"
-    assert result["paused"] == []
-    assert set(result["unpaused"]) == mod.EXPECTED_DAGS
+    assert result["paused"] == sorted(mod.PAUSED_SERVICE_DAGS)
+    assert set(result["unpaused"]) == mod.EXPECTED_DAGS - mod.PAUSED_SERVICE_DAGS
     assert result["scheduled_activation"] == scheduled
     assert json.loads(report_path.read_text(encoding="utf-8")) == result
 
@@ -2445,8 +2447,8 @@ def _pending_activation_report():
         "passed": True,
         "activation_state": "pending_consumer",
         "kept_paused": False,
-        "paused": [mod.ISOLATED_DAILY_DAG_ID],
-        "unpaused": sorted(mod.EXPECTED_DAGS - {mod.ISOLATED_DAILY_DAG_ID}),
+        "paused": sorted(mod.PAUSED_SERVICE_DAGS | {mod.ISOLATED_DAILY_DAG_ID}),
+        "unpaused": sorted(mod.EXPECTED_DAGS - mod.PAUSED_SERVICE_DAGS - {mod.ISOLATED_DAILY_DAG_ID}),
         "schedule_boundary": mod.validate_matching_schedule_boundaries(
             shared_initial=NEXT_SCHEDULE_BOUNDARY,
             shared_final=NEXT_SCHEDULE_BOUNDARY,
@@ -2936,8 +2938,8 @@ def test_active_resume_rejects_incomplete_forged_or_invalid_report_proof(
     payload.update(
         {
             "activation_state": "active",
-            "paused": [],
-            "unpaused": sorted(mod.EXPECTED_DAGS),
+            "paused": sorted(mod.PAUSED_SERVICE_DAGS),
+            "unpaused": sorted(mod.EXPECTED_DAGS - mod.PAUSED_SERVICE_DAGS),
             "scheduled_activation": _proved_scheduled_activation(),
         }
     )
@@ -2965,8 +2967,8 @@ def test_active_resume_rejects_absent_or_mismatched_live_exact_run(
     payload.update(
         {
             "activation_state": "active",
-            "paused": [],
-            "unpaused": sorted(mod.EXPECTED_DAGS),
+            "paused": sorted(mod.PAUSED_SERVICE_DAGS),
+            "unpaused": sorted(mod.EXPECTED_DAGS - mod.PAUSED_SERVICE_DAGS),
             "scheduled_activation": _proved_scheduled_activation(),
         }
     )
@@ -3438,6 +3440,7 @@ def test_atomic_writer_transaction_names_exact_seven_and_rejects_partial_result(
     code = commands[0][-1]
     compile(code, "<automatic-writer-transaction>", "exec")
     assert f"ids = {sorted(mod.EXPECTED_DAGS)!r}" in code
+    assert f"legacy_ids = {sorted(mod.AUTOMATIC_PAUSED_DAGS)!r}" in code
     assert "SERIALIZABLE" in code
     assert "with_for_update" in code
     assert result["active_runs"] == {}
@@ -3648,7 +3651,7 @@ def test_automatic_activation_enables_children_shared_then_owner_last(
     result = mod.activate_automatic_catalog(args, run=run)
 
     assert result["activation_state"] == "active"
-    assert result["paused"] == sorted(mod.LEGACY_OWNER_DAGS)
+    assert result["paused"] == sorted(mod.AUTOMATIC_PAUSED_DAGS)
     assert result["unpaused"] == sorted(mod.AUTOMATIC_ACTIVE_DAGS)
     assert events.index("fresh_shared_snapshot") < events.index("full_quiescence")
     assert events.index("full_quiescence") < events.index("live_canary")
@@ -3754,7 +3757,7 @@ def test_automatic_activation_preserves_pending_when_owner_response_is_lost(
     )
     original = mod.atomic_automatic_writer_transition
     active_pause_shape = {
-        dag_id: dag_id in mod.LEGACY_OWNER_DAGS for dag_id in mod.EXPECTED_DAGS
+        dag_id: dag_id in mod.AUTOMATIC_PAUSED_DAGS for dag_id in mod.EXPECTED_DAGS
     }
 
     def lose_owner_response(container, *, phase, selected_date=None, run):
@@ -3956,7 +3959,7 @@ def test_owner_committed_recovery_rejects_unsafe_live_state(
         monkeypatch, args, deployment, isolated, shared, handoff
     )
     active_pause_shape = {
-        dag_id: dag_id in mod.LEGACY_OWNER_DAGS for dag_id in mod.EXPECTED_DAGS
+        dag_id: dag_id in mod.AUTOMATIC_PAUSED_DAGS for dag_id in mod.EXPECTED_DAGS
     }
     monkeypatch.setattr(
         mod,
@@ -4062,7 +4065,7 @@ def test_owner_committed_recovery_promotes_only_exact_shared_state(
             mod, "_now", lambda: "2026-07-21T16:00:00+00:00"
         )
     active_pause_shape = {
-        dag_id: dag_id in mod.LEGACY_OWNER_DAGS for dag_id in mod.EXPECTED_DAGS
+        dag_id: dag_id in mod.AUTOMATIC_PAUSED_DAGS for dag_id in mod.EXPECTED_DAGS
     }
     monkeypatch.setattr(
         mod,
@@ -4343,3 +4346,33 @@ def test_live_canary_requires_exact_bronze_only_lineage():
             canary,
             run=_live_run([_INGEST_OK], canary, {**_BRONZE_LIVE, "digest": "e" * 64}),
         )
+
+
+def test_c1_updater_is_projected_fenced_and_kept_paused():
+    from scripts import fotmob_cleanup, fotmob_recover, fotmob_rollback, purge_fotmob_competitions
+    from dags.utils import fotmob_publication
+
+    dag_id = "dag_refresh_fotmob_c1"
+    dag_path = "dags/" + dag_id + ".py"
+    assert mod.EXPECTED_DAGS == fotmob_runtime.EXPECTED_DAGS
+    mod.validate_dagbag([{"dag_id": value} for value in mod.EXPECTED_DAGS | {dag_id}], [])
+    assert mod.EXPECTED_DAG_FILES[dag_id] == "/opt/airflow/" + dag_path
+    assert mod.EXPECTED_SCHEDULES[dag_id] == "15 * * * *"
+    assert fotmob_runtime.AUTOMATIC_EXPECTED_SCHEDULES[dag_id] == "15 * * * *"
+    assert fotmob_runtime.PROJECTION_SOURCES[dag_id + ".py"] == dag_path
+    for module in (mod, fotmob_runtime):
+        assert dag_path in module.ISOLATED_DAG_ROOT_PATHS
+        assert dag_path in module.SHARED_REQUIRED_RUNTIME_PATHS
+        assert dag_id in module.PAUSED_SERVICE_DAGS
+        assert dag_id in module.AUTOMATIC_PAUSED_DAGS
+        assert dag_id not in module.AUTOMATIC_ACTIVE_DAGS
+    assert dag_id in fotmob_cleanup.PAUSED_DAGS
+    assert dag_id in fotmob_rollback.DAGS
+    assert dag_id in purge_fotmob_competitions.ISOLATED_WRITER_DAG_IDS
+    assert mod.EXPECTED_DAGS == fotmob_publication.FOTMOB_EXPECTED_ISOLATED_DAGS
+    assert fotmob_recover.ACTIVE_PAUSE_STATES[dag_id] is True
+    assert fotmob_recover.ALL_PAUSED_STATES[dag_id] is True
+    script = SCRIPT.with_name("b6_deliver.sh").read_text()
+    parsed_query = next(line for line in script.splitlines() if "parsed=$(" in line)
+    assert "'" + dag_id + "'" in parsed_query
+    assert '[ "$parsed" = 7 ]' in script

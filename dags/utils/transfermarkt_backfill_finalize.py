@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from scrapers.transfermarkt.raw_store import RawResponseStore
+from scrapers.transfermarkt.revisions import SUPPORTED_MANIFEST_REVISIONS
 from utils import transfermarkt_backfill_state as state
 from utils import transfermarkt_native_v2 as tm_v2
 from utils.transfermarkt_backfill_artifacts import BackfillArtifactStore
@@ -86,9 +87,9 @@ def _validated_manifest(
         "canonical_competition_id": scope.target.canonical_competition_id,
         "canonical_season": scope.target.canonical_season,
         "registry_snapshot_id": registry_snapshot_id or campaign.registry_snapshot_id,
-        "parser_revision": "v2",
-        "schema_revision": "2",
     }
+    if (manifest.parser_revision, manifest.schema_revision) not in SUPPORTED_MANIFEST_REVISIONS:
+        raise BackfillFinalizeError("scope manifest parser/schema revisions are unsupported")
     for field, expected in expected_identity.items():
         if str(getattr(manifest, field)) != str(expected):
             raise BackfillFinalizeError(

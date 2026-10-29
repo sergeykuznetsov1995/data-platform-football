@@ -801,6 +801,10 @@ class FakeControl:
                     str(typed_parser_version),
                     str(stateful_parser_version),
                 ), {}).get("status") != "succeeded"
+                and self.observations.get((
+                    str(item["logical_refresh_id"]), str(parser_version),
+                    str(typed_parser_version), str(stateful_parser_version),
+                ), {}).get("error_class") != "IncompleteMatchPageError"
             ]
         return rows[:limit]
 
@@ -1134,6 +1138,8 @@ class FakeControl:
             "dataset_validation_counts": {"succeeded": 1},
             "sentinel_coverage": _complete_sentinel_coverage(),
             "unknown_gender_registry_count": 0,
+            "frontier_gender_total": 1,
+            "frontier_gender_classified": 1,
             "unvalidated_target_count": 0,
             "unprocessed_raw_count": 0,
             "lane_unprocessed_raw_count": 0,
@@ -1821,6 +1827,11 @@ def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
         fetcher_factory=forbidden_transport,
     )
     pipeline.batch_persist_enabled = True
+    # These fixtures isolate cohort persistence/fencing; sampling is covered
+    # by the parse-wave regression in test_fbref_history_controller.py.
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, records, generic, typed
 
 
@@ -2142,7 +2153,9 @@ class DurableReplayPipeline(FBrefPipeline):
         )
 
 
-def _pipeline_with_small_durable_matches(path):
+def _pipeline_with_small_durable_matches(
+    path, match_ids=("d000000a", "d000000b")
+):
     raw = _raw_store(path)
     control = FakeControl(raw)
     control.registry["9"] = {
@@ -2160,7 +2173,7 @@ def _pipeline_with_small_durable_matches(path):
       <tbody><tr><td data-stat="label">durable</td></tr></tbody>
     </table></body></html>
     """
-    for position, match_id in enumerate(("d000000a", "d000000b")):
+    for position, match_id in enumerate(match_ids):
         target = PageTarget(
             source="fbref",
             page_kind="match",
@@ -2200,6 +2213,9 @@ def _pipeline_with_small_durable_matches(path):
     )
 
     pipeline.batch_persist_enabled = True
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, records
 
 
@@ -4457,7 +4473,8 @@ def test_current_completed_transition_refreshes_instead_of_adopting_prior_raw(
     assert "http" in control.events
 
 
-def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
+@pytest.mark.parametrize("incomplete_match", [False, True])
+def test_historical_refetch_does_not_adopt_prior_logical_refresh_raw(tmp_path, incomplete_match):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     run_id = str(uuid.UUID(int=1))
@@ -4468,6 +4485,8 @@ def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
         "2024-2025",
         "https://fbref.com/en/comps/9/2024-2025/Premier-League-Stats",
     )
+    if incomplete_match:
+        target = match_page_target("a071faa8")
     stale = b"<html>prior-season-observation</html>"
     fresh = b"<html>fresh-season-observation</html>"
     raw.commit_fetch(
@@ -4494,6 +4513,9 @@ def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
     control.frontier[target.target_id] = {
         "refresh_policy": "historical_once",
         "state": "queued",
+        "requires_fresh_match_fetch": incomplete_match,
+        # A transient network failure must not re-enable old-raw adoption.
+        "last_error_class": "ReadTimeout" if incomplete_match else None,
     }
 
     pipeline = FBrefPipeline(
@@ -4507,7 +4529,7 @@ def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
     result = pipeline.fetch_wave(
         run_id,
         worker_id="worker-1",
-        page_kinds=["season"],
+        page_kinds=[target.page_kind],
         settings=_settings("backfill"),
     )
 
@@ -4954,6 +4976,9 @@ def _pipeline_with_saved_generic_pages(tmp_path, competition_ids, broken=()):
         fetcher_factory=forbidden_transport,
     )
     pipeline.batch_persist_enabled = True
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, generic
 
 
@@ -5871,7 +5896,7 @@ def test_seed_filter_applies_from_competition_and_discovery_paths(tmp_path):
 @pytest.mark.parametrize(
     ("run_type", "seeded_season", "season_policy"),
     [
-        ("current", "2025", "daily"),
+        ("current", "2025", "weekly"),
         ("backfill", "2024", "historical_once"),
     ],
 )
@@ -8046,6 +8071,7 @@ def test_canary_validation_does_not_require_global_publication_freshness(tmp_pat
 @pytest.mark.parametrize(
     ("mutation", "expected_error"),
     [
+        ({"frontier_gender_total": 2, "frontier_gender_classified": 1}, "frontier_gender_classification_incomplete"),
         ({"unprocessed_raw_count": 2}, "unprocessed_raw_count=2"),
         (
             {"dataset_validation_counts": {"failed": 1}},
@@ -14502,6 +14528,10 @@ class _FlakyTrinoWriter(FakeWriter):
 
 def _transient_cohort(tmp_path, *, count, errors):
     control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=count)
+    for item in control.fetches:
+        item["attempt_id"] = pipeline.raw_store.read_fetch_record(
+            item["logical_refresh_id"]
+        ).attempt_id
     pipeline.generic_writer = _FlakyTrinoWriter(errors)
     # What run_live_waves switches on for its own waves.
     pipeline._defer_transient_parse = True
@@ -14795,7 +14825,7 @@ def test_frontier_closed_run_does_not_reparse(tmp_path):
     assert waves == []
 
 
-def _session_abort_error(reason):
+def _session_abort_error(reason, *, strict_close_failed=False):
     """Replay real transport flags through the fetcher classifier (#1588)."""
     from unittest.mock import MagicMock
     from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
@@ -14807,6 +14837,15 @@ def _session_abort_error(reason):
         transport._abort_session_for_byte_budget("response_exceeded_reservation")
     elif reason == "request_budget_exhausted":
         transport._request_budget_exhausted = True
+    elif reason == "unrouted_websocket_upgrade":
+        request = MagicMock(
+            resource_type="websocket", url="wss://fbref.com/socket",
+            redirected_from=None,
+        )
+        request.is_navigation_request.return_value = False
+        transport._on_response(SimpleNamespace(
+            request=request, status=101, headers={},
+        ))
     stats = transport.traffic_stats()
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
     fetcher._http_session = None
@@ -14844,8 +14883,19 @@ def _session_abort_error(reason):
     fetcher._lease_client.close_strict.return_value = SimpleNamespace(
         total_bytes=0 if reason == "browser_provider_cap_exhausted" else 100
     )
+    if strict_close_failed:
+        fetcher._lease_client.close_strict.side_effect = FBrefProxyLeaseError(
+            "strict close rejected: uncertain accounting"
+        )
     with pytest.raises(FetchError) as raised:
         fetcher.ensure_clearance()
+    if reason == "unrouted_websocket_upgrade":
+        from scrapers.fbref.camoufox_fetch import (
+            UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
+        )
+        assert raised.value.browser_unobserved_bytes == (
+            UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+        )
     return raised.value
 
 
@@ -14900,6 +14950,7 @@ def _session_failure_wave(
         "request_budget_exhausted",
         "browser_provider_cap_exhausted",
         "browser_provider_drain_failed",
+        "unrouted_websocket_upgrade",
     ],
 )
 def test_session_abort_defers_once_and_continues_wave(tmp_path, reason):
@@ -15075,3 +15126,593 @@ def test_session_abort_persistent_settlement_precedes_reset(
             assert order == sorted(order)
         assert control.run["bytes_used"] == 130
         assert control.run["bytes_reserved"] == 0
+
+
+@pytest.mark.parametrize("kind,policy,hours", [
+    ("season", "weekly", 160), ("season_stats", "weekly", 160),
+    ("squad", "monthly", 664),
+])
+def test_1325_current_enrichment_seed_and_fetch_cadence(monkeypatch, kind, policy, hours):
+    from datetime import timedelta
+    import scrapers.fbref.pipeline as module
+    now = datetime(2026, 10, 20, 0, 15, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "_utcnow", lambda: now)
+    assert module._frontier_policy(kind, historical=False)[0] == policy
+    assert module._frontier_policy(kind, historical=False)[1] < module._frontier_policy("match", historical=False)[1]
+    target = PageTarget(source="fbref", page_kind=kind, target_id=f"fbref:{kind}:1325",
+                        canonical_url="https://fbref.com/en/comps/9/2026-2027",
+                        source_ids={"competition_id": "9", "season_id": "2026-2027"})
+    assert module.frontier_target(target).refresh_policy == policy
+    assert module.frontier_target(target, historical=True).refresh_policy == "historical_once"
+    due = module._next_fetch_at(kind, historical=False)
+    assert due == now + timedelta(hours=hours)
+    # Every normal six-hour phase, including a two-hour execution allowance.
+    sla = 672 if kind == "squad" else 168
+    for phase_minutes in range(360):
+        assert (due-now) + timedelta(minutes=phase_minutes, hours=2) < timedelta(hours=sla)
+    assert module._frontier_policy(kind, historical=True) == ("historical_once", 10)
+    assert module._next_fetch_at(kind, historical=True) is None
+
+
+def test_1325_new_urgent_between_admission_and_claim_defers_cleanly(tmp_path):
+    from scrapers.fbref.control import CohortTarget
+    from scrapers.fbref.pipeline import FBrefPipeline
+    control = FakeControl()
+    control.claim_targets = lambda *a, **k: []
+    control.get_run_target_counts = lambda *a: {}
+    control.create_due_run_cohort = lambda *a, **k: [CohortTarget("season", str(uuid.uuid4()), 0)]
+    control.count_skipped_enrichment = lambda run, ids: int(ids == ["season"])
+    pipeline = FBrefPipeline(control, _raw_store(tmp_path), generic_writer=FakeWriter())
+    settings = PipelineSettings(run_type="current", request_limit=100, byte_limit=50*1024*1024)
+    pipeline._remaining_wave_limit = lambda *a, **k: 25
+    result = pipeline.fetch_wave("run", worker_id="worker", page_kinds=["season"], settings=settings)
+    assert result.claimed == result.cohort_size == 0
+    assert result.failures == []
+
+
+def test_1325_live_cycle_continues_after_enrichment_handback(tmp_path):
+    from scrapers.fbref.control import CohortTarget
+    control = FakeControl()
+    control.claim_targets = lambda *a, **k: []
+    control.get_run_target_counts = lambda *a: {}
+    control.create_due_run_cohort = lambda *a, **k: [CohortTarget("season", str(uuid.uuid4()), 0)]
+    control.count_skipped_enrichment = lambda run, ids: int(ids == ["season"])
+    pipeline = FBrefPipeline(control, _raw_store(tmp_path), generic_writer=FakeWriter())
+    pipeline._remaining_wave_limit = lambda *a, **k: 25
+    original_fetch = pipeline.fetch_wave
+    calls = []
+
+    def fetch(*args, **kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return original_fetch(*args, **kwargs)
+        if len(calls) == 2:
+            # The next admission now sees and fetches the newly urgent match.
+            return WaveResult(cohort_size=1, claimed=1, fetched=1)
+        return WaveResult()
+
+    pipeline.fetch_wave = fetch
+    pipeline.parse_wave = lambda *a, **k: WaveResult()
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()), worker_id="current", page_kinds=["season", "match"],
+        settings=_settings(), max_batches=3,
+    )
+    assert len(calls) == 3
+    assert result.fetch.fetched == 1
+    assert result.frontier_closed
+
+
+@pytest.mark.parametrize("kind", ["generic", "match"])
+@pytest.mark.parametrize("mode", ["sequential", "single", "shared"])
+@pytest.mark.parametrize("failed_write", [False, True])
+def test_processing_work_excludes_shared_writes_and_measures_individual_pages(
+    tmp_path, kind, mode, failed_write
+):
+    if kind == 'match':
+        pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
+        page_kinds = ['match']
+    else:
+        pipeline, control, _ = _pipeline_with_saved_generic_pages(tmp_path, ['9', '12'])
+        page_kinds = ['competition']
+    batch = mode != "sequential"
+    pipeline.batch_persist_enabled = batch
+    if mode == "single":
+        pipeline.batch_persist_matches = 1
+    now = [0.0]
+    pipeline.stage_clock = lambda: now[0]
+
+    def timed(target, name, seconds):
+        original = getattr(target, name)
+
+        def call(*args, **kwargs):
+            now[0] += seconds
+            return original(*args, **kwargs)
+
+        setattr(target, name, call)
+
+    timed(pipeline.raw_store, 'load_fetch_html', 2)
+    timed(pipeline, '_parse_generic', 3)
+    timed(pipeline, '_apply_stateful_effects', 13)
+    timed(pipeline, '_record_page_completion', 17)
+    timed(pipeline, '_record_generic_table_results', 1)
+    timed(pipeline, '_match_item_cells' if kind == 'match' else '_generic_item_cells', 4)
+    # Batch doubles spend time on every page. Shared work cannot provide an
+    # individual measurement, including when a failed batch is retried alone.
+    timed(pipeline.generic_writer, 'persist_page', 7)
+    if kind == 'match':
+        timed(pipeline, '_parse_typed_match', 5)
+        timed(pipeline.typed_adapter.writer, 'persist_match', 11)
+    if failed_write and batch:
+        original_write = pipeline.generic_writer.persist_pages
+
+        def fail_after_shared_write(items):
+            original_write(items)
+            now[0] += 23
+            raise RuntimeError("shared write interrupted")
+
+        pipeline.generic_writer.persist_pages = fail_after_shared_write
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=page_kinds, settings=_settings()
+    )
+    assert result.parsed == 2
+    measurements = [row['processing_work_ms'] for row in control.observations.values()]
+    if mode == "shared":
+        assert measurements == [None, None]
+        return
+    expected = 2 + 3 + 1 + 13 + 17 + 7
+    if batch:
+        expected += 4
+    if failed_write and batch:
+        expected += 23 + 7
+    if kind == 'match':
+        expected += 5 + 11
+    assert measurements == [expected * 1000] * 2
+
+
+def test_incomplete_preparation_does_not_publish_processing_measurement(tmp_path):
+    pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
+    original = pipeline._parse_typed_match
+    calls = [0]
+
+    def fail_preparation_once(*args):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ValueError('preparation interrupted')
+        return original(*args)
+
+    pipeline._parse_typed_match = fail_preparation_once
+    result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=['match'], settings=_settings())
+    assert result.parsed == 2
+    assert next(iter(control.observations.values()))['processing_work_ms'] is None
+
+
+@pytest.mark.parametrize("strict_close_failed", [False, True])
+def test_27_october_403_refresh_then_unrouted_upgrade(tmp_path, strict_close_failed):
+    run_id = str(uuid.UUID(int=1588))
+    first, following = [_match_fetch_lease(run_id, n) for n in (1, 2)]
+    retry = replace(first, attempt_id=str(uuid.UUID(int=9999)), attempt_number=2)
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [[first, following], [retry]])
+    control.run.update(request_limit=4000, byte_limit=2048 * 1024 * 1024)
+    opened = []
+    fetched = []
+
+    class Fetcher(FakeFetcher):
+        def __init__(self):
+            super().__init__(control.events, b"<html>ok</html>")
+            opened.append(self)
+
+        def ensure_clearance(self):
+            if len(opened) == 2:
+                # Real response callback -> real metered ensure_clearance.
+                raise _session_abort_error(
+                    "unrouted_websocket_upgrade",
+                    strict_close_failed=strict_close_failed,
+                )
+            return super().ensure_clearance()
+
+        def fetch(self, url, **kwargs):
+            fetched.append(url)
+            if len(opened) == 1:
+                raise FetchError(
+                    "HTTP 403", error_class="http_status", http_status=403,
+                    target_requests=1, http_status_history=(403,),
+                    provider_billed_bytes=50,
+                )
+            return super().fetch(url, **kwargs)
+
+    pipeline = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: Fetcher(), sleep=lambda _: None, clock=lambda: NOW,
+    )
+    kwargs = dict(
+        worker_id="w", page_kinds=["match"],
+        settings=replace(_settings(), shard_size=2, request_limit=4000,
+                         byte_limit=2048 * 1024 * 1024),
+    )
+    if strict_close_failed:
+        with pytest.raises(FetchWaveError, match="hard_transport_policy"):
+            pipeline.fetch_wave(run_id, **kwargs)
+        assert len(opened) == 2
+        assert fetched == [first.canonical_url]
+        assert control.failed[-1][1]["requeue"] is False
+    else:
+        result = pipeline.fetch_wave(run_id, **kwargs)
+        assert result.deferred_session_failures == 1
+        assert result.fetched == 1
+        assert result.failures == []
+        assert len(opened) == 3
+        assert fetched == [first.canonical_url, following.canonical_url]
+        assert control.failed[-1][1]["requeue"] is True
+        assert control.failed[-1][1]["provider_billed_bytes"] == 100
+    assert control.failed[0][1]["session_retry"] is True
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("scheduler_fails", [False, True])
+def test_scored_incomplete_match_fails_page_and_requests_refetch_without_dead_letter(tmp_path, monkeypatch, batched, scheduler_fails):
+    from scrapers.fbref import match_parser
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(tmp_path, ("0701e218",))
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    pipeline.batch_persist_enabled = batched
+    refetches = []
+    def refetch(target_id, **kwargs):
+        refetches.append((target_id, kwargs))
+        if scheduler_fails:
+            raise OSError("control unavailable")
+        control.frontier[target_id].update(state="retry", last_error_class="IncompleteMatchPageError")
+        return True
+    control.schedule_incomplete_match_refetch = refetch
+    if scheduler_fails:
+        with pytest.raises(ParseWaveError, match="control unavailable"):
+            pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    else:
+        result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+        assert result.incomplete_match_refetches == 1
+        assert result.parsed == 0
+        assert result.failures == []
+    record = records[0]
+    assert refetches == [(record.target_id, {"content_hash": record.content_hash,
+                                          "logical_refresh_id": record.logical_refresh_id})]
+    assert control.frontier[record.target_id]["state"] == ("fetched" if scheduler_fails else "retry")
+    observation = next(iter(control.observations.values()))
+    assert observation["status"] == "failed"
+    assert observation["error_class"] == ("OSError" if scheduler_fails else "IncompleteMatchPageError")
+    if not scheduler_fails:
+        recovered = pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+        )
+        assert recovered.cohort_size == 0
+        assert len(refetches) == 1
+    manifests = [m for m in control.manifests if m["target_id"] == record.target_id]
+    assert not any(m["dataset"] == "typed:__complete__" for m in manifests)
+    assert any(m["dataset"] == "__page__" and m["validation_status"] == "failed" for m in manifests)
+    assert any(m["dataset"] == "typed:match_events" and m["availability"] == "error" for m in manifests)
+    assert typed.calls == []
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_scored_match_without_tables_refetches_with_real_generic_writer(tmp_path, monkeypatch, batched):
+    from scrapers.fbref.bronze import FBrefGenericBronzeWriter
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = PageTarget(
+        source="fbref", page_kind="match", target_id="fbref:match:13351335",
+        canonical_url="https://fbref.com/en/matches/13351335/test",
+        source_ids={"competition_id": "9", "season_id": "2025-2026", "match_id": "13351335"},
+    )
+    html = '<html><div class="scorebox"><div class="score">1</div><div class="score">0</div></div></html>'
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id, "page_kind": "match", "state": "fetched",
+        "last_content_hash": record.content_hash, "last_logical_refresh_id": refresh,
+    }
+    control.fetches = [{"target_id": target.target_id, "page_kind": "match", "logical_refresh_id": refresh}]
+    writer = FBrefGenericBronzeWriter(manager=object())
+    # Keep real writer validation; only database writes are stubbed.
+    monkeypatch.setattr(writer, "ensure_tables", lambda: None)
+    monkeypatch.setattr(writer, "_merge_dataframe", lambda _table, frame, **_kwargs: len(frame))
+    typed = FakeTypedWriter()
+    pipeline = FBrefPipeline(control, raw, generic_writer=writer, typed_adapter=FakeTypedAdapter(typed))
+    pipeline.batch_persist_enabled = batched
+    refetches = []
+
+    def refetch(target_id, **kwargs):
+        refetches.append((target_id, kwargs))
+        control.frontier[target_id]["state"] = "retry"
+        return True
+
+    control.schedule_incomplete_match_refetch = refetch
+    result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    assert result.incomplete_match_refetches == 1
+    assert result.parsed == 0
+    assert refetches == [(target.target_id, {"content_hash": record.content_hash, "logical_refresh_id": refresh})]
+    assert control.frontier[target.target_id]["state"] == "retry"
+    observation = next(iter(control.observations.values()))
+    assert observation["status"] == "failed"
+    assert observation["error_class"] == "IncompleteMatchPageError"
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+    for dataset in ("typed:match_events", "typed:lineups", "__page__"):
+        assert any(m["dataset"] == dataset and m["validation_status"] == "failed" for m in control.manifests)
+
+
+@pytest.mark.parametrize("dataset", ["typed:match_events", "typed:lineups"])
+@pytest.mark.parametrize("availability,count,persistence", [("empty", 0, "skipped"), ("available", 0, "succeeded")])
+def test_acceptance_rejects_zero_rows_for_scored_match(dataset, availability, count, persistence):
+    from scrapers.fbref.pipeline import _acceptance_coverage_errors
+    target_id = "fbref:match:13351335"
+    manifests = []
+    for name in ("__page__", "typed:__complete__", "typed:shot_events", "typed:match_events",
+                 "typed:lineups", "typed:match_team_stats", "typed:match_managers",
+                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_player_stats"):
+        manifests.append(dict(target_id=target_id, dataset=name, availability="available",
+                              row_count=1, parse_status="succeeded", persistence_status="succeeded",
+                              validation_status="succeeded",
+                              error_message="scored_match_requires_rows" if name == "typed:__complete__" else None))
+    broken = next(m for m in manifests if m["dataset"] == dataset)
+    broken.update(availability=availability, row_count=count, persistence_status=persistence,
+                  validation_status=persistence, empty_reason="source_empty")
+    errors = _acceptance_coverage_errors({"target_ids": [target_id]}, {
+        "targets": [dict(target_id=target_id, page_kind="match", status="succeeded",
+                         http_status=200, raw_manifest_key="raw", content_hash="hash")],
+        "datasets": manifests,
+    })
+    assert any(f"{target_id}:{dataset}" in error for error in errors)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("dag_id", ["dag_ingest_fbref", "dag_backfill_fbref"])
+def test_incomplete_match_recovery_drains_batches_before_fetch(tmp_path, monkeypatch, batched, dag_id):
+    from dags.utils import fbref_pipeline_tasks
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218", "a071faa8", "13351335", "13351336"),
+    )
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    pipeline.batch_persist_enabled = batched
+    refetches = []
+
+    def refetch(target_id, **_kwargs):
+        refetches.append(target_id)
+        control.frontier[target_id]["state"] = "retry"
+        return True
+
+    control.schedule_incomplete_match_refetch = refetch
+    monkeypatch.setattr(fbref_pipeline_tasks, "_pipeline", lambda: pipeline)
+    # Small shards force two all-incomplete cohorts before the empty cohort.
+    run_type = "backfill" if dag_id == "dag_backfill_fbref" else "current"
+    control.run["run_type"] = run_type
+    settings = replace(_settings(run_type), shard_size=2)
+    monkeypatch.setattr(fbref_pipeline_tasks, "_settings", lambda **_kwargs: settings)
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__incomplete-recovery", dag_id=dag_id,
+        page_kinds=["match"], run_type=run_type,
+    )
+    assert recovered["batches"] == 2
+    assert recovered["incomplete_match_refetches"] == 4
+    assert recovered["parsed"] == 0
+    assert recovered["recovery_stalled"] is False
+    assert refetches == [record.target_id for record in records]
+    assert len(control.observations) == 4
+    assert all(row["status"] == "failed" for row in control.observations.values())
+    assert all(row["state"] == "retry" for row in control.frontier.values())
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+
+    # The subsequent fetch step runs with an offline transport stub.
+    pipeline.fetcher_factory = lambda *_: FakeFetcher(control.events, b"<html></html>")
+    pipeline.sleep = lambda _: None
+    pipeline.clock = lambda: NOW
+    fetched = pipeline.fetch_wave(
+        str(uuid.uuid4()), worker_id="worker", page_kinds=["competition_index"],
+        settings=settings,
+    )
+    assert fetched.fetched == 1
+    assert "http" in control.events
+
+
+@pytest.mark.parametrize("stage", ["manifest", "observation_fence", "refetch_refused"])
+def test_incomplete_match_refetch_keeps_control_failures_fatal(tmp_path, monkeypatch, stage):
+    from scrapers.fbref import match_parser
+
+    pipeline, control, _records, _generic, typed = _pipeline_with_saved_matches(tmp_path, ("0701e218",))
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    control.schedule_incomplete_match_refetch = lambda *_args, **_kwargs: stage != "refetch_refused"
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("control unavailable")
+
+    if stage == "manifest":
+        monkeypatch.setattr(pipeline, "_record_page_completion", unavailable)
+    elif stage == "observation_fence":
+        monkeypatch.setattr(control, "fail_observation_processing", unavailable)
+    with pytest.raises(ParseWaveError, match="IncompleteMatchPageError"):
+        pipeline.recover_unprocessed_wave(str(uuid.uuid4()), page_kinds=["match"], settings=_settings())
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+class _DeadlineControl(FakeControl):
+    """Persist carryover in control state, never in the pipeline instance."""
+
+    def record_deferred_parse_observations(self, run_id, observations):
+        installed = self.run.setdefault("metadata", {}).setdefault(
+            "deferred_parse_observations", []
+        )
+        for item in observations:
+            assert any(
+                row["attempt_id"] == item["attempt_id"]
+                and row["logical_refresh_id"] == item["logical_refresh_id"]
+                for row in self.fetches
+            ), "carryover requires a successful control attempt"
+            key = tuple(item[name] for name in (
+                "logical_refresh_id", "parser_version", "typed_parser_version",
+                "stateful_parser_version",
+            ))
+            if self.observations[key]["status"] == "failed":
+                evidence = {"run_id": run_id, **item}
+                if evidence not in installed:
+                    installed.append(evidence)
+
+    def get_run_summary(self, run_id, **versions):
+        summary = super().get_run_summary(run_id, **versions)
+        pending = self.list_unprocessed_fetches(
+            run_type=self.run["run_type"], page_kinds=["match"], limit=25,
+            **versions,
+        )
+        deferred = self.run.get("metadata", {}).get("deferred_parse_observations", [])
+        exempt = {row["logical_refresh_id"] for row in deferred}
+        missing = sum(row["logical_refresh_id"] not in exempt for row in pending)
+        summary.update(
+            unvalidated_target_count=missing,
+            unprocessed_raw_count=missing,
+            lane_unprocessed_raw_count=len(pending),
+            global_unprocessed_raw_count=len(pending),
+            deferred_parse_observation_count=len(deferred),
+        )
+        return summary
+
+
+def _deadline_match_run(tmp_path, *, control_error=False):
+    from trino.exceptions import TrinoConnectionError
+
+    raw = _raw_store(tmp_path)
+    control = _DeadlineControl(raw)
+    control.run["status"] = "running"
+    run_id = str(uuid.uuid4())
+    target = PageTarget(
+        source="fbref", page_kind="match", target_id="fbref:match:0d4d2370",
+        canonical_url="https://fbref.com/en/matches/0d4d2370",
+        source_ids={"match_id": "0d4d2370", "competition_id": "9", "season_id": "2025-2026"},
+    )
+    html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode().replace("0701e218", "0d4d2370")
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.fetches.append({
+        "run_id": run_id, "target_id": target.target_id,
+        "page_kind": "match", "logical_refresh_id": refresh,
+        "attempt_id": record.attempt_id,
+    })
+    control.frontier[target.target_id] = {
+        "state": "fetched", "last_content_hash": record.content_hash,
+    }
+    pipeline = FBrefPipeline(
+        control, raw,
+        generic_writer=_FlakyTrinoWriter([TrinoConnectionError("failed to cancel query")]),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(claimed=1, fetched=1)
+    ticks = iter([0.0, 10.0])
+    pipeline.monotonic = lambda: next(ticks)
+    if control_error:
+        def fail(*_a, **_k):
+            raise StateConflict("carryover write failed")
+        control.record_deferred_parse_observations = fail
+    return control, pipeline, run_id, refresh, record
+
+
+@pytest.mark.parametrize("recovered_attempt", [False, True])
+@pytest.mark.parametrize("batch_persist_enabled", [False, True])
+def test_deadline_transient_match_carries_raw_to_next_run(
+    tmp_path, recovered_attempt, batch_persist_enabled,
+):
+    control, pipeline, run_id, refresh, record = _deadline_match_run(tmp_path)
+    pipeline.batch_persist_enabled = batch_persist_enabled
+    if batch_persist_enabled:
+        pipeline.generic_writer.batch_error = pipeline.generic_writer.errors[0]
+    if recovered_attempt:
+        # Raw survived a failed/expired attempt; complete_fetch succeeded on a
+        # later attempt without rewriting the immutable fetch manifest.
+        control.fetches[0]["attempt_id"] = str(uuid.uuid4())
+    result = pipeline.run_live_waves(
+        run_id, worker_id="match-worker", page_kinds=["match"],
+        settings=_settings(), deadline_monotonic=5.0,
+    )
+    assert result.deadline_reached
+    assert result.parse.deferred_parse_failures == [
+        "fbref:match:0d4d2370:TrinoConnectionError"
+    ]
+    # The Airflow validator is a fresh process; the in-memory deferral history
+    # cannot be its source of truth.
+    validator = FBrefPipeline(
+        control, pipeline.raw_store, generic_writer=FakeWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+        fetcher_factory=lambda *_: pytest.fail("recovery must not fetch HTTP"),
+    )
+    summary = validator.validate_and_finish(run_id, publication_eligible=False)
+    evidence = control.run["metadata"]["deferred_parse_observations"]
+    assert len(evidence) == 1
+    assert evidence[0]["attempt_id"] == control.fetches[0]["attempt_id"]
+    if recovered_attempt:
+        assert evidence[0]["attempt_id"] != record.attempt_id
+    assert evidence[0]["content_hash"] == record.content_hash
+    assert control.raw_store.read_fetch_record(refresh) == record
+    assert next(iter(control.observations.values()))["status"] == "failed"
+    assert any(row["validation_status"] == "failed" for row in control.manifests)
+    assert summary["unvalidated_target_count"] == 0
+    assert summary["unprocessed_raw_count"] == 0
+    assert summary["lane_unprocessed_raw_count"] == 1
+    assert summary["global_unprocessed_raw_count"] == 1
+    assert summary["deferred_parse_observation_count"] == 1
+    recovered = validator.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+    assert recovered.parsed == 1
+    summary = control.get_run_summary(
+        run_id, parser_version=PAGE_DOCUMENT_VERSION,
+        typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+        stateful_parser_version=DISCOVERY_PARSER_VERSION,
+    )
+    assert summary["global_unprocessed_raw_count"] == 0
+    assert control.raw_store.read_fetch_record(refresh) == record
+
+
+def test_deadline_carryover_write_failure_stays_loud(tmp_path):
+    control, pipeline, run_id, _refresh, _record = _deadline_match_run(
+        tmp_path, control_error=True,
+    )
+    with pytest.raises(StateConflict, match="carryover write failed"):
+        pipeline.run_live_waves(
+            run_id, worker_id="match-worker", page_kinds=["match"],
+            settings=_settings(), deadline_monotonic=5.0,
+        )
+    with pytest.raises(RunValidationError, match="unvalidated_target_count=1"):
+        pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+
+def test_deadline_carryover_does_not_exempt_unrelated_raw(tmp_path):
+    control, pipeline, run_id, _refresh, _record = _deadline_match_run(tmp_path)
+    pipeline.run_live_waves(
+        run_id, worker_id="match-worker", page_kinds=["match"],
+        settings=_settings(), deadline_monotonic=5.0,
+    )
+    target = PageTarget(
+        source="fbref", page_kind="match", target_id="fbref:match:ffffffff",
+        canonical_url="https://fbref.com/en/matches/ffffffff",
+        source_ids={"match_id": "ffffffff"},
+    )
+    refresh, _record = _commit_for_parse(pipeline.raw_store, target, "<html>other</html>")
+    control.fetches.append({
+        "run_id": run_id, "target_id": target.target_id,
+        "page_kind": "match", "logical_refresh_id": refresh,
+    })
+    with pytest.raises(
+        RunValidationError, match="unvalidated_target_count=1; unprocessed_raw_count=1",
+    ):
+        pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+
+@pytest.mark.parametrize("operation", ["record_dataset_manifest", "fail_observation_processing"])
+def test_deadline_does_not_carry_transient_failure_after_control_failure(tmp_path, operation):
+    control, pipeline, run_id, _refresh, _record = _deadline_match_run(tmp_path)
+
+    def fail(*_a, **_k):
+        raise RuntimeError("control unavailable")
+
+    setattr(control, operation, fail)
+    with pytest.raises(ParseWaveError, match="control unavailable"):
+        pipeline.run_live_waves(
+            run_id, worker_id="match-worker", page_kinds=["match"],
+            settings=_settings(), deadline_monotonic=5.0,
+        )
+    assert not control.run.get("metadata", {}).get("deferred_parse_observations")

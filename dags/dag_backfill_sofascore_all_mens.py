@@ -172,10 +172,12 @@ def _validate_historical_scope(**environment: str) -> dict[str, Any]:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AirflowException(f"scope result is unreadable: {exc}") from exc
-    if result.get("status") != "success":
+    if result.get("status") not in {"success", "waiting"}:
         raise AirflowException("scope cycle did not finish successfully")
     action = environment.get("SOFASCORE_CAMPAIGN_ACTION")
     if action == "metadata":
+        if result.get("status") != "success":
+            raise AirflowException("metadata cycle did not finish successfully")
         snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
         if (
             snapshot.get("campaign_id")
@@ -203,6 +205,14 @@ def _validate_historical_scope(**environment: str) -> dict[str, Any]:
         or int(result.get("source_season_id", 0)) != int(season_id)
     ):
         raise AirflowException("scope result provenance mismatch")
+    if result.get("status") == "waiting":
+        from dags.scripts.run_sofascore_scope_cycle import waiting_for_finished_matches
+        scope = {"tournament_id": int(tournament_id), "source_season_id": int(season_id),
+                 "canonical_season": environment.get("SOFASCORE_CANONICAL_SEASON")}
+        if (result.get("run_id") != environment.get("SOFASCORE_SCOPE_RUN_ID")
+                or not waiting_for_finished_matches(result, scope)):
+            raise AirflowException("unverified history waiting outcome")
+        return {"status": "waiting", "scope_key": environment["SOFASCORE_SCOPE_KEY"]}
     if environment.get("SOFASCORE_HISTORY_GROUP") != "july":
         state.mark_completed(
             STATE_PATH, campaign_id=campaign_id,
@@ -292,7 +302,7 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
 
 
 def _finalize_slots(reservation, snapshot, context, release):
-    from scrapers.sofascore.history_worker import stamp_result
+    from scrapers.sofascore.history_worker import scope_outcome, stamp_result
     campaign, run_id = snapshot["campaign_id"], reservation["run_id"]
     for index, item in reservation["items"].items():
         if item["accounted"]:
@@ -303,7 +313,12 @@ def _finalize_slots(reservation, snapshot, context, release):
         if ti is None or _task_state(ti) not in {"success", "failed", "upstream_failed", "skipped", "removed"}:
             raise AirflowException("history slot is not terminal; cannot reconcile")
         environment = reservation["plan"][item["plan_index"]]
-        outcome = item["outcome"] or {"status": "not_started" if item["attempts"] == 0 else "failed",
+        outcome = item["outcome"]
+        if outcome is None and item["attempts"] > 0:
+            saved = scope_outcome(environment, 0)
+            if saved["status"] in {"success", "partial"}:
+                outcome = saved
+        outcome = outcome or {"status": "not_started" if item["attempts"] == 0 else "failed",
                                     "reason": "history worker interrupted before accounting",
                                     "source_requests": 0 if item["attempts"] == 0 else None}
         history_controller.record_scope(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id,

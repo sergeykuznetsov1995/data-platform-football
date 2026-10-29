@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Ночной автомат доставки Understat (#1432) в общее боевое дерево планировщика ($TREE).
+# Автомат доставки Understat (#1432) в общее боевое дерево планировщика ($TREE).
+# С 29.10 (гриль процесса) доставляет в любой час, когда контур свободен; раньше — окно 11:00–08:30 UTC раз в сутки.
 # Доставляет из origin/master ТОЛЬКО файлы Understat, перезаписью на месте (`cat >`, инод
 # сохраняется, ctime каталогов dags/ и scrapers/ не меняется — сторож WhoScored молчит).
 # Режимы: без аргумента — ночной запуск; --check — все проверки без записи;
@@ -24,7 +25,7 @@ SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__ini
 # medallion/proxy pins ограничены native-путём Understat и regression tests:
 # новые зависимости или API требуют пересмотра, произвольные версии запрещены.
 # Источник разрешения и доказательства фиксируются в PR/операционном handoff.
-ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=8b52267bf748ffa3bb0156a89c97774e14c19c91 scrapers/utils/proxy_manager.py=01c904cbbef5f5d694648d97d13baa5431233c5a"
+ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=8b52267bf748ffa3bb0156a89c97774e14c19c91 scrapers/utils/proxy_manager.py=01c904cbbef5f5d694648d97d13baa5431233c5a scrapers/base/trino_manager.py=1e64e7b2148509e88ade408a0f422f434f8ca825"
 # Порядок записи файлов вне scrapers/understat/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py dags/dag_backfill_understat.py dags/dag_ingest_understat.py"
 DAGS="dag_ingest_understat dag_backfill_understat"
@@ -103,14 +104,24 @@ restore() {
   return $rc
 }
 
-# Причина не трогать бой сейчас (пусто — можно): окно 11:00–08:30 UTC и занятость Understat.
+# Гриль 29.10: доставка в любой час, когда контур свободен. Вместо окна по часам — запас до ближайшего
+# запуска сбора по расписанию Airflow (dag.next_dagrun_create_after; DAG без расписания и на паузе не считаются).
+NEXT_RUN_MARGIN=${NEXT_RUN_MARGIN:-1800}   # секунд; хватает на доставку, перечитывание DAG и откат
+next_run_reason() {
+  local nxt left
+  nxt=$(q "select coalesce(min(extract(epoch from next_dagrun_create_after))::bigint, 0) from dag where dag_id in ('dag_ingest_understat','dag_backfill_understat') and not is_paused")
+  [ -n "$nxt" ] || { echo "метабаза не ответила (next_dagrun)"; return; }
+  [ "$nxt" = 0 ] && return
+  left=$(( nxt - $(date -u +%s) ))
+  [ "$left" -ge "$NEXT_RUN_MARGIN" ] || echo "до запуска сбора по расписанию $((left/60)) мин (< $((NEXT_RUN_MARGIN/60))) — доставка после прогона"
+}
+# Причина не трогать бой сейчас (пусто — можно): занятость Understat и запас до запуска DAG по расписанию.
 busy_reason() {
-  local hhmm n
-  hhmm=$(date -u +%H%M)
-  if (( 10#$hhmm >= 830 && 10#$hhmm < 1100 )); then echo "вне окна ($hhmm UTC; окно 11:00–08:30)"; return; fi
+  local n
   n=$(q "select count(*) from task_instance where dag_id in ('dag_ingest_understat','dag_backfill_understat') and state in ('running','queued')")
   if [ "$n" != "0" ]; then echo "Understat занят: task_instance running/queued = '${n:-метабаза не ответила}'"
   elif pgrep -f 'run_understat_scrape[r]' >/dev/null; then echo "Understat занят: живой процесс run_understat_scraper"
+  else next_run_reason
   fi
 }
 set_accepted() { echo "$1" > "$ACCEPTED_F.tmp" && mv "$ACCEPTED_F.tmp" "$ACCEPTED_F"; }
@@ -149,15 +160,11 @@ if [ -f "$INFLIGHT" ]; then
     exit 0
   fi
 fi
-LATCH="$STATE/understat-auto-deliver-attempted-$DAY"
-if [ "$MODE" = night ] && [ -f "$LATCH" ]; then log "сегодня ($DAY) попытка уже была — выход"; exit 0; fi
-
-# --- окно и занятость Understat
+# --- занятость Understat и запас до прогона; защёлка «одна попытка на SHA» — ниже, после сверки с базой
 BUSY=$(busy_reason)
 if [ -n "$BUSY" ]; then
   [ "$MODE" = --check ] && log "заметка: $BUSY" || { log "$BUSY — выход"; exit 0; }
 fi
-[ "$MODE" = night ] && touch "$LATCH"
 
 # --- база, самопроверка, общие модули
 g fetch -q origin || stop "git fetch origin не удался"
@@ -203,10 +210,14 @@ while IFS=$'\t' read -r st p1 p2; do
   esac
 done < <(g diff --name-status "$ACC" "$SHA" -- $UNDERSTAT_PATHS ':(glob)dags/**/*understat*.py')
 if [ "${#ST[@]}" = 0 ]; then
+  [ "$ACC" = "$SHA" ] && [ "$MODE" = night ] && exit 0   # тик каждый час: без шума в логе и журнале
   log "нечего доставлять: файлы Understat ${ACC:0:7} = ${SHA:0:7}"
   [ "$MODE" = night ] && { set_accepted "$SHA" || stop "не записан $ACCEPTED_F"; journal "нечего доставлять, база сдвинута"; }
   exit 0
 fi
+LATCH="$STATE/understat-auto-deliver-attempted-${SHA:0:12}"   # одна попытка на SHA, не на сутки (гриль 29.10)
+if [ "$MODE" = night ] && [ -f "$LATCH" ]; then log "попытка доставки ${SHA:0:12} уже была — жду нового коммита master"; exit 0; fi
+[ "$MODE" = night ] && touch "$LATCH"
 ORDERED=$(
   printf '%s\n' "${!ST[@]}" | grep '^scrapers/understat/' | grep -v '/__init__\.py$' | LC_ALL=C sort
   printf '%s\n' "${!ST[@]}" | grep '^scrapers/understat/.*__init__\.py$' | LC_ALL=C sort -r

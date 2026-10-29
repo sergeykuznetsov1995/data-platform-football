@@ -62,6 +62,11 @@ class StubCursor:
 
     def execute(self, sql):
         self.sql_log.append(sql)
+        if sql.startswith('SELECT * FROM ') and sql.endswith(' LIMIT 0'):
+            table = sql.split()[3]
+            self.description = [(column,) for column in dq.NATIVE_PAYLOAD_COLUMNS[table]]
+            self._rows = []
+            return
         for match, rows in self.overrides:
             hit = match(sql) if callable(match) else (match in sql)
             if hit:
@@ -71,6 +76,18 @@ class StubCursor:
 
     def fetchall(self):
         return self._rows
+
+
+def test_career_debt_reports_unfinished_scope_evidence_separately():
+    cur = StubCursor(overrides=[('WITH career_roster AS', [(1, 0, 1, 2, 2)])])
+    results = dq.run_bronze_dq(cur, registry_snapshot_id='snap-1',
+        zone='full', legacy_allowlist=[])
+    result = next(item for item in results if item.name == 'tm_career_debt')
+    assert result.value == {
+        'career_fetches_pending': 1, 'null_evidence_manifests': 0,
+        'complete_manifests': 1, 'roster_players': 2, 'debt_ratio': 0.5,
+        'target_scopes': 2, 'missing_complete_manifests': 1,
+    }
 
 
 def _pair_counts_override(table, rows):
@@ -96,6 +113,83 @@ def _full_pins():
 # ---------------------------------------------------------------------------
 # SQL builders
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('zone', ['full', 'scope_set'])
+@pytest.mark.parametrize('table', [MV_POINTS, TRANSFER_EVENTS])
+@pytest.mark.parametrize('schema, changed', [
+    ('old', None), ('old', 'existing'), ('partial', 'addition'),
+    ('current', 'addition'), ('broken', None), ('unavailable', None),
+])
+def test_intra_batch_checks_snapshot_schema_before_first_fresh_write(
+    table, zone, schema, changed,
+):
+    import duckdb
+    import sqlglot
+    from sqlglot import exp
+    from scrapers.transfermarkt.revisions import CAREER_NULLABLE_ADDITIONS
+    from utils.transfermarkt_daily_dq import _PinnedCursor
+
+    payload = dq.NATIVE_PAYLOAD_COLUMNS[table]
+    additions = [column for column in payload if column in CAREER_NULLABLE_ADDITIONS]
+    existing = next(column for column in payload if column not in additions)
+    columns = list(dict.fromkeys([
+        *dq.NATIVE_BRONZE_KEYS[table], '_batch_id',
+        'source_competition_id', 'source_edition_id', *payload,
+    ]))
+    if schema == 'old':
+        columns = [column for column in columns if column not in additions]
+    elif schema == 'partial':
+        columns = [column for column in columns if column not in additions[1:]]
+    elif schema == 'broken':
+        columns.remove(existing)
+
+    with duckdb.connect() as conn:
+        conn.execute('CREATE TABLE facts (' + ', '.join(f'{column} VARCHAR' for column in columns) + ')')
+        if changed:
+            values = ['GB1' if column == 'source_competition_id' else
+                      '2026' if column == 'source_edition_id' else 'same'
+                      for column in columns]
+            conn.execute('INSERT INTO facts VALUES (' + ', '.join('?' for _ in columns) + ')', values)
+            values[columns.index(existing if changed == 'existing' else additions[0])] = 'different'
+            conn.execute('INSERT INTO facts VALUES (' + ', '.join('?' for _ in columns) + ')', values)
+
+        class SnapshotCursor(StubCursor):
+            def execute(self, sql):
+                if (f'FROM {table} ' not in sql
+                        or not (sql.endswith(' LIMIT 0') or 'payload_variants' in sql)):
+                    return super().execute(sql)
+                self.sql_log.append(sql)
+                assert f'FROM {table} FOR VERSION AS OF {pins[table]}' in sql
+                if schema == 'unavailable' and sql.endswith(' LIMIT 0'):
+                    raise RuntimeError('schema lookup failed')
+                expression = sqlglot.parse_one(sql, read='trino')
+                for relation in expression.find_all(exp.Table):
+                    relation.set('catalog', None)
+                    relation.set('db', None)
+                    relation.set('this', exp.to_identifier('facts'))
+                    relation.set('version', None)
+                result = conn.execute(expression.sql(dialect='duckdb'))
+                self.description = result.description
+                self._rows = result.fetchall()
+
+        pins = _full_pins()
+        cur = SnapshotCursor()
+        results = dq.run_bronze_dq(
+            _PinnedCursor(cur, pins) if zone == 'full' else cur,
+            registry_snapshot_id='snap-1', pins=pins, zone=zone,
+            scope_bindings=[('child', 'GB1__2026', 'GB1', '2026')],
+        )
+        conflict = next(result for result in results
+                        if result.name == f'tm_bronze_intra_batch_conflicts[{dq._display(table)}]')
+        if schema in ('broken', 'unavailable'):
+            assert conflict.error and not conflict.passed
+        else:
+            assert conflict.error is None
+            assert conflict.value == (1 if changed else 0)
+            assert conflict.passed == (changed is None)
+            split = next(sql for sql in cur.sql_log if 'payload_variants' in sql and f'FROM {table} ' in sql)
+            for column in payload:
+                assert (column in split) == (column in columns)
 
 @pytest.mark.parametrize('table, comp, ed', [
     (MEMBERSHIPS, 'competition_id', 'edition_id'),

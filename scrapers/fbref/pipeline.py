@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -21,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse, urlsplit
 
+from scrapers.fbref.policy import CURRENT_ENRICHMENT
 from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
@@ -123,7 +125,7 @@ from scrapers.fbref.typed_bronze import (
     parse_season_stats_html as parse_typed_season_stats_html,
     typed_result_requires_persistence,
 )
-from scrapers.fbref.match_parser import MatchParseResult
+from scrapers.fbref.match_parser import IncompleteMatchPageError, MatchParseResult
 
 
 SENTINEL_COMPETITIONS = (
@@ -802,6 +804,7 @@ _DISCOVERY_EDGE_BATCH_LIMIT = 5000
 class WaveResult:
     cohort_size: int = 0
     claimed: int = 0
+    enrichment_handed_back: int = 0
     fetched: int = 0
     recovered_from_raw: int = 0
     parsed: int = 0
@@ -823,6 +826,7 @@ class WaveResult:
     deferred_session_failures: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    incomplete_match_refetches: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -920,6 +924,7 @@ class _ProcessedObservation:
     skipped_ineligible: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    incomplete_match_refetches: int = 0
     deferred_parse_failures: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
@@ -936,9 +941,11 @@ class _ClaimedMatchObservation:
     match_id: str
     stateful_run_id: str
     stateful_run_type: str
+    processing_work_seconds: Optional[float] = None
 
     def sequential_args(self, *, generic_persisted: bool = False) -> dict:
         return {
+            "processing_work_seconds": self.processing_work_seconds,
             "run_id": self.run_id,
             "html": self.html,
             "record": self.record,
@@ -969,9 +976,11 @@ class _ClaimedGenericObservation:
     stateful_run_id: str
     stateful_run_type: str
     recover_cross_run: bool = False
+    processing_work_seconds: Optional[float] = None
 
     def sequential_args(self, *, generic_persisted: bool = False) -> dict:
         return {
+            "processing_work_seconds": self.processing_work_seconds,
             "run_id": self.run_id,
             "html": self.html,
             "record": self.record,
@@ -1841,12 +1850,19 @@ def _acceptance_coverage_errors(
                 "typed:match_officials", "typed:match_keeper_stats",
                 "typed:match_player_stats", "typed:__complete__",
             }
+        completion = manifests_by_target.get(target_id, {}).get("typed:__complete__", {})
+        scored_match = page_kind == "match" and completion.get("error_message") == "scored_match_requires_rows"
         for dataset_name in sorted(required_typed):
+            requires_rows = scored_match and dataset_name in {"typed:match_events", "typed:lineups"}
+            manifest = manifests_by_target.get(target_id, {}).get(dataset_name, {})
             if not _manifest_ok(
                 target_id,
                 dataset_name,
-                allow_skipped=dataset_name != "typed:__complete__",
-            ):
+                allow_skipped=dataset_name != "typed:__complete__" and not requires_rows,
+            ) or (requires_rows and (
+                manifest.get("availability") != "available"
+                or int(manifest.get("row_count") or 0) <= 0
+            )):
                 missing_target_manifests.append(f"{target_id}:{dataset_name}")
     if missing_target_manifests:
         errors.append(
@@ -2303,14 +2319,13 @@ def _is_mass_contract_rejection(result: "WaveResult") -> bool:
 def _frontier_policy(page_kind: str, *, historical: bool) -> tuple[str, int]:
     if historical:
         return "historical_once", 10
+    if page_kind in CURRENT_ENRICHMENT:
+        return CURRENT_ENRICHMENT[page_kind][:2]
     policies = {
         "competition_index": ("daily", 100),
         "competition": ("weekly", 90),
-        "season": ("daily", 80),
-        "season_stats": ("daily", 75),
         "schedule": ("six_hourly", 85),
         "standings": ("daily", 70),
-        "squad": ("weekly", 60),
         "player": ("monthly", 40),
         "matchlog": ("monthly", 20),
         "match": ("daily", 65),
@@ -2339,16 +2354,15 @@ def frontier_target(
 def _next_fetch_at(page_kind: str, *, historical: bool) -> Optional[datetime]:
     if historical:
         return None
+    if page_kind in CURRENT_ENRICHMENT:
+        return _utcnow() + timedelta(hours=CURRENT_ENRICHMENT[page_kind][2])
     delays = {
         # Small cadence slack keeps a 06:00 scheduled run due even when the
         # previous task finished a few minutes after its nominal slot.
         "competition_index": timedelta(hours=23),
         "competition": timedelta(days=6, hours=23),
         "schedule": timedelta(hours=5),
-        "season": timedelta(hours=23),
-        "season_stats": timedelta(hours=23),
         "standings": timedelta(hours=23),
-        "squad": timedelta(days=6, hours=23),
         "player": timedelta(days=29, hours=23),
         "matchlog": timedelta(days=29, hours=23),
         "match": timedelta(hours=23),
@@ -2656,6 +2670,7 @@ class FBrefPipeline:
         # the one caller that guarantees a later parse wave in this process.
         # A single parse_fbref_wave or recovery drain stays loud.
         self._parse_deferrals: dict[str, int] = {}
+        self._parse_carryovers: dict[str, dict] = {}
         self._defer_transient_parse = False
         self._parse_deferrals_pending = False
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
@@ -3476,7 +3491,7 @@ class FBrefPipeline:
             leases = self.control.claim_targets(
                 run_id,
                 worker_id,
-                limit=len(cohort),
+                limit=limit,
                 lease_seconds=FETCH_LEASE_SECONDS,
                 page_kinds=page_kinds,
                 refresh_policies=policies,
@@ -3485,9 +3500,19 @@ class FBrefPipeline:
             result.cohort_size = len(leases)
         result.claimed = len(leases)
         if len(leases) != result.cohort_size:
+            # A newly due match/schedule can preempt enrichment between the
+            # admission and claim transactions. Only confirmed hand-backs
+            # excuse missing claims; lost/blocked leases still fail closed.
+            result.enrichment_handed_back = self.control.count_skipped_enrichment(
+                run_id, [item.target_id for item in cohort]
+            )
+            result.cohort_size -= result.enrichment_handed_back
+        if len(leases) != result.cohort_size:
             raise FetchWaveError(
                 f"Claimed {len(leases)} of {result.cohort_size} cohort targets"
             )
+        if not leases:
+            return result
         owns_session = _live_session is None
         live_session = _live_session or _LiveFetchSession(
             persistent_enabled=settings.persistent_http_session,
@@ -3532,6 +3557,8 @@ class FBrefPipeline:
                     cross_run_historical_raw = (
                         frontier.get("refresh_policy") == "historical_once"
                         and lease.page_kind != "season"
+                        and not frontier.get("requires_fresh_match_fetch")
+                        and frontier.get("last_error_class") != "IncompleteMatchPageError"
                     )
                     recoverable = exact_refresh_raw or cross_run_historical_raw
                     if recoverable:
@@ -3874,6 +3901,7 @@ class FBrefPipeline:
                         live_session.consecutive_clearance_refreshes += 1
                         clearance_streak_exhausted = (
                             exc.session_failure_reason is not None
+                            or (not historical and lease.page_kind in CURRENT_ENRICHMENT)
                             or live_session.consecutive_clearance_refreshes
                             > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
                         )
@@ -4526,6 +4554,7 @@ class FBrefPipeline:
             finalization_guard=self.finalization_guard,
         )
         failed = True
+        self._parse_carryovers = {}
         self._defer_transient_parse = True
         try:
             # Each claim independently evaluates _FRONTIER_SCOPE_CTE while
@@ -4617,7 +4646,11 @@ class FBrefPipeline:
 
                     if fetched.budget_exhausted:
                         break
-                    if fetched.claimed == 0 and parsed.cohort_size == 0:
+                    if (
+                        fetched.claimed == 0
+                        and parsed.cohort_size == 0
+                        and fetched.enrichment_handed_back == 0
+                    ):
                         aggregate.frontier_closed = True
                         break
                 if (
@@ -4629,7 +4662,8 @@ class FBrefPipeline:
                     # the last wave deferred, and no later wave will retry it
                     # (#1759).  Parse once more: raw only, no request, no paid
                     # lease.  A deadline stop skips this -- the task timeout
-                    # is the harder limit -- and validation reports the raw.
+                    # is the harder limit -- and unfinished transient
+                    # observations carry over below.
                     with self._profiled_wave() as parse_ms:
                         parsed = self.parse_wave(
                             run_id,
@@ -4676,6 +4710,10 @@ class FBrefPipeline:
                         f"no page fetched; {deferred} target failure(s) "
                         "deferred"
                     )
+            if aggregate.deadline_reached and self._parse_carryovers:
+                self.control.record_deferred_parse_observations(
+                    run_id, list(self._parse_carryovers.values())
+                )
             failed = False
             return aggregate
         finally:
@@ -5687,6 +5725,8 @@ class FBrefPipeline:
         counts: Optional[Mapping[str, int]] = None
         try:
             if parsed.has_errors:
+                if any(d.error_type == "IncompleteMatchPageError" for d in parsed.datasets.values()):
+                    raise IncompleteMatchPageError("Scored match has no events or lineups")
                 raise TypedBronzeError("Typed match parser failed")
             counts = self.typed_adapter.writer.persist_match(
                 parsed,
@@ -5695,13 +5735,13 @@ class FBrefPipeline:
                 run_id=run_id,
                 target_identity=record.logical_refresh_id,
             )
-        except Exception:
+        except Exception as exc:
             self._record_typed_results(
-                record, parsed.datasets, persisted=None
+                record, parsed.datasets, persisted=None, error=exc
             )
             raise
         self._record_typed_results(record, parsed.datasets, persisted=counts)
-        self._record_typed_completion(record)
+        self._record_typed_completion(record, has_score=parsed.has_score)
 
     def _record_typed_results(
         self,
@@ -5709,6 +5749,7 @@ class FBrefPipeline:
         parsed: Mapping[str, object],
         *,
         persisted: Optional[Mapping[str, int]],
+        error: Optional[Exception] = None,
         control=None,
     ) -> None:
         control_store = self.control if control is None else control
@@ -5739,9 +5780,15 @@ class FBrefPipeline:
                     else "skipped"
                 ),
                 row_count=int(getattr(dataset, "row_count", 0) or 0),
-                error_class=getattr(dataset, "error_type", None),
+                error_class=(
+                    type(error).__name__
+                    if failed and status != "error" and error is not None
+                    else getattr(dataset, "error_type", None)
+                ),
                 error_message=(
-                    getattr(dataset, "error_message", None)
+                    str(error)
+                    if failed and status != "error" and error is not None
+                    else getattr(dataset, "error_message", None)
                     or getattr(dataset, "reason", None)
                 ),
             )
@@ -5751,6 +5798,7 @@ class FBrefPipeline:
         record: RawFetchRecord,
         *,
         control=None,
+        has_score: bool = False,
     ) -> None:
         """Cache typed success only after every dataset result."""
 
@@ -5765,6 +5813,7 @@ class FBrefPipeline:
             persistence_status="succeeded",
             validation_status="succeeded",
             row_count=0,
+            error_message="scored_match_requires_rows" if has_score else None,
         )
 
     def _persist_typed(
@@ -5826,6 +5875,8 @@ class FBrefPipeline:
                 )
                 parsed = match.datasets
                 if match.has_errors:
+                    if any(d.error_type == "IncompleteMatchPageError" for d in match.datasets.values()):
+                        raise IncompleteMatchPageError("Scored match has no events or lineups")
                     raise TypedBronzeError("Typed match parser failed")
                 counts = self.typed_adapter.writer.persist_match(
                     match,
@@ -5836,16 +5887,16 @@ class FBrefPipeline:
                 )
             else:
                 return
-        except Exception:
+        except Exception as exc:
             if "parsed" in locals():
                 self._record_typed_results(
-                    record, parsed, persisted=None
+                    record, parsed, persisted=None, error=exc
                 )
             raise
         self._record_typed_results(record, parsed, persisted=counts)
         # This must remain the final typed manifest.  A crash while recording
         # any individual result therefore leaves replay work discoverable.
-        self._record_typed_completion(record)
+        self._record_typed_completion(record, has_score=record.page_kind == "match" and match.has_score)
 
     def _persist_guarded_typed(
         self,
@@ -6199,16 +6250,40 @@ class FBrefPipeline:
                     f"{record.target_id}:manifest:"
                     f"{type(manifest_exc).__name__}:{manifest_exc}"
                 )
+        # Record the retry decision before releasing the observation. If that
+        # transaction fails, recovery must still retry scheduling this raw.
+        refetch_error = None
+        refetch_scheduled = False
+        if isinstance(exc, IncompleteMatchPageError):
+            try:
+                refetch_scheduled = self.control.schedule_incomplete_match_refetch(
+                    record.target_id, content_hash=record.content_hash,
+                    logical_refresh_id=record.logical_refresh_id,
+                )
+            except Exception as refetch_exc:
+                refetch_error = refetch_exc
+                failures.append(
+                    f"{record.target_id}:refetch:"
+                    f"{type(refetch_exc).__name__}:{refetch_exc}"
+                )
         try:
             self.control.fail_observation_processing(
                 observation_lease,
-                error_class=type(exc).__name__,
-                error_message=str(exc),
+                error_class=type(refetch_error or exc).__name__,
+                error_message=str(refetch_error or exc),
             )
         except Exception as fence_exc:
             failures.append(
                 f"{record.target_id}:observation_fence:"
                 f"{type(fence_exc).__name__}:{fence_exc}"
+            )
+        if refetch_scheduled and not failures:
+            # The page stays failed and cannot publish, but a fresh request
+            # now owns its recovery. Let the drain reach the next raw batch.
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=stale_typed_observations_skipped,
+                incomplete_match_refetches=1,
             )
         if isinstance(exc, SourceContractRejected):
             retired = False
@@ -6237,7 +6312,7 @@ class FBrefPipeline:
                     contract_quarantined=1,
                     failures=tuple(failures),
                 )
-        elif not _is_infrastructure_failure(exc):
+        elif not isinstance(exc, IncompleteMatchPageError) and not _is_infrastructure_failure(exc):
             # Classification comes first, and every way of not reporting a
             # failure lives under it.  A failure of the world around the page
             # -- a dead gateway, a lost lease, a frontier fence that did not
@@ -6324,6 +6399,33 @@ class FBrefPipeline:
             # The failure manifest and the released observation above both
             # landed, so the next parse wave re-lists this raw (#1759).
             self._parse_deferrals[record.target_id] = deferrals + 1
+            # A later wave of the same raw can fail with another transient
+            # error; manifests written by the earlier one keep their error, so
+            # the card keeps every distinct pair, the latest last (#1915).
+            error = {
+                "error_class": type(exc).__name__,
+                "error_message": str(exc)[:2000],
+            }
+            previous = self._parse_carryovers.get(record.logical_refresh_id)
+            deferred_errors = [
+                row
+                for row in (previous or {}).get("deferred_errors", [])
+                if row != error
+            ][-MAX_PARSE_DEFERRALS_PER_TARGET:] + [error]
+            self._parse_carryovers[record.logical_refresh_id] = {
+                "logical_refresh_id": record.logical_refresh_id,
+                "target_id": record.target_id,
+                "content_hash": record.content_hash,
+                "raw_manifest_key": self.raw_store.fetch_manifest_key(
+                    record.logical_refresh_id
+                ),
+                "parser_version": observation_lease.parser_version,
+                "typed_parser_version": observation_lease.typed_parser_version,
+                "stateful_parser_version": observation_lease.stateful_parser_version,
+                **error,
+                "deferred_errors": deferred_errors,
+                "reason": "deadline_after_transient_trino_failure",
+            }
             logger.warning(
                 "Deferred %s to a later parse wave after transient Trino "
                 "failure %d/%d: %s: %s",
@@ -6367,9 +6469,11 @@ class FBrefPipeline:
         stateful_run_type: str,
         typed_batch_counts: Optional[Mapping[str, int]] = None,
         progress: Optional[dict[str, int]] = None,
+        processing_work_seconds: Optional[float] = None,
     ) -> _ProcessedObservation:
         """Finish one supplied lease under an already-held frontier verdict."""
 
+        work_started = self.stage_clock()
         typed_page = record.page_kind in {
             "schedule",
             "season",
@@ -6413,7 +6517,7 @@ class FBrefPipeline:
                             typed_match.datasets,
                             persisted=typed_batch_counts,
                         )
-                        self._record_typed_completion(record)
+                        self._record_typed_completion(record, has_score=typed_match.has_score)
                 else:
                     if self._typed_context(record) is None:
                         raise TypedBronzeError(
@@ -6450,6 +6554,14 @@ class FBrefPipeline:
             observation_lease,
             typed_status=typed_status,
             stateful_status=stateful_status,
+            processing_work_ms=(
+                None
+                if processing_work_seconds is None
+                else math.ceil(
+                    (processing_work_seconds + self.stage_clock() - work_started)
+                    * 1000
+                )
+            ),
         )
         return _ProcessedObservation(
             parsed=1,
@@ -6474,13 +6586,30 @@ class FBrefPipeline:
         match_id: Optional[str] = None,
         generic_persisted: bool = False,
         recover_cross_run: bool = False,
+        processing_work_seconds: Optional[float] = None,
     ) -> _ProcessedObservation:
         """Persist and finish an already-claimed observation without I/O."""
 
+        work_started = self.stage_clock()
         prepared_page = page
         try:
             if prepared_page is None:
                 prepared_page = self._parse_generic(html, record)
+            # A scored match shell must request fresh raw before generic
+            # contract rejection can send it to the dead-letter quarantine.
+            if record.page_kind == "match" and prepared_page.errors:
+                if typed_match is None:
+                    typed_match, match_id, typed_context = self._parse_typed_match(
+                        html, record
+                    )
+                if any(
+                    dataset.error_type == "IncompleteMatchPageError"
+                    for dataset in typed_match.datasets.values()
+                ):
+                    self._record_typed_results(
+                        record, typed_match.datasets, persisted=None
+                    )
+                    raise IncompleteMatchPageError("Scored match has no events or lineups")
         except Exception as exc:
             return self._failed_claimed_observation(
                 record=record,
@@ -6534,6 +6663,11 @@ class FBrefPipeline:
                     stateful_run_id=stateful_run_id,
                     stateful_run_type=stateful_run_type,
                     progress=progress,
+                    processing_work_seconds=(
+                        None
+                        if processing_work_seconds is None
+                        else processing_work_seconds + self.stage_clock() - work_started
+                    ),
                 )
         except Exception as exc:
             return self._failed_claimed_observation(
@@ -6596,7 +6730,9 @@ class FBrefPipeline:
                 cohort_cells = 0
 
         for item in materialized:
+            work_started = self.stage_clock()
             item_cells = self._match_item_cells(item)
+            item = self._add_shared_processing_work([item], work_started)[0]
             if item.page.errors or item.typed_match.has_errors:
                 flush_cohort()
                 outcomes.append(
@@ -6665,7 +6801,9 @@ class FBrefPipeline:
                 cohort_cells = 0
 
         for item in materialized:
+            work_started = self.stage_clock()
             item_cells = self._generic_item_cells(item)
+            item = self._add_shared_processing_work([item], work_started)[0]
             # A page with parser errors writes error evidence instead of rows,
             # which the batch writer rejects outright; oversized pages keep
             # their own write so one page cannot blow the cohort's cell bound.
@@ -6687,9 +6825,37 @@ class FBrefPipeline:
         flush_cohort()
         return outcomes
 
+    def _add_shared_processing_work(self, items, started):
+        """Keep a measurement only when the operation belongs to one page."""
+        elapsed = self.stage_clock() - started
+        return [
+            replace(
+                item,
+                processing_work_seconds=(
+                    None
+                    if len(items) != 1 or item.processing_work_seconds is None
+                    else item.processing_work_seconds + elapsed
+                ),
+            )
+            for item in items
+        ]
+
+    def _process_prepared_observations(self, items, process_batch, *, sample_timing):
+        outcomes = []
+        if sample_timing and len(items) > 1:
+            # Shared writes cannot measure one page's work. Persist one
+            # prepared page alone, retaining its measured preparation work.
+            outcomes.append(
+                self._process_claimed_observation(**items[0].sequential_args())
+            )
+            items = items[1:]
+        outcomes.extend(process_batch(items))
+        return outcomes
+
     def _persist_and_finish_generic_batch(
         self, items: Sequence[_ClaimedGenericObservation]
     ) -> list[_ProcessedObservation]:
+        work_started = self.stage_clock()
         try:
             generic_counts = self.generic_writer.persist_pages(
                 [
@@ -6707,6 +6873,7 @@ class FBrefPipeline:
                     "Generic batch returned misaligned item counts"
                 )
         except Exception:
+            items = self._add_shared_processing_work(items, work_started)
             # The writer may have committed a prefix. Re-run each page
             # sequentially: same lease, same immutable raw, idempotent write.
             return [
@@ -6714,8 +6881,10 @@ class FBrefPipeline:
                 for item in items
             ]
 
+        items = self._add_shared_processing_work(items, work_started)
         outcomes: list[_ProcessedObservation] = []
         for item in items:
+            work_started = self.stage_clock()
             # The per-page path records these right after its own write; the
             # cohort has to do it here, or the pages it wrote carry no dataset
             # manifests.
@@ -6731,6 +6900,7 @@ class FBrefPipeline:
                     )
                 )
                 continue
+            item = self._add_shared_processing_work([item], work_started)[0]
             outcomes.append(
                 self._process_claimed_observation(
                     **item.sequential_args(generic_persisted=True)
@@ -6741,6 +6911,7 @@ class FBrefPipeline:
     def _persist_and_finish_match_batch(
         self, items: Sequence[_ClaimedMatchObservation]
     ) -> list[_ProcessedObservation]:
+        work_started = self.stage_clock()
         try:
             generic_counts = self.generic_writer.persist_pages(
                 [
@@ -6758,6 +6929,7 @@ class FBrefPipeline:
                     "Generic batch returned misaligned item counts"
                 )
         except Exception:
+            items = self._add_shared_processing_work(items, work_started)
             # The generic writer may have committed a prefix. Re-run each
             # parsed page idempotently, using the same lease and immutable raw.
             return [
@@ -6765,9 +6937,11 @@ class FBrefPipeline:
                 for item in items
             ]
 
+        items = self._add_shared_processing_work(items, work_started)
         outcomes: dict[str, _ProcessedObservation] = {}
         active_items = []
         for item in items:
+            work_started = self.stage_clock()
             try:
                 self._record_generic_table_results(item.record, item.page)
             except Exception as exc:
@@ -6780,11 +6954,14 @@ class FBrefPipeline:
                     )
                 )
             else:
-                active_items.append(item)
+                active_items.extend(
+                    self._add_shared_processing_work([item], work_started)
+                )
         finish_failures: list[
             tuple[_ClaimedMatchObservation, Exception, dict[str, int]]
         ] = []
         lock_errors: list[Exception] = []
+        work_started = self.stage_clock()
         with _captured_exit_stack(lock_errors) as stack:
             # One control transaction for the whole cohort: per-match guards
             # took one Postgres connection each, and 25 of them overran the
@@ -6835,6 +7012,7 @@ class FBrefPipeline:
                 except Exception as exc:
                     batch_error = exc
 
+            active_items = self._add_shared_processing_work(active_items, work_started)
             for item in active_items:
                 verdict = verdicts[item.record.target_id]
                 if verdict is None:
@@ -6875,6 +7053,7 @@ class FBrefPipeline:
                             stateful_run_type=item.stateful_run_type,
                             typed_batch_counts=typed_counts,
                             progress=progress,
+                            processing_work_seconds=item.processing_work_seconds,
                         )
                     )
                 except Exception as exc:
@@ -7004,6 +7183,7 @@ class FBrefPipeline:
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
         result.dead_lettered += outcome.dead_lettered
+        result.incomplete_match_refetches += outcome.incomplete_match_refetches
         result.deferred_parse_failures.extend(outcome.deferred_parse_failures)
         result.failures.extend(outcome.failures)
 
@@ -7105,7 +7285,7 @@ class FBrefPipeline:
             control=replay_control,
         )
         self._record_typed_completion(
-            item.record, control=replay_control
+            item.record, control=replay_control, has_score=item.typed_match.has_score
         )
         self._record_page_completion(
             item.record,
@@ -7478,6 +7658,7 @@ class FBrefPipeline:
             return item_stateful_run_id, item_stateful_run_type
 
         def process_sequential_item(item):
+            work_started = self.stage_clock()
             try:
                 claimed = self._load_and_claim_observation(item)
             except Exception as exc:
@@ -7500,12 +7681,28 @@ class FBrefPipeline:
                 stateful_run_id=item_run_id,
                 stateful_run_type=item_run_type,
                 recover_cross_run=_recover_cross_run,
+                processing_work_seconds=self.stage_clock() - work_started,
             )
             self._merge_processed_result(result, outcome)
+
+        timing_sampled = False
+
+        def process_prepared_items(prepared, process_batch):
+            nonlocal timing_sampled
+            outcomes = self._process_prepared_observations(
+                prepared,
+                process_batch,
+                sample_timing=not timing_sampled and self.batch_persist_matches > 1,
+            )
+            if len(prepared) > 1:
+                timing_sampled = True
+            for outcome in outcomes:
+                self._merge_processed_result(result, outcome)
 
         def flush_match_items(buffer):
             prepared: list[_ClaimedMatchObservation] = []
             for item in buffer:
+                work_started = self.stage_clock()
                 try:
                     claimed = self._load_and_claim_observation(item)
                 except Exception as exc:
@@ -7541,6 +7738,7 @@ class FBrefPipeline:
                     self._merge_processed_result(result, outcome)
                     continue
                 prepared.append(_ClaimedMatchObservation(
+                    processing_work_seconds=self.stage_clock() - work_started,
                     run_id=run_id,
                     html=html,
                     record=record,
@@ -7552,12 +7750,12 @@ class FBrefPipeline:
                     stateful_run_id=item_run_id,
                     stateful_run_type=item_run_type,
                 ))
-            for outcome in self._process_claimed_match_batch(prepared):
-                self._merge_processed_result(result, outcome)
+            process_prepared_items(prepared, self._process_claimed_match_batch)
 
         def flush_generic_items(buffer):
             prepared: list[_ClaimedGenericObservation] = []
             for item in buffer:
+                work_started = self.stage_clock()
                 try:
                     claimed = self._load_and_claim_observation(item)
                 except Exception as exc:
@@ -7589,6 +7787,7 @@ class FBrefPipeline:
                     self._merge_processed_result(result, outcome)
                     continue
                 prepared.append(_ClaimedGenericObservation(
+                    processing_work_seconds=self.stage_clock() - work_started,
                     run_id=run_id,
                     html=html,
                     record=record,
@@ -7598,8 +7797,7 @@ class FBrefPipeline:
                     stateful_run_type=item_run_type,
                     recover_cross_run=_recover_cross_run,
                 ))
-            for outcome in self._process_claimed_generic_batch(prepared):
-                self._merge_processed_result(result, outcome)
+            process_prepared_items(prepared, self._process_claimed_generic_batch)
 
         if not self.batch_persist_enabled:
             for item in fetches:
@@ -7631,6 +7829,12 @@ class FBrefPipeline:
                 if len(generic_buffer) == self.batch_persist_matches:
                     flush_buffers(matches=False, generic=True)
             flush_buffers(matches=True, generic=True)
+        for item in fetches:
+            carryover = self._parse_carryovers.get(str(item["logical_refresh_id"]))
+            if carryover is not None:
+                # Raw may belong to a failed attempt recovered by this cohort's
+                # successful attempt. Carryover must fence the successful one.
+                carryover["attempt_id"] = str(item["attempt_id"])
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_deferred_parse_failures(result):
@@ -7964,6 +8168,10 @@ class FBrefPipeline:
             ):
                 errors.append("replay_candidates_remaining")
         if not isolated_acceptance:
+            if ("frontier_gender_total" not in summary
+                or "frontier_gender_classified" not in summary
+                or summary["frontier_gender_total"] != summary["frontier_gender_classified"]):
+                errors.append("frontier_gender_classification_incomplete")
             if int(summary.get("female_downstream_targets") or 0) != 0:
                 errors.append("female_downstream_targets_nonzero")
             if int(summary.get("unknown_gender_downstream_targets") or 0) != 0:

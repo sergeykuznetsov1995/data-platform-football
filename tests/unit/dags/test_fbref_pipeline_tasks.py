@@ -3933,3 +3933,25 @@ def test_history_guard_normalizes_utc_and_rolls_day():
     )
     assert verdict["ingest_window_start"] == "2026-10-02T00:00:00+00:00"
     assert verdict["deadline"] == "2026-10-01T23:15:00+00:00"
+
+
+@pytest.mark.unit
+def test_1325_squad_freshness_is_optional_but_enforced_when_present(monkeypatch):
+    from airflow.exceptions import AirflowFailException
+    summary = _freshness_summary()
+    squad = {"sla_seconds": 28*86400, "total_targets": 0, "fresh_targets": 0,
+             "stale_targets": 0, "never_fetched_targets": 0,
+             "aged_targets": 0, "stale_never_fetched_targets": 0}
+    summary["freshness_by_page_kind"]["squad"] = squad
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control))
+    assert "squad" in fbref_pipeline_tasks.FBREF_PUBLICATION_CURRENT_PAGE_KINDS
+    assert fbref_pipeline_tasks.FBREF_CURRENT_SCOPE_FRESHNESS_HOURS["squad"] == 28*24
+    assert fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        run_type="backfill", airflow_run_id="test1325", dag_id="dag_backfill_fbref"
+    )["status"] == "passed"
+    # The strict historical gate rejects real aged squad evidence.
+    squad.update(total_targets=1, stale_targets=1, aged_targets=1)
+    with pytest.raises(AirflowFailException, match="squad"):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(run_type="backfill", airflow_run_id="test1325", dag_id="dag_backfill_fbref")

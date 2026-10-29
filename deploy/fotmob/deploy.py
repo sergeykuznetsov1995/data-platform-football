@@ -2,7 +2,7 @@
 """Deploy and admit the isolated FotMob Airflow stack.
 
 Admission is deliberately fail-closed: the scheduler must be healthy, its
-DagBag must contain exactly the six FotMob DAGs, and import errors must be empty
+DagBag must contain exactly the seven FotMob DAGs, and import errors must be empty
 before any DAG is unpaused.  A JSON report is written for every attempt.
 """
 
@@ -42,9 +42,11 @@ EXPECTED_DAGS = frozenset(
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
         "dag_collect_fotmob_players",
+        "dag_refresh_fotmob_c1",
     }
 )
 EXPECTED_DAG_FILES = {
+    "dag_refresh_fotmob_c1": "/opt/airflow/dags/dag_refresh_fotmob_c1.py",
     "dag_orchestrate_fotmob": "/opt/airflow/dags/dag_orchestrate_fotmob.py",
     "dag_ingest_fotmob": "/opt/airflow/dags/dag_ingest_fotmob.py",
     "dag_trigger_fotmob_daily": "/opt/airflow/dags/dag_trigger_fotmob_daily.py",
@@ -61,6 +63,7 @@ EXPECTED_SCHEDULES = {
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
     "dag_collect_fotmob_players": "None",
+    "dag_refresh_fotmob_c1": "15 * * * *",
 }
 AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
 LEGACY_OWNER_DAGS = frozenset(
@@ -71,6 +74,9 @@ LEGACY_OWNER_DAGS = frozenset(
         "dag_collect_fotmob_players",
     }
 )
+# C1 requires separate approval after bootstrap; ordinary admission keeps it paused.
+PAUSED_SERVICE_DAGS = frozenset({"dag_refresh_fotmob_c1"})
+AUTOMATIC_PAUSED_DAGS = LEGACY_OWNER_DAGS | PAUSED_SERVICE_DAGS
 AUTOMATIC_ACTIVE_DAGS = frozenset(
     {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob"}
 )
@@ -149,6 +155,7 @@ ISOLATED_DAG_ROOT_PATHS = {
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
     "dags/dag_collect_fotmob_players.py",
+    "dags/dag_refresh_fotmob_c1.py",
 }
 ISOLATED_DAG_PREFIXES = (
     "dags/scripts/",
@@ -169,6 +176,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
     "dags/dag_collect_fotmob_players.py",
+    "dags/dag_refresh_fotmob_c1.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
     "dags/dag_trigger_fotmob_daily.py",
@@ -193,6 +201,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/match_refresh.py",
     "scrapers/fotmob/player_collector.py",
     "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",
@@ -567,8 +576,8 @@ def _commit_trigger_activation(
         # This is the exact state at the durable transition cut.  Resume owns
         # the subsequent idempotent unpauses; pending is not a false active
         # snapshot while the daily trigger is still paused.
-        "paused": [ISOLATED_DAILY_DAG_ID],
-        "unpaused": sorted(EXPECTED_DAGS - {ISOLATED_DAILY_DAG_ID}),
+        "paused": sorted(PAUSED_SERVICE_DAGS | {ISOLATED_DAILY_DAG_ID}),
+        "unpaused": sorted(EXPECTED_DAGS - PAUSED_SERVICE_DAGS - {ISOLATED_DAILY_DAG_ID}),
         "schedule_boundary": schedule_boundary,
         "activation_safety_window": safety_window,
         "scheduled_activation": {
@@ -698,6 +707,7 @@ def prepare_dagbag(release_root: Path, evidence_dir: Path, sha: str) -> Path:
     """Create/reuse an exact read-only projection that masks image-baked DAGs."""
 
     sources = {
+        "dag_refresh_fotmob_c1.py": release_root / "dags/dag_refresh_fotmob_c1.py",
         "dag_orchestrate_fotmob.py": release_root
         / "dags/dag_orchestrate_fotmob.py",
         "dag_ingest_fotmob.py": release_root / "dags/dag_ingest_fotmob.py",
@@ -1034,7 +1044,7 @@ def atomic_automatic_writer_transition(
     selected_date: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Validate and update all six DagModel rows in one metadata transaction."""
+    """Validate and update all seven DagModel rows in one metadata transaction."""
 
     if phase not in {"children", "owner", "pause_all"}:
         raise DeploymentError("unknown automatic writer transition")
@@ -1056,7 +1066,7 @@ from sqlalchemy import text
 
 ids = {sorted(EXPECTED_DAGS)!r}
 active_ids = {sorted(AUTOMATIC_ACTIVE_DAGS)!r}
-legacy_ids = {sorted(LEGACY_OWNER_DAGS)!r}
+legacy_ids = {sorted(AUTOMATIC_PAUSED_DAGS)!r}
 phase = {phase!r}
 selected_date = {selected_date!r}
 s = Session()
@@ -1065,7 +1075,7 @@ try:
     models = s.query(DagModel).filter(DagModel.dag_id.in_(ids)).with_for_update().all()
     by_id = {{model.dag_id: model for model in models}}
     if set(by_id) != set(ids):
-        raise RuntimeError('exact six DagModel rows are required')
+        raise RuntimeError('exact seven DagModel rows are required')
     run_rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
         DagRun.dag_id.in_(ids), DagRun.state.in_(('running', 'queued'))
     ).with_for_update().all()
@@ -1116,7 +1126,7 @@ try:
         for dag_id in ids
     )
     if phase == 'children' and not all_paused:
-        raise RuntimeError('children transition requires all six paused')
+        raise RuntimeError('children transition requires all seven paused')
     if phase == 'owner' and not children_shape:
         raise RuntimeError('owner transition has unexpected pause shape')
     for dag_id, model in by_id.items():
@@ -1177,7 +1187,7 @@ def inspect_automatic_writer_pause_shape(
     expected_paused: set[str] | None,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Read all six live DagModel rows without trusting the report snapshot."""
+    """Read all seven live DagModel rows without trusting the report snapshot."""
 
     if expected_paused is not None and not expected_paused.issubset(EXPECTED_DAGS):
         raise DeploymentError("automatic writer pause expectation is invalid")
@@ -1975,8 +1985,8 @@ def _continue_pending_consumer_activation(
             **pending,
             "generated_at": _now(),
             "activation_state": "active",
-            "paused": [],
-            "unpaused": sorted(EXPECTED_DAGS),
+            "paused": sorted(PAUSED_SERVICE_DAGS),
+            "unpaused": sorted(EXPECTED_DAGS - PAUSED_SERVICE_DAGS),
             "scheduled_activation": activation,
         }
         _validate_active_scheduled_proof(
@@ -2532,6 +2542,7 @@ active_ids = (
     'dag_refresh_fotmob',
     'dag_backfill_fotmob',
     'dag_collect_fotmob_players',
+    'dag_refresh_fotmob_c1',
     'dag_orchestrate_fotmob',
 )
 pause_rows = s.query(DagModel.dag_id, DagModel.is_paused).filter(
@@ -2867,6 +2878,7 @@ s.close()
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
             "dag_collect_fotmob_players",
+            "dag_refresh_fotmob_c1",
             "dag_orchestrate_fotmob",
         )
     }
@@ -2942,7 +2954,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--automatic-catalog",
         action="store_true",
-        help="Prepare the six-DAG automatic catalog rollout (must stay paused)",
+        help="Prepare the seven-DAG automatic catalog rollout (must stay paused)",
     )
     parser.add_argument(
         "--activate-automatic",
@@ -3180,8 +3192,8 @@ def _validate_pending_report(payload: Mapping[str, Any]) -> dict[str, str]:
     }
     if (
         payload.get("kept_paused") is not False
-        or payload.get("paused") != [ISOLATED_DAILY_DAG_ID]
-        or payload.get("unpaused") != sorted(EXPECTED_DAGS - {ISOLATED_DAILY_DAG_ID})
+        or payload.get("paused") != sorted(PAUSED_SERVICE_DAGS | {ISOLATED_DAILY_DAG_ID})
+        or payload.get("unpaused") != sorted(EXPECTED_DAGS - PAUSED_SERVICE_DAGS - {ISOLATED_DAILY_DAG_ID})
         or not isinstance(activation, Mapping)
         or frozenset(activation_fields) not in allowed_activation_fields
         or activation.get("status") != "pending"
@@ -3261,8 +3273,8 @@ def resume_pending_activation(
         if (
             payload.get("passed") is not True
             or payload.get("kept_paused") is not False
-            or payload.get("paused") != []
-            or set(payload.get("unpaused") or ()) != EXPECTED_DAGS
+            or payload.get("paused") != sorted(PAUSED_SERVICE_DAGS)
+            or set(payload.get("unpaused") or ()) != EXPECTED_DAGS - PAUSED_SERVICE_DAGS
         ):
             raise DeploymentError("active report has no exact scheduled handoff proof")
         expected = _validated_commit_boundary(payload)
@@ -3773,7 +3785,7 @@ def deploy(
                 "dag_ingest_fotmob",
             ):
                 airflow("dags", "unpause", dag_id)
-            assert_paused({"dag_trigger_fotmob_daily"})
+            assert_paused(PAUSED_SERVICE_DAGS | {"dag_trigger_fotmob_daily"})
             if active_runs():
                 raise DeploymentError(
                     "isolated stack gained an active run before schedule admission"
@@ -3984,7 +3996,7 @@ def activate_automatic_catalog(
             raise DeploymentError(str(exc)) from exc
         inspect_automatic_writer_pause_shape(
             isolated_container,
-            expected_paused=set(LEGACY_OWNER_DAGS),
+            expected_paused=set(AUTOMATIC_PAUSED_DAGS),
             run=run,
         )
         atomic_shared_consumer_transition(
@@ -4083,7 +4095,7 @@ def activate_automatic_catalog(
                 run=run,
             )
             active_pause_shape = {
-                dag_id: dag_id in LEGACY_OWNER_DAGS
+                dag_id: dag_id in AUTOMATIC_PAUSED_DAGS
                 for dag_id in sorted(EXPECTED_DAGS)
             }
             if resume_snapshot["pause_states"] == active_pause_shape:
@@ -4162,7 +4174,7 @@ def activate_automatic_catalog(
                     "passed": True,
                     "activation_state": "active",
                     "kept_paused": False,
-                    "paused": sorted(LEGACY_OWNER_DAGS),
+                    "paused": sorted(AUTOMATIC_PAUSED_DAGS),
                     "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
                     "automatic_rollout": {
                         **dict(rollout),
@@ -4302,7 +4314,7 @@ def activate_automatic_catalog(
                         "passed": True,
                         "activation_state": "active",
                         "kept_paused": False,
-                        "paused": sorted(LEGACY_OWNER_DAGS),
+                        "paused": sorted(AUTOMATIC_PAUSED_DAGS),
                         "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
                         "automatic_rollout": {
                             **dict(rollout),
@@ -4408,7 +4420,7 @@ def activate_automatic_catalog(
             "passed": True,
             "activation_state": "pending_automatic",
             "kept_paused": False,
-            "paused": sorted(LEGACY_OWNER_DAGS | {AUTOMATIC_OWNER_DAG_ID}),
+            "paused": sorted(AUTOMATIC_PAUSED_DAGS | {AUTOMATIC_OWNER_DAG_ID}),
             "unpaused": sorted(
                 AUTOMATIC_ACTIVE_DAGS - {AUTOMATIC_OWNER_DAG_ID}
             ),
@@ -4466,7 +4478,7 @@ def activate_automatic_catalog(
             "generated_at": _now(),
             "activation_state": "active",
             "kept_paused": False,
-            "paused": sorted(LEGACY_OWNER_DAGS),
+            "paused": sorted(AUTOMATIC_PAUSED_DAGS),
             "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
             "automatic_rollout": {
                 **dict(pending["automatic_rollout"]),
@@ -4519,7 +4531,7 @@ def activate_automatic_catalog(
                     run=run,
                 )
                 active_pause_shape = {
-                    dag_id: dag_id in LEGACY_OWNER_DAGS
+                    dag_id: dag_id in AUTOMATIC_PAUSED_DAGS
                     for dag_id in sorted(EXPECTED_DAGS)
                 }
                 if observed_owner.get("pause_states") == active_pause_shape:
@@ -4544,7 +4556,7 @@ def activate_automatic_catalog(
                 "passed": False,
                 "activation_state": "pending_automatic",
                 "kept_paused": False,
-                "paused": sorted(LEGACY_OWNER_DAGS),
+                "paused": sorted(AUTOMATIC_PAUSED_DAGS),
                 "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
                 "error": f"{type(exc).__name__}: {exc}",
                 "recovery_required": True,
@@ -4579,7 +4591,7 @@ def activate_automatic_catalog(
                 "passed": False,
                 "activation_state": "pending_automatic",
                 "kept_paused": False,
-                "paused": sorted(LEGACY_OWNER_DAGS | {AUTOMATIC_OWNER_DAG_ID}),
+                "paused": sorted(AUTOMATIC_PAUSED_DAGS | {AUTOMATIC_OWNER_DAG_ID}),
                 "unpaused": sorted(
                     AUTOMATIC_ACTIVE_DAGS - {AUTOMATIC_OWNER_DAG_ID}
                 ),

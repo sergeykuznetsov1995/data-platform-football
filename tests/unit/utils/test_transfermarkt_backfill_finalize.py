@@ -796,3 +796,24 @@ def test_corrupt_old_complete_batch_attestation_blocks_final_campaign_close(
     assert repository.campaign.report_uri is None
     assert repository.batch.status is state.BatchStatus.COMPLETE
     assert repository.batch.platform_incidents[-1].phase == "campaign_completion"
+
+
+@pytest.mark.parametrize('parser,schema', [('v2', '2'), ('registry-v2', '4'), ('registry-v2', '2')])
+def test_manifest_revision_pairs_support_historical_recovery(monkeypatch, parser, schema):
+    campaign, scope, _batch = _campaign_and_claim()
+    manifest = SimpleNamespace(
+        validate=lambda _entities: None, digest='digest',
+        dq_evidence={'silver_trigger_allowed': False, 'standing_policy_hash': campaign.policy_sha256},
+        scope_id=scope.target.scope_id, competition_id=scope.target.competition_id,
+        edition_id=scope.target.edition_id, canonical_competition_id=scope.target.canonical_competition_id,
+        canonical_season=scope.target.canonical_season, registry_snapshot_id=campaign.registry_snapshot_id,
+        parser_revision=parser, schema_revision=schema,
+    )
+    monkeypatch.setattr(finalize.ScopeManifest, 'from_mapping', staticmethod(lambda _value: manifest))
+    if (parser, schema) == ('registry-v2', '2'):
+        with pytest.raises(finalize.BackfillFinalizeError, match='parser/schema'):
+            finalize._validated_manifest({'manifest_digest': 'digest'}, policy_sha256=campaign.policy_sha256,
+                                         campaign=campaign, scope=scope)
+    else:
+        assert finalize._validated_manifest({'manifest_digest': 'digest'}, policy_sha256=campaign.policy_sha256,
+                                             campaign=campaign, scope=scope) is manifest

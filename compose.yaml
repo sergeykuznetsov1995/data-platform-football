@@ -1035,17 +1035,21 @@ services:
     deploy:
       resources:
         limits:
-          # 5G caused silent memcg-OOM restarts every 20-50 min under bronze
-          # write load (#847): JVM RSS = 3.5G heap + parquet/direct buffers +
-          # metaspace + code cache > 5G; the kernel kills java, the launcher
-          # (PID 1) exits 0, so Docker never sets OOMKilled — it looks like an
-          # external restart. 8G left ~4G native headroom over the 4G heap
-          # (configs/trino/jvm.config) — but OpenMetadata table profiling
-          # (heavy profile) pushed RSS to 8.3G and OOM'd twice; 12G covers the
-          # profiling-driven off-heap spikes.
-          memory: 12G
+          # The former 5G limit caused silent memcg-OOM restarts every 20-50
+          # min under bronze write load (#847): heap + parquet/direct buffers +
+          # metaspace + code cache exceeded the cgroup; the kernel kills java,
+          # the launcher (PID 1) exits 0, so Docker never sets OOMKilled — it
+          # looks like an external restart. 12G then sat at the ceiling again
+          # under 8 parallel bronze writers (10.8G RSS + 1G swapped, #1937).
+          # 20G leaves ~10G native/off-heap room around the 10G JVM heap
+          # (configs/trino/jvm.config). Applied live 29.10.2026 via
+          # `docker update --memory 20g --memory-swap 20g trino`.
+          memory: 20G
         reservations:
           memory: 1G
+    # Docker MemorySwap is memory + swap; equal to memory = no swap for the JVM
+    # (a swapped heap turns every GC into a multi-second stall).
+    memswap_limit: 20G
 
   # ===========================================================================
   # Superset - BI / Dashboards

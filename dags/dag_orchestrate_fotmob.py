@@ -173,7 +173,8 @@ def _ingest_child_observations(
                 # упавшая в 23:55, держит паузу и после полуночи, а волна, начатая
                 # вчера, может кончиться сегодня. Ограничивать паузу возрастом старта
                 # нечем: жёсткий таймаут 15 ч накрывает только scrape_fotmob_data, а
-                # дальше ран ждёт Silver — общего потолка длительности у DagRun нет.
+                # дальше идут валидация и публикация Bronze — общего потолка
+                # длительности у DagRun нет.
                 or_(
                     DagRun.start_date >= day_start,
                     DagRun.end_date >= observed_at - FAILURE_BACKOFF,
@@ -720,10 +721,10 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
             allowed_states=["success"],
             failed_states=["failed"],
             reset_dag_run=False,
-            # Родитель ждёт ребёнка, поэтому его таймаут обязан быть длиннее
-            # CHILD_TIMEOUT_MINUTES (15 ч) — иначе первым падает ожидание, а живой
-            # ребёнок остаётся сиротой и продолжает писать в bronze.
-            execution_timeout=timedelta(hours=16),
+            # Покрывает весь ingest: scraper 15 ч + служебные задачи в общем
+            # однослотовом пуле и повторы 16 ч 10 мин + резерв планирования
+            # 50 мин. Иначе ожидание падает раньше ребёнка, пишущего в Bronze.
+            execution_timeout=timedelta(hours=32),
             retries=0,
         )
 

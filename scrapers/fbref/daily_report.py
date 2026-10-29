@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from urllib.parse import urlparse
 from scrapers.fbref.report_observations import played_score
+from scrapers.fbref.policy import CURRENT_ENRICHMENT, PUBLICATION_FRESHNESS_PAGE_KINDS
 
 REPORT_VERSION = "fbref-daily-v1"
 EXCLUDED_IDS = {"Big5", "850", "851", "852", "853"}
@@ -110,6 +111,51 @@ def _scope(snapshot: Mapping) -> tuple[dict, set, list]:
     return adults, pairs, gaps
 
 
+def _day_comparator_scope(snapshot: Mapping, pairs: set, day: date) -> tuple[set, list]:
+    """Keep every current pair without positive evidence of edition closure.
+
+    A year in the registry, a fresh schedule fetch and empty day windows do
+    not establish closure. The snapshot has no authoritative edition bounds
+    or complete tournament catalogue, so it cannot justify exclusions.
+    """
+    return pairs, []
+
+
+def _edition_token(key: object) -> str | None:
+    # Detection only: this never makes an unknown phase an accepted alias.
+    return season_token(str(key or "").split(" - ", 1)[0])
+
+
+def _fotmob_season_keys(entry: Mapping, fid: object, sid: str) -> set[str]:
+    # Only exact, competition-specific aliases are allowed. Never strip phases
+    # globally or assume that an absent phase has been fetched successfully.
+    aliases = entry.get("season_keys", {}).get(sid, {}).get(str(fid))
+    return set(aliases) if aliases else set()
+
+
+def _confirmation(row: Mapping, as_of: datetime) -> datetime | None:
+    try:
+        fetched = instant(row.get("fetched_at"))
+        validated = instant(row.get("validated_at") or row.get("fetched_at"))
+    except (ValueError, TypeError):
+        return None
+    if row.get("stale") or fetched is None or validated is None:
+        return None
+    return validated if fetched <= validated <= as_of else None
+
+
+def _without_reference(entry: Mapping, as_of: datetime) -> bool:
+    # An empty ID list alone is still a mapping defect. This explicit decision
+    # is backed by the owner's complete source catalogue, dated for audit.
+    try:
+        evidence_date = date.fromisoformat(entry.get("reference_evidence_date", ""))
+    except (ValueError, TypeError):
+        return False
+    return (entry.get("reference_coverage") == "absent_from_fotmob_catalog"
+            and bool(entry.get("reference_evidence")) and evidence_date <= as_of.date()
+            and not entry.get("fotmob_ids"))
+
+
 def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                    as_of: datetime) -> tuple[dict, list]:
     counts = Counter()
@@ -124,22 +170,73 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
         entry = mapping.get(cid, {})
         ids = entry.get("fotmob_ids", [])
         if not ids:
-            problems.append({"competition_id": cid, "reason": entry.get("reason", "unmapped")})
+            if _without_reference(entry, as_of):
+                continue
+            problems.append({"competition_id": cid, "reason": "unmapped_fotmob_competition",
+                             "detail": entry.get("reason", "unmapped")})
             continue
         seen = set()
         valid = True
         for fid in ids:
-            available = [s for s in seasons if str(s["competition_id"]) == str(fid)
-                         and season_token(s.get("season_key")) == canonical_season]
-            fresh = [s for s in available if instant(s.get("fetched_at")) is not None
-                     and timedelta(0) <= as_of - instant(s["fetched_at"]) <= timedelta(hours=24)]
-            if not fresh:
-                problems.append({"competition_id": cid, "fotmob_id": str(fid),
-                                 "reason": "missing_or_stale_fotmob_season"})
+            aliases = _fotmob_season_keys(entry, fid, sid)
+            def matches_season(key):
+                return key in aliases if aliases else season_token(key) == canonical_season
+            known_keys = {str(r.get("season_key") or "")
+                          for r in [*seasons, *fixtures, *snapshot.get("fotmob_phase_catalog", [])]
+                          if str(r["competition_id"]) == str(fid)}
+            newer = sorted(key for key in known_keys
+                           if _edition_token(key) and
+                           int(_edition_token(key)[-4:]) > int(canonical_season[-4:]))
+            if newer:
+                problems.append({"competition_id": cid, "season_id": sid,
+                                 "fotmob_id": str(fid), "reason": "fbref_registry_behind_fotmob",
+                                 "newer_season_keys": newer})
                 valid = False
-                continue
+            unknown_phases = sorted(key for key in known_keys
+                                    if (_edition_token(key) == canonical_season
+                                        or _edition_token(key) is None)
+                                    and not matches_season(key))
+            if unknown_phases:
+                problems.append({"competition_id": cid, "season_id": sid,
+                                 "fotmob_id": str(fid), "reason": "unknown_fotmob_season_phase",
+                                 "season_keys": unknown_phases})
+                valid = False
+            if aliases:
+                # Loaded seasons are not a complete phase catalogue. Require
+                # a fresh full discovery, then load/confirm ALL its phases.
+                catalog = [r for r in snapshot.get("fotmob_phase_catalog", [])
+                           if str(r["competition_id"]) == str(fid)]
+                latest_catalog = max((_confirmation(r, as_of) for r in catalog
+                                      if _confirmation(r, as_of) is not None), default=None)
+                catalog_keys = {str(r["season_key"]) for r in catalog
+                                if _confirmation(r, as_of) == latest_catalog}
+                edition_keys = {k for k in catalog_keys if _edition_token(k) == canonical_season}
+                if (latest_catalog is None or as_of - latest_catalog > timedelta(hours=24)
+                        or not edition_keys or not edition_keys <= aliases
+                        or any(_edition_token(k) is None for k in catalog_keys)):
+                    problems.append({"competition_id": cid, "season_id": sid,
+                                     "fotmob_id": str(fid),
+                                     "reason": "missing_or_incomplete_fotmob_phase_catalog",
+                                     "season_keys": sorted(edition_keys)})
+                    valid = False
+            # Every explicit phase must have its own fresh confirmation.
+            required = [{key} for key in sorted(aliases)] if aliases else [
+                {key for key in known_keys if matches_season(key)}]
+            for keys in required:
+                available = [s for s in seasons if str(s["competition_id"]) == str(fid)
+                             and s.get("season_key") in keys]
+                confirmations = [_confirmation(s, as_of) for s in available]
+                confirmations = [t for t in confirmations if t is not None]
+                latest = max(confirmations, default=None)
+                if latest is None or as_of - latest > timedelta(hours=24):
+                    problems.append({"competition_id": cid, "fotmob_id": str(fid), "season_id": sid,
+                                     "season_keys": sorted(keys),
+                                     "reason": "stale_fotmob_season" if latest else "missing_fotmob_season",
+                                     "last_confirmed_at": latest.isoformat() if latest else None,
+                                     "age_hours": (as_of-latest).total_seconds()/3600 if latest else None})
+                    valid = False
             for row in fixtures:
-                if str(row["competition_id"]) != str(fid) or season_token(row.get("season_key")) != canonical_season:
+                if str(row["competition_id"]) != str(fid) or not matches_season(row.get("season_key")):
                     continue
                 if row.get("finished") is not True or any(row.get(k) is True for k in ("cancelled", "awarded")) or str(row.get("postponed") or "").lower() not in {"", "false"}:
                     continue
@@ -154,6 +251,99 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                     seen.add((str(fid), str(row["match_id"])))
         counts[cid] = len(seen) if valid else None
     return dict(counts), problems
+
+
+def page_age_scope(snapshot: Mapping) -> tuple[set, set]:
+    adults, pairs, _ = _scope(snapshot)
+    active = {cid for cid,c in adults.items() if c.get("crawl_state") == "active"
+              and c.get("present") and c.get("lifecycle_state") in {"present", "missing_once"}}
+    return active, pairs
+
+
+def _page_age_result(by_kind, excluded, standings, errors):
+    total = sum(by_kind[k]["total"] for k in CURRENT_ENRICHMENT)
+    fresh = sum(by_kind[k]["fresh"] for k in CURRENT_ENRICHMENT)
+    return {"by_kind": by_kind, "total": total, "fresh": fresh,
+            "fresh_percent": 100*fresh/total if total else None, "excluded": dict(excluded),
+            "standings_confirmed_seasons": standings, "errors": list(errors)}
+
+
+def page_age_metrics(snapshot: Mapping, as_of: datetime) -> dict:
+    aggregate = snapshot.get("page_ages")
+    excluded = Counter(snapshot.get("page_age_exclusions") or {})
+    errors = list(snapshot.get("page_age_errors", []))
+    if isinstance(aggregate, Mapping) and "by_kind" in aggregate:
+        if instant(aggregate["cutoff"]) == instant(as_of):
+            excluded.update(aggregate["excluded"])
+            return _page_age_result(dict(sorted(aggregate["by_kind"].items())), excluded,
+                                    aggregate["standings_confirmed_seasons"], errors)
+        # A saved aggregate cannot be aged again, unlike a row snapshot.
+        errors.append({"source": "fbref_page_ages", "reason": "aggregate_cutoff_mismatch"})
+        snapshot = dict(snapshot, page_ages=[])
+    active, pairs = page_age_scope(snapshot)
+    buckets = {kind: [] for kind in PUBLICATION_FRESHNESS_PAGE_KINDS}
+    seen = set()
+    standings = {(r["target_id"], r["content_hash"]) for r in snapshot.get("standings_inventory", [])}
+    standings_confirmed = 0
+    for row in snapshot.get("page_ages", []):
+        if row["target_id"] in seen:
+            continue
+        seen.add(row["target_id"])
+        kind = row["page_kind"]
+        buckets.setdefault(kind, [])
+        reason = None
+        if row.get("state") in {"quarantined", "dead", "skipped"}:
+            reason = row["state"]
+        elif row.get("refresh_policy") == "historical_once":
+            reason = "history"
+        elif kind == "squad" and any(part in {"matchlogs", "goallogs", "history", "wages"}
+                for part in urlparse(row["canonical_url"]).path.split("/")[4:]):
+            reason = "non_roster"
+        elif kind != "competition_index" and (not row.get("current_ownership") or not any(
+            str(scope["competition_id"]) in active and
+            (kind == "competition" or (str(scope["competition_id"]), str(scope["season_id"])) in pairs)
+            for scope in row.get("scopes", [])
+        )):
+            reason = "outside_current_adult_scope"
+        if reason:
+            excluded[reason] += 1
+            continue
+        if (kind == "season" and row.get("processed") and
+                (row["target_id"], row.get("last_content_hash")) in standings):
+            standings_confirmed += 1
+        fetched = instant(row.get("last_fetched_at"))
+        buckets[kind].append(None if fetched is None else (as_of-fetched).total_seconds()/3600)
+    def metrics(values, hours):
+        ages = [v for v in values if v is not None and v >= 0]
+        fresh = sum(0 <= v < hours for v in ages)
+        return {"total": len(values), "sla_hours": hours, "fresh": fresh,
+                "fresh_percent": 100*fresh/len(values) if values else None,
+                "never": values.count(None), "aged": sum(v >= hours for v in ages),
+                "median_hours": median(ages) if ages else None,
+                "p95_hours": percentile95(ages), "max_hours": max(ages) if ages else None}
+    by_kind = {kind: metrics(values, 672 if kind == "squad" else
+                           24 if kind in {"match", "schedule", "competition_index"} else
+                           720 if kind in {"player", "matchlog"} else 168)
+               for kind, values in sorted(buckets.items())}
+    return _page_age_result(by_kind, excluded, standings_confirmed, errors)
+
+
+def page_age_line(report: Mapping) -> str:
+    chunks = []
+    for kind, row in report["page_ages"]["by_kind"].items():
+        pct = f"{row['fresh_percent']:.1f}%" if row["fresh_percent"] is not None else "н/д"
+        ages = "/".join(f"{row[k]:.1f}" if row[k] is not None else "н/д"
+                        for k in ("median_hours", "p95_hours", "max_hours"))
+        chunks.append(f"{kind}: N={row['total']}, fresh{row['sla_hours']//24}={row['fresh']} ({pct}), "
+                      f"never={row['never']}, aged={row['aged']}, median/p95/max={ages} ч")
+    overall = report["page_ages"]
+    pct = f"{overall['fresh_percent']:.1f}%" if overall["fresh_percent"] is not None else "н/д"
+    chunks.append(f"season/season_stats/squad: {overall['fresh']}/{overall['total']} ({pct})")
+    chunks.append(f"season results*_overall={overall['standings_confirmed_seasons']}")
+    chunks.append("исключения=" + str(overall["excluded"]))
+    if overall["errors"]:
+        chunks.append("н/д: ошибки измерения=" + str(overall["errors"]))
+    return "Возраст по видам страниц: " + "; ".join(chunks)
 
 
 def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
@@ -233,7 +423,10 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
             "source_lag_hours": source_lag,
         })
     totals = Counter(row["status"] for row in entries)
-    fm_counts, fm_problems = _fotmob_counts(snapshot, mapping, pairs, day, as_of)
+    comparator_pairs, day_scope_exclusions = _day_comparator_scope(snapshot, pairs, day)
+    without_reference = sorted({cid for cid, _ in comparator_pairs
+                                if _without_reference(mapping.get(cid, {}), as_of)})
+    fm_counts, fm_problems = _fotmob_counts(snapshot, mapping, comparator_pairs, day, as_of)
     errors = list(snapshot.get("errors", []))
     population_complete = not gaps and not errors and bool(pairs) and all(r["date_confirmed"] for r in entries)
     completed = population_complete and bool(entries) and not totals["unknown"] and all(
@@ -241,30 +434,37 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
     )
     pct = 100 * totals["on_time"] / len(entries) if entries and population_complete and not totals["unknown"] else None
     by_competition = []
-    for cid in sorted({cid for cid, _ in pairs}):
+    for cid in sorted({cid for cid, _ in comparator_pairs}):
         rows = [r for r in entries if r["competition_id"] == cid]
         count = Counter(r["status"] for r in rows)
         k = fm_counts.get(cid)
         by_competition.append({"competition_id": cid, "name": adults[cid]["name"],
                                "played": len(rows), **{s: count[s] for s in ("on_time", "late", "pending", "unknown")},
+                               "reference_coverage": ("absent_from_fotmob_catalog"
+                                   if cid in without_reference else
+                                   "mapped" if mapping.get(cid, {}).get("fotmob_ids") else "unmapped"),
                                "fotmob": k, "difference": len(rows) - k if k is not None else None})
     return {
         "schema_version": REPORT_VERSION, "date": day.isoformat(), "as_of": as_of.isoformat(),
         "date_basis": "UTC kickoff date; undated FBref rows retained by source date and marked unconfirmed",
         "adult_universe": len(adults), "active_current_scopes": len(pairs),
-        "scope_gaps": gaps, "errors": errors, "population_complete": population_complete,
+        "scope_gaps": gaps, "day_scope_exclusions": day_scope_exclusions,
+        "errors": errors, "population_complete": population_complete,
         "played": len(entries), **{s: totals[s] for s in ("on_time", "late", "pending", "unknown")},
         "on_time_percent": pct, "final": completed,
         "milestone_day_pass": completed and pct >= 99 and not fm_problems and all(
             r["difference"] == 0 for r in by_competition
+            if r["competition_id"] not in without_reference
         ),
         "fotmob": sum(fm_counts.values()) if not fm_problems and not errors else None,
         "fotmob_known_count": sum(v for v in fm_counts.values() if v is not None),
         "fotmob_problems": fm_problems,
+        "without_reference": without_reference,
         "source_lag": {**_stats(source_lags), "unknown": len(entries) - len(source_lags),
                        "basis": "observed completed link minus explicit kickoff + 2h; upper-bound estimate"},
         "match_to_first_fetch": _stats(fetch_lags), "match_to_bronze": _stats(bronze_lags),
         "competitions": by_competition, "matches": sorted(entries, key=lambda r: (r["competition_id"], r["match_id"] or "")),
+        "page_ages": page_age_metrics(snapshot, as_of),
         "violators": [r for r in entries if r["status"] == "late"],
     }
 
@@ -292,17 +492,25 @@ def summary_line(report: Mapping) -> str:
     percentage = f"{pct:.2f} %" if pct is not None else "н/д"
     k = report["fotmob"] if report["fotmob"] is not None else "н/д"
     state = "окончательный" if report["final"] else "предварительный"
+    reasons = Counter(p["reason"] for p in report["fotmob_problems"])
+    unconfirmed = sum(not r["date_confirmed"] for r in report["matches"])
+    deadlines = sum(instant(r["deadline"]) > instant(report["as_of"])
+                    for r in report["matches"] if r["deadline"])
+    differences = sum(r["difference"] not in (None, 0) for r in report["competitions"])
+    blockers = (f"UTC не подтверждено {unconfirmed}; дедлайн не истёк {deadlines}; "
+                f"FotMob причины {dict(reasons)}; известно частично {report['fotmob_known_count']}; "
+                f"расхождений {differences}; без эталона: {len(report.get('without_reference', []))}")
     return (f"FBref: матчей {report['date']} UTC {report['played']}, ≤24 ч {report['on_time']} "
             f"({percentage}), у FotMob {k}; {state}; ожидают {report['pending']}, "
             f"неизвестно {report['unknown']}; "
-            f"пробелов данных {len(report['scope_gaps']) + len(report['errors'])}")
+            f"пробелов данных {len(report['scope_gaps']) + len(report['errors'])}; {blockers}")
 
 
 def render_markdown(report: Mapping) -> str:
     def hours(value):
         return f"{value:.3f} ч" if value is not None else "н/д"
     lag = report["source_lag"]
-    output = [f"# FBref — {report['date']}", "", summary_line(report), "",
+    output = [f"# FBref — {report['date']}", "", summary_line(report), "", page_age_line(report), "",
               f"Срез: {instant(report['as_of']).astimezone(ZoneInfo('Europe/Moscow')).isoformat()} МСК.", "",
               f"Задержка FBref: медиана {hours(lag['median_hours'])}, 95-й процентиль {hours(lag['p95_hours'])}; "
               f"выборка {lag['samples']}, неизвестно {lag['unknown']}.",

@@ -1,0 +1,76 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -315,59 +315,21 @@
+ 
+ 
+ def _c1_sql(d):
+-    """Запрос C1 за сутки d (ISO-дата): по строке на матч со сроком (начало + 26 ч) в d.
+-
+-    #1563: сирота (сезон у источника не is_latest при наличии текущего, матч не finished) — вне due.
+-    """
++    """C1: one complete, fresh, atomically published day (#1896)."""
++    d = datetime.strptime(d, "%Y-%m-%d").date().isoformat()
+     return (
+-        "WITH inc AS (SELECT DISTINCT CAST(competition_id AS varchar) AS cid "
+-        "FROM iceberg.bronze.fotmob_competition_scope_observations_current "
+-        "WHERE decision='included'), "
+-        "p AS (SELECT match_id, min(_ingested_at) AS fi "
+-        "FROM iceberg.bronze.fotmob_match_payloads GROUP BY match_id), "
+-        "st AS (SELECT DISTINCT s.competition_id AS cid, s.source_season_key AS sk "
+-        "FROM iceberg.bronze.fotmob_competition_seasons_current s WHERE NOT s.is_latest "
+-        "AND s.competition_id IN (SELECT competition_id FROM "
+-        "iceberg.bronze.fotmob_competition_seasons_current WHERE is_latest)), "
+-        "m AS (SELECT m.match_id, CAST(from_iso8601_timestamp(m.utc_time) "
+-        "AT TIME ZONE 'UTC' AS timestamp(6)) + interval '26' hour AS deadline "
+-        "FROM iceberg.bronze.fotmob_matches_current m "
+-        "JOIN inc i ON i.cid=CAST(m.competition_id AS varchar) "
+-        "LEFT JOIN st ON st.cid=CAST(m.competition_id AS varchar) "
+-        "AND st.sk=m.source_season_key "
+-        "WHERE m.cancelled=false AND (st.cid IS NULL OR m.finished) "
+-        f"AND m.utc_time >= to_iso8601(timestamp '{d} 00:00:00' - interval '3' day)) "
+-        ", md AS (SELECT CAST(m.match_id AS varchar) AS mid, m.deadline, p.fi "
+-        "FROM m LEFT JOIN p ON p.match_id=m.match_id "
+-        f"WHERE m.deadline >= timestamp '{d} 00:00:00' "
+-        f"AND m.deadline < timestamp '{d} 00:00:00' + interval '1' day), "
+-        "h AS (SELECT entity_id AS mid, count(DISTINCT CASE WHEN status='not_available' "
+-        "AND error_code='source_data_not_found' THEN run_id END) AS na_runs, "
+-        "date_diff('second', min(CASE WHEN status='not_available' "
+-        "AND error_code='source_data_not_found' THEN completed_at END), "
+-        "max(CASE WHEN status='not_available' "
+-        "AND error_code='source_data_not_found' THEN completed_at END)) AS na_spread, "
+-        "count_if(status='success') AS succ "
+-        "FROM iceberg.bronze.fotmob_ingest_manifest WHERE target_type='match' "
+-        "AND entity_id IN (SELECT mid FROM md) GROUP BY entity_id), "
+-        # #1533: снимки расписания; окно чтения по _ingested_at (4 сут) — без него Trino
+-        # читает всю append-таблицу. deadline - 23 ч = начало + 3 ч.
+-        "snap AS (SELECT CAST(s.match_id AS varchar) AS mid, "
+-        "min(CASE WHEN s.finished THEN s._observed_at END) AS first_ft, "
+-        "count_if(NOT s.finished AND s._observed_at >= md.deadline - interval '23' hour "
+-        "AND s._observed_at < md.deadline) AS saw_unfinished "
+-        "FROM iceberg.bronze.fotmob_matches s "
+-        "JOIN md ON CAST(s.match_id AS varchar)=md.mid "
+-        f"WHERE s._ingested_at >= timestamp '{d} 00:00:00' - interval '4' day "
+-        f"AND s.utc_time >= to_iso8601(timestamp '{d} 00:00:00' - interval '3' day) "
+-        "GROUP BY 1), "
+-        "r AS (SELECT md.mid, md.deadline, md.fi, coalesce(h.na_runs, 0) AS na_runs, "
+-        "coalesce(h.na_spread, 0) AS na_spread, coalesce(h.succ, 0) AS succ, "
+-        "snap.first_ft, coalesce(snap.saw_unfinished, 0) AS saw_unfinished "
+-        "FROM md LEFT JOIN h ON h.mid=md.mid LEFT JOIN snap ON snap.mid=md.mid) "
+-        "SELECT r.mid, r.deadline, r.fi, r.na_runs, r.na_spread, r.succ, "
+-        "r.first_ft, r.saw_unfinished "
+-        "FROM (VALUES 1) AS one(x) LEFT JOIN r ON true")
++        "WITH scanned AS (SELECT * FROM iceberg.bronze.fotmob_c1_inputs "
++        f"WHERE deadline_day=DATE '{d}'), "
++        "checked AS (SELECT i.*, "
++        "count_if(kind='day' AND complete AND published_at >= "
++        "CAST(current_timestamp AT TIME ZONE 'UTC' AS timestamp(6)) - interval '2' hour) OVER () AS markers, "
++        "count_if(complete IS DISTINCT FROM true) OVER () AS incomplete "
++        "FROM (VALUES 1) AS one(x) LEFT JOIN scanned i ON true) "
++        "SELECT IF(markers=1 AND incomplete=0, match_id, "
++        "CAST(CAST(concat('C1 incomplete day ', "
++        f"'{d}') AS bigint) AS varchar)), "
++        "deadline, first_ingested, na_runs, na_spread_s, success_count, "
++        "first_ft, saw_unfinished FROM checked")
+ 
+ 
+ def _c1_measure(d, now):

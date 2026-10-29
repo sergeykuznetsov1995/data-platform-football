@@ -17,7 +17,8 @@
 
 ## Окно и занятость
 
-Окно 11:00–08:30 UTC (вне него — выход без действий). Дополнительно: в метабазе нет
+Окна по часам нет (гриль 29.10): доставка в любой час, если до ближайшего запуска DAG по расписанию
+(`dag.next_dagrun_create_after`) не меньше `NEXT_RUN_MARGIN` (30 мин). Дополнительно: в метабазе нет
 `task_instance` DAG `dag_ingest_understat`/`dag_backfill_understat` в `running`/`queued` и нет живого
 процесса `run_understat_scraper`. Занятость меряется по задачам, а не по `dag_run.state`: прогон
 истории на паузе висит в `running` на сенсоре (`up_for_reschedule`) и доставке не мешает.
@@ -88,13 +89,13 @@ echo <полный-sha> > /root/watchdog/state/understat-accepted
 /root/understat-auto-deliver.sh --check
 ```
 
-Строка crontab (время хоста — CEST, UTC+2):
+Строка crontab (ежечасно; защёлка — одна попытка на SHA master):
 
 ```
-10 3 * * * /root/understat-auto-deliver.sh >> /root/watchdog/understat_auto_deliver_cron.log 2>&1
+10 * * * * /root/understat-auto-deliver.sh >> /root/watchdog/understat_auto_deliver_cron.log 2>&1
 ```
 
-= 01:10 UTC; после перехода на зимнее время 25.10 — 02:10 UTC, всё ещё в окне.
+До 29.10 автомат ходил раз в сутки (`10 3 * * *`) в окно 11:00–08:30 UTC.
 
 ## Ручные режимы
 

@@ -83,8 +83,12 @@ observability-only and must never gate.
 
 from __future__ import annotations
 
+from dags.utils.transfermarkt_career_debt import career_debt_ctes
+
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Mapping, Sequence
+
+from scrapers.transfermarkt.revisions import CAREER_NULLABLE_ADDITIONS
 
 from utils.transfermarkt_scope_state import (
     REGISTRY_STATE_TABLE,
@@ -227,11 +231,14 @@ NATIVE_PAYLOAD_COLUMNS = {
     ),
     'iceberg.bronze.transfermarkt_market_value_points': (
         'value_eur', 'club_name', 'age', 'mv_raw',
+        'is_value_removed', 'club_id', 'mv_last_change',
     ),
     'iceberg.bronze.transfermarkt_transfer_events': (
         'player_id', 'transfer_date', 'event_season', 'from_club_id',
         'from_club_name', 'to_club_id', 'to_club_name', 'fee_text',
         'fee_eur', 'market_value_eur', 'is_upcoming',
+        'from_is_special', 'to_is_special', 'from_country_flag', 'to_country_flag',
+        'from_country_id', 'to_country_id', 'is_loan_end',
     ),
     'iceberg.bronze.transfermarkt_coach_profiles': (
         'coach_slug', 'name', 'dob', 'nationality',
@@ -536,6 +543,7 @@ def build_intra_batch_duplicates_sql(
     *,
     pins: Mapping[str, Any] | None = None,
     scope_pairs: Sequence[Sequence[str]] | None = None,
+    available_columns: Iterable[str] | None = None,
 ) -> str:
     """Split intra-batch duplicates: conflicting groups vs identical repeats."""
 
@@ -549,9 +557,14 @@ def build_intra_batch_duplicates_sql(
         _scope_pairs_predicate(table, scope_pairs)
         if scope_pairs is not None else None
     )
-    return _duplicate_split_sql(
-        table, group, NATIVE_PAYLOAD_COLUMNS[table], pins, where=where,
-    )
+    payload = NATIVE_PAYLOAD_COLUMNS[table]
+    if available_columns is not None:
+        available = set(available_columns)
+        payload = tuple(
+            column for column in payload
+            if column in available or column not in CAREER_NULLABLE_ADDITIONS
+        )
+    return _duplicate_split_sql(table, group, payload, pins, where=where)
 
 
 def build_cross_batch_duplicates_sql(
@@ -777,18 +790,17 @@ FROM (
 WHERE rn = 1"""
 
 
-def build_career_debt_sql() -> str:
-    """Career-fetch debt over latest complete manifests + NULL-evidence count."""
+def build_career_debt_sql(*, registry_snapshot_id: str) -> str:
+    """Unique roster players missing either committed full career endpoint."""
 
-    return f"""SELECT COALESCE(SUM(pending), 0),
-       COUNT_IF(pending IS NULL),
-       COUNT(*)
-FROM (
-    SELECT TRY_CAST(json_extract_scalar(
+    return f"""WITH {career_debt_ctes()}, targets AS (
+    {build_registry_target_sql(registry_snapshot_id)}
+), latest AS (
+    SELECT competition_id, edition_id, TRY_CAST(json_extract_scalar(
         entity_manifest_json, '$.dq_evidence.career_fetches_pending'
     ) AS bigint) AS pending
     FROM (
-        SELECT entity_manifest_json, ROW_NUMBER() OVER (
+        SELECT competition_id, edition_id, entity_manifest_json, ROW_NUMBER() OVER (
             PARTITION BY competition_id, edition_id
             ORDER BY committed_at DESC
         ) AS rn
@@ -796,7 +808,16 @@ FROM (
         WHERE status = {_sql_literal(SCOPE_COMPLETION_STATUS)}
     )
     WHERE rn = 1
-)"""
+)
+SELECT (
+    SELECT COUNT(DISTINCT d.player_id) FROM career_debt d
+    JOIN targets t ON t.competition_id = d.competition_id AND t.edition_id = d.edition_id
+), COUNT_IF(l.competition_id IS NOT NULL AND l.pending IS NULL), COUNT(l.competition_id), (
+    SELECT COUNT(DISTINCT r.player_id) FROM career_roster r
+    JOIN targets t ON t.competition_id = r.competition_id AND t.edition_id = r.edition_id
+), COUNT(*)
+FROM targets t
+LEFT JOIN latest l ON l.competition_id = t.competition_id AND l.edition_id = t.edition_id"""
 
 
 # ---------------------------------------------------------------------------
@@ -1003,6 +1024,18 @@ def run_bronze_dq(
 
         display = _display(table)
         try:
+            if (prefix == 'tm_bronze'
+                    and table in _MEMBERSHIP_PLAYER_TABLES):
+                # Read the checked snapshot's schema, even before the first
+                # fresh write has added the nullable career fields.
+                cur.execute(f'SELECT * FROM {_pinned(table, pins)} LIMIT 0')
+                cur.fetchall()
+                available = [column[0] for column in cur.description]
+                sqls = entity_sqls(
+                    lambda table, **kwargs: build_intra_batch_duplicates_sql(
+                        table, available_columns=available, **kwargs,
+                    ), table,
+                )
             conflicts = identical = 0
             for sql in sqls:
                 cur.execute(sql)
@@ -1363,7 +1396,7 @@ def run_bronze_dq(
     run('tm_target_scope_coverage', 'target_scope_coverage', 'WARNING', coverage)
 
     def career_debt():
-        cur.execute(build_career_debt_sql())
+        cur.execute(build_career_debt_sql(registry_snapshot_id=snapshot))
         rows = list(cur.fetchall())
         if len(rows) != 1:
             raise ValueError('career debt query must return exactly one row')
@@ -1375,9 +1408,18 @@ def run_bronze_dq(
             'null_evidence_manifests': null_evidence,
             'complete_manifests': manifest_count,
         }
+        if len(rows[0]) > 3:
+            roster_size = int(rows[0][3])
+            value.update(roster_players=roster_size,
+                debt_ratio=pending / roster_size if roster_size else None)
+        if len(rows[0]) > 4:
+            target_count = int(rows[0][4])
+            value.update(target_scopes=target_count,
+                missing_complete_manifests=target_count - manifest_count)
         details = (
-            f'{pending} pending career fetches across {manifest_count} '
-            f'complete manifests; {null_evidence} without evidence'
+            f'{pending} unique target roster players without complete careers; '
+            f'{manifest_count} complete manifests; {null_evidence} without evidence; '
+            f"{value.get('missing_complete_manifests', 0)} missing complete manifests"
         )
         return True, details, value
     run('tm_career_debt', 'career_debt', 'WARNING', career_debt)

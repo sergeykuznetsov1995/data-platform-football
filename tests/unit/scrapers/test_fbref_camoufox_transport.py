@@ -125,6 +125,165 @@ class _Response:
         self.status = status
 
 
+@pytest.mark.parametrize("setting,blocked", [(None, True), ("0", False), ("1", True)])
+def test_script_default_blocks_before_admission_and_allows_challenge(monkeypatch, setting, blocked):
+    monkeypatch.delenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", raising=False)
+    if setting is not None:
+        monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", setting)
+    transport = CamoufoxFbrefTransport(max_network_requests=10)
+    script = _Route("script", "https://fbref.com/static/site.js")
+    transport._maybe_block(script)
+    assert script.aborted == int(blocked)
+    assert transport.traffic_stats()["real_requests_count"] == int(not blocked)
+    if blocked:
+        assert transport._inflight_reserved_bytes == 0
+    challenge = _Route("script", "https://challenges.cloudflare.com/turnstile/x.js")
+    transport._maybe_block(challenge)
+    assert challenge.continued == 1
+    document = _Route()
+    transport._maybe_block(document)
+    assert document.continued == 1
+
+
+class _ReplayPage:
+    """Small DOM model, not a JS engine: only explicit resource effects run."""
+
+    def __init__(self, html, resources=()):
+        from bs4 import BeautifulSoup
+
+        self.dom = BeautifulSoup(html, "html.parser")
+        self.resources = resources
+        self.routes = []
+
+    def navigate(self, transport, url):
+        document = _Route("document", url)
+        transport._maybe_block(document)
+        self.routes.append(document)
+        if not document.continued:
+            self.dom.clear()
+            return
+        for resource_url, effect in self.resources:
+            route = _Route("script", resource_url)
+            transport._maybe_block(route)
+            self.routes.append(route)
+            if route.continued:
+                effect(self.dom)
+
+    def evaluate(self, expression):
+        from bs4 import BeautifulSoup, Comment
+        from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
+
+        if expression == "!!document.querySelector('table')":
+            return self.dom.find("table") is not None
+        if expression == FBREF_UNCOMMENT_TABLES_JS:
+            for comment in list(self.dom.find_all(string=lambda node: isinstance(node, Comment))):
+                if "<table" in str(comment):
+                    fragment = BeautifulSoup(str(comment), "html.parser")
+                    comment.replace_with(*list(fragment.contents))
+            return None
+        raise AssertionError(f"Unsupported replay expression: {expression}")
+
+    def content(self):
+        return str(self.dom)
+
+
+def _replay_fetch(monkeypatch, html, setting, resources=()):
+    monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", setting)
+    transport = CamoufoxFbrefTransport()
+    page = _ReplayPage(html, resources)
+    transport._page = page
+    monkeypatch.setattr(transport, "POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(transport, "CF_SOLVE_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(transport, "MAX_PROXY_ROTATIONS", 0)
+    monkeypatch.setattr(transport, "_challenge_shell_present", lambda: False)
+    monkeypatch.setattr(transport, "_click_turnstile", lambda: False)
+    monkeypatch.setattr(
+        transport, "_navigate_with_one_manual_redirect",
+        lambda url: page.navigate(transport, url),
+    )
+    return transport.fetch("https://fbref.com/en/"), page, transport
+
+
+def _table_inventory(page):
+    # DOM serialization/uncommenting changes hashes and source locations.
+    # Compare the data contract, including every row and cell, instead.
+    return [(
+        table.table_id, table.availability, table.header_paths,
+        [(row.source_row_index, row.entity_ids, [(
+            cell.cell_index, cell.data_stat, cell.raw_header_path,
+            cell.raw_value, cell.entity_ids,
+        ) for cell in row.cells]) for row in table.rows],
+    ) for table in page.tables]
+
+
+@pytest.mark.parametrize("fixture,kind,comment_table", [
+    ("matches/0701e218.html.gz", "match", False),
+    ("matches/0701e218.html.gz", "match", True),
+    ("report_observations/schedule-70.html", "schedule", False),
+    ("proxy_waste/season.html", "season_stats", False),
+])
+def test_script_blocking_preserves_saved_page_inventory(monkeypatch, fixture, kind, comment_table):
+    import gzip
+    from bs4 import BeautifulSoup, Comment
+    from scrapers.fbref.page_document import parse_page_document
+
+    path = Path(__file__).parents[2] / "fixtures" / "fbref" / fixture
+    html = gzip.decompress(path.read_bytes()).decode() if path.suffix == ".gz" else path.read_text()
+    if comment_table:
+        soup = BeautifulSoup(html, "html.parser")
+        # Leave a real DOM table, as required by the solve contract.
+        tables = soup.find_all("table")
+        assert len(tables) > 1
+        assert tables[-1].get("id")
+        tables[-1].replace_with(Comment(str(tables[-1])))
+        html = str(soup)
+    baseline = parse_page_document(html, target_id=fixture, page_kind=kind)
+    assert baseline.tables
+    if comment_table:
+        assert any(table.source_location.startswith("comment") for table in baseline.tables)
+
+    def decorate(dom):
+        dom.append(BeautifulSoup('<span id="script-ran">loaded</span>', "html.parser"))
+
+    inventories = []
+    for setting in ("0", "1"):
+        fetched, replay, _ = _replay_fetch(monkeypatch, html, setting, [
+            ("https://fbref.com/static/site.js", decorate),
+        ])
+        assert fetched is not None
+        assert replay.routes[0].continued == 1
+        assert replay.routes[1].continued == int(setting == "0")
+        assert ('id="script-ran"' in fetched) == (setting == "0")
+        page = parse_page_document(fetched, target_id=fixture, page_kind=kind)
+        assert page.errors == baseline.errors == ()
+        assert _table_inventory(page) == _table_inventory(baseline)
+        inventories.append(_table_inventory(page))
+    assert inventories[0] == inventories[1]
+
+
+@pytest.mark.parametrize("script_dependent", [False, True])
+def test_inventory_replay_rejects_missing_dom_tables(monkeypatch, script_dependent):
+    from bs4 import BeautifulSoup
+
+    def insert_table(dom):
+        dom.append(BeautifulSoup(
+            '<table id="stats_standard"><tr><td>required JS</td></tr></table>',
+            "html.parser",
+        ))
+
+    resources = [("https://fbref.com/static/site.js", insert_table)] if script_dependent else []
+    for setting in ("0", "1"):
+        fetched, replay, transport = _replay_fetch(
+            monkeypatch, "<html><body>no server tables</body></html>", setting, resources,
+        )
+        if script_dependent and setting == "0":
+            assert fetched is not None
+            assert replay.dom.find("table") is not None
+        else:
+            assert fetched is None
+            assert transport._last_solve_failure == "page_contract"
+
+
 class _StatusFailsResponse:
     def __init__(self, request, headers):
         self.request = request
@@ -891,11 +1050,12 @@ def test_one_600kb_undeclared_response_keeps_a_4mib_session_alive():
 
 
 @pytest.mark.unit
-def test_replay_of_20260923_xhr_592492_does_not_abort():
+def test_replay_of_20260923_xhr_592492_does_not_abort(monkeypatch):
     """Replay of the 23.09 bootstrap: seven browser requests, one XHR of
     592 492 bytes against a 589 824-byte reservation, 16 MiB transport cap.
     Before #1385 this aborted with
     ``completed_size_exceeded_reservation:592492>589824`` and killed the run."""
+    monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", "0")
     cap = 16 * 1024 * 1024
     transport = CamoufoxFbrefTransport(max_network_bytes=cap)
     sizes = [
@@ -2570,6 +2730,7 @@ def test_managed_shell_is_counted_before_turnstile_iframe(monkeypatch):
 
 
 def test_popup_and_subresource_share_context_admission(monkeypatch):
+    monkeypatch.setenv("FBREF_CAMOUFOX_BLOCK_SCRIPTS", "0")
     page = MagicMock()
     page.evaluate.return_value = True
     context = MagicMock()
@@ -3159,3 +3320,46 @@ def test_traffic_delta_never_bills_a_falling_reservation_gauge_negative():
     third = transport.traffic_delta()
     assert third["inflight_reserved_bytes"] == 250
     assert third["budget_unobserved_bytes"] == 250
+
+
+@pytest.mark.parametrize("status, resource, navigation, expected", [
+    (101, "websocket", False, "unrouted_websocket_upgrade"),
+    (200, "websocket", False, "unrouted_http_response"),
+    (101, "document", False, "unrouted_http_response"),
+    (101, "websocket", True, "unrouted_http_response"),
+])
+def test_unrouted_upgrade_is_distinct_but_still_blocked_and_charged(
+    status, resource, navigation, expected, caplog
+):
+    transport = CamoufoxFbrefTransport(geoip=False, max_network_bytes=4096)
+    request = MagicMock(resource_type=resource, url="wss://fbref.com/socket", redirected_from=None)
+    request.is_navigation_request.return_value = navigation
+    transport._on_response(_Response(request, {}, status=status))
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == expected
+    assert stats["unobserved_reserved_bytes"] == UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+    assert stats["real_requests_count"] == 1
+    assert "redirected_from_source=False" in caplog.text
+
+
+@pytest.mark.parametrize("upgrade_first", [False, True])
+def test_upgrade_does_not_mask_another_network_policy_failure(upgrade_first):
+    transport = CamoufoxFbrefTransport(geoip=False)
+    reasons = ["unrouted_websocket_upgrade", "unrouted_http_completion"]
+    if not upgrade_first:
+        reasons.reverse()
+    for reason in reasons:
+        transport._latch_unexpected_network(reason)
+    assert transport.traffic_stats()["network_policy_failure"] == "unrouted_http_completion"
+
+
+def test_detached_upgrade_request_keeps_fatal_policy_latch():
+    transport = CamoufoxFbrefTransport(geoip=False)
+    request = MagicMock(resource_type="websocket", url="wss://fbref.com/socket")
+    request.is_navigation_request.side_effect = RuntimeError("request detached")
+    transport._on_response(_Response(request, {}, status=101))
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+    assert stats["unobserved_reserved_bytes"] == UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES

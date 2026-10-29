@@ -28,6 +28,7 @@ TAG = DIGEST[:8]
 HIST = "dag_backfill_sofascore_all_mens"
 REFRESH = "dag_refresh_sofascore_all_mens"
 MAINT = "dag_sofascore_manifest_maintenance"
+COMPACT = "dag_sofascore_schedule_maintenance"
 
 
 def _write(path: Path, text: str, mode: int | None = None) -> Path:
@@ -183,6 +184,7 @@ def _layout(
     (state_dir / f"paused_{HIST}").write_text("f\n")
     (state_dir / f"paused_{REFRESH}").write_text(f"{refresh_paused}\n")
     (state_dir / f"paused_{MAINT}").write_text(f"{maint_paused}\n")
+    (state_dir / f"paused_{COMPACT}").write_text(f"{maint_paused}\n")
     for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
         _write(release / "deploy" / "sofascore" / name, "services: {}\n")
     # Ломатель тупика едет в дереве релиза: deploy.sh кормит его текстом stdin `docker exec`.
@@ -1275,10 +1277,13 @@ def test_the_manifest_maintenance_is_paused_before_the_first_wait(tmp_path: Path
     pause_maint = r.args.index(f"exec sofascore-airflow-scheduler airflow dags pause {MAINT}")
     first_poll = next(i for i, a in enumerate(r.args) if "state IN ('scheduled','up_for_retry')" in a)
     assert pause_maint < first_poll, r.args
+    pause_compact = r.args.index(f"exec sofascore-airflow-scheduler airflow dags pause {COMPACT}")
+    assert pause_compact < first_poll, r.args
 
 
 @pytest.mark.unit
-def test_a_running_maintenance_task_is_waited_for(tmp_path: Path) -> None:
+@pytest.mark.parametrize("maintenance_dag", [MAINT, COMPACT])
+def test_a_running_maintenance_task_is_waited_for(tmp_path: Path, maintenance_dag: str) -> None:
     """Задачи обслуживания попали во второе число строки опроса: пересоздание scheduler'а
     оборвало бы их так же, как задачи дейли."""
     r = _deploy(
@@ -1287,7 +1292,7 @@ def test_a_running_maintenance_task_is_waited_for(tmp_path: Path) -> None:
         world=dict(scope_state="scheduled", scope_try=1),
         seed_sql=(
             "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
-            f" VALUES ('{MAINT}','maint-1','compact_manifest',-1,'running','default_pool',1);"
+            f" VALUES ('{maintenance_dag}','maint-1','compact_manifest',-1,'running','default_pool',1);"
         ),
     )
 
@@ -1312,6 +1317,7 @@ def test_a_manual_deploy_restores_the_maintenance_pause_on_every_outcome(
 
     assert r.proc.returncode == rc, r.out
     assert (r.state_dir / f"paused_{MAINT}").read_text().strip() == "f"
+    assert (r.state_dir / f"paused_{COMPACT}").read_text().strip() == "f"
 
 
 @pytest.mark.unit
@@ -1333,6 +1339,7 @@ def test_a_deploy_from_the_automat_leaves_the_maintenance_paused(
 
     assert r.proc.returncode == rc, r.out
     assert (r.state_dir / f"paused_{MAINT}").read_text().strip() == "t"
+    assert (r.state_dir / f"paused_{COMPACT}").read_text().strip() == "t"
     assert "её вернёт автомат ночной доставки" in r.log
 
 
@@ -1509,7 +1516,7 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
-            *is_active=true*) echo 5 ;;
+            *is_active=true*) echo 6 ;;
             *"pool='sofascore_history_pool'"*) echo 3 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;

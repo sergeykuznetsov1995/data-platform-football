@@ -36,10 +36,12 @@ class FBrefProxyLeaseError(RuntimeError):
     """A paid lease could not be created or accounted exactly."""
 
     def __init__(
-        self, message: str, *, session_failure_reason: Optional[str] = None
+        self, message: str, *, session_failure_reason: Optional[str] = None,
+        terminal_flags: tuple[str, ...] = (),
     ) -> None:
         super().__init__(message)
         self.session_failure_reason = session_failure_reason
+        self.terminal_flags = terminal_flags
 
 
 @dataclass(frozen=True)
@@ -485,8 +487,15 @@ class FBrefProxyLeaseClient:
                 or stats.budget_exceeded
                 or stats.closed
             ):
+                terminal_flags = tuple(
+                    name
+                    for name in ("accounting_uncertain", "budget_exceeded", "closed")
+                    if getattr(stats, name)
+                )
                 raise FBrefProxyLeaseError(
-                    "FBref paid proxy drain found terminal accounting state"
+                    "FBref paid proxy drain found terminal accounting state: "
+                    + ", ".join(terminal_flags),
+                    terminal_flags=terminal_flags,
                 )
             if stats.expired:
                 raise FBrefProxyLeaseError(

@@ -8,7 +8,8 @@
 # это worktree, checkout подменил бы скрипт посреди работы.
 # Режимы: без аргумента — cron-тик; --check — все проверки без единой записи;
 # --rollback [sha] — на указанный SHA (по умолчанию — прежний принятый) тем же порядком.
-# Cron: 15 * * * * (каждый час — приёмка висящей доставки; доставка — только в окне).
+# Cron: 15 * * * * (каждый час — приёмка висящей доставки; доставка — в любой час, когда контур свободен
+# и до прогона по расписанию есть запас — гриль 29.10; раньше — окно 02:00–05:00 UTC).
 # shellcheck disable=SC2086  # $WS_PATHS намеренно режется на слова (список путей git)
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 set -u -o pipefail
@@ -26,7 +27,6 @@ COMPOSE_ENV_FILE="${WHOSCORED_COMPOSE_ENV_FILE:-/root/data-platform-football/.en
 TRINO_RO="${TRINO_RO:-/root/.claude/bin/trino-ro.sh}"
 TG_ENV="${TG_ENV:-$HOME/.claude/telegram.env}"
 HISTORY_PAT="${HISTORY_PAT:-whoscored_history_backfil[l]/driver}"
-WIN_FROM=0200 WIN_TO=0500            # окно доставки, UTC (прогоны — 10:00 и 22:00 UTC)
 REREAD_TRIES=30                      # × 20 с = 10 мин на перечитывание DAG
 MODE="${1:-night}"
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -92,12 +92,35 @@ measure() {
   [[ "$r" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]] && echo "${r//,/ }"
 }
 
-# Причина не трогать бой сейчас (пусто — можно): идёт прогон или жива история.
+# Причина не трогать бой сейчас (пусто — можно). Cooldown истории не считается работой.
+# Гриль 29.10: доставка в любой час, когда контур свободен. Вместо окна по часам — запас до ближайшего
+# запуска сбора по расписанию Airflow (dag.next_dagrun_create_after; DAG без расписания и на паузе не считаются).
+NEXT_RUN_MARGIN=${NEXT_RUN_MARGIN:-1800}   # секунд; хватает на доставку, перечитывание DAG и откат
+next_run_reason() {
+  local nxt left
+  nxt=$(q "select coalesce(min(extract(epoch from next_dagrun_create_after))::bigint, 0) from dag where dag_id in ($DAG_IDS) and not is_paused")
+  [ -n "$nxt" ] || { echo "метабаза не ответила (next_dagrun)"; return; }
+  [ "$nxt" = 0 ] && return
+  left=$(( nxt - $(date -u +%s) ))
+  [ "$left" -ge "$NEXT_RUN_MARGIN" ] || echo "до запуска сбора по расписанию $((left/60)) мин (< $((NEXT_RUN_MARGIN/60))) — доставка после прогона"
+}
 busy_reason() {
-  local n
-  n=$(q "select count(*) from dag_run where state in ('running','queued')")
-  if [ "$n" != "0" ]; then echo "контур занят: dag_run running/queued = '${n:-метабаза не ответила}'"
+  local counts other history
+  counts=$(q "select
+    count(*) filter (where dr.dag_id <> 'dag_backfill_whoscored'),
+    count(*) filter (where dr.dag_id = 'dag_backfill_whoscored' and exists (
+      select 1 from task_instance ti where ti.dag_id = dr.dag_id and ti.run_id = dr.run_id
+      and ti.task_id in ('run_backfill_chunk','finalize_chunk')
+      and ti.state in ('running','queued','scheduled','up_for_retry')))
+    from dag_run dr where dr.state in ('running','queued')") \
+    || { echo "контур занят: метабаза не ответила"; return; }
+  [[ "$counts" =~ ^[0-9]+\|[0-9]+$ ]] \
+    || { echo "контур занят: некорректный ответ метабазы '${counts}'"; return; }
+  other=${counts%|*}; history=${counts#*|}
+  if [ "$other" != 0 ]; then echo "контур занят: dag_run running/queued = '$other'"
   elif pgrep -f "$HISTORY_PAT" >/dev/null; then echo "контур занят: жив драйвер истории"
+  elif [ "$history" != 0 ]; then echo "контур занят: проход истории"
+  else next_run_reason
   fi
 }
 
@@ -314,18 +337,19 @@ after=$NEXT" || { touch "$OFF"; tg "🆘 WhoScored: не записан $INFLIGH
   exit 0
 fi
 
-# --- доставка: окно, раз в сутки, контур свободен
-HHMM=$(date -u +%H%M)
-LATCH="$STATE/whoscored-auto-deliver-attempted-$DAY"
-if (( 10#$HHMM < 10#$WIN_FROM || 10#$HHMM >= 10#$WIN_TO )); then
-  [ "$CHECK" = 1 ] && log "заметка: вне окна ($HHMM UTC; окно $WIN_FROM–$WIN_TO)" || exit 0
-fi
-if [ "$CHECK" = 0 ] && [ -f "$LATCH" ]; then exit 0; fi
+# --- доставка: в любой час, когда контур свободен (гриль 29.10); одна попытка на SHA master (защёлка ниже)
 BUSY=$(busy_reason)
+if [ "$CHECK" = 0 ] && [ "$BUSY" = "контур занят: проход истории" ]; then
+  log "жду окно между проходами истории (до 15 минут)"
+  for ((i=0; i<30; i++)); do
+    sleep 30
+    BUSY=$(busy_reason)
+    [ "$BUSY" = "контур занят: проход истории" ] || break
+  done
+fi
 if [ -n "$BUSY" ]; then
   [ "$CHECK" = 1 ] && log "заметка: $BUSY" || { log "$BUSY — выход"; exit 0; }
 fi
-[ "$CHECK" = 0 ] && touch "$LATCH"
 
 # --- пин = origin/master (в --check без fetch: fetch пишет refs общего .git)
 if [ "$CHECK" = 0 ]; then g fetch -q origin || stop "git fetch origin не удался"; fi
@@ -333,8 +357,11 @@ SHA=$(g rev-parse origin/master) || stop "нет origin/master"
 [ "$CHECK" = 1 ] && log "заметка: --check без fetch — пин по локальному origin/master"
 if [ "$SHA" = "$(cat "$REJECTED" 2>/dev/null)" ]; then log "пин ${SHA:0:12} уже откачен — жду нового коммита master"; exit 0; fi
 if [ "$SHA" = "$ACC" ] || g diff --quiet "$ACC" "$SHA" -- $WS_PATHS; then
-  log "без изменений: пути WhoScored ${ACC:0:12} = ${SHA:0:12}"; journal "без изменений"; exit 0
+  log "без изменений: пути WhoScored ${ACC:0:12} = ${SHA:0:12}"; exit 0   # каждый час — в журнал не пишем
 fi
+LATCH="$STATE/whoscored-auto-deliver-attempted-${SHA:0:12}"   # одна попытка на SHA, не на сутки
+if [ "$CHECK" = 0 ] && [ -f "$LATCH" ]; then log "попытка доставки ${SHA:0:12} уже была — жду нового коммита master"; exit 0; fi
+[ "$CHECK" = 0 ] && touch "$LATCH"
 [ "$(md5sum < "$SELF" | cut -c1-32)" = "$(g show "$SHA:deploy/whoscored/auto_deliver.sh" 2>/dev/null | md5sum | cut -c1-32)" ] \
   || stop "копия автомата $SELF отстала от master ${SHA:0:7} — переустанови копию (README)"
 # Образ по тегу (pull_policy: never): тег мог быть пересобран — тогда compose тихо сменил бы образ.
@@ -348,6 +375,9 @@ done
 log "к доставке: ${ACC:0:12} → ${SHA:0:12} ($(g diff --name-only "$ACC" "$SHA" -- $WS_PATHS | wc -l) файлов в путях WhoScored)"
 if [ "$CHECK" = 1 ]; then log "проверки пройдены (--check, ничего не записано)"; exit 0; fi
 
+# Проверка выше не блокирует scheduler: стартовавший во время подмены проход истории
+# может упасть (принятый владельцем риск #1923). DAG не ставим на паузу;
+# приёмка доставки остаётся по ежедневнику, а не по истории.
 # --- доставка. Состояние для отката пишется ДО checkout; не записалось — бой не трогаем.
 put "$INFLIGHT" "phase=deploying
 sha=$SHA

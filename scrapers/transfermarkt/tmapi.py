@@ -24,6 +24,9 @@ from datetime import date
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlencode
 
+MAX_PLAYER_IDS = 100
+MAX_PLAYERS_QUERY_BYTES = 2000
+
 TMAPI_BASE = "https://tmapi.transfermarkt.technology"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 _SAISON_RE = re.compile(r"(?:18|19|20|21)\d{2}")
@@ -31,6 +34,28 @@ _SAISON_RE = re.compile(r"(?:18|19|20|21)\d{2}")
 
 class TmapiSchemaError(ValueError):
     """A tmapi payload does not have the shape this module relies on."""
+
+
+def normalize_market_value(value: Any) -> Any:
+    """Compare source zero and Bronze's absent rating as the same value.
+
+    Keep positive amounts and all other fields (including dates) strict.
+    The dash is the website's unpriced display before Bronze parsing.
+    """
+    return None if value is None or value == 0 or value == '-' else value
+
+
+def player_signal_signature(fields: Mapping[str, Any]) -> str:
+    normalized = dict(fields)
+    normalized['market_value_eur'] = normalize_market_value(fields['market_value_eur'])
+    normalized['market_value_present'] = normalized['market_value_eur'] is not None
+    return _signal_hash(normalized)
+
+
+def _signal_hash(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        fields, sort_keys=True, separators=(',', ':'), allow_nan=False,
+    ).encode('utf-8')).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -63,9 +88,12 @@ class PlayerSignal:
 
     @property
     def signature(self) -> str:
-        return hashlib.sha256(json.dumps(
-            self.as_dict(), sort_keys=True, separators=(',', ':'), allow_nan=False,
-        ).encode('utf-8')).hexdigest()
+        return player_signal_signature(self.as_dict())
+
+    @property
+    def legacy_signature(self) -> str:
+        """Read old saved facts without changing their immutable raw payload."""
+        return _signal_hash(self.as_dict())
 
 
 def _source_id(value: Any) -> str:
@@ -186,14 +214,17 @@ def competition_regulation_url(competition_id: Any) -> str:
 
 
 def players_url(player_ids) -> str:
-    """Public player signal packet: at most 300 distinct positive IDs."""
+    """Public player packet within the WAF ID and encoded query limits."""
     ids = tuple(str(value).strip() for value in player_ids)
     if (
-        not 1 <= len(ids) <= 300 or len(set(ids)) != len(ids)
+        not 1 <= len(ids) <= MAX_PLAYER_IDS or len(set(ids)) != len(ids)
         or any(not re.fullmatch(r'[0-9]+', value) or int(value) <= 0 for value in ids)
     ):
-        raise ValueError('players packet requires 1..300 unique positive IDs')
-    return f'{TMAPI_BASE}/players?' + urlencode([('ids[]', value) for value in ids])
+        raise ValueError('players packet requires 1..100 unique positive IDs')
+    query = urlencode([('ids[]', value) for value in ids])
+    if len(query.encode('ascii')) > MAX_PLAYERS_QUERY_BYTES:
+        raise ValueError('players packet query exceeds 2000 bytes')
+    return f'{TMAPI_BASE}/players?' + query
 
 
 def _data(payload: Any) -> Any:
@@ -298,7 +329,11 @@ __all__ = [
     "current_saison_id",
     "parse_competition_clubs",
     "parse_regulation",
+    "MAX_PLAYER_IDS",
+    "MAX_PLAYERS_QUERY_BYTES",
     "players_url",
     "PlayerSignal",
     "parse_player_signals",
+    "normalize_market_value",
+    "player_signal_signature",
 ]

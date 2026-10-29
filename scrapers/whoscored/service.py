@@ -92,6 +92,7 @@ from .transport import (
     FetchRequest,
     CloudflareChallenge,
     StageStatisticsUnavailable,
+    StageBootstrapRedirect,
     ProxyUnavailable,
     TransportBudgets,
     TransportContext,
@@ -2566,6 +2567,9 @@ class WhoScoredIngestService:
                         raw_uris=raw_uris,
                         source_empty=source_empty,
                         source_unavailable=source_unavailable,
+                        checked_stage_ids=(
+                            result.metadata["source_stage_ids"] + collected.source_stage_absent
+                        ),
                         **({"require_schedule_game_ids": True} if refresh_months else {}),
                     )
                 except ScheduleCompletenessError as exc:
@@ -2680,6 +2684,7 @@ class WhoScoredIngestService:
                     "stage_xg_checked": [],
                     "stage_xg_retained": [],
                     "stage_xg_deferred": [],
+                    "stage_xg_redirected": [],
                 }
             )
             previous = (
@@ -2714,6 +2719,7 @@ class WhoScoredIngestService:
                 spools.append(spool)
                 rows[table] = spool
             retained: set[int] = set()
+            checked_stages: list[int] = []
             now = datetime.now(timezone.utc)
             changed = False
             for stage in collected.stage_rows:
@@ -2840,6 +2846,18 @@ class WhoScoredIngestService:
                 except WhoScoredTransportError as exc:
                     for spool in spools:
                         spool.rollback_stage()
+                    if isinstance(exc, StageBootstrapRedirect):
+                        logger.warning(
+                            "%s: stage=%s xG bootstrap HTTP %s; url=%r location=%r; redirected",
+                            self.scope.spec, stage_id, exc.status_code, exc.url,
+                            exc.redirect_location,
+                        )
+                        result.metadata["stage_xg_redirected"].append({
+                            "stage_id": stage_id, "status_code": exc.status_code,
+                            "url": exc.url, "location": exc.redirect_location,
+                        })
+                        retained.add(stage_id)
+                        continue
                     cause = exc
                     cooldown = False
                     while cause is not None:
@@ -2875,8 +2893,16 @@ class WhoScoredIngestService:
                         raw_uris.append(uri)
                         payload_hashes.append(digest)
                 feed_checks[key] = {"checked_at": checked.isoformat(), "final": final}
-                result.metadata["stage_xg_checked"].append(stage_id)
+                checked_stages.append(stage_id)
                 changed = True
+            for stage_id in collected.source_stage_absent:
+                key = str(stage_id)
+                check = {"checked_at": now.isoformat(), "final": not collected.active}
+                if previous.get("feed_checks", {}).get(key, {}).get("final") is not True:
+                    changed = True
+                feed_checks[key] = check
+                for suffix in ("team:xg-teamstats:summary", "player:xg-stats:summary"):
+                    feed_states[f"{stage_id}:{suffix}"] = DatasetStatus.NOT_AVAILABLE.value
             if not changed:
                 if policy_current and previous:
                     self.repository.cleanup_stage_feed_snapshot(
@@ -2937,6 +2963,7 @@ class WhoScoredIngestService:
                 expected_previous_stage_batch_id=previous.get("batch_id", ""),
             )
             result.committed_batches["scope"].append(str(batch_id))
+            result.metadata["stage_xg_checked"] = checked_stages
             result.succeeded = 1
             for table, values in rows.items():
                 result.counts[table.removeprefix("whoscored_")] = len(values)
@@ -2957,6 +2984,7 @@ class WhoScoredIngestService:
         limit: Optional[int] = None,
         force_replay: bool = False,
         historical_replay: bool = False,
+        lane: Optional[str] = None,
     ) -> EntityResult:
         result = EntityResult(
             "matches",
@@ -2971,6 +2999,7 @@ class WhoScoredIngestService:
             limit=limit,
             include_success=force_replay,
             include_exact_count=True,
+            **({"lane": lane} if lane is not None else {}),
         )
         result.attempted = len(candidates)
         result.attempted_snapshots["match"] = {
@@ -3342,6 +3371,7 @@ class WhoScoredIngestService:
         limit: Optional[int] = None,
         match_ids: Optional[Iterable[int]] = None,
         force_replay: bool = False,
+        historical: bool = False,
     ) -> EntityResult:
         result = EntityResult(
             "previews",
@@ -3355,6 +3385,7 @@ class WhoScoredIngestService:
             limit=limit,
             match_ids=match_ids,
             force_replay=force_replay,
+            **({"historical": True} if historical else {}),
         )
         result.attempted = len(candidates)
         result.attempted_snapshots["preview"] = {

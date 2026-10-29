@@ -39,7 +39,7 @@ SHOT_RESULTS = {
 
 
 class UnderstatSchemaDrift(ValueError):
-    """The source added a field that the production contract does not audit."""
+    """The source violates a required field, type or value contract."""
 
 
 _DATE_FIELDS = frozenset({
@@ -88,10 +88,13 @@ _PLAYER_REQUIRED_FIELDS = _PLAYER_FIELDS - frozenset({"player_id", "player"})
 _BREAKDOWN_REQUIRED_FIELDS = frozenset({"shots", "goals", "xG", "against"})
 
 
-def _reject_unknown(value: Mapping[str, Any], allowed: frozenset[str], path: str) -> None:
+def _warn_unknown(
+    value: Mapping[str, Any], allowed: frozenset[str], path: str,
+    *, warnings: Optional[list[dict[str, Any]]] = None,
+) -> None:
     unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise UnderstatSchemaDrift(f"{path}: unknown fields {unknown}")
+    if unknown and warnings is not None:
+        warnings.append({"path": path, "fields": unknown})
 
 
 def _require_mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -120,9 +123,10 @@ def _validate_object(
     path: str,
     allowed: frozenset[str],
     required: Optional[frozenset[str]] = None,
+    warnings: Optional[list[dict[str, Any]]] = None,
 ) -> Mapping[str, Any]:
     result = _require_mapping(value, path)
-    _reject_unknown(result, allowed, path)
+    _warn_unknown(result, allowed, path, warnings=warnings)
     _require_fields(result, required if required is not None else allowed, path)
     return result
 
@@ -161,22 +165,28 @@ def _validate_keyed_records_or_empty_list(
     return result
 
 
-def _validate_match_record(match: Mapping[str, Any], path: str, *, team: bool) -> None:
+def _validate_match_record(
+    match: Mapping[str, Any], path: str, *, team: bool,
+    warnings: Optional[list[dict[str, Any]]] = None,
+) -> None:
     fields = _TEAM_DATE_FIELDS if team else _DATE_FIELDS
     required = _TEAM_DATE_REQUIRED_FIELDS if team else _DATE_REQUIRED_FIELDS
-    _reject_unknown(match, fields, path)
+    _warn_unknown(match, fields, path, warnings=warnings)
     _require_fields(match, required, path)
     for side in ("h", "a"):
         _validate_object(
-            match[side], path=f"{path}.{side}", allowed=_SIDE_FIELDS
+            match[side], path=f"{path}.{side}", allowed=_SIDE_FIELDS,
+            warnings=warnings,
         )
     for field in ("goals", "xG"):
         _validate_object(
-            match[field], path=f"{path}.{field}", allowed=_PAIR_FIELDS
+            match[field], path=f"{path}.{field}", allowed=_PAIR_FIELDS,
+            warnings=warnings,
         )
     if "forecast" in match:
         _validate_object(
-            match["forecast"], path=f"{path}.forecast", allowed=_FORECAST_FIELDS
+            match["forecast"], path=f"{path}.forecast", allowed=_FORECAST_FIELDS,
+            warnings=warnings,
         )
 
 
@@ -204,17 +214,23 @@ def _mapped_enum(
         ) from exc
 
 
-def validate_league_payload(payload: Mapping[str, Any]) -> None:
+def validate_league_payload(
+    payload: Mapping[str, Any], *, warnings: Optional[list[dict[str, Any]]] = None,
+) -> None:
     payload = _validate_object(
         payload,
         path="getLeagueData",
         allowed=_LEAGUE_TOP_LEVEL_FIELDS,
+        warnings=warnings,
     )
     dates = _require_list(payload["dates"], "getLeagueData.dates")
     expected_history_sides: dict[tuple[str, str], str] = {}
     for index, match in enumerate(dates):
         match = _require_mapping(match, f"getLeagueData.dates[{index}]")
-        _validate_match_record(match, f"getLeagueData.dates[{index}]", team=False)
+        _validate_match_record(
+            match, f"getLeagueData.dates[{index}]", team=False,
+            warnings=warnings,
+        )
         is_result = _boolean(
             match["isResult"],
             f"getLeagueData.dates[{index}].isResult",
@@ -235,7 +251,10 @@ def validate_league_payload(payload: Mapping[str, Any]) -> None:
     players = _require_list(payload["players"], "getLeagueData.players")
     for index, player in enumerate(players):
         player = _require_mapping(player, f"getLeagueData.players[{index}]")
-        _reject_unknown(player, _PLAYER_FIELDS, f"getLeagueData.players[{index}]")
+        _warn_unknown(
+            player, _PLAYER_FIELDS, f"getLeagueData.players[{index}]",
+            warnings=warnings,
+        )
         _require_fields(
             player, _PLAYER_REQUIRED_FIELDS, f"getLeagueData.players[{index}]"
         )
@@ -244,7 +263,7 @@ def validate_league_payload(payload: Mapping[str, Any]) -> None:
     )
     for index, team in enumerate(teams):
         team = _require_mapping(team, f"getLeagueData.teams[{index}]")
-        _reject_unknown(team, _TEAM_FIELDS, f"getLeagueData.teams[{index}]")
+        _warn_unknown(team, _TEAM_FIELDS, f"getLeagueData.teams[{index}]", warnings=warnings)
         # #1428: before its first match a team may be a bare placeholder
         # without id/title; one with history must stay fully identified.
         if not {"id", "title"} <= set(team) and team.get("history") in (None, []):
@@ -258,10 +277,11 @@ def validate_league_payload(payload: Mapping[str, Any]) -> None:
             history = _require_mapping(
                 history, history_path
             )
-            _reject_unknown(
+            _warn_unknown(
                 history,
                 _HISTORY_FIELDS,
                 history_path,
+                warnings=warnings,
             )
             _require_fields(
                 history,
@@ -294,17 +314,22 @@ def validate_league_payload(payload: Mapping[str, Any]) -> None:
                     history[field],
                     path=f"{history_path}.{field}",
                     allowed=_PPDA_FIELDS,
+                    warnings=warnings,
                 )
 
 
-def validate_match_payload(payload: Mapping[str, Any]) -> None:
+def validate_match_payload(
+    payload: Mapping[str, Any], *, warnings: Optional[list[dict[str, Any]]] = None,
+) -> None:
     payload = _validate_object(
-        payload, path="getMatchData", allowed=_MATCH_TOP_LEVEL_FIELDS
+        payload, path="getMatchData", allowed=_MATCH_TOP_LEVEL_FIELDS,
+        warnings=warnings,
     )
     _require_mapping(payload["tmpl"], "getMatchData.tmpl")
     for container in ("rosters", "shots"):
         sides = _validate_object(
-            payload[container], path=f"getMatchData.{container}", allowed=_PAIR_FIELDS
+            payload[container], path=f"getMatchData.{container}", allowed=_PAIR_FIELDS,
+            warnings=warnings,
         )
         for side in ("h", "a"):
             _validate_record_container(
@@ -317,7 +342,7 @@ def validate_match_payload(payload: Mapping[str, Any]) -> None:
             _validate_record_container(rosters[side], f"getMatchData.rosters.{side}")
         ):
             path = f"getMatchData.rosters.{side}[{index}]"
-            _reject_unknown(player, _ROSTER_FIELDS, path)
+            _warn_unknown(player, _ROSTER_FIELDS, path, warnings=warnings)
             _require_fields(
                 player, _ROSTER_FIELDS, path
             )
@@ -330,7 +355,7 @@ def validate_match_payload(payload: Mapping[str, Any]) -> None:
             _validate_record_container(shots[side], f"getMatchData.shots.{side}")
         ):
             path = f"getMatchData.shots.{side}[{index}]"
-            _reject_unknown(shot, _SHOT_FIELDS, path)
+            _warn_unknown(shot, _SHOT_FIELDS, path, warnings=warnings)
             _require_fields(shot, _SHOT_FIELDS, path)
             if str(shot.get("h_a")) != side:
                 raise UnderstatSchemaDrift(
@@ -343,10 +368,12 @@ def validate_match_payload(payload: Mapping[str, Any]) -> None:
 
 
 def validate_team_payload(
-    payload: Mapping[str, Any], source_season_id: Optional[int] = None
+    payload: Mapping[str, Any], source_season_id: Optional[int] = None,
+    *, warnings: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     payload = _validate_object(
-        payload, path="getTeamData", allowed=_TEAM_TOP_LEVEL_FIELDS
+        payload, path="getTeamData", allowed=_TEAM_TOP_LEVEL_FIELDS,
+        warnings=warnings,
     )
     # #1428 (R-38): for a team outside the requested season the source silently
     # answers with its previous season. Lower bound only: 2019/20 ran into
@@ -359,7 +386,10 @@ def validate_team_payload(
     dates = _require_list(payload["dates"], "getTeamData.dates")
     for index, match in enumerate(dates):
         match = _require_mapping(match, f"getTeamData.dates[{index}]")
-        _validate_match_record(match, f"getTeamData.dates[{index}]", team=True)
+        _validate_match_record(
+            match, f"getTeamData.dates[{index}]", team=True,
+            warnings=warnings,
+        )
         if season_start is not None and str(match["datetime"]).strip() < season_start:
             raise UnderstatSchemaDrift(
                 f"getTeamData.dates[{index}].datetime {match['datetime']!r} is "
@@ -368,19 +398,27 @@ def validate_team_payload(
     players = _require_list(payload["players"], "getTeamData.players")
     for index, player in enumerate(players):
         player = _require_mapping(player, f"getTeamData.players[{index}]")
-        _reject_unknown(player, _PLAYER_FIELDS, f"getTeamData.players[{index}]")
+        _warn_unknown(
+            player, _PLAYER_FIELDS, f"getTeamData.players[{index}]",
+            warnings=warnings,
+        )
         _require_fields(player, _PLAYER_REQUIRED_FIELDS, f"getTeamData.players[{index}]")
     statistics = payload["statistics"]
     # #1428: a team without a played match answers [], null or {}.
     if statistics is None or (isinstance(statistics, list) and not statistics):
         statistics = {}
     statistics = _require_mapping(statistics, "getTeamData.statistics")
-    _reject_unknown(statistics, _BREAKDOWN_DIMENSIONS, "getTeamData.statistics")
-    if statistics:
+    _warn_unknown(
+        statistics, _BREAKDOWN_DIMENSIONS, "getTeamData.statistics",
+        warnings=warnings,
+    )
+    if set(statistics) & _BREAKDOWN_DIMENSIONS:
         _require_fields(
             statistics, _BREAKDOWN_DIMENSIONS, "getTeamData.statistics"
         )
     for dimension, categories in statistics.items():
+        if dimension not in _BREAKDOWN_DIMENSIONS:
+            continue
         categories = _require_mapping(
             categories, f"getTeamData.statistics.{dimension}"
         )
@@ -388,10 +426,11 @@ def validate_team_payload(
             values = _require_mapping(
                 values, f"getTeamData.statistics.{dimension}.{category}"
             )
-            _reject_unknown(
+            _warn_unknown(
                 values,
                 _BREAKDOWN_FIELDS,
                 f"getTeamData.statistics.{dimension}.{category}",
+                warnings=warnings,
             )
             _require_fields(
                 values,
@@ -402,6 +441,7 @@ def validate_team_payload(
                 values["against"],
                 path=f"getTeamData.statistics.{dimension}.{category}.against",
                 allowed=_AGAINST_FIELDS,
+                warnings=warnings,
             )
 
 
@@ -927,6 +967,8 @@ def parse_team_payload(
 
     breakdown_rows: list[dict[str, Any]] = []
     for dimension, categories in _mapping(payload.get("statistics")).items():
+        if dimension not in _BREAKDOWN_DIMENSIONS:
+            continue
         for category, values in _mapping(categories).items():
             values = _mapping(values)
             against = _mapping(values.get("against"))

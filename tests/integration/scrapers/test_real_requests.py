@@ -22,35 +22,6 @@ import pytest
 
 
 # =============================================================================
-# Understat Tests (No Tor Required)
-# =============================================================================
-
-@pytest.mark.integration
-class TestUnderstatIntegration:
-    """Integration tests for Understat scraper."""
-
-    def test_read_schedule(self, understat_scraper, skip_if_no_network, integration_delay):
-        """Test reading Understat schedule with real request."""
-        df = understat_scraper.read_schedule()
-
-        assert df is not None, "DataFrame should not be None"
-        assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        assert len(df) > 0, "DataFrame should not be empty"
-        assert '_source' in df.columns, "Should have metadata column"
-        assert df['_source'].iloc[0] == 'understat', "Source should be 'understat'"
-
-    def test_read_player_season_stats(self, understat_scraper, skip_if_no_network, integration_delay):
-        """Test reading player stats."""
-        df = understat_scraper.read_player_season_stats()
-
-        assert df is not None, "DataFrame should not be None"
-        assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        # May be empty for current season if no data yet
-        if len(df) > 0:
-            assert '_source' in df.columns, "Should have metadata column"
-
-
-# =============================================================================
 # ESPN Tests (No Tor Required)
 # =============================================================================
 
@@ -126,17 +97,6 @@ class TestSoFIFAIntegration:
 @pytest.mark.integration
 class TestSourceAvailability:
     """Tests to verify source websites are accessible."""
-
-    def test_understat_accessible(self, skip_if_no_network):
-        """Test that understat.com is accessible."""
-        import requests
-
-        response = requests.get(
-            'https://understat.com/league/EPL/2024',
-            timeout=30,
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        assert response.status_code == 200
 
     def test_espn_accessible(self, skip_if_no_network):
         """Test that espn.com is accessible."""
@@ -249,16 +209,6 @@ class TestSourceAvailabilityWithTor:
 @pytest.mark.integration
 class TestDataQuality:
     """Tests to verify data quality from scrapers."""
-
-    def test_understat_schedule_columns(self, understat_scraper, skip_if_no_network, integration_delay):
-        """Verify Understat schedule has expected columns."""
-        df = understat_scraper.read_schedule()
-
-        if df is not None and len(df) > 0:
-            # Check for essential columns
-            assert 'league' in df.columns or 'ENG-Premier League' in str(df.index.names)
-            assert '_source' in df.columns
-            assert '_ingested_at' in df.columns
 
     def test_matchhistory_odds_columns(self, matchhistory_scraper, skip_if_no_network, integration_delay):
         """Verify MatchHistory has betting odds columns."""

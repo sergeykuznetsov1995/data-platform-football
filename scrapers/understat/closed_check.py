@@ -1,13 +1,10 @@
 """Weekly change check for closed Understat seasons (#1431).
 
-A *closed* scope is a season whose source start year is older than the
-current source season (``current_source_season_id``: the season starting in
-July of the calendar year, one date for all leagues).  The daily plan ingests
-only non-closed scopes, including the next-season probe.  Closed scopes of the
-rolling window are checked once a week (Monday) with one ``getLeagueData``
-request: three fingerprints of the league response are compared with the
-fingerprints recorded by the last complete attempt, and the scope is
-re-ingested in full only when one of them differs.
+A *closed* scope has a completed league schedule outside the two-day refresh
+window, as confirmed by the catalog. The daily plan ingests non-closed scopes,
+including a continuing previous season. Closed scopes of the rolling window
+are checked once a week (Monday) with one ``getLeagueData`` request; a changed
+fingerprint triggers full re-ingestion.
 
 The fingerprints are ``dataframe_content_hash`` of the frames produced by
 ``parse_schedule``, ``parse_player_season_stats`` and
@@ -57,8 +54,12 @@ def _source_season_id(scope: Any) -> int:
 
 
 def is_scope_closed(scope: Any, today: date) -> bool:
-    """Catalog rule: the season started before the current source season."""
+    """Respect confirmed catalog classification; support legacy bare scopes."""
 
+    if isinstance(scope, Mapping) and "is_closed" in scope:
+        return bool(scope["is_closed"])
+    if hasattr(scope, "is_closed"):
+        return bool(scope.is_closed)
     return _source_season_id(scope) < current_source_season_id(today)
 
 

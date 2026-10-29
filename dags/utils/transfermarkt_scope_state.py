@@ -234,16 +234,32 @@ class ScopeManifest:
         if not isinstance(coverage, Mapping):
             raise ScopeManifestError('roster coverage must be a mapping')
         pending = 0
+        from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY
+        global_debt = bool(coverage) and all(
+            isinstance(item, Mapping) and item.get('policy_version') == CAREER_DEBT_POLICY
+            for item in coverage.values()
+        )
+        debt_ids = set()
         for entity, item in coverage.items():
             if not isinstance(item, Mapping):
                 raise ScopeManifestError(
                     f'{entity}: roster coverage must be a mapping'
                 )
-            if set(item) != {'roster_size', 'selected', 'pending'}:
+            fields = {'roster_size', 'selected', 'pending'}
+            if global_debt:
+                fields |= {'policy_version', 'debt_player_ids', 'refresh_pending'}
+            if set(item) != fields:
                 raise ScopeManifestError(
                     f'{entity}: roster coverage has an unbound field set'
                 )
-            for name, number in item.items():
+            if global_debt:
+                ids = item['debt_player_ids']
+                if (not isinstance(ids, list) or any(not isinstance(pid, str) or not pid for pid in ids)
+                    or len(set(ids)) != len(ids) or len(ids) != item['pending']):
+                    raise ScopeManifestError(f'{entity}: invalid career debt player IDs')
+                debt_ids.update(ids)
+            for name in fields - {'policy_version', 'debt_player_ids'}:
+                number = item[name]
                 if isinstance(number, bool) or not isinstance(number, int):
                     raise ScopeManifestError(
                         f'{entity}: roster coverage {name} must be an integer'
@@ -253,6 +269,8 @@ class ScopeManifest:
                         f'{entity}: roster coverage {name} must not be negative'
                     )
             pending += int(item['pending'])
+        if global_debt:
+            pending = len(debt_ids)
         declared = value['career_fetches_pending']
         if isinstance(declared, bool) or not isinstance(declared, int):
             raise ScopeManifestError('career_fetches_pending must be an integer')

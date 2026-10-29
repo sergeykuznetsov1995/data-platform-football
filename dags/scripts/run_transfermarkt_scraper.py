@@ -12,6 +12,11 @@ Exit codes: 0 success/no-op/dry-run, 1 hard failure, 2 genuine empty fallback,
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 from scrapers.transfermarkt.writer import execute_statement, writer_lock, guard_frames, guard_cached_frames, is_mutation, locked_write
 
 import argparse
@@ -37,6 +42,7 @@ from dags.utils.transfermarkt_dq_contracts import (
     input_from_capture,
     validate_scope_capture,
 )
+from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY, CAREER_TTL, SUCCESS_STATUSES
 # The budget canon is stdlib-only and safe at module import time; the heavy
 # scraper modules stay lazy inside _run_entity.
 from scrapers.transfermarkt.models import (
@@ -121,8 +127,8 @@ REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
 _MIN_REPLACE_RATIO = 0.9
 _WINDOW_STRIDE_DAYS = 7
 FETCH_STATE_TABLE = 'iceberg.ops.transfermarkt_fetch_state'
-PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', 'v2')
-SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', '2')
+PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', DEFAULT_PARSER_REVISION)
+SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', DEFAULT_SCHEMA_REVISION)
 REFRESH_MODES = {'auto', 'current', 'historical', 'force'}
 WRITE_MODES = {'dual', 'native-only', 'legacy-only'}
 DUAL_WRITE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_dual_write_manifest_v2'
@@ -779,6 +785,8 @@ def _load_data_derived_state(
     source = _DERIVED_STATE_SOURCES.get(endpoint)
     if source is None:
         return {}
+    from scrapers.transfermarkt.scraper import PARSER_REVISION, SCHEMA_REVISION
+    compatible = ' AND n.parser_revision = ? AND n.schema_revision = ? '
     table, key_column = source
     entity = {
         'market_value_points': 'market_value_points',
@@ -797,6 +805,7 @@ def _load_data_derived_state(
             f"SELECT CAST(n.{key_column} AS varchar), count(*), max(n._ingested_at) "
             f"FROM {table} n "
             f"WHERE CAST(n.{key_column} AS varchar) IN ({placeholders}) "
+            + compatible +
             f"AND EXISTS (SELECT 1 FROM {DUAL_WRITE_MANIFEST_TABLE} m "
             "WHERE m.entity = ? AND m.status = 'success' "
             "AND m.legacy_batch_id = m.native_batch_id "
@@ -804,7 +813,7 @@ def _load_data_derived_state(
             "AND m.legacy_hash = m.native_hash "
             "AND m.native_batch_id = n._batch_id) "
             f"GROUP BY n.{key_column}",
-            tuple(roster) + (entity,),
+            tuple(roster) + (PARSER_REVISION, SCHEMA_REVISION, entity),
             fetch=True,
         ) or []
         derived = {
@@ -860,10 +869,10 @@ def _load_data_derived_state(
         conn = scraper._bronze_connection()
         native_rows = _execute_cursor(
             conn,
-            f"SELECT CAST(player_id AS varchar), {select_columns}, "
+            f"SELECT CAST(n.player_id AS varchar), {select_columns}, "
             "_ingested_at, _batch_id "
-            f"FROM {table} WHERE CAST(player_id AS varchar) IN ({placeholders})",
-            tuple(roster),
+            f"FROM {table} n WHERE CAST(n.player_id AS varchar) IN ({placeholders})" + compatible,
+            tuple(roster) + (PARSER_REVISION, SCHEMA_REVISION),
             fetch=True,
         ) or []
         legacy_rows = _execute_cursor(
@@ -1438,6 +1447,7 @@ def _select_player_ids(
         raise _EmptyRosterError(
             f'no player ids in Bronze roster for {league}/{season}'
         )
+    roster = list(dict.fromkeys(str(pid) for pid in roster))
     state = _load_fetch_state(
         scraper,
         spec.state_endpoint or spec.name,
@@ -1475,6 +1485,8 @@ def _select_player_ids(
     )
     derived = (_load_data_derived_state(scraper, endpoint, league, season, derived_scope)
         if legacy_materialization_required else {})
+    derived = {pid: item for pid, item in derived.items()
+        if pid not in state or state[pid].get('status') in SUCCESS_STATUSES}
     hydrate_ids = sorted(
         source_id for source_id, item in derived.items()
         if item.get('needs_legacy_materialization')
@@ -1530,6 +1542,20 @@ def _select_player_ids(
         candidates = [pid for pid in roster if pid not in cached]
         cache_hits = len(set(roster) & cached)
         selected = candidates[:limit]
+    elif refresh_mode == 'current':
+        changes = _load_career_changes(scraper, roster)
+        now = datetime.now(timezone.utc)
+        cached = {
+            pid for pid, item in state.items()
+            if item.get('status') in SUCCESS_STATUSES
+            and (stamp := _as_utc(item.get('last_success_at'))) is not None
+            and now - CAREER_TTL < stamp <= now
+            and (changes.get(pid) is None or changes[pid] <= stamp)
+        }
+        candidates = [pid for pid in roster if pid not in cached]
+        cache_hits = len(set(roster) & cached)
+        if any(not output.is_legacy for output in spec.outputs):
+            hydrate_ids = sorted(set(hydrate_ids) | (set(roster) & cached))
     else:
         already_this_run = {
             pid for pid, item in state.items()
@@ -1550,6 +1576,7 @@ def _select_player_ids(
             return (last is not None, str(last or ''), (0, int(pid)) if pid.isdigit() else (1, pid))
 
         selected = sorted(candidates, key=_age_key)[:limit]
+        hydrate_ids = [pid for pid in hydrate_ids if pid not in selected]
 
     # One cycle buys at most ``limit`` careers of a roster that can run to
     # thousands.  Whoever reads this scope's manifest has to be able to see how
@@ -1561,6 +1588,14 @@ def _select_player_ids(
         'selected': len(selected),
         'pending': pending,
     }
+    if refresh_mode == 'current':
+        debt_ids = [pid for pid in roster if _as_utc(state.get(pid, {}).get('last_success_at')) is None]
+        coverage.update(
+            policy_version=CAREER_DEBT_POLICY,
+            debt_player_ids=debt_ids,
+            pending=len(debt_ids),
+            refresh_pending=sum(pid not in debt_ids and pid not in selected for pid in candidates),
+        )
     from scrapers.transfermarkt.history_portion import enabled as history_enabled
     if refresh_mode == 'historical' and history_enabled():
         coverage.update(roster_ids=list(roster), remaining_ids=list(candidates[len(selected):]))
@@ -1571,6 +1606,38 @@ def _select_player_ids(
         cache_hits, pending,
     )
     return selected, cache_hits, seeded, hydrate_ids, coverage
+
+
+def _load_career_changes(scraper, roster):
+    """Only changed player signals invalidate a globally fresh career.
+
+    A cold observation in another scope is a new association, not a change to
+    the player. Missing signal tables on the legacy lane leave the slow TTL.
+    """
+    from dags.utils.transfermarkt_current_state import SIGNALS_TABLE
+    if not callable(getattr(scraper, '_bronze_connection', None)):
+        return {}
+    try:
+        rows = _execute_cursor(scraper._bronze_connection(),
+            f'SELECT entity_id, MAX(first_detected_at) FROM {SIGNALS_TABLE} '
+            "WHERE entity = 'player' AND measurement_kind = 'change' "
+            'AND entity_id IN (' + ', '.join('?' for _ in roster) + ') GROUP BY entity_id',
+            tuple(roster), fetch=True) or []
+    except Exception as exc:
+        if any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+            return {}
+        raise RuntimeError('career change signals unavailable; refusing paid refetch') from exc
+    return {str(pid): stamp for pid, value in rows if (stamp := _as_utc(value)) is not None}
+
+
+def _commit_career_coverage(results, selected, rows):
+    """Selection does not pay debt; only a successful Bronze+manifest commit does."""
+    coverage = results.get('roster_coverage', {})
+    if coverage.get('policy_version') != CAREER_DEBT_POLICY:
+        return
+    successful = {str(pid) for pid, row in zip(selected, rows) if row[0] in SUCCESS_STATUSES}
+    coverage['debt_player_ids'] = [pid for pid in coverage['debt_player_ids'] if pid not in successful]
+    coverage['pending'] = len(coverage['debt_player_ids'])
 
 
 def _frame_hash(frame) -> str:
@@ -2021,6 +2088,7 @@ _CAREER_CACHE_COLUMNS = {
         'market_value_points',
         (
             'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
+            'is_value_removed', 'club_id', 'mv_last_change',
             '_source', '_entity_type', '_ingested_at', '_batch_id',
         ),
         ('player_id', 'mv_date'),
@@ -2033,6 +2101,8 @@ _CAREER_CACHE_COLUMNS = {
             'transfer_id', 'player_id', 'transfer_date', 'event_season',
             'from_club_id', 'from_club_name', 'to_club_id', 'to_club_name',
             'fee_text', 'fee_eur', 'market_value_eur', 'is_upcoming',
+            'from_is_special', 'to_is_special', 'from_country_flag', 'to_country_flag',
+            'from_country_id', 'to_country_id', 'is_loan_end',
             '_source', '_entity_type', '_ingested_at', '_batch_id',
         ),
         ('transfer_id',),
@@ -2060,6 +2130,16 @@ def _load_cached_career_frames(scraper, spec: EntitySpec, source_ids: Sequence[s
         frame = pd.DataFrame(columns=columns)
     loaded = set(frame['player_id'].dropna().astype(str)) if not frame.empty else set()
     untracked = sorted(set(source_ids) - loaded)
+    empty_refs = []
+    if untracked:
+        state = _load_fetch_state(scraper, entity, strict=True)
+        empty_ids = [pid for pid in untracked
+            if state.get(pid, {}).get('status') in {'valid_empty', 'authoritative_empty'}]
+        for pid in empty_ids:
+            empty_refs.append(
+                _load_cached_empty_career_ref(scraper, spec, pid, state[pid]))
+        loaded.update(empty_ids)
+        untracked = sorted(set(source_ids) - loaded)
     legacy_output = next((output for output in spec.outputs if output.is_legacy), None)
     if untracked and legacy_output is not None:
         placeholders = ', '.join('?' for _ in untracked)
@@ -2070,11 +2150,72 @@ def _load_cached_career_frames(scraper, spec: EntitySpec, source_ids: Sequence[s
             f"OR EXISTS (SELECT 1 FROM {legacy_table} l WHERE CAST(l.player_id AS varchar) = CAST(n.player_id AS varchar) AND l._batch_id = n._batch_id))")
         cached = _query_dataframe(scraper._bronze_connection(), f"SELECT n.* FROM {table} n WHERE CAST(n.player_id AS varchar) IN ({placeholders}) AND {proof}", (*untracked, entity))
         frame = pd.concat([frame, cached], ignore_index=True) if not frame.empty else cached
-    loaded = set(frame['player_id'].dropna().astype(str)) if not frame.empty else set()
+    loaded.update(frame['player_id'].dropna().astype(str))
     missing = sorted(set(source_ids) - loaded)
     if missing:
         raise RuntimeError('complete career cache changed before materialisation; missing source ids: ' + str(missing))
+    frame.attrs['tm_cached_empty_capture_refs'] = empty_refs
     return {key: frame}
+
+
+def _load_cached_empty_career_ref(scraper, spec, player, state):
+    """Reprove the original typed empty, including raw and current physical rows."""
+    import pandas as pd
+    from scrapers.transfermarkt.career_refs import TABLE, physical_predicate
+    from scrapers.transfermarkt.superseded import _raw_player
+    native = next(output for output in spec.outputs if not output.is_legacy)
+    connection = scraper._bronze_connection()
+    cursor = connection.cursor()
+    try:
+        candidates = _execute_cursor(connection,
+            f'SELECT cycle_id, entity, native_batch_id FROM {TABLE} '
+            'WHERE native_table = ? AND json_extract_scalar(capture_times_json, ?) IS NOT NULL '
+            'ORDER BY committed_at DESC', (native.table_name, '$."' + player + '"'), fetch=True) or []
+        stamp = _as_utc(state.get('last_success_at'))
+        for cycle, entity, batch in candidates:
+            capture = physical_predicate(cursor, cycle, entity, native.table_name, batch_id=batch)
+            refs = [item for item in capture.empty_refs if str(item['player_id']) == player] if capture else []
+            if len(refs) != 1 or stamp is None or _as_utc(refs[0]['captured_at']) != stamp:
+                continue
+            ref = refs[0]
+            evidence = {'checkpoint_ids': [player],
+                'state_rows': [(ref['status'], ref['expected_rows'], ref['payload_hash'], None)],
+                'captured_at_by_id': {player: ref['captured_at']},
+                'raw_attempts': ref['raw_attempts'], 'cache_sources': ref['cache_sources']}
+            _raw_player(scraper, {'evidence': evidence}, pd.DataFrame(), player, entity)
+            for snapshot in {None, capture.snapshot_id}:
+                relation = 'iceberg.bronze.' + native.table_name
+                if snapshot is not None:
+                    relation += f' FOR VERSION AS OF {snapshot}'
+                try:
+                    execute_statement(cursor, f'SELECT COUNT(*) FROM {relation} WHERE player_id = ?', (player,))
+                    if int(cursor.fetchall()[0][0]) != 0:
+                        raise RuntimeError('cached empty career has physical rows: ' + player)
+                except Exception as exc:
+                    if snapshot is not None or not any(token in str(exc).lower()
+                            for token in ('table_not_found', 'table not found', 'does not exist')):
+                        raise
+            return ref
+    finally:
+        cursor.close()
+        connection.close()
+    raise RuntimeError('cached empty career lacks original typed proof: ' + player)
+
+
+def _guard_cached_empty_careers(scraper, spec, frames):
+    # Recheck cached emptiness under the same lock as writes: another
+    # writer may have replaced that global career since cache selection.
+    for output in spec.outputs:
+        if output.is_legacy:
+            continue
+        frame = frames.get(output.key)
+        refs = frame.attrs.get('tm_cached_empty_capture_refs', []) if frame is not None else []
+        if refs:
+            state = _load_fetch_state(scraper, spec.state_endpoint, strict=True)
+            for ref in refs:
+                player = str(ref['player_id'])
+                if _load_cached_empty_career_ref(scraper, spec, player, state.get(player, {})) != ref:
+                    raise RuntimeError('cached empty career proof changed: ' + player)
 
 
 def _align_ingested_at_units(frames):
@@ -2135,6 +2276,9 @@ def _merge_career_cache_frames(
     # Cache hydration is a read reference, never a new native capture. Keep
     # original native batch/lineage; the manifest records these physical refs.
     native.attrs['tm_captured_player_ids'] = captured
+    native.attrs['tm_cached_empty_capture_refs'] = (
+        stored.attrs.get('tm_cached_empty_capture_refs', []) if stored is not None else []
+    )
     native.attrs['tm_original_capture_refs'] = [
         {'player_id': str(player), 'batch_id': str(batch)}
         for player, batch in native[['player_id', '_batch_id']].drop_duplicates().itertuples(index=False, name=None)
@@ -2444,10 +2588,11 @@ def _apply_career_window(scraper, spec, selected, results):
     if isinstance(coverage, dict):
         if 'remaining_ids' in coverage:
             coverage['remaining_ids'] = list(deferred) + coverage['remaining_ids']
-        coverage.update(
-            selected=len(attempted),
-            pending=coverage['pending'] + len(deferred),
-        )
+        coverage['selected'] = len(attempted)
+        if coverage.get('policy_version') == CAREER_DEBT_POLICY:
+            coverage['refresh_pending'] += sum(pid not in coverage['debt_player_ids'] for pid in deferred)
+        else:
+            coverage['pending'] += len(deferred)
     return list(attempted)
 
 
@@ -2477,6 +2622,7 @@ def _save_frames(
             if key in native_keys and frame is not None and captured_mask(frame) is not None else frame
             for key, frame in frames.items()
         }
+        _guard_cached_empty_careers(scraper, spec, frames)
         guard_cached_frames(scraper, spec.outputs, frames)
         guard_frames(scraper, spec.outputs, captured_frames)
         for output in spec.outputs:
@@ -2515,6 +2661,8 @@ def _save_frames(
                 replace_partitions=list(output.replace_keys) or None,
                 min_replace_ratio=guard,
                 replace_guard_key=output.guard_key,
+                **({'natural_keys': ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']}
+                   if output.key == 'attribute_observations' else {}),
             )
             results['tables'].append(table_path)
             results['outputs'][output.key] = {
@@ -2617,6 +2765,7 @@ def _reconcile_native_career_intent(scraper, spec, mode, revision, league, seaso
         results['checkpoint_status'] = _commit_checkpoint_or_pending(scraper, spec,
             evidence['checkpoint_ids'], evidence['state_rows'], original_run, league, season,
             captured_at_by_id=evidence.get('captured_at_by_id'))
+        _commit_career_coverage(results, evidence['checkpoint_ids'], evidence['state_rows'])
         results['native_write_complete'] = mode != 'legacy-only'
         results['reconciled_without_http'] = True
         results['original_capture_run_key'] = original_run
@@ -3269,6 +3418,7 @@ def _persist_dual_write_manifest(
     season: int,
 ) -> Dict[str, Any]:
     """Persist one compatibility-checked row per native↔legacy pair."""
+    _guard_cached_empty_careers(scraper, spec, frames)
     legacy_specs = [output for output in spec.outputs if output.is_legacy]
     native_specs = [output for output in spec.outputs if not output.is_legacy]
     if len(legacy_specs) != 1 or not native_specs:
@@ -3376,7 +3526,7 @@ def _persist_dual_write_manifest(
         )
         native_batch_id = _frame_batch_id(native_frame, str(scraper._batch_id) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else run_key)
         from scrapers.transfermarkt.career_refs import persist_capture_refs
-        capture_proof = persist_capture_refs(conn, run_key, contract['entity'], native.table_name, native_frame, legacy=True, empty_refs=_career_empty_capture_refs(scraper) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else [], batch_id=native_batch_id)
+        capture_proof = persist_capture_refs(conn, run_key, contract['entity'], native.table_name, native_frame, legacy=True, empty_refs=_career_empty_capture_refs(scraper) + native_frame.attrs.get('tm_cached_empty_capture_refs', []) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else [], batch_id=native_batch_id)
         if applicability == 'not_applicable':
             native_batch_id = legacy_batch_id
         status = (
@@ -3490,6 +3640,7 @@ def _persist_native_write_manifest(
     Silver/Gold slot.  Empty evidence is promotable only when the typed source
     outcome is explicitly ``authoritative_empty`` or ``not_applicable``.
     """
+    _guard_cached_empty_careers(scraper, spec, frames)
     revision = int(writer_revision)
     if revision < 0:
         raise ValueError('writer_revision must be non-negative')
@@ -3534,7 +3685,7 @@ def _persist_native_write_manifest(
         )
         native_batch_id = _frame_batch_id(frame, str(scraper._batch_id) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else run_key)
         from scrapers.transfermarkt.career_refs import persist_capture_refs
-        capture_proof = persist_capture_refs(conn, run_key, contract['entity'], native.table_name, frame, empty_refs=_career_empty_capture_refs(scraper) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else [], batch_id=native_batch_id)
+        capture_proof = persist_capture_refs(conn, run_key, contract['entity'], native.table_name, frame, empty_refs=_career_empty_capture_refs(scraper) + frame.attrs.get('tm_cached_empty_capture_refs', []) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else [], batch_id=native_batch_id)
         allowed_empty = bool(
             results.get('authoritative_empty')
             or applicability in {'authoritative_empty', 'not_applicable'}
@@ -3812,6 +3963,10 @@ def _run_entity_unbounded(
             ),
             cache_ttl_seconds=cache_ttl,
             canonical_season=os.environ.get('TM_CANONICAL_SEASON'),
+            request_deadline_monotonic=(
+                float(os.environ['TM_REQUEST_DEADLINE_MONOTONIC'])
+                if 'TM_REQUEST_DEADLINE_MONOTONIC' in os.environ else None
+            ),
         ) as scraper:
             _reconcile_pending_fetch_state(scraper)
             if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS} and not dry_run:
@@ -3837,7 +3992,7 @@ def _run_entity_unbounded(
                         selected, cache_hits, seeded, career_hydrate_ids,
                         coverage,
                     ) = _select_player_ids(
-                        scraper, spec, league, season, int(limit),
+                        scraper, write_spec, league, season, int(limit),
                         window_offset, refresh_mode, run_key,
                         allow_state_writes=not dry_run,
                         legacy_materialization_required=legacy_write_enabled,
@@ -3914,7 +4069,7 @@ def _run_entity_unbounded(
                 career_cache_has_rows = bool(
                     career_cache_frames is not None
                     and any(
-                        not frame.empty
+                        frame.attrs.get('tm_cached_empty_capture_refs') or not frame.empty
                         for frame in career_cache_frames.values()
                     )
                 )
@@ -3981,9 +4136,11 @@ def _run_entity_unbounded(
                     if career_cache_frames is not None:
                         # Bootstrap projection must not re-admit the deferred
                         # tail or resurrect a newly authoritative empty career.
-                        cache_ids = set(selected) - set(_valid_empty_ids(
-                            scraper, spec, selected,
-                        ))
+                        cache_ids = (
+                            (set(selected) | set(career_hydrate_ids))
+                            - set(results['career_window']['deferred_ids'])
+                            - set(_valid_empty_ids(scraper, spec, selected))
+                        )
                         career_hydrate_ids = [
                             sid for sid in career_hydrate_ids if sid in cache_ids
                         ]
@@ -4030,20 +4187,29 @@ def _run_entity_unbounded(
                 if selected is not None and checkpoint_spec is not None else []
             )
             checkpoint_ids = list(dict.fromkeys(
-                list(selected or []) + career_hydrate_ids
+                list(selected or [])
+                # Current cache projections retain the original global state.
+                + (career_hydrate_ids if refresh_mode != 'current' else [])
             ))
 
             if authoritative_frame is None or getattr(authoritative_frame, 'empty', True):
                 if (
-                    spec.name == ENTITY_COACHES
-                    and selected == []
+                    selected == []
                     and results.get('cache_only_materialization')
-                    and coach_cache_frames is not None
+                    and (coach_cache_frames is not None or (
+                        career_cache_frames is not None
+                        and any(frame.attrs.get('tm_cached_empty_capture_refs')
+                                for frame in career_cache_frames.values())
+                    ))
                 ):
                     # Cached global stints may legitimately have no overlap
                     # with the requested historical season.  That empty
                     # seasonal projection is authoritative: keep global facts,
                     # clear stale scoped legacy rows, and record empty parity.
+                    if career_cache_frames is not None:
+                        # The loader verified original typed-empty/raw proof.
+                        for frame in frames.values():
+                            frame.attrs['fetch_status'] = 'authoritative_empty'
                     results['rows'] = 0
                     results[spec.count_field] = 0
                     results['outputs'] = {
@@ -4064,7 +4230,7 @@ def _run_entity_unbounded(
                     _save_frames(
                         scraper, write_spec, frames, force_replace, results,
                     )
-                    if legacy_write_enabled:
+                    if legacy_write_enabled and spec.name == ENTITY_COACHES:
                         scoped_clubs = all_coach_memberships[
                             'club_id'
                         ].dropna().astype(str).tolist()
@@ -4206,6 +4372,7 @@ def _run_entity_unbounded(
                                 raise RuntimeError(
                                     'valid-empty commit has no recoverable checkpoint'
                                 )
+                            _commit_career_coverage(results, selected, rows)
                             if career_intent_path is not None:
                                 from scrapers.transfermarkt.write_intents import finish_intent
                                 _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
@@ -4422,6 +4589,7 @@ def _run_entity_unbounded(
                         raise RuntimeError(
                             'Bronze+manifest committed without recoverable checkpoint'
                         )
+                    _commit_career_coverage(results, checkpoint_ids, rows)
                 if career_intent_path is not None:
                     from scrapers.transfermarkt.write_intents import finish_intent
                     _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
@@ -4454,7 +4622,7 @@ def _run_entity_unbounded(
         exit_code = 3
     except Exception as exc:  # noqa: BLE001
         from scrapers.transfermarkt.history_portion import HistoryContinuation, enabled as history_enabled
-        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded, SourceStreamPaused
         if history_enabled() and (isinstance(exc, (HistoryContinuation, CurrentPortionDeadlineExceeded)) or str(exc) == 'historical portion boundary reached'):
             results['continuation'] = True
         safe_error = _redact_sensitive(exc)
@@ -4470,6 +4638,8 @@ def _run_entity_unbounded(
             _mark_failure(results, stage='platform', kind='traffic_meter')
         elif isinstance(exc, RawStoreError):
             _mark_failure(results, stage='platform', kind='raw_store')
+        elif isinstance(exc, SourceStreamPaused) and not history_enabled():
+            _mark_failure(results, stage='source', kind='source_paused')
         elif failure_phase == 'source':
             _mark_failure(results, stage='source', kind='source_runtime')
         else:

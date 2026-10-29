@@ -13,9 +13,55 @@ class UnderstatTableContract:
 
     table_name: str
     result_key: str
-    reader_method: str
     natural_key: tuple[str, ...]
     required_columns: tuple[str, ...]
+
+    @property
+    def column_types(self) -> Mapping[str, str]:
+        """Declared source types; only forecast types are enforced in this migration."""
+        return MappingProxyType({
+            column: _column_type(column) for column in self.required_columns
+        })
+
+
+FORECAST_COLUMNS = ("forecast_home_win", "forecast_draw", "forecast_away_win")
+_INTEGER_COLUMNS = frozenset((
+    "season_id", "source_season_id", "game_id", "home_team_id",
+    "away_team_id", "shot_id", "team_id", "player_id", "assist_player_id",
+    "position_id", "roster_entry_id", "roster_in", "roster_out", "minute",
+    "matches", "minutes", "goals", "np_goals", "own_goals", "assists", "shots",
+    "key_passes", "yellow_cards", "red_cards", "against_shots", "against_goals",
+))
+_DOUBLE_COLUMNS = frozenset((
+    *FORECAST_COLUMNS, "xg", "np_xg", "xa", "xg_chain", "xg_buildup",
+    "location_x", "location_y", "against_xg",
+))
+_TEAM_INTEGER_METRICS = frozenset((
+    "points", "goals", "ppda_att", "ppda_def", "ppda_allowed_att",
+    "ppda_allowed_def", "deep_completions", "deep_allowed",
+))
+_TEAM_DOUBLE_METRICS = frozenset((
+    "expected_points", "xg", "np_xg", "np_xg_difference", "ppda",
+))
+
+
+def _column_type(column: str) -> str:
+    if column in {"is_result", "has_data", "is_multi_team"}:
+        return "boolean"
+    if column == "date":
+        return "timestamp(6)"
+    if column in _INTEGER_COLUMNS:
+        return "bigint"
+    if column in _DOUBLE_COLUMNS:
+        return "double"
+    for prefix in ("home_", "away_"):
+        if column.startswith(prefix):
+            metric = column[len(prefix):]
+            if metric in _TEAM_INTEGER_METRICS:
+                return "bigint"
+            if metric in _TEAM_DOUBLE_METRICS:
+                return "double"
+    return "varchar"
 
 
 _SCOPE = ("league_id", "league", "season_id", "season", "source_season_id")
@@ -24,7 +70,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_schedule",
         result_key="schedule",
-        reader_method="read_schedule",
         natural_key=("league", "season", "game_id"),
         required_columns=_SCOPE
         + (
@@ -52,7 +97,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_shots",
         result_key="shots",
-        reader_method="read_shot_events",
         natural_key=("shot_id",),
         required_columns=_SCOPE
         + (
@@ -79,7 +123,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_players",
         result_key="player_stats",
-        reader_method="read_player_season_stats",
         natural_key=("league", "season", "player_id"),
         required_columns=_SCOPE
         + (
@@ -110,7 +153,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_team_match_stats",
         result_key="team_match_stats",
-        reader_method="read_team_match_stats",
         natural_key=("league", "season", "game_id"),
         required_columns=_SCOPE
         + (
@@ -154,7 +196,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_player_match_stats",
         result_key="player_match_stats",
-        reader_method="read_player_match_stats",
         natural_key=("league", "season", "game_id", "team_id", "player_id"),
         required_columns=_SCOPE
         + (
@@ -188,7 +229,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_player_team_season_stats",
         result_key="player_team_season_stats",
-        reader_method="read_player_team_season_stats",
         natural_key=("league", "season", "team_id", "player_id"),
         required_columns=_SCOPE
         + (
@@ -216,7 +256,6 @@ TABLE_CONTRACTS: tuple[UnderstatTableContract, ...] = (
     UnderstatTableContract(
         table_name="understat_team_season_breakdowns",
         result_key="team_season_breakdowns",
-        reader_method="read_team_season_breakdowns",
         natural_key=("league", "season", "team_id", "dimension", "category"),
         required_columns=_SCOPE
         + (

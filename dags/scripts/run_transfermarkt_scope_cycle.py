@@ -8,6 +8,11 @@ manifest stay content-addressed under the planner-provided result directory.
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 from scrapers.transfermarkt.writer import execute_statement
 
 import argparse
@@ -934,8 +939,15 @@ def _runner_environment(
     parser_entity: str,
     retry_budget: int,
     listing_authoritative_empty: bool = False,
+    request_deadline_monotonic: float | None = None,
 ) -> Mapping[str, str]:
     env = dict(os.environ)
+    if request_deadline_monotonic is not None:
+        existing = env.get('TM_REQUEST_DEADLINE_MONOTONIC')
+        env['TM_REQUEST_DEADLINE_MONOTONIC'] = str(
+            min(float(existing), request_deadline_monotonic)
+            if existing is not None else request_deadline_monotonic
+        )
     if listing_authoritative_empty:
         # #1025: the players entity proved the participant listing is
         # authoritatively empty; the entities that follow in this cycle
@@ -1412,13 +1424,17 @@ def _build_scope_manifest(
     # roster this scope actually holds: a manifest that only says 'complete'
     # cannot tell a scope covering every player from one covering a hundred.
     roster_coverage = {
-        run.parser_entity: {key: run.result['roster_coverage'][key] for key in ('roster_size', 'selected', 'pending')}
+        run.parser_entity: {key: value for key, value in run.result['roster_coverage'].items()
+                            if key not in {'roster_ids', 'remaining_ids'}}
         for run in runs
         if isinstance(run.result.get('roster_coverage'), Mapping)
     }
     pending_total = sum(
         int(item.get('pending', 0)) for item in roster_coverage.values()
     )
+    from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY
+    if roster_coverage and all(item.get('policy_version') == CAREER_DEBT_POLICY for item in roster_coverage.values()):
+        pending_total = len({pid for item in roster_coverage.values() for pid in item['debt_player_ids']})
     if pending_total:
         print(
             f'ROSTER COVERAGE: {pending_total} career fetches still pending '
@@ -1475,8 +1491,8 @@ def _build_scope_manifest(
         canonical_season=identity.canonical_season,
         registry_snapshot_id=identity.registry_snapshot_id,
         capture_revision=identity.capture_revision,
-        parser_revision=os.environ.get('TM_PARSER_VERSION', 'v2'),
-        schema_revision=os.environ.get('TM_SCHEMA_VERSION', '2'),
+        parser_revision=os.environ.get('TM_PARSER_VERSION', DEFAULT_PARSER_REVISION),
+        schema_revision=os.environ.get('TM_SCHEMA_VERSION', DEFAULT_SCHEMA_REVISION),
         reader_revision=int(args.reader_revision),
         entities=tuple(evidence),
         dq_evidence=dq_evidence,
@@ -2699,6 +2715,10 @@ def _run_scope_cycle(
                 command,
                 env=_runner_environment(
                     identity, args, packets, parser_entity, child_retry_budget,
+                    request_deadline_monotonic=(
+                        None if history_portion.enabled()
+                        else time.monotonic() + entity_timeout
+                    ),
                     listing_authoritative_empty=any(
                         run.parser_entity == 'players'
                         and isinstance(

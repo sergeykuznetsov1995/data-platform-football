@@ -20,7 +20,7 @@ import pandas as pd
 from dags.scripts import run_transfermarkt_scraper as run
 from scrapers.transfermarkt.writer import StaleTransfermarktWrite, writer_lock, writer_deadline, guard_frames
 from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
-from scrapers.transfermarkt.current_capture import FullRosterSnapshot
+from scrapers.transfermarkt.current_capture import FullRosterSnapshot, verify_contract_overrides
 from scrapers.transfermarkt import scraper as tm
 from scrapers.transfermarkt.season import season_to_saison_id
 
@@ -334,6 +334,8 @@ def _receipt_columns(proof_columns, frame):
 
 
 def _roster_frames(scraper, snapshot, scope, cycle_id):
+    if snapshot.contract_overrides:
+        verify_contract_overrides(snapshot, scraper._http_client._raw_store)
     now = _stamp(getattr(scraper, '_current_roster_write_at', None) or datetime.now(timezone.utc))
     retained_stamps = _retained_roster_stamps(scraper, snapshot, scope)
     memberships, observations, contracts = [], [], []
@@ -352,7 +354,7 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
         observed_at = now if changed else retained_stamps.get(('memberships', key), fetched_at)
         lineage = {'source_competition_id': scope['competition_id'], 'source_edition_id': scope['edition_id'],
             'source_url': row['_source_url'], 'source_body_hash': row['_source_body_hash'], 'fetched_at': fetched_at,
-            'parser_revision': tm.PARSER_REVISION, 'schema_revision': tm.SCHEMA_REVISION,
+            'parser_revision': tm.contract_parser_revision(row), 'schema_revision': tm.SCHEMA_REVISION,
             'cycle_id': cycle_id, 'scope_id': scope['scope_id']}
         common = {'competition_id': scope['competition_id'], 'edition_id': scope['edition_id'],
             'league': scope['compatibility_league'], 'season': scope['canonical_season'],
@@ -360,13 +362,19 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
         memberships.append({**common, 'club_slug': row.get('club_slug'), 'club_name': row.get('current_club_name'),
                             'player_slug': row['player_slug'], 'player_name': row['name'],
                             **{field: row.get(field) for field in tm.SQUAD_CONTEXT_FIELDS}})
-        observations.append({**row, **common, 'club_name': row.get('current_club_name')})
+        contract_source = row.get('_contract_source', {})
+        date_lineage = {key: (_stamp(value) if key == 'fetched_at' else value)
+                        for key, value in contract_source.items() if key in {'source_url', 'source_body_hash', 'fetched_at'}}
+        observations.append({**row, **common, **date_lineage, 'club_name': row.get('current_club_name')})
         if scope['record'].team_type.value == 'club':
             contracts.append({**lineage, 'competition_id': scope['competition_id'], 'edition_id': scope['edition_id'],
                 'team_id': str(row['club_id']), 'team_name': row.get('current_club_name'), 'player_id': str(row['player_id']),
                 'contract_until': row.get('contract_until'),
-                'observed_at': now if changed else retained_stamps.get(('contract_observations', key), fetched_at),
-                'applicability_status': 'ok'})
+                'observed_at': now if changed else retained_stamps.get(('contract_observations', (str(row['club_id']), str(row['player_id']),
+                    date_lineage.get('source_body_hash', row['_source_body_hash']),
+                    date_lineage.get('fetched_at', fetched_at).isoformat(timespec='microseconds'))),
+                    date_lineage.get('fetched_at', fetched_at)),
+                'applicability_status': tm.contract_status(row), **date_lineage})
     bundle = {}
     for key, rows, columns, entity in (
         ('memberships', memberships, tm.SQUAD_MEMBERSHIP_COLUMNS, 'squad_memberships'),
@@ -544,7 +552,24 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     empty = []
     admitted_windows = []
     stop_reason = 'window_complete'
+    cached = _global_career_captures(scraper, spec, selected, resolved) if not retired else {}
     for player in selected:
+        if player in cached:
+            source = cached[player]
+            bundle = run._merge_career_cache_frames(scraper, spec, {},
+                {source['native_key']: source['frame']}, resolved['competition_id'], int(resolved['edition_id']))
+            # The current writer commits a new local bundle from verified raw,
+            # rather than a scope-runner reference to an old native batch.
+            for frame in bundle.values():
+                frame.attrs.clear()
+            pieces.append(bundle)
+            processed.append(player)
+            state_rows.append(source['state'])
+            if source['state'][0] in {'authoritative_empty', 'valid_empty'}:
+                empty.append(player)
+            envelope = source['raw']['envelope']
+            scraper._http_client._cache_sources[envelope['envelope_id']] = scraper._http_client._raw_store.verify_attempt_envelope(envelope['envelope_id'])
+            continue
         decoded = scraper._http_client.get_traffic_stats()['decoded_response_body_bytes']
         if decoded >= decoded_body_soft_stop_bytes:
             stop_reason = 'decoded_body_soft_stop'
@@ -579,26 +604,82 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     for frame in frames.values():
         if frame.empty and empty:
             frame.attrs['fetch_status'] = 'authoritative_empty'
-    scraper._tm_empty_capture_times = run._career_capture_times(scraper, spec, frames, processed)
+    clocks = run._career_capture_times(scraper, spec, frames, processed)
+    clocks.update({player: source['raw']['fetched_at'] for player, source in cached.items() if player in processed})
+    scraper._tm_empty_capture_times = clocks
     from scrapers.transfermarkt.first_seen import prepare_frames
     frames = prepare_frames(scraper, spec.outputs, frames)
     intent_path = save_intent(intent_identity, frames, mode=mode, revision=revision,
         batch_id=str(scraper._batch_id), cycle_id=cycle_id, empty=empty,
         processed=processed, state_rows=state_rows, window=window,
-        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed),
+        captured_at_by_id=clocks,
         raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()),
         signal_generations=dict(getattr(scraper, '_current_career_signal_generations', {}) or {}))
     scraper._tm_career_intent_path = intent_path
     receipt, committed_frames = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
     checkpoint_status = run._commit_checkpoint_or_pending(scraper, spec, processed, state_rows, cycle_id,
         resolved['competition_id'], int(resolved['edition_id']),
-        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed))
+        captured_at_by_id=clocks)
     receipt['checkpoint_status'] = checkpoint_status
     receipt.update(business_entity=spec.state_endpoint, career_window=window, **window)
+    if cached:
+        receipt['cached_capture_ids'] = {player: source['raw']['capture_id'] for player, source in cached.items() if player in processed}
+        receipt['signal_generations'] = dict(getattr(scraper, '_current_career_signal_generations', {}) or {})
     receipt['committed_at'] = archive_complete(intent_path, receipt, committed_frames)['committed_at']
     finish_intent(intent_path)
     scraper._tm_career_intent_path = None
     return receipt
+
+
+def _global_career_captures(scraper, spec, selected, scope):
+    """Reuse fresh global careers only after original raw/physical receipt checks."""
+    generations = getattr(scraper, '_current_career_signal_generations', {}) or {}
+    if not generations:
+        return {}  # Explicit callers without a signal generation retain force semantics.
+    from scrapers.transfermarkt.career_refs import TABLE
+    from scrapers.transfermarkt.write_intents import completed_capture
+    from scrapers.transfermarkt.superseded import verify_complete
+    state = run._load_fetch_state(scraper, spec.state_endpoint)
+    changes = run._load_career_changes(scraper, selected)
+    native = next(output for output in spec.outputs if not output.is_legacy)
+    cached = {}
+    now = datetime.now(timezone.utc)
+    for player in selected:
+        if player in getattr(scraper, '_current_career_force_ids', set()):
+            continue  # A CEAPI/tmapi mismatch requires a new source observation.
+        prior = state.get(player, {})
+        stamp = run._as_utc(prior.get('last_success_at'))
+        if (prior.get('status') not in run.SUCCESS_STATUSES or stamp is None
+            or not now - run.CAREER_TTL < stamp <= now
+            or (changes.get(player) is not None and changes[player] > stamp)):
+            continue
+        # JSON paths are bound parameters, including numeric source IDs.
+        candidates = run._execute_cursor(scraper._bronze_connection(),
+            f'SELECT cycle_id, entity, native_batch_id FROM {TABLE} '
+            'WHERE native_table = ? AND json_extract_scalar(capture_times_json, ?) IS NOT NULL '
+            'ORDER BY committed_at DESC', (native.table_name, '$."' + player + '"'), fetch=True) or []
+        for cycle, entity, batch in candidates:
+            archived = completed_capture(cycle, entity, batch)
+            if archived is None:
+                continue
+            evidence = archived['journal']['evidence']
+            if run._as_utc(evidence.get('captured_at_by_id', {}).get(player)) != stamp:
+                continue
+            identity = archived['journal']['identity']
+            if (identity.get('scope_id') == scope['scope_id']
+                and evidence.get('signal_generations', {}).get(player) != generations.get(player)):
+                continue
+            try:
+                proof = verify_complete(scraper, spec, archived, players=[player])
+            except StaleTransfermarktWrite:
+                continue
+            original_ids = evidence.get('processed', evidence.get('checkpoint_ids', []))
+            original_states = dict(zip(original_ids, evidence['state_rows'], strict=True))
+            cached[player] = {'native_key': native.key,
+                'frame': proof['frames'][native.key][proof['frames'][native.key].player_id.astype(str) == player].copy(),
+                'state': original_states[player], 'raw': proof['raw'][player]}
+            break
+    return cached
 
 
 def _write_cached_supersession(scraper, spec, scope, mode, revision, cycle_id, selected, cached, identity, soft_stop, *, original_evidence=None):

@@ -161,7 +161,9 @@ class StubTransport:
         self._results.append(result)
         return result
 
-    def fetch_json(self, endpoint, params=None):
+    def fetch_json(self, endpoint, params=None, **kwargs):
+        if kwargs.get("before_attempt") is not None:
+            kwargs["before_attempt"]()
         return self._get(endpoint, params, False)
 
     def replay_json(self, endpoint, params=None):
@@ -1980,6 +1982,7 @@ def test_backfill_skips_fresh_prior_generation_children():
     for target_type, target, entity_id in prior_targets:
         commit = TargetCommit(
             run_id="prior-publication-generation",
+            fetched_at=datetime.now(timezone.utc),
             target_type=target_type,
             target_key=target.target_key,
             status=ManifestStatus.SUCCESS,
@@ -3525,3 +3528,104 @@ def test_1771_team_refresh_with_real_repository_replaces_old_parse():
         # Ensure latest_success refers to the preceding, different raw batch
         # when the original payload returns on the third observation.
         writer.rows["fotmob_ingest_manifest"][-1]["completed_at"] = datetime(2026, 7, 11 + attempt)
+
+
+def test_late_match_enriches_attendance_and_stats_at_both_thresholds(monkeypatch):
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    target = canonicalize_target("matchDetails", {"matchId": "100"})
+    first = {"general": {"matchId": 100}, "content": {
+        "matchFacts": {"infoBox": {"Attendance": None}}, "stats": {"periods": {}},
+    }}
+    enriched = copy.deepcopy(first)
+    enriched["content"]["matchFacts"]["infoBox"]["Attendance"] = 14757
+    enriched["content"]["stats"]["periods"] = {"All": {"stats": []}}
+    service, transport, repository = _service({target.canonical_url: first})
+    # Ordinary traffic in this wave funds the <=10% late quota.
+    service.ledger.requests = 90
+    clock = [datetime(2026, 1, 1, 15)]  # T = kickoff + 3h
+    monkeypatch.setattr(service_module, "utc_now", lambda: clock[0])
+    original_get = transport._get
+
+    def timed_get(*args, **kwargs):
+        fetch = original_get(*args, **kwargs)
+        return replace(fetch, fetched_at=clock[0].isoformat())
+
+    monkeypatch.setattr(transport, "_get", timed_get)
+    assert service.sync_match_payloads(bundle).succeeded == 1
+    clock[0] += timedelta(hours=5)
+    assert service.sync_match_payloads(bundle).skipped == 1
+    transport.responses[target.canonical_url] = enriched
+    clock[0] += timedelta(hours=1)
+    assert service.sync_match_payloads(bundle).succeeded == 1
+    rows = repository.tables["fotmob_match_payloads"]
+    assert rows[-1]["match_facts_json"]["infoBox"]["Attendance"] == 14757
+    assert rows[-1]["stats_json"] == enriched["content"]["stats"]
+    clock[0] += timedelta(hours=41)
+    assert service.sync_match_payloads(bundle).skipped == 1
+    clock[0] += timedelta(hours=1)
+    assert service.sync_match_payloads(bundle).succeeded == 1
+    clock[0] += timedelta(days=20)
+    assert service.sync_match_payloads(bundle).skipped == 1
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_1792_league_season_manifest_preserves_304_validation_not_replay_time(stale):
+    service, transport, repository = _service({})
+    fetch = _null_body_fetch("leagues", {"id": 47})
+    fetch = replace(fetch, outcome=FetchOutcome.STALE_REPLAY if stale else FetchOutcome.NOT_MODIFIED,
+                    stale=stale, terminal=False, json_data={}, body=b"{}",
+                    content_hash="a"*64, fetched_at="2026-10-01T00:00:00+00:00",
+                    source_observed_at="2026-10-21T04:00:00+00:00")
+    service._commit_for_fetch(fetch, target_type="league_season", competition_id=47,
+                              source_season_key="2026/2027")
+    commit = repository.commits[-1]
+    assert commit.fetched_at == datetime(2026, 10, 1)
+    assert commit.capabilities.get("source_observed_at") == (
+        None if stale else "2026-10-21T04:00:00+00:00")
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_1792_competition_seasons_manifest_preserves_304_validation(stale):
+    service, transport, repository = _service({})
+    fetch = _null_body_fetch("leagues", {"id": 47})
+    fetch = replace(fetch, outcome=FetchOutcome.STALE_REPLAY if stale else FetchOutcome.NOT_MODIFIED,
+                    stale=stale, terminal=False, json_data={}, body=b"{}",
+                    content_hash="a"*64, fetched_at="2026-10-01T00:00:00+00:00",
+                    source_observed_at="2026-10-21T04:00:00+00:00")
+    service._commit_for_fetch(fetch, target_type="competition_seasons", competition_id=47,
+                              entity_id=47)
+    commit = repository.commits[-1]
+    assert commit.fetched_at == datetime(2026, 10, 1)
+    assert commit.capabilities.get("source_observed_at") == (
+        None if stale else "2026-10-21T04:00:00+00:00")
+
+
+def test_1290_queue_cannot_spend_more_than_eight_request_budget():
+    from tests.unit.scrapers.test_fotmob_transport import _transport, FakeResponse
+    transport, session = _transport([FakeResponse(503)] * 8, max_attempts=4)
+    service = FotMobIngestService(
+        transport=transport, repository=MemoryFotMobRepository(),
+        mode=RunMode.DAILY, run_id="budget-regression", max_workers=2,
+        budget=TransportBudget(max_requests=8, max_direct_bytes=10000))
+    results = service._fetch_many([(str(i), "leagues", {"id": i}) for i in range(10)])
+    assert len(results) == 10
+    assert len(session.calls) == service.ledger.requests == 8
+    assert sum(isinstance(value, Exception) for value in results.values()) == 8
+
+
+def test_1290_ban_cancels_pending_queue_and_preserves_report_reason():
+    from tests.unit.scrapers.test_fotmob_transport import _transport, FakeResponse
+    from dags.scripts.run_fotmob_scraper import _native_output_payload
+    transport, session = _transport([FakeResponse(200, b'{}')] + [FakeResponse(403)] * 20)
+    service = FotMobIngestService(
+        transport=transport, repository=MemoryFotMobRepository(),
+        mode=RunMode.DAILY, run_id="ban-regression", max_workers=1,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10000))
+    results = service._fetch_many([(str(i), "leagues", {"id": i}) for i in range(20)])
+    assert results["0"].ok
+    assert len(session.calls) == 4
+    payload = _native_output_payload(service.report([OperationResult("wave", succeeded=1)], datetime.now(timezone.utc)))
+    assert payload["stop_reason"] == "ban"
+    assert payload["blocked_until"]
+    assert payload["complete"] is False and payload["status"] == "incomplete"

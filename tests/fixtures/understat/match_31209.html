@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+		<base href="https://understat.com/">
+		<title>Arsenal 2 - 1 Chelsea (September 06 2026) | EPL | 2026/2027 | xG | Understat.com</title>
+        <meta charset="UTF-8" />
+		<meta name="description" content="Arsenal 2 - 1 Chelsea. Check out detailed player statistic, goals, assists, key passes, xG, shot map, xGplot.">
+		<meta name="Keywords" content="Arsenal, Chelsea, EPL, 2026/2027, (September 06 2026), xG, expected goals, shot map">
+		<meta name="viewport" user-scalable="no" content="width=device-width, maximum-scale=1, initial-scale=1">
+		<script src="https://sdk.adlook.tech/inventory/core.js" async type="text/javascript"></script>
+			<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+	<link rel="manifest" href="manifest.json">
+	<link rel="mask-icon" href="safari-pinned-tab.svg" color="#5bbad5">
+	<meta name="apple-mobile-web-app-title" content="understat">
+	<meta name="application-name" content="understat">
+	<meta name="theme-color" content="#ffffff">
+	<meta http-equiv="cache-control" content="no-cache">
+	<meta http-equiv="expires" content="0">
+	<link href="css/main.min.css?t=1765221332" rel="stylesheet" media="screen">
+    </head>
+    <body class="theme-dark">
+		<script>
+			var THEME = localStorage.getItem("theme") || 'DARK';
+			document.body.className = "theme-" + THEME.toLowerCase();
+		</script>
+        	<div class="wrapper">
+				<header id="header" class="clearfix">
+			<div class="header-wrapper">
+					<span class="block-match-result">
+		<h1>
+			<a href="https://understat.com/team/Arsenal/2026">Arsenal</a> 2 - 1<a href="https://understat.com/team/Chelsea/2026">Chelsea</a>
+		</h1>
+	</span>
+				<nav class="m-navigation-main">
+					<input class="toggle" id="toggle" type="checkbox">
+					<label class="toggle" for="toggle">
+						<div class="line-wrap">
+							<div class="line top"></div>
+							<div class="line center"></div>
+							<div class="line bottom"></div>
+						</div>
+					</label>
+					<ul class="h-inner">
+						<li class="player-search">
+							<input name="player-search" class="typeahead" type="search" placeholder="Find player by name" />
+							<span class="icon"><i class="fa fa-search"></i></span>
+							<!--
+							<div class="li-container">
+								<div class="li-inner">
+									<input class="typeahead" type="search" placeholder="Find player by name" />
+									<span class="icon"><i class="fa fa-search"></i></span>
+								</div>
+							</div>
+							-->
+						</li>
+						<li>
+							<a href="" class="menu-link ">
+								<span class="link-icon" title="Main page">
+									<i class="fas fa-home" aria-hidden="true"></i>
+								</span>
+								<span class="menu-title">
+									<span class="link-icon">
+										<i class="fas fa-home" aria-hidden="true"></i>
+									</span>
+									Main page
+								</span>
+							</a>
+						</li>
+						<li>
+							<a href="office" class="menu-link ">
+								<span class="link-icon" title="Personal cabinet">
+									<i class="fas fa-sign-in-alt" aria-hidden="true"></i>
+								</span>
+								<span class="menu-title">
+									<span class="link-icon">
+										<i class="fas fa-sign-in-alt" aria-hidden="true"></i>
+									</span>
+									Personal cabinet
+								</span>
+							</a>
+						</li>
+					</ul>
+				</nav>
+			</div>
+		</header>
+		
+		<div id="preloader" class="preloader">
+			<div class="preloader-container">
+				<div class="circ1"><div></div></div>
+				<div class="circ2"><div></div></div>
+				<div class="circ3"><div></div></div>
+				<div class="circ4"><div></div></div>
+			</div>
+		</div>
+		
+		<div id="table-preloader" class="preloader table-preloader is-hide">
+			<div class="preloader-container">
+				<div class="circ1"><div></div></div>
+				<div class="circ2"><div></div></div>
+				<div class="circ3"><div></div></div>
+				<div class="circ4"><div></div></div>
+			</div>
+		</div>
+		
+		<input id="themes-switch" type="checkbox" name="themes-switch" checked>
+		<label for="themes-switch" title="Change theme"></label>
+		
+		<div class="page-wrapper">
+										<div class="promotion">
+				<ins class="adsbygoogle" style="display:block" data-ad-client="ca-pub-7470116180195095" data-ad-slot="2199699885" data-ad-format="auto" data-full-width-responsive="true"></ins>
+			</div>
+										<ul class="breadcrumb">
+	<li><a href="https://understat.com/">Home</a></li>
+	<li><a href="league/EPL/2026">EPL</a></li>
+	<li>Sep 06 2026</li>
+</ul>
+			<div class="block">
+	<div class="block-content is-hide">
+		<div class="block-match">
+			<div class="filters">
+	<div class="filter">
+		<input id="scheme1" type="radio" name="scheme" value="field" checked />
+		<label for="scheme1">Field</label>
+				<input id="scheme2" type="radio" name="scheme" value="chart" />
+		<label for="scheme2">Timing chart</label>
+		<input id="scheme3" type="radio" name="scheme" value="stats" />
+		<label for="scheme3">Stats</label>
+			</div>
+</div>
+
+<div class="scheme-block" data-scheme="field">
+	<canvas id="field"></canvas>
+	<i class="icon-full-screen"></i>
+	<div id="note" style="display:none;"></div>
+</div>
+
+<div class="scheme-block is-hide" data-scheme="chart">
+	<div class="chart-container-match">
+		<canvas id="chart"></canvas>
+	</div>
+	<div class="chartjs-tooltip is-hide team-home"></div>
+	<div class="chartjs-tooltip is-hide team-away"></div>
+</div>
+
+<div class="scheme-block is-hide" data-scheme="stats">
+		<div class="progress-bar teams-titles">
+		<div class="progress-title">TEAMS</div>
+		<div class="progress-home progress-over" style="width: 50%">
+			<div class="progress-value">Arsenal</div>
+		</div>
+		<div class="progress-away" style="width: 50%; left: 50%">
+			<div class="progress-value">Chelsea</div>
+		</div>
+	</div>
+	
+	<div class="progress-bar">
+		<div class="progress-title">CHANCES</div>
+		<div class="progress-home" style="width: 91%" title="91%">
+			<div class="progress-value">91<small>%</small></div>
+		</div>
+		<div class="progress-draw" style="width: 7%; left: 91%" title="7%">
+			<div class="progress-value"></div>
+		</div>
+		<div class="progress-away" style="width: 2%" title="2%">
+			<div class="progress-value"></div>
+		</div>
+	</div>
+	
+	<div class="progress-bar">
+		<div class="progress-title">GOALS</div>
+		<div class="progress-home progress-over" style="width: 66.666666666667%" title="67%">
+			<div class="progress-value">2</div>
+		</div>
+		<div class="progress-away" style="width: 33.333333333333%; left: 66.666666666667%" title="33%">
+			<div class="progress-value">1</div>
+		</div>
+	</div>
+	
+	<div class="progress-bar">
+		<div class="progress-title">xG</div>
+		<div class="progress-home progress-over" style="width: 86.696530161079%" title="87%">
+			<div class="progress-value">2<span class="progress-value-decimal">.81</span></div>
+		</div>
+		<div class="progress-away" style="width: 13.303469838921%; left: 86.696530161079%" title="13%">
+			<div class="progress-value">0<span class="progress-value-decimal">.43</span></div>
+		</div>
+	</div>
+		
+	<div class="progress-bar">
+		<div class="progress-title">SHOTS</div>
+		<div class="progress-home progress-over" style="width: 55.172413793103%"  title="55%">
+			<div class="progress-value">16</div>
+		</div>
+		<div class="progress-away" style="width: 44.827586206897%; left: 55.172413793103%" title="45%">
+			<div class="progress-value">13</div>
+		</div>
+	</div>
+		
+	<div class="progress-bar">
+		<div class="progress-title">SHOTS ON TARGET</div>
+		<div class="progress-home progress-over" style="width: 64.285714285714%" title="64%">
+			<div class="progress-value">9</div>
+		</div>
+		<div class="progress-away" style="width: 35.714285714286%; left: 64.285714285714%" title="36%">
+			<div class="progress-value">5</div>
+		</div>
+	</div>
+	
+	<div class="progress-bar">
+		<div class="progress-title" title="Passes completed within an estimated 20 yards of goal (crosses excluded)">DEEP</div>
+		<div class="progress-home progress-over" style="width: 77.272727272727%" title="77%">
+			<div class="progress-value">17</div>
+		</div>
+		<div class="progress-away" style="width: 22.727272727273%; left: 77.272727272727%" title="23%">
+			<div class="progress-value">5</div>
+		</div>
+	</div>
+		
+	<div class="progress-bar">
+		<div class="progress-title" title="Passes allowed per defensive action in the opposition half">PPDA</div>
+		<div class="progress-home progress-over" style="width: 52.477572432637%" title="52%">
+			<div class="progress-value">8<span class="progress-value-decimal">.90</span></div>
+		</div>
+		<div class="progress-away" style="width: 47.522427567363%; left: 52.477572432637%" title="48%">
+			<div class="progress-value">9<span class="progress-value-decimal">.83</span></div>
+		</div>
+	</div>
+	
+	<div class="progress-bar">
+		<div class="progress-title" title="Expected points">xPTS</div>
+		<div class="progress-home progress-over" style="width: 95.461846017155%" title="95%">
+			<div class="progress-value">2<span class="progress-value-decimal">.79</span></div>
+		</div>
+		<div class="progress-away" style="width: 4.5381539828452%; left: 95.461846017155%" title="5%">
+			<div class="progress-value">0<span class="progress-value-decimal">.13</span></div>
+		</div>
+	</div>
+</div>
+<script>
+	var match_info 	= JSON.parse('\x7B\x22id\x22\x3A\x2231209\x22,\x22fid\x22\x3A\x221983568\x22,\x22h\x22\x3A\x2283\x22,\x22a\x22\x3A\x2280\x22,\x22date\x22\x3A\x222026\x2D09\x2D06\x2015\x3A30\x3A00\x22,\x22league_id\x22\x3A\x221\x22,\x22season\x22\x3A\x222026\x22,\x22h_goals\x22\x3A\x222\x22,\x22a_goals\x22\x3A\x221\x22,\x22team_h\x22\x3A\x22Arsenal\x22,\x22team_a\x22\x3A\x22Chelsea\x22,\x22h_xg\x22\x3A\x222.80555\x22,\x22a_xg\x22\x3A\x220.430508\x22,\x22h_w\x22\x3A\x220.9066\x22,\x22h_d\x22\x3A\x220.0737\x22,\x22h_l\x22\x3A\x220.0197\x22,\x22league\x22\x3A\x22EPL\x22,\x22h_shot\x22\x3A\x2216\x22,\x22a_shot\x22\x3A\x2213\x22,\x22h_shotOnTarget\x22\x3A\x229\x22,\x22a_shotOnTarget\x22\x3A\x225\x22,\x22h_deep\x22\x3A\x2217\x22,\x22a_deep\x22\x3A\x225\x22,\x22a_ppda\x22\x3A\x229.8333\x22,\x22h_ppda\x22\x3A\x228.9048\x22,\x22isData\x22\x3Atrue\x7D');
+</script>		</div>
+	</div>
+</div>
+<div class="block">
+	<div class="timeline-block">
+						
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>1'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+																									<div class="timeline-text">
+														<div class="timeline-group">
+								<i class="fas fa-futbol" aria-hidden="true" title="Goal"></i>
+																<span class="timeline-match-score">0 - 1</span>
+																<a class="timeline-player-name" href="https://understat.com/player/12412">Morgan Rogers</a>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+					
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>13'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap">
+								<i class="fas fa-square yellow-card" aria-hidden="true" title="Yellow card"></i>
+								<a class="timeline-player-name" href="https://understat.com/player/8272">João Pedro</a>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>24'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+																									<div class="timeline-text">
+														<div class="timeline-group">
+								<a class="timeline-player-name" href="https://understat.com/player/5220">Kai Havertz</a>
+																<span class="timeline-match-score">1 - 1</span>
+																<i class="fas fa-futbol" aria-hidden="true" title="Goal"></i>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+					
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>44'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap">
+								<i class="fas fa-square yellow-card" aria-hidden="true" title="Yellow card"></i>
+								<a class="timeline-player-name" href="https://understat.com/player/8497">Cole Palmer</a>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>49'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+																									<div class="timeline-text">
+														<div class="timeline-group">
+								<a class="timeline-player-name" href="https://understat.com/player/2517">Martin Odegaard</a>
+																<span class="timeline-match-score">2 - 1</span>
+																<i class="fas fa-futbol" aria-hidden="true" title="Goal"></i>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>57'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap">
+								<a class="timeline-player-name" href="https://understat.com/player/9746">Christos Tzolis</a>
+								<i class="fas fa-square yellow-card" aria-hidden="true" title="Yellow card"></i>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>57'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap">
+								<i class="fas fa-square yellow-card" aria-hidden="true" title="Yellow card"></i>
+								<a class="timeline-player-name" href="https://understat.com/player/8853">Maxence Lacroix</a>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+					
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>64'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/10004">Romeo Lavia</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/9017">Malo Gusto</a></div>
+													</div>
+					</div>
+				</div>
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/13776">Jorrel Hato</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/11087">Pep Chavarría</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>71'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+																					<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/8129">Riccardo Calafiori</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/9911">Piero Hincapié</a></div>
+													</div>
+					</div>
+				</div>
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+																					<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/12272">Myles Lewis-Skelly</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/7526">Martín Zubimendi</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>81'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+																					<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/2517">Martin Odegaard</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/5304">Mikel Merino</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>82'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+																					<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/5220">Kai Havertz</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/7254">Viktor Gyokeres</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>82'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap">
+								<i class="fas fa-square yellow-card" aria-hidden="true" title="Yellow card"></i>
+								<a class="timeline-player-name" href="https://understat.com/player/12412">Morgan Rogers</a>
+							</div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+					
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>85'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/6382">Pedro Neto</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/13775">Estêvão</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+					
+				<div class="timeline-item timeline-item-right">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>91'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/12412">Morgan Rogers</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/501">Danny Welbeck</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+							<div class="timeline-item">
+			<span class="timeline-note"></span>
+			<div class="timeline-time"><span>94'</span></div>
+			<div class="timeline-content">
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+														<div class="timeline-group timeline-no-wrap">
+								<a class="timeline-player-name" href="https://understat.com/player/5304">Mikel Merino</a>
+								<i class="fas fa-square yellow-card" aria-hidden="true" title="Yellow card"></i>
+							</div>
+													</div>
+					</div>
+				</div>
+							<div class="timeline-row">
+					<div class="timeline-row-inner">
+												<div class="timeline-text">
+																					<div class="timeline-group timeline-no-wrap" title="Substituted off"><a class="timeline-player-name" href="https://understat.com/player/7322">Bukayo Saka</a><i class="fas fa-long-arrow-alt-down color-negative icon-sub" aria-hidden="true"></i></div>
+							<div class="timeline-group timeline-no-wrap" title="Substituted on"><i class="fas fa-long-arrow-alt-up color-positive icon-sub" aria-hidden="true"></i><a class="timeline-player-name" href="https://understat.com/player/11357">Noni Madueke</a></div>
+													</div>
+					</div>
+				</div>
+						</div>
+		</div>
+		
+				</div></div>
+<div class="block">
+	<div class="block-content is-hide">
+		<div class="filters">
+	<div class="filter">
+		<input id="team-home" type="radio" name="team" value="h" checked />
+		<label for="team-home">Arsenal</label>
+		<input id="team-away" type="radio" name="team" value="a" />
+		<label for="team-away">Chelsea</label>
+	</div>
+</div>
+<div id="match-rosters" class="rosters simplebar" data-type="scroll" data-custom-scroll='{"vertical":false}'></div>	</div>
+</div>
+		</div>
+		
+		<div class="overlay pre-fade-out"></div>
+		
+		<div id="popupTableExport" class="popup-wrapper is-hide pre-fade-out">
+			<div class="popup-overlay"></div>
+			<div class="popup-container">
+				<div class="popup-inner">
+					<div class="popup-header">
+						<div class="popup-title">Select file format</div>
+						<i class="popup-close fa fa-times" aria-hidden="true"></i>
+					</div>
+					<div class="popup-body">
+						<div class="popup-control">
+							<button class="table-export" data-ext="csv">csv</button>
+							<button class="table-export" data-ext="json">json</button>
+							<button class="table-export" data-ext="xlsx">xlsx</button>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+		
+		<div class="grass-container">
+			<div class="grass"></div>
+			<div class="grass"></div>
+		</div>
+		
+		<footer id="footer">
+			<div class="footer-wrapper">
+				<ul>
+										<li><a href="league/EPL">EPL</a></li>
+										<li><a href="league/La_liga">La liga</a></li>
+										<li><a href="league/Bundesliga">Bundesliga</a></li>
+										<li><a href="league/Serie_A">Serie A</a></li>
+										<li><a href="league/Ligue_1">Ligue 1</a></li>
+										<li><a href="league/RFPL">RFPL</a></li>
+									</ul>
+				<div><a href="mailto:support@understat.com">support@understat.com</a></div>
+				<div>&copy; understat 2017&mdash;2026</div>
+			</div>
+		</footer>
+	</div>
+
+	<div id="mainModal" class="modal-wrapper is-hide pre-fade-out">
+		<div class="modal-overlay"></div>
+		<div class="preloader">
+			<div class="preloader-container">
+				<div class="circ1"><div></div></div>
+				<div class="circ2"><div></div></div>
+				<div class="circ3"><div></div></div>
+				<div class="circ4"><div></div></div>
+			</div>
+		</div>
+		<div class="modal-container">
+			<div class="modal-inner pre-fade-out">
+				<div class="modal-header">
+					<div class="modal-title"></div>
+					<span class="modal-close"></span>
+				</div>
+				<div class="modal-body"></div>
+			</div>
+		</div>
+	</div>
+	
+        		<!--<script src="//ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js" defer></script>-->
+	<script src="//ajax.googleapis.com/ajax/libs/webfont/1.6.26/webfont.js" type="text/javascript"></script>
+	<script>
+		/*
+		var flagFontsLoading = false;
+		WebFont.load({
+			google: {
+				families: ['Barlow:500', 'Anton']
+			},
+			active: function(){
+				flagFontsLoading = true;
+			},
+			inactive: function(){
+				flagFontsLoading = true;
+			}
+		});
+		*/
+		var flagFontsLoading = true;
+		var BASE_URL = 'https://understat.com/',
+			PROMOTION =  JSON.parse('\x7B\x22id\x22\x3A\x227\x22,\x22name\x22\x3A\x22adsense\x22,\x22template\x22\x3A\x22\x3Cins\x20class\x3D\x5C\x22adsbygoogle\x5C\x22\x20style\x3D\x5C\x22display\x3Ablock\x5C\x22\x20data\x2Dad\x2Dclient\x3D\x5C\x22ca\x2Dpub\x2D7470116180195095\x5C\x22\x20data\x2Dad\x2Dslot\x3D\x5C\x222199699885\x5C\x22\x20data\x2Dad\x2Dformat\x3D\x5C\x22auto\x5C\x22\x20data\x2Dfull\x2Dwidth\x2Dresponsive\x3D\x5C\x22true\x5C\x22\x3E\x3C\x5C\x2Fins\x3E\x22,\x22js\x22\x3A\x22\x28adsbygoogle\x20\x3D\x20window.adsbygoogle\x20\x7C\x7C\x20\x5B\x5D\x29.push\x28\x7B\x7D\x29\x3B\x22,\x22countries_list_type\x22\x3A\x22black\x22,\x22clicks\x22\x3A\x226558\x22,\x22is_user_click\x22\x3Afalse,\x22country\x22\x3A\x7B\x22name\x22\x3A\x22Denmark\x22,\x22code\x22\x3A\x22DK\x22\x7D\x7D') ;
+	</script>
+		<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+		<script src="//code.jquery.com/jquery-1.12.4.min.js" type="text/javascript"></script>
+	<script src="https://code.jquery.com/ui/1.12.1/jquery-ui.min.js" defer integrity="sha256-VazP97ZCwtekAsvgPBSUwPFKdrwD3unUfSGVYrahUqU=" crossorigin="anonymous"></script>
+	<!--<script src="//cdnjs.cloudflare.com/ajax/libs/Chart.js/2.7.2/Chart.min.js" defer type="text/javascript"></script>-->
+	<script src="https://cdn.jsdelivr.net/npm/chart.js@2.9.3/dist/Chart.min.js" defer type="text/javascript"></script>
+	<script src="js/jquery.iframetracker.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/timsort.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/tooltip.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/pagination.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/select.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/jquery.mousewheel.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/modernizr.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/simplebar.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/typeahead.bundle.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/jTable.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/main.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/alasql.min.js?t=1765138215" defer type="text/javascript"></script>
+	<script src="js/xlsx.core.min.js?t=1765138215" defer type="text/javascript"></script>
+	<!--<script src="js/jquery.touchSwipe.min.js?t=1765138215" defer type="text/javascript"></script>-->
+	
+	<script>
+		/*
+		(function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+		(i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+		m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+		})(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+		ga('create', 'UA-101482034-1', 'auto');	
+		ga('send', 'pageview');
+		*/
+					window.onload = function() { (adsbygoogle = window.adsbygoogle || []).push({}); }
+			</script>
+	<!-- Yandex.Metrika counter -->
+	<script type="text/javascript">
+		(function(m,e,t,r,i,k,a){
+			m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};
+			m[i].l=1*new Date();
+			for (var j = 0; j < document.scripts.length; j++) {if (document.scripts[j].src === r) { return; }}
+			k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)
+		})(window, document,'script','https://mc.yandex.ru/metrika/tag.js?id=105424535', 'ym');
+
+		ym(105424535, 'init', {ssr:true, webvisor:true, clickmap:true, ecommerce:"dataLayer", accurateTrackBounce:true, trackLinks:true});
+	</script>
+	<noscript><div><img src="https://mc.yandex.ru/watch/105424535" style="position:absolute; left:-9999px;" alt="" /></div></noscript>
+	<!-- /Yandex.Metrika counter -->
+	
+
+	<script src="js/match.min.js?t=1765138215" defer type="text/javascript"></script>
+    </body>
+</html>

@@ -435,7 +435,7 @@ def run_default() -> Dict[str, Any]:
 
     import requests
 
-    with requests.Session() as session:
+    with requests.Session() as session, ClubEloTransport(session) as transport:
         return run_daily(
-            ClubEloTransport(session), IcebergDailyStore(), history.IcebergHistoryStore()
+            transport, IcebergDailyStore(), history.IcebergHistoryStore()
         )

@@ -3614,12 +3614,19 @@ def _career_debt_report(
         for item in manifests
         if 'career_fetches_pending' in item.dq_evidence
     )
-    roster = sum(
-        int(entity['roster_size'])
-        for item in manifests
-        if 'roster_coverage' in item.dq_evidence
-        for entity in item.dq_evidence['roster_coverage'].values()
-    )
+    from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY
+
+    roster = 0
+    for item in manifests:
+        coverage = item.dq_evidence.get('roster_coverage', {})
+        sizes = [int(entity['roster_size']) for entity in coverage.values()]
+        if coverage and all(entity.get('policy_version') == CAREER_DEBT_POLICY
+                            for entity in coverage.values()):
+            # Both endpoints describe the same scope roster. New manifests
+            # count a player missing either endpoint once in the numerator.
+            roster += max(sizes)
+        else:
+            roster += sum(sizes)  # Legacy manifests count endpoint work.
     if roster > 0:
         ratio = Fraction(pending, roster)
     else:

@@ -15,11 +15,9 @@ from .catalog import (
     LEAGUE_BY_CANONICAL,
     PRODUCTION_LEAGUES,
     UnderstatScope,
-    source_season_id_from_slug,
-    season_slug,
 )
 from .client import UnderstatClient
-from .contracts import TABLE_CONTRACTS
+from .contracts import FORECAST_COLUMNS
 from .service import UnderstatSource
 
 
@@ -27,21 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class UnderstatScraper(BaseScraper):
-    """Native Understat scraper with legacy ``read_*`` compatibility methods.
+    """Native Understat scraper for scope-aware production orchestration.
 
-    Production orchestration should call :meth:`scrape_scope`, which guarantees
-    that every match payload is fetched once and parsed into both derived
-    tables. The individual readers share a scope cache and exist for ad-hoc
-    callers which used the old soccerdata-backed API.
+    :meth:`scrape_scope` guarantees that every match payload is fetched once
+    and parsed into both derived tables.
     """
 
     SOURCE_NAME = "understat"
     DEFAULT_RATE_LIMIT = 30
     SUPPORTED_LEAGUES = list(PRODUCTION_LEAGUES)
-    TABLE_SPECS = [
-        (contract.reader_method, contract.table_name, contract.result_key)
-        for contract in TABLE_CONTRACTS
-    ]
 
     def __init__(
         self,
@@ -106,7 +98,6 @@ class UnderstatScraper(BaseScraper):
             source = UnderstatSource(client)
         self.source = source
         self.client = source.client
-        self._scope_cache: dict[tuple[str, str, int], dict[str, pd.DataFrame]] = {}
 
     def discover_scopes(self, *, force_refresh: bool = True) -> tuple[UnderstatScope, ...]:
         return self.source.catalog.discover_scopes(force_refresh=force_refresh)
@@ -145,6 +136,16 @@ class UnderstatScraper(BaseScraper):
         """#1431: one-request league fingerprints for the weekly closed check."""
 
         return self.source.league_snapshot(league, season_slug, source_season_id)
+
+    def confirm_cache(self) -> None:
+        self.source.confirm_cache()
+
+    def note_quality(self, league: str, source_season_id: int, report: Any, *,
+                     publication_ready: bool = True) -> None:
+        """Keep pending/failed scopes daily until the existing DQ gates heal."""
+        self.source.catalog.note_quality(
+            league, source_season_id, report, publication_ready=publication_ready
+        )
 
     @property
     def last_league_hashes(self) -> dict[str, str]:
@@ -208,6 +209,19 @@ class UnderstatScraper(BaseScraper):
                 replace_guard_key,
             )
 
+        # An all-NULL forecast otherwise becomes Arrow null and Trino VARCHAR.
+        # Do not coerce invalid numbers to NULL or alter unrelated source types.
+        if table_name == "understat_schedule" and any(
+            column in df for column in FORECAST_COLUMNS
+        ):
+            df = df.copy()
+            for column in FORECAST_COLUMNS:
+                if column in df:
+                    values = pd.to_numeric(df[column], errors="raise").astype("Float64")
+                    if (df[column].notna() & values.isna()).any():
+                        raise ValueError(f"Invalid numeric value in {column}")
+                    df[column] = values
+
         prepared = self._iceberg_writer._add_metadata_columns(
             df,
             self.SOURCE_NAME,
@@ -226,83 +240,6 @@ class UnderstatScraper(BaseScraper):
         self._stats["tables_written"].append(table_path)
         logger.info("Saved %d rows to %s", len(df), table_path)
         return table_path
-
-    def _configured_scopes(self) -> list[tuple[str, str, int]]:
-        if not self.seasons:
-            raise ValueError("At least one explicit canonical season is required")
-        result: list[tuple[str, str, int]] = []
-        for league in self.leagues:
-            for raw in self.seasons:
-                if isinstance(raw, bool):
-                    raise ValueError("Boolean is not a valid Understat season")
-                if isinstance(raw, int):
-                    source_year = raw
-                    slug = season_slug(source_year)
-                elif isinstance(raw, str):
-                    source_year = source_season_id_from_slug(raw)
-                    slug = raw
-                else:
-                    raise ValueError(f"Unsupported season value: {raw!r}")
-                result.append((league, slug, source_year))
-        return result
-
-    def _read_table(self, table_name: str) -> Optional[pd.DataFrame]:
-        frames: list[pd.DataFrame] = []
-        for league, slug, source_year in self._configured_scopes():
-            key = (league, slug, source_year)
-            if key not in self._scope_cache:
-                self._scope_cache[key] = self.scrape_scope(
-                    league,
-                    slug,
-                    source_year,
-                    mode="current",
-                )
-            frame = self._scope_cache[key][table_name]
-            if not frame.empty:
-                frames.append(frame)
-        if not frames:
-            return None
-        result = pd.concat(frames, ignore_index=True).convert_dtypes()
-        contract = next(item for item in TABLE_CONTRACTS if item.table_name == table_name)
-        return self._add_metadata(result, contract.result_key)
-
-    def read_schedule(
-        self, include_matches_without_data: bool = True, force_cache: bool = False
-    ) -> Optional[pd.DataFrame]:
-        frame = self._read_table("understat_schedule")
-        if frame is not None and not include_matches_without_data:
-            frame = frame[frame["has_data"].fillna(False).astype(bool)]
-        return frame
-
-    def read_shot_events(self, match_id: Any = None) -> Optional[pd.DataFrame]:
-        return self._filter_match(self._read_table("understat_shots"), match_id)
-
-    def read_player_season_stats(self, force_cache: bool = False) -> Optional[pd.DataFrame]:
-        return self._read_table("understat_players")
-
-    def read_team_match_stats(self, force_cache: bool = False) -> Optional[pd.DataFrame]:
-        return self._read_table("understat_team_match_stats")
-
-    def read_player_match_stats(self, match_id: Any = None) -> Optional[pd.DataFrame]:
-        return self._filter_match(
-            self._read_table("understat_player_match_stats"), match_id
-        )
-
-    def read_player_team_season_stats(self) -> Optional[pd.DataFrame]:
-        return self._read_table("understat_player_team_season_stats")
-
-    def read_team_season_breakdowns(self) -> Optional[pd.DataFrame]:
-        return self._read_table("understat_team_season_breakdowns")
-
-    @staticmethod
-    def _filter_match(frame: Optional[pd.DataFrame], match_id: Any) -> Optional[pd.DataFrame]:
-        if frame is None or match_id is None:
-            return frame
-        match_ids = [match_id] if isinstance(match_id, (int, str)) else list(match_id)
-        selected = frame[frame["game_id"].isin([int(value) for value in match_ids])]
-        if selected.empty:
-            raise ValueError("No matches found with the given IDs in selected scopes")
-        return selected
 
     def scrape_all(
         self, min_replace_ratio: Optional[float] = 0.9

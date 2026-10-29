@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import importlib
 import json
+import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import sys
 
@@ -51,7 +53,7 @@ def _scope(
         league=league,
         season=season,
         source_season_id=source_id,
-        is_closed=True,
+        is_closed=source_id < 2026,
         discovered=discovered,
     )
 
@@ -383,3 +385,62 @@ def test_closed_check_validation_accepts_only_complete(dag_module, tmp_path):
         dag_module.validate_scope_result(
             **_validation_context(path, mode="closed_check")
         )
+
+
+def test_html_task_is_optional_and_after_json(dag_module):
+    task = _bash("enrich_matches")
+    assert "--enrich-matches" in task.bash_command
+    assert task._init_kwargs["trigger_rule"] == "all_done"
+    assert task.upstream_task_ids == {"run_current_scope"}
+    assert task.downstream_task_ids == {"enrichment_finished"}
+    assert _python("enrichment_finished")._init_kwargs["trigger_rule"] == "all_done"
+    assert task._init_kwargs["retries"] == 0
+    assert task._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert task._init_kwargs["priority_weight"] < dag_module.CURRENT_PRIORITY
+
+
+def test_html_runner_imports_with_image_environment(dag_module):
+    task = _bash("enrich_matches")
+    root = Path(__file__).resolve().parents[3]
+    environment = {**os.environ, "PYTHONPATH": "", "PYTHONSAFEPATH": "1"}
+    # Translate only the container mount to this checkout; retain task settings.
+    environment.update({
+        key: value.replace("/opt/airflow", str(root))
+        for key, value in task._init_kwargs.get("env", {}).items()
+    })
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import runpy
+from unittest.mock import patch
+
+runner = runpy.run_path('dags/scripts/run_understat_scraper.py')
+with (
+    patch('scrapers.understat.UnderstatClient') as client,
+    patch('scrapers.understat.manifest.UnderstatManifestRepository.from_env') as repository,
+    patch('scrapers.understat.enrichment.run_enrichment') as enrich,
+):
+    enrich.return_value = {'status': 'test_enriched'}
+    assert runner['main'](['--enrich-matches']) == 0
+    enrich.assert_called_once_with(client.return_value.__enter__.return_value,
+                                   repository.return_value)
+"""],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "test_enriched"}
+
+
+def test_optional_leaf_does_not_mask_json_failure(dag_module):
+    from airflow.exceptions import AirflowFailException
+
+    watcher = _python("json_collection_failed")
+    assert watcher._init_kwargs["trigger_rule"] == "one_failed"
+    assert watcher._init_kwargs["retries"] == 0
+    assert watcher.upstream_task_ids == {"run_current_scope"}
+    assert not watcher.downstream_task_ids
+    with pytest.raises(AirflowFailException, match="JSON collection failed"):
+        watcher.python_callable()

@@ -902,6 +902,13 @@ def validate_season_alignment(
                 (index, tuple(sorted(source_values)), tuple(sorted(canonical_values)))
             )
     report = DQReport()
+    for index, source, canonical in mismatches:
+        report.reject_row(
+            index,
+            "season_mismatch",
+            f"season {source!r} / {canonical!r} is not "
+            f"{expected_source!r} / {expected_canonical!r}",
+        )
     if mismatches:
         report.add(
             "season_mismatch",

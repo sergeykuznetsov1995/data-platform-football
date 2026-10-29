@@ -45,6 +45,7 @@ DAGS = (
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
+    "dag_refresh_fotmob_c1",
 )
 PRESERVED_DYNAMIC_CATALOG_EVIDENCE = frozenset(
     {

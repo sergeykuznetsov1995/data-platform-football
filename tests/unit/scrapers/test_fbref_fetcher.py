@@ -1609,3 +1609,22 @@ def test_session_abort_strict_refusal_stays_red_even_if_tolerant_close_succeeds(
     # A tolerant accounting read can record spend, but cannot authorize requeue.
     assert raised.value.provider_billed_bytes == 0
     fetcher._lease_client.acquire.assert_not_called()
+
+
+@pytest.mark.parametrize("guard", ["unpaid", "no_lease", "redirect", "geoip", "other_network"])
+def test_websocket_deferral_does_not_override_other_policy_failures(guard):
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher._lease_client = None if guard == "unpaid" else MagicMock()
+    fetcher._provider_lease = None if guard == "no_lease" else MagicMock()
+    stats = {
+        "network_policy_failed": True,
+        "network_policy_failure": "unrouted_websocket_upgrade",
+    }
+    if guard == "redirect":
+        stats["redirect_blocked"] = True
+    elif guard == "geoip":
+        stats["geoip_lookup_failed"] = True
+    elif guard == "other_network":
+        stats["network_policy_failure"] = "unrouted_http_response"
+    reason = fetcher._hard_transport_policy_reason(stats)
+    assert fetcher._local_session_failure_reason(stats, reason) is None

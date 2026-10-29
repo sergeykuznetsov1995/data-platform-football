@@ -410,6 +410,27 @@ def build_signal_merge(state: SignalState) -> str:
                   _SIGNAL_UPDATE_GUARD)
 
 
+def build_player_signature_migration(state: SignalState, signature: str) -> str:
+    """Compare-and-swap a proven applied player's signature, preserving evidence.
+
+    This is separate from acknowledgement: no status, raw or Bronze fields are
+    updated, and a missing or concurrently changed row is never inserted.
+    The caller proves equivalence against the saved exact player fields.
+    """
+    if state.observation.entity != 'player' or state.status != 'applied':
+        raise CurrentStateError('signature migration requires an applied player')
+    _hash('signature', signature)
+    values = _signal_values(state)
+    projection = ', '.join(f'{_sql(value)} AS {name}' for name, value in values.items())
+    keys = ('scope_id', 'entity', 'entity_id')
+    join = ' AND '.join(f't.{key} = s.{key}' for key in keys)
+    guard = ' AND '.join(f't.{name} IS NOT DISTINCT FROM s.{name}'
+                         for name in values if name not in keys)
+    return (f'MERGE INTO {SIGNALS_TABLE} t USING (SELECT {projection}) s ON {join}\n'
+            f'WHEN MATCHED AND {guard} THEN UPDATE SET '
+            f'observed_signature = {_sql(signature)}, applied_signature = {_sql(signature)}')
+
+
 def build_signals_merge(states: Iterable[SignalState]) -> str:
     """One bounded transaction per packet; duplicate keys cannot race in MERGE."""
     packet = tuple(states)

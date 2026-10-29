@@ -108,14 +108,17 @@ class _FakeManager:
                 for literal in sql.split(" IN (", 1)[1].rsplit(")", 1)[0].split(",")
             }
             rows = self.files[table]
-            merged_size = sum(size for _p, path, size in rows if path in paths)
-            partition = next(part for part, path, _s in rows if path in paths)
+            sizes = {}
+            for partition, path, size in rows:
+                if path in paths:
+                    sizes[partition] = sizes.get(partition, 0) + size
             self.files[table] = [row for row in rows if row[1] not in paths]
             self.merged += 1
-            self.files[table].append(
-                (partition, f"merged-{self.merged}.parquet", merged_size)
+            self.files[table].extend(
+                (partition, f"merged-{self.merged}-{index}.parquet", size)
+                for index, (partition, size) in enumerate(sizes.items())
             )
-            return [(len(paths), 1)]
+            return [(len(paths), len(sizes))]
         if "count(*)" in sql:
             rows = self.files[table]
             return [(len(rows), sum(size for _p, _path, size in rows))]
@@ -225,21 +228,56 @@ class TestWaveBarrier:
 
 @pytest.mark.unit
 class TestChunkPlanning:
-    def test_chunks_respect_every_bound_and_never_mix_partitions(self):
+    def test_chunks_respect_every_bound(self):
         candidates = _files("player", 1_000, size=1024, prefix="p" * 200) + _files(
             "match", 1_500, size=1024, prefix="m" * 200
         )
 
         chunks = maintenance.plan_chunks(MANIFEST, candidates)
 
-        assert [chunk["partition"] for chunk in chunks][0] == "match"
+        assert chunks[0]["partitions"][0] == "match"
         for chunk in chunks:
             assert 2 <= chunk["files"] <= maintenance.MAX_FILES_PER_CHUNK
             assert chunk["bytes"] <= maintenance.MAX_INPUT_BYTES_PER_CHUNK
             assert chunk["sql_bytes"] <= maintenance.MAX_SQL_BYTES
             assert len(chunk["paths"]) == chunk["files"]
-            assert len({path.split("-")[1] for path in chunk["paths"]}) == 1
+            assert len(chunk["partitions"]) <= maintenance.MAX_PARTITIONS_PER_CHUNK
+            sql_bytes = len(maintenance.chunk_sql(MANIFEST, chunk["paths"]).encode("utf-8"))
+            assert sql_bytes <= chunk["sql_bytes"]
         assert sum(chunk["files"] for chunk in chunks) == 2_500
+
+    @pytest.mark.parametrize(
+        "size,prefix", [(1024, "f"), (7_000_000, "f"), (1024, "я'" * 1000)]
+    )
+    def test_packed_partitions_respect_combined_limits(self, size, prefix):
+        candidates = [
+            row
+            for index in range(40)
+            for row in _files(str(index), 30, size=size, prefix=prefix)
+        ]
+        candidates += _files("lonely", 1)
+        chunks = maintenance.plan_chunks(MANIFEST, candidates)
+        expected = {
+            path: (partition, size)
+            for partition, path, size in candidates
+            if partition != "lonely"
+        }
+        selected = [path for chunk in chunks for path in chunk["paths"]]
+        assert len(selected) == len(set(selected))
+        assert set(selected) == expected.keys()
+        for chunk in chunks:
+            assert chunk["files"] <= maintenance.MAX_FILES_PER_CHUNK
+            assert chunk["bytes"] <= maintenance.MAX_INPUT_BYTES_PER_CHUNK
+            assert chunk["sql_bytes"] <= maintenance.MAX_SQL_BYTES
+            sql_bytes = len(maintenance.chunk_sql(MANIFEST, chunk["paths"]).encode("utf-8"))
+            assert sql_bytes <= chunk["sql_bytes"]
+            counts = {}
+            for path in chunk["paths"]:
+                partition, _size = expected[path]
+                counts[partition] = counts.get(partition, 0) + 1
+            assert set(counts) == set(chunk["partitions"])
+            assert len(counts) <= maintenance.MAX_PARTITIONS_PER_CHUNK
+            assert min(counts.values()) >= 2
 
     def test_input_bytes_bound_splits_a_partition(self):
         candidates = _files("match", 20, size=8 * 1024 * 1024 - 1)
@@ -304,6 +342,44 @@ class TestChunkSql:
 
 @pytest.mark.unit
 class TestDeadline:
+    def test_many_small_partitions_complete_before_cutoff_and_stay_compacted(self):
+        candidates = [row for index in range(400) for row in _files(str(index), 2)]
+        manager = _FakeManager({MANIFEST: candidates + _files("lonely", 1)})
+        clock = _Clock(_at(23, 30))
+        original = manager.execute_query
+
+        def _execute(sql):
+            result = original(sql)
+            if sql.lstrip().upper().startswith("ALTER"):
+                clock.value += timedelta(seconds=1)
+            return result
+
+        def _sleep(seconds):
+            clock.value += timedelta(seconds=seconds)
+
+        manager.execute_query = _execute
+        result = _run(manager, now=clock, sleep=_sleep)
+
+        assert result["stopped"] == "complete"
+        assert result["chunks"] == 13
+        assert clock.value < _at(23, 44)
+        assert result["files_after"] == 401
+        assert result["bytes_before"] == result["bytes_after"]
+        assert {partition: size for partition, _path, size in manager.files[MANIFEST]} == {
+            **{str(index): 20_000 for index in range(400)},
+            "lonely": 10_000,
+        }
+        alters = [sql for sql in manager.queries if sql.startswith("ALTER")]
+        for partition, path, _size in candidates:
+            assert sum(maintenance._path_sql_literal(path) in sql for sql in alters) == 1
+        assert all("f-lonely-" not in sql for sql in alters)
+
+        before = list(manager.files[MANIFEST])
+        repeated = _run(manager, now=_Clock(_at(23, 30)))
+        assert repeated["stopped"] == "complete"
+        assert repeated["chunks"] == 0
+        assert manager.files[MANIFEST] == before
+
     def test_no_chunk_starts_after_the_cutoff(self):
         manager = _FakeManager({MANIFEST: _files("match", 2_500, size=1024)})
 

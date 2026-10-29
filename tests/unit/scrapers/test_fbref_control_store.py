@@ -48,7 +48,15 @@ class FakeCursor:
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split())
         self.executions.append((normalized, params))
-        self.rows, self.rowcount = self.handler(normalized, params)
+        if normalized.startswith((
+            "SELECT pg_advisory_xact_lock_shared(%s)",
+            "SELECT target_id FROM fbref_control.page_scope_summary ",
+            "SELECT fbref_control.refresh_page_scope_summary(",
+            "SELECT target_id FROM fbref_control.page_frontier WHERE target_id = ANY(",
+        )):
+            self.rows, self.rowcount = [], 0
+        else:
+            self.rows, self.rowcount = self.handler(normalized, params)
 
     def fetchone(self):
         return self.rows.pop(0) if self.rows else None
@@ -787,7 +795,7 @@ def test_publication_policy_distinguishes_required_from_discovered_standings():
         "match",
     )
     assert PUBLICATION_FRESHNESS_PAGE_KINDS == frozenset(
-        (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings")
+        (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings", "squad")
     )
     assert set(DISCOVERY_SPINE_PAGE_KINDS).isdisjoint(
         OTHER_PUBLICATION_CRITICAL_PAGE_KINDS
@@ -833,8 +841,8 @@ def test_due_cohort_uses_explicit_publication_admission_tiers():
     # admission-tier arrays moved behind them.
     assert selected["params"][:4] == (None, None, None, None)
     assert selected["params"][4:7] == (
-        list(DISCOVERY_SPINE_PAGE_KINDS),
-        list(DISCOVERY_SPINE_PAGE_KINDS),
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
         list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
     )
     assert selected["params"][-2:] == (run_id, 5)
@@ -1041,7 +1049,7 @@ def test_claim_scope_is_narrowed_to_this_runs_targets():
     assert "JOIN scope_candidates AS claim_candidate" in sql
     assert "ON candidate.target_id = edge.child_target_id" in sql
     # The candidate predicate is the outer predicate, verbatim.
-    assert sql.count("status IN ('pending', 'retry')") == 2
+    assert sql.count("status IN ('pending', 'retry')") == 3
     assert seen["params"] == (
         run_id,
         run_id,
@@ -1103,8 +1111,8 @@ def test_due_cohort_scope_is_narrowed_to_due_candidates():
         ["match"],
         ["daily"],
         ["daily"],
-        list(DISCOVERY_SPINE_PAGE_KINDS),
-        list(DISCOVERY_SPINE_PAGE_KINDS),
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
         list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
         ["match"],
         ["match"],
@@ -2653,3 +2661,251 @@ def test_batch_latest_content_guard_rejects_duplicate_target():
             ("fbref:match:aaaa", "h", refresh),
         ]):
             pass
+
+
+def test_1325_normalization_preserves_fences_and_backoff():
+    statements = []
+    def handler(sql, params):
+        statements.append(sql)
+        if "SELECT frontier.target_id FROM fbref_control.page_frontier" in sql:
+            return [{"target_id": "season"}], 1
+        return [], 0
+    store = ControlStore("postgresql://unused/test", connection_factory=FakeFactory(handler))
+    assert store.normalize_current_enrichment() == 0
+    assert store.normalize_current_enrichment() == 0
+    assert statements[0] == statements[2] and statements[1] == statements[3]
+    assert "FOR UPDATE OF frontier SKIP LOCKED" in statements[0]
+    sql = statements[1]
+    assert "frontier.target_id = ANY(%s::text[])" in sql
+    assert "IS DISTINCT FROM" in sql
+    assert "frontier.state IN ('queued', 'retry', 'fetched')" in sql
+    assert "member.status IN ('pending', 'leased', 'retry')" in sql
+    assert "run.status IN ('pending', 'running')" in sql
+    assignment = sql[sql.index("SET refresh_policy"):sql.index("FROM desired")]
+    assert "retry_after" not in assignment and "state =" not in assignment
+    assert "next_fetch_at" not in assignment
+    assert "frontier.next_fetch_at) IS DISTINCT FROM" not in sql
+    assert "has_current_ownership" in sql and "canonical_scope" in sql
+    assert "'monthly', 50, 664" in sql and "'weekly', 60, 160" in sql
+
+
+@pytest.mark.parametrize("limit,cap", [(1, 0), (3, 0), (4, 1), (25, 6)])
+def test_1325_due_and_claim_cap_old_cohorts_and_small_budget(limit, cap):
+    seen = {}
+    run_id = str(uuid.uuid4())
+    def handler(sql, params):
+        if "SELECT status FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running"}], 1
+        if "END AS admission_tier" in sql:
+            seen["due"] = sql
+            return [], 0
+        if "SELECT COALESCE(max(ordinal)" in sql:
+            return [{"next_ordinal": 0}], 1
+        return _claim_sql_probe(run_id, seen)(sql, params)
+    store = ControlStore("postgresql://unused/test", connection_factory=FakeFactory(handler))
+    assert store.create_due_run_cohort(run_id, limit=limit) == []
+    assert store.claim_targets(run_id, "test", limit=limit) == []
+    assert f"eligible.kind_ordinal <= {cap}" in seen["due"]
+    assert f"claim_order.kind_ordinal <= {cap}" in seen["sql"]
+    case = seen["due"].split("END AS admission_tier")[0]
+    assert "('season', 'season_stats', 'squad')" in case
+    assert "WHEN frontier.page_kind IN ('match', 'schedule') THEN 0" in seen["sql"]
+    assert "THEN 2 ELSE 1 END," in seen["sql"]
+    assert "THEN frontier.priority ELSE 0 END DESC, target.ordinal" in seen["sql"]
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_1325_explicit_acceptance_keeps_all_seven_enrichment_members(frozen):
+    run_id = str(uuid.uuid4())
+    seen = {}
+    target_ids = ["season", *[f"stats-{i}" for i in range(5)], "squad"]
+    metadata = {
+        "acceptance_profile": True,
+        "execution_mode": "acceptance_nonpublishing",
+        "acceptance_cohort": {"target_ids": target_ids} if frozen else {},
+    }
+    probe = _claim_sql_probe(run_id, seen)
+
+    def handler(sql, params):
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running", "metadata": metadata}], 1
+        if "SET status = 'skipped'" in sql:
+            # An external urgent match must not remove frozen members.
+            assert "AND NOT %s" in sql
+            assert params == (run_id, frozen, run_id)
+            seen["handback"] = True
+            return [], 0
+        return probe(sql, params)
+
+    store = ControlStore("postgresql://unused/test", connection_factory=FakeFactory(handler))
+    store.claim_targets(run_id, "acceptance", limit=25)
+    assert seen["handback"]
+    # Seven enrichment members must pass even alongside the mandatory spine.
+    assert f"WHERE ({frozen} OR NOT claim_order.enrichment" in seen["sql"]
+    assert "claim_order.kind_ordinal <= 6" in seen["sql"]
+
+
+def test_1325_urgent_handback_excludes_all_existing_run_members():
+    """A requeued/skipped match cannot be admitted again in the same run."""
+    run_id = str(uuid.uuid4())
+    seen = {}
+    probe = _claim_sql_probe(run_id, seen)
+
+    def handler(sql, params):
+        if "SET status = 'skipped'" in sql:
+            membership = " ".join(sql.split())
+            assert "member.target_id = urgent.target_id" in membership
+            assert (
+                "AND (member.run_id = %s OR ( "
+                "member.status IN ('pending', 'leased', 'retry') "
+                "AND owner.status IN ('pending', 'running') ))"
+            ) in membership
+            assert params == (run_id, False, run_id)
+            seen["handback"] = True
+        return probe(sql, params)
+
+    store = ControlStore(
+        "postgresql://unused/test", connection_factory=FakeFactory(handler)
+    )
+    assert store.claim_targets(run_id, "current", limit=25) == []
+    assert seen["handback"]
+
+
+@pytest.mark.parametrize('outcome', ['completed', 'already_succeeded', 'lost'])
+def test_processing_measurement_is_atomic_with_fenced_completion(monkeypatch, outcome):
+    from scrapers.fbref.control import LeaseLost
+    from scrapers.fbref.control.models import ObservationLease
+    from scrapers.fbref.control import store as module
+
+    now = [10.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    lease = ObservationLease(
+        logical_refresh_id=str(uuid.uuid4()), target_id='target', content_hash='hash',
+        parser_version='page', typed_parser_version='typed', stateful_parser_version='stateful',
+        claim_token=str(uuid.uuid4()), lease_expires_at=datetime.now(timezone.utc),
+    )
+
+    def handler(sql, params):
+        if "SET status = 'succeeded'" in sql:
+            assert "status = 'processing' AND claim_token = %s" in sql
+            assert params[-1] == lease.claim_token
+            now[0] += 0.125
+            return [], int(outcome == 'completed')
+        if 'SET processing_work_ms' in sql:
+            assert params == (30125, lease.logical_refresh_id, 'page', 'typed', 'stateful')
+            return [], 1
+        return [{'status': 'succeeded' if outcome == 'already_succeeded' else 'processing'}], 1
+
+    factory = FakeFactory(handler)
+    store = ControlStore('postgresql://unused/db', connection_factory=factory)
+    if outcome == 'lost':
+        with pytest.raises(LeaseLost):
+            store.complete_observation_processing(lease, typed_status='skipped', stateful_status='succeeded', processing_work_ms=30000)
+    else:
+        store.complete_observation_processing(lease, typed_status='skipped', stateful_status='succeeded', processing_work_ms=30000)
+    connection = factory.connections[0]
+    assert connection.committed == (outcome != 'lost')
+    assert sum('SET processing_work_ms' in sql for sql, _ in connection.fake_cursor.executions) == (outcome == 'completed')
+
+
+def test_processing_work_migration_preserves_unknown_old_measurements():
+    migration = next(m for m in MIGRATIONS if m.version == 14)
+    assert migration.version == 14
+    assert migration.name == 'observation_processing_work'
+    sql = ' '.join(migration.statements)
+    assert 'ADD COLUMN processing_work_ms bigint' in sql
+    assert 'CHECK (processing_work_ms >= 0)' in sql
+    assert 'DEFAULT' not in sql and 'UPDATE' not in sql and 'NOT NULL' not in sql
+
+
+@pytest.mark.parametrize("state,newer,same_hash", [
+    ("fetched", False, True), ("leased", False, True),
+    ("fetched", True, True), ("fetched", False, False),
+])
+def test_incomplete_match_refetch_fences_refresh_hash_and_new_lease(state, newer, same_hash):
+    refresh = str(uuid.uuid4())
+    def handler(sql, params):
+        if "SELECT state, last_content_hash" in sql:
+            assert "FOR NO KEY UPDATE" in sql
+            return [{"state": state, "last_content_hash": "a" if same_hash else "b"}], 1
+        if "SELECT logical_refresh_id, content_hash" in sql:
+            assert "ORDER BY lease_epoch DESC, attempt_number DESC" in sql
+            return [{"logical_refresh_id": str(uuid.uuid4()) if newer else refresh,
+                     "content_hash": "a"}], 1
+        if "INSERT INTO fbref_control.incomplete_match_refetch" in sql:
+            assert "retry.attempts < 3" in sql
+            assert "retry.logical_refresh_id <> EXCLUDED.logical_refresh_id" in sql
+            return [{"attempts": 2}], 1
+        if "UPDATE fbref_control.page_frontier" in sql:
+            assert "last_etag = NULL, last_modified = NULL" in sql
+            assert params == (2, 2, "match")
+            return [], 1
+        pytest.fail(sql)
+    factory = FakeFactory(handler)
+    store = ControlStore("postgresql://unused/db", connection_factory=factory)
+    expected = state == "fetched" and not newer and same_hash
+    assert store.schedule_incomplete_match_refetch("match", content_hash="a", logical_refresh_id=refresh) == expected
+    statements = factory.connections[0].fake_cursor.executions
+    assert any("UPDATE fbref_control.page_frontier" in sql for sql, _ in statements) == expected
+
+
+def test_incomplete_match_replay_or_exhaustion_does_not_reschedule():
+    factory = FakeFactory(lambda sql, params: ([], 0))
+    store = ControlStore("postgresql://unused/db", connection_factory=factory)
+    store._latest_content_verdict = lambda *_: True
+    assert not store.schedule_incomplete_match_refetch("match", content_hash="a", logical_refresh_id=uuid.uuid4())
+    assert not any("UPDATE fbref_control.page_frontier" in sql for sql, _ in factory.connections[0].fake_cursor.executions)
+
+
+def test_gender_gate_counts_entire_frontier_including_inherited_and_quarantined_targets():
+    run_id = str(uuid.uuid4())
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if "AS classified_count" in sql:
+            assert "LEFT JOIN fbref_control.page_scope_summary" in sql
+            assert "competition_registry" not in sql
+            assert "WHERE frontier.state NOT IN" in sql  # FILTER only; all rows stay in count.
+            assert "scope.gender_classified" in sql and "scope.pending" in sql
+            assert "frontier.page_kind <> 'competition_index'" in sql
+            assert "page_scope_registry_dirty" in sql
+            return [
+                {"gender": "male", "count": 1, "active_count": 1, "classified_count": 1},
+                {"gender": "female", "count": 2, "active_count": 1, "classified_count": 2},
+                {"gender": "mixed", "count": 1, "active_count": 1, "classified_count": 1},
+                {"gender": "unknown", "count": 1, "active_count": 1, "classified_count": 1},
+            ], 4
+        return [], 0
+    store = ControlStore("postgresql://unused/db", connection_factory=FakeFactory(handler))
+    summary = store.get_run_summary(run_id)
+    assert summary["frontier_gender_total"] == summary["frontier_gender_classified"] == 5
+    assert summary["frontier_gender_counts"] == {"male": 1, "female": 2, "mixed": 1, "unknown": 1}
+    assert summary["female_downstream_targets"] == 2
+    assert summary["unknown_gender_downstream_targets"] == 1
+
+
+def test_gender_backfill_rolls_back_and_resumes_the_same_keyset_batch():
+    checkpoint = [""]
+    def handler(sql, params):
+        if "SELECT after_target_id FROM fbref_control.page_gender_backfill" in sql:
+            return [{"after_target_id": checkpoint[0]}], 1
+        if "WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE" in sql:
+            assert params == ("", 2)
+            return [{"target_id": "a"}, {"target_id": "b"}], 2
+        if "UPDATE fbref_control.page_gender_backfill" in sql:
+            checkpoint[0] = params[0]
+        return [], 0
+    factory = FakeFactory(handler)
+    store = ControlStore("postgresql://unused/db", connection_factory=factory)
+    def fail_refresh(*_):
+        raise TimeoutError("batch timeout")
+    store._refresh_scope_summaries = fail_refresh
+    with pytest.raises(TimeoutError):
+        store.backfill_page_gender_classes(batch_size=2)
+    assert factory.connections[0].rolled_back and checkpoint == [""]
+    refreshed = []
+    store._refresh_scope_summaries = lambda cursor, targets: refreshed.extend(targets)
+    result = store.backfill_page_gender_classes(batch_size=2)
+    assert refreshed == ["a", "b"] and checkpoint == ["b"]
+    assert result == {"processed": 2, "after_target_id": "b", "done": False}
+    assert factory.connections[1].committed

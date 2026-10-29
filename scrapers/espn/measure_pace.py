@@ -22,7 +22,7 @@ from .criterion import meets, render_daily_criterion_sql
 from .gate import TransportGate, default_state_path
 from .history import live_debt
 from .pace import PaceWindow, evaluate
-from .pace_report import attempt_metrics, format_measurement, load_evidence, write_metrics
+from .pace_report import attempt_metrics, format_measurement, load_evidence, sql_unknown, write_metrics
 from .pace_store import ControllerBusy, PaceStore
 from .parallel import WORKERS, bounded_fetch, interruptible_sleep, protected
 from .transport_contracts import AllOriginsBlocked, LaneClosed
@@ -170,7 +170,8 @@ class Controller:
     def check(self):
         if self.cancel.is_set() or self.stop_file.exists():
             raise MeasurementStopped('measurement stop requested')
-        if self.decision_due or self.state.get('restart_pending') is not None:
+        if (self.decision_due or self.state.get('restart_pending') is not None
+                or self.state.get('sql_restart_pending') is not None):
             raise LaneClosed('controller evidence boundary; drain workers')
         if self.history_stop is not None and self.history_stop.exists():
             raise LaneClosed('history stop file present')
@@ -192,6 +193,22 @@ class Controller:
         if self.io is not None:
             self.freshness = self.io.snapshot('freshness') or {}
             observation = self.io.snapshot('debt')
+            if self.state['step'] == 2 and observation is not None:
+                pending = self.state.get('sql_restart_pending')
+                if (pending is not None and observation['known']
+                        and observation.get('observed_at', observation['at']) >= pending
+                        and self.now().timestamp() - observation.get('observed_at', observation['at']) <= MAXIMUM_GAP):
+                    self.state['start'] = observation['at']
+                    self.state.pop('sql_restart_pending')
+                sql = self._sql_unknown(observation)
+                self.state['sql_unknown'] = sql
+                self.state['sql_unknown_checked_at'] = self.now().timestamp()
+                if not sql['allowed'] and 'sql_restart_pending' not in self.state:
+                    at = self.now().timestamp()
+                    self.state['start'] = at
+                    self.state['sql_restart_pending'] = at
+                    self.store.record('lifecycle', at, event='window_restarted', reason='sql_unknown_limit_or_unexplained_gap')
+                self.store.save(self.state)
             if observation is None or observation == self.observation:
                 return
             snapshot = self.gate.snapshot()
@@ -225,6 +242,8 @@ class Controller:
         self.observation = observation
         at, known = observation['at'], observation['known']
         state = self.state
+        if snapshot['step'] != 2:
+            state.pop('sql_restart_pending', None)
         if (self.max_step == 3 and state['step'] == 3 and snapshot['confirmed_ceiling'] == 2
                 and any(e['reason'] == 's3_expired' and e['at'] >= state['epoch']
                         for e in snapshot['events'])):
@@ -233,9 +252,12 @@ class Controller:
             self.cancel.set()
         gap = self.io is None and previous is not None and at - previous['at'] > MAXIMUM_GAP
         recovered = known and previous is not None and not previous['known']
+        sql_safe = (self.io is not None and state['step'] == 2
+                    and observation.get('mandatory_restart_at', observation.get('restart_at', at)) <= state['start']
+                    and self._sql_unknown(observation)['allowed'])
         if (snapshot['revision'] != state['revision'] or snapshot['measurement_started_at'] != state['epoch']
-                or not known or gap or recovered
-                or observation.get('restart_at', 0) > state['start']):
+                or (not sql_safe and (not known or gap or recovered
+                    or observation.get('restart_at', 0) > state['start']))):
             state.update(start=max(at if self.io is None else observation.get('restart_at', at), state['start']), revision=snapshot['revision'],
                          epoch=snapshot['measurement_started_at'], step=snapshot['step'])
             self.store.record('lifecycle', at, event='window_restarted', reason=observation.get('error') or 'epoch_or_observation_gap')
@@ -276,7 +298,8 @@ class Controller:
         current = self.now().timestamp()
         fresh_ok = (fresh.get('eligible') is True and
                     current - fresh.get('checked_at', 0) <= FRESHNESS_SECONDS + MAXIMUM_GAP)
-        complete = (start < end and self.journal.coverage(begin, finish) and load['continuous']
+        complete = (start < end and self.journal.coverage(begin, finish)
+                    and (load['continuous'] or load['sql_gap_allowed'])
                     and bool(profile) and snapshot['revision'] == self.state['revision']
                     and snapshot['measurement_started_at'] == self.state['epoch'])
         # All traffic must meet the absolute latency bound; relative comparison
@@ -416,9 +439,17 @@ class Controller:
         if self.io is None:
             return True
         debt = self.io.snapshot('debt')
-        return bool(debt and debt['known'] and not debt['debt']
-                    and debt['restart_at'] <= start
+        boundary = 'mandatory_restart_at' if self.state['step'] == 2 else 'restart_at'
+        return bool(self.state.get('sql_restart_pending') is None
+                    and debt and debt['known'] and not debt['debt']
+                    and debt.get(boundary, debt['restart_at']) <= start
+                    and (self.state['step'] != 2 or self._sql_unknown(debt)['allowed'])
                     and self.now().timestamp() - debt['observed_at'] <= MAXIMUM_GAP)
+
+    def _sql_unknown(self, debt):
+        start, end = self.state['start'], self.now().timestamp()
+        rows = self.store.rows('observation', start, end)
+        return sql_unknown(rows, start, end, query_started_at=debt.get('query_started_at'))
 
     def _final_freshness(self):
         if self.io is None:
@@ -431,10 +462,7 @@ class Controller:
             fresh = self.io.snapshot('freshness')
             if fresh and fresh['observed_at'] >= requested and fresh['sequence'] > sequence:
                 self.observe()
-                debt = self.io.snapshot('debt')
-                valid = (fresh.get('eligible') and debt and debt['known']
-                         and debt['restart_at'] <= self.state['start']
-                         and self.now().timestamp() - debt['observed_at'] <= MAXIMUM_GAP
+                valid = (fresh.get('eligible') and self._debt_valid(self.state['start'])
                          and self.now().timestamp() - fresh['observed_at'] <= FRESHNESS_SECONDS + MAXIMUM_GAP)
                 return dict(fresh, eligible=bool(valid))
             self.cancel.wait(0.05)
@@ -612,6 +640,9 @@ def read_status(path, *, now=None):
     report.update(status=state.get('status'), accepted_step=state.get('accepted_step'),
                   completed=state.get('completed', []), heartbeat=state.get('heartbeat'),
                   publication=state.get('publication'), publication_pending=state.get('publication_pending'))
+    if state.get('sql_unknown') is not None:
+        report['load'] = dict(report.get('load') or {}, sql_unknown=state['sql_unknown'])
+        report['sql_unknown_checked_at'] = state.get('sql_unknown_checked_at')
     report['stale'] = state.get('status') != 'complete' and (
         state.get('status') != 'running' or now.timestamp() - state.get('heartbeat', 0) > MAXIMUM_GAP)
     durable_publication = store.latest('publication')

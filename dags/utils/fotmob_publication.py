@@ -173,6 +173,7 @@ FOTMOB_EXPECTED_ISOLATED_DAGS = frozenset(
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
         FOTMOB_PLAYER_COLLECTOR_DAG_ID,
+        "dag_refresh_fotmob_c1",
     }
 )
 FOTMOB_ISOLATED_RUNTIME_ROOTS = {
@@ -206,6 +207,7 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
         "dags/dag_collect_fotmob_players.py",
+        "dags/dag_refresh_fotmob_c1.py",
         "dags/dag_trigger_fotmob_daily.py",
         "dags/scripts/run_fotmob_scraper.py",
         "dags/utils/fotmob_publication.py",
@@ -215,6 +217,7 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/domain.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/match_refresh.py",
         "scrapers/fotmob/player_collector.py",
         "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
@@ -233,6 +236,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
         "dags/dag_collect_fotmob_players.py",
+        "dags/dag_refresh_fotmob_c1.py",
         "dags/dag_master_pipeline.py",
         "dags/dag_sofascore_pipeline.py",
         "dags/dag_trigger_fotmob_daily.py",
@@ -257,6 +261,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/raw_store.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/match_refresh.py",
         "scrapers/fotmob/player_collector.py",
         "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
@@ -1459,6 +1464,7 @@ def attest_fotmob_isolated_runtime(
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
+                "dag_refresh_fotmob_c1",
             }
         )
         and report_unpaused
@@ -1473,9 +1479,9 @@ def attest_fotmob_isolated_runtime(
         common_admission
         and report.get("activation_state") == "pending_consumer"
         and report.get("kept_paused") is False
-        and report_paused == [FOTMOB_ISOLATED_DAILY_DAG_ID]
+        and report_paused == sorted({FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"})
         and report_unpaused
-        == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS - {FOTMOB_ISOLATED_DAILY_DAG_ID})
+        == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS - {FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"})
     )
     kept_paused_admission = (
         common_admission
@@ -1699,6 +1705,7 @@ def attest_fotmob_shared_runtime(
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
             "dag_collect_fotmob_players",
+            "dag_refresh_fotmob_c1",
         }
         and isinstance(unpaused, list)
         and set(unpaused)
@@ -1720,6 +1727,7 @@ def attest_fotmob_shared_runtime(
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
             "dag_collect_fotmob_players",
+            "dag_refresh_fotmob_c1",
         }
         and isinstance(unpaused, list)
         and set(unpaused)

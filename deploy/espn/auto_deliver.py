@@ -54,7 +54,7 @@ STATIC_PATHS = ("deploy/espn", "configs/espn")
 BYTE_CHECK = {"deploy/espn/dags": "/opt/airflow/dags", "scrapers/espn": "/opt/airflow/scrapers/espn"}
 DAGS_TARGET = "/opt/airflow/dags"
 WAVE_HOURS = (0, 6, 12, 18)
-WINDOW = timedelta(minutes=10)
+WINDOW = timedelta(minutes=30)   # запас до волны ≥ 2× потолка переключения (гриль 29.10; было 10 мин)
 ACCEPT_TIMEOUT_S = 420
 ACCEPT_POLL_S = 20
 KEEP_ROOTS = 3
@@ -257,6 +257,8 @@ def contour_paths(h: Host, sha: str) -> set[str]:
 
 def contour_differs(h: Host, a: str, b: str) -> bool:
     paths = sorted(contour_paths(h, a) | contour_paths(h, b))
+    # Документация и host units не исполняются в контейнере и не требуют его рестарта.
+    paths += [":(exclude)deploy/espn/README.md", ":(exclude)deploy/espn/systemd/**"]
     return bool(git(h, "diff", "--name-only", a, b, "--", *paths).strip())
 
 

@@ -122,17 +122,21 @@ def _approved_args(
     payload: dict,
     *,
     packet_suffix: str = '',
+    write_mode: str = 'dual',
+    refresh_mode: str = 'auto',
 ) -> tuple[list[str], Path]:
     journal_path = tmp_path / 'approvals.json'
     base = [
         '--payload-json', json.dumps(payload, sort_keys=True),
         '--reader-revision', '7',
         '--candidate-slot', 'b',
-        '--write-mode', 'dual',
+        '--write-mode', write_mode,
         '--approval-journal', str(journal_path),
     ]
+    if refresh_mode != 'auto':
+        base.extend(['--refresh-mode', refresh_mode])
     operation = cycle.approved_operation_argv(base)
-    tables = tuple(sorted(cycle.required_write_tables('dual')))
+    tables = tuple(sorted(cycle.required_write_tables(write_mode)))
     values = {
         'argv': operation,
         'concurrency': 1,
@@ -357,6 +361,8 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
         for command, options in calls
     )
     assert manifest['status'] == 'complete'
+    assert manifest['parser_revision'] == 'registry-v2'
+    assert manifest['schema_revision'] == '4'
     assert manifest['dq']['silver_trigger_allowed'] is True
     assert manifest['dq_evidence']['silver_trigger_allowed'] is True
     assert manifest['dq']['participant_contract']['endpoint_coverage'] == 1.0
@@ -1787,7 +1793,13 @@ def test_daily_admission_ignores_this_scopes_own_resumed_ledger(tmp_path):
     assert manifest['status'] == 'complete'
 
 
-def test_career_entities_get_the_canon_timeout(tmp_path):
+@pytest.mark.parametrize('existing_deadline', [None, 500.0, 10000.0])
+def test_career_entities_get_the_canon_timeout(tmp_path, monkeypatch, existing_deadline):
+    monkeypatch.setattr(cycle.time, 'monotonic', lambda: 100.0)
+    if existing_deadline is None:
+        monkeypatch.delenv('TM_REQUEST_DEADLINE_MONOTONIC', raising=False)
+    else:
+        monkeypatch.setenv('TM_REQUEST_DEADLINE_MONOTONIC', str(existing_deadline))
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
     args = _parse_args(argv)
@@ -1813,6 +1825,11 @@ def test_career_entities_get_the_canon_timeout(tmp_path):
         'coaches': 3600,
     }
     assert cycle.CAREER_ENTITY_TIMEOUT_SECONDS == 5_400
+    for _, options in calls:
+        expected = 100.0 + options['timeout']
+        if existing_deadline is not None:
+            expected = min(existing_deadline, expected)
+        assert float(options['env']['TM_REQUEST_DEADLINE_MONOTONIC']) == expected
 
 
 # ---------------------------------------------------------------------------

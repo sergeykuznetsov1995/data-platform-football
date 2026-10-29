@@ -7,8 +7,8 @@ plus the next season when Understat starts publishing it.  Each discovered
 subprocess can therefore never hide another league's empty or partial result.
 
 Historical seasons are deliberately not accepted as a UI override here.  The
-paused, self-draining ``dag_backfill_understat`` owns history and resumes from
-the durable Understat publication manifest.
+self-draining ``dag_backfill_understat`` is created paused, owns history, and
+resumes from the durable Understat publication manifest.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from typing import Any
 from airflow import DAG
 from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
 
 from utils.config import DAG_TAGS, SCHEDULES, UNDERSTAT_LEAGUES
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
@@ -117,6 +118,16 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
     return plan
 
 
+def finish_optional_enrichment() -> None:
+    """An optional task infrastructure failure cannot fail the JSON DagRun."""
+    logger.info("Optional Understat HTML step finished; see its task for details")
+
+
+def fail_json_collection() -> None:
+    """Keep JSON failures visible when the optional all_done leaf succeeds."""
+    raise AirflowFailException("Understat JSON collection failed; see mapped scope tasks")
+
+
 RUN_SCOPE_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
@@ -180,7 +191,38 @@ with DAG(
         execution_timeout=timedelta(minutes=45),
     ).expand(env=plan_scopes.output)
 
-    plan_scopes >> run_scope
+    enrich_matches = BashOperator(
+        task_id="enrich_matches",
+        bash_command=("cd /opt/airflow && exec /opt/legacy-scraper-venv/bin/python "
+                      "dags/scripts/run_understat_scraper.py --enrich-matches"),
+        env={"PYTHONPATH": "/opt/airflow:/opt/airflow/dags"},
+        append_env=True,
+        cwd="/opt/airflow",
+        trigger_rule="all_done",
+        retries=0,
+        pool=INGEST_SCRAPER_POOL,
+        priority_weight=1,
+        execution_timeout=timedelta(minutes=10),
+    )
+
+    json_failure = PythonOperator(
+        task_id="json_collection_failed",
+        python_callable=fail_json_collection,
+        trigger_rule="one_failed",
+        retries=0,
+        pool=INGEST_SCRAPER_POOL,
+        priority_weight=CURRENT_PRIORITY,
+    )
+
+    enrichment_finished = PythonOperator(
+        task_id="enrichment_finished",
+        python_callable=finish_optional_enrichment,
+        trigger_rule="all_done",
+        retries=0,
+    )
+
+    plan_scopes >> run_scope >> enrich_matches >> enrichment_finished
+    run_scope >> json_failure
 
 
 __all__ = [

@@ -783,3 +783,50 @@ def test_unsupported_sample_is_unproven_instead_of_synthetic_row(tmp_path):
     assert report["freshness_pct"] == 0
     assert report["unsupported_samples"] == 1
     assert report["samples"][0]["unproven_reason"] == "unsupported_change_kind"
+
+
+@pytest.mark.parametrize('name', [
+    'standing_approval_policy.json', 'standing_registry_policy.json', 'standing_backfill_policy.json',
+])
+@pytest.mark.parametrize('days', [29, 30, 31, 0, -1])
+def test_cli_policy_expiry_uses_current_clock(tmp_path, monkeypatch, capsys, name, days):
+    now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+    policy_dir = tmp_path / 'dags' / 'configs' / 'transfermarkt'
+    policy_dir.mkdir(parents=True)
+    for source in (cli.ROOT / 'dags' / 'configs' / 'transfermarkt').glob('standing*policy.json'):
+        body = json.loads(source.read_text())
+        expires = now + timedelta(days=days if source.name == name else 60)
+        body['expires_at'] = expires.isoformat()
+        (policy_dir / source.name).write_text(json.dumps(body))
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, '_utc_now', lambda: now, raising=False)
+    path = tmp_path / 'report.json'
+    path.write_text(json.dumps(execute(), default=str))
+    assert cli.main(['--day', DAY, '--as-of', AS_OF.isoformat(), '--report-json', str(path)]) == 0
+    summary = json.loads(capsys.readouterr().out)['summary']
+    assert ('ТРЕВОГА' in summary) == (days < 30)
+    if days < 30:
+        assert name in summary
+        assert (now + timedelta(days=days)).isoformat() in summary
+        assert ('истекла' in summary) == (days <= 0)
+
+
+@pytest.mark.parametrize('fault', ['missing', 'json', 'schema', 'encoding'])
+def test_cli_policy_read_error_is_visible(tmp_path, monkeypatch, capsys, fault):
+    policy_dir = tmp_path / 'dags' / 'configs' / 'transfermarkt'
+    policy_dir.mkdir(parents=True)
+    for source in (cli.ROOT / 'dags' / 'configs' / 'transfermarkt').glob('standing*policy.json'):
+        (policy_dir / source.name).write_bytes(source.read_bytes())
+    name = 'standing_approval_policy.json'
+    path = policy_dir / name
+    if fault == 'missing':
+        path.unlink()
+    else:
+        path.write_bytes({'json': b'{', 'schema': b'{}', 'encoding': b'\xff'}[fault])
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, '_utc_now', lambda: datetime(2026, 10, 28, tzinfo=timezone.utc), raising=False)
+    report = tmp_path / 'report.json'
+    report.write_text(json.dumps(execute(), default=str))
+    assert cli.main(['--day', DAY, '--as-of', AS_OF.isoformat(), '--report-json', str(report)]) == 0
+    summary = json.loads(capsys.readouterr().out)['summary']
+    assert f'ТРЕВОГА: {name}: ошибка чтения политики' in summary

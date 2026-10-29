@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 
 import yaml
@@ -26,7 +25,11 @@ SHARED_FILTER_SHA256 = (
     # #1398 dedicated TM streams; both source contracts are retained.
     # #1365 follow-up: executable sofascore-only mode and registry startup.
     # #1365 aggregate-pressure compaction; dedicated FBref bytes unchanged.
-    "3f6858b53d828c957fc117ca8dc6a4d4c88781e9fc05a762fb664c03174b72be"
+    # #1790: SofaScore archived recovery and WAL pressure compaction.
+    # #1804: align the FBref history-controller DAG allowlist with the client.
+    # #1788: measured CONNECT 502 refusal for SofaScore discovery; FBref bytes unchanged.
+    # #1788: any measured CONNECT refusal for SofaScore discovery.
+    "ba80bd8d1ddc24c2c244c22318e3e9ee54e4fd98c420171d36d8c5925c6994c7"
 )
 
 
@@ -38,6 +41,16 @@ def _load(path: Path, name: str):
     return module
 
 
+def test_fbref_proxy_dag_allowlists_match_the_lease_client():
+    from scrapers.fbref.proxy_lease import FBREF_DAG_IDS
+
+    shared = _load(SHARED_FILTER, "shared_fbref_dag_allowlist")
+    dedicated = _load(FBREF_FILTER, "dedicated_fbref_dag_allowlist")
+
+    assert shared.FBREF_DAG_IDS == FBREF_DAG_IDS
+    assert dedicated.FBREF_DAG_IDS == FBREF_DAG_IDS
+
+
 def test_fbref_runtime_is_separate_from_paid_sofascore_filter_bytes():
     assert hashlib.sha256(SHARED_FILTER.read_bytes()).hexdigest() == (
         SHARED_FILTER_SHA256
@@ -46,15 +59,10 @@ def test_fbref_runtime_is_separate_from_paid_sofascore_filter_bytes():
     assert "scripts/fbref_proxy/filter_proxy.py" not in runtime_files(ROOT)
 
 
-def test_fbref_runtime_is_still_sealed_by_the_internal_release_contract():
-    lock = json.loads(
-        (ROOT / "scrapers/whoscored/runtime_contract.lock").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert lock["files"]["scripts/fbref_proxy/filter_proxy.py"] == (
-        hashlib.sha256(FBREF_FILTER.read_bytes()).hexdigest()
-    )
+def test_fbref_runtime_has_no_whoscored_bootstrap_or_campaign_import():
+    source = FBREF_FILTER.read_text(encoding="utf-8")
+    assert "_WHOSCORED_RUNTIME_CONTRACT" not in source
+    assert "scrapers.whoscored.proxy_campaign" not in source
 
 
 def test_only_fbref_services_execute_the_fbref_specific_runtime():

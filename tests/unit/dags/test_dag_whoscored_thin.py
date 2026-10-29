@@ -159,26 +159,22 @@ def test_ingest_has_validation_and_freshness(ingest):
 
 # ----------------------------- backfill ----------------------------------
 
-def test_backfill_dag_is_manual_and_paused(backfill):
+def test_backfill_dag_is_continuous_and_paused(backfill):
     from utils.default_args import SCRAPER_ARGS
 
     assert backfill.dag.dag_id == "dag_backfill_whoscored"
-    # History stays manual until #1480.
-    assert backfill.dag.schedule is None
+    assert backfill.dag.schedule == "@continuous"
     assert backfill.dag._dag_kwargs["max_active_runs"] == 1
     assert backfill.dag._dag_kwargs["is_paused_upon_creation"] is True
     assert backfill.dag._dag_kwargs["default_args"] is SCRAPER_ARGS
-    params = backfill.dag._dag_kwargs["params"]
-    assert set(params) == {"max_work_items"}
-    assert params["max_work_items"].default == 100
 
 
 def test_backfill_drains_full_catalog_over_the_pool(backfill):
     chunk = _bash("run_backfill_chunk")
     cmd = chunk._init_kwargs["bash_command"]
-    assert "run_whoscored_scraper.py backfill" in cmd
-    assert "--all-catalog" in cmd
-    assert "--queue-id whoscored-history" in cmd
+    assert "run_whoscored_scraper.py history" in cmd
+    assert "--all-catalog" not in cmd
+    assert "--queue-id" not in cmd
     assert "--transport-policy direct_only" in cmd
     for banned in ("--proxy-approval", "direct_then_paid", "gateway"):
         assert banned not in cmd
@@ -458,3 +454,64 @@ def test_freshness_without_report_is_error(ingest, tmp_path, trino, monkeypatch)
     with pytest.raises(AirflowException, match="freshness\\[denominator\\]"):
         ingest.validate_bronze_freshness(**context)
     assert trino["sql"] == []
+
+
+@pytest.mark.parametrize("report", [None, [], {}, {"status": "success"},
+    {"schema_version": 3, "command": "history", "status": "failed", "history": {}},
+    {"schema_version": 3, "command": "history", "status": "success", "history": {"attempted": 26}}])
+def test_history_finalize_rejects_missing_or_invalid_report(backfill, tmp_path, report):
+    from types import SimpleNamespace
+    context = _budget_context(tmp_path, report)
+    if report is None:
+        from pathlib import Path
+        Path(context["templates_dict"]["result_path"]).unlink()
+    context["dag_run"] = SimpleNamespace(get_task_instance=lambda task: SimpleNamespace(state="success"))
+    with pytest.raises(Exception, match="history"):
+        backfill.finalize_chunk(**context)
+
+
+@pytest.mark.parametrize("task_state", ["failed", "upstream_failed", "running", None])
+def test_history_finalize_rejects_process_failure_even_with_valid_report(backfill, tmp_path, task_state):
+    from types import SimpleNamespace
+    context = _budget_context(tmp_path, {"schema_version": 3, "command": "history",
+        "status": "success", "history": {"attempted": 0}, "errors": []})
+    from unittest.mock import MagicMock
+    context["ti"] = MagicMock()
+    context["dag_run"] = SimpleNamespace(get_task_instance=lambda task: SimpleNamespace(state=task_state))
+    with pytest.raises(Exception, match="process failed"):
+        backfill.finalize_chunk(**context)
+
+
+def test_history_valid_report_schedules_cooldown(backfill, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    context = _budget_context(tmp_path, {"schema_version": 3, "command": "history",
+        "status": "success", "history": {"attempted": 25}, "errors": []})
+    context["dag_run"] = SimpleNamespace(get_task_instance=lambda task: SimpleNamespace(state="success"))
+    context["ti"] = MagicMock()
+    backfill.finalize_chunk(**context)
+    context["ti"].xcom_push.assert_called_once()
+    assert _python("finalize_chunk")._init_kwargs["trigger_rule"] == "all_done"
+    assert _python("wait_before_next_continuous_run")._init_kwargs.get("trigger_rule", "all_success") == "all_success"
+
+
+def test_history_and_current_share_activation_flag():
+    from datetime import timedelta
+    for module, task in (("dag_ingest_whoscored", "ingest_matches"),
+                         ("dag_backfill_whoscored", "run_backfill_chunk")):
+        _reload(module)
+        command = _bash(task)._init_kwargs["bash_command"]
+        assert "--split-lanes" in command
+        assert "var.value.get('whoscored_history_enabled', 'false')" in command
+    assert _bash("run_backfill_chunk")._init_kwargs["execution_timeout"] == timedelta(hours=8)
+    assert _bash("run_backfill_chunk")._init_kwargs["retries"] == 0
+
+
+def test_current_validation_leaves_old_debt_to_history(ingest, tmp_path, trino):
+    from datetime import timedelta
+    from dags.scripts.whoscored_criterion import DEADLINE_HOURS
+    ingest.validate_data(**_budget_context(tmp_path, _report(match_lane="current")))
+    sql = next(sql for sql in trino["sql"] if "NOT ceiling" in sql)
+    cutoff = (ingest._utc_now() - timedelta(days=7) + timedelta(hours=DEADLINE_HOURS)).strftime("%Y-%m-%d")
+    assert "current_overdue WHERE deadline >= TIMESTAMP" in sql
+    assert cutoff in sql

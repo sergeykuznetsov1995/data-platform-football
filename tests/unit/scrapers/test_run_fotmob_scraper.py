@@ -19,6 +19,59 @@ import pytest
 from scrapers.fotmob.repository import MemoryFotMobRepository
 
 
+@pytest.mark.parametrize("recovered", [True, False])
+def test_catalog_exit_republishes_pending_pause_without_another_fetch(monkeypatch, recovered):
+    import psycopg2
+    from dags.scripts import run_fotmob_scraper as mod
+    from scrapers.fotmob.shared_rate_limiter import CompositeRateLimiter, RefundableRateLimiter
+    from tests.unit.scrapers.test_fotmob_shared_rate_limiter import _limiter
+    from tests.unit.scrapers.test_fotmob_transport import FakeResponse, _transport
+    from tests.unit.scrapers.test_fotmob_service import _service
+
+    shared, connection = _limiter(rows=[(3.0,)] * 4)
+    original_pause = shared.pause
+    calls = []
+
+    def interrupted_pause(until, reason):
+        calls.append((until, reason))
+        if len(calls) == 1 or not recovered:
+            raise psycopg2.OperationalError("metadb unavailable")
+        original_pause(until, reason)
+
+    monkeypatch.setattr(shared, "pause", interrupted_pause)
+    first, session = _transport([FakeResponse(429, headers={"Retry-After": "7200"})])
+    first.rate_limiter = CompositeRateLimiter(
+        RefundableRateLimiter(max_requests=60, window_seconds=60, burst_size=4), shared,
+    )
+    service, _, repository = _service({})
+    service.transport = first
+    repository.ensure_current_views = MagicMock(return_value=[])
+    args = mod._argument_parser().parse_args(["--mode", "discover"])
+
+    rc, report = _run_native_admitted(mod, args, service=service)
+
+    assert rc == 1
+    assert len(session.calls) == 1
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    if not recovered:
+        assert any("pause flush" in error for error in report["errors"])
+        assert first._pause_pending
+        return
+    until = first.blocked_until
+    assert connection.pause == (until, "retry_after")
+    assert not first._pause_pending
+    second, second_session = _transport([FakeResponse(200, b'{}')])
+    second.rate_limiter = CompositeRateLimiter(
+        RefundableRateLimiter(max_requests=60, window_seconds=60, burst_size=4),
+        type(shared)("ignored", connection=connection),
+    )
+    result = second.fetch_json("allLeagues")
+    assert result.stop_reason == "retry_after"
+    assert result.blocked_until == until
+    assert second_session.calls == []
+
+
 def _transfer_cli():
     return [
         "--mode",
@@ -4602,6 +4655,7 @@ class TestFotmobNativeRunner:
             for item in competitions
         }
         repository = SimpleNamespace(
+            stored_match_rows=lambda: [],
             scope_completion_times=MagicMock(return_value={}),
             competition_completion_times=MagicMock(return_value={}),
             flush=MagicMock(return_value=[]),
@@ -5616,7 +5670,9 @@ class _IndexedRepository:
         match_id = self.collected.get(target_key)
         if match_id is None:
             return None
-        return {"stale": match_id in self.stale}
+        return {"stale": match_id in self.stale, "fetched_at": datetime(2026, 9, 15, 22)}
+
+    latest_match_source = latest_success
 
 
 class _BareRepository:

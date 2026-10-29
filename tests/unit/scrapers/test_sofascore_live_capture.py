@@ -2455,3 +2455,176 @@ def test_sparse_resume_first_endpoint_accounts_browser_bootstrap(
     assert snapshot["spent_provider_bytes"] == provider_bytes
     assert snapshot["hard_run_bytes"] == policy.hard_run_bytes == 1_317_644
     assert snapshot["reservations"] == {}
+
+
+@pytest.mark.parametrize("delta", [1, 2])
+@pytest.mark.parametrize("scenario", ["success", "persistent", "exhausted", "close_error", "timeout", "api_error", "empty204", "empty404"])
+def test_anchor_captcha_retries_with_fresh_browser_and_exact_meter(tmp_path, delta, scenario):
+    from unittest.mock import MagicMock
+    from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 40, 40, 90], final_total=90)
+    captures = []
+    empty_status = {"empty204": 204, "empty404": 404}.get(scenario)
+    if empty_status:
+        client.totals = deque([0, 0, 40, 40, 90, 90, 120])
+        client.final_total = 120
+    persistent = scenario in {"persistent", "close_error"}
+    failed = persistent or scenario in {"timeout", "api_error"}
+    if scenario == "exhausted":
+        original_reserve = runtime.engine.budget.reserve
+        def reserve(run_id, endpoint):
+            if runtime.engine.budget.spent:
+                raise ProxyBudgetExceeded("test allocation exhausted")
+            return original_reserve(run_id, endpoint)
+        runtime.engine.budget.reserve = reserve
+        client.totals = deque([0, 0, 40])
+        client.final_total = 40
+    if scenario == "close_error":
+        def close(*_args, **_kwargs):
+            raise SofascoreLeaseProtocolError("separate close failure")
+        client.close = close
+
+    class Browser(_Capture):
+        def warm_exact_json(self, url):
+            challenged = persistent or len(captures) == 1
+            if scenario == "timeout" and len(captures) == 2:
+                from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
+                raise ProxyConnectivityError("second warm timeout")
+            self._page = MagicMock()
+            self._exact_only = False
+            self._allowed_api_path = None
+            self._allowed_external_url = None
+            self._nav_timeout_ms = 100
+
+            def navigate(*_args, **_kwargs):
+                for _ in range(delta if challenged else 1):
+                    self._request()
+                return SimpleNamespace(status=200, url=(
+                    "https://www.sofascore.com/captcha.html?token=secret" if challenged
+                    else "https://www.sofascore.com/"))
+
+            self._page.goto.side_effect = navigate
+            self._page.evaluate.return_value = "https://www.sofascore.com"
+            self._navigate_exact_origin = lambda anchor: SofascoreCamoufoxCapture._navigate_exact_origin(self, anchor)
+            SofascoreCamoufoxCapture.warm_exact_json(self, url)
+
+    factory = _TransportFactory(client, _Capture([]))
+    def transport_factory(engine, **kwargs):
+        transport = factory(engine, **kwargs)
+        def new_capture(**capture_kwargs):
+            if captures:
+                assert captures[-1].exit_calls == 1
+            browser = Browser([
+                _record(b'{"items":[{"id":1}]}', empty_status or (503 if scenario == "api_error" else 200)),
+                _record(b'{"items":[{"id":2}]}'),
+            ])
+            captures.append(browser)
+            return browser.configure(**capture_kwargs)
+        transport._capture_factory = new_capture
+        return transport
+
+    def run():
+        return capture_live_specs(runtime, [_spec(17371523), _spec(2)] if empty_status else [_spec(17371523)],
+            canonical_url="https://www.sofascore.com/event/17371523",
+            scope="ENG-Premier League:2526", entity="match_capture",
+            transport_factory=transport_factory)
+
+    if scenario == "exhausted":
+        with pytest.raises(ProxyBudgetExceeded, match="sofascore_anchor_challenge"):
+            run()
+        assert not captures[0].fetch_paths
+    elif failed:
+        with pytest.raises(RuntimeError):
+            run()
+        assert runtime.manifest_store.get(_spec(17371523).key).status.value == "retryable_failure"
+        assert "sofascore_anchor_challenge" in runtime.manifest_store.get(_spec(17371523).key).error_message
+        if scenario != "api_error":
+            assert all(not browser.fetch_paths for browser in captures)
+    else:
+        results, traffic = run()
+        assert len(results) == (2 if empty_status else 1)
+        if empty_status:
+            assert results[0].manifest.status.value in {"legitimate_empty", "not_supported"}
+        assert traffic["source_request_count"] == delta + (3 if empty_status else 2)
+        assert traffic["browser_navigations"] == 2
+        assert traffic["browser_sessions"] == 2
+        assert traffic["endpoint_request_provider_bytes"] == {"event": [40, 50, 30] if empty_status else [40, 50]}
+    assert len(captures) == (1 if scenario == "exhausted" else 2)
+    assert all(browser.exit_calls == 1 for browser in captures)
+    assert len(client.acquire_calls) == 1
+    assert runtime.engine.budget.spent == (40 if scenario == "exhausted" else (120 if empty_status else 90))
+
+
+def test_dynamic_season_rejected_optional_referee_is_retained_without_retry(tmp_path):
+    from scrapers.sofascore.season_pipeline import build_referee_profile_spec
+
+    runtime, _ = _runtime(tmp_path)
+    profile = build_referee_profile_spec(
+        referee_id=791840, expected_slugs=("sofia-prychyna",),
+        source_tournament_id=17, source_season_id=76986,
+        freshness_key="final", paid_proxy=True,
+    )
+    required = _spec(16412939)
+    specs = (profile, required)
+    client = _LeaseClient([0, 0, 80, 80, 180], final_total=180)
+    capture = _Capture([
+        _record(b'{"referee":{"id":789719,"slug":"sofiia-prychyna"}}'),
+        _record(b'{"items":[{"id":16412939}]}'),
+    ])
+    factory = _TransportFactory(client, capture)
+
+    def planner():
+        # A rejected JSON exists locally even though the profile stays pending.
+        missing = tuple(spec.key for spec in specs
+                        if not runtime.raw_store.has_payload(spec.raw_target))
+        return SimpleNamespace(specs=specs, missing_raw_keys=missing)
+
+    results, plan, traffic = capture_live_dynamic_specs(
+        runtime, planner, canonical_url="https://www.sofascore.com/tournament/17",
+        scope="SS-17:2526", entity="season_capture", transport_factory=factory,
+        optional_schema_endpoints=frozenset({"referee_profile"}),
+    )
+    assert len(results) == 2
+    assert results[0].manifest.status.value == "schema_error"
+    assert results[1].manifest.error_type == "DeferredMaterialization"
+    assert plan.missing_raw_keys == ()
+    assert factory.calls == capture.enter_calls == 1
+    assert traffic["provider_total_bytes"] == 180
+    assert runtime.raw_store.has_payload(profile.raw_target)
+
+
+def test_dynamic_optional_referee_does_not_tolerate_manifest_write_failure(tmp_path, monkeypatch):
+    from scrapers.sofascore.manifest import ManifestStatus
+    from scrapers.sofascore.season_pipeline import build_referee_profile_spec
+
+    runtime, _ = _runtime(tmp_path)
+    profile = build_referee_profile_spec(
+        referee_id=791840, expected_slugs=("sofia-prychyna",),
+        source_tournament_id=17, source_season_id=76986,
+        freshness_key="final", paid_proxy=True,
+    )
+    upsert = runtime.manifest_store.upsert
+
+    def fail_success(record):
+        if record.key == profile.key and record.status == ManifestStatus.SUCCESS:
+            raise OSError("referee manifest storage unavailable")
+        upsert(record)
+
+    monkeypatch.setattr(runtime.manifest_store, "upsert", fail_success)
+    client = _LeaseClient([0, 0, 80], final_total=80)
+    capture = _Capture([_record(b'{"referee":{"id":791840,"slug":"sofia-prychyna"}}')])
+
+    def planner():
+        missing = () if runtime.raw_store.has_payload(profile.raw_target) else (profile.key,)
+        return SimpleNamespace(specs=(profile,), missing_raw_keys=missing)
+
+    with pytest.raises(RuntimeError, match="OSError: referee manifest storage unavailable"):
+        capture_live_dynamic_specs(
+            runtime, planner, canonical_url="https://www.sofascore.com/tournament/17",
+            scope="SS-17:2526", entity="season_capture",
+            transport_factory=_TransportFactory(client, capture),
+            optional_schema_endpoints=frozenset({"referee_profile"}),
+        )
+    assert runtime.manifest_store.get(profile.key).error_type == "OSError"
