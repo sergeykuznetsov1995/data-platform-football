@@ -61,10 +61,12 @@ TEST_TREE=${FOTMOB_VALIDATION_ROOT:?FOTMOB_VALIDATION_ROOT не задан}
 TEST_TREE=$(realpath -e "$TEST_TREE") || die "validation tree отсутствует"
 prod_real=$(realpath -e "$PROD_TREE") || die "production tree отсутствует"
 test "$TEST_TREE" != "$prod_real" || die "проверки не могут выполняться в production-дереве"
-validation_sha=$(git -C "$TEST_TREE" rev-parse HEAD) || die "validation HEAD недоступен"
+# Validation tree принадлежит claude-am, а B6 запускает root из cron без SUDO_UID:
+# без safe.directory git отвергает дерево как «dubious ownership» (провал 28.10).
+validation_sha=$(git -c safe.directory="$TEST_TREE" -C "$TEST_TREE" rev-parse HEAD) || die "validation HEAD недоступен"
 target_sha=$(git -C "$TREE" rev-parse "${TARGET}^{commit}")
 [ "$validation_sha" = "$target_sha" ] || die "validation tree не соответствует цели"
-validation_status=$(git -C "$TEST_TREE" status --porcelain) || die "validation status недоступен"
+validation_status=$(git -c safe.directory="$TEST_TREE" -C "$TEST_TREE" status --porcelain) || die "validation status недоступен"
 [ -z "$validation_status" ] || die "validation tree грязное"
 }
 
