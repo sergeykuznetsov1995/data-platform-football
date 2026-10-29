@@ -3515,7 +3515,11 @@ def _nonpublishing_summary(*, stale_kind: str | None = None) -> dict:
 def test_initialize_backfill_records_nonpublishing_evidence(monkeypatch):
     """T1: непубликующая история оставляет доказательство в метаданных рана."""
 
+    from scrapers.fbref.history import HistoryCampaign
+
     monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
+    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", MagicMock())
+    monkeypatch.setattr(HistoryCampaign, "has_timing", lambda self: True)
     pipeline = MagicMock()
     pipeline.initialize_run.return_value = (
         "22222222-2222-4222-8222-222222222222"

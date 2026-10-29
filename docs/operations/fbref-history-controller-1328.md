@@ -188,11 +188,17 @@ Owner steps on production, after the reviewed release is delivered:
    airflow-scheduler`) in a quiet window: no active FBref run, not within
    15 minutes of a current window (00/06/12/18 UTC) and not inside a history
    admission window. Follow `/root/SHARED-STACK-PROTOCOL.md`.
-4. Unpause the controller between 22:30 and 23:00 UTC (01:30–02:00 МСК). Make
-   the first run a canary: trigger with `request_limit=100`, `byte_limit_mb=50`
-   and check its XCom (`admitted_batches`, pages, timing) before leaving the
-   scheduled slices on.
-5. Never launch the old driver alongside this DAG.
+4. Unpause the controller between 22:30 and 23:00 UTC (01:30–02:00 МСК). No
+   manual trigger is needed: the first scheduled run after unpause is the
+   canary by rule. While `fbref_control.history_timing` has no row with
+   measured pages, `initialize_run` and `run_live_waves` cap the run at
+   min(param, 100 requests) and min(param, 50 MiB), whatever conf or params
+   say, and log `canary_first_run=True`. From the next run on, the normal
+   limits apply.
+5. After that run, check the `run_live_waves` XCom (`canary_first_run`,
+   `request_limit`, `byte_limit_mb`, `admitted_batches`, pages) and that its
+   measurement landed in `history_timing`. To stop, pause the controller.
+6. Never launch the old driver alongside this DAG.
 
 ## Rollback
 

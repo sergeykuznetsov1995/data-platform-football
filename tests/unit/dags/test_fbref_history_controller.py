@@ -402,6 +402,7 @@ def _slice_clock(monkeypatch, at, page_seconds=180):
     monkeypatch.setattr(tasks, "datetime", Clock)
     monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
     monkeypatch.setattr(HistoryCampaign, "page_seconds", lambda self: page_seconds)
+    monkeypatch.setattr(HistoryCampaign, "has_timing", lambda self: True)
     monkeypatch.setattr(tasks, "_control_store", MagicMock())
 
 
@@ -536,3 +537,99 @@ def test_history_live_waves_refuse_beyond_slice_ceilings(monkeypatch, kwargs):
             **arguments,
         )
     popen.assert_not_called()
+
+
+def _history_with_timing(monkeypatch, present):
+    from scrapers.fbref.history import HistoryCampaign
+
+    monkeypatch.setattr(HistoryCampaign, "has_timing", lambda self: present)
+
+
+@pytest.mark.parametrize("present,limits", [(False, (100, 50)), (True, (4096, 2048))])
+def test_first_history_run_is_initialized_as_canary_by_rule(monkeypatch, present, limits):
+    monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
+    monkeypatch.setattr(tasks, "_control_store", MagicMock())
+    _history_with_timing(monkeypatch, present)
+    pipeline = MagicMock()
+    monkeypatch.setattr(tasks, "_pipeline", lambda: pipeline)
+    tasks.initialize_fbref_run(
+        airflow_run_id="scheduled__history",
+        dag_id="dag_fbref_history_controller",
+        run_type="backfill",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=1,
+        publishing=False,
+    )
+    settings = pipeline.initialize_run.call_args.kwargs["settings"]
+    assert (settings.request_limit, settings.byte_limit // (1024 * 1024)) == limits
+
+
+@pytest.mark.parametrize("present,limits", [(False, ("100", "50")), (True, ("4096", "2048"))])
+def test_first_history_live_waves_use_canary_limits_by_rule(monkeypatch, present, limits):
+    _slice_clock(monkeypatch, datetime(2026, 10, 9, 22, 30, tzinfo=timezone.utc))
+    _history_with_timing(monkeypatch, present)
+    monkeypatch.setenv(tasks.LEGACY_SCRAPER_PYTHON_ENV, sys.executable)
+    captured = {}
+
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return ('FBREF_LIVE_WAVES_RESULT:{"batches": 1}\n', "")
+
+    monkeypatch.setattr(
+        tasks.subprocess,
+        "Popen",
+        lambda command, **_kwargs: captured.update(command=command) or Process(),
+    )
+    monkeypatch.setattr(tasks, "_process_group_exists", lambda _pgid: False)
+    result = tasks.run_fbref_live_waves(
+        airflow_run_id="scheduled__history",
+        dag_id="dag_fbref_history_controller",
+        worker_id="backfill-live",
+        page_kinds=["match"],
+        run_type="backfill",
+        request_limit="4096",
+        byte_limit_mb="2048",
+        shard_size=1,
+        max_batches=12,
+        deadline_seconds=35 * 60,
+    )
+    command = captured["command"]
+    assert (
+        command[command.index("--request-limit") + 1],
+        command[command.index("--byte-limit-mb") + 1],
+    ) == limits
+    assert result["canary_first_run"] is (not present)
+    assert result["admitted_batches"] == 10
+
+
+def test_history_timing_presence_counts_only_measured_pages():
+    import sqlite3
+    from contextlib import contextmanager
+    from scrapers.fbref.history import HistoryCampaign
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    db.execute("CREATE TABLE fbref_control.history_timing (run_id text, pages integer)")
+
+    class Cursor:
+        def execute(self, sql, params=()):
+            self.row = dict(db.execute(sql, params).fetchone())
+
+        def fetchone(self):
+            return self.row
+
+    @contextmanager
+    def transaction():
+        yield Cursor()
+
+    campaign = HistoryCampaign(SimpleNamespace(_transaction=transaction))
+    assert campaign.has_timing() is False
+    db.execute("INSERT INTO fbref_control.history_timing VALUES ('a', 0)")
+    assert campaign.has_timing() is False
+    db.execute("INSERT INTO fbref_control.history_timing VALUES ('b', 3)")
+    assert campaign.has_timing() is True

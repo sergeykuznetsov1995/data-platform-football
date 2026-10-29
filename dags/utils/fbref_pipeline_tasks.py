@@ -140,6 +140,23 @@ FBREF_LIVE_BUDGET_PROFILES = {
 }
 
 
+def _history_run_limits(request_limit, byte_limit_mb) -> tuple[int, int, bool]:
+    """The first history run is a canary by rule, whatever conf/params say.
+
+    Until a history run has recorded measured pages, admission relies on the
+    current lane's timings, so that run is capped at the canary profile (#1958).
+    """
+    from scrapers.fbref.history import HistoryCampaign
+
+    if HistoryCampaign(_control_store()).has_timing():
+        return int(request_limit), int(byte_limit_mb), False
+    return (
+        min(int(request_limit), FBREF_CANARY_REQUEST_LIMIT),
+        min(int(byte_limit_mb), FBREF_CANARY_BYTE_LIMIT_MB),
+        True,
+    )
+
+
 def _normalize_live_batch_count(value: object) -> int:
     """Accept only an integer or a templated decimal integer string."""
 
@@ -1611,6 +1628,13 @@ def initialize_fbref_run(
             raise ValueError("History controller shard_size must be exactly one")
         if _boolean_parameter(publishing, name="publishing"):
             raise ValueError("The history controller cannot publish downstream")
+        request_limit, byte_limit_mb, canary = _history_run_limits(
+            request_limit, byte_limit_mb
+        )
+        logger.info(
+            "FBref history run limits: request_limit=%s byte_limit_mb=%s "
+            "canary_first_run=%s", request_limit, byte_limit_mb, canary,
+        )
     publishes = _boolean_parameter(publishing, name="publishing")
     if not publishes and normalized_run_type != "backfill":
         raise ValueError(
@@ -2184,6 +2208,9 @@ def run_fbref_live_waves(
             datetime.fromisoformat(admission["deadline"]) - datetime.now(timezone.utc)
         ).total_seconds()
         deadline_seconds = min(float(deadline_seconds), max(remaining, 1.0))
+        request_limit, byte_limit_mb, canary = _history_run_limits(
+            request_limit, byte_limit_mb
+        )
     command = [
         _legacy_scraper_python(),
         LIVE_WAVES_RUNNER,
@@ -2345,6 +2372,13 @@ def run_fbref_live_waves(
             error_message=str(exc),
         )
         raise
+    if run_type == "backfill":
+        result.update(
+            canary_first_run=canary,
+            request_limit=int(request_limit),
+            byte_limit_mb=int(byte_limit_mb),
+            admitted_batches=normalized_batches,
+        )
     logger.info("FBref live waves: %s", json.dumps(result, sort_keys=True))
     return result
 
