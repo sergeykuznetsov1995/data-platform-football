@@ -78,6 +78,7 @@ def test_sync_script_renders_eight_bcrypt_accounts(tmp_path):
                    + "TRINO_SRC_NOT_A_SOURCE_PASSWORD=ignored\n")
     db = tmp_path / "password.db"
     db.write_text("airflow:$2y$10$existinghash\n")
+    db.chmod(0o600)  # a stricter mode left by an operator must be repaired
     res = subprocess.run([str(SCRIPT), str(db), str(env)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
     lines = db.read_text().splitlines()
@@ -85,6 +86,8 @@ def test_sync_script_renders_eight_bcrypt_accounts(tmp_path):
     users = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in lines[1:]}
     assert set(users) == {f"src_{s}" for s in SOURCES}
     assert all(h.startswith("$2y$10$") for h in users.values()), users
+    # bind-mounted into the container, read by uid 1000, not root: must stay 644
+    assert oct(db.stat().st_mode & 0o777) == "0o644", oct(db.stat().st_mode)
     # second run replaces, never duplicates
     res = subprocess.run([str(SCRIPT), str(db), str(env)], capture_output=True, text=True)
     assert res.returncode == 0 and len(db.read_text().splitlines()) == 9

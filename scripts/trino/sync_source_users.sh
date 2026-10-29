@@ -43,3 +43,7 @@ for src in "${sources[@]}"; do
   printf '%s' "${!var}" | htpasswd -i -B -C 10 "$db" "src_$src" 2>/dev/null
   echo "ok src_$src"
 done
+# Trino runs as uid 1000 inside the container while the bind-mounted file is
+# root-owned: anything stricter than 644 makes PasswordStore.readPasswordFile
+# fail and EVERY password login (airflow included) dies — 29.10.2026, 2 h outage.
+chmod 644 "$db"
