@@ -14,7 +14,10 @@ pages. This transport is the single, polite way to fetch them:
 - retries only on network errors and 5xx (``retries`` extra attempts,
   ``retry_pause`` seconds apart);
 - a single 403 + ``cf-mitigated: challenge`` bootstraps clearance via the
-  dedicated lease and FlareSolverr; raw bytes still come only from requests;
+  dedicated lease and FlareSolverr; raw bytes still come only from requests.
+  A failed solver attempt (dead proxy tunnel, solver timeout, unsolved
+  challenge) is retried with a fresh lease — a new exit — up to
+  ``BOOTSTRAP_ATTEMPTS`` times (#1955); a lease failure stops at once;
 - other 403 / 429 / a ``cf-mitigated`` header mean the site blocks us:
   ``ClubEloBlocked`` stops the whole run, no retry;
 - ``wire_bytes`` counts the compressed bytes read from the socket, the body is
@@ -49,6 +52,8 @@ FIXED_PATHS = frozenset({"/Ranking", "/Results", "/login/"})
 # escaped "%2F" or "%2e%2e" would smuggle a second segment or a dot-segment).
 _SLUG_PATH = re.compile(r"^/[^/\\?#%\s]+$")
 BLOCK_STATUSES = frozenset({403, 429})
+BOOTSTRAP_ATTEMPTS = 3
+BOOTSTRAP_RETRY_PAUSE = 10.0
 
 
 class ClubEloBlocked(RuntimeError):
@@ -149,30 +154,61 @@ class ClubEloTransport:
         if self._closed:
             return
         self._closed = True
+        self._release_bootstrap()
+        try:
+            self.session.close()
+        except Exception:
+            logger.warning("ClubElo transport cleanup failed: http session")
+
+    def _release_bootstrap(self):
+        """Release solver session, solver and lease; keep the HTTP session."""
+        # Calls stay ``self._solver.<method>(...)``: the delivery
+        # compatibility check (deploy/clubelo) inspects exactly that form.
         actions = []
         if self._solver is not None:
             if self._solver_session is not None:
-                actions.append(lambda: self._solver.destroy_session(self._solver_session))
-            actions.append(self._solver.close)
+                actions.append(("solver session",
+                                lambda: self._solver.destroy_session(self._solver_session)))
+            actions.append(("solver", lambda: self._solver.close()))
         if self._lease is not None:
-            actions.append(self._lease.close)
-        actions.append(self.session.close)
-        for action in actions:
+            actions.append(("lease", self._lease.close))
+        for name, action in actions:
             try:
                 action()
             except Exception:
-                logger.warning("ClubElo transport cleanup failed")
+                logger.warning("ClubElo transport cleanup failed: %s", name)
+        self._solver = self._solver_session = self._lease = None
 
     def _bootstrap(self):
+        self._bootstrap_attempted = True
+        for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+            if attempt > 1:
+                self._sleep(BOOTSTRAP_RETRY_PAUSE)
+            try:
+                return self._bootstrap_once()
+            except _BootstrapFailure as failure:
+                reason, retry = failure.reason, failure.retry
+            logger.warning("ClubElo Cloudflare bootstrap attempt %d/%d failed: %s",
+                           attempt, BOOTSTRAP_ATTEMPTS, reason)
+            self._release_bootstrap()
+            if not retry:
+                break
+        self.close()
+        raise ClubEloBlocked(f"Cloudflare bootstrap: {reason} "
+                             f"(attempt {attempt}/{BOOTSTRAP_ATTEMPTS})")
+
+    def _bootstrap_once(self):
         from scrapers.base.flaresolverr_client import FlareSolverrClient
         from scrapers.clubelo.proxy_lease import ClubEloLease
 
-        self._bootstrap_attempted = True
+        if self.base_url != BASE_URL:
+            raise _BootstrapFailure("invalid ClubElo origin", retry=False)
         try:
-            if self.base_url != BASE_URL:
-                raise ValueError("invalid ClubElo origin")
             self._lease = ClubEloLease()
             self._lease.acquire()
+        except Exception as exc:
+            raise _BootstrapFailure(_lease_reason(exc), retry=False) from None
+        try:
             self._solver = FlareSolverrClient(
                 url=os.environ.get("CLUBELO_FLARESOLVERR_URL", "http://flaresolverr:8191"),
                 default_timeout=120, default_max_timeout_ms=90000,
@@ -180,6 +216,8 @@ class ClubEloTransport:
             self._solver_session = "clubelo-" + uuid.uuid4().hex
             self._solver.create_session(self._solver_session, proxy_url=self._lease.proxy_url)
             solution = self._solver.get(BASE_URL + "/Ranking", self._solver_session)
+            if not isinstance(solution, dict):
+                raise ValueError("invalid clearance")
             cookies, ua = solution.get("cookies"), solution.get("userAgent")
             if (solution.get("status") != 200 or not isinstance(ua, str) or not ua.strip()
                     or any(ord(c) < 32 or ord(c) > 126 for c in ua)
@@ -196,18 +234,14 @@ class ClubEloTransport:
                     raise ValueError("invalid clearance cookie")
             if not any(c["name"] == "cf_clearance" for c in cookies):
                 raise ValueError("missing clearance cookie")
-            self.session.cookies.clear()
-            for cookie in cookies:
-                self.session.cookies.set(cookie["name"], cookie["value"],
-                                         domain="clubelo.com", path="/", secure=True)
-            self.session.headers["User-Agent"] = ua
-            self.session.proxies = {"https": self._lease.proxy_url}
         except Exception as exc:
-            # Do not include gateway/solver errors: they can contain credentials.
-            self.close()
-            reason = str(exc) if isinstance(exc, ValueError) and str(exc).startswith(
-                "ClubElo proxy control token") else "lease or solver failed"
-            raise ClubEloBlocked("Cloudflare bootstrap: " + reason) from None
+            raise _BootstrapFailure(_solver_reason(exc), retry=True) from None
+        self.session.cookies.clear()
+        for cookie in cookies:
+            self.session.cookies.set(cookie["name"], cookie["value"],
+                                     domain="clubelo.com", path="/", secure=True)
+        self.session.headers["User-Agent"] = ua
+        self.session.proxies = {"https": self._lease.proxy_url}
 
     def _pace(self) -> None:
         if self._last_request is not None:
@@ -273,6 +307,48 @@ class ClubEloTransport:
                 logger.warning("ClubElo %s attempt %d: %s", path, attempt + 1, last_error)
                 continue
         raise ClubEloFetchError(f"{path}: {last_error} after {self.retries + 1} attempts")
+
+
+class _BootstrapFailure(Exception):
+    """One failed bootstrap attempt: a fixed, credential-free reason."""
+
+    def __init__(self, reason: str, *, retry: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry = retry
+
+
+# Gateway/solver error texts can contain credentials: callers get only these
+# fixed labels, never ``str(exc)`` (except our own fixed ValueError texts).
+def _lease_reason(exc: Exception) -> str:
+    if isinstance(exc, ValueError) and str(exc).startswith("ClubElo "):
+        return "lease: " + str(exc)
+    return f"lease: gateway error ({type(exc).__name__})"
+
+
+_CLEARANCE_ERRORS = frozenset({"invalid clearance", "invalid clearance cookie",
+                               "missing clearance cookie"})
+
+
+def _solver_reason(exc: Exception) -> str:
+    from scrapers.base.flaresolverr_client import (
+        FlareSolverrCFChallengeFailed,
+        FlareSolverrError,
+        FlareSolverrTimeout,
+    )
+
+    if isinstance(exc, ValueError) and str(exc) in _CLEARANCE_ERRORS:
+        return "challenge not solved: " + str(exc)
+    if isinstance(exc, FlareSolverrCFChallengeFailed):
+        return "challenge not solved: solver gave up"
+    if isinstance(exc, FlareSolverrTimeout):
+        return "solver timeout or unreachable"
+    if isinstance(exc, FlareSolverrError):
+        text = str(exc).upper()
+        if "ERR_TUNNEL" in text or "ERR_PROXY" in text:
+            return "proxy tunnel failed"
+        return "solver error"
+    return f"solver error ({type(exc).__name__})"
 
 
 def _page(path: str, status: int, headers, wire: bytes) -> Page:

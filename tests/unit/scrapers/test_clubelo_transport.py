@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import gzip
 
 import pytest
@@ -290,9 +291,10 @@ def test_invalid_solver_response_fails_closed(bootstrap, solution):
     events, _, Solver = bootstrap
     Solver.solution = solution
     session = _challenge_session({"/Ranking": _challenge()})
-    with pytest.raises(ClubEloBlocked, match="lease or solver failed"), _transport(session) as transport:
+    with pytest.raises(ClubEloBlocked, match=r"challenge not solved: .*\(attempt 3/3\)"), \
+            _transport(session) as transport:
         transport.get("/Ranking")
-    assert events.count("release") == events.count("destroy") == 1
+    assert events.count("acquire") == events.count("release") == events.count("destroy") == 3
     assert len(session.calls) == 1
 
 
@@ -308,7 +310,7 @@ def test_bootstrap_error_is_redacted_and_cleaned(bootstrap, monkeypatch, failure
         with _transport(_challenge_session({"/Ranking": _challenge()})) as transport:
             transport.get("/Ranking")
     assert "secret" not in str(caught.value) and "password" not in str(caught.value)
-    assert events.count("release") == 1
+    assert events.count("release") == (1 if failure == "acquire" else 3)
 
 
 def test_proxied_network_error_does_not_leak_credentials(bootstrap, caplog):
@@ -325,3 +327,71 @@ def test_challenge_solver_has_ninety_seconds_with_http_margin(bootstrap):
         config = transport._solver.config
         assert config["default_max_timeout_ms"] == 90000
         assert config["default_timeout"] >= config["default_max_timeout_ms"] / 1000 + 30
+
+
+def test_dead_tunnel_retries_with_a_fresh_lease(bootstrap, caplog):
+    from scrapers.base.flaresolverr_client import FlareSolverrError
+
+    events, Lease, Solver = bootstrap
+    answers = [FlareSolverrError("HTTP 500: net::ERR_TUNNEL_CONNECTION_FAILED lease:secret-lease"),
+               Solver.solution]
+    original_get = Solver.get
+
+    def get(self, url, session_id):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            events.append(("solve", url))
+            raise answer
+        return original_get(self, url, session_id)
+
+    Solver.get = get
+    clock = Clock()
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session, clock=clock) as transport:
+        assert transport.get("/Ranking").body == b"RAW"
+        assert session.proxies == {"https": Lease.proxy_url}
+    assert events == ["acquire", ("create", Lease.proxy_url), ("solve", "https://clubelo.com/Ranking"),
+                      "destroy", "solver-close", "release",
+                      "acquire", ("create", Lease.proxy_url), ("solve", "https://clubelo.com/Ranking"),
+                      "destroy", "solver-close", "release"]
+    assert 10.0 in clock.sleeps
+    assert "attempt 1/3 failed: proxy tunnel failed" in caplog.text
+    assert "secret-lease" not in caplog.text
+
+
+def test_lease_failure_is_named_and_not_retried(bootstrap, monkeypatch):
+    events, Lease, _ = bootstrap
+
+    def refused(self):
+        events.append("acquire")
+        raise ValueError("ClubElo gateway refused the lease")
+
+    monkeypatch.setattr(Lease, "acquire", refused)
+    with pytest.raises(ClubEloBlocked, match=r"lease: ClubElo gateway refused the lease \(attempt 1/3\)"):
+        with _transport(_challenge_session({"/Ranking": _challenge()})) as transport:
+            transport.get("/Ranking")
+    assert events == ["acquire", "release"]
+
+
+@pytest.mark.parametrize("error, reason", [
+    ("FlareSolverrTimeout", "solver timeout or unreachable"),
+    ("FlareSolverrCFChallengeFailed", "challenge not solved: solver gave up"),
+    ("FlareSolverrError", "solver error"),
+    ("RuntimeError", r"solver error \(RuntimeError\)"),
+    ("ValueError", r"solver error \(ValueError\)"),
+])
+def test_solver_failure_reason_is_named(bootstrap, monkeypatch, error, reason):
+    from scrapers.base import flaresolverr_client
+
+    events, _, Solver = bootstrap
+    exc_type = getattr(flaresolverr_client, error, None) or getattr(builtins, error)
+
+    def fail(self, url, session_id):
+        raise exc_type("secret-lease password")
+
+    monkeypatch.setattr(Solver, "get", fail)
+    with pytest.raises(ClubEloBlocked, match=reason + r" \(attempt 3/3\)") as caught:
+        with _transport(_challenge_session({"/Ranking": _challenge()})) as transport:
+            transport.get("/Ranking")
+    assert "secret" not in str(caught.value)
+    assert events.count("acquire") == events.count("release") == 3
