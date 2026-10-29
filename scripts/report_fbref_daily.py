@@ -18,6 +18,7 @@ from scrapers.fbref.daily_report import (  # noqa: E402
     build_daily_report, page_age_line, instant, milestone_streak, render_markdown, summary_line,
 )
 from scrapers.fbref.daily_report_reader import collect_snapshot  # noqa: E402
+from scrapers.fbref.weekly_report import build_weekly_report, weekly_lines  # noqa: E402
 
 
 def host_postgres(query: str):
@@ -88,14 +89,15 @@ def main(argv=None) -> int:
         host_postgres, host_trino, day=day, as_of=now, mapping=mapping, lookback=args.lookback)
     reports = [build_daily_report(snapshot, day=day - timedelta(days=i), as_of=now, mapping=mapping)
                for i in range(args.lookback)]
+    weekly = build_weekly_report(snapshot, as_of=now, mapping=mapping)
     current = reports[0]
     final = next((r for r in reports if r["final"]), None)
-    bundle = {"report": current, "latest_final": final, "days": reports,
+    bundle = {"weekly": weekly, "report": current, "latest_final": final, "days": reports,
               "milestone_streak": milestone_streak(reports)}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     label = f"{day.isoformat()}-{now.strftime('%Y%m%dT%H%M%SZ')}"
     (args.output_dir / f"{label}.json").write_text(json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
-    (args.output_dir / f"{label}.md").write_text(render_markdown(current) + "\n" + (
+    (args.output_dir / f"{label}.md").write_text(render_markdown(current) + "\n" + "\n".join(weekly_lines(weekly)) + "\n\n" + (
         "Последний окончательный срез: " + summary_line(final) if final else "Окончательных срезов пока нет."
     ) + f"\nСерия ≥99 %: {bundle['milestone_streak']} суток.\n")
     (args.output_dir / f"{label}-snapshot.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
@@ -103,6 +105,7 @@ def main(argv=None) -> int:
     print("Последний окончательный: " + summary_line(final) if final else "Окончательных срезов пока нет.")
     print(f"Серия ≥99 %: {bundle['milestone_streak']} суток.")
     print(page_age_line(current))
+    print("\n".join(weekly_lines(weekly)))
     return 2 if args.require_final and not current["final"] else 0
 
 

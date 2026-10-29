@@ -46,7 +46,8 @@ def test_1805_cli_reuses_saved_page_age_aggregate_for_lookback(tmp_path, capsys)
     assert main(["--input", str(input_path), "--date", "2026-10-07", "--as-of", cutoff,
                  "--lookback", "3", "--output-dir", str(tmp_path / "out")]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 4 and lines[3] == page_age_line({"page_ages": expected})
+    assert len(lines) >= 9 and lines[3] == page_age_line({"page_ages": expected})
+    assert lines[4].startswith("FBref: недельная полнота ")
     bundle_path = next(p for p in (tmp_path / "out").glob("*.json") if "snapshot" not in p.name)
     bundle = json.loads(bundle_path.read_text())
     assert all(report["page_ages"] == expected for report in bundle["days"])
