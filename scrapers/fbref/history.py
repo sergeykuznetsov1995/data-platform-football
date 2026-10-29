@@ -267,7 +267,11 @@ class HistoryCampaign:
                   SELECT campaign.competition_id,campaign.season_id,
                     count(DISTINCT frontier.target_id) AS discovered,
                     count(DISTINCT frontier.target_id) FILTER (WHERE
-                      frontier.state <> 'fetched' OR frontier.last_content_hash IS NULL
+                      -- A target parked on 301/308 is done with a reason until
+                      -- the redirect registry (#1933); its siblings still count.
+                      NOT (frontier.state = 'quarantined'
+                           AND frontier.last_error_class = 'RedirectUnresolved')
+                      AND (frontier.state <> 'fetched' OR frontier.last_content_hash IS NULL
                       OR NOT EXISTS (
                         SELECT 1 FROM fbref_control.fetch_attempt attempt
                         JOIN fbref_control.observation_processing observed
@@ -281,7 +285,7 @@ class HistoryCampaign:
                           AND observed.typed_status IN ('succeeded','skipped')
                           AND observed.stateful_status IN ('succeeded','skipped')
                           AND observed.validation_status='succeeded'
-                      )) AS remaining,
+                      ))) AS remaining,
                     bool_or(frontier.page_kind='season' OR (campaign.direct_match_only AND frontier.page_kind='match')) AS root_seen
                   FROM fbref_control.history_campaign_season campaign
                   LEFT JOIN canonical_scope scope ON scope.competition_id=campaign.competition_id

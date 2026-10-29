@@ -3066,6 +3066,17 @@ class FBrefPipeline:
             return "acceptance_replay_source_strict_evidence_invalid"
         return None
 
+    def recover_schedule_discovery(self, *, limit: int = 25, after=None) -> dict:
+        """Repair a denominator page using saved raw, without source HTTP."""
+        from scrapers.fbref.schedule_recovery import recover_schedules
+
+        return recover_schedules(self, limit=limit, after=after)
+
+    def recover_all_schedule_discovery(self) -> dict:
+        from scrapers.fbref.schedule_recovery import recover_all_schedules
+
+        return recover_all_schedules(self)
+
     def seed_historical_seasons(
         self,
         *,
@@ -3119,6 +3130,11 @@ class FBrefPipeline:
                 existing = self.control.get_frontier_target(target.target_id)
                 if existing and existing.get("state") == "fetched" and existing.get("next_fetch_at") is None:
                     # Durable descendants, rather than a root refetch, advance this season.
+                    continue
+                if existing and existing.get("state") == "quarantined" and (
+                    existing.get("last_error_class") == "RedirectUnresolved"
+                ):
+                    # Parked on 301/308 until #1933: not crawlable, never a cohort root.
                     continue
             base = frontier_target(target, historical=True)
             self.control.upsert_frontier_target(
@@ -5038,6 +5054,8 @@ class FBrefPipeline:
         run_id: str,
         html: str,
         record: RawFetchRecord,
+        *,
+        seed_competition_ids: Optional[set[str]] = None,
     ) -> tuple[int, int]:
         parsed = parse_competition_index_html(html)
         competitions = parsed.datasets["competitions"].records
@@ -5075,6 +5093,11 @@ class FBrefPipeline:
         links: list[DiscoveredPageLink] = []
         skipped = 0
         for competition in competitions:
+            if (
+                seed_competition_ids is not None
+                and competition.competition_id not in seed_competition_ids
+            ):
+                continue
             if competition_eligibility(competition).value != "eligible":
                 skipped += 1
                 continue

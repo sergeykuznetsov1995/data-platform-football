@@ -1896,10 +1896,19 @@ def seed_fbref_historical_seasons(
         reservation_mb=reservation_mb,
     )
     metadata = (_control_store().get_run(run_id) or {}).get("metadata", {})
-    result = _pipeline().seed_historical_seasons(
+    pipeline = _pipeline()
+    # Campaign slices keep their exact cohort; ordinary backfill repairs the
+    # full durable denominator before selecting unfinished historical roots.
+    recovery = (
+        pipeline.recover_all_schedule_discovery()
+        if "history_campaign" not in metadata else None
+    )
+    result = pipeline.seed_historical_seasons(
         run_id=run_id, settings=settings, limit=int(shard_size),
         **({"seasons": metadata["history_seasons"]} if "history_campaign" in metadata else {}),
     )
+    if recovery is not None:
+        result["schedule_recovery"] = recovery
     logger.info("FBref backfill seed for %s: %s", run_id, result)
     return result
 
@@ -2808,11 +2817,14 @@ def guard_fbref_history_slice(**_context):
 
 def prepare_fbref_history_campaign(*, airflow_run_id, dag_id):
     from scrapers.fbref.history import HistoryCampaign
+    # Repair descendants before completion can close a season with only its root.
+    # Selection below still pins the exact campaign cohort for live waves.
+    recovery = _pipeline().recover_all_schedule_discovery()
     campaign = HistoryCampaign(_control_store())
     campaign.reconcile()
     run_id = _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id)
     selected = campaign.select(run_id)
-    return {"selected": selected, **campaign.summary()}
+    return {"selected": selected, "schedule_recovery": recovery, **campaign.summary()}
 
 
 def checkpoint_fbref_history_campaign(*, airflow_run_id, dag_id, **context):
