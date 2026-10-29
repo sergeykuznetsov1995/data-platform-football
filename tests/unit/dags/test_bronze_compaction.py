@@ -12,7 +12,13 @@ from utils import maintenance_tasks as maintenance
 
 @pytest.fixture
 def runner(monkeypatch):
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 10, 29, 2, tzinfo=timezone.utc)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    monkeypatch.setattr(compaction, "datetime", Clock)
+    monkeypatch.setattr(compaction.time, "time", lambda: now.timestamp())
     monkeypatch.setattr(
         compaction, "nightly_deadline", lambda: now + timedelta(hours=3)
     )
@@ -402,9 +408,9 @@ def test_checkpoints_keep_total_budget_and_release_per_portion(runner, monkeypat
 
     monkeypatch.setattr(compaction, "_publication_fence", fence)
 
-    def probe(_conn, *, table, partition_offset=0, **kwargs):
-        calls.append((table, partition_offset))
-        return maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0)
+    def probe(_conn, *, table, partition_cursor=None, **kwargs):
+        calls.append((table, partition_cursor))
+        return maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0, "partition-32")
 
     monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
     monkeypatch.setattr(maintenance, "_compact_exact_files", lambda *_a, **kw: {})
@@ -438,7 +444,7 @@ def test_checkpoints_keep_total_budget_and_release_per_portion(runner, monkeypat
     assert result["portions"] == 3
     assert result["input_bytes"] == 60
     assert result["stop_reason"] == "budget"
-    assert calls == [("espn_match", 0), ("fbref_schedule", 0), ("espn_match", 1)]
+    assert calls == [("espn_match", None), ("fbref_schedule", None), ("espn_match", "partition-32")]
     assert locks == [
         ("acquire", False),
         ("release", False),
@@ -649,7 +655,7 @@ def test_atomic_reservation_rejects_competing_run(runner, monkeypatch, shared_db
 
     def probe(*args, **kwargs):
         # A different run spends the last slot after this run read the budget.
-        assert compaction._shared_budget(runner, reservation=("espn_match", 20, 1))
+        assert compaction._shared_budget(runner, reservation=("espn_match", 20, "partition-32"))
         return maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0)
 
     monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
@@ -666,11 +672,12 @@ def test_partition_cursor_survives_nights_with_replenished_first_partition(
     clock = [runner]
     monkeypatch.setattr(compaction, "nightly_deadline", lambda: clock[0])
 
-    def probe(*args, partition_offset=0, **kwargs):
-        offsets.append(partition_offset)
+    def probe(*args, partition_cursor=None, **kwargs):
+        offsets.append(partition_cursor)
         # Each partition still has small files every night, including the first.
         return maintenance._CompactionProbeResult(
-            ((f"s3://p{partition_offset}/a", 10), (f"s3://p{partition_offset}/b", 10)), 0
+            (("s3://a", 10), ("s3://b", 10)), 0,
+            {None: "p32", "p32": "p64", "p64": "p96"}[partition_cursor]
         )
 
     monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
@@ -680,14 +687,68 @@ def test_partition_cursor_survives_nights_with_replenished_first_partition(
             context={}, tables=("espn_match",), deadline=clock[0], max_portions=1
         )
         clock[0] += timedelta(days=1)
-    assert offsets == [0, 1, 2]
+    assert offsets == [None, "p32", "p64"]
     state = compaction._shared_budget(clock[0])
     assert state["portions"] == state["input_bytes"] == 0
-    assert state["partition_offsets"]["espn_match"] == 3
+    assert state["partition_cursors"]["espn_match"] == "p96"
 
 
 def test_expired_checkpoint_cannot_reset_current_window_budget(runner, shared_db):
-    state = compaction._shared_budget(runner, reservation=("espn_match", 20, 1))
+    state = compaction._shared_budget(runner, reservation=("espn_match", 20, "partition-32"))
     with pytest.raises(TimeoutError, match="live nightly deadline"):
         compaction._shared_budget(runner - timedelta(days=1))
     assert compaction._shared_budget(runner) == state
+
+
+def test_shared_legacy_offsets_migrate_without_refunding_budget(runner, shared_db):
+    import json
+
+    old = dict(window=runner.date().isoformat(), portions=7, input_bytes=1234,
+               partition_offsets={"espn_match": 42})
+    shared_db[0]["bronze_compaction_shared_budget"] = shared_db[2](
+        key="bronze_compaction_shared_budget", val=json.dumps(old)
+    )
+    state = compaction._shared_budget(runner)
+    assert state == dict(window=runner.date().isoformat(), portions=7,
+                         input_bytes=1234, partition_cursors={})
+
+
+def test_legacy_checkpoint_preserves_queue_and_charges(runner, monkeypatch):
+    checkpoint = dict(portions=7, input_bytes=1234, selected_files=14,
+                      failures=[], targets={}, delete_partitions={},
+                      queue=["espn_match"], partition_offsets={"espn_match": 42})
+    seen = []
+
+    def probe(*args, partition_cursor=None, **kwargs):
+        seen.append(partition_cursor)
+        return maintenance._CompactionProbeResult((), 0)
+
+    monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
+    result = compaction.run_compaction(
+        tables=["espn_match"], deadline=runner, checkpoint=checkpoint
+    )
+    assert seen == [None]
+    assert result["portions"] == 7 and result["input_bytes"] == 1234
+    assert result["partition_cursors"] == {}
+    assert "partition_offsets" not in result
+
+
+def test_airflow_dry_run_does_not_write_checkpoint(runner, monkeypatch, shared_db):
+    from types import SimpleNamespace
+
+    visited = []
+
+    def probe(*args, table, **kwargs):
+        visited.append(table)
+        return maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0, "p32")
+
+    monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
+    context = dict(dag=SimpleNamespace(dag_id="catchup"), run_id="dry",
+                   task=SimpleNamespace(task_id="compact"))
+    result = compaction.compaction_step(
+        context=context, tables=["espn_match", "sofascore_schedule"],
+        deadline=runner, dry_run=True,
+    )
+    assert visited == ["espn_match", "sofascore_schedule"]
+    assert result["portions"] == 2 and result["stop_reason"] == "exhausted"
+    assert not shared_db[0]
