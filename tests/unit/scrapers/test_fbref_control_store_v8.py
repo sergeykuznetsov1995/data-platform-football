@@ -1344,13 +1344,14 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
         database.execute(
             "INSERT INTO fbref_control.page_frontier (target_id, source, source_ids, "
             "refresh_policy, state, next_fetch_at, last_error_class, "
-            "last_content_hash, last_fetched_at, last_http_status) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "last_content_hash, last_fetched_at, last_http_status, last_error_message) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (row["target_id"], "fbref",
              json.dumps({"competition_id": row["competition_id"]}),
              row["refresh_policy"], row["state"], row.get("next_fetch_at"),
              row.get("last_error_class"), row.get("last_content_hash"),
-             row.get("last_fetched_at"), row.get("last_http_status", 200)),
+             row.get("last_fetched_at"), row.get("last_http_status", 200),
+             row.get("last_error_message")),
         )
 
     def handler(sql, _params):
@@ -1487,6 +1488,43 @@ def test_reconcile_parks_redirected_history_instead_of_restoring_it():
     assert messages["moved"] == "HTTP 301; awaiting #1933"
     assert messages["moved_new"] == "HTTP 308; awaiting #1933"
     assert counts["frontier_scope_reopened"] == 3
+
+
+def test_reconcile_restores_terminal_quarantine_instead_of_fetched():
+    # ParseContractQuarantined -> an older reconcile skipped it (class kept)
+    # -> repair: the verdict comes back, not a fetched state (#1949).
+    discontinued = {
+        "competition_id": "68", "crawl_state": "skipped",
+        "metadata": {"current_scope_lifecycle": "discontinued",
+                     "current_scope_reason": "last_source_season_2010"},
+    }
+    processed = {"last_content_hash": "h", "last_fetched_at": "2026-10-01"}
+    rows = [
+        {"target_id": "contract", "competition_id": "68", "refresh_policy": "historical_once",
+         "state": "skipped", "last_error_class": "ParseContractQuarantined",
+         "last_error_message": "unusable table shape", **processed},
+        {"target_id": "still_parked", "competition_id": "68",
+         "refresh_policy": "historical_once", "state": "quarantined",
+         "last_error_class": "ParseContractQuarantined", **processed},
+        # A transient fetch failure is not a verdict: the processed raw stands.
+        {"target_id": "transient", "competition_id": "68", "refresh_policy": "historical_once",
+         "state": "skipped", "last_error_class": "timeout", **processed},
+    ]
+    counts, states, messages = _reconcile_scope_on_sqlite([discontinued], rows)
+    assert messages["contract"] == "unusable table shape"
+    assert states == {
+        "contract": ("quarantined", None, "ParseContractQuarantined"),
+        "still_parked": ("quarantined", None, "ParseContractQuarantined"),
+        "transient": ("fetched", None, "timeout"),
+    }
+    assert counts["frontier_scope_reopened"] == 2
+    assert counts["frontier_scope_closed"] == 0
+    # A second pass leaves the restored verdict alone.
+    rows[0]["state"] = "quarantined"
+    rows[2]["state"] = "fetched"
+    again = _reconcile_scope_on_sqlite([discontinued], rows)
+    assert again[1] == states
+    assert again[0]["frontier_scope_reopened"] == again[0]["frontier_scope_closed"] == 0
 
 
 def test_redirect_parking_text_has_one_definition():

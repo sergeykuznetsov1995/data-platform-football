@@ -958,6 +958,9 @@ _HISTORICAL_COMPETITION_SQL = """(
 # A permanent redirect parks a target until the redirect registry (#1933).
 _REDIRECT_HTTP_STATUS_SQL = "last_http_status IN (301, 308)"
 _REDIRECT_PARK_MESSAGE_SQL = "'HTTP ' || last_http_status || '; awaiting #1933'"
+# Quarantine verdicts that only an out-of-band decision may lift; a reconcile
+# that skipped such a target keeps the class, so reopen restores the verdict.
+_TERMINAL_QUARANTINE_CLASSES_SQL = "('ParseContractQuarantined')"
 
 
 class ControlStore:
@@ -4537,6 +4540,10 @@ class ControlStore:
                          AND {_REDIRECT_HTTP_STATUS_SQL}
                         THEN 'quarantined'
                         WHEN competition.crawl_state <> 'active'
+                         AND frontier.last_error_class IN
+                             {_TERMINAL_QUARANTINE_CLASSES_SQL}
+                        THEN 'quarantined'
+                        WHEN competition.crawl_state <> 'active'
                          AND frontier.last_content_hash IS NOT NULL
                          AND frontier.last_fetched_at IS NOT NULL
                         THEN 'fetched'
@@ -4544,7 +4551,10 @@ class ControlStore:
                     END,
                     next_fetch_at = CASE
                         WHEN competition.crawl_state <> 'active'
-                         AND ({_REDIRECT_HTTP_STATUS_SQL} OR (
+                         AND ({_REDIRECT_HTTP_STATUS_SQL}
+                         OR frontier.last_error_class IN
+                             {_TERMINAL_QUARANTINE_CLASSES_SQL}
+                         OR (
                            frontier.last_content_hash IS NOT NULL
                            AND frontier.last_fetched_at IS NOT NULL
                          ))
