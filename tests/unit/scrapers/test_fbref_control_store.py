@@ -2909,3 +2909,87 @@ def test_gender_backfill_rolls_back_and_resumes_the_same_keyset_batch():
     assert refreshed == ["a", "b"] and checkpoint == ["b"]
     assert result == {"processed": 2, "after_target_id": "b", "done": False}
     assert factory.connections[1].committed
+
+
+def test_schedule_recovery_inventory_includes_completed_roots_and_pages_denominator():
+    def handler(sql, params):
+        assert "competition.gender = 'male'" in sql
+        assert "season.present" in sql and "competition.crawl_state = 'active'" in sql
+        assert "current_scope_lifecycle' = 'discontinued'" in sql
+        assert "#superseded:" in sql
+        assert "root.state AS root_state" in sql
+        assert "root.last_http_status AS root_http_status" in sql
+        assert "schedule.last_http_status AS schedule_http_status" in sql
+        assert "frontier.state = 'fetched'" not in sql
+        assert "root.state =" not in sql
+        assert "attempt.status = 'succeeded'" in sql
+        assert "observed.validation_status = 'succeeded'" in sql
+        assert "ORDER BY edition.sort_year, season.competition_id, season.season_id" in sql
+        assert params[2:] == (-2025, -2025, "9", "2024-2025", 2)
+        return [{"competition_id": "9", "season_id": "2023-2024", "sort_year": -2024}], 1
+
+    factory = FakeFactory(handler)
+    store = ControlStore("postgresql://test/db", connection_factory=factory)
+    rows = store.list_schedule_recovery_seasons(limit=2, after=(-2025, "9", "2024-2025"))
+    assert rows[0]["season_id"] == "2023-2024"
+    with pytest.raises(ValueError, match="limit"):
+        store.list_schedule_recovery_seasons(limit=26)
+
+
+def test_schedule_recovery_quarantine_inventory_includes_stats_and_cursor():
+    def handler(sql, params):
+        assert "frontier.page_kind IN ('season', 'season_stats', 'schedule')" in sql
+        assert "frontier.state = 'quarantined'" in sql
+        assert 'AS historical_eligible' in sql
+        assert 'NOT season.is_current' in sql
+        assert "competition.gender = 'male'" in sql
+        assert 'frontier.target_id > %s' in sql
+        assert params[2:] == ('previous', 'previous', 25)
+        return [{'target_id': 'parked', 'last_error_message': 'invalid_season'}], 1
+    store = ControlStore('postgresql://test/db', connection_factory=FakeFactory(handler))
+    assert store.list_schedule_recovery_quarantine(after_target_id='previous')[0]['target_id'] == 'parked'
+    with pytest.raises(ValueError, match='limit'):
+        store.list_schedule_recovery_quarantine(limit=26)
+
+
+@pytest.mark.parametrize("inventory", ["seasons", "quarantine"])
+@pytest.mark.parametrize("row", [
+    {"competition_id": "1", "gender": "male", "name": "U21 League"},
+    {"competition_id": "1", "gender": "male", "classification": "Youth"},
+    {"competition_id": "1", "gender": "male", "metadata": {"source_section": "Under-19"}},
+    {"competition_id": "850", "gender": "male", "name": "League"},
+    {"competition_id": "9", "gender": "male", "name": "Premier League"},
+])
+def test_schedule_recovery_filters_adult_denominator_before_pagination(inventory, row):
+    import re
+    from scrapers.fbref.daily_report import adult_competition
+
+    def handler(sql, params):
+        assert "competition.competition_id <> ALL(%s)" in sql
+        assert "competition.metadata ->> 'source_section') !~* %s" in sql
+        assert sql.index("!~* %s") < sql.rindex("ORDER BY")
+        excluded, pattern = params[:2]
+        text = " ".join([row.get("name", ""), row.get("classification", ""),
+                         row.get("metadata", {}).get("source_section", "")])
+        admitted = row["competition_id"] not in excluded and not re.search(
+            pattern.replace(r"\y", r"\b"), text, re.I,
+        )
+        assert bool(admitted) == adult_competition(row)
+        return ([row] if admitted else []), int(bool(admitted))
+
+    store = ControlStore("postgresql://test/db", connection_factory=FakeFactory(handler))
+    rows = getattr(store, "list_schedule_recovery_" + inventory)(limit=1)
+    assert bool(rows) == adult_competition(row)
+
+
+def test_schedule_recovery_index_requires_successful_saved_raw():
+    def handler(sql, params):
+        assert "frontier.page_kind = 'competition_index'" in sql
+        assert "attempt.status = 'succeeded'" in sql
+        assert "attempt.raw_manifest_key IS NOT NULL" in sql
+        assert "ORDER BY attempt.finished_at DESC, attempt.attempt_id DESC" in sql
+        assert "LIMIT 1" in sql
+        return [{"logical_refresh_id": "index", "content_hash": "hash"}], 1
+
+    store = ControlStore("postgresql://test/db", connection_factory=FakeFactory(handler))
+    assert store.latest_schedule_recovery_index()["logical_refresh_id"] == "index"

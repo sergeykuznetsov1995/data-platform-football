@@ -5129,6 +5129,176 @@ class ControlStore:
             )
             return _fetchall(cursor)
 
+    def latest_schedule_recovery_index(self) -> Optional[dict]:
+        """Latest successful index fetch, including not-yet-parsed raw."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT attempt.logical_refresh_id, attempt.content_hash
+                FROM fbref_control.fetch_attempt attempt
+                JOIN fbref_control.page_frontier frontier USING (target_id)
+                WHERE frontier.source = 'fbref'
+                  AND frontier.page_kind = 'competition_index'
+                  AND attempt.status = 'succeeded'
+                  AND attempt.raw_manifest_key IS NOT NULL
+                  AND attempt.content_hash IS NOT NULL
+                ORDER BY attempt.finished_at DESC, attempt.attempt_id DESC
+                LIMIT 1
+                """
+            )
+            return _fetchone(cursor)
+
+    def list_schedule_recovery_quarantine(
+        self, *, after_target_id: Optional[str] = None, limit: int = 25,
+    ) -> list[dict]:
+        """Inventory each parked discovery target; retain unresolved reasons."""
+        if not 1 <= int(limit) <= 25:
+            raise ValueError("limit must be between 1 and 25")
+        from scrapers.fbref.daily_report import EXCLUDED_IDS, NON_ADULT
+
+        adult_pattern = NON_ADULT.pattern.replace(r"\b", r"\y")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT frontier.*, EXISTS (
+                    SELECT 1 FROM fbref_control.season_registry season
+                    JOIN fbref_control.competition_registry competition
+                      ON competition.source = season.source
+                     AND competition.competition_id = season.competition_id
+                    WHERE season.source = frontier.source
+                      AND season.competition_id = frontier.source_ids ->> 'competition_id'
+                      AND season.season_id = frontier.source_ids ->> 'season_id'
+                      AND season.present AND season.lifecycle_state = 'present'
+                      AND NOT season.is_current
+                      AND strpos(season.canonical_url, '#superseded:') = 0
+                      AND competition.gender = 'male'
+                      AND competition.competition_id <> ALL(%s)
+                      AND concat_ws(' ', competition.name, competition.classification,
+                          competition.metadata ->> 'source_section') !~* %s
+                      AND competition.present
+                      AND competition.lifecycle_state IN ('present', 'missing_once')
+                      AND (competition.crawl_state = 'active' OR (
+                        competition.crawl_state = 'skipped'
+                        AND competition.metadata ->> 'current_scope_lifecycle' = 'discontinued'
+                        AND competition.metadata ->> 'current_scope_reason' IS NOT NULL
+                      ))
+                ) AS historical_eligible
+                FROM fbref_control.page_frontier frontier
+                WHERE frontier.source = 'fbref' AND frontier.state = 'quarantined'
+                  AND frontier.page_kind IN ('season', 'season_stats', 'schedule')
+                  AND (%s::text IS NULL OR frontier.target_id > %s)
+                ORDER BY frontier.target_id LIMIT %s
+                """,
+                (sorted(EXCLUDED_IDS), adult_pattern, after_target_id, after_target_id, int(limit)),
+            )
+            return _fetchall(cursor)
+
+    def list_schedule_recovery_seasons(
+        self, *, limit: int = 25,
+        after: Optional[tuple[int, str, str]] = None,
+    ) -> list[dict]:
+        """Page the adult male denominator newest first, regardless of root completion.
+
+        Negative edition year makes the cursor ascend while recent seasons
+        (including the last ten) precede older ones. Unknown IDs follow dates.
+        This read-only inventory never requeues a root or clears quarantine.
+        """
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 25:
+            raise ValueError("limit must be between 1 and 25")
+        if after is not None and len(after) != 3:
+            raise ValueError("after must be (sort_year, competition_id, season_id)")
+        year, competition, season = (None, None, None) if after is None else (
+            int(after[0]), _text(after[1], "competition_id"),
+            _text(after[2], "season_id"),
+        )
+        from scrapers.fbref.daily_report import EXCLUDED_IDS, NON_ADULT
+
+        adult_pattern = NON_ADULT.pattern.replace(r"\b", r"\y")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT season.*, edition.sort_year,
+                       root.state AS root_state,
+                       root.last_error_class AS root_error_class,
+                       root.last_error_message AS root_error_message,
+                       root.last_http_status AS root_http_status,
+                       raw.logical_refresh_id, raw.content_hash,
+                       schedule.target_id AS schedule_target_id,
+                       schedule.canonical_url AS schedule_canonical_url,
+                       schedule.state AS schedule_state,
+                       schedule.last_error_class AS schedule_error_class,
+                       schedule.last_error_message AS schedule_error_message,
+                       schedule.last_http_status AS schedule_http_status,
+                       EXISTS (
+                         SELECT 1 FROM fbref_control.observation_processing observed
+                         WHERE observed.logical_refresh_id =
+                               schedule_raw.logical_refresh_id
+                           AND observed.status = 'succeeded'
+                           AND observed.generic_status = 'succeeded'
+                           AND observed.typed_status IN ('succeeded', 'skipped')
+                           AND observed.stateful_status = 'succeeded'
+                           AND observed.validation_status = 'succeeded'
+                       ) AS schedule_processed
+                FROM fbref_control.season_registry season
+                JOIN fbref_control.competition_registry competition
+                  ON competition.source = season.source
+                 AND competition.competition_id = season.competition_id
+                CROSS JOIN LATERAL (
+                  SELECT -COALESCE(substring(season.season_id FROM
+                    '([0-9]{4})$')::integer, 0) AS sort_year
+                ) edition
+                LEFT JOIN fbref_control.page_frontier root
+                  ON root.source = season.source AND root.page_kind = 'season'
+                 AND root.source_ids ->> 'competition_id' = season.competition_id
+                 AND root.source_ids ->> 'season_id' = season.season_id
+                LEFT JOIN LATERAL (
+                  SELECT attempt.logical_refresh_id, attempt.content_hash
+                  FROM fbref_control.fetch_attempt attempt
+                  WHERE attempt.target_id = root.target_id
+                    AND attempt.status = 'succeeded'
+                    AND attempt.raw_manifest_key IS NOT NULL
+                    AND attempt.content_hash IS NOT NULL
+                  ORDER BY attempt.finished_at DESC, attempt.attempt_id DESC
+                  LIMIT 1
+                ) raw ON true
+                LEFT JOIN fbref_control.page_frontier schedule
+                  ON schedule.source = season.source AND schedule.page_kind = 'schedule'
+                 AND schedule.source_ids ->> 'competition_id' = season.competition_id
+                 AND schedule.source_ids ->> 'season_id' = season.season_id
+                LEFT JOIN LATERAL (
+                  SELECT attempt.logical_refresh_id
+                  FROM fbref_control.fetch_attempt attempt
+                  WHERE attempt.target_id = schedule.target_id
+                    AND attempt.status = 'succeeded'
+                    AND attempt.content_hash = schedule.last_content_hash
+                  ORDER BY attempt.finished_at DESC, attempt.attempt_id DESC
+                  LIMIT 1
+                ) schedule_raw ON true
+                WHERE season.source = 'fbref'
+                  AND season.lifecycle_state = 'present' AND season.present
+                  AND strpos(season.canonical_url, '#superseded:') = 0
+                  AND competition.gender = 'male'
+                  AND competition.competition_id <> ALL(%s)
+                  AND concat_ws(' ', competition.name, competition.classification,
+                      competition.metadata ->> 'source_section') !~* %s
+                  AND (competition.crawl_state = 'active' OR (
+                    NOT season.is_current AND competition.crawl_state = 'skipped'
+                    AND competition.metadata ->> 'current_scope_lifecycle' = 'discontinued'
+                    AND competition.metadata ->> 'current_scope_reason' IS NOT NULL
+                  ))
+                  AND competition.present
+                  AND competition.lifecycle_state IN ('present', 'missing_once')
+                  AND (%s::integer IS NULL OR
+                    (edition.sort_year, season.competition_id, season.season_id)
+                      > (%s, %s, %s))
+                ORDER BY edition.sort_year, season.competition_id, season.season_id
+                LIMIT %s
+                """,
+                (sorted(EXCLUDED_IDS), adult_pattern, year, year, competition, season, normalized_limit),
+            )
+            return _fetchall(cursor)
+
     def list_backfill_seasons(
         self,
         *,

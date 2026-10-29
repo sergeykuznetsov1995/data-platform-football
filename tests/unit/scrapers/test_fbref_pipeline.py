@@ -15716,3 +15716,307 @@ def test_deadline_does_not_carry_transient_failure_after_control_failure(tmp_pat
             settings=_settings(), deadline_monotonic=5.0,
         )
     assert not control.run.get("metadata", {}).get("deferred_parse_observations")
+
+
+def _schedule_recovery_fixture(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {"competition_id": "9", "gender": "male"}
+    target = season_page_target("9", "2024-2025", "https://fbref.com/en/comps/9/2024-2025/Stats")
+    html = '<a href="/en/comps/9/2024-2025/schedule/Scores-and-Fixtures">Scores &amp; Fixtures</a>'
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id, "page_kind": "season",
+        "canonical_url": target.canonical_url, "source_ids": dict(target.source_ids),
+        "refresh_policy": "historical_once", "state": "fetched", "next_fetch_at": None,
+        "last_content_hash": record.content_hash, "last_logical_refresh_id": refresh,
+    }
+    row = {"competition_id": "9", "season_id": "2024-2025", "is_current": False,
+           "canonical_url": target.canonical_url, "metadata": {}, "sort_year": -2025,
+           "logical_refresh_id": refresh, "content_hash": record.content_hash}
+    calls = []
+    control.list_schedule_recovery_seasons = lambda **kw: calls.append(kw) or [row]
+    control.get_succeeded_fetch_evidence = lambda *a, **kw: {"logical_refresh_id": refresh}
+    # Recovery is offline: any source fetch is a defect.
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter(),
+                             fetcher_factory=lambda *_: pytest.fail("source HTTP"))
+    return pipeline, control, row, record, calls
+
+
+def test_schedule_recovery_restores_completed_season_without_refetch(tmp_path):
+    pipeline, control, row, record, calls = _schedule_recovery_fixture(tmp_path)
+    result = pipeline.recover_schedule_discovery(limit=1)
+    schedule_id = "fbref:schedule:9:2024-2025"
+    assert result["results"][0]["reason"] == "schedule_queued"
+    assert result["next_after"] == (-2025, "9", "2024-2025")
+    assert control.frontier[schedule_id]["refresh_policy"] == "historical_once"
+    assert control.frontier[record.target_id]["next_fetch_at"] is None
+    assert control.provenance[0]["parent_content_hash"] == record.content_hash
+    assert control.provenance[0]["logical_refresh_id"] == record.logical_refresh_id
+    # Simulate the inventory's next view after the durable upsert.
+    row.update(schedule_target_id=schedule_id, schedule_state="queued")
+    pipeline.recover_schedule_discovery(limit=1, after=result["next_after"])
+    assert len(control.frontier) == 2
+    assert len(control.provenance) == 1
+    assert calls[-1]["after"] == result["next_after"]
+    assert not control.claim_calls and not control.reservations
+
+
+@pytest.mark.parametrize("updates, reason", [
+    ({"logical_refresh_id": None, "root_state": "fetched"}, "raw_missing"),
+    ({"content_hash": "wrong"}, "raw_identity_mismatch"),
+    ({"metadata": {"direct_match_only": True}}, "direct_match_only"),
+    ({"root_state": "quarantined", "root_error_class": "ParserError",
+      "root_error_message": "invalid_season"}, "season_quarantined"),
+    ({"schedule_target_id": "s", "schedule_state": "quarantined",
+      "schedule_error_class": "ParserError", "schedule_error_message": "bad page"},
+     "schedule_quarantined"),
+    ({"schedule_target_id": "s", "schedule_state": "fetched", "schedule_processed": True},
+     "schedule_processed"),
+])
+def test_schedule_recovery_reports_gaps_and_preserves_quarantine(tmp_path, updates, reason):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    row.update(updates)
+    result = pipeline.recover_schedule_discovery(limit=1)
+    assert result["results"][0]["reason"] == reason
+    assert result["next_after"] is not None
+    assert list(control.frontier) == [record.target_id]
+    assert not control.provenance
+
+
+def test_schedule_recovery_refuses_stale_raw(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    control.frontier[record.target_id]["last_content_hash"] = "newer"
+    assert pipeline.recover_schedule_discovery()["results"][0]["reason"] == "raw_not_latest_or_leased"
+    assert not control.provenance
+
+
+def test_schedule_recovery_reports_missing_link_from_saved_raw(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    refresh, record = _commit_for_parse(pipeline.raw_store, season_page_target(
+        "9", "2024-2025", row["canonical_url"]), '<table id="stats"><tr><td>data</td></tr></table>')
+    row.update(logical_refresh_id=refresh, content_hash=record.content_hash)
+    result = pipeline.recover_schedule_discovery()
+    assert result["results"][0]["reason"] == "schedule_link_missing"
+    assert not control.provenance
+
+
+def test_schedule_recovery_provenance_is_distinct_from_ordinary_discovery(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    html, _ = pipeline.raw_store.load_fetch_html(record.logical_refresh_id)
+    pipeline._parse_discovery_children(html, record, historical=True)
+    ordinary = list(control.provenance)
+    # Existing scope quarantine is the recovery path; don't overwrite its
+    # immutable ordinary discovery edge with recovery-specific metadata.
+    row.update(schedule_target_id="fbref:schedule:9:2024-2025",
+               schedule_state="quarantined", schedule_error_class="ScopeQuarantined")
+    real_record = control.record_frontier_provenance
+
+    def immutable_provenance(edge):
+        for previous in control.provenance:
+            if (previous["parent_target_id"], previous["child_target_id"], previous["relation"],
+                previous["parser_version"], previous["parent_content_hash"]) == (
+                edge.parent_target_id, edge.child_target_id, edge.relation,
+                edge.parser_version, edge.parent_content_hash):
+                if previous["metadata"] != dict(edge.metadata):
+                    raise StateConflict("immutable provenance metadata")
+        return real_record(edge)
+
+    control.record_frontier_provenance = immutable_provenance
+    pipeline.recover_schedule_discovery()
+    pipeline.recover_schedule_discovery()
+    assert all(previous in control.provenance for previous in ordinary)
+    edges = [edge for edge in control.provenance
+             if edge["relation"] == "page_link:schedule:install:schedule-recovery-v1"]
+    assert len(edges) == 1
+
+
+def test_schedule_recovery_does_not_reopen_unresolved_scope_quarantine(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    html, _ = pipeline.raw_store.load_fetch_html(record.logical_refresh_id)
+    pipeline._parse_discovery_children(html, record, historical=True)
+    target_id = "fbref:schedule:9:2024-2025"
+    control.frontier[target_id].update(state="quarantined", last_error_class="ScopeQuarantined",
+                                       last_error_message="invalid_season")
+    row.update(schedule_target_id=target_id, schedule_state="quarantined",
+               schedule_error_class="ScopeQuarantined", schedule_error_message="invalid_season")
+    result = pipeline.recover_schedule_discovery()
+    assert result["results"][0]["reason"] == "schedule_quarantined"
+    assert result["results"][0]["quarantine_reason"] == "invalid_season"
+    assert control.frontier[target_id]["state"] == "quarantined"
+
+
+def test_schedule_recovery_queues_never_fetched_registry_season(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    row.update(logical_refresh_id=None, root_state=None)
+    control.frontier.clear()
+    result = pipeline.recover_schedule_discovery()
+    assert result['results'][0]['reason'] == 'season_queued'
+    assert list(control.frontier) == [record.target_id]
+    assert control.frontier[record.target_id]['canonical_url'] == row['canonical_url']
+    assert not control.claim_calls and not control.reservations
+
+
+def test_schedule_recovery_drains_denominator_and_accounts_for_stats_quarantine(tmp_path):
+    pipeline, control, row, record, calls = _schedule_recovery_fixture(tmp_path)
+    target_id = 'fbref:season_stats:9:2024-2025:standard'
+    control.frontier[target_id] = {
+        'target_id': target_id, 'page_kind': 'season_stats',
+        'canonical_url': 'https://fbref.com/en/comps/9/2024-2025/standard/Stats',
+        'source_ids': dict(record.source_ids), 'refresh_policy': 'current_season_daily',
+        'priority': 5, 'state': 'quarantined', 'last_error_class': 'ParserError',
+        'last_error_message': 'saved parser verdict',
+    }
+    parked = dict(control.frontier[target_id], historical_eligible=True)
+    control.list_schedule_recovery_quarantine = lambda **kw: [parked]
+    # Exactly one full page followed by a final empty page, even when most
+    # editions cannot be replayed. The cursor must advance across the gaps.
+    gaps = [dict(row, season_id=str(2000 + i), sort_year=-(2000 + i),
+                 metadata={'direct_match_only': True}) for i in range(24)]
+    def inventory(**kw):
+        calls.append(kw)
+        return [row, *gaps] if kw['after'] is None else []
+    control.list_schedule_recovery_seasons = inventory
+    result = pipeline.recover_all_schedule_discovery()
+    assert len(result['results']) == 25
+    assert calls[-1]['after'] == (-2023, '9', '2023')
+    assert control.frontier['fbref:schedule:9:2024-2025']['state'] == 'queued'
+    assert result['quarantines'] == [{
+        'target_id': target_id, 'state': 'quarantined',
+        'reason': 'saved parser verdict', 'error_class': 'ParserError',
+    }]
+    assert not control.claim_calls and not control.reservations
+
+
+@pytest.mark.parametrize("invalid", [None, "hash", "stale", "missing_links"])
+def test_schedule_recovery_registers_qualifiers_from_saved_index_with_provenance(tmp_path, invalid):
+    pipeline, control, row, _, _ = _schedule_recovery_fixture(tmp_path)
+    names = [
+        ("80", "Champions League Qualifying", "M"),
+        ("81", "Conference League Qualification", "M"),
+        ("82", "Champions League Youth Qualifying", "M"),
+        ("83", "Champions League Qualifying", "F"),
+        ("84", "Other League", "M"),
+    ]
+    if invalid == "missing_links":
+        names = names[-1:]
+    html = '<h2>International Cups</h2><table>' + ''.join(
+        f'<tr><td data-stat="gender">{gender}</td><th>'
+        f'<a href="/en/comps/{comp}/history/Seasons">{name}</a></th>'
+        f'<td data-stat="maxseason"><a href="/en/comps/{comp}/2026-2027/Stats">'
+        '2026-2027</a></td></tr>' for comp, name, gender in names
+    ) + '</table>'
+    refresh, record = _commit_for_parse(pipeline.raw_store, competition_index_target(), html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id, "page_kind": "competition_index",
+        "canonical_url": record.canonical_url, "source_ids": {}, "state": "fetched",
+        "last_content_hash": "changed" if invalid == "stale" else record.content_hash,
+        "last_logical_refresh_id": refresh,
+    }
+    control.latest_schedule_recovery_index = lambda: {
+        "logical_refresh_id": refresh,
+        "content_hash": "changed" if invalid == "hash" else record.content_hash,
+    }
+    control.get_succeeded_fetch_evidence = lambda *a, **kw: {"run_id": str(uuid.uuid4())}
+    reasons = {"hash": "index_raw_identity_mismatch", "stale": "index_raw_not_latest_or_leased",
+               "missing_links": "qualification_links_missing"}
+    result = pipeline.recover_schedule_discovery()["qualifications"]
+    if invalid:
+        assert result["reason"] == reasons[invalid]
+        assert "80" not in control.registry
+        return
+    assert result["reason"] == "qualification_histories_seeded"
+    assert result["competition_ids"] == ["80", "81"]
+    for comp in ("80", "81"):
+        target_id = f"fbref:competition:{comp}"
+        assert control.registry[comp]["gender"] == "male"
+        assert control.frontier[target_id]["state"] == "queued"
+        edge = next(edge for edge in control.provenance if edge["child_target_id"] == target_id)
+        assert edge["parent_target_id"] == record.target_id
+        assert edge["parent_content_hash"] == record.content_hash
+        assert edge["logical_refresh_id"] == refresh
+    assert not any(f"fbref:competition:{comp}" in control.frontier for comp in ("82", "83", "84"))
+    pipeline.recover_schedule_discovery()
+    assert len([edge for edge in control.provenance if edge["parent_target_id"] == record.target_id]) == 2
+    assert not control.claim_calls and not control.reservations
+
+
+@pytest.mark.parametrize("http_status", [301, 308])
+def test_schedule_recovery_reports_unresolved_season_redirect_without_requeue_loop(
+    tmp_path, http_status,
+):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    row.update(logical_refresh_id=None, root_state="retry", root_http_status=http_status)
+    control.frontier[record.target_id].update(
+        state="retry", last_http_status=http_status, next_fetch_at="later",
+    )
+    control.list_schedule_recovery_quarantine = lambda **kw: []
+    before = {key: dict(value) for key, value in control.frontier.items()}
+    upserts = []
+    real_upsert = control.upsert_frontier_target
+    control.upsert_frontier_target = lambda target: upserts.append(target) or real_upsert(target)
+    for _ in range(2):
+        result = pipeline.recover_all_schedule_discovery()
+        assert result["results"][0]["reason"] == "redirect_unresolved"
+        assert result["results"][0]["detail"] == f"HTTP {http_status}"
+    assert upserts == []
+    assert control.frontier == before
+    assert not control.provenance
+
+
+def test_schedule_recovery_reports_unresolved_schedule_redirect_without_reseeding(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    target_id = "fbref:schedule:9:2024-2025"
+    row.update(schedule_target_id=target_id, schedule_state="quarantined",
+               schedule_error_class="ScopeQuarantined", schedule_http_status=301)
+    result = pipeline.recover_schedule_discovery()
+    assert result["results"][0]["reason"] == "redirect_unresolved"
+    assert target_id not in control.frontier
+    assert not control.provenance
+
+
+def test_schedule_recovery_keeps_redirected_scope_quarantine_parked(tmp_path):
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(tmp_path)
+    target_id = "fbref:season:9:2023-2024"
+    control.frontier[target_id] = {
+        "target_id": target_id, "page_kind": "season",
+        "canonical_url": "https://fbref.com/en/comps/9/2023-2024/Stats",
+        "source_ids": {"competition_id": "9", "season_id": "2023-2024"},
+        "refresh_policy": "historical_once", "priority": 5, "state": "quarantined",
+        "last_error_class": "ScopeQuarantined", "last_error_message": "invalid_season",
+        "last_http_status": 301,
+    }
+    parked = dict(control.frontier[target_id], historical_eligible=True)
+    control.list_schedule_recovery_quarantine = lambda **kw: [parked]
+    upserts = []
+    real_upsert = control.upsert_frontier_target
+    control.upsert_frontier_target = lambda target: upserts.append(target) or real_upsert(target)
+    control.list_schedule_recovery_seasons = lambda **kw: []
+    result = pipeline.recover_all_schedule_discovery()
+    assert result["quarantines"][0]["reason"] == "redirect_unresolved"
+    assert result["quarantines"][0]["detail"] == "invalid_season"
+    assert all(target.target_id != target_id for target in upserts)
+
+
+def test_schedule_recovery_seeds_europa_league_qualifiers(tmp_path):
+    pipeline, control, _, _, _ = _schedule_recovery_fixture(tmp_path)
+    html = (
+        '<h2>International Cups</h2><table><tr><td data-stat="gender">M</td><th>'
+        '<a href="/en/comps/86/history/Seasons">Europa League Qualifying</a></th>'
+        '<td data-stat="maxseason"><a href="/en/comps/86/2026-2027/Stats">'
+        '2026-2027</a></td></tr></table>'
+    )
+    refresh, record = _commit_for_parse(pipeline.raw_store, competition_index_target(), html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id, "page_kind": "competition_index",
+        "canonical_url": record.canonical_url, "source_ids": {}, "state": "fetched",
+        "last_content_hash": record.content_hash, "last_logical_refresh_id": refresh,
+    }
+    control.latest_schedule_recovery_index = lambda: {
+        "logical_refresh_id": refresh, "content_hash": record.content_hash,
+    }
+    control.get_succeeded_fetch_evidence = lambda *a, **kw: {"run_id": str(uuid.uuid4())}
+    result = pipeline.recover_schedule_discovery()["qualifications"]
+    assert result["reason"] == "qualification_histories_seeded"
+    assert result["competition_ids"] == ["86"]
+    assert control.frontier["fbref:competition:86"]["state"] == "queued"
