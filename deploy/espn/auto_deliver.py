@@ -306,7 +306,7 @@ def measurement_reason(h: Host) -> str | None:
         return "статус замера #1510 недоступен: невалидный JSON"
     if not isinstance(report, dict):
         return "статус замера #1510 недоступен: JSON не объект"
-    if report.get("status") in ("starting", "running", "draining") and report.get("stale") is not True:
+    if report.get("status") in ("starting", "running", "draining"):
         return f"идёт замер темпа #1510 (status={report['status']}, step={report.get('step')})"
     return None
 

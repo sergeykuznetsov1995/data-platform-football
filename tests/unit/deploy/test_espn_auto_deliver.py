@@ -481,7 +481,8 @@ def test_window_between_waves(env, clock, running, busy):
     ((0, json.dumps({"status": "stopped", "stale": True}), ""), False),
     ((0, json.dumps({"status": "failed", "stale": True}), ""), False),
     ((0, json.dumps({"stale": True, "reason": "no_controller_state"}), ""), False),
-    ((0, json.dumps({"status": "running", "stale": True}), ""), False),
+    *[((0, json.dumps({"status": status, "stale": True}), ""), True)
+      for status in ("starting", "running", "draining")],
     ((1, "", "exec failed"), True),
     ((124, "", "timeout 60s"), True),
     ((0, "not json", ""), True),
@@ -500,6 +501,30 @@ def test_cron_waits_for_measurement(env, result, blocked):
     if blocked:
         assert "замер" in host.lines[-1]
         assert host.sent == []
+
+
+@pytest.mark.parametrize("status", ["running", "draining"])
+def test_cron_waits_for_stale_measurement_status(env, tmp_path, status):
+    from scrapers.espn.measure_pace import read_status
+    from scrapers.espn.pace_store import PaceStore
+
+    repo, paths, world, host, base = env
+    seed(env)
+    store = PaceStore(tmp_path / "pace.sqlite3")
+    store.save({"status": status, "heartbeat": START.timestamp(), "report": {"step": 2}})
+    if status == "running":
+        store.record("observation", START.timestamp(), known=False, reason="debt_query_stale")
+    report = read_status(store.path, now=START)
+    assert report["status"] == status
+    assert report["stale"] is True
+    world.measurement_result = (0, json.dumps(report), "")
+    repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == base
+    assert up_calls(world) == []
+    assert world.measurement_calls == 1
+    assert "замер" in host.lines[-1]
+    assert host.sent == []
 
 
 @pytest.mark.parametrize("mode", ["--target", "--rollback"])
