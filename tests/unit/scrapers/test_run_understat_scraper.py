@@ -1275,3 +1275,31 @@ def test_previous_catalog_readiness_is_cleared_before_publication(tmp_path, fail
     state = catalog.record_league(definition, 2025, LEAGUE_PAYLOAD)
     assert state["quality_ready"] is (failure is None)
     assert state["is_closed"] is (failure is None)
+
+
+def test_source_diagnostics_survive_runner_quality_without_blocking_or_extra_calls():
+    frames = _complete_frames()
+    frames['understat_player_match_stats']['roster_entry_ids'] = '11,12'
+    factory, scraper = _scraper_factory(frames)
+    payload, exit_code = runner.run_scope(_args(), scraper_factory=factory, repository=_Repository())
+    assert exit_code == 0
+    quality = payload['scope_attempt']['quality']
+    assert any(issue['code'] == 'multiple_roster_entries' and issue['status'] == 'warning'
+               for issue in quality['issues'])
+    assert scraper.scrape_scope.call_count == 1
+    assert scraper.save_to_iceberg.call_count == 7
+    from scrapers.understat.quality import validate_understat_scope
+    from scrapers.understat.manifest import ScopeKey
+    scope = ScopeKey(LEAGUE, '2526', source_season_id='2025')
+    report = validate_understat_scope(frames, scope=scope, active=True)
+    assert report.passed
+    baseline = {key: frame.copy(deep=True) for key, frame in frames.items()}
+    # Different source roster provenance must not change row counts or payloads.
+    import unittest.mock
+    with unittest.mock.patch('scrapers.understat.anomalies.diagnose_matches', return_value=[]):
+        plain = validate_understat_scope(baseline, scope=scope, active=True)
+    assert report.row_counts == plain.row_counts
+    assert report.payload_hashes == plain.payload_hashes
+    assert report.publishable == plain.publishable
+    frames['understat_shots'] = pd.concat([frames['understat_shots']] * 2)
+    assert not validate_understat_scope(frames, scope=scope, active=True).passed

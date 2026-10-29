@@ -59,7 +59,7 @@ def _load(path, tables, window):
         state = json.loads(path.read_text())
         # Never turn malformed/incompatible state into a fresh nightly budget.
         if (
-            state.get("version") != 1
+            state.get("version") not in (1, 2)
             or state.get("tables") != tables
             or not isinstance(state.get("window"), str)
             or state["window"] > window
@@ -70,15 +70,21 @@ def _load(path, tables, window):
             or not isinstance(state.get("queue"), list)
             or len(set(state["queue"])) != len(state["queue"])
             or set(state["queue"]) - set(tables)
-            or not isinstance(state.get("partition_offsets"), dict)
-            or any(k not in tables or type(v) is not int or v < 0
-                   for k, v in state["partition_offsets"].items())
+            or (state.get("version") == 1 and (
+                not isinstance(state.get("partition_offsets"), dict)
+                or any(k not in tables or type(v) is not int or v < 0
+                       for k, v in state["partition_offsets"].items())))
+            or (state.get("version") == 2 and (
+                not isinstance(state.get("partition_cursors"), dict)
+                or set(state["partition_cursors"]) - set(tables)))
         ):
             raise ValueError("Invalid direct compaction state")
         datetime.strptime(state["window"], "%Y-%m-%d")
+        compaction._migrate_partition_cursors(state)
+        state["version"] = 2
     else:
-        state = dict(version=1, tables=tables, window=window, portions=0,
-                     input_bytes=0, queue=tables[:], partition_offsets={})
+        state = dict(version=2, tables=tables, window=window, portions=0,
+                     input_bytes=0, queue=tables[:], partition_cursors={})
     if state["window"] != window:
         state.update(window=window, portions=0, input_bytes=0)
         if not state["queue"]:
@@ -161,14 +167,14 @@ def run_direct(args, deadline):
                         state["portions"] = state["input_bytes"] = 0
                         state["queue"] = tables[:]
 
-                    def reserve(table, size, next_offset):
+                    def reserve(table, size, next_cursor):
                         if (state["portions"] >= args.portions
                                 or state["input_bytes"] + size > args.bytes):
                             return False
                         # Charge AND rotate before ALTER, including process death.
                         state["portions"] += 1
                         state["input_bytes"] += size
-                        state["partition_offsets"][table] = next_offset
+                        state["partition_cursors"][table] = next_cursor
                         state["queue"].remove(table)
                         state["queue"].append(table)
                         _save(args.state_file, state)
@@ -197,7 +203,7 @@ def run_direct(args, deadline):
                             tables=[table], deadline=deadline, dry_run=not args.apply,
                             stop=stop, max_portions=args.portions,
                             max_input_bytes=args.bytes - state["input_bytes"], portion_limit=1,
-                            partition_offsets=state["partition_offsets"],
+                            partition_cursors=state["partition_cursors"],
                             window_budget=state if args.apply else None,
                             reserve=reserve if args.apply else None,
                             connection_factory=lambda: compaction.maintenance._get_trino_connection(

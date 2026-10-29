@@ -1119,7 +1119,7 @@ class TestMemorySafeProjection:
         assert "_ingested_at" not in hash_fields
 
         contract_tree = ast.parse(
-            (PROJECT_ROOT / "scripts" / "whoscored_v2_object_contract.py").read_text(
+            (PROJECT_ROOT / "scripts" / "whoscored_v2_inventory.py").read_text(
                 encoding="utf-8"
             )
         )

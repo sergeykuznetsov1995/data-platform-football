@@ -130,6 +130,9 @@ class Queries:
                                 "query_max_execution_time": f"{QUERY_SECONDS}s"},
         )
         if password:
+            # With a custom http_session the client ignores verify=; the
+            # session's own setting decides (self-signed Trino certificate).
+            self.session.verify = False
             options.update(http_scheme="https", verify=False,
                            auth=trino.auth.BasicAuthentication(options["user"], password))
         self.connection = trino.dbapi.connect(**options)

@@ -183,13 +183,17 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
     if len(tables) != 1:
         raise LayoutChanged(f"expected one match table, got {len(tables)}")
     table = tables[0]
-    header = table.xpath("./tr[th]|./thead/tr[th]|./tbody/tr[th]")
-    if len(header) != 1 or len(header[0].xpath("./th")) != MATCH_TABLE_COLUMNS:
-        raise LayoutChanged("match table header is not one row of 14 th")
-    names = [_text(th) for th in header[0].xpath("./th")]
-    names[0] = re.sub(r"^\d{4}\s*", "", names[0])  # "2026Date" → "Date"
-    if tuple(names) != MATCH_TABLE_HEADERS:
-        raise LayoutChanged(f"match table headers changed: {names}")
+    headers = table.xpath("./tr[th]|./thead/tr[th]|./tbody/tr[th]")
+    if not headers:
+        raise LayoutChanged("match table has no headers")
+    # The last 16 matches can span years, each with its own identical header.
+    for header in headers:
+        if len(header.xpath("./th")) != MATCH_TABLE_COLUMNS:
+            raise LayoutChanged("match table header is not a row of 14 th")
+        names = [_text(th) for th in header.xpath("./th")]
+        names[0] = re.sub(r"^\d{4}\s*", "", names[0])  # "2026Date" → "Date"
+        if tuple(names) != MATCH_TABLE_HEADERS:
+            raise LayoutChanged(f"match table headers changed: {names}")
     rows = []
     for seq, tr in enumerate(table.xpath(".//tr[td]")):
         tds = tr.xpath("./td")

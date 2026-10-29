@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -269,6 +269,23 @@ def _publication_fence(enabled, deadline=None):
             control.finish_run(run_id, succeeded=succeeded)
 
 
+def _migrate_partition_cursors(state):
+    # Numeric offsets cannot be mapped after partitions disappear. Restart the
+    # traversal once, keeping every charged byte/portion and the pending queue.
+    if "partition_cursors" not in state:
+        state["partition_cursors"] = {}
+    state.pop("partition_offsets", None)
+    cursors = state["partition_cursors"]
+    if not isinstance(cursors, dict):
+        raise ValueError("Invalid compaction partition cursors")
+    for key, value in cursors.items():
+        if not isinstance(key, str):
+            raise ValueError("Invalid compaction partition cursor table")
+        if value is not None:
+            maintenance._path_sql_literal(value)
+    return state
+
+
 def _shared_budget(deadline, *, reservation=None):
     """Atomically reserve the UTC window budget; keep partition cursors across nights.
 
@@ -297,17 +314,17 @@ def _shared_budget(deadline, *, reservation=None):
         session.execute(text("SELECT pg_advisory_xact_lock(1892)"))
         check_window()
         row = session.query(Variable).filter(Variable.key == key).one_or_none()
-        state = json.loads(row.val) if row else {}
+        state = _migrate_partition_cursors(json.loads(row.val) if row else {})
         window = deadline.astimezone(timezone.utc).date().isoformat()
         if state.get("window") != window:
             state = {
                 "window": window,
                 "portions": 0,
                 "input_bytes": 0,
-                "partition_offsets": state.get("partition_offsets", {}),
+                "partition_cursors": state.get("partition_cursors", {}),
             }
         if reservation is not None:
-            table, size, next_offset = reservation
+            table, size, next_cursor = reservation
             if (
                 state["portions"] >= MAX_PORTIONS
                 or state["input_bytes"] + size > MAX_INPUT_BYTES
@@ -315,7 +332,7 @@ def _shared_budget(deadline, *, reservation=None):
                 return None
             state["portions"] += 1
             state["input_bytes"] += size
-            state["partition_offsets"][table] = next_offset
+            state["partition_cursors"][table] = next_cursor
         value = json.dumps(state)
         if row is None:
             session.add(Variable(key=key, val=value))
@@ -338,7 +355,7 @@ def run_compaction(
     portion_limit=None,
     reserve=None,
     window_budget=None,
-    partition_offsets=None,
+    partition_cursors=None,
     connection_factory=None,
 ):
     """Re-read metadata for each portion; never replay paths or run retention.
@@ -376,6 +393,7 @@ def run_compaction(
         "delete_partitions": {},
         "stop_reason": "exhausted",
     }
+    _migrate_partition_cursors(result)
     result["stop_reason"] = "exhausted"
     portions_at_start = result["portions"]
     raw = (connection_factory or maintenance._get_trino_connection)()
@@ -390,10 +408,9 @@ def run_compaction(
                 result["targets"][table] = "not_present"
         else:
             queue = deque(result["queue"])
-        partition_offsets = defaultdict(
-            int,
-            partition_offsets if partition_offsets is not None
-            else result.get("partition_offsets", {}),
+        partition_cursors = dict(
+            partition_cursors if partition_cursors is not None
+            else result["partition_cursors"]
         )
         while queue:
             conn.check()
@@ -430,18 +447,10 @@ def run_compaction(
                         schema="bronze",
                         table=table,
                         max_input_bytes=input_budget,
-                        partition_offset=partition_offsets[table],
+                        multi_partition=True,
+                        partition_cursor=partition_cursors.get(table),
                         max_files=maintenance.COMPACTION_MAX_FILES_PER_PORTION,
                     )
-                    if not probe.candidates and partition_offsets[table]:
-                        partition_offsets[table] = 0
-                        probe = maintenance._compaction_candidates(
-                            conn,
-                            schema="bronze",
-                            table=table,
-                            max_input_bytes=input_budget,
-                            max_files=maintenance.COMPACTION_MAX_FILES_PER_PORTION,
-                        )
                     result["delete_partitions"][table] = probe.skipped_delete_partitions
                     if not probe.candidates:
                         result["targets"][table] = (
@@ -452,11 +461,12 @@ def run_compaction(
                         continue
                     paths = probe.candidates
                     if not dry_run and reserve is not None and not reserve(
-                        table, sum(size for _, size in paths), partition_offsets[table] + 1
+                        table, sum(size for _, size in paths), probe.next_partition_cursor
                     ):
                         queue.appendleft(table)
                         result["stop_reason"] = "budget"
                         break
+                    partition_cursors[table] = probe.next_partition_cursor
                     if dry_run:
                         result["targets"][table] = "dry_run"
                         stats = {}
@@ -503,7 +513,6 @@ def run_compaction(
                         ):
                             raise RuntimeError("Compaction made no proven progress")
                         result["targets"][table] = "compacted"
-                        partition_offsets[table] += 1
                         queue.append(table)
                     event = {
                         "table": table,
@@ -531,7 +540,7 @@ def run_compaction(
                 result["failures"].append((table, str(exc)))
                 result["targets"][table] = "failed"
         result["queue"] = list(queue)
-        result["partition_offsets"] = dict(partition_offsets)
+        result["partition_cursors"] = dict(partition_cursors)
         for table in queue:
             result["targets"][table] = "pending"
     finally:
@@ -543,7 +552,7 @@ def compaction_step(*, context, tables, deadline, **kwargs):
     """One portion per sensor poke releases the pool between rewrites."""
     checkpoint_key = None
     checkpoint = None
-    if context.get("run_id") and context.get("task"):
+    if context.get("run_id") and context.get("task") and not kwargs.get("dry_run", False):
         from airflow.models import Variable
 
         identity = "\0".join(
@@ -559,19 +568,19 @@ def compaction_step(*, context, tables, deadline, **kwargs):
         deadline = datetime.fromisoformat(checkpoint["deadline"])
     shared = _shared_budget(deadline) if not kwargs.get("dry_run", False) else None
 
-    def reserve(table, size, next_offset):
+    def reserve(table, size, next_cursor):
         return _shared_budget(
-            deadline, reservation=(table, size, next_offset)
+            deadline, reservation=(table, size, next_cursor)
         ) is not None
 
     result = run_compaction(
         tables=tables,
         deadline=deadline,
         checkpoint=checkpoint,
-        portion_limit=1,
+        portion_limit=None if kwargs.get("dry_run", False) else 1,
         reserve=reserve if shared is not None else None,
         window_budget=shared,
-        partition_offsets=shared["partition_offsets"] if shared is not None else None,
+        partition_cursors=shared["partition_cursors"] if shared is not None else None,
         **kwargs,
     )
     result["deadline"] = deadline.isoformat()

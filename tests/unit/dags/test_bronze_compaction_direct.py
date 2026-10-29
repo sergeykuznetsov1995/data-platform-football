@@ -35,9 +35,10 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(compaction.maintenance, "_get_trino_connection", connect)
     monkeypatch.setattr(compaction.maintenance, "_list_tables", lambda *_: ["espn_match", "fbref_schedule"])
 
-    def probe(*_, partition_offset=0, **kw):
-        offsets.append(partition_offset)
-        return compaction.maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0)
+    def probe(*_, partition_cursor=None, **kw):
+        offsets.append(partition_cursor)
+        return compaction.maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0,
+            str(int(partition_cursor or "0") + 32))
 
     monkeypatch.setattr(compaction.maintenance, "_compaction_candidates", probe)
     counts = iter([100, 99] * 200)
@@ -74,10 +75,10 @@ def test_apply_restart_budget_and_next_night_keep_positions(host, monkeypatch):
     monkeypatch.setattr(compaction, "nightly_deadline", lambda: tomorrow)
     monkeypatch.setattr(compaction.time, "time", lambda: tomorrow.replace(hour=2).timestamp())
     assert direct.run_direct(args, tomorrow) == 0
-    assert offsets == [0, 1, 2, 3]
+    assert offsets == [None, "32", "64", "96"]
     assert all(c == dict(host="127.0.0.1", port=8082) for c in connections)
     state = json.loads(args.state_file.read_text())
-    assert state["portions"] == 2 and state["partition_offsets"]["espn_match"] == 4
+    assert state["portions"] == 2 and state["partition_cursors"]["espn_match"] == "128"
     assert "s3://" not in args.state_file.read_text()
 
 
@@ -87,14 +88,14 @@ def test_failed_attempt_is_reserved_before_alter_and_secrets_hidden(host, monkey
     def fail(*_, **kw):
         state = json.loads(args.state_file.read_text())
         assert state["portions"] == 1
-        assert state["partition_offsets"]["espn_match"] == 1
+        assert state["partition_cursors"]["espn_match"] == "32"
         raise RuntimeError(os.environ["TRINO_PASSWORD"])
 
     monkeypatch.setattr(compaction.maintenance, "_compact_exact_files", fail)
     assert direct.run_direct(args, deadline) == 1
     assert summary(args)["portions"] == 1
     assert direct.run_direct(args, deadline) == 1
-    assert offsets == [0, 1]
+    assert offsets == [None, "32"]
     assert "test-secret" not in args.journal.read_text()
     assert direct.run_direct(args, deadline) == 0
     assert summary(args)["stop_reason"] == "budget"
@@ -315,7 +316,7 @@ def test_process_interruption_keeps_charge_and_rotated_queue(host, monkeypatch):
     state = json.loads(args.state_file.read_text())
     assert state["queue"] == ["fbref_schedule", "espn_match"]
     assert state["portions"] == 1 and state["input_bytes"] == 20
-    assert state["partition_offsets"] == {"espn_match": 1}
+    assert state["partition_cursors"] == {"espn_match": "32"}
     tables = []
     counts = iter([100, 99])
     monkeypatch.setattr(compaction.maintenance, "_fetch_scalar",

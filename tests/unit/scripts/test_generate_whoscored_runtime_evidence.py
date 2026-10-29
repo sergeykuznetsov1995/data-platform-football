@@ -242,11 +242,16 @@ def test_changed_payload_does_not_match_unchanged_runtime_evidence(tmp_path):
 
 
 @pytest.mark.unit
-def test_sofascore_chunk_dependency_changes_whoscored_runtime_evidence(tmp_path):
-    """#1730: importing the shared planner must bind its new local module."""
-    dependency = evidence.PurePosixPath("scrapers/sofascore/season_chunks.py")
+@pytest.mark.parametrize("relative", (
+    "scrapers/sofascore/season_chunks.py",
+    "scripts/whoscored_v2_inventory.py",
+))
+def test_dependency_changes_whoscored_runtime_evidence(tmp_path, relative):
+    """Shared dependencies must remain bound to the runtime fingerprint."""
+    dependency = evidence.PurePosixPath(relative)
     source = (ROOT / evidence.SOURCE_RELATIVE).read_bytes()
-    paths = set(evidence._expected_runtime_files(source)) | {dependency}
+    paths = set(evidence._expected_runtime_files(source))
+    assert dependency in paths
     for relative in paths:
         parent = tmp_path
         for part in relative.parts[:-1]:
@@ -261,6 +266,21 @@ def test_sofascore_chunk_dependency_changes_whoscored_runtime_evidence(tmp_path)
     after = evidence.render_evidence(tmp_path)
     assert before != after
     assert dependency.as_posix() in json.loads(before[evidence.LOCK_RELATIVE])["files"]
+
+
+@pytest.mark.unit
+def test_inventory_import_shadow_is_rejected(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from scrapers.whoscored import runtime_contract as contract
+
+    module_name = "scripts.whoscored_v2_inventory"
+    shadow = tmp_path / "whoscored_v2_inventory.py"
+    monkeypatch.setitem(sys.modules, module_name, SimpleNamespace(__file__=str(shadow)))
+
+    with pytest.raises(contract.RuntimeContractError, match=module_name):
+        contract._validate_loaded_runtime_modules(
+            ROOT, contract._expected_runtime_module_origins(ROOT)
+        )
 
 
 @pytest.mark.unit

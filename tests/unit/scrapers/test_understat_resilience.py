@@ -221,7 +221,8 @@ def test_closed_check_repeated_warning_is_recorded_once():
                                    scraper_factory=MagicMock(side_effect=[probe, full]),
                                    repository=repository)
     assert code == 0
-    assert len(result["scope_attempt"]["quality"]["issues"]) == 1
+    assert sum(issue["code"] == "unknown_source_fields"
+               for issue in result["scope_attempt"]["quality"]["issues"]) == 1
 
 
 def test_backfill_skip_reports_zero_current_http_calls(caplog):
