@@ -448,12 +448,24 @@ capture each exact `docker image inspect --format '{{.Id}}'` value. The four
 Airflow base services share one ID and the three Superset services share one
 ID, but every Compose service must be named explicitly:
 
-PR-A (#1486) retired the runtime-evidence generator and `whoscored-ci.yml`.
-The runtime lock and image trust roots remain unchanged; do not regenerate or
-edit them by hand. The promotion procedure below is historical and remains
-blocked until the later WhoScored isolation work supplies its replacement.
-Shared TLS and Camoufox image smoke checks now live in the manually dispatched
-`scheduler-runtime-ci.yml`; that workflow does not authorize WhoScored promotion.
+The runtime lock and its three image trust roots are generated files too; do
+not edit them by hand. Before the payload commit, refresh and then verify all
+four files with the isolated deterministic generator. It publishes the
+production trust root last, so an interrupted refresh remains blocked:
+
+```bash
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/generate_whoscored_runtime_evidence.py" \
+  --root "$RELEASE" --write
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/generate_whoscored_runtime_evidence.py" \
+  --root "$RELEASE" --check
+git -C "$RELEASE" diff -- \
+  scrapers/whoscored/runtime_contract.lock \
+  docker/images/airflow/whoscored-runtime-trust-root-generic \
+  docker/images/airflow/whoscored-runtime-trust-root-test \
+  docker/images/airflow/whoscored-runtime-trust-root-production
+```
 
 Use one protected Buildx state and evidence directory outside the checkout.
 The metadata files are part of promotion evidence: keep them root-owned mode

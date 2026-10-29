@@ -324,12 +324,10 @@ def test_current_repository_evidence_matches_its_declared_state(
     else:
         pytest.fail("repository attestation has an unsupported state")
     assert provenance.canonical_bytes(discovery.report).endswith(b"\n")
-    assert not (root / ".github/workflows/whoscored-ci.yml").exists()
-    assert any(
-        issue["category"] == "github_action_unpinned"
-        and "workflow is missing" in issue["detail"]
-        for issue in discovery.issues
-    )
+    workflow = (root / ".github/workflows/whoscored-ci.yml").read_text(encoding="utf-8")
+    assert "scripts/validate_whoscored_build_provenance.py" in workflow
+    assert "--expect-blocked" in workflow
+    assert "--expect-ready-build" in workflow
 
 
 def test_current_repository_generate_ready_discovers_all_split_project_services(
@@ -356,12 +354,8 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
         revision=revision,
     )
 
-    assert discovery.report["status"] == "blocked-v1"
-    assert any(
-        issue["category"] == "github_action_unpinned"
-        and "workflow is missing" in issue["detail"]
-        for issue in discovery.issues
-    )
+    assert discovery.report["status"] == "ready-v1"
+    assert discovery.issues == []
     assert {
         record["service"] for record in discovery.records["local_images"]
     } == set(payload_ids)
@@ -371,12 +365,7 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
     } <= {
         path.relative_to(root).as_posix() for path in discovery.material_paths
     }
-    assert discovery.records["github_actions"] == []
-    assert all(
-        discovery.records[key]
-        for key in provenance.RECORD_KEYS
-        if key != "github_actions"
-    )
+    assert all(discovery.records[key] for key in provenance.RECORD_KEYS)
 
 
 def test_declared_repository_mode_emits_report_but_default_rejects_without_deployment(
