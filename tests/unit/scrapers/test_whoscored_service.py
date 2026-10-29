@@ -3790,6 +3790,24 @@ def test_profile_candidates_use_one_deduplicated_union_scope_query(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("player_ids, limit, error", [
+    ([0, 7], 25, "sorted unique IDs"),
+    ([-1, 7], 25, "sorted unique IDs"),
+    ([True, 7], 25, "sorted unique IDs"),
+    (["7"], 25, "sorted unique IDs"),
+    ([11, 7], 25, "sorted unique IDs"),
+    ([7, 7], 25, "sorted unique IDs"),
+    ([7, 11], 1, "exceed the task limit"),
+])
+def test_explicit_profile_ids_reject_invalid_selection(tmp_path, player_ids, limit, error):
+    service, repository, _ = _service(tmp_path)
+
+    with pytest.raises(ValueError, match=error):
+        service.sync_profiles(limit=limit, player_ids=player_ids)
+
+    assert repository.profile_commits == []
+
+
 def test_explicit_profile_ids_bypass_mutable_candidate_selection(tmp_path):
     service, repository, _ = _service(tmp_path)
     repository.profile_candidates = [999999]
