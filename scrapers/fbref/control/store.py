@@ -941,6 +941,21 @@ _DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
 )"""
 
 
+# One definition of a historically eligible competition (#1949): current
+# male rows plus source-proven discontinued ones. Callers alias the registry
+# as ``competition``.
+_HISTORICAL_COMPETITION_SQL = """(
+    competition.gender = 'male'
+    AND competition.present
+    AND competition.lifecycle_state IN ('present', 'missing_once')
+    AND (competition.crawl_state = 'active' OR (
+      competition.crawl_state = 'skipped'
+      AND competition.metadata ->> 'current_scope_lifecycle' = 'discontinued'
+      AND competition.metadata ->> 'current_scope_reason' IS NOT NULL
+    ))
+)"""
+
+
 class ControlStore:
     """Transactional API over the dedicated ``fbref_control`` schema."""
 
@@ -4511,9 +4526,22 @@ class ControlStore:
             counts["snapshot_baseline"] = baseline_count
             counts["snapshot_shrink_overridden"] = int(severe_shrink)
             cursor.execute(
-                """
+                f"""
                 UPDATE fbref_control.page_frontier AS frontier
-                SET state = 'queued', next_fetch_at = clock_timestamp(),
+                SET state = CASE
+                        WHEN competition.crawl_state <> 'active'
+                         AND frontier.last_content_hash IS NOT NULL
+                         AND frontier.last_fetched_at IS NOT NULL
+                        THEN 'fetched'
+                        ELSE 'queued'
+                    END,
+                    next_fetch_at = CASE
+                        WHEN competition.crawl_state <> 'active'
+                         AND frontier.last_content_hash IS NOT NULL
+                         AND frontier.last_fetched_at IS NOT NULL
+                        THEN NULL
+                        ELSE clock_timestamp()
+                    END,
                     last_error_class = CASE
                         WHEN frontier.state = 'quarantined' THEN NULL
                         ELSE frontier.last_error_class
@@ -4527,24 +4555,28 @@ class ControlStore:
                 WHERE competition.source = frontier.source
                   AND competition.competition_id =
                       frontier.source_ids ->> 'competition_id'
-                  AND competition.gender = 'male'
-                  AND competition.crawl_state = 'active'
-                  AND competition.lifecycle_state IN (
-                      'present', 'missing_once'
-                  )
-                  AND competition.present
+                  AND {_HISTORICAL_COMPETITION_SQL}
                   AND (
-                    frontier.state = 'skipped'
+                    (
+                      competition.crawl_state = 'active'
+                      AND (
+                        frontier.state = 'skipped'
+                        OR (
+                          frontier.state = 'quarantined'
+                          AND frontier.last_error_class = 'ScopeQuarantined'
+                        )
+                      )
+                    )
                     OR (
-                      frontier.state = 'quarantined'
-                      AND frontier.last_error_class = 'ScopeQuarantined'
+                      frontier.refresh_policy = 'historical_once'
+                      AND frontier.state = 'skipped'
                     )
                   )
                 """
             )
             counts["frontier_scope_reopened"] = cursor.rowcount
             cursor.execute(
-                """
+                f"""
                 UPDATE fbref_control.page_frontier AS frontier
                 SET state = CASE
                         WHEN competition.gender IN ('female', 'unknown')
@@ -4577,6 +4609,10 @@ class ControlStore:
                     )
                     OR NOT competition.present
                   )
+                  AND NOT (
+                    frontier.refresh_policy = 'historical_once'
+                    AND {_HISTORICAL_COMPETITION_SQL}
+                  )
                   AND frontier.state <> 'leased'
                 """
             )
@@ -4608,14 +4644,9 @@ class ControlStore:
         """Allow source-proven discontinued adult competitions in historical discovery."""
         with self._transaction() as cursor:
             cursor.execute(
-                """
-                SELECT * FROM fbref_control.competition_registry
-                WHERE source = %s AND gender = 'male'
-                  AND (crawl_state = 'active' OR (crawl_state='skipped'
-                    AND metadata->>'current_scope_lifecycle'='discontinued'
-                    AND metadata->>'current_scope_reason' IS NOT NULL))
-                  AND lifecycle_state IN ('present', 'missing_once')
-                  AND present
+                f"""
+                SELECT * FROM fbref_control.competition_registry AS competition
+                WHERE source = %s AND {_HISTORICAL_COMPETITION_SQL}
                 ORDER BY competition_id
                 """,
                 (_text(source, "source"),),
@@ -5159,7 +5190,7 @@ class ControlStore:
         adult_pattern = NON_ADULT.pattern.replace(r"\b", r"\y")
         with self._transaction() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT frontier.*, EXISTS (
                     SELECT 1 FROM fbref_control.season_registry season
                     JOIN fbref_control.competition_registry competition
@@ -5171,17 +5202,10 @@ class ControlStore:
                       AND season.present AND season.lifecycle_state = 'present'
                       AND NOT season.is_current
                       AND strpos(season.canonical_url, '#superseded:') = 0
-                      AND competition.gender = 'male'
                       AND competition.competition_id <> ALL(%s)
                       AND concat_ws(' ', competition.name, competition.classification,
                           competition.metadata ->> 'source_section') !~* %s
-                      AND competition.present
-                      AND competition.lifecycle_state IN ('present', 'missing_once')
-                      AND (competition.crawl_state = 'active' OR (
-                        competition.crawl_state = 'skipped'
-                        AND competition.metadata ->> 'current_scope_lifecycle' = 'discontinued'
-                        AND competition.metadata ->> 'current_scope_reason' IS NOT NULL
-                      ))
+                      AND {_HISTORICAL_COMPETITION_SQL}
                 ) AS historical_eligible
                 FROM fbref_control.page_frontier frontier
                 WHERE frontier.source = 'fbref' AND frontier.state = 'quarantined'
@@ -5217,7 +5241,7 @@ class ControlStore:
         adult_pattern = NON_ADULT.pattern.replace(r"\b", r"\y")
         with self._transaction() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT season.*, edition.sort_year,
                        root.target_id AS root_target_id,
                        root.state AS root_state,
@@ -5247,7 +5271,7 @@ class ControlStore:
                  AND competition.competition_id = season.competition_id
                 CROSS JOIN LATERAL (
                   SELECT -COALESCE(substring(season.season_id FROM
-                    '([0-9]{4})$')::integer, 0) AS sort_year
+                    '([0-9]{{4}})$')::integer, 0) AS sort_year
                 ) edition
                 LEFT JOIN fbref_control.page_frontier root
                   ON root.source = season.source AND root.page_kind = 'season'
@@ -5279,17 +5303,11 @@ class ControlStore:
                 WHERE season.source = 'fbref'
                   AND season.lifecycle_state = 'present' AND season.present
                   AND strpos(season.canonical_url, '#superseded:') = 0
-                  AND competition.gender = 'male'
                   AND competition.competition_id <> ALL(%s)
                   AND concat_ws(' ', competition.name, competition.classification,
                       competition.metadata ->> 'source_section') !~* %s
-                  AND (competition.crawl_state = 'active' OR (
-                    NOT season.is_current AND competition.crawl_state = 'skipped'
-                    AND competition.metadata ->> 'current_scope_lifecycle' = 'discontinued'
-                    AND competition.metadata ->> 'current_scope_reason' IS NOT NULL
-                  ))
-                  AND competition.present
-                  AND competition.lifecycle_state IN ('present', 'missing_once')
+                  AND {_HISTORICAL_COMPETITION_SQL}
+                  AND (competition.crawl_state = 'active' OR NOT season.is_current)
                   AND (%s::integer IS NULL OR
                     (edition.sort_year, season.competition_id, season.season_id)
                       > (%s, %s, %s))

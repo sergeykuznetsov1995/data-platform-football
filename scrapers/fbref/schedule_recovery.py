@@ -215,7 +215,8 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
                 row["schedule_state"], row.get("schedule_error_class"),
                 row.get("schedule_http_status"),
             )
-            if not row.get("schedule_processed") and schedule_redirect:
+            # A later 301/308 parks even a once-processed schedule (#1949).
+            if schedule_redirect:
                 if schedule_redirect == "park":
                     _park_redirect(pipeline, result, row["schedule_target_id"],
                                    row["schedule_http_status"])

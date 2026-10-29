@@ -1271,7 +1271,7 @@ def test_competition_disappearance_debounces_two_accepted_snapshots():
                     present=True,
                 )
             return [], 1
-        if "SET state = 'queued'" in sql:
+        if "ELSE 'queued'" in sql:
             eligible = (
                 registry["lifecycle_state"] in {"present", "missing_once"}
                 and registry["present"]
@@ -1313,6 +1313,160 @@ def test_competition_disappearance_debounces_two_accepted_snapshots():
         "present = consecutive_misses + 1 < 2" in sql
         for sql in missing_sql
     )
+
+
+def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
+    """Run the production reconcile frontier UPDATEs on SQLite JSON/UPDATE FROM."""
+    database = sqlite3.connect(":memory:")
+    database.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    database.create_function("clock_timestamp", 0, lambda: "2026-10-29 12:00:00")
+    database.execute(
+        "CREATE TABLE fbref_control.competition_registry (source TEXT, "
+        "competition_id TEXT, gender TEXT, crawl_state TEXT, lifecycle_state TEXT, "
+        "present INTEGER, metadata TEXT)"
+    )
+    database.execute(
+        "CREATE TABLE fbref_control.page_frontier (target_id TEXT, source TEXT, "
+        "source_ids TEXT, refresh_policy TEXT, state TEXT, next_fetch_at TEXT, "
+        "retry_after TEXT, last_error_class TEXT, last_error_message TEXT, "
+        "last_content_hash TEXT, last_fetched_at TEXT, updated_at TEXT)"
+    )
+    for row in registry_rows:
+        database.execute(
+            "INSERT INTO fbref_control.competition_registry VALUES (?,?,?,?,?,?,?)",
+            ("fbref", row["competition_id"], row.get("gender", "male"),
+             row["crawl_state"], row.get("lifecycle_state", "present"),
+             int(row.get("present", True)), json.dumps(row.get("metadata", {}))),
+        )
+    for row in frontier_rows:
+        database.execute(
+            "INSERT INTO fbref_control.page_frontier (target_id, source, source_ids, "
+            "refresh_policy, state, next_fetch_at, last_error_class, "
+            "last_content_hash, last_fetched_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (row["target_id"], "fbref",
+             json.dumps({"competition_id": row["competition_id"]}),
+             row["refresh_policy"], row["state"], row.get("next_fetch_at"),
+             row.get("last_error_class"), row.get("last_content_hash"),
+             row.get("last_fetched_at")),
+        )
+
+    def handler(sql, _params):
+        if "SELECT * FROM fbref_control.registry_snapshot" in sql:
+            return [{"successful": True, "source": "fbref",
+                     "fetched_at": datetime(2026, 10, 29, tzinfo=timezone.utc)}], 1
+        if "SELECT max(last_seen_at) AS latest" in sql:
+            return [{"latest": None}], 1
+        if "SELECT count(*) AS count" in sql:
+            return [{"count": 0}], 1
+        if sql.startswith("UPDATE fbref_control.page_frontier AS frontier"):
+            return [], database.execute(sql).rowcount
+        return [], 0
+
+    store, _ = make_store(handler)
+    try:
+        counts = store.reconcile_competitions(str(uuid.uuid4()), [])
+        states = {
+            row[0]: row[1:] for row in database.execute(
+                "SELECT target_id, state, next_fetch_at, last_error_class "
+                "FROM fbref_control.page_frontier"
+            )
+        }
+    finally:
+        database.close()
+    return counts, states
+
+
+def test_reconcile_keeps_and_restores_history_of_discontinued_competitions():
+    discontinued = {
+        "competition_id": "68", "crawl_state": "skipped",
+        "metadata": {"current_scope_lifecycle": "discontinued",
+                     "current_scope_reason": "last_source_season_2010"},
+    }
+    processed = {"last_content_hash": "h", "last_fetched_at": "2026-10-01"}
+    counts, states = _reconcile_scope_on_sqlite(
+        [
+            discontinued,
+            # Same lifecycle evidence cannot rescue other closures.
+            dict(discontinued, competition_id="70", gender="female"),
+            dict(discontinued, competition_id="71", lifecycle_state="disappeared",
+                 present=False),
+            {"competition_id": "72", "crawl_state": "skipped"},
+        ],
+        [
+            # Skipped by an earlier reconcile: processed root returns as done,
+            # an unfetched one is queued.
+            {"target_id": "root", "competition_id": "68", "refresh_policy": "historical_once",
+             "state": "skipped", **processed},
+            {"target_id": "schedule", "competition_id": "68",
+             "refresh_policy": "historical_once", "state": "skipped"},
+            {"target_id": "done", "competition_id": "68", "refresh_policy": "historical_once",
+             "state": "fetched", **processed},
+            {"target_id": "leased", "competition_id": "68",
+             "refresh_policy": "historical_once", "state": "leased"},
+            {"target_id": "daily", "competition_id": "68",
+             "refresh_policy": "current_season_daily", "state": "queued",
+             "next_fetch_at": "2026-10-29"},
+            {"target_id": "female", "competition_id": "70",
+             "refresh_policy": "historical_once", "state": "fetched", **processed},
+            {"target_id": "gone", "competition_id": "71",
+             "refresh_policy": "historical_once", "state": "fetched", **processed},
+            {"target_id": "plain_skip", "competition_id": "72",
+             "refresh_policy": "historical_once", "state": "fetched", **processed},
+        ],
+    )
+    assert states == {
+        "root": ("fetched", None, None),
+        "schedule": ("queued", "2026-10-29 12:00:00", None),
+        "done": ("fetched", None, None),
+        "leased": ("leased", None, None),
+        "daily": ("skipped", None, None),
+        "female": ("quarantined", None, "ScopeQuarantined"),
+        "gone": ("skipped", None, None),
+        "plain_skip": ("skipped", None, None),
+    }
+    assert counts["frontier_scope_reopened"] == 2
+    assert counts["frontier_scope_closed"] == 4
+
+    # Idempotent: a second accepted snapshot changes nothing for history.
+    _, again = _reconcile_scope_on_sqlite(
+        [discontinued],
+        [{"target_id": "root", "competition_id": "68", "refresh_policy": "historical_once",
+          "state": "fetched", **processed}],
+    )
+    assert again == {"root": ("fetched", None, None)}
+
+
+def test_reconcile_keeps_active_competition_reopen_queued():
+    _, states = _reconcile_scope_on_sqlite(
+        [{"competition_id": "9", "crawl_state": "active"}],
+        [{"target_id": "root", "competition_id": "9", "refresh_policy": "historical_once",
+          "state": "skipped", "last_content_hash": "h", "last_fetched_at": "2026-10-01"},
+         {"target_id": "parked", "competition_id": "9",
+          "refresh_policy": "current_season_daily", "state": "quarantined",
+          "last_error_class": "ScopeQuarantined"}],
+    )
+    assert states == {
+        "root": ("queued", "2026-10-29 12:00:00", None),
+        "parked": ("queued", "2026-10-29 12:00:00", None),
+    }
+
+
+def test_historical_competition_predicate_has_one_definition():
+    from scrapers.fbref.control import store as store_module
+
+    users = [
+        ControlStore.reconcile_competitions,
+        ControlStore.eligible_historical_competitions,
+        ControlStore.list_schedule_recovery_quarantine,
+        ControlStore.list_schedule_recovery_seasons,
+    ]
+    for method in users:
+        source = inspect.getsource(method)
+        assert "{_HISTORICAL_COMPETITION_SQL}" in source, method.__name__
+        assert "current_scope_lifecycle" not in source, method.__name__
+    assert inspect.getsource(ControlStore.reconcile_competitions).count(
+        "{_HISTORICAL_COMPETITION_SQL}") == 2
+    assert inspect.getsource(store_module).count("'current_scope_lifecycle'") == 1
 
 
 def test_season_snapshot_rejects_multiple_current_rows():
