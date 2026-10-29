@@ -21,6 +21,19 @@ def whoscored_test_locks(request, monkeypatch):
         monkeypatch.setenv(variable, str(directory))
 
 
+@pytest.fixture(autouse=True)
+def transfermarkt_test_writer_lock(request, monkeypatch):
+    """Keep the Transfermarkt writer lock off the production log volume.
+
+    The writer defaults to /opt/airflow/logs, which unprivileged hosts cannot
+    write; tests that need a specific lock still override this per test.
+    """
+    if "transfermarkt" not in request.node.path.name:
+        return
+    lock = request.getfixturevalue("tmp_path_factory").mktemp("tm-lock") / "writer.lock"
+    monkeypatch.setenv("TM_WRITER_LOCK_PATH", str(lock))
+
+
 @pytest.fixture(scope="session")
 def protected_whoscored_checkout():
     """Copy tracked bytes, retaining Git identity without altering the checkout.

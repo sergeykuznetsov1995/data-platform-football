@@ -17,6 +17,7 @@ from .catalog import (
     UnderstatScope,
 )
 from .client import UnderstatClient
+from .contracts import FORECAST_COLUMNS
 from .service import UnderstatSource
 
 
@@ -207,6 +208,19 @@ class UnderstatScraper(BaseScraper):
                 min_replace_ratio,
                 replace_guard_key,
             )
+
+        # An all-NULL forecast otherwise becomes Arrow null and Trino VARCHAR.
+        # Do not coerce invalid numbers to NULL or alter unrelated source types.
+        if table_name == "understat_schedule" and any(
+            column in df for column in FORECAST_COLUMNS
+        ):
+            df = df.copy()
+            for column in FORECAST_COLUMNS:
+                if column in df:
+                    values = pd.to_numeric(df[column], errors="raise").astype("Float64")
+                    if (df[column].notna() & values.isna()).any():
+                        raise ValueError(f"Invalid numeric value in {column}")
+                    df[column] = values
 
         prepared = self._iceberg_writer._add_metadata_columns(
             df,

@@ -1250,7 +1250,7 @@ class _FakeQuery:
 def test_repository_append_is_one_append_only_row_and_is_fully_injectable():
     writer = _FakeWriter()
     query = _FakeQuery()
-    repository = UnderstatManifestRepository(writer=writer, query=query)
+    repository = UnderstatManifestRepository(writer=writer, query=query, ensure_table_on_write=True)
 
     path = repository.append_attempt(_complete_attempt())
 
@@ -1458,6 +1458,7 @@ def test_failures_journal_is_a_separate_table_with_the_manifest_schema():
         error_message="getTeamData.statistics: expected an object",
     )
 
+    repository.ensure_failures_table()
     repository.append_failure(failure)
 
     ddl = query.calls[1][0]
@@ -1608,3 +1609,38 @@ def test_incomplete_closed_scopes_rejects_unsafe_inputs():
         repository.incomplete_closed_scopes(
             before_source_season_id=2025, contract_version="x' OR 1=1 --", limit=1
         )
+
+
+def test_independent_repositories_validate_existing_schema_without_ddl():
+    def schema(sql, params):
+        assert sql.startswith("SELECT column_name, data_type")
+        return [(name, "bigint" if name == "attempt_no" else "varchar") for name in MANIFEST_COLUMNS]
+
+    query = _FakeQuery(schema)
+    for _ in range(2):
+        repository = UnderstatManifestRepository(writer=_FakeWriter(), query=query)
+        repository.validate_tables()
+        repository.append_attempt(_complete_attempt())
+    assert len(query.calls) == 4
+    assert not any("CREATE" in sql for sql, _ in query.calls)
+
+
+@pytest.mark.parametrize("rows", [[], [("attempt_no", "varchar")]])
+def test_manifest_preflight_rejects_absent_or_incompatible_schema(rows):
+    writer = _FakeWriter()
+    repository = UnderstatManifestRepository(writer=writer, query=_FakeQuery(lambda *_: rows))
+    with pytest.raises(RuntimeError, match="bootstrap"):
+        repository.validate_tables()
+    assert not writer.calls
+
+
+def test_explicit_manifest_bootstrap_creates_and_validates_both_journals():
+    def schema(sql, params):
+        if sql.startswith("SELECT"):
+            return [(name, "bigint" if name == "attempt_no" else "varchar") for name in MANIFEST_COLUMNS]
+        return []
+    query = _FakeQuery(schema)
+    repository = UnderstatManifestRepository(query=query)
+    repository.bootstrap()
+    assert sum(sql.startswith("CREATE TABLE") for sql, _ in query.calls) == 2
+    assert sum(sql.startswith("SELECT") for sql, _ in query.calls) == 2
