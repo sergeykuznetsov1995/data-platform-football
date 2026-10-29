@@ -16,8 +16,13 @@ db="${1:?password.db path}"
 env_file="${2:-$(dirname "$0")/../../.env}"
 sources=(fbref fotmob sofascore whoscored transfermarkt espn understat clubelo)
 
-# shellcheck disable=SC1090
-set -a; . "$env_file"; set +a
+# Read only our own variables: the shared .env holds values bash cannot source
+# (unquoted brackets/URLs in OM_AUTH_PUBLIC_KEYS etc.), so never `. .env`.
+while IFS= read -r line; do
+  key="${line%%=*}"; val="${line#*=}"
+  val="${val%\"}"; val="${val#\"}"
+  export "$key=$val"
+done < <(grep -E '^TRINO_SRC_[A-Z]+_PASSWORD=' "$env_file" || true)
 command -v htpasswd >/dev/null || { echo "htpasswd (apache2-utils) is required" >&2; exit 1; }
 
 missing=()

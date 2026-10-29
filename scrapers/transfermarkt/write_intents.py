@@ -95,6 +95,29 @@ def pending_intents(identity):
         if resolution_for(path) is not None:
             continue
         if all(payload['identity'].get(key) == value for key, value in identity.items()):
+            if (payload['identity'].get('kind') in {'current', 'scope'}
+                and payload['identity'].get('entity') in {'market_value_history', 'transfers'}):
+                from scrapers.transfermarkt import scraper as tm
+                for key, columns in (('market_value_points', tm.MARKET_VALUE_POINT_COLUMNS),
+                                     ('transfer_events', tm.TRANSFER_EVENT_COLUMNS)):
+                    if key not in payload['frames']:
+                        continue
+                    frame = unpack_frames({key: payload['frames'][key]})[key]
+                    refs = frame.attrs.get('tm_original_capture_refs', [])
+                    cached = {(str(ref['player_id']), str(ref['batch_id'])) for ref in refs}
+                    # Cached rows retain their original lineage. The writer
+                    # verifies their physical content before any mutation.
+                    fresh = frame.loc[[
+                        (str(player), str(batch)) not in cached
+                        for player, batch in frame[['player_id', '_batch_id']].itertuples(index=False, name=None)
+                    ]]
+                    if not set(columns) <= set(frame.columns) or any(
+                        not fresh.empty and (fresh[column].isna().any()
+                            or set(fresh[column].astype(str)) != {revision})
+                        for column, revision in (('parser_revision', tm.PARSER_REVISION),
+                                                 ('schema_revision', tm.SCHEMA_REVISION))
+                    ):
+                        raise RuntimeError('career replay parser/schema contract differs; original intent retained')
             matches.append((path, payload))
     return matches
 

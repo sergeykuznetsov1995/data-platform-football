@@ -41,11 +41,24 @@ headroom 3 ГБ и запрет MERGE без фильтра партиций (г
    `docker update --memory 20g --memory-swap 20g trino`.
 4. Heap и группы ресурсов требуют рестарта JVM — только свой сервис, только ночью:
    ```bash
-   docker compose -f /root/dpf-whoscored-merge/compose.yaml \
+   # файлы и env-файлы — ровно те, что в метках живого проекта:
+   # docker inspect trino --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
+   # docker inspect trino --format '{{index .Config.Labels "com.docker.compose.project.environment_file"}}'
+   sudo docker compose -f /root/dpf-whoscored-merge/compose.yaml \
      -f /root/whoscored-954-runtime/deploy-949/prod.override.yaml \
      -f /root/stack-recovery/recovery.override.yaml \
-     --project-directory /root/dpf-whoscored-merge up -d --no-deps trino
+     -f /root/stack-recovery/proxy-filter-image-r.override.yaml \
+     --project-directory /root/dpf-whoscored-merge \
+     --env-file /root/data-platform-football/.env \
+     --env-file /root/.secrets/whoscored-runtime-v2.env \
+     --env-file /root/.secrets/whoscored-proxy-v2.env \
+     --env-file /root/fbref-949-secrets/acceptance-949-go.env \
+     --env-file /root/a0-window-2026-08-03/a0-window.env \
+     up -d --no-deps trino
    ```
+   Один общий `.env` не годится: `FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH` (обязательная переменная
+   `x-airflow-common`) лежит в `a0-window.env`, без неё `compose config` падает на интерполяции
+   (29.10.2026). Перед `up` — `… config trino | grep -A3 'limits:'` должен показать `21474836480`.
 5. Проверка: `docker inspect trino` → Memory=21474836480, `RestartCount` не растёт;
    `SELECT * FROM system.runtime.nodes`; `curl -k https://localhost:8443/v1/info`;
    в логе `======== SERVER STARTED ========` без `OutOfMemoryError`.

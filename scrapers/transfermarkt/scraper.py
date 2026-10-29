@@ -27,6 +27,11 @@ Source: https://www.transfermarkt.com
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.revisions import (
+    PARSER_REVISION as DEFAULT_PARSER_REVISION,
+    SCHEMA_REVISION as DEFAULT_SCHEMA_REVISION,
+)
+
 import hashlib
 import json
 import logging
@@ -111,8 +116,8 @@ _CLUB_COACH_HISTORY_PATH = (
 
 R0_2B_FALLBACK_MARKER = 'TM_FALLBACK'
 
-PARSER_REVISION = os.environ.get('TM_PARSER_VERSION', 'registry-v1')
-SCHEMA_REVISION = os.environ.get('TM_SCHEMA_VERSION', '3')
+PARSER_REVISION = os.environ.get('TM_PARSER_VERSION', DEFAULT_PARSER_REVISION)
+SCHEMA_REVISION = os.environ.get('TM_SCHEMA_VERSION', DEFAULT_SCHEMA_REVISION)
 
 # Per-player loops abort after this many fetch failures in a row (burned
 # proxies, CF lockout). Module-level so tests can monkeypatch it.
@@ -991,6 +996,14 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
     return out
 
 
+def _image_id(raw, path: str) -> Optional[str]:
+    """Read a numeric source ID only from the observed image path."""
+    if not isinstance(raw, str):
+        return None
+    match = re.fullmatch(r'/' + re.escape(path) + r'/([0-9]+)(?:_[0-9]+)?\.png', urlsplit(raw).path)
+    return match.group(1) if match else None
+
+
 def _parse_mv_history(payload: dict, player_id: str) -> List[Dict]:
     """Project ``/ceapi/marketValueDevelopment/graph/{id}`` JSON to flat rows.
 
@@ -1014,7 +1027,10 @@ def _parse_mv_history(payload: dict, player_id: str) -> List[Dict]:
         rows.append({
             'player_id': str(player_id),
             'mv_date': mv_date,
-            'value_eur': _coerce_int(entry.get('y')),
+            'value_eur': None if entry.get('mw') == '-' else _coerce_int(entry.get('y')),
+            'is_value_removed': entry.get('mw') == '-' if entry.get('mw') is not None else None,
+            'club_id': _image_id(entry.get('wappen'), 'wappen/profil'),
+            'mv_last_change': _parse_tm_date(payload.get('last_change')),
             'club_name': entry.get('verein'),
             'age': _coerce_int(entry.get('age')),
             'mv_raw': entry.get('mw'),
@@ -1134,6 +1150,9 @@ def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
         from_d = entry.get('from') if isinstance(entry.get('from'), dict) else {}
         to_d = entry.get('to') if isinstance(entry.get('to'), dict) else {}
         fee_text = entry.get('fee')
+        if isinstance(fee_text, str):
+            from bs4 import BeautifulSoup
+            fee_text = BeautifulSoup(fee_text, 'html.parser').get_text(' ', strip=True)
 
         identity_base = json.dumps({
             'event_season': event_season,
@@ -1165,6 +1184,13 @@ def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
             'from_club_name': from_d.get('clubName'),
             'to_club_id': _extract_club_id_from_href(to_d.get('href')),
             'to_club_name': to_d.get('clubName'),
+            'from_is_special': from_d.get('isSpecial') if isinstance(from_d.get('isSpecial'), bool) else None,
+            'to_is_special': to_d.get('isSpecial') if isinstance(to_d.get('isSpecial'), bool) else None,
+            'from_country_flag': from_d.get('countryFlag'),
+            'to_country_flag': to_d.get('countryFlag'),
+            'from_country_id': _image_id(from_d.get('countryFlag'), 'flagge/verysmall'),
+            'to_country_id': _image_id(to_d.get('countryFlag'), 'flagge/verysmall'),
+            'is_loan_end': fee_text.startswith('End of loan') if isinstance(fee_text, str) else None,
             'fee_text': fee_text,
             'fee_eur': _parse_tm_money_eur(fee_text),
             'market_value_eur': _parse_tm_money_eur(entry.get('marketValue')),
@@ -1322,12 +1348,15 @@ PLAYER_CONTRACT_OBSERVATION_COLUMNS = [
 ]
 MARKET_VALUE_POINT_COLUMNS = [
     'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
+    'is_value_removed', 'club_id', 'mv_last_change',
     *_SCOPE_LINEAGE_COLUMNS,
 ]
 TRANSFER_EVENT_COLUMNS = [
     'transfer_id', 'player_id', 'transfer_date', 'event_season',
     'from_club_id', 'from_club_name', 'to_club_id', 'to_club_name',
     'fee_text', 'fee_eur', 'market_value_eur', 'is_upcoming',
+    'from_is_special', 'to_is_special', 'from_country_flag', 'to_country_flag',
+    'from_country_id', 'to_country_id', 'is_loan_end',
     *_SCOPE_LINEAGE_COLUMNS,
 ]
 COACH_PROFILE_COLUMNS = [
@@ -1363,10 +1392,14 @@ _NULLABLE_INTEGER_COLUMNS = {
     'age', 'height_cm', 'market_value_eur', 'value_eur', 'fee_eur',
     'shirt_number', 'signed_from_fee_eur',
 }
-_NULLABLE_BOOLEAN_COLUMNS = {'is_upcoming', 'is_on_loan', 'is_captain'}
+_NULLABLE_BOOLEAN_COLUMNS = {
+    'is_upcoming', 'is_on_loan', 'is_captain', 'is_value_removed',
+    'from_is_special', 'to_is_special', 'is_loan_end',
+}
 # Added after the tables existed: a first batch where one is all-NULL must not
 # evolve the column as VARCHAR (Arrow types an all-None object column as null).
 SQUAD_DATE_COLUMNS = ('joined_at', 'loan_until', 'injury_return_date')
+CAREER_DATE_COLUMNS = ('mv_last_change',)
 
 
 def _apply_nullable_dtypes(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1899,7 +1932,7 @@ class TransfermarktScraper(BaseScraper):
 
     def get_fetch_outcomes_envelope(self) -> Dict:
         return {
-            'schema_version': os.environ.get('TM_SCHEMA_VERSION', '2'),
+            'schema_version': SCHEMA_REVISION,
             'outcomes': self.get_fetch_outcomes(),
         }
 

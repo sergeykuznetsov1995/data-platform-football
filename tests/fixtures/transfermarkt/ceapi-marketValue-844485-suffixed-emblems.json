@@ -1,0 +1,22 @@
+{
+  "list": [
+    {
+      "x": 1642201200000,
+      "y": 50000,
+      "mw": "€50K",
+      "datum_mw": "15/01/2022",
+      "verein": "AmaZulu FC",
+      "age": "21",
+      "wappen": "https://img.a.transfermarkt.technology/wappen/profil/9370_1762320933.png?lm=1789459654"
+    },
+    {
+      "x": 1704409200000,
+      "y": 150000,
+      "mw": "€150K",
+      "datum_mw": "05/01/2024",
+      "verein": "AmaZulu FC",
+      "age": "23",
+      "wappen": "https://img.a.transfermarkt.technology/wappen/profil/9370_1762320933.png?lm=1789459654"
+    }
+  ]
+}
