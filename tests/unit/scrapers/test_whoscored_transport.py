@@ -5985,19 +5985,23 @@ def test_statistics_cached_source_absence_keeps_original_observation_time():
 
 
 @pytest.mark.unit
-def test_statistics_bootstrap_redirect_cannot_bind_destination_token():
-    from scrapers.whoscored.transport import StageStatisticsUnavailable
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_statistics_bootstrap_redirect_cannot_bind_destination_token(status_code):
+    from scrapers.whoscored.transport import StageBootstrapRedirect, StageStatisticsUnavailable
 
     direct = FakeHTTPSession(
         FakeHTTPResponse(
-            status_code=302,
+            status_code=status_code,
             content=_statistics_html(),
-            headers={"location": PLAYER_STATS_BOOTSTRAP},
+            headers={"lOcAtIoN": "https://user:password@www.whoscored.com/x;jsessionid=SECRET/y;token=TOKEN?q=PRIVATE#fragment"},
         )
     )
     transport, _ = _transport(direct)
     with pytest.raises(WhoScoredTransportError) as caught:
         transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert isinstance(caught.value, StageBootstrapRedirect)
+    assert caught.value.status_code == status_code
+    assert caught.value.redirect_location == "https://www.whoscored.com/x/y"
     assert caught.value.kind is FailureKind.HTTP_STATUS
     assert not isinstance(caught.value, StageStatisticsUnavailable)
     assert direct.calls[0][2]["allow_redirects"] is False

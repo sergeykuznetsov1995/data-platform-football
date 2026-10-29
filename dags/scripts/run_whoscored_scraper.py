@@ -1458,6 +1458,7 @@ def _merge_result(
                 "stage_xg_checked",
                 "stage_xg_retained",
                 "stage_xg_deferred",
+                "stage_xg_redirected",
             )
             if key in metadata
         }
@@ -1805,12 +1806,16 @@ def _finish(report: dict[str, Any], output: str) -> int:
     match_backlog = report.get("match_candidates") or {}
     logger.info(
         "WhoScored run complete: status=%s scopes=%d rows=%d errors=%d "
-        "match_backlog_remaining=%s",
+        "match_backlog_remaining=%s stage_xg_redirected=%d",
         report["status"],
         len(report["scopes"]),
         report["rows"],
         len(report["errors"]),
         match_backlog.get("remaining"),
+        sum(
+            len(scope.get("stage_xg", {}).get("stage_xg_redirected", []))
+            for scope in report["scopes"]
+        ),
     )
     print(json.dumps(report, ensure_ascii=False))
     return exit_code
