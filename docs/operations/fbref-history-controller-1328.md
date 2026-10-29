@@ -13,12 +13,15 @@ set this switch. The old `dag_backfill_fbref` remains a manual dry-run entry;
 its live initialization and runner are rejected. Do not restart the stopped
 `/root/fbref_history_backfill/driver.sh` alongside the controller.
 
-The default schedule is 22:30 UTC (01:30 МСК). Both scheduled and manual history
-admission must occur between 22:30 and 23:00 UTC. Delayed/queued/restarted runs
-recheck the window before lock acquisition and before any live runner starts.
-All four current reservations, including the prior day's midnight tail, remain
-protected. History cannot borrow daytime gaps without a separately reviewed
-product decision.
+The schedule is `30 4,16,22 * * *` UTC: three slices at 04:30, 16:30 and
+22:30 UTC (07:30, 19:30 and 01:30 МСК), each starting where a current
+reservation ends (#1958, owner decision 29.10.2026). Both scheduled and manual
+history admission must occur inside one of 04:30–05:00, 16:30–17:00 or
+22:30–23:00 UTC. Delayed/queued/restarted runs recheck the window before lock
+acquisition and before any live runner starts. All four current reservations,
+including the prior day's midnight tail, remain protected: each slice must end
+by 05:15, 17:15 or 23:15 UTC (next current window minus 45 minutes). The single
+policy place is `dags/utils/fbref_current_windows.py`.
 
 Migration 12 adds `history_campaign_season`, `history_timing` and
 `publication_waiter`. Campaign `adult-men-2026-v1` uses the complete adult men's
@@ -96,7 +99,7 @@ poke clocks. Existing owner,
 expiry and publication-generation fencing still fail closed for invalid state.
 
 TTL is at most the remaining DagRun duration at acquisition: current 18 hours,
-bootstrap 8 hours, history 20 minutes, replay 18 hours or acceptance/replay
+bootstrap 8 hours, history 45 minutes, replay 18 hours or acceptance/replay
 3 hours. No FBref task uses the former eight-day default. The janitor retains
 its existing one-hour lease and exact writer fence. The FBref-only wrapper
 keeps the previous bounded wait as the default for standalone callers; this
@@ -107,20 +110,23 @@ throttle. Initial evidence comes from successful committed fetch-through-parse
 observations; later history samples record actual wave `wall_ms`. Unknown or
 invalid/failed-only timing refuses admission. The conservative floor is
 180 seconds per page, plus ten minutes setup/finalization and a 45-minute
-margin before the next current window. Two pages are reserved: one recovery
-page and one live page. The live task has a 15-minute hard timeout; the full
-history run/lock ceiling is 20 minutes. The guard and hard limits complement
-one another: an observed estimate is not a worst-case guarantee.
+margin before the next current window. Admission picks `admitted_batches`: the
+largest live batch count (one page each, at most `max_batches` ≤ 12) whose
+projection — setup + (batches + 1 recovery page) × measured page time — still
+ends by the slice deadline; zero refuses the run before any paid request. The
+check repeats when `run_live_waves` starts, which runs only the batches admitted
+at that moment and stops new batches at the slice deadline. The live task has a
+35-minute wave deadline and a 40-minute hard timeout; the full history run/lock
+ceiling is 45 minutes. The guard and hard limits complement one another: an
+observed estimate is not a worst-case guarantee.
 
-This is a conservative initial throughput setting: **at most one new live page
-per night**, plus one recovered page; about seven new live pages per week, often
-less when current work, missing catalog coverage or timing closes the window.
-It establishes safe resumable ownership, not a fast historical backfill. A
-season may take many slices. Increasing shard/batch size or opening additional
-night slices requires measured complete fetch+parse/setup/tail costs, a guard
-that fits the four current reservations, regression checks and separate launch
-approval for the resulting operational scope. There is no automatic increase
-that can bypass these bounds.
+Throughput at the 180-second floor: **about ten new live pages per slice, ~30 per
+day**, often less when current work, slow measured pages, missing catalog
+coverage or queue delay shrink the slice. A season may still take many slices.
+Increasing shard/batch size, the 12-batch ceiling or opening additional slices
+requires measured complete fetch+parse/setup/tail costs, a guard that fits the
+four current reservations, regression checks and a reviewed PR. There is no
+automatic increase that can bypass these bounds.
 
 ## Isolated validation
 
@@ -167,6 +173,26 @@ in the actual production metabase.
    switch through the approved integration runtime configuration and unpause
    the new controller. Do not trigger the legacy DAG/driver, activate Silver,
    manufacture a current acceptance window or duplicate the existing observer.
+
+## Enabling at ~30 pages a day (#1958)
+
+Owner steps on production, after the reviewed release is delivered:
+
+1. Keep `dag_fbref_history_controller` paused. Deliver the FBref release through
+   the normal coordinated procedure (step 3 above; `compose.yaml` and the
+   WhoScored admission script are sealed, so the delivery carries the fresh
+   runtime-contract lock and trust roots).
+2. Set `FBREF_HISTORY_CONTROLLER_ENABLED=1` in the production compose
+   environment (`.env` or the approved override). Only `0` and `1` are admitted.
+3. Recreate only the scheduler (`docker compose ... up -d --no-deps
+   airflow-scheduler`) in a quiet window: no active FBref run, not within
+   15 minutes of a current window (00/06/12/18 UTC) and not inside a history
+   admission window. Follow `/root/SHARED-STACK-PROTOCOL.md`.
+4. Unpause the controller between 22:30 and 23:00 UTC (01:30–02:00 МСК). Make
+   the first run a canary: trigger with `request_limit=100`, `byte_limit_mb=50`
+   and check its XCom (`admitted_batches`, pages, timing) before leaving the
+   scheduled slices on.
+5. Never launch the old driver alongside this DAG.
 
 ## Rollback
 

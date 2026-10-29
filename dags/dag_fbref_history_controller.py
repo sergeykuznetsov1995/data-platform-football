@@ -17,6 +17,11 @@ from scrapers.fbref.settings import (
 )
 
 from utils.default_args import DEFAULT_ARGS
+from utils.fbref_current_windows import (
+    HISTORY_MAX_BATCHES,
+    HISTORY_SCHEDULE,
+    HISTORY_WAVE_DEADLINE_SECONDS,
+)
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
@@ -59,7 +64,10 @@ BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = 1
 MAX_SHARD_SIZE = 1
-BACKFILL_MAX_BATCHES = 1
+BACKFILL_MAX_BATCHES = HISTORY_MAX_BATCHES
+# One limit for the run, its lock TTL and the lock wait: a 04:30/16:30/22:30
+# start ends by the 45-minute margin before the next current window.
+HISTORY_RUN_TIMEOUT = timedelta(minutes=45)
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
@@ -80,13 +88,13 @@ with DAG(
         "weight_rule": "absolute",
     },
     description="Durable bounded FBref history controller",
-    schedule="30 22 * * *",
+    schedule=HISTORY_SCHEDULE,
     is_paused_upon_creation=True,
     start_date=datetime(2026, 7, 11, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
-    dagrun_timeout=timedelta(minutes=20),
+    dagrun_timeout=HISTORY_RUN_TIMEOUT,
     on_failure_callback=fbref_dag_failure_callback,
     render_template_as_native_obj=True,
     tags=["fbref", "bronze", "backfill", "raw-first"],
@@ -138,15 +146,17 @@ with DAG(
 
     One new controller, initially paused and disabled by FBREF_HISTORY_CONTROLLER_ENABLED.
     No launch before accepted current prerequisites and explicit authorization.
-    UTC slices at 22:30 advance one season and at most one live page
-    plus one recovery page. Start-year order: 2026 through 2017 across the full
-    adult men's registry, then deeper. Missing and current-owned seasons remain
+    UTC slices at 04:30, 16:30 and 22:30 (admission until :00) advance one season
+    with up to twelve live pages plus one recovery page per slice; the measured
+    projection admits about ten, ~30 pages a day. Growth needs a PR.
+    Start-year order: 2026 through 2017 across the full adult men's registry,
+    then deeper. Missing and current-owned seasons remain
     visible; current refresh owns its pages. Never launch the old driver alongside
     this DAG. Retries retain pinned membership and recover committed raw.
     Every writer shares the one-slot FBref pool. Current tasks and lock waiters
     precede history; waiting sensors reschedule. Admission rechecks after waiting,
     refuses unknown timing and includes measured fetch+parse duration.
-    Twenty-minute run/lock limits and a 45-minute margin protect four current
+    Forty-five-minute run/lock limits and a 45-minute margin protect four current
     reservations. History stays nonpublishing. Silver is outside this controller.
     """,
 ) as dag:
@@ -183,7 +193,7 @@ with DAG(
     assert_history_window = PythonOperator(
         task_id="assert_history_window",
         python_callable=guard_fbref_history_slice,
-        op_kwargs={},
+        op_kwargs={"max_batches": MAX_BATCHES},
         trigger_rule="all_success",
     )
 
@@ -210,13 +220,13 @@ with DAG(
         op_kwargs={
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
-            "ttl_seconds": 20 * 60,
+            "ttl_seconds": int(HISTORY_RUN_TIMEOUT.total_seconds()),
         },
         retries=0,
         trigger_rule="all_success",
         mode="reschedule",
         poke_interval=30,
-        timeout=20 * 60,
+        timeout=int(HISTORY_RUN_TIMEOUT.total_seconds()),
         pool=FBREF_SCRAPER_POOL,
     )
 
@@ -311,10 +321,10 @@ with DAG(
             "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
             "max_batches": MAX_BATCHES,
-            "deadline_seconds": 10 * 60,
+            "deadline_seconds": HISTORY_WAVE_DEADLINE_SECONDS,
         },
         pool=FBREF_SCRAPER_POOL,
-        execution_timeout=timedelta(minutes=15),
+        execution_timeout=timedelta(seconds=HISTORY_WAVE_DEADLINE_SECONDS + 5 * 60),
         retries=0,
         trigger_rule="all_success",
     )

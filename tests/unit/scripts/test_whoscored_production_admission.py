@@ -975,6 +975,7 @@ def _rendered_environment(service: str) -> dict[str, str]:
                 "FBREF_BATCH_PERSIST": "0",
                 "FBREF_BATCH_PERSIST_MATCHES": "8",
                 "FBREF_BATCH_PERSIST_MAX_CELLS": "150000",
+                "FBREF_HISTORY_CONTROLLER_ENABLED": "0",
                 "FBREF_PERSISTENT_HTTP_SESSION": "0",
                 "ICEBERG_WAREHOUSE": "football",
                 "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID": "d" * 64,
@@ -3486,6 +3487,7 @@ def test_scheduler_admission_derives_source_stores_from_warehouse_bucket():
         ("FBREF_BATCH_PERSIST", "1"),
         ("FBREF_BATCH_PERSIST_MATCHES", "25"),
         ("FBREF_BATCH_PERSIST_MAX_CELLS", "500000"),
+        ("FBREF_HISTORY_CONTROLLER_ENABLED", "1"),
         ("FBREF_PERSISTENT_HTTP_SESSION", "1"),
     ),
 )
@@ -3510,6 +3512,8 @@ def test_scheduler_admission_accepts_reviewed_fbref_runtime_controls(
         ("FBREF_BATCH_PERSIST_MATCHES", "26"),
         ("FBREF_BATCH_PERSIST_MAX_CELLS", "999"),
         ("FBREF_BATCH_PERSIST_MAX_CELLS", "500001"),
+        ("FBREF_HISTORY_CONTROLLER_ENABLED", "true"),
+        ("FBREF_HISTORY_CONTROLLER_ENABLED", ""),
         ("FBREF_PERSISTENT_HTTP_SESSION", "true"),
     ),
 )

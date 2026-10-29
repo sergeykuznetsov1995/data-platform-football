@@ -37,7 +37,13 @@ from scrapers.fbref.settings import (
     strict_binary_flag,
 )
 
-from utils.fbref_current_windows import current_window_reservations
+from utils.fbref_current_windows import (
+    HISTORY_MAX_BATCHES,
+    HISTORY_SLICE_HOURS_UTC,
+    HISTORY_WAVE_DEADLINE_SECONDS,
+    current_window_reservations,
+    history_slice_window,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -2161,9 +2167,23 @@ def run_fbref_live_waves(
     if run_type == "backfill":
         if dag_id != "dag_fbref_history_controller":
             raise RuntimeError("Legacy history runner is retired")
-        guard_fbref_history_slice()
-        if int(shard_size) != 1 or normalized_batches != 1 or not 0 < float(deadline_seconds) <= 600:
-            raise ValueError("History slice must stay one page/one batch with a bounded deadline")
+        if (
+            int(shard_size) != 1
+            or normalized_batches > HISTORY_MAX_BATCHES
+            or not 0 < float(deadline_seconds) <= HISTORY_WAVE_DEADLINE_SECONDS
+        ):
+            raise ValueError(
+                "History slice must stay one page per batch, at most "
+                f"{HISTORY_MAX_BATCHES} batches, with a bounded deadline"
+            )
+        # Re-admit at wave start: queue/setup time shrinks the slice, so the
+        # batch count and deadline are recomputed now, not taken from 22:30.
+        admission = guard_fbref_history_slice(max_batches=normalized_batches)
+        normalized_batches = min(normalized_batches, admission["admitted_batches"])
+        remaining = (
+            datetime.fromisoformat(admission["deadline"]) - datetime.now(timezone.utc)
+        ).total_seconds()
+        deadline_seconds = min(float(deadline_seconds), max(remaining, 1.0))
     command = [
         _legacy_scraper_python(),
         LIVE_WAVES_RUNNER,
@@ -2802,17 +2822,33 @@ def wait_fbref_publication_lock(*, airflow_run_id, dag_id, ttl_seconds, **contex
     return bool(result.get("acquired") or result.get("idempotent"))
 
 
-def guard_fbref_history_slice(**_context):
+def guard_fbref_history_slice(*, max_batches=HISTORY_MAX_BATCHES, **_context):
+    """Admit the largest live batch count whose projection fits the slice.
+
+    One extra page is reserved for the single recovery batch of the slice.
+    ``admitted_batches`` caps run_live_waves; zero admits nothing.
+    """
     _require_history_controller_enabled()
+    from airflow.exceptions import AirflowFailException
     now = datetime.now(timezone.utc)
-    if not (now.hour == 22 and now.minute >= 30):
-        from airflow.exceptions import AirflowFailException
-        raise AirflowFailException("FBref history admission is restricted to the night window 22:30-23:00 UTC")
+    if history_slice_window(now) is None:
+        windows = ", ".join(f"{hour:02d}:30-{hour + 1:02d}:00" for hour in HISTORY_SLICE_HOURS_UTC)
+        raise AirflowFailException(f"FBref history admission is restricted to UTC windows {windows}")
+    ceiling = _normalize_live_batch_count(max_batches)
     from scrapers.fbref.history import HistoryCampaign, HISTORY_SETUP_SECONDS
-    return guard_fbref_history_window(max_batches=2, shard_size=1,
-        overhead_minutes=HISTORY_SETUP_SECONDS // 60,
-        now=now,
-        measured_page_seconds=HistoryCampaign(_control_store()).page_seconds())
+    measured = HistoryCampaign(_control_store()).page_seconds()
+    refusal = None
+    for admitted in range(ceiling, 0, -1):
+        try:
+            verdict = guard_fbref_history_window(max_batches=admitted + 1, shard_size=1,
+                overhead_minutes=HISTORY_SETUP_SECONDS // 60,
+                now=now,
+                measured_page_seconds=measured)
+        except AirflowFailException as exc:
+            refusal = exc
+            continue
+        return {**verdict, "admitted_batches": admitted}
+    raise refusal
 
 
 def prepare_fbref_history_campaign(*, airflow_run_id, dag_id):

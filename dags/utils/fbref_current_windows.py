@@ -52,3 +52,35 @@ def current_window_reservations(now: datetime):
             yield start, start + timedelta(
                 seconds=budget + CURRENT_RESERVATION_HEADROOM_SECONDS
             )
+
+
+# History slices open where a current reservation ends (04:30, 16:30, 22:30 UTC)
+# and admit a run for 30 minutes. Pages per slice are bounded by the measured
+# projection against the next reservation (#1958); growth needs a PR.
+HISTORY_SLICE_HOURS_UTC = (4, 16, 22)
+HISTORY_SLICE_START_MINUTE = 30
+HISTORY_SLICE_ADMISSION_MINUTES = 30
+HISTORY_SCHEDULE = (
+    f"{HISTORY_SLICE_START_MINUTE} "
+    + ",".join(map(str, HISTORY_SLICE_HOURS_UTC))
+    + " * * *"
+)
+HISTORY_MAX_BATCHES = 12
+HISTORY_WAVE_DEADLINE_SECONDS = 35 * 60
+
+
+def history_slice_window(now: datetime):
+    """Return (start, admission_end) of the slice containing ``now``, else None.
+
+    Naive datetimes are interpreted as UTC, never the worker's local timezone.
+    """
+    at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    at = at.astimezone(timezone.utc)
+    for hour in HISTORY_SLICE_HOURS_UTC:
+        start = at.replace(
+            hour=hour, minute=HISTORY_SLICE_START_MINUTE, second=0, microsecond=0
+        )
+        end = start + timedelta(minutes=HISTORY_SLICE_ADMISSION_MINUTES)
+        if start <= at < end:
+            return start, end
+    return None

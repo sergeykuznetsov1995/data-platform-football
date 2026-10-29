@@ -791,6 +791,8 @@ services:
       # Scheduler-only because LocalExecutor children inherit it. WhoScored's
       # admission policy validates this exact FBref-only binary control.
       FBREF_PERSISTENT_HTTP_SESSION: ${FBREF_PERSISTENT_HTTP_SESSION:-0}
+      # Default-off history controller (#1958); the owner enables it on prod.
+      FBREF_HISTORY_CONTROLLER_ENABLED: ${FBREF_HISTORY_CONTROLLER_ENABLED:-0}
     # YAML merge keys replace sequences, so repeat the common mounts before
     # appending the scheduler-only, deployment-owned approval directory.
     volumes:
