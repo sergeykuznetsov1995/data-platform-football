@@ -157,7 +157,7 @@ def _without_reference(entry: Mapping, as_of: datetime) -> bool:
 
 
 def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
-                   as_of: datetime) -> tuple[dict, list]:
+                   as_of: datetime, *, registered_seasons: frozenset = frozenset()) -> tuple[dict, list]:
     counts = Counter()
     problems = []
     seasons = snapshot.get("fotmob_seasons", [])
@@ -186,7 +186,8 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                           if str(r["competition_id"]) == str(fid)}
             newer = sorted(key for key in known_keys
                            if _edition_token(key) and
-                           int(_edition_token(key)[-4:]) > int(canonical_season[-4:]))
+                           int(_edition_token(key)[-4:]) > int(canonical_season[-4:])
+                           and _edition_token(key) not in registered_seasons)
             if newer:
                 problems.append({"competition_id": cid, "season_id": sid,
                                  "fotmob_id": str(fid), "reason": "fbref_registry_behind_fotmob",

@@ -7,6 +7,7 @@ from typing import Callable
 
 from scrapers.fbref.daily_report import adult_competition, instant, page_age_scope
 from scrapers.fbref.policy import PUBLICATION_FRESHNESS_PAGE_KINDS
+from scrapers.fbref.weekly_report import completed_week
 
 REGISTRY_SQL = """
 SELECT jsonb_build_object(
@@ -18,7 +19,7 @@ SELECT jsonb_build_object(
    FROM fbref_control.competition_registry WHERE source='fbref') c),
  'seasons', (SELECT coalesce(jsonb_agg(s), '[]') FROM (
    SELECT competition_id,season_id,is_current,present,lifecycle_state
-   FROM fbref_control.season_registry WHERE source='fbref' AND is_current) s),
+   FROM fbref_control.season_registry WHERE source='fbref') s),
  'schedule_health', (SELECT coalesce(jsonb_agg(h), '[]') FROM (
    SELECT s.competition_id, s.season_id,
           bool_or(f.page_kind = 'schedule' AND f.last_fetched_at IS NOT NULL
@@ -33,7 +34,7 @@ SELECT jsonb_build_object(
    LEFT JOIN fbref_control.page_frontier f
      ON f.source_ids->>'competition_id' = s.competition_id
     AND f.source_ids->>'season_id' = s.season_id
-   WHERE s.is_current AND s.present
+   WHERE s.present
    GROUP BY s.competition_id,s.season_id
  ) h)
 )::text
@@ -43,7 +44,7 @@ OBSERVATIONS_SQL = """
 SELECT coalesce(jsonb_agg(o), '[]')::text
 FROM fbref_control.match_report_observation o
 JOIN fbref_control.season_registry s USING (competition_id,season_id)
-WHERE s.is_current AND o.first_seen_at <= '{cutoff}'::timestamptz
+WHERE o.first_seen_at <= '{cutoff}'::timestamptz
 """
 
 READINESS_SQL = """
@@ -70,7 +71,7 @@ SELECT coalesce(jsonb_agg(r), '[]')::text FROM (
   AND t.validation_status = 'succeeded'
   AND t.completed_at >= o.first_completed_seen_at
   AND t.completed_at <= '{cutoff}'::timestamptz
- WHERE s.is_current
+ WHERE o.first_seen_at <= '{cutoff}'::timestamptz
  GROUP BY o.competition_id,o.season_id,o.match_id
 ) r
 """
@@ -218,8 +219,10 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
         snapshot["errors"].append({"source": "fbref_registry", "reason": "empty_adult_universe"})
         return snapshot
     fb_ids = ",".join("'" + str(int(cid)) + "'" for cid in sorted(adults))
-    start = (day - timedelta(days=lookback - 1)).isoformat()
-    end = day.isoformat()
+    week_start, week_end = completed_week(as_of)
+    start = min(day - timedelta(days=lookback - 1), week_start).isoformat()
+    end = max(day, week_end - timedelta(days=1)).isoformat()
+    snapshot["coverage"] = {"start": start, "end": end, "as_of": cutoff}
     snapshot["schedules"] = read("fbref_schedule", trino, f"""
         SELECT source_competition_id,source_season_id,date,time,home,away,score,notes,match_url
         FROM iceberg.bronze.fbref_schedule
