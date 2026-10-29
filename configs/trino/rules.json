@@ -1,18 +1,18 @@
 {
   "catalogs": [
-    { "user": "airflow|superset|openmetadata", "allow": "all" },
+    { "user": "airflow|superset|openmetadata|src_[a-z]+", "allow": "all" },
     { "group": "platform-admins", "allow": "all" },
     { "catalog": "iceberg|system", "allow": "read-only" },
     { "allow": "none" }
   ],
   "schemas": [
-    { "user": "airflow|superset|openmetadata", "owner": true },
+    { "user": "airflow|superset|openmetadata|src_[a-z]+", "owner": true },
     { "group": "platform-admins", "owner": true },
     { "owner": false }
   ],
   "tables": [
     {
-      "user": "airflow|superset|openmetadata",
+      "user": "airflow|superset|openmetadata|src_[a-z]+",
       "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
     },
     {
@@ -28,7 +28,7 @@
   ],
   "procedures": [
     {
-      "user": "airflow|superset|openmetadata",
+      "user": "airflow|superset|openmetadata|src_[a-z]+",
       "privileges": ["EXECUTE", "GRANT_EXECUTE"]
     },
     {
