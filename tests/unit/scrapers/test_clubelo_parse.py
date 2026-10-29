@@ -105,6 +105,52 @@ def test_club_pages(slug, points, first, last, no_result):
     assert sum(not m["has_result"] for m in page.matches) == no_result
 
 
+def history_headers_html(slug):
+    path = Path(__file__).parents[2] / "fixtures/clubelo/history_headers" / f"{slug}.html.gz"
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        return fh.read()
+
+
+@pytest.mark.parametrize("slug, points, boundary, newer, older", [
+    ("sk-beveren", 29, 14,
+     (date(2026, 1, 17), "2-1", 1623), (date(2025, 12, 20), "4-2", 1579)),
+    ("bandirmaspor", 53, 14,
+     (date(2026, 1, 17), "4-1", 1587), (date(2025, 12, 27), "0-2", 1572)),
+    ("johor-darul-tazim", 32, 9,
+     (date(2026, 2, 10), "1-2", 1572), (date(2025, 12, 9), "0-0", 1559)),
+])
+def test_club_matches_with_year_headers(slug, points, boundary, newer, older):
+    page = parse_club_page(history_headers_html(slug), slug)
+    assert page.captured_rating_date == date(2026, 10, 27)
+    assert len(page.points) == points
+    assert len(page.matches) == 16
+    assert [m["row_seq"] for m in page.matches] == list(range(16))
+    for row, expected in zip(page.matches[boundary:boundary + 2], (newer, older)):
+        assert (row["match_date"], row["ft"], row["new_elo"]) == expected
+
+
+@pytest.mark.parametrize("old, new, error", [
+    ("<th>New Rank</th>", "", "14 th"),
+    ("<th>P</th>", "<th>Pen</th>", "headers changed"),
+    ("<th>Elo %</th><th>FT</th>", "<th>FT</th><th>Elo %</th>", "headers changed"),
+])
+def test_second_year_header_fails_closed(old, new, error):
+    html = history_headers_html("sk-beveren")
+    start = html.index('<tr><th><span class="max960">2025</span>')
+    assert old in html[start:]
+    broken = html[:start] + html[start:].replace(old, new, 1)
+    with pytest.raises(LayoutChanged, match=error):
+        parse_club_page(broken, "sk-beveren")
+
+
+def test_match_table_without_headers_fails_closed():
+    html = history_headers_html("sk-beveren")
+    # Keep header text so the table is still found, but remove every th row.
+    broken = html.replace("<th", "<caption").replace("</th>", "</caption>")
+    with pytest.raises(LayoutChanged, match="no headers"):
+        parse_club_page(broken, "sk-beveren")
+
+
 def test_riverplate_header_and_rows(riverplate_html):
     page = parse_club_page(riverplate_html, "riverplate")
     assert page.club_name == "River Plate"
