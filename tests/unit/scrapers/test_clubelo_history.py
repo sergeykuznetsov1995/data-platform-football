@@ -360,3 +360,63 @@ def test_known_slugs_on_an_empty_manifest():
     writer.read_table.return_value = pd.DataFrame(
         [["Arsenal"], ["riverplate"], ["Arsenal"]], columns=["slug"])
     assert history.IcebergHistoryStore(writer).known_slugs() == {"Arsenal", "riverplate"}
+
+
+@pytest.mark.parametrize("interval,expected", [(None, 1.0), ("2", 2.0), ("1.5", 1.5)])
+def test_cli_history_interval_reaches_real_transport(tmp_path, monkeypatch, interval, expected):
+    import importlib
+    import json
+    import sys
+    from contextlib import nullcontext
+
+    import requests
+
+    session = FakeSession(_answers())
+    session.close = MagicMock()
+    store = MemoryStore(_closed_except(CLUBS))
+    now = [0.0]
+    request_times = []
+    original_get = session.get
+
+    def get(url, **kwargs):
+        request_times.append(now[0])
+        return original_get(url, **kwargs)
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    def transport(session, **kwargs):
+        return ClubEloTransport(session, clock=lambda: now[0], sleep=sleep, **kwargs)
+
+    monkeypatch.setattr(session, "get", get)
+    monkeypatch.setattr(requests, "Session", lambda: nullcontext(session))
+    monkeypatch.setattr(history, "ClubEloTransport", transport)
+    monkeypatch.setattr(history, "IcebergHistoryStore", lambda: store)
+    output = tmp_path / "history.json"
+    args = ["run_clubelo_scraper.py", "--mode", "history", "--output", str(output)]
+    if interval is not None:
+        args += ["--history-min-interval", interval]
+    monkeypatch.setattr(sys, "argv", args)
+    runner = importlib.import_module("dags.scripts.run_clubelo_scraper")
+    assert runner.main() == 0
+    assert len(request_times) == 5
+    assert all(b - a >= expected for a, b in zip(request_times, request_times[1:]))
+    # No real waits or HTTP/SQL: full parsing and writes use the fixture store.
+    assert now[0] == 4 * expected
+    assert json.loads(output.read_text())["pending_after"] == 0
+    assert store.ensured
+    session.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("interval", [0, -1, 0.5, float("nan"), float("inf"), -float("inf")])
+def test_run_default_rejects_invalid_interval_before_side_effects(monkeypatch, interval):
+    import requests
+
+    session = MagicMock()
+    store = MagicMock()
+    monkeypatch.setattr(requests, "Session", session)
+    monkeypatch.setattr(history, "IcebergHistoryStore", store)
+    with pytest.raises(ValueError, match="finite and >= 1"):
+        history.run_default(min_interval=interval)
+    session.assert_not_called()
+    store.assert_not_called()

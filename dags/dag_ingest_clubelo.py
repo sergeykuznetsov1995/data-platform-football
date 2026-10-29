@@ -58,6 +58,7 @@ with DAG(
         # Manual only — "Trigger DAG w/ config" {"run_history": true}; the
         # daily chain is skipped in that run.
         'run_history': False,
+        'history_min_interval': 1.0,
         'run_watch': False,
     },
     doc_md="""
@@ -97,7 +98,9 @@ with DAG(
     skips the daily chain. Batches of 200 clubs are resumable: a new run
     continues with the clubs not yet closed in
     `bronze.clubelo_history_manifest`. Any failed page, redirect, block or
-    pending club makes the task red.
+    pending club makes the task red. Set `history_min_interval` to a finite
+    number >= 1 to slow history requests (seconds, default 1). Batch size
+    controls commits, not the number of clubs processed in the run.
 
     ### Registration / Fixtures watch (#1466)
 
@@ -169,9 +172,11 @@ rm -f /tmp/clubelo_history_result.json && \
 /opt/legacy-scraper-venv/bin/python dags/scripts/run_clubelo_scraper.py \
     --mode history \
     --batch-size 200 \
+    --history-min-interval "$CLUBELO_HISTORY_MIN_INTERVAL" \
     --output /tmp/clubelo_history_result.json
 """,
         env={
+            'CLUBELO_HISTORY_MIN_INTERVAL': '{{ params.history_min_interval }}',
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',

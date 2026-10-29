@@ -19,6 +19,7 @@ reports optional weekly checks without making daily collection red.
 import argparse
 import json
 import logging
+import math
 import sys
 
 logging.basicConfig(
@@ -57,7 +58,7 @@ def run_history_mode(args) -> int:
     try:
         from scrapers.clubelo.history import exit_code, run_default
 
-        results = run_default(batch_size=args.batch_size)
+        results = run_default(batch_size=args.batch_size, min_interval=args.history_min_interval)
         code = exit_code(results)
     except Exception as e:
         logger.error(f"ClubElo history failed: {e}", exc_info=True)
@@ -112,11 +113,17 @@ def main():
         default=200,
         help='--mode history: clubs per committed batch (default 200)'
     )
+    parser.add_argument(
+        '--history-min-interval', type=float, default=1.0,
+        help='--mode history: minimum seconds between requests (finite, >= 1; default 1)'
+    )
     parser.add_argument('--state-file', default='/opt/airflow/logs/clubelo_registration_watch.json',
                         help='--mode watch: persistent dedup state on the logs volume')
     parser.add_argument('--source', choices=['html', 'api'], default='html',
                         help='--mode watch: same source switch as the collection; api remains unimplemented')
     args = parser.parse_args()
+    if not math.isfinite(args.history_min_interval) or args.history_min_interval < 1:
+        parser.error("--history-min-interval must be finite and >= 1 second")
 
     if args.mode == 'watch':
         return run_watch_mode(args)
