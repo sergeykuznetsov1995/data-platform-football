@@ -30,6 +30,7 @@ from utils.understat_tasks import (
     _close_understat_client,
     _deduplicate_scopes,
     UnderstatScopeOperator,
+    maintain_understat_snapshots,
     scope_environment,
     validate_scope_result,
     validate_understat_leagues,
@@ -221,7 +222,16 @@ with DAG(
         retries=0,
     )
 
-    plan_scopes >> run_scope >> enrich_matches >> enrichment_finished
+    maintain_snapshots = PythonOperator(
+        task_id="maintain_snapshots",
+        python_callable=maintain_understat_snapshots,
+        trigger_rule="all_done",
+        retries=1,
+        priority_weight=1,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+    plan_scopes >> run_scope >> enrich_matches >> enrichment_finished >> maintain_snapshots
     run_scope >> json_failure
 
 
