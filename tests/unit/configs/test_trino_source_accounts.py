@@ -71,7 +71,11 @@ def test_sync_script_renders_eight_bcrypt_accounts(tmp_path):
     if shutil.which("htpasswd") is None:
         pytest.skip("htpasswd (apache2-utils) not installed")
     env = tmp_path / ".env"
-    env.write_text("".join(f"TRINO_SRC_{s.upper()}_PASSWORD=pw-{s}\n" for s in SOURCES))
+    # the shared .env contains lines bash cannot source — the script must not
+    # `. .env` (29.10: OM_AUTH_PUBLIC_KEYS=[https://...] broke the prod render)
+    env.write_text("OM_AUTH_PUBLIC_KEYS=[https://a.example/certs, https://b.example/certs]\n"
+                   + "".join(f"TRINO_SRC_{s.upper()}_PASSWORD=pw-{s}\n" for s in SOURCES)
+                   + "TRINO_SRC_NOT_A_SOURCE_PASSWORD=ignored\n")
     db = tmp_path / "password.db"
     db.write_text("airflow:$2y$10$existinghash\n")
     res = subprocess.run([str(SCRIPT), str(db), str(env)], capture_output=True, text=True)
