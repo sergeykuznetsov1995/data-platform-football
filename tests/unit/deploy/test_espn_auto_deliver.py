@@ -117,6 +117,8 @@ class World:
         self.compose_calls: list[list[str]] = []
         self.compose_envs: list[str] = []
         self.ignore_init = False
+        self.measurement_result = (0, json.dumps({"stale": True, "reason": "no_controller_state"}), "")
+        self.measurement_calls = 0
 
 
 class FakeHost(ad.Host):
@@ -149,6 +151,10 @@ class FakeHost(ad.Host):
         if cmd[1] == "exec" and cmd[2] == ad.METADB:
             return self._psql(cmd[-1])
         if cmd[1] == "exec" and cmd[2] == ad.SCHEDULER:
+            if cmd[3:] == ["python", "-m", "scrapers.espn.measure_pace", "status", "--format", "json"]:
+                assert timeout == 60
+                w.measurement_calls += 1
+                return w.measurement_result
             target = cmd[-1]
             rel = {v: k for k, v in ad.BYTE_CHECK.items()}[target]
             base = w.root / rel
@@ -464,6 +470,78 @@ def test_window_between_waves(env, clock, running, busy):
     assert (state(paths, "accepted") == sha) is not busy
     assert bool(up_calls(world)) is not busy
     assert host.sent == ([] if busy else [f"✅ ESPN выкачен {sha[:12]} (master)"])
+
+
+@pytest.mark.parametrize("result, blocked", [
+    ((0, json.dumps({"status": status, "step": 2, "stale": False}), ""), True)
+    for status in ("starting", "running", "draining")
+] + [
+    ((0, json.dumps({"status": "running", "step": 2}), ""), True),
+    ((0, json.dumps({"status": "complete", "stale": False}), ""), False),
+    ((0, json.dumps({"status": "stopped", "stale": True}), ""), False),
+    ((0, json.dumps({"status": "failed", "stale": True}), ""), False),
+    ((0, json.dumps({"stale": True, "reason": "no_controller_state"}), ""), False),
+    *[((0, json.dumps({"status": status, "stale": True}), ""), True)
+      for status in ("starting", "running", "draining")],
+    ((1, "", "exec failed"), True),
+    ((124, "", "timeout 60s"), True),
+    ((0, "not json", ""), True),
+    ((0, "null", ""), True),
+    ((0, "[]", ""), True),
+])
+def test_cron_waits_for_measurement(env, result, blocked):
+    repo, paths, world, host, base = env
+    seed(env)
+    world.measurement_result = result
+    sha = repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == (base if blocked else sha)
+    assert bool(up_calls(world)) is not blocked
+    assert world.measurement_calls == 1
+    if blocked:
+        assert "замер" in host.lines[-1]
+        assert host.sent == []
+
+
+@pytest.mark.parametrize("status", ["running", "draining"])
+def test_cron_waits_for_stale_measurement_status(env, tmp_path, status):
+    from scrapers.espn.measure_pace import read_status
+    from scrapers.espn.pace_store import PaceStore
+
+    repo, paths, world, host, base = env
+    seed(env)
+    store = PaceStore(tmp_path / "pace.sqlite3")
+    store.save({"status": status, "heartbeat": START.timestamp(), "report": {"step": 2}})
+    if status == "running":
+        store.record("observation", START.timestamp(), known=False, reason="debt_query_stale")
+    report = read_status(store.path, now=START)
+    assert report["status"] == status
+    assert report["stale"] is True
+    world.measurement_result = (0, json.dumps(report), "")
+    repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == base
+    assert up_calls(world) == []
+    assert world.measurement_calls == 1
+    assert "замер" in host.lines[-1]
+    assert host.sent == []
+
+
+@pytest.mark.parametrize("mode", ["--target", "--rollback"])
+def test_manual_delivery_skips_measurement(env, mode):
+    repo, paths, world, host, base = env
+    seed(env)
+    sha = repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "fix")
+    assert ad.main(["--target", sha], host=host) == 0
+    world.compose_calls.clear()
+    world.measurement_result = (0, json.dumps({"status": "running", "step": 2, "stale": False}), "")
+    # Для --target нужен новый SHA; --rollback возвращает посеянный релиз.
+    target = repo.commit({"scrapers/espn/helper.py": "def go():\n    return 3\n"}, "next") if mode == "--target" else base
+    args = [mode, target] if mode == "--target" else [mode]
+    assert ad.main(args, host=host) == 0
+    assert state(paths, "accepted") == target
+    assert up_calls(world)
+    assert world.measurement_calls == 0
 
 
 # ---------- приёмка и откат ----------
