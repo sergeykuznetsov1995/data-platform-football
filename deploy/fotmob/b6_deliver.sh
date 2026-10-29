@@ -22,6 +22,7 @@ DELIVER_NONCE=${FOTMOB_DELIVER_NONCE:-}
 DELIVER_NONCE_FILE=${FOTMOB_DELIVER_NONCE_FILE:-}
 # shellcheck source=deploy/fotmob/env.sh
 . "$(dirname "$(readlink -f "$0")")/env.sh"
+. "$(dirname "$(readlink -f "$0")")/delivery_barrier.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
 fotmob_load_package "${PACKAGE_FILE:-${FOTMOB_DELIVERY_PACKAGE:?FOTMOB_DELIVERY_PACKAGE не задан}}" "$PACKAGE_DIGEST" || exit 2
 
@@ -165,7 +166,11 @@ if [ "$MODE" != apply ]; then say "check ПРОЙДЕН (apply не запрош
 
 DELIVERY_STARTED_AT=$(date -u +%FT%TZ)
 say "3. Переключение (git checkout -B deploy/fotmob-b6-master $TARGET)"
-git checkout -B deploy/fotmob-b6-master "$TARGET"
+if [ "$DRY" = 1 ]; then
+  git checkout -B deploy/fotmob-b6-master "$TARGET"
+else
+  barrier_checkout -B deploy/fotmob-b6-master "$TARGET" || die "барьер доставки не пройден; паузы сохранены"
+fi
 git log --oneline -1
 
 if [ "$DRY" = 1 ]; then say "сухой прогон: приёмка контейнером пропущена"; exit 0; fi

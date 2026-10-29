@@ -103,13 +103,32 @@ def _layout(tmp_path: Path) -> dict[str, str]:
     }
 
 
+BARRIER_PRODUCERS = (
+    "dag_backfill_fotmob", "dag_collect_fotmob_players", "dag_orchestrate_fotmob",
+    "dag_refresh_fotmob", "dag_refresh_fotmob_c1", "dag_trigger_fotmob_daily",
+)
+
+
+def _barrier_stub_cases(tmp_path: Path) -> str:
+    external = tmp_path / "external.airflowignore"
+    external.write_text("external block-list\n", encoding="utf-8")
+    snapshot = "\n".join(f"{dag}|{'t' if dag == 'dag_backfill_fotmob' else 'f'}" for dag in BARRIER_PRODUCERS)
+    return (
+        f'  *"SELECT dag_id, is_paused"*) printf "%s\\n" "{snapshot}" ;;\n'
+        '  *"UPDATE dag SET is_paused=true"*) echo 0 ;;\n'
+        '  *"BEGIN;"*) echo 5 ;;\n'
+        f'  *inspect*) echo "{external}" ;;\n'
+        f'  *"md5sum /opt/airflow/dags/.airflowignore"*) md5sum "{external}" ;;\n'
+    )
+
+
 def _install(tmp_path: Path, stubs: Path) -> Path:
     """Копия deploy/fotmob как после `install` рунбука (скрипты рядом, автомат зовёт
     b6_deliver.sh по соседству) с ровно одной правкой: фиксированный PATH автомата
     получает впереди каталог заглушек. Возвращает путь установленного автомата."""
     libexec = tmp_path / "libexec"
     libexec.mkdir()
-    for src in (AUTO, B6, ALERT, ENV_SH):
+    for src in (AUTO, B6, ALERT, ENV_SH, DEPLOY / "delivery_barrier.sh"):
         text = src.read_text(encoding="utf-8")
         if src == AUTO:
             assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
@@ -256,10 +275,13 @@ def _two_commits(repo: Path) -> tuple[str, str]:
     repo.mkdir(exist_ok=True)
     _git(repo, "init", "-q")
     (repo / "a.txt").write_text("a", encoding="utf-8")
-    _git(repo, "add", "a.txt")
+    (repo / "dags").mkdir()
+    (repo / "dags/.airflowignore").write_text("one\n")
+    _git(repo, "add", "a.txt", "dags/.airflowignore")
     _git(repo, "commit", "-q", "-m", "one")
     one = _git(repo, "rev-parse", "HEAD")
     (repo / "a.txt").write_text("b", encoding="utf-8")
+    (repo / "dags/.airflowignore").write_text("two\n")
     _git(repo, "commit", "-q", "-am", "two")
     two = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "-q", "--detach", one)
@@ -349,6 +371,7 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
         stubs, "docker",
         f'echo "$*" >> "{calls}"\n'
         'case "$*" in\n'
+        + _barrier_stub_cases(tmp_path) +
         '  *pgrep*) exit 1 ;;\n'                    # юнит кампании в контейнере не жив
         f'  *md5sum*) echo "{md5}  file" ;;\n'      # целевой модуль виден из контейнера
         '  *sha256sum*) echo "' + 'a' * 64 + '  file" ;;\n'
@@ -596,6 +619,7 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
         stubs, "docker",
         f'echo "$*" >> "{calls}"\n'
         'case "$*" in\n'
+        + _barrier_stub_cases(tmp_path) +
         '  *pgrep*) exit 1 ;;\n'
         f'  *md5sum*) echo "{md5}  file" ;;\n'
         # Команду чтения task-лога исполняем по-настоящему, подменив только корень путей.
@@ -952,6 +976,7 @@ def _pin_probe(script: Path, tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     shutil.copy(ENV_SH, tmp_path / "env.sh")
+    shutil.copy(DEPLOY / "delivery_barrier.sh", tmp_path / "delivery_barrier.sh")
     return probe
 
 
@@ -1291,3 +1316,245 @@ def test_review_recovery_package_cannot_start_new_delivery(tmp_path: Path) -> No
     assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
     assert not list(w["state"].glob("fotmob-auto-deliver-attempted-*"))
     assert not w["driver_started"].exists()
+
+
+def _trace_barrier(w: dict, tmp_path: Path, failure: str = "") -> Path:
+    """SQL/process stubs only; checkout and shell control flow remain real."""
+    events = tmp_path / "barrier.events"
+    live = tmp_path / "barrier.live"
+    docker = w["stubs"] / "docker"
+    text = docker.read_text()
+    cases = (
+        '  *"UPDATE dag SET is_paused=true"*)\n'
+        f'    echo pause >> "{events}"\n'
+        + ('    exit 42 ;;\n' if failure == "pause" else
+           '    echo 1 ;;\n' if failure == "unconfirmed" else '    echo 0 ;;\n')
+        + '  *"FROM task_instance"*)\n'
+        f'    if [ ! -e "{live}" ]; then touch "{live}"; echo live >> "{events}"; echo 1;\n'
+        f'    else echo drained >> "{events}"; echo 0; fi ;;\n'
+        '  *"BEGIN;"*)\n'
+        # Pauses originally set by the owner must never be removed.
+        '    [[ "$*" != *"is_paused=false WHERE dag_id=\'dag_backfill_fotmob\'"* ]] || exit 43\n'
+        f'    echo release >> "{events}"; echo 5 ;;\n'
+    )
+    if failure in ("query", "timeout"):
+        start = cases.index('  *"FROM task_instance"*)')
+        end = cases.index('  *"BEGIN;"*)', start)
+        cases = cases[:start] + '  *"FROM task_instance"*) ' + (
+            'exit 42 ;;\n' if failure == "query" else 'echo 1 ;;\n'
+        ) + cases[end:]
+    docker.write_text(text.replace('case "$*" in\n', 'case "$*" in\n' + cases, 1))
+    _stub(w["stubs"], "git",
+          'for arg in "$@"; do [ "$arg" = checkout ] || continue\n'
+          f'  echo checkout >> "{events}"\ndone\nexec /usr/bin/git "$@"\n')
+    return events
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", ["red-wave", "recovery", "apply", "failed-apply"])
+def test_checkout_barrier_drains_a_wave_born_after_the_zero_snapshot(tmp_path: Path, route: str) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__race|failed|2026-09-08T00:00:10|refresh")
+    if route == "recovery":
+        (w["state"] / "fotmob-b6-inflight").touch()
+    if route in ("apply", "failed-apply"):
+        _git(w["repo"], "checkout", "-q", "--detach", w["one"])
+        (w["state"] / "fotmob-b6-accepted").unlink()
+        w["log"].write_text("")
+        validation = Path(w["values"]["FOTMOB_VALIDATION_ROOT"])
+        _git(tmp_path, "clone", "-q", str(w["repo"]), str(validation))
+        _git(validation, "checkout", "-q", "--detach", w["two"])
+        _date_stub(w["stubs"], "2000")
+        docker = w["stubs"] / "docker"
+        text = docker.read_text().replace('case "$*" in\n', 'case "$*" in\n'
+            '  *sha256sum*) echo "' + 'a' * 64 + '  file" ;;\n'
+            '  *"last_parsed_time >"*) echo 7 ;;\n', 1)
+        if route == "failed-apply":
+            # B6 fails after checkout at import_error, then the real auto rollback runs.
+            text = text.replace('  *"count(*)"*) echo 0 ;;', '  *"FROM import_error"*) echo 1 ;;\n  *"count(*)"*) echo 0 ;;')
+        docker.write_text(text)
+        w["values"]["FOTMOB_REPOSITORY_MD5"] = w["values"]["FOTMOB_NEW_CODE_MD5"]
+        _write_env(w["env_file"], **w["values"])
+        (w["state"] / "fotmob-campaign.hold").touch()
+    events = _trace_barrier(w, tmp_path)
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"BARRIER_WAIT": "10"})
+    rows = events.read_text().splitlines()
+    assert rows[:4] == ["pause", "live", "drained", "checkout"], proc.stderr + w["log"].read_text()
+    if route == "failed-apply":
+        # Import error deliberately also blocks confirmation: keep pauses for the owner.
+        assert rows.count("checkout") == 2
+        assert "release" not in rows
+        assert (w["state"] / "fotmob-delivery-pauses").is_file()
+    else:
+        assert rows[-1] == "release"
+        assert not (w["state"] / "fotmob-delivery-pauses").exists()
+    assert "AIRFLOWIGNORE md5 до/после checkout" in w["log"].read_text()
+    assert (tmp_path / "external.airflowignore").read_text() == "external block-list\n"
+    assert (w["repo"] / "dags/.airflowignore").read_text() == ("two\n" if route == "apply" else "one\n")
+    assert _git(w["repo"], "rev-parse", "HEAD") == (w["two"] if route == "apply" else w["one"])
+    assert proc.returncode == (0 if route == "apply" else 1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["pause", "unconfirmed", "query", "timeout"])
+def test_checkout_barrier_fails_closed(tmp_path: Path, failure: str) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__race|failed|2026-09-08T00:00:10|refresh")
+    events = _trace_barrier(w, tmp_path, failure)
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"BARRIER_WAIT": "0"})
+    assert proc.returncode == 1
+    assert "checkout" not in events.read_text()
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    assert (w["state"] / "fotmob-delivery-pauses").is_file()
+    assert "checkout запрещён" in w["log"].read_text()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("resume", ["helper", "auto-inflight", "auto-off"])
+def test_checkout_barrier_recovers_original_pauses_after_sigkill(tmp_path: Path, resume: str) -> None:
+    w = _phase2_world(tmp_path, "")
+    events = _trace_barrier(w, tmp_path)
+    journal = w["state"] / "fotmob-delivery-pauses"
+    # Kill after UPDATE, before drain. Journal must predate the UPDATE.
+    docker = w["stubs"] / "docker"
+    text = docker.read_text()
+    docker.write_text(text.replace('    echo 0 ;;', f'    kill -KILL "$(cat {tmp_path / "barrier.pid"})"; exit 42 ;;', 1))
+    script = tmp_path / "barrier.sh"
+    script.write_text(f'echo $$ > "{tmp_path / "barrier.pid"}"\n. "{DEPLOY / "delivery_barrier.sh"}"\nbarrier_acquire\n')
+    proc = _run(script, env_file=w["env_file"], stubs=w["stubs"], extra_env=w["values"])
+    assert proc.returncode != 0
+    original = journal.read_text()
+    assert "dag_orchestrate_fotmob|f" in original and "dag_backfill_fotmob|t" in original
+    if resume != "helper":
+        docker.write_text(text)
+        _git(w["repo"], "checkout", "-q", "--detach", w["one"])
+        marker = w["state"] / ("fotmob-b6-inflight" if resume == "auto-inflight" else "fotmob-auto-deliver.off")
+        marker.touch()
+        events.write_text("")
+        proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+        assert proc.returncode == (1 if resume == "auto-inflight" else 0), proc.stderr
+        assert not journal.exists()
+        assert marker.exists(), "recovery must not clear INFLIGHT/OFF"
+        assert events.read_text().splitlines() == ["release"], "no checkout during pause restoration"
+        return
+    # Snapshot now says all paused, but recovery must reuse the saved original.
+    docker.write_text(text.replace("|f", "|t"))
+    script.write_text(f'. "{DEPLOY / "delivery_barrier.sh"}"\nbarrier_acquire && barrier_release\n')
+    proc = _run(script, env_file=w["env_file"], stubs=w["stubs"], extra_env=w["values"])
+    assert proc.returncode == 0, proc.stderr
+    assert not journal.exists()
+    assert events.read_text().splitlines()[-1] == "release"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["late-apply", "internal-ignore", "changed-ignore"])
+def test_checkout_barrier_rechecks_window_and_external_ignore(tmp_path: Path, failure: str) -> None:
+    w = _phase2_world(tmp_path, "")
+    events = _trace_barrier(w, tmp_path)
+    _date_stub(w["stubs"], "2321" if failure == "late-apply" else "2000")
+    if failure == "internal-ignore":
+        docker = w["stubs"] / "docker"
+        docker.write_text(docker.read_text().replace(
+            str(tmp_path / "external.airflowignore"), str(w["repo"] / "dags/.airflowignore")))
+    if failure == "changed-ignore":
+        git = w["stubs"] / "git"
+        git.write_text(git.read_text().replace('  echo checkout',
+            f'  echo changed > "{tmp_path / "external.airflowignore"}"\n  echo checkout'))
+    script = tmp_path / "barrier.sh"
+    script.write_text(f'. "{DEPLOY / "delivery_barrier.sh"}"\n'
+                      f'barrier_checkout -B deploy/test "{w["one"]}"\n')
+    proc = _run(script, env_file=w["env_file"], stubs=w["stubs"],
+                extra_env={**w["values"], "TREE": str(w["repo"])})
+    assert proc.returncode == 1, proc.stderr
+    rows = events.read_text().splitlines()
+    assert ("checkout" in rows) == (failure == "changed-ignore")
+    assert "release" not in rows
+    assert (w["state"] / "fotmob-delivery-pauses").is_file()
+
+
+@pytest.mark.unit
+def test_checkout_barrier_rolls_back_when_c1_appears_after_apply(tmp_path: Path) -> None:
+    """Execute barrier SQL: the target adds c1 after a five-producer snapshot."""
+    import sqlite3
+    import sys
+
+    w = _phase2_world(tmp_path, "")
+    _date_stub(w["stubs"], "2000")
+    db_path = tmp_path / "metadata.sqlite"
+    with sqlite3.connect(db_path) as db:
+        db.execute("CREATE TABLE dag (dag_id TEXT PRIMARY KEY, is_paused BOOLEAN)")
+        db.executemany("INSERT INTO dag VALUES (?, ?)", [
+            (dag, dag == "dag_backfill_fotmob") for dag in BARRIER_PRODUCERS if dag != "dag_refresh_fotmob_c1"
+        ])
+        db.execute("CREATE TABLE dag_run (dag_id TEXT, state TEXT)")
+        db.execute("CREATE TABLE task_instance (dag_id TEXT, state TEXT)")
+    sql_runner = tmp_path / "metadata.py"
+    sql_runner.write_text('''import sqlite3
+import sys
+
+class BoolAnd:
+    def __init__(self):
+        self.value = True
+    def step(self, value):
+        self.value = self.value and bool(value)
+    def finalize(self):
+        return self.value
+
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.create_aggregate("bool_and", 1, BoolAnd)
+if sys.argv[2] == "add-c1":
+    db.execute("INSERT INTO dag VALUES ('dag_refresh_fotmob_c1', true)")
+else:
+    for statement in sys.argv[-1].split(";"):
+        if not statement.strip():
+            continue
+        cursor = db.execute(statement)
+        if cursor.description:
+            for row in cursor:
+                print("|".join("t" if value == 1 else "f" if value == 0 else str(value)
+                               for value in row) if len(row) == 2 else row[0])
+''')
+    docker = w["stubs"] / "docker"
+    fallback = w["stubs"] / "docker-fallback"
+    shutil.copy(docker, fallback)
+    _stub(w["stubs"], "docker", 'case "$*" in\n'
+          '  *psql*) exec "' + sys.executable + '" "' + str(sql_runner) + '" "' + str(db_path) + '" query "${@: -1}" ;;\n'
+          'esac\nexec "' + str(fallback) + '" "$@"\n')
+    script = tmp_path / "barrier.sh"
+    script.write_text(f'. "{DEPLOY / "delivery_barrier.sh"}"\n'
+                      f'barrier_checkout -B deploy/test "{w["two"]}" || exit 11\n'
+                      f'"{sys.executable}" "{sql_runner}" "{db_path}" add-c1 || exit 12\n'
+                      f'barrier_checkout -f "{w["one"]}" || exit 13\n'
+                      'barrier_release || exit 14\n')
+    proc = _run(script, env_file=w["env_file"], stubs=w["stubs"],
+                extra_env={**w["values"], "TREE": str(w["repo"])})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    with sqlite3.connect(db_path) as db:
+        paused = dict(db.execute("SELECT dag_id, is_paused FROM dag"))
+    assert {dag for dag, value in paused.items() if value} == {"dag_backfill_fotmob", "dag_refresh_fotmob_c1"}
+    assert not (w["state"] / "fotmob-delivery-pauses").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("broken", ["empty", "duplicate", "unknown", "symlink", "unterminated"])
+def test_checkout_barrier_rejects_a_damaged_pause_journal(tmp_path: Path, broken: str) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__race|failed|2026-09-08T00:00:10|refresh")
+    events = _trace_barrier(w, tmp_path)
+    journal = w["state"] / "fotmob-delivery-pauses"
+    rows = [f"{dag}|f" for dag in BARRIER_PRODUCERS]
+    if broken == "empty":
+        rows = []
+    elif broken == "duplicate":
+        rows[-1] = rows[0]
+    elif broken == "unknown":
+        rows[-1] = "foreign_dag|f"
+    journal.write_text("".join(row + "\n" for row in rows))
+    if broken == "unterminated":
+        with journal.open("a") as output:
+            output.write("dag_refresh_fotmob_c1|f")
+    if broken == "symlink":
+        journal.rename(tmp_path / "journal-target")
+        journal.symlink_to(tmp_path / "journal-target")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1
+    assert not events.exists(), "a damaged journal must block before UPDATE/checkout"
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]

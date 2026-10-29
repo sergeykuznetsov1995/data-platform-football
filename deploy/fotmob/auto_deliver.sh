@@ -54,6 +54,7 @@ HERE=$(dirname "$(readlink -f "$0")")
 ENV_FILE="${FOTMOB_ENV_FILE:-/etc/data-platform/fotmob.env}"
 # shellcheck source=deploy/fotmob/env.sh
 . "$HERE/env.sh"
+. "$HERE/delivery_barrier.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
 # При оборванной доставке используем её сохранённые пины, даже если указатель
 # следующего пакета уже изменён. Без снимка неверный пакет требует рук и алерта.
@@ -315,6 +316,12 @@ lock_alert(){
   if tg "🆘 FotMob: автомат не может взять свой замок ($1) — доставки НЕ БУДЕТ. НУЖНЫ РУКИ. Лог: $LOG"; then
     mark_said "$mark"
   fi
+}
+barrier_failed(){
+  log "БАРЬЕР ДОСТАВКИ НЕ ПОДТВЕРЖДЁН — checkout/снятие пауз запрещены, журнал сохранён"
+  tg_durable "🆘 FotMob: барьер доставки не подтверждён. Дерево/паузы требуют разбора, журнал $STATE/fotmob-delivery-pauses сохранён. Автомат глушу. Лог: $LOG"
+  set_off
+  exit 1
 }
 # Checkout может отвязать вложенный file bind-mount ignore (#1576).
 warn_airflowignore_change(){
@@ -670,6 +677,16 @@ if [ "$PACKAGE_FAILED" = 1 ]; then
   [ "$PACKAGE_RECOVERED" = 1 ] || exit 2
 fi
 
+# SIGKILL до checkout или после завершённого отката мог оставить свои паузы.
+# Только подтверждённое чистое откатное дерево позволяет восстановить их без
+# checkout. INFLIGHT/OFF не снимаем: прежний протокол разбора остаётся в силе.
+if [ "$IS_PROD" = 1 ] && [ -e "$STATE/fotmob-delivery-pauses" ]; then
+  if why=$(confirm_rollback) && barrier_ignore_md5 >/dev/null; then
+    barrier_release || barrier_failed
+    log "после прерывания восстановлены собственные паузы: $why"
+  fi
+fi
+
 # ---- 0. Выключатель --------------------------------------------------------
 # Автомат сам ставит его, когда откат не подтверждён, а человек — когда откатил
 # дерево руками: иначе следующий тик cron через 5 минут вернул бы забракованный
@@ -754,11 +771,12 @@ if is_plain "$INFLIGHT"; then
   # SHA принят», и дерево, вернувшееся на цель мимо автомата, снова выглядело бы
   # принятым (ревью Sol, раунд 28).
   rm -f "$ACCEPTED"
-  git -C "$TREE" checkout -f "$ROLLBACK_REF" >> "$LOG" 2>&1
+  barrier_checkout -f "$ROLLBACK_REF" >> "$LOG" 2>&1 || barrier_failed
   sleep 90
   # Маркер снимаем ТОЛЬКО по подтверждённому откату, иначе автомат замолчал бы
   # с деревом в неизвестном состоянии (ревью Sol, раунд 2).
   if why=$(confirm_rollback); then
+    barrier_release || barrier_failed
     log "восстановление подтверждено: $why"
     tg_durable "⚠️ FotMob: прошлая доставка оборвалась на середине (HEAD был $h). Дерево возвращено: $why.${RESCUE_NOTE} Кампания остановлена. Следующая попытка — в ближайшее окно."
     rm -f "$INFLIGHT"
@@ -970,7 +988,7 @@ wave_rollback(){ # $1 = pending-маркер, $2 = маркер вердикта
   log "выключатель поставлен — начинаю откат на $ROLLBACK_SHA"
   rescue_diff
   rm -f "$ACCEPTED"   # принятым считается только подтверждённый SHA, а он забракован
-  git -C "$TREE" checkout -f "$ROLLBACK_REF" >> "$LOG" 2>&1
+  barrier_checkout -f "$ROLLBACK_REF" >> "$LOG" 2>&1 || barrier_failed
   log "дерево переключено на $ROLLBACK_REF — выдержка ${ROLLBACK_SETTLE:-90}s и проверка"
   sleep "${ROLLBACK_SETTLE:-90}"
   if ! why=$(confirm_rollback); then
@@ -982,6 +1000,7 @@ wave_rollback(){ # $1 = pending-маркер, $2 = маркер вердикта
     tg_durable "🆘 FotMob: первая волна на новом коде красная, откатывал — и откат НЕ подтверждён ($why).${RESCUE_NOTE} НУЖНЫ РУКИ. Автомат заглушен ($OFF); маркер незавершённого отката ($1) оставлен — после разбора и снятия $OFF автомат доведёт откат сам. Лог: $LOG"
     exit 1
   fi
+  barrier_release || barrier_failed
   log "ОТКАТ ПО КРАСНОЙ ВОЛНЕ ПОДТВЕРЖДЁН: $why"
   tg_durable "⛔ FotMob: бой откачен на $ROLLBACK_SHA из-за красной первой волны \`$run\` ($reason). Откат подтверждён: $why.${RESCUE_NOTE} Кампания остановлена. Автомат глушу: снять $OFF после разбора. Разбор: $LOG"
   # Выключатель уже стоит (поставлен до дерева) — pending можно снимать.
@@ -1391,6 +1410,7 @@ if [ "$delivered" = 0 ]; then
   fi
 
   if [ "$ok" = 1 ]; then
+    barrier_release || barrier_failed
     log "ДОСТАВЛЕНО: HEAD=$head_after"
     # Постоянный след приёмки: по нему следующие тики отличат принятый код от
     # просто «дерева на нужном SHA» (ревью Sol, раунд 28).
@@ -1457,9 +1477,10 @@ if [ "$delivered" = 0 ]; then
       fi
       rescue_diff
       rm -f "$ACCEPTED"   # см. выше: принятым считается только подтверждённый SHA
-      git -C "$TREE" checkout -f "$ROLLBACK_REF" >> "$LOG" 2>&1
+      barrier_checkout -f "$ROLLBACK_REF" >> "$LOG" 2>&1 || barrier_failed
       sleep 90
       if why=$(confirm_rollback); then
+        barrier_release || barrier_failed
         log "ОТКАТ ПОДТВЕРЖДЁН: $why"
         tg_durable "⛔ FotMob B6 не доставлен (код $rc, приёмка не подтверждена). Откат подтверждён: $why.${RESCUE_NOTE} Кампания остановлена. Разбор: $LOG"
         rm -f "$INFLIGHT"
