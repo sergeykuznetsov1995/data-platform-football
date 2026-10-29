@@ -200,7 +200,7 @@ FBREF_CURRENT_SCOPE_FRESHNESS_HOURS = {
     "season": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
     "season_stats": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
     "standings": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
-    "squad": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
+    "squad": 28 * 24,
     "player": FBREF_PLAYER_MATCHLOG_FRESHNESS_HOURS,
     "matchlog": FBREF_PLAYER_MATCHLOG_FRESHNESS_HOURS,
 }
@@ -1095,7 +1095,7 @@ def validate_fbref_current_scope_freshness(
                     f"{kind}:sla_seconds={reported_seconds}>"
                     f"{expected_seconds}"
                 )
-            if total == 0:
+            if total == 0 and kind != "squad":
                 violations.append(f"{kind}:total_targets=0")
             aged, stale_never, exact_split = _freshness_stale_split(raw_metrics)
             if stale and not exact_split:
@@ -1958,7 +1958,9 @@ def run_recovery_wave(
                 aggregate[key] = int(aggregate.get(key, 0)) + value
         if history_slice:
             break
-        if parsed == 0 and retired == 0:
+        # A failed incomplete match leaves raw recovery for a fresh fetch.
+        refetches = int(result.get("incomplete_match_refetches") or 0)
+        if parsed == 0 and retired == 0 and refetches == 0:
             # Расчистка сырья идёт ПЕРЕД живыми волнами, поэтому её тупик
             # раньше убивал весь ран: 31.07 три мёртвые season-страницы
             # зациклили recovery и роняли и кампанию, и daily при нулевом

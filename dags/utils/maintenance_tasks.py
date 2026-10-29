@@ -80,15 +80,16 @@ WHOSCORED_DAILY_RETENTION = "14d"
 OTHER_HIGH_CHURN_DAILY_RETENTION = "3d"
 
 # Live-file compaction is deliberately much tighter than snapshot cleanup.
-# A maintenance task may rewrite at most four exact path sets / 2 GiB of input,
-# and each table contributes at most 64 files / 512 MiB from one partition.
+# Legacy callers retain four path sets / 2 GiB; the nightly executor has a
+# separate run budget. Each portion selects at most 1024 files / 512 MiB.
 # The selector ranks partitions from Iceberg's ``$files`` metadata, then reads
-# at most 256 paths from one eligible partition. OPTIMIZE is never allowed to
+# at most 1024 paths from one eligible partition. OPTIMIZE is never allowed to
 # scan/rewrite a whole table.
 COMPACTION_FILE_SIZE_THRESHOLD = "64MB"
 COMPACTION_SMALL_FILE_MAX_BYTES = 64 * 1024 * 1024
 COMPACTION_DISCOVERY_MAX_FILES = 256
 COMPACTION_MAX_FILES_PER_TABLE = 64
+COMPACTION_MAX_FILES_PER_PORTION = 1024
 COMPACTION_MAX_INPUT_BYTES_PER_TABLE = 512 * 1024 * 1024
 COMPACTION_MAX_TABLES_PER_RUN = 4
 COMPACTION_MAX_INPUT_BYTES_PER_RUN = 2 * 1024 * 1024 * 1024
@@ -847,7 +848,11 @@ def _row_to_stats(cursor) -> dict:
 def _list_tables(conn, schema: str) -> List[str]:
     cur = conn.cursor()
     try:
-        cur.execute(f"SHOW TABLES FROM iceberg.{schema}")
+        cur.execute(
+            "SELECT table_name FROM iceberg.information_schema.tables "
+            f"WHERE table_schema = {_path_sql_literal(schema)} "
+            "AND table_type = 'BASE TABLE' ORDER BY table_name"
+        )
         rows = cur.fetchall()
     finally:
         cur.close()
@@ -863,11 +868,6 @@ def cleanup_whoscored_dq_stage_partitions() -> dict:
     works even when no backfill has completed recently.
     """
 
-    from scrapers.whoscored.runtime_contract import (
-        require_production_runtime_class,
-    )
-
-    require_production_runtime_class(operation="WhoScored frozen DQ cleanup")
     from dags.scripts.whoscored_frozen_dq import (
         DQ_STAGE_RETENTION_DAYS,
         DQ_STAGE_TABLE,
@@ -1046,6 +1046,7 @@ class _CompactionProbeResult:
 
     candidates: tuple[tuple[str, int], ...]
     skipped_delete_partitions: int
+    next_partition_cursor: Optional[str] = None
 
 
 def _is_missing_partition_column_error(exc: BaseException) -> bool:
@@ -1062,6 +1063,8 @@ def _run_compaction_probe_query(
     files_sql: str,
     budget: int,
     partitioned: bool = True,
+    partition_offset: int = 0,
+    max_files: int = COMPACTION_MAX_FILES_PER_TABLE,
 ) -> list:
     if partitioned:
         inventory_sql = f"""
@@ -1091,7 +1094,8 @@ def _run_compaction_probe_query(
                 FROM partition_inventory
                 WHERE small_data_files_count >= 2
                   AND delete_files_count = 0
-                ORDER BY first_small_file_path
+                ORDER BY partition
+                OFFSET {partition_offset}
                 LIMIT 1
             ),
             candidate_files AS (
@@ -1103,7 +1107,7 @@ def _run_compaction_probe_query(
                   AND f.file_size_in_bytes > 0
                   AND f.file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}
                 ORDER BY f.file_path
-                LIMIT {COMPACTION_DISCOVERY_MAX_FILES}
+                LIMIT {max(COMPACTION_DISCOVERY_MAX_FILES, max_files)}
             ),"""
     else:
         # Unpartitioned table: ``$files`` has no ``partition`` column, the
@@ -1134,7 +1138,7 @@ def _run_compaction_probe_query(
                   AND f.file_size_in_bytes > 0
                   AND f.file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}
                 ORDER BY f.file_path
-                LIMIT {COMPACTION_DISCOVERY_MAX_FILES}
+                LIMIT {max(COMPACTION_DISCOVERY_MAX_FILES, max_files)}
             ),"""
     cur = conn.cursor()
     try:
@@ -1155,7 +1159,7 @@ def _run_compaction_probe_query(
             selected_files AS (
                 SELECT file_path, file_size_in_bytes, file_rank
                 FROM bounded_files
-                WHERE file_rank <= {COMPACTION_MAX_FILES_PER_TABLE}
+                WHERE file_rank <= {max_files}
                   AND running_bytes <= {budget}
             ),
             delete_file_summary AS (
@@ -1181,30 +1185,107 @@ def _run_compaction_probe_query(
         cur.close()
 
 
+def _run_multi_partition_probe(conn, *, schema_sql, files_sql, budget, max_files,
+                               partition_cursor, partitioned=True):
+    # JSON gives the complete Iceberg partition tuple a stable, serializable key.
+    key = "json_format(CAST(partition AS JSON))" if partitioned else "'[]'"
+    cursor_sql = _path_sql_literal(partition_cursor) if partition_cursor is not None else "''"
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            WITH inventory AS (
+                SELECT file_path, file_size_in_bytes, content,
+                       {key} AS partition_key
+                FROM iceberg.{schema_sql}.{files_sql}
+            ),
+            partition_inventory AS (
+                SELECT partition_key,
+                       count_if(content = 0 AND file_size_in_bytes > 0
+                           AND file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}) AS small_count,
+                       count_if(content IS DISTINCT FROM 0) AS delete_count
+                FROM inventory GROUP BY partition_key
+            ),
+            candidate_files AS (
+                SELECT f.file_path, f.file_size_in_bytes, f.partition_key,
+                       CASE WHEN f.partition_key > {cursor_sql} THEN 0 ELSE 1 END AS turn
+                FROM inventory f JOIN partition_inventory p
+                    ON f.partition_key = p.partition_key
+                WHERE p.small_count >= 2 AND p.delete_count = 0
+                  AND f.content = 0 AND f.file_size_in_bytes > 0
+                  AND f.file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}
+                ORDER BY turn, f.partition_key, f.file_path
+                LIMIT {max(COMPACTION_DISCOVERY_MAX_FILES, max_files)}
+            ),
+            bounded_files AS (
+                SELECT *, row_number() OVER (
+                           ORDER BY turn, partition_key, file_path) AS file_rank,
+                       sum(file_size_in_bytes) OVER (
+                           ORDER BY turn, partition_key, file_path
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_bytes
+                FROM candidate_files
+            ),
+            within_budget AS (
+                SELECT * FROM bounded_files
+                WHERE file_rank <= {max_files} AND running_bytes <= {budget}
+            ),
+            grouped_files AS (
+                SELECT *, count(*) OVER (PARTITION BY partition_key) AS selected_count
+                FROM within_budget
+            ),
+            selected_files AS (
+                SELECT * FROM grouped_files WHERE selected_count >= 2
+            ),
+            summary AS (
+                SELECT (SELECT coalesce(count_if(delete_count > 0), 0)
+                        FROM partition_inventory) AS skipped,
+                       (SELECT partition_key FROM selected_files
+                        ORDER BY file_rank DESC LIMIT 1) AS next_cursor
+            )
+            SELECT f.file_path, f.file_size_in_bytes, s.skipped,
+                   f.partition_key, s.next_cursor
+            FROM selected_files f CROSS JOIN summary s
+            UNION ALL
+            SELECT NULL, NULL, skipped, NULL, next_cursor FROM summary
+            WHERE NOT EXISTS (SELECT 1 FROM selected_files)
+        """)
+        return cur.fetchall()
+    finally:
+        cur.close()
+
+
 def _compaction_candidates(
     conn,
     *,
     schema: str,
     table: str,
     max_input_bytes: int,
+    partition_offset: int = 0,
+    max_files: int = COMPACTION_MAX_FILES_PER_TABLE,
+    multi_partition: bool = False,
+    partition_cursor: Optional[str] = None,
 ) -> _CompactionProbeResult:
-    """Return a bounded exact-path set from one small-file partition.
+    """Return a bounded exact-path set from clean small-file partitions.
 
     The exact ``count_if`` predicate avoids permanently skipping partitions
-    that contain both large and small files. The lowest lexical small-file
-    path is a deterministic progress cursor: after those exact paths are
-    rewritten, the next partition/path set advances without mutable state.
+    that contain both large and small files. Repeated portions use an offset
+    in the ordered partition metadata for legacy maintenance callers. Bronze
+    opts into a cyclic key cursor and selects across multiple partitions.
+    Metadata is read again before every rewrite.
 
     Any partition containing a live position/equality delete file is excluded.
     Otherwise OPTIMIZE could read bytes that are absent from the data-file-only
     budget, and exact-path subset rewrites can leave active delete files behind.
     The skipped partition count is returned for operational visibility rather
-    than silently undercounting that workload. Only one clean partition and a
-    256-path window reach the bounded ranking CTE. Both the 64-file and byte
+    than silently undercounting that workload. A bounded discovery window
+    reaches the ranking CTE. Both the file and byte
     limits are enforced in SQL and revalidated in Python before a path can
     reach ``OPTIMIZE``.
     """
 
+    if type(max_files) is not int or not 2 <= max_files <= COMPACTION_MAX_FILES_PER_PORTION:
+        raise ValueError("max_files exceeds the portion bound")
+    if type(partition_offset) is not int or partition_offset < 0:
+        raise ValueError("partition_offset must be a non-negative integer")
     if type(max_input_bytes) is not int or max_input_bytes <= 0:
         raise ValueError("max_input_bytes must be a positive integer")
     budget = min(max_input_bytes, COMPACTION_MAX_INPUT_BYTES_PER_TABLE)
@@ -1212,12 +1293,23 @@ def _compaction_candidates(
         return _CompactionProbeResult((), 0)
     schema_sql = _quote_identifier(schema)
     files_sql = _quote_identifier(f"{table}$files")
+    if partition_cursor is not None:
+        _path_sql_literal(partition_cursor)
+    probe_query = (
+        _run_multi_partition_probe if multi_partition else _run_compaction_probe_query
+    )
+    position = (
+        {"partition_cursor": partition_cursor} if multi_partition
+        else {"partition_offset": partition_offset}
+    )
     try:
-        rows = _run_compaction_probe_query(
+        rows = probe_query(
             conn,
             schema_sql=schema_sql,
             files_sql=files_sql,
             budget=budget,
+            **position,
+            max_files=max_files,
         )
     except Exception as exc:
         if not _is_missing_partition_column_error(exc):
@@ -1226,21 +1318,35 @@ def _compaction_candidates(
         # column in ``$files``, so the partition-ranked probe fails with
         # COLUMN_NOT_FOUND. The whole table is then the single candidate:
         # same bounded predicates and delete-file contract, no grouping.
-        rows = _run_compaction_probe_query(
+        rows = probe_query(
             conn,
             schema_sql=schema_sql,
             files_sql=files_sql,
             budget=budget,
             partitioned=False,
+            **({"partition_cursor": partition_cursor} if multi_partition else {}),
+            max_files=max_files,
         )
 
     selected: list[tuple[str, int]] = []
     selected_paths: set[str] = set()
     selected_bytes = 0
+    partition_counts = {}
+    next_cursor = None
     skipped_delete_partitions: Optional[int] = None
     for row in rows:
-        if not isinstance(row, (list, tuple)) or len(row) != 3:
+        if not isinstance(row, (list, tuple)) or len(row) != (5 if multi_partition else 3):
             raise RuntimeError("Iceberg compaction metadata row is malformed")
+        if multi_partition:
+            key, cursor = row[3:]
+            if cursor is not None:
+                _path_sql_literal(cursor)
+            if skipped_delete_partitions is not None and cursor != next_cursor:
+                raise RuntimeError("Iceberg compaction partition cursor is inconsistent")
+            next_cursor = cursor
+            if row[0] is not None:
+                _path_sql_literal(key)
+                partition_counts[key] = partition_counts.get(key, 0) + 1
         path = row[0]
         size = row[1]
         skipped = row[2]
@@ -1267,16 +1373,23 @@ def _compaction_candidates(
         selected_paths.add(path)
         selected_bytes += size
 
-    if len(selected) > COMPACTION_MAX_FILES_PER_TABLE or selected_bytes > budget:
+    if len(selected) > max_files or selected_bytes > budget:
         raise RuntimeError("Iceberg compaction metadata exceeded its SQL bounds")
     if skipped_delete_partitions is None:
         raise RuntimeError("Iceberg compaction delete-file summary is missing")
+
+    if multi_partition and (
+        any(n < 2 for n in partition_counts.values())
+        or (selected and next_cursor is None)
+    ):
+        raise RuntimeError("Iceberg compaction partition selection is invalid")
 
     # Trino rewrites small files only when at least two selected files belong
     # to the partition. A singleton procedure call would create no progress.
     return _CompactionProbeResult(
         tuple(selected) if len(selected) >= 2 else (),
         skipped_delete_partitions,
+        next_cursor,
     )
 
 
@@ -1336,10 +1449,13 @@ def _compact_exact_files(
     schema: str,
     table: str,
     candidates: Sequence[tuple[str, int]],
+    max_files: int = COMPACTION_MAX_FILES_PER_TABLE,
 ) -> dict:
     """Compact only the validated file paths selected by the bounded probe."""
 
-    if not 2 <= len(candidates) <= COMPACTION_MAX_FILES_PER_TABLE:
+    if type(max_files) is not int or not 2 <= max_files <= COMPACTION_MAX_FILES_PER_PORTION:
+        raise ValueError("max_files exceeds the portion bound")
+    if not 2 <= len(candidates) <= max_files:
         raise RuntimeError("Iceberg compaction candidate count is outside its bound")
     total_bytes = 0
     path_literals: list[str] = []
@@ -1412,6 +1528,7 @@ def maintain_iceberg_tables(
     *,
     compact_live_files: bool = False,
     compaction_rotation: Optional[int] = None,
+    compaction_schemas: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run bounded compaction and retention maintenance on Iceberg tables.
 
@@ -1426,20 +1543,15 @@ def maintain_iceberg_tables(
         compact_live_files: opt in to an exact-path, globally bounded small-file
             rewrite before snapshot/orphan retention. A bare/full-table
             ``OPTIMIZE`` is never issued.
+        compaction_schemas: schemas eligible for rewriting; retention still
+            processes every requested schema.
         compaction_rotation: logical scheduled-run sequence used to rotate the
             first eligible table fairly. Daily DAGs pass a date ordinal and
             weekly DAGs pass ``ordinal // 7``. Defaults to today's ordinal for
             direct/manual invocations.
     """
+    compaction_schema_set = set(compaction_schemas) if compaction_schemas is not None else set(schemas)
     filter_set = set(table_filter) if table_filter is not None else None
-    if filter_set is None or filter_set.intersection(WHOSCORED_HIGH_CHURN):
-        from scrapers.whoscored.runtime_contract import (
-            require_production_runtime_class,
-        )
-
-        require_production_runtime_class(
-            operation="WhoScored Iceberg lifecycle maintenance"
-        )
     if type(compact_live_files) is not bool:
         raise ValueError("compact_live_files must be a boolean")
     if compaction_rotation is None:
@@ -1509,6 +1621,8 @@ def maintain_iceberg_tables(
         if compact_live_files:
             eligible: list[_CompactionTarget] = []
             for schema, table, display_name, _sql_name in tables_to_maintain:
+                if schema not in compaction_schema_set:
+                    continue
                 compaction_tables_probed += 1
                 try:
                     probe = _compaction_candidates(

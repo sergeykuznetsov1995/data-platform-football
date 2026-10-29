@@ -4239,3 +4239,26 @@ def test_source_revision_1998901_does_not_authorize_mixed_batch(
     assert all(
         set(batches) == {pins["old"]["batch_id"]} for batches in physical.values()
     )
+
+
+def test_schedule_checked_stages_are_canonical_and_part_of_batch_identity():
+    trino = MagicMock()
+    trino.table_exists.return_value = True
+    counts = '{"whoscored_schedule":1}'
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    kwargs = dict(league="L", season="S", entity_group="season",
+                  datasets={"whoscored_schedule": [{"league": "L", "season": "S", "game_id": 1}]},
+                  distinct_keys={"whoscored_schedule": "game_id"},
+                  payload_sha256="a" * 64, raw_uris=["s3://raw/schedule"])
+    batches = []
+    for ids in ([2, 1, 1], [1, 2], [1, 2, 3]):
+        states = json.dumps({"whoscored_schedule": "available", "__checked_stage_ids__": sorted(set(ids))})
+        trino.execute_query.side_effect = [[(counts, states)], [(1,)]]
+        batches.append(repository.commit_scope_bundle(**kwargs, checked_stage_ids=ids))
+        trino.execute_query.side_effect = None
+        trino.execute_query.return_value = [(states,)]
+        assert repository.latest_schedule_stage_ids("L", "S") == tuple(sorted(set(ids)))
+        sql = trino.execute_query.call_args.args[0]
+        assert "state = 'success'" in sql and "completed_at DESC" in sql
+    assert batches[0] == batches[1] != batches[2]
+    repository.writer.write_dataframe.assert_not_called()

@@ -87,3 +87,10 @@ def test_committed_policy_validity_window_is_well_formed():
 
     policy = load_standing_policy(POLICY_PATH)
     assert policy.expires_at > policy.approved_at
+
+
+def test_committed_policy_renewal_has_twelve_calendar_months():
+    policy = load_standing_policy(POLICY_PATH)
+    assert policy.policy_version == 3
+    assert policy.approved_at == datetime(2026, 10, 28, tzinfo=timezone.utc)
+    assert policy.expires_at >= policy.approved_at.replace(year=policy.approved_at.year + 1)

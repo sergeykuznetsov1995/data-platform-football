@@ -772,3 +772,72 @@ def test_wait_drained_rejects_uncertain_or_hidden_provider_work():
 
     with pytest.raises(FBrefProxyLeaseError, match="drain"):
         client.wait_drained(lease, expected=CONTEXT)
+
+
+@pytest.mark.parametrize(
+    "flags, reason",
+    [
+        ({"budget_exceeded": True}, None),
+        ({"accounting_uncertain": True}, None),
+        ({"expired": True, "budget_exceeded": True}, None),
+        ({"expired": True}, "provider_lease_expired"),
+        ({"active_tunnels": 1}, "provider_drain_timeout"),
+    ],
+)
+def test_drain_reason_distinguishes_transient_failure_from_accounting_policy(
+    flags, reason
+):
+    session = _Session(
+        [_Response(201, _lease_body()), _Response(200, _stats_body(**flags))]
+    )
+    ticks = iter([0, 1])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        monotonic=lambda: next(ticks),
+        drain_timeout_seconds=0.01,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        client.wait_drained(lease, expected=CONTEXT)
+    assert raised.value.session_failure_reason == reason
+
+
+def test_meter_transport_reason_does_not_hide_daily_limit_rejection():
+    class UnavailableSession:
+        def request(self, *_args, **_kwargs):
+            raise OSError("unavailable")
+
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=UnavailableSession(),
+    )
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+    assert raised.value.session_failure_reason == "provider_meter_unavailable"
+    client._session = _Session([_Response(429, {"error": "daily limit"})])
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+    assert raised.value.session_failure_reason is None
+
+
+@pytest.mark.parametrize("flags", [
+    {"accounting_uncertain": True},
+    {"budget_exceeded": True},
+    {"closed": True},
+    {"accounting_uncertain": True, "budget_exceeded": True, "closed": True},
+])
+def test_terminal_drain_exposes_flags_without_session_deferral(flags):
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899", control_token=TOKEN,
+        session=_Session([_Response(201, _lease_body()), _Response(200, _stats_body(**flags))]),
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        client.wait_drained(lease, expected=CONTEXT)
+    assert set(raised.value.terminal_flags) == set(flags)
+    assert raised.value.session_failure_reason is None
+    for flag in flags:
+        assert flag in str(raised.value)

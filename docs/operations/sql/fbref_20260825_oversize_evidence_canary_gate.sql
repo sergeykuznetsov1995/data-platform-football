@@ -767,7 +767,7 @@ attempt_gate AS (
                'manifests/fetches/' ||
                all_attempts.attempt_logical_refresh_id::text || '.json'
            AND all_attempts.transport_version =
-               'fbref-camoufox-metered-warm-http-v10'
+               'fbref-camoufox-metered-warm-http-v11'
            AND NULLIF(all_attempts.session_version, '') IS NOT NULL
            AND all_attempts.decoded_bytes > 4194304
            AND all_attempts.decoded_bytes <= 8388608

@@ -310,6 +310,34 @@ def test_season_phase_signs_only_the_bounded_season_allocation(tmp_path, monkeyp
     }
 
 
+def test_season_preparer_signs_planned_chunk_and_reuses_immutable_plan(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from scrapers.sofascore.season_chunks import SeasonScheduleChunk, decode_season_chunk_unit
+
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", "day-fixed")
+    monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "week-fixed")
+    chunk = SeasonScheduleChunk("17", "76986", (50, 100), (0, 0), "a" * 64)
+    base = _season_plan("schedule_last")
+    season_plan = SimpleNamespace(**vars(base))
+    season_plan.schedule_chunk = chunk
+    patches = _common_patches(season_plan)
+    kwargs = dict(
+        dag_id="dag_ingest_sofascore", base_run_id="chunk-run", phase="season",
+        competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+        artifact_path=tmp_path / "artifact.json", output_path=tmp_path / "plan.json",
+    )
+    with patches[0], patches[1], patches[2], patches[3]:
+        path = prepare_workload_plan(**kwargs)
+        season_plan.schedule_chunk = replace(chunk, last=(100, 150))
+        assert prepare_workload_plan(**kwargs) == path
+    plan = load_plan(path, control_token=TOKEN)
+    assert decode_season_chunk_unit(target_ids(plan.allocations[0])[0]) == chunk
+    assert plan.allocations[0].workload_class == season_workload_class(EPL_SEASON_SHAPE)
+    assert plan.run_cap_bytes == 345
+    assert plan.freshness_key("season") == "day-fixed"
+
+
 def test_historical_scope_can_pin_season_freshness_across_days(
     tmp_path, monkeypatch
 ):

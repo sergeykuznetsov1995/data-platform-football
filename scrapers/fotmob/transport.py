@@ -10,7 +10,7 @@ import random
 import threading
 import time
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
@@ -31,6 +31,8 @@ from scrapers.fotmob.raw_store import (
 FOTMOB_API_BASE = "https://www.fotmob.com/api/data"
 FOTMOB_ALLOWED_HOSTS = frozenset({"www.fotmob.com", "data.fotmob.com"})
 RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429})
+BAN_TARGET_THRESHOLD = 3
+BAN_PAUSE_SECONDS = 15 * 60
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -81,6 +83,9 @@ class FetchResult:
     proxy_bytes: int
     error: Optional[str] = None
     retry_after: Optional[timedelta] = None
+    source_observed_at: Optional[str] = None
+    stop_reason: Optional[str] = None
+    blocked_until: Optional[datetime] = None
 
     @property
     def status(self) -> str:
@@ -287,7 +292,13 @@ class FotMobTransport:
         self.backoff_base = max(0.0, backoff_base)
         self.jitter_seconds = max(0.0, jitter_seconds)
         self.max_retry_delay = max(0.0, max_retry_delay)
+        self._guard_lock = threading.Lock()
+        self._forbidden_targets: set[str] = set()
+        self.blocked_until: Optional[datetime] = None
+        self.stop_reason: Optional[str] = None
+        self._pause_pending = False
         self._stats_lock = threading.Lock()
+        self._thread_attempts = threading.local()
         self._cancelled = threading.Event()
         self._stats: dict[str, Any] = {}
         self.reset_stats()
@@ -313,12 +324,14 @@ class FotMobTransport:
         self.sleep_fn(delay)
         self._raise_if_cancelled()
 
-    def _acquire_rate_limit(self) -> None:
+    def _acquire_rate_limit(self) -> bool:
         if self.rate_limiter is None:
-            return
+            return True
         acquire = self.rate_limiter.acquire
         while True:
             self._raise_if_cancelled()
+            if self._pause_state() is not None:
+                return False
             try:
                 acquired = acquire(timeout=0.25)
             except TypeError:
@@ -326,7 +339,86 @@ class FotMobTransport:
                 # limiter supports bounded waits and remains cancellable.
                 acquired = acquire()
             if acquired is not False:
-                return
+                return True
+
+    def _shared_guard(self):
+        return getattr(self.rate_limiter, "shared", None)
+
+    def flush_pending_pause(self) -> None:
+        """Publish an unconfirmed pause even when no further fetch is planned."""
+        with self._guard_lock:
+            if self._pause_pending:
+                self._shared_guard().pause(self.blocked_until, self.stop_reason)
+                self._pause_pending = False
+
+    def _pause(self, seconds: float, reason: str) -> None:
+        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        with self._guard_lock:
+            if self.blocked_until is None or until > self.blocked_until:
+                self.blocked_until = until
+            if self.stop_reason != "ban":
+                self.stop_reason = reason
+            shared = self._shared_guard()
+            if shared is not None:
+                self._pause_pending = True
+                shared.pause(self.blocked_until, self.stop_reason)
+                self._pause_pending = False
+
+    def _pause_state(self):
+        shared = self._shared_guard()
+        if shared is not None:
+            self.flush_pending_pause()
+            state = shared.pause_state()
+            if state is not None:
+                with self._guard_lock:
+                    until, reason = state
+                    if self.blocked_until is None or until > self.blocked_until:
+                        self.blocked_until = until
+                    if self.stop_reason != "ban":
+                        self.stop_reason = reason
+        with self._guard_lock:
+            if self.blocked_until and (
+                self.stop_reason == "ban"
+                or self.blocked_until > datetime.now(timezone.utc)
+            ):
+                return self.blocked_until, self.stop_reason
+        return None
+
+    def _observe_response(self, target, response) -> None:
+        with self._guard_lock:
+            if int(response.status_code) == 403:
+                self._forbidden_targets.add(target.target_key)
+                banned = len(self._forbidden_targets) >= BAN_TARGET_THRESHOLD
+            else:
+                self._forbidden_targets.clear()
+                banned = False
+        if banned:
+            self._pause(BAN_PAUSE_SECONDS, "ban")
+        seconds = _parse_retry_after(
+            response.headers.get("Retry-After"), datetime.now(timezone.utc)
+        )
+        if seconds is not None and seconds > 0:
+            self._pause(seconds, "retry_after")
+
+    def _can_retry_response(self, response, attempts: int, limit: int) -> bool:
+        seconds = _parse_retry_after(
+            response.headers.get("Retry-After"), datetime.now(timezone.utc)
+        )
+        return attempts < limit and (seconds or 0) <= self.max_retry_delay
+
+    def _paused_result(self, target, attempts, network_bytes):
+        state = self._pause_state()
+        if state is None:
+            return None
+        until, reason = state
+        result = self._result(
+            outcome=FetchOutcome.RETRYABLE_FAILURE,
+            target=target, http_status=None, body=None, json_data=None,
+            attempts=attempts, network_bytes=network_bytes,
+            error=f"FotMob source paused: {reason}",
+            retry_after=max(timedelta(0), until - datetime.now(timezone.utc)),
+        )
+        return self._finish(replace(result, stop_reason=reason, blocked_until=until))
 
     def reset_stats(self) -> None:
         with self._stats_lock:
@@ -352,11 +444,25 @@ class FotMobTransport:
             values["outcome_counts"] = dict(self._stats["outcome_counts"])
         return TransportStats(**values)
 
+    def thread_attempt_stats(self, *, reset: bool = False) -> dict[str, int]:
+        """Completed HTTP attempts on this worker, also available after an exception."""
+        if reset:
+            self._thread_attempts.attempts = 0
+            self._thread_attempts.direct_bytes = 0
+        return {
+            "attempts": getattr(self._thread_attempts, "attempts", 0),
+            "direct_bytes": getattr(self._thread_attempts, "direct_bytes", 0),
+            "proxy_bytes": 0,
+        }
+
     def _start_target(self) -> None:
+        self.thread_attempt_stats(reset=True)
         with self._stats_lock:
             self._stats["logical_targets"] += 1
 
     def _record_attempt(self, status: Union[int, str], encoded_bytes: int) -> None:
+        self._thread_attempts.attempts = getattr(self._thread_attempts, "attempts", 0) + 1
+        self._thread_attempts.direct_bytes = getattr(self._thread_attempts, "direct_bytes", 0) + encoded_bytes
         status_key = str(status)
         with self._stats_lock:
             self._stats["attempts"] += 1
@@ -365,7 +471,19 @@ class FotMobTransport:
             self._stats["encoded_bytes"] += encoded_bytes
             self._stats["direct_bytes"] += encoded_bytes
 
+    def _record_response_bytes(self, encoded_bytes: int) -> None:
+        self._thread_attempts.direct_bytes = getattr(self._thread_attempts, "direct_bytes", 0) + encoded_bytes
+        with self._stats_lock:
+            self._stats["encoded_bytes"] += encoded_bytes
+            self._stats["direct_bytes"] += encoded_bytes
+
     def _finish(self, result: FetchResult) -> FetchResult:
+        with self._guard_lock:
+            if self.blocked_until and self.blocked_until > datetime.now(timezone.utc):
+                result = replace(
+                    result, stop_reason=self.stop_reason,
+                    blocked_until=self.blocked_until,
+                )
         with self._stats_lock:
             self._stats["retries"] += result.retries
             counts = self._stats["outcome_counts"]
@@ -450,6 +568,7 @@ class FotMobTransport:
         error: Optional[str] = None,
         expects_json: bool = True,
         retry_after: Optional[timedelta] = None,
+        source_observed_at: Optional[str] = None,
     ) -> FetchResult:
         # FotMob answers HTTP 200 with a literal JSON ``null`` body for dead
         # catalog entries (placeholder/promo competitions).  A null payload
@@ -497,6 +616,11 @@ class FotMobTransport:
             proxy_bytes=0,
             error=error,
             retry_after=retry_after,
+            source_observed_at=(
+                source_observed_at or (record.validated_at if record is not None else datetime.now(timezone.utc).isoformat())
+                if not stale and outcome in {FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED}
+                else None
+            ),
             **fields,
         )
 
@@ -757,10 +881,18 @@ class FotMobTransport:
         last_status: Optional[int] = None
         last_error: Optional[str] = None
         while attempts < self.max_attempts:
-            attempts += 1
-            self._acquire_rate_limit()
+            paused = self._paused_result(target, attempts, network_bytes)
+            if paused is not None:
+                return paused
+            if not self._acquire_rate_limit():
+                continue
+            paused = self._paused_result(target, attempts, network_bytes)
+            if paused is not None:
+                return paused
             self._raise_if_cancelled()
+            attempts += 1
             response: Optional[requests.Response] = None
+            recorded = False
             try:
                 response = self.session.get(
                     target.canonical_url,
@@ -773,9 +905,12 @@ class FotMobTransport:
                     getattr(response, "url", None) or target.canonical_url
                 )
                 last_status = int(response.status_code)
+                self._record_attempt(last_status, 0)
+                recorded = True
+                self._observe_response(target, response)
                 encoded = _read_encoded_response(response)
                 network_bytes += len(encoded)
-                self._record_attempt(last_status, len(encoded))
+                self._record_response_bytes(len(encoded))
                 if last_status in {204, 404}:
                     return self._finish(
                         self._result(
@@ -796,7 +931,7 @@ class FotMobTransport:
                 )
                 if retryable:
                     last_error = f"FotMob returned retryable HTTP {last_status}"
-                    if attempts < self.max_attempts:
+                    if self._can_retry_response(response, attempts, self.max_attempts):
                         self._sleep_interruptibly(
                             self._retry_delay(
                                 attempts, response.headers.get("Retry-After")
@@ -868,7 +1003,8 @@ class FotMobTransport:
                     )
                 )
             except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
-                self._record_attempt("exception", 0)
+                if not recorded:
+                    self._record_attempt("exception", 0)
                 self._raise_if_cancelled()
                 last_error = f"request failed: {type(exc).__name__}: {exc}"
                 if attempts < self.max_attempts:
@@ -898,7 +1034,10 @@ class FotMobTransport:
         params: Optional[Params] = None,
         *,
         allow_stale_on_error: bool = True,
+        max_attempts: Optional[int] = None,
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> FetchResult:
+        attempt_limit = self.max_attempts if max_attempts is None else min(self.max_attempts, max(1, max_attempts))
         self._raise_if_cancelled()
         target = canonicalize_target(url_or_endpoint, params)
         self._start_target()
@@ -914,11 +1053,21 @@ class FotMobTransport:
         network_bytes = 0
         last_status: Optional[int] = None
         last_error = cache_error
-        while attempts < self.max_attempts:
-            attempts += 1
-            self._acquire_rate_limit()
+        while attempts < attempt_limit:
+            paused = self._paused_result(target, attempts, network_bytes)
+            if paused is not None:
+                return paused
+            if not self._acquire_rate_limit():
+                continue
+            paused = self._paused_result(target, attempts, network_bytes)
+            if paused is not None:
+                return paused
             self._raise_if_cancelled()
+            if before_attempt is not None:
+                before_attempt()
+            attempts += 1
             response: Optional[requests.Response] = None
+            recorded = False
             try:
                 response = self.session.get(
                     target.canonical_url,
@@ -952,9 +1101,12 @@ class FotMobTransport:
                             )
                         )
                 last_status = int(response.status_code)
+                self._record_attempt(last_status, 0)
+                recorded = True
+                self._observe_response(target, response)
                 encoded = _read_encoded_response(response)
                 network_bytes += len(encoded)
-                self._record_attempt(last_status, len(encoded))
+                self._record_response_bytes(len(encoded))
 
                 if last_status in {204, 404}:
                     return self._finish(
@@ -987,13 +1139,14 @@ class FotMobTransport:
                             )
                         )
                     record = cached_record
+                    validated_at = datetime.now(timezone.utc).isoformat()
                     if self.raw_store is not None:
                         try:
                             record = self.raw_store.store(
                                 target,
                                 cached_body,
                                 fetched_at=cached_record.fetched_at,
-                                validated_at=datetime.now(timezone.utc).isoformat(),
+                                validated_at=validated_at,
                                 etag=response.headers.get("ETag") or cached_record.etag,
                                 last_modified=(
                                     response.headers.get("Last-Modified")
@@ -1012,6 +1165,7 @@ class FotMobTransport:
                     return self._finish(
                         self._result(
                             outcome=FetchOutcome.NOT_MODIFIED,
+                            source_observed_at=validated_at,
                             target=target,
                             http_status=last_status,
                             body=cached_body,
@@ -1028,7 +1182,7 @@ class FotMobTransport:
                 )
                 if retryable:
                     last_error = f"FotMob returned retryable HTTP {last_status}"
-                    if attempts < self.max_attempts:
+                    if self._can_retry_response(response, attempts, attempt_limit):
                         self._sleep_interruptibly(
                             self._retry_delay(
                                 attempts,
@@ -1043,7 +1197,10 @@ class FotMobTransport:
                         network_bytes=network_bytes,
                         cached_body=cached_body,
                         cached_record=cached_record,
-                        allow_stale_on_error=allow_stale_on_error,
+                        allow_stale_on_error=(
+                            allow_stale_on_error
+                            and self._can_retry_response(response, 0, 1)
+                        ),
                         error=last_error,
                         retry_after=self._retry_after_duration(
                             response.headers.get("Retry-After")
@@ -1158,10 +1315,11 @@ class FotMobTransport:
                     )
                 )
             except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
-                self._record_attempt("exception", 0)
+                if not recorded:
+                    self._record_attempt("exception", 0)
                 self._raise_if_cancelled()
                 last_error = f"request failed: {type(exc).__name__}: {exc}"
-                if attempts < self.max_attempts:
+                if attempts < attempt_limit:
                     self._sleep_interruptibly(self._retry_delay(attempts, None))
                     continue
                 return self._stale_or_failure(

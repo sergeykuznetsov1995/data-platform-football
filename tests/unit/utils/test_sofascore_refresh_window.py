@@ -67,7 +67,7 @@ def test_round_limit_is_finite_even_if_source_keeps_growing():
     assert result['stop_reason'] == 'round_cap'
 
 
-def test_failed_scope_remains_failed_and_stops_refill():
+def test_failed_scope_remains_failed():
     clock, calls, pending, plan, _ = _harness([593], [])
     result = refill_window(initial_elapsed_s=0, deadline_epoch=15000,
                            pending=pending, plan=plan,
@@ -190,3 +190,40 @@ def test_a_success_between_blips_resets_the_streak():
     assert visited == ['1', '2', '3', '4', '5']
     assert result['status'] == 'partial'
     assert result['transient_failures'] == 4
+
+
+def test_failed_scope_keeps_filling_the_window_and_stays_red():
+    rows, visited, plan, execute = _scopes_harness(['refreshed', 'failed', 'refreshed'])
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3']
+    assert result['status'] == 'failed'
+    assert result['stop_reason'] == 'scope_failure'
+    assert result['blocked_scopes'] == ['c:2']
+
+
+def test_a_streak_of_failed_scopes_stops_the_window():
+    rows, visited, plan, execute = _scopes_harness(['failed'] * 4)
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3']
+    assert result['status'] == 'failed'
+    assert result['stop_reason'] == 'scope_failure'
+
+
+def test_alternating_blips_and_failed_scopes_still_stop_the_window():
+    rows, visited, plan, execute = _scopes_harness(
+        ['transient_failure', 'failed', 'transient_failure', 'failed', 'refreshed'])
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3']
+    assert result['status'] == 'failed'
+    assert result['stop_reason'] == 'scope_failure'
+
+
+def test_persisted_report_is_red_right_after_a_failed_scope():
+    rows, visited, plan, execute = _scopes_harness(['failed', 'refreshed'])
+    saved = []
+    refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                  plan=plan, execute=execute, now=lambda: 1000, persist=saved.append)
+    assert all(r['status'] == 'failed' and r['stop_reason'] == 'scope_failure' for r in saved)

@@ -252,6 +252,9 @@ class _Repository:
         self.ensured = False
         self.verified: list[ScopeAttempt] = []
 
+    def validate_tables(self):
+        self.validated = True
+
     def ensure_table(self):
         self.ensured = True
 
@@ -842,28 +845,22 @@ def test_early_failure_before_attempt_is_journaled_with_next_attempt_no(
     assert journaled.error_message == result["errors"][0]
 
 
-def test_every_run_ensures_the_failures_journal_before_any_failure():
+def test_every_run_validates_both_journals_without_ddl():
     factory, _ = _scraper_factory(_complete_frames())
-    repository = _Repository()
-
-    _, exit_code = runner.run_scope(
-        _args(), scraper_factory=factory, repository=repository
-    )
-
-    assert exit_code == 0
-    assert repository.ensured and repository.failures_ensured
-    assert repository.failures == []
+    for _ in range(2):
+        repository = _Repository()
+        _, exit_code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+        assert exit_code == 0
+        assert repository.validated
+        assert not repository.ensured and not repository.failures_ensured
 
     broken = _Repository()
-
-    def journal_outage():
-        raise ConnectionError("trino unavailable")
-
-    broken.ensure_failures_table = journal_outage
-    _, broken_exit = runner.run_scope(
-        _args(), scraper_factory=factory, repository=broken
-    )
-    assert broken_exit == 0
+    def missing_schema():
+        raise RuntimeError("missing manifest schema")
+    broken.validate_tables = missing_schema
+    with pytest.raises(RuntimeError, match="missing manifest schema"):
+        runner.run_scope(_args(), scraper_factory=factory, repository=broken)
+    assert not broken.appended and not broken.failures
 
 
 def test_first_empty_match_attempt_publishes_complete_waiting_quarantine(monkeypatch):
@@ -1095,10 +1092,13 @@ def test_closed_check_unchanged_leaves_manifest_untouched_and_reports_latest():
     assert repository.verified[-1] is baseline
     assert payload == {
         **runner._result_payload(baseline),
+        "request_count": 2,
+        "retry_count": None,
         "closed_check": {
             "unchanged": True,
             "hashes": _LEAGUE_HASHES,
             "request_count": 2,
+            "retry_count": None,
         },
     }
 
@@ -1219,3 +1219,121 @@ def test_closed_check_without_baseline_hashes_reingests_without_probe():
     full.scrape_scope.assert_called_once()
     assert repository.appended[-1].quality["league_payload_hashes"] == _LEAGUE_HASHES
     assert repository.appended[-1].quality["request_count"] == 380
+
+
+@pytest.mark.parametrize("physical", [True, False])
+def test_catalog_quality_ready_requires_verified_manifest_publication(physical):
+    factory, scraper = _scraper_factory(_complete_frames())
+    repository = _Repository(physical=physical)
+    def note_quality(league, year, report, *, publication_ready=True):
+        if not publication_ready:
+            assert not repository.appended
+            return
+        assert repository.verified
+        assert repository.appended[-1].status is ManifestStatus.COMPLETE
+        assert report.passed
+    scraper.note_quality.side_effect = note_quality
+    _, code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+    assert code == (0 if physical else 2)
+    assert scraper.note_quality.call_count == (2 if physical else 1)
+
+
+@pytest.mark.parametrize("failure", ["write", "physical", "terminal", None])
+def test_previous_catalog_readiness_is_cleared_before_publication(tmp_path, failure):
+    from datetime import date
+    from types import SimpleNamespace
+    from scrapers.understat.catalog import LEAGUE_BY_CANONICAL, UnderstatCatalog
+    from tests.unit.scrapers.test_understat_native import LEAGUE_PAYLOAD
+
+    definition = LEAGUE_BY_CANONICAL[LEAGUE]
+    catalog = UnderstatCatalog(SimpleNamespace(cache_dir=tmp_path), today=date(2025, 8, 3))
+    catalog.record_league(definition, 2025, LEAGUE_PAYLOAD)
+    catalog.note_quality(LEAGUE, 2025, SimpleNamespace(passed=True, match_quarantine=[]))
+    assert catalog._confirmed(definition)["2025"]["quality_ready"]
+    factory, scraper = _scraper_factory(_complete_frames())
+    scraper.note_quality.side_effect = catalog.note_quality
+    repository = _Repository(physical=failure != "physical")
+    append = repository.append_attempt
+
+    def append_attempt(attempt):
+        if attempt.status is ManifestStatus.IN_PROGRESS:
+            assert not catalog._confirmed(definition)["2025"]["quality_ready"]
+        if failure == "terminal" and attempt.status is ManifestStatus.COMPLETE:
+            raise ValueError("terminal manifest failed")
+        return append(attempt)
+
+    repository.append_attempt = append_attempt
+    if failure == "write":
+        scraper.save_to_iceberg.side_effect = ValueError("write failed")
+    _, code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+    assert code == (0 if failure is None else 2)
+    # Once the last match leaves N, failed publication must remain daily.
+    catalog.today = date(2025, 8, 10)
+    state = catalog.record_league(definition, 2025, LEAGUE_PAYLOAD)
+    assert state["quality_ready"] is (failure is None)
+    assert state["is_closed"] is (failure is None)
+
+
+def test_explicit_bootstrap_cli_does_not_start_scope_ingestion(monkeypatch):
+    from scrapers.understat.manifest import UnderstatManifestRepository
+
+    repository = MagicMock()
+    monkeypatch.setattr(UnderstatManifestRepository, "from_env", lambda: repository)
+    monkeypatch.setattr(runner, "run_scope", lambda *_: pytest.fail("bootstrap ingested a scope"))
+    assert runner.main(["--bootstrap-manifest"]) == 0
+    repository.bootstrap.assert_called_once_with()
+
+
+def test_optional_html_failure_never_runs_or_fails_json(monkeypatch, capsys, tmp_path):
+    import scrapers.understat.enrichment as enrichment
+    from scrapers.understat.manifest import UnderstatManifestRepository
+
+    def fail(*args, **kwargs):
+        raise OSError("optional cache unavailable")
+    monkeypatch.setenv("UNDERSTAT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(enrichment, "run_enrichment", fail)
+    monkeypatch.setattr(UnderstatManifestRepository, "from_env", lambda: object())
+    monkeypatch.setattr(runner, "run_scope", lambda *args: pytest.fail("JSON path called"))
+    assert runner.main(["--enrich-matches"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "deferred"
+
+
+def test_optional_html_import_failure_is_contained(monkeypatch, capsys):
+    import builtins
+
+    original = builtins.__import__
+    def fail_html(name, *args, **kwargs):
+        if name == "scrapers.understat.enrichment":
+            raise ImportError("optional dependency unavailable")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", fail_html)
+    assert runner.main(["--enrich-matches"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "deferred"
+
+
+def test_source_diagnostics_survive_runner_quality_without_blocking_or_extra_calls():
+    frames = _complete_frames()
+    frames['understat_player_match_stats']['roster_entry_ids'] = '11,12'
+    factory, scraper = _scraper_factory(frames)
+    payload, exit_code = runner.run_scope(_args(), scraper_factory=factory, repository=_Repository())
+    assert exit_code == 0
+    quality = payload['scope_attempt']['quality']
+    assert any(issue['code'] == 'multiple_roster_entries' and issue['status'] == 'warning'
+               for issue in quality['issues'])
+    assert scraper.scrape_scope.call_count == 1
+    assert scraper.save_to_iceberg.call_count == 7
+    from scrapers.understat.quality import validate_understat_scope
+    from scrapers.understat.manifest import ScopeKey
+    scope = ScopeKey(LEAGUE, '2526', source_season_id='2025')
+    report = validate_understat_scope(frames, scope=scope, active=True)
+    assert report.passed
+    baseline = {key: frame.copy(deep=True) for key, frame in frames.items()}
+    # Different source roster provenance must not change row counts or payloads.
+    import unittest.mock
+    with unittest.mock.patch('scrapers.understat.anomalies.diagnose_matches', return_value=[]):
+        plain = validate_understat_scope(baseline, scope=scope, active=True)
+    assert report.row_counts == plain.row_counts
+    assert report.payload_hashes == plain.payload_hashes
+    assert report.publishable == plain.publishable
+    frames['understat_shots'] = pd.concat([frames['understat_shots']] * 2)
+    assert not validate_understat_scope(frames, scope=scope, active=True).passed

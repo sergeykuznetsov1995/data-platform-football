@@ -541,7 +541,7 @@ class UnderstatManifestRepository:
         catalog: str = "iceberg",
         schema: str = MANIFEST_SCHEMA,
         table: str = MANIFEST_TABLE,
-        ensure_table_on_write: bool = True,
+        ensure_table_on_write: bool = False,
     ) -> None:
         self.catalog = _validate_identifier(catalog, "catalog")
         self.schema = _validate_identifier(schema, "schema")
@@ -598,6 +598,33 @@ class UnderstatManifestRepository:
             rows = query(sql, params)
             return rows or []
         raise TypeError("query adapter must expose execute_query or _execute")
+
+    def validate_tables(self) -> None:
+        """Fail before collection if either pre-bootstrapped journal is incompatible."""
+        expected = {column: "varchar" for column in MANIFEST_COLUMNS}
+        expected["attempt_no"] = "bigint"
+        for table in (self.table, FAILURES_TABLE):
+            rows = self._execute(
+                f"SELECT column_name, data_type FROM {self.catalog}.information_schema.columns "
+                "WHERE table_schema = ? AND table_name = ?",
+                params=(self.schema, table),
+            )
+            actual = {
+                (row["column_name"] if isinstance(row, Mapping) else row[0]):
+                (row["data_type"] if isinstance(row, Mapping) else row[1]).lower()
+                for row in rows
+            }
+            if actual != expected:
+                raise RuntimeError(
+                    f"Incompatible or missing {self.catalog}.{self.schema}.{table}; "
+                    "run explicit manifest bootstrap before ingestion"
+                )
+
+    def bootstrap(self) -> None:
+        """Explicit one-time DDL; never called by ordinary ingestion."""
+        self.ensure_table()
+        self.ensure_failures_table()
+        self.validate_tables()
 
     def ensure_table(self) -> None:
         if self._table_ensured:
@@ -800,24 +827,6 @@ class UnderstatManifestRepository:
         if attempt is None or attempt.status is not ManifestStatus.COMPLETE:
             return False
         return not verify_physical or self.verify_physical_batch(attempt)
-
-    is_published = is_scope_complete
-
-    def next_incomplete(
-        self,
-        scopes: Iterable[ScopeKey],
-        *,
-        contract_version: str = CONTRACT_VERSION,
-        verify_physical: bool = True,
-    ) -> Optional[ScopeKey]:
-        for scope in scopes:
-            if not self.is_scope_complete(
-                scope,
-                contract_version=contract_version,
-                verify_physical=verify_physical,
-            ):
-                return scope
-        return None
 
     def incomplete_closed_scopes(
         self,

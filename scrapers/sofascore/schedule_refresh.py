@@ -348,6 +348,7 @@ def fetch_season_schedules(
     start_pages: Optional[Mapping[tuple[int, int], int]] = None,
     resume_anchors: Optional[Mapping[tuple[int, int], int]] = None,
     chase_before: Optional[Mapping[tuple[int, int], int]] = None,
+    probe_targets: Optional[Collection[tuple[int, int]]] = None,
     owed_pages: Optional[Collection[tuple[int, int]]] = None,
     missing_fail_share: Optional[float] = _MISSING_FAIL_SHARE,
     failures: Optional[list] = None,
@@ -374,6 +375,13 @@ def fetch_season_schedules(
     on the next page).  Without it a season that finished more than a page of
     matches since its last visit would silently lose the overflow — page 0 is
     only the freshest 30.  ``max_pages`` is the bound on that chase.
+
+    ``probe_targets`` limits only those exact native tournament/season pairs
+    to the first tail page. A fresh suffix beyond that page is returned in the
+    normal incomplete queue; a probe never claims a complete season. Resumed
+    chains cannot be probes because their overlap/backtracking costs more than
+    the one-page probe allowance. All targets still share the same drift and
+    refusal checks.
 
     The exact response bytes are stored before the payload is validated so a
     schema surprise from the source leaves replayable evidence behind.
@@ -410,6 +418,9 @@ def fetch_season_schedules(
     incomplete: list[tuple[int, int, int, int]] = []
     starts = dict(start_pages or {})
     anchors = dict(resume_anchors or {})
+    probes = frozenset(probe_targets or ())
+    if any(int(starts.get(pair, 0)) > 0 for pair in probes):
+        raise ValueError("head-only probes cannot resume an existing page chain")
     counters = empty_schedule_counters()
     # Chains resumed from the retry queue, and how many of them broke.  They are
     # kept OUT of the drift threshold below: a queued chain whose page breaks is
@@ -452,7 +463,7 @@ def fetch_season_schedules(
         resumed_targets += int(bool(owed_page))
         first = max(0, owed_page - 1) if owed_page else 0
         anchor = int(anchors.get(pair, 0))
-        stop = owed_page + max(1, int(max_pages))
+        stop = owed_page + (1 if pair in probes else max(1, int(max_pages)))
         backtracked = 0
         if first:
             counters["resumed"] += 1

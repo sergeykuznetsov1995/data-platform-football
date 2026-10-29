@@ -2,17 +2,75 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import subprocess
+import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
 import pytest
 
-from scripts import whoscored_production_admission as admission
+# Production rejects group-writable checkout ancestors, even during import.
+# Use exact checkout bytes in a private tree; never bypass its permission checks.
+_SOURCE_ROOT = Path(__file__).resolve().parents[3]
+_HELPERS = (
+    "scripts/whoscored_production_admission.py",
+    "scripts/validate_whoscored_build_provenance.py",
+)
+
+
+def _copy_protected_file(root: Path, relative: str) -> None:
+    source = _SOURCE_ROOT / relative
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    parent = target.parent
+    while parent != root:
+        parent.chmod(0o700)
+        parent = parent.parent
+    raw = source.read_bytes()
+    target.write_bytes(raw)
+    target.chmod(0o600)
+    assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(raw).digest()
+
+
+def _load_test_admission() -> tuple[tempfile.TemporaryDirectory, ModuleType]:
+    # Explicit /tmp: TMPDIR may itself be inside the group-writable checkout.
+    release = tempfile.TemporaryDirectory(
+        prefix="whoscored-admission-test-", dir="/tmp"
+    )
+    try:
+        root = Path(release.name)
+        for relative in _HELPERS:
+            _copy_protected_file(root, relative)
+        spec = importlib.util.spec_from_file_location(
+            "_test_whoscored_production_admission", root / _HELPERS[0]
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(spec.name, None)
+        # Capacity receipt tests verify real checkout files and the unchanged lock.
+        for relative in module._CAPACITY_RUNTIME_FILE_PATHS - set(_HELPERS):
+            _copy_protected_file(root, relative)
+        return release, module
+    except BaseException:
+        release.cleanup()
+        raise
+
+
+_test_release, admission = _load_test_admission()
+
+
+def teardown_module() -> None:
+    _test_release.cleanup()
 
 
 SHA_A = "a" * 64
@@ -6875,3 +6933,45 @@ def test_direct_cli_rejects_unprotected_release_before_validator_executes(
     assert result.returncode == admission.EXIT_CONFIG
     assert result.stderr == b""
     assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("unsafe", ["parent", "file", "symlink"])
+def test_cli_rejects_unsafe_validator_without_executing_it(unsafe: str) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="whoscored-admission-negative-", dir="/tmp"
+    ) as directory:
+        root = Path(directory)
+        for relative in _HELPERS:
+            _copy_protected_file(root, relative)
+        validator = root / _HELPERS[1]
+        sentinel = root / "executed"
+        validator.write_text(
+            f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n",
+            encoding="utf-8",
+        )
+        if unsafe == "parent":
+            validator.parent.chmod(0o770)
+        elif unsafe == "file":
+            validator.chmod(0o660)
+        else:
+            target = validator.with_suffix(".target")
+            validator.rename(target)
+            validator.symlink_to(target)
+        result = subprocess.run(
+            ("/usr/bin/python3", "-I", "-S", str(root / _HELPERS[0]), "--help"),
+            env={"HOME": "/nonexistent", "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == admission.EXIT_CONFIG
+        assert not sentinel.exists()
+
+
+def test_protected_test_release_preserves_checkout_bytes() -> None:
+    root = Path(_test_release.name)
+    for relative in admission._CAPACITY_RUNTIME_FILE_PATHS:
+        assert (root / relative).read_bytes() == (_SOURCE_ROOT / relative).read_bytes()
+    assert (
+        admission.provenance._whoscored_loaded_source_sha256
+        == hashlib.sha256((_SOURCE_ROOT / _HELPERS[1]).read_bytes()).hexdigest()
+    )

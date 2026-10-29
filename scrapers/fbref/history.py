@@ -369,21 +369,30 @@ class HistoryCampaign:
                 return max(
                     HISTORY_PAGE_SECONDS_FLOOR, math.ceil(float(row["seconds"]) / 1000)
                 )
-            # Initial admission uses actual committed fetch-through-parse time,
-            # rather than the old page throttle projection or an invented speed.
+            # Batch claim/completion timestamps include other pages' work.
+            # Only measured work and one unambiguous successful fetch qualify.
             cursor.execute(
-                """SELECT max(seconds) AS seconds FROM (
-                SELECT extract(epoch FROM (observed.completed_at-attempt.started_at)) AS seconds
+                """WITH measured AS (
+                SELECT observed.completed_at, observed.processing_work_ms,
+                  (SELECT max(attempt.latency_ms)
+                   FROM fbref_control.fetch_attempt attempt
+                   WHERE attempt.logical_refresh_id=observed.logical_refresh_id
+                     AND attempt.target_id=observed.target_id
+                     AND attempt.content_hash=observed.content_hash
+                     AND attempt.status='succeeded'
+                   HAVING count(*)=1) AS fetch_ms
                 FROM fbref_control.observation_processing observed
-                JOIN fbref_control.fetch_attempt attempt USING(logical_refresh_id)
                 WHERE observed.status='succeeded' AND observed.generic_status='succeeded'
                   AND observed.typed_status IN ('succeeded','skipped')
                   AND observed.stateful_status IN ('succeeded','skipped')
                   AND observed.validation_status='succeeded'
                   AND observed.parser_version=%s AND observed.typed_parser_version=%s
                   AND observed.stateful_parser_version=%s
-                  AND observed.completed_at>attempt.started_at
-                ORDER BY observed.completed_at DESC LIMIT 100
+                  AND observed.processing_work_ms>0 AND observed.completed_at IS NOT NULL
+            ) SELECT max(seconds) AS seconds FROM (
+                SELECT (fetch_ms+processing_work_ms)/1000.0 AS seconds
+                FROM measured WHERE fetch_ms>0
+                ORDER BY completed_at DESC LIMIT 100
             ) timings""",
                 (
                     PAGE_DOCUMENT_VERSION,

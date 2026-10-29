@@ -1086,3 +1086,23 @@ def test_extract_tournament_standings_distinct_names_keep_plain_group():
     rows = extract_tournament_standings(_wc_group_standings_buffer(), 16, 58210)
     assert [r["group"] for r in rows] == [
         "Group A", "Group A", "Group B", "Group B"]
+
+
+@pytest.mark.parametrize("delta", [1, 2])
+def test_exact_warm_captcha_has_retryable_safe_reason(delta):
+    cap = _cap()
+    cap._page = MagicMock()
+    response = MagicMock(status=200, url="https://www.sofascore.com/captcha.html?token=secret")
+
+    def navigate(*_args, **_kwargs):
+        cap._source_request_count += delta
+        return response
+
+    cap._page.goto.side_effect = navigate
+    cap._page.evaluate.return_value = "https://www.sofascore.com"
+    with pytest.raises(RuntimeError) as captured:
+        cap.warm_exact_json("https://www.sofascore.com/event/17371523")
+    assert getattr(captured.value, "reason", None) == "sofascore_anchor_challenge"
+    assert "secret" not in str(captured.value)
+    assert cap._source_request_count == delta
+    assert cap._navigation_count == 1

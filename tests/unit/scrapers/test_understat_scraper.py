@@ -1,5 +1,7 @@
 """Public facade tests for the source-native Understat scraper."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -87,12 +89,8 @@ def test_scrape_scope_preserves_explicit_canonical_signature(scraper):
     ]
 
 
-def test_read_wrappers_share_one_seven_table_scope_fetch(scraper):
-    facade, source = scraper
-    frames = [getattr(facade, contract.reader_method)() for contract in TABLE_CONTRACTS]
-    assert len(source.calls) == 1
-    assert all(frame is not None and len(frame) == 1 for frame in frames)
-    assert all("_batch_id" in frame.columns for frame in frames)
+def test_scope_discovery_is_forwarded(scraper):
+    facade, _source = scraper
     assert facade.discover_scopes() == ("discovered",)
     assert facade.rolling_scopes() == ("rolling",)
 
@@ -152,11 +150,81 @@ def test_scope_writer_requires_runner_owned_batch_id(scraper):
         )
 
 
-def test_table_specs_come_from_registry_and_legacy_writer_is_disabled(scraper):
+def test_legacy_writer_is_disabled(scraper):
     facade, _source = scraper
-    assert facade.TABLE_SPECS == [
-        (contract.reader_method, contract.table_name, contract.result_key)
-        for contract in TABLE_CONTRACTS
-    ]
     with pytest.raises(RuntimeError, match="scope-aware"):
         facade.scrape_all()
+
+
+@pytest.mark.parametrize(
+    "filename, removed",
+    [
+        (
+            "scraper.py",
+            {
+                "TABLE_SPECS", "_scope_cache", "_configured_scopes", "_read_table",
+                "_filter_match", "read_schedule", "read_shot_events",
+                "read_player_season_stats", "read_team_match_stats",
+                "read_player_match_stats", "read_player_team_season_stats",
+                "read_team_season_breakdowns",
+            },
+        ),
+        ("contracts.py", {"reader_method"}),
+        ("manifest.py", {"is_published", "next_incomplete"}),
+    ],
+)
+def test_retired_api_has_no_definitions_or_references(filename, removed):
+    source = Path(__file__).resolve().parents[3] / "scrapers" / "understat" / filename
+    tree = ast.parse(source.read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.keyword):
+            names.add(node.arg)
+    assert not names & removed
+
+
+@pytest.mark.parametrize("values", [[None, None], [0, 1, None], [0.125, 0.75, None]])
+def test_forecast_writer_types_survive_real_arrow_preparation(scraper, values):
+    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.understat.contracts import FORECAST_COLUMNS
+
+    facade, _ = scraper
+    writer = facade._iceberg_writer
+    writer._add_metadata_columns.side_effect = lambda df, source, batch_id: df.assign(_batch_id=batch_id)
+    frame = pd.DataFrame({column: values for column in FORECAST_COLUMNS}).convert_dtypes()
+    facade.save_to_iceberg(frame, "understat_schedule", batch_id="batch")
+    prepared = writer.write_dataframe.call_args.kwargs["df"]
+    arrow = IcebergWriter()._pandas_to_arrow(prepared)
+    types = TrinoTableManager.__new__(TrinoTableManager).arrow_schema_to_trino(arrow.schema)
+    for column in FORECAST_COLUMNS:
+        assert types[column] == "DOUBLE"
+        assert str(arrow.schema.field(column).type) == "double"
+        assert str(prepared[column].dtype) == "Float64"
+        assert arrow[column].to_pylist() == values
+    assert prepared["_batch_id"].tolist() == ["batch"] * len(values)
+
+
+@pytest.mark.parametrize("invalid", ["invalid", ""])
+def test_forecast_writer_rejects_invalid_numbers_before_write(scraper, invalid):
+    facade, _ = scraper
+    with pytest.raises(ValueError):
+        facade.save_to_iceberg(
+            pd.DataFrame({"forecast_draw": [invalid]}),
+            "understat_schedule", batch_id="batch",
+        )
+    facade._iceberg_writer.write_dataframe.assert_not_called()
+
+
+def test_contract_declares_all_columns_without_changing_batch_versions():
+    for contract in TABLE_CONTRACTS:
+        assert set(contract.column_types) == set(contract.required_columns)
+        assert contract.column_types["league_id"] == "varchar"
+        assert contract.column_types["season"] == "varchar"
+    assert TABLE_CONTRACTS[0].column_types["forecast_draw"] == "double"

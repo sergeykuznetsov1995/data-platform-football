@@ -35,14 +35,14 @@ if str(ROOT / 'dags') not in sys.path:
 from dags.utils.transfermarkt_current_state import (
     CURRENT_POLICY_VERSION, CurrentWork, EditionCheck, ScopeCursor, SignalObservation,
     SignalState, build_check_merge, build_current_state_tables, build_measurement_kind_migration_sql,
-    build_signal_merge, build_signals_merge, build_check_fingerprint_migrations_sql,
+    build_signal_merge, build_signals_merge, build_player_signature_migration, build_check_fingerprint_migrations_sql,
     denominator_definition_hash, edition_measurement_fingerprint, current_scope_targets, daily_complete, mark_applied,
     mark_seen, mark_failed, plan_current_work, record_check,
 )
 from dags.utils.transfermarkt_current_timetable import available_work_seconds
 from scrapers.transfermarkt.current_capture import (
     ClubRosterSnapshot, FullRosterSnapshot, assemble_full_roster,
-    club_listing_signatures, player_changes, semantic_signature,
+    club_listing_signatures, player_changes, semantic_signature, verify_contract_overrides,
 )
 from scrapers.transfermarkt.models import (
     FetchOutcome, FetchStatus, PRODUCTION_ENTITY_BUDGETS, SharedTrafficLedger, stable_payload_hash,
@@ -371,6 +371,7 @@ def seed_current_baseline(scraper, entry, preflight, verify_complete_scope):
     if manifest.dq_evidence.get('career_fetches_pending') != 0:
         raise CurrentPortionError('baseline_required: previous scope still has unverified career remainder')
     snapshot = FullRosterSnapshot.from_mapping(entry['snapshot'])
+    verify_contract_overrides(snapshot, scraper._http_client._raw_store)
     if snapshot.scope_id != manifest.scope_id:
         raise CurrentPortionError('baseline_required: snapshot belongs to another complete scope')
     if verify_complete_scope is None:
@@ -383,14 +384,13 @@ def seed_current_baseline(scraper, entry, preflight, verify_complete_scope):
     roster_proof = verify_current_roster_baseline(scraper, snapshot, receipts, preflight)
     _, roster_at = _proof(roster_proof)
     signals = {}
-    from scrapers.transfermarkt.scraper import _parse_squad_page
+    from scrapers.transfermarkt.scraper import squad_replay_matches
     store = scraper._http_client._raw_store
     for club in snapshot.clubs.values():
         body, raw = store.load_capture(club.raw_capture_id)
         if (raw.url != club.source_url or raw.scope_id != snapshot.scope_id
             or hashlib.sha256(body).hexdigest() != club.source_body_hash
-            or semantic_signature(_parse_squad_page(body.decode('utf-8'), club.club_id))
-                != semantic_signature([dict(row) for row in club.rows])):
+            or not squad_replay_matches(body.decode('utf-8'), club.club_id, club.rows)):
             raise CurrentPortionError('baseline_required: warm roster differs from immutable full raw')
     for key, value in entry.get('signals', {}).items():
         state = SignalState.from_mapping(value)
@@ -506,15 +506,15 @@ class _Scope:
         self.resume = json.loads(self.cursor.resume_json)
         self.snapshot = FullRosterSnapshot.from_mapping(data['snapshot']) if data.get('snapshot') else None
         if self.snapshot is not None:
-            from scrapers.transfermarkt.scraper import _parse_squad_page
+            verify_contract_overrides(self.snapshot, scraper._http_client._raw_store)
+            from scrapers.transfermarkt.scraper import squad_replay_matches
             receipts = data.get('roster_receipts', [])
             for club in self.snapshot.clubs.values():
                 raw, receipt = scraper._http_client._raw_store.load_capture(club.raw_capture_id)
                 if (hashlib.sha256(raw).hexdigest() != club.source_body_hash
                     or receipt.scope_id != target.scope_id or receipt.url != club.source_url
                     or _utc(receipt.fetched_at) != club.raw_fetched_at
-                    or semantic_signature(_parse_squad_page(raw.decode('utf-8'), club.club_id))
-                        != semantic_signature([dict(row) for row in club.rows])):
+                    or not squad_replay_matches(raw.decode('utf-8'), club.club_id, club.rows)):
                     raise CurrentPortionError('retained full roster differs from verified raw capture')
                 matching = [proof for proof in receipts if proof.get('bronze_manifest') == club.bronze_manifest
                             and proof.get('club_receipts', {}).get(club.club_id, {}).get('raw_capture_id') == club.raw_capture_id]
@@ -660,12 +660,31 @@ class _Scope:
             self.scraper._http_client._record_cache_hit(label='current_players', duration_seconds=0)
             packets[capture_id] = (parsed, receipt)
         parsed, receipt = packets[capture_id]
-        if player_id not in parsed or parsed[player_id].signature != fact['signature']:
+        if player_id not in parsed or fact['signature'] not in (parsed[player_id].signature, parsed[player_id].legacy_signature):
             raise CurrentPortionError('cached global player fields differ from primary raw payload')
         outcome = FetchOutcome(status=FetchStatus.OK, cache_hit=True, raw_capture_id=capture_id,
             raw_body_hash=receipt.content_hash, raw_fetched_at=receipt.fetched_at,
             raw_uri=receipt.raw_uri, raw_attempt_envelope_ids=tuple(fact['raw_attempt_envelope_ids']))
         return parsed[player_id], outcome, receipt.url, fact['primary_scope_id']
+
+    def _normalize_player_signature(self, player_id, previous):
+        """Migrate only a signature proven by the saved exact player fields.
+
+        Preserve pending/failed status and all Bronze proof and event times.
+        Positive values and already canonical signatures are unchanged.
+        """
+        old = tmapi.PlayerSignal(**previous)
+        state = self.signals.get(f'player:{player_id}')
+        if old.signature == old.legacy_signature or state is None or state.observation.signature != old.legacy_signature:
+            return
+        if state.status == 'applied':
+            _sql(self.scraper, build_player_signature_migration(state, old.signature))
+        self.signals[f'player:{player_id}'] = replace(
+            state, observation=replace(state.observation, signature=old.signature),
+            applied_signature=old.signature if state.applied_signature == old.legacy_signature else state.applied_signature)
+        applied = self.data.get('player_roster_applied', {})
+        if applied.get(player_id) == old.legacy_signature:
+            applied[player_id] = old.signature
 
     def _save_player_packet(self, parsed, outcome, url):
         facts = {}
@@ -824,8 +843,8 @@ class _Scope:
         source_times = list(progress.get('source_times', []))
         source_scopes = dict(progress.get('source_scopes', {}))
         membership_validation = dict(progress.get('membership_validation', {}))
-        for offset in range(progress['offset'], len(ids), 300):
-            packet = ids[offset:offset + 300]
+        for offset in range(progress['offset'], len(ids), tmapi.MAX_PLAYER_IDS):
+            packet = ids[offset:offset + tmapi.MAX_PLAYER_IDS]
             facts = {player_id: self._player_fact(player_id, packets) for player_id in packet}
             missing = [player_id for player_id, fact in facts.items() if fact is None]
             if missing:
@@ -851,6 +870,8 @@ class _Scope:
                 source_times.append(outcome.raw_fetched_at)
                 source_scopes[outcome.raw_capture_id] = primary_scope
                 previous = self.data.setdefault('player_values', {}).get(player_id)
+                if previous is not None:
+                    self._normalize_player_signature(player_id, previous)
                 national_career_only = False
                 if national and previous is not None:
                     old_assignments = [assignment for assignment in previous.get('assignments', []) if assignment[1] == 'nationalTeam']
@@ -858,14 +879,14 @@ class _Scope:
                     national_career_only = (
                         (not old_assignments or not new_assignments
                          or semantic_signature(old_assignments) == semantic_signature(new_assignments))
-                        and previous.get('market_value_eur') == signal.market_value_eur
+                        and tmapi.normalize_market_value(previous.get('market_value_eur')) == tmapi.normalize_market_value(signal.market_value_eur)
                         and previous.get('attributes_json') == signal.attributes_json)
                 value_dates = self.data.get('career_value_dates', {})
                 known_value_date = value_dates.get(player_id)
                 date_only = previous is not None and (
                     previous.get('market_value_date') != signal.market_value_date
-                    and semantic_signature({key: value for key, value in previous.items() if key != 'market_value_date'})
-                    == semantic_signature({key: value for key, value in signal.as_dict().items() if key != 'market_value_date'}))
+                    and tmapi.player_signal_signature({key: value for key, value in previous.items() if key != 'market_value_date'})
+                    == tmapi.player_signal_signature({key: value for key, value in signal.as_dict().items() if key != 'market_value_date'}))
                 player_rows = [row for row in self.snapshot.rows if row['player_id'] == player_id]
                 baseline_proof = None
                 if previous is None:
@@ -879,7 +900,7 @@ class _Scope:
                     comparable_matches = (
                         self.data.get('roster_proof')
                         and signal_roster_clubs == memberships[player_id]
-                        and all(row.get('market_value_eur') == signal.market_value_eur
+                        and all(tmapi.normalize_market_value(row.get('market_value_eur')) == tmapi.normalize_market_value(signal.market_value_eur)
                                 and (national or (str(row['contract_until']) if row.get('contract_until') is not None else None) == signal.contract_until)
                                 and (row.get('market_value_date') is None or str(row['market_value_date']) == signal.market_value_date)
                                 for row in player_rows))
@@ -912,7 +933,7 @@ class _Scope:
                         self.resume.setdefault('squad_generations', {})[club_id] = semantic_signature(
                             [state.first_detected_at.isoformat(), signal.signature])
                     careers = self.resume.setdefault('careers', {})
-                    if (previous.get('market_value_eur'), previous.get('market_value_date')) != (signal.market_value_eur, signal.market_value_date):
+                    if (tmapi.normalize_market_value(previous.get('market_value_eur')), previous.get('market_value_date')) != (tmapi.normalize_market_value(signal.market_value_eur), signal.market_value_date):
                         careers.setdefault('market_value_points', []).append(player_id)
                     if _professional_assignment_changed(previous, signal):
                         careers.setdefault('transfer_events', []).append(player_id)
@@ -1002,6 +1023,43 @@ class _Scope:
             self.signals.update(updates)
         self.persist()
 
+    def supplement_contracts(self, snapshot):
+        """Use only already observed packets; keep HTML rows and timestamps intact.
+
+        Carry forward only within the same edition and club. Retained committed
+        clubs keep their original evidence; historical editions never use tmapi.
+        """
+        if self.row.get('is_current') is not True or self.scope['record'].team_type.value != 'club':
+            return snapshot
+        overrides = dict(snapshot.contract_overrides)
+        store = self.scraper._http_client._raw_store
+        for state in self.signals.values():
+            obs = state.observation
+            if obs.entity != 'player':
+                continue
+            body, raw = store.load_capture(obs.raw_capture_id)
+            if (raw.url != obs.source_url or raw.content_hash != obs.source_body_hash
+                or hashlib.sha256(body).hexdigest() != raw.content_hash
+                or raw.status_code != 200 or _utc(raw.fetched_at) != _utc(obs.raw_fetched_at)):
+                raise CurrentPortionError('contract packet differs from immutable raw proof')
+            ids = parse_qs(urlsplit(raw.url).query).get('ids[]', [])
+            signal = tmapi.parse_player_signals(json.loads(body.decode('utf-8')), expected_ids=ids)[obs.entity_id]
+            if signal.contract_until is None:
+                continue
+            for club_id in snapshot.changed_club_ids:
+                if club_id not in signal.club_ids:
+                    continue
+                for row in snapshot.clubs[club_id].rows:
+                    if (row['player_id'] == obs.entity_id and row['contract_until'] is None
+                        and row.get('_contract_status') in {'unknown', 'not_rendered'}):
+                        overrides[club_id + ':' + obs.entity_id] = {
+                            'contract_until': signal.contract_until, 'source_url': raw.url,
+                            'source_body_hash': raw.content_hash, 'fetched_at': raw.fetched_at,
+                            'raw_capture_id': raw.capture_id}
+        enriched = replace(snapshot, contract_overrides=overrides)
+        verify_contract_overrides(enriched, store)
+        return enriched
+
     def validate_player_business(self, snapshot):
         """Do not acknowledge a detector while a CDN serves old squad fields."""
         if self.row.get('is_current') is False:
@@ -1024,9 +1082,10 @@ class _Scope:
             expected = set(values['club_ids']) & set(snapshot.expected_team_ids)
             changed = memberships if national else memberships | expected
             inconsistent = (not national and memberships != expected) or any(
-                row['market_value_eur'] != values['market_value_eur']
-                or (not national and (str(row['contract_until']) if row['contract_until'] is not None else None)
-                    != values['contract_until']) for row in rows)
+                tmapi.normalize_market_value(row['market_value_eur']) != tmapi.normalize_market_value(values['market_value_eur'])
+                or (not national and str(row['contract_until']) != str(values['contract_until'])
+                    and not (row['contract_until'] is None
+                             and row.get('_contract_status') in {'unknown', 'not_rendered'})) for row in rows)
             if inconsistent:
                 mismatches.update(changed)
                 failed.append((key, mark_failed(state, 'source_mismatch: tmapi and complete squad fields disagree')))
@@ -1073,6 +1132,11 @@ class _Scope:
             if existing:
                 saved = ClubRosterSnapshot.from_mapping(club_id, existing)
                 if self._verified_pending_capture(saved, url, generation):
+                    if any('_contract_status' not in row for row in saved.rows):
+                        body, _ = self.scraper._http_client._raw_store.load_capture(saved.raw_capture_id)
+                        saved = replace(saved, rows=_parse_squad_page(body.decode('utf-8'), club_id))
+                        captured[club_id] = saved.as_dict()
+                        self.persist()
                     continue
                 captured.pop(club_id, None)
                 self.resume.get('capture_proofs', {}).pop(club_id, None)
@@ -1101,11 +1165,18 @@ class _Scope:
         membership_changed = self.snapshot is not None and set(self.snapshot.expected_team_ids) != set(clubs)
         if not required and self.snapshot is not None and not membership_changed:
             return
+        candidate_clubs = {club_id: ClubRosterSnapshot.from_mapping(club_id, captured[club_id])
+                           if club_id in captured else self.snapshot.clubs[club_id] for club_id in clubs}
+        candidate = FullRosterSnapshot(self.target.scope_id, self.target.competition_id, self.target.edition_id,
+                                       self.resume['squad_year'], tuple(clubs), candidate_clubs, tuple(captured),
+                                       {key: value for key, value in (self.snapshot.contract_overrides.items() if self.snapshot else ())
+                                        if key.split(':')[0] in set(clubs) - set(captured)})
+        candidate = self.supplement_contracts(candidate)
         snapshot = assemble_full_roster(
             self.snapshot, clubs, captured, required,
             scope_id=self.target.scope_id, competition_id=self.target.competition_id,
             edition_id=self.target.edition_id, squad_saison_id=self.resume['squad_year'],
-            participant_membership_verified=True,
+            participant_membership_verified=True, contract_overrides=candidate.contract_overrides,
         )
         self.validate_player_business(snapshot)
         previous_rows = ([row for row in self.snapshot.rows if row['club_id'] in set(snapshot.expected_team_ids)]
@@ -1142,7 +1213,7 @@ class _Scope:
         return value
 
     def _verified_pending_capture(self, saved, url, generation, checkpoint=None):
-        from scrapers.transfermarkt.scraper import _parse_squad_page
+        from scrapers.transfermarkt.scraper import squad_replay_matches
         if self.now() - saved.raw_fetched_at >= timedelta(hours=48) or self.now() < saved.raw_fetched_at:
             return False
         if saved.signature != self.resume.get('clubs', {}).get(saved.club_id, {}).get('signature'):
@@ -1169,8 +1240,7 @@ class _Scope:
             return False
         if (outcome.raw_capture_id != saved.raw_capture_id or outcome.raw_body_hash != saved.source_body_hash
             or _utc(outcome.raw_fetched_at) != saved.raw_fetched_at
-            or semantic_signature(_parse_squad_page(outcome.value, saved.club_id))
-                != semantic_signature([dict(row) for row in saved.rows])):
+            or not squad_replay_matches(outcome.value, saved.club_id, saved.rows)):
             raise CurrentPortionError('unfinished squad parsed rows differ from verified raw attempt chain')
         checkpoint = self.scraper._http_client._cache[url]
         if checkpoint['outcome'].get('version') == 3:
@@ -1209,6 +1279,7 @@ class _Scope:
             or intent['membership_changed'] != (self.snapshot is not None
                 and set(self.snapshot.expected_team_ids) != set(snapshot.expected_team_ids))):
             raise CurrentPortionError('roster_write_intent is not a complete authorized replacement')
+        verify_contract_overrides(snapshot, self.scraper._http_client._raw_store)
         from scrapers.transfermarkt.scraper import _TM_BASE, _CLUB_SQUAD_PATH
         source_ages = {}
         for club_id, club in snapshot.clubs.items():
@@ -1243,7 +1314,7 @@ class _Scope:
 
     def _verify_reconciliation_capture(self, saved, expected_url, checkpoint):
         """Validate a complete write's historical inputs, independently of HTTP cache."""
-        from scrapers.transfermarkt.scraper import _parse_squad_page
+        from scrapers.transfermarkt.scraper import squad_replay_matches
         version = checkpoint.get('outcome', {}).get('version')
         if version not in (3, 4):
             raise CurrentPortionError('write reconciliation requires typed raw attempt evidence')
@@ -1273,8 +1344,7 @@ class _Scope:
             or outcome.status != FetchStatus.OK or outcome.label != 'squad' or outcome.status_code != 200
             or outcome.raw_capture_id != saved.raw_capture_id or outcome.raw_body_hash != saved.source_body_hash
             or _utc(outcome.raw_fetched_at) != saved.raw_fetched_at or outcome.payload_hash != stable_payload_hash(replay)
-            or semantic_signature(_parse_squad_page(replay, saved.club_id))
-                != semantic_signature([dict(row) for row in saved.rows])):
+            or not squad_replay_matches(replay, saved.club_id, saved.rows)):
             raise CurrentPortionError('write reconciliation raw identity/body/parsed rows differ')
         if saved.applicability_status == 'authoritative_empty':
             from bs4 import BeautifulSoup
@@ -1456,7 +1526,7 @@ class _Scope:
                         expected = self.data.get('player_values', {}).get(player_id)
                         if expected and expected.get('market_value_present') and points:
                             latest = max(points, key=lambda point: str(point['mv_date']))
-                            if (latest['value_eur'] != expected['market_value_eur']
+                            if (tmapi.normalize_market_value(latest['value_eur']) != tmapi.normalize_market_value(expected['market_value_eur'])
                                 or (expected.get('market_value_date') is not None
                                     and str(latest['mv_date']) != expected['market_value_date'])):
                                 mismatched_ids.append(player_id)

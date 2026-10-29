@@ -26,20 +26,23 @@
 --    require a new candidate commit and review; never waive the executable
 --    bidirectional equality below. Operator variables are not an approval
 --    mechanism and cannot override the baked values.
--- 3. Deploy the combined reviewed Bronze change: fetcher v10 with the bounded
---    season_stats 8 MiB decoded-body cap, its derived 9 MiB target reservation,
+-- 3. Deploy the combined reviewed Bronze change: fetcher v11 with session-failure
+--    deferral, the bounded season_stats 8 MiB decoded-body cap and its derived
+--    9 MiB target reservation,
 --    current-season source-link remediation, and this exact2 diagnostic. Then
 --    run this read-only
 --    runtime attestation in the scheduler. It must print the version and four
 --    hashes exactly, and prove the effective 8/9 MiB bounds; a mismatch is
 --    NO-GO:
---    docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect,pathlib; import scrapers.fbref.settings as fbref_settings; from scrapers.fbref.fetcher import FETCHER_VERSION; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import FBrefPipeline,run_oversize_evidence_canary; a=hashlib.sha256(inspect.getsource(ControlStore.create_explicit_run_cohort).encode()).hexdigest(); b=hashlib.sha256(inspect.getsource(FBrefPipeline.seed_acceptance_cohort).encode()).hexdigest(); c=hashlib.sha256(pathlib.Path(inspect.getsourcefile(FBrefPipeline)).read_bytes()).hexdigest(); d=hashlib.sha256(pathlib.Path(inspect.getsourcefile(fbref_settings)).read_bytes()).hexdigest(); assert callable(run_oversize_evidence_canary); assert FETCHER_VERSION == 'fbref-camoufox-metered-warm-http-v10'; assert fbref_settings.FBREF_PERSISTENT_HTTP_SESSION is True; assert fbref_settings.DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES == 8388608; assert fbref_settings.DEFAULT_REQUEST_RESERVATION_BYTES == 9437184; assert a == '15c5f5e578b1e0dac676b2069e66c8d9340ea1d0e824797aadaaeaea176edb0f'; assert b == '979865b0254f44532428678598c03ede952212a56cfce275f8eb07cc548f541b'; assert c == '51ca028d890c95264f65c8f53bab3a453d4a87d5eb46cd7360c55de5eb776382'; assert d == 'a8397e96e0c15711f33bde0e9a497e5f9c2cbd1b88536abd57d9bbd35d45f664'; print(FETCHER_VERSION,a,b,c,d)"
+--    docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect,pathlib; import scrapers.fbref.settings as fbref_settings; from scrapers.fbref.fetcher import FETCHER_VERSION; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import FBrefPipeline,run_oversize_evidence_canary; a=hashlib.sha256(inspect.getsource(ControlStore.create_explicit_run_cohort).encode()).hexdigest(); b=hashlib.sha256(inspect.getsource(FBrefPipeline.seed_acceptance_cohort).encode()).hexdigest(); c=hashlib.sha256(pathlib.Path(inspect.getsourcefile(FBrefPipeline)).read_bytes()).hexdigest(); d=hashlib.sha256(pathlib.Path(inspect.getsourcefile(fbref_settings)).read_bytes()).hexdigest(); assert callable(run_oversize_evidence_canary); assert FETCHER_VERSION == 'fbref-camoufox-metered-warm-http-v11'; assert fbref_settings.FBREF_PERSISTENT_HTTP_SESSION is True; assert fbref_settings.DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES == 8388608; assert fbref_settings.DEFAULT_REQUEST_RESERVATION_BYTES == 9437184; assert a == '15c5f5e578b1e0dac676b2069e66c8d9340ea1d0e824797aadaaeaea176edb0f'; assert b == '979865b0254f44532428678598c03ede952212a56cfce275f8eb07cc548f541b'; assert c == 'f0e8bec11d4d6d141f2d7423e58141f25d7edc9570d1a14d851b7c2969caaaf6'; assert d == 'a8397e96e0c15711f33bde0e9a497e5f9c2cbd1b88536abd57d9bbd35d45f664'; print(FETCHER_VERSION,a,b,c,d)"
 -- 4. Complete the current-season remediation acceptance in
 --    docs/operations/fbref_current_season_reconcile.md first.
 --    In particular, old (6,2022)/(678,2021) playingtime frontiers must be
 --    daily but quarantined as ScopeQuarantined/noncurrent_season and not due.
 --    Competition 569/2025-2026 must still be present and current before its
 --    exact playingtime/standard pair can be requeued.
+--    Only that selected pair moves from daily to weekly on requeue, matching
+--    the current season_stats claim policy; terminal provenance stays intact.
 --    This ordering is mandatory: false-current pages must consume no proxy.
 -- 5. Only after that acceptance, with FBref ingestion paused and every
 --    writer/lease guard clear, apply the baked artifact without authority
@@ -516,6 +519,7 @@ AS
 WITH updated_rows AS (
     UPDATE fbref_control.page_frontier AS frontier
     SET state = 'queued',
+        refresh_policy = 'weekly',
         updated_at = clock_timestamp()
     FROM fbref_20260825_oversize_evidence_selected AS selected
     WHERE frontier.target_id = selected.target_id

@@ -12,9 +12,11 @@ import hashlib
 import json
 import math
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -22,6 +24,8 @@ from scrapers.base.sql_validator import validate_identifier
 from scrapers.fbref.control.migrations import (
     MIGRATION_LOCK_KEY,
     MIGRATIONS,
+    SCOPE_CTE_V13 as _FRONTIER_SCOPE_CTE_TEMPLATE,
+    SCOPE_SUMMARY_LOCK_KEY,
     bootstrap_statements,
 )
 from scrapers.fbref.control.models import (
@@ -44,6 +48,7 @@ from scrapers.fbref.control.replay_effects import (
     normalize_replay_control_effects,
 )
 from scrapers.fbref.policy import (
+    CURRENT_ENRICHMENT,
     DISCOVERY_SPINE_PAGE_KINDS,
     OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
     PUBLICATION_FRESHNESS_PAGE_KINDS,
@@ -78,6 +83,25 @@ class StateConflict(ControlStoreError):
     """An idempotency key already exists with different immutable data."""
 
 
+class _ScopeBackfillCursor:
+    """Keep every statement inside the remaining batch time budget."""
+
+    def __init__(self, cursor: Any, seconds: float = 25):
+        self._cursor = cursor
+        self._deadline = monotonic() + seconds
+
+    def execute(self, sql, params=None):
+        remaining_ms = math.ceil((self._deadline - monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise TimeoutError("page scope backfill batch exceeded its time budget")
+        self._cursor.execute("SELECT set_config('statement_timeout', %s, true)",
+                             (f"{remaining_ms}ms",))
+        self._cursor.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 ConnectionFactory = Callable[[str], Any]
 _CONTROL_URI_ENV = "FBREF_CONTROL_DB_URI"
 _AIRFLOW_URI_ENV = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"
@@ -102,7 +126,7 @@ _PAGE_KIND_SLA_SECONDS = {
     "season": 604_800,
     "season_stats": 604_800,
     "standings": 604_800,
-    "squad": 604_800,
+    "squad": 2_419_200,
     "player": 2_592_000,
     "matchlog": 2_592_000,
 }
@@ -132,100 +156,6 @@ _PUBLICATION_PHASES = {
     "abandoned",
     "failed",
 }
-_FRONTIER_SCOPE_CTE_TEMPLATE = """
-    {with_clause}declared_scope AS (
-        SELECT frontier.target_id, frontier.source,
-               frontier.source_ids ->> 'competition_id' AS competition_id,
-               frontier.source_ids ->> 'season_id' AS season_id
-        FROM fbref_control.page_frontier AS frontier{declared_candidate_join}
-        WHERE frontier.source_ids ? 'competition_id'
-        UNION
-        SELECT edge.child_target_id AS target_id, child.source,
-               edge.carried_competition_id AS competition_id,
-               edge.carried_season_id AS season_id
-        FROM fbref_control.frontier_provenance AS edge
-        JOIN fbref_control.page_frontier AS child
-          ON child.target_id = edge.child_target_id{edge_candidate_join}
-        WHERE edge.carried_competition_id IS NOT NULL
-    ),
-    canonical_scope AS (
-        SELECT declared.target_id, declared.source,
-               declared.competition_id,
-               COALESCE(alias.season_id, declared.season_id) AS season_id
-        FROM declared_scope AS declared
-        LEFT JOIN fbref_control.season_alias AS alias
-          ON alias.source = declared.source
-         AND alias.competition_id = declared.competition_id
-         AND alias.alias = declared.season_id
-    ),
-    scope_rollup AS (
-        SELECT scoped.target_id,
-               count(DISTINCT (
-                   scoped.competition_id, scoped.season_id
-               )) AS scope_count,
-               bool_or(competition.competition_id IS NULL)
-                   AS competition_missing,
-               bool_or(competition.gender = 'female') AS has_female,
-               bool_or(competition.gender = 'unknown') AS has_unknown,
-               bool_or(
-                   competition.gender = 'male'
-                   AND competition.crawl_state = 'active'
-                   AND competition.lifecycle_state IN ('present', 'missing_once')
-                   AND competition.present
-                   AND (
-                       scope_frontier.page_kind = 'competition'
-                       OR (
-                           scoped.season_id IS NOT NULL
-                           AND season.lifecycle_state = 'present'
-                           AND season.present
-                           AND season.is_current
-                       )
-                   )
-               ) AS has_current_ownership,
-               bool_or(
-                   competition.competition_id IS NOT NULL
-                   AND (
-                       competition.gender <> 'male'
-                       OR (competition.crawl_state <> 'active' AND NOT (
-                           scope_frontier.refresh_policy='historical_once'
-                           AND competition.crawl_state='skipped'
-                           AND competition.metadata->>'current_scope_lifecycle'='discontinued'
-                           AND competition.metadata->>'current_scope_reason' IS NOT NULL
-                       ))
-                       OR competition.lifecycle_state NOT IN (
-                           'present', 'missing_once'
-                       )
-                       OR NOT competition.present
-                   )
-               ) AS inactive_competition,
-               bool_or(
-                   scoped.season_id IS NOT NULL
-                   AND (
-                       season.season_id IS NULL
-                       OR season.lifecycle_state <> 'present'
-                       OR NOT season.present
-                   )
-               ) AS invalid_season,
-               bool_or(
-                   scoped.season_id IS NOT NULL
-                   AND season.lifecycle_state = 'present'
-                   AND season.present
-                   AND season.is_current
-               ) AS has_current_season,
-               bool_or(scoped.season_id IS NULL)
-                   AS has_competition_scope
-        FROM canonical_scope AS scoped
-        JOIN fbref_control.page_frontier scope_frontier ON scope_frontier.target_id=scoped.target_id
-        LEFT JOIN fbref_control.competition_registry AS competition
-          ON competition.source = scoped.source
-         AND competition.competition_id = scoped.competition_id
-        LEFT JOIN fbref_control.season_registry AS season
-          ON season.source = scoped.source
-         AND season.competition_id = scoped.competition_id
-         AND season.season_id = scoped.season_id
-        GROUP BY scoped.target_id
-    )
-"""
 
 
 _FRONTIER_SCOPE_CTE = _FRONTIER_SCOPE_CTE_TEMPLATE.format(
@@ -987,6 +917,30 @@ def _budget_from_row(row: Mapping[str, Any]) -> BudgetReservation:
     )
 
 
+# pipeline.MAX_PARSE_DEFERRALS_PER_TARGET + 1: every transient error one raw
+# can collect in a run before its deferrals run out (#1915).
+_MAX_DEFERRED_PARSE_ERRORS = 3
+
+_DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS carried
+    WHERE carried.logical_refresh_id = attempt.logical_refresh_id
+      AND carried.status = 'failed'
+      AND %s::jsonb @> jsonb_build_array(jsonb_build_object(
+        'run_id', attempt.run_id::text,
+        'attempt_id', attempt.attempt_id::text,
+        'logical_refresh_id', attempt.logical_refresh_id::text,
+        'target_id', attempt.target_id,
+        'content_hash', attempt.content_hash,
+        'raw_manifest_key', attempt.raw_manifest_key,
+        'parser_version', carried.parser_version,
+        'typed_parser_version', carried.typed_parser_version,
+        'stateful_parser_version', carried.stateful_parser_version,
+        'failed_updated_at', extract(epoch from carried.updated_at)::text
+      ))
+)"""
+
+
 class ControlStore:
     """Transactional API over the dedicated ``fbref_control`` schema."""
 
@@ -1049,6 +1003,165 @@ class ControlStore:
         finally:
             cursor.close()
             connection.close()
+
+    @staticmethod
+    def _lock_scope_targets(cursor: Any, target_ids: Sequence[str],
+                            canonical_urls: Sequence[str] = ()) -> None:
+        # Match frontier writer order before taking summary locks. No provenance
+        # scan and no change to lease fields or append-only evidence.
+        cursor.execute(
+            "SELECT target_id FROM fbref_control.page_frontier "
+            "WHERE target_id = ANY(%s::text[]) OR canonical_url = ANY(%s::text[]) "
+            "ORDER BY target_id FOR NO KEY UPDATE",
+            (list(target_ids), list(canonical_urls)),
+        )
+        cursor.fetchall()
+
+    @staticmethod
+    def _refresh_scope_summaries(cursor: Any, target_ids: Sequence[str]) -> None:
+        if target_ids:
+            cursor.execute("SELECT pg_advisory_xact_lock_shared(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
+            # Lock before the computation's command snapshot: a waiter must see
+            # both a preceding writer's scopes and its committed registry edits.
+            cursor.execute("SELECT target_id FROM fbref_control.page_scope_summary "
+                           "WHERE target_id = ANY(%s::text[]) ORDER BY target_id FOR UPDATE",
+                           (list(target_ids),))
+            cursor.fetchall()
+            cursor.execute("SELECT fbref_control.refresh_page_scope_summary(%s::text[])",
+                           (list(target_ids),))
+
+    @contextmanager
+    def _registry_scope_transaction(self):
+        with self._transaction() as cursor:
+            yield cursor
+            self._refresh_registry_scopes(cursor)
+
+    def _refresh_registry_scopes(self, cursor: Any) -> int:
+        # Lock the captured invalidations until commit. An edit of the same
+        # competition waits, then enqueues a fresh invalidation after our DELETE;
+        # skip rows held by other registry edits to avoid a queue-lock deadlock.
+        # Only captured rows are acknowledged; skipped invalidations stay queued.
+        cursor.execute("""SELECT source, competition_id
+            FROM fbref_control.page_scope_registry_dirty
+            ORDER BY source, competition_id FOR UPDATE SKIP LOCKED""")
+        dirty = _fetchall(cursor)
+        if not dirty:
+            return 0
+        # All registry/frontier mutations are finished before this exclusive
+        # gate. A writer takes its shared gate after locking its full frontier
+        # set, before changing summary rows. Thus enumeration cannot miss a
+        # committed new scope, nor publish flags from an old registry snapshot.
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
+        affected = json.dumps(dirty, sort_keys=True, separators=(",", ":"))
+        after = ""
+        refreshed = 0
+        while True:
+            cursor.execute("""
+                SELECT summary.target_id
+                FROM fbref_control.page_scope_summary summary
+                JOIN fbref_control.page_frontier frontier USING (target_id)
+                WHERE summary.target_id > %s AND EXISTS (
+                    SELECT 1 FROM jsonb_to_recordset(%s::jsonb)
+                        AS dirty(source text, competition_id text)
+                    WHERE dirty.source = frontier.source AND (
+                        dirty.competition_id = frontier.source_ids->>'competition_id'
+                        OR summary.provenance_scopes @> jsonb_build_array(
+                            jsonb_build_object('competition_id', dirty.competition_id))))
+                ORDER BY summary.target_id LIMIT 250
+            """, (after, affected))
+            target_ids = [row["target_id"] for row in _fetchall(cursor)]
+            if not target_ids:
+                break
+            self._refresh_scope_summaries(cursor, target_ids)
+            after = target_ids[-1]
+            refreshed += len(target_ids)
+        cursor.execute("""DELETE FROM fbref_control.page_scope_registry_dirty queued
+            USING jsonb_to_recordset(%s::jsonb) AS dirty(source text, competition_id text)
+            WHERE queued.source = dirty.source AND queued.competition_id = dirty.competition_id""",
+            (affected,))
+        return refreshed
+
+    def refresh_page_scopes(self) -> int:
+        """Repair registry invalidations from direct SQL, without provenance."""
+        with self._transaction() as cursor:
+            return self._refresh_registry_scopes(cursor)
+
+    def backfill_page_scopes(self, *, batch_size: int = 100) -> dict:
+        """Commit one resumable, bounded primary-key batch of old targets."""
+        size = int(batch_size)
+        if not 1 <= size <= 1000:
+            raise ValueError("batch_size must be between 1 and 1000")
+        with self._transaction() as raw_cursor:
+            cursor = _ScopeBackfillCursor(raw_cursor)
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            # Bounded per-target sorts, never a sort of all provenance edges.
+            cursor.execute("SET LOCAL work_mem = '4MB'")
+            cursor.execute("SET LOCAL enable_seqscan = off")
+            cursor.execute("""SELECT after_target_id FROM fbref_control.page_scope_backfill
+                              WHERE singleton FOR UPDATE""")
+            after = _fetchone(cursor)["after_target_id"]
+            cursor.execute("""SELECT target_id FROM fbref_control.page_frontier
+                WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE""",
+                (after, size))
+            target_ids = [row["target_id"] for row in _fetchall(cursor)]
+            cursor.execute("SELECT pg_advisory_xact_lock_shared(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
+            for target_id in target_ids:
+                cursor.execute("""INSERT INTO fbref_control.page_scope_summary(target_id)
+                    VALUES (%s) ON CONFLICT DO NOTHING""", (target_id,))
+                cursor.execute("""SELECT target_id FROM fbref_control.page_scope_summary
+                    WHERE target_id = %s FOR UPDATE""", (target_id,))
+                # A separate command after the row lock sees committed edges
+                # from any preceding writer. Later writers merge incrementally.
+                update_sql = """UPDATE fbref_control.page_scope_summary SET
+                    provenance_scopes = coalesce((SELECT jsonb_agg(scope) FROM (
+                        SELECT DISTINCT jsonb_build_object(
+                            'competition_id', carried_competition_id,
+                            'season_id', carried_season_id) AS scope
+                        FROM fbref_control.frontier_provenance
+                        WHERE child_target_id = %s AND carried_competition_id IS NOT NULL
+                    ) scopes), '[]'::jsonb), is_complete = true, pending = true
+                    WHERE target_id = %s"""
+                cursor.execute("EXPLAIN (FORMAT JSON) " + update_sql, (target_id, target_id))
+                plan = _fetchone(cursor)["QUERY PLAN"]
+                if '"Node Type": "Seq Scan"' in json.dumps(plan):
+                    raise ControlStoreError("page scope backfill requires indexed provenance lookup")
+                cursor.execute(update_sql, (target_id, target_id))
+            self._refresh_scope_summaries(cursor, target_ids)
+            if target_ids:
+                after = target_ids[-1]
+                cursor.execute("""UPDATE fbref_control.page_scope_backfill
+                    SET after_target_id = %s WHERE singleton""", (after,))
+            return {"processed": len(target_ids), "after_target_id": after,
+                    "done": len(target_ids) < size}
+
+    def backfill_page_gender_classes(self, *, batch_size: int = 100) -> dict:
+        """Commit one resumable classification batch after ownership backfill."""
+        size = int(batch_size)
+        if not 1 <= size <= 1000:
+            raise ValueError("batch_size must be between 1 and 1000")
+        with self._transaction() as raw_cursor:
+            cursor = _ScopeBackfillCursor(raw_cursor)
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            cursor.execute("SET LOCAL work_mem = '4MB'")
+            cursor.execute("""SELECT after_target_id FROM fbref_control.page_gender_backfill
+                WHERE singleton FOR UPDATE""")
+            after = _fetchone(cursor)["after_target_id"]
+            cursor.execute("""SELECT target_id FROM fbref_control.page_frontier
+                WHERE target_id > %s ORDER BY target_id LIMIT %s FOR NO KEY UPDATE""",
+                (after, size))
+            targets = [row["target_id"] for row in _fetchall(cursor)]
+            cursor.execute("""SELECT frontier.target_id FROM fbref_control.page_frontier frontier
+                LEFT JOIN fbref_control.page_scope_summary scope USING (target_id)
+                WHERE frontier.target_id = ANY(%s::text[]) AND NOT coalesce(scope.is_complete, false)""", (targets,))
+            if _fetchall(cursor):
+                raise ControlStoreError("ownership backfill must finish before gender backfill")
+            self._refresh_scope_summaries(cursor, targets)
+            if targets:
+                after = targets[-1]
+                cursor.execute("""UPDATE fbref_control.page_gender_backfill
+                    SET after_target_id = %s WHERE singleton""", (after,))
+            return {"processed": len(targets), "after_target_id": after,
+                    "done": len(targets) < size}
 
     def migrate(self) -> tuple[int, ...]:
         """Apply all pending migrations under one transaction advisory lock."""
@@ -2307,6 +2420,7 @@ class ControlStore:
                         f"Competition {item.competition_id} history raw changed"
                     )
             yield _CursorBoundControlStore(base=self, cursor=cursor)
+            self._refresh_registry_scopes(cursor)
 
     def assert_no_active_publication_generation(
         self,
@@ -3428,6 +3542,10 @@ class ControlStore:
                         f"acceptance-replay-control://{replay_refresh}",
                     ),
                 )
+            self._refresh_scope_summaries(cursor, [
+                make_replay_control_target_id(replay_run, target["target_id"])
+                for target in normalized_targets
+            ])
             replay_control = _CursorBoundReplayControlStore(
                 base=self,
                 cursor=cursor,
@@ -4251,7 +4369,7 @@ class ControlStore:
             if shrink_override_reason is None
             else _text(shrink_override_reason, "shrink_override_reason")
         )
-        with self._transaction() as cursor:
+        with self._registry_scope_transaction() as cursor:
             cursor.execute(
                 """
                 SELECT * FROM fbref_control.registry_snapshot
@@ -4619,7 +4737,7 @@ class ControlStore:
         snapshot = _uuid(snapshot_id, "snapshot_id")
         competition = _text(competition_id, "competition_id")
         seasons = self._validated_seasons(competition, entries)
-        with self._transaction() as cursor:
+        with self._registry_scope_transaction() as cursor:
             cursor.execute(
                 """
                 SELECT * FROM fbref_control.registry_snapshot
@@ -4859,7 +4977,7 @@ class ControlStore:
             if snapshot_id is None
             else _uuid(snapshot_id, "snapshot_id")
         )
-        with self._transaction() as cursor:
+        with self._registry_scope_transaction() as cursor:
             cursor.execute(
                 """
                 INSERT INTO fbref_control.season_alias (
@@ -5413,6 +5531,9 @@ class ControlStore:
                 ),
             )
 
+            if _cursor is None:
+                self._refresh_scope_summaries(cursor, [target_id])
+
     def record_frontier_provenance(
         self,
         provenance: FrontierProvenance,
@@ -5460,6 +5581,8 @@ class ControlStore:
         )
         expected_metadata = dict(provenance.metadata)
         with self._transaction(_cursor) as cursor:
+            if _cursor is None:
+                self._lock_scope_targets(cursor, [child])
             cursor.execute(
                 """
                 INSERT INTO fbref_control.frontier_provenance (
@@ -5526,6 +5649,8 @@ class ControlStore:
                     f"Frontier provenance {parent} -> {child} already has "
                     "different immutable evidence"
                 )
+            if _cursor is None:
+                self._refresh_scope_summaries(cursor, [child])
             return str(row["provenance_id"])
 
     def upsert_frontier_discovery_batch(
@@ -5585,10 +5710,15 @@ class ControlStore:
             return {"target_count": 0, "provenance_count": 0}
 
         with self._transaction() as cursor:
+            target_ids = sorted({target.target_id for target in ordered_targets}
+                                | {edge.child_target_id for edge in ordered_provenance})
+            self._lock_scope_targets(cursor, target_ids,
+                                     [target.canonical_url for target in ordered_targets])
             for target in ordered_targets:
                 self.upsert_frontier_target(target, _cursor=cursor)
             for edge in ordered_provenance:
                 self.record_frontier_provenance(edge, _cursor=cursor)
+            self._refresh_scope_summaries(cursor, target_ids)
         return {
             "target_count": len(ordered_targets),
             "provenance_count": len(ordered_provenance),
@@ -5889,6 +6019,40 @@ class ControlStore:
     ) -> dict[str, int]:
         """Compatibility alias for full frontier scope reconciliation."""
         return self.reconcile_frontier_scope(source=source)
+
+    def schedule_incomplete_match_refetch(
+        self, target_id: object, *, content_hash: object, logical_refresh_id: object,
+    ) -> bool:
+        """At most three fresh requests; stale raw replay cannot spend retries."""
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        with self._transaction() as cursor:
+            if self._latest_content_verdict(cursor, target, digest, refresh) is not True:
+                return False
+            cursor.execute("""INSERT INTO fbref_control.incomplete_match_refetch AS retry
+                    (target_id, attempts, logical_refresh_id)
+                SELECT target_id, 1, %s FROM fbref_control.page_frontier
+                WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')
+                ON CONFLICT (target_id) DO UPDATE SET attempts = retry.attempts + 1,
+                    logical_refresh_id = EXCLUDED.logical_refresh_id
+                WHERE retry.attempts < 3
+                    AND retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                RETURNING attempts""", (refresh, target))
+            row = _fetchone(cursor)
+            if row is None:
+                return False
+            cursor.execute("""UPDATE fbref_control.page_frontier
+                SET state = 'retry',
+                    next_fetch_at = clock_timestamp() + %s * interval '5 minutes',
+                    retry_after = clock_timestamp() + %s * interval '5 minutes',
+                    last_etag = NULL, last_modified = NULL,
+                    last_error_class = 'IncompleteMatchPageError',
+                    last_error_message = 'scored_match_incomplete',
+                    updated_at = clock_timestamp()
+                WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
+                (2 ** (row["attempts"] - 1), 2 ** (row["attempts"] - 1), target))
+            return bool(cursor.rowcount)
 
     def quarantine_contract_rejected_target(
         self,
@@ -6674,6 +6838,68 @@ class ControlStore:
                 inserted += 1
         return inserted
 
+    def normalize_current_enrichment(self) -> int:
+        """Repair recurring current targets without opening quarantines or leases."""
+        values = ", ".join(
+            f"('{kind}', '{policy}', {priority}, {hours})"
+            for kind, (policy, priority, hours) in CURRENT_ENRICHMENT.items()
+        )
+        scope_sql = _frontier_scope_cte_for_candidates("""
+            SELECT f.target_id FROM fbref_control.page_frontier f
+            WHERE f.page_kind IN ('season', 'season_stats', 'squad')
+              AND f.refresh_policy <> 'historical_once'
+              AND f.state IN ('queued', 'retry', 'fetched')
+        """) + f", desired(page_kind, policy, priority, hours) AS (VALUES {values}) "
+        predicate = """
+                WHERE frontier.target_id = scope.target_id
+                  AND frontier.source = 'fbref'
+                  AND frontier.page_kind = desired.page_kind
+                  AND frontier.refresh_policy <> 'historical_once'
+                  AND frontier.state IN ('queued', 'retry', 'fetched')
+                  AND COALESCE(scope.has_current_ownership, false)
+                  AND NOT COALESCE(scope.competition_missing, true)
+                  AND NOT COALESCE(scope.has_female, false)
+                  AND NOT COALESCE(scope.has_unknown, true)
+                  AND NOT COALESCE(scope.inactive_competition, true)
+                  AND NOT COALESCE(scope.invalid_season, true)
+                  AND (frontier.page_kind <> 'squad' OR
+                       frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM fbref_control.run_target member
+                    JOIN fbref_control.crawl_run run USING (run_id)
+                    WHERE member.target_id = frontier.target_id
+                      AND member.status IN ('pending', 'leased', 'retry')
+                      AND run.status IN ('pending', 'running')
+                  )
+                  AND (frontier.refresh_policy, frontier.priority)
+                    IS DISTINCT FROM (desired.policy, desired.priority)
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                scope_sql + """
+                SELECT frontier.target_id FROM fbref_control.page_frontier AS frontier,
+                  desired, scope_rollup AS scope
+                """ + predicate + " ORDER BY frontier.target_id FOR UPDATE OF frontier SKIP LOCKED"
+            )
+            target_ids = [row["target_id"] for row in _fetchall(cursor)]
+            if not target_ids:
+                return 0
+            # Admission fences the same frontier row. Recheck membership in a
+            # new command snapshot after acquiring that fence, as due admission
+            # does, so a concurrent cohort cannot be normalized underneath it.
+            cursor.execute(
+                scope_sql + """
+                UPDATE fbref_control.page_frontier AS frontier
+                SET refresh_policy = desired.policy, priority = desired.priority,
+                    updated_at = clock_timestamp()
+                FROM desired, scope_rollup AS scope
+                """ + predicate + " AND frontier.target_id = ANY(%s::text[])",
+                (target_ids,),
+            )
+            updated = cursor.rowcount
+            self._refresh_scope_summaries(cursor, target_ids)
+            return updated
+
     def create_due_run_cohort(
         self,
         run_id: object,
@@ -6699,6 +6925,9 @@ class ControlStore:
             )
             if not policies:
                 return []
+        if (policies is not None and "historical_once" not in policies
+                and set(policies) & {"daily", "weekly", "monthly", "six_hourly"}):
+            self.normalize_current_enrichment()
         # Admission tiers keep the publication spine ahead of an arbitrarily
         # old enrichment backlog.  In particular, a newly discovered current
         # match must not need a previous fetch before it becomes critical.
@@ -6753,6 +6982,9 @@ class ControlStore:
                            frontier.created_at
                          ) AS due_at,
                          CASE
+                           WHEN frontier.page_kind IN ('season', 'season_stats', 'squad')
+                            AND frontier.refresh_policy <> 'historical_once'
+                             THEN 5
                            WHEN frontier.page_kind = 'competition_index'
                              THEN 0
                            WHEN frontier.page_kind = ANY(%s::text[])
@@ -6776,7 +7008,16 @@ class ControlStore:
                             AND frontier.refresh_policy <> 'historical_once'
                              THEN 4
                            ELSE 5
-                         END AS admission_tier
+                         END AS admission_tier,
+                         row_number() OVER (
+                           PARTITION BY (frontier.page_kind IN ('season', 'season_stats', 'squad')
+                             AND frontier.refresh_policy <> 'historical_once')
+                           ORDER BY frontier.priority DESC,
+                             COALESCE(frontier.retry_after, frontier.next_fetch_at,
+                               frontier.last_fetched_at, frontier.created_at), frontier.target_id
+                         ) AS kind_ordinal,
+                         (frontier.page_kind IN ('season', 'season_stats', 'squad')
+                           AND frontier.refresh_policy <> 'historical_once') AS enrichment
                   FROM fbref_control.page_frontier AS frontier
                   JOIN scope_candidates AS cohort_candidate
                     ON cohort_candidate.target_id = frontier.target_id
@@ -6792,6 +7033,7 @@ class ControlStore:
                             AND frontier.next_fetch_at <= clock_timestamp()
                         )
                     )
+                  AND (frontier.page_kind <> 'squad' OR frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
                   AND (frontier.next_fetch_at IS NULL
                        OR frontier.next_fetch_at <= clock_timestamp())
                   AND (frontier.retry_after IS NULL
@@ -6850,7 +7092,10 @@ class ControlStore:
                 FROM eligible
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = eligible.target_id
+                WHERE NOT eligible.enrichment OR eligible.kind_ordinal <= {normalized_limit // 4}
+                   OR NOT EXISTS (SELECT 1 FROM eligible urgent WHERE urgent.admission_tier < 5)
                 ORDER BY eligible.admission_tier,
+                         CASE WHEN eligible.enrichment THEN frontier.priority ELSE 0 END DESC,
                          eligible.due_at,
                          frontier.priority DESC,
                          frontier.created_at,
@@ -6863,8 +7108,8 @@ class ControlStore:
                     kinds,
                     policies,
                     policies,
-                    list(DISCOVERY_SPINE_PAGE_KINDS),
-                    list(DISCOVERY_SPINE_PAGE_KINDS),
+                    [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
+                    [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
                     list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
                     kinds,
                     kinds,
@@ -6954,6 +7199,22 @@ class ControlStore:
             str(row["status"]): int(row["count"]) for row in _fetchall(cursor)
         }
 
+    def count_skipped_enrichment(self, run_id: object, target_ids: Sequence[str]) -> int:
+        """Confirm deliberate hand-back between admission and the first claim."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT count(*) AS count FROM fbref_control.run_target member
+                JOIN fbref_control.page_frontier page USING (target_id)
+                WHERE member.run_id = %s AND member.target_id = ANY(%s::text[])
+                  AND member.status = 'skipped'
+                  AND page.page_kind IN ('season', 'season_stats', 'squad')
+                  AND page.refresh_policy <> 'historical_once'
+                  AND page.state IN ('queued', 'retry')
+                """, (_uuid(run_id, "run_id"), list(target_ids)),
+            )
+            return int(_fetchone(cursor)["count"])
+
     def get_run_target_counts(self, run_id: object) -> dict[str, int]:
         """Return the run's target counts by status without the full summary.
 
@@ -6964,6 +7225,134 @@ class ControlStore:
         run = _uuid(run_id, "run_id")
         with self._transaction() as cursor:
             return self._target_counts(cursor, run)
+
+    def record_deferred_parse_observations(
+        self, run_id: object, observations: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Carry bounded, still-failed live observations across a deadline.
+
+        Lock the source run and observations together. Raw and processing state
+        stay intact for lane recovery; only this run's validation is exempted.
+        """
+        run = _uuid(run_id, "run_id")
+        if not 1 <= len(observations) <= 25:
+            raise StateConflict(
+                "Deferred parse carryover must contain 1..25 observations"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT status, run_type, metadata FROM fbref_control.crawl_run "
+                "WHERE run_id = %s FOR UPDATE",
+                (run,),
+            )
+            source = _fetchone(cursor)
+            if source is None or source["run_type"] not in _RECOVERY_RUN_TYPES:
+                raise StateConflict("Only live runs can carry deferred parses")
+            metadata = _json_mapping(
+                source.get("metadata") or {}, "crawl run metadata"
+            )
+            if metadata.get("acceptance_profile") or metadata.get("acceptance_replay"):
+                raise StateConflict("Acceptance runs cannot carry deferred parses")
+            installed = list(metadata.get("deferred_parse_observations") or [])
+            carried = list(installed)
+            for item in sorted(
+                observations, key=lambda row: row["logical_refresh_id"]
+            ):
+                evidence = dict(item)
+                evidence["run_id"] = run
+                if evidence.get("reason") != "deadline_after_transient_trino_failure":
+                    raise StateConflict("Unknown deferred parse reason")
+                if "deferred_errors" in evidence:
+                    errors = evidence["deferred_errors"]
+                    if (
+                        not isinstance(errors, list)
+                        or not 1 <= len(errors) <= _MAX_DEFERRED_PARSE_ERRORS
+                        or any(
+                            not isinstance(error, Mapping)
+                            or set(error) != {"error_class", "error_message"}
+                            or not all(
+                                isinstance(value, str)
+                                for value in error.values()
+                            )
+                            for error in errors
+                        )
+                        or dict(errors[-1]) != {
+                            "error_class": evidence["error_class"],
+                            "error_message": evidence["error_message"],
+                        }
+                    ):
+                        raise StateConflict("Invalid deferred parse errors")
+                cursor.execute(
+                    """
+                    SELECT observed.status, observed.error_class,
+                           observed.error_message,
+                           extract(epoch from observed.updated_at)::text AS failed_updated_at
+                    FROM fbref_control.fetch_attempt AS attempt
+                    JOIN fbref_control.observation_processing AS observed
+                      ON observed.logical_refresh_id = attempt.logical_refresh_id
+                     AND observed.target_id = attempt.target_id
+                     AND observed.content_hash = attempt.content_hash
+                    WHERE attempt.run_id = %s AND attempt.attempt_id = %s
+                      AND attempt.logical_refresh_id = %s
+                      AND attempt.target_id = %s AND attempt.content_hash = %s
+                      AND attempt.raw_manifest_key = %s
+                      AND attempt.status = 'succeeded'
+                      AND observed.parser_version = %s
+                      AND observed.typed_parser_version = %s
+                      AND observed.stateful_parser_version = %s
+                    FOR UPDATE OF observed
+                    """,
+                    (
+                        run,
+                        evidence["attempt_id"],
+                        evidence["logical_refresh_id"],
+                        evidence["target_id"],
+                        evidence["content_hash"],
+                        evidence["raw_manifest_key"],
+                        evidence["parser_version"],
+                        evidence["typed_parser_version"],
+                        evidence["stateful_parser_version"],
+                    ),
+                )
+                observed = _fetchone(cursor)
+                if observed is not None and observed["status"] == "succeeded":
+                    continue  # A later wave/recovery already completed this raw.
+                if (
+                    observed is None
+                    or observed["status"] != "failed"
+                    or observed["error_class"] != evidence["error_class"]
+                    or observed["error_message"] != evidence["error_message"]
+                ):
+                    raise StateConflict("Deferred observation changed before carryover")
+                evidence["failed_updated_at"] = observed["failed_updated_at"]
+                if evidence in carried:
+                    continue
+                if source["status"] != "running":
+                    raise StateConflict("Deferred parses require a running source run")
+                # A retry can fail identically with a new observation timestamp.
+                # Replace its previous fence instead of accumulating exemptions.
+                carried = [
+                    row for row in carried
+                    if {
+                        key: value for key, value in row.items()
+                        if key != "failed_updated_at"
+                    } != {
+                        key: value for key, value in evidence.items()
+                        if key != "failed_updated_at"
+                    }
+                ]
+                carried.append(evidence)
+            if len(carried) > 25:
+                raise StateConflict("Too many deferred parse observations")
+            if carried != installed:
+                cursor.execute(
+                    "UPDATE fbref_control.crawl_run "
+                    "SET metadata = metadata || %s::jsonb, updated_at = clock_timestamp() "
+                    "WHERE run_id = %s",
+                    (_json({"deferred_parse_observations": carried}), run),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict("Deferred parse run disappeared")
 
     def get_run_summary(
         self,
@@ -7029,6 +7418,61 @@ class ControlStore:
                     "crawl run_type must be current, backfill, replay, or "
                     "publication"
                 )
+            metadata = _json_mapping(
+                summary.get("metadata") or {}, "crawl run metadata"
+            )
+            deferred = [
+                row
+                for row in metadata.get("deferred_parse_observations", [])
+                if recovery_lane_run_type is not None
+                and not metadata.get("acceptance_profile")
+                and not metadata.get("acceptance_replay")
+                and parser is not None
+                and row.get("run_id") == run
+                and row.get("parser_version") == parser
+                and row.get("typed_parser_version") == typed_parser
+                and row.get("stateful_parser_version") == stateful_parser
+            ]
+            deferred_json = json.dumps(deferred)
+            deferred_manifest_sql = _DEFERRED_PARSE_ATTEMPT_SQL.replace(
+                "carried.status = 'failed'",
+                "carried.status = 'failed' "
+                # A manifest keeps the error of the wave that wrote it; the
+                # card lists every deferred error of this raw (#1915).
+                "AND EXISTS (SELECT 1 "
+                "FROM jsonb_array_elements(%s::jsonb) AS card(value) "
+                "CROSS JOIN LATERAL jsonb_array_elements(coalesce("
+                "card.value -> 'deferred_errors', "
+                "jsonb_build_array(jsonb_build_object("
+                "'error_class', card.value ->> 'error_class', "
+                "'error_message', card.value ->> 'error_message')))) "
+                "AS deferred_error(value) "
+                "WHERE card.value ->> 'run_id' = attempt.run_id::text "
+                "AND card.value ->> 'attempt_id' = attempt.attempt_id::text "
+                "AND card.value ->> 'logical_refresh_id' = "
+                "attempt.logical_refresh_id::text "
+                "AND card.value ->> 'target_id' = attempt.target_id "
+                "AND card.value ->> 'content_hash' = attempt.content_hash "
+                "AND card.value ->> 'raw_manifest_key' = attempt.raw_manifest_key "
+                "AND card.value ->> 'parser_version' = carried.parser_version "
+                "AND card.value ->> 'typed_parser_version' = "
+                "carried.typed_parser_version "
+                "AND card.value ->> 'stateful_parser_version' = "
+                "carried.stateful_parser_version "
+                "AND card.value ->> 'failed_updated_at' = "
+                "extract(epoch from carried.updated_at)::text "
+                "AND deferred_error.value ->> 'error_class' = manifest.error_class "
+                "AND deferred_error.value ->> 'error_message' = "
+                "left(manifest.error_message, 2000)) "
+                "AND ((manifest.dataset = '__page__' "
+                "AND manifest.parser_version = carried.parser_version) "
+                "OR (manifest.dataset LIKE 'typed:%%' "
+                "AND manifest.parser_version = carried.typed_parser_version "
+                "AND manifest.parse_status = 'succeeded' "
+                "AND manifest.persistence_status = 'failed'))",
+            )
+            summary["deferred_parse_observation_count"] = len(deferred)
+            summary["deferred_parse_observations"] = deferred
             summary["target_counts"] = self._target_counts(cursor, run)
             cursor.execute(
                 """
@@ -7201,7 +7645,7 @@ class ControlStore:
                 for row in _fetchall(cursor)
             }
             cursor.execute(
-                """
+                f"""
                 SELECT manifest.validation_status AS status, count(*) AS count
                 FROM fbref_control.dataset_manifest AS manifest
                 JOIN fbref_control.fetch_attempt AS attempt
@@ -7211,6 +7655,10 @@ class ControlStore:
                   ON frontier.target_id = attempt.target_id
                 WHERE attempt.run_id = %s AND attempt.status = 'succeeded'
                   AND frontier.state <> 'quarantined'
+                  AND NOT (
+                    manifest.validation_status = 'failed'
+                    AND ({deferred_manifest_sql})
+                  )
                   AND (
                     %s::text IS NULL
                     OR (
@@ -7231,6 +7679,8 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
+                    deferred_json,
                     parser,
                     parser,
                     typed_parser,
@@ -7244,7 +7694,7 @@ class ControlStore:
                 for row in _fetchall(cursor)
             }
             cursor.execute(
-                """
+                f"""
                 SELECT count(*) AS count
                 FROM (
                     SELECT DISTINCT attempt.target_id, attempt.content_hash
@@ -7254,6 +7704,7 @@ class ControlStore:
                     WHERE attempt.run_id = %s
                       AND attempt.status = 'succeeded'
                       AND frontier.state <> 'quarantined'
+                      AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                       AND (
                         (
                           %s::text IS NULL
@@ -7294,6 +7745,7 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     parser,
                     parser,
                     parser,
@@ -7670,6 +8122,11 @@ class ControlStore:
                     LEFT JOIN scope_rollup AS scope
                       ON scope.target_id = frontier.target_id
                     WHERE frontier.source = 'fbref'
+                      AND (frontier.page_kind NOT IN ('season', 'season_stats', 'squad')
+                        OR (frontier.state NOT IN ('quarantined', 'dead', 'skipped')
+                          AND frontier.refresh_policy <> 'historical_once'
+                          AND (frontier.page_kind <> 'squad' OR frontier.canonical_url
+                            !~ '/(matchlogs|goallogs|history|wages)(/|$)')))
                       -- Current runs cannot claim historical one-shot matches.
                       AND NOT (
                         frontier.page_kind = 'match'
@@ -7828,10 +8285,11 @@ class ControlStore:
             summary["publication_scope_freshness"] = publication_freshness
 
             cursor.execute(
-                """
+                f"""
                 SELECT frontier.page_kind,
                        count(*) FILTER (
                            WHERE attempt.run_id = %s
+                             AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                        ) AS run_count,
                        count(*) FILTER (
                            WHERE source_run.run_type = %s
@@ -7854,6 +8312,7 @@ class ControlStore:
                            attempt.finished_at, attempt.started_at
                        )) FILTER (
                            WHERE attempt.run_id = %s
+                             AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
                        ) AS run_oldest_raw_at,
                        min(COALESCE(
                            attempt.finished_at, attempt.started_at
@@ -7953,11 +8412,13 @@ class ControlStore:
                 """,
                 (
                     run,
+                    deferred_json,
                     recovery_lane_run_type,
                     recovery_lane_run_type,
                     raw_sla,
                     raw_sla,
                     run,
+                    deferred_json,
                     recovery_lane_run_type,
                     parser,
                     parser,
@@ -8136,29 +8597,31 @@ class ControlStore:
             }
             cursor.execute(
                 """
-                SELECT competition.gender, count(DISTINCT frontier.target_id)
-                           AS count
+                SELECT CASE WHEN scope.is_complete AND NOT scope.pending
+                                 AND scope.gender_classified
+                                 AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+                            THEN scope.gender_class ELSE 'unknown' END AS gender,
+                       count(*) AS count,
+                       count(*) FILTER (WHERE frontier.state NOT IN
+                           ('skipped', 'quarantined', 'dead')
+                           AND frontier.page_kind <> 'competition_index') AS active_count,
+                       count(*) FILTER (WHERE scope.is_complete AND NOT scope.pending
+                           AND scope.gender_classified
+                           AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)) AS classified_count
                 FROM fbref_control.page_frontier AS frontier
-                JOIN fbref_control.competition_registry AS competition
-                  ON competition.source = frontier.source
-                 AND competition.competition_id =
-                     frontier.source_ids ->> 'competition_id'
-                WHERE competition.gender IN ('female', 'unknown')
-                  AND frontier.state NOT IN (
-                      'skipped', 'quarantined', 'dead'
-                  )
-                GROUP BY competition.gender
-                ORDER BY competition.gender
+                LEFT JOIN fbref_control.page_scope_summary AS scope USING (target_id)
+                GROUP BY 1 ORDER BY 1
                 """
             )
-            out_of_scope = {
-                str(row["gender"]): int(row["count"])
-                for row in _fetchall(cursor)
+            gender_rows = _fetchall(cursor)
+            summary["frontier_gender_counts"] = {
+                str(row["gender"]): int(row["count"]) for row in gender_rows
             }
-            summary["female_downstream_targets"] = out_of_scope.get("female", 0)
-            summary["unknown_gender_downstream_targets"] = out_of_scope.get(
-                "unknown", 0
-            )
+            summary["frontier_gender_total"] = sum(int(row["count"]) for row in gender_rows)
+            summary["frontier_gender_classified"] = sum(int(row["classified_count"]) for row in gender_rows)
+            out_of_scope = {str(row["gender"]): int(row["active_count"]) for row in gender_rows}
+            summary["female_downstream_targets"] = out_of_scope.get("female", 0) + out_of_scope.get("mixed", 0)
+            summary["unknown_gender_downstream_targets"] = out_of_scope.get("unknown", 0)
             cursor.execute(
                 """
                 SELECT metadata
@@ -8791,8 +9254,8 @@ class ControlStore:
                         AND failed_observed.typed_parser_version = %s
                         AND failed_observed.stateful_parser_version = %s
                         AND failed_observed.status = 'failed'
-                    )
-                    AND EXISTS (
+                        AND (failed_observed.error_class = 'IncompleteMatchPageError'
+                             OR EXISTS (
                       SELECT 1
                       FROM fbref_control.fetch_attempt AS newer_attempt
                       JOIN fbref_control.observation_processing
@@ -8814,6 +9277,7 @@ class ControlStore:
                             'succeeded', 'skipped'
                         )
                         AND newer_observed.validation_status = 'succeeded'
+                             ))
                     )
                   )
                 ORDER BY COALESCE(
@@ -8851,7 +9315,16 @@ class ControlStore:
                        refresh_policy, state, priority, next_fetch_at,
                        retry_after, last_fetched_at, last_http_status,
                        last_content_hash, last_etag, last_modified,
-                       last_error_class, last_error_message
+                       last_error_class, last_error_message,
+                       EXISTS (SELECT 1 FROM fbref_control.incomplete_match_refetch retry
+                           WHERE retry.target_id = page_frontier.target_id
+                             AND retry.logical_refresh_id = (
+                                 SELECT attempt.logical_refresh_id
+                                 FROM fbref_control.fetch_attempt attempt
+                                 WHERE attempt.target_id = page_frontier.target_id
+                                   AND attempt.status = 'succeeded'
+                                 ORDER BY attempt.lease_epoch DESC, attempt.attempt_number DESC
+                                 LIMIT 1)) AS requires_fresh_match_fetch
                 FROM fbref_control.page_frontier
                 WHERE target_id = %s
                 """,
@@ -9081,9 +9554,16 @@ class ControlStore:
         *,
         typed_status: str,
         stateful_status: str,
+        processing_work_ms: Optional[int] = None,
     ) -> None:
         """Close an observation only after all stateful effects succeeded."""
 
+        started = time.monotonic()
+        work_ms = (
+            None
+            if processing_work_ms is None
+            else _non_negative(processing_work_ms, "processing_work_ms")
+        )
         typed = str(typed_status).strip().lower()
         stateful = str(stateful_status).strip().lower()
         if typed not in {"succeeded", "skipped"}:
@@ -9115,6 +9595,20 @@ class ControlStore:
                 (typed, stateful, *identity, lease.claim_token),
             )
             if cursor.rowcount:
+                if work_ms is not None:
+                    # The fenced UPDATE holds the row until commit. Include its
+                    # work in the same transaction; telemetry/commit is excluded.
+                    cursor.execute(
+                        """UPDATE fbref_control.observation_processing
+                        SET processing_work_ms = %s
+                        WHERE logical_refresh_id = %s AND parser_version = %s
+                          AND typed_parser_version = %s
+                          AND stateful_parser_version = %s""",
+                        (
+                            work_ms + math.ceil((time.monotonic() - started) * 1000),
+                            *identity,
+                        ),
+                    )
                 return
             cursor.execute(
                 """
@@ -9236,6 +9730,8 @@ class ControlStore:
                             AND observed.stateful_parser_version = %s
                             AND (
                                 observed.status = 'succeeded'
+                                OR (observed.status = 'failed'
+                                    AND observed.error_class = 'IncompleteMatchPageError')
                                 OR (
                                     observed.status = 'processing'
                                     AND observed.lease_expires_at >
@@ -9761,6 +10257,56 @@ class ControlStore:
                 run_ids=(run,),
                 run_rows_locked=True,
             )
+            # Explicit acceptance must fetch its whole frozen cohort in one
+            # wave, independently of work outside that bounded experiment.
+            frozen_acceptance = (
+                run_metadata.get("acceptance_profile") is True
+                and run_metadata.get("execution_mode") == "acceptance_nonpublishing"
+                and bool(run_metadata.get("acceptance_cohort"))
+            )
+            # A resumed enrichment cohort cannot hide newly due match/schedule
+            # work outside it. Hand back unleased enrichment before admission;
+            # retry/backoff and the frontier identity remain untouched.
+            cursor.execute(
+                _frontier_scope_cte_for_candidates("""
+                  SELECT f.target_id FROM fbref_control.page_frontier f
+                  WHERE f.page_kind IN ('match', 'schedule')
+                    AND f.refresh_policy <> 'historical_once'
+                    AND (f.state IN ('queued', 'retry') OR
+                         (f.state = 'fetched' AND f.next_fetch_at IS NOT NULL))
+                    AND (f.next_fetch_at IS NULL OR f.next_fetch_at <= clock_timestamp())
+                    AND (f.retry_after IS NULL OR f.retry_after <= clock_timestamp())
+                """) + """
+                UPDATE fbref_control.run_target AS target
+                SET status = 'skipped', updated_at = clock_timestamp()
+                FROM fbref_control.page_frontier AS page
+                WHERE target.run_id = %s AND target.target_id = page.target_id
+                  AND NOT %s
+                  AND target.status IN ('pending', 'retry')
+                  AND page.state IN ('queued', 'retry')
+                  AND page.page_kind IN ('season', 'season_stats', 'squad')
+                  AND page.refresh_policy <> 'historical_once'
+                  AND EXISTS (
+                    SELECT 1 FROM scope_candidates urgent
+                    JOIN scope_rollup scope USING (target_id)
+                    WHERE COALESCE(scope.has_current_ownership, false)
+                      AND NOT COALESCE(scope.competition_missing, true)
+                      AND NOT COALESCE(scope.has_female, false)
+                      AND NOT COALESCE(scope.has_unknown, true)
+                      AND NOT COALESCE(scope.inactive_competition, true)
+                      AND NOT COALESCE(scope.invalid_season, true)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM fbref_control.run_target member
+                        JOIN fbref_control.crawl_run owner USING (run_id)
+                        WHERE member.target_id = urgent.target_id
+                          AND (member.run_id = %s OR (
+                            member.status IN ('pending', 'leased', 'retry')
+                            AND owner.status IN ('pending', 'running')
+                          ))
+                      )
+                  )
+                """, (run, frozen_acceptance, run),
+            )
             cursor.execute(
                 _frontier_scope_cte_for_candidates(
                     """        SELECT candidate_target.target_id
@@ -9768,7 +10314,24 @@ class ControlStore:
         WHERE candidate_target.run_id = %s
           AND candidate_target.status IN ('pending', 'retry')"""
                 )
-                + """
+                + f"""
+                , claim_order AS (
+                  SELECT member.target_id,
+                    (page.page_kind IN ('season', 'season_stats', 'squad')
+                      AND page.refresh_policy <> 'historical_once') AS enrichment,
+                    row_number() OVER (
+                      PARTITION BY (page.page_kind IN ('season', 'season_stats', 'squad')
+                        AND page.refresh_policy <> 'historical_once')
+                      ORDER BY member.ordinal
+                    ) AS kind_ordinal
+                  FROM fbref_control.run_target member
+                  JOIN fbref_control.page_frontier page USING (target_id)
+                  WHERE member.run_id = '{run}'
+                    AND member.status IN ('pending', 'retry')
+                    AND page.state IN ('queued', 'retry')
+                    AND (page.retry_after IS NULL OR page.retry_after <= clock_timestamp())
+                    AND (page.next_fetch_at IS NULL OR page.next_fetch_at <= clock_timestamp())
+                )
                 SELECT target.target_id, target.logical_refresh_id,
                        frontier.canonical_url, frontier.page_kind,
                        frontier.source_ids, frontier.lease_epoch
@@ -9781,7 +10344,10 @@ class ControlStore:
                   ON claim_candidate.target_id = target.target_id
                 LEFT JOIN scope_rollup AS scope
                   ON scope.target_id = frontier.target_id
-                WHERE target.run_id = %s AND run.status = 'running'
+                JOIN claim_order ON claim_order.target_id = target.target_id
+                WHERE ({frozen_acceptance} OR NOT claim_order.enrichment OR claim_order.kind_ordinal <= {normalized_limit // 4}
+                  OR NOT EXISTS (SELECT 1 FROM claim_order urgent WHERE NOT urgent.enrichment))
+                  AND target.run_id = %s AND run.status = 'running'
                   AND target.status IN ('pending', 'retry')
                   AND frontier.state IN ('queued', 'retry')
                   AND (%s::text[] IS NULL
@@ -9804,11 +10370,18 @@ class ControlStore:
                       )
                     )
                   )
+                  AND (frontier.page_kind <> 'squad' OR frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
                   AND (frontier.next_fetch_at IS NULL
                        OR frontier.next_fetch_at <= clock_timestamp())
                   AND (frontier.retry_after IS NULL
                        OR frontier.retry_after <= clock_timestamp())
-                ORDER BY frontier.priority DESC, target.ordinal
+                ORDER BY CASE
+                    WHEN frontier.refresh_policy = 'historical_once' THEN 0
+                    WHEN frontier.page_kind IN ('match', 'schedule') THEN 0
+                    WHEN frontier.page_kind IN ('season', 'season_stats', 'squad') THEN 2
+                    ELSE 1 END,
+                    CASE WHEN frontier.refresh_policy = 'historical_once' THEN frontier.priority ELSE 0 END DESC,
+                    target.ordinal
                 LIMIT %s
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,
@@ -11602,6 +12175,10 @@ class _CursorBoundControlStore(ControlStore):
             raise ControlStoreError(
                 "bound control transaction cannot change its cursor"
             )
+        yield self._bound_cursor
+
+    @contextmanager
+    def _registry_scope_transaction(self):
         yield self._bound_cursor
 
 

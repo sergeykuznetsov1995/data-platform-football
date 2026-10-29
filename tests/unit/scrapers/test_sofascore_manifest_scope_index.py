@@ -22,6 +22,7 @@ from scrapers.sofascore.manifest import (
     InMemoryManifestStore,
     ManifestStatus,
     preload_manifest_scope,
+    refresh_manifest_scope,
 )
 from scrapers.sofascore.pipeline import (
     EVENT_PATHS,
@@ -147,6 +148,26 @@ def test_preload_is_one_select_and_scope_reads_never_query_trino():
     assert store.get(_spec("99999999", "lineups").key) is None
     assert manager.selects == 1
     assert trino_accounting.snapshot()["select"] == 1
+
+
+@pytest.mark.unit
+def test_scope_refresh_after_capture_lock_discards_stale_cache_without_losing_buffer():
+    manager = _seeded_manager()
+    inner = TrinoManifestStore(manager)
+    buffered = BatchingManifestStore(inner, max_pending=200)
+    buffered.preload_scope(TOURNAMENT, SEASON)
+    first = _spec("99999998", "lineups")
+    second = _spec("99999999", "lineups")
+    assert buffered.get(first.key) is None
+    # A sibling completed an endpoint while this runtime waited for scope lock.
+    manager.rows.append(manifest_to_row(_success(first)))
+    assert buffered.get(first.key) is None
+    buffered.upsert(_success(second))
+    refresh_manifest_scope(buffered, TOURNAMENT, SEASON)
+    assert buffered.get(first.key).is_terminal
+    assert buffered.get(second.key).is_terminal
+    assert buffered.pending_count == 0
+    assert manager.selects == 2
 
 
 @pytest.mark.unit

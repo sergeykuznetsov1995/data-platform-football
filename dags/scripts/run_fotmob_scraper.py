@@ -20,12 +20,17 @@ import signal
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from scrapers.fotmob.match_refresh import MATCH_SETTLE_MARGIN, match_refresh, source_observed_at
+from scrapers.fotmob.domain import ScopeRef, SeasonBundle
 from scrapers.fotmob.interruption import FotMobTerminated
+from scrapers.fotmob.shared_rate_limiter import (
+    FOTMOB_SHARED_RPM as FOTMOB_SHARED_RPM_CEILING,
+)
 from scrapers.fotmob.writer_lock import WriterLockBusy, writer_lock
 
 from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_groups
@@ -145,7 +150,6 @@ CURRENT_SCOPE_COOLDOWN = timedelta(hours=48)
 CURRENT_SCOPE_OBLIGATION_COOLDOWN = timedelta(hours=2)
 # Сколько ждать ПОСЛЕ начала матча, прежде чем идти за его флагом: полтора часа
 # игры плюс запас на то, что источник проставляет терминальный статус не мгновенно.
-MATCH_SETTLE_MARGIN = timedelta(hours=3)
 # Короткий возврат скоупа ради матча, по которому источник ответил «данных нет»
 # (#1450): дыра считается подтверждённой после двух ранов с промежутком не меньше
 # двух часов (или после трёх любых); спустя трое суток от начала матча короткого
@@ -173,7 +177,6 @@ WRITER_LOCK_ENV = "FOTMOB_WRITER_LOCK"
 # этого числа — сегодня 60/мин, ровно та нагрузка, которую источник видит от
 # одной волны. Раньше суммарный потолок держался лишь тем, что замок писателя
 # исключал одновременную работу волны и кампании.
-FOTMOB_SHARED_RPM_CEILING = 60.0
 FOTMOB_SHARED_RPM_ENV = "FOTMOB_SHARED_RPM"
 # Маркер узкого замка: по нему драйвер кампании отличает дерево, в котором волна
 # и юнит могут писать одновременно, от прежнего с замком на весь ран.
@@ -682,34 +685,28 @@ def _schedule_cooldown(matches: Iterable[Mapping[str, Any]], now: datetime) -> t
     return min(CURRENT_SCOPE_COOLDOWN, earliest_future + MATCH_SETTLE_MARGIN - now)
 
 
+def _match_refresh_cooldown(matches, service, now):
+    due = [service.match_refresh_state(match, now).next_due for match in matches]
+    return min(
+        (max(timedelta(minutes=1), value - now) for value in due if value is not None),
+        default=CURRENT_SCOPE_COOLDOWN,
+    )
+
+
 def _match_debt_is_open(
     match: Mapping[str, Any],
     repository: Any,
     now: datetime,
     canonicalize: Any,
 ) -> bool:
-    """Придёт ли раннер за карточкой этого матча, если обойдёт скоуп сейчас.
-
-    Дословно фильтр `FotMobIngestService.sync_match_payloads`
-    (`scrapers/fotmob/service.py:2466-2493`): долг — ровно то, что раннер сам
-    запросил бы после обхода, ни больше. Матч, который начался, но не помечен
-    `finished`, долгом НЕ считается: его карточку раннер не качает
-    (`include_unfinished=False`), и такой матч дал бы вечный долг.
-    """
-
-    if not match.get("finished"):
-        return False
-    if match.get("cancelled") or match.get("postponed"):
-        return False
-    kickoff = _match_kickoff(match.get("utc_time"))
-    if kickoff is None or kickoff > now - MATCH_SETTLE_MARGIN:
-        return False
+    """The same primary/late obligation used by the ingest service."""
     match_id = match.get("match_id")
     if match_id is None:
         return False
     target = canonicalize("matchDetails", {"matchId": str(match_id)})
-    previous = repository.latest_success(target.target_key)
-    return previous is None or bool(previous.get("stale"))
+    lookup = repository.latest_match_source
+    previous = lookup(target.target_key)
+    return match_refresh(match, source_observed_at(previous), now).kind in {"primary", "late"}
 
 
 def _unconfirmed_gap_matches(
@@ -811,11 +808,14 @@ def _scope_debt_counts(
         if bundle is None:
             continue
         identity = tuple(bundle.scope.identity[:2])
-        counts[identity] = sum(
-            1
-            for match in bundle.matches
-            if _match_debt_is_open(match, repository, now, canonicalize_target)
-        )
+        counts[identity] = 0
+        for match in bundle.matches:
+            if match_refresh(match, None, now).kind != "primary":
+                continue
+            target = canonicalize_target("matchDetails", {"matchId": str(match.get("match_id"))})
+            observed = source_observed_at(repository.latest_match_source(target.target_key))
+            if match_refresh(match, observed, now).kind == "primary":
+                counts[identity] += 1
     return counts
 
 
@@ -1025,7 +1025,6 @@ def _with_shared_rpm_ceiling(limiter, *, workers: int):
     shared = PgSharedRateLimiter(
         resolve_control_db_uri(os.environ),
         rpm=rpm,
-        burst=float(max(1, workers)),
     )
     return CompositeRateLimiter(limiter, shared)
 
@@ -1364,7 +1363,8 @@ def _run_transfers(args, service, started_at, operations, finish):
         status["completed_transfer_competition_ids"]
     )
     if (
-        flushed
+        payload.get("stop_reason") != "ban"
+        and flushed
         and catalog_complete
         and unfinished_ids
         and unfinished_ids <= deferred_ids
@@ -1457,6 +1457,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
 
     def finish() -> tuple[int, dict[str, Any]]:
+        pause_flush = getattr(
+            getattr(service, "transport", None), "flush_pending_pause", None
+        )
+        if pause_flush is not None:
+            pause_operation = OperationResult("pause_flush", attempted=1)
+            try:
+                pause_flush()
+                pause_operation.succeeded = 1
+            except Exception as exc:
+                pause_operation.errors.append(
+                    f"pause flush: {type(exc).__name__}: {exc}"
+                )
+            operations.append(pause_operation)
         # Buffered commits are only durable once flushed. Every exit path of
         # this run — completion, budget cut, empty catalog — goes through
         # finish(), so the flush belongs here and its failure must turn the
@@ -1679,6 +1692,31 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         }
         return rc, payload
 
+    if getattr(args, "match_ids", None):
+        ids = sorted(set(args.match_ids))
+        rows = service.repository.stored_match_rows(ids)
+        found = {int(row["match_id"]) for row in rows}
+        if found != set(ids):
+            operations.append(OperationResult(
+                "match_payloads", errors=[f"missing saved match metadata: {sorted(set(ids) - found)}"],
+            ))
+        else:
+            for row in {int(row["match_id"]): row for row in rows}.values():
+                bundle = SeasonBundle(
+                    ScopeRef(int(row["competition_id"]), row["source_season_key"]),
+                    details={}, capabilities={}, matches=(row,),
+                )
+                operation = service.sync_match_payloads(
+                    bundle, include_unfinished=True, force_refresh=True,
+                )
+                if operation.succeeded != 1:
+                    operation.retryable.append(
+                        f"match {row['match_id']} refresh incomplete: "
+                        f"{operation.metadata.get('deferred_reason', 'no successful payload')}"
+                    )
+                operations.append(operation)
+        return finish()
+
     explicit_scopes = _parse_scopes(args.scope)
     explicit_ids = {competition_id for competition_id, _ in explicit_scopes}
     daily_competition_ids = {
@@ -1686,6 +1724,26 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     }
     requested_competition_ids = explicit_ids | daily_competition_ids
     entities = _selected_native_entities(args)
+
+    match_bundles = {}
+    if "matches" in entities and args.mode not in {"replay", "discover"}:
+        grouped = {}
+        for row in service.repository.stored_match_rows():
+            identity = (int(row["competition_id"]), str(row["source_season_key"]))
+            if explicit_scopes and identity not in explicit_scopes:
+                continue
+            if daily_competition_ids and identity[0] not in daily_competition_ids:
+                continue
+            grouped.setdefault(identity, []).append(row)
+        for identity, rows in grouped.items():
+            bundle = SeasonBundle(
+                ScopeRef(*identity), details={}, capabilities={}, matches=tuple(rows),
+            )
+            match_bundles[identity] = bundle
+            # Finish raw-first publication before any discovery, deadline or
+            # season-budget gate can hide it. This pass cannot schedule HTTP.
+            if any(service._recover_match_fetch(match) is not None for match in rows):
+                operations.append(service.sync_match_payloads(bundle, phase="recovery"))
 
     catalog = service.discover_catalog()
     operations.append(catalog.operation)
@@ -2026,6 +2084,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if automatic_contract is not None
         else journal_plan_signature
     )
+    explicit_history = bool(explicit_scopes) and mode == RunMode.BACKFILL and not automatic_catalog
 
     if args.mode == RunMode.DISCOVER.value:
         rc, payload = finish()
@@ -2073,6 +2132,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             if raw_store is not None and raw_store.has_target(target):
                 previously_complete.add(season.identity)
 
+    # A source gap resolves the campaign unit, but must never enter the
+    # successful full-coverage journal (or its automatic-history bridge).
+    explicit_gap_records = (
+        service.repository.source_gap_scope_records(journal_plan_signature)
+        if explicit_history else {}
+    )
+    gap_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    resumed_gaps = {
+        identity: record for identity, record in explicit_gap_records.items()
+        if identity in explicit_scopes and identity not in previously_complete
+        and timedelta(0) <= gap_observed_at - _naive_utc(record["completed_at"]) < SOURCE_GAP_REVIEW_AFTER
+    }
+
     # The external campaign has one exact, un-laned season+matches contract.
     # Its marker is partial evidence for the wider automatic HISTORY plan, not
     # a full history completion: scopes still run for every other family and
@@ -2098,6 +2170,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
     remaining_scope_entities = scope_entities - _CAMPAIGN_SCOPE_ENTITIES
     planner_complete_scopes = set(previously_complete)
+    planner_complete_scopes.update(resumed_gaps)
     if campaign_plan_signature is not None and not remaining_scope_entities:
         # A season+matches-only history contract has nothing left to execute.
         # Keep the journals separate and let the exact campaign marker satisfy
@@ -2115,6 +2188,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         else {}
     )
     planning_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    refresh_scopes = set()
+    if "matches" in entities and mode not in {RunMode.REPLAY, RunMode.DISCOVER}:
+        for discovered in discovery_results:
+            if discovered.selected_bundle is not None:
+                bundle = discovered.selected_bundle
+                match_bundles[tuple(bundle.scope.identity[:2])] = bundle
+        for identity, bundle in match_bundles.items():
+            states = [service.match_refresh_state(match, planning_observed_at) for match in bundle.matches]
+            if any(state.kind == "late" for state in states):
+                refresh_scopes.add(identity)
+        # Keep the campaign's family bridge only for scopes with no due card.
+        campaign_completed_scopes -= refresh_scopes
+        planner_complete_scopes -= refresh_scopes
 
     work = plan_seasons(
         classifications,
@@ -2125,6 +2211,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         lane=(automatic_lane if automatic_catalog else None),
         attempt_states=attempt_states,
         scope_debt=scope_debt,
+        match_refresh_scopes=refresh_scopes,
     )
     daily_scope_times = {}
     if mode == RunMode.DAILY and not automatic_catalog:
@@ -2138,6 +2225,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 work_item.competition_id,
             )
         )
+    def match_scope_priority(item):
+        bundle = match_bundles.get(item.identity)
+        states = (
+            [service.match_refresh_state(match, planning_observed_at).kind for match in bundle.matches]
+            if bundle is not None else []
+        )
+        return 0 if "primary" in states or bundle is None else (2 if "late" in states else 1)
+
+    if "matches" in entities and mode != RunMode.REPLAY:
+        work.sort(key=match_scope_priority)
     # Очередь кандидатов полосы: неизменное обязательство каталога минус
     # закрытые скоупы и признанные дыры источника, чей 30-дневный срок
     # пересмотра ещё не наступил. Планировщик временно исключает ровно те же
@@ -2296,7 +2393,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     operations.append(work_plan)
     if automatic_catalog:
         operations.append(attempt_operation)
-    completed_scopes: list[str] = []
+    source_gap_scopes = [format_scope_token(*identity) for identity in sorted(resumed_gaps)]
+    completed_scopes: list[str] = list(source_gap_scopes)
+    for identity, record in sorted(resumed_gaps.items()):
+        operations.append(OperationResult(
+            "scope_source_gap", skipped=1,
+            metadata={
+                **record, "scope": format_scope_token(*identity),
+                "completed_at": record["completed_at"].isoformat(), "resumed": True,
+            },
+        ))
     # Скоупы, у которых доказательства дыры источника уже собраны, но второго
     # наблюдения ещё нет. До #1255 такой скоуп шёл в work_plan.retryable и красил
     # первую попытку, хотя источник честно ответил «матчей нет».
@@ -2304,122 +2410,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     calendar_unavailable_scopes: list[str] = []
     replay_gap_entries: list[dict[str, Any]] = []
 
-    # Complete one exact scope end-to-end before starting the next.  This is
-    # the fairness boundary that prevents a season-first pass from consuming
-    # the whole request budget and permanently starving child entities.
-    for work_index, item in enumerate(work):
+    late_bundles = []
+
+    def finalize_scope(
+        item, bundle, scope_operations, player_ids, calendar_unavailable, observed_at,
+    ) -> tuple[bool, bool]:
         scope_key = format_scope_token(item.competition_id, item.source_season_key)
-        campaign_scope_complete = item.identity in campaign_completed_scopes
-        observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        deadline_at = getattr(args, "deadline_at", None)
-        deferred_reason = None
-        if deadline_at is not None and observed_at >= deadline_at:
-            deferred_reason = "run deadline deferred scope"
-        elif automatic_catalog and service.ledger.remaining_requests < max_attempts:
-            deferred_reason = "request budget deferred scope"
-        if deferred_reason is not None:
-            deferred = work[work_index:]
-            work_plan.skipped += len(deferred)
-            work_plan.metadata.setdefault("runtime_deferred_scopes", []).extend(
-                format_scope_token(value.competition_id, value.source_season_key)
-                for value in deferred
-            )
-            add_automatic_deferral(
-                kind=("deadline" if "deadline" in deferred_reason else "budget"),
-                target_type="scope",
-                targets=[
-                    format_scope_token(value.competition_id, value.source_season_key)
-                    for value in deferred
-                ],
-                reason=deferred_reason,
-            )
-            for deferred_item in deferred:
-                record_automatic_attempt(
-                    deferred_item,
-                    outcome="deferred",
-                    reason=deferred_reason,
-                    next_retry_at=observed_at + timedelta(minutes=1),
-                )
-            break
-        scope_operations = []
-        season_method = (
-            service.read_season_dependency
-            if campaign_scope_complete
-            else service.sync_season
-        )
-        operation, bundle = season_method(
-            item.competition_id,
-            item.source_season_key,
-            prefetched=selected_fetches.get(item.identity),
-        )
-        operations.append(operation)
-        scope_operations.append(operation)
-        calendar_unavailable = (
-            bundle is None
-            and operation.metadata.get("calendar_unavailability", {}).get("reason")
-            == "source_calendar_unavailable"
-        )
-        if calendar_unavailable:
-            calendar_unavailable_scopes.append(scope_key)
-        if bundle is None:
-            work_plan.retryable.append(f"scope {scope_key} has no season bundle")
-        else:
-            if "leaderboards" in entities:
-                leaderboard_operation = service.sync_leaderboards(bundle)
-                operations.append(leaderboard_operation)
-                scope_operations.append(leaderboard_operation)
-
-            if "matches" in entities and not campaign_scope_complete:
-                capacity = service.ledger.remaining_requests // max_attempts
-                per_run_limit = args.match_limit or len(bundle.matches)
-                match_operation = service.sync_match_payloads(
-                    bundle,
-                    limit=min(per_run_limit, capacity),
-                )
-                operations.append(match_operation)
-                scope_operations.append(match_operation)
-
-            player_ids: set[int] = set()
-            if "teams" in entities:
-                capacity = service.ledger.remaining_requests // max_attempts
-                per_run_limit = args.team_limit or len(bundle.teams)
-                team_operation, player_ids = service.sync_team_snapshots(
-                    bundle,
-                    limit=min(per_run_limit, capacity),
-                    # An advertised team without a global /teams payload is a
-                    # fact about the source in ANY season: besides removed
-                    # deep-history clubs, current small-cup entrants and
-                    # bracket placeholders (e.g. team id -1) never get a page
-                    # (#1070: 96 proven null-body teams in latest seasons).
-                    # The absence path commits EXCLUDED without tombstoning a
-                    # last-good snapshot, so latest seasons are safe too.
-                    allow_advertised_absence=True,
-                )
-                operations.append(team_operation)
-                scope_operations.append(team_operation)
-
-            if "players" in entities:
-                if mode == RunMode.REPLAY:
-                    # Raw replay performs no HTTP attempts and resolves each
-                    # rotating Next.js target from its durable manifest.  A
-                    # network request budget must not truncate a large squad.
-                    capacity = len(player_ids)
-                    build_reserve = 0
-                else:
-                    capacity = service.ledger.remaining_requests // max_attempts
-                    build_reserve = 0 if args.next_build_id else max_attempts
-                per_run_limit = args.player_limit or len(player_ids)
-                player_operation = service.sync_player_snapshots(
-                    player_ids,
-                    build_id=(args.next_build_id or None),
-                    limit=min(
-                        per_run_limit,
-                        max(0, capacity - build_reserve),
-                    ),
-                )
-                operations.append(player_operation)
-                scope_operations.append(player_operation)
-
+        budget_failure = False
         outstanding = {
             item.entity: _outstanding_targets(item)
             for item in scope_operations
@@ -2436,6 +2433,64 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             and not outstanding
             and source_missing_matches == 0
         )
+        deferral = next((
+            operation.metadata["deferred_reason"]
+            for operation in scope_operations
+            if operation.entity == "match_payloads"
+            and operation.metadata.get("deferred_reason")
+        ), None)
+        if deferral and all(operation.ok for operation in scope_operations) and outstanding:
+            reason = (
+                "run deadline deferred late matches" if deferral == "deadline"
+                else f"match budget deferred scope: {deferral}"
+            )
+            add_automatic_deferral(
+                kind="deadline" if deferral == "deadline" else "budget",
+                target_type="scope", targets=[scope_key], reason=reason,
+            )
+            record_automatic_attempt(
+                item, outcome="deferred", reason=reason,
+                next_retry_at=observed_at + timedelta(minutes=1),
+            )
+            if not automatic_catalog:
+                work_plan.retryable.append(f"scope {scope_key} incomplete; {reason}")
+            work_plan.metadata.setdefault("incomplete_scopes", []).append(
+                {"scope": scope_key, "outstanding": outstanding}
+            )
+            return False, True
+        if (
+            explicit_history and bundle is not None and source_missing_matches > 0
+            and all(operation.ok and not operation.review_required for operation in scope_operations)
+            and not outstanding
+        ):
+            proofs = {
+                str(proof["match_id"]): proof
+                for operation in scope_operations if operation.entity == "match_payloads"
+                for proof in operation.metadata.get("source_gap_matches", [])
+            }
+            known_times = all(
+                _match_kickoff(match.get("utc_time")) is not None
+                for match in bundle.matches if str(match.get("match_id")) in proofs
+            )
+            if proofs and known_times and not _unconfirmed_gap_matches(
+                bundle.matches, service.repository, observed_at, run_id,
+            ):
+                gap = OperationResult("scope_source_gap", attempted=1, metadata={"scope": scope_key})
+                try:
+                    paths, evidence = service.record_scope_source_gap(
+                        bundle, plan_signature=journal_plan_signature,
+                        scope_entities=scope_entities, source_gap_matches=list(proofs.values()),
+                    )
+                    gap.tables.extend(paths)
+                    gap.metadata.update(evidence)
+                    gap.succeeded = 1
+                    work_plan.succeeded += 1
+                    source_gap_scopes.append(scope_key)
+                    completed_scopes.append(scope_key)
+                except Exception as exc:
+                    gap.record_exception(f"scope {scope_key} source gap: {type(exc).__name__}: {exc}", exc)
+                operations.append(gap)
+                return gap.ok, False
         if scope_ok and bundle is not None:
             descriptors = (
                 (
@@ -2507,7 +2562,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     reason="scope completion committed",
                     next_retry_at=(
                         observed_at
-                        + _schedule_cooldown(bundle.matches, observed_at)
+                        + min(
+                            _schedule_cooldown(bundle.matches, observed_at),
+                            _match_refresh_cooldown(bundle.matches, service, observed_at),
+                        )
                         if automatic_lane == ScopeLane.CURRENT
                         else None
                     ),
@@ -2680,6 +2738,138 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                         "missing_player_ids": list(missing_player_ids),
                     }
                 )
+
+        return scope_ok, budget_failure
+
+    # Keep primary entities of each scope together so season discovery cannot
+    # consume the whole request budget before child entities. Scope completion
+    # waits until the late pass after primary collection across the wave.
+    for work_index, item in enumerate(work):
+        scope_key = format_scope_token(item.competition_id, item.source_season_key)
+        campaign_scope_complete = item.identity in campaign_completed_scopes
+        observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        deadline_at = getattr(args, "deadline_at", None)
+        deferred_reason = None
+        if deadline_at is not None and observed_at >= deadline_at:
+            deferred_reason = "run deadline deferred scope"
+        elif automatic_catalog and service.ledger.remaining_requests < max_attempts:
+            deferred_reason = "request budget deferred scope"
+        if deferred_reason is not None:
+            deferred = work[work_index:]
+            work_plan.skipped += len(deferred)
+            work_plan.metadata.setdefault("runtime_deferred_scopes", []).extend(
+                format_scope_token(value.competition_id, value.source_season_key)
+                for value in deferred
+            )
+            add_automatic_deferral(
+                kind=("deadline" if "deadline" in deferred_reason else "budget"),
+                target_type="scope",
+                targets=[
+                    format_scope_token(value.competition_id, value.source_season_key)
+                    for value in deferred
+                ],
+                reason=deferred_reason,
+            )
+            for deferred_item in deferred:
+                record_automatic_attempt(
+                    deferred_item,
+                    outcome="deferred",
+                    reason=deferred_reason,
+                    next_retry_at=observed_at + timedelta(minutes=1),
+                )
+            break
+        scope_operations = []
+        player_ids: set[int] = set()
+        season_method = (
+            service.read_season_dependency
+            if campaign_scope_complete
+            else service.sync_season
+        )
+        operation, bundle = season_method(
+            item.competition_id,
+            item.source_season_key,
+            prefetched=selected_fetches.get(item.identity),
+        )
+        operations.append(operation)
+        scope_operations.append(operation)
+        calendar_unavailable = (
+            bundle is None
+            and operation.metadata.get("calendar_unavailability", {}).get("reason")
+            == "source_calendar_unavailable"
+        )
+        if calendar_unavailable:
+            calendar_unavailable_scopes.append(scope_key)
+        if bundle is None:
+            work_plan.retryable.append(f"scope {scope_key} has no season bundle")
+        else:
+            if "leaderboards" in entities:
+                leaderboard_operation = service.sync_leaderboards(bundle)
+                operations.append(leaderboard_operation)
+                scope_operations.append(leaderboard_operation)
+
+            if "matches" in entities and not campaign_scope_complete:
+                capacity = service.ledger.remaining_requests // max_attempts
+                per_run_limit = args.match_limit or len(bundle.matches)
+                match_operation = service.sync_match_payloads(
+                    bundle,
+                    limit=min(per_run_limit, capacity),
+                    phase=("primary" if mode != RunMode.REPLAY else None),
+                )
+                operations.append(match_operation)
+                scope_operations.append(match_operation)
+
+            if "teams" in entities:
+                capacity = service.ledger.remaining_requests // max_attempts
+                per_run_limit = args.team_limit or len(bundle.teams)
+                team_operation, player_ids = service.sync_team_snapshots(
+                    bundle,
+                    limit=min(per_run_limit, capacity),
+                    # An advertised team without a global /teams payload is a
+                    # fact about the source in ANY season: besides removed
+                    # deep-history clubs, current small-cup entrants and
+                    # bracket placeholders (e.g. team id -1) never get a page
+                    # (#1070: 96 proven null-body teams in latest seasons).
+                    # The absence path commits EXCLUDED without tombstoning a
+                    # last-good snapshot, so latest seasons are safe too.
+                    allow_advertised_absence=True,
+                )
+                operations.append(team_operation)
+                scope_operations.append(team_operation)
+
+            if "players" in entities:
+                if mode == RunMode.REPLAY:
+                    # Raw replay performs no HTTP attempts and resolves each
+                    # rotating Next.js target from its durable manifest.  A
+                    # network request budget must not truncate a large squad.
+                    capacity = len(player_ids)
+                    build_reserve = 0
+                else:
+                    capacity = service.ledger.remaining_requests // max_attempts
+                    build_reserve = 0 if args.next_build_id else max_attempts
+                per_run_limit = args.player_limit or len(player_ids)
+                player_operation = service.sync_player_snapshots(
+                    player_ids,
+                    build_id=(args.next_build_id or None),
+                    limit=min(
+                        per_run_limit,
+                        max(0, capacity - build_reserve),
+                    ),
+                )
+                operations.append(player_operation)
+                scope_operations.append(player_operation)
+
+        context = (item, bundle, scope_operations, player_ids, calendar_unavailable, observed_at)
+        if bundle is not None and "matches" in entities and mode != RunMode.REPLAY:
+            late_bundles.append(context)
+            # Decide whether to continue primary collection from its own result.
+            # Completion and the attempt journal wait for the late pass.
+            scope_ok = all(op.ok and not _outstanding_targets(op) for op in scope_operations)
+            budget_failure = any(
+                _is_budget_deferral_error(error)
+                for op in scope_operations for error in op.errors
+            )
+        else:
+            scope_ok, budget_failure = finalize_scope(*context)
 
         if (
             not scope_ok
@@ -2908,6 +3098,18 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     else:
         completed_transfer_competition_ids = []
 
+    for context in late_bundles:
+        item, bundle, scope_operations, player_ids, calendar_unavailable, _ = context
+        late_operation = service.sync_match_payloads(
+            bundle, phase="late", limit=args.match_limit or None,
+        )
+        operations.append(late_operation)
+        scope_operations.append(late_operation)
+        finalize_scope(
+            item, bundle, scope_operations, player_ids, calendar_unavailable,
+            datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+
     # Доказательства рана — это исходы, которые записал ОН САМ. Раньше здесь
     # перечитывалась карта состояний: под контентной подписью она совпадала с
     # работой рана, под стабильной содержит историю всей полосы, и отчёт начал
@@ -3027,6 +3229,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 f"{len(obligation_scopes)} obligation scopes remain outside the "
                 "completion journal"
             )
+
     rc, payload = finish()
     replay_missing_inputs = (
         _replay_missing_raw_evidence(
@@ -3050,10 +3253,18 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         "scope_plan_signature": scope_plan_signature,
         "planned_scopes": planned_scopes,
         "completed_scopes": completed_scopes,
+        "source_gap_scopes": source_gap_scopes,
         "calendar_unavailable_scopes": sorted(calendar_unavailable_scopes),
         "completed_transfer_competition_ids": (completed_transfer_competition_ids),
         "requests_per_minute": args.requests_per_minute,
     }
+    if explicit_history and rc != 0:
+        # The external driver advances from this list even when rc != 0.
+        # In particular, a failed final manifest flush cannot close a unit.
+        payload["selection"]["completed_scopes"] = [
+            scope for scope in completed_scopes if scope not in source_gap_scopes
+        ]
+        payload["selection"]["source_gap_scopes"] = []
     if replay_missing_inputs is not None:
         payload["selection"]["replay_missing_player_inputs"] = replay_missing_inputs
     daily_contract = getattr(args, "daily_competition_contract", None)
@@ -3150,7 +3361,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             retryable_attempts or unauthorized_operation_retries
         ) and not scope_progress
         if (
-            terminal_attempts
+            payload.get("stop_reason") == "ban"
+            or terminal_attempts
             or unauthorized_deferred_attempts
             or hard_failures
             or no_progress_failure
@@ -3265,6 +3477,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--competition-limit", type=int, default=0)
     parser.add_argument("--season-limit", type=int, default=0)
     parser.add_argument("--match-limit", type=int, default=0)
+    parser.add_argument("--match-ids", type=int, nargs="+", default=[])
     parser.add_argument("--team-limit", type=int, default=0)
     parser.add_argument("--player-limit", type=int, default=0)
     parser.add_argument(
@@ -3299,6 +3512,11 @@ def _argument_parser() -> argparse.ArgumentParser:
 def _validate_args(
     parser: argparse.ArgumentParser, args
 ) -> dict[str, Any] | None:
+    if getattr(args, "match_ids", None):
+        if any(value <= 0 for value in args.match_ids):
+            parser.error("--match-ids must contain positive IDs")
+        if args.mode not in {"daily", "refresh", "backfill", "replay"} or getattr(args, "catalog_contract", ""):
+            parser.error("--match-ids requires an explicit non-catalog ingest mode")
     positive = {
         "--max-requests": args.max_requests,
         "--max-direct-mib": args.max_direct_mib,

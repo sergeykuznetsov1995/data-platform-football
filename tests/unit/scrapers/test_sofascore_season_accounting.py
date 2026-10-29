@@ -50,13 +50,23 @@ def save_receipt(path, day, *, slot=0, status="failed", start="2026-10-15T01:00:
     env = {"SOFASCORE_CAMPAIGN_ACTION": "capture", "SOFASCORE_SCOPE_RESULT_PATH": f"/{run}.json",
            "SOFASCORE_SCOPE_RUN_ID": f"native-{tid}-scope", "SOFASCORE_EXPECTED_CAMPAIGN_ID": "campaign",
            "SOFASCORE_EXPECTED_SNAPSHOT_ID": "snapshot", "SOFASCORE_TOURNAMENT_ID": str(tid),
-           "SOFASCORE_SOURCE_SEASON_ID": "2", "SOFASCORE_HISTORY_GROUP": "2"}
+           "SOFASCORE_SOURCE_SEASON_ID": "2", "SOFASCORE_HISTORY_GROUP": "2",
+           "SOFASCORE_CANONICAL_SEASON": "2627"}
     item = {"slot": slot, "index": 0, "plan_index": 0, "started_at": start, "finished_at": end,
             "accounted": True, "attempts": attempts, "outcome": {"status": status}, "environment": env}
     payload = {"history_scope_attempt": True, "scope_digest": run, "run_id": f"native-{tid}-scope",
                "campaign_id": "campaign", "tournament_id": tid, "source_season_id": 2,
                "history_slot": {"slot": slot, "dag_run_id": run, "started_at": start,
                                 "finished_at": end, "terminal_state": status}}
+    if status == "waiting":
+        payload.update(status="waiting", waiting_reason="season_has_no_finished_matches",
+                       phases=[{"phase": "season", "status": "success", "schedule_inventory": {
+                           "verified": True, "tournament_id": tid, "source_season_id": 2,
+                           "canonical_season": "2627", "finished_matches": 0, "schedule_events": 153}}])
+    if status == 'partial':
+        from tests.unit.scrapers.test_sofascore_history_controller import continuation_report
+        payload.update(continuation_report(tid, 2, 'campaign', f'native-{tid}-scope'))
+        item['outcome']['partial'] = payload['phases'][0]['partial']
     (path / f"{run}.json").write_text(json.dumps(payload))
     plan_digest = digest([env])
     receipt = {"history_slots_receipt": True, "dag_run_id": run, "campaign_id": "campaign",
@@ -265,6 +275,25 @@ def test_internal_retry_needs_saved_failed_attempt_and_retains_it(tmp_path):
     assert report["attempts"][0]["attempt_history"][0]["status"] == "failed"
 
 
+@pytest.mark.parametrize('attempts', [1, 2])
+def test_season_continuation_occupies_slot_without_closure_or_publication(tmp_path, attempts):
+    day = day_input()
+    save_receipt(tmp_path, day, status='partial', attempts=attempts)
+    if attempts == 2:
+        day['expected_runs'][0]['attempt_histories'] = {'0': [
+            dict(status='failed', started_at='2026-10-15T01:00:00Z', finished_at='2026-10-15T01:10:00Z'),
+            dict(status='partial', started_at='2026-10-15T01:12:00Z', finished_at='2026-10-15T02:00:00Z')]}
+        day['run_roster_digest'] = digest(day['expected_runs'])
+    report = summarize_day(journal_for_day(count=0), day, tmp_path)
+    assert report['missing_evidence'] == []
+    assert report['attempts'][0]['status'] == 'partial'
+    assert report['occupied_slot_seconds'] == 3600
+    assert report['closed_seasons'] == 0 and report['closed_matches'] == 0
+    assert report['verdict'] == 'FAIL'  # Valid evidence, insufficient completed work.
+    falsely_closed = summarize_day(journal_for_day(), day, tmp_path)
+    assert any('successful history publication' in reason for reason in falsely_closed['missing_evidence'])
+
+
 @pytest.mark.parametrize("change", ["digest", "report", "checkpoint", "slot", "native_group", "capture_gate"])
 def test_corrupt_or_cross_identity_receipts_are_unknown(tmp_path, change):
     day = day_input()
@@ -291,6 +320,22 @@ def test_corrupt_or_cross_identity_receipts_are_unknown(tmp_path, change):
     assert summarize_day(journal_for_day(), day, tmp_path)["verdict"] == "UNKNOWN"
 
 
+@pytest.mark.parametrize("active,rejected", [("2", False), ("3", True)])
+def test_only_deeper_groups_need_the_core_gate(tmp_path, active, rejected):
+    day = day_input()
+    save_receipt(tmp_path, day)
+    checkpoint_path = tmp_path / "checkpoint-run-a.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["groups"]["1"].update(closed=98, gate_passed=False)
+    checkpoint["active_group"] = active
+    raw = json.dumps(checkpoint).encode()
+    checkpoint_path.write_bytes(raw)
+    day["expected_runs"][0]["checkpoint_sha256"] = hashlib.sha256(raw).hexdigest()
+    day["run_roster_digest"] = digest(day["expected_runs"])
+    missing = summarize_day(journal_for_day(), day, tmp_path)["missing_evidence"]
+    assert any("before core gate" in m for m in missing) is rejected
+
+
 @pytest.mark.parametrize("status,publication_run", [("failed", "native-1-scope::targets"),
                                                      ("success", "refresh-run::targets"),
                                                      ("success", None)])
@@ -310,3 +355,18 @@ def test_started_history_scope_never_credits_refresh_publications(tmp_path, stat
     report = summarize_day(state, day, tmp_path)
     assert report["verdict"] == "UNKNOWN"
     assert any("publication association" in reason for reason in report["missing_evidence"])
+
+
+def test_waiting_consumes_slot_time_without_claiming_history_closures(tmp_path):
+    day = day_input()
+    save_receipt(tmp_path, day, status='waiting', attempts=2)
+    day['expected_runs'][0]['attempt_histories'] = {'0': [
+        {'status':'failed', 'started_at':'2026-10-15T01:00:00Z', 'finished_at':'2026-10-15T01:10:00Z'},
+        {'status':'waiting', 'started_at':'2026-10-15T01:12:00Z', 'finished_at':'2026-10-15T02:00:00Z'}]}
+    day['run_roster_digest'] = digest(day['expected_runs'])
+    report = summarize_day(journal_for_day(count=0), day, tmp_path)
+    assert report['missing_evidence'] == []
+    assert report['verdict'] == 'FAIL'
+    assert report['closed_seasons'] == report['closed_matches'] == 0
+    assert report['occupied_slot_seconds'] == 3600
+    assert report['attempts'][0]['status'] == 'waiting'

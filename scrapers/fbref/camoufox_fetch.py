@@ -426,7 +426,8 @@ def should_block_request(
 
     Never blocks document/xhr/fetch (FBref's page itself), nor any
     Cloudflare/Turnstile asset — the allow-guard runs before the type block.
-    ``block_scripts=True`` (FBREF_CAMOUFOX_BLOCK_SCRIPTS=1, experimental)
+    ``block_scripts=True`` (the transport default; disable with
+    FBREF_CAMOUFOX_BLOCK_SCRIPTS=0)
     additionally aborts script resources: the Python parser reads tables from
     HTML comments server-side, so FBref's own JS is not needed for content,
     and challenge JS is covered by the allow-list.
@@ -650,11 +651,11 @@ class CamoufoxFbrefTransport:
         self.cf_challenges_passed = 0
         self.cf_challenges_failed = 0
         self._last_solve_failure: Optional[str] = None
-        # Env-tunables: experimental script blocking + page-count restart
+        # Env-tunables: script blocking + page-count restart
         # (Firefox memory creep on 380+-page backfills). A restart costs a
         # full CF cold-start (~4 MB measured) — keep the limit high.
         self._block_scripts = os.environ.get(
-            "FBREF_CAMOUFOX_BLOCK_SCRIPTS", "").strip() == "1"
+            "FBREF_CAMOUFOX_BLOCK_SCRIPTS", "1").strip() != "0"
         try:
             self._max_pages_per_session = int(
                 os.environ.get("FBREF_CAMOUFOX_MAX_PAGES") or 200)
@@ -1703,7 +1704,9 @@ class CamoufoxFbrefTransport:
             UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
         )
         self._network_policy_failed = True
-        self._network_policy_failure = reason
+        # A later upgrade must not hide a different transport-policy bypass.
+        if self._network_policy_failure in {None, "unrouted_websocket_upgrade"}:
+            self._network_policy_failure = reason
         self._last_solve_failure = "network_policy"
         self._blocked_count += 1
         self._budget_blocked_count += 1
@@ -2043,7 +2046,7 @@ class CamoufoxFbrefTransport:
             source is not None,
             self._normalized_https_url(url) == source,
             redirected_from is not None,
-            self._normalized_https_url(
+            source is not None and self._normalized_https_url(
                 self._request_url(redirected_from)
                 if redirected_from is not None
                 else None
@@ -2091,7 +2094,20 @@ class CamoufoxFbrefTransport:
                 )
                 return
             self._remember_unrouted_response(req)
-            self._reject_unrouted_request()
+            try:
+                navigation = req.is_navigation_request
+                navigation = navigation() if callable(navigation) else navigation
+                websocket_upgrade = (
+                    self._response_status(response) == 101
+                    and req.resource_type == "websocket"
+                    and navigation is False
+                )
+            except Exception:  # noqa: BLE001 — detached request is not proof
+                websocket_upgrade = False
+            if websocket_upgrade:
+                self._latch_unexpected_network("unrouted_websocket_upgrade")
+            else:
+                self._reject_unrouted_request()
             try:
                 self._log_unrouted_response(response, req)
             except Exception:  # noqa: BLE001 — policy latch must survive logs

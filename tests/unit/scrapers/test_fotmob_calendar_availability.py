@@ -11,6 +11,7 @@ import pytest
 from scrapers.fotmob.catalog import classify_competition, competition_from_league_payload
 from scrapers.fotmob.planner import RunMode, ScopeAttemptState
 from scrapers.fotmob.repository import ManifestStatus
+from scrapers.fotmob.service import _is_calendar_unavailable_stub
 from scrapers.fotmob.transport import FetchOutcome, canonicalize_target
 from tests.unit.scrapers.test_fotmob_calendar_contract import calendar
 from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
@@ -19,6 +20,61 @@ from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
 def unavailable():
     path = Path(__file__).parents[2] / "fixtures/fotmob/league_10056_calendar_unavailable.json"
     return json.loads(path.read_text())
+
+
+def seasons_only_unavailable():
+    path = Path(__file__).parents[2] / "fixtures/fotmob/league_9862_calendar_unavailable.json"
+    return json.loads(path.read_text())
+
+
+def test_seasons_only_fixture_matches_retained_copy_hash_and_scope():
+    path = Path(__file__).parents[2] / "fixtures/fotmob/league_9862_calendar_unavailable.json"
+    provenance = json.loads(path.with_suffix(".provenance.json").read_text())
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == provenance["sha256"]
+    payload = seasons_only_unavailable()
+    assert payload["details"]["id"] == provenance["competition_id"] == 9862
+    assert payload["details"]["selectedSeason"] == provenance["source_season_key"] == "2017/2018"
+    assert payload["tabs"] == ["seasons"]
+
+
+@pytest.mark.parametrize("tabs,accepted", [
+    ([], True), (["seasons"], True), (["matches"], False),
+    (["seasons", "fixtures"], False), (None, False), ("seasons", False),
+    ({"seasons": True}, False),
+])
+def test_retained_seasons_stub_requires_only_supported_tabs(tabs, accepted):
+    payload = seasons_only_unavailable()
+    payload["tabs"] = tabs
+    assert _is_calendar_unavailable_stub(payload) is accepted
+    url = canonicalize_target("leagues", {"id": 9862, "season": "2017/2018"}).canonical_url
+    service, _, repo = _service({url: payload})
+    result, bundle = service.sync_season(9862, "2017/2018")
+    assert bundle is None and result.succeeded == 0
+    assert not repo.tables.get("fotmob_matches")
+    assert not any(c.target_type == "scope_completion" for c in repo.commits)
+    assert not repo.latest_success(canonicalize_target(url).target_key)
+    if accepted:
+        assert not result.errors and result.retryable
+        assert result.metadata["calendar_unavailability"]["reason"] == "source_calendar_unavailable"
+        assert repo.commits[-1].status == ManifestStatus.RETRYABLE_FAILURE
+        assert repo.commits[-1].error_code == "source_calendar_unavailable"
+    else:
+        assert result.errors and not result.retryable
+        assert "calendar_unavailability" not in result.metadata
+        assert repo.commits[-1].status == ManifestStatus.SCHEMA_DRIFT
+
+
+def test_discovery_accepts_retained_seasons_only_stub():
+    payload = seasons_only_unavailable()
+    comp = competition_from_league_payload(payload)
+    url = canonicalize_target("leagues", {"id": 9862}).canonical_url
+    service, _, repo = _service({url: payload})
+    result = service.discover_competition(classify_competition(comp, comp))
+    assert result.operation.ok, result.operation.errors
+    assert result.seasons and result.selected_bundle is None
+    assert result.operation.metadata["calendar_available"] is False
+    assert not repo.tables.get("fotmob_matches")
+    assert not any(c.target_type == "scope_completion" for c in repo.commits)
 
 
 SIX_CALENDARS = [(10433, "2022/2023"), (9170, "2023"), (9669, "2023/2024"),
@@ -42,8 +98,10 @@ def test_retained_fixtures_match_source_hashes_and_scope_identity():
 
 
 @pytest.mark.parametrize("variant", ["id", "season"])
-def test_unavailable_identity_mismatch_remains_drift(variant):
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_unavailable_identity_mismatch_remains_drift(variant, tabs):
     payload = unavailable()
+    payload["tabs"] = tabs
     season = payload["details"]["selectedSeason"]
     payload["details"]["id" if variant == "id" else "selectedSeason"] = 999 if variant == "id" else "2025/2026"
     url = canonicalize_target("leagues", {"id": 10056, "season": season}).canonical_url
@@ -117,8 +175,10 @@ def test_discovery_accepts_only_season_metadata_without_a_calendar_bundle():
 
 
 @pytest.mark.parametrize("persist", [True, False])
-def test_unavailable_new_calendar_remains_retryable_without_typed_rows(persist):
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_unavailable_new_calendar_remains_retryable_without_typed_rows(persist, tabs):
     payload = unavailable()
+    payload["tabs"] = tabs
     season = payload["details"]["selectedSeason"]
     url = canonicalize_target("leagues", {"id": 10056, "season": season}).canonical_url
     service, _, repo = _service({url: payload})
@@ -137,9 +197,11 @@ def test_unavailable_new_calendar_remains_retryable_without_typed_rows(persist):
         assert not repo.commits
 
 
-def test_unavailable_stub_cannot_replace_thirty_known_matches():
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_unavailable_stub_cannot_replace_thirty_known_matches(tabs):
     good = calendar()
     stub = unavailable()
+    stub["tabs"] = tabs
     stub["details"].update(id=10618, selectedSeason="2026", latestSeason="2026")
     stub["allAvailableSeasons"] = ["2026"]
     url = canonicalize_target("leagues", {"id": 10618, "season": "2026"}).canonical_url
@@ -153,8 +215,10 @@ def test_unavailable_stub_cannot_replace_thirty_known_matches():
 
 
 @pytest.mark.parametrize("variant", ["unknown", "null", "object", "extra_fixture", "tabs", "false_number"])
-def test_malformed_or_unclassified_page_does_not_use_availability_policy(variant):
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_malformed_or_unclassified_page_does_not_use_availability_policy(variant, tabs):
     payload = unavailable()
+    payload["tabs"] = tabs
     if variant == "unknown":
         payload["newRoot"] = 1
     elif variant == "null":
@@ -177,8 +241,10 @@ def test_malformed_or_unclassified_page_does_not_use_availability_policy(variant
     assert "calendar_unavailability" not in result.metadata
 
 
-def test_discovery_of_unavailable_calendar_still_rejects_unknown_paths():
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_discovery_of_unavailable_calendar_still_rejects_unknown_paths(tabs):
     payload = unavailable()
+    payload["tabs"] = tabs
     payload["newRoot"] = 1
     comp = competition_from_league_payload(payload)
     url = canonicalize_target("leagues", {"id": comp.competition_id}).canonical_url
@@ -188,8 +254,10 @@ def test_discovery_of_unavailable_calendar_still_rejects_unknown_paths():
     assert not repo.tables.get("fotmob_competition_seasons")
 
 
-def test_unknown_history_cannot_authorize_source_absence():
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_unknown_history_cannot_authorize_source_absence(tabs):
     payload = unavailable()
+    payload["tabs"] = tabs
     season = payload["details"]["selectedSeason"]
     url = canonicalize_target("leagues", {"id": 10056, "season": season}).canonical_url
     service, _, repo = _service({url: payload})
@@ -201,8 +269,10 @@ def test_unknown_history_cannot_authorize_source_absence():
     assert "calendar_unavailability" not in result.metadata
 
 
-def test_replay_keeps_strict_calendar_failure():
+@pytest.mark.parametrize("tabs", [[], ["seasons"]])
+def test_replay_keeps_strict_calendar_failure(tabs):
     payload = unavailable()
+    payload["tabs"] = tabs
     season = payload["details"]["selectedSeason"]
     url = canonicalize_target("leagues", {"id": 10056, "season": season}).canonical_url
     service, _, repo = _service({url: payload}, mode=RunMode.REPLAY)

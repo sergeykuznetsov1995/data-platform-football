@@ -136,6 +136,7 @@ services:
         airflow dags pause dag_refresh_fotmob || true
         airflow dags pause dag_backfill_fotmob || true
         airflow dags pause dag_collect_fotmob_players || true
+        airflow dags pause dag_refresh_fotmob_c1 || true
         airflow dags pause dag_orchestrate_fotmob || true
     depends_on:
       airflow-metadb:

@@ -27,22 +27,39 @@ def schedule_observations(html: str, rows: list[dict]) -> list[dict]:
     ]
     for document in documents:
         for row in document.select("table[id^=sched] tr"):
-            link = row.select_one('a[href*="/en/matches/"]')
-            stamp = row.select_one("[data-venue-epoch]") or row.select_one("[data-venue-time]")
-            if link is None or stamp is None:
+            # The date cell links to /en/matches/YYYY-MM-DD before the
+            # score/report link. Validate each candidate, not just the first.
+            match_ids = set()
+            for link in row.select('a[href*="/en/matches/"]'):
+                try:
+                    match_ids.add(match_page_target(link["href"]).source_ids["match_id"])
+                except ValueError:
+                    continue
+            if len(match_ids) != 1:
                 continue
-            try:
-                match_id = match_page_target(link["href"]).source_ids["match_id"]
-                value = str(stamp.get("data-venue-epoch", stamp.get("data-venue-time")))
-                if re.fullmatch(r"\d{10}", value):
-                    instant = datetime.fromtimestamp(int(value), timezone.utc)
-                else:
-                    instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    if instant.tzinfo is None or instant.utcoffset() is None:
+            match_id = next(iter(match_ids))
+            instants = set()
+            for stamp in row.select("[data-venue-epoch], [data-venue-time]"):
+                for attribute in ("data-venue-epoch", "data-venue-time"):
+                    value = str(stamp.get(attribute, ""))
+                    try:
+                        if re.fullmatch(r"\d{10}", value):
+                            value_at = datetime.fromtimestamp(int(value), timezone.utc)
+                        else:
+                            value_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                            if value_at.tzinfo is None or value_at.utcoffset() is None:
+                                continue
+                        instants.add(value_at)
+                    except (ValueError, OverflowError, OSError):
                         continue
-                kickoff[match_id] = instant
-            except (ValueError, OverflowError, OSError):
+            if not instants:
                 continue
+            value_at = next(iter(instants)) if len(instants) == 1 else None
+            # Conflicts within a row or across duplicate rows stay unconfirmed.
+            if match_id in kickoff and kickoff[match_id] != value_at:
+                kickoff[match_id] = None
+            else:
+                kickoff[match_id] = value_at
     observations = {}
     for row in rows:
         if not row.get("match_url"):

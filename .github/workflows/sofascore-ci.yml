@@ -13,6 +13,7 @@ on:
       - "dags/dag_trigger_sofascore_daily.py"
       - "dags/dag_trigger_sofascore_daily_tail.py"
       - "dags/dag_sofascore_manifest_maintenance.py"
+      - "dags/dag_sofascore_schedule_maintenance.py"
       - "dags/.airflowignore"
       - "dags/utils/sofascore_all_mens_state.py"
       - "dags/dag_iceberg_maintenance.py"
@@ -77,6 +78,7 @@ jobs:
             dags/dag_trigger_sofascore_daily.py \
             dags/dag_trigger_sofascore_daily_tail.py \
             dags/dag_sofascore_manifest_maintenance.py \
+            dags/dag_sofascore_schedule_maintenance.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
@@ -103,6 +105,7 @@ jobs:
             dags/dag_sofascore_pipeline.py \
             dags/dag_trigger_sofascore_daily.py dags/dag_trigger_sofascore_daily_tail.py \
             dags/dag_sofascore_manifest_maintenance.py \
+            dags/dag_sofascore_schedule_maintenance.py \
             scripts/migrate_sofascore_production.py
           python -m py_compile \
             dags/dag_iceberg_maintenance.py \
@@ -139,6 +142,7 @@ jobs:
             tests/unit/scrapers/test_sofascore_schedule_refresh.py \
             tests/unit/scrapers/test_sofascore_rate_control.py \
             tests/unit/scrapers/test_sofascore_writer_lock.py \
+            tests/unit/scrapers/test_sofascore_maintenance.py \
             tests/unit/scrapers/test_sofascore_camoufox_capture.py \
             tests/unit/scrapers/test_sofascore_catalog.py \
             tests/unit/scrapers/test_sofascore_capture_adapters.py \
@@ -157,6 +161,10 @@ jobs:
             tests/unit/scrapers/test_scrapers_lazy_import.py \
             tests/unit/scrapers/test_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_season_pipeline.py \
+            tests/unit/scrapers/test_sofascore_season_chunks.py \
+            tests/unit/scrapers/test_sofascore_season_chunk_capture.py \
+            tests/unit/scrapers/test_sofascore_runtime_fingerprint.py \
+            tests/unit/scrapers/test_sofascore_season_accounting.py \
             tests/unit/scrapers/test_sofascore_static_workload_policy.py \
             tests/unit/scripts/test_backfill_sofascore.py \
             tests/unit/scripts/test_bench_sofascore_offline_replay.py \

@@ -27,7 +27,7 @@ def qualified_fixture(tmp_path, *, changes=True, players=1000):
     cohort = {"player_ids": ids, "groups": sorted(GROUPS), "scope_basis": "source_current_edition", "source_current_editions_proven": True,
               "edition_proofs": proofs, "scopes": scopes}
     paths = []
-    batch_urls = {start // 300: players_url(ids[start:start + 300]) for start in range(0, players, 300)}
+    batch_urls = {start // 100: players_url(ids[start:start + 100]) for start in range(0, players, 100)}
     for day in (10, 11):
         prefix = f"2026-10-{day:02d}T10:00:"
         rows = []
@@ -37,7 +37,7 @@ def qualified_fixture(tmp_path, *, changes=True, players=1000):
             value = 2000 if changed else 1000
             value_date = "2026-10-11" if changed else "2026-10-10"
             api = {"value": value, "value_date": value_date, "value_present": True, "contract": "2028-06-30", "clubs": [club]}
-            urls = {"tmapi": batch_urls[offset // 300], "plus1": f"https://www.transfermarkt.com/test/kader/verein/{club}/plus/1",
+            urls = {"tmapi": batch_urls[offset // 100], "plus1": f"https://www.transfermarkt.com/test/kader/verein/{club}/plus/1",
                     "mv": f"https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/{player}",
                     "transfers": f"https://www.transfermarkt.com/ceapi/transferHistory/list/{player}"}
             raw = {endpoint: {"capture_id": hashlib.sha256(f"synthetic/{day}/{endpoint}/{player}".encode()).hexdigest(),
@@ -92,7 +92,7 @@ def test_no_real_change_or_insufficient_cohort_never_qualifies(tmp_path, changes
 
 
 @pytest.mark.parametrize("change", [
-    lambda report: report["qualification_observation"]["players"][0]["plus1"].update(contract="2029-06-30"),
+    lambda report: report["qualification_observation"]["players"][0]["plus1"].update(club_id="99999"),
     lambda report: report["qualification_observation"]["players"][0]["ceapi"]["mv"].update(value=9999),
     lambda report: report["qualification_observation"]["players"][0]["ceapi"]["transfers"].update(status="unknown"),
     lambda report: report["qualification_observation"].update(missing_ids=["1"]),
@@ -103,6 +103,69 @@ def test_no_real_change_or_insufficient_cohort_never_qualifies(tmp_path, changes
 def test_consistent_file_hashes_do_not_hide_bad_concrete_source_evidence(tmp_path, change):
     wrapper = mutate_report(qualified_fixture(tmp_path), change)
     with pytest.raises(QualificationError):
+        validate_qualification(wrapper)
+
+
+@pytest.mark.parametrize("contracts,accepted", [(10, True), (20, True), (21, False)])
+def test_concrete_contract_tolerance_is_recomputed(tmp_path, contracts, accepted):
+    def alter(report):
+        for row in report["qualification_observation"]["players"][:contracts]:
+            row["plus1"]["contract"] = "2029-06-30"
+        # Report flags/counts cannot hide concrete mismatches.
+        report.update(field_parity_gate=True, contract_mismatch_count=0, contract_mismatch_share=0)
+    wrapper = mutate_report(qualified_fixture(tmp_path), alter)
+    if accepted:
+        assert validate_qualification(wrapper)["source_parity"]
+    else:
+        with pytest.raises(QualificationError, match="contract"):
+            validate_qualification(wrapper)
+
+
+@pytest.mark.parametrize("roster_value,reference_value,accepted", [
+    (None, None, True), (None, 0, True), (100000, None, False), (None, 100000, False),
+])
+def test_concrete_zero_value_parity(tmp_path, roster_value, reference_value, accepted):
+    def alter(report):
+        row = report["qualification_observation"]["players"][1]
+        row["tmapi"].update(value=0)
+        row["plus1"]["value"] = roster_value
+        row["ceapi"]["mv"]["value"] = reference_value
+    wrapper = mutate_report(qualified_fixture(tmp_path), alter)
+    if accepted:
+        result = validate_qualification(wrapper)
+        assert result["source_parity"]
+    else:
+        with pytest.raises(QualificationError):
+            validate_qualification(wrapper)
+
+
+def test_zero_to_none_does_not_prove_a_real_changed_observation(tmp_path):
+    wrapper = qualified_fixture(tmp_path, changes=False)
+    artifact_path = Path(wrapper["evidence_path"])
+    artifact = json.loads(artifact_path.read_text())
+    for index, link in enumerate(artifact["reports"]):
+        path = artifact_path.parent / link["path"]
+        report = json.loads(path.read_text())
+        row = report["qualification_observation"]["players"][0]
+        row["tmapi"].update(value=None if index == 0 else 0, value_present=index == 1, value_date=None)
+        row["plus1"]["value"] = None
+        row["ceapi"]["mv"].update(value=None if index == 0 else 0, value_date=None)
+        path.write_text(json.dumps(report))
+        link["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    artifact_path.write_text(json.dumps(artifact))
+    wrapper["evidence_sha256"] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    with pytest.raises(QualificationError, match="no real"):
+        validate_qualification(wrapper)
+
+
+def test_tolerated_contract_discrepancy_cannot_prove_matched_change(tmp_path):
+    def alter(report):
+        row = report["qualification_observation"]["players"][0]
+        row["tmapi"].update(value=1000, value_date="2026-10-10", contract="2029-06-30")
+        row["plus1"].update(value=1000, contract="2030-06-30")
+        row["ceapi"]["mv"].update(value=1000, value_date="2026-10-10")
+    wrapper = mutate_report(qualified_fixture(tmp_path), alter)
+    with pytest.raises(QualificationError, match="no real"):
         validate_qualification(wrapper)
 
 
@@ -240,3 +303,14 @@ def test_player_absent_on_day2_qualifies_only_with_measured_recheck_of_new_club(
     recheck_path.write_text(json.dumps(recheck))
     with pytest.raises(QualificationError, match="bounded original-cohort subset"):
         build_qualification(day1, day2, tmp_path / "absent-not-rechecked.json", recheck=recheck_path)
+
+
+@pytest.mark.parametrize('ids', [[str(i) for i in range(1, 102)],
+                                [str(i) for i in range(1, 301)],
+                                [str(10000000000 + i) for i in range(100)]])
+def test_qualification_rejects_packets_exceeding_transport_limits(ids):
+    from urllib.parse import urlencode
+    from scrapers.transfermarkt.signal_qualification import _packet_ids
+    url = 'https://tmapi.transfermarkt.technology/players?' + urlencode([('ids[]', value) for value in ids])
+    with pytest.raises(QualificationError):
+        _packet_ids(url)

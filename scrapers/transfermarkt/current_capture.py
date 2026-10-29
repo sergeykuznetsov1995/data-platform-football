@@ -2,6 +2,10 @@
 
 No writer or network calls live here. A retained club needs a committed Bronze
 manifest; a freshly captured club needs complete parsed fields and raw lineage.
+Contract overrides retain separate tmapi evidence without changing HTML rows.
+Carry-forward preserves source and observation timestamps for committed clubs;
+current contracts must never cross editions or clubs. Pre-v2 snapshots retain
+original parser/status semantics solely to reproduce their committed receipts.
 """
 
 from __future__ import annotations
@@ -10,13 +14,14 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from scrapers.transfermarkt.registry import deterministic_scope_id
+from scrapers.transfermarkt.tmapi import normalize_market_value
 
 
 FULL_PLAYER_FIELDS = frozenset({
@@ -150,7 +155,7 @@ def player_changes(
             endpoints.add('transfer_events')
         if player in old and player in new:
             def values(memberships: Mapping[str, Mapping[str, Any]]) -> set[str]:
-                return {_json([row.get('market_value_eur'),
+                return {_json([normalize_market_value(row.get('market_value_eur')),
                                row.get('market_value_date', row.get('market_value_updated_at'))])
                         for row in memberships.values()}
             if values(old[player]) != values(new[player]):
@@ -258,6 +263,7 @@ class FullRosterSnapshot:
     expected_team_ids: tuple[str, ...]
     clubs: Mapping[str, ClubRosterSnapshot]
     changed_club_ids: tuple[str, ...] = ()
+    contract_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text('scope_id', self.scope_id)
@@ -284,6 +290,18 @@ class FullRosterSnapshot:
         object.__setattr__(self, 'expected_team_ids', expected)
         object.__setattr__(self, 'clubs', MappingProxyType(clubs))
         object.__setattr__(self, 'changed_club_ids', changed)
+        overrides = {}
+        for key, proof in self.contract_overrides.items():
+            club_id, player_id = key.split(':')
+            if club_id not in clubs or player_id not in {row['player_id'] for row in clubs[club_id].rows}:
+                raise CurrentCaptureError('contract override belongs to another membership')
+            if set(proof) != {'contract_until', 'source_url', 'source_body_hash', 'fetched_at', 'raw_capture_id'}:
+                raise CurrentCaptureError('contract override fields differ')
+            date.fromisoformat(proof['contract_until'])
+            _hash('contract source_body_hash', proof['source_body_hash'])
+            _timestamp(proof['fetched_at'])
+            overrides[key] = MappingProxyType(dict(proof))
+        object.__setattr__(self, 'contract_overrides', MappingProxyType(overrides))
 
     @property
     def rows(self) -> list[dict[str, Any]]:
@@ -291,7 +309,9 @@ class FullRosterSnapshot:
         for club_id in self.expected_team_ids:
             club = self.clubs[club_id]
             for row in club.rows:
-                rows.append({**dict(row), '_source_url': club.source_url,
+                override = self.contract_overrides.get(club_id + ':' + row['player_id'])
+                enriched = {'contract_until': override['contract_until'], '_contract_source': dict(override)} if override else {}
+                rows.append({**dict(row), **enriched, '_source_url': club.source_url,
                              '_source_body_hash': club.source_body_hash,
                              '_source_fetched_at': club.raw_fetched_at.isoformat()})
         return rows
@@ -300,11 +320,13 @@ class FullRosterSnapshot:
         return {'scope_id': self.scope_id, 'competition_id': self.competition_id,
                 'edition_id': self.edition_id, 'squad_saison_id': self.squad_saison_id,
                 'expected_team_ids': list(self.expected_team_ids),
-                'clubs': {club_id: club.as_dict() for club_id, club in self.clubs.items()}}
+                'clubs': {club_id: club.as_dict() for club_id, club in self.clubs.items()},
+                **({'contract_overrides': {key: dict(value) for key, value in self.contract_overrides.items()}}
+                   if self.contract_overrides else {})}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'FullRosterSnapshot':
-        if set(value) != {'scope_id', 'competition_id', 'edition_id', 'squad_saison_id', 'expected_team_ids', 'clubs'}:
+        if set(value) - {'contract_overrides'} != {'scope_id', 'competition_id', 'edition_id', 'squad_saison_id', 'expected_team_ids', 'clubs'}:
             raise CurrentCaptureError('full roster snapshot fields differ')
         if not isinstance(value['clubs'], Mapping):
             raise CurrentCaptureError('club snapshots must be an object')
@@ -312,7 +334,30 @@ class FullRosterSnapshot:
                  for club_id, club in value['clubs'].items()}
         return cls(scope_id=value['scope_id'], competition_id=value['competition_id'],
                    edition_id=value['edition_id'], squad_saison_id=value['squad_saison_id'],
-                   expected_team_ids=value['expected_team_ids'], clubs=clubs)
+                   expected_team_ids=value['expected_team_ids'], clubs=clubs,
+                   contract_overrides=value.get('contract_overrides', {}))
+
+
+def verify_contract_overrides(snapshot, store):
+    """Recheck both immutable inputs on restart and before materializing dates."""
+    from scrapers.transfermarkt import tmapi
+
+    for key, proof in snapshot.contract_overrides.items():
+        club_id, player_id = key.split(':')
+        club = snapshot.clubs[club_id]
+        row = next(row for row in club.rows if row['player_id'] == player_id)
+        body, raw = store.load_capture(proof['raw_capture_id'])
+        ids = parse_qs(urlsplit(raw.url).query).get('ids[]', [])
+        if (raw.url != tmapi.players_url(ids) or raw.status_code != 200
+            or raw.content_hash != proof['source_body_hash'] or raw.url != proof['source_url']
+            or hashlib.sha256(body).hexdigest() != raw.content_hash
+            or _timestamp(raw.fetched_at) != _timestamp(proof['fetched_at'])):
+            raise CurrentCaptureError('contract override raw proof differs')
+        signal = tmapi.parse_player_signals(json.loads(body.decode('utf-8')), expected_ids=ids)[player_id]
+        if (row['contract_until'] is not None or row.get('_contract_status') not in {'unknown', 'not_rendered'}
+            or club_id not in signal.club_ids or not signal.contract_until
+            or signal.contract_until != proof['contract_until']):
+            raise CurrentCaptureError('contract override does not match player membership/date')
 
 
 def assemble_full_roster(
@@ -322,6 +367,7 @@ def assemble_full_roster(
     competition_id: str | None = None, edition_id: str | None = None,
     squad_saison_id: int | None = None,
     participant_membership_verified: bool = False,
+    contract_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> FullRosterSnapshot:
     """All changed and new clubs must complete; retain only verified old clubs."""
     expected = tuple(_id('expected club', club) for club in expected_team_ids)
@@ -359,8 +405,10 @@ def assemble_full_roster(
                 if club.applicability_status == 'authoritative_empty' and old.rows:
                     raise CurrentCaptureError('90% completeness guard refuses emptying populated club')
                 for field in _BIO_FIELDS:
-                    if any(row[field] is not None for row in old.rows) and not any(
-                        row[field] is not None for row in club.rows
+                    if any(row[field] is not None or (field == 'contract_until' and
+                        snapshot.contract_overrides.get(club_id + ':' + row['player_id'])) for row in old.rows) and not any(
+                        row[field] is not None or (field == 'contract_until' and
+                            (contract_overrides or {}).get(club_id + ':' + row['player_id'])) for row in club.rows
                     ):
                         raise CurrentCaptureError(f'updated full squad lost {field} evidence')
         elif snapshot is not None and club_id in snapshot.clubs:
@@ -375,4 +423,6 @@ def assemble_full_roster(
     ):
         raise CurrentCaptureError('assembled full roster is below existing 90% completeness guard')
     return FullRosterSnapshot(identity, competition, edition, saison, expected, clubs,
-                              tuple(completed_updated_clubs))
+                              tuple(completed_updated_clubs),
+                              contract_overrides if contract_overrides is not None else {key: value for key, value in (snapshot.contract_overrides.items() if snapshot else ())
+                               if key.split(':')[0] in expected_set - set(completed_updated_clubs)})

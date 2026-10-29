@@ -222,7 +222,15 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
             groups[group]["unknown_scopes"] += missing_core
             if missing_core:
                 groups[group]["gate_passed"] = False
-        active = next((g for g in ("1", "2") if not groups[g]["gate_passed"]), None)
+        open_core = [g for g in ("1", "2") if not groups[g]["gate_passed"]]
+        # A core group blocked only by unplannable scopes must not starve the
+        # other one's ready debt; deeper groups still wait for both gates.
+        workable = [g for g in ("1", "2")
+                    if any(s["group"] == g and s["kind"] == "ready"
+                           and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0))
+                           for s in scopes)]
+        active = (next((g for g in open_core if g in workable), workable[0] if workable else open_core[0])
+                  if open_core else None)
         if active is None:
             active = next((g for g in ("july", "3", "4", "5")
                            if (groups[g]["remaining"] or groups[g]["unknown_scopes"])
@@ -400,7 +408,13 @@ def account_scope(environment, outcome, *, state_path, failures_path, release):
     campaign = environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"]
     scope_key = environment["SOFASCORE_SCOPE_KEY"]
     run_id = environment["SOFASCORE_SCOPE_RUN_ID"]
-    if outcome["status"] == "not_started":
+    if outcome["status"] in {"not_started", "waiting"}:
+        return
+    if outcome["status"] == "partial":
+        from dags.utils.sofascore_red_share import validate_season_continuation
+        validate_season_continuation(outcome.get("partial"),
+            tournament_id=environment["SOFASCORE_TOURNAMENT_ID"],
+            season_id=environment["SOFASCORE_SOURCE_SEASON_ID"])
         return
     if outcome["status"] == "success":
         if environment.get("SOFASCORE_HISTORY_GROUP") != "july":

@@ -265,7 +265,7 @@ def test_parked_core_scope_remains_debt_and_blocks_gate(tmp_path):
     ev = evidence(snap)
     failures = {"history-test:8:826": {"count": 3, "last_at": NOW.isoformat()}}
     planned = run(tmp_path, snap, ev, failures=failures)
-    assert not planned
+    assert [p["SOFASCORE_HISTORY_GROUP"] for p in planned] == ["2"]
     groups = controller.read_summary(tmp_path / "controller.json", "history-test")["groups"]
     assert groups["1"]["parked"] == 1 and not groups["1"]["gate_passed"]
 
@@ -293,6 +293,22 @@ def test_future_metadata_missing_core_cannot_vanish_from_99_denominator(tmp_path
     assert not planned
     report = controller.read_summary(tmp_path / "controller.json", "history-test")
     assert report["groups"]["1"]["unknown_scopes"] == 1
+
+
+@pytest.mark.parametrize("group2_closed", [0, 9900])
+def test_blocked_group1_without_ready_debt_yields_to_group2_not_deeper(tmp_path, group2_closed):
+    snap = snapshot(ids=(8,))
+    ev = evidence(snap, totals=10000, closed=10000)
+    group_closed(ev, 26, 0)
+    group_closed(ev, 25, group2_closed)
+    group_closed(ev, 24, 0)
+    failures = {"history-test:8:826": {"count": 3, "streak_no_traffic": 3, "last_release": "test"}}
+    planned = run(tmp_path, snap, ev, failures=failures)
+    assert [p["SOFASCORE_HISTORY_GROUP"] for p in planned] == ["2"]
+    finish(tmp_path)
+    group_closed(ev, 25, 10000)
+    assert run(tmp_path, snap, ev, failures=failures, run_id="run2") == []
+    assert controller.read_summary(tmp_path / "controller.json", "history-test")["active_group"] == "1"
 
 
 def test_summary_reports_actual_match_fraction_not_completed_scopes(tmp_path):
@@ -646,3 +662,182 @@ def test_restarted_slot_accounts_saved_success_after_last_attempt_without_source
     assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
                     state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
                     admitted=lambda:False,execute=lambda *a:pytest.fail('saved success must not recapture'),clock=lambda:NOW)==0
+
+
+def test_history_waiting_is_accounted_once_without_retry_failure_or_completion(tmp_path):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import run_slot
+    snap, _, path = slot_queue(tmp_path, ids=(8, 17))
+    calls = []
+    def execute(env, timeout):
+        calls.append(env['SOFASCORE_SCOPE_KEY'])
+        inventory = {'verified': True, 'tournament_id': int(env['SOFASCORE_TOURNAMENT_ID']),
+                     'source_season_id': int(env['SOFASCORE_SOURCE_SEASON_ID']),
+                     'canonical_season': env['SOFASCORE_CANONICAL_SEASON'],
+                     'finished_matches': 0, 'schedule_events': 153}
+        result = {'status': 'waiting', 'waiting_reason': 'season_has_no_finished_matches',
+                  'campaign_id': snap['campaign_id'], 'tournament_id': inventory['tournament_id'],
+                  'source_season_id': inventory['source_season_id'],
+                  'canonical_season': inventory['canonical_season'], 'run_id': env['SOFASCORE_SCOPE_RUN_ID'],
+                  'phases': [{'phase': 'season', 'status': 'success', 'schedule_inventory': inventory}]}
+        dest = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(result))
+        return 0
+    assert run_slot(checkpoint=path, campaign_id='history-test', run_id='run1', slot=0,
+                    state_path=tmp_path/'state.json', failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True, execute=execute, clock=lambda:NOW,
+                    sleep=lambda _:pytest.fail('waiting must not be retried'), release='test') == 0
+    assert len(calls) == 2
+    assert not (tmp_path/'state.json').exists()
+    assert not (tmp_path/'failures.json').exists()
+    stored = controller.read_summary(path, 'history-test')['run']
+    assert all(i['accounted'] and i['attempts'] == 1 and i['outcome']['status'] == 'waiting'
+               for i in stored['items'].values())
+    controller.finalize(path, campaign_id='history-test', run_id='run1')
+
+
+@pytest.mark.parametrize('mutation', ['unverified', 'wrong_season', 'wrong_run', 'failed_process'])
+def test_history_worker_rejects_unverified_empty_waiting(tmp_path, mutation):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import scope_outcome
+    _, _, checkpoint = slot_queue(tmp_path, ids=(8,))
+    _, env = claim(checkpoint, 0)
+    inventory = {'verified': True, 'tournament_id': int(env['SOFASCORE_TOURNAMENT_ID']),
+                 'source_season_id': int(env['SOFASCORE_SOURCE_SEASON_ID']),
+                 'canonical_season': env['SOFASCORE_CANONICAL_SEASON'],
+                 'finished_matches': 0, 'schedule_events': 153}
+    result = {'status': 'waiting', 'waiting_reason': 'season_has_no_finished_matches',
+              'campaign_id': 'history-test', 'tournament_id': inventory['tournament_id'],
+              'source_season_id': inventory['source_season_id'], 'run_id': env['SOFASCORE_SCOPE_RUN_ID'],
+              'phases': [{'phase': 'season', 'status': 'success', 'schedule_inventory': inventory}]}
+    if mutation == 'unverified':
+        inventory['verified'] = False
+    if mutation == 'wrong_season':
+        inventory['source_season_id'] += 1
+    if mutation == 'wrong_run':
+        result['run_id'] = 'old-attempt'
+    path = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result))
+    assert scope_outcome(env, 1 if mutation == 'failed_process' else 0)['status'] == 'failed'
+def continuation_report(tid=8, sid=826, campaign='history-test', run_id='scope'):
+    import base64
+    import hashlib
+    chunk = dict(tournament_id=str(tid), season_id=str(sid), last=[0, 49], next=[0, 1],
+                 evidence_digest='a' * 64)
+    unit = 'season-chunk-v1.' + base64.urlsafe_b64encode(
+        json.dumps(chunk, sort_keys=True, separators=(',', ':')).encode()).decode().rstrip('=')
+    partial = dict(kind='season_schedule_continuation', stop_reason='schedule_chunk_complete',
+                   raw_manifest_committed=True, chunk_unit=unit,
+                   continuation={'last': 49, 'next': None})
+    return dict(status='partial', campaign_id=campaign, tournament_id=tid, source_season_id=sid,
+                scope_digest=hashlib.sha256(f'{tid}:{sid}'.encode()).hexdigest(),
+                run_id=run_id, errors=[], phases=[dict(phase='season', status='partial',
+                exit_code=0, errors=[], source_request_count=49, partial=partial)])
+
+
+def test_healthy_season_part_releases_slot_without_retry_or_mutating_failure_memory(tmp_path):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import run_slot
+    snap, _, path = slot_queue(tmp_path, ids=(8, 17))
+    state_path, failures = tmp_path/'state.json', tmp_path/'failures.json'
+    _, first = claim(path, 0)
+    state = __import__('dags.utils.sofascore_all_mens_state', fromlist=['mark_failed'])
+    state.mark_failed(failures, campaign_id='history-test', scope_key=first['SOFASCORE_SCOPE_KEY'],
+                      run_id='prior', reason='prior failure', source_requests=0, release='test')
+    before = failures.read_bytes()
+    calls = []
+    def execute(env, timeout):
+        calls.append(env['SOFASCORE_TOURNAMENT_ID'])
+        report = continuation_report(int(env['SOFASCORE_TOURNAMENT_ID']),
+                                     int(env['SOFASCORE_SOURCE_SEASON_ID']),
+                                     run_id=env['SOFASCORE_SCOPE_RUN_ID'])
+        dest = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(report))
+        return 0
+    assert run_slot(checkpoint=path, campaign_id='history-test', run_id='run1', slot=0,
+                    state_path=state_path, failures_path=failures, admitted=lambda:True,
+                    execute=execute, sleep=lambda _:pytest.fail('healthy part must not retry'),
+                    clock=lambda:NOW, release='test') == 0
+    assert calls == ['8', '17']
+    assert failures.read_bytes() == before and not state_path.exists()
+    ledger = controller.read_summary(path, 'history-test')['run']
+    assert ledger['slots']['0'] is None
+    assert all(i['outcome']['status'] == 'partial' and i['attempts'] == 1 and i['accounted']
+               for i in ledger['items'].values())
+    assert not inventory.verified_schedules(tmp_path/'results')
+    finish(tmp_path)
+    ev = evidence(snap, closed=100)
+    for row in ev['scopes']:
+        if row['season_id'] == 826:
+            row['schedule_complete'] = False
+    next_run = run(tmp_path, snap, ev, run_id='run2', slot_count=3)
+    assert next_run[0]['SOFASCORE_SCOPE_KEY'] == first['SOFASCORE_SCOPE_KEY']
+    assert next_run[0]['SOFASCORE_SCOPE_RUN_ID'] != first['SOFASCORE_SCOPE_RUN_ID']
+    assert controller.read_summary(path, 'history-test')['groups']['1']['gate_passed'] is False
+
+
+def test_partial_accounting_preserves_existing_completed_quarantine_and_parking(tmp_path):
+    from scrapers.sofascore.history_worker import scope_outcome
+    from pathlib import Path
+    _, _, path = slot_queue(tmp_path, ids=(8,))
+    _, env = claim(path, 0)
+    dest = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(continuation_report(run_id=env['SOFASCORE_SCOPE_RUN_ID'])))
+    outcome = scope_outcome(env, 0)
+    state_path, failures = tmp_path/'state.json', tmp_path/'failures.json'
+    state_path.write_text('{"existing_completed": ["other-season"]}')
+    failures.write_text(json.dumps({'failures': {env['SOFASCORE_SCOPE_KEY']: {
+        'count': 3, 'completed_rejected_endpoints': 5, 'last_release': 'test',
+        'parked_at': NOW.isoformat(), 'quarantine_reason': 'season_mismatch'}}}))
+    before = state_path.read_bytes(), failures.read_bytes()
+    for _ in range(2):
+        controller.account_scope(env, outcome, state_path=state_path,
+                                 failures_path=failures, release='test')
+    assert (state_path.read_bytes(), failures.read_bytes()) == before
+
+
+@pytest.mark.parametrize('saved_outcome', [False, True])
+def test_restarted_slot_accounts_saved_season_part_with_closed_door(tmp_path, saved_outcome):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import run_slot, scope_outcome
+    _, _, path = slot_queue(tmp_path, ids=(8,))
+    index, env = claim(path, 0)
+    controller.record_scope(path, campaign_id='history-test', run_id='run1', slot=0,
+                            index=index, started_attempt=True)
+    dest = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(continuation_report(run_id=env['SOFASCORE_SCOPE_RUN_ID'])))
+    if saved_outcome:
+        controller.record_scope(path, campaign_id='history-test', run_id='run1', slot=0,
+                                index=index, outcome=scope_outcome(env, 0))
+    assert run_slot(checkpoint=path, campaign_id='history-test', run_id='run1', slot=0,
+                    state_path=tmp_path/'state.json', failures_path=tmp_path/'failures.json',
+                    admitted=lambda:False, execute=lambda *a:pytest.fail('must recover without capture'),
+                    clock=lambda:NOW, release='test') == 0
+    assert not (tmp_path/'state.json').exists() and not (tmp_path/'failures.json').exists()
+    assert controller.read_summary(path, 'history-test')['run']['items']['0']['accounted']
+
+
+@pytest.mark.parametrize('damage', ['kind', 'phase', 'raw', 'boolean', 'empty', 'keys',
+                                   'identity', 'unit', 'errors', 'phase_errors', 'exit', 'frontier'])
+def test_unproven_partial_is_still_failed(tmp_path, damage):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import scope_outcome
+    _, _, path = slot_queue(tmp_path, ids=(8,))
+    _, env = claim(path, 0)
+    report = continuation_report(run_id=env['SOFASCORE_SCOPE_RUN_ID'])
+    phase, partial = report['phases'][0], report['phases'][0]['partial']
+    if damage == 'kind': partial['kind'] = 'time_budget'
+    elif damage == 'phase': phase['phase'] = 'matches'
+    elif damage == 'raw': partial['raw_manifest_committed'] = 1
+    elif damage == 'boolean': partial['continuation']['last'] = True
+    elif damage == 'empty': partial['continuation']['last'] = None
+    elif damage == 'keys': partial['continuation']['extra'] = 50
+    elif damage == 'identity': report['source_season_id'] = 999
+    elif damage == 'unit': partial['chunk_unit'] = '8:826'
+    elif damage == 'errors': report['errors'] = ['capture failed']
+    elif damage == 'phase_errors': phase['errors'] = ['budget exhausted']
+    elif damage == 'exit': phase['exit_code'] = True
+    elif damage == 'frontier': partial['continuation']['last'] = 48
+    dest = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(report))
+    assert scope_outcome(env, 0)['status'] == 'failed'

@@ -1134,6 +1134,7 @@ def _owned_history(monkeypatch, tmp_path, *, lane='history', duration=0):
         return session
 
     monkeypatch.setattr(requests, 'Session', factory)
+    _clear_proxy_env(monkeypatch)  # worker() reads os.environ
     client = EspnHttpClient(EspnRawStore.from_uri(tmp_path.as_uri()),
                            gate=_gate(tmp_path, lane=lane), environ={},
                            monotonic_fn=lambda: clock[0])

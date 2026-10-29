@@ -35,6 +35,14 @@ DEFAULT_LEASE_TTL_SECONDS = 7200
 class FBrefProxyLeaseError(RuntimeError):
     """A paid lease could not be created or accounted exactly."""
 
+    def __init__(
+        self, message: str, *, session_failure_reason: Optional[str] = None,
+        terminal_flags: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.session_failure_reason = session_failure_reason
+        self.terminal_flags = terminal_flags
+
 
 @dataclass(frozen=True)
 class FBrefProxyLease:
@@ -174,7 +182,8 @@ class FBrefProxyLeaseClient:
             )
         except Exception as exc:  # noqa: BLE001 - requests adapter boundary
             raise FBrefProxyLeaseError(
-                f"FBref proxy meter request failed: {type(exc).__name__}"
+                f"FBref proxy meter request failed: {type(exc).__name__}",
+                session_failure_reason="provider_meter_unavailable",
             ) from exc
         status = int(getattr(response, "status_code", 0) or 0)
         try:
@@ -476,11 +485,22 @@ class FBrefProxyLeaseClient:
             if (
                 stats.accounting_uncertain
                 or stats.budget_exceeded
-                or stats.expired
                 or stats.closed
             ):
+                terminal_flags = tuple(
+                    name
+                    for name in ("accounting_uncertain", "budget_exceeded", "closed")
+                    if getattr(stats, name)
+                )
                 raise FBrefProxyLeaseError(
-                    "FBref paid proxy drain found terminal accounting state"
+                    "FBref paid proxy drain found terminal accounting state: "
+                    + ", ".join(terminal_flags),
+                    terminal_flags=terminal_flags,
+                )
+            if stats.expired:
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy lease expired before drain",
+                    session_failure_reason="provider_lease_expired",
                 )
             if (
                 stats.active_tunnels == 0
@@ -493,7 +513,8 @@ class FBrefProxyLeaseClient:
                 return stats
             if self._monotonic() >= deadline:
                 raise FBrefProxyLeaseError(
-                    "FBref paid proxy tunnels did not drain before accounting"
+                    "FBref paid proxy tunnels did not drain before accounting",
+                    session_failure_reason="provider_drain_timeout",
                 )
             self._sleep(0.05)
 

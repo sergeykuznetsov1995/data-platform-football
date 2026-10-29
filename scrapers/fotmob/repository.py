@@ -48,6 +48,7 @@ from scrapers.fotmob.domain import (
     ProbeStatus,
     ScopeDecision,
 )
+from scrapers.fotmob.match_refresh import source_observed_at
 from scrapers.fotmob.planner import ScopeAttemptState
 from scrapers.fotmob.row_identity import OBSERVATION_COLUMNS, row_multiset
 
@@ -280,6 +281,57 @@ def _scope_attempt_target_key(
         }
     ).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
+
+
+def _scope_source_gap_records(
+    rows: Iterable[Mapping[str, Any]], plan_signature: str, parser_version: str,
+) -> dict[tuple[int, str], dict[str, Any]]:
+    """Decode explicit gap markers separately from full coverage successes."""
+    output: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in rows:
+        if (
+            row.get("target_type") != "scope_source_gap"
+            or row.get("entity_id") != plan_signature
+            or row.get("parser_version") != parser_version
+            or row.get("status") != ManifestStatus.NOT_AVAILABLE.value
+        ):
+            continue
+        try:
+            raw = row.get("capabilities_json")
+            values = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+            completed = _evidence_datetime(row.get("completed_at"))
+            identity = (int(row["competition_id"]), str(row["source_season_key"]))
+            proofs = values.get("source_gap_matches")
+            if (
+                completed is None or not identity[1]
+                or values.get("plan_signature") != plan_signature
+                or values.get("outcome") != "source_gap"
+                or not isinstance(proofs, list) or not proofs
+                or any(not isinstance(proof, Mapping) or any(
+                    not proof.get(key) for key in
+                    ("match_id", "target_key", "raw_uri", "content_hash", "run_id", "observed_at")
+                ) or proof.get("reason") != "source_data_not_found" for proof in proofs)
+            ):
+                continue
+            expected = values.get("match_ids")
+            available = values.get("available_match_ids")
+            if not isinstance(expected, list) or not isinstance(available, list):
+                continue
+            missing = [proof["match_id"] for proof in proofs]
+            if (
+                len(set(expected)) != len(expected)
+                or len(set(available)) != len(available)
+                or len(set(missing)) != len(missing)
+                or set(available) & set(missing)
+                or set(available) | set(missing) != set(expected)
+            ):
+                continue
+            record = {**values, "completed_at": completed, "run_id": row.get("run_id")}
+            if identity not in output or completed >= output[identity]["completed_at"]:
+                output[identity] = record
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return output
 
 
 def _scope_attempt_state_from_values(
@@ -879,6 +931,7 @@ class FotMobRepository:
         "completed_at",
         "actual_counts_json",
         "capabilities_json",
+        "error_code",
     )
 
     def __init__(
@@ -948,6 +1001,7 @@ class FotMobRepository:
         # thing the backfill did (678 of ~1900 queries per 40 min, ~7 queries
         # and ~13 s per target). Preloading the answer once makes those reads
         # free; commits keep the index current so read-your-writes still holds.
+        self._match_source_index: Optional[dict[str, dict[str, Any]]] = None
         self._manifest_index: dict[str, dict[str, Any]] = {}
         self._entity_index: dict[tuple[str, str], dict[str, Any]] = {}
         self._run_manifest_index: dict[str, dict[str, Any]] = {}
@@ -1278,6 +1332,7 @@ class FotMobRepository:
     def _index_pending(self, manifest_row: Mapping[str, Any]) -> None:
         """Make a buffered commit visible to this run's incremental reads."""
 
+        self._index_match_source(manifest_row)
         status = str(manifest_row.get("status"))
         parser_version = manifest_row.get("parser_version")
         entity_id = manifest_row.get("entity_id")
@@ -1312,6 +1367,7 @@ class FotMobRepository:
     def _index_committed(self, manifest_row: Mapping[str, Any]) -> None:
         """Fold a durable commit into the preloaded index."""
 
+        self._index_match_source(manifest_row)
         status = str(manifest_row.get("status"))
         parser_version = manifest_row.get("parser_version")
         entity_id = manifest_row.get("entity_id")
@@ -1555,6 +1611,12 @@ class FotMobRepository:
             _scope("source_season_key"),
             _scope("stage_id"),
             _scope("entity_id"),
+            (
+                source_observed_at(row).isoformat()
+                if row.get("target_type") == "match"
+                and status in {"success", "not_modified"}
+                and source_observed_at(row) is not None else None
+            ),
         )
 
     def _stored_manifest_fingerprints(
@@ -1578,7 +1640,8 @@ class FotMobRepository:
                 f"""
                 SELECT run_id, batch_id, target_key, content_hash,
                        parser_version, status, competition_id,
-                       source_season_key, stage_id, entity_id
+                       source_season_key, stage_id, entity_id,
+                       target_type, capabilities_json, stale, fetched_at
                 FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
                 WHERE batch_id IN ({values})
                 """
@@ -1594,6 +1657,7 @@ class FotMobRepository:
                 source_season_key,
                 stage_id,
                 entity_id,
+                target_type, capabilities_json, stale, fetched_at,
             ) in rows:
                 fingerprint = self._manifest_fingerprint(
                     {
@@ -1607,6 +1671,9 @@ class FotMobRepository:
                         "source_season_key": source_season_key,
                         "stage_id": stage_id,
                         "entity_id": entity_id,
+                        "target_type": target_type,
+                        "capabilities_json": capabilities_json,
+                        "stale": stale, "fetched_at": fetched_at,
                     }
                 )
                 fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
@@ -2265,6 +2332,17 @@ class FotMobRepository:
                             f"{table}: replacement target has no manifest identity"
                         )
                     manifest_partition = ", ".join(manifest_identity)
+                    observation_order = ""
+                    if table == "fotmob_match_payloads":
+                        # Parallel waves may publish an older response last.
+                        observation_order = """
+                                       COALESCE(
+                                           TRY(CAST(from_iso8601_timestamp(
+                                               json_extract_scalar(capabilities_json,
+                                                   '$.source_observed_at')
+                                           ) AS TIMESTAMP(6))), fetched_at
+                                       ) DESC,
+                        """
                     committed_cte = f"""
                     observed_targets AS (
                         SELECT batch_id, target_key, parser_version, status,
@@ -2274,6 +2352,7 @@ class FotMobRepository:
                                        CASE WHEN parser_version =
                                                  '{safe_parser_version}'
                                             THEN 1 ELSE 0 END DESC,
+                                       {observation_order}
                                        completed_at DESC, batch_id DESC
                                ) AS target_rn
                         FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
@@ -2456,6 +2535,70 @@ class FotMobRepository:
             output[evidence.competition_id] = evidence
         return output
 
+    def _index_match_source(self, row: Mapping[str, Any]) -> None:
+        if self._match_source_index is None or not (
+            row.get("target_type") == "match"
+            and row.get("parser_version") == PARSER_VERSION
+            and row.get("status") in {"success", "not_modified"}
+        ):
+            return
+        observed = source_observed_at(row)
+        key = str(row.get("target_key"))
+        previous = self._match_source_index.get(key)
+        if observed is not None and (
+            previous is None or observed >= source_observed_at(previous)
+        ):
+            self._match_source_index[key] = dict(row)
+
+    def latest_match_source(self, target_key: str) -> Optional[dict[str, Any]]:
+        """Last published successful source observation, unaffected by failures."""
+        if self._match_source_index is None:
+            self._match_source_index = {}
+            getter = getattr(self.writer, "_get_trino_manager", None)
+            if getter is not None:
+                trino = getter()
+                if trino.table_exists(self.schema, MANIFEST_TABLE):
+                    columns = (*self._READ_COLUMNS, "target_type")
+                    rows = trino.execute_query(f"""
+                        SELECT {", ".join(columns)}
+                        FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                        WHERE target_type = 'match'
+                          AND parser_version = '{PARSER_VERSION}'
+                          AND status IN ('success', 'not_modified')
+                          AND NOT coalesce(stale, false)
+                    """)
+                    for row in rows:
+                        self._index_match_source(dict(zip(columns, row)))
+        for row in self._pending_manifest:
+            self._index_match_source(row)
+        return self._match_source_index.get(str(target_key))
+
+    def stored_match_rows(self, match_ids: Optional[Iterable[int]] = None) -> list[dict[str, Any]]:
+        """Read exact saved calendar metadata; never discover via HTTP."""
+        ids = sorted({int(value) for value in match_ids}) if match_ids is not None else None
+        getter = getattr(self.writer, "_get_trino_manager", None)
+        if ids == [] or getter is None:
+            return []
+        trino = getter()
+        if not trino.table_exists(self.schema, "fotmob_matches_current"):
+            return []
+        columns = (
+            "competition_id", "source_season_key", "match_id", "utc_time", "finished",
+            "cancelled", "postponed", "home_team_id", "away_team_id", "page_url",
+        )
+        where = (
+            "CAST(match_id AS VARCHAR) IN (" + ", ".join(repr(str(value)) for value in ids) + ")"
+            if ids is not None else
+            "finished AND TRY(from_iso8601_timestamp(CAST(utc_time AS VARCHAR))) >= "
+            "from_iso8601_timestamp('" + (utc_now() - timedelta(days=7)).isoformat() + "Z')"
+        )
+        rows = trino.execute_query(f"""
+            SELECT {", ".join(columns)}
+            FROM {self.catalog}.{self.schema}.fotmob_matches_current
+            WHERE {where}
+        """)
+        return [dict(zip(columns, row)) for row in rows]
+
     def latest_success(
         self, target_key: str, *, run_id: Optional[str] = None
     ) -> Optional[dict[str, Any]]:
@@ -2498,7 +2641,7 @@ class FotMobRepository:
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
                    status, stale, fetched_at, completed_at, actual_counts_json,
-                   capabilities_json
+                   capabilities_json, error_code
             FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
             WHERE target_key = '{safe}'
               AND parser_version = '{safe_version}'
@@ -2565,7 +2708,7 @@ class FotMobRepository:
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
                    status, stale, fetched_at, completed_at, actual_counts_json,
-                   capabilities_json
+                   capabilities_json, error_code
             FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
             WHERE target_type = '{safe_type}'
               AND entity_id = '{safe_id}'
@@ -2815,6 +2958,30 @@ class FotMobRepository:
             except (TypeError, ValueError):
                 continue
         return output
+
+    def source_gap_scope_records(
+        self, plan_signature: str, *, parser_version: str = PARSER_VERSION,
+    ) -> dict[tuple[int, str], dict[str, Any]]:
+        """Read explicit source-gap resolutions, including buffered markers."""
+        columns = (
+            "competition_id", "source_season_key", "entity_id", "parser_version",
+            "target_type", "status", "capabilities_json", "completed_at", "run_id",
+        )
+        rows = list(self._pending_manifest)
+        getter = getattr(self.writer, "_get_trino_manager", None)
+        if getter is not None:
+            signature = str(plan_signature).replace("'", "''")
+            version = str(parser_version).replace("'", "''")
+            durable = getter().execute_query(f"""
+                SELECT {", ".join(columns)}
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = 'scope_source_gap'
+                  AND entity_id = '{signature}'
+                  AND parser_version = '{version}'
+                  AND status = 'not_available'
+            """)
+            rows.extend(dict(zip(columns, row)) for row in durable)
+        return _scope_source_gap_records(rows, plan_signature, parser_version)
 
     def scope_attempt_states(
         self,
@@ -3353,6 +3520,19 @@ class MemoryFotMobRepository:
         self.commit(commit)
         return f"memory://{MANIFEST_TABLE}"
 
+    def latest_match_source(self, target_key: str) -> Optional[dict[str, Any]]:
+        rows = [commit.manifest_row() for commit in self.commits
+                if commit.target_key == target_key and commit.target_type == "match"
+                and commit.parser_version == PARSER_VERSION
+                and commit.status in {ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED}]
+        rows = [row for row in rows if source_observed_at(row) is not None]
+        return max(rows, key=source_observed_at) if rows else None
+
+    def stored_match_rows(self, match_ids: Optional[Iterable[int]] = None) -> list[dict[str, Any]]:
+        ids = {str(value) for value in match_ids} if match_ids is not None else None
+        return [row for row in self.tables.get("fotmob_matches", [])
+                if ids is None or str(row.get("match_id")) in ids]
+
     def latest_success(
         self, target_key: str, *, run_id: Optional[str] = None
     ) -> Optional[dict[str, Any]]:
@@ -3488,6 +3668,14 @@ class MemoryFotMobRepository:
             and commit.competition_id is not None
             and commit.source_season_key is not None
         }
+
+    def source_gap_scope_records(
+        self, plan_signature: str, *, parser_version: str = PARSER_VERSION,
+    ) -> dict[tuple[int, str], dict[str, Any]]:
+        return _scope_source_gap_records(
+            (commit.manifest_row() for commit in self.commits),
+            plan_signature, parser_version,
+        )
 
     def scope_attempt_states(
         self,

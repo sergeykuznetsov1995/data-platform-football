@@ -183,13 +183,17 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
     if len(tables) != 1:
         raise LayoutChanged(f"expected one match table, got {len(tables)}")
     table = tables[0]
-    header = table.xpath("./tr[th]|./thead/tr[th]|./tbody/tr[th]")
-    if len(header) != 1 or len(header[0].xpath("./th")) != MATCH_TABLE_COLUMNS:
-        raise LayoutChanged("match table header is not one row of 14 th")
-    names = [_text(th) for th in header[0].xpath("./th")]
-    names[0] = re.sub(r"^\d{4}\s*", "", names[0])  # "2026Date" → "Date"
-    if tuple(names) != MATCH_TABLE_HEADERS:
-        raise LayoutChanged(f"match table headers changed: {names}")
+    headers = table.xpath("./tr[th]|./thead/tr[th]|./tbody/tr[th]")
+    if not headers:
+        raise LayoutChanged("match table has no headers")
+    # The last 16 matches can span years, each with its own identical header.
+    for header in headers:
+        if len(header.xpath("./th")) != MATCH_TABLE_COLUMNS:
+            raise LayoutChanged("match table header is not a row of 14 th")
+        names = [_text(th) for th in header.xpath("./th")]
+        names[0] = re.sub(r"^\d{4}\s*", "", names[0])  # "2026Date" → "Date"
+        if tuple(names) != MATCH_TABLE_HEADERS:
+            raise LayoutChanged(f"match table headers changed: {names}")
     rows = []
     for seq, tr in enumerate(table.xpath(".//tr[td]")):
         tds = tr.xpath("./td")
@@ -588,6 +592,25 @@ def check_ranking(
         )
 
 
+def _external_result_team(td) -> bool:
+    # Observed /Results clubs outside ClubElo: no link, flag or rank.
+    spans = list(td)
+    classes = ("min481", "max640", "min641", "min1081")
+    return (
+        td.attrib == {"class": "l"}
+        and len(spans) == len(classes)
+        and not (td.text or "").strip()
+        and all(
+            span.tag == "span" and span.attrib == {"class": cls}
+            and len(span) == 0 and not (span.tail or "").strip()
+            for span, cls in zip(spans, classes)
+        )
+        and not (spans[0].text or "").strip()
+        and bool((spans[1].text or "").strip())
+        and bool((spans[2].text or "").strip())
+    )
+
+
 def _team(td) -> Dict[str, Any]:
     slug = _first(td.xpath('.//a[span[@class="max640"]]/@href'))
     rank = _first(td.xpath(".//small/text()"))
@@ -600,7 +623,8 @@ def _team(td) -> Dict[str, Any]:
         "country": _first(td.xpath(".//img/@alt")),
         "rank": _integer(rank.strip(), "team rank") if rank and rank.strip() else None,
     }
-    if not team["slug"] and not (team["country"] and team["name"]):
+    if (not team["slug"] and not (team["country"] and team["name"])
+            and not _external_result_team(td)):
         raise LayoutChanged(f"C3 result team without link, country or name: {_text(td)!r}")
     team["key"] = team["slug"] or f"~{team['country'] or ''}:{team['name']}"
     return team

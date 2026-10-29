@@ -76,8 +76,8 @@ def test_operator_order_marks_terminal_candidate_no_go_pending_review() -> None:
     raw = _raw(REMEDIATION_FILE)
     fetcher = _raw(FETCHER_FILE)
 
-    assert "fbref-camoufox-metered-warm-http-v10" in raw
-    assert "fbref-camoufox-metered-warm-http-v10" in fetcher
+    assert "fbref-camoufox-metered-warm-http-v11" in raw
+    assert "fbref-camoufox-metered-warm-http-v11" in fetcher
     assert "TERMINAL AUTHORITY BAKED" in raw
     assert "CANDIDATE NO-GO UNTIL INDEPENDENT REVIEW" in raw
     assert "DO NOT EXECUTE" in raw
@@ -90,6 +90,24 @@ def test_operator_order_marks_terminal_candidate_no_go_pending_review() -> None:
     assert "8 mib decoded-body cap" in raw.lower()
     assert "9 mib target reservation" in raw.lower()
     assert "8 mib+1" in raw.lower()
+
+
+def test_runtime_pins_match_current_transport_and_pipeline() -> None:
+    version = re.search(r'FETCHER_VERSION = "([^"]+)"', _raw(FETCHER_FILE))[1]
+    raw = _raw(REMEDIATION_FILE)
+
+    assert f"assert FETCHER_VERSION == '{version}'" in raw
+    assert (
+        f"assert c == '{hashlib.sha256(PIPELINE_FILE.read_bytes()).hexdigest()}'"
+        in raw
+    )
+    assert f"all_attempts.transport_version = '{version}'" in _sql(GATE_FILE)
+
+    pg = _raw(POSTGRES_REGRESSION_FILE)
+    versions = re.findall(r"'fbref-camoufox-metered-warm-http-v\d+'", pg)
+    assert versions == [f"'{version}'"] * 3 + [
+        "'fbref-camoufox-metered-warm-http-v10'",
+    ] + [f"'{version}'"] * 2
 
 
 @pytest.mark.parametrize("path", [REMEDIATION_FILE, GATE_FILE])
@@ -243,6 +261,7 @@ def test_frontier_selection_is_exact_and_preserves_history_fields() -> None:
     set_clause = update[update.index(" set ") : update.index(" from ")]
     assert set(re.findall(r"\b([a-z_]+) =", set_clause)) == {
         "state",
+        "refresh_policy",
         "updated_at",
     }
     for preserved in (
@@ -295,6 +314,47 @@ def test_exact_cohort_mechanism_does_not_rely_on_due_time() -> None:
     assert "next_fetch_at =" not in update
     assert "$prospective_exact_cohort_proof$" in sql
     assert "unexpected eligible target" in sql
+
+
+def test_reanimated_exact_pair_matches_real_canary_claim_policy() -> None:
+    from scrapers.fbref import pipeline
+
+    sql = _sql(REMEDIATION_FILE)
+    update = sql[sql.index("update fbref_control.page_frontier") :]
+    set_clause = update[update.index(" set ") : update.index(" from ")]
+    policy_assignment = re.search(r"refresh_policy = '([^']+)'", set_clause)
+    # The frozen cohort preserves the frontier policy, including the old daily
+    # policy when reanimation does not explicitly migrate it.
+    policy = policy_assignment[1] if policy_assignment else "daily"
+    frozen = dict.fromkeys(DIAGNOSTIC_TARGET_IDS, policy)
+    settings = pipeline._oversize_evidence_settings(
+        pipeline.OversizeEvidenceConfig(logical_run_label="policy-regression")
+    )
+
+    class ClaimReached(Exception):
+        pass
+
+    class Control:
+        def get_run(self, run_id):
+            return {"metadata": {"persistent_http_session": True}}
+
+        def claim_targets(self, run_id, worker_id, **kwargs):
+            assert kwargs["page_kinds"] == ("season_stats",)
+            assert kwargs["limit"] == 25
+            claimable = {
+                target for target, policy in frozen.items()
+                if policy in kwargs["refresh_policies"]
+            }
+            assert claimable == DIAGNOSTIC_TARGET_IDS
+            raise ClaimReached
+
+    subject = pipeline.FBrefPipeline(Control(), None)
+    with pytest.raises(ClaimReached):
+        subject.fetch_wave(
+            "policy-regression", worker_id="canary",
+            page_kinds=pipeline._OVERSIZE_EVIDENCE_PAGE_KINDS,
+            settings=settings,
+        )
 
 
 def test_purpose_built_runner_is_fetch_only_and_physically_nonpublishing() -> None:
@@ -497,7 +557,7 @@ def test_success_gate_proves_full_raw_and_page_accounting_are_lossless() -> (
         in sql
     )
     assert (
-        "all_attempts.transport_version = 'fbref-camoufox-metered-warm-http-v10'"
+        "all_attempts.transport_version = 'fbref-camoufox-metered-warm-http-v11'"
         in sql
     )
     assert "page.attempt_session_version <> page.session_id::text" in sql

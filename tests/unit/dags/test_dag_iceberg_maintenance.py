@@ -13,7 +13,7 @@ def _load_module():
     return importlib.import_module("dag_iceberg_maintenance")
 
 
-def test_weekly_maintenance_activates_bounded_compaction(monkeypatch) -> None:
+def test_weekly_maintenance_leaves_compaction_to_nightly_pass(monkeypatch) -> None:
     import utils.maintenance_tasks as maintenance
 
     mod = _load_module()
@@ -28,12 +28,7 @@ def test_weekly_maintenance_activates_bounded_compaction(monkeypatch) -> None:
 
     mod._maintain(logical_date=logical_date)
 
-    assert calls == [
-        {
-            "compact_live_files": True,
-            "compaction_rotation": logical_date.date().toordinal() // 7,
-        }
-    ]
+    assert calls == [{"compact_live_files": True, "compaction_schemas": ("silver", "gold"), "compaction_rotation": logical_date.date().toordinal() // 7}]
 
 
 def test_manifest_lifecycle_is_an_independent_weekly_task(monkeypatch) -> None:

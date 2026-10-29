@@ -84,11 +84,15 @@ def refill_window(
     blocked: dict[tuple[str, str, str], str] = {}
     used = 0.0
     transient = 0
+    streak = 0
+    failed = False
     status = "partial"
     reason = "round_cap"
 
     def report():
-        return {"status": status, "stop_reason": reason,
+        # #1778: a red scope keeps the run red at every persisted point.
+        return {"status": "failed" if failed else status,
+                "stop_reason": reason if status == "failed" or not failed else "scope_failure",
                 "elapsed_s": round(used, 3), "outcomes": list(outcomes),
                 "blocked_scopes": sorted(blocked.values()),
                 "transient_failures": sum(o.get("status") == "transient_failure" for o in outcomes),
@@ -134,20 +138,30 @@ def refill_window(
         if outcome.get("status") == "transient_failure":
             blocked[key] = env['SOFASCORE_SCOPE_KEY']
             transient += 1
+            streak += 1
             if transient >= max_transient_failures:
                 status, reason = "failed", "transient_failures"
                 if persist:
                     persist(report())
                 break
+            if streak >= max_transient_failures:
+                break
             if persist:
                 persist(report())
             continue
         transient = 0
+        # #1778: one red scope costs that scope, not the rest of the window;
+        # the run stays red, and a streak of failures of any kind stops it.
         if outcome.get("status") not in {"success", "refreshed", "partial"}:
-            status, reason = "failed", "scope_failure"
+            blocked[key] = env['SOFASCORE_SCOPE_KEY']
+            failed = True
+            streak += 1
             if persist:
                 persist(report())
-            break
+            if streak >= max_transient_failures:
+                break
+            continue
+        streak = 0
         before = sum(int(row[2]) for row in rows if _partition(row) == key)
         refreshed = pending()
         after = sum(int(row[2]) for row in refreshed if _partition(row) == key)

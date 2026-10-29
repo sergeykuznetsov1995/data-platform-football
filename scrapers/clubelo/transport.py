@@ -13,7 +13,9 @@ pages. This transport is the single, polite way to fetch them:
   caller turns it into ``no_page``;
 - retries only on network errors and 5xx (``retries`` extra attempts,
   ``retry_pause`` seconds apart);
-- 403 / 429 / a ``cf-mitigated`` header mean the site blocks us:
+- a single 403 + ``cf-mitigated: challenge`` bootstraps clearance via the
+  dedicated lease and FlareSolverr; raw bytes still come only from requests;
+- other 403 / 429 / a ``cf-mitigated`` header mean the site blocks us:
   ``ClubEloBlocked`` stops the whole run, no retry;
 - ``wire_bytes`` counts the compressed bytes read from the socket, the body is
   decompressed here; a response sent without gzip is gzipped by us
@@ -28,8 +30,10 @@ from __future__ import annotations
 import gzip
 import hashlib
 import logging
+import os
 import re
 import time
+import uuid
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -115,6 +119,14 @@ class ClubEloTransport:
         base_url: str = BASE_URL,
     ) -> None:
         self.session = session
+        # Never inherit HTTP(S)_PROXY or netrc from the worker environment.
+        self.session.trust_env = False
+        self.session.proxies = {}
+        self._bootstrap_attempted = False
+        self._lease = None
+        self._solver = None
+        self._solver_session = None
+        self._closed = False
         self.min_interval = min_interval
         self.timeout = timeout
         self.retries = retries
@@ -125,6 +137,77 @@ class ClubEloTransport:
         self._last_request: Optional[float] = None
         self.requests = 0
         self.wire_bytes = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def close(self):
+        """Release browser, lease and HTTP pools, including partial bootstrap."""
+        if self._closed:
+            return
+        self._closed = True
+        actions = []
+        if self._solver is not None:
+            if self._solver_session is not None:
+                actions.append(lambda: self._solver.destroy_session(self._solver_session))
+            actions.append(self._solver.close)
+        if self._lease is not None:
+            actions.append(self._lease.close)
+        actions.append(self.session.close)
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                logger.warning("ClubElo transport cleanup failed")
+
+    def _bootstrap(self):
+        from scrapers.base.flaresolverr_client import FlareSolverrClient
+        from scrapers.clubelo.proxy_lease import ClubEloLease
+
+        self._bootstrap_attempted = True
+        try:
+            if self.base_url != BASE_URL:
+                raise ValueError("invalid ClubElo origin")
+            self._lease = ClubEloLease()
+            self._lease.acquire()
+            self._solver = FlareSolverrClient(
+                url=os.environ.get("CLUBELO_FLARESOLVERR_URL", "http://flaresolverr:8191"),
+                default_timeout=120, default_max_timeout_ms=90000,
+            )
+            self._solver_session = "clubelo-" + uuid.uuid4().hex
+            self._solver.create_session(self._solver_session, proxy_url=self._lease.proxy_url)
+            solution = self._solver.get(BASE_URL + "/Ranking", self._solver_session)
+            cookies, ua = solution.get("cookies"), solution.get("userAgent")
+            if (solution.get("status") != 200 or not isinstance(ua, str) or not ua.strip()
+                    or any(ord(c) < 32 or ord(c) > 126 for c in ua)
+                    or not isinstance(cookies, list) or not cookies):
+                raise ValueError("invalid clearance")
+            for cookie in cookies:
+                if (not isinstance(cookie, dict)
+                        or not isinstance(cookie.get("name"), str) or not cookie["name"]
+                        or not isinstance(cookie.get("value"), str) or not cookie["value"]
+                        or cookie.get("domain", "clubelo.com") not in {"clubelo.com", ".clubelo.com"}
+                        or cookie.get("path", "/") != "/"
+                        or any(ord(c) < 33 or ord(c) > 126 or c in ';,'
+                               for c in cookie["name"] + cookie["value"])):
+                    raise ValueError("invalid clearance cookie")
+            if not any(c["name"] == "cf_clearance" for c in cookies):
+                raise ValueError("missing clearance cookie")
+            self.session.cookies.clear()
+            for cookie in cookies:
+                self.session.cookies.set(cookie["name"], cookie["value"],
+                                         domain="clubelo.com", path="/", secure=True)
+            self.session.headers["User-Agent"] = ua
+            self.session.proxies = {"https": self._lease.proxy_url}
+        except Exception as exc:
+            # Do not include gateway/solver errors: they can contain credentials.
+            self.close()
+            reason = str(exc) if isinstance(exc, ValueError) and str(exc).startswith(
+                "ClubElo proxy control token") else "lease or solver failed"
+            raise ClubEloBlocked("Cloudflare bootstrap: " + reason) from None
 
     def _pace(self) -> None:
         if self._last_request is not None:
@@ -137,6 +220,8 @@ class ClubEloTransport:
         """Fetch one white-listed path; see the module docstring for rules."""
 
         check_path(path)
+        if self._closed:
+            raise ClubEloBlocked("ClubElo transport is closed")
         url = self.base_url + path
         last_error = ""
         for attempt in range(self.retries + 1):
@@ -153,21 +238,25 @@ class ClubEloTransport:
                     stream=True,
                 )
             except requests.RequestException as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = type(exc).__name__
                 logger.warning("ClubElo %s attempt %d: %s", path, attempt + 1, last_error)
                 continue
             try:
                 status = int(response.status_code)
                 headers = response.headers
+                if (status == 403 and headers.get("cf-mitigated", "").lower() == "challenge"
+                        and not self._bootstrap_attempted):
+                    response.close()
+                    self._bootstrap()
+                    return self.get(path)
                 if status in BLOCK_STATUSES or "cf-mitigated" in headers:
                     raise ClubEloBlocked(
-                        f"{path}: HTTP {status}, cf-mitigated="
-                        f"{headers.get('cf-mitigated')!r}"
+                        f"{path}: HTTP {status}, site blocked the request"
                     )
                 try:
                     wire = response.raw.read(decode_content=False)
                 except Exception as exc:  # urllib3 errors mid-body are network errors
-                    last_error = f"{type(exc).__name__}: {exc}"
+                    last_error = type(exc).__name__
                     continue
             finally:
                 response.close()

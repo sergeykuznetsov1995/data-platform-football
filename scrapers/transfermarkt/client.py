@@ -909,11 +909,43 @@ class TransfermarktHttpClient:
                     self._request_deadline_monotonic - self._monotonic()
                     - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
                 )
-            self._lease_provider.acquire_request_permit(
-                metadata=metadata,
-                request_id=request_id,
-                **options,
-            )
+            while True:
+                try:
+                    self._lease_provider.acquire_request_permit(
+                        metadata=metadata,
+                        request_id=request_id,
+                        **options,
+                    )
+                    break
+                except SourceStreamPaused as exc:
+                    from .history_portion import enabled as history_enabled
+                    if history_enabled() or self._request_deadline_monotonic is None:
+                        raise
+                    delay = max(0.0, exc.resume_at_epoch - self._time()) + 0.1
+                    remaining = (
+                        self._request_deadline_monotonic - self._monotonic()
+                        - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS
+                    )
+                    if not math.isfinite(delay) or delay >= remaining:
+                        raise
+                    self._sleep(delay)
+                    try:
+                        self._request_timeout()
+                    except CurrentPortionDeadlineExceeded:
+                        raise exc
+                    if self._lease_expiring() or (
+                        self._lease is not None and self._lease.expires_at <= self._time()
+                    ):
+                        self._discard_client()
+                        self._close_lease(label=label)
+                        self._ensure_client(
+                            url=url, label=label, context=context, retry=False,
+                        )
+                    options["max_wait_seconds"] = min(
+                        TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS,
+                        self._request_deadline_monotonic - self._monotonic()
+                        - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
+                    )
         except CurrentPortionDeadlineExceeded:
             raise
         except TrafficMeterError:
@@ -2013,6 +2045,7 @@ class TransfermarktHttpClient:
         for attempt in range(1, attempts_cap + 1):
             self._request_timeout()
             proxy_status = ""
+            proxy_upstream_status = None
             self._check_request_budget()
             self._check_decoded_budget(before_request=True)
             self._check_provider_budget(retry=attempt > 1)
@@ -2036,6 +2069,9 @@ class TransfermarktHttpClient:
                     url=url,
                     label=label,
                     context=context,
+                )
+                client, proxy_obj = self._ensure_client(
+                    url=url, label=label, context=context, retry=attempt > 1,
                 )
                 if self._lease_expiring() or self._lease_near_byte_cap():
                     # Planned rotation right before I/O: rate-limit and
@@ -2097,6 +2133,8 @@ class TransfermarktHttpClient:
                 response_headers = getattr(resp, "headers", {})
                 if not isinstance(response_headers, Mapping):
                     response_headers = {}
+                if status_code >= 500 or status_code == 407:
+                    proxy_upstream_status = _header_value(response_headers, PROXY_UPSTREAM_STATUS_HEADER) or None
                 try:
                     body, raw_record, attempt_envelope = self._commit_raw_response(
                         url=url,
@@ -2408,6 +2446,22 @@ class TransfermarktHttpClient:
                     retry=attempt > 1,
                     duration_seconds=elapsed,
                 )
+                if status_code == 405:
+                    # AWS WAF uses 405 for CAPTCHA. A plain method error must
+                    # not slow the source; identify the header or saved HTML.
+                    text = body.decode('utf-8', errors='replace').lower()
+                    is_aws_captcha = (
+                        (_header_value(response_headers, 'x-amzn-waf-action') or '').lower() == 'captcha'
+                        or ('<title>human verification</title>' in text
+                            and '.captcha.awswaf.com/' in text)
+                    )
+                    if is_aws_captcha:
+                        # Account the actual source reply before fallible feedback.
+                        # A control failure is not another source/transport attempt.
+                        try:
+                            self._report_site_block(status_code, challenge=True)
+                        except Exception as exc:
+                            raise TrafficMeterError('CAPTCHA site feedback unavailable') from exc
                 if not proxy_success:
                     self._avoid_on_next_client(proxy_obj)
                     self._discard_failed_transport(label=label)
@@ -2548,6 +2602,7 @@ class TransfermarktHttpClient:
         return self._finish(FetchOutcome(
             status=terminal_status,
             status_code=last_status,
+            proxy_upstream_status=proxy_upstream_status,
             error=last_error,
             attempts=self._attempts - endpoint_attempt_start,
             label=label,

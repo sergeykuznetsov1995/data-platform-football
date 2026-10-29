@@ -760,6 +760,7 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
             'foot': None,
             'nationality': None,
             'contract_until': None,
+            '_contract_status': 'parse_error' if 'contract_until' in col_fields.values() else 'not_rendered',
             **dict.fromkeys(SQUAD_CONTEXT_FIELDS),
         }
 
@@ -819,6 +820,8 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
                     row['foot'] = text.lower() if text not in ('', '-') else None
                 elif field == 'contract_until':
                     row['contract_until'] = _parse_tm_date(text)
+                    row['_contract_status'] = ('ok' if row['contract_until'] is not None else
+                                               'unknown' if text in ('', '-', '–') else 'parse_error')
                 elif field == 'joined_at':
                     row['joined_at'] = _parse_tm_date(text)
                 elif field == 'signed_from':
@@ -826,6 +829,26 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
 
         players.append(row)
     return players
+
+
+def contract_status(row):
+    """Legacy snapshots retain their original semantics for receipt verification."""
+    return row.get('_contract_status', 'ok')
+
+
+def contract_parser_revision(row):
+    return PARSER_REVISION + '-contracts-v2' if '_contract_status' in row else PARSER_REVISION
+
+
+def squad_replay_matches(html, club_id, rows):
+    """Reproduce pre-contract snapshots without changing their stored evidence."""
+    parsed = _parse_squad_page(html, club_id)
+    saved = [dict(row) for row in rows]
+    if saved and all('_contract_status' not in row for row in saved):
+        for row in parsed:
+            row.pop('_contract_status', None)
+    from scrapers.transfermarkt.current_capture import semantic_signature
+    return semantic_signature(parsed) == semantic_signature(saved)
 
 
 def _parse_coach_profile(html: str, coach_id: str) -> Optional[Dict]:
@@ -2900,7 +2923,7 @@ class TransfermarktScraper(BaseScraper):
                     .astimezone(timezone.utc).replace(tzinfo=None)
                     if sp.get('_source_fetched_at') else observed_at
                 ),
-                'parser_revision': PARSER_REVISION,
+                'parser_revision': contract_parser_revision(sp),
                 'schema_revision': SCHEMA_REVISION,
                 'cycle_id': os.environ.get('TM_RUN_ID', self._batch_id),
                 'scope_id': scope['scope_id'],
@@ -2950,11 +2973,11 @@ class TransfermarktScraper(BaseScraper):
                     'player_id': str(sp['player_id']),
                     'contract_until': sp.get('contract_until'),
                     'observed_at': observed_at,
-                    'applicability_status': 'ok',
+                    'applicability_status': contract_status(sp),
                     'source_url': lineage['source_url'],
                     'source_body_hash': lineage['source_body_hash'],
                     'fetched_at': lineage['fetched_at'],
-                    'parser_revision': PARSER_REVISION,
+                    'parser_revision': lineage['parser_revision'],
                     'schema_revision': SCHEMA_REVISION,
                     'cycle_id': lineage['cycle_id'],
                     'scope_id': scope['scope_id'],

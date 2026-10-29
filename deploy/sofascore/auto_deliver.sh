@@ -102,11 +102,12 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
 MAINT=dag_sofascore_manifest_maintenance
+COMPACT=dag_sofascore_schedule_maintenance
 
 # Окно и потолки. Переопределяются из окружения только для стенда.
 WINDOW_FROM=${WINDOW_FROM:-0330}   # 03:30 UTC: скоупы истории идут 8–81 мин (p90 остатка
@@ -317,6 +318,11 @@ restore_state(){
 # откатывал бы бой при живом прогоне обслуживания. Инвариант: на разрушительном пути
 # обслуживание под паузой.
 restore_maint(){
+  local compact_want
+  compact_want=$(snap_get COMPACT_PAUSED)
+  if [ "$compact_want" = f ]; then
+    restore_pause "$COMPACT" "$compact_want" || return 1
+  fi
   local want
   want=$(snap_get MAINT_PAUSED)
   case "$want" in
@@ -358,11 +364,18 @@ mounts_all_in(){  # mounts_all_in <дерево>
 }
 # 1 — принято, 0 — не принято, X — проверить нечем (вслепую не решаем).
 acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt scheduler'а>
-  local new="$1" started="$2" dags errs gw n c line want got
-  dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
+  local new="$1" started="$2" dags errs gw n c line want got dag_sql="" dag_count=0
+  for c in $CORE_DAGS; do
+    # Rollback may target a release predating schedule compaction.
+    [ "$c" != "$COMPACT" ] || [ -f "$new/dags/$COMPACT.py" ] || continue
+    dag_sql="$dag_sql'$c',"
+    dag_count=$(( dag_count + 1 ))
+  done
+  dag_sql=${dag_sql%,}
+  dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($dag_sql) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
   errs=$(metadb "SELECT count(*) FROM import_error;")
   case "$dags$errs" in *X*) echo X; return ;; esac
-  [ "$dags" = 5 ] || { echo 0; return; }
+  [ "$dags" = "$dag_count" ] || { echo 0; return; }
   [ "$errs" = 0 ] || { echo 0; return; }
   # Три шлюза ОДНИМ вызовом: `docker inspect a b c` при отсутствии имени печатает только
   # найденные и отдаёт rc=1 — «нет контейнера» иначе было бы неотличимо от «упал docker».
@@ -399,7 +412,6 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
   done <<< "$WATCHDOG_UNITS"
   echo 1
 }
-CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
 
 # Единственный источник истины о бое — env-файл контура; deploy.sh перепинывает его ДО
 # пересоздания контейнеров, поэтому обрыв между этими шагами оставляет env на новом дереве
@@ -429,6 +441,10 @@ snapshot_ok(){
       *) log "снимок отката неполон: пауза $MAINT не прочитана"; return 1 ;;
     esac
   fi
+  case "$(snap_get COMPACT_PAUSED)" in
+    t|f|'') ;;
+    *) log "снимок отката неполон: пауза $COMPACT не прочитана"; return 1 ;;
+  esac
   for p in $POOLS; do
     case "$(snap_get "POOL_$p")" in
       ''|*[!0-9]*) log "снимок отката неполон: слоты пула $p не число"; return 1 ;;
@@ -464,7 +480,7 @@ repin_env_to_old(){  # repin_env_to_old <старое дерево>
 # Best-effort: шаги выполняются, даже если предыдущий не удался. Исход решается ТОЛЬКО
 # подтверждением теми же шестью признаками против старого дерева, а не кодами возврата.
 rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt scheduler'а до отката>
-  local old="$1" started_before="$2" c left seen tries deadline busy_now
+  local old="$1" started_before="$2" c left seen tries deadline busy_now compact_pause compact_busy
   set +e
   # Улики до отката: --force-recreate сносит контейнеры вместе с логами.
   for c in "$SCHED" $GATEWAY_CONTAINERS; do
@@ -483,6 +499,13 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
   # Откат ПЕРЕСОЗДАЁТ контейнеры: обслуживание манифеста обязано стоять на паузе и здесь,
   # независимо от того, кто её снял (идемпотентно; свой прогон обслуживания оборвался бы).
   sched airflow dags pause "$MAINT"
+  compact_pause=$(metadb "SELECT is_paused FROM dag WHERE dag_id='$COMPACT';")
+  case "$compact_pause" in
+    t|f) sched airflow dags pause "$COMPACT"
+      [ "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$COMPACT';")" = t ] || return 1 ;;
+    '') ;;  # First release: DAG is not registered on the old tree.
+    *) return 1 ;;
+  esac
   # Результат проверяем: без паузы прогон обслуживания стартует между проверкой «контур
   # свободен» и пересозданием контейнеров — и будет оборван молча, а откат отчитается как
   # штатный (Sol круг 2). Откат из-за этого не отменяем: бой на непринятом дереве хуже.
@@ -497,6 +520,8 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
     ROLLBACK_NOTE="$ROLLBACK_NOTE ВНИМАНИЕ: откат пересоздавал контейнеры при непустом контуре (dag_run в работе: '$busy_now') — идущий прогон дейли/актуалки/обслуживания оборван, его трафик оплачен впустую."
     log "ОТКАТ ПРИ ЗАНЯТОМ КОНТУРЕ (dag_run: '$busy_now') — идущий прогон будет оборван"
   fi
+  compact_busy=$(metadb "SELECT count(*) FROM dag_run WHERE dag_id='$COMPACT' AND state IN ('queued','running');")
+  [ "$compact_busy" = 0 ] || { log "откат отложен: $COMPACT ещё работает или метабаза недоступна"; return 1; }
   SOFASCORE_RELEASE_ROOT="$old" \
   SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST="$(snap_get OLD_ARTIFACT_HOST)" \
   SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$(snap_get OLD_ARTIFACT_ID)" \
@@ -542,7 +567,7 @@ acceptance_rollback(){
 }
 contour_busy(){
   # Историю сюда НЕ включаем: ею занимается шаг drain внутри deploy.sh.
-  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT') AND state IN ('queued','running');"
+  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT','$COMPACT') AND state IN ('queued','running');"
 }
 
 # --- окно доставки ----------------------------------------------------------------------
@@ -1205,6 +1230,7 @@ fi
   printf 'HIST_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$HIST';")"
   printf 'REFRESH_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$REFRESH';")"
   printf 'MAINT_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$MAINT';")"
+  printf 'COMPACT_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$COMPACT';")"
   for p in $POOLS; do printf 'POOL_%s=%s\n' "$p" "$(metadb "SELECT slots FROM slot_pool WHERE pool='$p';")"; done
   printf 'SCHED_CREATED=%s\n' "$SCHED_CREATED_BEFORE"
 } >> "$SNAPSHOT" 2>/dev/null

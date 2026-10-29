@@ -67,6 +67,11 @@ from .repository import (
     TargetCommit,
     utc_now,
 )
+from .raw_store import RawStoreError
+from .match_refresh import (
+    LATE_MATCH_CUTOFF, MATCH_SETTLE_MARGIN,
+    MatchRefresh, match_refresh, match_time, source_observed_at,
+)
 from .transport import FetchOutcome, FetchResult, FotMobTransport, canonicalize_target
 
 
@@ -100,7 +105,8 @@ def _failure_status(exc: BaseException) -> ManifestStatus:
 def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
     """Recognize the retained metadata-only source page, never an empty list.
 
-    This shape was observed for six included competitions before #1288.
+    This shape was observed for six included competitions before #1288 and
+    with only the seasons tab for the historical Super Cup page in #1812.
     Extra calendar fields and malformed explicit lists remain schema drift.
     Caller must still validate all JSON paths and protect committed matches.
     """
@@ -117,7 +123,7 @@ def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
         and isinstance(overview_matches, Mapping)
         and set(overview_matches) == {"hasOngoingMatch"}
         and overview_matches["hasOngoingMatch"] is False
-        and payload.get("tabs") == []
+        and payload.get("tabs") in ([], ["seasons"])
         and payload.get("table") is None
         and payload.get("stats") == {}
         and payload.get("playoff") is None
@@ -571,11 +577,13 @@ class RunReport:
     operations: list[OperationResult] = field(default_factory=list)
     budget: dict[str, int] = field(default_factory=dict)
     transport: dict[str, Any] = field(default_factory=dict)
+    stop_reason: Optional[str] = None
+    blocked_until: Optional[datetime] = None
     exclusions: tuple[dict[str, str], ...] = INTENTIONAL_EXCLUSIONS
 
     @property
     def ok(self) -> bool:
-        return bool(self.operations) and all(item.ok for item in self.operations)
+        return self.stop_reason != "ban" and bool(self.operations) and all(item.ok for item in self.operations)
 
     @property
     def status(self) -> str:
@@ -586,6 +594,8 @@ class RunReport:
             "run_id": self.run_id,
             "mode": self.mode,
             "status": self.status,
+            "stop_reason": self.stop_reason,
+            "blocked_until": self.blocked_until.isoformat() if self.blocked_until else None,
             "started_at": self.started_at.isoformat(),
             "completed_at": self.completed_at.isoformat()
             if self.completed_at
@@ -618,6 +628,7 @@ class FotMobIngestService:
         self.run_id = run_id or utc_run_id()
         self.ledger = BudgetLedger(budget or TransportBudget())
         self.max_workers = min(int(max_workers), 16)
+        self._late_match_requests = 0
         self._budget_lock = threading.Lock()
         self._cancelled = threading.Event()
         self._next_build_id: Optional[str] = None
@@ -678,11 +689,18 @@ class FotMobIngestService:
                     "remaining request budget cannot cover one retry-bounded "
                     f"target ({self.ledger.remaining_requests}<{max_attempts})"
                 )
-            if getattr(self, "deadline_at", None) is not None and (
-                self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes
-            ):
+            if self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes:
                 raise BudgetExceeded("FotMob direct-byte budget exhausted")
-        fetch = self.transport.fetch_json(endpoint, params)
+        attempt_stats = getattr(self.transport, "thread_attempt_stats", None)
+        if attempt_stats is not None:
+            attempt_stats(reset=True)
+        try:
+            fetch = self.transport.fetch_json(endpoint, params)
+        except Exception:
+            if attempt_stats is not None:
+                with self._budget_lock:
+                    self.ledger.account_fetch(**attempt_stats())
+            raise
         self._account(fetch)
         self._raise_if_cancelled()
         return fetch
@@ -725,6 +743,9 @@ class FotMobIngestService:
             }
             for future in as_completed(futures):
                 self._raise_if_cancelled()
+                if getattr(self.transport, "stop_reason", None) == "ban":
+                    for pending in futures:
+                        pending.cancel()
                 key = futures[future]
                 try:
                     output[key] = future.result()
@@ -787,6 +808,19 @@ class FotMobIngestService:
         force_dataset_write: bool = False,
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
+        capabilities = dict(capabilities or {})
+        if target_type in {"match", "league_season", "competition_seasons"} and not fetch.stale and manifest_status in {
+            ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED,
+        }:
+            observed = match_time(fetch.source_observed_at or fetch.fetched_at)
+            if observed is not None:
+                # League and season-catalog manifests are read as ISO timestamps
+                # by the daily meter; keep an explicit UTC offset independent of
+                # SQL session.
+                capabilities["source_observed_at"] = (
+                    observed.replace(tzinfo=timezone.utc) if target_type != "match"
+                    else observed
+                ).isoformat()
         commit = TargetCommit(
             run_id=self.run_id,
             target_type=target_type,
@@ -2691,12 +2725,98 @@ class FotMobIngestService:
             "missing_expected_sections": missing,
         }
 
+    def match_refresh_state(self, match: Mapping[str, Any], now: datetime) -> MatchRefresh:
+        target = canonicalize_target("matchDetails", {"matchId": str(match.get("match_id"))})
+        previous = self.repository.latest_match_source(target.target_key)
+        return match_refresh(match, source_observed_at(previous), now)
+
+    def _recover_match_fetch(self, match: Mapping[str, Any]) -> Optional[FetchResult]:
+        raw_store = getattr(self.transport, "raw_store", None)
+        if raw_store is None:
+            return None
+        target = canonicalize_target("matchDetails", {"matchId": str(match["match_id"])})
+        previous = self.repository.latest_match_source(target.target_key)
+        last = source_observed_at(previous)
+        try:
+            _, record = raw_store.load(target)
+        except RawStoreError:
+            return None
+        observed = match_time(record.validated_at)
+        if observed is None or (last is not None and observed <= last):
+            return None
+        # A raw response can survive a crash before publication. Recover only
+        # an open threshold, including after the HTTP cutoff, with no request.
+        state = match_refresh(match, last, observed, allow_after_cutoff=True)
+        if state.kind not in {"primary", "late"}:
+            return None
+        latest = self.repository.latest_entity_attempt("match", match["match_id"])
+        if (latest and latest.get("content_hash") == record.content_hash
+            and (latest.get("status") == ManifestStatus.SCHEMA_DRIFT.value
+                 or (latest.get("status") == ManifestStatus.NOT_AVAILABLE.value
+                     and latest.get("error_code") == "source_data_not_found"))):
+            return None
+        fetch = self.transport.replay_json("matchDetails", {"matchId": str(match["match_id"])})
+        # The mutable raw manifest may have changed during replay. Never pair
+        # another payload or validation with the observation checked above.
+        if (fetch.content_hash != record.content_hash
+            or fetch.source_observed_at != record.validated_at):
+            return None
+        return replace(fetch, source_observed_at=record.validated_at)
+
+    def _fetch_match(
+        self, match_id: str, *, late: bool, single_attempt: bool,
+        cutoff_at: Optional[datetime] = None,
+    ) -> FetchResult:
+        self._raise_if_cancelled()
+        if (getattr(self, "_match_budget_stopped", False)
+            or self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes):
+            raise BudgetExceeded("match byte budget exhausted")
+        max_attempts = 1 if single_attempt else max(1, int(getattr(self.transport, "max_attempts", 1)))
+        if self.ledger.remaining_requests < max_attempts:
+            raise BudgetExceeded("remaining request budget cannot cover match retries")
+        if late and 9 * (self._late_match_requests + max_attempts) > (
+            self.ledger.requests - self._late_match_requests
+        ):
+            raise BudgetExceeded("late match quota deferred target")
+        before = self.transport.snapshot_stats()
+
+        def before_attempt() -> None:
+            self._raise_if_cancelled()
+            if cutoff_at is not None and utc_now() >= cutoff_at:
+                raise RuntimeError("FotMob match refresh cutoff reached")
+
+        try:
+            kwargs = {"max_attempts": 1} if single_attempt else {}
+            if cutoff_at is not None:
+                kwargs["before_attempt"] = before_attempt
+            fetch = self.transport.fetch_json("matchDetails", {"matchId": match_id}, **kwargs)
+        except Exception:
+            after = self.transport.snapshot_stats()
+            attempts = max(0, after.attempts - before.attempts)
+            self._late_match_requests += attempts if late else 0
+            self.ledger.account_fetch(
+                attempts=attempts, direct_bytes=max(0, after.direct_bytes - before.direct_bytes),
+                proxy_bytes=max(0, after.proxy_bytes - before.proxy_bytes),
+            )
+            raise
+        self._late_match_requests += fetch.attempts if late else 0
+        try:
+            self._account(fetch)
+        except BudgetExceeded as exc:
+            # The raw response already exists. Publish it before returning the
+            # budget error; a restart must not discard the final observation.
+            self._match_budget_error = str(exc)
+            self._match_budget_stopped = True
+        return fetch
+
     def sync_match_payloads(
         self,
         bundle: SeasonBundle,
         *,
         include_unfinished: bool = False,
         limit: Optional[int] = None,
+        phase: Optional[str] = None,
+        force_refresh: bool = False,
     ) -> OperationResult:
         """Fetch each needed match with exactly one ``matchDetails`` request."""
 
@@ -2713,38 +2833,61 @@ class FotMobIngestService:
                 "source_season_key": bundle.scope.source_season_key,
             },
         )
-        requests: list[tuple[str, str, Mapping[str, Any]]] = []
-        by_key: dict[str, Mapping[str, Any]] = {}
+        candidates = []
+        now = utc_now()
         for match in matches:
-            match_id = match.get("match_id")
-            key = str(match_id)
-            manifest_target = canonicalize_target(
-                "matchDetails", {"matchId": str(match_id)}
-            )
-            previous = self.repository.latest_success(manifest_target.target_key)
-            if (
-                previous is not None
-                and not previous.get("stale")
-                and self.mode != RunMode.REPLAY
-            ):
+            state = self.match_refresh_state(match, now)
+            # Recovery precedes quota, deadline and cutoff, and is parsed anew.
+            recover = None
+            if self.mode != RunMode.REPLAY and not force_refresh:
+                recover = self._recover_match_fetch(match)
+            kind = state.kind
+            if self.mode == RunMode.REPLAY or force_refresh:
+                kind = "primary"
+            if phase is not None and kind != phase and recover is None:
                 result.skipped += 1
                 continue
-            by_key[key] = match
-            requests.append((key, "matchDetails", {"matchId": str(match_id)}))
-        if limit is not None:
-            requests = requests[: max(0, int(limit))]
-            by_key = {key: by_key[key] for key, _, _ in requests}
-        try:
-            fetched = self._fetch_many(requests)
-        except BudgetExceeded as exc:
-            result.errors.append(str(exc))
-            return result
-        for key, outcome in fetched.items():
-            match = by_key[key]
-            if isinstance(outcome, Exception):
-                result.record_exception(f"match {key}: {outcome}", outcome)
+            if kind not in {"primary", "late"} and recover is None:
+                result.skipped += 1
                 continue
-            fetch = outcome
+            candidates.append((kind, match, recover))
+        candidates.sort(key=lambda item: item[0] != "primary")
+        selected = candidates if limit is None else candidates[:max(0, int(limit))]
+        for kind, match, recovered in selected:
+            key = str(match.get("match_id"))
+            try:
+                if recovered is not None:
+                    fetch = recovered
+                elif self.mode == RunMode.REPLAY:
+                    fetch = self._fetch("matchDetails", {"matchId": key}, replay=True)
+                else:
+                    if not force_refresh:
+                        kind = self.match_refresh_state(match, utc_now()).kind
+                        if kind not in {"primary", "late"}:
+                            result.skipped += 1
+                            continue
+                    fetch = self._fetch_match(
+                        key, late=kind == "late", single_attempt=force_refresh,
+                        cutoff_at=(
+                            match_time(match.get("utc_time")) + MATCH_SETTLE_MARGIN + LATE_MATCH_CUTOFF
+                            if kind == "late" else None
+                        ),
+                    )
+            except BudgetExceeded as exc:
+                result.metadata["deferred_reason"] = str(exc)
+                break
+            except Exception as exc:
+                if str(exc) == "FotMob match refresh cutoff reached":
+                    result.skipped += 1
+                    continue
+                if str(exc) == "FotMob ingestion deadline reached":
+                    result.metadata["deferred_reason"] = "deadline"
+                    continue
+                result.record_exception(f"match {key}: {exc}", exc)
+                continue
+            if getattr(self, "_match_budget_error", None):
+                result.errors.append(self._match_budget_error)
+                self._match_budget_error = None
             if not fetch.ok:
                 self._commit_for_fetch(
                     fetch,
@@ -2770,6 +2913,18 @@ class FotMobIngestService:
                 result.metadata["intentional_not_available"] = (
                     int(result.metadata.get("intentional_not_available", 0)) + 1
                 )
+                # Keep identity-bearing proof, not just a count. Explicit
+                # historical scopes may resolve this absence on their first
+                # run, but only after the raw-bearing manifest is committed.
+                result.metadata.setdefault("source_gap_matches", []).append({
+                    "match_id": key,
+                    "target_key": fetch.target_key,
+                    "raw_uri": fetch.raw_uri,
+                    "content_hash": fetch.content_hash,
+                    "run_id": self.run_id,
+                    "reason": "source_data_not_found",
+                    "observed_at": fetch.source_observed_at or fetch.fetched_at,
+                })
                 continue
             try:
                 try:
@@ -2783,6 +2938,7 @@ class FotMobIngestService:
                         entity_id=key, error_code=type(shape_exc).__name__, error=str(shape_exc),
                     )
                     continue
+                row["_observed_at"] = match_time(fetch.source_observed_at or fetch.fetched_at)
                 paths = inventory_json_paths(fetch.data)
                 inventory, unknown = self._inventory_rows(
                     "match",
@@ -3454,6 +3610,82 @@ class FotMobIngestService:
             ).encode("utf-8")
         ).hexdigest()
 
+    def record_scope_source_gap(
+        self,
+        bundle: SeasonBundle,
+        *,
+        plan_signature: str,
+        scope_entities: Iterable[str],
+        source_gap_matches: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Resolve an explicit scope without claiming unavailable rows exist.
+
+        Every finished match must have a successful published card or an exact
+        raw-bearing absence committed by this run. Flush dependencies before
+        buffering the marker, so even a partial final flush cannot publish a
+        resolution ahead of its evidence.
+        """
+        signature = str(plan_signature).strip()
+        if not signature or not source_gap_matches:
+            raise ValueError("source gap requires a plan and match evidence")
+        expected = {str(match["match_id"]) for match in bundle.matches if match.get("finished")}
+        proofs = {str(proof["match_id"]): dict(proof) for proof in source_gap_matches}
+        if len(proofs) != len(source_gap_matches) or not set(proofs) <= expected:
+            raise ValueError("source gap evidence must identify unique finished matches")
+        available = set()
+        for match_id in sorted(expected):
+            target = canonicalize_target("matchDetails", {"matchId": match_id})
+            if self.repository.latest_match_source(target.target_key) is not None:
+                if match_id in proofs:
+                    raise ValueError("source gap cannot replace successful match details")
+                available.add(match_id)
+                continue
+            proof = proofs.get(match_id)
+            manifest = self.repository.latest_entity_attempt("match", match_id, run_id=self.run_id)
+            if (
+                proof is None or manifest is None
+                or manifest.get("status") != ManifestStatus.NOT_AVAILABLE.value
+                or manifest.get("error_code") != "source_data_not_found"
+                or manifest.get("stale")
+                or proof.get("run_id") != self.run_id
+                or proof.get("reason") != "source_data_not_found"
+                or not proof.get("observed_at")
+                or any(not proof.get(key) or proof[key] != manifest.get(key)
+                       for key in ("target_key", "raw_uri", "content_hash"))
+                or proof.get("target_key") != target.target_key
+            ):
+                raise ValueError(f"match {match_id} has no committed source gap proof")
+        evidence = {
+            "plan_signature": signature,
+            "outcome": "source_gap",
+            "reason": "source_data_not_found",
+            "scope_entities": sorted(set(scope_entities)),
+            "match_ids": sorted(expected),
+            "available_match_ids": sorted(available),
+            "source_gap_matches": [proofs[key] for key in sorted(proofs)],
+        }
+        paths = list(self.repository.flush())
+        commit = TargetCommit(
+            run_id=self.run_id,
+            target_type="scope_source_gap",
+            target_key=_completion_target_key(
+                "scope_source_gap", bundle.scope.competition_id,
+                bundle.scope.source_season_key, signature,
+            ),
+            status=ManifestStatus.NOT_AVAILABLE,
+            competition_id=str(bundle.scope.competition_id),
+            source_season_key=bundle.scope.source_season_key,
+            entity_id=signature,
+            observation_id=self.run_id,
+            content_hash=hashlib.sha256(_json(evidence).encode("utf-8")).hexdigest(),
+            capabilities=evidence,
+            error_code="source_data_not_found",
+            error="explicit historical scope resolved with source gaps",
+            completed_at=utc_now(),
+        )
+        paths.extend(self.repository.commit(commit))
+        return list(dict.fromkeys(paths)), evidence
+
     def record_scope_completion(
         self,
         competition_id: int,
@@ -3591,6 +3823,8 @@ class FotMobIngestService:
             operations=list(operations),
             budget=self.ledger.as_dict(),
             transport=transport,
+            stop_reason=getattr(self.transport, "stop_reason", None),
+            blocked_until=getattr(self.transport, "blocked_until", None),
         )
 
 

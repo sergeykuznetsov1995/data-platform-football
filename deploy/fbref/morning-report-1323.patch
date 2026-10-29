@@ -1,6 +1,6 @@
 --- a/morning_report.py
 +++ b/morning_report.py
-@@ -1767,6 +1767,20 @@
+@@ -1767,6 +1767,21 @@
      out = run(f"docker exec postgres psql -U airflow -d airflow -tAc \"{sql}\"", timeout=30)
      rows = [r.strip() for r in out.splitlines() if r.strip()]
      return rows[0] if rows else None
@@ -15,13 +15,14 @@
 +        spec = importlib.util.spec_from_file_location("fbref_daily_report_adapter", adapter)
 +        module = importlib.util.module_from_spec(spec)
 +        spec.loader.exec_module(module)
++        # Includes current season/season_stats/squad ages (#1325).
 +        return module.fbref_daily_report()
 +    except Exception:
 +        return ["• FBref #1323: отчёт недоступен; приёмка не подтверждена ⚠️"]
 
 
  def fbref_idle():
-@@ -3867,7 +3881,7 @@
+@@ -3867,7 +3882,7 @@
          "🔵 ESPN:", *espn_section(),
          "🟤 Transfermarkt:", *transfermarkt_daily(), *transfermarkt_kib_per_request(),
          "🟤 ClubElo:", *clubelo_section(),

@@ -156,14 +156,14 @@ class TestHistoryMode:
         rc, stub = self._run_history(["--batch-size", "50", "--output", temp_output],
                                      self._result())
         assert rc == 0
-        stub.run_default.assert_called_once_with(batch_size=50)
+        stub.run_default.assert_called_once_with(batch_size=50, min_interval=1.0)
         with open(temp_output) as f:
             assert json.load(f)["pages_ok"] == 4
 
     @pytest.mark.unit
     def test_default_batch_size_is_200(self, temp_output):
         _, stub = self._run_history(["--output", temp_output], self._result())
-        stub.run_default.assert_called_once_with(batch_size=200)
+        stub.run_default.assert_called_once_with(batch_size=200, min_interval=1.0)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("overrides", [
@@ -194,3 +194,36 @@ class TestHistoryMode:
         assert exc.value.code == 0
         out = capsys.readouterr().out
         assert "history" in out and "--batch-size" in out and "daily" in out
+
+
+@pytest.mark.parametrize("interval", ["0", "-1", "0.5", "nan", "inf", "-inf", "bad"])
+def test_invalid_history_interval_fails_before_collection(tmp_path, monkeypatch, interval):
+    output = tmp_path / "result.json"
+    stub = MagicMock()
+    monkeypatch.setattr(sys, "argv", ["run_clubelo_scraper.py", "--mode", "history",
+                                    "--output", str(output), f"--history-min-interval={interval}"])
+    with patch.dict(sys.modules, {"scrapers.clubelo.history": stub}):
+        runner = importlib.import_module("dags.scripts.run_clubelo_scraper")
+        with pytest.raises(SystemExit) as exc:
+            runner.main()
+    assert exc.value.code == 2
+    stub.run_default.assert_not_called()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mode", ["daily", "watch"])
+def test_history_interval_does_not_change_daily_or_watch(tmp_path, monkeypatch, mode):
+    stub = MagicMock()
+    stub.run_default.return_value = {}
+    stub.exit_code.return_value = 0
+    state = str(tmp_path / "state.json")
+    monkeypatch.setattr(sys, "argv", ["run_clubelo_scraper.py", "--mode", mode,
+                                    "--output", str(tmp_path / "result.json"),
+                                    "--state-file", state, "--history-min-interval", "2"])
+    with patch.dict(sys.modules, {f"scrapers.clubelo.{mode}": stub}):
+        runner = importlib.import_module("dags.scripts.run_clubelo_scraper")
+        assert runner.main() == 0
+    if mode == "daily":
+        stub.run_default.assert_called_once_with()
+    else:
+        stub.run_default.assert_called_once_with(state_file=state, source="html")

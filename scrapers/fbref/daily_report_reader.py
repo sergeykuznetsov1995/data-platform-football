@@ -1,9 +1,12 @@
 """Bounded SELECT-only snapshot collection for the daily host report."""
 
 from datetime import date, datetime, timedelta
+import json
+import re
 from typing import Callable
 
-from scrapers.fbref.daily_report import adult_competition, instant
+from scrapers.fbref.daily_report import adult_competition, instant, page_age_scope
+from scrapers.fbref.policy import PUBLICATION_FRESHNESS_PAGE_KINDS
 
 REGISTRY_SQL = """
 SELECT jsonb_build_object(
@@ -73,24 +76,143 @@ SELECT coalesce(jsonb_agg(r), '[]')::text FROM (
 """
 
 
+# Stored scopes preserve canonical aliases and provenance without scanning edges.
+# Fail closed during initial backfill or after an out-of-band registry edit.
+PAGE_AGES_SQL = """
+WITH classified AS MATERIALIZED (
+ SELECT f.target_id,f.page_kind,f.last_content_hash,
+        scope.is_complete AND NOT scope.pending AS scope_summary_ready,
+        extract(epoch FROM ('{cutoff}'::timestamptz - f.last_fetched_at))::double precision / 3600 AS age_hours,
+        CASE WHEN f.page_kind='squad' AND
+          (string_to_array(regexp_replace(split_part(split_part(f.canonical_url, '?', 1), '#', 1),
+            '^([A-Za-z][A-Za-z0-9+.-]*:)?//[^/]*|;[^/]*$', '', 'g'), '/'))[5:]
+            && ARRAY['matchlogs','goallogs','history','wages'] THEN 'non_roster'
+        WHEN f.page_kind <> 'competition_index' AND NOT (
+          coalesce(scope.has_current_ownership,false)
+          AND NOT coalesce(scope.competition_missing,true)
+          AND NOT coalesce(scope.has_female,false)
+          AND NOT coalesce(scope.has_unknown,true)
+          AND NOT coalesce(scope.inactive_competition,true)
+          AND NOT coalesce(scope.invalid_season,true)
+          AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(scope.scopes) e
+            WHERE e->>'competition_id' IN (SELECT jsonb_array_elements_text({active_competitions}::jsonb))
+              AND (f.page_kind='competition' OR EXISTS (
+                SELECT 1 FROM jsonb_to_recordset({current_pairs}::jsonb) AS p(competition_id text,season_id text)
+                WHERE p.competition_id=e->>'competition_id' AND p.season_id=e->>'season_id'))
+          )) THEN 'outside_current_adult_scope' END AS reason
+ FROM fbref_control.page_frontier f
+ LEFT JOIN fbref_control.page_scope_summary scope USING (target_id)
+ WHERE f.source='fbref' AND f.refresh_policy <> 'historical_once'
+   AND f.state NOT IN ('dead','skipped','quarantined') AND f.created_at <= '{cutoff}'::timestamptz
+), kinds AS (
+ SELECT page_kind, CASE WHEN page_kind='squad' THEN 672
+   WHEN page_kind IN ('match','schedule','competition_index') THEN 24
+   WHEN page_kind IN ('player','matchlog') THEN 720 ELSE 168 END AS sla_hours
+ FROM (SELECT DISTINCT page_kind FROM classified
+       UNION SELECT jsonb_array_elements_text({page_kinds}::jsonb)) k
+), counts AS (
+ SELECT page_kind,count(*) AS total,
+        count(*) FILTER (WHERE age_hours >= 0 AND age_hours < sla_hours) AS fresh,
+        count(*) FILTER (WHERE age_hours IS NULL) AS never,
+        count(*) FILTER (WHERE age_hours >= sla_hours) AS aged,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY age_hours) FILTER (WHERE age_hours >= 0) AS median_hours,
+        percentile_cont(0.95) WITHIN GROUP (ORDER BY age_hours) FILTER (WHERE age_hours >= 0) AS p95_hours,
+        max(age_hours) FILTER (WHERE age_hours >= 0) AS max_hours
+ FROM classified JOIN kinds USING (page_kind) WHERE reason IS NULL GROUP BY page_kind
+), metrics AS (
+ SELECT k.page_kind,jsonb_build_object(
+   'total',coalesce(c.total,0),'sla_hours',k.sla_hours,'fresh',coalesce(c.fresh,0),
+   'fresh_percent',100.0*c.fresh/nullif(c.total,0),'never',coalesce(c.never,0),'aged',coalesce(c.aged,0),
+   'median_hours',c.median_hours,'p95_hours',c.p95_hours,'max_hours',c.max_hours) AS metrics
+ FROM kinds k LEFT JOIN counts c USING (page_kind)
+)
+SELECT CASE WHEN coalesce((SELECT bool_or(NOT coalesce(scope_summary_ready,false)) FROM classified),false)
+  OR EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+ THEN jsonb_build_object('error','scope_summary_incomplete')::text
+ ELSE jsonb_build_object(
+   'cutoff','{cutoff}',
+   'by_kind',(SELECT jsonb_object_agg(page_kind,metrics) FROM metrics),
+   'excluded',(SELECT coalesce(jsonb_object_agg(reason,n),'{}'::jsonb) FROM (
+     SELECT reason,count(*) AS n FROM classified WHERE reason IS NOT NULL GROUP BY reason) reasons),
+   'standings_confirmed_seasons',(SELECT count(*) FROM classified f WHERE
+     CASE WHEN f.page_kind='season' AND f.reason IS NULL THEN
+       CASE WHEN EXISTS (SELECT 1 FROM jsonb_to_recordset({standings_inventory}::jsonb)
+           AS i(target_id text,content_hash text)
+           WHERE i.target_id=f.target_id AND i.content_hash=f.last_content_hash) THEN
+         EXISTS (SELECT 1 FROM fbref_control.dataset_manifest m
+           WHERE m.target_id=f.target_id AND m.content_hash=f.last_content_hash
+             AND m.dataset='__page__' AND m.parse_status='succeeded'
+             AND m.persistence_status='succeeded' AND m.validation_status='succeeded'
+             AND m.completed_at <= '{cutoff}'::timestamptz)
+       ELSE false END ELSE false END)
+ )::text END
+"""
+
+
+def page_ages_query(snapshot: dict, as_of: datetime) -> str:
+    """Pass the existing Python scope rules as escaped JSON SQL literals."""
+    active, pairs = page_age_scope(snapshot)
+    inventory = sorted({(r["target_id"], r["content_hash"])
+                        for r in snapshot.get("standings_inventory", [])}, key=lambda pair: tuple(map(str, pair)))
+    values = {
+        "active_competitions": sorted(active),
+        "current_pairs": [{"competition_id": cid, "season_id": sid} for cid, sid in sorted(pairs)],
+        "page_kinds": sorted(PUBLICATION_FRESHNESS_PAGE_KINDS),
+        "standings_inventory": [{"target_id": target, "content_hash": digest} for target, digest in inventory],
+    }
+    # Replace placeholders in one pass: source values cannot introduce another placeholder.
+    literals = {key: "E'" + json.dumps(value).replace("\\", "\\\\").replace("'", "''") + "'"
+                for key, value in values.items()}
+    literals["cutoff"] = instant(as_of).isoformat()
+    return re.sub(r"\{([a-z_]+)\}", lambda match: literals[match[1]], PAGE_AGES_SQL)
+
+
+PAGE_AGE_EXCLUSIONS_SQL = """
+SELECT coalesce(jsonb_object_agg(reason,n), '{}')::text FROM (
+ SELECT CASE WHEN state IN ('dead','skipped','quarantined') THEN state ELSE 'history' END AS reason,
+        count(*) AS n
+ FROM fbref_control.page_frontier WHERE source='fbref'
+   AND created_at <= '{cutoff}'::timestamptz
+   AND (state IN ('dead','skipped','quarantined') OR refresh_policy='historical_once')
+ GROUP BY 1
+) counts
+"""
+
+
 def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
                      as_of: datetime, mapping: dict, lookback: int = 14) -> dict:
     """Call injected SELECT executors; never migrate, seed, fetch or publish."""
     cutoff = instant(as_of).isoformat()
     snapshot = {"competitions": [], "seasons": [], "schedules": [],
                 "observations": [], "readiness": [], "schedule_health": [],
-                "fotmob_seasons": [], "fotmob_matches": [], "errors": []}
+                "fotmob_seasons": [], "fotmob_matches": [], "errors": [], "page_age_errors": []}
     def read(label, function, query, default):
         try:
             return function(query)
         except Exception:
             # Driver exceptions may contain credentials: record the failed source only.
-            snapshot["errors"].append({"source": label, "reason": "read_failed"})
+            error_key = "page_age_errors" if label in {
+                "fbref_page_ages", "fbref_page_age_exclusions", "fbref_standings_inventory"
+            } else "errors"
+            snapshot[error_key].append({"source": label, "reason": "read_failed"})
             return default
     registry = read("fbref_registry", pg, REGISTRY_SQL.format(cutoff=cutoff), {})
     snapshot.update(registry)
     snapshot["observations"] = read("fbref_observations", pg, OBSERVATIONS_SQL.format(cutoff=cutoff), [])
     snapshot["readiness"] = read("fbref_readiness", pg, READINESS_SQL.format(cutoff=cutoff), [])
+    snapshot["standings_inventory"] = read("fbref_standings_inventory", trino, f"""
+        SELECT DISTINCT target_id,content_hash
+        FROM iceberg.bronze.fbref_table_inventory
+        WHERE page_kind='season' AND regexp_like(table_id, '^results.*_overall$')
+          AND persisted_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+    """, [])
+    snapshot["page_ages"] = read("fbref_page_ages", pg, page_ages_query(snapshot, as_of), [])
+    if isinstance(snapshot["page_ages"], dict) and snapshot["page_ages"].get("error") == "scope_summary_incomplete":
+        snapshot["page_ages"] = []
+        snapshot["page_age_errors"].append({"source": "fbref_page_ages", "reason": "scope_summary_incomplete"})
+    snapshot["page_age_exclusions"] = read("fbref_page_age_exclusions", pg,
+        PAGE_AGE_EXCLUSIONS_SQL.replace("{cutoff}", cutoff), {})
     adults = {str(c["competition_id"]) for c in snapshot["competitions"] if adult_competition(c)}
     if not adults:
         snapshot["errors"].append({"source": "fbref_registry", "reason": "empty_adult_universe"})
@@ -110,14 +232,52 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
         return snapshot
     fm_list = ",".join("'" + fid + "'" for fid in fm_ids)
     snapshot["fotmob_seasons"] = read("fotmob_season_manifest", trino, f"""
+        WITH evidence AS (
+          SELECT *, coalesce(
+            try(CAST(from_iso8601_timestamp(json_extract_scalar(
+              capabilities_json, '$.source_observed_at')) AT TIME ZONE 'UTC' AS timestamp)),
+            fetched_at) AS validated_at
+          FROM iceberg.bronze.fotmob_ingest_manifest
+        )
         SELECT competition_id,source_season_key AS season_key,
-               to_iso8601(with_timezone(max(fetched_at), 'UTC')) AS fetched_at
-        FROM iceberg.bronze.fotmob_ingest_manifest
+               to_iso8601(with_timezone(max(fetched_at), 'UTC')) AS fetched_at,
+               to_iso8601(with_timezone(max(validated_at), 'UTC')) AS validated_at
+        FROM evidence
         WHERE target_type = 'league_season' AND competition_id IN ({fm_list})
           AND status IN ('success','not_modified') AND NOT coalesce(stale,false)
           AND fetched_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+          AND validated_at >= fetched_at
+          AND validated_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
           AND completed_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
         GROUP BY competition_id,source_season_key
+    """, [])
+    snapshot["fotmob_phase_catalog"] = read("fotmob_phase_catalog", trino, f"""
+        WITH evidence AS (
+          SELECT competition_id,batch_id,fetched_at,completed_at,stale,coalesce(
+            try(CAST(from_iso8601_timestamp(json_extract_scalar(
+              capabilities_json, '$.source_observed_at')) AT TIME ZONE 'UTC' AS timestamp)),
+            fetched_at) AS validated_at
+          FROM iceberg.bronze.fotmob_ingest_manifest
+          WHERE target_type='competition_seasons' AND competition_id IN ({fm_list})
+            AND status IN ('success','not_modified')
+        ), catalogs AS (
+          SELECT competition_id,batch_id,fetched_at,validated_at,stale,
+                 row_number() OVER (PARTITION BY competition_id
+                                    ORDER BY completed_at DESC,batch_id DESC) AS rn
+          FROM evidence
+          WHERE fetched_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+            AND validated_at >= fetched_at
+            AND validated_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+            AND completed_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+        )
+        SELECT CAST(s.competition_id AS varchar) AS competition_id,
+               s.source_season_key AS season_key,
+               to_iso8601(with_timezone(m.fetched_at, 'UTC')) AS fetched_at,
+               to_iso8601(with_timezone(m.validated_at, 'UTC')) AS validated_at
+        FROM catalogs m JOIN iceberg.bronze.fotmob_competition_seasons s
+          ON s._target_batch_id=m.batch_id
+        WHERE m.rn=1 AND NOT coalesce(m.stale,false)
+          AND s._ingested_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
     """, [])
     snapshot["fotmob_matches"] = read("fotmob_matches", trino, f"""
         SELECT competition_id,source_season_key AS season_key,match_id,utc_time,timezone,

@@ -4,7 +4,7 @@
 The automatic owner deliberately retains the singleton publication lock when
 an Airflow trigger fails ambiguously.  This coordinator is the only production
 path that may release such a lock.  It first re-attests both live runtimes,
-pauses the exact six isolated DAGs, proves their metadata is idle, and checks
+pauses the exact seven isolated DAGs, proves their metadata is idle, and checks
 the deterministic owner -> ingest lineage.
 
 Two recoveries are intentionally narrow:
@@ -24,7 +24,7 @@ Two recoveries are intentionally narrow:
 
 ``consuming`` is never released here.  Partial shared writes need a separate,
 reviewed data repair and the command emits a durable blocked report instead.
-All successful recoveries leave the six isolated DAGs paused; production is
+All successful recoveries leave the seven isolated DAGs paused; production is
 resumed only through a new automatic rollout ceremony.
 """
 
@@ -79,6 +79,7 @@ ISOLATED_DAGS = (
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
+    "dag_refresh_fotmob_c1",
 )
 LEGACY_DAGS = frozenset(ISOLATED_DAGS[2:])
 ACTIVE_PAUSE_STATES = {dag_id: dag_id in LEGACY_DAGS for dag_id in ISOLATED_DAGS}
@@ -646,7 +647,7 @@ try:
         session.execute(text('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE'))
     models=session.query(DagModel).filter(DagModel.dag_id.in_(DAGS)).with_for_update().all()
     if {{str(row.dag_id) for row in models}} != set(DAGS):
-        raise RuntimeError('exact six isolated DagModels are not present')
+        raise RuntimeError('exact seven isolated DagModels are not present')
     pause_before={{str(row.dag_id):bool(row.is_paused) for row in models}}
     if PAUSE:
         for row in models:
@@ -1057,7 +1058,7 @@ def _validate_isolated_quiescence(snapshot: Any) -> dict[str, Any]:
     if before not in (ACTIVE_PAUSE_STATES, ALL_PAUSED_STATES):
         raise RecoveryError("isolated pause state differs from automatic deployment")
     if after != ALL_PAUSED_STATES:
-        raise RecoveryError("recovery did not pause the exact six isolated DAGs")
+        raise RecoveryError("recovery did not pause the exact seven isolated DAGs")
     active = snapshot.get("active_runs")
     if not isinstance(active, list):
         raise RecoveryError("isolated active-run evidence is malformed")

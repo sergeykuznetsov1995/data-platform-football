@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import math
 import pathlib
 import sys
 import time
@@ -483,10 +484,13 @@ def exit_code(result: Dict[str, Any]) -> int:
     return 1 if incomplete else 0
 
 
-def run_default(*, batch_size: int = DEFAULT_BATCH_SIZE) -> Dict[str, Any]:
+def run_default(*, batch_size: int = DEFAULT_BATCH_SIZE, min_interval: float = 1.0) -> Dict[str, Any]:
     """Production wiring: a requests session and the Iceberg store."""
+
+    if not math.isfinite(min_interval) or min_interval < 1:
+        raise ValueError("history min_interval must be finite and >= 1 second")
 
     import requests
 
-    with requests.Session() as session:
-        return run_history(ClubEloTransport(session), IcebergHistoryStore(), batch_size=batch_size)
+    with requests.Session() as session, ClubEloTransport(session, min_interval=min_interval) as transport:
+        return run_history(transport, IcebergHistoryStore(), batch_size=batch_size)

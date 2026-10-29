@@ -52,7 +52,8 @@ class LegacyCutoverBlocked(ValueError):
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Ingest one exact Understat league-season scope"
+        description="Ingest one exact Understat league-season scope",
+        epilog="One-time journal initialization: run with --bootstrap-manifest alone.",
     )
     parser.add_argument(
         "--mode",
@@ -132,9 +133,18 @@ def _result_payload(
     *,
     tables: Optional[Mapping[str, str]] = None,
     errors: Optional[list[str]] = None,
+    http_counts: Optional[Mapping[str, Optional[int]]] = None,
 ) -> dict[str, Any]:
     serialized = attempt.to_dict()
     scope = serialized["scope"]
+    counts = {
+        key: (http_counts if http_counts is not None else serialized["quality"]).get(key)
+        for key in ("request_count", "retry_count")
+    }
+    logger.info(
+        "Understat HTTP totals: request_count=%s retry_count=%s",
+        counts["request_count"], counts["retry_count"],
+    )
     return {
         "status": serialized["status"],
         "league": scope["league"],
@@ -149,6 +159,7 @@ def _result_payload(
         "tables": dict(tables or {}),
         "errors": list(errors or []),
         "scope_attempt": serialized,
+        **counts,
     }
 
 
@@ -190,6 +201,22 @@ def _scraper_request_count(scraper: Any) -> Optional[int]:
     if isinstance(count, bool) or not isinstance(count, int):
         return None
     return count
+
+
+def _scraper_retry_count(scraper: Any) -> Optional[int]:
+    count = getattr(getattr(scraper, "client", None), "retry_count", None)
+    return count if isinstance(count, int) and not isinstance(count, bool) else None
+
+
+def _scraper_schema_warnings(
+    scraper: Any, previous: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    warnings = getattr(getattr(scraper, "source", None), "schema_warnings", None)
+    result = list(previous or [])
+    for warning in warnings if isinstance(warnings, list) else []:
+        if warning not in result:
+            result.append(warning)
+    return result
 
 
 def _add_counts(*counts: Optional[int]) -> Optional[int]:
@@ -287,6 +314,7 @@ def _journal_early_failure(
         )
         if repository is None:
             repository = UnderstatManifestRepository.from_env()
+        repository.validate_tables()
         latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
         batch_id = str(uuid.uuid4())
         attempt = build_failure_attempt(
@@ -321,7 +349,6 @@ def run_scope(
     from scrapers.understat import UnderstatScraper
     from scrapers.understat.catalog import (
         LEAGUE_BY_CANONICAL,
-        current_source_season_id,
         season_slug,
     )
     from scrapers.understat.manifest import (
@@ -377,6 +404,8 @@ def run_scope(
     written_tables: dict[str, str] = {}
     # #1431: request accounting across the closed-check probe and full path.
     probe_request_count: Optional[int] = None
+    probe_retry_count: Optional[int] = None
+    probe_warnings: list[dict[str, Any]] = []
     active_scraper: Any = None
 
     if repository is None:
@@ -384,14 +413,9 @@ def run_scope(
     if scraper_factory is None:
         scraper_factory = UnderstatScraper
 
+    repository.validate_tables()
+
     try:
-        repository.ensure_table()
-        # #1429: the failures journal exists before the first failure, so the
-        # daily meter can always read it; its outage never fails the scope.
-        try:
-            repository.ensure_failures_table()
-        except Exception:
-            logger.exception("Unable to ensure the Understat failures journal")
         latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
         attempt_no = (latest.attempt_no + 1) if latest else 1
         if (
@@ -437,7 +461,9 @@ def run_scope(
                     scope.league,
                     scope.season,
                 )
-                return _result_payload(latest), 0
+                return _result_payload(
+                    latest, http_counts={"request_count": 0, "retry_count": 0}
+                ), 0
         if args.mode == "closed_check":
             from scrapers.understat.closed_check import LEAGUE_HASH_ENTITIES
 
@@ -468,6 +494,8 @@ def run_scope(
                         args.source_season_id,
                     )
                     probe_request_count = _scraper_request_count(probe)
+                    probe_retry_count = _scraper_retry_count(probe)
+                    probe_warnings = _scraper_schema_warnings(probe)
                     active_scraper = None
                 changed = [
                     entity
@@ -491,7 +519,10 @@ def run_scope(
                     if quarantine.state == "waiting_data"
                 )
                 waiting_quarantine = bool(waiting_game_ids)
-                if not changed and baseline_is_latest and not waiting_quarantine:
+                if (
+                    not changed and baseline_is_latest
+                    and not waiting_quarantine and not probe_warnings
+                ):
                     try:
                         unchanged_verified = repository.verify_physical_batch(
                             baseline
@@ -514,6 +545,7 @@ def run_scope(
                             started_at=started_at,
                             league_payload_hashes=snapshot,
                             request_count=probe_request_count,
+                            retry_count=probe_retry_count,
                         )
                         _journal_failure_best_effort(repository, failure)
                         return _result_payload(
@@ -530,11 +562,17 @@ def run_scope(
                             scope.season,
                             snapshot,
                         )
-                        payload = _result_payload(baseline)
+                        payload = _result_payload(
+                            baseline, http_counts={
+                                "request_count": probe_request_count,
+                                "retry_count": probe_retry_count,
+                            },
+                        )
                         payload["closed_check"] = {
                             "unchanged": True,
                             "hashes": snapshot,
                             "request_count": probe_request_count,
+                            "retry_count": probe_retry_count,
                         }
                         return payload, 0
                     logger.info(
@@ -626,20 +664,24 @@ def run_scope(
             report = validate_understat_scope(
                 frames,
                 scope=scope,
-                active=(
-                    args.mode == "current"
-                    and args.source_season_id >= current_source_season_id()
-                ),
+                # A current season can continue across July; the catalog
+                # routes closed scopes through closed_check.
+                active=args.mode == "current",
                 previous_row_counts=previous_counts,
                 previous_quality=previous.quality if previous is not None else {},
                 observed_at=datetime.fromisoformat(started_at),
                 batch_id=batch_id,
                 coverage_exceptions=coverage_exceptions_for_scope(scope),
+                schema_warnings=_scraper_schema_warnings(scraper, probe_warnings),
+                retry_count=_add_counts(probe_retry_count, _scraper_retry_count(scraper)),
                 league_payload_hashes=_scraper_league_hashes(scraper),
                 request_count=_add_counts(
                     probe_request_count, _scraper_request_count(scraper)
                 ),
             )
+            note_quality = getattr(scraper, "note_quality", None)
+            if callable(note_quality) and not report.passed:
+                note_quality(args.league, args.source_season_id, report)
             proposed_attempt = build_scope_attempt(
                 report,
                 batch_id=batch_id,
@@ -679,6 +721,11 @@ def run_scope(
                 entities_to_write = ()
 
             if entities_to_write:
+                # A previous successful publication cannot certify this write.
+                # Clear readiness before even the IN_PROGRESS marker can persist.
+                if callable(note_quality):
+                    note_quality(args.league, args.source_season_id, report,
+                                 publication_ready=False)
                 # Fence the exact scope before the first non-transactional
                 # table replacement. If the worker is killed mid-loop, this
                 # marker remains the latest attempt and every native consumer
@@ -744,6 +791,11 @@ def run_scope(
         # completion (including the physical fence), not DQ completion.
         proposed_attempt = replace(proposed_attempt, completed_at=utc_now_iso())
         repository.append_attempt(proposed_attempt)
+        confirm_cache = getattr(active_scraper, "confirm_cache", None)
+        if report.status is ManifestStatus.COMPLETE and callable(confirm_cache):
+            confirm_cache()
+        if callable(note_quality):
+            note_quality(args.league, args.source_season_id, report)
         if args.mode == "backfill" and report.status is not ManifestStatus.COMPLETE:
             message = (
                 "closed history scope did not publish completely: "
@@ -773,6 +825,8 @@ def run_scope(
                 site_result_game_ids=report.site_result_game_ids,
             )
         failure_kwargs.update(
+            schema_warnings=_scraper_schema_warnings(active_scraper, probe_warnings),
+            retry_count=_add_counts(probe_retry_count, _scraper_retry_count(active_scraper)),
             league_payload_hashes=_scraper_league_hashes(active_scraper),
             request_count=_add_counts(
                 probe_request_count, _scraper_request_count(active_scraper)
@@ -812,7 +866,28 @@ def run_scope(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = _argument_parser().parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--bootstrap-manifest"]:
+        from scrapers.understat.manifest import UnderstatManifestRepository
+
+        UnderstatManifestRepository.from_env().bootstrap()
+        return 0
+    if arguments == ["--enrich-matches"]:
+        try:
+            from scrapers.understat import UnderstatClient
+            from scrapers.understat.enrichment import run_enrichment
+            from scrapers.understat.manifest import UnderstatManifestRepository
+
+            with UnderstatClient(cache_dir=os.getenv(
+                "UNDERSTAT_CACHE_DIR", str(Path.home() / "soccerdata/data/UnderstatNative")
+            )) as client:
+                result = run_enrichment(client, UnderstatManifestRepository.from_env())
+        except Exception as exc:
+            logger.warning("Optional Understat HTML step failed", exc_info=True)
+            result = {"status": "deferred", "error": str(exc)}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    args = _argument_parser().parse_args(arguments)
     try:
         result, exit_code = run_scope(args)
     except Exception as exc:

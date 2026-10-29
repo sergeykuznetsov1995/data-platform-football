@@ -682,7 +682,7 @@ def test_report_accumulates_match_backlog_across_scopes():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("outcome", ["checked", "deferred", "failed"])
+@pytest.mark.parametrize("outcome", ["checked", "deferred", "redirected", "failed"])
 def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outcome):
     scopes = (
         runner.RunnerScope.parse("ENG-Premier League=2526"),
@@ -699,6 +699,10 @@ def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outc
             "stage_xg_checked": [stage] if outcome == "checked" else [],
             "stage_xg_retained": [stage + 100],
             "stage_xg_deferred": [stage] if outcome == "deferred" else [],
+            "stage_xg_redirected": [{"stage_id": stage, "status_code": 308,
+                                      "url": "https://www.whoscored.com/source",
+                                      "location": "https://www.whoscored.com/destination"}]
+            if outcome == "redirected" else [],
         }
         expected.append(json.loads(json.dumps(evidence)))
         result = _result(
@@ -2271,12 +2275,85 @@ def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_pa
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("healthy_third", [False, True])
-def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, healthy_third):
+@pytest.mark.parametrize("initial_failure", ["tls", "certificate", "http502"])
+@pytest.mark.parametrize("replay_failure", ["tls", "certificate", "http502", "timeout", "http500", "http503"])
+def test_source_replay_failure_continues_next_scope(
+    monkeypatch, tmp_path, initial_failure, replay_failure
+):
+    from curl_cffi.requests.exceptions import CertificateVerifyError, SSLError
+    from scrapers.whoscored.transport import (
+        EGRESS_PROBE_URL, TransportContext, WhoScoredTransport,
+    )
+
+    pool = tmp_path / "pool.txt"
+    pool.write_text("".join(f"pool.invalid:{10000 + i}:test:secret\n" for i in range(3)))
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    calls = []
+    proxies = []
+    failures = [
+        SSLError("curl: (35) TLS connect error", code=35)
+        if initial_failure == "tls" else CertificateVerifyError("curl: (60) certificate verify failed", code=60)
+        if initial_failure == "certificate" else 502,
+        SSLError("curl: (35) TLS connect error", code=35)
+        if replay_failure == "tls" else CertificateVerifyError("curl: (60) certificate verify failed", code=60)
+        if replay_failure == "certificate" else RuntimeError("curl: (28) timed out")
+        if replay_failure == "timeout" else int(replay_failure[4:]),
+        200,
+    ]
+
+    class Session:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            proxies.append(proxy)
+
+        def get(self, url, **kwargs):
+            calls.append((self.proxy, url))
+            outcome = 200 if url == EGRESS_PROBE_URL else failures.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return SimpleNamespace(status_code=outcome, content=b"{}", headers={})
+
+        def close(self):
+            pass
+
+    transport = WhoScoredTransport(
+        http_session_factory=Session,
+        direct_http_attempts=3,
+        direct_http_retry_backoff_seconds=0,
+        context=TransportContext(transport_policy="direct_only"),
+    )
+    source = "https://www.whoscored.com/tournaments/25590/data/?d=202610"
+
+    def schedule():
+        transport.fetch(source)
+        return DEFAULT_RESULTS["schedule"]
+
+    rc, report, service_cls, _ = _run(
+        monkeypatch, tmp_path,
+        ["daily", "--scope", "ENG-Premier League=2526", "--scope", "INT-World Cup=2026", "--skip-profiles"],
+        behaviors={"probe": transport.probe_egress, "schedule": schedule},
+    )
+
+    assert rc == 1
+    assert report["status"] == "failed"
+    assert [item["status"] for item in report["scopes"]] == ["failed", "success"]
+    assert len(service_cls.instances) == 2
+    assert len(report["error_details"]) == 1
+    assert len(proxies) == 2 and proxies[0] != proxies[1]
+    assert calls == [
+        (proxies[0], EGRESS_PROBE_URL), (proxies[0], source),
+        (proxies[1], EGRESS_PROBE_URL), (proxies[1], source),
+        (proxies[1], EGRESS_PROBE_URL), (proxies[1], source),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("healthy_fourth", [False, True])
+def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, healthy_fourth):
     from scrapers.utils.proxy_manager import ProxyManager
     from scrapers.whoscored.transport import TransportContext, WhoScoredTransport
 
-    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(3)]
+    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(4)]
     monkeypatch.setattr(
         ProxyManager,
         "get_http_proxy_url",
@@ -2285,7 +2362,7 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
         ),
     )
     pool = tmp_path / "pool.txt"
-    pool.write_text("pool.invalid:10000:test:secret\n")
+    pool.write_text("".join(f"pool.invalid:{10000 + i}:test:secret\n" for i in range(4)))
     monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
     calls = []
 
@@ -2295,7 +2372,7 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
 
         def get(self, url, **kwargs):
             calls.append((self.proxy, url))
-            if self.proxy != urls[2] or not healthy_third:
+            if self.proxy != urls[3] or not healthy_fourth:
                 raise RuntimeError("curl: (56) CONNECT tunnel failed, response 502")
             return SimpleNamespace(status_code=200)
 
@@ -2313,14 +2390,135 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
     )
     assert report["error_details"] == []
     assert all(url == "https://api.ipify.org" for _, url in calls)
-    if healthy_third:
+    if healthy_fourth:
         assert rc == 0
         assert len(service_cls.instances) == 2
         assert [service.probes for service in service_cls.instances] == [1, 1]
-        assert [proxy for proxy, _ in calls] == urls + [urls[2]]
+        assert [proxy for proxy, _ in calls] == urls + [urls[3]]
     else:
         assert rc == runner.SOURCE_UNAVAILABLE_EXIT_CODE == 3
         assert report["status"] == "source_unavailable"
         assert [item["status"] for item in report["scopes"]] == ["source_unavailable", "pending"]
         assert len(service_cls.instances) == 1
         assert [proxy for proxy, _ in calls] == urls
+        assert service_cls.instances[0].calls == []
+
+
+def test_history_disabled_keeps_runtime_preflight_but_no_repository(monkeypatch, tmp_path):
+    rc, report, service, catalog = _run(monkeypatch, tmp_path, ["history", "--transport-policy", "direct_only"])
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["history"] == {"reason": "disabled", "attempted": 0}
+
+
+
+def test_history_result_error_is_red_and_keeps_runtime_path(monkeypatch, tmp_path):
+    from scrapers.whoscored import history, history_state
+    monkeypatch.setattr(history_state, "HistoryState", lambda path: object())
+
+    def chunk(**kwargs):
+        kwargs["consume"](_result("matches", scope="ENG-Premier League=2526", errors=["bad chunk"]))
+
+    monkeypatch.setattr(history, "run_chunk", chunk)
+    rc, report, _, _ = _run(monkeypatch, tmp_path,
+                           ["history", "--split-lanes", "true", "--transport-policy", "direct_only"])
+    assert rc == 1
+    assert report["status"] == "failed"
+    assert any("bad chunk" in error for error in report["errors"])
+
+
+def test_current_lane_is_opt_in_in_service_invocation():
+    from unittest.mock import MagicMock
+    args = runner._build_parser().parse_args(["daily", "--skip-profiles"])
+    service = MagicMock()
+    runner._invoke(service, "matches", args)
+    assert "lane" not in service.sync_matches.call_args.kwargs
+    args.split_lanes = "true"
+    runner._invoke(service, "matches", args)
+    assert service.sync_matches.call_args.kwargs["lane"] == "current"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first_outcome", ["guard", "deferred"])
+def test_weekly_stages_continues_after_guard_or_deferred_scope(
+    monkeypatch, tmp_path, first_outcome
+):
+    from tests.unit.scrapers.test_whoscored_repository import (
+        _StageFeedStorage, _xg_row, _xg_scope_commit,
+    )
+    from scrapers.whoscored.repository import WhoScoredRepository
+    from tests.unit.scrapers.test_whoscored_service import _xg_service
+    from scrapers.whoscored.transport import FailureKind, StageBootstrapRedirect
+
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("old-a", 1), _xg_row("old-b", 1)])
+    original_manifest = dict(storage.manifests[0])
+    original_rows = [dict(row) for row in storage.tables["whoscored_player_stage_stats"]]
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    results = []
+
+    def stages():
+        service, service_repo, _, _, _, _, _ = _xg_service(tmp_path / str(len(results)))
+        if not results and first_outcome == "deferred":
+            def redirect(**kwargs):
+                raise StageBootstrapRedirect(
+                    "HTTP 301", kind=FailureKind.HTTP_STATUS,
+                    url=kwargs["url"], status_code=301,
+                )
+            service._prepare_stage_statistics = redirect
+        else:
+            def commit(**kwargs):
+                if not results:
+                    return _xg_scope_commit(repository, [_xg_row("new-a", 1)])
+                return repository.commit_scope_bundle(
+                    league="OTHER", season="S", entity_group="stages",
+                    datasets={"whoscored_player_stage_stats": [
+                        {**_xg_row("next", 2), "league": "OTHER"},
+                    ]},
+                    distinct_keys={"whoscored_player_stage_stats": "entity_key"},
+                    payload_sha256="c" * 64, raw_uris=["s3://next"],
+                    feed_policy="xg-only-v1",
+                )
+            service_repo.commit_scope_bundle = commit
+        result = service.sync_stage_feeds()
+        results.append(result)
+        return result
+
+    rc, report, services, _ = _run(
+        monkeypatch, tmp_path,
+        ["daily", "--split-lanes", "true", "--skip-profiles", "--daily-part", "stages",
+         "--weekly-gate", MONDAY_MORNING_SLOT, "--scope", "ENG-Premier League=2526",
+         "--scope", "INT-World Cup=2026"],
+        behaviors={"stages": stages},
+    )
+
+    assert len(results) == 2
+    assert [instance.calls for instance in services.instances] == [
+        [("stages", None)], [("stages", None)],
+    ]
+    assert rc == (1 if first_outcome == "guard" else 0)
+    assert report["status"] == ("failed" if first_outcome == "guard" else "success")
+    if first_outcome == "guard":
+        assert "published snapshot cannot shrink" in results[0].errors[0]
+    assert results[1].succeeded == 1
+    assert storage.manifests[0] == original_manifest
+    assert len(storage.manifests) == 2
+    assert [row for row in storage.tables["whoscored_player_stage_stats"]
+            if row["league"] == "L"] == original_rows
+
+
+def test_weekly_redirect_count_visible_in_run_summary(tmp_path, caplog):
+    import logging
+
+    scopes = [runner.RunnerScope.parse("ENG-Premier League=2526"),
+              runner.RunnerScope.parse("ESP-La Liga=2526")]
+    report = runner._new_report("weekly", scopes)
+    for index, scope in enumerate(scopes):
+        result = _result("stages", scope=scope.spec, metadata={
+            "stage_xg_redirected": [{"stage_id": 700 + index, "status_code": 301}]
+        })
+        runner._merge_result(report, result, scope_record=report["scopes"][index])
+    with caplog.at_level(logging.INFO):
+        rc = runner._finish(report, str(tmp_path / "summary.json"))
+    assert rc == 0 and report["status"] == "success"
+    assert "stage_xg_redirected=2" in caplog.text

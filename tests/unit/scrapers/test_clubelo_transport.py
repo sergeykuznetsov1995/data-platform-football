@@ -171,3 +171,157 @@ def test_truncated_gzip_is_retried_then_a_fetch_error():
     with pytest.raises(ClubEloFetchError, match="broken gzip"):
         transport.get("/riverplate")
     assert transport.requests == 3 and transport.wire_bytes == 3000
+
+
+@pytest.fixture
+def bootstrap(monkeypatch):
+    from scrapers.base import flaresolverr_client
+    from scrapers.clubelo import proxy_lease
+
+    events = []
+    proxy = "http://lease:secret-lease@clubelo_proxy_filter:8900"
+
+    class Lease:
+        proxy_url = proxy
+
+        def acquire(self):
+            events.append("acquire")
+            return self
+
+        def close(self):
+            events.append("release")
+
+    class Solver:
+        solution = {"status": 200, "html": "DOM MUST NOT BECOME RAW",
+                    "userAgent": "browser-UA", "cookies": [
+                        {"name": "cf_clearance", "value": "clear", "domain": ".clubelo.com"},
+                        {"name": "__cf_bm", "value": "bm"}]}
+
+        def __init__(self, **kwargs):
+            self.config = kwargs
+
+        def create_session(self, session_id, proxy_url):
+            events.append(("create", proxy_url))
+
+        def get(self, url, session_id):
+            events.append(("solve", url))
+            return self.solution
+
+        def destroy_session(self, session_id):
+            events.append("destroy")
+
+        def close(self):
+            events.append("solver-close")
+
+    monkeypatch.setattr(proxy_lease, "ClubEloLease", Lease)
+    monkeypatch.setattr(flaresolverr_client, "FlareSolverrClient", Solver)
+    return events, Lease, Solver
+
+
+def _challenge_session(answers):
+    session = FakeSession(answers)
+    session.cookies = requests.cookies.RequestsCookieJar()
+    session.headers = {}
+    session.proxies = {}
+    session.close = lambda: None
+    return session
+
+
+def _challenge():
+    return FakeResponse(403, b"challenge", {"cf-mitigated": "challenge"})
+
+
+def test_challenge_solver_then_http_raw_same_lease(bootstrap):
+    events, Lease, _ = bootstrap
+    session = _challenge_session({"/Results": [_challenge(), FakeResponse(200, b"HTTP RAW")],
+                                  "/Arsenal": FakeResponse(200, b"CLUB RAW")})
+    original_get = session.get
+    proxies = []
+
+    def get(url, **kwargs):
+        proxies.append(dict(session.proxies))
+        return original_get(url, **kwargs)
+
+    session.get = get
+    transport = _transport(session, retries=0)
+    page = transport.get("/Results")
+    with transport:
+        assert page.body == b"HTTP RAW" and gzip.decompress(page.body_gz) == b"HTTP RAW"
+        assert transport.get("/Arsenal").body == b"CLUB RAW"
+        assert session.trust_env is False
+        assert session.headers["User-Agent"] == "browser-UA"
+        assert session.cookies.get("cf_clearance", domain="clubelo.com") == "clear"
+        assert session.cookies.get("__cf_bm", domain="clubelo.com") == "bm"
+    transport.close()
+    assert proxies == [{}, {"https": Lease.proxy_url}, {"https": Lease.proxy_url}]
+    assert events == ["acquire", ("create", Lease.proxy_url),
+                      ("solve", "https://clubelo.com/Ranking"),
+                      "destroy", "solver-close", "release"]
+    assert all(response.closed for response in session.answers.values()
+               if isinstance(response, FakeResponse))
+
+
+def test_clean_http_never_bootstraps(bootstrap):
+    events, _, _ = bootstrap
+    session = _challenge_session({"/Ranking": FakeResponse(200, b"raw")})
+    with _transport(session) as transport:
+        assert transport.get("/Ranking").body == b"raw"
+        assert session.proxies == {} and session.trust_env is False
+    assert events == []
+
+
+def test_repeat_challenge_stops_and_releases(bootstrap):
+    events, _, _ = bootstrap
+    session = _challenge_session({"/Ranking": [_challenge(), _challenge()]})
+    with pytest.raises(ClubEloBlocked), _transport(session) as transport:
+        transport.get("/Ranking")
+    assert events.count("acquire") == events.count("release") == 1
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize("solution", [None, {}, {"status": 403},
+    {"status": 200, "cookies": [], "userAgent": "UA"},
+    {"status": 200, "cookies": [{"name": "x", "value": "v"}], "userAgent": "UA"},
+    {"status": 200, "cookies": [{"name": "cf_clearance", "value": "v", "domain": "evil.com"}], "userAgent": "UA"},
+    {"status": 200, "cookies": [{"name": "cf_clearance", "value": "v"}], "userAgent": "UA\r\ninjected"},
+    {"status": 200, "cookies": [{"name": "cf_clearance", "value": "v\ninjected"}], "userAgent": "UA"},
+])
+def test_invalid_solver_response_fails_closed(bootstrap, solution):
+    events, _, Solver = bootstrap
+    Solver.solution = solution
+    session = _challenge_session({"/Ranking": _challenge()})
+    with pytest.raises(ClubEloBlocked, match="lease or solver failed"), _transport(session) as transport:
+        transport.get("/Ranking")
+    assert events.count("release") == events.count("destroy") == 1
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["acquire", "create_session", "get"])
+def test_bootstrap_error_is_redacted_and_cleaned(bootstrap, monkeypatch, failure):
+    events, Lease, Solver = bootstrap
+
+    def fail(*args, **kwargs):
+        raise requests.ConnectionError("secret-lease password control-token")
+
+    monkeypatch.setattr(Lease if failure == "acquire" else Solver, failure, fail)
+    with pytest.raises(ClubEloBlocked) as caught:
+        with _transport(_challenge_session({"/Ranking": _challenge()})) as transport:
+            transport.get("/Ranking")
+    assert "secret" not in str(caught.value) and "password" not in str(caught.value)
+    assert events.count("release") == 1
+
+
+def test_proxied_network_error_does_not_leak_credentials(bootstrap, caplog):
+    session = _challenge_session({"/Ranking": [_challenge(), requests.exceptions.ProxyError("secret-lease")]})
+    with pytest.raises(ClubEloFetchError) as caught, _transport(session, retries=0) as transport:
+        transport.get("/Ranking")
+    assert "secret-lease" not in str(caught.value) + caplog.text
+
+
+def test_challenge_solver_has_ninety_seconds_with_http_margin(bootstrap):
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session) as transport:
+        transport.get("/Ranking")
+        config = transport._solver.config
+        assert config["default_max_timeout_ms"] == 90000
+        assert config["default_timeout"] >= config["default_max_timeout_ms"] / 1000 + 30

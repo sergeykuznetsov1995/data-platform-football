@@ -45,6 +45,7 @@ GATEWAYS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
 SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
 MAINT = "dag_sofascore_manifest_maintenance"
+COMPACT = "dag_sofascore_schedule_maintenance"
 # Четверг 03:30 UTC — середина окна доставки; воскресенье того же формата — для сдвига.
 THU_0330 = "2026-09-03 03:30:00"
 SUN_0330 = "2026-09-06 03:30:00"
@@ -277,6 +278,7 @@ exec /usr/bin/flock "$@"
         # Обслуживание манифеста живёт на паузе и распаущивается только своим прогоном:
         # deploy.sh паузит его на выкат, автомат возвращает после приёмки или отката.
         self.put(f"paused_{MAINT}", "t")
+        self.put(f"paused_{COMPACT}", "t")
 
     # -- сторожа: настоящие процессы с настоящим /proc/<pid>/cmdline ------------
     def watchdog_pids(self) -> None:
@@ -446,6 +448,7 @@ exit 0
             "HIST_PAUSED": "f",
             "REFRESH_PAUSED": "f",
             "MAINT_PAUSED": "t",
+            "COMPACT_PAUSED": "t",
             **{f"POOL_{p}": POOL_SLOTS[p] for p in POOLS},
             "SCHED_CREATED": "created-old",
         }
@@ -1725,3 +1728,78 @@ def test_an_instance_loaded_before_the_self_install_does_not_deliver(stand: Stan
     proc = stand.run(keep_copy=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
     assert _window(stand, stand.today)["OUTCOME"] == "delivered"
+
+
+@pytest.mark.unit
+def test_snapshot_remembers_schedule_compaction_pause(stand: Stand) -> None:
+    stand.watchdog_pids()
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stderr + stand.log_text()
+    snapshot = (stand.state / "sofascore-rollback.env").read_text()
+    assert "COMPACT_PAUSED=t\n" in snapshot
+
+
+@pytest.mark.unit
+def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(COMPACT_PAUSED="f")
+    stand.put(f"paused_{COMPACT}", "t")
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stderr
+    assert (stand.stub_state / f"paused_{COMPACT}").read_text().strip() == "f", stand.log_text()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("has_compaction,registered,expected", [
+    (True, 5, "0"), (True, 6, "1"), (False, 5, "1"),
+])
+def test_acceptance_requires_compaction_only_for_releases_containing_it(
+    tmp_path: Path, has_compaction: bool, registered: int, expected: str,
+) -> None:
+    """Execute the real acceptance function offline, including old-release rollback."""
+    tree = tmp_path / "release"
+    (tree / "dags").mkdir(parents=True)
+    if has_compaction:
+        (tree / "dags" / f"{COMPACT}.py").touch()
+    text = AUTO.read_text()
+    core = next(line for line in text.splitlines() if line.startswith("CORE_DAGS="))
+    acceptance = text.split("acceptance_seen(){", 1)[1].split("\n}", 1)[0]
+    sql_log = tmp_path / "sql"
+    script = core + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
+CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done)
+CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
+COMPACT=dag_sofascore_schedule_maintenance
+GATEWAY_CONTAINERS="gw1 gw2 gw3"
+WATCHDOG_UNITS=watchdog
+POOLS=""
+metadb(){
+  case "$1" in
+    *last_parsed_time*)
+      echo "$1" > "$SQL_LOG"
+      case "$1" in
+        *dag_sofascore_schedule_maintenance*) echo "$REGISTERED" ;;
+        *) echo 5 ;;
+      esac ;;
+    *) echo 0 ;;
+  esac
+}
+inspect(){ printf 'healthy 1073741824 sofascore-gw\n%.0s' {1..3}; }
+mounts_all_in(){ echo 1; }
+timeout(){
+  case "$*" in *ActiveState*) echo active ;; *MainPID*) echo $$ ;; esac
+}
+acceptance_seen "$2" "2026-10-28T03:00:00Z"
+'''
+    proc = subprocess.run(
+        ["bash", "-c", script, "test", "--expected-mount", str(tree)],
+        env={**os.environ, "SQL_LOG": str(sql_log), "REGISTERED": str(registered)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected, proc.stderr
+    assert (COMPACT in sql_log.read_text()) == has_compaction

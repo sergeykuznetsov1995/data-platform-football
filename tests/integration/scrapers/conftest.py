@@ -180,19 +180,6 @@ def minimal_versions():
 # =============================================================================
 
 @pytest.fixture
-def understat_scraper(minimal_leagues, minimal_seasons):
-    """Source-native Understat scraper — no soccerdata or Tor required."""
-    from scrapers.understat import UnderstatScraper
-
-    scraper = UnderstatScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
 def espn_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
     """ESPN scraper - no Tor required."""
     if not soccerdata_available:

@@ -55,6 +55,7 @@ EXPECTED_RUNTIME_FILES = (
     "dags/scripts/whoscored_rollout_acceptance.py",
     "dags/utils/__init__.py",
     "dags/utils/alerts.py",
+    "dags/utils/bronze_compaction.py",
     "dags/utils/config.py",
     "dags/utils/default_args.py",
     "dags/utils/maintenance_tasks.py",
@@ -94,6 +95,7 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/fotmob/constants.py",
     "scrapers/sofascore/__init__.py",
     "scrapers/sofascore/runtime_fingerprint.py",
+    "scrapers/sofascore/season_chunks.py",
     "scrapers/sofascore/workload_plan.py",
     "scrapers/utils/__init__.py",
     "scrapers/utils/proxy_manager.py",
@@ -102,6 +104,8 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/whoscored/catalog.py",
     "scrapers/whoscored/detailed_feeds.py",
     "scrapers/whoscored/domain.py",
+    "scrapers/whoscored/history.py",
+    "scrapers/whoscored/history_state.py",
     "scrapers/whoscored/parsers.py",
     "scrapers/whoscored/profile_policy.py",
     "scrapers/whoscored/proxy_campaign.py",
@@ -130,6 +134,7 @@ EXPECTED_RUNTIME_FILES = (
     "scripts/whoscored_production_admission.py",
     "scripts/whoscored_proxy_campaign.py",
     "scripts/whoscored_raw_backup.py",
+    "scripts/whoscored_v2_inventory.py",
     "scripts/whoscored_v2_object_contract.py",
 )
 _EXPECTED_RUNTIME_FILE_SET = frozenset(EXPECTED_RUNTIME_FILES)

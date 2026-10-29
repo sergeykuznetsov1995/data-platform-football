@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, timedelta
 import logging
 from typing import Any, Iterator, Mapping, Optional
 
@@ -16,6 +16,7 @@ from .catalog import (
     current_source_season_id,
     season_slug as make_season_slug,
 )
+from .cache_state import CacheState, digest
 from .client import UnderstatClient
 from .client import UnderstatHTTPError
 from .client import (
@@ -27,6 +28,7 @@ from .client import (
 )
 from .closed_check import league_payload_hashes
 from .parsers import (
+    TEAM_BREAKDOWN_DIMENSIONS,
     UnderstatSchemaDrift,
     parse_match_payload,
     parse_player_season_stats,
@@ -47,6 +49,22 @@ def _concat(frames: list[pd.DataFrame], empty: pd.DataFrame) -> pd.DataFrame:
     if not populated:
         return empty.copy()
     return pd.concat(populated, ignore_index=True).convert_dtypes()
+
+
+def _match_payload_is_complete(payload: Mapping[str, Any]) -> bool:
+    rosters = payload.get("rosters")
+    return (isinstance(rosters, Mapping)
+            and all(isinstance(rosters.get(side), (list, Mapping)) and rosters[side]
+                    for side in ("h", "a"))
+            and _match_payload_has_rows({"shots": payload.get("shots")}))
+
+
+def _team_payload_is_complete(payload: Mapping[str, Any]) -> bool:
+    statistics = payload.get("statistics")
+    return (bool(payload.get("players")) and isinstance(statistics, Mapping)
+            and set(statistics) == TEAM_BREAKDOWN_DIMENSIONS
+            and all(isinstance(categories, Mapping) and categories
+                    for categories in statistics.values()))
 
 
 def _match_payload_has_rows(payload: Mapping[str, Any]) -> bool:
@@ -74,6 +92,22 @@ class UnderstatSource:
         self.catalog = UnderstatCatalog(client, today=self.today)
         # #1431: fingerprints of the last parsed league response.
         self.last_league_hashes: dict[str, str] = {}
+        self.cache = CacheState(getattr(client, "cache_dir", None))
+        self.schema_warnings: list[dict[str, Any]] = []
+
+    def confirm_cache(self) -> None:
+        """Called by the runner after DQ, physical fence and terminal manifest."""
+        self.cache.confirm()
+
+    def _validate(self, validator: Any, payload: Any, response: str, **kwargs: Any) -> None:
+        warnings: list[dict[str, Any]] = []
+        try:
+            validator(payload, warnings=warnings, **kwargs)
+        finally:
+            for warning in warnings:
+                self.schema_warnings.append({**warning, "response": response})
+                logger.warning("Understat unknown fields: response=%s path=%s fields=%s",
+                               response, warning["path"], warning["fields"])
 
     @contextmanager
     def _keep_on_drift(self, payload: Any, cache_name: str) -> Iterator[None]:
@@ -125,6 +159,7 @@ class UnderstatSource:
         back to the full path, which fails as an unpublished closed scope.
         """
 
+        self.schema_warnings = []
         definition, scope = self._scope(league, season_slug, source_season_id)
         try:
             league_payload = self.client.get_league_data(
@@ -148,7 +183,10 @@ class UnderstatSource:
             league_payload,
             league_cache_name(definition.source_league, source_season_id),
         ):
-            validate_league_payload(league_payload)
+            self._validate(
+                validate_league_payload, league_payload,
+                league_cache_name(definition.source_league, source_season_id),
+            )
             return league_payload_hashes(
                 {
                     "schedule": parse_schedule(league_payload, scope),
@@ -170,6 +208,9 @@ class UnderstatSource:
     ) -> dict[str, pd.DataFrame]:
         if mode not in {"current", "history", "reparse"}:
             raise ValueError("mode must be current, history, or reparse")
+        # A previous failed/abandoned attempt must never certify a later one.
+        self.cache = CacheState(getattr(self.client, "cache_dir", None))
+        self.schema_warnings = []
         definition, scope = self._scope(league, season_slug, source_season_id)
         refresh_scope = force_refresh or mode in {"current", "reparse"}
         try:
@@ -193,10 +234,15 @@ class UnderstatSource:
             league_payload,
             league_cache_name(definition.source_league, source_season_id),
         ):
-            validate_league_payload(league_payload)
+            self._validate(
+                validate_league_payload, league_payload,
+                league_cache_name(definition.source_league, source_season_id),
+            )
             schedule = parse_schedule(league_payload, scope)
             players = parse_player_season_stats(league_payload, scope)
             team_match = parse_team_match_stats(league_payload, scope)
+        if not schedule.empty:
+            self.catalog.record_league(definition, source_season_id, league_payload)
         # #1431: fingerprint before has_data is rewritten from match responses.
         self.last_league_hashes = league_payload_hashes(
             {"schedule": schedule, "players": players, "team_match_stats": team_match}
@@ -208,14 +254,37 @@ class UnderstatSource:
         result_mask = schedule["is_result"].fillna(False).astype(bool)
         schedule.loc[result_mask, "has_data"] = False
         played_rows: list[dict[str, Any]] = []
-        for row in schedule[result_mask].to_dict(orient="records"):
+        cache = self.cache
+        incremental = mode == "current" and not force_refresh
+        raw_matches = {int(item["id"]): item for item in league_payload["dates"]}
+        records = schedule[result_mask].to_dict(orient="records")
+        cached = {}
+        fingerprints = {}
+        mandatory = set()
+        for row in records:
+            game_id = int(row["game_id"])
+            name = match_cache_name(game_id)
+            fingerprints[game_id] = digest(raw_matches[game_id])
+            cached[game_id] = cache.load(name, [league, source_season_id, game_id])
+            entry = cached[game_id]
+            if (entry is None or entry.get("fingerprint") != fingerprints[game_id]
+                    or not _match_payload_is_complete(entry["payload"])
+                    or row["date"].date() >= self.today - timedelta(days=2)):
+                mandatory.add(game_id)
+        rotation = cache.rotation(self.today, len(mandatory) + len(_team_records(league_payload.get("teams")))) if incremental else set()
+        team_matches: dict[int, list[Any]] = {}
+        for row in records:
+            game_id = int(row["game_id"])
+            name = match_cache_name(game_id)
+            rotate = (incremental and game_id not in mandatory and name in rotation
+                      and cache.claim_rotation(name, self.today))
+            refresh = force_refresh or mode == "reparse" or (incremental and (game_id in mandatory or rotate))
             try:
-                match_payload = self.client.get_match_data(
-                    int(row["game_id"]),
-                    # Current-season cache entries are never trusted forever:
-                    # a transient empty/partial response must heal on the next run.
-                    force_refresh=force_refresh or mode in {"current", "reparse"},
-                )
+                if incremental and not refresh:
+                    match_payload = cached[game_id]["payload"]
+                else:
+                    cache.invalidate(name)
+                    match_payload = self.client.get_match_data(game_id, force_refresh=refresh)
             except UnderstatHTTPError as exc:
                 if exc.status_code == 404:
                     logger.warning("Understat match %s has no payload", row["game_id"])
@@ -227,13 +296,24 @@ class UnderstatSource:
                 match_payload,
                 match_cache_name(int(row["game_id"])),
             ):
-                validate_match_payload(match_payload)
+                self._validate(
+                    validate_match_payload, match_payload,
+                    match_cache_name(int(row["game_id"])),
+                )
                 shot_frame, player_frame = parse_match_payload(
                     match_payload, scope, row
                 )
             schedule.loc[
                 schedule["game_id"] == row["game_id"], "has_data"
             ] = _match_payload_has_rows(match_payload)
+            if (refresh or not incremental) and _match_payload_is_complete(match_payload):
+                cache.save(name, [league, source_season_id, game_id],
+                           fingerprints[game_id], match_payload, self.today,
+                           match_date=row["date"].date().isoformat(), staged=True)
+            for team_id in (int(row["home_team_id"]), int(row["away_team_id"])):
+                team_matches.setdefault(team_id, []).append(
+                    [game_id, fingerprints[game_id], digest(match_payload)]
+                )
             played_rows.append(row)
             shots.append(shot_frame)
             player_matches.append(player_frame)
@@ -249,23 +329,32 @@ class UnderstatSource:
             # team page yet; asking for it only returns empty statistics.
             teams = sorted(
                 (
-                    (int(team["id"]), str(team["title"]))
+                    (int(team["id"]), str(team["title"]), team)
                     for team in _team_records(league_payload.get("teams"))
                     if team.get("history")
                 ),
                 key=lambda item: item[0],
             )
-            for team_id, team_name in teams:
+            for team_id, team_name, team_record in teams:
+                name = team_cache_name(team_name, source_season_id)
+                identity = [league, source_season_id, team_id]
+                fingerprint = digest([team_record, sorted(team_matches.get(team_id, []))])
+                entry = cache.load(name, identity) if incremental else None
+                refresh = (refresh_scope if not incremental else
+                           entry is None or entry.get("fingerprint") != fingerprint
+                           or not _team_payload_is_complete(entry["payload"]))
+                if refresh or not incremental:
+                    cache.invalidate(name)
                 team_payload = self.client.get_team_data(
-                    team_name,
-                    source_season_id,
-                    force_refresh=refresh_scope or mode == "reparse",
-                )
+                    team_name, source_season_id, force_refresh=refresh,
+                ) if refresh or not incremental else entry["payload"]
                 with self._keep_on_drift(
                     team_payload, team_cache_name(team_name, source_season_id)
                 ):
-                    validate_team_payload(
-                        team_payload, source_season_id=source_season_id
+                    self._validate(
+                        validate_team_payload, team_payload,
+                        team_cache_name(team_name, source_season_id),
+                        source_season_id=source_season_id
                     )
                     player_team, breakdowns = parse_team_payload(
                         team_payload,
@@ -273,6 +362,9 @@ class UnderstatSource:
                         team_id=team_id,
                         team_name=team_name,
                     )
+                if (refresh or not incremental) and _team_payload_is_complete(team_payload):
+                    cache.save(name, identity, fingerprint, team_payload, self.today,
+                               staged=True)
                 player_team_frames.append(player_team)
                 breakdown_frames.append(breakdowns)
 
