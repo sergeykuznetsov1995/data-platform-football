@@ -15959,7 +15959,7 @@ class _RedirectParkingControl(FakeControl):
             row = self.frontier.get(target_id)
             if not row or row.get("last_http_status") not in (301, 308):
                 continue
-            if row["state"] in ("queued", "retry") or (
+            if row["state"] in ("queued", "retry", "fetched") or (
                 row["state"] == "quarantined"
                 and row.get("last_error_class") == "ScopeQuarantined"
             ):
@@ -16092,9 +16092,10 @@ def test_schedule_recovery_parks_redirected_schedule_without_reseeding(tmp_path,
     assert not control.provenance
 
 
-@pytest.mark.parametrize("state", ["queued", "retry"])
+@pytest.mark.parametrize("state", ["queued", "retry", "fetched"])
 def test_schedule_recovery_parks_processed_schedule_that_later_redirected(tmp_path, state):
-    # fail_fetch keeps the old hash, so the processed raw still counts (#1949).
+    # fail_fetch keeps the old hash, so the processed raw still counts; a
+    # reconcile that skipped the retry may later restore it as fetched (#1949).
     pipeline, control, row, record, _ = _schedule_recovery_fixture(
         tmp_path, control_cls=_RedirectParkingControl)
     target_id = "fbref:schedule:9:2024-2025"

@@ -3003,7 +3003,7 @@ def test_schedule_recovery_parks_only_current_redirects_in_their_own_class():
         assert "last_error_class = 'RedirectUnresolved'" in sql
         assert "state = 'quarantined', next_fetch_at = NULL" in sql
         assert "AND last_http_status IN (301, 308)" in sql
-        assert "state IN ('queued', 'retry')" in sql
+        assert "state IN ('queued', 'retry', 'fetched')" in sql
         assert "last_error_class = 'ScopeQuarantined')" in sql
         assert "'; awaiting #1933'" in sql
         assert params == (["a", "b"],)

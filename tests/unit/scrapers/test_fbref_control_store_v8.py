@@ -1,5 +1,6 @@
 import inspect
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -1329,7 +1330,8 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
         "CREATE TABLE fbref_control.page_frontier (target_id TEXT, source TEXT, "
         "source_ids TEXT, refresh_policy TEXT, state TEXT, next_fetch_at TEXT, "
         "retry_after TEXT, last_error_class TEXT, last_error_message TEXT, "
-        "last_content_hash TEXT, last_fetched_at TEXT, updated_at TEXT)"
+        "last_content_hash TEXT, last_fetched_at TEXT, last_http_status INTEGER, "
+        "updated_at TEXT)"
     )
     for row in registry_rows:
         database.execute(
@@ -1342,12 +1344,13 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
         database.execute(
             "INSERT INTO fbref_control.page_frontier (target_id, source, source_ids, "
             "refresh_policy, state, next_fetch_at, last_error_class, "
-            "last_content_hash, last_fetched_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            "last_content_hash, last_fetched_at, last_http_status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (row["target_id"], "fbref",
              json.dumps({"competition_id": row["competition_id"]}),
              row["refresh_policy"], row["state"], row.get("next_fetch_at"),
              row.get("last_error_class"), row.get("last_content_hash"),
-             row.get("last_fetched_at")),
+             row.get("last_fetched_at"), row.get("last_http_status", 200)),
         )
 
     def handler(sql, _params):
@@ -1371,9 +1374,14 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
                 "FROM fbref_control.page_frontier"
             )
         }
+        messages = {
+            row[0]: row[1] for row in database.execute(
+                "SELECT target_id, last_error_message FROM fbref_control.page_frontier"
+            )
+        }
     finally:
         database.close()
-    return counts, states
+    return counts, states, messages
 
 
 def test_reconcile_keeps_and_restores_history_of_discontinued_competitions():
@@ -1383,7 +1391,7 @@ def test_reconcile_keeps_and_restores_history_of_discontinued_competitions():
                      "current_scope_reason": "last_source_season_2010"},
     }
     processed = {"last_content_hash": "h", "last_fetched_at": "2026-10-01"}
-    counts, states = _reconcile_scope_on_sqlite(
+    counts, states, _ = _reconcile_scope_on_sqlite(
         [
             discontinued,
             # Same lifecycle evidence cannot rescue other closures.
@@ -1428,7 +1436,7 @@ def test_reconcile_keeps_and_restores_history_of_discontinued_competitions():
     assert counts["frontier_scope_closed"] == 4
 
     # Idempotent: a second accepted snapshot changes nothing for history.
-    _, again = _reconcile_scope_on_sqlite(
+    _, again, _ = _reconcile_scope_on_sqlite(
         [discontinued],
         [{"target_id": "root", "competition_id": "68", "refresh_policy": "historical_once",
           "state": "fetched", **processed}],
@@ -1437,7 +1445,7 @@ def test_reconcile_keeps_and_restores_history_of_discontinued_competitions():
 
 
 def test_reconcile_keeps_active_competition_reopen_queued():
-    _, states = _reconcile_scope_on_sqlite(
+    _, states, _ = _reconcile_scope_on_sqlite(
         [{"competition_id": "9", "crawl_state": "active"}],
         [{"target_id": "root", "competition_id": "9", "refresh_policy": "historical_once",
           "state": "skipped", "last_content_hash": "h", "last_fetched_at": "2026-10-01"},
@@ -1449,6 +1457,242 @@ def test_reconcile_keeps_active_competition_reopen_queued():
         "root": ("queued", "2026-10-29 12:00:00", None),
         "parked": ("queued", "2026-10-29 12:00:00", None),
     }
+
+
+def test_reconcile_parks_redirected_history_instead_of_restoring_it():
+    # Processed schedule answered 301, an older reconcile skipped the retry:
+    # the reopen must park it, not restore fetched over the redirect (#1949).
+    discontinued = {
+        "competition_id": "68", "crawl_state": "skipped",
+        "metadata": {"current_scope_lifecycle": "discontinued",
+                     "current_scope_reason": "last_source_season_2010"},
+    }
+    processed = {"last_content_hash": "h", "last_fetched_at": "2026-10-01",
+                 "last_error_class": "http_status"}
+    counts, states, messages = _reconcile_scope_on_sqlite(
+        [discontinued, {"competition_id": "9", "crawl_state": "active"}],
+        [{"target_id": "moved", "competition_id": "68", "refresh_policy": "historical_once",
+          "state": "skipped", "last_http_status": 301, **processed},
+         {"target_id": "moved_new", "competition_id": "68",
+          "refresh_policy": "historical_once", "state": "skipped", "last_http_status": 308},
+         # Active scope keeps requeueing a 301 as the daily pipeline does.
+         {"target_id": "active", "competition_id": "9", "refresh_policy": "historical_once",
+          "state": "skipped", "last_http_status": 301, **processed}],
+    )
+    assert states == {
+        "moved": ("quarantined", None, "RedirectUnresolved"),
+        "moved_new": ("quarantined", None, "RedirectUnresolved"),
+        "active": ("queued", "2026-10-29 12:00:00", "http_status"),
+    }
+    assert messages["moved"] == "HTTP 301; awaiting #1933"
+    assert messages["moved_new"] == "HTTP 308; awaiting #1933"
+    assert counts["frontier_scope_reopened"] == 3
+
+
+def test_redirect_parking_text_has_one_definition():
+    reopen = inspect.getsource(ControlStore.reconcile_competitions)
+    park = inspect.getsource(ControlStore.park_redirected_targets)
+    for source in (reopen, park):
+        assert "{_REDIRECT_PARK_MESSAGE_SQL}" in source
+        assert "{_REDIRECT_HTTP_STATUS_SQL}" in source
+        assert "awaiting #1933" not in source
+
+
+_E2E_SCHEMA = (
+    "CREATE TABLE fbref_control.competition_registry (source TEXT, competition_id TEXT, "
+    "canonical_url TEXT, name TEXT, gender TEXT, classification TEXT, calendar_type TEXT, "
+    "lifecycle_state TEXT, crawl_state TEXT, present INTEGER, consecutive_misses INTEGER, "
+    "first_seen_at TEXT, last_seen_at TEXT, first_snapshot_id TEXT, last_snapshot_id TEXT, "
+    "metadata TEXT, PRIMARY KEY (source, competition_id))",
+    "CREATE TABLE fbref_control.snapshot_competition (snapshot_id TEXT, source TEXT, "
+    "competition_id TEXT, PRIMARY KEY (snapshot_id, source, competition_id))",
+    "CREATE TABLE fbref_control.season_registry (source TEXT, competition_id TEXT, "
+    "season_id TEXT, lifecycle_state TEXT, present INTEGER, is_current INTEGER)",
+    "CREATE TABLE fbref_control.season_alias (source TEXT, competition_id TEXT, "
+    "alias TEXT, season_id TEXT)",
+    "CREATE TABLE fbref_control.frontier_provenance (child_target_id TEXT, "
+    "carried_competition_id TEXT, carried_season_id TEXT)",
+    "CREATE TABLE fbref_control.page_frontier (target_id TEXT PRIMARY KEY, source TEXT, "
+    "page_kind TEXT, canonical_url TEXT, source_ids TEXT, refresh_policy TEXT, state TEXT, "
+    "next_fetch_at TEXT, retry_after TEXT, last_error_class TEXT, last_error_message TEXT, "
+    "last_content_hash TEXT, last_fetched_at TEXT, last_http_status INTEGER, updated_at TEXT)",
+    "CREATE TABLE fbref_control.fetch_attempt (target_id TEXT, content_hash TEXT, "
+    "status TEXT, logical_refresh_id TEXT)",
+    "CREATE TABLE fbref_control.observation_processing (logical_refresh_id TEXT, "
+    "parser_version TEXT, typed_parser_version TEXT, stateful_parser_version TEXT, "
+    "status TEXT, generic_status TEXT, typed_status TEXT, stateful_status TEXT, "
+    "validation_status TEXT)",
+    "CREATE TABLE fbref_control.history_campaign_season (campaign_id TEXT, "
+    "competition_id TEXT, season_id TEXT, year INTEGER, canonical_url TEXT, state TEXT, "
+    "catalog_snapshot_id TEXT, direct_match_only INTEGER, discovered INTEGER, "
+    "remaining INTEGER, updated_at TEXT)",
+)
+# PostgreSQL-only spellings in the production statements, and their SQLite twins.
+_E2E_DIALECT = (
+    ("%s::jsonb", "%s"),
+    ("= ANY(%s::text[])", "IN (SELECT value FROM json_each(%s))"),
+    ("=ANY(%s)", " IN (SELECT value FROM json_each(%s))"),
+    ("frontier.source_ids ? 'competition_id'",
+     "json_extract(frontier.source_ids, '$.competition_id') IS NOT NULL"),
+    ("count(DISTINCT ( scoped.competition_id, scoped.season_id ))",
+     "count(DISTINCT scoped.competition_id || '/' || coalesce(scoped.season_id, ''))"),
+    ("bool_or(", "max("),
+    ("strpos(", "instr("),
+    ("history_campaign_season campaign SET", "history_campaign_season AS campaign SET"),
+    ("%s", "?"),
+)
+
+
+def _e2e_execute(database, sql, params):
+    for postgres, sqlite in _E2E_DIALECT:
+        sql = sql.replace(postgres, sqlite)
+    values = tuple(
+        json.dumps(value) if isinstance(value, (list, tuple))
+        else value.isoformat() if isinstance(value, datetime)
+        else value
+        for value in params or ()
+    )
+    cursor = database.execute(sql, values)
+    return [dict(row) for row in cursor.fetchall()], cursor.rowcount
+
+
+def test_repair_twice_keeps_discontinued_history_closed_without_campaign_debt():
+    """Index reconcile (with qualifiers) + campaign health on one SQLite state (#1949)."""
+    from scrapers.fbref.discovery import DISCOVERY_PARSER_VERSION
+    from scrapers.fbref.history import CAMPAIGN_ID, HistoryCampaign
+    from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
+    from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
+
+    database = sqlite3.connect(":memory:")
+    database.row_factory = sqlite3.Row
+    database.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    database.create_function("clock_timestamp", 0, lambda: "2026-10-29 12:00:00")
+    for statement in _E2E_SCHEMA:
+        database.execute(statement)
+    discontinued = {"current_scope_lifecycle": "discontinued",
+                    "current_scope_reason": "last_source_season_2010"}
+    database.executemany(
+        "INSERT INTO fbref_control.competition_registry (source, competition_id, gender, "
+        "lifecycle_state, crawl_state, present, consecutive_misses, last_snapshot_id, "
+        "metadata) VALUES ('fbref', ?, 'male', 'present', ?, 1, 0, 'old', ?)",
+        [("68", "skipped", json.dumps(discontinued)), ("9", "active", "{}")],
+    )
+    targets = []
+    for season, schedule_status in (("2009", 200), ("2010", 301)):
+        database.execute(
+            "INSERT INTO fbref_control.season_registry VALUES "
+            "('fbref', '68', ?, 'present', 1, 0)", (season,))
+        database.execute(
+            "INSERT INTO fbref_control.history_campaign_season VALUES "
+            "(?, '68', ?, ?, ?, 'pending', NULL, 0, 0, 0, NULL)",
+            (CAMPAIGN_ID, season, int(season), f"https://fbref.com/en/comps/68/{season}"))
+        for kind, status in (("season", 200), ("schedule", schedule_status)):
+            targets.append((
+                f"fbref:{kind}:68:{season}", kind,
+                json.dumps({"competition_id": "68", "season_id": season}),
+                "historical_once", "skipped",
+                "http_status" if status != 200 else None, status,
+            ))
+    targets += [
+        ("fbref:competition:68", "competition", json.dumps({"competition_id": "68"}),
+         "current_weekly", "queued", None, 200),
+        ("fbref:competition:80", "competition", json.dumps({"competition_id": "80"}),
+         "current_weekly", "queued", None, 200),
+    ]
+    for target_id, kind, source_ids, policy, state, error_class, status in targets:
+        database.execute(
+            "INSERT INTO fbref_control.page_frontier (target_id, source, page_kind, "
+            "canonical_url, source_ids, refresh_policy, state, last_error_class, "
+            "last_content_hash, last_fetched_at, last_http_status) "
+            "VALUES (?, 'fbref', ?, ?, ?, ?, ?, ?, ?, '2026-10-01', ?)",
+            (target_id, kind, "https://fbref.com/" + target_id, source_ids, policy,
+             state, error_class, "hash:" + target_id, status))
+        database.execute(
+            "INSERT INTO fbref_control.fetch_attempt VALUES (?, ?, 'succeeded', ?)",
+            (target_id, "hash:" + target_id, "refresh:" + target_id))
+        database.execute(
+            "INSERT INTO fbref_control.observation_processing VALUES "
+            "(?, ?, ?, ?, 'succeeded', 'succeeded', 'succeeded', 'succeeded', 'succeeded')",
+            ("refresh:" + target_id, PAGE_DOCUMENT_VERSION, TYPED_BRONZE_PARSER_VERSION,
+             DISCOVERY_PARSER_VERSION))
+
+    on_sqlite = (
+        "INSERT INTO fbref_control.competition_registry",
+        "INSERT INTO fbref_control.snapshot_competition",
+        "UPDATE fbref_control.competition_registry",
+        "UPDATE fbref_control.page_frontier AS frontier",
+        "SELECT count(*) AS count FROM fbref_control.competition_registry",
+        "SELECT year,state,count(*) AS count FROM fbref_control.history_campaign_season",
+    )
+
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.registry_snapshot" in sql:
+            return [{"successful": True, "source": "fbref",
+                     "fetched_at": datetime(2026, 10, 29, tzinfo=timezone.utc)}], 1
+        if sql.startswith(on_sqlite) or ", health AS (" in sql:
+            return _e2e_execute(database, sql, params)
+        # Locks, catalog reads (no new campaign rows) and the latest-seen guard.
+        return [], 0
+
+    index = [
+        competition_entry(9),
+        competition_entry(68, crawl_state="skipped", metadata=discontinued),
+        CompetitionRegistryEntry(
+            competition_id="80",
+            canonical_url="https://fbref.com/en/comps/80/history/Seasons",
+            name="Champions League Qualifying", gender="male",
+            classification="international_cup",
+        ),
+    ]
+
+    def frontier():
+        return {row["target_id"]: (row["state"], row["last_error_class"]) for row in
+                database.execute("SELECT * FROM fbref_control.page_frontier")}
+
+    def campaign():
+        return {row["season_id"]: (row["state"], row["discovered"], row["remaining"])
+                for row in database.execute(
+                    "SELECT * FROM fbref_control.history_campaign_season")}
+
+    class LineCommentFreeCursor(FakeCursor):
+        # FakeCursor joins lines; drop SQL line comments before they swallow the rest.
+        def execute(self, sql, params=None):
+            super().execute(re.sub(r"--[^\n]*", "", sql), params)
+
+    def factory(_dsn):
+        connection = FakeConnection(handler)
+        connection.fake_cursor = LineCommentFreeCursor(handler)
+        return connection
+
+    store = ControlStore("postgresql://test/db", connection_factory=factory)
+    try:
+        passes = []
+        for _ in range(2):
+            counts = store.reconcile_competitions(str(uuid.uuid4()), index)
+            summary = HistoryCampaign(store).reconcile()
+            passes.append((counts, frontier(), campaign(), summary))
+    finally:
+        database.close()
+
+    (first, after_first, campaign_first, summary), (second, after_second, campaign_second, _) = passes
+    expected = {
+        "fbref:season:68:2009": ("fetched", None),
+        "fbref:schedule:68:2009": ("fetched", None),
+        "fbref:season:68:2010": ("fetched", None),
+        "fbref:schedule:68:2010": ("quarantined", "RedirectUnresolved"),
+        "fbref:competition:68": ("skipped", None),
+        "fbref:competition:80": ("queued", None),
+    }
+    assert after_first == expected
+    assert after_second == expected
+    assert campaign_first == campaign_second == {
+        "2009": ("closed", 2, 0), "2010": ("closed", 2, 0),
+    }
+    assert summary["years"] == {"2010": {"closed": 1}, "2009": {"closed": 1}}
+    assert first["frontier_scope_reopened"] == 4
+    assert second["frontier_scope_reopened"] == 0
+    # The second pass re-touches only the already-closed weekly target.
+    assert first["frontier_scope_closed"] == second["frontier_scope_closed"] == 1
 
 
 def test_historical_competition_predicate_has_one_definition():

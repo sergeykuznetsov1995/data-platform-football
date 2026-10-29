@@ -955,6 +955,10 @@ _HISTORICAL_COMPETITION_SQL = """(
     ))
 )"""
 
+# A permanent redirect parks a target until the redirect registry (#1933).
+_REDIRECT_HTTP_STATUS_SQL = "last_http_status IN (301, 308)"
+_REDIRECT_PARK_MESSAGE_SQL = "'HTTP ' || last_http_status || '; awaiting #1933'"
+
 
 class ControlStore:
     """Transactional API over the dedicated ``fbref_control`` schema."""
@@ -4530,6 +4534,9 @@ class ControlStore:
                 UPDATE fbref_control.page_frontier AS frontier
                 SET state = CASE
                         WHEN competition.crawl_state <> 'active'
+                         AND {_REDIRECT_HTTP_STATUS_SQL}
+                        THEN 'quarantined'
+                        WHEN competition.crawl_state <> 'active'
                          AND frontier.last_content_hash IS NOT NULL
                          AND frontier.last_fetched_at IS NOT NULL
                         THEN 'fetched'
@@ -4537,16 +4544,24 @@ class ControlStore:
                     END,
                     next_fetch_at = CASE
                         WHEN competition.crawl_state <> 'active'
-                         AND frontier.last_content_hash IS NOT NULL
-                         AND frontier.last_fetched_at IS NOT NULL
+                         AND ({_REDIRECT_HTTP_STATUS_SQL} OR (
+                           frontier.last_content_hash IS NOT NULL
+                           AND frontier.last_fetched_at IS NOT NULL
+                         ))
                         THEN NULL
                         ELSE clock_timestamp()
                     END,
                     last_error_class = CASE
+                        WHEN competition.crawl_state <> 'active'
+                         AND {_REDIRECT_HTTP_STATUS_SQL}
+                        THEN 'RedirectUnresolved'
                         WHEN frontier.state = 'quarantined' THEN NULL
                         ELSE frontier.last_error_class
                     END,
                     last_error_message = CASE
+                        WHEN competition.crawl_state <> 'active'
+                         AND {_REDIRECT_HTTP_STATUS_SQL}
+                        THEN {_REDIRECT_PARK_MESSAGE_SQL}
                         WHEN frontier.state = 'quarantined' THEN NULL
                         ELSE frontier.last_error_message
                     END,
@@ -5333,18 +5348,19 @@ class ControlStore:
             return 0
         with self._transaction() as cursor:
             cursor.execute(
-                """
+                f"""
                 UPDATE fbref_control.page_frontier
                 SET state = 'quarantined', next_fetch_at = NULL,
                     retry_after = NULL,
                     last_error_class = 'RedirectUnresolved',
-                    last_error_message =
-                        'HTTP ' || last_http_status || '; awaiting #1933',
+                    last_error_message = {_REDIRECT_PARK_MESSAGE_SQL},
                     updated_at = clock_timestamp()
                 WHERE target_id = ANY(%s)
-                  AND last_http_status IN (301, 308)
+                  AND {_REDIRECT_HTTP_STATUS_SQL}
                   AND (
-                    state IN ('queued', 'retry')
+                    -- A fetched target cannot carry a 301/308 of its own
+                    -- fetch: only a restored state can (#1949).
+                    state IN ('queued', 'retry', 'fetched')
                     OR (state = 'quarantined'
                         AND last_error_class = 'ScopeQuarantined')
                   )
