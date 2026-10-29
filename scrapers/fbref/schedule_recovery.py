@@ -29,11 +29,12 @@ def _redirect_verdict(state, error_class, http_status):
     """Mirror park_redirected_targets: 'park', 'parked' or None.
 
     A live 301/308 is recorded by fail_fetch under any class, so queued/retry
-    parks by state; a quarantine is ours to relabel only if it is the scope one.
+    parks by state, as does a fetched state restored over it (#1949); a
+    quarantine is ours to relabel only if it is the scope one.
     """
     if http_status not in _REDIRECT_STATUSES:
         return None
-    if state in {"queued", "retry"} or (
+    if state in {"queued", "retry", "fetched"} or (
         state == "quarantined" and error_class == "ScopeQuarantined"
     ):
         return "park"
@@ -215,7 +216,8 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
                 row["schedule_state"], row.get("schedule_error_class"),
                 row.get("schedule_http_status"),
             )
-            if not row.get("schedule_processed") and schedule_redirect:
+            # A later 301/308 parks even a once-processed schedule (#1949).
+            if schedule_redirect:
                 if schedule_redirect == "park":
                     _park_redirect(pipeline, result, row["schedule_target_id"],
                                    row["schedule_http_status"])

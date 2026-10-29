@@ -15959,7 +15959,7 @@ class _RedirectParkingControl(FakeControl):
             row = self.frontier.get(target_id)
             if not row or row.get("last_http_status") not in (301, 308):
                 continue
-            if row["state"] in ("queued", "retry") or (
+            if row["state"] in ("queued", "retry", "fetched") or (
                 row["state"] == "quarantined"
                 and row.get("last_error_class") == "ScopeQuarantined"
             ):
@@ -16088,6 +16088,36 @@ def test_schedule_recovery_parks_redirected_schedule_without_reseeding(tmp_path,
         assert control.frontier[target_id]["last_error_class"] == "RedirectUnresolved"
         row.update(schedule_state="quarantined", schedule_error_class="RedirectUnresolved")
     assert control.frontier[target_id]["state"] == "quarantined"
+    assert target_id not in control.claimable()
+    assert not control.provenance
+
+
+@pytest.mark.parametrize("state", ["queued", "retry", "fetched"])
+def test_schedule_recovery_parks_processed_schedule_that_later_redirected(tmp_path, state):
+    # fail_fetch keeps the old hash, so the processed raw still counts; a
+    # reconcile that skipped the retry may later restore it as fetched (#1949).
+    pipeline, control, row, record, _ = _schedule_recovery_fixture(
+        tmp_path, control_cls=_RedirectParkingControl)
+    target_id = "fbref:schedule:9:2024-2025"
+    control.frontier[target_id] = {
+        "target_id": target_id, "page_kind": "schedule", "state": state,
+        "canonical_url": "https://fbref.com/en/comps/9/2024-2025/schedule/Old",
+        "source_ids": dict(record.source_ids), "refresh_policy": "historical_once",
+        "last_error_class": "http_status", "last_http_status": 301,
+        "last_content_hash": "processed",
+    }
+    row.update(schedule_target_id=target_id, schedule_state=state,
+               schedule_error_class="http_status", schedule_http_status=301,
+               schedule_processed=True)
+    for _ in range(2):
+        result = pipeline.recover_schedule_discovery()["results"][0]
+        assert result["reason"] == "redirect_unresolved"
+        assert result["detail"] == "HTTP 301"
+        parked = control.frontier[target_id]
+        assert (parked["state"], parked["last_error_class"]) == (
+            "quarantined", "RedirectUnresolved")
+        row.update(schedule_state="quarantined", schedule_error_class="RedirectUnresolved")
+    assert result.get("parked_redirects", []) == []
     assert target_id not in control.claimable()
     assert not control.provenance
 
