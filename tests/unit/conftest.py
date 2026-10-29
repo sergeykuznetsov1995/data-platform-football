@@ -69,6 +69,22 @@ def transfermarkt_test_writer_lock(request, monkeypatch):
     monkeypatch.setenv("TM_WRITER_LOCK_PATH", str(lock))
 
 
+@pytest.fixture(autouse=True)
+def sofascore_published_status(request, monkeypatch):
+    """No-op SofaScore captures see every status row published (#1957).
+
+    The probe reads Bronze over Trino; tests of the repair override it.
+    """
+    if "sofascore" not in request.node.path.name:
+        return
+    from dags.scripts import run_sofascore_scraper
+
+    monkeypatch.setattr(
+        run_sofascore_scraper, "_published_status_ids",
+        lambda _league, _season, match_ids: {str(match_id) for match_id in match_ids},
+    )
+
+
 @pytest.fixture(scope="session")
 def protected_whoscored_checkout():
     """Copy tracked bytes, retaining Git identity without altering the checkout.

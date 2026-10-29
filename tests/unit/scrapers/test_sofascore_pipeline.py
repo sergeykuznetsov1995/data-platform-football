@@ -3861,4 +3861,5 @@ def test_runner_scopes_all_partitioned_merges_except_rejected_rows():
         tables.append(table)
     assert set(tables) == PARTITION_SCOPED_TABLES
     assert len(set(tables)) == 15
-    assert tables.count("sofascore_match_capture_status") == 2
+    # Legacy and long-manifest commits, plus the lost-status repair (#1957).
+    assert tables.count("sofascore_match_capture_status") == 3

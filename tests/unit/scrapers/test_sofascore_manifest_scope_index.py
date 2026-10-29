@@ -314,6 +314,82 @@ def test_match_capture_of_30_matches_reads_the_manifest_once(tmp_path, monkeypat
 
 
 @pytest.mark.unit
+def test_noop_capture_republishes_lost_status_of_terminal_matches(tmp_path, monkeypatch):
+    """#1957: a never-served match without its status row is repaired, not skipped forever.
+
+    A served match that lost status stays unpublished: its rows may be lost too.
+    """
+    from dataclasses import replace
+
+    from dags.scripts import run_sofascore_scraper as runner
+
+    gone = MATCH_IDS[:2]
+    manager = FakeTrinoManager()
+    manager.rows = [
+        manifest_to_row(
+            replace(_success(_spec(match_id, endpoint)), status=ManifestStatus.NOT_SUPPORTED,
+                    row_count=0, http_status=404)
+            if match_id in gone else _success(_spec(match_id, endpoint))
+        )
+        for match_id in MATCH_IDS
+        for endpoint in EVENT_PATHS
+    ]
+    runtime = _runtime(tmp_path, manager)
+    monkeypatch.setattr(
+        runner, "_resolve_match_ids_from_bronze", lambda *args, **kwargs: MATCH_IDS
+    )
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (int(TOURNAMENT), int(SEASON))
+    )
+    lost = MATCH_IDS[:3]
+    monkeypatch.setattr(
+        runner, "_published_status_ids", lambda _league, _season, ids: set(ids) - set(lost)
+    )
+    monkeypatch.setenv("SOFASCORE_WRITER_LOCK", "0")
+    saves = []
+
+    class RecordingScraper:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def _add_metadata(self, df, entity_type):
+            return df
+
+        def save_to_iceberg(self, **kwargs):
+            saves.append(kwargs)
+            return f"iceberg.bronze.{kwargs['table_name']}"
+
+    output = tmp_path / "match-capture.json"
+    with patch("scrapers.sofascore.SofaScoreScraper", RecordingScraper):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["matches_skipped_existing"] == len(MATCH_IDS)
+    assert result["traffic"]["request_count"] == 0
+    assert result["capture_status_repaired"] == 2
+    [save] = saves
+    assert save["table_name"] == "sofascore_match_capture_status"
+    assert save["natural_keys"] == ["league", "season", "match_id"]
+    assert sorted(save["df"]["match_id"].astype(str)) == gone
+    assert save["df"]["capture_complete"].all()
+
+
+@pytest.mark.unit
 def test_counted_connection_classifies_every_cursor_execute():
     cursor = MagicMock()
     connection = MagicMock()
