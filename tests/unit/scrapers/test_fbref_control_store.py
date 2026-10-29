@@ -3027,3 +3027,24 @@ def test_schedule_recovery_parked_class_is_outside_reconcile_backfill_and_claim(
     assert "AND frontier.last_error_class = 'ScopeQuarantined'" in backfill
     claim = _inspect.getsource(ControlStore.claim_targets)
     assert "quarantined" not in claim
+
+
+def test_history_campaign_counts_parked_redirect_as_done_not_remaining():
+    from scrapers.fbref.history import HistoryCampaign
+
+    executed = []
+
+    def handler(sql, params):
+        executed.append(sql)
+        return [], 0
+
+    store = ControlStore("postgresql://test/db", connection_factory=FakeFactory(handler))
+    HistoryCampaign(store).reconcile()
+    health = next(sql for sql in executed if "AS remaining" in sql)
+    remaining = health[health.index("FILTER (WHERE"):health.index("AS remaining")]
+    # Parked roots/children stop holding the season open or the year barrier;
+    # root_seen still counts the parked season root.
+    assert ("NOT (frontier.state = 'quarantined' "
+            "AND frontier.last_error_class = 'RedirectUnresolved')") in remaining
+    assert remaining.index("RedirectUnresolved") < remaining.index("frontier.state <> 'fetched'")
+    assert "bool_or(frontier.page_kind='season'" in health

@@ -15995,6 +15995,13 @@ class _RedirectParkingControl(FakeControl):
                 rows.append(season)
         return rows[:limit]
 
+    def create_run_cohort(self, run_id, cohort):
+        # The SQL refuses quarantined members as "absent or not crawlable".
+        for item in cohort:
+            if self.frontier.get(item.target_id, {}).get("state") == "quarantined":
+                raise StateConflict(f"Target {item.target_id} is absent or not crawlable")
+        return super().create_run_cohort(run_id, cohort)
+
     def claimable(self):
         # claim_targets selects only queued/retry (or due fetched) targets.
         return sorted(target_id for target_id, row in self.frontier.items()
@@ -16005,10 +16012,12 @@ class _RedirectParkingControl(FakeControl):
 def test_schedule_recovery_parks_redirected_season_out_of_seed_and_claim(tmp_path, http_status):
     pipeline, control, row, record, _ = _schedule_recovery_fixture(
         tmp_path, control_cls=_RedirectParkingControl)
-    row.update(logical_refresh_id=None, root_state="retry",
+    # fail_fetch records a live redirect under the generic http_status class.
+    row.update(logical_refresh_id=None, root_state="retry", root_error_class="http_status",
                root_target_id=record.target_id, root_http_status=http_status)
     control.frontier[record.target_id].update(
         state="retry", last_http_status=http_status, next_fetch_at=NOW,
+        last_error_class="http_status",
         last_content_hash=None, last_logical_refresh_id=None,
     )
     control.list_schedule_recovery_quarantine = lambda **kw: []
@@ -16033,8 +16042,10 @@ def test_schedule_recovery_parks_redirected_season_out_of_seed_and_claim(tmp_pat
 def test_schedule_recovery_parks_redirected_root_and_still_seeds_from_saved_raw(tmp_path):
     pipeline, control, row, record, _ = _schedule_recovery_fixture(
         tmp_path, control_cls=_RedirectParkingControl)
-    row.update(root_state="retry", root_target_id=record.target_id, root_http_status=301)
-    control.frontier[record.target_id].update(state="retry", last_http_status=301, next_fetch_at=NOW)
+    row.update(root_state="retry", root_error_class="http_status",
+               root_target_id=record.target_id, root_http_status=301)
+    control.frontier[record.target_id].update(
+        state="retry", last_http_status=301, next_fetch_at=NOW, last_error_class="http_status")
     control.list_schedule_recovery_quarantine = lambda **kw: []
     control.backfill_registry = [row]
     result = pipeline.recover_all_schedule_discovery()["results"][0]
@@ -16047,26 +16058,35 @@ def test_schedule_recovery_parks_redirected_root_and_still_seeds_from_saved_raw(
         run_id=str(uuid.uuid4()), settings=_settings("backfill"), limit=4)
     assert seeded["seeded"] == 0
     assert record.target_id not in control.claimable()
+    # The history campaign pins the season explicitly; the parked root must not
+    # enter the cohort (create_run_cohort would refuse it and loop the campaign).
+    pipeline.seed_historical_seasons(
+        run_id=str(uuid.uuid4()), settings=_settings("backfill"), seasons=[row])
+    assert control.events[-1] == "explicit_cohort:0"
+    assert control.upserts == ["fbref:schedule:9:2024-2025"]
 
 
-def test_schedule_recovery_parks_redirected_schedule_without_reseeding(tmp_path):
+@pytest.mark.parametrize("state, error_class", [
+    ("quarantined", "ScopeQuarantined"), ("retry", "http_status"), ("queued", "http_status"),
+])
+def test_schedule_recovery_parks_redirected_schedule_without_reseeding(tmp_path, state, error_class):
     pipeline, control, row, record, _ = _schedule_recovery_fixture(
         tmp_path, control_cls=_RedirectParkingControl)
     target_id = "fbref:schedule:9:2024-2025"
     control.frontier[target_id] = {
-        "target_id": target_id, "page_kind": "schedule", "state": "quarantined",
+        "target_id": target_id, "page_kind": "schedule", "state": state,
         "canonical_url": "https://fbref.com/en/comps/9/2024-2025/schedule/Old",
         "source_ids": dict(record.source_ids), "refresh_policy": "historical_once",
-        "last_error_class": "ScopeQuarantined", "last_error_message": "invalid_season",
+        "last_error_class": error_class, "last_error_message": "invalid_season",
         "last_http_status": 301,
     }
-    row.update(schedule_target_id=target_id, schedule_state="quarantined",
-               schedule_error_class="ScopeQuarantined", schedule_http_status=301)
+    row.update(schedule_target_id=target_id, schedule_state=state,
+               schedule_error_class=error_class, schedule_http_status=301)
     for _ in range(2):
         result = pipeline.recover_schedule_discovery()
         assert result["results"][0]["reason"] == "redirect_unresolved"
         assert control.frontier[target_id]["last_error_class"] == "RedirectUnresolved"
-        row.update(schedule_error_class="RedirectUnresolved")
+        row.update(schedule_state="quarantined", schedule_error_class="RedirectUnresolved")
     assert control.frontier[target_id]["state"] == "quarantined"
     assert target_id not in control.claimable()
     assert not control.provenance

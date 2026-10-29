@@ -23,7 +23,23 @@ logger = logging.getLogger(__name__)
 # A permanent redirect cannot be followed without a reviewed registry (#1933);
 # requeueing the same URL would only loop, so such targets are parked.
 _REDIRECT_STATUSES = frozenset({301, 308})
-_PARKABLE_CLASSES = frozenset({None, "ScopeQuarantined", "RedirectUnresolved"})
+
+
+def _redirect_verdict(state, error_class, http_status):
+    """Mirror park_redirected_targets: 'park', 'parked' or None.
+
+    A live 301/308 is recorded by fail_fetch under any class, so queued/retry
+    parks by state; a quarantine is ours to relabel only if it is the scope one.
+    """
+    if http_status not in _REDIRECT_STATUSES:
+        return None
+    if state in {"queued", "retry"} or (
+        state == "quarantined" and error_class == "ScopeQuarantined"
+    ):
+        return "park"
+    if state == "quarantined" and error_class == "RedirectUnresolved":
+        return "parked"
+    return None
 
 
 def recover_all_schedules(pipeline) -> dict:
@@ -178,7 +194,11 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
             }:
                 result["reason"] = "season_quarantined"
                 continue
-        if row.get("root_http_status") in _REDIRECT_STATUSES:
+        root_redirect = _redirect_verdict(
+            row.get("root_state"), row.get("root_error_class"),
+            row.get("root_http_status"),
+        )
+        if root_redirect == "park":
             # Any target last answered 301/308 is parked; its saved raw, if
             # any, still seeds the schedule below.
             _park_redirect(pipeline, result, row["root_target_id"],
@@ -191,13 +211,14 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
             )
             result["detail"] = row.get("schedule_error_message")
             result["quarantine_reason"] = row.get("schedule_error_message")
-            if (
-                not row.get("schedule_processed")
-                and row.get("schedule_http_status") in _REDIRECT_STATUSES
-                and row.get("schedule_error_class") in _PARKABLE_CLASSES
-            ):
-                _park_redirect(pipeline, result, row["schedule_target_id"],
-                               row["schedule_http_status"])
+            schedule_redirect = _redirect_verdict(
+                row["schedule_state"], row.get("schedule_error_class"),
+                row.get("schedule_http_status"),
+            )
+            if not row.get("schedule_processed") and schedule_redirect:
+                if schedule_redirect == "park":
+                    _park_redirect(pipeline, result, row["schedule_target_id"],
+                                   row["schedule_http_status"])
                 result["reason"] = "redirect_unresolved"
                 result["detail"] = f"HTTP {row['schedule_http_status']}"
                 continue
@@ -208,7 +229,7 @@ def recover_schedules(pipeline, *, limit: int = 25, after=None) -> dict:
         refresh = row.get("logical_refresh_id")
         if not refresh:
             result["reason"] = "raw_missing"
-            if row.get("root_http_status") in _REDIRECT_STATUSES:
+            if root_redirect:
                 result["reason"] = "redirect_unresolved"
                 result["detail"] = f"HTTP {row['root_http_status']}"
                 continue

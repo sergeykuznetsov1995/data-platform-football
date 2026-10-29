@@ -3131,6 +3131,11 @@ class FBrefPipeline:
                 if existing and existing.get("state") == "fetched" and existing.get("next_fetch_at") is None:
                     # Durable descendants, rather than a root refetch, advance this season.
                     continue
+                if existing and existing.get("state") == "quarantined" and (
+                    existing.get("last_error_class") == "RedirectUnresolved"
+                ):
+                    # Parked on 301/308 until #1933: not crawlable, never a cohort root.
+                    continue
             base = frontier_target(target, historical=True)
             self.control.upsert_frontier_target(
                 FrontierTarget(
