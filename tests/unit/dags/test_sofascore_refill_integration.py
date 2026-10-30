@@ -83,7 +83,6 @@ def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
     monkeypatch.setattr(module.time, 'time', lambda: 1000)
     monkeypatch.setattr(module.state, 'read_snapshot', lambda *a, **k: {'campaign_id':'c'})
-    monkeypatch.setattr(module, '_configured_tournament_ids', lambda: frozenset())
     rows = [[('SS-8','2026',593,None,0,825)], []]
     monkeypatch.setattr(module, '_pending_refresh_partitions', lambda: rows.pop(0))
     plans = []

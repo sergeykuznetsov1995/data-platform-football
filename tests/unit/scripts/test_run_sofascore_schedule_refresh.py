@@ -37,15 +37,6 @@ SNAPSHOT = {
             ],
         },
         {
-            "capture_key": "SS-17",
-            "unique_tournament_id": 17,
-            "metadata_status": "ready",
-            "seasons": [
-                {"source_season_id": 76986, "start_year": 2025,
-                 "canonical_season": "2526", "metadata_status": "ready"},
-            ],
-        },
-        {
             "capture_key": "SS-23",
             "unique_tournament_id": 23,
             "metadata_status": "ready",
@@ -133,7 +124,6 @@ def offline(monkeypatch, tmp_path):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", _FakeClient)
-    monkeypatch.setattr(refresh, "_configured_tournament_ids", lambda: frozenset({17}))
     calls = {"fetch": [], "writes": []}
 
     def partitions(window_hours):
@@ -275,7 +265,7 @@ def _argv(offline, *extra):
     ]
 
 
-def _digest(exclude=frozenset({17})):
+def _digest(exclude=frozenset()):
     return refresh.targets_digest(refresh.current_season_targets(SNAPSHOT, exclude))
 
 
@@ -678,6 +668,30 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
     # only readable next to the size of the class itself.
     assert report["class_members"] == {"backlog": 0, "overdue": 0, "due": 1, "stale": 0, "seed": 1}
     assert report["idle_runs"] == 0
+
+
+@pytest.mark.unit
+def test_daily_registry_leagues_are_swept_alongside_the_daily(offline):
+    # #1370: Premier League (17) is enabled in the daily registry, yet the
+    # all-men lane sweeps it too — both run side by side until the daily goes.
+    snapshot = json.loads(offline["snapshot"].read_text())
+    snapshot["tournaments"].append({
+        "capture_key": "SS-17",
+        "unique_tournament_id": 17,
+        "metadata_status": "ready",
+        "seasons": [
+            {"source_season_id": 76986, "start_year": 2025,
+             "canonical_season": "2526", "metadata_status": "ready"},
+        ],
+    })
+    offline["snapshot"].write_text(json.dumps(snapshot))
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    assert (17, 76986) in _fetch_by_class(offline)["seed"]["targets"]
+    report = json.loads(offline["output"].read_text())
+    assert report["excluded_tournaments"] == 0
 
 
 @pytest.mark.unit
@@ -1124,14 +1138,14 @@ def test_current_season_targets_take_the_newest_season_that_is_not_excluded():
 
 @pytest.mark.unit
 def test_current_season_targets_skip_configured_and_unready_tournaments():
-    targets = refresh.current_season_targets(SNAPSHOT, frozenset({17}))
+    targets = refresh.current_season_targets(SNAPSHOT, frozenset({23}))
 
-    assert [target.pair for target in targets] == [(7, 96518), (23, 88001)]
+    assert [target.pair for target in targets] == [(7, 96518)]
 
 
 @pytest.mark.unit
 def test_targets_digest_changes_with_the_sequence():
-    first = refresh.current_season_targets(SNAPSHOT, frozenset({17}))
+    first = refresh.current_season_targets(SNAPSHOT, frozenset({23}))
     second = refresh.current_season_targets(SNAPSHOT, frozenset())
 
     assert refresh.targets_digest(first) == refresh.targets_digest(list(first))
