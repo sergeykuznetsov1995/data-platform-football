@@ -772,11 +772,17 @@ def _materialize_endpoint_results(
             + repr(sorted(source_season_ids))
         )
     expected_source_season_id = next(iter(source_season_ids))
+    source_tournament_ids = {
+        str(result.manifest.key.source_tournament_id) for result in results
+    }
     # #1778: a match SofaScore moved to another season after its schedule row
     # was written is held like a rejected row, not a failure of the season.
     # Only an event that carries its own, different season while the rest of
     # the pass matches (or a replay of such a hold) counts as moved; a wrong
     # season for the whole pass or missing lineage still fails strictly below.
+    # #1962: an event whose own payload names another tournament was moved by
+    # the source (zones merged into one tournament) even when the whole pass
+    # moved; the same tournament in another season stays a strict red.
     events = frames["events"]
     moved = []
     if not events.empty:
@@ -793,7 +799,11 @@ def _materialize_endpoint_results(
             if column in row and any(
                 row.get(field) not in (None, "")
                 for field in ("season_id", "sofascore_season_id", "source_season_id")
-            ) and (aligned or str(row[column]) in held):
+            ) and (
+                aligned
+                or str(row[column]) in held
+                or _moved_to_another_tournament(row, source_tournament_ids)
+            ):
                 moved.append(
                     RejectedRow(
                         row={**row, "match_id": row[column]},
@@ -825,6 +835,24 @@ def _materialize_endpoint_results(
     frames["rejected_match_ids"] = rejected_match_ids
     frames["all_rejected"] = all_rejected
     return frames
+
+
+def _moved_to_another_tournament(row, source_tournament_ids) -> bool:
+    """True when the event payload itself names a different tournament (#1962)."""
+    import pandas as pd
+
+    payload_tournaments = set()
+    for field in ("tournament_unique_tournament_id", "unique_tournament_id"):
+        value = row.get(field)
+        if value is None or value == "" or pd.isna(value):
+            continue
+        # A frame column with a gap turns ids into floats (32089.0).
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        payload_tournaments.add(str(value))
+    return bool(payload_tournaments) and payload_tournaments.isdisjoint(
+        source_tournament_ids
+    )
 
 
 _ROW_REJECTED_ERROR = "RowRejected"

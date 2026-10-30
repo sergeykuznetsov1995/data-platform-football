@@ -1386,6 +1386,7 @@ def _event_records_for(
     incidents: bool = True,
     jersey_number=None,
     season_id=None,
+    tournament_id=None,
 ) -> dict:
     records = {}
     for endpoint in EVENT_PATHS:
@@ -1397,6 +1398,8 @@ def _event_records_for(
             payload["event"]["awayTeam"]["gender"] = away_gender
             if season_id is not None:
                 payload["event"]["season"]["id"] = season_id
+            if tournament_id is not None:
+                payload["event"]["uniqueTournament"]["id"] = tournament_id
             body = json.dumps(payload).encode("utf-8")
         if endpoint == "lineups" and jersey_number is not None:
             payload = json.loads(body)
@@ -1426,6 +1429,7 @@ def _match_batch_runtime(
     bad_jersey_number=None,
     good_jersey_number=None,
     bad_season_id=None,
+    bad_tournament_id=None,
 ):
     runtime, transport = _runtime(tmp_path)
     specs = {
@@ -1446,6 +1450,7 @@ def _match_batch_runtime(
                     bad_jersey_number if bad else good_jersey_number
                 ),
                 season_id=bad_season_id if bad else None,
+                tournament_id=bad_tournament_id if bad else None,
             )
         )
     ingest_prefetched_records(runtime, specs=specs, records=records)
@@ -1652,6 +1657,56 @@ def test_match_runner_fresh_pass_with_no_aligned_match_stays_strictly_red(tmp_pa
     )
     rc, result, saved, _ = _run_match_pass(
         runtime, [bad_match], tmp_path / "moved-fresh.json", monkeypatch
+    )
+    assert rc == 1
+    assert result["errors"][0].startswith("season_mismatch: 1 rows do not match")
+    assert "sofascore_rejected_rows" not in saved
+
+
+def test_match_runner_holds_a_pass_the_source_moved_to_another_tournament(
+    tmp_path, monkeypatch
+):
+    """#1962: SofaScore merged a tournament into another one; every scheduled
+    match now names the new tournament and season. The stale scope is held and
+    journaled (the new tournament collects them), not red and not duplicated."""
+    bad_match = "20000410"
+    runtime, transport, specs = _match_batch_runtime(
+        tmp_path, [bad_match], bad_match, bad_gender=False,
+        bad_season_id=88974, bad_tournament_id=32089,
+    )
+    rc, result, saved, _ = _run_match_pass(
+        runtime, [bad_match], tmp_path / "moved-tournament.json", monkeypatch
+    )
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    assert "sofascore_events" not in saved
+    journal = saved["sofascore_rejected_rows"]["df"]
+    assert set(journal["reason_code"]) == {"season_mismatch"}
+    assert set(journal["natural_key"]) == {f"76986|{bad_match}"}
+    held = runtime.manifest_store.get(specs[(bad_match, "event")].key)
+    assert held.error_type == "RowRejected"
+
+    # The held replay stays green with zero traffic.
+    rc, again, saved, _ = _run_match_pass(
+        runtime, [bad_match], tmp_path / "moved-tournament-again.json", monkeypatch
+    )
+    assert rc == 0, again["errors"]
+    assert transport.calls == 0
+    assert "sofascore_events" not in saved
+
+
+def test_match_runner_wrong_season_of_the_same_tournament_stays_strictly_red(
+    tmp_path, monkeypatch
+):
+    """#1962 keeps #1778: the payload names our tournament, so a foreign season
+    for the whole pass is a wrong season in config, not a source move."""
+    bad_match = "20000420"
+    runtime, _, _ = _match_batch_runtime(
+        tmp_path, [bad_match], bad_match, bad_gender=False,
+        bad_season_id=87177, bad_tournament_id=17,
+    )
+    rc, result, saved, _ = _run_match_pass(
+        runtime, [bad_match], tmp_path / "same-tournament.json", monkeypatch
     )
     assert rc == 1
     assert result["errors"][0].startswith("season_mismatch: 1 rows do not match")
