@@ -6,6 +6,7 @@ SQLite file belongs in the existing persistent Airflow logs volume.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import sqlite3
 import uuid
 from datetime import date
@@ -18,8 +19,10 @@ CHUNK_SIZE = 25
 COOLDOWN_SECONDS = 3600
 # Schedule sync covers the entire season; historical lineups rarely change.
 DEFERRED_REFRESH_SECONDS = 24 * 3600
-# Longer than the task's eight-hour execution timeout, including kill grace.
-LEASE_SECONDS = 9 * 3600
+# Longer than the task's 45-minute execution timeout, including kill grace.
+LEASE_SECONDS = 3600
+# After browser-level Cloudflare evidence only worker 0 keeps working (#1481).
+DEGRADED_SECONDS = 3600
 TOP_FIVE = {2, 3, 4, 5, 22}
 
 def current_running() -> bool:
@@ -30,6 +33,11 @@ def current_running() -> bool:
         return session.query(DagRun).filter(
             DagRun.dag_id == "dag_ingest_whoscored", DagRun.state == "running",
         ).first() is not None
+
+
+def share(key: str, workers: int) -> int:
+    """Stable worker index of a scope; Python's hash() differs per process."""
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:16], 16) % workers
 
 
 def queue(catalog, *, today: date) -> list[dict]:
@@ -96,6 +104,8 @@ class HistoryState:
             columns = {row[1] for row in con.execute("PRAGMA table_info(scopes)")}
             if "schedule_next_at" not in columns:
                 con.execute("ALTER TABLE scopes ADD COLUMN schedule_next_at REAL NOT NULL DEFAULT 0")
+            con.execute("CREATE TABLE IF NOT EXISTS circuit (name TEXT PRIMARY KEY, "
+                        "until REAL NOT NULL)")
 
     @contextmanager
     def _connect(self):
@@ -163,3 +173,15 @@ class HistoryState:
     def parked(self, *, now: float) -> int:
         with self._connect() as con:
             return con.execute("SELECT COUNT(*) FROM scopes WHERE failed=1 AND next_at>?", (now,)).fetchone()[0]
+
+    def trip_degraded(self, *, now: float) -> None:
+        """Shared flag: every worker but 0 stops at its next scope boundary."""
+        with self._connect() as con:
+            con.execute("INSERT INTO circuit(name, until) VALUES('degraded', ?) "
+                        "ON CONFLICT(name) DO UPDATE SET until=MAX(until, excluded.until)",
+                        (now + DEGRADED_SECONDS,))
+
+    def degraded(self, *, now: float) -> bool:
+        with self._connect() as con:
+            row = con.execute("SELECT until FROM circuit WHERE name='degraded'").fetchone()
+            return row is not None and row[0] > now

@@ -315,6 +315,10 @@ def validate_bronze_freshness(**context: Any) -> None:
         )
 
 
+# Current collection shares the single ingest pool slot with history (#1481):
+# when the slot frees, the scheduler hands it to these tasks first.
+CURRENT_FIRST = {"priority_weight": 100, "weight_rule": "absolute"}
+
 with DAG(
     dag_id=DAG_ID,
     default_args=SCRAPER_ARGS,
@@ -326,6 +330,7 @@ with DAG(
 ) as dag:
     discover_catalog = BashOperator(
         task_id="discover_catalog",
+        **CURRENT_FIRST,
         bash_command=(
             "cd {root} && rm -f {discovery} && "
             "python {runner} discover "
@@ -340,6 +345,7 @@ with DAG(
 
     ingest_matches = BashOperator(
         task_id="ingest_matches",
+        **CURRENT_FIRST,
         # The runner exits non-zero whenever ANY scope failed or the pool was
         # dead (exit 3, #1476). A written report means the run completed and
         # validate_data downstream is the judge; the task itself only fails
@@ -361,6 +367,7 @@ with DAG(
 
     ingest_stages = BashOperator(
         task_id="ingest_stages",
+        **CURRENT_FIRST,
         # Stage-statistics feeds, once a week: the runner gates on the run
         # slot (data_interval_end = 10:00 Monday), not on the start time.
         # all_done: runs after ingest_matches whatever its state.  The task
@@ -383,12 +390,14 @@ with DAG(
 
     validate = PythonOperator(
         task_id="validate_data",
+        **CURRENT_FIRST,
         python_callable=validate_data,
         templates_dict={"result_path": RESULT_PATH},
     )
 
     bronze_freshness = PythonOperator(
         task_id="validate_bronze_freshness",
+        **CURRENT_FIRST,
         python_callable=validate_bronze_freshness,
         templates_dict={"result_path": RESULT_PATH},
         trigger_rule="all_done",

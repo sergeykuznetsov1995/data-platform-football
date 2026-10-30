@@ -4440,3 +4440,33 @@ def test_transport_source_browser_constructor_remains_patchable(monkeypatch):
     transport = WhoScoredTransport(direct_http_session=FakeHTTPSession())
     assert isinstance(transport._direct_fs, FakeFSClient)
     assert len(created) == 1
+
+
+
+@pytest.mark.unit
+def test_history_workers_own_disjoint_pool_lines_through_rotation(monkeypatch, tmp_path):
+    # #1481: worker i owns lines j with j % N == i; a rotation after a proxy
+    # failure stays inside that subset and never takes a neighbour's address.
+    pool = tmp_path / "pool.txt"
+    pool.write_text("".join(f"pool.example.io:{10000 + i}:poolu:poolpw\n" for i in range(7)))
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    monkeypatch.setenv("WHOSCORED_TRANSPORT_POLICY", "direct_only")
+    monkeypatch.setenv("WHOSCORED_PROXY_MEMBER", "5")
+
+    def ports(worker):
+        monkeypatch.setenv("WHOSCORED_PROXY_WORKER", worker)
+        transport = WhoScoredTransport(
+            direct_fs_client=FakeFSClient(),
+            http_session_factory=lambda proxy_url: FakeHTTPSession(),
+            context=TransportContext(transport_policy="direct_only"),
+        )
+        seen = [transport._pool_proxy_url]
+        tried = set(seen)
+        while transport._rotate_pool_proxy(tried):
+            seen.append(transport._pool_proxy_url)
+            tried.add(transport._pool_proxy_url)
+        return [int(url.rsplit(":", 1)[1]) - 10000 for url in seen]
+
+    owned = [ports(f"{i}/3") for i in range(3)]
+    assert owned[0][0] == [0, 3, 6][5 % 3]
+    assert [sorted(lines) for lines in owned] == [[0, 3, 6], [1, 4], [2, 5]]

@@ -1263,7 +1263,20 @@ class WhoScoredTransport:
             raise ValueError(
                 f"WHOSCORED_PROXY_FILE is not readable: {type(exc).__name__}"
             ) from exc
-        proxy_url = manager.get_http_proxy_url()
+        worker = os.environ.get("WHOSCORED_PROXY_WORKER", "").strip()
+        if worker:
+            # Parallel history workers own disjoint pool lines, so a later
+            # rotation can never move onto a neighbour's address (#1481).
+            index, _, count = worker.partition("/")
+            if not (index.isdigit() and count.isdigit() and int(index) < int(count)):
+                raise ValueError("WHOSCORED_PROXY_WORKER must be INDEX/COUNT")
+            manager._proxies = [proxy for line, proxy in enumerate(manager._proxies)
+                                if line % int(count) == int(index)]
+        member = os.environ.get("WHOSCORED_PROXY_MEMBER", "").strip()
+        if member.isdigit() and manager.total_count:
+            proxy_url = manager._proxies[int(member) % manager.total_count].http_url
+        else:
+            proxy_url = manager.get_http_proxy_url()
         if proxy_url is None and required:
             raise ValueError("WHOSCORED_PROXY_FILE has no usable pool member")
         if proxy_url is not None:
