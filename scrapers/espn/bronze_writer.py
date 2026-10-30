@@ -89,7 +89,7 @@ def delete_filter(
     )
 
 
-def write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | None:
+def _write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | None:
     """Replace the rows of the batch matches in all four tables.
 
     ``trino`` is a ``TrinoTableManager``.  An empty batch writes nothing and
@@ -103,12 +103,13 @@ def write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | N
         ingested_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     rows = batch_rows(batch.matches, stamp=stamp)
+    _carry_deep(trino, batch, rows)
     # Matches this batch publishes first (no carried value); their time is
     # taken just before the match commit below.
     first_published = [
         row
         for row, payload in zip(rows[MATCH_TABLE], batch.matches)
-        if payload.first_published_at is None and row["first_published_at"] is not None
+        if payload.first_published_at is None and row["first_published_at"] == stamp.ingested_at
     ]
     scope = delete_filter(batch.competition_slug, batch.season_year, event_ids)
     # Types of every row are checked against the DDL before the first commit.
@@ -144,3 +145,51 @@ def write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | N
             )
         written[table] = inserted
     return BatchReceipt(stamp.batch_id, stamp.ingested_at, written)
+
+
+def stored_rows(trino, table, scope):
+    schema = TABLES[table]
+    values = trino.execute_query(
+        f"SELECT {', '.join(schema.names)} FROM iceberg.bronze.{table} WHERE {scope}"
+    )
+    return [dict(zip(schema.names, row)) for row in values]
+
+
+def _carry_deep(trino, batch, rows):
+    """Re-read under edition_lock: every Summary path retains deep children."""
+    scope = delete_filter(batch.competition_slug, batch.season_year,
+                          [payload.schedule.event_id for payload in batch.matches])
+    before = {table: stored_rows(trino, table, scope)
+              for table in (MATCH_TABLE, LINEUP_TABLE, TEAM_STATS_TABLE)}
+    carry_deep_rows(before, rows)
+
+
+def carry_deep_rows(before, rows):
+    """Apply the same retained deep cells to previews and actual writes."""
+    stored = {row["event_id"]: row for row in before[MATCH_TABLE]}
+    for row in rows[MATCH_TABLE]:
+        old = stored.get(row["event_id"])
+        if old is not None:
+            row["deep_state"] = old["deep_state"]
+            if old["first_published_at"] is not None:
+                row["first_published_at"] = old["first_published_at"]
+    for table in (LINEUP_TABLE, TEAM_STATS_TABLE):
+        keys = ("event_id", "team_id", "athlete_id") if table == LINEUP_TABLE else ("event_id", "team_id")
+        old = {tuple(row[key] for key in keys): row for row in before[table]
+               if row["deep_stats_json"] is not None}
+        for row in rows[table]:
+            previous = old.pop(tuple(row[key] for key in keys), None)
+            if previous is not None:
+                row["deep_stats_json"] = previous["deep_stats_json"]
+        # A poorer Summary cannot delete already captured deep statistics.
+        rows[table].extend(old.values())
+
+
+def write_tournament_batch(batch: TournamentBatch, *, trino, state_dir=None) -> BatchReceipt | None:
+    from .deep_store import edition_lock
+
+    event_ids = _validate(batch)
+    if not event_ids:
+        return None
+    with edition_lock(batch.competition_slug, batch.season_year, state_dir):
+        return _write_tournament_batch(batch, trino=trino)

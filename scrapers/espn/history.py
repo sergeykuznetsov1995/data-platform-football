@@ -68,6 +68,7 @@ from . import urls
 from .bronze_rows import MatchPayload
 from .bronze_schema import BRONZE_DATABASE, MATCH_TABLE
 from .bronze_writer import TournamentBatch, write_tournament_batch
+from .deep_store import client_state_dir
 from .core_lists import CoreSeason, collect_refs, event_ids as core_event_ids, parse_season
 from .denominator import Denominator
 from .editions import EditionState
@@ -595,7 +596,8 @@ class _Runner:
         step = self.client.gate.snapshot()['step'] if hasattr(self.client, 'gate') else 0
         succeeded = False
         try:
-            write_tournament_batch(TournamentBatch(slug, year, payloads), trino=self.trino)
+            write_tournament_batch(TournamentBatch(slug, year, payloads), trino=self.trino,
+                                   state_dir=client_state_dir(self.client))
             succeeded = True
         finally:
             if self._pace_store is not None:

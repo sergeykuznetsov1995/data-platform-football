@@ -16,6 +16,7 @@ import re
 import uuid
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pyarrow as pa
 import pytest
 
@@ -42,6 +43,21 @@ class FakeTrino:
     def __init__(self) -> None:
         self.tables: dict[str, list[dict]] = {name: [] for name in TABLES}
         self.calls: list[dict] = []
+
+    def execute_query(self, sql, params=None):
+        """Full-row publication reads under the edition lock."""
+        match = re.match(r"SELECT (.+) FROM iceberg.bronze.(\w+) WHERE (.+)$", sql)
+        assert match, sql
+        columns, table, where = match.groups()
+        scope = _SCOPE.match(where)
+        assert scope, where
+        ids = {int(value) for value in scope["ids"].split(", ")}
+        return [tuple(None if pd.isna(row[column]) else row[column]
+                      for column in columns.split(", "))
+                for row in self.tables[table]
+                if row["competition_slug"] == scope["slug"]
+                and row["season_year"] == int(scope["year"])
+                and row["event_id"] in ids]
 
     def arrow_schema_to_trino(self, schema):
         from scrapers.base.trino_manager import TrinoTableManager
@@ -206,7 +222,9 @@ def test_real_manager_replaces_with_one_merge_per_table() -> None:
         staged[stage] = len(frame)
         return len(frame)
 
-    def execute(sql, fetch=False):
+    def execute(sql, fetch=False, params=None):
+        if sql.startswith("SELECT competition_slug, season_year, event_id,"):
+            return []
         if fetch:
             stage = re.search(r"FROM iceberg\.bronze\.(\S+)", sql).group(1)
             return [[staged[stage]]]

@@ -21,7 +21,7 @@ import subprocess
 
 from .bronze_rows import BatchStamp, MatchPayload, RawRef, batch_rows
 from .bronze_schema import MATCH_TABLE, NATURAL_KEYS, TABLES
-from .bronze_writer import TournamentBatch, delete_filter, write_tournament_batch
+from .bronze_writer import TournamentBatch, carry_deep_rows, delete_filter, write_tournament_batch
 from .denominator import load_denominator
 from .editions_store import load as load_editions
 from .history import duplicate_owners, mark_duplicates
@@ -209,6 +209,7 @@ def _prepare_write(payload, competition, edition, store, trino):
     after = batch_rows(
         [payload], stamp=BatchStamp("preview", datetime.now(timezone.utc))
     )
+    carry_deep_rows(before, after)
     if _loses_rows(before, after):
         raise ValueError("downgrade_rejected: actual Bronze cells")
     return payload
@@ -296,6 +297,7 @@ def run(
     competition=None,
     code_sha=None,
     require_complete_editions=False,
+    state_dir=None,
 ):
     """Only the injected raw reader and (in write mode) Bronze manager do IO."""
     if batch_size < 1:
@@ -393,7 +395,7 @@ def run(
             for p, _ in pending
         ]
         receipt = write_tournament_batch(
-            TournamentBatch(*key, payloads), trino=trino
+            TournamentBatch(*key, payloads), trino=trino, state_dir=state_dir
         )
         # Publish the owner before hiding qualifying rows. A retry also repairs
         # an interruption between publication and marking the duplicates.
@@ -508,6 +510,9 @@ def main(argv=None):
         "--require-complete-editions", action="store_true",
         help="reject writes if selected manifest seasons are absent from editions",
     )
+    from .gate import default_state_path
+
+    parser.add_argument("--state-dir", type=Path, default=default_state_path().parent)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--code-sha", help="release commit in containers without .git")
     args = parser.parse_args(argv)
@@ -525,6 +530,7 @@ def main(argv=None):
         competition=args.competition,
         code_sha=args.code_sha,
         require_complete_editions=args.require_complete_editions,
+        state_dir=args.state_dir,
     )
     output = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
     if args.report:

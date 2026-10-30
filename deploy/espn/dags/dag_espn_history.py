@@ -3,7 +3,7 @@
 Lives in ``deploy/espn/dags/`` next to ``dag_espn_current`` (the espn-live DAG
 folder, #1507), never in ``dags/``.  Paused on creation; the owner unpauses it.
 
-prepare -> run_history.  The logic is ``scrapers.espn.history``: one run walks
+prepare -> run_history (up to 2 min deep, then history within the same 12 min).  The logic is ``scrapers.espn.history``: one run walks
 the queue ``iceberg.ops.espn_history_queue_v1`` until it is empty, the time
 budget (12 min from the DAG run start) ends, the live lane has a debt, the gate closes the
 ``history`` lane or the stop file appears; each of those is a clean end.
@@ -66,6 +66,7 @@ def _client():
 def prepare(**_: Any) -> None:
     from scrapers.base.iceberg_writer import IcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
+    from scrapers.espn.deep_store import ensure_depth_table
     from scrapers.espn.history import ensure_queue_table
     from scrapers.espn.journal import ensure_journal_table
 
@@ -73,6 +74,7 @@ def prepare(**_: Any) -> None:
     connection = _trino().connection
     ensure_journal_table(connection)
     ensure_queue_table(connection)
+    ensure_depth_table(connection)
 
 
 def _run_start(context: dict[str, Any]) -> datetime:
@@ -90,6 +92,11 @@ def run_history(**context: Any) -> dict[str, Any]:
         logger.info("ESPN history: stop file %s present, nothing to do", stop_file)
         return {"reason": history.STOPPED}
     trino = _trino()
+    try:
+        deep_report = _run_deep(trino, context)
+    except Exception as exc:
+        logger.exception("ESPN deep stage failed; history continues within its original deadline")
+        deep_report = {"reason": "error", "error_type": type(exc).__name__}
     client = _client()
     try:
         run = history.run_history(
@@ -106,7 +113,31 @@ def run_history(**context: Any) -> dict[str, Any]:
     finally:
         client.close()
     logger.info("ESPN history: %s", run.as_dict())
-    return run.as_dict()
+    return {**run.as_dict(), "deep": deep_report}
+
+
+def _run_deep(trino, context):
+    """At most 2 of the shared 12 minutes; history retains the remaining time.
+
+    Keeping this inside the existing task also keeps delivery's active-DAG
+    guard and the background pool effective. No additional DAG or workers.
+    """
+    from scrapers.espn.deep import run_deep
+    from scrapers.espn.denominator import load_denominator
+    from scrapers.espn.gate import TransportGate
+    from scrapers.espn.history import default_stop_file
+    from scrapers.espn.transport import EspnHttpClient
+
+    deadline = _run_start(context) + timedelta(minutes=2)
+    if datetime.now(timezone.utc) >= deadline:
+        return {"reason": "deadline"}
+    client = EspnHttpClient(gate=TransportGate(lane="history", purpose="deep"))
+    try:
+        return run_deep(client=client, trino=trino, conn=trino.connection,
+                        denominator=load_denominator(), run_id=str(context.get("run_id") or "manual"),
+                        deadline=deadline, stop_file=default_stop_file())
+    finally:
+        client.close()
 
 
 with DAG(

@@ -251,6 +251,7 @@ class EspnHttpClient:
         """Independent Session, ledger and raw queue on the same VM gate/spool."""
         gate = TransportGate(
             policy=self.gate.policy, state_path=self.gate.state_path, lane=self.lane,
+            purpose=self.gate.purpose, admission_check=self.gate.admission_check,
             step_ceiling=self.gate.step_ceiling, utcnow_fn=self.gate.utcnow_fn,
             sleep_fn=sleep_fn or self.gate.sleep_fn,
         )
@@ -551,11 +552,11 @@ class EspnHttpClient:
             try:
                 permit = self.gate.acquire(cluster)
             except (LaneClosed, AllOriginsBlocked, DailyCapExceeded) as exc:
-                disposition = {
-                    LaneClosed: "lane_closed",
-                    AllOriginsBlocked: "blocked_deferred",
-                    DailyCapExceeded: "daily_cap",
-                }[type(exc)]
+                disposition = next(value for kind, value in (
+                    (LaneClosed, "lane_closed"),
+                    (AllOriginsBlocked, "blocked_deferred"),
+                    (DailyCapExceeded, "daily_cap"),
+                ) if isinstance(exc, kind))
                 exc.ledger_entry = self._entry(
                     target,
                     endpoint_type,

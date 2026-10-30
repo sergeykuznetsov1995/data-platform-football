@@ -28,6 +28,8 @@ def dag_module():
     spec = importlib.util.spec_from_file_location("dag_espn_history_under_test", DAG_FILE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._real_run_deep = module._run_deep
+    module._run_deep = lambda trino, context: {"reason": "offline stub"}
     return module
 
 
@@ -165,3 +167,21 @@ def test_client_is_on_the_history_lane(dag_module, monkeypatch, tmp_path) -> Non
         monkeypatch.delenv(name, raising=False)
     client = dag_module._client()
     assert client.lane == "history" and client.gate.lane == "history"
+
+
+def test_deep_stage_keeps_shared_history_deadline(dag_module, monkeypatch, tmp_path):
+    import scrapers.espn.deep as deep
+    import scrapers.espn.transport as transport
+    from scrapers.espn import denominator
+
+    start = datetime.now(timezone.utc)
+    seen = {}
+    closed = []
+    monkeypatch.setattr(transport, "EspnHttpClient", lambda **kw: SimpleNamespace(close=lambda: closed.append(True)))
+    monkeypatch.setattr(denominator, "load_denominator", lambda: "denominator")
+    monkeypatch.setattr(deep, "run_deep", lambda **kw: seen.update(kw) or {"reason": "idle"})
+    monkeypatch.setenv("ESPN_GATE_STATE_PATH", str(tmp_path / "gate.json"))
+    trino = SimpleNamespace(connection="conn")
+    dag_module._real_run_deep(trino, {"dag_run": SimpleNamespace(start_date=start), "run_id": "r"})
+    assert seen["deadline"] == start + timedelta(minutes=2)
+    assert seen["run_id"] == "r" and closed == [True]

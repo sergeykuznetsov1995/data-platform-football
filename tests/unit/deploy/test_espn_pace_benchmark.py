@@ -76,3 +76,17 @@ def test_namespace_creation_failure_never_drops_existing_schema(tmp_path):
         run_benchmark(trino, None, PaceStore(tmp_path / 'pace.sqlite3'), [object()])
     assert len(trino.sql) == 1
     assert trino.sql[0].startswith('CREATE SCHEMA')
+
+
+def test_writer_state_read_stays_in_isolated_schema():
+    from scrapers.espn.bronze_writer import stored_rows
+    trino = BenchTrino()
+    schema = 'espn_pace_bench_' + 'c' * 32
+    adapter = IsolatedManager(trino, schema)
+    stored_rows(adapter, 'espn_match', "competition_slug = 'eng.1' AND season_year = 2015 AND event_id IN (1)")
+    assert f'FROM iceberg.{schema}.espn_match WHERE' in trino.sql[0]
+    assert 'iceberg.bronze.' not in trino.sql[0]
+    with pytest.raises(ValueError):
+        adapter.execute_query('SELECT * FROM iceberg.bronze.espn_match')
+    with pytest.raises(ValueError):
+        stored_rows(adapter, 'espn_match', "competition_slug = 'eng.1' AND season_year = 2015 AND event_id IN (1); DROP SCHEMA bronze")
