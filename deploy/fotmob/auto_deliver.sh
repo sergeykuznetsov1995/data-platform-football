@@ -959,13 +959,13 @@ def check(lines):
             proven |= kind in network and contextual
             terminal_infra = contextual and (kind in network or kind == \"TrinoError\" and proven)
             low_level_timeout = kind == \"TimeoutError\" and bool(re.fullmatch(
-                r\"The read operation timed out|_ssl[.]c:\d+: The handshake operation timed out\", detail))
+                r\"timed out|The read operation timed out|_ssl[.]c:\d+: The handshake operation timed out\", detail))
             # Low-level TCP errors gain host context only in a later wrapper.
             # Accept the chain only when its terminal exception proves that host.
             tcp_error = kind in {\"ConnectionRefusedError\", \"NewConnectionError\", \"MaxRetryError\"} and bool(transport.search(detail))
             if not terminal_infra and not low_level_timeout and not tcp_error:
                 unsafe = True
-    incomplete |= waiting or not seen
+    incomplete |= waiting or chained or not seen
     unsafe |= not (terminal_infra and proven)
 
 for path in sys.argv[1:]:

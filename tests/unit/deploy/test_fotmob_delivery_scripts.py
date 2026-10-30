@@ -1583,6 +1583,8 @@ def _infra_traceback(host: str = "trino", kind: str = "ReadTimeout") -> str:
             f"HTTPSConnectionPool(host='{host}', port=8443): Max retries exceeded with url: /v1/statement "
             "(Caused by NewConnectionError: Failed to establish a new connection: [Errno 111] Connection refused)"
         )
+    if kind == "ConnectTimeout":
+        detail = f"HTTPSConnectionPool(host='{host}', port=8443): Connection timed out. (connect timeout=5)"
     chain = (
         'Traceback (most recent call last):\n'
         + '  File "/opt/airflow/scrapers/base/trino_manager.py", line 335, in _execute\n' * 8
@@ -1601,6 +1603,22 @@ def _infra_traceback(host: str = "trino", kind: str = "ReadTimeout") -> str:
             f'urllib3.exceptions.MaxRetryError: {detail}\n\n'
             'During handling of the above exception, another exception occurred:\n\n'
         ) + chain
+    if kind == "ConnectTimeout":
+        chain = (
+            'Traceback (most recent call last):\n  File ignored\n'
+            'TimeoutError: timed out\n\n'
+            'During handling of the above exception, another exception occurred:\n\n'
+            'Traceback (most recent call last):\n  File ignored\n'
+            f'urllib3.exceptions.ConnectTimeoutError: {detail}\n\n'
+            'The above exception was the direct cause of the following exception:\n\n'
+            'Traceback (most recent call last):\n  File ignored\n'
+            f'urllib3.exceptions.MaxRetryError: {detail}\n\n'
+            'During handling of the above exception, another exception occurred:\n\n'
+        ) + chain + (
+            '\nThe above exception was the direct cause of the following exception:\n\n'
+            'Traceback (most recent call last):\n  File ignored\n'
+            f'trino.exceptions.TrinoConnectionError: {detail}\n'
+        )
     if host == "trino":
         chain += (
             '\nThe above exception was the direct cause of the following exception:\n\n'
@@ -1627,6 +1645,7 @@ def _attempt_path(tmp_path: Path, run: str, attempt: int = 1) -> Path:
 @pytest.mark.parametrize("host,kind", [
     ("trino", "ReadTimeout"), ("metadb", "OperationalError"),
     ("fotmob-airflow-metadb", "OperationalError"), ("trino", "ConnectionError"),
+    ("trino", "ConnectTimeout"),
 ])
 def test_phase2_defers_infrastructure_failure_then_accepts_green(
     tmp_path: Path, host: str, kind: str,
@@ -1656,12 +1675,14 @@ def test_phase2_defers_infrastructure_failure_then_accepts_green(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("case", ["source", "mixed", "previous_attempt", "truncated", "missing_traceback", "terminal_timeout", "custom_exception", "wrapper_only", "prior_timeout", "bare_assertion", "refused_with_code", "source_refused"])
+@pytest.mark.parametrize("case", ["source", "mixed", "previous_attempt", "truncated", "missing_traceback", "terminal_timeout", "custom_exception", "wrapper_only", "prior_timeout", "bare_assertion", "refused_with_code", "source_refused", "source_connect_timeout", "unknown_connect_timeout", "truncated_handling", "truncated_cause"])
 def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, case: str) -> None:
     run = "fotmob_orchestrated__bad"
     text = _infra_traceback("fotmob.com" if case == "source" else "trino")
     if case in {"refused_with_code", "source_refused"}:
         text = _infra_traceback("fotmob.com" if case == "source_refused" else "trino", "ConnectionError")
+    if case in {"source_connect_timeout", "unknown_connect_timeout"}:
+        text = _infra_traceback("fotmob.com" if case == "source_connect_timeout" else "unknown", "ConnectTimeout")
     if case in {"bare_assertion", "refused_with_code"}:
         assertion = (
             "Traceback (most recent call last):\n  File ignored\nAssertionError\n\n"
@@ -1672,6 +1693,12 @@ def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, ca
         text += "2026-10-30 06:29:05 [ERROR] __main__: ValueError: broken contract\n"
     if case == "truncated":
         text += "Traceback (most recent call last):\n  File ignored\n"
+    if case in {"truncated_handling", "truncated_cause"}:
+        text += (
+            "\nDuring handling of the above exception, another exception occurred:\n\n"
+            if case == "truncated_handling" else
+            "\nThe above exception was the direct cause of the following exception:\n\n"
+        )
     if case in {"terminal_timeout", "custom_exception"}:
         text += (
             "\nDuring handling of the above exception, another exception occurred:\n\n"
@@ -1700,7 +1727,7 @@ def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, ca
     if case == "previous_attempt":
         _attempt_path(tmp_path, run, 2).write_text("[ERROR] __main__: RuntimeError: broken\n", encoding="utf-8")
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
-    unread = case in {"truncated", "missing_traceback"}
+    unread = case in {"truncated", "missing_traceback", "truncated_handling", "truncated_cause"}
     assert proc.returncode == (0 if unread else 1), proc.stderr + proc.stdout
     assert _git(w["repo"], "rev-parse", "HEAD") == w["two" if unread else "one"]
     verdicts = list(w["state"].glob("fotmob-wave-verdict-*"))
