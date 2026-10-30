@@ -39,6 +39,7 @@ logger = logging.getLogger("snapshot_bronze_schemas")
 CLUBELO_TABLES = frozenset({
     "clubelo_rank_snapshot",
     "clubelo_result",
+    "clubelo_fixture",
     "clubelo_raw_page",
     "clubelo_club_elo_point",
     "clubelo_club_match",

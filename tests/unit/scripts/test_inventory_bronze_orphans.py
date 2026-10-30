@@ -134,6 +134,7 @@ def test_clubelo_html_tables_never_droppable():
     live = [
         'clubelo_rank_snapshot', 'clubelo_result', 'clubelo_club_elo_point',
         'clubelo_club_match', 'clubelo_history_manifest', 'clubelo_raw_page',
+        'clubelo_fixture',
     ]
     orphans = mod.find_orphans(live, mod.build_keep_set())
     droppable, blocked = mod.classify_orphans(orphans)

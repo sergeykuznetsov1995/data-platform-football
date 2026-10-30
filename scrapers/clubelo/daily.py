@@ -29,9 +29,11 @@ One run, in this order:
    history run (``history.collect_new_slugs``). Its failure makes the run red
    but does not roll back the written snapshot.
 7. Together with a /Results fetch only (once per rating date): ``/Fixtures``
-   is stored raw in ``clubelo_raw_page`` (#1982 step 1, raw-first before a
-   parser exists). Best effort: a failure lands in ``fixtures_error`` and
-   never reddens the run or touches the written tables.
+   → raw row, parse (``parse_fixtures``), ``bronze.clubelo_fixture``: the
+   partition of the page's h1 date is replaced (one row per match, the
+   site's forecast as of that fetch; #1982). Best effort: a failure lands in
+   ``fixtures_error`` and never reddens the run or touches the other tables;
+   a layout change writes no parsed fixture rows.
 
 Any failed contract check, guard, date mismatch, block or error before step 4
 writes nothing parsed, logs the failed check and exits non-zero. No Telegram
@@ -52,10 +54,12 @@ import pyarrow as pa
 
 from scrapers.clubelo import history
 from scrapers.clubelo.parse import (
+    FixturesPage,
     LayoutChanged,
     RankingPage,
     ResultsPage,
     check_ranking,
+    parse_fixtures,
     parse_ranking,
     parse_results,
 )
@@ -73,6 +77,7 @@ DATABASE = history.DATABASE
 SNAPSHOT_TABLE = "clubelo_rank_snapshot"
 RESULT_TABLE = "clubelo_result"
 RESULT_KEYS = ("match_date", "home_key", "away_key")
+FIXTURE_TABLE = "clubelo_fixture"
 EXPECTED_CLUBS = 1741  # eloData rows of /Ranking on 2026-09-22
 MIN_COMPLETENESS = 0.95
 MIN_REPLACE_RATIO = 0.9
@@ -145,6 +150,43 @@ RESULT_SCHEMA = pa.schema(
 )
 
 
+_FIXTURE_SIDE = [
+    ("key", pa.string()),
+    ("slug", pa.string()),
+    ("tlc", pa.string()),
+    ("name", pa.string()),
+    ("country", pa.string()),
+    ("rank", pa.int32()),
+    ("so_far", pa.float64()),  # "So Far" in ``so_far_unit`` (Points on 30.10)
+    ("win_pct", pa.float64()),  # "1" for home, "2" for away
+    ("stake", pa.string()),  # "At stake": Champion, Relegation, Round of 16, …
+    # Stake percents as shown: "2.2", a bound "<0.1", impossible "0"
+    ("stake_chance", pa.string()),
+    ("stake_if_win", pa.string()),
+    ("stake_if_draw", pa.string()),
+    ("stake_if_loss", pa.string()),
+]
+
+FIXTURE_SCHEMA = pa.schema(
+    [
+        ("rating_date", pa.date32()),  # h1 date of /Fixtures; the partition
+        ("game_id", pa.int64()),  # the site's game id (data-live-status-game-id)
+        ("kickoff_utc", pa.timestamp("us")),
+        ("competition", pa.string()),  # section row: league/stage as shown
+        ("so_far_unit", pa.string()),
+        ("row_seq", pa.int32()),
+        ("draw_pct", pa.float64()),
+    ]
+    + [(f"home_{name}", kind) for name, kind in _FIXTURE_SIDE]
+    + [(f"away_{name}", kind) for name, kind in _FIXTURE_SIDE]
+    + [
+        ("page_created_at", pa.timestamp("us")),
+        ("fetched_at", pa.timestamp("us")),
+    ]
+    + _META
+)
+
+
 class GuardRefused(RuntimeError):
     """The snapshot is too small to replace a partition — nothing written."""
 
@@ -172,6 +214,10 @@ class IcebergDailyStore:
         self.writer.create_table_if_not_exists(
             self.database, RESULT_TABLE, RESULT_SCHEMA,
             partition_spec=[("match_date", "identity")],
+        )
+        self.writer.create_table_if_not_exists(
+            self.database, FIXTURE_TABLE, FIXTURE_SCHEMA,
+            partition_spec=[("rating_date", "identity")],
         )
 
     def snapshot_counts(self, rating_date: date) -> Tuple[Optional[int], Optional[int]]:
@@ -201,7 +247,14 @@ class IcebergDailyStore:
         return bool(rows)
 
     def replace_snapshot(self, rating_date: date, rows: List[Dict[str, Any]]) -> int:
-        table = pa.Table.from_pylist(rows, schema=SNAPSHOT_SCHEMA)
+        return self._replace_by_rating_date(SNAPSHOT_TABLE, SNAPSHOT_SCHEMA, rating_date, rows)
+
+    def replace_fixtures(self, rating_date: date, rows: List[Dict[str, Any]]) -> int:
+        return self._replace_by_rating_date(FIXTURE_TABLE, FIXTURE_SCHEMA, rating_date, rows)
+
+    def _replace_by_rating_date(self, name: str, schema: pa.Schema, rating_date: date,
+                                rows: List[Dict[str, Any]]) -> int:
+        table = pa.Table.from_pylist(rows, schema=schema)
         # The writer compares the partition column with a string value; the
         # ISO string is cast back to the table's date type when aligned.
         iso = rating_date.isoformat()
@@ -210,7 +263,7 @@ class IcebergDailyStore:
         return self.writer.replace_identity_partition_arrow_batches(
             [table],
             database=self.database,
-            table=SNAPSHOT_TABLE,
+            table=name,
             partition_column="rating_date",
             partition_value=iso,
         )
@@ -298,15 +351,23 @@ class _Daily:
         )
 
     def fixtures(self) -> None:
-        """#1982 step 1: /Fixtures raw only; a failure never reddens the run."""
+        """#1982: /Fixtures raw, parse, replace; a failure never reddens the run."""
         try:
-            page, _ = self.fetch("/Fixtures")
+            page, html = self.fetch("/Fixtures")
+            self.result["fixtures_raw"] = True
+            self.result["fixtures_wire_bytes"] = page.wire_bytes
+            parsed: FixturesPage = parse_fixtures(html)
+            self.result["fixtures_rating_date"] = parsed.rating_date.isoformat()
+            if parsed.rows:
+                common = {"rating_date": parsed.rating_date,
+                          "page_created_at": parsed.page_created_at,
+                          "fetched_at": page.fetched_at}
+                self.store.replace_fixtures(
+                    parsed.rating_date, [self.row(**common, **row) for row in parsed.rows])
+            self.result["fixtures_rows"] = len(parsed.rows)
         except Exception as exc:
             self.result["fixtures_error"] = f"{type(exc).__name__}: {exc}"
-            logger.warning("ClubElo /Fixtures raw capture failed: %s", self.result["fixtures_error"])
-            return
-        self.result["fixtures_raw"] = True
-        self.result["fixtures_wire_bytes"] = page.wire_bytes
+            logger.warning("ClubElo /Fixtures failed: %s", self.result["fixtures_error"])
 
     def row(self, **values) -> Dict[str, Any]:
         return {**values, **self.meta, "_ingested_at": history._utcnow()}
@@ -355,6 +416,8 @@ def run_daily(
         "history_new_failed_slugs": [],
         "fixtures_raw": False,
         "fixtures_wire_bytes": 0,
+        "fixtures_rating_date": None,
+        "fixtures_rows": 0,
         "fixtures_error": None,
         "wire_bytes": 0,
         "wire_bytes_daily": 0,

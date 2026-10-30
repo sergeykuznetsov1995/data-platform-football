@@ -19,6 +19,7 @@ from scrapers.clubelo import daily, history
 from scrapers.clubelo.parse import parse_ranking_slugs
 from scrapers.clubelo.transport import ClubEloTransport
 from tests.unit.scrapers.clubelo_fakes import (
+    FIXTURE_DIR,
     FakeResponse,
     FakeSession,
     MemoryStore,
@@ -43,6 +44,7 @@ class MemoryDailyStore:
         self.results: Dict[Tuple, Dict] = {}
         self.counts = dict(counts or {})
         self.replaces: List[date] = []
+        self.fixtures: Dict[date, List[Dict]] = {}
 
     def ensure_tables(self) -> None:
         pass
@@ -56,6 +58,11 @@ class MemoryDailyStore:
         self.replaces.append(rating_date)
         self.snapshot[rating_date] = list(rows)
         self.counts[rating_date] = sum(not r["is_provisional"] for r in rows)
+        return len(rows)
+
+    def replace_fixtures(self, rating_date, rows):
+        assert rows and all(r["rating_date"] == rating_date for r in rows)
+        self.fixtures[rating_date] = list(rows)
         return len(rows)
 
     def merge_results(self, rows):
@@ -288,7 +295,55 @@ def test_fixtures_failure_never_reddens_the_run(answer, caplog):
     assert result["fixtures_raw"] is False and result["fixtures_error"]
     assert RATING_DATE in store.snapshot and len(store.results) == 63
     assert "/Fixtures" not in [r["page"] for r in hist.rows(history.RAW_TABLE)]
-    assert "ClubElo /Fixtures raw capture failed" in caplog.text
+    assert "ClubElo /Fixtures failed" in caplog.text and store.fixtures == {}
+
+
+def _live_fixtures() -> FakeResponse:
+    path = FIXTURE_DIR.parent / "20261030" / "Fixtures.html.gz"
+    return FakeResponse(200, path.read_bytes(), {"content-encoding": "gzip"})
+
+
+def test_empty_fixtures_page_writes_no_fixture_rows():
+    # 24.09: no matches announced — data truth, not a failure
+    result, store, *_ = _run()
+    assert result["fixtures_raw"] is True and result["fixtures_error"] is None
+    assert result["fixtures_rows"] == 0 and result["fixtures_rating_date"] == "2026-09-22"
+    assert store.fixtures == {}
+
+
+def test_live_fixtures_replace_their_rating_date():
+    result, store, *_ = _run(_answers(**{"/Fixtures": _live_fixtures()}))
+    assert daily.exit_code(result) == 0 and result["fixtures_error"] is None
+    assert result["fixtures_rows"] == 50 and result["fixtures_rating_date"] == "2026-10-30"
+    rows = store.fixtures[date(2026, 10, 30)]
+    assert len(rows) == 50 and len({r["game_id"] for r in rows}) == 50
+    first = rows[0]
+    assert (first["game_id"], first["model_version"], first["_batch_id"]) == (
+        1709689, "web-2026", "test-daily")
+    assert first["page_created_at"] == datetime(2026, 10, 30, 16, 20, 19)
+    assert isinstance(first["fetched_at"], datetime)
+    assert set(first) == set(daily.FIXTURE_SCHEMA.names)
+
+
+def test_fixtures_layout_change_writes_nothing_and_stays_green(caplog):
+    broken = gzip.decompress(_live_fixtures().raw.wire).decode("utf-8").replace(
+        "data-live-status-game-id", "data-game", 1)
+    result, store, hist, *_ = _run(_answers(**{"/Fixtures": gzip_response(broken)}))
+    assert daily.exit_code(result) == 0 and result["written"] is True
+    assert result["fixtures_raw"] is True and "LayoutChanged" in result["fixtures_error"]
+    assert store.fixtures == {} and RATING_DATE in store.snapshot
+    assert [r["page"] for r in hist.rows(history.RAW_TABLE)][-1] == "/Fixtures"
+
+
+def test_store_replace_fixtures_uses_its_own_partition():
+    _, mem, *_ = _run(_answers(**{"/Fixtures": _live_fixtures()}))
+    writer = MagicMock()
+    writer.replace_identity_partition_arrow_batches.side_effect = lambda t, **kw: t[0].num_rows
+    day = date(2026, 10, 30)
+    assert daily.IcebergDailyStore(writer).replace_fixtures(day, mem.fixtures[day]) == 50
+    kwargs = writer.replace_identity_partition_arrow_batches.call_args.kwargs
+    assert (kwargs["table"], kwargs["partition_column"], kwargs["partition_value"]) == (
+        "clubelo_fixture", "rating_date", "2026-10-30")
 
 
 def test_block_stops_the_run():
@@ -395,6 +450,7 @@ def test_store_creates_date_partitioned_tables():
     calls = {c.args[1]: c for c in writer.create_table_if_not_exists.call_args_list}
     assert calls["clubelo_rank_snapshot"].kwargs["partition_spec"] == [("rating_date", "identity")]
     assert calls["clubelo_result"].kwargs["partition_spec"] == [("match_date", "identity")]
+    assert calls["clubelo_fixture"].kwargs["partition_spec"] == [("rating_date", "identity")]
     assert calls["clubelo_rank_snapshot"].args[2].field("rating_date").type == pa.date32()
 
 

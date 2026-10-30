@@ -1,0 +1,96 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_fixture
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_fixture
+  description: |
+    Ближайшие матчи со страницы /Fixtures ClubElo с прогнозом сайта (#1982): 1/X/2, очки
+    на сейчас и «на кону» у каждой команды (шанс сейчас и при победе/ничьей/поражении).
+    Пишет scrapers/clubelo/daily.py (dag_ingest_clubelo) раз на дату рейтинга вместе с
+    /Results: партиция identity(rating_date) заменяется целиком — одна строка на матч,
+    прогноз на момент забора. Сырая страница — clubelo_raw_page (page='/Fixtures').
+    Пустая страница (как 24.09) ничего не пишет. Смена вёрстки — ничего разобранного
+    не пишется, прогон не краснеет (fixtures_error в результате). Модель 'web-2026'.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: rating_date
+    description: h1-дата страницы /Fixtures (дата рейтинга сайта). Партиция.
+  - name: game_id
+    description: Id матча на сайте (data-live-status-game-id). Ключ строки внутри партиции.
+  - name: kickoff_utc
+    description: Начало матча, UTC (data-utc-time).
+  - name: competition
+    description: "Строка-секция над матчем: лига/стадия, как на странице (бывает без страны, напр. 'Regular Season')."
+  - name: so_far_unit
+    description: Единица колонки «So Far» в секции (на 30.10 — 'Points').
+  - name: row_seq
+    description: Порядок матча на странице (с 0).
+  - name: draw_pct
+    description: "Прогноз сайта: вероятность ничьей, % (колонка «X»)."
+  - name: home_key
+    description: Ключ хозяев — slug или '~CC:Имя', если ссылки на страницу клуба нет.
+  - name: home_slug
+    description: Slug хозяев; NULL без ссылки на страницу клуба.
+  - name: home_tlc
+    description: Трёхбуквенный код хозяев (узкая вёрстка).
+  - name: home_name
+    description: Название хозяев, как на странице.
+  - name: home_country
+    description: Страна хозяев (alt флага).
+  - name: home_rank
+    description: Мировое место хозяев на странице; NULL, если не показано.
+  - name: home_so_far
+    description: "«So Far» хозяев: набранное в турнире на момент забора, в единицах so_far_unit."
+  - name: home_win_pct
+    description: "Прогноз сайта: вероятность победы хозяев, % (колонка «1» у хозяев, «2» у гостей)."
+  - name: home_stake
+    description: "«At stake» хозяев: на что влияет матч (Champion, Relegation, Promotion, Round of 16, …) — текст широкой вёрстки."
+  - name: home_stake_chance
+    description: "Шанс хозяев на stake сейчас, % как показан: число, граница '<0.1' или '0' (исход невозможен). Текст."
+  - name: home_stake_if_win
+    description: Шанс хозяев на stake при победе, % как показан (текст).
+  - name: home_stake_if_draw
+    description: Шанс хозяев на stake при ничьей, % как показан (текст).
+  - name: home_stake_if_loss
+    description: Шанс хозяев на stake при поражении, % как показан (текст).
+  - name: away_key
+    description: Ключ гостей — slug или '~CC:Имя', если ссылки на страницу клуба нет.
+  - name: away_slug
+    description: Slug гостей; NULL без ссылки на страницу клуба.
+  - name: away_tlc
+    description: Трёхбуквенный код гостей (узкая вёрстка).
+  - name: away_name
+    description: Название гостей, как на странице.
+  - name: away_country
+    description: Страна гостей (alt флага).
+  - name: away_rank
+    description: Мировое место гостей на странице; NULL, если не показано.
+  - name: away_so_far
+    description: "«So Far» гостей: набранное в турнире на момент забора, в единицах so_far_unit."
+  - name: away_win_pct
+    description: "Прогноз сайта: вероятность победы гостей, % (колонка «1» у хозяев, «2» у гостей)."
+  - name: away_stake
+    description: "«At stake» гостей: на что влияет матч (Champion, Relegation, Promotion, Round of 16, …) — текст широкой вёрстки."
+  - name: away_stake_chance
+    description: "Шанс гостей на stake сейчас, % как показан: число, граница '<0.1' или '0' (исход невозможен). Текст."
+  - name: away_stake_if_win
+    description: Шанс гостей на stake при победе, % как показан (текст).
+  - name: away_stake_if_draw
+    description: Шанс гостей на stake при ничьей, % как показан (текст).
+  - name: away_stake_if_loss
+    description: Шанс гостей на stake при поражении, % как показан (текст).
+  - name: page_created_at
+    description: "«Page created on …» страницы, наивный UTC."
+  - name: fetched_at
+    description: Момент забора страницы, наивный UTC.
+  - name: model_version
+    description: Версия модели сайта ('web-2026').
+  - name: _source
+    description: Источник строки.
+  - name: _ingested_at
+    description: Момент записи строки.
+  - name: _batch_id
+    description: Id прогона dag_ingest_clubelo.
