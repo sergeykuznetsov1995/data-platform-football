@@ -404,6 +404,31 @@ def test_skipped_feeds_defer_scope_and_continue_queue(tmp_path, other_scope):
     assert service.sync_stage_feeds.call_count == calls + int(other_scope) + (2 if other_scope else 1)
 
 
+def test_feeds_commit_without_checked_stage_is_idle(tmp_path):
+    # Catalog says ended, source says active: the stage never turns final, so
+    # every chunk re-commits the retained snapshot without checking anything.
+    from dataclasses import replace
+
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    ended = replace(s, end=NOW.date() - timedelta(days=1), is_active=False)
+    kwargs["catalog"] = catalog((s.scope.competition_id, 2, [ended]))
+    repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id): coverage(closed=100)}
+    repo.list_match_candidates.return_value = []
+    repo.latest_stage_feed_snapshot.return_value = {
+        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "feed_checks": {"1": {"final": False, "checked_at": NOW.isoformat()}},
+    }
+    service.sync_stage_feeds.return_value = SimpleNamespace(
+        skipped=0, metadata={"stage_xg_checked": [], "stage_xg_retained": [1]})
+    assert history.run_chunk(**kwargs)["reason"] == "idle"
+    kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 31, timezone.utc)
+    history.run_chunk(**kwargs)
+    assert service.sync_stage_feeds.call_count == 1
+    kwargs["now"] = datetime.fromtimestamp(NOW.timestamp() + 3601, timezone.utc)
+    history.run_chunk(**kwargs)
+    assert service.sync_stage_feeds.call_count == 2
+
+
 def test_runner_records_each_scope_after_skipped_feeds(tmp_path, monkeypatch):
     from functools import partial
 
@@ -595,7 +620,8 @@ def test_mixed_stage_refresh_survives_restart_and_failure(tmp_path, failed):
     assert row["unknown_stages"] == 0
     repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id): row}
     repo.list_match_candidates.return_value = []
-    service.sync_stage_feeds.return_value = SimpleNamespace(skipped=0)
+    service.sync_stage_feeds.return_value = SimpleNamespace(
+        skipped=0, metadata={"stage_xg_checked": [1]})
     # Useful work takes priority over refreshing the deferred schedule.
     history.run_chunk(**kwargs)
     service.sync_schedule.assert_not_called()
