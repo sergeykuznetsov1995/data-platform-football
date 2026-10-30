@@ -37,7 +37,11 @@ from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
 from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
-from scrapers.whoscored.parsers import MATCH_AVAILABILITY_VERSION, PARSER_VERSION
+from scrapers.whoscored.parsers import (
+    MATCH_AVAILABILITY_VERSION,
+    PARSER_VERSION,
+    WhoScoredParseError,
+)
 from scrapers.whoscored.profile_policy import MAX_DAILY_PROFILE_CANDIDATES
 
 logger = logging.getLogger(__name__)
@@ -99,6 +103,12 @@ MATCH_REFRESH_DAYS = 7
 # exhausted it leaves the daily run and the frozen history plan alike (#1476);
 # only an explicit forced replay re-attempts it.
 DAILY_RETRYABLE_MAX_ATTEMPTS = 8
+# #1484: a final match whose page stays truncated after this many fetches is a
+# terminal source fact (``terminal/truncated``), not endless retry churn.
+TRUNCATED_MAX_ATTEMPTS = 3
+# A declared ``expanded_max_minute`` outside this range is source garbage
+# (e.g. 5302); the completeness gate then assumes a regular 90 minutes.
+MAX_DECLARED_MATCH_MINUTES = 150
 # #1474: one re-probe of a "not available" match in an available stage, and one
 # probe of an unknown/unavailable stage per this period.
 NOT_AVAILABLE_REPROBE_HOURS = 72
@@ -1456,6 +1466,10 @@ def deterministic_preview_not_available_batch_id(
     )
 
 
+class WhoScoredTruncatedMatchError(WhoScoredParseError):
+    """A final match page carries a truncated event stream (#915, #1484)."""
+
+
 @dataclass(frozen=True)
 class MatchCandidate:
     game_id: int
@@ -1467,6 +1481,8 @@ class MatchCandidate:
     match_is_opta: bool
     attempt_no: int = 1
     exact_candidate_count: Optional[int] = None
+    # failure_code of a ``retryable``/``terminal`` journal row (None otherwise).
+    previous_failure_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -3830,13 +3846,18 @@ class WhoScoredRepository:
             else ""
         )
         # History freezes its plan from ``include_all_completed``; a match that
-        # exhausted the retry ceiling leaves that plan too (#1476).  Explicit
-        # ids stay a deliberate replay without the ceiling.
+        # exhausted the retry ceiling leaves that plan too (#1476), and so does
+        # a terminal source truncation (#1484).  Explicit ids stay a
+        # deliberate replay without the ceiling.
         history_retry_cap = (
             f"""NOT (
                     COALESCE(m.state, '') = 'retryable'
                     AND COALESCE(m.attempt_no, 0)
                         >= {int(DAILY_RETRYABLE_MAX_ATTEMPTS)}
+                )
+                AND NOT (
+                    COALESCE(m.state, '') = 'terminal'
+                    AND COALESCE(m.failure_code, '') = 'truncated'
                 )"""
             if include_all_completed and not explicit_ids
             else "TRUE"
@@ -4018,7 +4039,11 @@ class WhoScoredRepository:
                            WHEN m.state = 'retryable'
                            THEN COALESCE(m.attempt_no, 0) + 1
                            ELSE 1
-                       END AS attempt_no{daily_projection}
+                       END AS attempt_no,
+                       CASE
+                           WHEN m.state IN ('retryable', 'terminal')
+                           THEN m.failure_code
+                       END AS previous_failure_code{daily_projection}
                 FROM schedule s
                 LEFT JOIN {latest} m
                   ON m.league = s.league
@@ -4031,7 +4056,7 @@ class WhoScoredRepository:
                   {id_filter}{lane_filter}
             )
             SELECT game_id, league, season, game, date, status, match_is_opta,
-                   attempt_no{count_projection}
+                   attempt_no, previous_failure_code{count_projection}
             FROM eligible{stage_filter}
             {order_sql}
             {limit_sql}
@@ -4047,7 +4072,10 @@ class WhoScoredRepository:
                 status=int(row[5]),
                 match_is_opta=_coerce_bool(row[6]),
                 attempt_no=int(row[7]),
-                exact_candidate_count=(int(row[8]) if include_exact_count else None),
+                previous_failure_code=(
+                    str(row[8]) if row[8] is not None else None
+                ),
+                exact_candidate_count=(int(row[9]) if include_exact_count else None),
             )
             for row in rows
         ]
@@ -5562,12 +5590,16 @@ class WhoScoredRepository:
             and commit.kickoff is not None
             and commit.kickoff <= _utc_now() - MATCH_COMPLETION_GRACE
         )
-        if completed and commit.is_opta is True:
+        # ``is_opta`` from the schedule is false for every match (#1484), so it
+        # stays metadata and does not switch this gate off.
+        if completed:
             status = str(commit.dataset_statuses.get("events") or "")
             match_rows = tuple(commit.datasets.get("matches", ()))
             declared_duration = 90
             if match_rows and match_rows[0].get("expanded_max_minute") is not None:
-                declared_duration = max(1, int(match_rows[0]["expanded_max_minute"]))
+                declared = int(match_rows[0]["expanded_max_minute"])
+                if 1 <= declared <= MAX_DECLARED_MATCH_MINUTES:
+                    declared_duration = declared
             event_minutes = [
                 row.get("expanded_minute", row.get("minute"))
                 for row in commit.events
@@ -5584,7 +5616,7 @@ class WhoScoredRepository:
                 or len(commit.events) < minimum_rows
                 or max_minute < minimum_max_minute
             ):
-                raise ValueError(
+                raise WhoScoredTruncatedMatchError(
                     f"game {commit.game_id} has incomplete final Opta events: "
                     f"status={status or 'missing'}, rows={len(commit.events)}, "
                     f"max_minute={max_minute}, declared_duration={declared_duration}"

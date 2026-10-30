@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -613,3 +614,98 @@ def test_scheduled_retention_cleanup_does_not_require_a_current_population():
     assert len(cursor.queries) == 1
     assert "WHERE population_sha256<>" not in cursor.queries[0]
     assert f"LIMIT {DQ_STAGE_CLEANUP_LIMIT}" in cursor.queries[0]
+
+
+@pytest.mark.parametrize(
+    ("is_opta", "declared", "events", "last_minute", "incomplete"),
+    [
+        # #1484: game 1995702 -- non-Opta, 95' declared, events end at 49'.
+        (False, 95, 743, 49, 1),
+        (False, 95, 743, 94, 0),
+        # Game 1955886 declares 5302': treated as 90 like the repository gate.
+        (False, 5302, 704, 5258, 0),
+    ],
+)
+def test_incomplete_final_games_metric_mirrors_the_repository_gate(
+    is_opta, declared, events, last_minute, incomplete
+):
+    duckdb = pytest.importorskip("duckdb")
+    relation = _relation()
+    cursor = _Cursor(relation)
+    frozen_historical_integrity(
+        cursor,
+        {"staged_relation": relation},
+        parser_version="parser-v1",
+        availability_version="availability-v1",
+        match_dataset_tables={},
+        preview_dataset_tables={},
+    )
+    query = next(
+        query for query in cursor.queries if "whoscored_frozen_events" in query
+    ).replace(f" FOR VERSION AS OF {relation['snapshot_id']}", "")
+
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS iceberg")
+    con.execute("CREATE SCHEMA iceberg.bronze")
+    con.execute(
+        f"CREATE TABLE {DQ_STAGE_QUALIFIED} (population_sha256 VARCHAR, "
+        "row_kind VARCHAR, league VARCHAR, season VARCHAR, game_id BIGINT)"
+    )
+    con.execute(
+        f"INSERT INTO {DQ_STAGE_QUALIFIED} VALUES (?, 'match', 'WS-1', '2026', 42)",
+        [relation["population_sha256"]],
+    )
+    con.execute(
+        "CREATE TABLE iceberg.bronze.whoscored_match_ingest_manifest ("
+        "league VARCHAR, season VARCHAR, game_id BIGINT, batch_id VARCHAR, "
+        "state VARCHAR, parser_version VARCHAR, availability_version VARCHAR, "
+        "raw_uri VARCHAR, payload_sha256 VARCHAR, is_final BOOLEAN, "
+        "is_opta BOOLEAN, events_count BIGINT, dataset_statuses_json VARCHAR, "
+        "completed_at TIMESTAMP, fetched_at TIMESTAMP, _ingested_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO iceberg.bronze.whoscored_match_ingest_manifest VALUES "
+        "('WS-1', '2026', 42, 'ws2-42', 'success', 'parser-v1', "
+        "'availability-v1', 's3://raw/42', 'sha', TRUE, ?, ?, "
+        "'{\"events\":\"available\"}', NOW(), NOW(), NOW())",
+        [is_opta, events],
+    )
+    con.execute(
+        "CREATE TABLE iceberg.bronze.whoscored_events_current ("
+        "league VARCHAR, season VARCHAR, game_id BIGINT, source_event_id BIGINT, "
+        "opta_event_id BIGINT, team_id BIGINT, team_event_id BIGINT, "
+        "related_team_event_id BIGINT, expanded_minute BIGINT, minute BIGINT, "
+        "source_raw_json VARCHAR, _game_batch_id VARCHAR)"
+    )
+    con.executemany(
+        "INSERT INTO iceberg.bronze.whoscored_events_current VALUES "
+        "('WS-1', '2026', 42, ?, ?, 1, ?, NULL, ?, ?, ?, 'ws2-42')",
+        [
+            [
+                index + 1,
+                index + 1,
+                index + 1,
+                minute,
+                minute,
+                json.dumps({"id": index + 1, "eventId": index + 1}),
+            ]
+            for index in range(events)
+            for minute in [last_minute if index == events - 1 else index % 45]
+        ],
+    )
+    con.execute(
+        "CREATE TABLE iceberg.bronze.whoscored_matches_current ("
+        "league VARCHAR, season VARCHAR, game_id BIGINT, "
+        "expanded_max_minute BIGINT, _game_batch_id VARCHAR)"
+    )
+    con.execute(
+        "INSERT INTO iceberg.bronze.whoscored_matches_current VALUES "
+        "('WS-1', '2026', 42, ?, 'ws2-42')",
+        [declared],
+    )
+
+    rendered = sqlglot.transpile(query, read="trino", write="duckdb")[0]
+    mismatches, incomplete_games, invalid, *_ = con.execute(rendered).fetchone()
+
+    assert (mismatches, invalid) == (0, 0)
+    assert incomplete_games == incomplete

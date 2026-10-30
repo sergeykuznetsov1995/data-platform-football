@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+import gzip
 import json
 import re
 import sqlite3
@@ -31,6 +32,7 @@ from scrapers.whoscored.repository import (
     WHOSCORED_BUSINESS_TABLES,
     WhoScoredScopeRowSpool,
     WhoScoredRepository,
+    WhoScoredTruncatedMatchError,
     _clean_unicode,
     canonical_catalog_rows,
     catalog_payload_sha256,
@@ -1209,6 +1211,85 @@ def test_final_opta_match_rejects_a_valid_but_truncated_event_prefix():
 
 
 @pytest.mark.unit
+def test_final_non_opta_match_1995702_with_events_ending_at_49_is_truncated():
+    # #1484: the schedule flags every match is_opta=False; the real page of
+    # game 1995702 declares 95 minutes while its events stop at 49'.
+    from pathlib import Path
+
+    from scrapers.whoscored.parsers import parse_match_html
+
+    fixture = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "whoscored"
+        / "match-1995702.raw.gz"
+    )
+    with gzip.open(fixture, "rt", encoding="utf-8") as handle:
+        html = handle.read()
+    parsed = parse_match_html(
+        html,
+        scope=WhoScoredScope("WS-test", "2526", "split_year"),
+        game_id=1995702,
+        game="Home-Away",
+    )
+    commit = replace(
+        _commit(),
+        game_id=1995702,
+        events=parsed.events.rows,
+        lineups=parsed.lineups.rows,
+        lineups_available=parsed.lineups.status.value == "available",
+        datasets={
+            name: dataset.rows
+            for name, dataset in parsed.datasets.items()
+            if name not in {"events", "lineups"}
+        },
+        dataset_statuses={
+            name: dataset.status.value for name, dataset in parsed.datasets.items()
+        },
+        is_opta=False,
+        schedule_status=6,
+    )
+    repository = WhoScoredRepository(writer=MagicMock(), trino=MagicMock())
+
+    with pytest.raises(
+        WhoScoredTruncatedMatchError,
+        match="rows=743, max_minute=49, declared_duration=95",
+    ):
+        repository.validate_match_commit(commit)
+
+
+@pytest.mark.unit
+def test_final_match_guard_ignores_a_garbage_declared_duration():
+    # Game 1955886: the source declares expandedMaxMinute=5302.  Without a
+    # ceiling 704 complete events fail as "too few rows" (704 < 5302).
+    repository = WhoScoredRepository(writer=MagicMock(), trino=MagicMock())
+    events = tuple(
+        {
+            "source_event_id": index + 1,
+            "opta_event_id": index + 1,
+            "team_event_id": index + 1,
+            "team_id": 1,
+            "expanded_minute": 5258 if index == 703 else index % 95,
+        }
+        for index in range(704)
+    )
+    commit = replace(
+        _commit(),
+        events=events,
+        is_opta=False,
+        schedule_status=6,
+        datasets={"matches": ({"expanded_max_minute": 5302},)},
+        dataset_statuses={
+            "events": "available",
+            "lineups": "empty",
+            "matches": "available",
+        },
+    )
+
+    repository.validate_match_commit(commit)
+
+
+@pytest.mark.unit
 def test_final_opta_match_cannot_replace_a_larger_published_event_stream(
     monkeypatch,
 ):
@@ -1252,11 +1333,24 @@ def test_completed_non_opta_match_cannot_shrink_any_published_dataset(monkeypatc
     trino = MagicMock()
     writer = MagicMock()
     repository = WhoScoredRepository(writer=writer, trino=trino)
+    # A complete event stream: the final-match gate (#1484) applies to non-Opta
+    # matches too, so only the lineup regression may reject this commit.
+    events = tuple(
+        {
+            "source_event_id": index + 1,
+            "opta_event_id": index + 1,
+            "team_event_id": index + 1,
+            "team_id": 1,
+            "expanded_minute": min(index, 95),
+        }
+        for index in range(100)
+    )
     commit = replace(
         _commit(
             lineups=({"player_id": 10},),
             lineups_available=True,
         ),
+        events=events,
         is_opta=False,
         schedule_status=6,
         dataset_statuses={"events": "available", "lineups": "available"},
@@ -1747,6 +1841,7 @@ def test_match_candidates_increment_latest_retry_and_reset_after_success():
                 6,
                 True,
                 4,
+                "truncated",
             )
         ],
         [
@@ -1759,6 +1854,7 @@ def test_match_candidates_increment_latest_retry_and_reset_after_success():
                 6,
                 True,
                 1,
+                None,
             )
         ],
     ]
@@ -1768,7 +1864,9 @@ def test_match_candidates_increment_latest_retry_and_reset_after_success():
     success_refresh = repository.list_match_candidates("INT-World Cup", "2026")
 
     assert retry[0].attempt_no == 4
+    assert retry[0].previous_failure_code == "truncated"
     assert success_refresh[0].attempt_no == 1
+    assert success_refresh[0].previous_failure_code is None
     sql = trino.execute_query.call_args_list[0].args[0]
     assert "whoscored_match_ingest_latest" in sql
     assert "WHEN m.state = 'retryable'" in sql
@@ -1796,8 +1894,8 @@ def test_match_candidates_expose_exact_backlog_count_when_requested():
     trino = MagicMock()
     # Both returned rows carry the exact pre-LIMIT backlog (5) on every row.
     trino.execute_query.return_value = [
-        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, 5),
-        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, 5),
+        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, None, 5),
+        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, None, 5),
     ]
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
 
@@ -1833,10 +1931,13 @@ def test_backfill_freeze_includes_every_completed_match_regardless_manifest():
     assert repository.list_completed_match_candidates("INT-World Cup", "2026") == []
 
     sql = " ".join(trino.execute_query.call_args.args[0].split())
-    # Only the retry ceiling (#1476) narrows the frozen history plan.
+    # Only the retry ceiling (#1476) and a terminal truncation (#1484) narrow
+    # the frozen history plan.
     assert (
         "AND (NOT ( COALESCE(m.state, '') = 'retryable' "
-        "AND COALESCE(m.attempt_no, 0) >= 8 ))"
+        "AND COALESCE(m.attempt_no, 0) >= 8 ) "
+        "AND NOT ( COALESCE(m.state, '') = 'terminal' "
+        "AND COALESCE(m.failure_code, '') = 'truncated' ))"
     ) in sql
     assert "retry_after" not in sql
     assert "parser_version IS DISTINCT FROM" not in sql

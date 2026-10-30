@@ -77,6 +77,9 @@ from .repository import (
     ProfileCommit,
     PreviewCommit,
     PreviewFailure,
+    DAILY_RETRYABLE_MAX_ATTEMPTS,
+    TRUNCATED_MAX_ATTEMPTS,
+    WhoScoredTruncatedMatchError,
     scope_write_chunk_rows_from_env,
     WhoScoredScopeRowSpool,
     WhoScoredRepository,
@@ -2977,7 +2980,9 @@ class WhoScoredIngestService:
                 response, raw_uri = self._fetch(
                     target,
                     validator=validate,
-                    allow_cache=True,
+                    # A truncated page is retried from the source (#1484):
+                    # the cached copy is the very page that was truncated.
+                    allow_cache=candidate.previous_failure_code != "truncated",
                     # Final historical pages are immutable source evidence.
                     # Reparse persisted raw bytes regardless of age and use
                     # the source only when that object is absent or invalid.
@@ -3022,6 +3027,8 @@ class WhoScoredIngestService:
                 )
                 try:
                     self.repository.validate_match_commit(commit)
+                except WhoScoredTruncatedMatchError:
+                    raise
                 except ValueError as exc:
                     raise WhoScoredParseError(str(exc)) from exc
                 pending.append((commit, parsed))
@@ -3139,17 +3146,43 @@ class WhoScoredIngestService:
                     else:
                         failure_outcomes.append((state, str(candidate.game_id)))
             except WhoScoredParseError as exc:
+                attempt_no = int(candidate.attempt_no)
+                truncated = isinstance(exc, WhoScoredTruncatedMatchError)
+                state = "parse_failed"
+                retry_after = None
+                if truncated:
+                    # #1484: refetch a truncated page a bounded number of
+                    # times, then record it as a terminal source fact.
+                    # ``attempt_no`` continues any retryable streak (it is 1
+                    # otherwise), so alternating truncation and transport
+                    # failures still hit the daily retry ceiling.
+                    state = (
+                        "terminal"
+                        if (
+                            candidate.previous_failure_code == "truncated"
+                            and attempt_no >= TRUNCATED_MAX_ATTEMPTS
+                        )
+                        or attempt_no >= DAILY_RETRYABLE_MAX_ATTEMPTS
+                        else "retryable"
+                    )
+                    if state == "retryable":
+                        delay_hours = min(6 * (2 ** min(attempt_no - 1, 3)), 48)
+                        retry_after = datetime.now(timezone.utc).replace(
+                            tzinfo=None
+                        ) + timedelta(hours=delay_hours)
                 try:
                     failure_row, _failure_batch_id = self.repository.build_failure_row(
                         ManifestFailure(
                             game_id=candidate.game_id,
                             league=self.scope.competition_id,
                             season=self.scope.season_id,
-                            state="parse_failed",
-                            failure_code=FailureKind.CONTENT.value,
+                            state=state,
+                            failure_code=(
+                                "truncated" if truncated else FailureKind.CONTENT.value
+                            ),
                             error=str(exc)[:4000],
-                            retry_after=None,
-                            attempt_no=int(candidate.attempt_no),
+                            retry_after=retry_after,
+                            attempt_no=attempt_no,
                             game=candidate.game,
                             kickoff=candidate.kickoff,
                             is_opta=candidate.match_is_opta,
@@ -3175,7 +3208,11 @@ class WhoScoredIngestService:
                         f"game {candidate.game_id} failure manifest: "
                         f"{type(manifest_exc).__name__}: {manifest_exc}"
                     )
-                result.errors.append(f"game {candidate.game_id}: {exc}")
+                else:
+                    if truncated:
+                        failure_outcomes.append((state, str(candidate.game_id)))
+                if not truncated:
+                    result.errors.append(f"game {candidate.game_id}: {exc}")
             except ProxyUnavailable as exc:
                 # Dead pool: no failure row, no attempt_no bump for this or
                 # any later candidate; already parsed matches still commit.
