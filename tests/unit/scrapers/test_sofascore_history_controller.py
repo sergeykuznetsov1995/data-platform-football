@@ -394,7 +394,8 @@ def test_verified_page_chains_survive_report_retention_in_checkpoint(tmp_path):
 
 
 @pytest.mark.parametrize('metadata_status', ['ready', 'excluded'])
-def test_empty_or_excluded_core_tournament_remains_unknown(tmp_path, metadata_status):
+def test_empty_or_excluded_core_tournament_is_reported_not_blocking(tmp_path, metadata_status):
+    """Owner 29.10 (#1966): settled exclusions stay visible but deep history proceeds."""
     snap = snapshot()
     snap['tournaments'][1].update(metadata_status=metadata_status, seasons=[])
     snap['snapshot_id'] = _snapshot_digest(snap)
@@ -403,10 +404,33 @@ def test_empty_or_excluded_core_tournament_remains_unknown(tmp_path, metadata_st
         if row['season_id'] % 100 == 24:
             row['closed'] = 0
     planned = run(tmp_path, snap, ev)
-    assert not planned
+    assert [p['SOFASCORE_HISTORY_GROUP'] for p in planned] == ['3']
+    report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
+    for group in ('1', '2'):
+        assert report['groups'][group]['unknown_scopes'] == 0
+        assert report['groups'][group]['excluded_core'] == 1
+    assert 'исключено core 1' in report['summary']
+
+
+def test_core_with_pending_metadata_and_no_seasons_still_blocks(tmp_path):
+    snap = snapshot()
+    snap['tournaments'][1].update(metadata_status='pending', seasons=[])
+    snap['snapshot_id'] = _snapshot_digest(snap)
+    run(tmp_path, snap, evidence(snap, closed=100))
     report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
     assert report['groups']['1']['unknown_scopes'] == 1
-    assert report['groups']['2']['unknown_scopes'] == 1
+    assert not report['groups']['1']['gate_passed']
+
+
+def test_core_with_every_season_excluded_is_settled(tmp_path):
+    snap = snapshot()
+    for season in snap['tournaments'][1]['seasons']:
+        season['metadata_status'] = 'excluded'
+    snap['snapshot_id'] = _snapshot_digest(snap)
+    run(tmp_path, snap, evidence(snap, closed=100))
+    report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
+    assert report['groups']['1']['unknown_scopes'] == 0
+    assert report['groups']['1']['excluded_core'] == 1
 
 
 def test_verified_empty_schedule_is_known_zero_not_an_endless_bootstrap(tmp_path):
