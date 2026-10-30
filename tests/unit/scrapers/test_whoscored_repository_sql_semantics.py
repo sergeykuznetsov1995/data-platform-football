@@ -658,3 +658,56 @@ def test_history_plan_freeze_drops_terminal_truncation_but_replay_refetches_it()
     )
     assert replay.previous_failure_code == "truncated"
     assert replay.attempt_no == 1
+
+
+@pytest.mark.unit
+def test_previous_parser_success_with_raw_stays_covered_legacy_does_not():
+    """#1483 round 2: a v8 success is a reparse candidate, not a coverage gap."""
+
+    con = _connection()
+    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
+                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
+    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
+                "(?, ?, 'success', '{\"whoscored_schedule\":3}')", [LEAGUE, SEASON])
+    for game_id in (1, 2, 3):
+        _game(con, game_id, 10, 20)
+        _attempt(con, game_id, "success", 19)
+    con.execute("UPDATE iceberg.bronze.whoscored_match_ingest_manifest "
+                "SET parser_version = 'whoscored-parser-v8' WHERE game_id = 2")
+    con.execute("UPDATE iceberg.bronze.whoscored_match_ingest_manifest "
+                "SET parser_version = 'legacy-v1', batch_id = 'legacy-3', raw_uri = NULL "
+                "WHERE game_id = 3")
+    repository = _history_repository(con)
+
+    result = repository.history_coverage()[(LEAGUE, SEASON)]
+
+    assert (result["closeable"], result["closed"]) == (3, 2)
+    assert {c.game_id for c in repository.list_match_candidates(
+        LEAGUE, SEASON, limit=300, lane="history")} == {2, 3}
+
+
+@pytest.mark.unit
+def test_profile_parser_replays_are_latest_raw_backed_attempts_of_another_parser():
+    con = _connection()
+    con.execute(
+        "CREATE TABLE iceberg.bronze.whoscored_profile_ingest_manifest ("
+        "player_id BIGINT, state VARCHAR, raw_uri VARCHAR, parser_version VARCHAR, "
+        "fetched_at TIMESTAMP, _ingested_at TIMESTAMP, _batch_id VARCHAR)"
+    )
+    old = NOW - timedelta(days=120)
+    for player_id, state, raw_uri, version in (
+        (1, "success", "s3://raw/1", "whoscored-parser-v8"),
+        (2, "success", "s3://raw/2", PARSER_VERSION),
+        (3, "success", None, "legacy-v1"),
+        (4, "not_available", None, "whoscored-parser-v8"),
+        (5, "parse_failed", "s3://raw/5", "whoscored-parser-v8"),
+    ):
+        con.execute(
+            "INSERT INTO iceberg.bronze.whoscored_profile_ingest_manifest "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [player_id, state, raw_uri, version, old, old, f"b{player_id}"],
+        )
+    repository = _history_repository(con)
+    repository.trino.table_exists.return_value = True
+
+    assert repository.list_profile_parser_replays([1, 2, 3, 4, 5, 6]) == {1, 5}

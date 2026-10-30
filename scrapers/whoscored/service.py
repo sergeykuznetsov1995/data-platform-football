@@ -3659,6 +3659,9 @@ class WhoScoredIngestService:
             "payload_sha256": entity_id_payload_sha256(selected_player_ids),
         }
         pending_commits: list[ProfileCommit] = []
+        parser_replays = self.repository.list_profile_parser_replays(
+            selected_player_ids
+        )
         for player_id in selected_player_ids:
             target = profile_page_target(player_id)
             parsed_holder: dict[str, Any] = {}
@@ -3698,7 +3701,13 @@ class WhoScoredIngestService:
                     target,
                     validator=validate,
                     allow_cache=True,
-                    cache_ttl=timedelta(days=PROFILE_REFRESH_DAYS),
+                    # A parser-version change rereads the stored page of any
+                    # age (#1483); only cadence refreshes reach the source.
+                    cache_ttl=(
+                        None
+                        if player_id in parser_replays
+                        else timedelta(days=PROFILE_REFRESH_DAYS)
+                    ),
                 )
             except WhoScoredTransportError as exc:
                 # Local safety ceilings and storage/proxy infrastructure

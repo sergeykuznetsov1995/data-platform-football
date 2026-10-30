@@ -3198,6 +3198,27 @@ class WhoScoredRepository:
             LIMIT {limit}
             """
 
+    def list_profile_parser_replays(self, player_ids: Iterable[int]) -> set[int]:
+        """Players whose latest attempt holds page bytes of another parser.
+
+        Like ``MatchCandidate.parser_replay`` (#1483): a parser-version change
+        rereads the raw cache regardless of its age instead of the source.
+        """
+        ids = sorted({int(value) for value in player_ids})
+        if not ids or not self.trino.table_exists(self.schema, PROFILE_MANIFEST_TABLE):
+            return set()
+        rows = self.trino.execute_query(
+            "SELECT player_id FROM ("
+            "SELECT m.*, ROW_NUMBER() OVER (PARTITION BY player_id "
+            "ORDER BY fetched_at DESC, _ingested_at DESC, _batch_id DESC) AS rn "
+            f"FROM {self.catalog}.{self.schema}.{PROFILE_MANIFEST_TABLE} m "
+            f"WHERE player_id IN ({','.join(str(value) for value in ids)})"
+            ") WHERE rn = 1 AND state IN ('success', 'parse_failed') "
+            "AND raw_uri IS NOT NULL "
+            f"AND parser_version IS DISTINCT FROM {_sql_string(PARSER_VERSION)}"
+        )
+        return {int(row[0]) for row in rows}
+
     def list_profile_candidates(
         self,
         *,
@@ -4343,9 +4364,11 @@ class WhoScoredRepository:
             ), games AS (
                 SELECT s.*,
                        (st.successes > 0 OR st.absent < st.absent_needed) AS closeable,
+                       -- A success with stored bytes is covered whatever its
+                       -- parser version: a reparse is a candidate, not a gap.
                        (m.state = 'success' AND m.batch_id LIKE 'ws2-%'
-                        AND m.raw_uri IS NOT NULL AND m.payload_sha256 IS NOT NULL
-                        AND m.parser_version = {_sql_string(PARSER_VERSION)}) AS success,
+                        AND m.raw_uri IS NOT NULL
+                        AND m.payload_sha256 IS NOT NULL) AS success,
                        (m.state = 'not_available' AND na.n >= 2
                         AND st.successes > 0) AS final_absent,
                        COALESCE(m.completed_at, m.fetched_at) AS closed_at
