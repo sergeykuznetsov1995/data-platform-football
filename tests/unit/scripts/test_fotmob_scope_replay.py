@@ -640,3 +640,17 @@ def test_newer_304_validation_of_old_profile_wins_over_earlier_failure(tmp_path)
     assert report["decisions"][0]["observed_at"] == (
         "2026-08-08T12:00:00+00:00"
     )
+
+
+def test_saved_hash_references_survive_pointer_movement(tmp_path):
+    catalog_hash = _store_catalog(tmp_path, [{"id": 47, "name": "League A"}])
+    _store_profile(tmp_path, 47, "League A")
+    references = [json.loads(path.read_text()) for path in (tmp_path / "targets").rglob("*.json")]
+    selected_profile_hash = next(ref["content_hash"] for ref in references if ref["canonical_url"] != mod.CATALOG_URL)
+    _store_profile(tmp_path, 47, "League B", gender="female")
+    _store_catalog(tmp_path, [{"id": 48, "name": "Other"}])
+    report = mod.build_replay_report(tmp_path, references=references)
+    assert report["catalog_content_hash"] == catalog_hash
+    assert report["decisions"][0]["profile_content_hash"] == selected_profile_hash
+    assert report["decisions"][0]["profile_name"] == "League A"
+    assert report["decisions"][0]["decision"] == "included"

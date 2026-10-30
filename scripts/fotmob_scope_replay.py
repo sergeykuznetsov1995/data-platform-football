@@ -171,7 +171,7 @@ def _raw_uri_prefix(raw_uri: Any, *, blob_key: str, path: Path) -> str:
 
 
 def _load_manifest_payload(
-    raw_root: Path, path: Path
+    raw_root: Path, path: Path, *, selected: Mapping[str, Any] | None = None,
 ) -> tuple[
     str,
     int | None,
@@ -183,8 +183,7 @@ def _load_manifest_payload(
     str,
 ] | None:
     try:
-        raw_manifest = path.read_bytes()
-        manifest = json.loads(raw_manifest)
+        manifest = selected if selected is not None else json.loads(path.read_bytes())
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ReplayError(f"invalid raw target manifest {path}: {exc}") from exc
     if not isinstance(manifest, Mapping):
@@ -267,15 +266,22 @@ def _load_manifest_payload(
     )
 
 
-def _stored_evidence(raw_root: Path) -> tuple[_Catalog, dict[int, _Profile]]:
+def _stored_evidence(
+    raw_root: Path, references: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[_Catalog, dict[int, _Profile]]:
     targets = raw_root / "targets" / "sha256"
-    if not targets.is_dir():
+    if references is None and not targets.is_dir():
         raise ReplayError(f"raw root has no targets/sha256 directory: {raw_root}")
     catalog: _Catalog | None = None
     profiles: dict[int, _Profile] = {}
     store_prefix: str | None = None
-    for path in sorted(targets.rglob("*.json")):
-        loaded = _load_manifest_payload(raw_root, path)
+    selections = (
+        [(targets / str(ref.get("target_key", ""))[:2] / (str(ref.get("target_key", "")) + ".json"), ref)
+         for ref in references]
+        if references is not None else [(path, None) for path in sorted(targets.rglob("*.json"))]
+    )
+    for path, selected in selections:
+        loaded = _load_manifest_payload(raw_root, path, selected=selected)
         if loaded is None:
             continue
         (
@@ -671,13 +677,15 @@ def _unavailable_decisions(
     return decisions, classifications
 
 
-def build_replay_report(raw_root: Path) -> dict[str, Any]:
+def build_replay_report(
+    raw_root: Path, *, references: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Re-run the production classifier over immutable local raw evidence."""
 
     root = Path(raw_root).resolve()
     if not root.is_dir():
         raise ReplayError(f"raw root is not a directory: {root}")
-    stored_catalog, stored_profiles = _stored_evidence(root)
+    stored_catalog, stored_profiles = _stored_evidence(root, references)
     try:
         discovery = discover_competitions(stored_catalog.payload)
     except (CatalogShapeError, TypeError, ValueError) as exc:
@@ -970,6 +978,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--references", type=Path, help="JSON array of saved raw manifests (selected hashes)")
     parser.add_argument(
         "--expected-summary",
         type=Path,
@@ -981,7 +990,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        report = build_replay_report(args.raw_root)
+        references = None
+        if args.references is not None:
+            try:
+                references = json.loads(args.references.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ReplayError(f"invalid saved references: {exc}") from exc
+            if not isinstance(references, list) or any(not isinstance(ref, Mapping) for ref in references):
+                raise ReplayError("saved references must be an array of raw manifests")
+        report = build_replay_report(args.raw_root, references=references)
         if args.expected_summary is not None:
             try:
                 expected = json.loads(args.expected_summary.read_text(encoding="utf-8"))

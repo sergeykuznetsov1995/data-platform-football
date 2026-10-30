@@ -32,6 +32,7 @@ from .catalog import (
     competition_from_league_payload,
     discover_competitions,
     parse_seasons,
+    validate_selected_season,
 )
 from .domain import (
     CompetitionRef,
@@ -194,7 +195,13 @@ def _validated_at(previous: Optional[Mapping[str, Any]]) -> Optional[datetime]:
 
     if not previous or previous.get("stale"):
         return None
-    return _aware_datetime(previous.get("completed_at") or previous.get("fetched_at"))
+    capabilities = previous.get("capabilities_json") or {}
+    if isinstance(capabilities, str):
+        capabilities = json.loads(capabilities)
+    return _aware_datetime(
+        capabilities.get("validated_at") or capabilities.get("source_observed_at")
+        or previous.get("fetched_at")
+    )
 
 
 def _content_hash(values: Iterable[str]) -> str:
@@ -678,7 +685,12 @@ class FotMobIngestService:
     ) -> FetchResult:
         self._raise_if_cancelled()
         if replay or self.mode == RunMode.REPLAY:
-            fetch = self.transport.replay_json(endpoint, params)
+            target = canonicalize_target(endpoint, params)
+            previous = self.repository.latest_success(target.target_key)
+            fetch = (
+                self.transport.replay_target_key(target.target_key, observation=previous)
+                if previous is not None else self.transport.replay_json(endpoint, params)
+            )
             self._account(fetch)
             self._raise_if_cancelled()
             return fetch
@@ -755,19 +767,21 @@ class FotMobIngestService:
 
     def _replay_many_target_keys(
         self,
-        targets: Mapping[str, str],
+        targets: Mapping[str, Mapping[str, Any]],
     ) -> dict[str, FetchResult | Exception]:
         """Replay exact raw manifests concurrently without reconstructing URLs."""
 
         unique = {
-            str(entity_id): str(target_key) for entity_id, target_key in targets.items()
+            str(entity_id): observation for entity_id, observation in targets.items()
         }
         if not unique:
             return {}
         self._raise_if_cancelled()
 
-        def replay(target_key: str) -> FetchResult:
-            fetch = self.transport.replay_target_key(target_key)
+        def replay(observation: Mapping[str, Any]) -> FetchResult:
+            fetch = self.transport.replay_target_key(
+                str(observation["target_key"]), observation=observation,
+            )
             self._account(fetch)
             self._raise_if_cancelled()
             return fetch
@@ -809,10 +823,13 @@ class FotMobIngestService:
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
         capabilities = dict(capabilities or {})
-        if target_type in {"match", "league_season", "competition_seasons"} and not fetch.stale and manifest_status in {
-            ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED,
+        capabilities["canonical_url"] = fetch.url
+        if fetch.validated_at or fetch.source_observed_at or fetch.fetched_at:
+            capabilities["validated_at"] = fetch.validated_at or fetch.source_observed_at or fetch.fetched_at
+        if not fetch.stale and manifest_status in {
+            ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED, ManifestStatus.NOT_AVAILABLE,
         }:
-            observed = match_time(fetch.source_observed_at or fetch.fetched_at)
+            observed = match_time(fetch.source_observed_at or fetch.validated_at or fetch.fetched_at)
             if observed is not None:
                 # League and season-catalog manifests are read as ISO timestamps
                 # by the daily meter; keep an explicit UTC offset independent of
@@ -845,6 +862,7 @@ class FotMobIngestService:
             cache_hit=fetch.cache_hit,
             stale=fetch.stale,
             fetched_at=_aware_datetime(fetch.fetched_at),
+            validated_at=_aware_datetime(fetch.validated_at or fetch.source_observed_at or fetch.fetched_at),
             retry_after=retry_after,
             direct_bytes=fetch.direct_bytes,
             proxy_bytes=fetch.proxy_bytes,
@@ -1952,20 +1970,23 @@ class FotMobIngestService:
             {"id": int(competition_id), "season": source_season_key},
         )
         prefetched_source_url: Optional[str] = None
+        replay_existing = False
         try:
             if prefetched is None:
                 previous = self.repository.latest_success(exact.target_key)
                 replay_existing = previous is not None and self.mode == RunMode.BACKFILL
-                fetch = self._fetch(
-                    exact.canonical_url,
-                    replay=replay_existing,
-                )
+                if previous is not None and (replay_existing or self.mode == RunMode.REPLAY):
+                    fetch = self.transport.replay_target_key(exact.target_key, observation=previous)
+                    self._account(fetch)
+                else:
+                    fetch = self._fetch(exact.canonical_url)
                 if replay_existing and not fetch.ok:
                     result.metadata["raw_replay_fallback"] = {
                         "outcome": fetch.status,
                         "error": fetch.error,
                     }
                     fetch = self._fetch(exact.canonical_url)
+                    replay_existing = False
             else:
                 # Discovery fetched the selected season through ``?id=``.  It
                 # is byte-equivalent and saves a request, but the logical
@@ -2000,6 +2021,15 @@ class FotMobIngestService:
 
         try:
             scope = ScopeRef(int(competition_id), str(source_season_key))
+            if replay_existing and fetch.ok:
+                try:
+                    validate_selected_season(fetch.data, str(source_season_key))
+                except SelectedSeasonMismatch as exc:
+                    result.metadata["raw_replay_fallback"] = {"error": str(exc)}
+                    fetch = self._fetch(exact.canonical_url)
+                    if not fetch.ok:
+                        self._record_failure(result, fetch.url, fetch)
+                        return result, None
             try:
                 bundle = parse_season_bundle(fetch.data, scope)
             except CalendarMissingError:
@@ -2074,7 +2104,7 @@ class FotMobIngestService:
                 alias_cached = getattr(self.transport, "alias_cached_json", None)
                 if alias_cached is not None:
                     try:
-                        alias_cached(prefetched_source_url, exact.canonical_url)
+                        alias_cached(prefetched_source_url, exact.canonical_url, observation=prefetched)
                     except Exception as exc:
                         raise CatalogShapeError(
                             "selected-season raw alias failed: "
@@ -2435,7 +2465,7 @@ class FotMobIngestService:
             # old fallback before it can become a trusted same-day checkpoint.
             if previous.get("stale"):
                 return None
-            observed = previous.get("completed_at")
+            observed = _validated_at(previous)
             if isinstance(observed, str):
                 observed = datetime.fromisoformat(observed.replace("Z", "+00:00"))
             if not isinstance(observed, datetime):
@@ -3447,7 +3477,7 @@ class FotMobIngestService:
             ]
 
         if self.mode == RunMode.REPLAY and build_id is None:
-            target_keys: dict[str, str] = {}
+            target_keys: dict[str, Mapping[str, Any]] = {}
             fetched: dict[str, FetchResult | Exception] = {}
             for player_id in due:
                 previous = self.repository.latest_entity_raw_target("player", player_id)
@@ -3462,7 +3492,7 @@ class FotMobIngestService:
                         "no raw-bearing v1/v2 player manifest for offline replay"
                     )
                 else:
-                    target_keys[str(player_id)] = target_key
+                    target_keys[str(player_id)] = previous
             fetched.update(self._replay_many_target_keys(target_keys))
             current_build = None
         else:
