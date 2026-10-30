@@ -1032,7 +1032,10 @@ def test_current_view_fails_closed_without_manifest_batch_column():
         FotMobRepository(writer=writer).ensure_current_views()
 
 
-def test_memory_completion_markers_are_exact_signature_and_season_scoped():
+def test_memory_completion_markers_are_exact_signature_and_season_scoped(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fotmob.repository.utc_now", lambda: datetime(2026, 7, 11, 8, 30)
+    )
     repository = MemoryFotMobRepository()
     repository.record(
         _commit(
@@ -3302,3 +3305,75 @@ def test_1771_team_merge_requires_matching_singleton_evidence(corruption):
     with pytest.raises(RuntimeError, match="expected either 0 or 1"):
         repository.flush()
     assert not any(kwargs.get("merge_keys") for _, kwargs in writer.calls)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_missing_players_cooldown_and_attempt_order_survive_build_change(monkeypatch, backend):
+    import re
+    import sqlite3
+    from types import SimpleNamespace
+    import scrapers.fotmob.repository as module
+
+    now = datetime(2026, 10, 30, 12)
+    monkeypatch.setattr(module, "utc_now", lambda: now)
+    memory = MemoryFotMobRepository()
+    memory.commit(_commit(target_type="team", entity_id="1"), [TableRows(
+        "fotmob_squad_snapshots",
+        [{"team_id": "1", "member_type": "player", "member_id": str(i)}
+         for i in range(1, 7)], "squad_snapshots",
+    )])
+    # Exercise the actual selection SQL with only Trino syntax adapted to SQLite.
+    db = sqlite3.connect(":memory:")
+    db.executescript("""
+        CREATE TABLE fotmob_squad_snapshots_current(member_type TEXT, member_id TEXT);
+        CREATE TABLE fotmob_player_snapshots_current(player_id TEXT);
+        CREATE TABLE fotmob_ingest_manifest(
+            entity_id TEXT, target_type TEXT, attempts INTEGER, status TEXT,
+            completed_at TEXT, target_key TEXT);
+    """)
+    db.executemany("INSERT INTO fotmob_squad_snapshots_current VALUES ('player', ?)",
+                   [(str(i),) for i in range(1, 7)])
+
+    def execute(sql):
+        sql = sql.replace(f"{repository.catalog}.{repository.schema}.", "")
+        sql = re.sub(r"TRY_CAST\(([^()]+) AS BIGINT\)", r"CAST(\1 AS INTEGER)", sql)
+        sql = sql.replace("TIMESTAMP '", "'")
+        return db.execute(sql).fetchall()
+
+    trino = SimpleNamespace(table_exists=lambda *args: True, execute_query=execute)
+    repository = FotMobRepository(writer=SimpleNamespace(_get_trino_manager=lambda: trino))
+    select = (memory if backend == "memory" else repository).missing_current_squad_player_ids
+
+    def attempt(player_id, status, completed, build="old-build"):
+        key = f"https://www.fotmob.com/_next/data/{build}/players/{player_id}.json"
+        memory.commit(_commit(target_type="player", entity_id=str(player_id),
+                              target_key=key, status=status, attempts=1,
+                              completed_at=completed), [])
+        db.execute("INSERT INTO fotmob_ingest_manifest VALUES (?, 'player', 1, ?, ?, ?)",
+                   (str(player_id), status.value, completed.isoformat(sep=" "), key))
+
+    assert select(2) == [1, 2]
+    for i in (1, 2):
+        attempt(i, ManifestStatus.NOT_AVAILABLE, now)
+    assert select(2) == [3, 4]
+    # Success without a typed card must remain repairable. Existing typed cards
+    # stay excluded, and non-success attempts participate in the fair ordering.
+    attempt(3, ManifestStatus.RETRYABLE_FAILURE, now + timedelta(hours=1))
+    attempt(4, ManifestStatus.TERMINAL_FAILURE, now + timedelta(hours=1))
+    attempt(5, ManifestStatus.SUCCESS, now + timedelta(hours=2))
+    memory.tables["fotmob_player_snapshots"] = [{"player_id": "6"}]
+    db.execute("INSERT INTO fotmob_player_snapshots_current VALUES ('6')")
+    now += timedelta(hours=24) - timedelta(microseconds=1)
+    assert select(10) == [3, 4, 5]
+    now += timedelta(microseconds=1)
+    assert select(2) == [1, 2]  # exact cooldown boundary, oldest attempts first
+    assert select(10) == [1, 2, 3, 4, 5]
+    # A new build URL still updates the same entity's attempt history.
+    attempt(1, ManifestStatus.NOT_AVAILABLE, now, build="new-build")
+    attempt(2, ManifestStatus.NOT_AVAILABLE, now, build="new-build")
+    assert select(2) == [3, 4]
+    attempt(3, ManifestStatus.RETRYABLE_FAILURE, now)
+    assert select(2) == [4, 5]  # select by age, return canonical numeric order
+    attempt(4, ManifestStatus.RETRYABLE_FAILURE, now + timedelta(seconds=1))
+    assert select(2) == [3, 5]  # priority order is 5, 3; output must be sorted
+    db.close()

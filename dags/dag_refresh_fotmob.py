@@ -57,7 +57,7 @@ RUN_ID_PREFIX = "fotmob_refresh__"
 # sustained direct-only traffic (a full ~494 rotation lands in ~2-3 days at
 # these settings), shrink the chunk if a single run struggles to finish.
 # Proxy bytes stay 0 — FotMob is direct-only by design.
-REFRESH_ENTITIES = "season,leaderboards,matches,teams,players,transfers"
+REFRESH_ENTITIES = "season,leaderboards,matches,teams,transfers"
 REFRESH_MAX_REQUESTS = 15_000
 REFRESH_MAX_DIRECT_MIB = 1024
 REFRESH_REQUESTS_PER_MINUTE = 60

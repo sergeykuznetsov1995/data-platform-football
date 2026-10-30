@@ -1,9 +1,9 @@
-"""Manual owner for missing FotMob player cards.
+"""Daily collector for missing FotMob player cards.
 
 The collector is separate from catalog waves and history campaigns. It only
 asks the ingest child for current-squad identities absent from the typed player
-snapshot view. The DAG is deliberately trigger-only and starts paused so an
-operator can run it inside a known free publication-writer window.
+snapshot view. The DAG starts paused for the acceptance run in a free
+publication-writer window; daily collection starts after operator activation.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -58,7 +58,7 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
         dag_id="dag_collect_fotmob_players",
         description="Collect only missing current-squad FotMob player cards",
         default_args={**DEFAULT_ARGS, "retries": 0},
-        schedule=None,
+        schedule="@daily",
         start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         max_active_runs=1,
@@ -81,7 +81,10 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
             task_id=TRIGGER_TASK_ID,
             trigger_dag_id=INGEST_DAG_ID,
             trigger_run_id="fotmob_players__" + GENERATION_TEMPLATE,
-            logical_date="{{ logical_date.isoformat() }}",
+            # Keep a stable child date outside the orchestrator's five-minute grid.
+            logical_date=(
+                "{{ (logical_date + macros.timedelta(microseconds=1)).isoformat() }}"
+            ),
             wait_for_completion=True,
             poke_interval=30,
             allowed_states=["success"],

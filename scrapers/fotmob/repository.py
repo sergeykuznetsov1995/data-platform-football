@@ -50,6 +50,7 @@ from scrapers.fotmob.domain import (
 )
 from scrapers.fotmob.match_refresh import source_observed_at
 from scrapers.fotmob.planner import ScopeAttemptState
+from scrapers.fotmob.player_collector import PLAYER_COLLECTOR_NOT_AVAILABLE_COOLDOWN
 from scrapers.fotmob.row_identity import OBSERVATION_COLUMNS, row_multiset
 
 
@@ -3312,7 +3313,7 @@ class FotMobRepository:
         return output
 
     def missing_current_squad_player_ids(self, limit: int) -> list[int]:
-        """Return a bounded, deterministic roster-to-card anti-join."""
+        """Return missing cards by oldest attempt, excluding recent source absences."""
 
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be positive")
@@ -3328,15 +3329,31 @@ class FotMobRepository:
             raise RuntimeError("FotMob current view is unavailable")
         rows = trino.execute_query(
             f"""
-            SELECT DISTINCT TRY_CAST(s.member_id AS BIGINT) AS player_id
-            FROM {self.catalog}.{self.schema}.{squad_table} s
-            LEFT JOIN {self.catalog}.{self.schema}.{player_table} p
-              ON TRY_CAST(p.player_id AS BIGINT) = TRY_CAST(s.member_id AS BIGINT)
-            WHERE s.member_type = 'player'
-              AND TRY_CAST(s.member_id AS BIGINT) > 0
-              AND p.player_id IS NULL
-            ORDER BY player_id
-            LIMIT {limit}
+            WITH attempts AS (
+                SELECT TRY_CAST(entity_id AS BIGINT) AS player_id,
+                       MAX(completed_at) AS last_attempt,
+                       MAX(CASE WHEN status = 'not_available'
+                                THEN completed_at END) AS last_unavailable
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = 'player' AND attempts > 0
+                GROUP BY TRY_CAST(entity_id AS BIGINT)
+            ), candidates AS (
+                SELECT DISTINCT TRY_CAST(s.member_id AS BIGINT) AS player_id,
+                       a.last_attempt
+                FROM {self.catalog}.{self.schema}.{squad_table} s
+                LEFT JOIN {self.catalog}.{self.schema}.{player_table} p
+                  ON TRY_CAST(p.player_id AS BIGINT) = TRY_CAST(s.member_id AS BIGINT)
+                LEFT JOIN attempts a
+                  ON a.player_id = TRY_CAST(s.member_id AS BIGINT)
+                WHERE s.member_type = 'player'
+                  AND TRY_CAST(s.member_id AS BIGINT) > 0
+                  AND p.player_id IS NULL
+                  AND (a.last_unavailable IS NULL OR a.last_unavailable <=
+                       TIMESTAMP '{(utc_now() - PLAYER_COLLECTOR_NOT_AVAILABLE_COOLDOWN).isoformat(sep=" ")}')
+                ORDER BY a.last_attempt ASC NULLS FIRST, player_id
+                LIMIT {limit}
+            )
+            SELECT player_id FROM candidates ORDER BY player_id
             """
         )
         output: list[int] = []
@@ -3502,8 +3519,8 @@ class MemoryFotMobRepository:
             values["status"] = commit.status
             values["actual_counts"] = derived
             commit = TargetCommit(**values)
-        if commit.completed_at is None and commit.fetched_at is None:
-            # Rawless decisions need a stable observation time, as in Bronze.
+        if commit.completed_at is None:
+            # Persist completion time for every attempt, as in Bronze.
             commit = replace(commit, completed_at=utc_now())
         self.commits.append(commit)
         for dataset in datasets:
@@ -3886,7 +3903,34 @@ class MemoryFotMobRepository:
                 continue
             if player_id > 0:
                 existing_ids.add(player_id)
-        return sorted(squad_ids - existing_ids)[:limit]
+        last_attempt: dict[int, datetime] = {}
+        last_unavailable: dict[int, datetime] = {}
+        for commit in self.commits:
+            if commit.target_type != "player" or commit.attempts <= 0:
+                continue
+            try:
+                player_id = int(commit.entity_id)
+            except (TypeError, ValueError):
+                continue
+            completed = _evidence_datetime(commit.completed_at)
+            if completed is None:
+                continue
+            last_attempt[player_id] = max(
+                last_attempt.get(player_id, datetime.min), completed
+            )
+            if commit.status == ManifestStatus.NOT_AVAILABLE:
+                last_unavailable[player_id] = max(
+                    last_unavailable.get(player_id, datetime.min), completed
+                )
+        cutoff = utc_now() - PLAYER_COLLECTOR_NOT_AVAILABLE_COOLDOWN
+        eligible = [
+            player_id for player_id in squad_ids - existing_ids
+            if last_unavailable.get(player_id, datetime.min) <= cutoff
+        ]
+        eligible.sort(key=lambda player_id: (
+            last_attempt.get(player_id, datetime.min), player_id
+        ))
+        return sorted(eligible[:limit])
 
     def previous_catalog_snapshots(self, limit: int = 2) -> list[set[int]]:
         # Match the production query: an offline raw replay is useful for

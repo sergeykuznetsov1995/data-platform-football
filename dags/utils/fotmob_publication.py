@@ -107,7 +107,6 @@ FOTMOB_DAILY_ENTITIES = (
     "leaderboards",
     "matches",
     "teams",
-    "players",
     "transfers",
 )
 FOTMOB_DAILY_MAX_REQUESTS = 10_000
@@ -633,14 +632,15 @@ def _active_owner_writer_authorization(
             if isinstance(decision, Mapping)
             else PLAYER_COLLECTOR_MODE
         )
-        expected_run_type = (
-            "scheduled"
+        # The player collector runs daily and may still be triggered by hand (#1297).
+        expected_run_types = (
+            {"scheduled"}
             if owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
-            else "manual"
+            else {"manual", "scheduled"}
         )
         if (
             owner is None
-            or state(owner.run_type) != expected_run_type
+            or state(owner.run_type) not in expected_run_types
             or state(owner.state) not in {"running", "success"}
             or trigger is None
             or state(trigger.state)
@@ -1362,7 +1362,7 @@ def fotmob_ceremony_configured(
 
 
 def _player_collector_owner_context(context: Mapping[str, Any]) -> dict[str, Any]:
-    """Bind one trigger-only collector run to a stable non-zero interval."""
+    """Bind one manual or scheduled collector run to a stable interval."""
 
     dag_run = context.get("dag_run")
     dag_id = getattr(dag_run, "dag_id", None)
@@ -1371,12 +1371,15 @@ def _player_collector_owner_context(context: Mapping[str, Any]) -> dict[str, Any
     normalized_run_type = str(getattr(run_type, "value", run_type) or "").casefold()
     if (
         dag_id != FOTMOB_PLAYER_COLLECTOR_DAG_ID
-        or normalized_run_type != "manual"
+        or normalized_run_type not in {"manual", "scheduled"}
         or not run_id
     ):
         raise _airflow_exception(
-            "FotMob player collector requires its exact manual owner DagRun"
+            "FotMob player collector requires its exact manual or scheduled owner DagRun"
         )
+    if normalized_run_type == "scheduled":
+        _context_interval(context)
+        return dict(context)
     logical_date = (
         context.get("logical_date")
         or getattr(dag_run, "logical_date", None)
@@ -1634,7 +1637,7 @@ def attest_fotmob_isolated_runtime(
 
 
 def attest_fotmob_player_collector_runtime(**context: Any) -> dict[str, Any]:
-    """Attest only the exact trigger-only manual player collector owner."""
+    """Attest only the exact manual or scheduled player collector owner."""
 
     normalized = _player_collector_owner_context(context)
     return attest_fotmob_isolated_runtime(
@@ -2020,7 +2023,7 @@ def expected_publication(owner: str, context: Mapping[str, Any]) -> dict[str, An
 def expected_player_collector_publication(
     context: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return the retry-stable publication identity of one manual collector."""
+    """Return the retry-stable publication identity of one collector run."""
 
     normalized = _player_collector_owner_context(context)
     return expected_publication("isolated", normalized)
@@ -2127,7 +2130,7 @@ def initialize_fotmob_publication(
 def initialize_fotmob_player_collector_publication(
     **context: Any,
 ) -> dict[str, Any]:
-    """Initialize only the exact manual collector's stable generation."""
+    """Initialize only the exact collector's stable generation."""
 
     normalized = _player_collector_owner_context(context)
     return initialize_fotmob_publication(
@@ -2418,7 +2421,7 @@ def fail_unsealed_fotmob_publication(
 def fail_unsealed_fotmob_player_collector_publication(
     *, success_task_id: str, writer_task_ids: Sequence[str] = (), **context: Any
 ) -> dict[str, Any]:
-    """Finalize the same stable generation minted by the manual collector."""
+    """Finalize the same stable generation minted by the collector."""
 
     normalized = _player_collector_owner_context(context)
     return fail_unsealed_fotmob_publication(

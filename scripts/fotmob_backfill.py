@@ -125,7 +125,6 @@ _MODE_INTERVAL_PARITY = {"backfill": 0, "replay": 1, AUTOMATIC_CANARY_MODE: 2}
 AUTOMATIC_CANARY_ENTITIES = (
     "leaderboards",
     "matches",
-    "players",
     "season",
     "teams",
     "transfers",

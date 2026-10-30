@@ -35,14 +35,15 @@ ADVANCED_SCHEDULE_BOUNDARY = {
 }
 
 
-def test_player_collector_is_a_projected_paused_manual_owner():
+def test_player_collector_is_a_projected_paused_daily_owner():
     dag_id = "dag_collect_fotmob_players"
     dag_path = "dags/dag_collect_fotmob_players.py"
 
     assert dag_id in mod.EXPECTED_DAGS
     assert dag_id in mod.LEGACY_OWNER_DAGS
     assert mod.EXPECTED_DAG_FILES[dag_id] == "/opt/airflow/" + dag_path
-    assert mod.EXPECTED_SCHEDULES[dag_id] == "None"
+    assert mod.EXPECTED_SCHEDULES[dag_id] == "@daily"
+    assert fotmob_runtime.AUTOMATIC_EXPECTED_SCHEDULES[dag_id] == "@daily"
     assert fotmob_runtime.PROJECTION_SOURCES[
         "dag_collect_fotmob_players.py"
     ] == dag_path
@@ -101,7 +102,6 @@ def _automatic_catalog_admission(
     entities = (
         "leaderboards",
         "matches",
-        "players",
         "season",
         "teams",
         "transfers",
@@ -241,7 +241,10 @@ def _automatic_catalog_admission(
             "active_runs": {},
         },
         "legacy_owners": {
-            dag_id: {"schedule": None, "is_paused": True}
+            dag_id: {
+                "schedule": "@daily" if dag_id == "dag_collect_fotmob_players" else None,
+                "is_paused": True,
+            }
             for dag_id in (
                 "dag_trigger_fotmob_daily",
                 "dag_refresh_fotmob",
@@ -445,6 +448,34 @@ def _automatic_rollout_certificate(admission, *, evidence_dir, handoff):
             ),
         },
     }
+
+
+@pytest.mark.parametrize("changes", [{"schedule": None}, {"is_paused": False}])
+def test_automatic_admission_requires_daily_collector_to_remain_paused(changes):
+    payload = _automatic_catalog_admission()
+    payload["legacy_owners"]["dag_collect_fotmob_players"].update(changes)
+    with pytest.raises(fotmob_runtime.RuntimeBindingError, match="legacy owner"):
+        fotmob_runtime.validate_automatic_catalog_admission(payload)
+
+
+def test_automatic_admission_builder_accepts_canary_without_wave_players():
+    payload = _automatic_catalog_admission()
+    canary = {
+        **payload["canary"],
+        "candidate": payload["canary"]["final_publication"]["candidate"],
+        "current_run_reports": payload["current_run_reports"],
+    }
+    admission = mod.build_automatic_catalog_admission(
+        canary,
+        canary,
+        writer_snapshot=payload["writer_snapshot"],
+        scope_observations=payload["scope_observations"],
+        validated_at=payload["validated_at"],
+    )
+    assert admission["legacy_owners"]["dag_collect_fotmob_players"] == {
+        "schedule": "@daily", "is_paused": True,
+    }
+    assert fotmob_runtime.validate_automatic_catalog_admission(admission)["passed"]
 
 
 def test_automatic_catalog_admission_accepts_one_recomputed_contract():

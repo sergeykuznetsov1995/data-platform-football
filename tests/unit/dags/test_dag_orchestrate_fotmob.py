@@ -157,7 +157,7 @@ def test_only_automatic_owner_keeps_an_isolated_schedule(monkeypatch):
         "dag_orchestrate_fotmob": "*/5 * * * *",
         "dag_refresh_fotmob": None,
         "dag_backfill_fotmob": None,
-        "dag_collect_fotmob_players": None,
+        "dag_collect_fotmob_players": "@daily",
         "dag_trigger_fotmob_daily": None,
     }
 

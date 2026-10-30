@@ -432,7 +432,12 @@ def _load_source_refresh_contract(args) -> dict[str, Any] | None:
 def _selected_native_entities(args) -> frozenset[str]:
     if getattr(args, "source_refresh_contract", None) is not None:
         return frozenset({"players"})
-    return _parse_native_entities(args.entities)
+    entities = _parse_native_entities(args.entities)
+    # Waves never collect cards (#1297). Backfill keeps them: the #930 coordinator
+    # contract still lists players; orchestrated backfill profiles omit them.
+    if args.mode in {"daily", "refresh"} and "players" in entities:
+        raise ValueError("network waves cannot collect players; use the player collector")
+    return entities
 
 
 def _parse_native_entities(value: str) -> frozenset[str]:
@@ -1423,6 +1428,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     from scrapers.fotmob.service import OperationResult
     from scrapers.fotmob.transport import canonicalize_target
 
+    _selected_native_entities(args)
     started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     run_id = args.run_id or (f"fotmob-{datetime.now(timezone.utc):%Y%m%dT%H%M%S.%fZ}")
     if service is None:

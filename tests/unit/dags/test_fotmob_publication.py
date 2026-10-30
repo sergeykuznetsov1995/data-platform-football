@@ -497,24 +497,25 @@ def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_p
     assert "must-not-appear" not in json.dumps(result)
 
 
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
 def test_deployed_player_collector_owner_gets_retry_stable_nonzero_identity(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, run_type
 ):
     roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
         tmp_path
     )
     dag_run = SimpleNamespace(
         dag_id="dag_collect_fotmob_players",
-        run_type="manual",
-        run_id="manual__collector-1",
+        run_type=run_type,
+        run_id=f"{run_type}__collector-1",
         logical_date=START,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
     )
     context = {
         "dag_run": dag_run,
         "data_interval_start": START,
-        "data_interval_end": START,
+        "data_interval_end": START + timedelta(days=1) if run_type == "scheduled" else START,
     }
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
 
@@ -529,13 +530,17 @@ def test_deployed_player_collector_owner_gets_retry_stable_nonzero_identity(
 
     assert admitted["deployment_id"] == "f" * 32
     assert first == second
+    if run_type == "scheduled":
+        assert first["binding"]["data_interval_start"] == START.isoformat(timespec="microseconds")
+        assert first["binding"]["data_interval_end"] == (START + timedelta(days=1)).isoformat(timespec="microseconds")
     assert first["binding"]["data_interval_start"] < first["binding"][
         "data_interval_end"
     ]
 
 
-def test_deployed_player_collector_initializer_uses_same_manual_admission(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
+def test_deployed_player_collector_initializer_uses_same_owner_admission(
+    tmp_path, monkeypatch, run_type
 ):
     roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
         tmp_path
@@ -550,17 +555,17 @@ def test_deployed_player_collector_initializer_uses_same_manual_admission(
     )
     dag_run = SimpleNamespace(
         dag_id="dag_collect_fotmob_players",
-        run_type="manual",
-        run_id="manual__collector-1",
+        run_type=run_type,
+        run_id=f"{run_type}__collector-1",
         logical_date=START,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
     )
 
     result = publication.initialize_fotmob_player_collector_publication(
         dag_run=dag_run,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
         hostname="1" * 12,
         roots=roots,
         ti=MagicMock(),
@@ -573,18 +578,19 @@ def test_deployed_player_collector_initializer_uses_same_manual_admission(
     ]
 
 
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
 def test_player_collector_finalizer_targets_the_initialized_generation(
-    monkeypatch,
+    monkeypatch, run_type,
 ):
     _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     dag_run = SimpleNamespace(
         dag_id="dag_collect_fotmob_players",
-        run_type="manual",
-        run_id="manual__collector-1",
+        run_type=run_type,
+        run_id=f"{run_type}__collector-1",
         logical_date=START,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
         get_task_instances=lambda: [
             SimpleNamespace(
                 task_id="trigger_fotmob_player_collector", state="success"
@@ -594,7 +600,7 @@ def test_player_collector_finalizer_targets_the_initialized_generation(
     context = {
         "dag_run": dag_run,
         "data_interval_start": START,
-        "data_interval_end": START,
+        "data_interval_end": START + timedelta(days=1) if run_type == "scheduled" else START,
     }
 
     initialized = publication.expected_player_collector_publication(context)
@@ -1468,7 +1474,7 @@ def test_daily_trigger_conf_is_exact_all_entity_profile():
         "competition_scope_file": publication.FOTMOB_DAILY_SCOPE_FILE,
         "competition_scope_sha256": publication.FOTMOB_DAILY_SCOPE_SHA256,
         "competition_ids_sha256": (publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256),
-        "entities": "season,leaderboards,matches,teams,players,transfers",
+        "entities": "season,leaderboards,matches,teams,transfers",
         "max_requests": 10_000,
         "max_direct_mib": 512,
         "competition_limit": 0,
@@ -1501,7 +1507,7 @@ def test_catalog_trigger_conf_rejects_discover_and_preserves_live_modes():
             "mode": mode,
             "scope": "",
             "catalog_contract": "fotmob-catalog-v1",
-            "entities": "season,leaderboards,matches,teams,players,transfers",
+            "entities": "season,leaderboards,matches,teams,transfers",
             "max_requests": 10_000,
             "max_direct_mib": 512,
             "max_proxy_mib": 0,
@@ -2310,3 +2316,88 @@ def test_deployed_owner_gate_admits_refresh_and_backfill_scheduled_runs(tmp_path
             roots=roots,
             dag_run=SimpleNamespace(dag_id="dag_ingest_fotmob", run_type="scheduled"),
         )
+
+
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
+def test_ceremony_authorizes_child_of_daily_or_manual_player_collector(
+    monkeypatch, run_type
+):
+    binding = _binding()
+    generation_id = publication.make_generation_id(binding)
+    payload = {"generation_id": generation_id, "binding": binding}
+
+    class Column:
+        def __eq__(self, _other):
+            return True
+
+        def in_(self, _values):
+            return True
+
+        def desc(self):
+            return self
+
+    class Model:
+        dag_id = run_id = task_id = key = timestamp = Column()
+
+    class XCom(Model):
+        @staticmethod
+        def deserialize_value(row):
+            return row.value
+
+    class DagRun(Model):
+        pass
+
+    class TaskInstance(Model):
+        pass
+
+    owner_run_id = f"{run_type}__collector-1"
+    dag_runs = [
+        SimpleNamespace(run_type=run_type, state="running"),
+        SimpleNamespace(
+            state="running",
+            conf={publication.FOTMOB_PUBLICATION_CONF_KEY: payload, "mode": "players"},
+        ),
+    ]
+    results = {
+        XCom: [
+            SimpleNamespace(
+                dag_id="dag_collect_fotmob_players", run_id=owner_run_id, value=payload
+            )
+        ],
+        TaskInstance: [SimpleNamespace(state="success")],
+        DagRun: dag_runs,
+    }
+
+    class Query:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *_args):
+            return self
+
+        order_by = limit = filter
+
+        def all(self):
+            return results[self.model]
+
+        def one_or_none(self):
+            return results[self.model].pop(0)
+
+    class Session:
+        def query(self, model):
+            return Query(model)
+
+        def close(self):
+            pass
+
+    models = sys.modules["airflow.models"]
+    for name, value in {"DagRun": DagRun, "TaskInstance": TaskInstance, "XCom": XCom}.items():
+        monkeypatch.setattr(models, name, value, raising=False)
+    settings = ModuleType("airflow.settings")
+    settings.Session = Session
+    monkeypatch.setitem(sys.modules, "airflow.settings", settings)
+
+    authorized = publication._active_owner_writer_authorization(generation_id, payload)
+
+    assert authorized["owner_run_id"] == owner_run_id
+    assert authorized["ingest_run_id"] == f"fotmob_players__{generation_id}"

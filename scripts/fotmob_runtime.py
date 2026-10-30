@@ -225,7 +225,7 @@ AUTOMATIC_EXPECTED_SCHEDULES = {
     "dag_trigger_fotmob_daily": "None",
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
-    "dag_collect_fotmob_players": "None",
+    "dag_collect_fotmob_players": "@daily",
     "dag_refresh_fotmob_c1": "15 * * * *",
 }
 AUTOMATIC_LANES = frozenset({"daily", "refresh", "backfill"})
@@ -234,7 +234,6 @@ AUTOMATIC_ADMISSION_FUTURE_TOLERANCE = timedelta(minutes=1)
 AUTOMATIC_DAILY_ENTITIES = (
     "leaderboards",
     "matches",
-    "players",
     "season",
     "teams",
     "transfers",
@@ -362,11 +361,13 @@ def validate_automatic_catalog_admission(
         state = legacy.get(dag_id)
         if (
             not isinstance(state, Mapping)
-            or state.get("schedule") is not None
+            or state.get("schedule") != (
+                "@daily" if dag_id == "dag_collect_fotmob_players" else None
+            )
             or state.get("is_paused") is not True
         ):
             raise RuntimeBindingError(
-                f"automatic legacy owner {dag_id} is scheduled or unpaused"
+                f"automatic legacy owner {dag_id} has an unexpected schedule or is unpaused"
             )
 
     lane_budgets = value.get("lane_budgets")

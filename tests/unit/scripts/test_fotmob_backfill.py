@@ -1349,3 +1349,13 @@ def test_recovery_rejects_legacy_silver_candidate(tmp_path, monkeypatch):
     report = mod.recover_backfill(arguments)
     assert report["passed"] is False
     assert "not bronze-only" in str(report.get("error"))
+
+
+def test_automatic_canary_entity_contract_uses_wave_profile_without_players():
+    from dags.utils.fotmob_publication import FOTMOB_DAILY_ENTITIES
+
+    assert mod.AUTOMATIC_CANARY_ENTITIES == tuple(sorted(FOTMOB_DAILY_ENTITIES))
+    from scripts import fotmob_runtime
+
+    assert "players" not in mod.AUTOMATIC_CANARY_ENTITIES
+    assert mod.AUTOMATIC_CANARY_ENTITIES == fotmob_runtime.AUTOMATIC_DAILY_ENTITIES

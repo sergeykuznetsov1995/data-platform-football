@@ -338,8 +338,8 @@ def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
             if normalized_lane is FotMobLane.DAILY
             else _background_deadline(now)
         )
-        # Исторический контракт и его подпись остаются прежними. Актуальные
-        # полосы больше не расходуют матчевый бюджет на повтор трансферов.
+        # Карточки собирает отдельный DAG; актуальные полосы также
+        # не расходуют матчевый бюджет на повтор трансферов.
         entities = tuple(
             entity for entity in FOTMOB_DAILY_ENTITIES
             if normalized_lane is FotMobLane.BACKFILL or entity != "transfers"
