@@ -50,6 +50,8 @@ FIELDS = {
     'coach_stints': ('club_id', 'coach_id', 'appointed_date', 'role'),
 }
 PLACEHOLDERS = ('-', '—', '?', 'n/a', 'unknown')
+# Registry keys are ids and ISO dates, so this marker cannot collide with one.
+_NULL_KEY = '<null>'
 
 
 def _utc(value: datetime) -> datetime:
@@ -211,6 +213,24 @@ def build_empty_routes_sql(routes: Mapping[str, str]) -> str:
   WHERE rn = 1 GROUP BY 1"""
 
 
+def build_first_seen_invariance_sql(name: str, keys: tuple[str, ...], table: str) -> str:
+    """Keys are extracted before the join so Trino hash-joins on equalities;
+    COALESCE to a marker keeps IS NOT DISTINCT FROM semantics (#1971)."""
+    marker = dq._sql_literal(_NULL_KEY)
+    extracted, joins = [], []
+    for index, key in enumerate(keys):
+        value = (f'CAST(CAST(b.{key} AS date) AS varchar)'
+                 if key in {'mv_date', 'appointed_date', 'left_date'}
+                 else f'CAST(b.{key} AS varchar)')
+        extracted.append(f"TRY(json_extract_scalar(key_json, '$[{index}]')) k{index}")
+        joins.append(f'COALESCE(r.k{index}, {marker}) = COALESCE({value}, {marker})')
+    return (f'SELECT COUNT(*) FROM {table} b LEFT JOIN (SELECT first_seen_at, {", ".join(extracted)} '
+            f'FROM {FIRST_SEEN_REGISTRY} WHERE table_name = {dq._sql_literal(name)}) r '
+            f'ON {" AND ".join(joins)} '
+            'WHERE b.first_seen_at IS NOT NULL '
+            'AND (r.first_seen_at IS NULL OR b.first_seen_at <> r.first_seen_at)')
+
+
 def collect_first_seen_metrics(cur, implementation_at: datetime,
                                pins: Mapping[str, int], progress=None) -> tuple[dict, list]:
     """Use the writer's canonical natural keys; no schema migration in audits."""
@@ -240,17 +260,7 @@ def collect_first_seen_metrics(cur, implementation_at: datetime,
             progress(metrics, checks)
         mismatch = None
         if FIRST_SEEN_REGISTRY in pins:
-            joins = []
-            for index, key in enumerate(keys):
-                value = (f'CAST(CAST(b.{key} AS date) AS varchar)'
-                         if key in {'mv_date', 'appointed_date', 'left_date'}
-                         else f'CAST(b.{key} AS varchar)')
-                joins.append(f"TRY(json_extract_scalar(r.key_json, '$[{index}]')) IS NOT DISTINCT FROM {value}")
-            predicate = ' AND '.join(joins)
-            mismatch = int(_row(cur, f'SELECT COUNT(*) FROM {table} b LEFT JOIN {FIRST_SEEN_REGISTRY} r '
-                                 f'ON r.table_name = {dq._sql_literal(name)} AND {predicate} '
-                                 'WHERE b.first_seen_at IS NOT NULL '
-                                 'AND (r.first_seen_at IS NULL OR b.first_seen_at <> r.first_seen_at)')[0])
+            mismatch = int(_row(cur, build_first_seen_invariance_sql(name, keys, table))[0])
             checks.append(dq.BronzeCheckResult(
                 name=f'tm_daily_first_seen_invariance[{name}]', kind='daily_first_seen_invariance',
                 severity='ERROR', passed=mismatch == 0, value=mismatch))
