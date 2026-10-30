@@ -10,13 +10,13 @@ from utils.transfermarkt_history_order import history_claim_key
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
 WINDOW = ",".join(str(year) for year in range(2015, 2025))
-# id, tier, class, route, step2 window
+# id, tier, class, route, step2 window (cups and national teams list none)
 COMPETITIONS = (
     ("GB1", "1", "core_club", "wettbewerb", WINDOW),
-    ("L1", "1", "core_club", "wettbewerb", WINDOW),
+    ("ES1", "1", "core_club", "wettbewerb", WINDOW),
     ("ES2", "2", "core_club", "wettbewerb", WINDOW),
-    ("FAC", "cup", "core_club", "pokal", WINDOW),
-    ("EM", "international", "core_national", "pokal", WINDOW),
+    ("FAC", "cup", "core_club", "pokal", ""),
+    ("EM", "international", "core_national", "pokal", ""),
 )
 
 
@@ -56,38 +56,49 @@ def _claimed(campaign, scopes, key, **kwargs):
     return [(by_id[sid].competition_id, by_id[sid].edition_id) for sid in claim.batch.scope_ids]
 
 
-PAIRS = [(cid, edition) for cid, *_ in COMPETITIONS for edition in ("2024", "2019", "2005")]
+def _order(key, scopes):
+    return [(item.target.competition_id, item.target.edition_id)
+            for item in sorted(scopes, key=lambda item: (1, *key(item)))]
+
+
+# EM is played every 4 years: its newest historical edition 2020 is the previous one.
 EXPECTED = [
-    ("GB1", "2024"), ("L1", "2024"), ("ES2", "2024"), ("FAC", "2024"), ("EM", "2024"),
-    ("GB1", "2019"), ("L1", "2019"), ("ES2", "2019"), ("FAC", "2019"), ("EM", "2019"),
-    ("GB1", "2005"), ("L1", "2005"), ("ES2", "2005"), ("FAC", "2005"), ("EM", "2005"),
+    ("GB1", "2025"), ("ES1", "2025"), ("ES2", "2025"), ("FAC", "2025"), ("EM", "2020"),
+    ("GB1", "2024"), ("ES1", "2024"), ("ES2", "2019"), ("GB1", "2015"), ("FAC", "2024"), ("EM", "2016"),
+    ("GB1", "2005"), ("EM", "2008"),
     ("XX9", "2024"),
 ]
 
 
-def test_steps_then_top_leagues_kind_and_tier(tmp_path):
-    key = history_claim_key(_denominator(tmp_path))
-    campaign, scopes = _campaign(PAIRS + [("XX9", "2024")])
-    ordered = sorted(scopes, key=lambda item: (1, *key(item)))
-    assert [(item.target.competition_id, item.target.edition_id) for item in ordered] == EXPECTED
+def test_steps_then_kind_season_top_leagues_and_tier(tmp_path):
+    campaign, scopes = _campaign(list(reversed(EXPECTED)))
+    key = history_claim_key(_denominator(tmp_path), campaign.targets)
+    assert _order(key, scopes) == EXPECTED
     assert _claimed(campaign, scopes, key) == EXPECTED[:state.MAX_SCOPE_BATCH]
     assert _claimed(campaign, list(reversed(scopes)), key) == EXPECTED[:state.MAX_SCOPE_BATCH]
 
 
 def test_retry_first_and_filters_still_apply(tmp_path):
-    key = history_claim_key(_denominator(tmp_path))
-    campaign, scopes = _campaign(PAIRS)
-    retry_index = next(i for i, item in enumerate(scopes) if item.target.edition_id == "2005"
-                       and item.target.competition_id == "EM")
+    campaign, scopes = _campaign(EXPECTED)
+    key = history_claim_key(_denominator(tmp_path), campaign.targets)
+    retry_index = next(i for i, item in enumerate(scopes) if item.target.edition_id == "2008")
     scopes[retry_index] = replace(scopes[retry_index], status=state.ScopeStatus.RETRYABLE_ERROR,
                                   next_retry_at=NOW - timedelta(minutes=1))
-    assert _claimed(campaign, scopes, key, limit=2) == [("EM", "2005"), ("GB1", "2024")]
+    assert _claimed(campaign, scopes, key, limit=2) == [("EM", "2008"), ("GB1", "2025")]
     allowed = {item.target.scope_id for item in scopes if item.target.competition_id == "ES2"}
     assert _claimed(campaign, scopes, key, limit=8, eligible_scope_ids=allowed) == [
-        ("ES2", "2024"), ("ES2", "2019"), ("ES2", "2005")]
+        ("ES2", "2025"), ("ES2", "2019")]
 
 
 def test_non_numeric_edition_goes_to_tail_without_error(tmp_path):
-    key = history_claim_key(_denominator(tmp_path))
     campaign, scopes = _campaign([("GB1", "2005"), ("GB1", "abc")])
+    key = history_claim_key(_denominator(tmp_path), campaign.targets)
     assert _claimed(campaign, scopes, key) == [("GB1", "2005"), ("GB1", "abc")]
+
+
+def test_real_denominator_puts_cup_window_before_deep_league_history():
+    denominator = load_denominator()
+    assert denominator.row("CL").route == "pokal" and denominator.row("CL").step2_saison_ids == ()
+    campaign, scopes = _campaign([("GB1", "2025"), ("GB1", "2005"), ("CL", "2025"), ("CL", "2024")])
+    key = history_claim_key(denominator, campaign.targets)
+    assert _order(key, scopes) == [("GB1", "2025"), ("CL", "2025"), ("CL", "2024"), ("GB1", "2005")]

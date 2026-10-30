@@ -962,9 +962,11 @@ def execute_history(scopes=(), attempts=(), batches=()):
     for status, updated_at in scopes:
         con.execute("INSERT INTO ops.transfermarkt_backfill_scope_v1 (status, updated_at) VALUES (?, ?)",
                     (status, updated_at.replace(tzinfo=None)))
-    for evidence, finished_at in attempts:
-        con.execute("INSERT INTO ops.transfermarkt_backfill_attempt_v1 (raw_evidence_ids_json, finished_at) VALUES (?, ?)",
-                    (json.dumps(evidence), finished_at.replace(tzinfo=None)))
+    for evidence, observed_at, finished_at in attempts:
+        con.execute("INSERT INTO ops.transfermarkt_backfill_attempt_v1 "
+                    "(raw_evidence_ids_json, source_observed_at, finished_at) VALUES (?, ?, ?)",
+                    (json.dumps(evidence), observed_at and observed_at.replace(tzinfo=None),
+                     finished_at.replace(tzinfo=None)))
     for streams, claimed_at in batches:
         record = {"scope_stream_ids": streams} if streams else {}
         con.execute("INSERT INTO ops.transfermarkt_backfill_batch_v1 (record_json, claimed_at) VALUES (?, ?)",
@@ -982,15 +984,18 @@ def test_history_day_counts_completed_editions_new_requests_and_streams():
     report = execute_history(
         scopes=[("complete", inside), ("complete", inside), ("complete", before), ("running", inside),
                 ("complete", after)],
-        # "e1" was already sent yesterday; a continuation re-references it.
-        attempts=[(["e1"], before), (["e1", "e2", "e3"], inside), (["e4"], after)],
+        # "e1" was already sent yesterday; a continuation re-references it.  "e5" was
+        # sent before Moscow midnight but finalised after it; "e6" has no observed time.
+        attempts=[(["e1"], before, before), (["e1", "e2", "e3"], inside, inside), (["e4"], after, after),
+                  (["e5"], START + timedelta(days=1) - timedelta(minutes=5), START + timedelta(days=1, minutes=10)),
+                  (["e6"], None, inside)],
         batches=[({"s1": "history-0", "s2": "history-1"}, inside), ({"s3": "history-0"}, inside),
                  ({"s4": "history-2"}, before), (None, inside)],
     )
-    assert (report["editions"], report["requests"], report["streams"]) == (2, 2, 2)
+    assert (report["editions"], report["requests"], report["streams"]) == (2, 4, 2)
     summary = measure.format_history_summary({**report, "report_day": DAY})
     assert summary == (f"Transfermarkt история {DAY} МСК: изданий 2 (цель ≥ 57), "
-                       "запросов 2 (ориентир 16,5 тыс.), потоков активных 2")
+                       "запросов 4 (ориентир 16,5 тыс.), потоков активных 2")
 
 
 @pytest.mark.parametrize("fault", [None, "sql", "two"])

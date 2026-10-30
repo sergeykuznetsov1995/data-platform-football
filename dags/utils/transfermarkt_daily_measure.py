@@ -194,10 +194,12 @@ HISTORY_REQUESTS_TARGET = 16_500
 def build_history_day_sql(day: date | str, *, as_of: datetime | str) -> tuple[str, tuple[Any, ...]]:
     """One read-only SELECT over the history ops journal for one Moscow day.
 
-    Editions: scopes that reached ``complete`` that day.  Requests: raw attempt
-    envelopes (responses and transport errors) first referenced by an attempt
-    that finished that day.  Streams: distinct history streams of batches
-    claimed that day.
+    Editions: scopes that reached ``complete`` that day.  Requests: distinct raw
+    attempt envelopes (responses and transport errors) dated by the earliest
+    attempt that references them.  Per-envelope request time lives only in the
+    raw store, not in Trino; the attempt's ``source_observed_at`` (its latest
+    request) is the closest time there, ``finished_at`` only when it is NULL.
+    Streams: distinct history streams of batches claimed that day.
     """
     start, end = day_bounds(day)
     observed = utc(as_of)
@@ -214,7 +216,7 @@ done AS (
    AND s.updated_at <= a.as_of
 ),
 envelopes AS (
- SELECT u.envelope_id, min(t.finished_at) AS first_at FROM {ATTEMPT_TABLE} t
+ SELECT u.envelope_id, min(COALESCE(t.source_observed_at, t.finished_at)) AS first_at FROM {ATTEMPT_TABLE} t
  CROSS JOIN UNNEST(CAST(json_parse(t.raw_evidence_ids_json) AS array(varchar))) AS u(envelope_id)
  GROUP BY u.envelope_id
 ),

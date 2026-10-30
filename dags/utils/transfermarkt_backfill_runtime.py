@@ -1284,7 +1284,7 @@ def claim_and_plan(
     # Admission filtering never rewrites excluded target state or proofs.
     claim = state.claim_scopes(campaign, before, lease_owner=lease_owner, now=now,
                                limit=limit, eligible_scope_ids=allowed_ids,
-                               sort_key=history_claim_key(denominator))
+                               sort_key=history_claim_key(denominator, available.values()))
     if claim.batch is None:
         return claim, ()
     capture_snapshots = {scope: (capture_snapshot_ids or {}).get(scope, str(rows[0]["registry_snapshot_id"]))
