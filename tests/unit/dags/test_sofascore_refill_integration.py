@@ -82,7 +82,7 @@ def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):
            'SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH':'15000'}
     monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
     monkeypatch.setattr(module.time, 'time', lambda: 1000)
-    monkeypatch.setattr(module.state, 'read_snapshot', lambda *a, **k: {'campaign_id':'c'})
+    monkeypatch.setattr(module.state, 'read_refresh_snapshot', lambda *a, **k: {'campaign_id':'c'})
     rows = [[('SS-8','2026',593,None,0,825)], []]
     monkeypatch.setattr(module, '_pending_refresh_partitions', lambda: rows.pop(0))
     plans = []
@@ -124,8 +124,10 @@ def test_refill_child_timeout_terminates_process_group(monkeypatch):
     child = Child()
     killed = []
     kwargs_seen = []
+    commands = []
     def popen(command, **kwargs):
         kwargs_seen.append(kwargs)
+        commands.append(command)
         return child
     monkeypatch.setattr(module.subprocess, 'Popen', popen)
     monkeypatch.setattr(module.os, 'killpg', lambda pid,sig:killed.append((pid,sig)))
@@ -140,6 +142,7 @@ def test_refill_child_timeout_terminates_process_group(monkeypatch):
         module._execute_refill_scope(env)
     assert killed == [(1234,module.signal.SIGTERM),(1234,module.signal.SIGKILL)]
     assert kwargs_seen[0]['start_new_session'] is True
+    assert '--registry-overlay' in commands[0]  # #1370: same scope as the mapped task
     assert child.waits == 3
 
 

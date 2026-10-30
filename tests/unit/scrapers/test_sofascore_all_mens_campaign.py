@@ -8,8 +8,13 @@ import yaml
 
 from scrapers.sofascore.all_mens_campaign import (
     CampaignScopeError,
+    _digest,
+    campaign_policy_id,
+    candidate_ids_digest,
     load_exact_scope,
     render_scope_overlays,
+    validate_campaign_snapshot,
+    with_registry_refresh,
 )
 from scrapers.sofascore.catalog import SofaScoreCatalog
 from scrapers.sofascore.workload_plan import WorkloadPlanError, team_count_band
@@ -302,3 +307,138 @@ def test_scope_outside_the_denominator_queues_is_refused(tmp_path, tournament_cl
     assert load_exact_scope(
         snapshot, tournament_id=17, source_season_id=76986
     )["capture_key"] == "SS-17"
+
+
+DAILY_LEAGUES = {8, 16, 17, 23, 34, 35, 203}
+# Enabled registry leagues the live campaign snapshot already holds.
+CAMPAIGN_REGISTRY_LEAGUES = (37, 38, 44, 52, 53, 182, 202, 238)
+
+
+def _campaign_without_daily_leagues():
+    """A policy-bound snapshot shaped like the live one: no daily league."""
+
+    document = _snapshot()
+    [row] = document["tournaments"]
+    document["tournaments"] = [
+        {**row, "unique_tournament_id": tid, "capture_key": f"SS-{tid}"}
+        for tid in CAMPAIGN_REGISTRY_LEAGUES
+    ]
+    document["candidate_count"] = len(CAMPAIGN_REGISTRY_LEAGUES)
+    policy = {
+        "candidate_count": len(CAMPAIGN_REGISTRY_LEAGUES),
+        "candidate_ids_sha256": candidate_ids_digest(document["tournaments"]),
+    }
+    document["policy_id"] = campaign_policy_id(policy)
+    document["campaign_id"] = _digest({
+        "policy_id": document["policy_id"],
+        "candidate_ids_sha256": policy["candidate_ids_sha256"],
+    })
+    document.pop("snapshot_id")
+    document["snapshot_id"] = _digest(document)
+    validate_campaign_snapshot(document, policy)
+    return document, policy
+
+
+@pytest.mark.unit
+def test_registry_overlay_adds_the_daily_leagues_under_the_same_campaign():
+    base, policy = _campaign_without_daily_leagues()
+
+    overlaid = with_registry_refresh(base)
+
+    kept = len(CAMPAIGN_REGISTRY_LEAGUES)
+    added = {row["unique_tournament_id"]: row for row in overlaid["tournaments"][kept:]}
+    assert set(added) == DAILY_LEAGUES
+    assert overlaid["tournaments"][:kept] == base["tournaments"]
+    for field in ("campaign_id", "policy_id", "candidate_count"):
+        assert overlaid[field] == base[field]
+    unsigned = {key: value for key, value in overlaid.items() if key != "snapshot_id"}
+    assert overlaid["snapshot_id"] == _digest(unsigned) != base["snapshot_id"]
+    assert len(base["tournaments"]) == kept  # the input is not mutated
+    epl = added[17]
+    assert (epl["capture_key"], epl["lane"], epl["metadata_status"]) == (
+        "SS-17", "registry_refresh", "ready"
+    )
+    assert [
+        (s["source_season_id"], s["canonical_season"], s["start_year"], s["metadata_status"])
+        for s in epl["seasons"]
+    ] == [(96668, "2627", 2026, "pending"), (76986, "2526", 2025, "pending")]
+    assert [s["start_year"] for s in added[16]["seasons"]] == [2026, 2022]
+    # The overlay never passes as a snapshot of its own.
+    with pytest.raises(CampaignScopeError):
+        validate_campaign_snapshot(overlaid, policy)
+
+
+@pytest.mark.unit
+def test_registry_overlay_leaves_a_tournament_already_in_the_snapshot():
+    base = _snapshot()  # holds 17 with its own ready season
+
+    overlaid = with_registry_refresh(base)
+
+    [epl] = [row for row in overlaid["tournaments"] if row["unique_tournament_id"] == 17]
+    assert epl == base["tournaments"][0]
+
+
+@pytest.mark.unit
+def test_exact_scope_admits_a_daily_league_only_with_the_registry_overlay(tmp_path):
+    base, _policy = _campaign_without_daily_leagues()
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps(base), encoding="utf-8")
+
+    # The history campaign reads the file alone: 17 stays refused.
+    with pytest.raises(CampaignScopeError, match="exactly one tournament 17"):
+        load_exact_scope(
+            snapshot, tournament_id=17, source_season_id=96668,
+            allow_pending_season=True,
+        )
+    scope = load_exact_scope(
+        snapshot, tournament_id=17, source_season_id=96668,
+        expected_campaign_id=base["campaign_id"],
+        allow_pending_season=True, registry_overlay=True,
+    )
+
+    assert scope["campaign_id"] == base["campaign_id"]
+    assert scope["snapshot_id"] == with_registry_refresh(base)["snapshot_id"]
+    assert (scope["capture_key"], scope["canonical_season"], scope["team_count"]) == (
+        "SS-17", "2627", None
+    )
+    paths = render_scope_overlays(scope, tmp_path / "scope")
+    assert SofaScoreCatalog.load(paths.registry_path)
+
+
+@pytest.mark.unit
+def test_refresh_lane_targets_and_plans_the_daily_leagues(tmp_path):
+    from dags.utils.sofascore_all_mens_state import (
+        current_season_targets,
+        plan_refresh_batch,
+        read_refresh_snapshot,
+    )
+
+    base, policy = _campaign_without_daily_leagues()
+    snapshot_path = tmp_path / "snapshot.json"
+    policy_path = tmp_path / "policy.json"
+    snapshot_path.write_text(json.dumps(base), encoding="utf-8")
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    snapshot = read_refresh_snapshot(snapshot_path, policy_path=policy_path)
+
+    targets = {t.tournament_id: t for t in current_season_targets(snapshot, frozenset())}
+    assert DAILY_LEAGUES < set(targets)
+    assert targets[17].partition == ("SS-17", "2627")
+    assert targets[16].partition == ("SS-16", "2026")
+    [env] = plan_refresh_batch(
+        snapshot, [("SS-17", "2627", 3, 1792024800, 3, 96668)],
+        queue_mode="deadline", snapshot_path=str(snapshot_path),
+        policy_path=str(policy_path),
+    )
+    assert env["SOFASCORE_TOURNAMENT_ID"] == "17"
+    assert env["SOFASCORE_SOURCE_SEASON_ID"] == "96668"
+    assert env["SOFASCORE_EXPECTED_CAMPAIGN_ID"] == base["campaign_id"]
+    # The scope cycle re-derives the very snapshot the plan was made from.
+    assert env["SOFASCORE_EXPECTED_SNAPSHOT_ID"] == snapshot["snapshot_id"]
+    scope = load_exact_scope(
+        snapshot_path, tournament_id=17, source_season_id=96668,
+        expected_snapshot_id=env["SOFASCORE_EXPECTED_SNAPSHOT_ID"],
+        expected_campaign_id=env["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
+        allow_pending_season=True, registry_overlay=True,
+    )
+    assert scope["snapshot_id"] == env["SOFASCORE_EXPECTED_SNAPSHOT_ID"]

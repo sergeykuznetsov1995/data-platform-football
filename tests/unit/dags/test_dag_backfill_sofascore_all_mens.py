@@ -73,6 +73,8 @@ def test_all_mens_backfill_uses_one_bounded_dynamic_operator():
     assert '--dag-id "${AIRFLOW_CTX_DAG_ID}"' in mapped.bash_command
     assert '--run-id "${AIRFLOW_CTX_DAG_RUN_ID}"' in mapped.bash_command
     assert '--task-id "${AIRFLOW_CTX_TASK_ID}"' in mapped.bash_command
+    # #1370: the daily registry leagues are refresh-only, never history scopes.
+    assert "--registry-overlay" not in mapped.bash_command
     assert mapped._init_kwargs["do_xcom_push"] is False
     assert mapped._init_kwargs["max_active_tis_per_dag"] == 3
 

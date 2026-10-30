@@ -57,7 +57,7 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     snapshot = {"snapshot_id": "d" * 64, "campaign_id": "e" * 64}
     calls = []
     monkeypatch.setattr(module, "_pending_refresh_partitions", lambda: calls.append("existing_read") or rows)
-    monkeypatch.setattr(module.state, "read_snapshot", lambda *a, **k: snapshot)
+    monkeypatch.setattr(module.state, "read_refresh_snapshot", lambda *a, **k: snapshot)
     monkeypatch.setattr(module.state, "plan_refresh_batch", lambda snapshot, pending, **kwargs:
                         selected if pending is rows else pytest.fail("planner input changed"))
     assert len(module._plan_refresh_batch(**context)) == 8
@@ -221,6 +221,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         "--phase matches",
         "--season-evidence bronze",
         "--allow-pending-season",
+        "--registry-overlay",
         '--run-id "${SOFASCORE_SCOPE_RUN_ID}"',
         '--expected-snapshot-id "${SOFASCORE_EXPECTED_SNAPSHOT_ID}"',
     ):
@@ -362,7 +363,7 @@ def _planner_kwargs(module, monkeypatch, **context):
         return []
 
     monkeypatch.setattr(
-        module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
+        module.state, "read_refresh_snapshot", lambda *a, **k: {"campaign_id": "c"}
     )
     monkeypatch.setattr(
         module, "_pending_refresh_partitions",
@@ -891,7 +892,7 @@ def test_validate_refresh_scope_accepts_a_partial_scope(
 def test_plan_task_maps_each_scope_with_its_own_timeout(clean_env, monkeypatch):
     module = _load_dag_module(monkeypatch)
     monkeypatch.setattr(
-        module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
+        module.state, "read_refresh_snapshot", lambda *a, **k: {"campaign_id": "c"}
     )
     monkeypatch.setattr(module, "_pending_refresh_partitions", lambda: [])
     monkeypatch.setattr(

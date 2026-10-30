@@ -338,7 +338,7 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
 
 def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     queue_mode = _refresh_queue_mode(context)
-    snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+    snapshot = state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     rows = _pending_refresh_partitions()
     observed_at = datetime.now(timezone.utc).isoformat()
     planned = state.plan_refresh_batch(
@@ -449,6 +449,7 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
         "--expected-snapshot-id", env["SOFASCORE_EXPECTED_SNAPSHOT_ID"],
         "--expected-campaign-id", env["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
         "--phase", "matches", "--season-evidence", "bronze", "--allow-pending-season",
+        "--registry-overlay",
         "--output-dir", env["SOFASCORE_SCOPE_OUTPUT_DIR"],
         "--output", env["SOFASCORE_SCOPE_RESULT_PATH"],
         "--workload-artifact", env["SOFASCORE_WORKLOAD_ARTIFACT"],
@@ -585,13 +586,13 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
         rows = _pending_refresh_partitions()
         pending_state.update(number=pending_state["number"] + 1, rows=rows,
                              observed_at=datetime.now(timezone.utc).isoformat(),
-                             snapshot=state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH))
+                             snapshot=state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH))
         _capture_refresh_evidence(context, pending_state["snapshot"], rows, [],
             f"pending-{pending_state['number']}", pending_state["observed_at"])
         return rows
 
     def plan(rows, budget, round_number):
-        snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+        snapshot = state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
         planned = state.plan_refresh_batch(
             snapshot, rows, batch_size=1, queue_mode=queue_mode,
             snapshot_path=SNAPSHOT_PATH, policy_path=POLICY_PATH,
@@ -815,6 +816,7 @@ started=$(date +%s)
   --phase matches \
   --season-evidence bronze \
   --allow-pending-season \
+  --registry-overlay \
   --output-dir "${SOFASCORE_SCOPE_OUTPUT_DIR}" \
   --output "${SOFASCORE_SCOPE_RESULT_PATH}" \
   --workload-artifact "${SOFASCORE_WORKLOAD_ARTIFACT}" \
