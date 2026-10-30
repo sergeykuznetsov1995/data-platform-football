@@ -672,15 +672,15 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
 
 @pytest.mark.unit
 def test_daily_registry_leagues_are_swept_alongside_the_daily(offline):
-    # #1370: Premier League (17) is enabled in the daily registry, yet the
-    # all-men lane sweeps it too — both run side by side until the daily goes.
+    # #1370: Eredivisie (37) is enabled in the daily registry, yet the all-men
+    # lane sweeps and writes it too — both run side by side until the daily goes.
     snapshot = json.loads(offline["snapshot"].read_text())
     snapshot["tournaments"].append({
-        "capture_key": "SS-17",
-        "unique_tournament_id": 17,
+        "capture_key": "SS-37",
+        "unique_tournament_id": 37,
         "metadata_status": "ready",
         "seasons": [
-            {"source_season_id": 76986, "start_year": 2025,
+            {"source_season_id": 77012, "start_year": 2025,
              "canonical_season": "2526", "metadata_status": "ready"},
         ],
     })
@@ -689,7 +689,8 @@ def test_daily_registry_leagues_are_swept_alongside_the_daily(offline):
 
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
 
-    assert (17, 76986) in _fetch_by_class(offline)["seed"]["targets"]
+    assert (37, 77012) in _fetch_by_class(offline)["seed"]["targets"]
+    assert {frozenset(exclude) for _, _, exclude in offline["calls"]["rows"]} == {frozenset()}
     report = json.loads(offline["output"].read_text())
     assert report["excluded_tournaments"] == 0
 

@@ -65,6 +65,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     [path] = (tmp_path / "evidence").glob("*/*.json")
     saved = json.loads(path.read_text())
     assert saved["due_core_scopes"] == 21 and len(saved["selected"]) == 8
+    # #1370: 8, 16 and 17 are enabled in the daily registry and stay core here.
+    assert {p["classification"] for p in saved["partitions"]} == {"core"}
     assert saved["due_core_matches"] == 42 and saved["overdue_core_matches"] == 21
     assert saved["identity"]["code_revision"] == "a" * 40
     window = saved["capture_window"]

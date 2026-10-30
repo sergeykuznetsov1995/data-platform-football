@@ -105,6 +105,7 @@ def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):
     assert result['stop_reason'] == 'empty_queue'
     assert plans[0]['scope_budget_s'] == 4660
     assert plans[0]['dag_run_id'] == 'run:refill:1'
+    assert 'exclude_tournament_ids' not in plans[0]  # #1370
     assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '15000'
     assert executed[0]['SOFASCORE_SCOPE_TIMEOUT_S'] == '3000'
     assert env['SOFASCORE_SCOPE_RESULT_PATH'] == str(initial)
