@@ -77,6 +77,7 @@ from .repository import (
     ProfileCommit,
     PreviewCommit,
     PreviewFailure,
+    DAILY_RETRYABLE_MAX_ATTEMPTS,
     TRUNCATED_MAX_ATTEMPTS,
     WhoScoredTruncatedMatchError,
     scope_write_chunk_rows_from_env,
@@ -3151,14 +3152,17 @@ class WhoScoredIngestService:
                 retry_after = None
                 if truncated:
                     # #1484: refetch a truncated page a bounded number of
-                    # times, then record it as a terminal source fact.  Only
-                    # consecutive truncations count: another retryable
-                    # failure's attempts do not carry over.
-                    if candidate.previous_failure_code != "truncated":
-                        attempt_no = 1
+                    # times, then record it as a terminal source fact.
+                    # ``attempt_no`` continues any retryable streak (it is 1
+                    # otherwise), so alternating truncation and transport
+                    # failures still hit the daily retry ceiling.
                     state = (
                         "terminal"
-                        if attempt_no >= TRUNCATED_MAX_ATTEMPTS
+                        if (
+                            candidate.previous_failure_code == "truncated"
+                            and attempt_no >= TRUNCATED_MAX_ATTEMPTS
+                        )
+                        or attempt_no >= DAILY_RETRYABLE_MAX_ATTEMPTS
                         else "retryable"
                     )
                     if state == "retryable":

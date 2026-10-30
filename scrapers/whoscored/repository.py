@@ -1481,7 +1481,7 @@ class MatchCandidate:
     match_is_opta: bool
     attempt_no: int = 1
     exact_candidate_count: Optional[int] = None
-    # failure_code of a pending ``retryable`` journal row (None otherwise).
+    # failure_code of a ``retryable``/``terminal`` journal row (None otherwise).
     previous_failure_code: Optional[str] = None
 
 
@@ -3846,13 +3846,18 @@ class WhoScoredRepository:
             else ""
         )
         # History freezes its plan from ``include_all_completed``; a match that
-        # exhausted the retry ceiling leaves that plan too (#1476).  Explicit
-        # ids stay a deliberate replay without the ceiling.
+        # exhausted the retry ceiling leaves that plan too (#1476), and so does
+        # a terminal source truncation (#1484).  Explicit ids stay a
+        # deliberate replay without the ceiling.
         history_retry_cap = (
             f"""NOT (
                     COALESCE(m.state, '') = 'retryable'
                     AND COALESCE(m.attempt_no, 0)
                         >= {int(DAILY_RETRYABLE_MAX_ATTEMPTS)}
+                )
+                AND NOT (
+                    COALESCE(m.state, '') = 'terminal'
+                    AND COALESCE(m.failure_code, '') = 'truncated'
                 )"""
             if include_all_completed and not explicit_ids
             else "TRUE"
@@ -4036,7 +4041,8 @@ class WhoScoredRepository:
                            ELSE 1
                        END AS attempt_no,
                        CASE
-                           WHEN m.state = 'retryable' THEN m.failure_code
+                           WHEN m.state IN ('retryable', 'terminal')
+                           THEN m.failure_code
                        END AS previous_failure_code{daily_projection}
                 FROM schedule s
                 LEFT JOIN {latest} m

@@ -3182,18 +3182,22 @@ def _match_1995702_html() -> str:
 
 
 @pytest.mark.parametrize(
-    ("previous_failure_code", "attempt_no", "state", "recorded_attempt", "has_retry_after"),
+    ("previous_failure_code", "attempt_no", "state", "has_retry_after"),
     [
-        (None, 1, "retryable", 1, True),
-        ("truncated", 2, "retryable", 2, True),
-        ("truncated", 3, "terminal", 3, False),
-        # A transport retry streak (browser, attempt 5) does not count toward
-        # the truncation cap: the first truncation starts at attempt 1.
-        ("browser", 6, "retryable", 1, True),
+        (None, 1, "retryable", True),
+        ("truncated", 2, "retryable", True),
+        ("truncated", 3, "terminal", False),
+        # After retryable/browser attempt 5 the streak continues (attempt 6),
+        # but only consecutive truncations count toward the cap of 3.
+        ("browser", 6, "retryable", True),
+        # Alternating browser/truncated failures still stop at the daily
+        # retry ceiling: the 8th attempt is terminal.
+        ("browser", 7, "retryable", True),
+        ("browser", 8, "terminal", False),
     ],
 )
 def test_truncated_final_match_is_retried_then_terminal(
-    tmp_path, previous_failure_code, attempt_no, state, recorded_attempt, has_retry_after
+    tmp_path, previous_failure_code, attempt_no, state, has_retry_after
 ):
     # #1484: the real truncated page of game 1995702 (events end at 49' of a
     # declared 95') with the schedule's is_opta=False goes through the real
@@ -3219,7 +3223,7 @@ def test_truncated_final_match_is_retried_then_terminal(
     failure = repository.failures[0]
     assert failure.state == state
     assert failure.failure_code == "truncated"
-    assert failure.attempt_no == recorded_attempt
+    assert failure.attempt_no == attempt_no
     assert (failure.retry_after is not None) is has_retry_after
     assert "incomplete final Opta events" in failure.error
     assert failure.raw_uri

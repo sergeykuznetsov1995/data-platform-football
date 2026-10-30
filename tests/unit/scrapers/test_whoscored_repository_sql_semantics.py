@@ -582,3 +582,47 @@ def test_truncated_retry_is_offered_once_due_and_terminal_truncated_never(lane):
     ).list_match_candidates(LEAGUE, SEASON, **kwargs)
     assert candidate.attempt_no == 3
     assert candidate.previous_failure_code == "truncated"
+
+
+@pytest.mark.unit
+def test_history_plan_freeze_drops_terminal_truncation_but_replay_refetches_it():
+    """#1484: terminal/truncated leaves the frozen plan; an explicit replay
+    still sees its failure_code, so the service fetches past the raw cache."""
+    from types import SimpleNamespace
+
+    from dags.scripts import run_whoscored_backfill_item as backfill_item
+    from dags.scripts import run_whoscored_scraper as runner
+
+    con = _connection()
+    for game_id in (51, 52, 53):
+        _game(con, game_id, 500, 20)
+    fetched = NOW - timedelta(days=2)
+    for game_id, failure_code in ((51, "truncated"), (52, "http")):
+        con.execute(
+            "INSERT INTO iceberg.bronze.whoscored_match_ingest_manifest VALUES "
+            "(?, ?, ?, 'terminal', ?, 's3://raw/x', 'sha', ?, NULL, NULL, 3, ?, ?, ?)",
+            [LEAGUE, SEASON, game_id, f"ws2-{game_id}", PARSER_VERSION,
+             fetched, fetched, failure_code],
+        )
+    _candidates(con)  # creates the *_latest view over the manifest
+
+    def execute_query(sql):
+        sql = sql.replace("CURRENT_TIMESTAMP", f"TIMESTAMP '{NOW.isoformat(sep=' ')}'")
+        rendered = sqlglot.transpile(sql, read="trino", write="duckdb")[0]
+        return con.execute(rendered).fetchall()
+
+    trino = MagicMock()
+    trino.execute_query.side_effect = execute_query
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    service = SimpleNamespace(repository=repository)
+    scope = runner.RunnerScope.parse(f"{LEAGUE}={SEASON}")
+
+    assert backfill_item._filtered_candidates(service, {"selector": {}}, scope) == [
+        52,
+        53,
+    ]
+    (replay,) = repository.list_match_candidates(
+        LEAGUE, SEASON, match_ids=[51], include_success=True
+    )
+    assert replay.previous_failure_code == "truncated"
+    assert replay.attempt_no == 1
