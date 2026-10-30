@@ -73,7 +73,8 @@ def _manifest_closed_except(open_slugs):
 
 def _answers(**extra):
     answers = {"/Ranking": fixture_response("Ranking.html.gz"),
-               "/Results": fixture_response("Results.html.gz")}
+               "/Results": fixture_response("Results.html.gz"),
+               "/Fixtures": fixture_response("Fixtures.html.gz")}
     for slug in NEW:
         answers[f"/{slug}"] = fixture_response(f"club_{slug}.html.gz")
     answers.update(extra)
@@ -114,8 +115,11 @@ def test_complete_run_writes_snapshot_results_and_new_slugs():
     # Ranking + Results wire bytes are the daily cost; the club pages come on top
     assert result["wire_bytes_daily"] == 88609 + 46210
     assert result["wire_bytes"] == result["wire_bytes_daily"] + sum(
-        len(session.answers[f"/{s}"].raw.wire) for s in NEW)
-    assert result["requests"] == 2 + 4
+        len(session.answers[f"/{s}"].raw.wire) for s in NEW) + result["fixtures_wire_bytes"]
+    assert result["requests"] == 2 + 4 + 1
+    # #1982 step 1: /Fixtures raw comes last, after the club pages
+    assert result["fixtures_raw"] is True and result["fixtures_error"] is None
+    assert result["fixtures_wire_bytes"] == len(session.answers["/Fixtures"].raw.wire)
     assert (result["history_new_candidates"], result["history_new_fetched"],
             result["history_new_ok"], result["history_new_failed"]) == (4, 4, 4, 0)
 
@@ -129,7 +133,7 @@ def test_complete_run_writes_snapshot_results_and_new_slugs():
     assert len(store.results) == 63
     # raw-first: both pages and the four club pages, gzip bytes of the body
     raw = hist.rows(history.RAW_TABLE)
-    assert [r["page"] for r in raw] == ["/Ranking", "/Results"] + [f"/{s}" for s in NEW]
+    assert [r["page"] for r in raw] == ["/Ranking", "/Results"] + [f"/{s}" for s in NEW] + ["/Fixtures"]
     assert gzip.decompress(raw[0]["body"]).decode("utf-8") == fixture_html("Ranking.html.gz")
     manifest = [r for r in hist.rows(history.MANIFEST_TABLE) if r.get("_batch_id") == "test-daily"]
     assert sorted(r["slug"] for r in manifest) == sorted(NEW)
@@ -146,7 +150,7 @@ def test_new_slugs_are_limited_and_known_ones_skipped():
     result, _, hist, session, *_ = _run(limit=2)
     assert (result["history_new_candidates"], result["history_new_fetched"]) == (4, 2)
     fetched = [c["path"] for c in session.calls][2:]
-    assert fetched == ["/Arsenal", "/santos-fc_2"]
+    assert fetched == ["/Arsenal", "/santos-fc_2", "/Fixtures"]
     assert daily.exit_code(result) == 0
 
 
@@ -164,8 +168,9 @@ def test_same_rating_date_is_a_replace_without_alert_or_new_slugs():
     assert daily.exit_code(result) == 0 and sent == []
     assert result["same_date"] is True and store.replaces == [RATING_DATE]
     assert result["history_new_fetched"] == 0
-    assert [c["path"] for c in session.calls] == ["/Ranking", "/Results"]
-    assert result["wire_bytes"] == result["wire_bytes_daily"] == 88609 + 46210
+    assert [c["path"] for c in session.calls] == ["/Ranking", "/Results", "/Fixtures"]
+    assert result["wire_bytes_daily"] == 88609 + 46210
+    assert result["wire_bytes"] == result["wire_bytes_daily"] + result["fixtures_wire_bytes"]
 
 
 def test_same_date_with_stored_results_does_not_fetch_results_again():
@@ -186,7 +191,7 @@ def test_results_ahead_of_ranking_are_fetched_again_on_the_same_date():
     answers = lambda: _answers(**{"/Results": _results_with_date("2026-09-23")})
     _run(answers(), store=store)
     result, store, _, session, *_ = _run(answers(), store=store)
-    assert [c["path"] for c in session.calls] == ["/Ranking", "/Results"]
+    assert [c["path"] for c in session.calls] == ["/Ranking", "/Results", "/Fixtures"]
     assert result["results_skipped"] is False and daily.exit_code(result) == 0
 
 
@@ -273,6 +278,17 @@ def test_older_results_catch_up_on_a_retry():
     assert slept == [daily.RESULTS_RETRY_PAUSE] and result["results_attempts"] == 2
     assert daily.exit_code(result) == 0 and len(store.results) == 63
 
+
+
+@pytest.mark.parametrize("answer", [FakeResponse(403), [network_error()] * 3, FakeResponse(302)])
+def test_fixtures_failure_never_reddens_the_run(answer, caplog):
+    # #1982 step 1: /Fixtures is raw-only and best effort
+    result, store, hist, *_ = _run(_answers(**{"/Fixtures": answer}))
+    assert daily.exit_code(result) == 0 and result["written"] is True
+    assert result["fixtures_raw"] is False and result["fixtures_error"]
+    assert RATING_DATE in store.snapshot and len(store.results) == 63
+    assert "/Fixtures" not in [r["page"] for r in hist.rows(history.RAW_TABLE)]
+    assert "ClubElo /Fixtures raw capture failed" in caplog.text
 
 
 def test_block_stops_the_run():
@@ -425,7 +441,7 @@ def test_external_results_allow_snapshot_and_merge_on_own_dates(day):
     results_date = date.fromisoformat(result["results_rating_date"])
     assert results_date == datetime.strptime(day, "%Y%m%d").date()
     assert {r["rating_date"] for r in store.results.values()} == {results_date}
-    assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking", "/Results"]
+    assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking", "/Results", "/Fixtures"]
     external = next(r for r in store.results.values() if r["home_key"].startswith("~:")
                     or r["away_key"].startswith("~:"))
     key = tuple(external[k] for k in daily.RESULT_KEYS)
