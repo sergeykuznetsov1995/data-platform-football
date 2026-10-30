@@ -149,7 +149,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                         if feeds_due:
                             result = service.sync_stage_feeds()
                             consume(result)
-                            did_work = did_work or result.skipped == 0
+                            # A re-commit of retained/absent stages checks nothing new;
+                            # counting it as work re-selects the scope every 30 s.
+                            did_work = did_work or (result.skipped == 0 and bool(
+                                result.metadata.get("stage_xg_checked")))
                 finally:
                     if collect_traffic is not None:
                         collect_traffic(service, season.scope)
