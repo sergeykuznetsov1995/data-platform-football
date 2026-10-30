@@ -272,7 +272,7 @@ exec /usr/bin/flock "$@"
         self.put("started", "2026-09-03T00:00:00.000000000Z")
         self.put("mounts_root", str(self.old_tree))
         self.put("mounts_sched_root", str(self.old_tree))
-        self.put("dags", "5")
+        self.put("dags", "6")
         self.put("import_error", "0")
         self.put("busy", "0")
         self._flock_stub()
@@ -705,16 +705,17 @@ def test_any_hour_with_a_free_contour_and_headroom_delivers(stand: Stand, when: 
 
 @pytest.mark.unit
 def test_the_nearest_scheduled_run_is_the_deadline(stand: Stand) -> None:
-    """Дедлайн — ближайший запуск сбора по расписанию: запас на осушение deploy.sh считается
-    от него, и он же уходит в запись попытки."""
+    """Дедлайн — ближайший запуск сбора по расписанию минус запас на откат (ROLLBACK_RESERVE):
+    запас на осушение deploy.sh считается от него, и он же уходит в запись попытки."""
     now = _epoch(THU_0330)
-    stand.put("next_run", str(now + 6000))
+    stand.put("next_run", str(now + 7800))
     stand.watchdog_pids()
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
     idle = int(stand.calls("deploy")[0].split("|")[1])
-    assert idle == 6000 - 3000 - 40, idle             # DEPLOY_CEILING 3000, ACCEPT_WAIT стенда 40
-    assert _window(stand, stand.win)["DEADLINE"] == str(now + 6000)
+    # ROLLBACK_RESERVE 1800, DEPLOY_CEILING 3000, ACCEPT_WAIT стенда 40
+    assert idle == 7800 - 1800 - 3000 - 40, idle
+    assert _window(stand, stand.win)["DEADLINE"] == str(now + 7800 - 1800)
 
 
 @pytest.mark.unit
@@ -1862,7 +1863,7 @@ def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
 
 @pytest.mark.unit
 @pytest.mark.parametrize("has_compaction,registered,expected", [
-    (True, 5, "0"), (True, 6, "1"), (False, 5, "1"),
+    (True, 6, "0"), (True, 7, "1"), (False, 6, "1"),
 ])
 def test_acceptance_requires_compaction_only_for_releases_containing_it(
     tmp_path: Path, has_compaction: bool, registered: int, expected: str,
@@ -1889,7 +1890,7 @@ metadb(){
       echo "$1" > "$SQL_LOG"
       case "$1" in
         *dag_sofascore_schedule_maintenance*) echo "$REGISTERED" ;;
-        *) echo 5 ;;
+        *) echo 6 ;;
       esac ;;
     *) echo 0 ;;
   esac

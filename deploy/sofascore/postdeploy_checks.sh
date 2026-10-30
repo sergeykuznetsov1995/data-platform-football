@@ -99,8 +99,8 @@ errs=$($PSQL "SELECT count(*) FROM import_error;")
 echo "import_error=$errs"
 [ "$errs" = "0" ] && ok "import_error=0" || fail "import_error=$errs"
 $PSQL "SELECT dag_id, is_paused, is_active FROM dag WHERE dag_id LIKE '%sofascore%' ORDER BY 1;"
-active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens','dag_ingest_sofascore','dag_trigger_sofascore_daily','dag_sofascore_manifest_maintenance','dag_sofascore_schedule_maintenance') AND is_active=true;")
-[ "$active" = "6" ] && ok "6 DAG контура активны" || fail "активных DAG контура: $active из 6"
+active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens','dag_ingest_sofascore','dag_trigger_sofascore_daily','dag_trigger_sofascore_daily_tail','dag_sofascore_manifest_maintenance','dag_sofascore_schedule_maintenance') AND is_active=true;")
+[ "$active" = "7" ] && ok "7 DAG контура активны" || fail "активных DAG контура: $active из 7"
 
 echo
 echo "== 5. Состояние кампании =="

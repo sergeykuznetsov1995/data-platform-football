@@ -107,7 +107,7 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_trigger_sofascore_daily_tail dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
@@ -128,6 +128,8 @@ DEPLOY_CEILING=${DEPLOY_CEILING:-3000}  # жёсткие потолки deploy.s
 ACCEPT_WAIT=${ACCEPT_WAIT:-480}    # dag_dir_list_interval = 300 с, 90 с не хватало (25.08)
 ACCEPT_POLL=${ACCEPT_POLL:-20}
 MIN_DRAIN=${MIN_DRAIN:-900}        # меньше 15 мин на осушение — не начинаем вовсе
+# Откат (два compose по 600 с + приёмка) тоже обязан кончиться до ближайшего прогона.
+ROLLBACK_RESERVE=${ROLLBACK_RESERVE:-1800}
 BUSY_RETRY=${BUSY_RETRY:-21600}    # rc=4: тот же sha — не раньше чем через 6 ч (каждый drain стопорит историю)
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}   # провальных попыток подряд до выключателя (имя — прежнее)
@@ -589,7 +591,9 @@ set_deadline(){
   nxt=$(metadb "SELECT coalesce(min(extract(epoch FROM next_dagrun_create_after))::bigint, 0) FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS) AND NOT is_paused;")
   case "$nxt" in ''|*[!0-9]*) return 1 ;; esac
   deadline=$(( now + DEADLINE_MAX ))
-  if [ "$nxt" != 0 ] && [ "$nxt" -lt "$deadline" ]; then deadline=$nxt; fi
+  if [ "$nxt" != 0 ] && [ $(( nxt - ROLLBACK_RESERVE )) -lt "$deadline" ]; then
+    deadline=$(( nxt - ROLLBACK_RESERVE ))
+  fi
   return 0
 }
 # Бой не подтверждён на master дольше суток — одна новость в сутки, на все причины сразу
@@ -1366,7 +1370,11 @@ if [ "$rc" = 4 ]; then
   rm -f "$INFLIGHT"
   if [ "$restored" = 1 ]; then
     window_close "$WIN" busy "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут" t
-    echo "busy $(date -u +%s)" > "$ATTEMPTED"
+    # Атомарно: пустая защёлка после обрыва записи заперла бы этот sha навсегда.
+    if ! { printf 'busy %s\n' "$(date -u +%s)" > "$ATTEMPTED.tmp" && mv -f "$ATTEMPTED.tmp" "$ATTEMPTED"; } 2>/dev/null; then
+      log "не смог пометить защёлку $ATTEMPTED как busy — снимаю её, повтор со следующего свободного часа"
+      rm -f "$ATTEMPTED" "$ATTEMPTED.tmp"
+    fi
   else
     window_close "$WIN" failed "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут, контур не вернулся" f
   fi
