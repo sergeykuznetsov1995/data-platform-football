@@ -2412,6 +2412,33 @@ def test_player_null_pageprops_data_is_intentional_not_available():
     assert commit.error_code == "source_player_no_data"
 
 
+def test_player_collector_cools_down_unavailable_service_attempt(monkeypatch):
+    from scrapers.fotmob import repository as repository_module
+    from scrapers.fotmob.repository import TableRows
+    from tests.unit.scrapers.test_fotmob_repository import _commit
+
+    now = datetime(2026, 10, 30, 12)
+    monkeypatch.setattr(repository_module, "utc_now", lambda: now)
+    url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    service, _, repository = _service({
+        url: {"pageProps": {"data": None}},
+    })
+    repository.commit(_commit(target_type="team", entity_id="1"), [TableRows(
+        "fotmob_squad_snapshots",
+        [{"team_id": "1", "member_type": "player", "member_id": str(i)}
+         for i in (10, 20)], "squad_snapshots",
+    )])
+    assert repository.missing_current_squad_player_ids(1) == [10]
+    result = service.sync_player_snapshots([10], build_id="build-1")
+    assert result.not_available == 1
+    assert repository.missing_current_squad_player_ids(2) == [20]
+    attempt = next(c for c in repository.commits if c.target_type == "player")
+    assert attempt.fetched_at is not None
+    assert attempt.completed_at == now
+    now += timedelta(hours=24)
+    assert repository.missing_current_squad_player_ids(2) == [10, 20]
+
+
 def test_player_no_data_tombstone_remains_retryable_under_once_policy():
     """A source gap is not the one confirmed collection promised by #1196."""
 

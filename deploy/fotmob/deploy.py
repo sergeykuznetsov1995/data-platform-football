@@ -62,7 +62,7 @@ EXPECTED_SCHEDULES = {
     "dag_trigger_fotmob_daily": "None",
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
-    "dag_collect_fotmob_players": "None",
+    "dag_collect_fotmob_players": "@daily",
     "dag_refresh_fotmob_c1": "15 * * * *",
 }
 AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
@@ -359,7 +359,12 @@ def build_automatic_catalog_admission(
         "writer_snapshot": dict(writer_snapshot),
         "scope_observations": dict(scope_observations),
         "legacy_owners": {
-            dag_id: {"schedule": None, "is_paused": True}
+            dag_id: {
+                "schedule": (
+                    "@daily" if dag_id == "dag_collect_fotmob_players" else None
+                ),
+                "is_paused": True,
+            }
             for dag_id in sorted(LEGACY_OWNER_DAGS)
         },
         "lane_budgets": {

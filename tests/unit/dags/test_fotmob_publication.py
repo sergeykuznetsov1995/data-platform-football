@@ -497,24 +497,25 @@ def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_p
     assert "must-not-appear" not in json.dumps(result)
 
 
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
 def test_deployed_player_collector_owner_gets_retry_stable_nonzero_identity(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, run_type
 ):
     roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
         tmp_path
     )
     dag_run = SimpleNamespace(
         dag_id="dag_collect_fotmob_players",
-        run_type="manual",
-        run_id="manual__collector-1",
+        run_type=run_type,
+        run_id=f"{run_type}__collector-1",
         logical_date=START,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
     )
     context = {
         "dag_run": dag_run,
         "data_interval_start": START,
-        "data_interval_end": START,
+        "data_interval_end": START + timedelta(days=1) if run_type == "scheduled" else START,
     }
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
 
@@ -529,13 +530,17 @@ def test_deployed_player_collector_owner_gets_retry_stable_nonzero_identity(
 
     assert admitted["deployment_id"] == "f" * 32
     assert first == second
+    if run_type == "scheduled":
+        assert first["binding"]["data_interval_start"] == START.isoformat(timespec="microseconds")
+        assert first["binding"]["data_interval_end"] == (START + timedelta(days=1)).isoformat(timespec="microseconds")
     assert first["binding"]["data_interval_start"] < first["binding"][
         "data_interval_end"
     ]
 
 
-def test_deployed_player_collector_initializer_uses_same_manual_admission(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
+def test_deployed_player_collector_initializer_uses_same_owner_admission(
+    tmp_path, monkeypatch, run_type
 ):
     roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
         tmp_path
@@ -550,17 +555,17 @@ def test_deployed_player_collector_initializer_uses_same_manual_admission(
     )
     dag_run = SimpleNamespace(
         dag_id="dag_collect_fotmob_players",
-        run_type="manual",
-        run_id="manual__collector-1",
+        run_type=run_type,
+        run_id=f"{run_type}__collector-1",
         logical_date=START,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
     )
 
     result = publication.initialize_fotmob_player_collector_publication(
         dag_run=dag_run,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
         hostname="1" * 12,
         roots=roots,
         ti=MagicMock(),
@@ -573,18 +578,19 @@ def test_deployed_player_collector_initializer_uses_same_manual_admission(
     ]
 
 
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
 def test_player_collector_finalizer_targets_the_initialized_generation(
-    monkeypatch,
+    monkeypatch, run_type,
 ):
     _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     dag_run = SimpleNamespace(
         dag_id="dag_collect_fotmob_players",
-        run_type="manual",
-        run_id="manual__collector-1",
+        run_type=run_type,
+        run_id=f"{run_type}__collector-1",
         logical_date=START,
         data_interval_start=START,
-        data_interval_end=START,
+        data_interval_end=START + timedelta(days=1) if run_type == "scheduled" else START,
         get_task_instances=lambda: [
             SimpleNamespace(
                 task_id="trigger_fotmob_player_collector", state="success"
@@ -594,7 +600,7 @@ def test_player_collector_finalizer_targets_the_initialized_generation(
     context = {
         "dag_run": dag_run,
         "data_interval_start": START,
-        "data_interval_end": START,
+        "data_interval_end": START + timedelta(days=1) if run_type == "scheduled" else START,
     }
 
     initialized = publication.expected_player_collector_publication(context)

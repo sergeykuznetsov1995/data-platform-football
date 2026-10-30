@@ -1032,7 +1032,10 @@ def test_current_view_fails_closed_without_manifest_batch_column():
         FotMobRepository(writer=writer).ensure_current_views()
 
 
-def test_memory_completion_markers_are_exact_signature_and_season_scoped():
+def test_memory_completion_markers_are_exact_signature_and_season_scoped(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fotmob.repository.utc_now", lambda: datetime(2026, 7, 11, 8, 30)
+    )
     repository = MemoryFotMobRepository()
     repository.record(
         _commit(

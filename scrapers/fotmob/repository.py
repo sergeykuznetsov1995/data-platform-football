@@ -3519,8 +3519,8 @@ class MemoryFotMobRepository:
             values["status"] = commit.status
             values["actual_counts"] = derived
             commit = TargetCommit(**values)
-        if commit.completed_at is None and commit.fetched_at is None:
-            # Rawless decisions need a stable observation time, as in Bronze.
+        if commit.completed_at is None:
+            # Persist completion time for every attempt, as in Bronze.
             commit = replace(commit, completed_at=utc_now())
         self.commits.append(commit)
         for dataset in datasets:
