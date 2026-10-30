@@ -228,6 +228,21 @@ def test_first_seen_completeness_and_invariance_execute_with_nullable_key(wareho
     assert all(not item.passed for item in checks)
 
 
+@pytest.mark.parametrize('table,keys', KEYS.items())
+def test_first_seen_invariance_joins_on_plain_equalities(table, keys):
+    """#1971: IS NOT DISTINCT FROM over JSON extracts planned a nested loop."""
+    sql = daily.build_first_seen_invariance_sql(table, keys, 'iceberg.bronze.' + table)
+    join = sqlglot.parse_one(sql, read='trino').find(exp.Join)
+    on = join.args['on']
+    assert not list(on.find_all(exp.NullSafeEQ, exp.JSONExtractScalar))
+    conditions = list(on.flatten()) if isinstance(on, exp.And) else [on]
+    assert len(conditions) == len(keys)
+    assert all(isinstance(item, exp.EQ) and all(isinstance(side, exp.Coalesce) for side in item.args.values())
+               for item in conditions)
+    registry = join.this.this
+    assert registry.find(exp.Where).sql(dialect='trino') == f"WHERE table_name = '{table}'"
+
+
 def test_missing_first_seen_schema_executes_and_stays_unknown(warehouse):
     cur, pins = _frozen(warehouse)
     metrics, checks = daily.collect_first_seen_metrics(cur, NOW, pins)

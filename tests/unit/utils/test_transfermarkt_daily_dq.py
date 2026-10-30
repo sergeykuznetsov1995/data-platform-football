@@ -270,10 +270,10 @@ def test_first_seen_audit_reuses_canonical_keys_including_nullable_left_date(ful
     pins = {daily.FIRST_SEEN_REGISTRY: 123}
     frozen = daily._PinnedCursor(cur, pins)
     daily.collect_first_seen_metrics(frozen, NOW, pins)
-    stints = next(sql for sql in cur.sql if 'r.key_json' in sql and 'transfermarkt_coach_stints' in sql)
+    stints = next(sql for sql in cur.sql if 'key_json' in sql and 'transfermarkt_coach_stints' in sql)
     assert "'$[3]'" in stints
-    assert 'IS NOT DISTINCT FROM CAST(CAST(b.left_date AS date) AS varchar)' in stints
-    assert f'{daily.FIRST_SEEN_REGISTRY} FOR VERSION AS OF 123' in stints
+    assert "= COALESCE(CAST(CAST(b.left_date AS date) AS varchar), '<null>')" in stints
+    assert f'FROM {daily.FIRST_SEEN_REGISTRY} FOR VERSION AS OF 123 WHERE table_name' in stints
 
 
 def test_summary_preserves_known_red_when_other_checks_are_incomplete():
