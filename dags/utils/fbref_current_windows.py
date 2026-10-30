@@ -67,6 +67,11 @@ HISTORY_SCHEDULE = (
 )
 HISTORY_MAX_BATCHES = 12
 HISTORY_WAVE_DEADLINE_SECONDS = 35 * 60
+# Raw recovery runs before every live wave; a parser-version bump turns the
+# whole archive into its cohort (#2001: ~51k pages at ~100/h).  Like the other
+# budgets this stops NEW batches only: an observed 25-page batch takes 10-15
+# min, so the worst case is ~45 min, well under the 2 h execution_timeout.
+RECOVERY_WAVE_DEADLINE_SECONDS = 30 * 60
 
 
 def history_slice_window(now: datetime):

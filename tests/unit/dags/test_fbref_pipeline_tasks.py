@@ -1703,6 +1703,112 @@ def test_recovery_drain_counts_dead_lettered_as_progress(monkeypatch):
     pipeline.fetch_wave.assert_not_called()
 
 
+def _progressing_recovery_batch():
+    batch = MagicMock()
+    batch.as_dict.return_value = {
+        "cohort_size": 25,
+        "claimed": 25,
+        "parsed": 25,
+    }
+    return batch
+
+
+def _fake_monotonic(monkeypatch, start, step):
+    ticks = {"now": start - step}
+
+    def monotonic():
+        ticks["now"] += step
+        return ticks["now"]
+
+    monkeypatch.setattr(fbref_pipeline_tasks.time, "monotonic", monotonic)
+
+
+@pytest.mark.unit
+def test_recovery_drain_stops_at_time_budget_and_leaves_cohort_to_next_run(
+    monkeypatch,
+):
+    """Бамп версии парсера делает когортой весь архив — живые волны не ждут его (#2001)."""
+
+    pipeline = MagicMock()
+    # Finite on purpose: an unbounded drain must fail here, not hang.
+    pipeline.recover_unprocessed_wave.side_effect = [
+        _progressing_recovery_batch() for _ in range(6)
+    ]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+    _fake_monotonic(monkeypatch, start=0.0, step=1000.0)
+
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__budgeted-recovery",
+        dag_id="dag_ingest_fbref",
+        page_kinds=["match"],
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        deadline_seconds=1500,
+    )
+
+    assert pipeline.recover_unprocessed_wave.call_count == 2
+    assert recovered["recovery_budget_exhausted"] is True
+    assert recovered["recovery_budget_seconds"] == 1500
+    assert recovered["batches"] == 2
+    assert recovered["parsed"] == 50
+    assert recovered["recovery_stalled"] is False
+    pipeline.fetch_wave.assert_not_called()
+
+
+@pytest.mark.unit
+def test_recovery_drain_runs_first_batch_before_checking_budget(monkeypatch):
+    pipeline = MagicMock()
+    pipeline.recover_unprocessed_wave.side_effect = [
+        _progressing_recovery_batch(),
+        _progressing_recovery_batch(),
+    ]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+    # Every clock read is already past the budget.
+    _fake_monotonic(monkeypatch, start=0.0, step=10_000.0)
+
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__late-recovery",
+        dag_id="dag_ingest_fbref",
+        page_kinds=["match"],
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        deadline_seconds=60,
+    )
+
+    # One batch always runs; the budget only gates the next one.
+    assert pipeline.recover_unprocessed_wave.call_count == 1
+    assert recovered["batches"] == 1
+    assert recovered["parsed"] == 25
+    assert recovered["recovery_budget_exhausted"] is True
+    pipeline.fetch_wave.assert_not_called()
+
+
+@pytest.mark.unit
+def test_recovery_drain_rejects_non_positive_budget(monkeypatch):
+    pipeline = MagicMock()
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    with pytest.raises(ValueError, match="recovery deadline must be positive"):
+        fbref_pipeline_tasks.run_recovery_wave(
+            airflow_run_id="manual__zero-budget-recovery",
+            dag_id="dag_ingest_fbref",
+            page_kinds=["match"],
+            run_type="current",
+            deadline_seconds=0,
+        )
+    pipeline.recover_unprocessed_wave.assert_not_called()
+
+
 @pytest.mark.unit
 def test_current_scope_freshness_accepts_complete_per_kind_evidence(monkeypatch):
     control = MagicMock()
