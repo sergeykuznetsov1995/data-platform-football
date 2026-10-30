@@ -240,7 +240,9 @@ NATURAL_KEYS: dict[str, tuple[str, ...]] = {
 
 def ensure_bronze_tables(writer) -> None:
     """Create the four tables when missing (``IcebergWriter``)."""
-    for table, schema in TABLES.items():
+    from .deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
+
+    for table, schema in {**TABLES, PLAYS_TABLE: PLAYS_SCHEMA}.items():
         writer.create_table_if_not_exists(
             BRONZE_DATABASE,
             table,

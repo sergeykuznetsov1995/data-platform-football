@@ -57,6 +57,8 @@ class EndpointType(str, Enum):
     CATALOG = "catalog"
     SCOREBOARD = "scoreboard"
     SUMMARY = "summary"
+    PLAYS = "plays"
+    TEAM_STATISTICS = "team_statistics"
 
     @classmethod
     def parse(cls, value: object) -> "EndpointType":
@@ -64,13 +66,13 @@ class EndpointType(str, Enum):
             return value
         if not isinstance(value, str):
             raise ValueError(
-                "ESPN endpoint type must be catalog, scoreboard or summary"
+                "ESPN endpoint type must be catalog, scoreboard, summary, plays or team_statistics"
             )
         try:
             return cls(value.strip().lower())
         except ValueError as exc:
             raise ValueError(
-                "ESPN endpoint type must be catalog, scoreboard or summary"
+                "ESPN endpoint type must be catalog, scoreboard, summary, plays or team_statistics"
             ) from exc
 
 

@@ -999,8 +999,12 @@ def _run_match_core(
                  AND CAST(e.game_id AS BIGINT)=CAST(m.game_id AS BIGINT)
                 GROUP BY 1,2,3
             ), match_rows AS (
+                -- Mirrors the repository final-match gate (#1484): a declared
+                -- duration outside 1..150 minutes is source garbage -> 90.
                 SELECT m.league,m.season,m.game_id,
-                       MAX(h.expanded_max_minute) expanded_max_minute
+                       CASE WHEN MAX(h.expanded_max_minute) BETWEEN 1 AND 150
+                            THEN MAX(h.expanded_max_minute) ELSE 90
+                       END declared_duration
                 FROM success_match m
                 LEFT JOIN iceberg.bronze.whoscored_matches_current h
                   ON h.league=m.league AND h.season=m.season
@@ -1017,13 +1021,13 @@ def _run_match_core(
                   AND e.game_id=m.game_id
                  JOIN match_rows h ON h.league=m.league AND h.season=m.season
                   AND h.game_id=m.game_id
-                 WHERE m.is_final=TRUE AND m.is_opta=TRUE AND (
+                 WHERE m.is_final=TRUE AND (
                     COALESCE(json_extract_scalar(
                         TRY(json_parse(m.dataset_statuses_json)),'$.events'
                     ),'')<>'available'
-                    OR e.rows_count<GREATEST(20,COALESCE(h.expanded_max_minute,90))
+                    OR e.rows_count<GREATEST(20,h.declared_duration)
                     OR COALESCE(e.max_minute,-1)<GREATEST(
-                        1,COALESCE(h.expanded_max_minute,90)-15
+                        1,h.declared_duration-15
                     )
                  )),
                 (SELECT COALESCE(SUM(invalid_identity_rows),0) FROM events_by_game),

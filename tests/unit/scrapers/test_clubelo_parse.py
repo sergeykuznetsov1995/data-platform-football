@@ -623,3 +623,90 @@ def test_external_results_duplicate_keeps_first_row_and_key():
     assert len(page.rows) == len(baseline.rows)
     assert [(r["match_date"], r["home_key"], r["away_key"], r["ft"]) for r in page.rows] == [
         (r["match_date"], r["home_key"], r["away_key"], r["ft"]) for r in baseline.rows]
+
+
+# ---- /Fixtures (#1982) ------------------------------------------------------
+
+LIVE_FIXTURES = Path(__file__).parents[2] / "fixtures" / "clubelo" / "20261030" / "Fixtures.html.gz"
+
+
+def _live_fixtures_html() -> str:
+    with gzip.open(LIVE_FIXTURES, "rt", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_live_fixtures_parse_every_match():
+    from datetime import datetime
+    from scrapers.clubelo.parse import parse_fixtures
+
+    page = parse_fixtures(_live_fixtures_html())
+    assert page.rating_date == date(2026, 10, 30)
+    assert page.page_created_at == datetime(2026, 10, 30, 16, 20, 19)
+    assert len(page.rows) == 50 and [r["row_seq"] for r in page.rows] == list(range(50))
+    assert len({r["competition"] for r in page.rows}) == 19
+    assert sum(bool(r["home_slug"]) for r in page.rows) == 33
+    first = page.rows[0]
+    assert first["game_id"] == 1709689 and first["kickoff_utc"] == datetime(2026, 10, 30, 15, 0)
+    assert (first["competition"], first["so_far_unit"]) == ("Regular Season", "Points")
+    assert (first["home_key"], first["home_slug"], first["home_tlc"]) == (
+        "~BUL:CSKA 1948 Sofia", None, "CSK")
+    assert (first["home_so_far"], first["home_win_pct"], first["draw_pct"], first["away_win_pct"]) == (
+        25.0, 68.3, 21.5, 10.2)
+    assert (first["home_stake"], first["home_stake_chance"], first["home_stake_if_win"],
+            first["home_stake_if_draw"], first["home_stake_if_loss"]) == (
+        "Champion", "2.2", "2.8", "1.0", "0.5")
+    assert (first["away_key"], first["away_stake"], first["away_stake_chance"]) == (
+        "~BUL:Spartak Varna", "Bottom 3", "23.7")
+    linked = next(r for r in page.rows if r["home_slug"] == "Shakhtar")
+    assert (linked["home_key"], linked["home_country"], linked["home_rank"]) == ("Shakhtar", "UKR", 137)
+    stakes = {r[f"{side}_stake"] for r in page.rows for side in ("home", "away")}
+    assert {"Champion", "Relegation", "Round of 16", "Clausura Champion"} <= stakes
+    shown = {r[f"{side}_stake_{n}"] for r in page.rows for side in ("home", "away")
+             for n in ("chance", "if_win", "if_draw", "if_loss")}
+    assert {"<0.1", "0"} <= shown and not any(v and v.endswith("%") for v in shown)
+
+
+def test_empty_fixtures_page_is_data_truth():
+    from scrapers.clubelo.parse import parse_fixtures
+
+    page = parse_fixtures(fixture_html("Fixtures.html.gz"))
+    assert page.rating_date == date(2026, 9, 22) and page.rows == []
+
+
+@pytest.mark.parametrize("old, new, check", [
+    ('<h1><a href="/2026-10-30/Fixtures">', '<h1><a href="/2026-10-30/Results">', "F1 h1"),
+    ("<th>Game</th>", "<th>Match</th>", "F1 fixtures table headers"),
+    ('data-live-status-game-id="1709689"', 'data-live-status-game-id="x1"', "F3 fixtures game id"),
+    ('data-utc-time="2026-10-30T15:00Z"></span></span><span class="max960">',
+     'data-utc-time="2026-10-30 15:00"></span></span><span class="max960">', "F3 fixtures game 1709689: kick-off"),
+    ('<span class="min1081">68.3</span>', '<span class="min1081">78.3</span>', "do not sum to 100"),
+    ('<span class="min1081">2.2</span>', '<span class="min1081">2,2</span>', "F3 chance"),
+    ('<i>  Regular Season</i>', '<i></i>', "F2 fixtures section row without a name"),
+])
+def test_fixtures_layout_changes_fail_closed(old, new, check):
+    from scrapers.clubelo.parse import parse_fixtures
+
+    html = _live_fixtures_html()
+    assert old in html
+    with pytest.raises(LayoutChanged, match=check):
+        parse_fixtures(html.replace(old, new, 1))
+
+
+def test_fixtures_repeated_game_fails_closed():
+    import re
+    from scrapers.clubelo.parse import parse_fixtures
+
+    html = _live_fixtures_html()
+    second = re.findall(r'data-live-status-game-id="(\d+)"', html)[1]
+    with pytest.raises(LayoutChanged, match="repeated"):
+        parse_fixtures(html.replace('data-live-status-game-id="1709689"',
+                                    f'data-live-status-game-id="{second}"', 1))
+
+
+def test_synthetic_watch_fixture_is_not_the_live_layout():
+    from scrapers.clubelo.parse import parse_fixtures
+
+    with gzip.open(Path(__file__).parents[2] / "fixtures" / "clubelo" / "watch" / "Fixtures_rows.html.gz",
+                   "rt", encoding="utf-8") as fh:
+        with pytest.raises(LayoutChanged, match="F1"):
+            parse_fixtures(fh.read())

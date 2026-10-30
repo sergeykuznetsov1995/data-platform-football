@@ -277,6 +277,8 @@ class TransportGate:
         state_path: Optional[os.PathLike | str] = None,
         lane: str = "live",
         *,
+        purpose: str | None = None,
+        admission_check: Callable[[], None] | None = None,
         step_ceiling: Optional[int] = None,
         utcnow_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleep_fn: Callable[[float], None] = time.sleep,
@@ -285,6 +287,10 @@ class TransportGate:
         if lane not in LANES:
             raise ValueError("ESPN gate lane must be live or history")
         self.lane = lane
+        self.purpose = purpose or lane
+        if self.purpose not in (lane, "deep") or (self.purpose == "deep" and lane != "history"):
+            raise ValueError("deep must use the history lane")
+        self.admission_check = admission_check
         self.state_path = Path(state_path) if state_path else default_state_path()
         if step_ceiling is None:
             raw = os.environ.get(STEP_CEILING_ENV, "").strip() or str(len(self.policy.steps) - 1)
@@ -316,6 +322,10 @@ class TransportGate:
         # lock; waiting never holds a permit, so a 403 or an auto-reset seen
         # by another process during the wait applies to this request too.
         while True:
+            if self.purpose == "deep":
+                if self.admission_check is None:
+                    raise LaneClosed("deep admission has no live-debt/stop check")
+                self.admission_check()
             with self._state() as state:
                 result = self._try_acquire(state, cluster, self._now())
             if isinstance(result, Permit):
@@ -542,6 +552,8 @@ class TransportGate:
         self._effective_step(state, now)  # expire S3 even while admission is blocked
         if self.lane == "history" and self._history_closed(state, now):
             raise LaneClosed("ESPN history lane is frozen")
+        if self.purpose == "deep" and now < max(state["hold_until"], state["cooldown_until"]):
+            raise LaneClosed("ESPN deep protection active")
         caps = self.policy.lanes[self.lane]
         daily = self._daily(state)
         # Daily request fuse per lane (R-44); bytes are counted, never capped
@@ -560,9 +572,16 @@ class TransportGate:
             history = [p[0] for p in state["permits"] if p[1] == "history"]
             if len(history) >= quota:
                 return max(0.05, history[0] + 60.0 - now)
+        if self.purpose == "deep":
+            deep = [p[0] for p in state["permits"] if len(p) > 2 and p[2] == "deep"]
+            quota = math.floor(math.floor(rate * (1.0 - self.policy.live_share)) * 0.2)
+            if quota < 1:
+                raise LaneClosed("deep has no quota at this pace")
+            if len(deep) >= quota:
+                return max(0.05, deep[0] + 60.0 - now)
         origin, probe = self._pick_origin(state, cluster, now, claim=True)
         state["next_permit_at"] = now + 60.0 / rate
-        state["permits"].append([now, self.lane])
+        state["permits"].append([now, self.lane, self.purpose])
         daily["requests"] += 1
         return Permit(cluster, origin, self.lane, step, probe, now)
 

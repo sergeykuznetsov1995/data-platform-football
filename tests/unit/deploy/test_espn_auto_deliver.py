@@ -425,6 +425,19 @@ def test_import_closure_follows_relative_and_lazy_imports():
     assert ad.import_closure(files.get, ["d.py"]) == {"d.py", "pkg/__init__.py", "pkg/a.py", "pkg/b.py"}
 
 
+def test_measure_module_and_its_imports_are_contour(env):
+    """Замер темпа #1510 исполняется из смонтированного scrapers/espn вне замыкания DAG."""
+    repo, paths, world, host, base = env
+    seed(env)
+    first = repo.commit({"scrapers/espn/measure_pace.py": "from . import pace_store\n",
+                         "scrapers/espn/pace_store.py": "X = 1\n"}, "measure")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == first
+    sha = repo.commit({"scrapers/espn/pace_store.py": "X = 2\n"}, "pace store fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == sha
+
+
 def test_rejected_sha_and_same_contour_are_not_retried(env):
     repo, paths, world, host, base = env
     seed(env)

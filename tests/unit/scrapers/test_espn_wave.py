@@ -145,6 +145,8 @@ class WaveTrino(FakeTrino):
         return [{key: _py(value) for key, value in row.items()} for row in self.tables["espn_match"]]
 
     def execute_query(self, sql, params=None):
+        if params is None and ", _source," in sql:
+            return super().execute_query(sql, params)
         self.queries.append(sql)
         if "espn_recheck_v1" in sql:
             slug, year = params

@@ -66,6 +66,7 @@ from .bronze_rows import (
 )
 from .bronze_schema import BRONZE_DATABASE, MATCH_TABLE
 from .bronze_writer import TournamentBatch, write_tournament_batch
+from .deep_store import client_state_dir
 from .core_lists import collect_refs, event_ids as core_event_ids, parse_event_status
 from .denominator import DenominatorRow
 from .editions import EditionState
@@ -1516,7 +1517,8 @@ def run_tournament(
         # Bronze rows never point at a raw body that is not written yet.
         client.flush()
         write_tournament_batch(
-            TournamentBatch(work.slug, work.season_year, payloads), trino=trino
+            TournamentBatch(work.slug, work.season_year, payloads), trino=trino,
+            state_dir=client_state_dir(client)
         )
         # After the write: a journalled outcome is what bronze holds.
         if journal:

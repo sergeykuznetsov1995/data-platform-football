@@ -170,7 +170,7 @@ if [ -f "$LEDGER" ] && [ -s "$LEDGER" ]; then
     archive="$GW_STATE/paid_requests.$(date -u +%Y%m%dT%H%M%SZ).jsonl.gz"
     # Цепочка `&&` под `set -e` не роняет скрипт: сбой gzip молча оставил бы .tmp и
     # выкат шёл бы дальше. Сбой — код 5 (шлюз уже остановлен), леджер не тронут.
-    if ! ( gzip -c "$LEDGER" > "$archive.tmp" && chmod 0600 "$archive.tmp" \
+    if ! ( gzip -c "$LEDGER" > "$archive.tmp" && chmod 0640 "$archive.tmp" \
            && mv -f "$archive.tmp" "$archive" && rm -f "$LEDGER" ); then
       rm -f "$archive.tmp"
       log "ledger archive failed: $LEDGER не тронут, выкат остановлен"
@@ -178,6 +178,15 @@ if [ -f "$LEDGER" ] && [ -s "$LEDGER" ]; then
     fi
     log "ledger archived: $archive (первая запись $first_at)"
   fi
+fi
+# Архивы читает отчёт трафика в планировщике (uid 50000, #1404). Идемпотентно и для
+# архивов прежних выкатов (root/0600); chown — только под root. Сбой не роняет выкат:
+# отчёт пометит нечитаемый архив и не даст ok по сверке.
+find "$GW_STATE" -maxdepth 1 -name 'paid_requests.*.jsonl.gz' -exec chmod 0640 {} + \
+  || log "ledger archives chmod failed"
+if [ "$(id -u)" = 0 ]; then
+  find "$GW_STATE" -maxdepth 1 -name 'paid_requests.*.jsonl.gz' -exec chown 50000:root {} + \
+    || log "ledger archives chown failed"
 fi
 
 STEP="gateway-up"

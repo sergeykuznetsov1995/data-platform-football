@@ -938,6 +938,111 @@ def test_rc4_means_the_contour_was_busy_and_nothing_was_touched(stand: Stand) ->
 
 
 @pytest.mark.unit
+def test_rc3_means_the_daily_window_and_nothing_was_touched(stand: Stand) -> None:
+    """Код 3 deploy.sh — «окно дейли»: отказ до замка и снимка пауз, бой не тронут (#1999).
+    Раньше автомат уводил его в блок провала: откат пересоздавал контейнеры нетронутого
+    контура, а запись failed третьей подряд включала выключатель."""
+    stand.watchdog_pids()
+    _put_window(stand, "2026-09-01", OUTCOME="failed", REASON="прошлая", RESTORED="t")
+    _put_window(stand, "2026-09-02", OUTCOME="failed", REASON="прошлая", RESTORED="t")
+    stand.put("deploy_rc", "3")
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    latch = stand.state / f"sofascore-auto-deliver-attempted-{stand.new_sha[:12]}"
+    assert latch.read_text().split()[0] == "busy"
+    assert not (stand.state / "sofascore-inflight").exists()
+    assert not (stand.state / "sofascore-auto-deliver.off").exists(), "busy в серию провалов не идёт"
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "busy" and "rc=3" in rec["REASON"] and rec["RESTORED"] == "t", rec
+    assert "окно дейли" in rec["REASON"], rec
+    assert not stand.calls("compose"), "отката не было"
+    assert "окно дейли" in stand.pending() and "НУЖНЫ РУКИ" not in stand.pending(), stand.pending()
+    assert stand.env_value("SOFASCORE_RELEASE_ROOT") == str(stand.old_tree)
+    assert (stand.stub_state / f"paused_{HIST}").read_text().strip() == "f"
+    assert (stand.stub_state / f"paused_{REFRESH}").read_text().strip() == "f"
+    for pool in POOLS:
+        assert (stand.stub_state / f"pool_{pool}").read_text().strip() == POOL_SLOTS[pool]
+
+
+def _real_deploy(tmp_path: Path, when: str) -> tuple[subprocess.CompletedProcess, Path, bytes, Path]:
+    """Настоящий deploy.sh против заглушек `date`, `docker`, `psql` (#1999). Дерево релиза и
+    env-файл — ровно то, что скрипт читает до часового запрета: без них он вышел бы кодом 2
+    раньше и тест стал бы зелёным по пустой причине."""
+    stubs = tmp_path / "bin"
+    calls = tmp_path / "calls"
+    _script(
+        stubs, "date",
+        f'''for a in "$@"; do [ "$a" = "-d" ] && exec /bin/date "$@"; done
+fmt=""
+for a in "$@"; do case "$a" in +*) fmt=$a ;; esac; done
+[ -n "$fmt" ] || exec /bin/date "$@"
+exec /bin/date -u -d "@{_epoch(when)}" "$fmt"
+''',
+    )
+    # Любой вызов — в журнал и отказ: дошедший до контура скрипт обрывается сразу, не ждёт.
+    for name in ("docker", "psql"):
+        _script(stubs, name, f'printf "%s %s\\n" {name} "$*" >> "{calls}"\nexit 1\n')
+    release = tmp_path / "releases" / "release-abcdef12"
+    (release / "configs" / "sofascore").mkdir(parents=True)
+    (release / "configs" / "sofascore" / "workload_policy.json").write_text("{}\n", encoding="utf-8")
+    (release / "deploy" / "sofascore").mkdir(parents=True)
+    for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
+        (release / "deploy" / "sofascore" / name).write_text("services: {}\n", encoding="utf-8")
+    runtime = tmp_path / "runtime"
+    lanes = [runtime / lane for lane in ("gw", "gw-history", "gw-players")]
+    for d in (runtime / "all-men", *lanes):
+        d.mkdir(parents=True)
+    env_file = tmp_path / "sofascore.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"SOFASCORE_RUNTIME_DIR={runtime}",
+                f"SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR={runtime / 'all-men'}",
+                f"SOFASCORE_GATEWAY_STATE_HOST_DIR={lanes[0]}",
+                f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={lanes[1]}",
+                f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={lanes[2]}",
+                f"SOFASCORE_PLATFORM_ENV_FILE={tmp_path / 'platform.env'}",
+                "SOFASCORE_HOST_PYTHON=/usr/bin/python3",
+                f"SOFASCORE_RELEASE_ROOT={tmp_path / 'releases' / 'release-old'}",
+                "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=cafebabe",
+                f"SOFASCORE_DEPLOY_LOCK={runtime / 'deploy.lock'}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    before = env_file.read_bytes()
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release), str(tmp_path / "releases" / "release-old")],
+        env={
+            "PATH": f"{stubs}:{os.environ['PATH']}",
+            "HOME": os.environ.get("HOME", "/nonexistent"),
+            "LANG": "C.UTF-8",
+            "SOFASCORE_ENV_FILE": str(env_file),
+        },
+        capture_output=True, text=True, timeout=60,
+    )
+    return proc, calls, before, env_file
+
+
+@pytest.mark.unit
+def test_the_real_deploy_sh_refuses_the_daily_window_without_touching_anything(tmp_path: Path) -> None:
+    """Контракт, на который опирается автомат (#1999): rc=3 настоящего deploy.sh — ни одного
+    вызова docker/psql (ни в шаге, ни в EXIT-trap), env-файл байт в байт прежний, замок не взят."""
+    proc, calls, before, env_file = _real_deploy(tmp_path / "window", "2026-11-01 14:30:00")
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "окно дейли" in proc.stderr, proc.stderr
+    assert not calls.exists(), calls.read_text(encoding="utf-8")
+    assert env_file.read_bytes() == before
+    assert not (tmp_path / "window" / "runtime" / "deploy.lock").exists(), "до замка не дошёл"
+    # Контрольная точка: вне окна тот же запуск проходит часовой запрет и упирается в контур
+    # (заглушка docker) — значит, rc=3 выше дала именно подменённая дата, а не что-то раньше.
+    proc, calls, _, _ = _real_deploy(tmp_path / "control", "2026-11-01 12:00:00")
+    assert proc.returncode not in (0, 2, 3), proc.stdout + proc.stderr
+    assert calls.exists() and "docker exec" in calls.read_text(encoding="utf-8"), proc.stdout + proc.stderr
+
+
+@pytest.mark.unit
 def test_a_delivery_timeout_is_named_and_rolled_back(stand: Stand) -> None:
     stand.watchdog_pids()
     stand.put("deploy_rc", "124")
