@@ -320,6 +320,7 @@ def test_capology_contract_lists_all_four_tables(table):
 CLUBELO_TABLES = [
     'clubelo_rank_snapshot',
     'clubelo_result',
+    'clubelo_fixture',
     'clubelo_club_elo_point',
     'clubelo_club_match',
     'clubelo_history_manifest',
@@ -344,6 +345,7 @@ def clubelo_schemas():
         for table, schema in {
             daily.SNAPSHOT_TABLE: daily.SNAPSHOT_SCHEMA,
             daily.RESULT_TABLE: daily.RESULT_SCHEMA,
+            daily.FIXTURE_TABLE: daily.FIXTURE_SCHEMA,
             **history.SCHEMAS,
         }.items()
     }
