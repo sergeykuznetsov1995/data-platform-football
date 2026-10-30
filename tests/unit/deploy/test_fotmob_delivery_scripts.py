@@ -11,6 +11,7 @@ Docker, pgrep и date подменяются заглушками в PATH.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -597,8 +598,8 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
     # Task-логи волн лежат на диске так же, как в контейнере, а заглушка docker
     # ИСПОЛНЯЕТ ту самую команду, которую автомат посылает внутрь, лишь подменив
     # корень путей. Иначе тест проверял бы заглушку, а не разбор кодов возврата:
-    # различить «совпадений нет» и «лог не прочитан» можно только на настоящем
-    # конвейере `ls || exit 3; grep | cut`.
+    # различить «ошибок нет» и «лог не прочитан» можно только на настоящем
+    # читателе task-логов.
     logs_root = tmp_path / "airflow-logs"
     for line in [r for r in rows.split("\n") if r.strip()]:
         run_id = line.split("|", 1)[0]
@@ -607,8 +608,8 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
             continue
         attempt.mkdir(parents=True)
         if log_mode == "unreadable":
-            # Каталог на месте файла: `ls` доволен, `grep` возвращает 2 — ровно тот
-            # сбой чтения, который без pipefail выглядел бы «ошибки раннера нет».
+            # Каталог на месте файла: читатель обязан сообщить о сбое чтения,
+            # не выдавая его за «ошибки раннера нет».
             (attempt / "attempt=1.log").mkdir()
         else:
             (attempt / "attempt=1.log").write_text(
@@ -922,9 +923,8 @@ def test_phase2_waits_while_the_metadb_still_has_an_active_wave(tmp_path: Path) 
 
 @pytest.mark.unit
 def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_grepped(tmp_path: Path) -> None:
-    """Лог на месте, но не читается (каталог вместо файла, нет прав, битый том): `grep`
-    возвращает 2. Без `pipefail` внутри контейнера этот код терялся бы за `cut`, и сбой
-    чтения выглядел бы как «ошибки раннера нет» — красная волна прошла бы мимо отката."""
+    """Лог на месте, но не читается: сбой чтения не должен выглядеть как
+    «ошибки раннера нет» — иначе красная волна прошла бы мимо отката."""
     w = _phase2_world(
         tmp_path, "fotmob_orchestrated__kkk|failed|2026-09-08T00:00:10|backfill", log_mode="unreadable",
     )
@@ -1571,3 +1571,126 @@ def test_checkout_barrier_rejects_a_damaged_pause_journal(tmp_path: Path, broken
     assert proc.returncode == 1
     assert not events.exists(), "a damaged journal must block before UPDATE/checkout"
     assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+
+
+_TRINO_POOL = "TrinoError: SQL execution failed: failed to fetch: HTTPSConnectionPool(host='{host}', port=8443): "
+# Настоящие строки errors[] отчёта раннера: инцидент #1978 и два вида отказа соединения.
+_INFRA_ERRORS = {
+    "read_timeout": _TRINO_POOL + "Read timed out. (read timeout=5)",
+    "refused": _TRINO_POOL + (
+        "Max retries exceeded with url: /v1/statement (Caused by NewConnectionError("
+        "'<urllib3.connection.HTTPSConnection object at 0x7f>: Failed to establish a new connection: "
+        "[Errno 111] Connection refused'))"
+    ),
+    "connect_timeout": _TRINO_POOL + (
+        "Max retries exceeded with url: /v1/statement (Caused by ConnectTimeoutError("
+        "<urllib3.connection.HTTPSConnection object at 0x7f>, 'Connection to trino timed out. "
+        "(connect timeout=5)'))"
+    ),
+}
+
+
+def _runner_log(*errors: str, report: bool = True) -> str:
+    # Формат task-лога: заголовок ошибки раннера, traceback, итоговый JSON-отчёт.
+    lines = [
+        "2026-10-30 06:28:43 [ERROR] __main__: Unexpected FotMob runner failure",
+        "Traceback (most recent call last):",
+        '  File "/opt/airflow/scrapers/base/trino_manager.py", line 335, in _execute',
+        "TimeoutError: The read operation timed out",
+    ]
+    if report:
+        lines.append(json.dumps({"complete": False, "errors": list(errors), "mode": "refresh", "rows": {}}))
+    return "".join(
+        f"[2026-10-30T06:28:43.589+0000] {{subprocess.py:106}} INFO - {line}\n" for line in lines
+    )
+
+
+def _infra_traceback(kind: str = "read_timeout") -> str:
+    return _runner_log(_INFRA_ERRORS[kind].format(host="trino"))
+
+
+def _attempt_path(tmp_path: Path, run: str, attempt: int = 1) -> Path:
+    return tmp_path / (
+        f"airflow-logs/dag_id=dag_ingest_fotmob/run_id={run}/"
+        f"task_id=scrape_fotmob_data/attempt={attempt}.log"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", sorted(_INFRA_ERRORS))
+def test_phase2_defers_infrastructure_failure_then_accepts_green(
+    tmp_path: Path, kind: str,
+) -> None:
+    run = "fotmob_orchestrated__infra"
+    rows = f"{run}|failed|2026-09-08T00:00:10|refresh\n"
+    w = _phase2_world(tmp_path, rows, runner_err=_infra_traceback(kind))
+    # Каждая попытка должна сама подтвердить отказ инфраструктуры.
+    _attempt_path(tmp_path, run, 2).write_text(_infra_traceback(kind), encoding="utf-8")
+    for _ in range(2):
+        proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+        assert proc.returncode == 0, proc.stderr + proc.stdout
+        assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+        assert w["driver_started"].exists(), "кампания продолжает работать"
+        assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+        assert not list(w["state"].glob("fotmob-wave-rollback-pending-*"))
+        assert not list(w["state"].glob("fotmob-wave-verdict-*"))
+    assert w["sent"].read_text(encoding="utf-8").count("отказ соединения/таймаут") == 1
+    (tmp_path / "waves.txt").write_text(
+        rows + "fotmob_orchestrated__green|success|2026-09-08T04:00:00|daily\n", encoding="utf-8",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "fotmob_orchestrated__green accepted" in verdict.read_text(encoding="utf-8")
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case", [
+    "source_host", "mixed_errors", "previous_attempt", "no_report", "empty_errors",
+    "sql_error", "code_error",
+])
+def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, case: str) -> None:
+    run = "fotmob_orchestrated__bad"
+    infra = _INFRA_ERRORS["read_timeout"].format(host="trino")
+    text = {
+        "source_host": _runner_log(_INFRA_ERRORS["read_timeout"].format(host="www.fotmob.com")),
+        "mixed_errors": _runner_log(infra, "ValueError: broken contract"),
+        "previous_attempt": _runner_log(infra),
+        "no_report": _runner_log(report=False),
+        "empty_errors": _runner_log(),
+        "sql_error": _runner_log("TrinoError: SQL execution failed: TrinoUserError(type=USER_ERROR, name=COLUMN_NOT_FOUND)"),
+        "code_error": _runner_log("KeyError: 'matchId'"),
+    }[case]
+    w = _phase2_world(
+        tmp_path, f"{run}|failed|2026-09-08T00:00:10|refresh\n"
+        "fotmob_orchestrated__green|success|2026-09-08T04:00:00|daily", runner_err=text,
+    )
+    if case == "previous_attempt":
+        _attempt_path(tmp_path, run, 2).write_text(_runner_log("RuntimeError: broken"), encoding="utf-8")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    verdicts = list(w["state"].glob("fotmob-wave-verdict-*"))
+    assert "rollback" in verdicts[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_rolls_back_the_fourth_consecutive_infrastructure_wave(tmp_path: Path) -> None:
+    rows = [f"fotmob_orchestrated__infra{i}|failed|2026-09-08T0{i}:00:10|refresh" for i in range(4)]
+    w = _phase2_world(tmp_path, "\n".join(rows), runner_err=_infra_traceback())
+    # Сигнал останавливает имитацию драйвера, поднятого предыдущим тиком.
+    _stub(w["stubs"], "pkill", f'rm -f "{w["driver_started"]}"\nexit 0\n')
+    # Сначала видны три волны: повторные тики не расходуют лимит заново.
+    (tmp_path / "waves.txt").write_text("\n".join(rows[:3]) + "\n", encoding="utf-8")
+    for _ in range(2):
+        proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+        assert proc.returncode == 0, proc.stderr + proc.stdout
+        assert not list(w["state"].glob("fotmob-wave-verdict-*"))
+    assert w["sent"].read_text(encoding="utf-8").count("отказ соединения/таймаут") == 3
+    (tmp_path / "waves.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "fotmob_orchestrated__infra3 rollback" in verdict.read_text(encoding="utf-8")
