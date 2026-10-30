@@ -67,21 +67,16 @@ class PaceIO:
                 if name == 'debt':
                     with self.lock:
                         self.debt_query = started.timestamp()
+                    before = self.gate.snapshot()
                 timer = time.monotonic()
                 error, result = None, {}
+                query_failed = False
                 try:
                     if manager is None:
                         manager = self.factory()
                     if name == 'debt':
-                        before = self.gate.snapshot()
                         debt = live_debt(manager, self.targets, started)
-                        after = self.gate.snapshot()
-                        result = dict(debt=debt, protected=protected(after, self.now().timestamp()),
-                                      step=after['step'], revision=after['revision'],
-                                      epoch=after['measurement_started_at'])
-                        if (before['revision'] != after['revision']
-                                or before['measurement_started_at'] != after['measurement_started_at']):
-                            error = 'gate_changed_during_debt'
+                        result = dict(debt=debt)
                     elif name == 'freshness':
                         result = self.read_freshness(manager, self.targets, started)
                     else:
@@ -90,10 +85,19 @@ class PaceIO:
                                       total_pending=self.journal.pending())
                 except Exception as exc:
                     error = type(exc).__name__
+                    query_failed = name == 'debt'
                 at = self.now().timestamp()
                 result.update(at=at, sequence=sequence, observed_at=started.timestamp(), seconds=time.monotonic() - timer,
                               error=error)
                 if name == 'debt':
+                    after = self.gate.snapshot()
+                    result.update(protected=protected(after, at), step=after['step'],
+                                  revision=after['revision'], epoch=after['measurement_started_at'])
+                    if (before['revision'] != after['revision']
+                            or before['measurement_started_at'] != after['measurement_started_at']):
+                        error = result['error'] = 'gate_changed_during_debt'
+                        query_failed = False
+                    result['query_failed'] = query_failed
                     result['query_error'] = error
                     if error is None and at - started.timestamp() > self.maximum_gap:
                         result['error'] = 'debt_query_stale'
@@ -105,8 +109,9 @@ class PaceIO:
                     result['restart_at'] = at if restart else previous['restart_at']
                     same_gate = (previous is not None and result.get('revision') == previous.get('revision')
                                  and result.get('epoch') == previous.get('epoch'))
-                    result['sql_lag_safe'] = bool(same_gate and error is None
-                        and previous.get('error') in (None, 'debt_query_stale')
+                    result['sql_lag_safe'] = bool(same_gate and (error is None or query_failed)
+                        and (previous.get('error') in (None, 'debt_query_stale')
+                             or previous.get('query_failed') is True)
                         and 0 <= started.timestamp() - previous['at'] <= self.maximum_gap)
                     result['mandatory_restart_at'] = (at if restart and not result['sql_lag_safe']
                         else previous.get('mandatory_restart_at', previous['restart_at']))
@@ -118,7 +123,8 @@ class PaceIO:
                 except Exception as exc:
                     result['error'] = 'evidence_write_' + type(exc).__name__
                     if name == 'debt':
-                        result.update(known=False, restart_at=at, mandatory_restart_at=at, sql_lag_safe=False)
+                        result.update(known=False, restart_at=at, mandatory_restart_at=at,
+                                      sql_lag_safe=False, query_failed=False)
                     elif name == 'freshness':
                         result['eligible'] = False
                 with self.lock:
