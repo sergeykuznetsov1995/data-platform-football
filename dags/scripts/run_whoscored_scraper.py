@@ -72,8 +72,10 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -216,6 +218,29 @@ def _parse_run_slot(value: str) -> datetime_lib.datetime:
     return slot.astimezone(datetime_lib.timezone.utc)
 
 
+HISTORY_STATE_PATH = "/opt/airflow/logs/whoscored-history.sqlite3"
+HISTORY_MAX_WORKERS = 4
+
+
+def _history_workers(value: str) -> int:
+    """Clamp the Airflow Variable to 1..4; anything unreadable means one."""
+    try:
+        return min(HISTORY_MAX_WORKERS, max(1, int(str(value).strip())))
+    except ValueError:
+        return 1
+
+
+def _history_worker(value: str) -> tuple[int, int]:
+    index, _, total = str(value).partition("/")
+    try:
+        worker = int(index), int(total)
+    except ValueError:
+        worker = (-1, 0)
+    if not (1 <= worker[1] <= HISTORY_MAX_WORKERS and 0 <= worker[0] < worker[1]):
+        raise argparse.ArgumentTypeError("--worker must be INDEX/COUNT, COUNT in 1..4")
+    return worker
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run WhoScored ingestion")
     parser.add_argument("command", choices=COMMANDS)
@@ -339,6 +364,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-matches", type=int, default=None)
     parser.add_argument("--split-lanes", choices=("true", "false"), default="false")
+    parser.add_argument("--workers", type=_history_workers, default=1,
+                        help="history: parallel worker processes (1..4, clamped)")
+    parser.add_argument("--worker", type=_history_worker, default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         "--daily-part",
         choices=DAILY_PARTS,
@@ -510,6 +539,9 @@ def _validate_args(
         parser.error("proxy approval arguments require direct_then_paid")
     if args.command == "history" and (scopes or args.max_matches is not None):
         parser.error("history uses its computed queue and fixed match limit")
+    if (args.workers != 1 or args.worker is not None) and (
+            args.command != "history" or args.transport_policy != "direct_only"):
+        parser.error("--workers/--worker are valid only for direct_only history")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be positive")
     if args.command == "backfill" and args.chunk_size != DEFAULT_BACKFILL_CHUNK_SIZE:
@@ -2149,50 +2181,163 @@ def _validate_cli_backfill_deadline(plan: Mapping[str, Any]) -> None:
 
 
 def _run_history(args, service_cls, report):
-    from scrapers.whoscored import history, history_state
+    """One history pass: in-process, or ``--workers`` processes (#1481).
+
+    Schema DDL and SQLite migrations run here once, before any worker starts.
+    """
+    from scrapers.whoscored import history_state
 
     if args.split_lanes != "true":
         report["history"] = {"reason": "disabled", "attempted": 0}
         return _finish(report, args.output)
     try:
         repository = _new_repository()
-        repository.ensure_schema()
-        os.environ["WHOSCORED_SCHEMA_READY"] = "1"
-        generation, catalog = repository.load_catalog_generation_snapshot()
-        report["catalog_batch_id"] = str(generation["catalog_batch_id"])
-        checkpoint = history_state.HistoryState("/opt/airflow/logs/whoscored-history.sqlite3")
-
-        def consume(result):
-            scope = RunnerScope.parse(result.scope)
-            if not any(item["scope"] == scope.spec for item in report["scopes"]):
-                report["scopes"].extend(_new_report("history", [scope])["scopes"])
-            record = _scope_record(report, scope)
-            _merge_result(report, result, scope_record=record)
-            _record_result_state(report, record, scope, result.entity, result)
-            _set_scope_status(record)
-            if record["errors"]:
-                raise RuntimeError("; ".join(e["message"] for e in record["errors"]))
-
-        @contextmanager
-        def scoped_service(season, **kwargs):
-            with _transport_scope_environment(_scope_value(season.scope), "history"):
-                with service_cls(season, **kwargs) as service:
-                    yield service
-
-        report["history"] = history.run_chunk(
-            catalog=catalog, repository=repository, checkpoint=checkpoint,
-            service_cls=scoped_service, enabled=lambda: args.split_lanes == "true",
-            current_running=history_state.current_running, consume=consume,
-            collect_traffic=lambda service, scope: _collect_traffic(report, _scope_value(scope), service),
-        )
-        pace = report["history"].get("pace")
-        if pace:
-            logger.log(logging.WARNING if pace["alert"] else logging.INFO, pace["text"])
+        if args.worker is None or os.environ.get("WHOSCORED_SCHEMA_READY") != "1":
+            repository.ensure_schema()
+            os.environ["WHOSCORED_SCHEMA_READY"] = "1"
+        checkpoint = history_state.HistoryState(HISTORY_STATE_PATH)
+        if args.worker is None and args.workers > 1:
+            _run_history_workers(args, report)
+        else:
+            _run_history_chunk(args, service_cls, report, repository, checkpoint,
+                               args.worker or (0, 1))
     except Exception as exc:
         report["errors"].append(f"history: {exc}")
         report["error_details"].append({"scope": None, "entity": "history",
             "type": type(exc).__name__, "message": str(exc), "retryable": False})
     return _finish(report, args.output)
+
+
+def _run_history_chunk(args, service_cls, report, repository, checkpoint, worker):
+    from scrapers.whoscored import history, history_state
+
+    index, count = worker
+    if index > 0 and checkpoint.degraded(now=time.time()):
+        report["history"] = {"reason": "degraded", "attempted": 0}
+        return
+    if count > 1:
+        # Distinct pool lines within one run; the offset moves between runs.
+        run_id = os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", "")
+        offset = int(hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8], 16)
+        os.environ["WHOSCORED_PROXY_MEMBER"] = str(offset + index)
+    generation, catalog = repository.load_catalog_generation_snapshot()
+    report["catalog_batch_id"] = str(generation["catalog_batch_id"])
+
+    def consume(result):
+        scope = RunnerScope.parse(result.scope)
+        if not any(item["scope"] == scope.spec for item in report["scopes"]):
+            report["scopes"].extend(_new_report("history", [scope])["scopes"])
+        record = _scope_record(report, scope)
+        _merge_result(report, result, scope_record=record)
+        _record_result_state(report, record, scope, result.entity, result)
+        _set_scope_status(record)
+        if record["errors"]:
+            raise RuntimeError("; ".join(e["message"] for e in record["errors"]))
+
+    @contextmanager
+    def scoped_service(season, **kwargs):
+        with _transport_scope_environment(_scope_value(season.scope), "history"):
+            with service_cls(season, **kwargs) as service:
+                yield service
+
+    def collect_traffic(service, scope):
+        runner_scope = _scope_value(scope)
+        _collect_traffic(report, runner_scope, service)
+        traffic = report["traffic_by_scope"].get(runner_scope.spec)
+        if isinstance(traffic, Mapping) and traffic.get("browser_challenges"):
+            checkpoint.trip_degraded(now=time.time())
+            logger.warning("WhoScored history: Cloudflare challenged the browser; "
+                           "one worker for %d s", history_state.DEGRADED_SECONDS)
+
+    flag = {"read_at": float("-inf"), "degraded": False}
+
+    def owns(key):
+        # run_chunk asks for every eligible scope; re-read the flag at most
+        # every few seconds instead of opening SQLite per scope.
+        now = time.time()
+        if now - flag["read_at"] >= 5:
+            flag.update(read_at=now, degraded=checkpoint.degraded(now=now))
+        if flag["degraded"]:
+            return index == 0
+        return history_state.share(key, count) == index
+
+    report["history"] = history.run_chunk(
+        catalog=catalog, repository=repository, checkpoint=checkpoint,
+        service_cls=scoped_service, enabled=lambda: args.split_lanes == "true",
+        current_running=history_state.current_running, consume=consume,
+        collect_traffic=collect_traffic, owns=owns,
+    )
+    pace = report["history"].get("pace")
+    if pace:
+        logger.log(logging.WARNING if pace["alert"] else logging.INFO, pace["text"])
+
+
+def _spawn_history_worker(args, index: int, count: int, output: str):
+    return subprocess.Popen([
+        sys.executable, os.path.abspath(__file__), "history",
+        "--split-lanes", args.split_lanes, "--transport-policy", args.transport_policy,
+        "--worker", f"{index}/{count}", "--output", output,
+    ])
+
+
+def _run_history_workers(args, report):
+    """Wait for every worker; one failure never discards the others' work."""
+    count = args.workers
+    outputs = [f"{args.output}.worker-{index}.json" for index in range(count)]
+    for output in outputs:
+        Path(output).unlink(missing_ok=True)
+    processes = [_spawn_history_worker(args, index, count, output)
+                 for index, output in enumerate(outputs)]
+    workers = []
+    for index, (process, output) in enumerate(zip(processes, outputs)):
+        code = process.wait()
+        try:
+            child = json.loads(Path(output).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            child = None
+        if not isinstance(child, dict) or not isinstance(child.get("history"), dict):
+            message = f"history worker {index} exited {code} without a report"
+            report["errors"].append(message)
+            report["error_details"].append({"scope": None, "entity": "history",
+                "type": "WorkerFailed", "message": message, "retryable": False})
+            workers.append({"worker": index, "reason": "no_report", "attempted": 0})
+            continue
+        _merge_history_worker(report, child)
+        if code != 0 and child.get("status") == "success":
+            message = f"history worker {index} exited {code} after a green report"
+            report["errors"].append(message)
+            report["error_details"].append({"scope": None, "entity": "history",
+                "type": "WorkerFailed", "message": message, "retryable": False})
+        workers.append({"worker": index, **child["history"]})
+    attempted = [w.get("attempted") for w in workers]
+    report["history"] = {
+        "workers": workers,
+        "attempted": sum(a for a in attempted if type(a) is int),
+        "did_work": any(w.get("did_work") is True for w in workers),
+    }
+    pace = next((w["pace"] for w in workers if isinstance(w.get("pace"), dict)), None)
+    if pace is not None:
+        report["history"]["pace"] = pace
+
+
+def _merge_history_worker(report, child):
+    report["scopes"].extend(child.get("scopes") or [])
+    report["errors"].extend(child.get("errors") or [])
+    report["error_details"].extend(child.get("error_details") or [])
+    report["rows"] += int(child.get("rows") or 0)
+    report["row_counts_complete"] = (report["row_counts_complete"]
+                                     and child.get("row_counts_complete") is not False)
+    for key in ("entities", "traffic"):
+        _merge_traffic(report[key], child.get(key) or {})
+    report["traffic_by_scope"].update(child.get("traffic_by_scope") or {})
+    report["tables"] = sorted(set(report["tables"]) | set(child.get("tables") or []))
+    for key in ("producer_commits", "producer_attempts"):
+        for name, values in (child.get(key) or {}).items():
+            if isinstance(values, list) and isinstance(report[key].get(name), list):
+                report[key][name].extend(values)
+    if child.get("source_unavailable") and not report.get("source_unavailable"):
+        report["source_unavailable"] = child["source_unavailable"]
+    report["catalog_batch_id"] = report["catalog_batch_id"] or child.get("catalog_batch_id")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

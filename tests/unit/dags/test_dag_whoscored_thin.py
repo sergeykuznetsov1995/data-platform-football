@@ -515,3 +515,42 @@ def test_current_validation_leaves_old_debt_to_history(ingest, tmp_path, trino):
     cutoff = (ingest._utc_now() - timedelta(days=7) + timedelta(hours=DEADLINE_HOURS)).strftime("%Y-%m-%d")
     assert "current_overdue WHERE deadline >= TIMESTAMP" in sql
     assert cutoff in sql
+
+
+# ---------------------- parallel history workers (#1481) ------------------
+
+def _history_context(tmp_path, history):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    context = _budget_context(tmp_path, {"schema_version": 3, "command": "history",
+        "status": "success", "history": history, "errors": []})
+    context["dag_run"] = SimpleNamespace(get_task_instance=lambda task: SimpleNamespace(state="success"))
+    context["ti"] = MagicMock()
+    return context
+
+
+def test_history_workers_come_from_a_variable_in_one_unmapped_task(backfill):
+    # One task instance keeps the host auto-deliver busy query (task_id, no
+    # map_index) and the single ingest pool slot unchanged.
+    chunk = _bash("run_backfill_chunk")
+    assert "--workers {{ var.value.get('whoscored_history_workers', '3') | int }}" in (
+        chunk._init_kwargs["bash_command"])
+    assert chunk.is_mapped is False
+
+
+def test_history_finalize_accepts_three_full_workers(backfill, tmp_path):
+    workers = [{"worker": i, "attempted": 25, "did_work": True} for i in range(3)]
+    context = _history_context(tmp_path, {"workers": workers, "attempted": 75, "did_work": True})
+    backfill.finalize_chunk(**context)
+    context["ti"].xcom_push.assert_called_once()
+
+
+@pytest.mark.parametrize("history", [
+    {"workers": [{"attempted": 26}], "attempted": 26},
+    {"workers": [{"attempted": 25}, {"attempted": 25}], "attempted": 25},
+    {"workers": [{"attempted": 0}] * 5, "attempted": 0},
+    {"workers": [], "attempted": 0},
+])
+def test_history_finalize_bounds_every_worker(backfill, tmp_path, history):
+    with pytest.raises(Exception, match="history chunk"):
+        backfill.finalize_chunk(**_history_context(tmp_path, history))

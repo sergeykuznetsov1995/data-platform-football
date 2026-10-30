@@ -6343,3 +6343,50 @@ def test_transport_source_browser_constructor_remains_patchable(monkeypatch):
     assert isinstance(transport._direct_fs, FakeFSClient)
     assert isinstance(transport._paid_fs, FakeFSClient)
     assert len(created) == 2
+
+
+@pytest.mark.unit
+def test_history_worker_takes_its_own_pool_line(monkeypatch, tmp_path):
+    # #1481: parallel history workers egress from distinct, deterministic lines.
+    pool = tmp_path / "pool.txt"
+    pool.write_text("".join(f"pool.example.io:{10000 + i}:poolu:poolpw\n" for i in range(5)))
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    monkeypatch.setenv("WHOSCORED_TRANSPORT_POLICY", "direct_only")
+
+    def member(value):
+        monkeypatch.setenv("WHOSCORED_PROXY_MEMBER", value)
+        transport = WhoScoredTransport(
+            direct_fs_client=FakeFSClient(), paid_fs_client=FakeFSClient(),
+            http_session_factory=lambda proxy_url: FakeHTTPSession(),
+            context=TransportContext(transport_policy="direct_only"),
+        )
+        return transport._pool_proxy_url
+
+    assert [member(str(i)) for i in (7, 8, 9)] == [
+        f"http://poolu:poolpw@pool.example.io:{port}" for port in (10002, 10003, 10004)
+    ]
+    assert member("7") == member("7")
+
+
+@pytest.mark.unit
+def test_only_browser_level_cloudflare_counts_as_history_challenge(monkeypatch):
+    # #1481: curl challenges solved by the direct browser are routine; only a
+    # challenge of the browser itself may cut history down to one worker.
+    monkeypatch.setattr("scrapers.whoscored.transport.time.sleep", lambda delay: None)
+
+    def fetch(*browser_results):
+        direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+        transport = WhoScoredTransport(
+            direct_http_session=direct, direct_fs_client=FakeFSClient(*browser_results),
+            paid_fs_client=FakeFSClient(), proxy_client=FakeProxyClient(),
+            raw_cache=MemoryRawCache(),
+        )
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+        return transport.get_traffic_stats()
+
+    routine = fetch({"html": OK_HTML.decode(), "status": 200})
+    assert routine["failures"]["cloudflare"] == 1
+    assert routine["browser_challenges"] == 0
+    challenged = fetch(FlareSolverrCFChallengeFailed("cloudflare challenge"),
+                       {"html": OK_HTML.decode(), "status": 200})
+    assert challenged["browser_challenges"] == 1
