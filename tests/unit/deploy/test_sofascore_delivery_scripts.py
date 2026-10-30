@@ -691,7 +691,7 @@ def test_any_hour_with_a_free_contour_and_headroom_delivers(stand: Stand, when: 
     дедлайном попытки (ближайший прогон или потолок 2,5 ч)."""
     now = _epoch(when)
     stand.put("now_epoch", str(now))
-    stand.put("next_run", str(now + 3 * 3600))      # ближайший прогон через 3 ч — дальше потолка
+    stand.put("next_run", str(now + 4 * 3600))      # ближайший прогон через 4 ч: минус резерв отката — дальше потолка
     stand.watchdog_pids()
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
@@ -708,14 +708,26 @@ def test_the_nearest_scheduled_run_is_the_deadline(stand: Stand) -> None:
     """Дедлайн — ближайший запуск сбора по расписанию минус запас на откат (ROLLBACK_RESERVE):
     запас на осушение deploy.sh считается от него, и он же уходит в запись попытки."""
     now = _epoch(THU_0330)
-    stand.put("next_run", str(now + 7800))
+    stand.put("next_run", str(now + 8700))
     stand.watchdog_pids()
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
     idle = int(stand.calls("deploy")[0].split("|")[1])
-    # ROLLBACK_RESERVE 1800, DEPLOY_CEILING 3000, ACCEPT_WAIT стенда 40
-    assert idle == 7800 - 1800 - 3000 - 40, idle
-    assert _window(stand, stand.win)["DEADLINE"] == str(now + 7800 - 1800)
+    # ROLLBACK_RESERVE 2700, DEPLOY_CEILING 3000, ACCEPT_WAIT стенда 40
+    assert idle == 8700 - 2700 - 3000 - 40, idle
+    assert _window(stand, stand.win)["DEADLINE"] == str(now + 8700 - 2700)
+
+
+@pytest.mark.unit
+def test_a_next_run_not_computed_skips_the_tick(stand: Stand) -> None:
+    """Fail-closed (Sol r2): DAG пропал или у работающего DAG не вычислен следующий запуск —
+    запрос дедлайна даёт -1, тик пропускается, а не получает 2,5 ч."""
+    stand.put("next_run", "-1")
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stderr
+    assert "метабаза не ответила про ближайший запуск" in stand.log_text()
+    assert not stand.calls("deploy")
+    assert _records(stand) == []
 
 
 @pytest.mark.unit

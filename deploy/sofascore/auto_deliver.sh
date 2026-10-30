@@ -120,6 +120,7 @@ COMPACT=dag_sofascore_schedule_maintenance
 # (@continuous) сюда не входит — её осушает шаг drain deploy.sh; dag_ingest_sofascore расписания
 # не имеет, его запускают триггеры. Пересоздание контейнеров после дедлайна оборвало бы прогон.
 NEXT_RUN_DAGS="'dag_refresh_sofascore_all_mens','dag_trigger_sofascore_daily','dag_trigger_sofascore_daily_tail','dag_sofascore_schedule_maintenance','dag_sofascore_manifest_maintenance'"
+NEXT_RUN_COUNT=5
 # Не дальше 2,5 ч вперёд — длина бывшего окна 03:30–06:00: бюджет осушения deploy.sh (IDLE_WAIT)
 # не больше, чем был ночью (скоупы истории 8–81 мин, p90 остатка ≈ 75 мин).
 DEADLINE_MAX=${DEADLINE_MAX:-9000}
@@ -128,8 +129,9 @@ DEPLOY_CEILING=${DEPLOY_CEILING:-3000}  # жёсткие потолки deploy.s
 ACCEPT_WAIT=${ACCEPT_WAIT:-480}    # dag_dir_list_interval = 300 с, 90 с не хватало (25.08)
 ACCEPT_POLL=${ACCEPT_POLL:-20}
 MIN_DRAIN=${MIN_DRAIN:-900}        # меньше 15 мин на осушение — не начинаем вовсе
-# Откат (два compose по 600 с + приёмка) тоже обязан кончиться до ближайшего прогона.
-ROLLBACK_RESERVE=${ROLLBACK_RESERVE:-1800}
+# Откат тоже обязан кончиться до ближайшего прогона: ожидание контура 300 с + два compose по
+# 600 с + три рестарта сторожей по 60 с + приёмка 480 с = 2160 с, с запасом — 45 мин.
+ROLLBACK_RESERVE=${ROLLBACK_RESERVE:-2700}
 BUSY_RETRY=${BUSY_RETRY:-21600}    # rc=4: тот же sha — не раньше чем через 6 ч (каждый drain стопорит историю)
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}   # провальных попыток подряд до выключателя (имя — прежнее)
@@ -588,7 +590,9 @@ contour_busy(){
 set_deadline(){
   local nxt
   now=$(date -u +%s)
-  nxt=$(metadb "SELECT coalesce(min(extract(epoch FROM next_dagrun_create_after))::bigint, 0) FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS) AND NOT is_paused;")
+  # Fail-closed: DAG пропал из метабазы или у работающего DAG не вычислен следующий запуск —
+  # дедлайна нет (-1), тик пропускается. 0 — все на паузе, расписанных запусков нет.
+  nxt=$(metadb "SELECT CASE WHEN count(*) < $NEXT_RUN_COUNT OR count(*) FILTER (WHERE NOT is_paused AND next_dagrun_create_after IS NULL) > 0 THEN -1 ELSE coalesce(min(extract(epoch FROM next_dagrun_create_after)) FILTER (WHERE NOT is_paused), 0)::bigint END FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS);")
   case "$nxt" in ''|*[!0-9]*) return 1 ;; esac
   deadline=$(( now + DEADLINE_MAX ))
   if [ "$nxt" != 0 ] && [ $(( nxt - ROLLBACK_RESERVE )) -lt "$deadline" ]; then
@@ -1061,7 +1065,7 @@ if is_plain "$INFLIGHT"; then
     else
       infl_close failed "откат после обрыва доставки подтверждён, бой на $OLD" t
       why=$(streak_tail)
-      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}$why Следующая попытка — с новым коммитом master. Лог: $LOG"
+      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (семь DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}$why Следующая попытка — с новым коммитом master. Лог: $LOG"
     fi
   else
     infl_close needs-hands "обрыв доставки, откат на $OLD не подтверждён" f
@@ -1124,7 +1128,7 @@ if [ "$LIVE" = "$WANT" ]; then
       log "БОЙ НА MASTER, НО КОНТРАКТ ПРИЁМКИ НЕ СОШЁЛСЯ — маркер приёмки не выдаю"
       window_touch '?' "бой на master, контракт приёмки не сошёлся"
       if ! said_today "$STATE/sofascore-contract-failed-$TODAY"; then
-        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (пять DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
+        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (семь DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
         mark_said "$STATE/sofascore-contract-failed-$TODAY"
       fi
       exit 0
@@ -1189,7 +1193,7 @@ if is_plain "$ATTEMPTED"; then
   fi
 fi
 if ! set_deadline; then
-  log "метабаза не ответила про ближайший запуск сбора — тик пропущен"
+  log "метабаза не ответила про ближайший запуск сбора (или он не вычислен: DAG пропал, идёт прогон) — тик пропущен"
   window_note "метабаза не ответила про ближайший запуск сбора"
   exit 0
 fi
@@ -1446,7 +1450,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8}), артефакт ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}"
   # Маркер снимаем ПОСЛЕ гарантированной отправки: смерть между снятием и сообщением
   # оставила бы исход немым, а защёлка sha — следующие тики молчаливыми.
-  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (пять DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s. Учёт оплаченного скоупа истории: $accounted.${extra}"
+  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (семь DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s. Учёт оплаченного скоупа истории: $accounted.${extra}"
   # delivered пишется ПОСЛЕДНИМ (план 1245 §3.3): фаза finishing → снятие INFLIGHT → исход.
   # Обрыв до снятия маркера — следующий тик разберёт INFLIGHT (откат, failed); обрыв между
   # снятием и записью — просроченное закрытие даст unknown по DELIVERY_PHASE=finishing.
