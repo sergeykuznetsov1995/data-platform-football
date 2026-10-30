@@ -503,7 +503,7 @@ def test_history_and_current_share_activation_flag():
         command = _bash(task)._init_kwargs["bash_command"]
         assert "--split-lanes" in command
         assert "var.value.get('whoscored_history_enabled', 'false')" in command
-    assert _bash("run_backfill_chunk")._init_kwargs["execution_timeout"] == timedelta(hours=8)
+    assert _bash("run_backfill_chunk")._init_kwargs["execution_timeout"] == timedelta(minutes=45)
     assert _bash("run_backfill_chunk")._init_kwargs["retries"] == 0
 
 
@@ -554,3 +554,23 @@ def test_history_finalize_accepts_three_full_workers(backfill, tmp_path):
 def test_history_finalize_bounds_every_worker(backfill, tmp_path, history):
     with pytest.raises(Exception, match="history chunk"):
         backfill.finalize_chunk(**_history_context(tmp_path, history))
+
+
+def test_current_collection_wins_the_shared_slot_within_one_history_chunk(ingest):
+    # #1481: history holds the one ingest pool slot for at most 45 minutes,
+    # and every current-collection task outranks it when the slot frees.
+    from datetime import timedelta
+    from airflow.operators.bash import BashOperator
+    from airflow.operators.python import PythonOperator
+
+    tasks = [t for t in BashOperator._instances + PythonOperator._instances
+             if t.task_id in {"discover_catalog", "ingest_matches", "ingest_stages",
+                              "validate_data", "validate_bronze_freshness"}]
+    assert len(tasks) == 5
+    for task in tasks:
+        assert task._init_kwargs["priority_weight"] == 100
+        assert task._init_kwargs["weight_rule"] == "absolute"
+    _reload("dag_backfill_whoscored")
+    chunk = _bash("run_backfill_chunk")._init_kwargs
+    assert chunk["execution_timeout"] == timedelta(minutes=45)
+    assert chunk.get("priority_weight", 1) < 100

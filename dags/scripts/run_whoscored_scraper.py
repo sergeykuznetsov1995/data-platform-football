@@ -2196,8 +2196,9 @@ def _run_history(args, service_cls, report):
             repository.ensure_schema()
             os.environ["WHOSCORED_SCHEMA_READY"] = "1"
         checkpoint = history_state.HistoryState(HISTORY_STATE_PATH)
-        if args.worker is None and args.workers > 1:
-            _run_history_workers(args, report)
+        count = _history_workers_for_pool(args.workers) if args.worker is None else 1
+        if count > 1:
+            _run_history_workers(args, report, count)
         else:
             _run_history_chunk(args, service_cls, report, repository, checkpoint,
                                args.worker or (0, 1))
@@ -2216,10 +2217,12 @@ def _run_history_chunk(args, service_cls, report, repository, checkpoint, worker
         report["history"] = {"reason": "degraded", "attempted": 0}
         return
     if count > 1:
-        # Distinct pool lines within one run; the offset moves between runs.
+        # Pool lines j with j % count == index belong to this worker only,
+        # rotation included; the start line moves between runs.
         run_id = os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", "")
         offset = int(hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8], 16)
-        os.environ["WHOSCORED_PROXY_MEMBER"] = str(offset + index)
+        os.environ["WHOSCORED_PROXY_WORKER"] = f"{index}/{count}"
+        os.environ["WHOSCORED_PROXY_MEMBER"] = str(offset)
     generation, catalog = repository.load_catalog_generation_snapshot()
     report["catalog_batch_id"] = str(generation["catalog_batch_id"])
 
@@ -2244,10 +2247,13 @@ def _run_history_chunk(args, service_cls, report, repository, checkpoint, worker
         runner_scope = _scope_value(scope)
         _collect_traffic(report, runner_scope, service)
         traffic = report["traffic_by_scope"].get(runner_scope.spec)
-        if isinstance(traffic, Mapping) and traffic.get("browser_challenges"):
+        failures = traffic.get("failures") if isinstance(traffic, Mapping) else None
+        # Owner decision: any Cloudflare challenge, even one the browser
+        # solved, cuts history to one worker.
+        if isinstance(failures, Mapping) and failures.get("cloudflare"):
             checkpoint.trip_degraded(now=time.time())
-            logger.warning("WhoScored history: Cloudflare challenged the browser; "
-                           "one worker for %d s", history_state.DEGRADED_SECONDS)
+            logger.warning("WhoScored history: Cloudflare challenge; one worker for %d s",
+                           history_state.DEGRADED_SECONDS)
 
     flag = {"read_at": float("-inf"), "degraded": False}
 
@@ -2280,9 +2286,24 @@ def _spawn_history_worker(args, index: int, count: int, output: str):
     ])
 
 
-def _run_history_workers(args, report):
+def _history_workers_for_pool(requested: int) -> int:
+    """Each worker needs its own pool lines: never more workers than lines."""
+    path = os.environ.get("WHOSCORED_PROXY_FILE", "").strip()
+    if requested <= 1 or not path:
+        return requested
+    from scrapers.utils.proxy_manager import ProxyManager
+
+    manager = ProxyManager(rotation_strategy="random")
+    manager.load_from_file_custom_format(path)
+    count = max(1, min(requested, manager.total_count))
+    if count < requested:
+        logger.warning("WhoScored history: %d workers requested, proxy pool has %d "
+                       "lines; running %d", requested, manager.total_count, count)
+    return count
+
+
+def _run_history_workers(args, report, count):
     """Wait for every worker; one failure never discards the others' work."""
-    count = args.workers
     outputs = [f"{args.output}.worker-{index}.json" for index in range(count)]
     for output in outputs:
         Path(output).unlink(missing_ok=True)
@@ -2295,20 +2316,21 @@ def _run_history_workers(args, report):
             child = json.loads(Path(output).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             child = None
-        if not isinstance(child, dict) or not isinstance(child.get("history"), dict):
-            message = f"history worker {index} exited {code} without a report"
-            report["errors"].append(message)
-            report["error_details"].append({"scope": None, "entity": "history",
-                "type": "WorkerFailed", "message": message, "retryable": False})
+        if not isinstance(child, dict) or child.get("command") != "history":
+            _worker_failed(report, f"history worker {index} exited {code} without a report")
             workers.append({"worker": index, "reason": "no_report", "attempted": 0})
             continue
+        # A worker that raised has no "history" part, but its error, scopes
+        # and producer commits are real and stay in the pass report.
         _merge_history_worker(report, child)
+        part = child.get("history")
+        if not isinstance(part, dict):
+            part = {"reason": "failed", "attempted": 0}
+            if child.get("status") == "success":
+                _worker_failed(report, f"history worker {index} report has no history")
         if code != 0 and child.get("status") == "success":
-            message = f"history worker {index} exited {code} after a green report"
-            report["errors"].append(message)
-            report["error_details"].append({"scope": None, "entity": "history",
-                "type": "WorkerFailed", "message": message, "retryable": False})
-        workers.append({"worker": index, **child["history"]})
+            _worker_failed(report, f"history worker {index} exited {code} after a green report")
+        workers.append({"worker": index, **part})
     attempted = [w.get("attempted") for w in workers]
     report["history"] = {
         "workers": workers,
@@ -2318,6 +2340,12 @@ def _run_history_workers(args, report):
     pace = next((w["pace"] for w in workers if isinstance(w.get("pace"), dict)), None)
     if pace is not None:
         report["history"]["pace"] = pace
+
+
+def _worker_failed(report, message):
+    report["errors"].append(message)
+    report["error_details"].append({"scope": None, "entity": "history",
+        "type": "WorkerFailed", "message": message, "retryable": False})
 
 
 def _merge_history_worker(report, child):

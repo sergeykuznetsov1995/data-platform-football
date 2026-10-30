@@ -749,8 +749,6 @@ class TransportStats:
     browser_sessions: int = 0
     browser_batches: int = 0
     browser_batch_items: int = 0
-    # Cloudflare challenged the direct browser itself, not just curl (#1481).
-    browser_challenges: int = 0
     stage_xhr_token: Counter[str] = field(default_factory=Counter)
     paid_urls: set[str] = field(default_factory=set)
     paid_proxy_up_bytes: int = 0
@@ -772,7 +770,6 @@ class TransportStats:
             "browser_sessions": self.browser_sessions,
             "browser_batches": self.browser_batches,
             "browser_batch_items": self.browser_batch_items,
-            "browser_challenges": self.browser_challenges,
             "stage_xhr_token": dict(self.stage_xhr_token),
             "paid_urls": len(self.paid_urls),
             "paid_proxy_up_bytes": self.paid_proxy_up_bytes,
@@ -3187,9 +3184,17 @@ class WhoScoredTransport:
             raise ValueError(
                 f"WHOSCORED_PROXY_FILE is not readable: {type(exc).__name__}"
             ) from exc
+        worker = os.environ.get("WHOSCORED_PROXY_WORKER", "").strip()
+        if worker:
+            # Parallel history workers own disjoint pool lines, so a later
+            # rotation can never move onto a neighbour's address (#1481).
+            index, _, count = worker.partition("/")
+            if not (index.isdigit() and count.isdigit() and int(index) < int(count)):
+                raise ValueError("WHOSCORED_PROXY_WORKER must be INDEX/COUNT")
+            manager._proxies = [proxy for line, proxy in enumerate(manager._proxies)
+                                if line % int(count) == int(index)]
         member = os.environ.get("WHOSCORED_PROXY_MEMBER", "").strip()
         if member.isdigit() and manager.total_count:
-            # Parallel history workers each take their own pool line (#1481).
             proxy_url = manager._proxies[int(member) % manager.total_count].http_url
         else:
             proxy_url = manager.get_http_proxy_url()
@@ -3768,7 +3773,6 @@ class WhoScoredTransport:
                 direct_cf_failures += 1
                 last_cf = exc
                 self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                self.stats.browser_challenges += 1
                 self._source_tripped(exc)
                 if not exc.source_wide and self._source_inconclusive(url):
                     raise
@@ -4059,7 +4063,6 @@ class WhoScoredTransport:
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
                     self.stats.failures[FailureKind.CLOUDFLARE.value] += len(pending)
-                    self.stats.browser_challenges += 1
                     last_cf = exc
                     for _, item, _ in pending:
                         last_item_errors[item.cache_key] = exc
@@ -4141,7 +4144,6 @@ class WhoScoredTransport:
                         self._validate(browser, item.validator)
                     except CloudflareChallenge as exc:
                         self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                        self.stats.browser_challenges += 1
                         last_cf = exc
                         last_item_errors[item.cache_key] = exc
                         cf_failure_counts[item.cache_key] += 1

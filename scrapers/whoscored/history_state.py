@@ -19,8 +19,8 @@ CHUNK_SIZE = 25
 COOLDOWN_SECONDS = 3600
 # Schedule sync covers the entire season; historical lineups rarely change.
 DEFERRED_REFRESH_SECONDS = 24 * 3600
-# Longer than the task's eight-hour execution timeout, including kill grace.
-LEASE_SECONDS = 9 * 3600
+# Longer than the task's 45-minute execution timeout, including kill grace.
+LEASE_SECONDS = 3600
 # After browser-level Cloudflare evidence only worker 0 keeps working (#1481).
 DEGRADED_SECONDS = 3600
 TOP_FIVE = {2, 3, 4, 5, 22}

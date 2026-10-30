@@ -88,21 +88,32 @@ def _worker_env(tmp_path, monkeypatch, traffic):
     monkeypatch.setattr(history, "final_feeds", lambda *a, **k: True)
     monkeypatch.setattr(history, "run_chunk", __import__("functools").partial(
         history.run_chunk, now=kwargs["now"]))
-    monkeypatch.setenv("WHOSCORED_PROXY_MEMBER", "")  # restored after the test
-    monkeypatch.delenv("WHOSCORED_PROXY_MEMBER")
+    for name in ("WHOSCORED_PROXY_MEMBER", "WHOSCORED_PROXY_WORKER"):
+        monkeypatch.setenv(name, "")  # restored after the test
+        monkeypatch.delenv(name)
     monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "run-1")
     args = SimpleNamespace(split_lanes="true", output=str(tmp_path / "r.json"))
     return kwargs, s, repo, args
 
 
-def test_worker_owns_its_share_takes_a_pool_line_and_trips_on_browser_cf(tmp_path, monkeypatch):
-    kwargs, s, repo, args = _worker_env(tmp_path, monkeypatch, {"browser_challenges": 1})
+def test_non_cloudflare_failures_do_not_cut_workers(tmp_path, monkeypatch):
+    kwargs, s, repo, args = _worker_env(tmp_path, monkeypatch, {"failures": {"timeout": 2}})
+    owner = state.share(s.scope.spec, 3)
+    runner._run_history_chunk(args, kwargs["service_cls"], runner._new_report("history", []),
+                              repo, kwargs["checkpoint"], (owner, 3))
+    assert kwargs["checkpoint"].degraded(now=__import__("time").time()) is False
+
+
+def test_worker_owns_its_share_takes_a_pool_line_and_trips_on_any_cf(tmp_path, monkeypatch):
+    # Owner decision: a curl challenge the browser solved still counts.
+    kwargs, s, repo, args = _worker_env(tmp_path, monkeypatch, {"failures": {"cloudflare": 1}})
     owner = state.share(s.scope.spec, 3)
     report = runner._new_report("history", [])
     runner._run_history_chunk(args, kwargs["service_cls"], report, repo,
                               kwargs["checkpoint"], (owner, 3))
     assert report["history"]["scope"] == s.scope.spec
     assert runner.os.environ["WHOSCORED_PROXY_MEMBER"].isdigit()
+    assert runner.os.environ["WHOSCORED_PROXY_WORKER"] == f"{owner}/3"
     assert kwargs["checkpoint"].degraded(now=__import__("time").time()) is True
 
     # Degraded: worker 0 takes every scope, others leave before any query.
@@ -160,6 +171,7 @@ def test_parent_runs_schema_once_and_merges_every_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "HistoryState", lambda path: MagicMock())
     monkeypatch.setenv("WHOSCORED_SCHEMA_READY", "")  # restored after the test
     monkeypatch.delenv("WHOSCORED_SCHEMA_READY")
+    monkeypatch.delenv("WHOSCORED_PROXY_FILE", raising=False)
     children = {0: (0, _child(0)), 1: (1, _child(1, status="failed", errors=["boom"])),
                 2: (1, None)}
     spawned = []
@@ -201,8 +213,9 @@ def test_one_worker_keeps_the_in_process_path(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_spawn_history_worker", MagicMock(side_effect=AssertionError))
     chunk = MagicMock(return_value={"reason": "idle", "attempted": 0})
     monkeypatch.setattr(history, "run_chunk", chunk)
-    monkeypatch.setenv("WHOSCORED_PROXY_MEMBER", "")  # restored after the test
-    monkeypatch.delenv("WHOSCORED_PROXY_MEMBER")
+    for name in ("WHOSCORED_PROXY_MEMBER", "WHOSCORED_PROXY_WORKER"):
+        monkeypatch.setenv(name, "")  # restored after the test
+        monkeypatch.delenv(name)
     output = tmp_path / "result.json"
     args = runner._build_parser().parse_args(
         ["history", "--split-lanes", "true", "--workers", "1",
@@ -211,3 +224,56 @@ def test_one_worker_keeps_the_in_process_path(tmp_path, monkeypatch):
     chunk.assert_called_once()
     # One worker keeps the old random sticky pool member.
     assert "WHOSCORED_PROXY_MEMBER" not in runner.os.environ
+    assert "WHOSCORED_PROXY_WORKER" not in runner.os.environ
+
+
+@pytest.mark.parametrize("lines, expected", [(2, 2), (5, 3), (1, 1)])
+def test_workers_never_exceed_pool_lines(tmp_path, monkeypatch, lines, expected):
+    pool = tmp_path / "pool.txt"
+    pool.write_text("".join(f"p.example.io:{10000 + i}:u:p\n" for i in range(lines)))
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    assert runner._history_workers_for_pool(3) == expected
+
+
+def test_worker_exception_keeps_its_commits_and_real_error(tmp_path, monkeypatch):
+    # #1481 round 2: a worker whose run_chunk raised has no "history" part;
+    # its error and the work it already committed must reach the pass report.
+    repo = MagicMock()
+    repo.load_catalog_generation_snapshot.return_value = ({"catalog_batch_id": "c"}, object())
+    monkeypatch.setattr(runner, "_new_repository", lambda: repo)
+    monkeypatch.setattr(state, "HistoryState", lambda path: MagicMock(degraded=lambda now: False))
+    monkeypatch.delenv("WHOSCORED_PROXY_FILE", raising=False)
+    for name in ("WHOSCORED_SCHEMA_READY", "WHOSCORED_PROXY_MEMBER", "WHOSCORED_PROXY_WORKER"):
+        monkeypatch.setenv(name, "")  # restored after the test
+
+    def chunk(**kwargs):
+        kwargs["consume"](SimpleNamespace(
+            entity="matches", scope="ENG-Premier League=2526", counts={"events": 3},
+            tables=[], errors=[], retryable=[], metadata={}, attempted=1))
+        raise RuntimeError("trino went away")
+
+    monkeypatch.setattr(history, "run_chunk", chunk)
+    parser = runner._build_parser()
+
+    def spawn(args, index, count, output):
+        # The real child path: _run_history with --worker, writing its report.
+        child = parser.parse_args(["history", "--split-lanes", "true", "--worker",
+                                   f"{index}/{count}", "--transport-policy", "direct_only",
+                                   "--output", output])
+        code = runner._run_history(child, MagicMock(), runner._new_report("history", []))
+        return SimpleNamespace(wait=lambda: code)
+
+    monkeypatch.setattr(runner, "_spawn_history_worker", spawn)
+    output = tmp_path / "result.json"
+    args = parser.parse_args(["history", "--split-lanes", "true", "--workers", "2",
+                              "--transport-policy", "direct_only", "--output", str(output)])
+    assert runner._run_history(args, MagicMock(), runner._new_report("history", [])) == 1
+    report = json.loads(output.read_text(encoding="utf-8"))
+
+    assert report["status"] == "failed"
+    assert [w["reason"] for w in report["history"]["workers"]] == ["failed", "failed"]
+    assert report["history"]["attempted"] == 0
+    assert sum("trino went away" in e for e in report["errors"]) == 2
+    assert not any("without a report" in e for e in report["errors"])
+    assert [s["scope"] for s in report["scopes"]] == ["ENG-Premier League=2526"] * 2
+    assert report["entities"]

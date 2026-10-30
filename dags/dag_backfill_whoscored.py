@@ -29,6 +29,7 @@ RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
 # whoscored_history_workers Variable to 1..4 (1 = off switch, #1481).
 CHUNK_MATCH_LIMIT = 25
 MAX_WORKERS = 4
+CHUNK_TIMEOUT = timedelta(minutes=45)
 
 # Cooldown between continuous runs: short while draining, long while idle.
 ACTIVE_COOLDOWN = timedelta(seconds=30)
@@ -118,9 +119,10 @@ with DAG(
         ),
         env=_TASK_ENV,
         append_env=True,
-        # Schedule/feed collection can outlast the 25-match portion. Record
-        # duration_seconds in every report to tune this bound after activation.
-        execution_timeout=timedelta(hours=8),
+        # The chunk holds the single ingest pool slot that current collection
+        # waits for (#1481): 45 min bounds that wait. Live chunks before
+        # #1481 took 5 min median, 32 min max end to end.
+        execution_timeout=CHUNK_TIMEOUT,
         retries=0,
     )
 
