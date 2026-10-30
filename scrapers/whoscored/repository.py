@@ -37,7 +37,13 @@ from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
 from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
-from scrapers.whoscored.parsers import MATCH_AVAILABILITY_VERSION, PARSER_VERSION
+from scrapers.whoscored.parsers import (
+    CATALOG_AND_STAGE_FEED_PARSER_VERSIONS,
+    MATCH_AVAILABILITY_VERSION,
+    PARSER_VERSION,
+    canonical_json,
+    schema_fingerprint,
+)
 from scrapers.whoscored.profile_policy import MAX_DAILY_PROFILE_CANDIDATES
 
 logger = logging.getLogger(__name__)
@@ -80,7 +86,11 @@ _APPROVED_MATCH_SOURCE_REVISION = MappingProxyType(
                 "player_match_stats": 5837,
             }
         ),
-        "rows_sha256": "c898b97f6913ac15f8e97f7eb77c38f823a105c3a8edc96d093572fb57566782",
+        # Parsed by the running parser (v9 since #1483: header and substitution
+        # columns). The transition itself is published, and a v9 commit never
+        # matches ``new_parser_version``, so this pin only guards replays of
+        # the exact v8 identity.
+        "rows_sha256": "dbe1eaaad316e29f5040e347f79e6c22b9d3fd5109ce99d2b8af7250e1626051",
     }
 )
 
@@ -88,6 +98,7 @@ _APPROVED_MATCH_SOURCE_REVISION = MappingProxyType(
 MATCH_MANIFEST_TABLE = "whoscored_match_ingest_manifest"
 PREVIEW_MANIFEST_TABLE = "whoscored_preview_ingest_manifest"
 PROFILE_VERSIONS_TABLE = "whoscored_player_profile_versions"
+EVENT_TYPE_DICTIONARY_TABLE = "whoscored_event_type_dictionary"
 PROFILE_MANIFEST_TABLE = "whoscored_profile_ingest_manifest"
 CATALOG_MANIFEST_TABLE = "whoscored_catalog_manifest"
 SCOPE_MANIFEST_TABLE = "whoscored_scope_ingest_manifest"
@@ -142,6 +153,8 @@ WHOSCORED_BUSINESS_TABLES = (
     "whoscored_preview_sections",
     PROFILE_VERSIONS_TABLE,
     "whoscored_player_stage_participations",
+    "whoscored_player_characteristics",
+    "whoscored_event_type_dictionary",
 )
 
 MATCH_DATASET_TABLES = {
@@ -781,6 +794,8 @@ WHOSCORED_BUSINESS_COLUMN_CONTRACTS: dict[str, dict[str, str]] = {
         "away_score": "BIGINT",
         "status": "VARCHAR",
         "period": "VARCHAR",
+        "status_code": "BIGINT",
+        "period_code": "BIGINT",
         "expanded_max_minute": "BIGINT",
         "attendance": "BIGINT",
         "venue_name": "VARCHAR",
@@ -985,6 +1000,29 @@ WHOSCORED_BUSINESS_COLUMN_CONTRACTS: dict[str, dict[str, str]] = {
         "_parser_version": "VARCHAR",
         **_METADATA_COLUMNS,
     },
+    "whoscored_player_characteristics": {
+        "player_id": "BIGINT",
+        "kind": "VARCHAR",
+        "name": "VARCHAR",
+        "category": "VARCHAR",
+        "level": "VARCHAR",
+        "level_class": "VARCHAR",
+        "position": "BIGINT",
+        **_SOURCE_METADATA_COLUMNS,
+        "_profile_batch_id": "VARCHAR",
+        "_payload_sha256": "VARCHAR",
+        "_parser_version": "VARCHAR",
+        **_METADATA_COLUMNS,
+    },
+    EVENT_TYPE_DICTIONARY_TABLE: {
+        "dictionary_sha256": "VARCHAR",
+        "event_type_code": "BIGINT",
+        "event_type_name": "VARCHAR",
+        "first_seen_game_id": "BIGINT",
+        "parser_version": "VARCHAR",
+        **_SOURCE_METADATA_COLUMNS,
+        **_METADATA_COLUMNS,
+    },
 }
 
 if set(WHOSCORED_BUSINESS_COLUMN_CONTRACTS) != set(WHOSCORED_BUSINESS_TABLES):
@@ -997,6 +1035,18 @@ if set(WHOSCORED_BUSINESS_COLUMN_CONTRACTS) != set(WHOSCORED_BUSINESS_TABLES):
     raise RuntimeError(
         f"invalid WhoScored business schema contracts: missing={missing}, extra={extra}"
     )
+
+
+def event_type_dictionary_sha256(event_types: Mapping[str, int]) -> str:
+    """Content identity of one source event-type dictionary."""
+
+    encoded = json.dumps(
+        {str(name): int(code) for name, code in event_types.items()},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class BatchConflict(RuntimeError):
@@ -1467,6 +1517,9 @@ class MatchCandidate:
     match_is_opta: bool
     attempt_no: int = 1
     exact_candidate_count: Optional[int] = None
+    # The latest attempt already holds the page bytes and only the parser
+    # changed: replay the raw cache regardless of its age.
+    parser_replay: bool = False
 
 
 @dataclass(frozen=True)
@@ -1605,6 +1658,7 @@ class ProfileCommit:
     availability_version: str = MATCH_AVAILABILITY_VERSION
     participations: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
     participations_status: str = "empty"
+    characteristics: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
 
     @property
     def batch_id(self) -> str:
@@ -1684,6 +1738,8 @@ class WhoScoredRepository:
         self._published_preview_datasets_cache: dict[
             tuple[str, str, int], frozenset[str]
         ] = {}
+        # Dictionary digests already stored; loaded once per process.
+        self._event_type_dictionaries: Optional[set[str]] = None
 
     @property
     def _manifest(self) -> str:
@@ -1841,12 +1897,17 @@ class WhoScoredRepository:
         column_sql = ",\n                    ".join(
             f'"{name}" {data_type}' for name, data_type in columns.items()
         )
-        if table in {PROFILE_VERSIONS_TABLE, "whoscored_player_stage_participations"}:
+        if table in {
+            PROFILE_VERSIONS_TABLE,
+            "whoscored_player_stage_participations",
+            "whoscored_player_characteristics",
+        }:
             partitioning = " WITH (partitioning = ARRAY['bucket(player_id, 32)'])"
         elif table not in {
             "whoscored_competitions",
             "whoscored_seasons",
             "whoscored_stages",
+            EVENT_TYPE_DICTIONARY_TABLE,
         }:
             partitioning = " WITH (partitioning = ARRAY['league', 'season'])"
         else:
@@ -1860,7 +1921,25 @@ class WhoScoredRepository:
         )
         existing_columns = self.trino.get_table_columns(self.schema, table)
         if isinstance(existing_columns, Mapping):
-            existing = {str(name).lower() for name in existing_columns}
+            existing_types = {
+                str(name).lower(): str(data_type).replace(" ", "").lower()
+                for name, data_type in existing_columns.items()
+            }
+            existing = set(existing_types)
+            # A column is only ever added, never retyped: a live type that
+            # disagrees with the contract must stop the writer, not drift.
+            mismatched = sorted(
+                f"{name} live={existing_types[name.lower()]} contract={data_type}"
+                for name, data_type in columns.items()
+                if name.lower() in existing_types
+                and existing_types[name.lower()]
+                != data_type.replace(" ", "").lower()
+            )
+            if mismatched:
+                raise ValueError(
+                    f"WhoScored table {table} column types disagree with the "
+                    f"contract: {', '.join(mismatched)}"
+                )
         else:
             existing = {str(name).lower() for name in existing_columns}
         # CREATE IF NOT EXISTS plus additive ALTER is race-safe and preserves
@@ -2107,8 +2186,23 @@ class WhoScoredRepository:
                     self.schema, MATCH_MANIFEST_TABLE, name, data_type
                 )
         self._ensure_preview_schema()
+        self._ensure_business_table_contract(EVENT_TYPE_DICTIONARY_TABLE)
         if create_views:
             self._create_current_views()
+            dictionary = f"{self.catalog}.{self.schema}.{EVENT_TYPE_DICTIONARY_TABLE}"
+            # Concurrent writers may append the same digest twice.
+            self.trino._execute(
+                f"""
+                CREATE OR REPLACE VIEW {dictionary}_current AS
+                SELECT * FROM (
+                    SELECT d.*, ROW_NUMBER() OVER (
+                        PARTITION BY dictionary_sha256, event_type_code
+                        ORDER BY _ingested_at, first_seen_game_id
+                    ) AS _dictionary_rank
+                    FROM {dictionary} d
+                ) WHERE _dictionary_rank = 1
+                """
+            )
         self._ensure_profile_schema(create_views=create_views)
 
     @staticmethod
@@ -2189,7 +2283,7 @@ class WhoScoredRepository:
                 )
             seen.add(batch_id)
             parser_version = str(current.get("parser_version") or "")
-            if parser_version != PARSER_VERSION:
+            if parser_version not in CATALOG_AND_STAGE_FEED_PARSER_VERSIONS:
                 if (
                     first
                     and allow_legacy_parser_for_full_history
@@ -2614,7 +2708,7 @@ class WhoScoredRepository:
         manifest_parser = str(manifest["parser_version"] or "")
         manifest_schema = str(manifest["schema_fingerprint"] or "")
         current_identity = (
-            manifest_parser == PARSER_VERSION
+            manifest_parser in CATALOG_AND_STAGE_FEED_PARSER_VERSIONS
             and manifest_payload == physical_fingerprint
             and manifest_schema == physical_fingerprint
         )
@@ -2686,7 +2780,7 @@ class WhoScoredRepository:
         parser_version = str(row[2] or "")
         pre_lineage_full_history_bootstrap = (
             allow_legacy_parser_for_full_history
-            and parser_version == PARSER_VERSION
+            and parser_version in CATALOG_AND_STAGE_FEED_PARSER_VERSIONS
             and not row[7]
             and row[8] is None
             and not any(row[index] for index in (9, 10, 11))
@@ -2811,9 +2905,6 @@ class WhoScoredRepository:
     def _ensure_profile_schema(self, *, create_views: bool = True) -> None:
         versions = f"{self.catalog}.{self.schema}.{PROFILE_VERSIONS_TABLE}"
         manifest = f"{self.catalog}.{self.schema}.{PROFILE_MANIFEST_TABLE}"
-        participations = (
-            f"{self.catalog}.{self.schema}.whoscored_player_stage_participations"
-        )
         self._ensure_business_table_contract(PROFILE_VERSIONS_TABLE)
         self.trino._execute(
             f"""
@@ -2845,6 +2936,7 @@ class WhoScoredRepository:
             """
         )
         self._ensure_business_table_contract("whoscored_player_stage_participations")
+        self._ensure_business_table_contract("whoscored_player_characteristics")
         manifest_columns = {
             name.lower()
             for name in self.trino.get_table_columns(
@@ -2957,32 +3049,37 @@ class WhoScoredRepository:
             ) WHERE physical_rn = 1
             """
         )
-        self.trino._execute(
-            f"""
-            CREATE OR REPLACE VIEW
-                {self.catalog}.{self.schema}.whoscored_player_stage_participations_current
-            AS
-            WITH latest AS (
-                SELECT * FROM (
-                    SELECT m.*, ROW_NUMBER() OVER (
-                        PARTITION BY player_id
-                        ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
-                                 _profile_batch_id DESC, _batch_id DESC
-                    ) AS rn
-                    FROM {manifest} m
-                    WHERE m.state = 'success'
-                      AND m._profile_batch_id LIKE 'wspr2-%'
-                ) WHERE rn = 1
+        # Both profile-snapshot datasets expose the latest successful snapshot.
+        for table in (
+            "whoscored_player_stage_participations",
+            "whoscored_player_characteristics",
+        ):
+            physical = f"{self.catalog}.{self.schema}.{table}"
+            self.trino._execute(
+                f"""
+                CREATE OR REPLACE VIEW {physical}_current
+                AS
+                WITH latest AS (
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (
+                            PARTITION BY player_id
+                            ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
+                                     _profile_batch_id DESC, _batch_id DESC
+                        ) AS rn
+                        FROM {manifest} m
+                        WHERE m.state = 'success'
+                          AND m._profile_batch_id LIKE 'wspr2-%'
+                    ) WHERE rn = 1
+                )
+                SELECT p.*
+                FROM {physical} p
+                JOIN latest m
+                  ON m.player_id = p.player_id
+                 AND m._profile_batch_id = p._profile_batch_id
+                 AND m.payload_sha256 = p._payload_sha256
+                 AND m.parser_version = p._parser_version
+                """
             )
-            SELECT p.*
-            FROM {participations} p
-            JOIN latest m
-              ON m.player_id = p.player_id
-             AND m._profile_batch_id = p._profile_batch_id
-             AND m.payload_sha256 = p._payload_sha256
-             AND m.parser_version = p._parser_version
-            """
-        )
 
     @staticmethod
     def _profile_candidate_query(
@@ -3283,6 +3380,70 @@ class WhoScoredRepository:
         )
         return outcome_batch_id
 
+    def record_event_type_dictionary(
+        self,
+        event_types: Mapping[str, int],
+        *,
+        game_id: int,
+        parser_version: str = PARSER_VERSION,
+    ) -> bool:
+        """Append a dictionary version the first time its digest is seen.
+
+        Concurrent processes may both append one new digest; the ``_current``
+        view deduplicates on ``(dictionary_sha256, event_type_code)``.
+        """
+        digest = event_type_dictionary_sha256(event_types)
+        table = f"{self.catalog}.{self.schema}.{EVENT_TYPE_DICTIONARY_TABLE}"
+        if self._event_type_dictionaries is None:
+            rows = self.trino.execute_query(
+                f"SELECT DISTINCT dictionary_sha256 FROM {table}"
+            )
+            self._event_type_dictionaries = {str(row[0]) for row in rows}
+        if digest in self._event_type_dictionaries:
+            return False
+        self.writer.write_dataframe(
+            self._normalise_frame_types(
+                pd.DataFrame(
+                    [
+                        {
+                            "dictionary_sha256": digest,
+                            "event_type_code": int(code),
+                            "event_type_name": str(name),
+                            "first_seen_game_id": int(game_id),
+                            "parser_version": parser_version,
+                            "source_raw_json": canonical_json({str(name): int(code)}),
+                            "source_schema_fingerprint": schema_fingerprint(
+                                {str(name): int(code)}
+                            ),
+                            "_entity_type": "event_type_dictionary",
+                        }
+                        for name, code in sorted(
+                            event_types.items(), key=lambda item: item[1]
+                        )
+                    ]
+                ),
+                table=EVENT_TYPE_DICTIONARY_TABLE,
+            ),
+            database=self.schema,
+            table=EVENT_TYPE_DICTIONARY_TABLE,
+            source="whoscored",
+        )
+        self._event_type_dictionaries.add(digest)
+        return True
+
+    def _profile_characteristic_counts(self, quoted_batches: str) -> dict[str, int]:
+        if not self.trino.table_exists(
+            self.schema, "whoscored_player_characteristics"
+        ):
+            return {}
+        rows = self.trino.execute_query(
+            f"SELECT _profile_batch_id, COUNT(*) FROM "
+            f"{self.catalog}.{self.schema}.whoscored_player_characteristics "
+            f"WHERE _profile_batch_id IN ({quoted_batches}) "
+            "GROUP BY _profile_batch_id"
+        )
+        return {str(row[0]): int(row[1]) for row in rows}
+
     @_lock_commit_sequence
     def commit_profiles(self, commits: Sequence[ProfileCommit]) -> tuple[str, ...]:
         """Batch profile versions and manifests without one-row Iceberg writes."""
@@ -3383,12 +3544,28 @@ class WhoScoredRepository:
             participation_counts = {
                 str(row[0]): int(row[1]) for row in participation_rows_existing
             }
+        # A batch identity pins the payload and parser, so a commit without
+        # characteristics has nothing to write or verify.
+        characteristic_counts = (
+            self._profile_characteristic_counts(quoted_batches)
+            if any(commit.characteristics for commit in ordered)
+            else {}
+        )
         for commit in ordered:
             identity = (
                 int(commit.player_id),
                 commit.payload_sha256,
                 commit.parser_version,
             )
+            if characteristic_counts.get(commit.batch_id, 0) not in {
+                0,
+                len(commit.characteristics),
+            }:
+                raise BatchConflict(
+                    f"profile {identity} has partial characteristics batch "
+                    f"{characteristic_counts[commit.batch_id]}/"
+                    f"{len(commit.characteristics)}"
+                )
             physical_count = physical.get(commit.batch_id, 0)
             participation_count = participation_counts.get(commit.batch_id, 0)
             expected_participations = len(commit.participations)
@@ -3416,8 +3593,22 @@ class WhoScoredRepository:
 
         version_rows: list[dict[str, Any]] = []
         participation_rows: list[dict[str, Any]] = []
+        characteristic_rows: list[dict[str, Any]] = []
         now = _utc_now()
         for commit in ordered:
+            if not characteristic_counts.get(commit.batch_id, 0):
+                for characteristic in commit.characteristics:
+                    row = dict(characteristic)
+                    row.update(
+                        {
+                            "player_id": int(commit.player_id),
+                            "_profile_batch_id": commit.batch_id,
+                            "_payload_sha256": commit.payload_sha256,
+                            "_parser_version": commit.parser_version,
+                            "_entity_type": "player_characteristic",
+                        }
+                    )
+                    characteristic_rows.append(row)
             if physical.get(commit.batch_id, 0) == 0:
                 row = dict(commit.profile)
                 row.update(
@@ -3469,6 +3660,27 @@ class WhoScoredRepository:
                 partition_spec=[("player_id", "bucket(32)")],
                 source="whoscored",
             )
+        if characteristic_rows:
+            self.writer.write_dataframe(
+                self._normalise_frame_types(
+                    pd.DataFrame(characteristic_rows),
+                    table="whoscored_player_characteristics",
+                ),
+                database=self.schema,
+                table="whoscored_player_characteristics",
+                partition_spec=[("player_id", "bucket(32)")],
+                source="whoscored",
+            )
+            verified_characteristics = self._profile_characteristic_counts(
+                quoted_batches
+            )
+            for commit in ordered:
+                actual = verified_characteristics.get(commit.batch_id, 0)
+                if actual != len(commit.characteristics):
+                    raise BatchConflict(
+                        f"profile {commit.player_id} characteristics count is "
+                        f"{actual}, expected {len(commit.characteristics)}"
+                    )
 
         verified_rows = self.trino.execute_query(
             f"SELECT _profile_batch_id, player_id, payload_sha256, "
@@ -4000,6 +4212,18 @@ class WhoScoredRepository:
         order_sql = (
             "ORDER BY date DESC, game_id DESC" if daily else "ORDER BY date, game_id"
         )
+        # Journal candidates whose page was already parsed by another parser
+        # version replay the raw cache regardless of its age (#1483).
+        parser_replay = (
+            f"""COALESCE(
+                           m.state IN ('success', 'parse_failed')
+                           AND m.parser_version IS DISTINCT FROM
+                               {_sql_string(PARSER_VERSION)},
+                           FALSE
+                       )"""
+            if daily
+            else "FALSE"
+        )
         sql = f"""
             WITH schedule AS (
                 SELECT *, ROW_NUMBER() OVER (
@@ -4018,7 +4242,8 @@ class WhoScoredRepository:
                            WHEN m.state = 'retryable'
                            THEN COALESCE(m.attempt_no, 0) + 1
                            ELSE 1
-                       END AS attempt_no{daily_projection}
+                       END AS attempt_no,
+                       {parser_replay} AS parser_replay{daily_projection}
                 FROM schedule s
                 LEFT JOIN {latest} m
                   ON m.league = s.league
@@ -4031,7 +4256,7 @@ class WhoScoredRepository:
                   {id_filter}{lane_filter}
             )
             SELECT game_id, league, season, game, date, status, match_is_opta,
-                   attempt_no{count_projection}
+                   attempt_no, parser_replay{count_projection}
             FROM eligible{stage_filter}
             {order_sql}
             {limit_sql}
@@ -4047,7 +4272,8 @@ class WhoScoredRepository:
                 status=int(row[5]),
                 match_is_opta=_coerce_bool(row[6]),
                 attempt_no=int(row[7]),
-                exact_candidate_count=(int(row[8]) if include_exact_count else None),
+                parser_replay=_coerce_bool(row[8]),
+                exact_candidate_count=(int(row[9]) if include_exact_count else None),
             )
             for row in rows
         ]

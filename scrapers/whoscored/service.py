@@ -20,6 +20,7 @@ from .catalog import (
 )
 from .domain import SeasonFormat, TournamentEligibility, WhoScoredScope
 from .parsers import (
+    CATALOG_AND_STAGE_FEED_PARSER_VERSIONS,
     MAX_PLAYER_STAGE_STAT_PAGES,
     PARSER_VERSION,
     CalendarMonth,
@@ -2629,7 +2630,8 @@ class WhoScoredIngestService:
             }
             policy_current = (
                 previous.get("feed_policy") == STAGE_XG_FEED_POLICY
-                and previous.get("parser_version") == PARSER_VERSION
+                and previous.get("parser_version")
+                in CATALOG_AND_STAGE_FEED_PARSER_VERSIONS
             )
             raw_uris = [collected.raw_uris[0]]
             payload_hashes = [collected.payload_hashes[0]]
@@ -2981,9 +2983,10 @@ class WhoScoredIngestService:
                     # Final historical pages are immutable source evidence.
                     # Reparse persisted raw bytes regardless of age and use
                     # the source only when that object is absent or invalid.
+                    # A parser-version change is the same replay in any lane.
                     cache_ttl=(
                         None
-                        if historical_replay
+                        if historical_replay or candidate.parser_replay
                         else timedelta(days=MATCH_REFRESH_DAYS)
                     ),
                 )
@@ -3210,6 +3213,7 @@ class WhoScoredIngestService:
                             result.counts[name] = (
                                 result.counts.get(name, 0) + dataset.row_count
                             )
+                    self._record_event_type_dictionaries(pending, result)
         finally:
             self._write_match_failures(failure_rows, failure_outcomes, result)
         if proxy_down is not None:
@@ -3224,10 +3228,35 @@ class WhoScoredIngestService:
                     "iceberg.bronze.whoscored_formations",
                     "iceberg.bronze.whoscored_team_match_stats",
                     "iceberg.bronze.whoscored_player_match_stats",
+                    "iceberg.bronze.whoscored_event_type_dictionary",
                     "iceberg.bronze.whoscored_match_ingest_manifest",
                 ]
             )
         return result
+
+    def _record_event_type_dictionaries(
+        self, pending: Sequence[tuple[MatchCommit, Any]], result: EntityResult
+    ) -> None:
+        """Store each new page dictionary after its match batch committed."""
+
+        for commit, parsed in pending:
+            if not parsed.event_types:
+                continue
+            try:
+                if self.repository.record_event_type_dictionary(
+                    parsed.event_types,
+                    game_id=commit.game_id,
+                    parser_version=commit.parser_version,
+                ):
+                    result.counts["event_type_dictionary"] = result.counts.get(
+                        "event_type_dictionary", 0
+                    ) + len(parsed.event_types)
+            except Exception as exc:
+                result.errors.append(
+                    f"event type dictionary (game {commit.game_id}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return
 
     def _write_match_failures(
         self,
@@ -3772,6 +3801,7 @@ class WhoScoredIngestService:
                     parser_version=parsed.parser_version,
                     participations=parsed.participations.rows,
                     participations_status=parsed.participations.status.value,
+                    characteristics=parsed.characteristics.rows,
                 )
             )
         if pending_commits:
@@ -3795,11 +3825,15 @@ class WhoScoredIngestService:
                 result.counts["player_stage_participations"] = sum(
                     len(commit.participations) for commit in pending_commits
                 )
+                result.counts["player_characteristics"] = sum(
+                    len(commit.characteristics) for commit in pending_commits
+                )
         if selected_player_ids:
             result.tables.extend(
                 [
                     "iceberg.bronze.whoscored_player_profile_versions",
                     "iceberg.bronze.whoscored_player_stage_participations",
+                    "iceberg.bronze.whoscored_player_characteristics",
                     "iceberg.bronze.whoscored_profile_ingest_manifest",
                 ]
             )

@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
@@ -35,7 +35,13 @@ from .domain import (
 )
 
 
-PARSER_VERSION = "whoscored-parser-v8"
+PARSER_VERSION = "whoscored-parser-v9"
+# Parser versions whose catalog and stage-feed output equals the current one.
+# v9 (#1483) changed only match and profile parsing: committed v8 catalog and
+# stage-feed snapshots stay current instead of being rejected or re-fetched.
+CATALOG_AND_STAGE_FEED_PARSER_VERSIONS = frozenset(
+    {"whoscored-parser-v8", PARSER_VERSION}
+)
 # Availability is a separate source contract from successful row parsing.
 # Incrementing it replays old content failures even when matchCentreData itself
 # has not changed shape.
@@ -126,6 +132,9 @@ class MatchParseResult:
     formations: ParsedDataset
     team_match_stats: ParsedDataset
     player_match_stats: ParsedDataset
+    # Page-level source dictionary (event type name -> code); not a match
+    # dataset, so it never takes part in batch identity or completeness.
+    event_types: Optional[Mapping[str, int]] = None
 
     @property
     def datasets(self) -> Mapping[str, ParsedDataset]:
@@ -183,12 +192,14 @@ class ProfileParseResult:
     player_id: int
     profiles: ParsedDataset
     participations: ParsedDataset
+    characteristics: ParsedDataset
 
     @property
     def datasets(self) -> Mapping[str, ParsedDataset]:
         return {
             "player_profile_versions": self.profiles,
             "player_stage_participations": self.participations,
+            "player_characteristics": self.characteristics,
         }
 
 
@@ -797,6 +808,38 @@ def extract_matchcentre_data(html: str) -> dict[str, Any]:
     )
 
 
+_EVENT_TYPE_DICTIONARY_PATTERN = re.compile(
+    r"(?:(?:['\"]matchCentreEventTypeJson['\"])|(?:\bmatchCentreEventTypeJson\b))"
+    r"\s*:\s*"
+)
+
+
+def extract_matchcentre_event_types(html: str) -> Optional[dict[str, int]]:
+    """Extract the sibling ``matchCentreEventTypeJson`` name -> code map.
+
+    The dictionary is optional page metadata: an absent or malformed map
+    returns ``None`` and never fails the match itself.
+    """
+
+    try:
+        value = _extract_after_pattern(
+            html,
+            _EVENT_TYPE_DICTIONARY_PATTERN,
+            label="property 'matchCentreEventTypeJson'",
+            allow_date_expressions=False,
+        )
+    except JavaScriptLiteralError:
+        return None
+    if not isinstance(value, dict) or not value:
+        return None
+    if not all(
+        isinstance(name, str) and name and type(code) is int and code >= 0
+        for name, code in value.items()
+    ):
+        return None
+    return dict(value)
+
+
 def is_valid_match_page_without_matchcentre(html: str, *, game_id: int) -> bool:
     """Return whether source HTML proves that matchCentreData is unavailable.
 
@@ -1395,9 +1438,15 @@ def parse_match_record(
         "away_score": _optional_int(
             data.get("awayScore", away_scores.get("fulltime")), "awayScore"
         ),
-        "status": _display(data.get("status"))
-        or (data.get("status") if isinstance(data.get("status"), str) else None),
+        # matchCentreData carries the source status label in ``elapsed``
+        # (FT/AET/PEN) and numeric status/period codes; ``status``/``period``
+        # keys do not exist, so ``period`` stays NULL by contract.
+        "status": data.get("elapsed")
+        if isinstance(data.get("elapsed"), str) and data.get("elapsed")
+        else None,
         "period": _display(data.get("period")),
+        "status_code": _optional_int(data.get("statusCode"), "statusCode"),
+        "period_code": _optional_int(data.get("periodCode"), "periodCode"),
         "expanded_max_minute": _optional_int(
             data.get("expandedMaxMinute"), "expandedMaxMinute"
         ),
@@ -1412,14 +1461,14 @@ def parse_match_record(
             "referee.officialId",
         ),
         "referee_name": _mapping_text(referee, "name", "displayName"),
-        "weather": canonical_json(data.get("weather"))
-        if data.get("weather") is not None
+        "weather": data.get("weatherCode")
+        if isinstance(data.get("weatherCode"), str) and data.get("weatherCode")
         else None,
         "start_time": data.get("startTime")
         if isinstance(data.get("startTime"), str)
         else None,
-        "home_manager": _mapping_text(home.get("manager"), "name", "displayName"),
-        "away_manager": _mapping_text(away.get("manager"), "name", "displayName"),
+        "home_manager": _mapping_text(home.get("managerName")),
+        "away_manager": _mapping_text(away.get("managerName")),
         # ``data`` contains every event, player and stat for the match and can
         # exceed a megabyte.  Duplicating it into the one-row match projection
         # wastes storage and can exceed Trino's single-query limit.  The exact
@@ -1596,9 +1645,11 @@ def parse_substitutions(
             player_id = _required_int(
                 player.get("playerId"), f"{side}.players[{index}].playerId"
             )
-            for action, source_key in (
-                ("on", "subbedInExpandedMinute"),
-                ("off", "subbedOutExpandedMinute"),
+            for action, source_key, related_key in (
+                # The player who came on replaced ``subbedOutPlayerId``; the
+                # player who went off was replaced by ``subbedInPlayerId``.
+                ("on", "subbedInExpandedMinute", "subbedOutPlayerId"),
+                ("off", "subbedOutExpandedMinute", "subbedInPlayerId"),
             ):
                 minute = _optional_int(
                     player.get(source_key), f"{side}.players[{index}].{source_key}"
@@ -1623,7 +1674,10 @@ def parse_substitutions(
                         else None,
                         "action": action,
                         "expanded_minute": minute,
-                        "related_player_id": None,
+                        "related_player_id": _optional_int(
+                            player.get(related_key),
+                            f"{side}.players[{index}].{related_key}",
+                        ),
                         **_source_metadata(player),
                     }
                 )
@@ -1757,12 +1811,15 @@ def parse_match_html(
     game: Optional[str] = None,
     parser_version: str = PARSER_VERSION,
 ) -> MatchParseResult:
-    return parse_matchcentre_data(
-        extract_matchcentre_data(html),
-        scope=scope,
-        game_id=game_id,
-        game=game,
-        parser_version=parser_version,
+    return replace(
+        parse_matchcentre_data(
+            extract_matchcentre_data(html),
+            scope=scope,
+            game_id=game_id,
+            game=game,
+            parser_version=parser_version,
+        ),
+        event_types=extract_matchcentre_event_types(html),
     )
 
 
@@ -2119,6 +2176,9 @@ def parse_profile_bundle(
                     **_source_metadata(raw_record),
                 }
             )
+    characteristics = _parse_profile_characteristics(
+        soup, player_id=source_player_id
+    )
     soup.decompose()
     participations = (
         _dataset(
@@ -2138,6 +2198,70 @@ def parse_profile_bundle(
         player_id=source_player_id,
         profiles=profile,
         participations=participations,
+        characteristics=characteristics,
+    )
+
+
+_CHARACTER_SECTIONS = (
+    ("strengths", "strength"),
+    ("weaknesses", "weakness"),
+    ("style", "style"),
+)
+_CHARACTER_LEVEL_CLASS_RE = re.compile(r"^level\d+$")
+
+
+def _parse_profile_characteristics(
+    soup: BeautifulSoup, *, player_id: int
+) -> ParsedDataset:
+    """Strengths, weaknesses and style of play from ``.character-card``."""
+
+    card = soup.select_one("div.character-card")
+    if card is None:
+        return ParsedDataset(
+            "player_characteristics",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_character_card_absent",
+        )
+    rows: list[dict[str, Any]] = []
+    for section_class, kind in _CHARACTER_SECTIONS:
+        section = card.find("div", class_=section_class)
+        if section is None:
+            continue
+        position = 0
+        for character in section.select("div.character"):
+            label = character.find("div")
+            name = label.get_text(" ", strip=True) if label is not None else ""
+            if not name:
+                continue
+            icon = character.find("span", title=True)
+            level = character.find("span", class_=_CHARACTER_LEVEL_CLASS_RE)
+            level_class = None
+            if level is not None:
+                level_class = next(
+                    value
+                    for value in level.get("class", [])
+                    if _CHARACTER_LEVEL_CLASS_RE.match(value)
+                )
+            position += 1
+            row = {
+                "kind": kind,
+                "name": name,
+                "category": (
+                    (str(icon["title"]) or None) if icon is not None else None
+                ),
+                "level": (
+                    level.get_text(" ", strip=True) or None
+                    if level is not None
+                    else None
+                ),
+                "level_class": level_class,
+                "position": position,
+            }
+            rows.append(
+                {"player_id": player_id, **row, **_source_metadata(row)}
+            )
+    return _dataset(
+        "player_characteristics", rows, empty_reason="source_character_card_empty"
     )
 
 

@@ -81,7 +81,7 @@ def _attempt(con, game_id, state, fetched_days_ago):
     )
 
 
-def _candidates(con, **kwargs):
+def _repository(con):
     con.execute(
         """
         CREATE OR REPLACE VIEW iceberg.bronze.whoscored_match_ingest_latest AS
@@ -101,7 +101,11 @@ def _candidates(con, **kwargs):
 
     trino = MagicMock()
     trino.execute_query.side_effect = execute_query
-    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    return WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+
+def _candidates(con, **kwargs):
+    repository = _repository(con)
     return [
         candidate.game_id
         for candidate in repository.list_match_candidates(LEAGUE, SEASON, limit=300, **kwargs)
@@ -542,3 +546,31 @@ def test_history_deferred_age_window_preserves_coverage(lineup, age, deferred):
         assert (row["closeable"], row["closed"], row["unknown_stages"], row["closed_day"]) == (2, 1, 1, 1)
     finally:
         con.close()
+
+
+@pytest.mark.unit
+def test_previous_parser_success_is_a_cache_replay_candidate_in_both_lanes():
+    """#1483: a v8 success is due again under v9 and marked as a raw replay."""
+
+    con = _connection()
+    _game(con, 99, 10, 30)
+    _attempt(con, 99, "success", 29)
+    _game(con, 1, 10, 30)
+    _attempt(con, 1, "success", 29)
+    _game(con, 2, 10, 2)
+    _attempt(con, 2, "success", 1)
+    con.execute(
+        "UPDATE iceberg.bronze.whoscored_match_ingest_manifest "
+        "SET parser_version = 'whoscored-parser-v8' WHERE game_id IN (1, 2)"
+    )
+    _game(con, 3, 10, 30)
+
+    assert _candidates(con, lane="history") == [3, 1]
+    assert _candidates(con, lane="current") == [2]
+    replay = {
+        candidate.game_id: candidate.parser_replay
+        for candidate in _repository(con).list_match_candidates(
+            LEAGUE, SEASON, limit=300
+        )
+    }
+    assert replay == {1: True, 2: True, 3: False}

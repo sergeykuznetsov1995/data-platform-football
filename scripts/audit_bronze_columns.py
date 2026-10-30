@@ -459,6 +459,12 @@ WHOSCORED_IDENTITY_COLUMNS: dict[str, set[str]] = {
         "team_id",
         "source_path",
     },
+    "whoscored_player_characteristics": {"player_id", "kind", "name", "position"},
+    "whoscored_event_type_dictionary": {
+        "dictionary_sha256",
+        "event_type_code",
+        "event_type_name",
+    },
 }
 
 
@@ -486,7 +492,7 @@ def _understat_expected_tables() -> dict[str, set[str]]:
 
 if set(WHOSCORED_IDENTITY_COLUMNS) != set(WHOSCORED_CONTRACT.BUSINESS_TABLES):
     raise RuntimeError(
-        "WhoScored audit identity contract does not cover all 25 datasets"
+        "WhoScored audit identity contract does not cover all 27 datasets"
     )
 
 # Per-source parser "contract": minimal REQUIRED tables + columns each source's
