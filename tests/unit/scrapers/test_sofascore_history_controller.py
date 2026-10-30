@@ -295,6 +295,20 @@ def test_future_metadata_missing_core_cannot_vanish_from_99_denominator(tmp_path
     assert report["groups"]["1"]["unknown_scopes"] == 1
 
 
+def test_daily_registry_core_absent_from_snapshot_does_not_block_history_gates(tmp_path):
+    """Top leagues the daily lane owns until #1370 must not freeze deep history forever."""
+    snap = snapshot(ids=(8,))
+    ev = evidence(snap, closed=100)
+    rows = dict(denominator().rows)
+    rows[17] = DenominatorRow(17, "ENG-Premier League", "Premier League", "core", 1,
+                              "registry:tournaments.json (дейли до #1370)")
+    run(tmp_path, snap, ev, denominator=Denominator(rows))
+    report = controller.read_summary(tmp_path / "controller.json", "history-test")
+    assert report["groups"]["1"]["unknown_scopes"] == 0
+    assert report["groups"]["1"]["gate_passed"]
+    assert report["groups"]["2"]["gate_passed"]
+
+
 @pytest.mark.parametrize("group2_closed", [0, 9900])
 def test_blocked_group1_without_ready_debt_yields_to_group2_not_deeper(tmp_path, group2_closed):
     snap = snapshot(ids=(8,))
@@ -380,7 +394,8 @@ def test_verified_page_chains_survive_report_retention_in_checkpoint(tmp_path):
 
 
 @pytest.mark.parametrize('metadata_status', ['ready', 'excluded'])
-def test_empty_or_excluded_core_tournament_remains_unknown(tmp_path, metadata_status):
+def test_empty_or_excluded_core_tournament_is_reported_not_blocking(tmp_path, metadata_status):
+    """Owner 29.10 (#1966): settled exclusions stay visible but deep history proceeds."""
     snap = snapshot()
     snap['tournaments'][1].update(metadata_status=metadata_status, seasons=[])
     snap['snapshot_id'] = _snapshot_digest(snap)
@@ -389,10 +404,55 @@ def test_empty_or_excluded_core_tournament_remains_unknown(tmp_path, metadata_st
         if row['season_id'] % 100 == 24:
             row['closed'] = 0
     planned = run(tmp_path, snap, ev)
-    assert not planned
+    assert [p['SOFASCORE_HISTORY_GROUP'] for p in planned] == ['3']
+    report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
+    for group in ('1', '2'):
+        assert report['groups'][group]['unknown_scopes'] == 0
+        assert report['groups'][group]['excluded_core'] == 1
+    assert 'исключено core 1' in report['summary']
+
+
+@pytest.mark.parametrize("kind", ["mapping_required", "quarantined"])
+def test_unplannable_unknown_season_is_counted_but_does_not_hold_deep_history(tmp_path, kind):
+    """#1966: an unmapped or quarantined unknown season stays visible, deep history proceeds."""
+    snap = snapshot()
+    failures = {}
+    if kind == "mapping_required":
+        snap["tournaments"][1]["seasons"][0].update(canonical_season=None, season_format="unknown")
+        snap["snapshot_id"] = _snapshot_digest(snap)
+    else:
+        failures = {"history-test:17:1726": {"count": 3, "streak_no_traffic": 3, "last_release": "test"}}
+    ev = evidence(snap, closed=100)
+    ev["scopes"] = [row for row in ev["scopes"] if (row["tournament_id"], row["season_id"]) != (17, 1726)]
+    for row in ev["scopes"]:
+        if row["season_id"] % 100 == 24:
+            row["closed"] = 0
+    planned = run(tmp_path, snap, ev, failures=failures)
+    assert [p["SOFASCORE_HISTORY_GROUP"] for p in planned] == ["3"]
+    report = controller.read_summary(tmp_path / "controller.json", "history-test")
+    assert report["groups"]["1"][kind] == 1
+    assert report["groups"]["1"]["unknown_scopes"] == 0
+
+
+def test_core_with_pending_metadata_and_no_seasons_still_blocks(tmp_path):
+    snap = snapshot()
+    snap['tournaments'][1].update(metadata_status='pending', seasons=[])
+    snap['snapshot_id'] = _snapshot_digest(snap)
+    run(tmp_path, snap, evidence(snap, closed=100))
     report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
     assert report['groups']['1']['unknown_scopes'] == 1
-    assert report['groups']['2']['unknown_scopes'] == 1
+    assert not report['groups']['1']['gate_passed']
+
+
+def test_core_with_every_season_excluded_is_settled(tmp_path):
+    snap = snapshot()
+    for season in snap['tournaments'][1]['seasons']:
+        season['metadata_status'] = 'excluded'
+    snap['snapshot_id'] = _snapshot_digest(snap)
+    run(tmp_path, snap, evidence(snap, closed=100))
+    report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
+    assert report['groups']['1']['unknown_scopes'] == 0
+    assert report['groups']['1']['excluded_core'] == 1
 
 
 def test_verified_empty_schedule_is_known_zero_not_an_endless_bootstrap(tmp_path):
@@ -406,7 +466,8 @@ def test_verified_empty_schedule_is_known_zero_not_an_endless_bootstrap(tmp_path
     assert all(p['SOFASCORE_SOURCE_SEASON_ID'] != '826' for p in planned)
 
 
-def test_saved_july_cohort_absent_from_query_cannot_disappear_from_gate(tmp_path):
+def test_saved_july_cohort_absent_from_query_stays_visible_without_holding_history(tmp_path):
+    """Owner 29.10 (#1966): an unresolved July target is reported, deep history proceeds."""
     snap = snapshot()
     ev = inventory.from_rows(snap, [], [], july_cohort=[('8', '826', '7')])
     assert ev['july_unresolved'] == 1
@@ -414,9 +475,10 @@ def test_saved_july_cohort_absent_from_query_cannot_disappear_from_gate(tmp_path
     for row in ev['scopes']:
         if row['season_id'] % 100 == 24:
             row['closed'] = 0
-    assert run(tmp_path, snap, ev) == []
+    planned = run(tmp_path, snap, ev)
+    assert [p['SOFASCORE_HISTORY_GROUP'] for p in planned] == ['3']
     report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
-    assert report['active_group'] == 'july'
+    assert report['groups']['july']['unknown_scopes'] == 1
 
 
 def test_july_query_rereads_cohort_without_stats_timestamp_filter():

@@ -147,8 +147,11 @@ def coverage(scopes: list[dict], inventory: Mapping) -> dict:
         record["scopes"] += 1
         record["finished"] += row.get("finished", 0)
         record["closed"] += row.get("closed", 0)
-        record["unknown_scopes"] += int(scope["unknown"])
         kind = scope.get("kind", "ready")
+        # An unknown season that cannot be planned (no canonical mapping, or
+        # quarantined) stays visible in its own counter; like a settled core
+        # exclusion it no longer holds deep history (owner 29.10, #1966).
+        record["unknown_scopes"] += int(scope["unknown"] and kind not in ("mapping_required", "quarantined"))
         if kind in record:
             record[kind] += 1
         ids = row.get("july_match_ids", [])
@@ -180,7 +183,8 @@ def render_summary(groups: Mapping) -> str:
         parts.append(f'{g} {LABELS[g]}: {row["closed"]}/{row["finished"]} ({percent}), '
                      f'долг {row["remaining"]}, неизвестно {row["unknown_scopes"]}, '
                      f'pending {row["pending"] + row["mapping_required"]}, '
-                     f'parked {row["parked"]}, quarantine {row["quarantined"]}')
+                     f'parked {row["parked"]}, quarantine {row["quarantined"]}'
+                     + (f', исключено core {row["excluded_core"]}' if row.get("excluded_core") else ''))
     return "• очередь истории SofaScore: " + "; ".join(parts)
 
 
@@ -217,8 +221,20 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
             scope["kind"] = _kind(scope, failures or {}, release, moment, max_scope_attempts)
         groups = coverage(scopes, inventory)
         snapshot_ids = {int(s["tournament"]["unique_tournament_id"]) for s in scopes}
-        missing_core = sum(denominator.is_core(tid) and tid not in snapshot_ids for tid in denominator.rows)
+        # A core id without scopes blocks the gates only while it may still
+        # gain them. Daily-registry tournaments (basis ``registry:``) belong to
+        # the daily lane until #1370; a league whose metadata excluded it or
+        # every season (or found none) is settled -- owner 29.10: visible as
+        # excluded, not a reason to hold deep history (#1966).
+        settled = {int(t["unique_tournament_id"]) for t in snapshot["tournaments"]
+                   if t.get("metadata_status") == "excluded"
+                   or (t.get("metadata_status") == "ready"
+                       and all(s.get("metadata_status") == "excluded" for s in t["seasons"]))}
+        absent = [tid for tid in denominator.rows if denominator.is_core(tid) and tid not in snapshot_ids
+                  and not denominator.rows[tid].basis.startswith("registry:")]
+        missing_core = sum(tid not in settled for tid in absent)
         for group in ("1", "2"):
+            groups[group]["excluded_core"] = len(absent) - missing_core
             groups[group]["unknown_scopes"] += missing_core
             if missing_core:
                 groups[group]["gate_passed"] = False
@@ -232,11 +248,15 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
         active = (next((g for g in open_core if g in workable), workable[0] if workable else open_core[0])
                   if open_core else None)
         if active is None:
+            # Only a group with plannable work becomes active: unresolved July
+            # targets (no source season) or pending seasons would otherwise
+            # yield an empty plan on every run (#1966).
             active = next((g for g in ("july", "3", "4", "5")
                            if (groups[g]["remaining"] or groups[g]["unknown_scopes"])
-                           and (g == "july" or any(s["group"] == g and s["kind"] != "quarantined"
-                                                  and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0))
-                                                  for s in scopes))), "5")
+                           and any(s["kind"] == "ready" and (
+                               s["evidence"].get("july_match_ids") if g == "july" else
+                               s["group"] == g and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0)))
+                                   for s in scopes)), "5")
         candidates = []
         if isinstance(authorized_season_classes, Mapping):
             raise state.CampaignPlanningError("authorized_season_classes must be class names, not a mapping")
