@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from .core_lists import collect_refs, event_ids, parse_season
+from .history import MAX_ATTEMPTS
 from .journal import _literal
 from .parser_common import EspnParseError
 
@@ -98,7 +99,7 @@ def render_acceptance_sql(scope, evidence: Mapping[tuple[str, int], CoreEvidence
 expected_types AS ({types}), events AS ({events}), errors AS ({errors}),
 q AS (
     SELECT slug, season_year, count(*) AS rows,
-           bool_and(state IN ('done', 'empty', 'red')) AS finished,
+           bool_and(state IN ('done', 'empty') OR (state = 'red' AND attempts >= {MAX_ATTEMPTS})) AS finished,
            bool_or(state = 'red') AS red
     FROM iceberg.ops.espn_history_queue_v1 WHERE season_year > 0
     GROUP BY slug, season_year
@@ -117,7 +118,7 @@ q AS (
     SELECT DISTINCT m.competition_slug AS slug, m.season_year, m.event_id
     FROM iceberg.bronze.espn_match m JOIN scope s
       ON s.slug = m.competition_slug AND s.season_year = m.season_year
-    WHERE m.first_published_at IS NOT NULL
+    WHERE (m.first_published_at IS NOT NULL OR m.terminal_nonplayed = true)
 ), ids AS (
     SELECT coalesce(e.slug, p.slug) AS slug, coalesce(e.season_year, p.season_year) AS season_year,
            count(e.event_id) AS core_unique, count(p.event_id) AS published,
@@ -165,9 +166,12 @@ def render_acceptance(rows: Sequence[Sequence]) -> str:
 
 def _legacy_ctes(scope):
     scope = _scope(scope)
-    pairs = _values(((slug, year, str(year) if slug == "fifa.world" else f"{year % 100:02d}{(year + 1) % 100:02d}")
+    pairs = _values(((slug, year, str(year) if slug == "fifa.world" else f"{year % 100:02d}{(year + 1) % 100:02d}",
+                      f"{year}-01-01" if slug == "fifa.world" else f"{year}-07-01",
+                      f"{year + 1}-01-01" if slug == "fifa.world" else f"{year + 1}-07-01")
                      for slug, year in scope if slug in LEGACY_LEAGUES),
-                    (("slug", "varchar"), ("season_year", "integer"), ("season", "varchar")))
+                    (("slug", "varchar"), ("season_year", "integer"), ("season", "varchar"),
+                     ("start_date", "varchar"), ("end_date", "varchar")))
     leagues = _values(LEGACY_LEAGUES.items(), (("slug", "varchar"), ("league", "varchar")))
     return f"""scope AS ({pairs}), leagues AS ({leagues}), legacy AS (
     SELECT l.slug, s.* FROM iceberg.bronze.espn_schedule s
@@ -181,6 +185,9 @@ def render_parity_sql(scope) -> str:
 
     No arbitrary winner for duplicates. ITA '2021' is excluded and reported by
     render_legacy_parts_sql. NULL dates/scores and ambiguous keys are uncomparable.
+    Unmatched legacy dates also select candidate seasons: July-to-July for
+    leagues, calendar years for World Cups. These are hints, not core evidence;
+    conflicts with labels remain explicitly ambiguous (e.g. extended seasons).
     """
     return f"""WITH {_legacy_ctes(scope)}, n AS (
     SELECT m.competition_slug AS slug, m.season_year, m.event_id,
@@ -188,7 +195,7 @@ def render_parity_sql(scope) -> str:
            min(m.away_score) AS away_score, count(*) AS native_rows
     FROM iceberg.bronze.espn_match m JOIN scope s
       ON s.slug = m.competition_slug AND s.season_year = m.season_year
-    WHERE m.first_published_at IS NOT NULL
+    WHERE (m.first_published_at IS NOT NULL OR m.terminal_nonplayed = true)
     GROUP BY m.competition_slug, m.season_year, m.event_id
 ), native_links AS (
     SELECT n.*, count(*) OVER (PARTITION BY slug, event_id) AS native_labels FROM n
@@ -198,14 +205,26 @@ def render_parity_sql(scope) -> str:
            min(TRY_CAST(home_goals AS integer)) AS home_score,
            min(TRY_CAST(away_goals AS integer)) AS away_score, count(*) AS legacy_rows
     FROM legacy GROUP BY slug, CAST(season AS varchar), TRY_CAST(game_id AS bigint)
+), date_links AS (
+    SELECT l.slug, CAST(l.season AS varchar) AS season, TRY_CAST(l.game_id AS bigint) AS event_id,
+           array_agg(DISTINCT x.season_year ORDER BY x.season_year) AS date_seasons,
+           bool_or(x.season <> CAST(l.season AS varchar)) AS date_label_mismatch
+    FROM legacy l JOIN scope x ON x.slug = l.slug
+      AND TRY_CAST(l.match_date AS timestamp) >= CAST(x.start_date AS timestamp)
+      AND TRY_CAST(l.match_date AS timestamp) < CAST(x.end_date AS timestamp)
+    GROUP BY l.slug, CAST(l.season AS varchar), TRY_CAST(l.game_id AS bigint)
 ), links AS (
-    SELECT l.*, count(*) OVER (PARTITION BY slug, event_id) AS legacy_labels FROM l
+    SELECT l.*, count(*) OVER (PARTITION BY l.slug, l.event_id) AS legacy_labels,
+           d.date_seasons, d.date_label_mismatch
+    FROM l LEFT JOIN date_links d ON d.slug = l.slug
+      AND d.season IS NOT DISTINCT FROM l.season AND d.event_id IS NOT DISTINCT FROM l.event_id
 )
 SELECT coalesce(n.slug, l.slug) AS slug, n.season_year, l.season AS legacy_season,
        coalesce(n.event_id, l.event_id) AS event_id,
        n.slug IS NOT NULL AND l.slug IS NULL AS native_only,
        n.slug IS NULL AS legacy_only, n.native_rows, l.legacy_rows,
-       coalesce(n.native_rows > 1 OR n.native_labels > 1 OR l.legacy_rows > 1 OR l.legacy_labels > 1, false) AS ambiguous,
+       coalesce(n.native_rows > 1 OR n.native_labels > 1 OR l.legacy_rows > 1 OR l.legacy_labels > 1
+                OR (n.slug IS NULL AND l.date_label_mismatch), false) AS ambiguous,
        CASE WHEN n.native_rows = 1 AND n.native_labels = 1 AND l.legacy_rows = 1 AND l.legacy_labels = 1
                  AND n.kickoff IS NOT NULL AND l.kickoff IS NOT NULL
             THEN CAST(n.kickoff AS date) <> CAST(l.kickoff AS date) END AS date_mismatch,
@@ -214,10 +233,11 @@ SELECT coalesce(n.slug, l.slug) AS slug, n.season_year, l.season AS legacy_seaso
                  AND l.home_score IS NOT NULL AND l.away_score IS NOT NULL
             THEN n.home_score <> l.home_score OR n.away_score <> l.away_score END AS score_mismatch,
        CASE WHEN n.slug IS NOT NULL AND l.slug IS NOT NULL
-            THEN l.season <> s.season END AS season_mismatch
+            THEN l.season <> s.season END AS season_mismatch,
+       l.date_seasons
 FROM native_links n FULL JOIN links l ON n.slug = l.slug AND n.event_id = l.event_id
 LEFT JOIN scope s ON s.slug = n.slug AND s.season_year = n.season_year
-WHERE n.slug IS NOT NULL OR EXISTS (
+WHERE n.slug IS NOT NULL OR l.date_seasons IS NOT NULL OR EXISTS (
     SELECT 1 FROM scope x WHERE x.slug = l.slug AND x.season = l.season
 )
 ORDER BY slug, n.season_year, legacy_season, event_id"""
@@ -254,5 +274,5 @@ def render_parity(rows: Sequence[Sequence]) -> str:
     lines.extend(f"{r[0]}/{r[1]} legacy={r[2]} event_id={r[3]}: native_only={r[4]}, "
                  f"legacy_only={r[5]}, native_rows={r[6]}, legacy_rows={r[7]}, "
                  f"ambiguous={r[8]}, date_mismatch={r[9]}, score_mismatch={r[10]}, "
-                 f"season_mismatch={r[11]}" for r in rows)
+                 f"season_mismatch={r[11]}, date_seasons={r[12]}" for r in rows)
     return "\n".join(lines)

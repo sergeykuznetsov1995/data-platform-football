@@ -148,8 +148,9 @@ bodies used by the history lane (raw cache/export). `core_evidence` validates
 all declared types, pages, original counts and within-type unique event IDs.
 Do not reconstruct evidence from `queue.matches`: it has already lost cross-type
 duplicates. The report shows sum of core counts, union of IDs, cross-type
-repetitions and missing/extra published Bronze IDs. Missing evidence blocks
-non-red pairs. Pass confirmed pair-level quality defects as `quality_errors`,
+repetitions and missing/extra published Bronze IDs. Confirmed terminal nonplayed
+Bronze rows also count as completed IDs even without `first_published_at`.
+Missing evidence blocks non-red pairs. Pass confirmed pair-level quality defects as `quality_errors`,
 including capability-aware defects from `history_report` (valid-empty parts
 are defects only where the season actually has that capability). Persist the
 scope, raw evidence references, confirmed quality findings and report together;
@@ -159,7 +160,8 @@ The acceptance SELECT LEFT JOINs from scope, not queue. Any red type makes its p
 not-yet-inventoried (absent) pairs red; an inventory failure does not add
 a separate denominator row. Absent/pending/listed pairs and incomplete type
 evidence block completion. Terminal red pairs count against the strict
-`red * 5 < N` threshold; failed discovery may explain absent evidence for a red
+`red * 5 < N` threshold; retryable red rows (`attempts < MAX_ATTEMPTS`)
+still block completion; failed discovery may explain absent evidence for a red
 pair. A completed pair with missing/extra published IDs is red even if queue
 counts agree. The renderer includes every pair and its discrepancy fields.
 
@@ -169,6 +171,11 @@ calendar year as its legacy season label. It joins
 native `event_id` to schedule `game_id` within competition, across legacy season
 labels; dates and scores are checked separately. Output contains native-only,
 legacy-only, duplicate/ambiguous links, NULL comparisons and wrong season labels.
+Native parity includes confirmed terminal nonplayed rows without publication.
+Unmatched legacy rows are selected by label or date: July-to-July for leagues,
+calendar year for World Cups. The appended `date_seasons` column lists date-based
+candidate years; a conflict with the label marks an unmatched row ambiguous.
+These calendar hints do not prove season membership for extended seasons.
 `ITA-Serie A/2021` is explicitly excluded as the known copy of 2019/20 and
 counted in the parts report. Lineup/matchsheet rows without exactly one schedule
 link are uncomparable. Their scores are not a parity reference; score comparison

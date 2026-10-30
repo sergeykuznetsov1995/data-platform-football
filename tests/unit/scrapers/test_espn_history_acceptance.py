@@ -43,7 +43,7 @@ def test_acceptance_left_joins_scope_and_counts_red_pairs_once(db):
 def test_strict_red_share_boundary(db, red, accepted):
     scope = tuple(("eng.1", 1900 + i) for i in range(100))
     history.save_rows(db.con, [history.QueueRow(slug, year, 0,
-                      history.RED if i < red else history.EMPTY)
+                      history.RED if i < red else history.EMPTY, attempts=history.MAX_ATTEMPTS)
                       for i, (slug, year) in enumerate(scope)])
     evidence = {pair: CoreEvidence(pair[1], ()) for pair in scope[red:]}
     rows = db.run(render_acceptance_sql(scope, evidence))
@@ -204,3 +204,69 @@ def test_red_type_does_not_hide_missing_expected_type(db):
     rows = db.run(render_acceptance_sql(scope, evidence))
     assert rows[0][4] and not rows[0][12]
     assert "приёмка: нет" in render_acceptance(rows)
+
+
+@pytest.mark.parametrize("attempts", [0, history.MAX_ATTEMPTS - 1, history.MAX_ATTEMPTS])
+def test_retryable_red_pair_blocks_acceptance(db, attempts):
+    scope = tuple(("eng.1", 1900 + i) for i in range(80))
+    history.save_rows(db.con, [
+        history.QueueRow(slug, year, 0, history.RED if i == 0 else history.EMPTY,
+                         attempts=attempts if i == 0 else 0)
+        for i, (slug, year) in enumerate(scope)
+    ])
+    evidence = {pair: CoreEvidence(pair[1], ()) for pair in scope[1:]}
+    rows = db.run(render_acceptance_sql(scope, evidence))
+    exhausted = attempts >= history.MAX_ATTEMPTS
+    assert rows[0][3] is not exhausted
+    assert rows[0][12] is exhausted
+    assert ("приёмка: да" in render_acceptance(rows)) is exhausted
+
+
+def test_acceptance_includes_terminal_nonplayed_without_publication(db):
+    pair = ("eng.1", 2016)
+    history.save_rows(db.con, [history.QueueRow(*pair, 1, history.DONE)])
+    db.match(1, season_year=2016, status="STATUS_CANCELED", played_final=False,
+             terminal_nonplayed=True)
+    rows = db.run(render_acceptance_sql((pair,), {pair: CoreEvidence(2016, ((1, (1,)),))}))
+    assert rows[0][9:12] == (1, 0, 0)
+    assert "приёмка: да" in render_acceptance(rows)
+
+
+def test_parity_includes_terminal_nonplayed_without_publication(legacy):
+    legacy.con.execute("""INSERT INTO iceberg.bronze.espn_match
+        (competition_slug,season_year,event_id,status,played_final,terminal_nonplayed)
+        VALUES ('eng.1',2016,1,'STATUS_CANCELED',false,true)""")
+    legacy.con.execute("""INSERT INTO iceberg.bronze.espn_schedule VALUES
+        ('ENG-Premier League','1617','1','2016-08-20',NULL,NULL,'canceled')""")
+    rows = legacy.run(render_parity_sql((("eng.1", 2016),)))
+    assert len(rows) == 1
+    assert rows[0][3:6] == (1, False, False)
+    assert rows[0][10] is None
+
+
+@pytest.mark.parametrize("slug,league,year,label,dates", [
+    ("eng.1", "ENG-Premier League", 2016, "1516",
+     ("2016-06-30", "2016-07-01", "2017-06-30", "2017-07-01")),
+    ("fifa.world", "INT-World Cup", 2018, "2014",
+     ("2017-12-31", "2018-01-01", "2018-12-31", "2019-01-01")),
+])
+def test_parity_keeps_legacy_only_with_wrong_label_by_date(legacy, slug, league, year, label, dates):
+    for event_id, date in enumerate(dates):
+        legacy.con.execute("INSERT INTO iceberg.bronze.espn_schedule VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           [league, label, str(event_id), date, None, None, str(event_id)])
+    rows = legacy.run(render_parity_sql(((slug, year),)))
+    assert [r[3] for r in rows] == [1, 2]
+    assert all(r[1] is None and r[2] == label and r[5] and r[8] for r in rows)
+    assert all(r[12] == [year] for r in rows)
+    assert f"date_seasons=[{year}]" in render_parity(rows)
+
+
+@pytest.mark.parametrize("event_id", ["1", None])
+def test_parity_checks_all_dates_of_ambiguous_legacy_key(legacy, event_id):
+    for date in ("2016-06-30", "2016-08-20"):
+        legacy.con.execute("INSERT INTO iceberg.bronze.espn_schedule VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           ["ENG-Premier League", "1516", event_id, date, None, None, "a"])
+    rows = legacy.run(render_parity_sql((("eng.1", 2016),)))
+    assert len(rows) == 1
+    assert rows[0][5] and rows[0][7:9] == (2, True)
+    assert rows[0][12] == [2016]
