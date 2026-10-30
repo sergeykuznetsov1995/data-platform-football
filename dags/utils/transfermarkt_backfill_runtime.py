@@ -963,10 +963,10 @@ class BackfillStateRepository:
 
 def current_signal_qualification():
     """Use #1393's content-based activation proof, never a readiness boolean."""
-    from scrapers.transfermarkt.signal_qualification import validate_qualification
+    from scrapers.transfermarkt.signal_qualification import load_qualification_wrapper, validate_qualification
     path = Path(__file__).resolve().parents[1] / 'configs/transfermarkt/current_signal_qualification.json'
     try:
-        return validate_qualification(json.loads(path.read_text()))
+        return validate_qualification(load_qualification_wrapper(path))
     except (OSError, ValueError, TypeError) as exc:
         raise BackfillRuntimeError("current detector qualification is required before historical paid work") from exc
 

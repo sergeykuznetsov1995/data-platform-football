@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from scrapers.transfermarkt.signal_qualification import (
-    GROUPS, OBSERVATION_SCHEMA, QualificationError, build_qualification,
-    validate_qualification,
+    GROUPS, OBSERVATION_SCHEMA, OWNER_PARITY_DECISION, QualificationError, build_qualification,
+    load_qualification_wrapper, validate_qualification,
 )
 from scrapers.transfermarkt.tmapi import players_url
 
@@ -314,3 +314,102 @@ def test_qualification_rejects_packets_exceeding_transport_limits(ids):
     url = 'https://tmapi.transfermarkt.technology/players?' + urlencode([('ids[]', value) for value in ids])
     with pytest.raises(QualificationError):
         _packet_ids(url)
+
+
+def owner_block(artifact, **changes):
+    block = {"decision": OWNER_PARITY_DECISION, "decided_at": "2026-10-12T08:00:00+00:00", "decided_by": "owner",
+             "statement": "Принять по паритету (рекомендую)", "channel": "AskUserQuestion",
+             "reports_sha256": [link["sha256"] for link in artifact["reports"]], "proof_substitute": "live freshness measure #1395"}
+    block.update(changes)
+    return block
+
+
+def with_artifact(wrapper, change):
+    path = Path(wrapper["evidence_path"])
+    artifact = json.loads(path.read_text())
+    change(artifact)
+    path.write_text(json.dumps(artifact))
+    return {"evidence_path": str(path), "evidence_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def accepted_by_owner(wrapper, **changes):
+    return with_artifact(wrapper, lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, **changes)))
+
+
+def test_parity_without_change_qualifies_only_with_owner_decision_bound_to_reports(tmp_path):
+    wrapper = qualified_fixture(tmp_path, changes=False)
+    with pytest.raises(QualificationError, match="no real"):
+        validate_qualification(wrapper)
+    result = validate_qualification(accepted_by_owner(wrapper))
+    assert result["players_compared"] == 1000 and result["source_parity"]
+    assert result["same_day_changes"] is False and result["changed_observations"] == []
+    assert result["owner_acceptance"]["decision"] == OWNER_PARITY_DECISION
+
+
+@pytest.mark.parametrize("change", [
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, reports_sha256=["0" * 64, "1" * 64])),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, reports_sha256=[link["sha256"] for link in artifact["reports"]][::-1])),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, decision="accepted")),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, decided_at="2026-10-11T09:00:00+00:00")),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, decided_at="2999-01-01T00:00:00+00:00")),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, decided_at="2026-10-12T08:00:00")),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, decided_by="lead")),
+    lambda artifact: artifact.update(owner_acceptance=owner_block(artifact, statement=" ")),
+    lambda artifact: artifact.update(owner_acceptance=True),
+    lambda artifact: artifact.update(owner_acceptance=OWNER_PARITY_DECISION),
+    lambda artifact: artifact.update(accepted=True, same_day_changes=True),
+])
+def test_owner_decision_that_is_wrong_or_a_flag_never_qualifies_parity_only(tmp_path, change):
+    wrapper = with_artifact(qualified_fixture(tmp_path, changes=False), change)
+    wrapper.update(accepted=True, owner_acceptance=True, same_day_changes=True)
+    with pytest.raises(QualificationError, match="no real"):
+        validate_qualification(wrapper)
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda report: report.update(complete=False), "incomplete"),
+    (lambda report: report.update(players_checked=999), "player count"),
+])
+def test_owner_decision_does_not_hide_other_failures(tmp_path, change, message):
+    wrapper = accepted_by_owner(mutate_report(qualified_fixture(tmp_path, changes=False), change))
+    with pytest.raises(QualificationError, match=message):
+        validate_qualification(wrapper)
+
+
+def test_owner_decision_does_not_qualify_a_small_cohort(tmp_path):
+    with pytest.raises(QualificationError, match=">=1000"):
+        validate_qualification(accepted_by_owner(qualified_fixture(tmp_path, players=999, changes=False)))
+
+
+def test_real_change_keeps_its_own_proof_beside_owner_decision(tmp_path):
+    result = validate_qualification(accepted_by_owner(qualified_fixture(tmp_path)))
+    assert result["same_day_changes"] is True and result["changed_observations"]
+    assert "owner_acceptance" not in result
+
+
+def test_builder_binds_owner_decision_to_actual_report_hashes(tmp_path):
+    wrapper = qualified_fixture(tmp_path, changes=False)
+    artifact = json.loads(Path(wrapper["evidence_path"]).read_text())
+    day1, day2 = [Path(link["path"]) for link in artifact["reports"]]
+    block = owner_block(artifact)
+    del block["reports_sha256"]
+    result = build_qualification(day1, day2, tmp_path / "accepted.json", owner_acceptance=block)
+    assert result["owner_acceptance"]["reports_sha256"] == [link["sha256"] for link in artifact["reports"]]
+    with pytest.raises(QualificationError, match="other reports"):
+        build_qualification(day1, day2, tmp_path / "other.json", owner_acceptance={**block, "reports_sha256": ["0" * 64, "1" * 64]})
+
+
+def test_wrapper_evidence_path_is_relative_to_the_wrapper_file(tmp_path, monkeypatch):
+    evidence = Path(qualified_fixture(tmp_path)["evidence_path"])
+    wrapper_path = tmp_path / "configs" / "current_signal_qualification.json"
+    wrapper_path.parent.mkdir()
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    wrapper_path.write_text(json.dumps({"evidence_path": "../qualification/evidence.json", "evidence_sha256": digest}))
+    # From another CWD the same relative path would name a missing file.
+    (tmp_path / "elsewhere" / "deeper").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "elsewhere" / "deeper")
+    loaded = load_qualification_wrapper(wrapper_path)
+    assert Path(loaded["evidence_path"]).resolve() == evidence.resolve()
+    assert validate_qualification(loaded)["players_compared"] == 1000
+    wrapper_path.write_text(json.dumps({"evidence_path": str(evidence), "evidence_sha256": digest}))
+    assert load_qualification_wrapper(wrapper_path)["evidence_path"] == str(evidence)

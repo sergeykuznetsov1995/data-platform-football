@@ -51,8 +51,10 @@ def _python(task_id: str):
 
 
 def test_dag_is_continuous_single_run_and_has_no_scope_selectors(module):
+    from dags.utils.transfermarkt_current_timetable import TransfermarktCurrentTimetable
+
     assert module.dag.dag_id == "dag_backfill_transfermarkt"
-    assert module.dag.schedule == "@continuous"
+    assert isinstance(module.dag.schedule, TransfermarktCurrentTimetable)
     assert module.dag._dag_kwargs["max_active_runs"] == 1
     assert module.dag._dag_kwargs['dagrun_timeout'].total_seconds() == 2700
     assert module.dag._dag_kwargs["catchup"] is False

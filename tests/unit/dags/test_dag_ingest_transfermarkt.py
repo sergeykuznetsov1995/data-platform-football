@@ -32,6 +32,8 @@ def dag_module():
     # #1389: plan_exact_scopes ends with a paid gateway probe.  Unit tests of
     # the DAG never touch the network: record the calls instead.
     module = _reload_dag_module()
+    # Daily lane: no activation file. Signal-lane tests opt in explicitly.
+    module.CURRENT_QUALIFICATION_PATH = Path('/nonexistent/current_signal_qualification.json')
     module.probe_calls = []
     module._probe_gateway_exit = (
         lambda **kw: module.probe_calls.append(kw) or {'status_code': 200}

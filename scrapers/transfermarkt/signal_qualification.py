@@ -2,12 +2,14 @@
 
 A boolean or a file hash is not qualification. Two exact-cohort source parity
 reports and at least one real changed field observed by both reference and
-signal on the same Moscow day are required. This is experimental qualification,
+signal on the same Moscow day are required. A day without any real change is
+accepted only by the owner's parity decision recorded inside the hashed
+evidence and bound to both report hashes. This is experimental qualification,
 not runtime acceptance or permission to skip complete careers.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 import hashlib
 import json
@@ -26,6 +28,7 @@ OBSERVATION_SCHEMA = "tm-signal-parity-observation-v1"
 GROUPS = {"top_league", "lower_league", "calendar", "cup"}
 FIELDS = ("value", "value_date", "value_present", "contract", "clubs")
 CONTRACT_MISMATCH_THRESHOLD = 0.02
+OWNER_PARITY_DECISION = "parity_without_same_day_change"
 
 
 class QualificationError(ValueError):
@@ -205,6 +208,31 @@ def _edition_proofs(cohort_value, scopes):
     return max(stamps)
 
 
+def _owner_acceptance_valid(artifact, observed_to):
+    """The owner's parity decision, taken after both observations, for exactly these reports."""
+    block = artifact.get("owner_acceptance")
+    if not isinstance(block, dict) or block.get("decision") != OWNER_PARITY_DECISION or block.get("decided_by") != "owner":
+        return False
+    if block.get("reports_sha256") != [link.get("sha256") for link in artifact["reports"]]:
+        return False
+    if not isinstance(block.get("statement"), str) or not block["statement"].strip():
+        return False
+    try:
+        decided_at = _time(block.get("decided_at"))
+    except QualificationError:
+        return False
+    return observed_to <= decided_at <= datetime.now(timezone.utc)
+
+
+def load_qualification_wrapper(path: str | Path) -> dict:
+    """Read a wrapper whose relative ``evidence_path`` is relative to the wrapper file."""
+    path = Path(path)
+    wrapper = json.loads(path.read_text())
+    if isinstance(wrapper, dict) and isinstance(wrapper.get("evidence_path"), str) and not Path(wrapper["evidence_path"]).is_absolute():
+        wrapper["evidence_path"] = str(path.resolve().parent / wrapper["evidence_path"])
+    return wrapper
+
+
 def validate_qualification(qualification: Mapping[str, Any], *, editions_proven_by_pin: bool = False) -> dict:
     """Validate the wrapper, linked report hashes, all rows and changed evidence.
 
@@ -269,16 +297,19 @@ def validate_qualification(qualification: Mapping[str, Any], *, editions_proven_
             _require(abs(signal_time - reference_time) <= timedelta(hours=24), "changed reference was not matched within 24 hours")
             changes.append({"player_id": player, "field": field, "before": before["tmapi"][field], "after": after["tmapi"][field],
                             "signal_fetched_at": signal_time.isoformat(), "reference_fetched_at": reference_time.isoformat()})
-    _require(changes, "qualification has no real same-day changed observation")
+    if not changes:
+        _require(_owner_acceptance_valid(artifact, new_end), "qualification has no real same-day changed observation")
     result = dict(qualification)
-    result.update(players_compared=len(cohort), source_parity=True, same_day_changes=True,
+    result.update(players_compared=len(cohort), source_parity=True, same_day_changes=bool(changes),
                   qualified_at=new_end.isoformat(), changed_observations=changes,
                   schema_version=SCHEMA)
+    if not changes:
+        result["owner_acceptance"] = artifact["owner_acceptance"]
     return result
 
 
 def build_qualification(day1: str | Path, day2: str | Path, output: str | Path, *, recheck: str | Path | None = None,
-                        editions_proven_by_pin: bool = False) -> dict:
+                        editions_proven_by_pin: bool = False, owner_acceptance: Mapping[str, Any] | None = None) -> dict:
     """Build from concrete benchmark reports, then use the same runtime validator."""
     paths = [Path(day1).resolve(), Path(day2).resolve()]
     output = Path(output).resolve()
@@ -288,6 +319,10 @@ def build_qualification(day1: str | Path, day2: str | Path, output: str | Path, 
     if recheck is not None:
         recheck_path = Path(recheck).resolve()
         artifact["recheck"] = {"path": os.path.relpath(recheck_path, output.parent), "sha256": hashlib.sha256(recheck_path.read_bytes()).hexdigest()}
+    if owner_acceptance is not None:
+        hashes = [link["sha256"] for link in artifact["reports"]]
+        _require(owner_acceptance.get("reports_sha256", hashes) == hashes, "owner acceptance names other reports")
+        artifact["owner_acceptance"] = {**owner_acceptance, "reports_sha256": hashes}
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(artifact, indent=2) + "\n")
     wrapper = {"evidence_path": str(output), "evidence_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
