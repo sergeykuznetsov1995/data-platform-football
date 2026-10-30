@@ -552,11 +552,11 @@ class EspnHttpClient:
             try:
                 permit = self.gate.acquire(cluster)
             except (LaneClosed, AllOriginsBlocked, DailyCapExceeded) as exc:
-                disposition = {
-                    LaneClosed: "lane_closed",
-                    AllOriginsBlocked: "blocked_deferred",
-                    DailyCapExceeded: "daily_cap",
-                }[type(exc)]
+                disposition = next(value for kind, value in (
+                    (LaneClosed, "lane_closed"),
+                    (AllOriginsBlocked, "blocked_deferred"),
+                    (DailyCapExceeded, "daily_cap"),
+                ) if isinstance(exc, kind))
                 exc.ledger_entry = self._entry(
                     target,
                     endpoint_type,

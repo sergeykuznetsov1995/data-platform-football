@@ -22,7 +22,8 @@ from .bronze_writer import BronzeBatchError, delete_filter, stored_rows
 from .deep_parser import (PARSER_VERSION, collect_plays, deep_level, mask_xg,
                           parse_page, play_values, statistics, xg_support)
 from .deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
-from .deep_store import Depth, client_state_dir, edition_lock, load_depth, save_depth
+from .deep_store import (Depth, client_state_dir, edition_lock, load_depth, save_depth,
+                         load_retries, save_retry)
 from .history import history_stopped
 from .history_report import render_live_debt_sql
 from .journal import flush_journal, journal_rows
@@ -240,8 +241,18 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                         report["mapped"] += 1
                     if map_only or depth.deep_level != "full":
                         continue
+                    retries = load_retries(trino, slug, year)
+                    # Unattempted matches precede due retries, even after a restart.
+                    candidates.sort(key=lambda row: (row[0] in retries,
+                                                     retries.get(row[0]) or datetime.min, row[0]))
                     for event_id, home, away, state in candidates:
                         check()
+                        retry_after = retries.get(event_id)
+                        if retry_after is not None:
+                            if retry_after.tzinfo is None:
+                                retry_after = retry_after.replace(tzinfo=timezone.utc)
+                            if now_fn() < retry_after:
+                                continue
                         if state == "completed":
                             if depth.has_xg is not True:
                                 continue
@@ -251,6 +262,9 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                                     json.loads(row["deep_stats_json"]).get("has_xg") is True for row in stored):
                                 continue
                         try:
+                            # Persist before I/O so deadline/stop interruptions also
+                            # advance the next run instead of replaying its prefix.
+                            save_retry(conn, slug, year, event_id, now_fn() + timedelta(days=1))
                             manifest, play_rows = [], []
 
                             def page_fetch(index):
@@ -281,6 +295,7 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                                 plays=play_rows, teams=teams, manifest=manifest, has_xg=has_xg,
                                 state_dir=client_state_dir(client),
                             ))
+                            save_retry(conn, slug, year, event_id, None)
                         except (LaneClosed, AllOriginsBlocked, DailyCapExceeded):
                             raise
                         except (EspnParseError, EspnTransportError) as exc:

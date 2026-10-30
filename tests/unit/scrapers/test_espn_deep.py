@@ -175,7 +175,7 @@ def runner(tmp_path, monkeypatch):
         def execute_query(self, sql, params=None):
             if "AS debt" in sql:
                 return self.debt
-            if "espn_depth_v1" in sql:
+            if "espn_depth_v1" in sql or "espn_deep_retry_v1" in sql:
                 return conn.execute(sql, params).fetchall()
             if sql.startswith("SELECT event_id, home_team_id"):
                 return [(row["event_id"], row["home_team_id"], row["away_team_id"], row["deep_state"])
@@ -250,6 +250,9 @@ def test_runner_incomplete_page_does_not_publish(runner):
     assert not runner.bronze.tables[PLAYS_TABLE]
     assert runner.bronze.tables["espn_match"][0]["deep_state"] == "pending"
     runner.client.failed_page = False
+    assert deep.run_deep(**runner.args)["completed"] == 0
+    later = runner.args["now_fn"]() + timedelta(days=1)
+    runner.args.update(now_fn=lambda: later, deadline=later + timedelta(minutes=12))
     assert deep.run_deep(**runner.args)["completed"] == 1
 
 
@@ -524,3 +527,102 @@ def test_probe_budget_expiring_during_debt_query_still_collects_full(runner):
 
     runner.bronze.execute_query = query
     assert deep.run_deep(**runner.args)["completed"] == 1
+
+
+def test_probe_budget_expires_inside_real_gate_and_full_still_runs(runner, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scrapers.espn.deep_store import Depth, save_depth
+    from scrapers.espn.raw_store import EspnRawStore
+    from scrapers.espn.transport import EspnHttpClient
+    from tests.unit.scrapers.test_espn_transport import FakeSession
+
+    now = runner.args["now_fn"]()
+    clock = [now]
+    runner.args.update(now_fn=lambda: clock[0], deadline=now + timedelta(minutes=2))
+    runner.args["denominator"] = SimpleNamespace(
+        targets=lambda: {"bad", "eng.1"}, live_targets=lambda: {"bad", "eng.1"},
+        row=lambda slug: SimpleNamespace(current_season_year=2020))
+    save_depth(runner.conn, Depth("eng.1", 2020, 1000, "full", checked_at=now))
+    gate = runner.client.gate
+    gate.utcnow_fn = lambda: clock[0]
+    with gate._state() as state:
+        state["next_permit_at"] = now.timestamp() + 60
+
+    def sleep(seconds, check):
+        clock[0] += timedelta(seconds=25)
+        check()
+
+    monkeypatch.setattr(deep, "interruptible_sleep", sleep)
+    real = EspnHttpClient(raw_store=EspnRawStore.from_uri((tmp_path / "raw").as_uri()),
+                         gate=gate, session=FakeSession([]), environ={})
+    original = runner.client.fetch_json
+
+    def fetch(url, endpoint, params, **kwargs):
+        if "/leagues/bad/" in url:
+            return real.fetch_json(url, endpoint, params, **kwargs)
+        return original(url, endpoint, params, **kwargs)
+
+    runner.client.fetch_json = fetch
+    try:
+        assert deep.run_deep(**runner.args)["completed"] == 1
+        assert real.ledger[-1].disposition == "lane_closed"
+        assert not real.session.calls
+    finally:
+        real.close()
+
+
+def test_failed_prefix_defers_and_queue_advances_across_bounded_runs(runner):
+    from scrapers.espn.deep_store import Depth, save_depth
+    now = runner.args["now_fn"]()
+    clock = [now]
+    runner.args.update(now_fn=lambda: clock[0])
+    save_depth(runner.conn, Depth("eng.1", 2020, 1000, "full", checked_at=now))
+    for event_id in range(2, 6):
+        write_tournament_batch(_batch(_match(event_id, str(event_id))), trino=runner.bronze)
+    original = runner.client.fetch_json
+    attempted = []
+
+    def content(url, endpoint, params, **kwargs):
+        result = original(url, endpoint, params, **kwargs)
+        clock[0] += timedelta(seconds=1)
+        if url.endswith("statistics") and "/events/5/" not in url:
+            clock[0] += timedelta(seconds=30)
+            attempted.append(int(url.split("/events/")[1].split("/")[0]))
+            raise parser.EspnParseError("bad team statistics")
+        return result
+
+    runner.client.fetch_json = content
+    reports = []
+    for _ in range(5):
+        runner.args["deadline"] = clock[0] + timedelta(seconds=31)
+        reports.append(deep.run_deep(**runner.args))
+    assert sum(report["completed"] for report in reports) == 1
+    assert attempted == [1, 2, 3, 4]
+    assert runner.conn.execute("SELECT event_id FROM iceberg.ops.espn_deep_retry_v1 "
+                               "ORDER BY event_id").fetchall() == [(1,), (2,), (3,), (4,)]
+    # Once due, a repaired match is retried and its persistent deferral removed.
+    clock[0] = now + timedelta(days=1, minutes=5)
+    runner.args["deadline"] = clock[0] + timedelta(minutes=12)
+    runner.client.fetch_json = original
+    assert deep.run_deep(**runner.args)["completed"] == 4
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_retry_v1").fetchall() == []
+
+
+def test_interrupted_match_is_deferred_on_next_run(runner):
+    from scrapers.espn.deep_store import Depth, save_depth
+    now = runner.args["now_fn"]()
+    save_depth(runner.conn, Depth("eng.1", 2020, 1000, "full", checked_at=now))
+    write_tournament_batch(_batch(_match(2, "bb")), trino=runner.bronze)
+    original = runner.client.fetch_json
+
+    def interrupted(url, endpoint, params, **kwargs):
+        if "/events/1/" in url and params.get("page") == "2":
+            raise LaneClosed("deadline during match")
+        return original(url, endpoint, params, **kwargs)
+
+    runner.client.fetch_json = interrupted
+    assert deep.run_deep(**runner.args)["reason"] == "deadline during match"
+    runner.client.calls.clear()
+    runner.client.fetch_json = original
+    assert deep.run_deep(**runner.args)["completed"] == 1
+    assert all("/events/2/" in url for url, _ in runner.client.calls)
