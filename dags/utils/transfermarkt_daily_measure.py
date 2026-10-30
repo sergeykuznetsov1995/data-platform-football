@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
+from dags.utils.transfermarkt_backfill_state import ATTEMPT_TABLE, BATCH_TABLE, SCOPE_TABLE
 from dags.utils.transfermarkt_current_state import (CHECKS_TABLE, SIGNALS_TABLE, current_scope_targets,
                                                   denominator_definition_hash, edition_measurement_fingerprint)
 from scrapers.transfermarkt.current_capture import semantic_signature
@@ -183,6 +184,64 @@ SELECT a.*, c.*, e.*,
  'not_proven' AS site_freshness_status
 FROM args a CROSS JOIN coverage_totals c CROSS JOIN event_totals e'''
     return sql, params
+
+
+# Map of 23.09 for #1383 (task 17/#1402): history editions and requests per day.
+HISTORY_EDITIONS_TARGET = 57
+HISTORY_REQUESTS_TARGET = 16_500
+
+
+def build_history_day_sql(day: date | str, *, as_of: datetime | str) -> tuple[str, tuple[Any, ...]]:
+    """One read-only SELECT over the history ops journal for one Moscow day.
+
+    Editions: scopes that reached ``complete`` that day.  Requests: distinct raw
+    attempt envelopes (responses and transport errors) dated by the earliest
+    attempt that references them.  Per-envelope request time lives only in the
+    raw store, not in Trino; the attempt's ``source_observed_at`` (its latest
+    request) is the closest time there, ``finished_at`` only when it is NULL.
+    Error bound: an attempt runs within one history portion (MAX_PORTION_SECONDS,
+    45 min), so at most one attempt per stream straddles Moscow midnight and its
+    earlier requests (<= ~45 min of ~24 h) move to the next day.
+    Streams: distinct history streams of batches claimed that day.
+    """
+    start, end = day_bounds(day)
+    observed = utc(as_of)
+    if observed < start:
+        raise MeasurementError('as_of predates the report day')
+    params = (start.replace(tzinfo=None), end.replace(tzinfo=None), observed.replace(tzinfo=None))
+    sql = f'''WITH
+args(day_start, day_end, as_of) AS (
+ VALUES (CAST(? AS timestamp(6)), CAST(? AS timestamp(6)), CAST(? AS timestamp(6)))
+),
+done AS (
+ SELECT count(*) AS editions FROM {SCOPE_TABLE} s CROSS JOIN args a
+ WHERE s.status = 'complete' AND s.updated_at >= a.day_start AND s.updated_at < a.day_end
+   AND s.updated_at <= a.as_of
+),
+envelopes AS (
+ SELECT u.envelope_id, min(COALESCE(t.source_observed_at, t.finished_at)) AS first_at FROM {ATTEMPT_TABLE} t
+ CROSS JOIN UNNEST(CAST(json_parse(t.raw_evidence_ids_json) AS array(varchar))) AS u(envelope_id)
+ GROUP BY u.envelope_id
+),
+requests AS (
+ SELECT count(*) AS requests FROM envelopes e CROSS JOIN args a
+ WHERE e.first_at >= a.day_start AND e.first_at < a.day_end AND e.first_at <= a.as_of
+),
+streams AS (
+ SELECT count(DISTINCT u.stream_id) AS streams FROM {BATCH_TABLE} b CROSS JOIN args a
+ CROSS JOIN UNNEST(map_values(CAST(json_extract(b.record_json, '$.scope_stream_ids') AS map(varchar, varchar)))) AS u(stream_id)
+ WHERE b.claimed_at >= a.day_start AND b.claimed_at < a.day_end AND b.claimed_at <= a.as_of
+)
+SELECT a.*, d.editions, r.requests, s.streams
+FROM args a CROSS JOIN done d CROSS JOIN requests r CROSS JOIN streams s'''
+    return sql, params
+
+
+def format_history_summary(report: Mapping[str, Any]) -> str:
+    target = f'{HISTORY_REQUESTS_TARGET / 1000:.1f}'.replace('.', ',')
+    return (f'Transfermarkt история {report.get("report_day", "?")} МСК: изданий {report.get("editions", 0)} '
+            f'(цель ≥ {HISTORY_EDITIONS_TARGET}), запросов {report.get("requests", 0)} '
+            f'(ориентир {target} тыс.; ±1 попытка на границе суток), потоков активных {report.get("streams", 0)}')
 
 
 def format_daily_summary(report: Mapping[str, Any], *, dq_status: str = 'unknown',

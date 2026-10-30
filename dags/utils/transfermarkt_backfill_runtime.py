@@ -17,12 +17,13 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from scrapers.transfermarkt.denominator import load_denominator
+from scrapers.transfermarkt.denominator import Denominator, load_denominator
 from scrapers.transfermarkt.models import MAX_SCOPE_BATCH
 from scrapers.transfermarkt.raw_store import RawResponseStore
 from utils import transfermarkt_backfill_state as state
 from utils.transfermarkt_backfill_artifacts import BackfillArtifactStore
 from utils.transfermarkt_backfill_attempts import verify_envelope_set
+from utils.transfermarkt_history_order import history_claim_key
 from utils.transfermarkt_scope_planner import (
     RegistryScopeTarget,
     build_promoted_registry_query,
@@ -260,8 +261,14 @@ class BackfillStateRepository:
                 self.execute(mark_sql(target, status='pending', at=now))
         return {str(item['scope_id']) for item in self.query(f"SELECT scope_id FROM {TABLE} WHERE status <> 'complete'")}
 
-    def select_queue_campaign(self, *, now: datetime, allowed_ids=None, registry_targets=None) -> state.BackfillCampaign | None:
-        """Recover one busy batch first; otherwise pick oldest runnable entry."""
+    def select_queue_campaign(self, *, now: datetime, allowed_ids=None, registry_targets=None,
+                              denominator: Denominator | None = None) -> state.BackfillCampaign | None:
+        """Recover one busy batch first; otherwise pick the runnable campaign.
+
+        With a denominator and registry targets the campaign holding the best
+        history claim key wins (#1402), ties keep the oldest; otherwise the
+        oldest runnable campaign.
+        """
         latest_identities = ({_semantic_target_identity(target) for target in registry_targets}
                              if registry_targets is not None else None)
         campaigns = self.load_campaigns()
@@ -279,17 +286,26 @@ class BackfillStateRepository:
             raise BackfillRuntimeError("more than one campaign has a recoverable batch")
         if busy:
             return busy[0]
+        key = (history_claim_key(denominator, registry_targets)
+               if denominator is not None and registry_targets is not None else None)
+        best = None
         for campaign in opened:
             scopes = self.load_scopes(campaign.campaign_id)
             held_ids = {scope_id for batch in self.load_batches(campaign.campaign_id)
                         if batch.status is state.BatchStatus.WAITING_POLICY for scope_id in batch.scope_ids}
-            if any(item.target.scope_id not in held_ids and
-                   (latest_identities is None or _semantic_target_identity(item.target) in latest_identities) and (allowed_ids is None or item.target.scope_id in allowed_ids) and
-                   (item.status is state.ScopeStatus.PENDING or
-                   (item.status is state.ScopeStatus.RETRYABLE_ERROR and item.next_retry_at is not None
-                    and item.next_retry_at <= now)) for item in scopes):
+            ready = [item for item in scopes if item.target.scope_id not in held_ids and
+                     (latest_identities is None or _semantic_target_identity(item.target) in latest_identities) and (allowed_ids is None or item.target.scope_id in allowed_ids) and
+                     (item.status is state.ScopeStatus.PENDING or
+                     (item.status is state.ScopeStatus.RETRYABLE_ERROR and item.next_retry_at is not None
+                      and item.next_retry_at <= now))]
+            if not ready:
+                continue
+            if key is None:
                 return campaign
-        return None
+            rank = min(key(item) for item in ready)
+            if best is None or rank < best[0]:
+                best = (rank, campaign)
+        return best[1] if best else None
 
     def latest_campaign(self) -> state.BackfillCampaign | None:
         rows = self.query(
@@ -1152,11 +1168,13 @@ def validate_fresh_registry_snapshot(
 
 def historical_targets_from_registry(
     rows: Iterable[Mapping[str, Any]],
+    *,
+    denominator: Denominator | None = None,
 ) -> tuple[state.HistoricalScopeTarget, ...]:
     items = tuple(dict(item) for item in rows)
     targets = eligible_registry_scopes(items)
     # History is collected for the denominator file's live core only (#1390).
-    core = load_denominator().denominator_ids()
+    core = (denominator or load_denominator()).denominator_ids()
     historical = tuple(
         item for item in targets
         if not item.current and item.competition_id in core
@@ -1271,7 +1289,8 @@ def claim_and_plan(
 
     before = tuple(scopes)
     rows = tuple(registry_rows)
-    available = {item.scope_id: item for item in historical_targets_from_registry(rows)}
+    denominator = load_denominator()
+    available = {item.scope_id: item for item in historical_targets_from_registry(rows, denominator=denominator)}
     blocked_ids = set(blocked_scope_ids)
     allowed_ids = {item.target.scope_id for item in before
                    if item.target.scope_id not in blocked_ids
@@ -1279,7 +1298,8 @@ def claim_and_plan(
                    _semantic_target_identity(item.target) == _semantic_target_identity(available[item.target.scope_id])}
     # Admission filtering never rewrites excluded target state or proofs.
     claim = state.claim_scopes(campaign, before, lease_owner=lease_owner, now=now,
-                               limit=limit, eligible_scope_ids=allowed_ids)
+                               limit=limit, eligible_scope_ids=allowed_ids,
+                               sort_key=history_claim_key(denominator, available.values()))
     if claim.batch is None:
         return claim, ()
     capture_snapshots = {scope: (capture_snapshot_ids or {}).get(scope, str(rows[0]["registry_snapshot_id"]))

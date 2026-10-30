@@ -20,7 +20,7 @@ import re
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from scrapers.transfermarkt.models import (
     MAX_SCOPE_BATCH,
@@ -1654,6 +1654,19 @@ def _claim_sort_key(scope: BackfillScopeState) -> tuple[Any, ...]:
     return (1, datetime.min.replace(tzinfo=timezone.utc), scope.target.scope_id)
 
 
+def _ordered_claim_key(
+    sort_key: Callable[[BackfillScopeState], tuple[Any, ...]],
+) -> Callable[[BackfillScopeState], tuple[Any, ...]]:
+    """Retries stay first; the caller's key orders only fresh scopes."""
+
+    def key(scope: BackfillScopeState) -> tuple[Any, ...]:
+        if scope.status is ScopeStatus.RETRYABLE_ERROR:
+            return _claim_sort_key(scope)
+        return (1, *sort_key(scope))
+
+    return key
+
+
 def claim_scopes(
     campaign: BackfillCampaign,
     scopes: Iterable[BackfillScopeState],
@@ -1662,6 +1675,7 @@ def claim_scopes(
     now: datetime,
     limit: int = MAX_SCOPE_BATCH,
     eligible_scope_ids: Iterable[str] | None = None,
+    sort_key: Callable[[BackfillScopeState], tuple[Any, ...]] | None = None,
 ) -> ClaimResult:
     """Reclaim stale work and deterministically lease at most one bounded batch."""
 
@@ -1692,7 +1706,8 @@ def claim_scopes(
             or (scope.status is ScopeStatus.RETRYABLE_ERROR
                 and scope.next_retry_at is not None and scope.next_retry_at <= current))
     ]
-    chosen = tuple(sorted(ready, key=_claim_sort_key)[:limit])
+    order = _claim_sort_key if sort_key is None else _ordered_claim_key(sort_key)
+    chosen = tuple(sorted(ready, key=order)[:limit])
     if not chosen:
         return ClaimResult(
             batch=None,

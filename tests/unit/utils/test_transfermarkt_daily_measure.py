@@ -948,3 +948,100 @@ def test_cli_executes_promoted_registry_daily_select(tmp_path, monkeypatch, caps
         assert output["report"]["coverage_pct"] == 50
         assert snapshot.blocked_competitions[0][0] == "MISSING"
         assert output["summary"] == measure.format_daily_summary(report)
+
+
+def execute_history(scopes=(), attempts=(), batches=(), *, day=DAY):
+    from dags.utils import transfermarkt_backfill_state as backfill
+
+    sql, params = measure.build_history_day_sql(day, as_of=AS_OF)
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA ops")
+    for ddl in backfill.ddl_statements():
+        con.execute(sqlglot.transpile(ddl.split(" WITH (format")[0].replace("iceberg.ops.", "ops."),
+                                      read="trino", write="duckdb")[0])
+    for status, updated_at in scopes:
+        con.execute("INSERT INTO ops.transfermarkt_backfill_scope_v1 (status, updated_at) VALUES (?, ?)",
+                    (status, updated_at.replace(tzinfo=None)))
+    for evidence, observed_at, finished_at in attempts:
+        con.execute("INSERT INTO ops.transfermarkt_backfill_attempt_v1 "
+                    "(raw_evidence_ids_json, source_observed_at, finished_at) VALUES (?, ?, ?)",
+                    (json.dumps(evidence), observed_at and observed_at.replace(tzinfo=None),
+                     finished_at.replace(tzinfo=None)))
+    for streams, claimed_at in batches:
+        record = {"scope_stream_ids": streams} if streams else {}
+        con.execute("INSERT INTO ops.transfermarkt_backfill_batch_v1 (record_json, claimed_at) VALUES (?, ?)",
+                    (json.dumps(record), claimed_at.replace(tzinfo=None)))
+    executable = sqlglot.transpile(sql.replace("iceberg.ops.", "ops."), read="trino", write="duckdb")[0]
+    try:
+        cursor = con.execute(executable, params)
+        return dict(zip([item[0] for item in cursor.description], cursor.fetchone()))
+    finally:
+        con.close()
+
+
+def test_history_day_counts_completed_editions_new_requests_and_streams():
+    inside, before, after = START + timedelta(hours=2), START - timedelta(hours=1), START + timedelta(days=1, hours=1)
+    report = execute_history(
+        scopes=[("complete", inside), ("complete", inside), ("complete", before), ("running", inside),
+                ("complete", after)],
+        # "e1" was already sent yesterday; a continuation re-references it.  "e5" was
+        # sent before Moscow midnight but finalised after it; "e6" has no observed time.
+        attempts=[(["e1"], before, before), (["e1", "e2", "e3"], inside, inside), (["e4"], after, after),
+                  (["e5"], START + timedelta(days=1) - timedelta(minutes=5), START + timedelta(days=1, minutes=10)),
+                  (["e6"], None, inside)],
+        batches=[({"s1": "history-0", "s2": "history-1"}, inside), ({"s3": "history-0"}, inside),
+                 ({"s4": "history-2"}, before), (None, inside)],
+    )
+    assert (report["editions"], report["requests"], report["streams"]) == (2, 4, 2)
+    summary = measure.format_history_summary({**report, "report_day": DAY})
+    assert summary == (f"Transfermarkt история {DAY} МСК: изданий 2 (цель ≥ 57), "
+                       "запросов 4 (ориентир 16,5 тыс.; ±1 попытка на границе суток), потоков активных 2")
+
+
+def test_history_day_dates_a_midnight_straddling_attempt_by_its_last_request():
+    # Known bound: "m1" was sent at 23:55 МСК, "m2" at 00:05; the attempt carries only
+    # its latest request time, so both count on the next day.
+    midnight = START + timedelta(days=1)
+    attempt = (["m1", "m2"], midnight + timedelta(minutes=5), midnight + timedelta(minutes=10))
+    assert execute_history(attempts=[attempt])["requests"] == 0
+    assert execute_history(attempts=[attempt], day="2026-10-09")["requests"] == 2
+
+
+@pytest.mark.parametrize("fault", [None, "sql", "two"])
+def test_cli_history_reads_journal_and_hides_errors(monkeypatch, capsys, fault):
+    from dags.utils import transfermarkt_native_v2 as native
+
+    expected = measure.build_history_day_sql(DAY, as_of=AS_OF.isoformat())
+    row = {"editions": 3, "requests": 900, "streams": 2}
+
+    class Cursor:
+        def execute(self, sql, params=()):
+            assert (sql, params) == expected
+            if fault == "sql":
+                raise RuntimeError("private connection details")
+            self.description = [(key,) for key in row]
+            self.rows = [tuple(row.values())] * (2 if fault == "two" else 1)
+
+        def fetchall(self):
+            return self.rows
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(native, "connect", lambda: Connection())
+    result = cli.main(["--day", DAY, "--as-of", AS_OF.isoformat(), "--history"])
+    output = json.loads(capsys.readouterr().out)
+    if fault:
+        assert result == 1 and output["report"] is None
+        assert output["summary"] == f"Transfermarkt история {DAY} МСК: не измерено — ошибка чтения журнала истории"
+    else:
+        assert result == 0
+        assert output["summary"] == measure.format_history_summary({**row, "report_day": DAY})
+        assert "цель ≥ 57" in output["summary"] and "16,5 тыс." in output["summary"]
