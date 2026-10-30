@@ -107,7 +107,6 @@ FOTMOB_DAILY_ENTITIES = (
     "leaderboards",
     "matches",
     "teams",
-    "players",
     "transfers",
 )
 FOTMOB_DAILY_MAX_REQUESTS = 10_000

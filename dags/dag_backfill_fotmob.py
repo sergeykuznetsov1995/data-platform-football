@@ -53,7 +53,7 @@ TRIGGER_TASK_ID = "trigger_fotmob_backfill"
 #   * ``BACKFILL_SEASON_LIMIT`` truncates the planner to N new season-scopes so
 #     one run is bounded and the manifest resumes the rest on the next run.
 #   * proxy bytes stay 0 — FotMob is direct-only by design.
-BACKFILL_ENTITIES = "season,leaderboards,matches,teams,players,transfers"
+BACKFILL_ENTITIES = "season,leaderboards,matches,teams,transfers"
 BACKFILL_MAX_REQUESTS = 10_000
 BACKFILL_MAX_DIRECT_MIB = 512
 BACKFILL_REQUESTS_PER_MINUTE = 45

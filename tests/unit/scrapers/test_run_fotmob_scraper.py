@@ -4360,7 +4360,8 @@ class TestFotmobNativeRunner:
         assert repository.completed_competition_ids.call_args.kwargs == {}
 
     @pytest.mark.unit
-    def test_players_receive_deduplicated_ids_from_team_snapshots(self):
+    @pytest.mark.parametrize("mode", ["daily", "refresh", "backfill"])
+    def test_network_waves_keep_teams_without_player_cards(self, mode):
         from scrapers.fotmob.service import OperationResult
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import (
@@ -4378,7 +4379,7 @@ class TestFotmobNativeRunner:
                 "leagues", {"id": 47, "season": "2025/2026"}
             ).canonical_url: _league_payload(),
         }
-        service, _, _ = _service(responses)
+        service, _, repository = _service(responses)
         service.sync_team_snapshots = MagicMock(
             return_value=(OperationResult("team_snapshots", succeeded=2), {10, 11})
         )
@@ -4388,11 +4389,11 @@ class TestFotmobNativeRunner:
         args = mod._argument_parser().parse_args(
             [
                 "--mode",
-                "daily",
+                mode,
                 "--scope",
                 "47=2025/2026",
                 "--entities",
-                "players",
+                "teams",
                 "--next-build-id",
                 "build-1",
             ]
@@ -4401,10 +4402,23 @@ class TestFotmobNativeRunner:
         rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
-        assert report["selection"]["entities"] == ["players", "teams"]
-        service.sync_player_snapshots.assert_called_once_with(
-            {10, 11}, build_id="build-1", limit=2
+        assert report["selection"]["entities"] == ["teams"]
+        service.sync_team_snapshots.assert_called_once()
+        service.sync_player_snapshots.assert_not_called()
+        assert not repository.tables.get("fotmob_player_snapshots")
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("mode", ["daily", "refresh", "backfill"])
+    def test_network_waves_reject_players_before_http(self, mode):
+        mod = self._module()
+        args = mod._argument_parser().parse_args(
+            ["--mode", mode, "--entities", "teams,players"]
         )
+        service = MagicMock()
+        with pytest.raises(ValueError, match="network waves cannot collect players"):
+            _run_native_admitted(mod, args, service=service)
+        service.sync_player_snapshots.assert_not_called()
+        assert service.mock_calls == []
 
     @pytest.mark.unit
     def test_replay_player_batch_is_not_truncated_by_network_request_budget(self):

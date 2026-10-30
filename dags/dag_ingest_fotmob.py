@@ -1089,12 +1089,12 @@ with DAG(
         ),
         "deadline": Param(default="", type="string"),
         "entities": Param(
-            default="season,leaderboards,matches,teams,players,transfers",
+            default="season,leaderboards,matches,teams,transfers",
             type="string",
             title="Native entities",
             description=(
                 "Season facts are always synchronized; optional enrichments: "
-                "leaderboards,matches,teams,players,transfers"
+                "leaderboards,matches,teams,transfers"
             ),
         ),
         "max_requests": Param(default=2000, type="integer", minimum=1),
