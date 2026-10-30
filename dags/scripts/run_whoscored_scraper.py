@@ -77,16 +77,7 @@ _PRODUCER_COMMIT_PATTERNS = {
     "profile_not_available": re.compile(r"^wsprna2-[0-9a-f]{64}$"),
 }
 _PRODUCER_ATTEMPT_KINDS = ("match", "preview", "profile")
-TRANSPORT_POLICIES = ("direct_only", "direct_then_paid")
-PROXY_CAMPAIGN_CLI_ENV = {
-    "proxy_approval_path": "WHOSCORED_PROXY_APPROVAL_PATH",
-    "proxy_approval_id": "WHOSCORED_PROXY_APPROVAL_ID",
-    "proxy_approval_sha256": "WHOSCORED_PROXY_APPROVAL_SHA256",
-    "proxy_allocation_id": "WHOSCORED_PROXY_ALLOCATION_ID",
-    "proxy_attempt_id": "WHOSCORED_PROXY_ATTEMPT_ID",
-}
-PAID_GATEWAY_URL_ENV = "WHOSCORED_PAID_GATEWAY_URL"
-PAID_GATEWAY_TOKEN_ENV = "WHOSCORED_PAID_GATEWAY_TOKEN"
+TRANSPORT_POLICIES = ("direct_only",)
 _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
@@ -107,6 +98,7 @@ _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES = (
     "WHOSCORED_PAID_ALERT_SECRET_PATH",
     "WHOSCORED_PAID_ALERT_BINDING_PATH",
     "WHOSCORED_PAID_ALERT_RECEIPT_ROOT",
+    "WHOSCORED_PAID_GATEWAY_TOKEN",
 )
 _CANONICAL_SEASON_RE = re.compile(
     r"^[0-9]{4}(?:-(?:single|split|multi)-ws[1-9][0-9]*)?$"
@@ -248,7 +240,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transport-policy",
         choices=TRANSPORT_POLICIES,
         default=None,
-        help="Explicit route policy; paid mode also requires a signed allocation",
+        help="Route policy; only direct_only exists (#1487)",
     )
     parser.add_argument(
         "--direct-only",
@@ -257,22 +249,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Compatibility alias for --transport-policy direct_only",
     )
-    parser.add_argument(
-        "--allow-paid-proxy",
-        dest="legacy_allow_paid_proxy",
-        action="store_true",
-        default=False,
-        help=(
-            "Removed unsafe boolean opt-in; use --transport-policy "
-            "direct_then_paid with a signed approval"
-        ),
-    )
-    parser.add_argument("--proxy-approval-path", default=None)
-    parser.add_argument("--proxy-approval-id", default=None)
-    parser.add_argument("--proxy-approval-sha256", default=None)
-    parser.add_argument("--proxy-allocation-id", default=None)
-    parser.add_argument("--proxy-attempt-id", default=None)
-    parser.add_argument("--proxy-work-item-id", default=None)
     parser.add_argument(
         "--full-history",
         action="store_true",
@@ -356,25 +332,8 @@ def _validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> list[RunnerScope]:
     scopes = _resolve_scopes(parser, args.scope)
-    if args.legacy_allow_paid_proxy:
-        parser.error(
-            "--allow-paid-proxy cannot authorize paid traffic; use a signed "
-            "--transport-policy direct_then_paid campaign"
-        )
-    policy = args.transport_policy or "direct_only"
-    if args.direct_only and policy != "direct_only":
-        parser.error("--direct-only conflicts with --transport-policy direct_then_paid")
-    if policy != "direct_only":
-        # The paid gateway and its release pins went with the ceremony (#1487).
-        parser.error("direct_then_paid was removed (#1487); only direct_only runs")
-    args.transport_policy = policy
+    args.transport_policy = args.transport_policy or "direct_only"
     args.direct_only = True
-    proxy_values = {
-        attribute: str(getattr(args, attribute) or "").strip()
-        for attribute in PROXY_CAMPAIGN_CLI_ENV
-    }
-    if any(proxy_values.values()) or args.proxy_work_item_id:
-        parser.error("proxy approval arguments require direct_then_paid")
     if args.command == "history" and (scopes or args.max_matches is not None):
         parser.error("history uses its computed queue and fixed match limit")
     if args.chunk_size <= 0:
@@ -520,28 +479,9 @@ def _configure_transport_environment(args: argparse.Namespace) -> None:
     """Project validated CLI authority into the transport's process env."""
 
     os.environ["WHOSCORED_TRANSPORT_POLICY"] = str(args.transport_policy)
-    # Populated only from a verified schema-v3 approval below. Keeping the
-    # binding on the process-local Namespace lets the runner freeze exact due
-    # IDs before the schedule refresh can mutate repository eligibility.
-    args.scheduled_scope_workload = None
-    from scrapers.whoscored.proxy_campaign import (
-        SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV,
-    )
-
-    # This value is derived again from the verified scheduled authority below;
-    # a caller-controlled inherited value can never enlarge the scope runtime.
-    os.environ.pop(SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV, None)
     # The runner has no filtering-proxy or signing authority.  Remove legacy
-    # origins and authority secrets before any mutable runtime module or source
-    # transport can observe them.
+    # origins and authority secrets before any source transport can observe them.
     for name in _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES:
-        os.environ.pop(name, None)
-    # Paid credentials may be mounted on every worker, but a direct task
-    # removes the gateway authority and all campaign selectors before any
-    # transport is constructed.
-    os.environ.pop(PAID_GATEWAY_URL_ENV, None)
-    os.environ.pop(PAID_GATEWAY_TOKEN_ENV, None)
-    for name in PROXY_CAMPAIGN_CLI_ENV.values():
         os.environ.pop(name, None)
 
 
@@ -561,164 +501,6 @@ def _new_repository() -> Any:
     from scrapers.whoscored.repository import WhoScoredRepository
 
     return WhoScoredRepository()
-
-
-def _freeze_scheduled_scope_targets(
-    repository: Any,
-    selected: Sequence[tuple[RunnerScope, Any]],
-    args: argparse.Namespace,
-) -> None:
-    """Freeze exact signed match/preview IDs before the first source request.
-
-    ``sync_schedule`` intentionally refreshes Bronze before preview and match
-    ingestion. Without this process-local snapshot, that refresh could make a
-    different candidate set eligible after the signed workload was checked,
-    allowing paid traffic outside the owner-approved target identity.
-    """
-
-    workload = getattr(args, "scheduled_scope_workload", None)
-    if workload is None:
-        return
-    if not isinstance(workload, Mapping):
-        raise ValueError("scheduled paid scope workload is invalid")
-    if args.command != "daily" or len(selected) != 1:
-        raise ValueError("scheduled paid workload requires exactly one daily scope")
-
-    from scrapers.whoscored.proxy_campaign import (
-        scheduled_scope_player_pagination_target_limit,
-        scheduled_scope_schedule_target_limit,
-        scheduled_target_ids_sha256,
-    )
-    from scrapers.whoscored.repository import entity_id_payload_sha256
-
-    scope, runtime_scope = selected[0]
-    expected_work_item_id = (
-        "scope-" + hashlib.sha256(scope.spec.encode("utf-8")).hexdigest()
-    )
-    if (
-        workload.get("scope") != scope.spec
-        or workload.get("work_item_id") != expected_work_item_id
-        or workload.get("work_item_id") != args.proxy_work_item_id
-    ):
-        raise ValueError("scheduled paid workload belongs to another scope")
-
-    match_count = workload.get("match_target_count")
-    preview_count = workload.get("preview_target_count")
-    schedule_limit = workload.get("schedule_target_limit")
-    schedule_sha256 = workload.get("schedule_targets_sha256")
-    pagination_limit = workload.get("player_pagination_target_limit")
-    match_sha256 = workload.get("match_targets_sha256")
-    preview_sha256 = workload.get("preview_targets_sha256")
-    if (
-        type(schedule_limit) is not int
-        or schedule_limit <= 0
-        or not isinstance(schedule_sha256, str)
-        or _SHA256.fullmatch(schedule_sha256) is None
-        or type(pagination_limit) is not int
-        or pagination_limit < 0
-        or type(match_count) is not int
-        or not 0 <= match_count <= 100
-        or type(preview_count) is not int
-        or not 0 <= preview_count <= 256
-        or not isinstance(match_sha256, str)
-        or _SHA256.fullmatch(match_sha256) is None
-        or not isinstance(preview_sha256, str)
-        or _SHA256.fullmatch(preview_sha256) is None
-    ):
-        raise ValueError("scheduled paid target identity is invalid")
-
-    stage_ids = tuple(
-        sorted({int(value) for value in getattr(runtime_scope, "stage_ids", ())})
-    )
-    start = getattr(runtime_scope, "start", None)
-    end = getattr(runtime_scope, "end", None)
-    if not stage_ids or start is None or end is None or end < start:
-        raise ValueError("scheduled paid scope has no bounded frozen schedule")
-    season_month_count = (end.year - start.year) * 12 + end.month - start.month + 1
-    expected_schedule_limit = scheduled_scope_schedule_target_limit(
-        stage_count=len(stage_ids), season_month_count=season_month_count
-    )
-    expected_schedule_sha256 = scheduled_target_ids_sha256(
-        [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
-    )
-    expected_pagination_limit = scheduled_scope_player_pagination_target_limit(
-        stage_count=len(stage_ids),
-        non_pagination_target_count=(
-            expected_schedule_limit + match_count + preview_count
-        ),
-    )
-    if (
-        schedule_limit != expected_schedule_limit
-        or schedule_sha256 != expected_schedule_sha256
-        or pagination_limit != expected_pagination_limit
-    ):
-        raise ValueError(
-            "scheduled paid schedule target identity drifted before network"
-        )
-
-    matches = repository.list_match_candidates(
-        scope.competition_id,
-        scope.season_id,
-        limit=101,
-        include_exact_count=True,
-    )
-    observed_match_count = (
-        int(matches[0].exact_candidate_count)
-        if matches and matches[0].exact_candidate_count is not None
-        else len(matches)
-    )
-    match_ids = tuple(sorted({int(candidate.game_id) for candidate in matches}))
-    previews = repository.list_preview_candidates(
-        scope.competition_id,
-        scope.season_id,
-        limit=257,
-    )
-    preview_ids = tuple(sorted({int(candidate["game_id"]) for candidate in previews}))
-    if (
-        observed_match_count != len(match_ids)
-        or observed_match_count != match_count
-        or scheduled_target_ids_sha256(match_ids) != match_sha256
-        or len(previews) != len(preview_ids)
-        or len(preview_ids) != preview_count
-        or scheduled_target_ids_sha256(preview_ids) != preview_sha256
-    ):
-        raise ValueError("scheduled paid due target identity drifted before network")
-
-    args._match_ids = match_ids
-    args._preview_ids = preview_ids
-    args._scheduled_scope_attempts = {
-        "scope": scope.spec,
-        "match": {
-            "schema_version": 1,
-            "scope": scope.spec,
-            "count": len(match_ids),
-            "payload_sha256": entity_id_payload_sha256(match_ids),
-        },
-        "preview": {
-            "schema_version": 1,
-            "scope": scope.spec,
-            "count": len(preview_ids),
-            "payload_sha256": entity_id_payload_sha256(preview_ids),
-        },
-    }
-
-
-def _validate_scheduled_scope_attempts(
-    report: Mapping[str, Any], args: argparse.Namespace
-) -> None:
-    """Require service attempts to equal the immutable pre-schedule snapshot."""
-
-    expected = getattr(args, "_scheduled_scope_attempts", None)
-    if expected is None:
-        return
-    producer_attempts = report.get("producer_attempts")
-    if not isinstance(expected, Mapping) or not isinstance(producer_attempts, Mapping):
-        raise ValueError("scheduled paid attempted-target evidence is unavailable")
-    for kind in ("match", "preview"):
-        if producer_attempts.get(kind) != [expected[kind]]:
-            raise ValueError(
-                f"scheduled paid {kind} attempts differ from the signed target set"
-            )
 
 
 def _scope_value(value: Any) -> RunnerScope:
@@ -903,7 +685,6 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
         "tables_by_entity": {},
         "traffic": {},
         "traffic_by_scope": {},
-        "paid_proxy_bytes": 0,
         "queue": None,
         "catalog_batch_id": None,
         "catalog_payload_sha256": None,
@@ -932,23 +713,16 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
             "profile": [],
         },
         "transport_policy": "direct_only",
-        "proxy_approval_id": None,
-        "proxy_approval_sha256": None,
     }
 
 
 def _bind_report_transport_identity(
     report: MutableMapping[str, Any], args: argparse.Namespace
 ) -> None:
-    """Preserve paid identity whenever catalog selection rebuilds a report."""
+    """Preserve the transport identity whenever catalog selection rebuilds a report."""
 
     report["direct_only"] = bool(args.direct_only)
     report["transport_policy"] = args.transport_policy
-    report["proxy_approval_id"] = args.proxy_approval_id
-    report["proxy_approval_sha256"] = args.proxy_approval_sha256
-    report["proxy_allocation_id"] = args.proxy_allocation_id
-    report["proxy_work_item_id"] = args.proxy_work_item_id
-    report["proxy_attempt_id"] = args.proxy_attempt_id
     report["catalog_batch_id"] = args.catalog_batch_id
 
 
@@ -1229,25 +1003,6 @@ def _merge_traffic(target: MutableMapping[str, Any], source: Mapping[str, Any]) 
             target[key] = value
 
 
-def _paid_proxy_bytes(traffic: Mapping[str, Any]) -> int:
-    """Read the canonical paid byte counter without double-counting children."""
-    for key in ("paid_proxy_bytes", "paid_bytes"):
-        value = traffic.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return max(0, int(value))
-    routes = traffic.get("routes")
-    if isinstance(routes, Mapping):
-        total = 0
-        for route, counters in routes.items():
-            if not str(route).startswith("paid_") or not isinstance(counters, Mapping):
-                continue
-            value = counters.get("wire_bytes", counters.get("response_bytes", 0))
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                total += max(0, int(value))
-        return total
-    return 0
-
-
 def _operations(command: str, daily_part: str = "matches") -> tuple[str, ...]:
     if command == "daily":
         if daily_part == "stages":
@@ -1494,7 +1249,6 @@ def _finish(report: dict[str, Any], output: str) -> int:
         report["status"] = "success"
         exit_code = 0
     report["finished_at"] = _utc_now_iso()
-    report["paid_proxy_bytes"] = _paid_proxy_bytes(report.get("traffic", {}))
     _write_report(output, report)
     match_backlog = report.get("match_candidates") or {}
     logger.info(
@@ -1689,7 +1443,7 @@ def _run_service_operations(
                                 # Schedule is a hard prerequisite for preview
                                 # and match candidate selection.  Continuing
                                 # after any entity failure can scrape stale
-                                # candidates and spend paid budget needlessly.
+                                # candidates and spend source requests needlessly.
                                 break
                         except proxy_unavailable:
                             _collect_traffic(report, scope, service)
@@ -2096,32 +1850,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["catalog_batch_id"] = str(catalog_generation["catalog_batch_id"])
         if backfill_discovery_result is not None:
             _merge_unscoped_result(report, backfill_discovery_result)
-        try:
-            _freeze_scheduled_scope_targets(repository, selected, args)
-        except Exception as exc:
-            if selected:
-                owner = selected[0][0]
-                record = _scope_record(report, owner)
-                _record_error(
-                    report,
-                    record,
-                    owner,
-                    "scheduled-workload-preflight",
-                    exc,
-                )
-                _set_scope_status(record)
-            else:
-                report["errors"].append(f"scheduled-workload-preflight: {exc}")
-                report["error_details"].append(
-                    {
-                        "scope": None,
-                        "entity": "scheduled-workload-preflight",
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                        "retryable": False,
-                    }
-                )
-            return _finish(report, args.output)
         logger.info(
             "Starting WhoScored workflow: command=%s scopes=%s",
             args.command,
@@ -2170,19 +1898,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args=args,
                     operations=_operations("daily", args.daily_part),
                 )
-                try:
-                    _validate_scheduled_scope_attempts(report, args)
-                except Exception as exc:
-                    owner = selected[0][0]
-                    record = _scope_record(report, owner)
-                    _record_error(
-                        report,
-                        record,
-                        owner,
-                        "scheduled-workload-attempts",
-                        exc,
-                    )
-                    _set_scope_status(record)
             if not args.skip_profiles and not report["error_details"]:
                 _run_global_profiles(
                     service_cls=service_cls,

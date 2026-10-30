@@ -38,39 +38,13 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--direct-only", action="store_true", default=None)
-    parser.add_argument("--proxy-approval-path", default=None)
-    parser.add_argument("--proxy-approval-id", default=None)
-    parser.add_argument("--proxy-approval-sha256", default=None)
-    parser.add_argument("--proxy-allocation-id", default=None)
-    parser.add_argument("--proxy-attempt-id", default=None)
-    parser.add_argument("--proxy-work-item-id", default=None)
     return parser
 
 
-def _validate_transport_args(
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-) -> None:
-    policy = args.transport_policy or "direct_only"
-    if args.direct_only and policy != "direct_only":
-        parser.error("--direct-only conflicts with direct_then_paid")
-    if policy != "direct_only":
-        # The paid gateway and its release pins went with the ceremony (#1487).
-        parser.error("direct_then_paid was removed (#1487); only direct_only runs")
-    args.transport_policy = policy
+def _validate_transport_args(args: argparse.Namespace) -> None:
+    # argparse choices already admit only direct_only (#1487).
+    args.transport_policy = args.transport_policy or "direct_only"
     args.direct_only = True
-    if any(
-        getattr(args, name)
-        for name in (
-            "proxy_approval_path",
-            "proxy_approval_id",
-            "proxy_approval_sha256",
-            "proxy_allocation_id",
-            "proxy_attempt_id",
-            "proxy_work_item_id",
-        )
-    ):
-        parser.error("proxy approval arguments require direct_then_paid")
 
 
 def _decode_work_item(value: str) -> dict[str, Any]:
@@ -284,17 +258,6 @@ def _run_work_item(
     report["transport_policy"] = os.environ.get(
         "WHOSCORED_TRANSPORT_POLICY", "direct_only"
     )
-    report["proxy_approval_id"] = os.environ.get(
-        "WHOSCORED_PROXY_APPROVAL_ID"
-    )
-    report["proxy_approval_sha256"] = os.environ.get(
-        "WHOSCORED_PROXY_APPROVAL_SHA256"
-    )
-    report["proxy_allocation_id"] = os.environ.get(
-        "WHOSCORED_PROXY_ALLOCATION_ID"
-    )
-    report["proxy_work_item_id"] = str(item["work_id"])
-    report["proxy_attempt_id"] = os.environ.get("WHOSCORED_PROXY_ATTEMPT_ID")
     record = runner._scope_record(report, scope)
     outcome: dict[str, Any] = {}
     schedule_result: Any = None
@@ -465,7 +428,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         state = WhoScoredBackfillState.from_env()
         item = _decode_work_item(args.work_item)
-        _validate_transport_args(parser, args)
+        _validate_transport_args(args)
         runner._configure_transport_environment(args)
     except Exception as exc:
         report = runner._new_report("backfill", ())

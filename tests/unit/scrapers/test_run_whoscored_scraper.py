@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -509,49 +508,6 @@ def _run(
     output = tmp_path / "result.json"
     rc = runner.main([*args, "--output", str(output)])
     return rc, json.loads(output.read_text(encoding="utf-8")), runtime, catalog
-
-
-def _scheduled_scope_binding(scope, *, match_ids, preview_ids):
-    from scrapers.whoscored.proxy_campaign import (
-        scheduled_scope_player_pagination_target_limit,
-        scheduled_scope_schedule_target_limit,
-        scheduled_target_ids_sha256,
-    )
-
-    stage_ids = (23752,)
-    start = date(2025, 8, 1)
-    end = date(2026, 5, 31)
-    month_count = (end.year - start.year) * 12 + end.month - start.month + 1
-    schedule_limit = scheduled_scope_schedule_target_limit(
-        stage_count=len(stage_ids), season_month_count=month_count
-    )
-    pagination_limit = scheduled_scope_player_pagination_target_limit(
-        stage_count=len(stage_ids),
-        non_pagination_target_count=(
-            schedule_limit + len(match_ids) + len(preview_ids)
-        ),
-    )
-    work_item_id = "scope-" + hashlib.sha256(scope.spec.encode("utf-8")).hexdigest()
-    return (
-        SimpleNamespace(stage_ids=stage_ids, start=start, end=end),
-        work_item_id,
-        {
-            "scope": scope.spec,
-            "work_item_id": work_item_id,
-            "schedule_target_limit": schedule_limit,
-            "schedule_targets_sha256": scheduled_target_ids_sha256(
-                [
-                    f"season:{scope.spec}",
-                    *(f"stage:{value}" for value in stage_ids),
-                ]
-            ),
-            "player_pagination_target_limit": pagination_limit,
-            "match_target_count": len(match_ids),
-            "match_targets_sha256": scheduled_target_ids_sha256(match_ids),
-            "preview_target_count": len(preview_ids),
-            "preview_targets_sha256": scheduled_target_ids_sha256(preview_ids),
-        },
-    )
 
 
 @pytest.mark.unit
@@ -1128,21 +1084,20 @@ def test_removed_entity_cli_commands_are_rejected():
 @pytest.mark.unit
 def test_removed_paid_policy_is_rejected():
     parser = runner._build_parser()
-    args = parser.parse_args(
-        [
-            "replay",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--game-id",
-            "123",
-            "--output",
-            "/tmp/result.json",
-            "--transport-policy",
-            "direct_then_paid",
-        ]
-    )
     with pytest.raises(SystemExit):
-        runner._validate_args(parser, args)
+        parser.parse_args(
+            [
+                "replay",
+                "--scope",
+                "ENG-Premier League=2526",
+                "--game-id",
+                "123",
+                "--output",
+                "/tmp/result.json",
+                "--transport-policy",
+                "direct_then_paid",
+            ]
+        )
 
 
 @pytest.mark.unit
@@ -1184,10 +1139,9 @@ def test_discover_uses_scope_free_service_boundary(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
-def test_direct_only_removes_all_paid_authority_before_transport_construction(
+def test_direct_run_scrubs_authority_secrets_before_transport_construction(
     monkeypatch, tmp_path
 ):
-    monkeypatch.setenv("WHOSCORED_PAID_GATEWAY_URL", "http://paid-gateway")
     monkeypatch.setenv("WHOSCORED_PAID_GATEWAY_TOKEN", "g" * 32)
     monkeypatch.setenv("WHOSCORED_PAID_PROXY_URL", "http://paid-secret")
     monkeypatch.setenv("WHOSCORED_PROXY_CONTROL_URL", "http://control-secret")
@@ -1498,7 +1452,6 @@ def test_daily_profile_snapshot_drift_fails_before_source_transport(
 
     assert rc == 1
     assert service_cls.instances == []
-    assert report["paid_proxy_bytes"] == 0
     assert "changed before source work" in report["errors"][0]
 
 
@@ -1755,206 +1708,6 @@ def test_daily_profile_cli_enforces_the_deployed_lower_hard_cap(monkeypatch):
 
     with pytest.raises(SystemExit):
         runner._validate_args(parser, args)
-
-
-@pytest.mark.unit
-def test_scheduled_scope_freezes_signed_targets_across_schedule_mutation():
-    scope = runner.RunnerScope("ENG-Premier League", "2526")
-    runtime_scope, work_item_id, workload = _scheduled_scope_binding(
-        scope, match_ids=[11, 12], preview_ids=[21]
-    )
-
-    class Repository:
-        match_ids = [11, 12]
-        preview_ids = [21]
-
-        def list_match_candidates(
-            self,
-            competition_id,
-            season_id,
-            *,
-            limit,
-            include_exact_count,
-        ):
-            assert (competition_id, season_id, limit, include_exact_count) == (
-                "ENG-Premier League",
-                "2526",
-                101,
-                True,
-            )
-            return [
-                SimpleNamespace(
-                    game_id=value,
-                    exact_candidate_count=len(self.match_ids),
-                )
-                for value in self.match_ids
-            ]
-
-        def list_preview_candidates(self, competition_id, season_id, *, limit):
-            assert (competition_id, season_id, limit) == (
-                "ENG-Premier League",
-                "2526",
-                257,
-            )
-            return [{"game_id": value} for value in self.preview_ids]
-
-    repository = Repository()
-    args = SimpleNamespace(
-        command="daily",
-        max_matches=None,
-        proxy_work_item_id=work_item_id,
-        scheduled_scope_workload=workload,
-    )
-
-    runner._freeze_scheduled_scope_targets(
-        repository,
-        [(scope, runtime_scope)],
-        args,
-    )
-    repository.match_ids[:] = [99]
-    repository.preview_ids[:] = [98]
-
-    class Service:
-        calls = []
-
-        def sync_previews(self, **kwargs):
-            self.calls.append(("preview", kwargs))
-            return object()
-
-        def sync_matches(self, **kwargs):
-            self.calls.append(("match", kwargs))
-            return object()
-
-    service = Service()
-    runner._invoke(service, "previews", args)
-    runner._invoke(service, "matches", args)
-
-    assert service.calls[0] == (
-        "preview",
-        {"match_ids": (21,), "force_replay": False},
-    )
-    assert service.calls[1][0] == "match"
-    assert service.calls[1][1]["match_ids"] == (11, 12)
-    assert service.calls[1][1]["limit"] is None
-    assert "kickoff_from" not in service.calls[1][1]
-
-    attempts = args._scheduled_scope_attempts
-    report = {
-        "producer_attempts": {
-            "match": [attempts["match"]],
-            "preview": [attempts["preview"]],
-        }
-    }
-    runner._validate_scheduled_scope_attempts(report, args)
-    report["producer_attempts"]["preview"][0] = {
-        **attempts["preview"],
-        "count": 0,
-    }
-    with pytest.raises(ValueError, match="preview attempts differ"):
-        runner._validate_scheduled_scope_attempts(report, args)
-
-
-@pytest.mark.unit
-def test_scheduled_scope_preserves_explicit_empty_target_sets():
-    scope = runner.RunnerScope("ENG-Premier League", "2526")
-    runtime_scope, work_item_id, workload = _scheduled_scope_binding(
-        scope, match_ids=[], preview_ids=[]
-    )
-
-    class EmptyRepository:
-        def list_match_candidates(self, *_args, **_kwargs):
-            return []
-
-        def list_preview_candidates(self, *_args, **_kwargs):
-            return []
-
-    args = SimpleNamespace(
-        command="daily",
-        max_matches=None,
-        proxy_work_item_id=work_item_id,
-        scheduled_scope_workload=workload,
-    )
-    runner._freeze_scheduled_scope_targets(
-        EmptyRepository(),
-        [(scope, runtime_scope)],
-        args,
-    )
-
-    class Service:
-        def sync_matches(self, **kwargs):
-            return kwargs
-
-    kwargs = runner._invoke(Service(), "matches", args)
-    assert kwargs["match_ids"] == ()
-    assert kwargs["limit"] is None
-    assert "kickoff_from" not in kwargs
-
-
-@pytest.mark.unit
-def test_scheduled_scope_rejects_target_drift_before_network():
-    scope = runner.RunnerScope("ENG-Premier League", "2526")
-    runtime_scope, work_item_id, workload = _scheduled_scope_binding(
-        scope, match_ids=[11], preview_ids=[]
-    )
-
-    class DriftedRepository:
-        def list_match_candidates(self, *_args, **_kwargs):
-            return [SimpleNamespace(game_id=12, exact_candidate_count=1)]
-
-        def list_preview_candidates(self, *_args, **_kwargs):
-            return []
-
-    args = SimpleNamespace(
-        command="daily",
-        proxy_work_item_id=work_item_id,
-        scheduled_scope_workload=workload,
-    )
-    with pytest.raises(ValueError, match="drifted before network"):
-        runner._freeze_scheduled_scope_targets(
-            DriftedRepository(),
-            [(scope, runtime_scope)],
-            args,
-        )
-    assert not hasattr(args, "_match_ids")
-
-
-@pytest.mark.unit
-def test_report_rebuild_preserves_exact_paid_transport_identity():
-    args = SimpleNamespace(
-        direct_only=False,
-        transport_policy="direct_then_paid",
-        proxy_approval_id="approval-1",
-        proxy_approval_sha256="a" * 64,
-        proxy_allocation_id="allocation-1",
-        proxy_work_item_id="work-1",
-        proxy_attempt_id="attempt-1",
-        catalog_batch_id="catalog-1",
-    )
-    report = runner._new_report("backfill", ())
-
-    runner._bind_report_transport_identity(report, args)
-
-    assert {
-        key: report[key]
-        for key in (
-            "transport_policy",
-            "proxy_approval_id",
-            "proxy_approval_sha256",
-            "proxy_allocation_id",
-            "proxy_work_item_id",
-            "proxy_attempt_id",
-        )
-    } == {
-        "transport_policy": "direct_then_paid",
-        "proxy_approval_id": "approval-1",
-        "proxy_approval_sha256": "a" * 64,
-        "proxy_allocation_id": "allocation-1",
-        "proxy_work_item_id": "work-1",
-        "proxy_attempt_id": "attempt-1",
-    }
-
-
-# --- #1476: dead residential pool stops the run --------------------------------
 
 
 @pytest.mark.unit

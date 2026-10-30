@@ -13,7 +13,6 @@ from dags.scripts.run_whoscored_backfill_item import (
     _parser,
     _schedule_request_accounting,
     _source_request_attempts,
-    _validate_transport_args,
 )
 from dags.scripts.run_whoscored_scraper import RunnerScope
 
@@ -170,23 +169,21 @@ def test_schedule_accounting_rejects_missing_stage_evidence():
 
 @pytest.mark.unit
 def test_backfill_worker_rejects_the_removed_paid_policy():
-    parser = _parser()
-    args = parser.parse_args(
-        [
-            "--queue-id",
-            "queue",
-            "--plan-id",
-            "a" * 64,
-            "--work-item",
-            "encoded",
-            "--output",
-            "/tmp/result.json",
-            "--transport-policy",
-            "direct_then_paid",
-        ]
-    )
     with pytest.raises(SystemExit):
-        _validate_transport_args(parser, args)
+        _parser().parse_args(
+            [
+                "--queue-id",
+                "queue",
+                "--plan-id",
+                "a" * 64,
+                "--work-item",
+                "encoded",
+                "--output",
+                "/tmp/result.json",
+                "--transport-policy",
+                "direct_then_paid",
+            ]
+        )
 
 
 @pytest.mark.unit
