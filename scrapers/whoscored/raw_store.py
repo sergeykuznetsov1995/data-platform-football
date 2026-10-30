@@ -29,7 +29,6 @@ from urllib.parse import urlparse
 from pyarrow import fs
 
 from .domain import WhoScoredScope
-from .runtime_contract import require_production_runtime_class
 
 logger = logging.getLogger(__name__)
 
@@ -213,13 +212,11 @@ class WhoScoredRawStore:
     """
 
     def __init__(self, filesystem: fs.FileSystem, root: str) -> None:
-        require_production_runtime_class(operation="WhoScored raw persistence")
         self.filesystem = filesystem
         self.root = root.strip("/") if not root.startswith("/") else root.rstrip("/")
 
     @classmethod
     def from_uri(cls, uri: str) -> "WhoScoredRawStore":
-        require_production_runtime_class(operation="WhoScored raw persistence")
         invalid_uri = "Invalid S3 raw-store URI"
         if (
             type(uri) is not str

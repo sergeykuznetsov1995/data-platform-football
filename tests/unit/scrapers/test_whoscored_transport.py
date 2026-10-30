@@ -25,7 +25,6 @@ from scrapers.whoscored.source_circuit import (
     SharedSourceCircuit,
     SourceCircuitOpen,
 )
-from scrapers.whoscored.runtime_contract import RuntimeContractError
 from scrapers.whoscored.transport import (
     CachedPayload,
     CloudflareChallenge,
@@ -693,58 +692,6 @@ def test_paid_batch_records_one_hashed_aggregate_receipt_event():
     assert accounted[0]["gateway_endpoint_provider_bytes"] == endpoint_bytes
     assert accounted[0]["gateway_bootstrap_provider_bytes"] == 100
     assert transport.get_traffic_stats()["paid_proxy_bytes"] == 1_000
-
-
-@pytest.mark.unit
-def test_internal_flaresolverr_clients_bind_attested_runtime_hash(monkeypatch):
-    expected_hash = "a" * 64
-    monkeypatch.setattr(
-        transport_module,
-        "attested_runtime_file_sha256",
-        lambda relative: (
-            expected_hash
-            if relative == "scripts/flaresolverr_extended.py"
-            else pytest.fail("unexpected runtime identity path")
-        ),
-    )
-
-    transport = WhoScoredTransport(
-        direct_http_session=FakeHTTPSession(),
-    )
-
-    assert transport._direct_fs._expected_version == "3.4.6"
-    assert transport._direct_fs._expected_extension_sha256 == expected_hash
-    assert transport._paid_fs._expected_version == "3.4.6"
-    assert transport._paid_fs._expected_extension_sha256 == expected_hash
-
-
-@pytest.mark.unit
-def test_production_marker_cannot_lose_flaresolverr_attested_hash(monkeypatch):
-    def unavailable(_relative):
-        raise RuntimeContractError("guard missing")
-
-    monkeypatch.setattr(
-        transport_module,
-        "attested_runtime_file_sha256",
-        unavailable,
-    )
-    monkeypatch.setattr(
-        transport_module,
-        "require_production_runtime_class",
-        lambda *, operation: "production-v1",
-    )
-    monkeypatch.setattr(
-        transport_module.sys,
-        "_whoscored_runtime_class",
-        "production-v1",
-        raising=False,
-    )
-    direct = FakeHTTPSession()
-
-    with pytest.raises(RuntimeContractError, match="no attested FlareSolverr"):
-        WhoScoredTransport(direct_http_session=direct)
-
-    assert direct.calls == []
 
 
 @pytest.mark.unit

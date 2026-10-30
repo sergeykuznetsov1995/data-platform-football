@@ -7,39 +7,7 @@ Each invocation owns either one schedule freeze, one 25-match chunk, or one
 never update a shared queue file.
 """
 
-# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
-
 from __future__ import annotations
-
-import sys as _whoscored_bootstrap_sys
-
-_whoscored_source = __file__
-if not _whoscored_source.startswith("/"):
-    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
-_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
-_whoscored_root = "/opt/airflow" if _whoscored_production else _whoscored_source.rsplit("/dags/", 1)[0]
-if _whoscored_production:
-    if getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None) != 2:
-        raise RuntimeError("image-baked WhoScored startup anchor is required")
-elif getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None) != _whoscored_root:
-    _whoscored_anchor_path = (
-        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
-    )
-    _whoscored_anchor_globals = {
-        "__builtins__": __builtins__,
-        "sys": _whoscored_bootstrap_sys,
-        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
-        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
-    }
-    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
-        _whoscored_anchor_source = _whoscored_anchor_handle.read()
-    exec(
-        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
-        _whoscored_anchor_globals,
-    )
-_WHOSCORED_RUNTIME_CONTRACT = (
-    _whoscored_bootstrap_sys._load_whoscored_runtime_contract(_whoscored_root)
-)
 
 import argparse
 import base64
@@ -82,48 +50,27 @@ def _parser() -> argparse.ArgumentParser:
 def _validate_transport_args(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
-    *,
-    work_item_id: str,
 ) -> None:
     policy = args.transport_policy or "direct_only"
     if args.direct_only and policy != "direct_only":
         parser.error("--direct-only conflicts with direct_then_paid")
+    if policy != "direct_only":
+        # The paid gateway and its release pins went with the ceremony (#1487).
+        parser.error("direct_then_paid was removed (#1487); only direct_only runs")
     args.transport_policy = policy
-    args.direct_only = policy == "direct_only"
-    if args.direct_only:
-        if any(
-            getattr(args, name)
-            for name in (
-                "proxy_approval_path",
-                "proxy_approval_id",
-                "proxy_approval_sha256",
-                "proxy_allocation_id",
-                "proxy_attempt_id",
-                "proxy_work_item_id",
-            )
-        ):
-            parser.error("proxy approval arguments require direct_then_paid")
-        return
-    missing = [
-        name
+    args.direct_only = True
+    if any(
+        getattr(args, name)
         for name in (
             "proxy_approval_path",
             "proxy_approval_id",
             "proxy_approval_sha256",
+            "proxy_allocation_id",
+            "proxy_attempt_id",
+            "proxy_work_item_id",
         )
-        if not str(getattr(args, name) or "").strip()
-    ]
-    if missing:
-        parser.error(
-            "direct_then_paid requires signed proxy arguments: "
-            + ", ".join("--" + name.replace("_", "-") for name in missing)
-        )
-    if args.proxy_allocation_id:
-        parser.error("--proxy-allocation-id is internal and cannot select paid authority")
-    if args.proxy_work_item_id and args.proxy_work_item_id != work_item_id:
-        parser.error("--proxy-work-item-id differs from the immutable backfill item")
-    args.proxy_work_item_id = work_item_id
-    args.expected_proxy_work_item_id = work_item_id
+    ):
+        parser.error("proxy approval arguments require direct_then_paid")
 
 
 def _decode_work_item(value: str) -> dict[str, Any]:
@@ -515,22 +462,11 @@ def _run_work_item(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
-        operation="WhoScored backfill item entrypoint"
-    )
     try:
         state = WhoScoredBackfillState.from_env()
         item = _decode_work_item(args.work_item)
-        _validate_transport_args(
-            parser,
-            args,
-            work_item_id=str(item.get("work_id") or ""),
-        )
+        _validate_transport_args(parser, args)
         runner._configure_transport_environment(args)
-        runtime = _WHOSCORED_RUNTIME_CONTRACT.validate_runtime_contract(
-            report_schema_version=runner.REPORT_SCHEMA_VERSION
-        )
-        runner._validate_paid_release_pins(args, runtime)
     except Exception as exc:
         report = runner._new_report("backfill", ())
         _record_unscoped_error(report, exc)

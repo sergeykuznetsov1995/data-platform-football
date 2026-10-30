@@ -14,7 +14,6 @@ from dags.scripts.run_whoscored_backfill_item import (
     _schedule_request_accounting,
     _source_request_attempts,
     _validate_transport_args,
-    main,
 )
 from dags.scripts.run_whoscored_scraper import RunnerScope
 
@@ -170,71 +169,24 @@ def test_schedule_accounting_rejects_missing_stage_evidence():
 
 
 @pytest.mark.unit
-def test_backfill_worker_rejects_invalid_plan_before_runtime_projection(
-    monkeypatch, tmp_path
-):
-    from scrapers.whoscored import runtime_contract
-
-    observed = []
-
-    def validate(**kwargs):
-        observed.append(kwargs)
-
-    monkeypatch.setattr(runtime_contract, "validate_runtime_contract", validate)
-    output = tmp_path / "worker.json"
-
-    rc = main(
+def test_backfill_worker_rejects_the_removed_paid_policy():
+    parser = _parser()
+    args = parser.parse_args(
         [
             "--queue-id",
             "queue",
             "--plan-id",
             "a" * 64,
             "--work-item",
-            "not-valid-base64",
+            "encoded",
             "--output",
-            str(output),
+            "/tmp/result.json",
+            "--transport-policy",
+            "direct_then_paid",
         ]
     )
-
-    assert rc == 1
-    assert observed == []
-
-
-@pytest.mark.unit
-def test_backfill_worker_binds_paid_selector_to_decoded_work_item():
-    parser = _parser()
-    common = [
-        "--queue-id",
-        "queue",
-        "--plan-id",
-        "a" * 64,
-        "--work-item",
-        "encoded",
-        "--output",
-        "/tmp/result.json",
-        "--transport-policy",
-        "direct_then_paid",
-        "--proxy-approval-path",
-        "/run/approval.json",
-        "--proxy-approval-id",
-        "approval-1",
-        "--proxy-approval-sha256",
-        "b" * 64,
-    ]
-    args = parser.parse_args(common + ["--proxy-work-item-id", "wrong-item"])
     with pytest.raises(SystemExit):
-        _validate_transport_args(parser, args, work_item_id="immutable-item")
-
-    args = parser.parse_args(
-        common + ["--proxy-allocation-id", "attacker-allocation"]
-    )
-    with pytest.raises(SystemExit):
-        _validate_transport_args(parser, args, work_item_id="immutable-item")
-
-    args = parser.parse_args(common)
-    _validate_transport_args(parser, args, work_item_id="immutable-item")
-    assert args.proxy_work_item_id == "immutable-item"
-    assert args.expected_proxy_work_item_id == "immutable-item"
+        _validate_transport_args(parser, args)
 
 
 @pytest.mark.unit

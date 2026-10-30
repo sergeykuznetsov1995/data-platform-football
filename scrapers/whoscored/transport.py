@@ -31,7 +31,6 @@ import os
 import random
 import re
 import stat
-import sys
 import threading
 import time
 import uuid
@@ -80,11 +79,6 @@ from scrapers.whoscored.proxy_campaign import (
     canonical_stage_statistics_path,
     proxy_campaign_authority_context,
     strict_json_loads,
-)
-from scrapers.whoscored.runtime_contract import (
-    RuntimeContractError,
-    attested_runtime_file_sha256,
-    require_production_runtime_class,
 )
 from scrapers.whoscored.source_circuit import (
     CircuitPermit,
@@ -146,34 +140,11 @@ SOURCE_CIRCUIT_PATH_ENV = "WHOSCORED_SOURCE_CIRCUIT_PATH"
 SOURCE_CIRCUIT_WAIT_ENV = "WHOSCORED_SOURCE_CIRCUIT_WAIT"
 SUPERVISOR_SESSION_OWNER_ENV = "WHOSCORED_SUPERVISOR_SESSION_OWNER"
 SUPERVISOR_RESOURCE_LEDGER_ENV = "WHOSCORED_SUPERVISOR_RESOURCE_LEDGER_PATH"
-PINNED_FLARESOLVERR_VERSION = "3.4.6"
-FLARESOLVERR_EXTENSION_RUNTIME_PATH = "scripts/flaresolverr_extended.py"
 CAPACITY_BROWSER_SESSION_OWNER_PATTERN = r"[a-z0-9]{16,32}"
 _CAPACITY_BROWSER_SESSION_OWNER_RE = re.compile(
     rf"\A{CAPACITY_BROWSER_SESSION_OWNER_PATTERN}\Z",
     re.ASCII,
 )
-
-
-def _attested_flaresolverr_identity() -> Optional[tuple[str, str]]:
-    """Resolve the browser runtime only from the completed production barrier."""
-
-    try:
-        extension_sha256 = attested_runtime_file_sha256(
-            FLARESOLVERR_EXTENSION_RUNTIME_PATH
-        )
-    except RuntimeContractError:
-        # Unit/development callers do not install the image-baked production
-        # barrier.  A production marker, however, is emitted only after that
-        # barrier succeeds, so losing its cached hash is a hard configuration
-        # failure and can never silently disable response attestation.
-        if getattr(sys, "_whoscored_runtime_class", None) == "production-v1":
-            raise RuntimeContractError(
-                "production WhoScored runtime has no attested FlareSolverr "
-                "extension identity"
-            ) from None
-        return None
-    return PINNED_FLARESOLVERR_VERSION, extension_sha256
 
 
 def assert_paid_alert_runtime_available(context: "TransportContext") -> None:
@@ -2759,7 +2730,6 @@ class WhoScoredTransport:
         transport_policy: Optional[TransportPolicy | str] = None,
         paid_batch_enabled: Optional[bool] = None,
     ) -> None:
-        require_production_runtime_class(operation="WhoScored source transport")
         if direct_http_attempts < 1:
             raise ValueError("direct_http_attempts must be >= 1")
         if direct_browser_attempts < 1:
@@ -2936,25 +2906,10 @@ class WhoScoredTransport:
         if direct_http_session is not None:
             # An injected session is not ours to replace on a member swap.
             self._pool_manager = None
-        flaresolverr_identity = _attested_flaresolverr_identity()
-        identity_kwargs = (
-            {
-                "expected_version": flaresolverr_identity[0],
-                "expected_extension_sha256": flaresolverr_identity[1],
-            }
-            if flaresolverr_identity is not None
-            else {}
-        )
-        self._direct_fs = direct_fs_client or FlareSolverrClient(
-            url=flaresolverr_url,
-            **identity_kwargs,
-        )
+        self._direct_fs = direct_fs_client or FlareSolverrClient(url=flaresolverr_url)
         self._paid_fs = (
             paid_fs_client
-            or FlareSolverrClient(
-                url=flaresolverr_url,
-                **identity_kwargs,
-            )
+            or FlareSolverrClient(url=flaresolverr_url)
             if resolved_policy is TransportPolicy.DIRECT_ONLY
             else None
         )

@@ -21,49 +21,7 @@ Only these workflow commands are public.  Entity-level compatibility commands
 were removed after the resumable backfill/replay paths superseded them.
 """
 
-# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
-
 from __future__ import annotations
-
-import sys as _whoscored_bootstrap_sys
-
-_whoscored_source = __file__
-if not _whoscored_source.startswith("/"):
-    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
-_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
-_whoscored_root = (
-    "/opt/airflow"
-    if _whoscored_production
-    else _whoscored_source.rsplit("/dags/", 1)[0]
-)
-if _whoscored_production:
-    if (
-        getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None)
-        != 2
-    ):
-        raise RuntimeError("image-baked WhoScored startup anchor is required")
-elif (
-    getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None)
-    != _whoscored_root
-):
-    _whoscored_anchor_path = (
-        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
-    )
-    _whoscored_anchor_globals = {
-        "__builtins__": __builtins__,
-        "sys": _whoscored_bootstrap_sys,
-        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
-        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
-    }
-    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
-        _whoscored_anchor_source = _whoscored_anchor_handle.read()
-    exec(
-        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
-        _whoscored_anchor_globals,
-    )
-_WHOSCORED_RUNTIME_CONTRACT = _whoscored_bootstrap_sys._load_whoscored_runtime_contract(
-    _whoscored_root
-)
 
 import argparse
 import datetime as datetime_lib
@@ -394,80 +352,6 @@ def _resolve_scopes(
     return scopes
 
 
-def _expected_paid_work_item_id(
-    args: argparse.Namespace,
-    scopes: Sequence[RunnerScope],
-    *,
-    task_id: str,
-) -> str:
-    """Derive paid authority from immutable CLI work, never from its selector."""
-
-    from scrapers.whoscored.proxy_campaign import (
-        WHOSCORED_CANARY_CAPTURE_WORK_ITEM_ID,
-        WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID,
-        WHOSCORED_CANARY_FIXED_SCOPES,
-        WHOSCORED_CANARY_TASK_ID,
-    )
-
-    scope_specs = sorted(scope.spec for scope in scopes)
-    if task_id == "discover_whoscored_catalog":
-        if args.command != "discover" or args.full_history or scope_specs:
-            raise ValueError(
-                "paid catalog discovery selector differs from its immutable work item"
-            )
-        return "catalog-discovery"
-    if task_id == "ingest_active_scope":
-        if (
-            args.command != "daily"
-            or not args.skip_profiles
-            or args.profiles_only
-            or len(scope_specs) != 1
-            or not args.catalog_batch_id
-        ):
-            raise ValueError(
-                "paid daily scope selector differs from its immutable work item"
-            )
-        return "scope-" + hashlib.sha256(scope_specs[0].encode("utf-8")).hexdigest()
-    if task_id == "refresh_whoscored_profiles":
-        if (
-            args.command != "daily"
-            or not args.profiles_only
-            or args.skip_profiles
-            or not scope_specs
-            or not args.catalog_batch_id
-        ):
-            raise ValueError(
-                "paid profile selector differs from its immutable work item"
-            )
-        # The signed scheduled authority intentionally gives the single global
-        # profile task one stable work item. Exact catalog/scopes/candidates are
-        # bound separately by the v3 authority and runner arguments.
-        return "profiles-daily"
-    if task_id == WHOSCORED_CANARY_TASK_ID:
-        if args.command == "discover":
-            if not args.full_history or scope_specs:
-                raise ValueError(
-                    "paid canary discovery selector differs from release policy"
-                )
-            return WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID
-        if args.command == "backfill":
-            if (
-                tuple(scope_specs) != tuple(WHOSCORED_CANARY_FIXED_SCOPES)
-                or args.all_catalog
-                or args.full_history
-                or args.plan_id
-                or args.game_id
-                or args.date_from
-                or args.date_to
-                or int(args.max_work_items) != 100
-            ):
-                raise ValueError(
-                    "paid canary capture selector differs from release policy"
-                )
-            return WHOSCORED_CANARY_CAPTURE_WORK_ITEM_ID
-    raise ValueError(f"paid source task {task_id!r} has no immutable work-item policy")
-
-
 def _validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> list[RunnerScope]:
@@ -480,33 +364,16 @@ def _validate_args(
     policy = args.transport_policy or "direct_only"
     if args.direct_only and policy != "direct_only":
         parser.error("--direct-only conflicts with --transport-policy direct_then_paid")
+    if policy != "direct_only":
+        # The paid gateway and its release pins went with the ceremony (#1487).
+        parser.error("direct_then_paid was removed (#1487); only direct_only runs")
     args.transport_policy = policy
-    args.direct_only = policy == "direct_only"
+    args.direct_only = True
     proxy_values = {
         attribute: str(getattr(args, attribute) or "").strip()
         for attribute in PROXY_CAMPAIGN_CLI_ENV
     }
-    if policy == "direct_then_paid":
-        required = (
-            "proxy_approval_path",
-            "proxy_approval_id",
-            "proxy_approval_sha256",
-        )
-        missing = [name for name in required if not proxy_values[name]]
-        if missing:
-            parser.error(
-                "direct_then_paid requires all signed proxy arguments: "
-                + ", ".join("--" + name.replace("_", "-") for name in missing)
-            )
-        if _SHA256.fullmatch(proxy_values["proxy_approval_sha256"]) is None:
-            parser.error("--proxy-approval-sha256 must be 64 lowercase hex")
-        if proxy_values["proxy_allocation_id"]:
-            parser.error(
-                "--proxy-allocation-id is internal and cannot select paid authority"
-            )
-        if not args.proxy_work_item_id:
-            parser.error("direct_then_paid requires --proxy-work-item-id")
-    elif any(proxy_values.values()) or args.proxy_work_item_id:
+    if any(proxy_values.values()) or args.proxy_work_item_id:
         parser.error("proxy approval arguments require direct_then_paid")
     if args.command == "history" and (scopes or args.max_matches is not None):
         parser.error("history uses its computed queue and fixed match limit")
@@ -646,23 +513,6 @@ def _validate_args(
         )
     if args.command not in {"backfill", "replay"} and args.game_id:
         parser.error("match selectors are valid only for backfill or replay")
-    if policy == "direct_then_paid":
-        task_id = os.environ.get("AIRFLOW_CTX_TASK_ID", "").strip()
-        if not task_id:
-            parser.error("direct_then_paid requires AIRFLOW_CTX_TASK_ID")
-        try:
-            expected_work_item_id = _expected_paid_work_item_id(
-                args,
-                scopes,
-                task_id=task_id,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-        if str(args.proxy_work_item_id) != expected_work_item_id:
-            parser.error(
-                "--proxy-work-item-id differs from the immutable CLI work item"
-            )
-        args.expected_proxy_work_item_id = expected_work_item_id
     return scopes
 
 
@@ -686,153 +536,13 @@ def _configure_transport_environment(args: argparse.Namespace) -> None:
     # transport can observe them.
     for name in _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES:
         os.environ.pop(name, None)
-    if args.direct_only:
-        # Paid credentials may be mounted on every worker, but a direct task
-        # removes the gateway authority and all campaign selectors before any
-        # transport is constructed.
-        os.environ.pop(PAID_GATEWAY_URL_ENV, None)
-        os.environ.pop(PAID_GATEWAY_TOKEN_ENV, None)
-        for name in PROXY_CAMPAIGN_CLI_ENV.values():
-            os.environ.pop(name, None)
-        return
-    if not os.environ.get(PAID_GATEWAY_URL_ENV, "").strip():
-        raise ValueError(
-            "direct_then_paid requires the isolated paid application gateway URL"
-        )
-    if len(os.environ.get(PAID_GATEWAY_TOKEN_ENV, "").strip()) < 32:
-        raise ValueError(
-            f"{PAID_GATEWAY_TOKEN_ENV} must contain at least 32 characters"
-        )
-    identity = {
-        "dag_id": os.environ.get("AIRFLOW_CTX_DAG_ID", "").strip(),
-        "run_id": os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", "").strip(),
-        "task_id": os.environ.get("AIRFLOW_CTX_TASK_ID", "").strip(),
-    }
-    attempt_id = str(args.proxy_attempt_id or "").strip()
-    expected_attempt_id = ""
-    if all(identity.values()):
-        from scrapers.whoscored.proxy_campaign import deterministic_proxy_attempt_id
-
-        expected_attempt_id = deterministic_proxy_attempt_id(
-            **identity,
-            map_index=int(os.environ.get("AIRFLOW_CTX_MAP_INDEX", "-1")),
-            try_number=int(os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "0")),
-        )
-    if attempt_id:
-        if expected_attempt_id and attempt_id != expected_attempt_id:
-            raise ValueError(
-                "--proxy-attempt-id differs from the current Airflow task attempt"
-            )
-    else:
-        if not expected_attempt_id:
-            raise ValueError("paid work outside Airflow requires --proxy-attempt-id")
-        attempt_id = expected_attempt_id
-    if not identity["task_id"]:
-        raise ValueError("--proxy-work-item-id requires AIRFLOW_CTX_TASK_ID")
-    expected_work_item_id = str(getattr(args, "expected_proxy_work_item_id", "") or "")
-    if not expected_work_item_id:
-        raise ValueError("paid runner has no independently derived work-item identity")
-    if str(args.proxy_work_item_id) != expected_work_item_id:
-        raise ValueError(
-            "--proxy-work-item-id differs from the independently derived work item"
-        )
-    from scrapers.whoscored.proxy_campaign import (
-        WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT,
-        load_proxy_campaign_context,
-    )
-
-    metadata = load_proxy_campaign_context(
-        str(args.proxy_approval_path),
-        expected_approval_id=str(args.proxy_approval_id),
-        expected_approval_sha256=str(args.proxy_approval_sha256),
-        run_id=identity["run_id"],
-        task_id=identity["task_id"],
-        work_item_id=str(args.proxy_work_item_id),
-        attempt_id=attempt_id,
-    )
-    approval_payload = metadata.get("proxy_campaign_approval")
-    if not isinstance(approval_payload, Mapping):
-        raise ValueError("paid runner has no verified approval payload")
-    scheduled_authority = approval_payload.get("scheduled_authority")
-    if identity["task_id"] == "ingest_active_scope" and isinstance(
-        scheduled_authority, Mapping
-    ):
-        workloads = scheduled_authority.get("scope_workloads")
-        matching_workloads = (
-            [
-                item
-                for item in workloads
-                if isinstance(item, Mapping)
-                and item.get("work_item_id") == args.proxy_work_item_id
-            ]
-            if isinstance(workloads, list)
-            else []
-        )
-        if len(matching_workloads) != 1:
-            raise ValueError(
-                "paid daily scope has no unique signed pagination authority"
-            )
-        pagination_limit = matching_workloads[0].get("player_pagination_target_limit")
-        if (
-            isinstance(pagination_limit, bool)
-            or not isinstance(pagination_limit, int)
-            or not 0 <= pagination_limit <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT
-        ):
-            raise ValueError("paid daily scope pagination authority is invalid")
-        os.environ[SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV] = str(
-            pagination_limit
-        )
-        args.scheduled_scope_workload = dict(matching_workloads[0])
-    elif (
-        identity["task_id"] == "ingest_active_scope"
-        and approval_payload.get("schema_version") == 3
-    ):
-        raise ValueError("scheduled paid scope has no pagination authority")
-    args.proxy_runtime_sha256 = str(approval_payload.get("runtime_sha256") or "")
-    args.proxy_classifier_sha256 = str(approval_payload.get("classifier_sha256") or "")
-    if (
-        _SHA256.fullmatch(args.proxy_runtime_sha256) is None
-        or _SHA256.fullmatch(args.proxy_classifier_sha256) is None
-    ):
-        raise ValueError("paid approval has invalid release pins")
-    allocation_id = str(metadata["proxy_allocation_id"])
-    if (
-        identity["task_id"] == "run_whoscored_proxy_canary"
-        and getattr(args, "command", None) == "backfill"
-    ):
-        campaign_hash = hashlib.sha256(
-            str(metadata["proxy_campaign_id"]).encode("utf-8")
-        ).hexdigest()
-        if str(getattr(args, "queue_id", "") or "") != (
-            f"proxy-canary-{campaign_hash[:32]}"
-        ):
-            raise ValueError("canary queue id differs from the signed campaign")
-    values = {
-        "proxy_approval_path": args.proxy_approval_path,
-        "proxy_approval_id": args.proxy_approval_id,
-        "proxy_approval_sha256": args.proxy_approval_sha256,
-        "proxy_allocation_id": allocation_id,
-        "proxy_attempt_id": attempt_id,
-    }
-    for attribute, name in PROXY_CAMPAIGN_CLI_ENV.items():
-        os.environ[name] = str(values[attribute])
-    args.proxy_allocation_id = allocation_id
-    args.proxy_attempt_id = attempt_id
-
-    # Verify the exact pinned document/allocation before loading mutable runtime
-    # modules or constructing a source service.
-    from scrapers.whoscored.proxy_campaign import assert_paid_runtime_available
-    from scrapers.whoscored.transport import TransportContext
-
-    context = TransportContext.from_env()
-    assert_paid_runtime_available(context.as_dict())
-    allocation = context.proxy_campaign.get("proxy_allocation")
-    if (
-        identity["task_id"]
-        and isinstance(allocation, Mapping)
-        and allocation.get("task_id") != identity["task_id"]
-    ):
-        raise ValueError("signed proxy allocation belongs to another Airflow task")
+    # Paid credentials may be mounted on every worker, but a direct task
+    # removes the gateway authority and all campaign selectors before any
+    # transport is constructed.
+    os.environ.pop(PAID_GATEWAY_URL_ENV, None)
+    os.environ.pop(PAID_GATEWAY_TOKEN_ENV, None)
+    for name in PROXY_CAMPAIGN_CLI_ENV.values():
+        os.environ.pop(name, None)
 
 
 def _load_runtime() -> Any:
@@ -840,23 +550,6 @@ def _load_runtime() -> Any:
     from scrapers.whoscored.service import WhoScoredIngestService
 
     return WhoScoredIngestService
-
-
-def _validate_paid_release_pins(
-    args: argparse.Namespace, runtime: Mapping[str, Any]
-) -> None:
-    """Bind each paid subprocess to the release hashes in its approval."""
-
-    if args.direct_only:
-        return
-    if runtime.get("code_tree_sha256") != args.proxy_runtime_sha256:
-        raise ValueError("paid approval is pinned to another WhoScored runtime release")
-    from dags.scripts.whoscored_proxy_runtime import classifier_code_sha256
-
-    if classifier_code_sha256() != args.proxy_classifier_sha256:
-        raise ValueError(
-            "paid approval is pinned to another WhoScored catalog classifier"
-        )
 
 
 def _new_repository() -> Any:
@@ -2198,9 +1891,6 @@ def _run_history(args, service_cls, report):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
-        operation="WhoScored scraper entrypoint"
-    )
     _merge_json_selectors(parser, args)
     scopes = _validate_args(parser, args)
     report = _new_report(args.command, scopes)
@@ -2218,12 +1908,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         _configure_transport_environment(args)
         _bind_report_transport_identity(report, args)
-        # Recheck inside every mapped Bash process. A scheduler preflight alone
-        # cannot protect mutable bind mounts from deployment between tasks.
-        runtime = _WHOSCORED_RUNTIME_CONTRACT.validate_runtime_contract(
-            report_schema_version=REPORT_SCHEMA_VERSION
-        )
-        _validate_paid_release_pins(args, runtime)
         service_cls = _load_runtime()
     except Exception as exc:
         for scope in scopes:

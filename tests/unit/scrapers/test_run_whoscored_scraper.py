@@ -506,11 +506,6 @@ def _run(
     )
     monkeypatch.setattr(runner, "_load_runtime", lambda: runtime)
     monkeypatch.setattr(runner, "_new_repository", lambda: repository)
-    monkeypatch.setattr(
-        runner._WHOSCORED_RUNTIME_CONTRACT,
-        "validate_runtime_contract",
-        lambda **_kwargs: {},
-    )
     output = tmp_path / "result.json"
     rc = runner.main([*args, "--output", str(output)])
     return rc, json.loads(output.read_text(encoding="utf-8")), runtime, catalog
@@ -1122,21 +1117,18 @@ def test_runtime_import_failure_still_publishes_failure_report(monkeypatch, tmp_
 
 
 @pytest.mark.unit
-def test_every_cli_process_rechecks_the_runtime_contract(monkeypatch, tmp_path):
-    from scrapers.whoscored import runtime_contract
+def test_removed_entity_cli_commands_are_rejected():
+    parser = runner._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["matches", "--scope", "ENG-Premier League=2526"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["profiles", "--scope", "ENG-Premier League=2526"])
 
-    def fail_contract(**_kwargs):
-        raise runtime_contract.RuntimeContractError("worker tree changed")
 
-    monkeypatch.setattr(runtime_contract, "validate_runtime_contract", fail_contract)
-    monkeypatch.setattr(
-        runner,
-        "_load_runtime",
-        lambda: pytest.fail("source runtime loaded before contract validation"),
-    )
-    output = tmp_path / "result.json"
-
-    rc = runner.main(
+@pytest.mark.unit
+def test_removed_paid_policy_is_rejected():
+    parser = runner._build_parser()
+    args = parser.parse_args(
         [
             "replay",
             "--scope",
@@ -1144,23 +1136,13 @@ def test_every_cli_process_rechecks_the_runtime_contract(monkeypatch, tmp_path):
             "--game-id",
             "123",
             "--output",
-            str(output),
+            "/tmp/result.json",
+            "--transport-policy",
+            "direct_then_paid",
         ]
     )
-
-    report = json.loads(output.read_text(encoding="utf-8"))
-    assert rc == 1
-    assert report["status"] == "failed"
-    assert "worker tree changed" in report["errors"][0]
-
-
-@pytest.mark.unit
-def test_removed_entity_cli_commands_are_rejected():
-    parser = runner._build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["matches", "--scope", "ENG-Premier League=2526"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["profiles", "--scope", "ENG-Premier League=2526"])
+        runner._validate_args(parser, args)
 
 
 @pytest.mark.unit
@@ -1250,11 +1232,6 @@ def test_explicit_discovery_can_expand_the_historical_stage_catalog(
 
 @pytest.mark.unit
 def test_daily_without_scope_reads_the_denominator_scopes(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        runner._WHOSCORED_RUNTIME_CONTRACT,
-        "validate_runtime_contract",
-        lambda **_kwargs: {},
-    )
     rc, report, service_cls, catalog = _run(
         monkeypatch,
         tmp_path,
@@ -1428,11 +1405,6 @@ def test_daily_part_and_weekly_gate_are_rejected_outside_their_commands(argv):
 
 @pytest.mark.unit
 def test_daily_profiles_only_uses_one_global_active_scope_union(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        runner._WHOSCORED_RUNTIME_CONTRACT,
-        "validate_runtime_contract",
-        lambda **_kwargs: {},
-    )
     candidate_ids = list(range(1, 18))
     candidate_sha256 = profile_candidate_payload_sha256(candidate_ids)
     rc, report, service_cls, catalog = _run(
@@ -1532,11 +1504,6 @@ def test_daily_profile_snapshot_drift_fails_before_source_transport(
 
 @pytest.mark.unit
 def test_daily_worker_loads_the_exact_catalog_generation(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        runner._WHOSCORED_RUNTIME_CONTRACT,
-        "validate_runtime_contract",
-        lambda **_kwargs: {},
-    )
     rc, report, service_cls, catalog = _run(
         monkeypatch,
         tmp_path,
@@ -1582,11 +1549,6 @@ def test_replay_passes_a_frozen_explicit_game_set(monkeypatch, tmp_path):
 def test_backfill_freezes_s3_plan_and_receipts_for_25_match_chunks(
     monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(
-        runner._WHOSCORED_RUNTIME_CONTRACT,
-        "validate_runtime_contract",
-        lambda **_kwargs: {},
-    )
     game_ids = list(range(1, 53))
     rc, report, service_cls, catalog = _run(
         monkeypatch,
@@ -1796,93 +1758,6 @@ def test_daily_profile_cli_enforces_the_deployed_lower_hard_cap(monkeypatch):
 
 
 @pytest.mark.unit
-def test_paid_runner_derives_work_item_and_rejects_allocation_selector(monkeypatch):
-    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_active_scope")
-    scope = "ENG-Premier League=2526"
-    expected_work_item = (
-        "scope-" + __import__("hashlib").sha256(scope.encode("utf-8")).hexdigest()
-    )
-    base = [
-        "daily",
-        "--scope",
-        scope,
-        "--skip-profiles",
-        "--catalog-batch-id",
-        "catalog-1",
-        "--transport-policy",
-        "direct_then_paid",
-        "--proxy-approval-path",
-        "/run/approval.json",
-        "--proxy-approval-id",
-        "approval-1",
-        "--proxy-approval-sha256",
-        "a" * 64,
-        "--proxy-work-item-id",
-        expected_work_item,
-    ]
-
-    parser = runner._build_parser()
-    args = parser.parse_args(base)
-    scopes = runner._validate_args(parser, args)
-    assert [item.spec for item in scopes] == [scope]
-    assert args.expected_proxy_work_item_id == expected_work_item
-
-    parser = runner._build_parser()
-    with pytest.raises(SystemExit):
-        args = parser.parse_args(base + ["--proxy-allocation-id", "allocation-1"])
-        runner._validate_args(parser, args)
-
-    parser = runner._build_parser()
-    wrong = list(base)
-    wrong[-1] = "scope-attacker-selected"
-    with pytest.raises(SystemExit):
-        args = parser.parse_args(wrong)
-        runner._validate_args(parser, args)
-
-
-@pytest.mark.unit
-def test_paid_zero_profile_cli_binds_stable_scheduled_work_item(monkeypatch):
-    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "refresh_whoscored_profiles")
-    empty_sha256 = profile_candidate_payload_sha256([])
-    base = [
-        "daily",
-        "--profiles-only",
-        "--scope",
-        "ENG-Premier League=2526",
-        "--catalog-batch-id",
-        "catalog-1",
-        "--profiles-limit",
-        "0",
-        "--expected-profile-candidate-count",
-        "0",
-        "--expected-profile-candidate-sha256",
-        empty_sha256,
-        "--transport-policy",
-        "direct_then_paid",
-        "--proxy-approval-path",
-        "/run/approval.json",
-        "--proxy-approval-id",
-        "approval-1",
-        "--proxy-approval-sha256",
-        "a" * 64,
-        "--proxy-work-item-id",
-        "profiles-daily",
-    ]
-    parser = runner._build_parser()
-    args = parser.parse_args(base)
-    scopes = runner._validate_args(parser, args)
-    assert [item.spec for item in scopes] == ["ENG-Premier League=2526"]
-    assert args.expected_proxy_work_item_id == "profiles-daily"
-
-    wrong = list(base)
-    wrong[-1] = "profiles-attacker-selected"
-    parser = runner._build_parser()
-    with pytest.raises(SystemExit):
-        args = parser.parse_args(wrong)
-        runner._validate_args(parser, args)
-
-
-@pytest.mark.unit
 def test_scheduled_scope_freezes_signed_targets_across_schedule_mutation():
     scope = runner.RunnerScope("ENG-Premier League", "2526")
     runtime_scope, work_item_id, workload = _scheduled_scope_binding(
@@ -2041,129 +1916,6 @@ def test_scheduled_scope_rejects_target_drift_before_network():
             args,
         )
     assert not hasattr(args, "_match_ids")
-
-
-@pytest.mark.unit
-def test_standalone_paid_runner_enforces_code_owned_runtime_gates(monkeypatch):
-    import scrapers.whoscored.proxy_campaign as proxy_campaign_module
-    from scrapers.whoscored.transport import TransportContext
-
-    # The runner projects these values directly into os.environ.  Seed them via
-    # monkeypatch so its teardown knows to restore/delete every value written by
-    # the failed startup path instead of leaking paid authority to later tests.
-    for name in (
-        "WHOSCORED_TRANSPORT_POLICY",
-        "WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT",
-        *runner.PROXY_CAMPAIGN_CLI_ENV.values(),
-    ):
-        monkeypatch.setenv(name, "")
-
-    identity = {
-        "dag_id": "dag_backfill_whoscored",
-        "run_id": "run-1",
-        "task_id": "ingest_active_scope",
-    }
-    for name, value in {
-        "AIRFLOW_CTX_DAG_ID": identity["dag_id"],
-        "AIRFLOW_CTX_DAG_RUN_ID": identity["run_id"],
-        "AIRFLOW_CTX_TASK_ID": identity["task_id"],
-        "AIRFLOW_CTX_MAP_INDEX": "-1",
-        "AIRFLOW_CTX_TRY_NUMBER": "1",
-        "WHOSCORED_PAID_GATEWAY_URL": "http://whoscored-paid-gateway:8898",
-        "WHOSCORED_PAID_GATEWAY_TOKEN": "g" * 32,
-        "WHOSCORED_PROXY_CONTROL_TOKEN": "forbidden-control-secret",
-        "WHOSCORED_PROXY_APPROVAL_HMAC_SECRET": "forbidden-approval-secret",
-        "WHOSCORED_PAID_ALERT_HMAC_SECRET": "forbidden-alert-secret",
-    }.items():
-        monkeypatch.setenv(name, value)
-    attempt_id = proxy_campaign_module.deterministic_proxy_attempt_id(
-        **identity,
-        map_index=-1,
-        try_number=1,
-    )
-    allocation = {
-        "allocation_id": "allocation-1",
-        "task_id": identity["task_id"],
-    }
-    metadata = {
-        "transport_policy": "direct_then_paid",
-        "proxy_campaign_approval": {
-            "runtime_sha256": "a" * 64,
-            "classifier_sha256": "b" * 64,
-            "scheduled_authority": {
-                "scope_workloads": [
-                    {
-                        "work_item_id": "scope-work",
-                        "player_pagination_target_limit": 1,
-                    }
-                ]
-            },
-        },
-        "proxy_campaign_id": "campaign-1",
-        "proxy_allocation": allocation,
-        "proxy_allocation_id": "allocation-1",
-        "proxy_attempt_id": attempt_id,
-    }
-
-    def load_context(*_args, **_kwargs):
-        for name in runner._RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES:
-            assert name not in os.environ
-        assert os.environ[runner.PAID_GATEWAY_URL_ENV] == (
-            "http://whoscored-paid-gateway:8898"
-        )
-        assert os.environ[runner.PAID_GATEWAY_TOKEN_ENV] == "g" * 32
-        return metadata
-
-    monkeypatch.setattr(
-        proxy_campaign_module,
-        "load_proxy_campaign_context",
-        load_context,
-    )
-
-    def assert_runtime(context):
-        assert context["dag_id"] == identity["dag_id"]
-        assert context["run_id"] == identity["run_id"]
-        assert context["task_id"] == identity["task_id"]
-        assert context["proxy_campaign_id"] == "campaign-1"
-        raise proxy_campaign_module.ProxyCampaignValidationError(
-            "WhoScored paid traffic has no provider-side invoice hard cap"
-        )
-
-    monkeypatch.setattr(
-        proxy_campaign_module,
-        "assert_paid_runtime_available",
-        assert_runtime,
-    )
-    monkeypatch.setattr(
-        TransportContext,
-        "from_env",
-        classmethod(
-            lambda cls: cls(
-                **identity,
-                map_index=-1,
-                try_number=1,
-                transport_policy="direct_then_paid",
-                proxy_campaign=metadata,
-            )
-        ),
-    )
-    args = SimpleNamespace(
-        command="daily",
-        direct_only=False,
-        transport_policy="direct_then_paid",
-        proxy_attempt_id="",
-        proxy_work_item_id="scope-work",
-        expected_proxy_work_item_id="scope-work",
-        proxy_approval_path="/run/approval.json",
-        proxy_approval_id="approval-1",
-        proxy_approval_sha256="c" * 64,
-    )
-
-    with pytest.raises(
-        proxy_campaign_module.ProxyCampaignValidationError,
-        match="provider-side invoice hard cap",
-    ):
-        runner._configure_transport_environment(args)
 
 
 @pytest.mark.unit
