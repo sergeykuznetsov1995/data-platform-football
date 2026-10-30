@@ -1276,7 +1276,7 @@ def s2_sql_lane(c):
         def wait(self, _):
             io.stop.set()
     io.wakes['debt'] = OneQuery()
-    def query(seconds, *, debt=0, error=None, change=None):
+    def query(seconds, *, debt=0, error=None, change=None, factory_error=False, evidence_error=False):
         class SQL:
             def execute_query(self, _sql):
                 c.clock.now += timedelta(seconds=seconds)
@@ -1288,10 +1288,18 @@ def s2_sql_lane(c):
             def close(self):
                 pass
         io.factory = SQL
+        if factory_error:
+            def factory():
+                c.clock.now += timedelta(seconds=seconds)
+                raise error('offline')
+            io.factory = factory
         io.stop.clear()
         # Error retries use stop.wait; terminate after recording instead.
         original = c.store.record
         def record(kind, *args, **kwargs):
+            if evidence_error:
+                io.stop.set()
+                raise OSError('disk full')
             original(kind, *args, **kwargs)
             if kind == 'observation':
                 io.stop.set()
@@ -1373,14 +1381,55 @@ def test_s2_total_sql_unknown_limit(controller):
     assert c.state['start'] > start  # 4 * (1201 - 30) > 72 minutes.
 
 
-@pytest.mark.parametrize('error', [RuntimeError, TimeoutError])
-def test_s2_sql_errors_are_not_hidden_by_stale_label(controller, error):
+class TrinoError(Exception):
+    pass
+
+
+@pytest.mark.parametrize('error', [RuntimeError, TimeoutError, TrinoError])
+@pytest.mark.parametrize('factory_error', [False, True])
+def test_s2_sql_errors_preserve_window_until_recovery(controller, error, factory_error):
     c = controller
     query = s2_sql_lane(c)
     start = c.state['start']
-    result = query(97, error=error)
+    result = query(100, error=error, factory_error=factory_error)
     assert result['error'] == error.__name__
     assert result['query_error'] == error.__name__
+    assert result['sql_lag_safe']
+    assert not result['known']
+    assert c.state['sql_unknown']['allowed']
+    assert c.state['start'] == start
+    with pytest.raises(LaneClosed, match='unknown'):
+        c.check()
+    c.clock.now += timedelta(seconds=1)
+    result = query(0)
+    assert result['known']
+    assert result['sql_lag_safe']
+    assert c.state['sql_unknown']['allowed']
+    assert c.state['start'] == start
+    assert not any(row.get('event') == 'window_restarted'
+                   for row in c.store.rows('lifecycle', start, c.now().timestamp()))
+
+
+def test_s2_consecutive_sql_errors_exceed_continuous_limit(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    for _ in range(15):
+        query(100, error=TrinoError)
+        c.clock.now += timedelta(seconds=1)
+    assert c.state['start'] == start
+    query(100, error=TrinoError)
+    assert c.state['start'] > start
+
+
+def test_s2_sql_error_with_evidence_failure_restarts_window(controller):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    result = query(100, error=TrinoError, evidence_error=True)
+    assert result['error'] == 'evidence_write_OSError'
+    assert not result['sql_lag_safe']
+    assert not result['query_failed']
     assert c.state['start'] > start
 
 
@@ -1397,11 +1446,12 @@ def test_s2_known_debt_after_lag_remains_a_pause(controller):
     assert not c._debt_valid(start)
 
 
-def test_s2_gate_change_inside_slow_query_is_mandatory_restart(controller):
+@pytest.mark.parametrize('error', [None, TrinoError])
+def test_s2_gate_change_inside_slow_query_is_mandatory_restart(controller, error):
     c = controller
     query = s2_sql_lane(c)
     start = c.state['start']
-    result = query(97, change=lambda: c.gate.lower_ceiling(0, reason='test'))
+    result = query(97, error=error, change=lambda: c.gate.lower_ceiling(0, reason='test'))
     assert result['error'] == 'gate_changed_during_debt'
     assert not result['sql_lag_safe']
     assert c.state['start'] > start
