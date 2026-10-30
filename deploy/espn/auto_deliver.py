@@ -50,6 +50,8 @@ DEFAULT_POOL = "default_pool"   # пул Airflow, не наш: в pools.json е�
 ARCHIVE_PATHS = ("deploy/espn", "scrapers", "configs/espn")
 # Пути контура сверх замыкания импортов DAG: код доставки и данные, которые читает код.
 STATIC_PATHS = ("deploy/espn", "configs/espn")
+# Точки входа вне DAG, которые исполняются из смонтированного кода (замер темпа #1510).
+ENTRY_MODULES = ("scrapers/espn/measure_pace.py",)
 # Байты в контейнере = корню релиза: путь в корне → путь в контейнере.
 BYTE_CHECK = {"deploy/espn/dags": "/opt/airflow/dags", "scrapers/espn": "/opt/airflow/scrapers/espn"}
 DAGS_TARGET = "/opt/airflow/dags"
@@ -242,7 +244,8 @@ def import_closure(read, entries) -> set[str]:
 
 
 def contour_paths(h: Host, sha: str) -> set[str]:
-    """Пути контура в коммите: STATIC_PATHS + замыкание импортов DAG из deploy/espn/dags."""
+    """Пути контура в коммите: STATIC_PATHS + замыкание импортов DAG из deploy/espn/dags
+    и ENTRY_MODULES."""
     cache: dict[str, str | None] = {}
 
     def read(rel):
@@ -252,7 +255,8 @@ def contour_paths(h: Host, sha: str) -> set[str]:
 
     listing = git(h, "ls-tree", "-r", "--name-only", sha, "--", DAG_DIR_REL).split()
     dags = [p for p in listing if p.endswith(".py")]
-    return set(STATIC_PATHS) | import_closure(read, dags)
+    entries = [*dags, *(rel for rel in ENTRY_MODULES if read(rel) is not None)]
+    return set(STATIC_PATHS) | import_closure(read, entries)
 
 
 def contour_differs(h: Host, a: str, b: str) -> bool:
