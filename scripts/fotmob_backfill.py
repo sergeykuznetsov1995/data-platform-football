@@ -135,13 +135,6 @@ AUTOMATIC_CANARY_REQUESTS_PER_MINUTE = 60
 _PLAN_SIGNATURE_RE = re.compile(r"fmplan1-[0-9a-f]{64}")
 
 
-def _scope_entities(mode: str) -> tuple[str, ...]:
-    # Replay retains the historical acceptance contract, including player cards.
-    if mode == "replay":
-        return ISSUE_930_SCOPE_ENTITIES
-    return tuple(entity for entity in ISSUE_930_SCOPE_ENTITIES if entity != "players")
-
-
 def _expected_plan_signature() -> str:
     return deterministic_plan_signature(
         ISSUE_930_SCOPE_ENTITIES,
@@ -1253,7 +1246,7 @@ def _validation_summary(
             "budget": dict(budget),
         }
 
-    expected_entities = sorted(_scope_entities(mode))
+    expected_entities = sorted(ISSUE_930_SCOPE_ENTITIES)
     if (
         payload.get("status") != "success"
         or payload.get("run_id") != generation_id
@@ -1327,7 +1320,7 @@ def _base_report(
             else (
                 ["players"]
                 if isinstance(source_refresh, Mapping)
-                else list(_scope_entities(mode))
+                else list(ISSUE_930_SCOPE_ENTITIES)
             )
         ),
         "publication": dict(publication),
@@ -1707,7 +1700,7 @@ def run_backfill(
                 else (
                     "players"
                     if source_refresh is not None
-                    else ",".join(_scope_entities(mode))
+                    else ",".join(ISSUE_930_SCOPE_ENTITIES)
                 )
             ),
             "catalog_contract": (
@@ -1854,9 +1847,7 @@ def _load_recovery_report(
         else (
             ["players"]
             if isinstance(source_refresh, Mapping)
-            else list(
-                _scope_entities(report.get("mode", "") if isinstance(report, Mapping) else "")
-            )
+            else list(ISSUE_930_SCOPE_ENTITIES)
         )
     )
     expected_source = (

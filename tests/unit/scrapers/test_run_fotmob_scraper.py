@@ -4408,7 +4408,7 @@ class TestFotmobNativeRunner:
         assert not repository.tables.get("fotmob_player_snapshots")
 
     @pytest.mark.unit
-    @pytest.mark.parametrize("mode", ["daily", "refresh", "backfill"])
+    @pytest.mark.parametrize("mode", ["daily", "refresh"])
     def test_network_waves_reject_players_before_http(self, mode):
         mod = self._module()
         args = mod._argument_parser().parse_args(

@@ -433,7 +433,9 @@ def _selected_native_entities(args) -> frozenset[str]:
     if getattr(args, "source_refresh_contract", None) is not None:
         return frozenset({"players"})
     entities = _parse_native_entities(args.entities)
-    if args.mode in {"daily", "refresh", "backfill"} and "players" in entities:
+    # Waves never collect cards (#1297). Backfill keeps them: the #930 coordinator
+    # contract still lists players; orchestrated backfill profiles omit them.
+    if args.mode in {"daily", "refresh"} and "players" in entities:
         raise ValueError("network waves cannot collect players; use the player collector")
     return entities
 

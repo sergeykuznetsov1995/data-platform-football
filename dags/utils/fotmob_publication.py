@@ -632,14 +632,15 @@ def _active_owner_writer_authorization(
             if isinstance(decision, Mapping)
             else PLAYER_COLLECTOR_MODE
         )
-        expected_run_type = (
-            "scheduled"
+        # The player collector runs daily and may still be triggered by hand (#1297).
+        expected_run_types = (
+            {"scheduled"}
             if owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
-            else "manual"
+            else {"manual", "scheduled"}
         )
         if (
             owner is None
-            or state(owner.run_type) != expected_run_type
+            or state(owner.run_type) not in expected_run_types
             or state(owner.state) not in {"running", "success"}
             or trigger is None
             or state(trigger.state)

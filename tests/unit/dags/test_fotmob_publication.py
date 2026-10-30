@@ -2316,3 +2316,88 @@ def test_deployed_owner_gate_admits_refresh_and_backfill_scheduled_runs(tmp_path
             roots=roots,
             dag_run=SimpleNamespace(dag_id="dag_ingest_fotmob", run_type="scheduled"),
         )
+
+
+@pytest.mark.parametrize("run_type", ["manual", "scheduled"])
+def test_ceremony_authorizes_child_of_daily_or_manual_player_collector(
+    monkeypatch, run_type
+):
+    binding = _binding()
+    generation_id = publication.make_generation_id(binding)
+    payload = {"generation_id": generation_id, "binding": binding}
+
+    class Column:
+        def __eq__(self, _other):
+            return True
+
+        def in_(self, _values):
+            return True
+
+        def desc(self):
+            return self
+
+    class Model:
+        dag_id = run_id = task_id = key = timestamp = Column()
+
+    class XCom(Model):
+        @staticmethod
+        def deserialize_value(row):
+            return row.value
+
+    class DagRun(Model):
+        pass
+
+    class TaskInstance(Model):
+        pass
+
+    owner_run_id = f"{run_type}__collector-1"
+    dag_runs = [
+        SimpleNamespace(run_type=run_type, state="running"),
+        SimpleNamespace(
+            state="running",
+            conf={publication.FOTMOB_PUBLICATION_CONF_KEY: payload, "mode": "players"},
+        ),
+    ]
+    results = {
+        XCom: [
+            SimpleNamespace(
+                dag_id="dag_collect_fotmob_players", run_id=owner_run_id, value=payload
+            )
+        ],
+        TaskInstance: [SimpleNamespace(state="success")],
+        DagRun: dag_runs,
+    }
+
+    class Query:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *_args):
+            return self
+
+        order_by = limit = filter
+
+        def all(self):
+            return results[self.model]
+
+        def one_or_none(self):
+            return results[self.model].pop(0)
+
+    class Session:
+        def query(self, model):
+            return Query(model)
+
+        def close(self):
+            pass
+
+    models = sys.modules["airflow.models"]
+    for name, value in {"DagRun": DagRun, "TaskInstance": TaskInstance, "XCom": XCom}.items():
+        monkeypatch.setattr(models, name, value, raising=False)
+    settings = ModuleType("airflow.settings")
+    settings.Session = Session
+    monkeypatch.setitem(sys.modules, "airflow.settings", settings)
+
+    authorized = publication._active_owner_writer_authorization(generation_id, payload)
+
+    assert authorized["owner_run_id"] == owner_run_id
+    assert authorized["ingest_run_id"] == f"fotmob_players__{generation_id}"

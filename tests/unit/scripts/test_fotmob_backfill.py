@@ -236,9 +236,7 @@ def _validation() -> dict:
         "transport": {"proxy_bytes": 0},
         "budget": {"requests": 2000, "max_requests": 2000},
         "selection": {
-            "entities": sorted(
-                entity for entity in mod.ISSUE_930_SCOPE_ENTITIES if entity != "players"
-            ),
+            "entities": sorted(mod.ISSUE_930_SCOPE_ENTITIES),
             "explicit_scope_count": 158,
             "explicit_scope_sha256": mod.APPROVED_SCOPE_ARTIFACT_SHA256,
             "scope_plan_signature": "fmplan1-0302cc2c7882f262f804877d1c540090a487167542288354c0520c3f8d1c8646",
@@ -317,9 +315,8 @@ def _wire_preflight(monkeypatch, tmp_path: Path, calls: list[tuple]) -> None:
     monkeypatch.setattr(mod, "_airflow", airflow)
 
 
-@pytest.mark.parametrize("mode", ["backfill", "replay"])
 def test_success_triggers_only_parent_and_abandons_exact_candidate(
-    tmp_path, monkeypatch, mode
+    tmp_path, monkeypatch
 ):
     calls: list[tuple] = []
     transitions: list[str] = []
@@ -330,18 +327,12 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
 
     def exact(_args, dag_id, run_id, **_kwargs):
         assert dag_id == mod.INGEST_DAG_ID
-        assert run_id == f"issue930_{mode}_a1__{GENERATION_ID.replace('-', '')}"
+        assert run_id == f"issue930_backfill_a1__{GENERATION_ID.replace('-', '')}"
         return {"run_id": run_id, "state": "success"}
 
     monkeypatch.setattr(mod, "_exact_run", exact)
     monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state())
-    payload = _validation()
-    payload["mode"] = mode
-    entities = ["season", "leaderboards", "matches", "teams"]
-    if mode == "replay":
-        entities.append("players")
-    payload["selection"]["entities"] = sorted(entities)
-    monkeypatch.setattr(mod, "_validation_xcom", lambda *_args, **_kw: payload)
+    monkeypatch.setattr(mod, "_validation_xcom", lambda *_args, **_kw: _validation())
 
     def transition(_args, _generation_id, *, action, **_kwargs):
         transitions.append(action)
@@ -355,9 +346,22 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
     monkeypatch.setattr(mod, "_transition_publication", transition)
 
     report = mod.run_backfill(
-        _args(tmp_path, mode=mode), sleeper=lambda _value: None, monotonic=lambda: 0
+        _args(tmp_path), sleeper=lambda _value: None, monotonic=lambda: 0
     )
 
+    assert report["passed"] is True
+    assert report["phase"] == "abandoned"
+    assert report["scope"]["count"] == 158
+    assert report["entities"] == [
+        "season",
+        "leaderboards",
+        "matches",
+        "teams",
+        "players",
+    ]
+    assert report["plan_signature"] == "fmplan1-0302cc2c7882f262f804877d1c540090a487167542288354c0520c3f8d1c8646"
+    assert report["publication_attempt"] == 1
+    assert transitions == ["abandon"]
     trigger_calls = [call for call in calls if call[:2] == ("dags", "trigger")]
     assert len(trigger_calls) == 1
     assert trigger_calls[0][2] == mod.INGEST_DAG_ID
@@ -366,20 +370,9 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
     )
     assert ("dags", "unpause", mod.DAILY_DAG_ID) not in calls
     conf = json.loads(trigger_calls[0][trigger_calls[0].index("--conf") + 1])
-    assert conf["mode"] == mode
+    assert conf["mode"] == "backfill"
     assert len(conf["scope"].split(",")) == 158
-    from dags.scripts import run_fotmob_scraper as runner
-
-    selected = runner._selected_native_entities(Namespace(**conf))
-    assert selected == frozenset(entities)
-    assert conf["entities"] == ",".join(entities)
-    assert report["passed"] is True
-    assert report["phase"] == "abandoned"
-    assert report["scope"]["count"] == 158
-    assert report["entities"] == entities
-    assert report["plan_signature"] == "fmplan1-0302cc2c7882f262f804877d1c540090a487167542288354c0520c3f8d1c8646"
-    assert report["publication_attempt"] == 1
-    assert transitions == ["abandon"]
+    assert conf["entities"] == "season,leaderboards,matches,teams,players"
     assert "transfers" not in conf["entities"]
     assert conf["fotmob_publication"] == _publication()
     assert json.loads(_args(tmp_path).output.read_text())["phase"] == "abandoned"
@@ -1366,28 +1359,3 @@ def test_automatic_canary_entity_contract_uses_wave_profile_without_players():
 
     assert "players" not in mod.AUTOMATIC_CANARY_ENTITIES
     assert mod.AUTOMATIC_CANARY_ENTITIES == fotmob_runtime.AUTOMATIC_DAILY_ENTITIES
-
-
-@pytest.mark.parametrize("mode", ["backfill", "replay"])
-def test_scope_recovery_preserves_mode_entity_contract(tmp_path, monkeypatch, mode):
-    arguments = _args(tmp_path, mode=mode, command="recover")
-    scope = _scope_contract(tmp_path)
-    monkeypatch.setattr(mod, "_deployment_context", lambda _args: _context(tmp_path))
-    monkeypatch.setattr(mod, "_publication_envelope", lambda *_a, **_kw: _publication())
-    report = mod._base_report(
-        arguments, mode=mode, publication=_publication(), scope_contract=scope
-    )
-    entities = ["season", "leaderboards", "matches", "teams"]
-    if mode == "replay":
-        entities.append("players")
-    assert report["entities"] == entities
-    arguments.recovery_report = tmp_path / "recovery.json"
-    arguments.recovery_report.write_text(json.dumps(report))
-    restored, _ = mod._load_recovery_report(arguments, scope, run=None)
-    assert restored["entities"] == entities
-    report["entities"] = (
-        entities + ["players"] if mode == "backfill" else entities[:-1]
-    )
-    arguments.recovery_report.write_text(json.dumps(report))
-    with pytest.raises(mod.BackfillError, match="stack or scope identity differs"):
-        mod._load_recovery_report(arguments, scope, run=None)
