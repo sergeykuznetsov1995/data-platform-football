@@ -224,7 +224,17 @@ def test_header_of_another_season_is_an_error_not_a_skipped_match() -> None:
 
 
 def test_scope_file_and_the_ten_past_seasons() -> None:
-    assert history.load_scope() == (("eng.1", 2015),)
+    expected = {
+        (slug, year)
+        for slug in ("eng.1", "esp.1", "ger.1", "ita.1", "fra.1",
+                     "uefa.champions", "uefa.europa")
+        for year in range(2016, 2026)
+    }
+    expected.update(("uefa.europa.conf", year) for year in range(2021, 2026))
+    expected.update(("fifa.world", year) for year in (2018, 2022))
+    expected.update(("uefa.euro", year) for year in (2016, 2020, 2024))
+    assert set(history.load_scope()) == expected
+    assert len(expected) == 80
     assert history.history_years(range(2001, 2027), 2026) == tuple(range(2025, 2015, -1))
     # A national-team tournament: the editions of the last ten years.
     assert history.history_years([2010, 2014, 2018, 2022, 2026], 2026) == (2022, 2018)

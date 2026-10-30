@@ -283,6 +283,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Accept a snapshot season whose metadata is still pending.",
     )
+    parser.add_argument(
+        "--registry-overlay",
+        action="store_true",
+        help="Refresh lane: overlay the daily registry leagues (#1370).",
+    )
     return parser
 
 
@@ -342,6 +347,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             expected_snapshot_id=args.expected_snapshot_id,
             expected_campaign_id=args.expected_campaign_id,
             allow_pending_season=bool(args.allow_pending_season),
+            registry_overlay=bool(args.registry_overlay),
         )
         paths = render_scope_overlays(scope, output_dir / "scope")
         run_id = args.run_id or (

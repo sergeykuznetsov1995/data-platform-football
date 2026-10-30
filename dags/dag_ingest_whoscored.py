@@ -51,8 +51,6 @@ RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
 # (host:port:user:pass, one sticky member per task).  No default: an unset pool
 # fails discover instead of egressing from the host IP.
 _TASK_ENV = {
-    # Order matters: runtime_contract requires PYTHONPATH to be an ordered
-    # subsequence of the anchored sys.path (root, root/dags).
     "PYTHONPATH": f"{RUNTIME_ROOT}:{RUNTIME_ROOT}/dags",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",

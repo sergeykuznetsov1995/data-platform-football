@@ -1039,6 +1039,16 @@ def read_snapshot(
     return value
 
 
+def read_refresh_snapshot(
+    path: str | Path, *, policy_path: str | Path
+) -> Mapping[str, Any]:
+    """The validated snapshot plus the daily registry leagues (#1370)."""
+
+    from scrapers.sofascore.all_mens_campaign import with_registry_refresh
+
+    return with_registry_refresh(read_snapshot(path, policy_path=policy_path))
+
+
 def read_completed(path: str | Path, *, campaign_id: str) -> set[str]:
     source = Path(path)
     if not source.exists():

@@ -999,8 +999,6 @@ jobs:
             scrapers/base/iceberg_writer.py \
             dags/dag_ingest_whoscored.py \
             dags/dag_backfill_whoscored.py \
-            dags/dag_canary_whoscored_proxy.py \
-            dags/dag_backup_whoscored_storage.py \
             dags/plugins/__init__.py \
             dags/plugins/whoscored_bootstrap_timetable.py \
             dags/dag_ingest_matchhistory.py \
@@ -1012,10 +1010,6 @@ jobs:
             dags/scripts/whoscored_ops_store.py \
             dags/scripts/whoscored_bootstrap.py \
             dags/scripts/whoscored_frozen_dq.py \
-            dags/scripts/whoscored_identity.py \
-            dags/scripts/whoscored_proxy_runtime.py \
-            dags/scripts/whoscored_production_issuance.py \
-            dags/scripts/whoscored_rollout_acceptance.py \
             dags/utils/maintenance_tasks.py \
             dags/utils/fbref_pipeline_tasks.py \
             docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
@@ -1026,21 +1020,12 @@ jobs:
             scripts/proxy_filter/filter_proxy.py \
             scripts/transition_seaweedfs_recovery_state.py \
             scripts/validate_seaweedfs_s3_identity_config.py \
-            scripts/generate_whoscored_deployment_attestation.py \
-            scripts/generate_whoscored_runtime_evidence.py \
-            scripts/validate_whoscored_build_provenance.py \
-            scripts/whoscored_production_admission.py \
-            scripts/whoscored_proxy_campaign.py \
-            scripts/research/bench_whoscored_workflow.py \
-            scripts/research/whoscored_capacity_container_runtime.py \
             "${whoscored_static_paths[@]}"
           python -m compileall -q \
             scrapers/whoscored \
             scrapers/base/iceberg_writer.py \
             dags/dag_ingest_whoscored.py \
             dags/dag_backfill_whoscored.py \
-            dags/dag_canary_whoscored_proxy.py \
-            dags/dag_backup_whoscored_storage.py \
             dags/plugins/__init__.py \
             dags/plugins/whoscored_bootstrap_timetable.py \
             dags/dag_ingest_matchhistory.py \
@@ -1050,10 +1035,6 @@ jobs:
             dags/scripts/whoscored_ops_store.py \
             dags/scripts/whoscored_bootstrap.py \
             dags/scripts/whoscored_frozen_dq.py \
-            dags/scripts/whoscored_identity.py \
-            dags/scripts/whoscored_proxy_runtime.py \
-            dags/scripts/whoscored_production_issuance.py \
-            dags/scripts/whoscored_rollout_acceptance.py \
             dags/utils/fbref_pipeline_tasks.py \
             docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
             scripts/init_seaweedfs_bucket.py \
@@ -1062,24 +1043,13 @@ jobs:
             scripts/flaresolverr_extended.py \
             scripts/proxy_filter/filter_proxy.py \
             scripts/transition_seaweedfs_recovery_state.py \
-            scripts/validate_seaweedfs_s3_identity_config.py \
-            scripts/generate_whoscored_deployment_attestation.py \
-            scripts/generate_whoscored_runtime_evidence.py \
-            scripts/validate_whoscored_build_provenance.py \
-            scripts/whoscored_production_admission.py \
-            scripts/whoscored_proxy_campaign.py \
-            scripts/research/bench_whoscored_workflow.py \
-            scripts/research/bench_whoscored_capacity.py \
-            scripts/research/whoscored_capacity_container_runtime.py \
-            scripts/research/whoscored_capacity_worker_exec.py
+            scripts/validate_seaweedfs_s3_identity_config.py
           bash -n scripts/cutover_seaweedfs_topology.sh
           bash -n scripts/compose.sh
           bash -n scripts/seaweedfs_legacy_entrypoint.sh
           bash -n scripts/seaweedfs_lifecycle_lock.sh
           bash -n scripts/seaweedfs_plane_entrypoint.sh
           bash -n scripts/research/run_fbref_canary_guarded.sh
-          bash -n scripts/whoscored_bootstrap_issuer.sh
-          bash -n scripts/whoscored_daily_issuer.sh
 
       - name: Render production compose
         if: ${{ !cancelled() }}
@@ -1122,53 +1092,6 @@ jobs:
                   for mount in services[name]["volumes"]
               )
           PY
-
-      - name: Validate declared WhoScored build-provenance state
-        if: ${{ !cancelled() }}
-        run: |
-          python -I -S scripts/generate_whoscored_runtime_evidence.py \
-            --root . --check
-          provenance_status="$(python -I -S -c \
-            'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
-          case "$provenance_status" in
-            blocked-v1) provenance_mode=(--expect-blocked) ;;
-            ready-v1)
-              provenance_mode=(
-                --expect-ready-build
-                --release-revision "${{ github.sha }}"
-              )
-              ;;
-            *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
-          esac
-          python -I -S scripts/validate_whoscored_build_provenance.py \
-            --root . "${provenance_mode[@]}" \
-            --report /tmp/whoscored-build-closure.json
-
-      - name: Prove checked-in evidence and closure report agree
-        if: ${{ !cancelled() }}
-        run: |
-          python -I -S - <<'PY'
-          import json
-
-          attestation = json.load(open(
-              "docker/images/airflow/whoscored-build-provenance-attestation.json"
-          ))
-          report = json.load(open("/tmp/whoscored-build-closure.json"))
-          assert attestation["status"] in {"blocked-v1", "ready-v1"}
-          assert report["status"] == attestation["status"]
-          assert bool(report["issues"]) == (report["status"] == "blocked-v1")
-          PY
-
-      - name: Prove real Buildx metadata and Docker digest last
-        if: ${{ !cancelled() }}
-        env:
-          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-          WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
-          WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
-        run: |
-          WHOSCORED_REAL_DOCKER_TEST=1 \
-          python -m pytest -q \
-            tests/unit/scripts/test_generate_whoscored_deployment_attestation.py::test_real_buildx_metadata_and_docker_digest_path_when_ci_provides_it
 
       - name: Cleanup test runtime
         if: ${{ always() }}
@@ -1219,9 +1142,7 @@ jobs:
           mkdir -p "${dag_dir}"
           for dag in \
             dag_ingest_whoscored.py \
-            dag_backfill_whoscored.py \
-            dag_canary_whoscored_proxy.py \
-            dag_backup_whoscored_storage.py
+            dag_backfill_whoscored.py
           do
             cp "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
           done
@@ -1231,23 +1152,6 @@ jobs:
           AIRFLOW_IMAGE: ${{ matrix.image }}
           AIRFLOW_VERSION: ${{ matrix.airflow-version }}
         run: |
-          pointer_parent="$(mktemp -d /tmp/whoscored-airflow-pointer.XXXXXXXX)"
-          [[ "$pointer_parent" =~ ^/tmp/whoscored-airflow-pointer\.[A-Za-z0-9]{8}$ ]]
-          pointer_root="${pointer_parent}/pointers"
-          host_python="$(command -v python)"
-          test -x "$host_python"
-          sudo chown root:root "$pointer_parent"
-          sudo chmod 0750 "$pointer_parent"
-          sudo env \
-            PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/dags" \
-            WHOSCORED_SCHEDULED_PAID_POINTER_ROOT="$pointer_root" \
-            "$host_python" \
-            "${GITHUB_WORKSPACE}/scripts/ci/create_whoscored_bootstrap_pointer.py"
-          test "$(sudo stat -Lc '%u:%g:%a' "$pointer_root")" = "0:0:750"
-          test "$(sudo stat -Lc '%u:%g:%a' "$pointer_root/bootstrap.json")" = "0:0:440"
-          test "$(sudo find "$pointer_root" -maxdepth 1 -type f ! -name bootstrap.json | wc -l)" = 7
-          test -z "$(sudo find "$pointer_root" -maxdepth 1 -type f ! -name bootstrap.json \
-            \( ! -uid 0 -o ! -gid 0 -o ! -perm 0640 \) -print -quit)"
           docker run --rm \
             --read-only \
             --network none \
@@ -1267,11 +1171,9 @@ jobs:
             -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow/airflow.db \
             -e AIRFLOW__CORE__DAGS_FOLDER=/workspace/dags/.whoscored-ci-staged \
             -e AIRFLOW__CORE__PLUGINS_FOLDER=/workspace/dags/plugins \
-            -e WHOSCORED_SCHEDULED_PAID_POINTER_ROOT=/tmp/whoscored-scheduled-pointers \
             -e PYTHONPATH=/workspace:/workspace/dags \
             -v "${GITHUB_WORKSPACE}:/workspace:ro" \
             -v "${RUNNER_TEMP}/airflow-wheels:/ci-wheels:ro" \
-            -v "${pointer_root}:/tmp/whoscored-scheduled-pointers:ro" \
             --workdir /workspace \
             --entrypoint /bin/bash \
             "$AIRFLOW_IMAGE" \

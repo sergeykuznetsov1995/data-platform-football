@@ -50,7 +50,6 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "dags") not in sys.path:
     sys.path.insert(0, str(ROOT / "dags"))
 
-from scrapers.sofascore.catalog import SofaScoreCatalog  # noqa: E402
 from scrapers.sofascore.discovery import (  # noqa: E402
     DISCOVERY_LEASE_MAX_BYTES,
     DISCOVERY_LEASE_TTL_SECONDS,
@@ -63,6 +62,7 @@ from dags.utils.sofascore_all_mens_state import (  # noqa: E402
     SeasonTarget,
     current_season_targets,
 )
+from scrapers.sofascore.all_mens_campaign import with_registry_refresh  # noqa: E402
 from scrapers.sofascore.raw_store import RawPayloadStore  # noqa: E402
 from scrapers.sofascore.schedule_refresh import (  # noqa: E402
     MAX_BACKTRACK_PAGES,
@@ -227,12 +227,6 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
-
-
-def _configured_tournament_ids() -> frozenset[int]:
-    """Source ids of the leagues ``dag_ingest_sofascore`` already covers."""
-
-    return frozenset(SofaScoreCatalog.load().tournament_map(enabled_only=True).values())
 
 
 def ambiguous_current_seasons(
@@ -1330,14 +1324,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise ValueError("--page-budget must be positive")
         if args.budget_cap_bytes < 0:
             raise ValueError("--budget-cap-bytes cannot be negative")
-        snapshot = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+        # #1370: the daily registry leagues join the sweep as ``SS-<id>``.
+        snapshot = with_registry_refresh(
+            json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+        )
         snapshot_id = str(snapshot.get("snapshot_id") or "")
         raw_store = (
             RawPayloadStore.from_uri(args.raw_store_uri)
             if args.raw_store_uri
             else RawPayloadStore.from_env(optional=False)
         )
-        exclude = _configured_tournament_ids()
+        # #1370: the daily registry leagues are swept here as well, side by side.
+        exclude: frozenset[int] = frozenset()
         all_targets = current_season_targets(snapshot, exclude)
         if not all_targets:
             raise ValueError("campaign snapshot has no ready tournament season")

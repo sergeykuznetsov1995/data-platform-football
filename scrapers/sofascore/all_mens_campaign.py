@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from scrapers.sofascore.catalog import SofaScoreCatalog
+from scrapers.sofascore.catalog import DEFAULT_REGISTRY_PATH, SofaScoreCatalog
 from scrapers.sofascore.denominator import Denominator, load_denominator
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,109 @@ def _scope_digest(scope: Mapping[str, Any]) -> str:
     return _digest(unsigned)
 
 
+REGISTRY_REFRESH_LANE = "registry_refresh"
+# The current season, and the one before it so a season rollover can still be
+# ranked by start year; the history campaign never sees these rows.
+REGISTRY_REFRESH_SEASONS = 2
+
+
+def _registry_start_year(canonical: str, season_format: str) -> int:
+    if season_format == "single_year":
+        return int(canonical)
+    short = int(canonical[:2])
+    return (1900 if short >= 50 else 2000) + short
+
+
+def with_registry_refresh(
+    snapshot: Mapping[str, Any],
+    registry: Mapping[str, Any] | None = None,
+    denominator: Denominator | None = None,
+) -> dict[str, Any]:
+    """Overlay the daily registry leagues missing from the snapshot (#1370).
+
+    Refresh lane only, in memory: the committed campaign snapshot (and with it
+    ``campaign_id``, the history controller, the metadata enrichment) never
+    holds these rows.  Each enabled, approved adult men's first-team registry
+    tournament outside the snapshot becomes a ready ``SS-<id>`` row with its
+    newest ``REGISTRY_REFRESH_SEASONS`` seasons pending (the refresh lane
+    plans them from Bronze schedule evidence).  ``snapshot_id`` is re-signed,
+    while ``candidate_count`` stays, so the overlay can never pass
+    ``validate_campaign_snapshot`` as a snapshot of its own.
+    """
+
+    if registry is None:
+        registry = json.loads(DEFAULT_REGISTRY_PATH.read_text(encoding="utf-8"))
+    denominator = load_denominator() if denominator is None else denominator
+    rows = list(snapshot.get("tournaments") or [])
+    present = {
+        row.get("unique_tournament_id") for row in rows if isinstance(row, Mapping)
+    }
+    added = []
+    for entry in registry.get("tournaments") or []:
+        tournament_id = int(entry["unique_tournament_id"])
+        review = entry.get("review") or {}
+        confirmed = review.get("confirmed") or {}
+        if (
+            entry.get("enabled") is not True
+            or tournament_id in present
+            or review.get("status") != "approved"
+            or confirmed.get("gender") != "male"
+            or confirmed.get("age_group") != "adult"
+            or confirmed.get("team_level") != "first_team"
+            or denominator.queue_priority(tournament_id) <= 0
+        ):
+            continue
+        seasons = []
+        for season in entry.get("seasons") or []:
+            canonical = str(season.get("canonical_season") or "")
+            season_format = str(season.get("season_format") or "")
+            if not canonical.isdigit() or season_format not in {
+                "split_year", "single_year"
+            }:
+                continue
+            seasons.append({
+                "canonical_season": canonical,
+                "metadata_status": "pending",
+                "season_format": season_format,
+                "source_name": str(season.get("source_name") or canonical),
+                "source_season_id": int(season["season_id"]),
+                "start_year": _registry_start_year(canonical, season_format),
+            })
+        seasons.sort(
+            key=lambda item: (item["start_year"], item["source_season_id"]),
+            reverse=True,
+        )
+        added.append({
+            "capture_key": f"SS-{tournament_id}",
+            "category": dict(entry.get("category") or {}),
+            "classification": dict(entry.get("classification") or {}),
+            "eligibility_review": {
+                "confirmed": {
+                    "age_group": "adult",
+                    "professional": True,
+                    "team_level": "first_team",
+                },
+                "exclusion_reasons": [],
+                "reviewed_at": review.get("reviewed_at"),
+                "reviewed_by": review.get("reviewed_by"),
+                "status": "approved",
+            },
+            "kind": "league",
+            "lane": REGISTRY_REFRESH_LANE,
+            "metadata_status": "ready",
+            "name": str(entry.get("name") or ""),
+            "page_path": str(entry.get("page_path") or ""),
+            "seasons": seasons[:REGISTRY_REFRESH_SEASONS],
+            "slug": str(entry.get("slug") or ""),
+            "unique_tournament_id": tournament_id,
+        })
+    if not added:
+        return dict(snapshot)
+    overlaid = {**snapshot, "tournaments": rows + added}
+    overlaid["snapshot_id"] = _snapshot_digest(overlaid)
+    return overlaid
+
+
 def load_exact_scope(
     snapshot_path: str | Path,
     *,
@@ -124,6 +227,7 @@ def load_exact_scope(
     expected_campaign_id: str | None = None,
     allow_pending_season: bool = False,
     denominator: Denominator | None = None,
+    registry_overlay: bool = False,
 ) -> dict[str, Any]:
     """Load one ready tournament-season and bind it to the snapshot digest.
 
@@ -141,6 +245,11 @@ def load_exact_scope(
     between planning and run (#1354).  The campaign identity
     (``expected_campaign_id``), the digest and every row check below stay
     strict, so a revision can never swap the scope that was planned.
+
+    ``registry_overlay`` (refresh lane, #1370) applies
+    ``with_registry_refresh`` after the file's own digest check; without it a
+    daily registry league outside the snapshot is refused, as the history
+    campaign requires.
     """
 
     path = Path(snapshot_path)
@@ -153,6 +262,10 @@ def load_exact_scope(
     snapshot_id = str(document.get("snapshot_id") or "")
     if snapshot_id != _snapshot_digest(document):
         raise CampaignScopeError("campaign snapshot digest mismatch")
+    if registry_overlay:
+        denominator = load_denominator() if denominator is None else denominator
+        document = with_registry_refresh(document, denominator=denominator)
+        snapshot_id = str(document["snapshot_id"])
     if expected_snapshot_id and snapshot_id != expected_snapshot_id:
         logger.warning(
             "snapshot revised after planning (%s->%s), campaign identity intact",
@@ -439,4 +552,5 @@ __all__ = [
     "load_exact_scope",
     "render_scope_overlays",
     "validate_campaign_snapshot",
+    "with_registry_refresh",
 ]
