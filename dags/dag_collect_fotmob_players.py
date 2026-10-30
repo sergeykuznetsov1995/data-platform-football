@@ -81,7 +81,10 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
             task_id=TRIGGER_TASK_ID,
             trigger_dag_id=INGEST_DAG_ID,
             trigger_run_id="fotmob_players__" + GENERATION_TEMPLATE,
-            logical_date="{{ logical_date.isoformat() }}",
+            # Keep a stable child date outside the orchestrator's five-minute grid.
+            logical_date=(
+                "{{ (logical_date + macros.timedelta(microseconds=1)).isoformat() }}"
+            ),
             wait_for_completion=True,
             poke_interval=30,
             allowed_states=["success"],

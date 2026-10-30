@@ -126,3 +126,26 @@ def test_non_exact_isolated_role_does_not_materialize(monkeypatch):
     module = importlib.import_module("dag_collect_fotmob_players")
     assert module.dag is None
     assert PythonOperator._instances == []
+
+
+def test_child_date_avoids_existing_orchestrator_run_and_is_stable(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from airflow.operators.python import PythonOperator
+    from jinja2 import Environment
+
+    _reload_collector(monkeypatch, isolated=True)
+    trigger = next(
+        task for task in PythonOperator._instances
+        if task.task_id == "trigger_fotmob_player_collector"
+    )
+    logical_date = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    # Airflow's uniqueness key ignores run_id: the orchestrator owns this date.
+    existing_runs = {("dag_ingest_fotmob", logical_date): "orchestrator__existing"}
+    template = Environment().from_string(trigger._init_kwargs["logical_date"])
+    context = {"logical_date": logical_date, "macros": SimpleNamespace(timedelta=timedelta)}
+    child_date = datetime.fromisoformat(template.render(**context))
+    assert (trigger._init_kwargs["trigger_dag_id"], child_date) not in existing_runs
+    assert child_date == logical_date + timedelta(microseconds=1)
+    assert template.render(**context) == child_date.isoformat()
