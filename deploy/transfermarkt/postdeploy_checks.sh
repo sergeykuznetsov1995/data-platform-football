@@ -65,7 +65,8 @@ check_mounts "$SCHED" \
   "/opt/airflow/scrapers=$RELEASE/scrapers" \
   "/opt/airflow/scripts=$RELEASE/scripts" \
   "/opt/airflow/configs=$RELEASE/configs" \
-  "/opt/airflow/logs=$RUNTIME/logs"
+  "/opt/airflow/logs=$RUNTIME/logs" \
+  "/opt/airflow/gateway-state=$RUNTIME/gateway-state"
 # Только имена и несекретные значения: токены, пароли и ключи не печатаются.
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SCHED" \
   | grep -E '^(TM_PROXY_CONTROL_URL|TM_BACKFILL_PROXY_CONTROL_URL|TRANSFERMARKT_RAW_STORE_URI|TRANSFERMARKT_REQUIRE_RAW_STORE|TM_NATIVE_V2_ENABLED|TM_STANDING_POLICY_ENABLED|TM_REQUIRE_METERED_PROXY|ALERT_ENV)=' || true

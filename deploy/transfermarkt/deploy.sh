@@ -170,7 +170,8 @@ if [ -f "$LEDGER" ] && [ -s "$LEDGER" ]; then
     archive="$GW_STATE/paid_requests.$(date -u +%Y%m%dT%H%M%SZ).jsonl.gz"
     # Цепочка `&&` под `set -e` не роняет скрипт: сбой gzip молча оставил бы .tmp и
     # выкат шёл бы дальше. Сбой — код 5 (шлюз уже остановлен), леджер не тронут.
-    if ! ( gzip -c "$LEDGER" > "$archive.tmp" && chmod 0600 "$archive.tmp" \
+    # Архив читает отчёт трафика в планировщике (uid 50000, #1404): владелец 50000, 0640.
+    if ! ( gzip -c "$LEDGER" > "$archive.tmp" && chown 50000:root "$archive.tmp" && chmod 0640 "$archive.tmp" \
            && mv -f "$archive.tmp" "$archive" && rm -f "$LEDGER" ); then
       rm -f "$archive.tmp"
       log "ledger archive failed: $LEDGER не тронут, выкат остановлен"
