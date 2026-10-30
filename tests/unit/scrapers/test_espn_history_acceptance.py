@@ -29,7 +29,7 @@ def test_acceptance_left_joins_scope_and_counts_red_pairs_once(db):
     for event in (1, 2, 3):
         db.match(event, season_year=2016, first_published_at="2026-01-01")
     evidence = {("eng.1", 2016): CoreEvidence(2016, ((1, (1, 2)), (2, (2, 3))))}
-    rows = db.run(render_acceptance_sql(scope, evidence))
+    rows = db.run(render_acceptance_sql(scope, evidence, {pair: True for pair in scope}))
     assert len(rows) == 4  # unrelated red queue is absent
     assert [r[4] for r in rows] == [False, True, True, False]  # inventory affects only absent pairs
     assert rows[0][6:12] == (4, 3, 1, 3, 0, 0)  # raw count, union, cross-type duplicate
@@ -46,7 +46,7 @@ def test_strict_red_share_boundary(db, red, accepted):
                       history.RED if i < red else history.EMPTY, attempts=history.MAX_ATTEMPTS)
                       for i, (slug, year) in enumerate(scope)])
     evidence = {pair: CoreEvidence(pair[1], ()) for pair in scope[red:]}
-    rows = db.run(render_acceptance_sql(scope, evidence))
+    rows = db.run(render_acceptance_sql(scope, evidence, {pair: True for pair in scope}))
     assert sum(r[4] for r in rows) == red
     assert ("приёмка: да" in render_acceptance(rows)) is accepted
 
@@ -56,7 +56,7 @@ def test_unfinished_pair_blocks_even_below_red_threshold(db, state):
     history.save_rows(db.con, [history.QueueRow("eng.1", 2016, 1, state)])
     rows = db.run(render_acceptance_sql((("eng.1", 2016),), {
         ("eng.1", 2016): CoreEvidence(2016, ((1, ()),)),
-    }))
+    }, {("eng.1", 2016): True}))
     assert not rows[0][12]
     assert "приёмка: нет" in render_acceptance(rows)
 
@@ -64,10 +64,11 @@ def test_unfinished_pair_blocks_even_below_red_threshold(db, state):
 def test_missing_evidence_and_missing_type_block_completion(db):
     scope = (("eng.1", 2016),)
     history.save_rows(db.con, [history.QueueRow("eng.1", 2016, 1, history.DONE)])
-    assert "приёмка: нет" in render_acceptance(db.run(render_acceptance_sql(scope, {})))
+    rows = db.run(render_acceptance_sql(scope, {}, {pair: True for pair in scope}))
+    assert "приёмка: нет" in render_acceptance(rows)
     rows = db.run(render_acceptance_sql(scope, {
         scope[0]: CoreEvidence(2016, ((1, ()), (2, ()))),
-    }))
+    }, {pair: True for pair in scope}))
     assert not rows[0][12]
 
 
@@ -78,7 +79,8 @@ def test_completeness_compares_ids_not_queue_matches_or_just_counts(db):
     db.match(1, season_year=2016, first_published_at="2026-01-01")
     db.match(2, season_year=2016)  # not published
     db.match(3, season_year=2016, first_published_at="2026-01-01")  # unexpected id
-    rows = db.run(render_acceptance_sql(scope, {scope[0]: CoreEvidence(2016, ((1, (1, 2)),))}))
+    rows = db.run(render_acceptance_sql(
+        scope, {scope[0]: CoreEvidence(2016, ((1, (1, 2)),))}, {pair: True for pair in scope}))
     assert rows[0][4] is True
     assert rows[0][10:12] == (1, 1)
     assert rows[0][6] == rows[0][9] == 2  # equal counts do not prove completeness
@@ -87,7 +89,8 @@ def test_completeness_compares_ids_not_queue_matches_or_just_counts(db):
 def test_confirmed_quality_defect_is_red(db):
     scope = (("eng.1", 2016),)
     history.save_rows(db.con, [history.QueueRow("eng.1", 2016, 0, history.EMPTY)])
-    rows = db.run(render_acceptance_sql(scope, {scope[0]: CoreEvidence(2016, ())}, scope))
+    rows = db.run(render_acceptance_sql(
+        scope, {scope[0]: CoreEvidence(2016, ())}, {pair: False for pair in scope}))
     assert rows[0][4] is True
 
 
@@ -201,7 +204,7 @@ def test_red_type_does_not_hide_missing_expected_type(db):
                       for i, (slug, year) in enumerate(scope)])
     evidence = {pair: CoreEvidence(pair[1], ((1, ()),)) for pair in scope}
     evidence[scope[0]] = CoreEvidence(scope[0][1], ((1, ()), (2, ())))
-    rows = db.run(render_acceptance_sql(scope, evidence))
+    rows = db.run(render_acceptance_sql(scope, evidence, {pair: True for pair in scope}))
     assert rows[0][4] and not rows[0][12]
     assert "приёмка: нет" in render_acceptance(rows)
 
@@ -215,7 +218,7 @@ def test_retryable_red_pair_blocks_acceptance(db, attempts):
         for i, (slug, year) in enumerate(scope)
     ])
     evidence = {pair: CoreEvidence(pair[1], ()) for pair in scope[1:]}
-    rows = db.run(render_acceptance_sql(scope, evidence))
+    rows = db.run(render_acceptance_sql(scope, evidence, {pair: True for pair in scope}))
     exhausted = attempts >= history.MAX_ATTEMPTS
     assert rows[0][3] is not exhausted
     assert rows[0][12] is exhausted
@@ -227,7 +230,8 @@ def test_acceptance_includes_terminal_nonplayed_without_publication(db):
     history.save_rows(db.con, [history.QueueRow(*pair, 1, history.DONE)])
     db.match(1, season_year=2016, status="STATUS_CANCELED", played_final=False,
              terminal_nonplayed=True)
-    rows = db.run(render_acceptance_sql((pair,), {pair: CoreEvidence(2016, ((1, (1,)),))}))
+    rows = db.run(render_acceptance_sql(
+        (pair,), {pair: CoreEvidence(2016, ((1, (1,)),))}, {pair: True}))
     assert rows[0][9:12] == (1, 0, 0)
     assert "приёмка: да" in render_acceptance(rows)
 
@@ -270,3 +274,52 @@ def test_parity_checks_all_dates_of_ambiguous_legacy_key(legacy, event_id):
     assert len(rows) == 1
     assert rows[0][5] and rows[0][7:9] == (2, True)
     assert rows[0][12] == [2016]
+
+
+@pytest.mark.parametrize("assessment", [{}, {("eng.1", 2016): None}])
+def test_unknown_quality_blocks_otherwise_complete_acceptance(db, assessment):
+    scope = tuple(("eng.1", year) for year in range(2016, 2022))
+    history.save_rows(db.con, [history.QueueRow(*pair, 0, history.EMPTY) for pair in scope])
+    evidence = {pair: CoreEvidence(pair[1], ()) for pair in scope}
+    rows = db.run(render_acceptance_sql(scope, evidence, assessment))
+    assert "приёмка: нет" in render_acceptance(rows)
+    assert rows[0][13] is True
+
+
+def test_quality_assessment_is_required():
+    with pytest.raises(TypeError):
+        render_acceptance_sql((("eng.1", 2016),), {})
+
+
+@pytest.mark.parametrize("published_duplicate", [False, True])
+def test_physical_bronze_duplicates_make_complete_pair_red(db, published_duplicate):
+    pair = ("eng.1", 2016)
+    history.save_rows(db.con, [history.QueueRow(*pair, 1, history.DONE)])
+    evidence = {pair: CoreEvidence(2016, ((1, (1,)),))}
+    db.match(1, season_year=2016, first_published_at="2026-01-01")
+    db.match(1, season_year=2016,
+             first_published_at="2026-01-01" if published_duplicate else None)
+    # Unknown quality must not mask independently confirmed uniqueness defects.
+    rows = db.run(render_acceptance_sql((pair,), evidence, {}))
+    assert rows[0][4] is True
+    assert rows[0][9:12] == (1, 0, 0)
+    assert rows[0][14] == 1
+    assert "bronze_duplicates=1" in render_acceptance(rows)
+
+
+@pytest.mark.parametrize("part", ["lineup", "matchsheet"])
+@pytest.mark.parametrize("link", ["native", "date"])
+def test_legacy_parts_keep_wrong_label_via_schedule_scope(legacy, part, link):
+    legacy.con.execute("""INSERT INTO iceberg.bronze.espn_match
+        (competition_slug,season_year,event_id,first_published_at)
+        VALUES ('eng.1',2016,1,'2026-01-01')""")
+    legacy.con.execute("INSERT INTO iceberg.bronze.espn_schedule VALUES "
+                       "('ENG-Premier League','1516',?,?,NULL,NULL,'a')",
+                       ['1' if link == 'native' else '2', None if link == 'native' else '2016-08-20'])
+    # Multiple parts and a multi-season scope must not multiply report rows.
+    legacy.con.execute(f"INSERT INTO iceberg.bronze.espn_{part} VALUES "
+                       "('ENG-Premier League','1516','a'),('ENG-Premier League','1516','a'),"
+                       "('ENG-Premier League','1415','outside')")
+    rows = legacy.run(render_legacy_parts_sql((("eng.1", 2016), ("eng.1", 2017))))
+    assert (part, "eng.1", "1516", 2, 0) in rows
+    assert all(row[2] != '1415' for row in rows)

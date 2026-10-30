@@ -137,7 +137,8 @@ scope = load_scope()  # active pinned pairs, after explicit exclusions
 # Saved season JSON + all saved event-list pages of every type; no HTTP here.
 # pages_by_type = {type_id: [page_1_bytes, ..., page_N_bytes]}
 # evidence[(slug, year)] = core_evidence(season_json, pages_by_type)
-# acceptance_sql = render_acceptance_sql(scope, evidence, quality_errors)
+# quality_results[(slug, year)] = True / False / None  # pass / defect / unknown
+# acceptance_sql = render_acceptance_sql(scope, evidence, quality_results)
 # report = render_acceptance(rows_returned_by_read_only_query)
 parity_sql = render_parity_sql(scope)
 parts_sql = render_legacy_parts_sql(scope)
@@ -148,10 +149,13 @@ bodies used by the history lane (raw cache/export). `core_evidence` validates
 all declared types, pages, original counts and within-type unique event IDs.
 Do not reconstruct evidence from `queue.matches`: it has already lost cross-type
 duplicates. The report shows sum of core counts, union of IDs, cross-type
-repetitions and missing/extra published Bronze IDs. Confirmed terminal nonplayed
+repetitions, physical Bronze duplicate rows and missing/extra published Bronze IDs.
+Physical duplicates make a pair red, including unpublished duplicate rows. Confirmed terminal nonplayed
 Bronze rows also count as completed IDs even without `first_published_at`.
-Missing evidence blocks non-red pairs. Pass confirmed pair-level quality defects as `quality_errors`,
-including capability-aware defects from `history_report` (valid-empty parts
+Missing evidence blocks non-red pairs. The required `quality_results` mapping
+records each pair as True (checked, no defects), False (confirmed defects), or
+None (unknown). Missing/unknown assessments block acceptance, including for red
+pairs. Include capability-aware defects from `history_report` (valid-empty parts
 are defects only where the season actually has that capability). Persist the
 scope, raw evidence references, confirmed quality findings and report together;
 an omitted quality assessment is not proof that quality was checked.
@@ -177,7 +181,9 @@ calendar year for World Cups. The appended `date_seasons` column lists date-base
 candidate years; a conflict with the label marks an unmatched row ambiguous.
 These calendar hints do not prove season membership for extended seasons.
 `ITA-Serie A/2021` is explicitly excluded as the known copy of 2019/20 and
-counted in the parts report. Lineup/matchsheet rows without exactly one schedule
+counted in the parts report. Lineup/matchsheet coverage follows schedule links
+by native event ID, schedule dates or season labels, retaining the original
+legacy label. Rows without exactly one schedule
 link are uncomparable. Their scores are not a parity reference; score comparison
 uses schedule's `home_goals/away_goals` and leaves NULL as unknown. Legacy is
 never the completeness baseline. SQL is SELECT-only over Bronze/ops, no Silver

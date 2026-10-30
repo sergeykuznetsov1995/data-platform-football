@@ -71,18 +71,20 @@ def _scope(scope):
 
 
 def render_acceptance_sql(scope, evidence: Mapping[tuple[str, int], CoreEvidence],
-                          quality_errors=()) -> str:
+                          quality_results: Mapping[tuple[str, int], bool | None]) -> str:
     """One row per pinned pair, including absent pairs and failed inventories.
 
-    quality_errors are confirmed pair-level defects (e.g. capability-aware
-    empty-part defects); unknown/missing evidence blocks acceptance separately.
+    quality_results records capability-aware assessment per pair: True passes,
+    False is defective; None or an absent pair blocks acceptance as unknown.
     """
     scope = _scope(scope)
     for pair, item in evidence.items():
         if pair not in scope or pair[1] != item.year:
             raise ValueError("core evidence does not belong to the pinned season")
-    if not set(quality_errors).issubset(scope):
-        raise ValueError("quality error outside pinned scope")
+    if not set(quality_results).issubset(scope):
+        raise ValueError("quality result outside pinned scope")
+    if any(value is not None and type(value) is not bool for value in quality_results.values()):
+        raise ValueError("quality result must be True, False or None")
     pairs = _values(scope, (("slug", "varchar"), ("season_year", "integer")))
     counts = _values(((slug, year, sum(len(ids) for _, ids in item.types), len(item.types))
                       for (slug, year), item in evidence.items()),
@@ -94,8 +96,11 @@ def render_acceptance_sql(scope, evidence: Mapping[tuple[str, int], CoreEvidence
     events = _values(((slug, year, event) for (slug, year), item in evidence.items()
                       for _, ids in item.types for event in ids),
                      (("slug", "varchar"), ("season_year", "integer"), ("event_id", "bigint")))
-    errors = _values(quality_errors, (("slug", "varchar"), ("season_year", "integer")))
-    return f"""WITH scope AS ({pairs}), counts AS ({counts}),
+    errors = _values((pair for pair, passed in quality_results.items() if passed is False),
+                     (("slug", "varchar"), ("season_year", "integer")))
+    checked = _values((pair for pair, passed in quality_results.items() if passed is not None),
+                      (("slug", "varchar"), ("season_year", "integer")))
+    return f"""WITH scope AS ({pairs}), counts AS ({counts}), checked AS ({checked}),
 expected_types AS ({types}), events AS ({events}), errors AS ({errors}),
 q AS (
     SELECT slug, season_year, count(*) AS rows,
@@ -114,6 +119,14 @@ q AS (
     GROUP BY t.slug, t.season_year
 ), expected AS (
     SELECT DISTINCT slug, season_year, event_id FROM events
+), duplicate_keys AS (
+    SELECT m.competition_slug AS slug, m.season_year, m.event_id, count(*) - 1 AS duplicates
+    FROM iceberg.bronze.espn_match m JOIN scope s
+      ON s.slug = m.competition_slug AND s.season_year = m.season_year
+    GROUP BY m.competition_slug, m.season_year, m.event_id HAVING count(*) > 1
+), duplicates AS (
+    SELECT slug, season_year, sum(duplicates) AS duplicates
+    FROM duplicate_keys GROUP BY slug, season_year
 ), published AS (
     SELECT DISTINCT m.competition_slug AS slug, m.season_year, m.event_id
     FROM iceberg.bronze.espn_match m JOIN scope s
@@ -131,6 +144,7 @@ q AS (
 SELECT s.slug, s.season_year, q.slug IS NULL AS missing,
        coalesce(NOT q.finished, false) AS pending,
        (coalesce(q.red, false) OR (coalesce(i.red, false) AND q.slug IS NULL) OR err.slug IS NOT NULL
+        OR coalesce(dup.duplicates, 0) > 0
         OR (coalesce(q.finished, false) AND c.slug IS NOT NULL
             AND (coalesce(d.missing_ids, 0) > 0 OR coalesce(d.extra_ids, 0) > 0))) AS red,
        c.slug IS NULL AS evidence_missing,
@@ -140,27 +154,31 @@ SELECT s.slug, s.season_year, q.slug IS NULL AS missing,
        coalesce(d.missing_ids, 0) AS missing_ids, coalesce(d.extra_ids, 0) AS extra_ids,
        (coalesce(q.finished, false) AND ((c.slug IS NULL AND coalesce(q.red, false))
         OR (c.slug IS NOT NULL AND coalesce(t.gaps, 0) = 0
-        AND ((c.type_count = 0 AND q.rows = 1) OR c.type_count = q.rows)))) AS finished
+        AND ((c.type_count = 0 AND q.rows = 1) OR c.type_count = q.rows)))) AS finished,
+       ch.slug IS NULL AS quality_missing, coalesce(dup.duplicates, 0) AS bronze_duplicates
 FROM scope s LEFT JOIN q ON q.slug = s.slug AND q.season_year = s.season_year
 LEFT JOIN inventory i ON i.slug = s.slug
 LEFT JOIN counts c ON c.slug = s.slug AND c.season_year = s.season_year
 LEFT JOIN ids d ON d.slug = s.slug AND d.season_year = s.season_year
 LEFT JOIN type_gaps t ON t.slug = s.slug AND t.season_year = s.season_year
 LEFT JOIN errors err ON err.slug = s.slug AND err.season_year = s.season_year
+LEFT JOIN checked ch ON ch.slug = s.slug AND ch.season_year = s.season_year
+LEFT JOIN duplicates dup ON dup.slug = s.slug AND dup.season_year = s.season_year
 ORDER BY s.slug, s.season_year"""
 
 
 def render_acceptance(rows: Sequence[Sequence]) -> str:
     total = len(rows)
     red = sum(bool(row[4]) for row in rows)
-    blocked = sum(bool(row[2] or row[3] or (row[5] and not row[4]) or not row[12]) for row in rows)
+    blocked = sum(bool(row[2] or row[3] or (row[5] and not row[4]) or not row[12] or row[13]) for row in rows)
     accepted = total > 0 and not blocked and red * 5 < total
     lines = [f"Tier A: {total} пар, красных {red}, незавершённых {blocked}; "
              f"приёмка: {'да' if accepted else 'нет'} (красных строго < 20%)."]
     lines.extend(f"{r[0]}/{r[1]}: missing={r[2]}, pending={r[3]}, red={r[4]}, "
                  f"evidence_missing={r[5]}, core_count={r[6]}, unique={r[7]}, "
                  f"cross_type_duplicates={r[8]}, published={r[9]}, "
-                 f"missing_ids={r[10]}, extra_ids={r[11]}, finished={r[12]}" for r in rows)
+                 f"missing_ids={r[10]}, extra_ids={r[11]}, finished={r[12]}, "
+                 f"quality_missing={r[13]}, bronze_duplicates={r[14]}" for r in rows)
     return "\n".join(lines)
 
 
@@ -249,7 +267,21 @@ def render_legacy_parts_sql(scope) -> str:
     These tables lack event_id: only a unique schedule game link can identify
     one. NULL scores stay explicitly uncomparable, never a score mismatch.
     """
-    return f"""WITH {_legacy_ctes(scope)}, schedule_links AS (
+    return f"""WITH {_legacy_ctes(scope)}, scoped_schedule AS (
+    SELECT b.league, CAST(b.season AS varchar) AS season, b.game
+    FROM legacy b
+    WHERE EXISTS (
+        SELECT 1 FROM scope x WHERE x.slug = b.slug AND (
+            x.season = CAST(b.season AS varchar)
+            OR (TRY_CAST(b.match_date AS timestamp) >= CAST(x.start_date AS timestamp)
+                AND TRY_CAST(b.match_date AS timestamp) < CAST(x.end_date AS timestamp)))
+    ) OR EXISTS (
+        SELECT 1 FROM iceberg.bronze.espn_match m JOIN scope x
+          ON x.slug = m.competition_slug AND x.season_year = m.season_year
+        WHERE m.competition_slug = b.slug AND m.event_id = TRY_CAST(b.game_id AS bigint)
+          AND (m.first_published_at IS NOT NULL OR m.terminal_nonplayed = true)
+    )
+), schedule_links AS (
     SELECT league, CAST(season AS varchar) AS season, game,
            count(*) AS links, count(TRY_CAST(game_id AS bigint)) AS ids
     FROM legacy GROUP BY league, CAST(season AS varchar), game
@@ -261,8 +293,10 @@ def render_legacy_parts_sql(scope) -> str:
 SELECT p.part, l.slug, p.season, count(*) AS rows,
        count_if(coalesce(s.links, 0) <> 1 OR coalesce(s.ids, 0) <> 1) AS uncomparable
 FROM parts p JOIN leagues l ON l.league = p.league
-JOIN scope x ON x.slug = l.slug AND x.season = p.season
 LEFT JOIN schedule_links s ON s.league = p.league AND s.season = p.season AND s.game = p.game
+WHERE EXISTS (SELECT 1 FROM scope x WHERE x.slug = l.slug AND x.season = p.season)
+   OR EXISTS (SELECT 1 FROM scoped_schedule x WHERE x.league = p.league
+              AND x.season IS NOT DISTINCT FROM p.season AND x.game IS NOT DISTINCT FROM p.game)
 GROUP BY p.part, l.slug, p.season
 UNION ALL
 SELECT 'excluded_schedule', 'ita.1', '2021', count(*), count(*)
