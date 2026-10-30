@@ -30,8 +30,6 @@ ACTIVE_COOLDOWN = timedelta(seconds=30)
 IDLE_COOLDOWN = timedelta(minutes=15)
 
 _TASK_ENV = {
-    # Order matters: runtime_contract requires PYTHONPATH to be an ordered
-    # subsequence of the anchored sys.path (root, root/dags).
     "PYTHONPATH": f"{RUNTIME_ROOT}:{RUNTIME_ROOT}/dags",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",

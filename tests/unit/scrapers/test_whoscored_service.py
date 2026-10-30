@@ -22,7 +22,6 @@ from scrapers.whoscored.parsers import (
     DatasetStatus,
     ParsedDataset,
     PlayerStageStatisticsPage,
-    WhoScoredParseError,
 )
 from scrapers.whoscored.raw_store import (
     RawTarget,
@@ -286,7 +285,7 @@ class _Transport:
         return response
 
     def get_traffic_stats(self):
-        return {"paid_proxy_bytes": 0, "route_requests": {"direct_http": 1}}
+        return {"route_requests": {"direct_http": 1}}
 
     def close(self):
         return None
@@ -341,7 +340,7 @@ class _RawCacheAwareTransport:
         return response
 
     def get_traffic_stats(self):
-        return {"paid_proxy_bytes": 0}
+        return {}
 
     def close(self):
         return None
@@ -514,13 +513,13 @@ class _CatalogTransport:
         return None
 
     def get_traffic_stats(self):
-        return {"paid_proxy_bytes": 0, "route_requests": {"direct_http": 0}}
+        return {"route_requests": {"direct_http": 0}}
 
     def close(self):
         return None
 
 
-def test_default_transports_receive_only_the_paid_gateway_endpoint(monkeypatch):
+def test_default_transports_receive_no_paid_or_proxy_endpoints(monkeypatch):
     calls = []
 
     class CapturingTransport(_CatalogTransport):
@@ -549,9 +548,7 @@ def test_default_transports_receive_only_the_paid_gateway_endpoint(monkeypatch):
 
     assert len(calls) == 2
     for kwargs in calls:
-        assert kwargs["paid_gateway_url"] == "http://paid-gateway:8898"
-        assert "paid_proxy_url" not in kwargs
-        assert "proxy_control_url" not in kwargs
+        assert set(kwargs) == {"flaresolverr_url", "context"}
 
 
 def test_discover_catalog_requires_an_exact_date_before_runtime_setup():
@@ -730,7 +727,7 @@ class _FailingTransport:
         raise self.error
 
     def get_traffic_stats(self):
-        return {"paid_proxy_bytes": 0}
+        return {}
 
     def close(self):
         return None
@@ -782,7 +779,7 @@ class _RawPersistingContentFailureTransport:
         raise AssertionError("fixture content unexpectedly passed validation")
 
     def get_traffic_stats(self):
-        return {"paid_proxy_bytes": 0}
+        return {}
 
     def close(self):
         return None
@@ -2616,7 +2613,6 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
         "stage_streaks": 0,
         "stage_performance": 0,
     }
-    assert service.transport.budgets.max_paid_urls == 3
     policy = {
         (kind, ids.get("month")): kwargs.get("cache_ttl") for kind, ids, kwargs in calls
     }
@@ -2800,58 +2796,6 @@ def test_player_stage_statistics_fetches_every_declared_page(tmp_path, monkeypat
     assert {row["player_id"] for row in parsed.rows} == {11, 12}
     assert len(additional_raw) == 1
     assert additional_raw[0][1] == "s3://raw/page-2"
-
-
-def test_paid_player_pagination_limit_blocks_before_page_two_dial(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT", "0")
-    service, _, _ = _service(tmp_path)
-    spec = service._player_stage_statistics_spec(
-        stage_id=700,
-        source_season_id=9001,
-        active=True,
-        category="summary",
-        subcategory="all",
-        cache_ttl=None,
-        browser_bootstrap_url=(
-            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
-            "Stages/700/TeamStatistics"
-        ),
-    )
-    page = PlayerStageStatisticsPage(
-        page_number=1,
-        page_index=0,
-        total_pages=2,
-        total_results=2,
-        results_per_page=1,
-        first_record_index=0,
-        last_record_index=0,
-        index_base=0,
-        records=({"playerId": 11, "teamId": 26, "apps": 1},),
-    )
-    response = TransportResponse(
-        url=spec.target.canonical_url,
-        content=b"page-1",
-        status_code=200,
-        headers={},
-        route=TransportRoute.DIRECT_HTTP,
-        wire_bytes=6,
-        sha256=hashlib.sha256(b"page-1").hexdigest(),
-    )
-    dialled = False
-
-    def fetch_next(_specs):
-        nonlocal dialled
-        dialled = True
-        raise AssertionError("page two must not be dialled")
-
-    service._fetch_parsed_many = fetch_next
-    with pytest.raises(WhoScoredParseError, match="signed paid target limit"):
-        service._complete_player_statistics_pages(
-            [spec], [(response, "s3://raw/page-1", page)]
-        )
-    assert dialled is False
 
 
 def test_exact_zero_profile_candidates_perform_no_source_fetch(tmp_path):
@@ -3251,10 +3195,10 @@ def test_match_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path):
     service, repository, _ = _service(tmp_path)
     service.transport = _FailingTransport(
         WhoScoredTransportError(
-            "paid URL limit reached",
+            "response byte limit reached",
             kind=FailureKind.BUDGET,
             url="https://www.whoscored.com/Matches/123/Live",
-            route=TransportRoute.PAID_HTTP,
+            route=TransportRoute.DIRECT_HTTP,
             retryable=False,
         )
     )
@@ -3437,7 +3381,7 @@ def test_match_failure_manifest_error_is_visible_without_aborting_result(tmp_pat
     assert any("manifest sink unavailable" in error for error in result.errors)
 
 
-def test_preview_sync_commits_raw_first_batch_and_bounds_paid_urls(tmp_path):
+def test_preview_sync_commits_raw_first_batch(tmp_path):
     service, repository, raw_store = _service(tmp_path, html=_preview_html())
     repository.preview_candidates = [
         {
@@ -3463,7 +3407,6 @@ def test_preview_sync_commits_raw_first_batch_and_bounds_paid_urls(tmp_path):
         "preview_lineups": 0,
         "preview_sections": 2,
     }
-    assert service.transport.budgets.max_paid_urls == 3
     assert service.transport.cache_load_allowed == [True]
     commit = repository.preview_commits[0]
     assert commit.missing_players[0]["player_id"] == 10
@@ -3556,7 +3499,6 @@ def test_preview_transport_failure_is_backed_off_and_manifested(tmp_path):
     assert failure.attempt_no == 2
     assert before + timedelta(hours=11, minutes=59) < failure.retry_after
     assert failure.retry_after <= before + timedelta(hours=12, seconds=2)
-    assert service.transport.budgets.max_paid_urls == 3
 
 
 def test_preview_404_is_proven_not_available(tmp_path):
@@ -3898,10 +3840,10 @@ def test_profile_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path)
     repository.profile_candidates = [43]
     service.transport = _FailingTransport(
         WhoScoredTransportError(
-            "paid URL limit reached",
+            "response byte limit reached",
             kind=FailureKind.BUDGET,
             url="https://www.whoscored.com/Players/43/Show",
-            route=TransportRoute.PAID_HTTP,
+            route=TransportRoute.DIRECT_HTTP,
             retryable=False,
         )
     )

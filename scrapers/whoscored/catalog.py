@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 import math
-import os
 from pathlib import Path
 import re
 import unicodedata
@@ -15,7 +14,6 @@ from urllib.parse import urlsplit
 
 import yaml
 
-from . import runtime_contract as _runtime_contract
 from .domain import (
     SeasonFormat,
     TournamentClassification,
@@ -872,15 +870,6 @@ class WhoScoredCatalog:
     def from_file(
         cls, path: str | Path = DEFAULT_COMPETITIONS_PATH
     ) -> "WhoScoredCatalog":
-        if Path(os.path.abspath(path)) == Path(os.path.abspath(DEFAULT_COMPETITIONS_PATH)):
-            payload = _runtime_contract.read_attested_static_runtime_file(
-                "configs/medallion/competitions.yaml"
-            )
-            try:
-                document = yaml.safe_load(payload.decode("utf-8")) or {}
-            except UnicodeDecodeError as exc:
-                raise CatalogError("Competition catalog must be UTF-8") from exc
-            return cls.from_mapping(document)
         with Path(path).open("r", encoding="utf-8") as handle:
             document = yaml.safe_load(handle) or {}
         return cls.from_mapping(document)

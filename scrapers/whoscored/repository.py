@@ -39,7 +39,6 @@ from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
 from scrapers.whoscored.parsers import MATCH_AVAILABILITY_VERSION, PARSER_VERSION
 from scrapers.whoscored.profile_policy import MAX_DAILY_PROFILE_CANDIDATES
-from scrapers.whoscored.runtime_contract import require_production_runtime_class
 
 logger = logging.getLogger(__name__)
 
@@ -1674,7 +1673,6 @@ class WhoScoredRepository:
         catalog: str = "iceberg",
         schema: str = "bronze",
     ) -> None:
-        require_production_runtime_class(operation="WhoScored Iceberg persistence")
         self.writer = writer or IcebergWriter(catalog=catalog)
         self.trino = trino or self.writer._get_trino_manager()
         # An injected Trino manager must also back writes.  Otherwise the

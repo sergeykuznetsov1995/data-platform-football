@@ -140,7 +140,6 @@ def test_runtime_root_drives_cd_and_pythonpath(monkeypatch, module_name, task_id
 
     monkeypatch.setenv("WHOSCORED_RUNTIME_ROOT", "/opt/whoscored-src")
     module = _reload(module_name)
-    # Order is load-bearing: runtime_contract wants (root, root/dags).
     assert (
         module._TASK_ENV["PYTHONPATH"]
         == "/opt/whoscored-src:/opt/whoscored-src/dags"

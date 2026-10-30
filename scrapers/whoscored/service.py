@@ -57,10 +57,6 @@ from .raw_store import (
     schedule_month_target,
     stage_page_target,
 )
-from .proxy_campaign import (
-    SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV,
-    WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT,
-)
 from .runtime_limits import SOURCE_PAGE_REQUESTS_PER_MINUTE
 from .repository import (
     canonical_catalog_raw_inputs,
@@ -94,7 +90,6 @@ from .transport import (
     StageStatisticsUnavailable,
     StageBootstrapRedirect,
     ProxyUnavailable,
-    TransportBudgets,
     TransportContext,
     TransportResponse,
     WhoScoredTransport,
@@ -468,30 +463,8 @@ class WhoScoredIngestService:
             flaresolverr_url=os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
             ),
-            paid_gateway_url=(
-                os.environ.get("WHOSCORED_PAID_GATEWAY_URL", "").strip() or None
-            ),
             context=TransportContext.from_env().request_context(scope=self.scope.spec),
         )
-        raw_pagination_limit = os.environ.get(
-            SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV
-        )
-        if raw_pagination_limit is None:
-            self._player_pagination_target_limit: Optional[int] = None
-        else:
-            try:
-                pagination_limit = int(raw_pagination_limit)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "invalid signed WhoScored player pagination target limit"
-                ) from exc
-            if not 0 <= pagination_limit <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT:
-                raise ValueError(
-                    "signed WhoScored player pagination target limit exceeds "
-                    "the reviewed capture ceiling"
-                )
-            self._player_pagination_target_limit = pagination_limit
-        self._player_pagination_targets_consumed = 0
         from scrapers.utils.rate_limiter import RateLimiter
 
         self._rate_limiter = RateLimiter(
@@ -774,23 +747,6 @@ class WhoScoredIngestService:
 
         if len(specs) != len(results):
             raise WhoScoredParseError("structured feed result/spec count mismatch")
-        additional_target_count = sum(
-            parsed.total_pages - 1
-            for _response, _uri, parsed in results
-            if isinstance(parsed, PlayerStageStatisticsPage)
-        )
-        if self._player_pagination_target_limit is not None:
-            next_consumed = (
-                self._player_pagination_targets_consumed + additional_target_count
-            )
-            if next_consumed > self._player_pagination_target_limit:
-                raise WhoScoredParseError(
-                    "player statistics pagination exceeds the signed paid target "
-                    "limit before additional pages are fetched"
-                )
-            # Reserve the complete batch before its first page-2 dial.  A partial
-            # transport failure aborts the task and cannot reuse this allowance.
-            self._player_pagination_targets_consumed = next_consumed
         completed = list(results)
         additional_raw: list[tuple[TransportResponse, str]] = []
         for index, (spec, result) in enumerate(zip(specs, results)):
@@ -1065,9 +1021,6 @@ class WhoScoredIngestService:
         network = transport or WhoScoredTransport(
             flaresolverr_url=os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
-            ),
-            paid_gateway_url=(
-                os.environ.get("WHOSCORED_PAID_GATEWAY_URL", "").strip() or None
             ),
             context=TransportContext.from_env().request_context(
                 scope="catalog", entity="discovery"
@@ -2198,33 +2151,6 @@ class WhoScoredIngestService:
             self.catalog_season.start is None or self.catalog_season.start <= today
         ) and (self.catalog_season.end is None or self.catalog_season.end >= today)
 
-    def _bound_paid_fallback(self, eligible_urls: int) -> None:
-        """Tighten paid URL cardinality for the current entity batch.
-
-        The byte ceilings remain task-wide; this additionally prevents a
-        large roster/preview candidate list from turning a transient
-        Cloudflare incident into one paid lease per candidate.
-        """
-        campaign = getattr(
-            getattr(self.transport, "context", None), "proxy_campaign", {}
-        )
-        if isinstance(campaign, Mapping) and campaign.get("proxy_allocation"):
-            # A verified campaign already fixes the exact durable work-item
-            # request/lease/byte ceilings. Local cardinality heuristics must
-            # not silently shrink that signed allocation; proxy-filter carries
-            # its remaining balance across retries and DagRun continuations.
-            return
-        current = self.transport.budgets
-        self.transport.budgets = TransportBudgets.for_eligible_urls(
-            eligible_urls,
-            max_response_bytes=current.max_response_bytes,
-            max_paid_bytes_per_url=current.max_paid_bytes_per_url,
-            max_paid_bytes_per_lease=current.max_paid_bytes_per_lease,
-            max_paid_bytes_per_task=current.max_paid_bytes_per_task,
-            max_paid_browser_bootstraps=current.max_paid_browser_bootstraps,
-            lease_ttl_seconds=current.lease_ttl_seconds,
-        )
-
     def _collect_season_schedule(self, *, refresh_months: bool = False) -> _SeasonSchedule:
         """Fetch and merge one scope's season page, stage calendars and months.
 
@@ -2488,7 +2414,6 @@ class WhoScoredIngestService:
             attempted=1,
             committed_batches={"scope": []},
         )
-        self._bound_paid_fallback(2)
         try:
             for refresh_months in (False, True):
                 collected = (
@@ -2671,7 +2596,6 @@ class WhoScoredIngestService:
             attempted=1,
             committed_batches={"scope": []},
         )
-        self._bound_paid_fallback(2)
         spools: list[WhoScoredScopeRowSpool] = []
         try:
             collected = self._collect_season_schedule()
@@ -3022,7 +2946,6 @@ class WhoScoredIngestService:
             "attempted": result.attempted,
             "remaining": max(0, int(total_candidates) - result.attempted),
         }
-        self._bound_paid_fallback(len(candidates))
         pending: list[tuple[MatchCommit, Any]] = []
         # Failure manifests are appended once, after the match batch commit
         # (in ``finally``: they persist even when commit_matches fails).  The
@@ -3083,22 +3006,9 @@ class WhoScoredIngestService:
                         parsed.lineups.status is DatasetStatus.AVAILABLE
                     ),
                     transport_mode=response.route.value,
-                    proxy_mode=(
-                        "filtered_paid"
-                        if response.route.value.startswith("paid_")
-                        else "none"
-                    ),
+                    proxy_mode="none",
                     http_status=response.status_code,
-                    direct_bytes=(
-                        response.wire_bytes
-                        if not response.route.value.startswith("paid_")
-                        else 0
-                    ),
-                    paid_bytes=(
-                        response.wire_bytes
-                        if response.route.value.startswith("paid_")
-                        else 0
-                    ),
+                    direct_bytes=response.wire_bytes,
                     parser_version=parsed.parser_version,
                     kickoff=candidate.kickoff,
                     attempt_no=int(candidate.attempt_no),
@@ -3178,11 +3088,7 @@ class WhoScoredIngestService:
                             kickoff=candidate.kickoff,
                             is_opta=candidate.match_is_opta,
                             transport_mode=exc.route.value if exc.route else "none",
-                            proxy_mode=(
-                                "filtered_paid"
-                                if exc.route and exc.route.value.startswith("paid_")
-                                else "none"
-                            ),
+                            proxy_mode="none",
                             http_status=exc.status_code,
                             payload_sha256=getattr(exc, "payload_sha256", None),
                             raw_uri=getattr(exc, "raw_uri", None),
@@ -3254,26 +3160,12 @@ class WhoScoredIngestService:
                             transport_mode=(
                                 response.route.value if response is not None else "none"
                             ),
-                            proxy_mode=(
-                                "filtered_paid"
-                                if response is not None
-                                and response.route.value.startswith("paid_")
-                                else "none"
-                            ),
+                            proxy_mode="none",
                             http_status=(
                                 response.status_code if response is not None else None
                             ),
                             direct_bytes=(
-                                response.wire_bytes
-                                if response is not None
-                                and not response.route.value.startswith("paid_")
-                                else 0
-                            ),
-                            paid_bytes=(
-                                response.wire_bytes
-                                if response is not None
-                                and response.route.value.startswith("paid_")
-                                else 0
+                                response.wire_bytes if response is not None else 0
                             ),
                         )
                     )
@@ -3395,7 +3287,6 @@ class WhoScoredIngestService:
                 int(candidate["game_id"]) for candidate in candidates
             ),
         }
-        self._bound_paid_fallback(len(candidates))
         pending: list[tuple[PreviewCommit, Any]] = []
         proxy_down: Optional[ProxyUnavailable] = None
         for candidate in candidates:
@@ -3464,11 +3355,7 @@ class WhoScoredIngestService:
                             retry_after=retry_after,
                             attempt_no=attempt_no,
                             transport_mode=(exc.route.value if exc.route else "none"),
-                            proxy_mode=(
-                                "filtered_paid"
-                                if exc.route and exc.route.value.startswith("paid_")
-                                else "none"
-                            ),
+                            proxy_mode="none",
                             http_status=exc.status_code,
                             payload_sha256=getattr(exc, "payload_sha256", None),
                             raw_uri=getattr(exc, "raw_uri", None),
@@ -3525,14 +3412,12 @@ class WhoScoredIngestService:
                         result.terminal.append(str(candidate["game_id"]))
                     else:
                         # Parser/content drift must fail visibly. Transport
-                        # has already persisted the raw payload and never
-                        # escalates validator failures to paid proxy.
+                        # has already persisted the raw payload.
                         result.errors.append(f"preview {candidate['game_id']}: {exc}")
                 continue
 
             try:
                 parsed = parsed_holder["preview"]
-                paid_route = response.route.value.startswith("paid_")
                 commit = PreviewCommit(
                     game_id=int(candidate["game_id"]),
                     league=self.scope.competition_id,
@@ -3543,10 +3428,9 @@ class WhoScoredIngestService:
                     raw_uri=raw_uri,
                     missing_players=parsed.missing_players.rows,
                     transport_mode=response.route.value,
-                    proxy_mode="filtered_paid" if paid_route else "none",
+                    proxy_mode="none",
                     http_status=response.status_code,
-                    direct_bytes=0 if paid_route else response.wire_bytes,
-                    paid_bytes=response.wire_bytes if paid_route else 0,
+                    direct_bytes=response.wire_bytes,
                     attempt_no=int(candidate["attempt_no"]),
                     datasets={
                         "preview_lineups": parsed.preview_lineups.rows,
@@ -3564,7 +3448,6 @@ class WhoScoredIngestService:
                     raise WhoScoredParseError(str(exc)) from exc
                 pending.append((commit, parsed))
             except WhoScoredParseError as exc:
-                paid_route = response.route.value.startswith("paid_")
                 try:
                     self.repository.record_preview_failure(
                         PreviewFailure(
@@ -3581,10 +3464,9 @@ class WhoScoredIngestService:
                             payload_sha256=response.sha256,
                             raw_uri=raw_uri,
                             transport_mode=response.route.value,
-                            proxy_mode="filtered_paid" if paid_route else "none",
+                            proxy_mode="none",
                             http_status=response.status_code,
-                            direct_bytes=0 if paid_route else response.wire_bytes,
-                            paid_bytes=response.wire_bytes if paid_route else 0,
+                            direct_bytes=response.wire_bytes,
                         )
                     )
                 except Exception as manifest_exc:
@@ -3710,7 +3592,6 @@ class WhoScoredIngestService:
             "count": result.attempted,
             "payload_sha256": entity_id_payload_sha256(selected_player_ids),
         }
-        self._bound_paid_fallback(len(selected_player_ids))
         pending_commits: list[ProfileCommit] = []
         for player_id in selected_player_ids:
             target = profile_page_target(player_id)
@@ -3789,11 +3670,7 @@ class WhoScoredIngestService:
                         error=str(exc),
                         retry_after=retry_after,
                         transport_mode=exc.route.value if exc.route else "none",
-                        proxy_mode=(
-                            "filtered_paid"
-                            if exc.route and exc.route.value.startswith("paid_")
-                            else "none"
-                        ),
+                        proxy_mode="none",
                         http_status=exc.status_code,
                         payload_sha256=getattr(exc, "payload_sha256", None),
                         raw_uri=getattr(exc, "raw_uri", None),
@@ -3860,7 +3737,6 @@ class WhoScoredIngestService:
                         profile["date_of_birth"]
                     )
             except (WhoScoredParseError, ValueError) as exc:
-                paid_route = response.route.value.startswith("paid_")
                 try:
                     self.repository.record_profile_failure(
                         player_id=player_id,
@@ -3869,10 +3745,9 @@ class WhoScoredIngestService:
                         error=str(exc),
                         retry_after=None,
                         transport_mode=response.route.value,
-                        proxy_mode="filtered_paid" if paid_route else "none",
+                        proxy_mode="none",
                         http_status=response.status_code,
-                        direct_bytes=0 if paid_route else response.wire_bytes,
-                        paid_bytes=response.wire_bytes if paid_route else 0,
+                        direct_bytes=response.wire_bytes,
                         payload_sha256=response.sha256,
                         raw_uri=raw_uri,
                     )
@@ -3885,7 +3760,6 @@ class WhoScoredIngestService:
                     result.errors.append(f"profile {player_id}: {exc}")
                 continue
 
-            paid_route = response.route.value.startswith("paid_")
             pending_commits.append(
                 ProfileCommit(
                     player_id=player_id,
@@ -3893,9 +3767,8 @@ class WhoScoredIngestService:
                     payload_sha256=response.sha256,
                     raw_uri=raw_uri,
                     transport_mode=response.route.value,
-                    proxy_mode="filtered_paid" if paid_route else "none",
-                    direct_bytes=0 if paid_route else response.wire_bytes,
-                    paid_bytes=response.wire_bytes if paid_route else 0,
+                    proxy_mode="none",
+                    direct_bytes=response.wire_bytes,
                     parser_version=parsed.parser_version,
                     participations=parsed.participations.rows,
                     participations_status=parsed.participations.status.value,
