@@ -12,7 +12,7 @@ import sqlglot
 from dags.scripts import transfermarkt_traffic_report as cli
 from dags.utils import transfermarkt_backfill_state as backfill
 from dags.utils import transfermarkt_traffic_report as traffic
-from dags.utils.transfermarkt_daily_measure import day_bounds
+from dags.utils.transfermarkt_daily_measure import day_bounds, utc
 
 pytestmark = pytest.mark.unit
 
@@ -63,8 +63,13 @@ def write_ledger(directory: Path, events, *, archives=None):
     return directory
 
 
-def ledger_summary(directory: Path, stats=None):
-    return traffic.summarize_ledger(traffic.iter_ledger_events(directory, START, END, stats))
+def ledger_summary(directory: Path):
+    return traffic.read_ledger(directory, START, END)
+
+
+def summarize(events):
+    events = [{**item, "_at": utc(item["occurred_at"])} for item in events]
+    return traffic.summarize_ledger(events, START, END)
 
 
 def test_ledger_day_window_archives_and_malformed_lines(tmp_path):
@@ -78,9 +83,11 @@ def test_ledger_day_window_archives_and_malformed_lines(tmp_path):
         event(at="2026-10-29T15:00:10+00:00", size=180, dag="dag_discover_transfermarkt_registry",
               entity="squad", run="reg-run", direction="up"),
         event(at="2026-10-29T16:00:00+00:00", size=5, dag="", entity="gateway_probe", run=""),
+        event(at="2026-10-30T09:00:00+00:00", size=4, run="tomorrow-only"),
         event("lease_created", at="2026-10-29T04:45:28+00:00"),
         event("lease_closed", at="2026-10-29T04:45:27+00:00", tunnels_total=3),
         event("lease_closed", at="2026-10-29T06:00:00+00:00", tunnels_total=1, total_bytes=10**9),
+        event("lease_closed", at="2026-10-30T06:00:00+00:00", tunnels_total=5),
         event("connect_rejected", at="2026-10-29T04:46:35+00:00"),
         event("connect_rejected", at="2026-10-29T04:46:36+00:00"),
     ]
@@ -90,29 +97,36 @@ def test_ledger_day_window_archives_and_malformed_lines(tmp_path):
     })
     with (directory / "paid_requests.jsonl").open("a") as handle:
         handle.write("{not json\n" + json.dumps({"event_type": "bytes", "bytes": 9}) + "\n")
-    stats = {}
-    summary = ledger_summary(directory, stats)
+    summary = ledger_summary(directory)
     assert summary["provider_bytes"] == {"total": 1785, "up": 280, "down": 1505}
     assert summary["by_lane"] == {"current": 1300, "history": 300, "registry": 180, "other": 5}
     assert summary["by_stream"] == {"current-0": 1485, "history-1": 300}
     assert summary["by_lane_entity"]["registry"] == {"squads": 180}
-    assert summary["by_run"]["current"][CURRENT_RUN] == {"market_values": 1300}
+    run = summary["runs"][CURRENT_RUN]
+    assert (run["bytes_in_day"], run["bytes_window"], run["groups"]) == (1300, 31_300, {"market_values": 31_300})
+    assert run["started_before_day"] and run["in_progress"] and run["tunnels_window"] == 9
+    assert run["first_at"] == "2026-10-28T20:59:59+00:00" and run["last_at"] == "2026-10-29T21:00:00+00:00"
+    assert "tomorrow-only" not in summary["runs"]
     assert summary["run_ids"] == {"current": [CURRENT_RUN], "history": ["hist-run"],
                                   "registry": ["reg-run"], "other": [""]}
     assert (summary["leases_opened"], summary["leases_closed"], summary["tunnels"]) == (1, 2, 4)
     assert summary["tunnels_by_lane"] == {"current": 4}
     assert summary["connect_rejected"] == {"502": 2}
     assert summary["bytes_per_tunnel"] == 1785 / 4
-    assert stats["malformed_lines"] == 2
-    assert stats["files_read"] == ["paid_requests.20261029T120000Z.jsonl.gz", "paid_requests.jsonl"]
+    assert summary["malformed_lines"] == 2 and summary["complete"] is True
+    assert summary["files_read"] == ["paid_requests.20261029T120000Z.jsonl.gz", "paid_requests.jsonl"]
 
 
-def test_unreadable_archive_is_listed_and_missing_ledger_fails(tmp_path):
+def test_unreadable_archive_makes_ledger_incomplete_and_missing_ledger_fails(tmp_path):
     directory = write_ledger(tmp_path / "gw", [event(at="2026-10-29T10:00:00+00:00", size=7)])
     (directory / "paid_requests.20261030T000000Z.jsonl.gz").write_bytes(b"not gzip")
-    stats = {}
-    assert ledger_summary(directory, stats)["provider_bytes"]["total"] == 7
-    assert stats["archives_unreadable"] == ["paid_requests.20261030T000000Z.jsonl.gz"]
+    ledger = ledger_summary(directory)
+    assert ledger["provider_bytes"]["total"] == 7 and ledger["complete"] is False
+    assert ledger["archives_unreadable"] == ["paid_requests.20261030T000000Z.jsonl.gz"]
+    merged = traffic.merge_ops(ledger, [ops_row("events_v1", CURRENT_RUN, "market_value_points", 7)], {}, ALL_OK)
+    assert (merged["reconciliation"]["status"], merged["reconciliation"]["reason"]) == (
+        "not_measured", "ledger_incomplete")
+    assert merged["lanes"]["current"]["reconciliation_status"] == "not_measured"
     with pytest.raises(traffic.TrafficReportError):
         ledger_summary(tmp_path / "absent")
     (tmp_path / "empty").mkdir()
@@ -163,13 +177,16 @@ def test_ops_sql_aggregates_only_ledger_runs():
         traffic.build_ops_runs_sql([""])
 
 
+ALL_OK = {"events_v1": "ok", "proxy_traffic_runs": "ok", "current_receipts": "not_available"}
+
+
 def _ledger(by_run, tunnels=None):
     events = [event(at="2026-10-29T10:00:00+00:00", size=size, dag=dag, run=run, entity=entity)
               for dag, runs in by_run.items() for run, entities in runs.items()
               for entity, size in entities.items()]
-    events += [event("lease_closed", at="2026-10-29T11:00:00+00:00", dag=dag, tunnels_total=count)
-               for dag, count in (tunnels or {}).items()]
-    return traffic.summarize_ledger(events)
+    events += [event("lease_closed", at="2026-10-29T11:00:00+00:00", dag=dag, run=run, tunnels_total=count)
+               for dag, (run, count) in (tunnels or {}).items()]
+    return summarize(events)
 
 
 def ops_row(source, run, entity, provider, requests=0, **extra):
@@ -181,11 +198,11 @@ def test_merge_prefers_events_v1_assigns_lane_and_lists_unexplained():
     ledger = _ledger({"dag_ingest_transfermarkt": {"run-a": {"squad": 10_240, "gateway_probe": 50}},
                       "dag_backfill_transfermarkt": {"run-h": {"transfers": 2048}},
                       "dag_discover_transfermarkt_registry": {"reg": {"squad": 4096}}},
-                     tunnels={"dag_ingest_transfermarkt": 2})
+                     tunnels={"dag_ingest_transfermarkt": ("run-a", 2)})
     rows = [ops_row("proxy_traffic_runs", "run-a", "squad", 99_999, requests=99),
             ops_row("events_v1", "run-a", "squad", 10_000, requests=5, retries=1, cache_hits=2),
             ops_row("proxy_traffic_runs", "run-h", "transfers", 2000, requests=2)]
-    merged = traffic.merge_ops(ledger, rows, {"status": "not_available"})
+    merged = traffic.merge_ops(ledger, rows, {"status": "not_available"}, ALL_OK)
     current = merged["lanes"]["current"]
     assert (current["ops_provider_bytes"], current["requests"], current["retries"], current["cache_hits"]) == (
         10_000, 5, 1, 2)
@@ -200,21 +217,62 @@ def test_merge_prefers_events_v1_assigns_lane_and_lists_unexplained():
     assert merged["lanes"]["history"]["reconciliation_status"] == "gap"
     assert [(item["lane"], item["entity"]) for item in rec["unexplained"]] == [("current", "gateway_probe")]
     assert rec["unexplained_bytes"] == 50
-    assert traffic.merge_ops(ledger, None, {})["reconciliation"]["status"] == "not_measured"
+    none = {"events_v1": "not_available", "proxy_traffic_runs": "not_available", "current_receipts": "not_available"}
+    assert traffic.merge_ops(ledger, [], {}, none)["reconciliation"]["status"] == "not_measured"
 
 
 @pytest.mark.parametrize("ops, status", [(98_100, "ok"), (97_900, "gap"), (101_900, "ok"), (102_100, "gap")])
 def test_reconciliation_tolerance_is_two_percent(ops, status):
     ledger = _ledger({"dag_ingest_transfermarkt": {"run-a": {"squad": 100_000}}})
-    rec = traffic.merge_ops(ledger, [ops_row("events_v1", "run-a", "squad", ops)], {})["reconciliation"]
+    rec = traffic.merge_ops(ledger, [ops_row("events_v1", "run-a", "squad", ops)], {}, ALL_OK)["reconciliation"]
     assert rec["status"] == status and rec["delta_pct"] == pytest.approx((ops - 100_000) / 1000)
+
+
+def test_run_across_midnight_is_reconciled_whole_and_running_run_is_excluded():
+    mib = 1048576
+    ledger = summarize([{**item, "_at": utc(item["occurred_at"])} for item in (
+        event(at="2026-10-28T20:30:00+00:00", size=mib, run="night"),        # before the Moscow day
+        event(at="2026-10-28T21:30:00+00:00", size=mib, run="night"),        # in the day
+        event(at="2026-10-29T20:00:00+00:00", size=3 * mib, run="late"),
+        event(at="2026-10-29T21:30:00+00:00", size=mib, run="late"))])      # still spending tomorrow
+    assert ledger["by_lane"] == {"current": 4 * mib}
+    rows = [ops_row("events_v1", "night", "market_value_history", 2 * mib, requests=4),
+            ops_row("events_v1", "late", "market_value_points", 9 * mib)]
+    merged = traffic.merge_ops(ledger, rows, {}, ALL_OK)
+    rec = merged["reconciliation"]
+    assert (rec["status"], rec["ledger_provider_bytes"], rec["ops_provider_bytes"]) == ("ok", 2 * mib, 2 * mib)
+    assert rec["in_progress_runs"] == [{"run_id": "late", "lane": "current", "bytes_in_day": 3 * mib}]
+    assert merged["lanes"]["current"]["ledger_provider_bytes"] == 4 * mib
+
+
+def test_one_failed_source_makes_reconciliation_partial():
+    ledger = _ledger({"dag_ingest_transfermarkt": {"run-a": {"squad": 1000}}})
+    sources = {"events_v1": "ok", "proxy_traffic_runs": "not_available", "current_receipts": "empty"}
+    merged = traffic.merge_ops(ledger, [ops_row("events_v1", "run-a", "squad", 1000)], {}, sources)
+    rec = merged["reconciliation"]
+    assert rec["status"] == "partial" and rec["unavailable_sources"] == ["proxy_traffic_runs"]
+    assert merged["lanes"]["current"]["ops_provider_bytes"] == 1000
+    summary = traffic.format_traffic_summary({"report_day": DAY, "ledger": ledger, **merged})
+    assert summary.endswith("ops частично (недоступно: proxy_traffic_runs)")
+
+
+def test_wire_and_duration_are_none_until_a_source_measures_them():
+    ledger = _ledger({"dag_ingest_transfermarkt": {"run-a": {"squad": 1000}, "run-b": {"transfers": 10}}})
+    rows = [ops_row("proxy_traffic_runs", "run-a", "squad", 1000),
+            ops_row("events_v1", "run-b", "transfer_events", 6, wire_bytes=300, duration_ms=40),
+            ops_row("events_v1", "run-b", "transfers", 4, wire_bytes=200, duration_ms=10)]
+    merged = traffic.merge_ops(ledger, rows, {}, ALL_OK)
+    squads, transfers = merged["entities"]["current"]["squads"], merged["entities"]["current"]["transfers"]
+    assert (squads["wire_bytes"], squads["duration_ms"]) == (None, None)
+    assert (transfers["wire_bytes"], transfers["duration_ms"]) == (500, 50)
+    assert (merged["lanes"]["current"]["wire_bytes"], merged["lanes"]["current"]["duration_ms"]) == (500, 50)
 
 
 def test_registry_lane_is_outside_reconciliation():
     mib = 1048576
     ledger = _ledger({"dag_discover_transfermarkt_registry": {"reg": {"squad": 10 * mib}},
                       "dag_ingest_transfermarkt": {"run-a": {"squad": mib}}})
-    merged = traffic.merge_ops(ledger, [ops_row("events_v1", "run-a", "squad", mib, requests=4)], {})
+    merged = traffic.merge_ops(ledger, [ops_row("events_v1", "run-a", "squad", mib, requests=4)], {}, ALL_OK)
     rec = merged["reconciliation"]
     assert rec["status"] == "ok" and rec["not_covered_lanes"] == ["registry"]
     assert rec["ledger_provider_bytes"] == mib and rec["unexplained"] == []
@@ -222,7 +280,7 @@ def test_registry_lane_is_outside_reconciliation():
     summary = traffic.format_traffic_summary({"report_day": DAY, "ledger": ledger, **merged})
     assert "запросов 4," in summary
     assert summary.endswith("ops покрывает 100,0 % актуалки и истории (ok); реестр в ops не пишется")
-    empty = traffic.merge_ops(_ledger({"dag_ingest_transfermarkt": {"run-a": {"squad": 1}}}), [], {})
+    empty = traffic.merge_ops(_ledger({"dag_ingest_transfermarkt": {"run-a": {"squad": 1}}}), [], {}, ALL_OK)
     assert empty["reconciliation"]["not_covered_lanes"] == ["registry"]
 
 
@@ -232,44 +290,45 @@ def test_entity_names_merge_by_group():
     rows = [ops_row("proxy_traffic_runs", "run-a", "coaches", 9000, requests=3),
             ops_row("events_v1", "run-a", "coach_profiles", 4000, requests=1),
             ops_row("events_v1", "run-a", "coach_history", 5000, requests=1)]
-    merged = traffic.merge_ops(ledger, rows, {})
+    merged = traffic.merge_ops(ledger, rows, {}, ALL_OK)
     assert set(merged["entities"]["current"]) == {"coaches", "gateway_probe"}
     coaches = merged["entities"]["current"]["coaches"]
     assert coaches["ledger_provider_bytes"] == coaches["ops_provider_bytes"] == 9000 and coaches["requests"] == 2
     assert [(item["entity"], item["ledger_bytes"]) for item in merged["reconciliation"]["unexplained"]] == [
         ("gateway_probe", 7)]
     only_ops = traffic.merge_ops(_ledger({"dag_ingest_transfermarkt": {"run-a": {"coach_history": 9000}}}),
-                                 [ops_row("proxy_traffic_runs", "run-a", "coaches", 9000)], {})
+                                 [ops_row("proxy_traffic_runs", "run-a", "coaches", 9000)], {}, ALL_OK)
     assert only_ops["reconciliation"]["unexplained"] == []
 
 
-def receipt(child, at, by_entity, cycle="cycle-1"):
-    return {"cycle_id": cycle, "child_cycle_id": child, "kind": "listing", "captured_at": at,
+def receipt(child, by_entity, cycle="cycle-1"):
+    return {"cycle_id": cycle, "child_cycle_id": child, "kind": "listing", "captured_at": "2026-10-29T10:00:00+00:00",
             "traffic": {"shared_traffic_ledger": {"provider_metered_bytes": 1, "by_entity": by_entity}}}
 
 
-def test_current_receipts_window_and_duplicates(tmp_path):
+def test_current_receipts_by_run_and_duplicates(tmp_path):
     scopes = tmp_path / "current" / "scopes"
     scopes.mkdir(parents=True)
-    squad = {"squad": {"requests": 2, "retries": 1, "decoded_bytes": 900, "provider_bytes": 300, "cache_hits": 1}}
-    first = receipt("child-1", "2026-10-29T10:00:00+00:00", squad)
-    (scopes / "a.json").write_text(json.dumps({"traffic_receipts": [
-        first, first, receipt("child-2", "2026-10-29T21:00:00+00:00", squad)]}))
+    squad = {"squad": {"requests": 2, "retries": 1, "decoded_bytes": 900, "provider_bytes": 300, "cache_hits": 1,
+                       "wire_bytes": 250, "duration_seconds": 1.5}}
+    first = receipt("child-1", squad)
+    (scopes / "a.json").write_text(json.dumps({"traffic_receipts": [first, first, receipt("child-2", squad)]}))
     (scopes / "b.json").write_text(json.dumps({"traffic_receipts": [
-        first, receipt("child-3", "2026-10-28T21:00:00+00:00",
-                       {"transfers": {"requests": 1, "provider_bytes": 50}})]}))
+        first, receipt("child-3", {"transfers": {"requests": 1, "provider_bytes": 50}})]}))
     (scopes / "bad.json").write_text("{")
-    result = traffic.read_current_receipts(tmp_path / "current", START, END)
-    assert result["receipts"] == 2 and result["malformed"] == 1
+    result = traffic.read_current_receipts(tmp_path / "current", ["child-1", "child-3"])
+    assert result["status"] == "ok" and result["receipts"] == 2 and result["malformed"] == 1
     assert result["by_entity"]["squads"] == {"requests": 2, "retries": 1, "cache_hits": 1, "decoded_bytes": 900,
-                                            "provider_metered_bytes": 300}
+                                             "provider_metered_bytes": 300, "wire_bytes": 250, "duration_ms": 1500}
     assert result["by_entity"]["transfers"]["provider_metered_bytes"] == 50
     # The ledger run_id of the signal lane is the receipt's child_cycle_id.
     ledger = _ledger({"dag_ingest_transfermarkt": {"child-1": {"squad": 300}, "child-3": {"transfers": 50}}})
-    merged = traffic.merge_ops(ledger, [], result)
+    sources = {**ALL_OK, "current_receipts": "ok"}
+    merged = traffic.merge_ops(ledger, [], result, sources)
     assert merged["reconciliation"]["status"] == "ok" and merged["reconciliation"]["unexplained"] == []
     assert merged["lanes"]["current"]["requests"] == 3
-    assert traffic.read_current_receipts(tmp_path / "absent", START, END)["status"] == "not_available"
+    assert traffic.read_current_receipts(tmp_path / "current", ["other"])["status"] == "empty"
+    assert traffic.read_current_receipts(tmp_path / "absent", [])["status"] == "not_available"
 
 
 def scope_row(scope, competition, edition, status, *, manifest=None, evidence=(), days=(), campaign="camp"):
@@ -287,6 +346,19 @@ def editions(rows, campaign=None):
                   "(" + ", ".join("NULL" if v is None else "'" + v.replace("'", "''") + "'" for v in row) + ")"
                   for row in rows)]
     return _duck(*traffic.build_history_editions_sql(campaign), setup)
+
+
+def campaigns(rows, scopes=(), campaign=None):
+    ddl = {item.split("(")[0].split()[-1]: item for item in backfill.ddl_statements()}
+    setup = [sqlglot.transpile(ddl[table].split(" WITH (format")[0].replace("iceberg.ops.", "ops."),
+                               read="trino", write="duckdb")[0] for table in (backfill.CAMPAIGN_TABLE, backfill.SCOPE_TABLE)]
+    if rows:
+        setup.append("INSERT INTO ops.transfermarkt_backfill_campaign_v1 (campaign_id, status, target_count) VALUES "
+                     + ", ".join(f"('{c}', '{status}', {count})" for c, status, count in rows))
+    if scopes:
+        setup.append("INSERT INTO ops.transfermarkt_backfill_scope_v1 (campaign_id, scope_id) VALUES "
+                     + ", ".join(f"('{c}', '{scope}')" for c, scope in scopes))
+    return _duck(*traffic.build_history_campaigns_sql(campaign), setup)
 
 
 def test_history_step1_categories():
@@ -309,8 +381,12 @@ def test_history_step1_categories():
         "fr1-2024": "failed_with_evidence", "l1-2024": "undetermined", "nl1-2024": "undetermined",
         "gb1-2025-other": "loaded"}
     assert by_scope["it1-2024"]["evidence_missing"] and not by_scope["l1-2024"]["evidence_missing"]
-    summary = traffic.summarize_editions(rows)
+    known = [{"campaign_id": "camp", "status": "active", "target_count": 9, "scope_count": 9},
+             {"campaign_id": "old", "status": "complete", "target_count": 1, "scope_count": 1}]
+    summary = traffic.summarize_editions(rows, known)
+    assert summary["status"] == "ok"
     assert summary["campaigns"]["camp"] == {
+        "campaign_status": "active", "target_count": 9, "scope_count": 9, "complete_set": True,
         "step1_total": 6, "loaded": 1, "unavailable_with_evidence": 1, "failed_with_evidence": 1,
         "undetermined": 3, "evidence_missing": 2,
         "undetermined_scope_ids": ["it1-2024", "l1-2024", "nl1-2024"]}
@@ -321,6 +397,20 @@ def test_history_step1_categories():
     assert traffic.format_editions_summary({"history_editions": summary}) == (
         "история шаг 1: изданий 7, загружено 2, недоступно с доказательством 1, "
         "ошибка с доказательством 1, не определено 3")
+
+
+def test_campaign_denominator_blocks_acceptance():
+    found = campaigns([("camp", "active", 3), ("other", "active", 1)],
+                      scopes=[("camp", "a"), ("camp", "b"), ("other", "x")])
+    assert [(r["campaign_id"], r["status"], r["target_count"], r["scope_count"]) for r in found] == [
+        ("camp", "active", 3, 2), ("other", "active", 1, 1)]
+    summary = traffic.summarize_editions([], found)
+    assert summary["status"] == "incomplete" and summary["campaigns"]["camp"]["complete_set"] is False
+    assert traffic.format_editions_summary({"history_editions": summary}) == (
+        "история шаг 1: набор целей неполный: scope 2 из 3 (camp)")
+    assert campaigns([("camp", "active", 3)], campaign="nope") == []
+    assert traffic.summarize_editions([], [], "nope") == {"status": "not_available", "reason": "кампания не найдена"}
+    assert traffic.summarize_editions([], []) == {"status": "not_available", "reason": "кампаний нет"}
 
 
 def test_cli_no_trino_prints_summary(tmp_path, capsys):
@@ -343,7 +433,7 @@ def test_cli_no_trino_prints_summary(tmp_path, capsys):
     assert printed["summary"].splitlines() == [
         "Transfermarkt трафик 2026-10-29 МСК: оплачено 4,00 МиБ (реестр 1,00 / актуалка 3,00 / история 0,00), "
         "запросов —, КиБ/запрос: реестр —, актуалка —, история —, туннелей 2 (CONNECT-отказы 502: 1), "
-        "ops не измерено",
+        "ops не измерено (леджер неполный)",
         "ТРЕВОГА: леджер: нечитаемые архивы: paid_requests.20261030T000000Z.jsonl.gz",
         "история шаг 1: не измерено — Trino не читали (--no-trino)"]
 
@@ -378,4 +468,46 @@ def test_cli_trino_errors_become_not_available(tmp_path, capsys, monkeypatch):
     output = capsys.readouterr().out
     assert "secret" not in output and "8443" not in output
     report = json.loads(output)["report"]
-    assert report["ops"]["status"] == "not_available" and report["history_editions"]["status"] == "not_available"
+    assert report["ops_sources"] == {"events_v1": "not_available", "proxy_traffic_runs": "not_available",
+                                     "current_receipts": "not_available"}
+    assert report["history_editions"]["status"] == "not_available"
+    assert report["reconciliation"]["status"] == "not_measured"
+
+
+def test_cli_reads_ops_sources_independently(tmp_path, capsys, monkeypatch):
+    from dags.utils import transfermarkt_native_v2 as native
+
+    class Cursor:
+        description, rows = None, []
+
+        def execute(self, sql, params):
+            if "proxy_traffic_runs" in sql:
+                raise RuntimeError("table missing")
+            if "transfermarkt_proxy_ledger_events_v1" in sql:
+                self.description = [(name,) for name in ("ops_source", "run_id", "entity", "requests",
+                                                         "provider_metered_bytes", "wire_bytes")]
+                self.rows = [("events_v1", CURRENT_RUN, "market_value_points", 3, 100, 70)]
+            else:
+                self.description, self.rows = [("campaign_id",)], []
+
+        def fetchall(self):
+            return self.rows
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(native, "connect", Connection)
+    directory = write_ledger(tmp_path / "gw", [event(at="2026-10-29T10:00:00+00:00", size=100)])
+    assert cli.main(["--day", DAY, "--ledger-dir", str(directory), "--current-state-dir", str(tmp_path)]) == 0
+    report = json.loads(capsys.readouterr().out)["report"]
+    assert report["ops_sources"]["events_v1"] == "ok" and report["ops_sources"]["proxy_traffic_runs"] == "not_available"
+    assert report["lanes"]["current"]["ops_provider_bytes"] == 100 and report["lanes"]["current"]["wire_bytes"] == 70
+    assert report["reconciliation"]["status"] == "partial"
+    assert report["history_editions"] == {"status": "not_available", "reason": "кампаний нет"}

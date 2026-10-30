@@ -30,34 +30,41 @@ def _read(cur, sql, params):
 
 
 def execute_trino(run_ids, campaign):
-    """Return (ops rows | None, editions block); query errors never leak connection details."""
+    """Read each ops source and the history blocks independently.
+
+    Returns (ops rows, {source: ok|not_available}, editions block); successful
+    reads are kept when another fails. Errors never leak connection details.
+    """
     from dags.utils import transfermarkt_traffic_report as traffic
     from dags.utils import transfermarkt_native_v2 as native
 
-    ops, editions = None, {'status': 'not_available', 'reason': 'ошибка чтения журнала истории'}
+    rows, sources = [], {'events_v1': 'not_available', 'proxy_traffic_runs': 'not_available'}
+    editions = {'status': 'not_available', 'reason': 'ошибка чтения журнала истории'}
     try:
         connection = native.connect()
     except Exception:
-        return ops, {'status': 'not_available', 'reason': 'нет соединения с Trino'}
+        return rows, sources, {'status': 'not_available', 'reason': 'нет соединения с Trino'}
     try:
         cur = connection.cursor()
         try:
+            for source, build in (('events_v1', traffic.build_ops_events_sql),
+                                  ('proxy_traffic_runs', traffic.build_ops_runs_sql)):
+                try:
+                    rows.extend(_read(cur, *build(run_ids)) if run_ids else [])
+                    sources[source] = 'ok'
+                except Exception:
+                    pass
             try:
-                ops = []
-                if run_ids:
-                    for build in (traffic.build_ops_events_sql, traffic.build_ops_runs_sql):
-                        ops.extend(_read(cur, *build(run_ids)))
-            except Exception:
-                ops = None
-            try:
-                editions = traffic.summarize_editions(_read(cur, *traffic.build_history_editions_sql(campaign)))
+                campaigns = _read(cur, *traffic.build_history_campaigns_sql(campaign))
+                scopes = _read(cur, *traffic.build_history_editions_sql(campaign)) if campaigns else []
+                editions = traffic.summarize_editions(scopes, campaigns, campaign)
             except Exception:
                 pass
         finally:
             cur.close()
     finally:
         connection.close()
-    return ops, editions
+    return rows, sources, editions
 
 
 def main(argv=None) -> int:
@@ -74,27 +81,27 @@ def main(argv=None) -> int:
     parser.add_argument('--json', type=Path, help='also write the full report to this file')
     args = parser.parse_args(argv)
     start, end = day_bounds(args.day)
-    stats = {}
     try:
-        ledger = traffic.summarize_ledger(traffic.iter_ledger_events(args.ledger_dir, start, end, stats))
+        ledger = traffic.read_ledger(args.ledger_dir, start, end)
     except (OSError, traffic.TrafficReportError):
         print(json.dumps({'report': None, 'status': 'not_measured',
                           'summary': f'Transfermarkt трафик {args.day} МСК: не измерено — ошибка чтения леджера шлюза'},
                          ensure_ascii=False))
         return 1
-    ledger.update(stats)
-    receipts = traffic.read_current_receipts(args.current_state_dir, start, end)
+    run_ids = [run_id for run_id in ledger['runs'] if run_id]
+    receipts = traffic.read_current_receipts(args.current_state_dir, run_ids)
     if args.no_trino:
-        ops, editions = None, {'status': 'not_available', 'reason': 'Trino не читали (--no-trino)'}
+        ops = []
+        sources = {'events_v1': 'not_available', 'proxy_traffic_runs': 'not_available'}
+        editions = {'status': 'not_available', 'reason': 'Trino не читали (--no-trino)'}
     else:
-        run_ids = [run_id for runs in ledger['run_ids'].values() for run_id in runs if run_id]
-        ops, editions = execute_trino(run_ids, args.campaign)
+        ops, sources, editions = execute_trino(run_ids, args.campaign)
+    sources['current_receipts'] = receipts['status']
     report = {'report_version': traffic.VERSION, 'report_day': args.day,
               'day_start': start.isoformat(), 'day_end': end.isoformat(), 'ledger': ledger,
-              'ops': {'status': 'ok', 'rows': len(ops)} if ops is not None else {
-                  'status': 'not_available', 'reason': 'Trino не читали' if args.no_trino else 'ошибка чтения ops'},
+              'ops_sources': sources,
               'current_receipts': {key: value for key, value in receipts.items() if key != 'rows'},
-              **traffic.merge_ops(ledger, ops, receipts), 'history_editions': editions}
+              **traffic.merge_ops(ledger, ops, receipts, sources), 'history_editions': editions}
     summary = traffic.format_traffic_summary(report) + '\n' + traffic.format_editions_summary(report)
     payload = json.dumps({'report': report, 'summary': summary}, default=str, ensure_ascii=False)
     if args.json:

@@ -564,6 +564,18 @@ def test_a_failed_ledger_archive_stops_deploy_and_keeps_the_ledger(tmp_path: Pat
 
 
 @pytest.mark.unit
+def test_deploy_makes_existing_ledger_archives_group_readable(tmp_path: Path) -> None:
+    """#1404: архивы прежних выкатов (0600) становятся читаемыми для отчёта трафика."""
+    _state, runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    archive = runtime / "gateway-state" / "paid_requests.20261001T000000Z.jsonl.gz"
+    archive.write_bytes(b"x")
+    archive.chmod(0o600)
+    result = _run_deploy(release, stubs, env_file)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert archive.stat().st_mode & 0o777 == 0o640
+
+
+@pytest.mark.unit
 def test_a_hung_scheduler_does_not_confirm_the_rollback(stand: Stand) -> None:
     stand.put(f"health_{SCHED}", "unhealthy")
     result = stand.run()
