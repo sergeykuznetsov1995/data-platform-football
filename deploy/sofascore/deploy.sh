@@ -482,6 +482,7 @@ trap on_exit EXIT
 
 [ -s "$ARTIFACT" ] || { echo "в $RELEASE нет configs/sofascore/workload_policy.json" >&2; exit 2; }
 [ -f "$SCHED_COMPOSE" ] && [ -f "$GW_COMPOSE" ] || { echo "в $RELEASE нет deploy/sofascore/*.compose.yaml" >&2; exit 2; }
+# До замка и снимка пауз: rc=3 ничего не трогает, автомат доставки читает его как «не сейчас» (#1999).
 hour=$(date -u +%H%M)
 if [ "$hour" -ge 1355 ] && [ "$hour" -le 1535 ]; then echo "окно дейли 14:00–15:30 UTC — позже" >&2; exit 3; fi
 
