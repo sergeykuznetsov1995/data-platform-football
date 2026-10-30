@@ -17,12 +17,13 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from scrapers.transfermarkt.denominator import load_denominator
+from scrapers.transfermarkt.denominator import Denominator, load_denominator
 from scrapers.transfermarkt.models import MAX_SCOPE_BATCH
 from scrapers.transfermarkt.raw_store import RawResponseStore
 from utils import transfermarkt_backfill_state as state
 from utils.transfermarkt_backfill_artifacts import BackfillArtifactStore
 from utils.transfermarkt_backfill_attempts import verify_envelope_set
+from utils.transfermarkt_history_order import history_claim_key
 from utils.transfermarkt_scope_planner import (
     RegistryScopeTarget,
     build_promoted_registry_query,
@@ -1152,11 +1153,13 @@ def validate_fresh_registry_snapshot(
 
 def historical_targets_from_registry(
     rows: Iterable[Mapping[str, Any]],
+    *,
+    denominator: Denominator | None = None,
 ) -> tuple[state.HistoricalScopeTarget, ...]:
     items = tuple(dict(item) for item in rows)
     targets = eligible_registry_scopes(items)
     # History is collected for the denominator file's live core only (#1390).
-    core = load_denominator().denominator_ids()
+    core = (denominator or load_denominator()).denominator_ids()
     historical = tuple(
         item for item in targets
         if not item.current and item.competition_id in core
@@ -1271,7 +1274,8 @@ def claim_and_plan(
 
     before = tuple(scopes)
     rows = tuple(registry_rows)
-    available = {item.scope_id: item for item in historical_targets_from_registry(rows)}
+    denominator = load_denominator()
+    available = {item.scope_id: item for item in historical_targets_from_registry(rows, denominator=denominator)}
     blocked_ids = set(blocked_scope_ids)
     allowed_ids = {item.target.scope_id for item in before
                    if item.target.scope_id not in blocked_ids
@@ -1279,7 +1283,8 @@ def claim_and_plan(
                    _semantic_target_identity(item.target) == _semantic_target_identity(available[item.target.scope_id])}
     # Admission filtering never rewrites excluded target state or proofs.
     claim = state.claim_scopes(campaign, before, lease_owner=lease_owner, now=now,
-                               limit=limit, eligible_scope_ids=allowed_ids)
+                               limit=limit, eligible_scope_ids=allowed_ids,
+                               sort_key=history_claim_key(denominator))
     if claim.batch is None:
         return claim, ()
     capture_snapshots = {scope: (capture_snapshot_ids or {}).get(scope, str(rows[0]["registry_snapshot_id"]))
