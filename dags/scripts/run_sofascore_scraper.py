@@ -796,17 +796,11 @@ def _materialize_endpoint_results(
         aligned = len(report.rejected_indices) < len(records)
         for index, reasons in report.rejected_indices.items():
             row = records[index]
-            other_tournament = ""
+            other_tournament = _other_payload_tournament(row, source_tournament_ids)
             if column in row and any(
                 row.get(field) not in (None, "")
                 for field in ("season_id", "sofascore_season_id", "source_season_id")
-            ) and (
-                aligned
-                or str(row[column]) in held
-                or (other_tournament := _other_payload_tournament(
-                    row, source_tournament_ids
-                ))
-            ):
+            ) and (aligned or str(row[column]) in held or other_tournament):
                 message = reasons[0].message
                 if other_tournament:
                     message = f"moved to tournament {other_tournament}: {message}"

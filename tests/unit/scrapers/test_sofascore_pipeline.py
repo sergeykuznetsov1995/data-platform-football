@@ -1698,6 +1698,9 @@ def test_match_runner_holds_a_pass_the_source_moved_to_another_tournament(
     assert rc == 0, again["errors"]
     assert transport.calls == 0
     assert "sofascore_events" not in saved
+    assert "moved to tournament 32089" in (
+        saved["sofascore_rejected_rows"]["df"]["reason"].iloc[0]
+    )
 
 
 def test_match_runner_wrong_season_of_the_same_tournament_stays_strictly_red(
