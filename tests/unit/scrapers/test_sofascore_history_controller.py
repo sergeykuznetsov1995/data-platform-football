@@ -412,6 +412,28 @@ def test_empty_or_excluded_core_tournament_is_reported_not_blocking(tmp_path, me
     assert 'исключено core 1' in report['summary']
 
 
+@pytest.mark.parametrize("kind", ["mapping_required", "quarantined"])
+def test_unplannable_unknown_season_is_counted_but_does_not_hold_deep_history(tmp_path, kind):
+    """#1966: an unmapped or quarantined unknown season stays visible, deep history proceeds."""
+    snap = snapshot()
+    failures = {}
+    if kind == "mapping_required":
+        snap["tournaments"][1]["seasons"][0].update(canonical_season=None, season_format="unknown")
+        snap["snapshot_id"] = _snapshot_digest(snap)
+    else:
+        failures = {"history-test:17:1726": {"count": 3, "streak_no_traffic": 3, "last_release": "test"}}
+    ev = evidence(snap, closed=100)
+    ev["scopes"] = [row for row in ev["scopes"] if (row["tournament_id"], row["season_id"]) != (17, 1726)]
+    for row in ev["scopes"]:
+        if row["season_id"] % 100 == 24:
+            row["closed"] = 0
+    planned = run(tmp_path, snap, ev, failures=failures)
+    assert [p["SOFASCORE_HISTORY_GROUP"] for p in planned] == ["3"]
+    report = controller.read_summary(tmp_path / "controller.json", "history-test")
+    assert report["groups"]["1"][kind] == 1
+    assert report["groups"]["1"]["unknown_scopes"] == 0
+
+
 def test_core_with_pending_metadata_and_no_seasons_still_blocks(tmp_path):
     snap = snapshot()
     snap['tournaments'][1].update(metadata_status='pending', seasons=[])

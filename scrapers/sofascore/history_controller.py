@@ -147,8 +147,11 @@ def coverage(scopes: list[dict], inventory: Mapping) -> dict:
         record["scopes"] += 1
         record["finished"] += row.get("finished", 0)
         record["closed"] += row.get("closed", 0)
-        record["unknown_scopes"] += int(scope["unknown"])
         kind = scope.get("kind", "ready")
+        # An unknown season that cannot be planned (no canonical mapping, or
+        # quarantined) stays visible in its own counter; like a settled core
+        # exclusion it no longer holds deep history (owner 29.10, #1966).
+        record["unknown_scopes"] += int(scope["unknown"] and kind not in ("mapping_required", "quarantined"))
         if kind in record:
             record[kind] += 1
         ids = row.get("july_match_ids", [])
