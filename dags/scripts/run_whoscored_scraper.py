@@ -2307,8 +2307,16 @@ def _run_history_workers(args, report, count):
     outputs = [f"{args.output}.worker-{index}.json" for index in range(count)]
     for output in outputs:
         Path(output).unlink(missing_ok=True)
-    processes = [_spawn_history_worker(args, index, count, output)
-                 for index, output in enumerate(outputs)]
+    # Keep each started child as soon as it exists: a later spawn failure
+    # must still wait for, and merge, the workers already running.
+    processes = []
+    spawn_error = None
+    for index, output in enumerate(outputs):
+        try:
+            processes.append(_spawn_history_worker(args, index, count, output))
+        except Exception as exc:
+            spawn_error = (index, exc)
+            break
     workers = []
     for index, (process, output) in enumerate(zip(processes, outputs)):
         code = process.wait()
@@ -2331,6 +2339,11 @@ def _run_history_workers(args, report, count):
         if code != 0 and child.get("status") == "success":
             _worker_failed(report, f"history worker {index} exited {code} after a green report")
         workers.append({"worker": index, **part})
+    if spawn_error is not None:
+        index, exc = spawn_error
+        _worker_failed(report, f"history worker {index} could not start: "
+                               f"{type(exc).__name__}: {exc}")
+        workers.append({"worker": index, "reason": "spawn_failed", "attempted": 0})
     attempted = [w.get("attempted") for w in workers]
     report["history"] = {
         "workers": workers,

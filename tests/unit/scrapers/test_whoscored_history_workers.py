@@ -277,3 +277,39 @@ def test_worker_exception_keeps_its_commits_and_real_error(tmp_path, monkeypatch
     assert not any("without a report" in e for e in report["errors"])
     assert [s["scope"] for s in report["scopes"]] == ["ENG-Premier League=2526"] * 2
     assert report["entities"]
+
+
+def test_spawn_failure_still_merges_the_workers_already_running(tmp_path, monkeypatch):
+    # #1481 round 3: worker 1 cannot start; worker 0 already runs and its
+    # report (metrics, producer commits) must reach the failed pass report.
+    repo = MagicMock()
+    monkeypatch.setattr(runner, "_new_repository", lambda: repo)
+    monkeypatch.setattr(state, "HistoryState", lambda path: MagicMock())
+    monkeypatch.delenv("WHOSCORED_PROXY_FILE", raising=False)
+    monkeypatch.setenv("WHOSCORED_SCHEMA_READY", "")  # restored after the test
+    spawned = []
+
+    def spawn(args, index, count, output):
+        if index == 1:
+            raise OSError("Resource temporarily unavailable")
+        spawned.append(index)
+        Path(output).write_text(json.dumps(_child(index)), encoding="utf-8")
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setattr(runner, "_spawn_history_worker", spawn)
+    output = tmp_path / "result.json"
+    args = runner._build_parser().parse_args(
+        ["history", "--split-lanes", "true", "--workers", "3",
+         "--transport-policy", "direct_only", "--output", str(output)])
+    assert runner._run_history(args, MagicMock(), runner._new_report("history", [])) == 1
+    report = json.loads(output.read_text(encoding="utf-8"))
+
+    assert spawned == [0]
+    assert report["status"] == "failed"
+    assert [(w["worker"], w.get("reason")) for w in report["history"]["workers"]] == [
+        (0, None), (1, "spawn_failed")]
+    assert report["history"]["attempted"] == 25
+    assert report["producer_commits"]["match"] == ["b0"]
+    assert [s["scope"] for s in report["scopes"]] == ["L0=2526"]
+    assert report["rows"] == 10
+    assert any("worker 1 could not start: OSError" in e for e in report["errors"])
