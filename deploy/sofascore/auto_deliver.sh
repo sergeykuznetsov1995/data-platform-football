@@ -590,9 +590,9 @@ contour_busy(){
 set_deadline(){
   local nxt
   now=$(date -u +%s)
-  # Fail-closed: DAG пропал из метабазы или у работающего DAG не вычислен следующий запуск —
+  # Fail-closed: DAG пропал из метабазы (или неактивен) или у работающего DAG не вычислен следующий запуск —
   # дедлайна нет (-1), тик пропускается. 0 — все на паузе, расписанных запусков нет.
-  nxt=$(metadb "SELECT CASE WHEN count(*) < $NEXT_RUN_COUNT OR count(*) FILTER (WHERE NOT is_paused AND next_dagrun_create_after IS NULL) > 0 THEN -1 ELSE coalesce(min(extract(epoch FROM next_dagrun_create_after)) FILTER (WHERE NOT is_paused), 0)::bigint END FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS);")
+  nxt=$(metadb "SELECT CASE WHEN count(*) FILTER (WHERE is_active) < $NEXT_RUN_COUNT OR count(*) FILTER (WHERE NOT is_paused AND next_dagrun_create_after IS NULL) > 0 THEN -1 ELSE coalesce(min(extract(epoch FROM next_dagrun_create_after)) FILTER (WHERE NOT is_paused), 0)::bigint END FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS);")
   case "$nxt" in ''|*[!0-9]*) return 1 ;; esac
   deadline=$(( now + DEADLINE_MAX ))
   if [ "$nxt" != 0 ] && [ $(( nxt - ROLLBACK_RESERVE )) -lt "$deadline" ]; then
