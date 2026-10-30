@@ -28,6 +28,10 @@ One run, in this order:
    today's /Ranking but absent from the history manifest go through the
    history run (``history.collect_new_slugs``). Its failure makes the run red
    but does not roll back the written snapshot.
+7. Together with a /Results fetch only (once per rating date): ``/Fixtures``
+   is stored raw in ``clubelo_raw_page`` (#1982 step 1, raw-first before a
+   parser exists). Best effort: a failure lands in ``fixtures_error`` and
+   never reddens the run or touches the written tables.
 
 Any failed contract check, guard, date mismatch, block or error before step 4
 writes nothing parsed, logs the failed check and exits non-zero. No Telegram
@@ -293,6 +297,17 @@ class _Daily:
             f"after {retries + 1} attempts"
         )
 
+    def fixtures(self) -> None:
+        """#1982 step 1: /Fixtures raw only; a failure never reddens the run."""
+        try:
+            page, _ = self.fetch("/Fixtures")
+        except Exception as exc:
+            self.result["fixtures_error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("ClubElo /Fixtures raw capture failed: %s", self.result["fixtures_error"])
+            return
+        self.result["fixtures_raw"] = True
+        self.result["fixtures_wire_bytes"] = page.wire_bytes
+
     def row(self, **values) -> Dict[str, Any]:
         return {**values, **self.meta, "_ingested_at": history._utcnow()}
 
@@ -338,6 +353,9 @@ def run_daily(
         "history_new_no_page": 0,
         "history_new_failed": 0,
         "history_new_failed_slugs": [],
+        "fixtures_raw": False,
+        "fixtures_wire_bytes": 0,
+        "fixtures_error": None,
         "wire_bytes": 0,
         "wire_bytes_daily": 0,
         "requests": 0,
@@ -399,6 +417,8 @@ def run_daily(
             daily.run.rating_date = ranking.rating_date
             result.update(history.collect_new_slugs(daily.run, ranking.linked_slugs,
                                                     limit=new_slugs_limit))
+        if not result["results_skipped"]:
+            daily.fixtures()
     except ClubEloBlocked as exc:
         result["blocked"] = str(exc)
         logger.error("ClubElo blocked us, daily run stopped: %s", exc)
