@@ -128,6 +128,7 @@ DEPLOY_CEILING=${DEPLOY_CEILING:-3000}  # жёсткие потолки deploy.s
 ACCEPT_WAIT=${ACCEPT_WAIT:-480}    # dag_dir_list_interval = 300 с, 90 с не хватало (25.08)
 ACCEPT_POLL=${ACCEPT_POLL:-20}
 MIN_DRAIN=${MIN_DRAIN:-900}        # меньше 15 мин на осушение — не начинаем вовсе
+BUSY_RETRY=${BUSY_RETRY:-21600}    # rc=4: тот же sha — не раньше чем через 6 ч (каждый drain стопорит историю)
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}   # провальных попыток подряд до выключателя (имя — прежнее)
 HISTORY_SLOTS=${SOFASCORE_HISTORY_POOL_SLOTS:-3}
@@ -1173,7 +1174,16 @@ if odd_path "$ATTEMPTED"; then
   tg_durable "🆘 SofaScore: на месте защёлки $ATTEMPTED не обычный файл — понять, была ли попытка, нельзя. Ничего не делаю. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   exit 1
 fi
-is_plain "$ATTEMPTED" && exit 0
+if is_plain "$ATTEMPTED"; then
+  # rc=4 оставляет защёлку с пометкой busy: повтор того же sha — только после BUSY_RETRY.
+  read -r mark since < "$ATTEMPTED" || true
+  if [ "${mark:-}" = busy ] && [ "${since:-x}" -eq "${since:-x}" ] 2>/dev/null \
+     && [ $(( $(date -u +%s) - since )) -ge "$BUSY_RETRY" ]; then
+    rm -f "$ATTEMPTED"
+  else
+    exit 0
+  fi
+fi
 if ! set_deadline; then
   log "метабаза не ответила про ближайший запуск сбора — тик пропущен"
   window_note "метабаза не ответила про ближайший запуск сбора"
@@ -1342,8 +1352,8 @@ log "deploy.sh вернул $rc"
 
 # rc=4 — «контур занят, выкат не начат»: бой не тронут, откатывать нечего. С #1980 это не
 # провал кода, а «не сейчас»: запись закрывается busy (в серию провалов не идёт), защёлка этого
-# sha снимается — следующий свободный час попробует снова (IDLE_WAIT — весь запас до дедлайна,
-# так что раньше ближайшего прогона по расписанию повтора не будет). Контур не вернулся —
+# sha помечается busy и снимается через BUSY_RETRY: каждый drain стопорит историю, поэтому
+# повтор — не каждый свободный час, а не чаще раза в 6 ч. Контур не вернулся —
 # авария: failed, защёлка остаётся, выключатель.
 if [ "$rc" = 4 ]; then
   log "контур не освободился за ${IDLE_WAIT}s — выкат не начинался, откатывать нечего"
@@ -1356,7 +1366,7 @@ if [ "$rc" = 4 ]; then
   rm -f "$INFLIGHT"
   if [ "$restored" = 1 ]; then
     window_close "$WIN" busy "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут" t
-    rm -f "$ATTEMPTED"
+    echo "busy $(date -u +%s)" > "$ATTEMPTED"
   else
     window_close "$WIN" failed "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут, контур не вернулся" f
   fi
@@ -1366,7 +1376,7 @@ if [ "$rc" = 4 ]; then
     tg_durable "🆘 SofaScore: доставка ${WANT:0:8} не состоялась (контур не освободился за ${IDLE_WAIT}s, бой не тронут), И контур не вернулся в рабочее состояние —$RESTORE_NOTE Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     exit 1
   fi
-  tg_durable "⚠️ SofaScore: доставка ${WANT:0:8} не состоялась — контур не освободился за ${IDLE_WAIT}s (выкат не начинался, бой не тронут). Повторю после ближайшего прогона, когда контур освободится. Лог: $LOG"
+  tg_durable "⚠️ SofaScore: доставка ${WANT:0:8} не состоялась — контур не освободился за ${IDLE_WAIT}s (выкат не начинался, бой не тронут). Повторю не раньше чем через $(( BUSY_RETRY / 3600 )) ч, когда контур освободится. Лог: $LOG"
   exit 0
 fi
 

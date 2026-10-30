@@ -891,26 +891,32 @@ def test_the_happy_path_delivers_accepts_and_restores_the_snapshot(stand: Stand)
 @pytest.mark.unit
 def test_rc4_means_the_contour_was_busy_and_nothing_was_touched(stand: Stand) -> None:
     """Код 4 deploy.sh — «контур занят, выкат не начат»: откатывать нечего. #1980: это «не
-    сейчас», а не провал — запись busy (в серию не идёт), защёлка sha снимается, и следующий
-    свободный час пробует снова (IDLE_WAIT — весь запас до ближайшего прогона)."""
+    сейчас», а не провал — запись busy (в серию не идёт), защёлка sha помечается busy: каждый
+    drain стопорит историю, поэтому тот же sha пробуется снова не раньше BUSY_RETRY (6 ч)."""
     stand.watchdog_pids()
     _put_window(stand, "2026-09-01", OUTCOME="failed", REASON="прошлая", RESTORED="t")
     _put_window(stand, "2026-09-02", OUTCOME="failed", REASON="прошлая", RESTORED="t")
     stand.put("deploy_rc", "4")
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not (stand.state / f"sofascore-auto-deliver-attempted-{stand.new_sha[:12]}").exists()
+    latch = stand.state / f"sofascore-auto-deliver-attempted-{stand.new_sha[:12]}"
+    assert latch.read_text().split()[0] == "busy"
     assert not (stand.state / "sofascore-inflight").exists()
     assert not (stand.state / "sofascore-auto-deliver.off").exists(), "busy в серию провалов не идёт"
     rec = _window(stand, stand.today)
     assert rec["OUTCOME"] == "busy" and "rc=4" in rec["REASON"] and rec["RESTORED"] == "t", rec
-    assert "Повторю после ближайшего прогона" in stand.pending(), stand.pending()
-    # Следующий свободный тик — новая попытка того же sha, новая запись.
+    assert "Повторю не раньше чем через 6 ч" in stand.pending(), stand.pending()
     (stand.stub_state / "deploy_rc").unlink()
-    stand.put("now_epoch", str(_epoch("2026-09-03 06:00:00")))
+    # Свободный тик раньше BUSY_RETRY — тот же sha не пробуется: drain не стопорит историю снова.
+    calls = len(stand.calls("deploy"))
+    stand.put("now_epoch", str(int(latch.read_text().split()[1]) + 3600))
+    assert stand.run().returncode == 0
+    assert len(stand.calls("deploy")) == calls, "повтор раньше BUSY_RETRY"
+    # После BUSY_RETRY — новая попытка того же sha, новая запись.
+    stand.put("now_epoch", str(_epoch("2026-09-03 10:00:00")))
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
-    assert _window(stand, "2026-09-03T0600")["OUTCOME"] == "delivered"
+    assert _window(stand, "2026-09-03T1000")["OUTCOME"] == "delivered"
     assert not stand.calls("compose"), "отката не было"
     assert "контур не освободился" in stand.log_text()
     assert (stand.stub_state / f"paused_{HIST}").read_text().strip() == "f"
