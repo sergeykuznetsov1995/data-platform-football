@@ -896,9 +896,16 @@ wave_guard(){ # $1 = путь маркера фазы
   set_off
   exit 1
 }
-# Ошибка раннера: короткая причина, INFRA (подтверждённый отказ соединения)
-# или X (лог не прочитан/traceback оборван). Все попытки проверяются целиком:
-# смешанная ошибка кода не должна скрыться за инфраструктурной ошибкой.
+# Ошибка раннера в task-логе волны. Отвечает строкой ошибки, пустотой (её нет),
+# INFRA или X (лог не прочитан — вслепую не судим). Различать обязательно: «не
+# прочитал» под видом «ошибки нет» превращает красную волну с нашей ошибкой в
+# «краснота истории, не откат», и следующая зелёная актуалка приняла бы
+# забракованный код (ревью Sol, раунд 1). Лог волны — до 35 тыс. строк, одна
+# JSON-строка отчёта доходит до 650 КБ: разбираем на стороне контейнера.
+# INFRA (#1978) — только когда в КАЖДОЙ попытке итоговый отчёт раннера (`errors[]`,
+# верхнее исключение) целиком состоит из отказа HTTP-транспорта к Trino: таймаут
+# чтения, таймаут или отказ соединения. Traceback не разбираем — его формат зависит
+# от библиотек. Нет отчёта или любая другая ошибка — прежний путь (откат).
 runner_error(){ # $1 = run_id
   local out logs
   case "$1" in
@@ -907,91 +914,30 @@ runner_error(){ # $1 = run_id
       echo X; return ;;
   esac
   logs="/opt/airflow/logs/dag_id=dag_ingest_fotmob/run_id=$1/task_id=scrape_fotmob_data/attempt=*.log"
-  # Разбираем все попытки внутри контейнера: наружу идут только класс и короткая
-  # причина. Непрочитанный/оборванный traceback не разрешает принять следующую волну.
-  if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc "python3 -c '
-import re
-import sys
-
-header = re.compile(r\"\[ERROR\] __main__: (.*)\")
-logger = re.compile(r\"\d{4}-\d\d-\d\d .*?\[(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\] \")
-exception = re.compile(r\"^([A-Za-z_][\w.]*)(?::\s*(.*)|$)\")
-network = {\"TrinoConnectionError\", \"ReadTimeout\", \"ReadTimeoutError\", \"ConnectTimeout\", \"ConnectTimeoutError\", \"ConnectionError\", \"NewConnectionError\", \"MaxRetryError\", \"ConnectionRefusedError\", \"OperationalError\"}
-host = re.compile(r\"(?:host=|host |server at )[^A-Za-z0-9_]*(?:trino|metadb|postgres|fotmob-airflow-metadb)(?=[^A-Za-z0-9_.-]|$)\")
-transport = re.compile(r\"timed? out|timeout|connection refused|could not connect|failed to establish a new connection\", re.I)
-errors = []
-unsafe = False
-incomplete = False
-
-def check(lines):
-    global unsafe, incomplete
-    if not lines:
-        return
-    title = lines[0]
-    errors.append(title)
-    if title not in {\"Unexpected FotMob runner failure\", \"salvage flush after runner failure also failed\"}:
-        unsafe = True
-        return
-    terminal_infra = False
-    proven = False
-    chained = False
-    waiting = False
-    seen = False
-    for line in lines[1:]:
-        if line in {\"During handling of the above exception, another exception occurred:\", \"The above exception was the direct cause of the following exception:\"}:
-            chained = True
-        if line == \"Traceback (most recent call last):\":
-            if seen and not chained:
-                unsafe |= not (terminal_infra and proven)
-                proven = False
-            chained = False
-            if waiting:
-                incomplete = True
-            waiting = True
-            seen = True
-        match = exception.match(line)
-        if match:
-            waiting = False
-            kind, detail = match.groups()
-            detail = detail or \"\"
-            kind = kind.rsplit(\".\", 1)[-1]
-            contextual = bool(host.search(detail) and transport.search(detail))
-            proven |= kind in network and contextual
-            terminal_infra = contextual and (kind in network or kind == \"TrinoError\" and proven)
-            low_level_timeout = kind == \"TimeoutError\" and bool(re.fullmatch(
-                r\"timed out|The read operation timed out|_ssl[.]c:\d+: The handshake operation timed out\", detail))
-            # Low-level TCP errors gain host context only in a later wrapper.
-            # Accept the chain only when its terminal exception proves that host.
-            tcp_error = kind in {\"ConnectionRefusedError\", \"NewConnectionError\", \"MaxRetryError\"} and bool(transport.search(detail))
-            if not terminal_infra and not low_level_timeout and not tcp_error:
-                unsafe = True
-    incomplete |= waiting or chained or not seen
-    unsafe |= not (terminal_infra and proven)
-
+  if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc "ls $logs >/dev/null 2>&1 || exit 3; python3 -c '
+import json, re, sys
+infra = re.compile(r\"TrinoError: SQL execution failed: failed to fetch: HTTPSConnectionPool\(host=.trino., port=\d+\): (Read timed out\..*|Max retries exceeded with url: .*\(Caused by (ConnectTimeoutError|NewConnectionError)\(.*)\")
+first, all_infra = \"\", True
 for path in sys.argv[1:]:
-    block = []
-    size = 0
-    with open(path) as stream:
+    errors = None
+    with open(path, errors=\"replace\") as stream:
         for raw in stream:
             line = raw.rstrip(\"\n\").split(\" INFO - \", 1)[-1]
-            match = header.search(line)
-            if match or logger.search(line):
-                check(block)
-                block = []
-                size = 0
-            if match:
-                block = [match.group(1)]
-            elif block:
-                size += len(line)
-                if size > 2000000:
-                    raise ValueError(\"diagnostic block too large\")
-                block.append(line)
-    check(block)
-print(\"X\" if incomplete else \"INFRA\" if errors and not unsafe else errors[0][:300] if errors else \"\")
+            if not first and \"[ERROR] __main__:\" in line:
+                first = line.split(\"[ERROR] __main__:\", 1)[1].strip()
+            if line.startswith(\"{\") and \"\\\"errors\\\"\" in line:
+                try:
+                    report = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(report, dict) and isinstance(report.get(\"errors\"), list):
+                    errors = report[\"errors\"]
+    all_infra = all_infra and bool(errors) and all(isinstance(e, str) and infra.fullmatch(e) for e in errors)
+print(\"INFRA\" if all_infra else first[:300])
 ' $logs" 2>/dev/null); then
     echo X; return
   fi
-  printf '%s' "$out"
+  printf '%s' "$out" | head -n 1 | cut -c1-300
 }
 # Откат по красной первой волне ПОВТОРЯЕМ, а не разов: паузы между волнами почти нет
 # (замер 6 суток: следующая стартует через 18–80 с после конца предыдущей), поэтому в
@@ -1165,7 +1111,7 @@ wave_acceptance(){
         wave_guard "$infra_marker"
         if ! is_plain "$infra_marker"; then
           log "вторая фаза приёмки: $run — подтверждённый отказ инфраструктуры ($infra_count/3), жду следующую волну"
-          tg_durable "⚠️ FotMob $head_now: красная волна \`$run\` — отказ соединения/таймаут Trino или метабазы ($infra_count/3). Вердикт откладываю до следующей волны. Лог: $LOG"
+          tg_durable "⚠️ FotMob $head_now: красная волна \`$run\` — отказ соединения/таймаут Trino ($infra_count/3). Вердикт откладываю до следующей волны. Лог: $LOG"
           # Без следа предупреждения следующую волну пока не принимаем.
           mk_marker "$infra_marker" || return 0
         fi

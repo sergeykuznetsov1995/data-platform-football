@@ -11,6 +11,7 @@ Docker, pgrep и date подменяются заглушками в PATH.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -1572,66 +1573,40 @@ def test_checkout_barrier_rejects_a_damaged_pause_journal(tmp_path: Path, broken
     assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
 
 
-def _infra_traceback(host: str = "trino", kind: str = "ReadTimeout") -> str:
-    # Формат инцидента #1978: обёртка Airflow, длинный traceback, цепочка
-    # исключений и вторичная ошибка salvage flush того же инфраструктурного типа.
-    detail = f"HTTPSConnectionPool(host='{host}', port=8443): Read timed out. (read timeout=5)"
-    if kind == "OperationalError":
-        detail = f'connection to server at "{host}", port 5432 failed: Connection refused'
-    if kind == "ConnectionError":
-        detail = (
-            f"HTTPSConnectionPool(host='{host}', port=8443): Max retries exceeded with url: /v1/statement "
-            "(Caused by NewConnectionError: Failed to establish a new connection: [Errno 111] Connection refused)"
-        )
-    if kind == "ConnectTimeout":
-        detail = f"HTTPSConnectionPool(host='{host}', port=8443): Connection timed out. (connect timeout=5)"
-    chain = (
-        'Traceback (most recent call last):\n'
-        + '  File "/opt/airflow/scrapers/base/trino_manager.py", line 335, in _execute\n' * 8
-        + f"requests.exceptions.{kind}: {detail}\n"
-    )
-    if kind == "ConnectionError":
-        chain = (
-            'Traceback (most recent call last):\n  File ignored\n'
-            'ConnectionRefusedError: [Errno 111] Connection refused\n\n'
-            'The above exception was the direct cause of the following exception:\n\n'
-            'Traceback (most recent call last):\n  File ignored\n'
-            'urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPSConnection object at 0x123>: '
-            'Failed to establish a new connection: [Errno 111] Connection refused\n\n'
-            'The above exception was the direct cause of the following exception:\n\n'
-            'Traceback (most recent call last):\n  File ignored\n'
-            f'urllib3.exceptions.MaxRetryError: {detail}\n\n'
-            'During handling of the above exception, another exception occurred:\n\n'
-        ) + chain
-    if kind == "ConnectTimeout":
-        chain = (
-            'Traceback (most recent call last):\n  File ignored\n'
-            'TimeoutError: timed out\n\n'
-            'During handling of the above exception, another exception occurred:\n\n'
-            'Traceback (most recent call last):\n  File ignored\n'
-            f'urllib3.exceptions.ConnectTimeoutError: {detail}\n\n'
-            'The above exception was the direct cause of the following exception:\n\n'
-            'Traceback (most recent call last):\n  File ignored\n'
-            f'urllib3.exceptions.MaxRetryError: {detail}\n\n'
-            'During handling of the above exception, another exception occurred:\n\n'
-        ) + chain + (
-            '\nThe above exception was the direct cause of the following exception:\n\n'
-            'Traceback (most recent call last):\n  File ignored\n'
-            f'trino.exceptions.TrinoConnectionError: {detail}\n'
-        )
-    if host == "trino":
-        chain += (
-            '\nThe above exception was the direct cause of the following exception:\n\n'
-            'Traceback (most recent call last):\n'
-            '  File "/opt/airflow/scrapers/base/trino_manager.py", line 335, in _execute\n'
-            f"scrapers.base.trino_manager.TrinoError: SQL execution failed: {detail}\n"
-        )
-    text = "2026-10-30 06:28:43 [ERROR] __main__: Unexpected FotMob runner failure\n" + chain
-    text += "2026-10-30 06:29:04 [ERROR] __main__: salvage flush after runner failure also failed\n" + chain
+_TRINO_POOL = "TrinoError: SQL execution failed: failed to fetch: HTTPSConnectionPool(host='{host}', port=8443): "
+# Настоящие строки errors[] отчёта раннера: инцидент #1978 и два вида отказа соединения.
+_INFRA_ERRORS = {
+    "read_timeout": _TRINO_POOL + "Read timed out. (read timeout=5)",
+    "refused": _TRINO_POOL + (
+        "Max retries exceeded with url: /v1/statement (Caused by NewConnectionError("
+        "'<urllib3.connection.HTTPSConnection object at 0x7f>: Failed to establish a new connection: "
+        "[Errno 111] Connection refused'))"
+    ),
+    "connect_timeout": _TRINO_POOL + (
+        "Max retries exceeded with url: /v1/statement (Caused by ConnectTimeoutError("
+        "<urllib3.connection.HTTPSConnection object at 0x7f>, 'Connection to trino timed out. "
+        "(connect timeout=5)'))"
+    ),
+}
+
+
+def _runner_log(*errors: str, report: bool = True) -> str:
+    # Формат task-лога: заголовок ошибки раннера, traceback, итоговый JSON-отчёт.
+    lines = [
+        "2026-10-30 06:28:43 [ERROR] __main__: Unexpected FotMob runner failure",
+        "Traceback (most recent call last):",
+        '  File "/opt/airflow/scrapers/base/trino_manager.py", line 335, in _execute',
+        "TimeoutError: The read operation timed out",
+    ]
+    if report:
+        lines.append(json.dumps({"complete": False, "errors": list(errors), "mode": "refresh", "rows": {}}))
     return "".join(
-        f"[2026-10-30T06:28:43.589+0000] {{subprocess.py:106}} INFO - {line}\n"
-        for line in text.splitlines()
+        f"[2026-10-30T06:28:43.589+0000] {{subprocess.py:106}} INFO - {line}\n" for line in lines
     )
+
+
+def _infra_traceback(kind: str = "read_timeout") -> str:
+    return _runner_log(_INFRA_ERRORS[kind].format(host="trino"))
 
 
 def _attempt_path(tmp_path: Path, run: str, attempt: int = 1) -> Path:
@@ -1642,19 +1617,15 @@ def _attempt_path(tmp_path: Path, run: str, attempt: int = 1) -> Path:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("host,kind", [
-    ("trino", "ReadTimeout"), ("metadb", "OperationalError"),
-    ("fotmob-airflow-metadb", "OperationalError"), ("trino", "ConnectionError"),
-    ("trino", "ConnectTimeout"),
-])
+@pytest.mark.parametrize("kind", sorted(_INFRA_ERRORS))
 def test_phase2_defers_infrastructure_failure_then_accepts_green(
-    tmp_path: Path, host: str, kind: str,
+    tmp_path: Path, kind: str,
 ) -> None:
     run = "fotmob_orchestrated__infra"
     rows = f"{run}|failed|2026-09-08T00:00:10|refresh\n"
-    w = _phase2_world(tmp_path, rows, runner_err=_infra_traceback(host, kind))
-    # Несколько попыток должны читаться целиком, без усечения traceback.
-    _attempt_path(tmp_path, run, 2).write_text(_infra_traceback(host, kind), encoding="utf-8")
+    w = _phase2_world(tmp_path, rows, runner_err=_infra_traceback(kind))
+    # Каждая попытка должна сама подтвердить отказ инфраструктуры.
+    _attempt_path(tmp_path, run, 2).write_text(_infra_traceback(kind), encoding="utf-8")
     for _ in range(2):
         proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
         assert proc.returncode == 0, proc.stderr + proc.stdout
@@ -1675,67 +1646,33 @@ def test_phase2_defers_infrastructure_failure_then_accepts_green(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("case", ["source", "mixed", "previous_attempt", "truncated", "missing_traceback", "terminal_timeout", "custom_exception", "wrapper_only", "prior_timeout", "bare_assertion", "refused_with_code", "source_refused", "source_connect_timeout", "unknown_connect_timeout", "truncated_handling", "truncated_cause"])
+@pytest.mark.parametrize("case", [
+    "source_host", "mixed_errors", "previous_attempt", "no_report", "empty_errors",
+    "sql_error", "code_error",
+])
 def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, case: str) -> None:
     run = "fotmob_orchestrated__bad"
-    text = _infra_traceback("fotmob.com" if case == "source" else "trino")
-    if case in {"refused_with_code", "source_refused"}:
-        text = _infra_traceback("fotmob.com" if case == "source_refused" else "trino", "ConnectionError")
-    if case in {"source_connect_timeout", "unknown_connect_timeout"}:
-        text = _infra_traceback("fotmob.com" if case == "source_connect_timeout" else "unknown", "ConnectTimeout")
-    if case in {"bare_assertion", "refused_with_code"}:
-        assertion = (
-            "Traceback (most recent call last):\n  File ignored\nAssertionError\n\n"
-            "During handling of the above exception, another exception occurred:\n\n"
-        )
-        text = text.replace("Traceback (most recent call last):\n", assertion + "Traceback (most recent call last):\n", 1)
-    if case == "mixed":
-        text += "2026-10-30 06:29:05 [ERROR] __main__: ValueError: broken contract\n"
-    if case == "truncated":
-        text += "Traceback (most recent call last):\n  File ignored\n"
-    if case in {"truncated_handling", "truncated_cause"}:
-        text += (
-            "\nDuring handling of the above exception, another exception occurred:\n\n"
-            if case == "truncated_handling" else
-            "\nThe above exception was the direct cause of the following exception:\n\n"
-        )
-    if case in {"terminal_timeout", "custom_exception"}:
-        text += (
-            "\nDuring handling of the above exception, another exception occurred:\n\n"
-            "Traceback (most recent call last):\n  File ignored\n"
-            + ("TimeoutError: parser stalled\n" if case == "terminal_timeout" else "WriterLockLost: lost\n")
-        )
-    if case == "wrapper_only":
-        text = (
-            "[ERROR] __main__: Unexpected FotMob runner failure\n"
-            "Traceback (most recent call last):\n  File ignored\n"
-            "TrinoError: SQL execution failed: host=trino timeout\n"
-        )
-    if case == "prior_timeout":
-        text = text.replace(
-            "Traceback (most recent call last):",
-            "Traceback (most recent call last):\nTimeoutError: parser stalled\n\n"
-            "During handling of the above exception, another exception occurred:\n\n"
-            "Traceback (most recent call last):", 1,
-        )
-    if case == "missing_traceback":
-        text = "2026-10-30 06:28:43 [ERROR] __main__: Unexpected FotMob runner failure\n"
+    infra = _INFRA_ERRORS["read_timeout"].format(host="trino")
+    text = {
+        "source_host": _runner_log(_INFRA_ERRORS["read_timeout"].format(host="www.fotmob.com")),
+        "mixed_errors": _runner_log(infra, "ValueError: broken contract"),
+        "previous_attempt": _runner_log(infra),
+        "no_report": _runner_log(report=False),
+        "empty_errors": _runner_log(),
+        "sql_error": _runner_log("TrinoError: SQL execution failed: TrinoUserError(type=USER_ERROR, name=COLUMN_NOT_FOUND)"),
+        "code_error": _runner_log("KeyError: 'matchId'"),
+    }[case]
     w = _phase2_world(
         tmp_path, f"{run}|failed|2026-09-08T00:00:10|refresh\n"
         "fotmob_orchestrated__green|success|2026-09-08T04:00:00|daily", runner_err=text,
     )
     if case == "previous_attempt":
-        _attempt_path(tmp_path, run, 2).write_text("[ERROR] __main__: RuntimeError: broken\n", encoding="utf-8")
+        _attempt_path(tmp_path, run, 2).write_text(_runner_log("RuntimeError: broken"), encoding="utf-8")
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
-    unread = case in {"truncated", "missing_traceback", "truncated_handling", "truncated_cause"}
-    assert proc.returncode == (0 if unread else 1), proc.stderr + proc.stdout
-    assert _git(w["repo"], "rev-parse", "HEAD") == w["two" if unread else "one"]
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
     verdicts = list(w["state"].glob("fotmob-wave-verdict-*"))
-    if unread:
-        assert not verdicts
-        assert "task-лог не прочитан" in w["sent"].read_text(encoding="utf-8")
-    else:
-        assert "rollback" in verdicts[0].read_text(encoding="utf-8")
+    assert "rollback" in verdicts[0].read_text(encoding="utf-8")
 
 
 @pytest.mark.unit
