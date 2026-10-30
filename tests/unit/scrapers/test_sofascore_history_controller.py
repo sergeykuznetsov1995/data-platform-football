@@ -466,7 +466,8 @@ def test_verified_empty_schedule_is_known_zero_not_an_endless_bootstrap(tmp_path
     assert all(p['SOFASCORE_SOURCE_SEASON_ID'] != '826' for p in planned)
 
 
-def test_saved_july_cohort_absent_from_query_cannot_disappear_from_gate(tmp_path):
+def test_saved_july_cohort_absent_from_query_stays_visible_without_holding_history(tmp_path):
+    """Owner 29.10 (#1966): an unresolved July target is reported, deep history proceeds."""
     snap = snapshot()
     ev = inventory.from_rows(snap, [], [], july_cohort=[('8', '826', '7')])
     assert ev['july_unresolved'] == 1
@@ -474,9 +475,10 @@ def test_saved_july_cohort_absent_from_query_cannot_disappear_from_gate(tmp_path
     for row in ev['scopes']:
         if row['season_id'] % 100 == 24:
             row['closed'] = 0
-    assert run(tmp_path, snap, ev) == []
+    planned = run(tmp_path, snap, ev)
+    assert [p['SOFASCORE_HISTORY_GROUP'] for p in planned] == ['3']
     report = controller.read_summary(tmp_path / 'controller.json', 'history-test')
-    assert report['active_group'] == 'july'
+    assert report['groups']['july']['unknown_scopes'] == 1
 
 
 def test_july_query_rereads_cohort_without_stats_timestamp_filter():

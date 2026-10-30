@@ -248,11 +248,15 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
         active = (next((g for g in open_core if g in workable), workable[0] if workable else open_core[0])
                   if open_core else None)
         if active is None:
+            # Only a group with plannable work becomes active: unresolved July
+            # targets (no source season) or pending seasons would otherwise
+            # yield an empty plan on every run (#1966).
             active = next((g for g in ("july", "3", "4", "5")
                            if (groups[g]["remaining"] or groups[g]["unknown_scopes"])
-                           and (g == "july" or any(s["group"] == g and s["kind"] != "quarantined"
-                                                  and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0))
-                                                  for s in scopes))), "5")
+                           and any(s["kind"] == "ready" and (
+                               s["evidence"].get("july_match_ids") if g == "july" else
+                               s["group"] == g and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0)))
+                                   for s in scopes)), "5")
         candidates = []
         if isinstance(authorized_season_classes, Mapping):
             raise state.CampaignPlanningError("authorized_season_classes must be class names, not a mapping")
