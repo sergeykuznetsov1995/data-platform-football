@@ -113,6 +113,14 @@ x-tm-airflow-common: &tm-airflow-common
       target: /opt/airflow/logs
       bind:
         create_host_path: false
+    # Леджер шлюза для transfermarkt_traffic_report.py (#1404), только чтение. Не внутри
+    # /opt/airflow/logs: вложенный монт заставил бы Docker создать пустой каталог на хосте.
+    - type: bind
+      source: ${TRANSFERMARKT_RUNTIME_DIR:?set the durable Transfermarkt runtime directory}/gateway-state
+      target: /opt/airflow/gateway-state
+      read_only: true
+      bind:
+        create_host_path: false
   networks:
     - transfermarkt-net
     - dp-storage

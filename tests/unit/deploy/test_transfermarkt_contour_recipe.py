@@ -122,6 +122,9 @@ def test_airflow_compose_pins_the_contour_shape() -> None:
     assert targets["/opt/airflow/logs"] == (
         "${TRANSFERMARKT_RUNTIME_DIR:?set the durable Transfermarkt runtime directory}/logs"
     )
+    # Леджер шлюза для отчёта трафика (#1404): только чтение, вне /opt/airflow/logs.
+    ledger = next(v for v in scheduler["volumes"] if v["target"] == "/opt/airflow/gateway-state")
+    assert ledger["source"].endswith("}/gateway-state") and ledger["read_only"] is True
     for target in ("/opt/airflow/dags", "/opt/airflow/scrapers", "/opt/airflow/scripts", "/opt/airflow/configs"):
         assert targets[target].startswith("${TRANSFERMARKT_RELEASE_ROOT:?"), target
     assert scheduler["networks"] == ["transfermarkt-net", "dp-storage"]
