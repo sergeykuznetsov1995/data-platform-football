@@ -626,3 +626,33 @@ def test_interrupted_match_is_deferred_on_next_run(runner):
     runner.client.fetch_json = original
     assert deep.run_deep(**runner.args)["completed"] == 1
     assert all("/events/2/" in url for url, _ in runner.client.calls)
+
+
+def test_completed_prefix_never_starves_new_matches_across_bounded_runs(runner):
+    # #1986: SQL time is the budget; completed matches must not be re-read each run.
+    now = runner.args["now_fn"]()
+    clock = [now]
+    runner.args.update(now_fn=lambda: clock[0])
+    for event_id in range(2, 4):
+        write_tournament_batch(_batch(_match(event_id, str(event_id))), trino=runner.bronze)
+    assert deep.run_deep(**runner.args)["completed"] == 3
+    for event_id in range(4, 8):
+        write_tournament_batch(_batch(_match(event_id, str(event_id))), trino=runner.bronze)
+    original = runner.bronze.execute_query
+    team_reads = []
+
+    def timed(sql, params=None):
+        clock[0] += timedelta(seconds=1)
+        if "espn_team_stats" in sql:
+            clock[0] += timedelta(seconds=10)
+            team_reads.append(sql)
+        return original(sql, params)
+
+    runner.bronze.execute_query = timed
+    completed = []
+    for _ in range(4):
+        runner.args["deadline"] = clock[0] + timedelta(seconds=40)
+        completed.append(deep.run_deep(**runner.args)["completed"])
+    assert completed == [1, 1, 1, 1]
+    stored = {row["event_id"]: row["deep_state"] for row in runner.bronze.tables["espn_match"]}
+    assert stored == dict.fromkeys(range(1, 8), "completed")

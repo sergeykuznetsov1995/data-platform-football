@@ -241,26 +241,32 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                         report["mapped"] += 1
                     if map_only or depth.deep_level != "full":
                         continue
+                    # Completed matches leave the queue before any per-match work;
+                    # only those still missing confirmed xG are read again, in one batch.
+                    completed = [int(row[0]) for row in candidates if row[3] == "completed"]
+                    upgrade = set()
+                    if depth.has_xg is True and completed:
+                        confirmed = {}
+                        for row in stored_rows(trino, TEAM_STATS_TABLE, delete_filter(slug, year, completed)):
+                            confirmed.setdefault(row["event_id"], []).append(
+                                row["deep_stats_json"] is not None and
+                                json.loads(row["deep_stats_json"]).get("has_xg") is True)
+                        upgrade = {event_id for event_id in completed
+                                   if confirmed.get(event_id, []) != [True, True]}
+                    candidates = [row for row in candidates
+                                  if row[3] != "completed" or int(row[0]) in upgrade]
                     retries = load_retries(trino, slug, year)
                     # Unattempted matches precede due retries, even after a restart.
                     candidates.sort(key=lambda row: (row[0] in retries,
                                                      retries.get(row[0]) or datetime.min, row[0]))
-                    for event_id, home, away, state in candidates:
-                        check()
+                    for event_id, home, away, _ in candidates:
                         retry_after = retries.get(event_id)
                         if retry_after is not None:
                             if retry_after.tzinfo is None:
                                 retry_after = retry_after.replace(tzinfo=timezone.utc)
                             if now_fn() < retry_after:
                                 continue
-                        if state == "completed":
-                            if depth.has_xg is not True:
-                                continue
-                            scope = delete_filter(slug, year, [int(event_id)])
-                            stored = stored_rows(trino, TEAM_STATS_TABLE, scope)
-                            if len(stored) == 2 and all(row["deep_stats_json"] is not None and
-                                    json.loads(row["deep_stats_json"]).get("has_xg") is True for row in stored):
-                                continue
+                        check()
                         try:
                             # Persist before I/O so deadline/stop interruptions also
                             # advance the next run instead of replaying its prefix.
