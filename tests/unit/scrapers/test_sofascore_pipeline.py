@@ -1399,7 +1399,11 @@ def _event_records_for(
             if season_id is not None:
                 payload["event"]["season"]["id"] = season_id
             if tournament_id is not None:
-                payload["event"]["uniqueTournament"]["id"] = tournament_id
+                # Live payloads nest it: event.tournament.uniqueTournament.id.
+                payload["event"].pop("uniqueTournament", None)
+                payload["event"]["tournament"] = {
+                    "uniqueTournament": {"id": tournament_id}
+                }
             body = json.dumps(payload).encode("utf-8")
         if endpoint == "lineups" and jersey_number is not None:
             payload = json.loads(body)
@@ -1683,6 +1687,7 @@ def test_match_runner_holds_a_pass_the_source_moved_to_another_tournament(
     journal = saved["sofascore_rejected_rows"]["df"]
     assert set(journal["reason_code"]) == {"season_mismatch"}
     assert set(journal["natural_key"]) == {f"76986|{bad_match}"}
+    assert "moved to tournament 32089" in journal["reason"].iloc[0]
     held = runtime.manifest_store.get(specs[(bad_match, "event")].key)
     assert held.error_type == "RowRejected"
 

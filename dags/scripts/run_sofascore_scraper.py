@@ -796,20 +796,20 @@ def _materialize_endpoint_results(
         aligned = len(report.rejected_indices) < len(records)
         for index, reasons in report.rejected_indices.items():
             row = records[index]
+            other_tournament = _other_payload_tournament(row, source_tournament_ids)
             if column in row and any(
                 row.get(field) not in (None, "")
                 for field in ("season_id", "sofascore_season_id", "source_season_id")
-            ) and (
-                aligned
-                or str(row[column]) in held
-                or _moved_to_another_tournament(row, source_tournament_ids)
-            ):
+            ) and (aligned or str(row[column]) in held or other_tournament):
+                message = reasons[0].message
+                if other_tournament:
+                    message = f"moved to tournament {other_tournament}: {message}"
                 moved.append(
                     RejectedRow(
                         row={**row, "match_id": row[column]},
                         table=dq_tables["events"],
                         code="season_mismatch",
-                        message=reasons[0].message,
+                        message=message,
                         natural_key=f"{expected_source_season_id}|{row[column]}",
                     )
                 )
@@ -837,8 +837,8 @@ def _materialize_endpoint_results(
     return frames
 
 
-def _moved_to_another_tournament(row, source_tournament_ids) -> bool:
-    """True when the event payload itself names a different tournament (#1962)."""
+def _other_payload_tournament(row, source_tournament_ids) -> str:
+    """The tournament an event payload names instead of the scope's (#1962)."""
     import pandas as pd
 
     payload_tournaments = set()
@@ -850,9 +850,9 @@ def _moved_to_another_tournament(row, source_tournament_ids) -> bool:
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         payload_tournaments.add(str(value))
-    return bool(payload_tournaments) and payload_tournaments.isdisjoint(
-        source_tournament_ids
-    )
+    if payload_tournaments and payload_tournaments.isdisjoint(source_tournament_ids):
+        return ",".join(sorted(payload_tournaments))
+    return ""
 
 
 _ROW_REJECTED_ERROR = "RowRejected"
