@@ -250,14 +250,6 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, 
         conn.close()
 
 
-def _configured_tournament_ids() -> frozenset[int]:
-    """Source ids of the leagues the daily ingest already covers."""
-
-    from scrapers.sofascore.catalog import SofaScoreCatalog
-
-    return frozenset(SofaScoreCatalog.load().tournament_map(enabled_only=True).values())
-
-
 def _dag_run_type_name(dag_run: Any) -> str:
     """Normalize Airflow's enum and string DagRun type representations."""
 
@@ -312,7 +304,6 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
         raise AirflowException("refresh evidence needs a qualified delivered code revision")
     denominator = load_denominator()
-    daily = _configured_tournament_ids()
     native = {(int(str(r[0])[3:]), int(r[5])): r for r in rows}
     selected = []
     for env in planned:
@@ -332,7 +323,7 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
     # #1751: the evidence keeps its six-column census shape.
     document = planning_snapshot(identity, [tuple(r[:6]) for r in rows], selected,
         core_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 1],
-        daily_ids=daily, excluded_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 0],
+        excluded_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 0],
         disputed_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 9],
         input_complete=True, observed_at=observed_at)
     document.update(stage=stage, task_try_number=int(getattr(context.get("ti"), "try_number", 1)))
@@ -355,7 +346,6 @@ def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
         rows,
         batch_size=REFRESH_BATCH_SIZE,
         queue_mode=queue_mode,
-        exclude_tournament_ids=_configured_tournament_ids(),
         snapshot_path=SNAPSHOT_PATH,
         policy_path=POLICY_PATH,
         result_dir=RESULT_DIR,
@@ -604,7 +594,6 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
         snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
         planned = state.plan_refresh_batch(
             snapshot, rows, batch_size=1, queue_mode=queue_mode,
-            exclude_tournament_ids=_configured_tournament_ids(),
             snapshot_path=SNAPSHOT_PATH, policy_path=POLICY_PATH,
             result_dir=RESULT_DIR, workload_artifact=WORKLOAD_ARTIFACT,
             dag_run_id=f"{run_id}:refill:{round_number}", task_env=REFRESH_TASK_ENV,

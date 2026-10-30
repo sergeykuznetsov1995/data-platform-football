@@ -50,7 +50,6 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "dags") not in sys.path:
     sys.path.insert(0, str(ROOT / "dags"))
 
-from scrapers.sofascore.catalog import SofaScoreCatalog  # noqa: E402
 from scrapers.sofascore.discovery import (  # noqa: E402
     DISCOVERY_LEASE_MAX_BYTES,
     DISCOVERY_LEASE_TTL_SECONDS,
@@ -227,12 +226,6 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
-
-
-def _configured_tournament_ids() -> frozenset[int]:
-    """Source ids of the leagues ``dag_ingest_sofascore`` already covers."""
-
-    return frozenset(SofaScoreCatalog.load().tournament_map(enabled_only=True).values())
 
 
 def ambiguous_current_seasons(
@@ -1337,7 +1330,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.raw_store_uri
             else RawPayloadStore.from_env(optional=False)
         )
-        exclude = _configured_tournament_ids()
+        # #1370: the daily registry leagues are swept here as well, side by side.
+        exclude: frozenset[int] = frozenset()
         all_targets = current_season_targets(snapshot, exclude)
         if not all_targets:
             raise ValueError("campaign snapshot has no ready tournament season")
