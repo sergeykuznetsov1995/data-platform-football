@@ -149,7 +149,7 @@ def test_understat_audit_contract_is_loaded_from_native_registry():
 
 # --- WhoScored contract presence guard (#278) ------------------------------
 # The audit consumes the same dependency-free inventory as migration/cleanup:
-# 25 source datasets and five logical-commit manifests.  Deprecated parser-v2
+# 27 source datasets and five logical-commit manifests.  Deprecated parser-v2
 # tables must not remain as an "expected absent" escape hatch.
 def test_whoscored_contract_lists_complete_v2_inventory():
     expected = set(mod.WHOSCORED_CONTRACT.BUSINESS_TABLES) | set(
@@ -157,7 +157,7 @@ def test_whoscored_contract_lists_complete_v2_inventory():
     )
 
     assert set(mod.EXPECTED_TABLES['whoscored']) == expected
-    assert len(mod.WHOSCORED_CONTRACT.BUSINESS_TABLES) == 25
+    assert len(mod.WHOSCORED_CONTRACT.BUSINESS_TABLES) == 27
     assert 'whoscored_season_stages' not in expected
     assert 'whoscored_player_profile' not in expected
 

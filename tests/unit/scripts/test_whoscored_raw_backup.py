@@ -448,7 +448,7 @@ def test_restore_drill_generates_private_off_host_bound_raw_and_ops_evidence(
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH", raising=False)
     release = {
-        "parser_version": "whoscored-parser-v8",
+        "parser_version": "whoscored-parser-v9",
         "manifest_sha256": "a" * 64,
         "code_tree_sha256": "b" * 64,
     }

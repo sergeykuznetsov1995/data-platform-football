@@ -20,6 +20,7 @@ from scrapers.whoscored.catalog import (
     WhoScoredCatalog,
 )
 from scrapers.whoscored.parsers import (
+    PARSER_VERSION,
     CalendarMonth,
     DatasetStatus,
     ParsedDataset,
@@ -425,6 +426,9 @@ class _Repository:
     def commit_profiles(self, commits):
         self.profile_commits.extend(commits)
         return tuple(commit.batch_id for commit in commits)
+
+    def list_profile_parser_replays(self, player_ids):
+        return set(getattr(self, "profile_parser_replays", ())) & set(player_ids)
 
     def record_profile_failure(self, **failure):
         self.profile_failures.append(failure)
@@ -4162,6 +4166,19 @@ def test_xg_fresh_manifest_skips_requests_and_republication(tmp_path, negative):
     assert not prepared and not fetched and not repo.scope_snapshots
 
 
+def test_xg_final_v8_snapshot_stays_current_under_the_v9_parser(tmp_path):
+    """#1483: the parser bump does not re-download unchanged stage feeds."""
+
+    service, repo, now, prepared, fetched, _, _version = _xg_service(
+        tmp_path, final=True
+    )
+    _xg_previous(repo, now, "whoscored-parser-v8", final=True, days_ago=40)
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert result.metadata["stage_xg_retained"] == [700]
+    assert not prepared and not fetched
+
+
 def test_xg_expired_negative_reprobe_preserves_previous_positive_rows(tmp_path):
     from scrapers.whoscored.transport import StageStatisticsUnavailable
 
@@ -4522,3 +4539,160 @@ def test_xg_checked_excludes_unpublished_stages(tmp_path, failure):
     result = service.sync_stage_feeds()
     assert result.metadata["stage_xg_checked"] == []
     assert not repo.scope_snapshots
+
+
+class _ParserReplayRepository(_Repository):
+    def __init__(self):
+        super().__init__()
+        self.lanes = []
+        self.dictionaries = []
+
+    def list_match_candidates(self, *args, **kwargs):
+        self.lanes.append(kwargs.get("lane"))
+        return [replace(super().list_match_candidates()[0], parser_replay=True)]
+
+    def record_event_type_dictionary(self, event_types, *, game_id, parser_version):
+        self.dictionaries.append((dict(event_types), game_id, parser_version))
+        return True
+
+
+@pytest.mark.parametrize("lane", ["history", "current"])
+def test_parser_version_replay_reads_stale_raw_without_network(
+    tmp_path, monkeypatch, lane
+):
+    """#1483: a v8 success is reparsed from raw bytes of any age in both lanes."""
+
+    service, _, raw_store = _service(tmp_path)
+    repository = _ParserReplayRepository()
+    service.repository = repository
+    raw_store.store_bytes(
+        match_page_target(123), _match_html().encode(), content_type="text/html"
+    )
+    monkeypatch.setattr(raw_store, "is_fresh", lambda *_args, **_kwargs: False)
+    transport = _RawCacheAwareTransport(b"must not reach the network")
+    service.transport = transport
+
+    result = service.sync_matches(lane=lane)
+
+    assert result.status == "success", result.as_dict()
+    assert repository.lanes == [lane]
+    assert transport.network_calls == 0
+    assert repository.commits[0].transport_mode == "raw_cache"
+
+
+def test_match_page_dictionary_is_recorded_after_the_match_commit(tmp_path):
+    html = _match_html().replace(
+        "};</script>",
+        ', matchCentreEventTypeJson: {"shotSixYardBox":0,"pos":218}};</script>',
+    )
+    service, _, _ = _service(tmp_path, html=html)
+    repository = _ParserReplayRepository()
+    service.repository = repository
+
+    result = service.sync_matches()
+
+    assert result.status == "success", result.as_dict()
+    assert repository.dictionaries == [
+        ({"shotSixYardBox": 0, "pos": 218}, 123, PARSER_VERSION)
+    ]
+    assert result.counts["event_type_dictionary"] == 2
+
+
+def test_match_page_without_dictionary_still_commits(tmp_path):
+    service, _, _ = _service(tmp_path)
+    repository = _ParserReplayRepository()
+    service.repository = repository
+
+    result = service.sync_matches()
+
+    assert result.status == "success", result.as_dict()
+    assert len(repository.commits) == 1
+    assert repository.dictionaries == []
+
+
+def test_profile_commit_carries_character_card_rows(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.profile_candidates = [370912]
+    fixture = (
+        Path(__file__).parents[2]
+        / "fixtures"
+        / "whoscored"
+        / "profile-370912-characteristics.html"
+    ).read_text(encoding="utf-8")
+    service.transport = _Transport(
+        fixture.replace(
+            "</body>",
+            "<script>var currentParticipations = [{tournamentId:1,seasonId:2,"
+            "stageId:3,teamId:37,teamName:'Bayern Munich'}];</script></body>",
+        )
+    )
+
+    result = service.sync_profiles(limit=1)
+
+    assert result.status == "success", result.as_dict()
+    names = [row["name"] for row in repository.profile_commits[0].characteristics]
+    assert names == [
+        "Passing",
+        "Aerial Duels",
+        "Ball interception",
+        "Likes to play short passes",
+    ]
+    assert result.counts["player_characteristics"] == 4
+
+
+def test_profile_parser_version_replay_reads_stale_raw_without_network(
+    tmp_path, monkeypatch
+):
+    """#1483 round 2: a v8 profile older than 90 days is reparsed from raw."""
+
+    service, repository, raw_store = _service(tmp_path)
+    repository.profile_candidates = [370912]
+    repository.profile_parser_replays = {370912}
+    fixture = (
+        Path(__file__).parents[2]
+        / "fixtures"
+        / "whoscored"
+        / "profile-370912-characteristics.html"
+    ).read_text(encoding="utf-8")
+    page = fixture.replace(
+        "</body>",
+        "<script>var currentParticipations = [{tournamentId:1,seasonId:2,"
+        "stageId:3,teamId:37,teamName:'Bayern Munich'}];</script></body>",
+    )
+    raw_store.store_bytes(
+        profile_page_target(370912), page.encode(), content_type="text/html"
+    )
+    monkeypatch.setattr(raw_store, "is_fresh", lambda *_args, **_kwargs: False)
+    transport = _RawCacheAwareTransport(b"must not reach the network")
+    service.transport = transport
+
+    result = service.sync_profiles(limit=1)
+
+    assert result.status == "success", result.as_dict()
+    assert transport.network_calls == 0
+    assert repository.profile_commits[0].transport_mode == "raw_cache"
+
+
+def test_truncated_retry_skips_the_cache_even_on_a_parser_replay(tmp_path):
+    """#1483 x #1484: a truncated page is refetched, never replayed."""
+
+    service, _, raw_store = _service(tmp_path)
+    repository = _ParserReplayRepository()
+    repository.list_match_candidates = lambda *args, **kwargs: [
+        replace(
+            _Repository().list_match_candidates()[0],
+            parser_replay=True,
+            previous_failure_code="truncated",
+        )
+    ]
+    service.repository = repository
+    raw_store.store_bytes(
+        match_page_target(123), b"<html>truncated copy</html>", content_type="text/html"
+    )
+    transport = _RawCacheAwareTransport(_match_html().encode())
+    service.transport = transport
+
+    result = service.sync_matches()
+
+    assert result.status == "success", result.as_dict()
+    assert transport.network_calls == 1

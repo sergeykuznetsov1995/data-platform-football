@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "parser_version": "whoscored-parser-v8",
+  "parser_version": "whoscored-parser-v9",
   "report_schema_version": 3,
-  "business_dataset_count": 25,
+  "business_dataset_count": 27,
   "files": {
     ".dockerignore": "1d4b5983474e636a1e498b43c8bee69de0c1d1ba1ed8bfa02ea7eb4e03e70570",
     "configs/medallion/competitions.yaml": "8f390a96b7be13ff1abcc83102b3f25e4a94d82221ef80c8bf00792f9b8a7088",

@@ -8,6 +8,7 @@ import pytest
 from scrapers.whoscored import history, history_state as state
 from scrapers.whoscored.catalog import CatalogCompetition, CatalogSeason, WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
+from scrapers.whoscored.parsers import PARSER_VERSION
 from scrapers.whoscored.raw_store import profile_page_target
 from scrapers.whoscored.repository import WhoScoredRepository
 from scrapers.whoscored.service import WhoScoredIngestService
@@ -215,7 +216,7 @@ def test_failure_parks_scope_and_propagates(tmp_path):
 def test_final_feed_snapshot_not_repeated(tmp_path):
     kwargs, s, repo, service = setup_chunk(tmp_path)
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
         "feed_states": {"1:team:xg-teamstats:summary": "present",
                         "1:player:xg-stats:summary": "present"},
@@ -246,7 +247,7 @@ def test_empty_scopes_do_not_starve_fifth_or_second_wave(tmp_path):
                                          coverage(closed=100) for s in seasons}
     repo.list_match_candidates.side_effect = lambda league, *a, **k: [1] if league == "league-5" else []
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
         "feed_states": {"1:team:xg-teamstats:summary": "present",
                         "1:player:xg-stats:summary": "present"},
@@ -285,7 +286,7 @@ def test_missing_catalog_stage_blocks_wave_gate(tmp_path):
 @pytest.mark.parametrize("fault", ["future", "naive", "missing_time", "missing_feed"])
 def test_incomplete_feed_proof_is_not_final(tmp_path, fault):
     kwargs, s, repo, service = setup_chunk(tmp_path)
-    snapshot = {"parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+    snapshot = {"parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
         "feed_states": {"1:team:xg-teamstats:summary": "present",
                         "1:player:xg-stats:summary": "present"}}
@@ -298,6 +299,22 @@ def test_incomplete_feed_proof_is_not_final(tmp_path, fault):
     else:
         snapshot["feed_states"] = {}
     repo.latest_stage_feed_snapshot.return_value = snapshot
+    assert history.final_feeds(repo, s, moment=NOW) is False
+
+
+def test_v8_final_feed_proof_stays_final_under_the_v9_parser(tmp_path):
+    """#1483: v9 changed no stage-feed parsing; no history re-download."""
+
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    repo.latest_stage_feed_snapshot.return_value = {
+        "parser_version": "whoscored-parser-v8",
+        "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
+        "feed_states": {"1:team:xg-teamstats:summary": "present",
+                        "1:player:xg-stats:summary": "present"},
+    }
+    assert history.final_feeds(repo, s, moment=NOW) is True
+    repo.latest_stage_feed_snapshot.return_value["parser_version"] = "whoscored-parser-v7"
     assert history.final_feeds(repo, s, moment=NOW) is False
 
 
@@ -352,7 +369,7 @@ def test_deferred_stage_refresh_is_cooled_down_without_blocking_wave_two(tmp_pat
         coverage(closed=100, deferred_stages=int(s.scope.season_id == "2627")) for s in seasons}
     repo.list_match_candidates.side_effect = lambda league, slug, **k: [1] if slug == "2425" else []
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
         "feed_states": {"1:team:xg-teamstats:summary": "available",
                         "1:player:xg-stats:summary": "available"}}
@@ -381,7 +398,7 @@ def test_skipped_feeds_defer_scope_and_continue_queue(tmp_path, other_scope):
         (s.scope.competition_id, s.scope.season_id): coverage(closed=100) for s in seasons}
     repo.list_match_candidates.side_effect = lambda league, slug, **k: [1] if slug == "2425" else []
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": False, "checked_at": NOW.isoformat()}},
     }
     service.sync_stage_feeds.return_value = SimpleNamespace(skipped=1)
@@ -415,7 +432,7 @@ def test_feeds_commit_without_checked_stage_is_idle(tmp_path):
     repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id): coverage(closed=100)}
     repo.list_match_candidates.return_value = []
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": False, "checked_at": NOW.isoformat()}},
     }
     service.sync_stage_feeds.return_value = SimpleNamespace(
@@ -499,7 +516,7 @@ def deferred_chunk(tmp_path):
                                          coverage(closed=100, deferred_stages=1)}
     repo.list_match_candidates.return_value = []
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
         "feed_states": {"1:team:xg-teamstats:summary": "present",
                         "1:player:xg-stats:summary": "present"},
@@ -627,7 +644,7 @@ def test_mixed_stage_refresh_survives_restart_and_failure(tmp_path, failed):
     history.run_chunk(**kwargs)
     service.sync_schedule.assert_not_called()
     repo.latest_stage_feed_snapshot.return_value = {
-        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "parser_version": PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
         "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
         "feed_states": {"1:team:xg-teamstats:summary": "present",
                         "1:player:xg-stats:summary": "present"},

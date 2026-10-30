@@ -1,0 +1,33 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.whoscored_matches
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_matches
+  description: |
+    Append-only шапка матча WhoScored, разобранная parser v9 из matchCentreData:
+    одна строка на матч и match batch. Строки становятся видимы через
+    whoscored_matches_current только после успешного match manifest commit.
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: status
+    description: "Строковый статус матча из источника (`elapsed`) — FT, AET или PEN."
+  - name: period
+    description: Не публикуется источником в matchCentreData; всегда NULL.
+  - name: status_code
+    description: Числовой код статуса матча WhoScored (`statusCode`, 6 = завершён).
+  - name: period_code
+    description: Числовой код периода матча WhoScored (`periodCode`).
+  - name: weather
+    description: Код погоды WhoScored (`weatherCode`); пустая строка источника → NULL.
+  - name: start_time
+    description: Локальное время начала матча (Europe/London), строка из WhoScored (`startTime`).
+  - name: home_manager
+    description: Главный тренер домашней команды (`home.managerName`).
+  - name: away_manager
+    description: Главный тренер гостевой команды (`away.managerName`).
+  - name: expanded_max_minute
+    description: Последняя минута матча с учётом добавленного времени (`expandedMaxMinute`).

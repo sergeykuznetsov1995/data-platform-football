@@ -76,7 +76,7 @@ def test_audit_import_uses_pure_inventory(monkeypatch):
     module = _load("scripts/audit_bronze_columns.py", monkeypatch)
     inventory = module.WHOSCORED_CONTRACT
     inventory.validate_definition()
-    assert len(inventory.BUSINESS_TABLES) == 25
+    assert len(inventory.BUSINESS_TABLES) == 27
     assert len(inventory.MANIFEST_TABLES) == 5
     assert set(inventory.BATCH_COLUMN_BY_TABLE) == set(inventory.BUSINESS_TABLES)
     assert all(inventory.BUSINESS_REQUIRED_COLUMNS[table] for table in inventory.BUSINESS_TABLES)

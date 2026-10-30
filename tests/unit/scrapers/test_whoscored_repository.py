@@ -36,6 +36,7 @@ from scrapers.whoscored.repository import (
     _clean_unicode,
     canonical_catalog_rows,
     catalog_payload_sha256,
+    event_type_dictionary_sha256,
     catalog_raw_provenance_sha256,
     profile_candidate_payload_sha256,
     scope_write_chunk_rows_from_env,
@@ -396,7 +397,10 @@ def test_load_discovered_catalog_rejects_same_count_payload_corruption():
 
 
 def _lineage_catalog_repository(
-    *, cycle: bool = False, parent_hash_mismatch: bool = False
+    *,
+    cycle: bool = False,
+    parent_hash_mismatch: bool = False,
+    parser_version: str = PARSER_VERSION,
 ):
     catalog_rows = canonical_catalog_rows(
         {
@@ -427,7 +431,7 @@ def _lineage_catalog_repository(
             {
                 "batch_id": batch_id,
                 "payload_sha256": payload_sha256,
-                "parser_version": PARSER_VERSION,
+                "parser_version": parser_version,
                 "raw_inputs_json": raw_inputs_json,
                 "raw_provenance_sha256": raw_sha256,
                 "discovery_mode": "incremental" if parent else "full_history",
@@ -467,6 +471,24 @@ def _lineage_catalog_repository(
         def execute_query(cls, sql):
             if "SELECT batch_id FROM" in sql:
                 return [(current["batch_id"],)]
+            if "SELECT batch_id, payload_sha256, parser_version, raw_uri" in sql:
+                return [
+                    (
+                        current["batch_id"],
+                        current["payload_sha256"],
+                        current["parser_version"],
+                        "s3://raw/catalog.json.gz",
+                        current["raw_inputs_json"],
+                        datetime(2026, 7, 16),
+                        current["discovery_mode"],
+                        current["raw_provenance_sha256"],
+                        current["as_of_date"],
+                        current["parent_catalog_batch_id"],
+                        current["parent_catalog_payload_sha256"],
+                        current["parent_catalog_raw_provenance_sha256"],
+                        1,
+                    )
+                ]
             if "SELECT payload_json" in sql and "whoscored_competitions" in sql:
                 return [(json.dumps(catalog_rows["competitions"][0]),)]
             if "SELECT payload_json" in sql and (
@@ -527,6 +549,32 @@ def test_load_catalog_validates_long_parent_chain_with_one_lineage_query():
 
     assert len(catalog.competitions) == 1
     assert trino.lineage_queries == 1
+
+
+@pytest.mark.unit
+def test_v8_catalog_snapshot_loads_under_the_v9_parser_without_a_flag():
+    """#1483: v9 changed no catalog parsing; the live v8 lineage stays current."""
+
+    assert PARSER_VERSION == "whoscored-parser-v9"
+    repository, _trino, batch_id = _lineage_catalog_repository(
+        parser_version="whoscored-parser-v8"
+    )
+
+    generation, catalog = repository.load_catalog_generation_snapshot()
+
+    assert generation["catalog_batch_id"] == batch_id
+    assert generation["catalog_parser_version"] == "whoscored-parser-v8"
+    assert len(catalog.competitions) == 1
+
+
+@pytest.mark.unit
+def test_v7_catalog_lineage_still_needs_the_full_history_flag():
+    repository, _trino, _batch_id = _lineage_catalog_repository(
+        parser_version="whoscored-parser-v7"
+    )
+
+    with pytest.raises(BatchConflict, match="unsupported parser|identity mismatch"):
+        repository.load_catalog_generation_snapshot()
 
 
 @pytest.mark.unit
@@ -791,6 +839,99 @@ def test_business_contract_adds_missing_columns_and_preserves_legacy_extras():
 
 
 @pytest.mark.unit
+def test_business_contract_adds_only_the_missing_match_header_column():
+    """#1483: a live table without ``status_code`` gets exactly one ALTER."""
+
+    trino = _CleanSchemaTrino()
+    trino.tables["whoscored_matches"] = {
+        column: data_type
+        for column, data_type in WHOSCORED_BUSINESS_COLUMN_CONTRACTS[
+            "whoscored_matches"
+        ].items()
+        if column != "status_code"
+    }
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    repository._ensure_business_table_contract("whoscored_matches")
+
+    assert trino.added == [("whoscored_matches", "status_code", "BIGINT")]
+
+    trino.added.clear()
+    repository._ensure_business_table_contract("whoscored_matches")
+
+    assert trino.added == []
+
+
+@pytest.mark.unit
+def test_business_contract_rejects_a_retyped_live_column():
+    trino = _CleanSchemaTrino()
+    trino.tables["whoscored_matches"] = {
+        **WHOSCORED_BUSINESS_COLUMN_CONTRACTS["whoscored_matches"],
+        "status_code": "varchar",
+    }
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    with pytest.raises(ValueError, match="status_code live=varchar contract=BIGINT"):
+        repository._ensure_business_table_contract("whoscored_matches")
+
+    assert trino.added == []
+
+
+def _event_types() -> dict[str, int]:
+    import gzip
+    from pathlib import Path
+
+    from scrapers.whoscored.parsers import extract_matchcentre_event_types
+
+    fixture = Path(__file__).parents[2] / "fixtures" / "whoscored" / "match-1946345.raw.gz"
+    with gzip.open(fixture, "rt", encoding="utf-8") as handle:
+        return extract_matchcentre_event_types(handle.read())
+
+
+@pytest.mark.unit
+def test_event_type_dictionary_is_written_once_per_digest():
+    """#1483: 219 rows for a new digest; the same digest never appends again."""
+
+    event_types = _event_types()
+    digest = event_type_dictionary_sha256(event_types)
+    assert digest == event_type_dictionary_sha256(dict(reversed(event_types.items())))
+    trino = MagicMock()
+    trino.execute_query.return_value = [("f" * 64,)]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    assert repository.record_event_type_dictionary(event_types, game_id=1946345)
+    assert not repository.record_event_type_dictionary(event_types, game_id=1952492)
+
+    assert trino.execute_query.call_count == 1
+    assert "SELECT DISTINCT dictionary_sha256" in trino.execute_query.call_args.args[0]
+    writer.write_dataframe.assert_called_once()
+    frame = writer.write_dataframe.call_args.args[0]
+    assert writer.write_dataframe.call_args.kwargs["table"] == (
+        "whoscored_event_type_dictionary"
+    )
+    assert len(frame) == 219
+    assert set(frame["dictionary_sha256"]) == {digest}
+    assert set(frame["first_seen_game_id"]) == {1946345}
+    codes = dict(zip(frame["event_type_name"], frame["event_type_code"]))
+    assert codes["shotSixYardBox"] == 0
+    assert codes["pos"] == 218
+
+
+@pytest.mark.unit
+def test_known_event_type_dictionary_digest_is_not_rewritten():
+    event_types = _event_types()
+    trino = MagicMock()
+    trino.execute_query.return_value = [(event_type_dictionary_sha256(event_types),)]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    assert not repository.record_event_type_dictionary(event_types, game_id=1)
+
+    writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
 def test_contract_normalizer_is_deterministic_for_all_null_columns():
     schedule = WhoScoredRepository._normalise_frame_types(
         pd.DataFrame(
@@ -1019,7 +1160,7 @@ def test_commit_matches_identifies_a_record_by_counter_and_opta_id():
 
 @pytest.mark.unit
 def test_match_batch_v3_identity_is_bound_to_league_and_season():
-    first = _commit()
+    first = replace(_commit(), parser_version="whoscored-parser-v8")
     other_league = replace(first, league="OTHER")
     other_season = replace(first, season="2027")
 
@@ -1032,7 +1173,7 @@ def test_match_batch_v3_identity_is_bound_to_league_and_season():
 
 @pytest.mark.unit
 def test_preview_batch_v3_identity_is_bound_to_league_and_season():
-    first = _preview_commit()
+    first = replace(_preview_commit(), parser_version="whoscored-parser-v8")
     other_league = replace(first, league="OTHER")
     other_season = replace(first, season="2027")
 
@@ -1842,6 +1983,7 @@ def test_match_candidates_increment_latest_retry_and_reset_after_success():
                 True,
                 4,
                 "truncated",
+                False,
             )
         ],
         [
@@ -1855,6 +1997,7 @@ def test_match_candidates_increment_latest_retry_and_reset_after_success():
                 True,
                 1,
                 None,
+                False,
             )
         ],
     ]
@@ -1894,8 +2037,8 @@ def test_match_candidates_expose_exact_backlog_count_when_requested():
     trino = MagicMock()
     # Both returned rows carry the exact pre-LIMIT backlog (5) on every row.
     trino.execute_query.return_value = [
-        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, None, 5),
-        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, None, 5),
+        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, None, False, 5),
+        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, None, False, 5),
     ]
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
 

@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 
 from . import history_state as state
-from .parsers import PARSER_VERSION
+from .parsers import CATALOG_AND_STAGE_FEED_PARSER_VERSIONS
 from .repository import STAGE_XG_FEED_POLICY
 
 
@@ -33,7 +33,8 @@ def final_feeds(repository, season, *, moment) -> bool:
     snapshot = repository.latest_stage_feed_snapshot(
         season.scope.competition_id, season.scope.season_id,
     )
-    if (not snapshot or snapshot.get("parser_version") != PARSER_VERSION
+    if (not snapshot
+            or snapshot.get("parser_version") not in CATALOG_AND_STAGE_FEED_PARSER_VERSIONS
             or snapshot.get("feed_policy") != STAGE_XG_FEED_POLICY or not season.stage_ids):
         return False
     checks = snapshot.get("feed_checks", {})

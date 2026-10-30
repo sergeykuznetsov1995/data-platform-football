@@ -49,7 +49,11 @@ PREVIEW_TABLES = (
 PROFILE_TABLES = (
     "whoscored_player_profile_versions",
     "whoscored_player_stage_participations",
+    "whoscored_player_characteristics",
 )
+
+# Source dictionaries are versioned by content digest, not by a commit batch.
+DICTIONARY_TABLES = ("whoscored_event_type_dictionary",)
 
 BUSINESS_TABLES = (
     *CATALOG_TABLES,
@@ -57,6 +61,7 @@ BUSINESS_TABLES = (
     *MATCH_TABLES,
     *PREVIEW_TABLES,
     *PROFILE_TABLES,
+    *DICTIONARY_TABLES,
 )
 
 MANIFEST_TABLES = (
@@ -88,7 +93,9 @@ PREVIEW_VIEWS = (
 PROFILE_BRONZE_VIEWS = (
     "whoscored_player_roster",
     "whoscored_player_stage_participations_current",
+    "whoscored_player_characteristics_current",
 )
+DICTIONARY_VIEWS = tuple(f"{table}_current" for table in DICTIONARY_TABLES)
 
 BRONZE_VIEWS = (
     *CATALOG_VIEWS,
@@ -96,6 +103,7 @@ BRONZE_VIEWS = (
     *MATCH_VIEWS,
     *PREVIEW_VIEWS,
     *PROFILE_BRONZE_VIEWS,
+    *DICTIONARY_VIEWS,
 )
 SILVER_VIEWS = ("whoscored_player_profile_current",)
 
@@ -182,6 +190,7 @@ BATCH_COLUMN_BY_TABLE = {
     **{table: "_game_batch_id" for table in MATCH_TABLES},
     **{table: "_preview_batch_id" for table in PREVIEW_TABLES},
     **{table: "_profile_batch_id" for table in PROFILE_TABLES},
+    **{table: "dictionary_sha256" for table in DICTIONARY_TABLES},
 }
 
 BUSINESS_REQUIRED_COLUMNS: dict[str, Sequence[str]] = {
@@ -265,9 +274,9 @@ DEPRECATED_ACTIVE_TABLES = (
 def validate_definition() -> None:
     """Fail at import time when the static contract is internally ambiguous."""
 
-    if len(BUSINESS_TABLES) != 25:
+    if len(BUSINESS_TABLES) != 27:
         raise RuntimeError(
-            f"WhoScored contract must contain 25 business tables, got {len(BUSINESS_TABLES)}"
+            f"WhoScored contract must contain 27 business tables, got {len(BUSINESS_TABLES)}"
         )
     if len(set(BUSINESS_TABLES)) != len(BUSINESS_TABLES):
         raise RuntimeError("WhoScored business-table contract contains duplicates")

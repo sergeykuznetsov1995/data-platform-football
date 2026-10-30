@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (4 live write-only tables; native Understat contract added 2026-07-27)
+## 1. Register (6 live write-only tables; native Understat contract added 2026-07-27, WhoScored #1483 2026-10-30)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -35,6 +35,8 @@ per-item/per-season HTTP.
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
 | `fbref_match_keeper_stats` | FREE (parsed from the same match page as `combined_match_data`, `data_readers.py:1107`) | per-match GK stats (SoTA/GA/saves/save%); 7,677 rows; found in R5 review — was never registered | **(b) future** (per-match keeper block is absent from Gold entirely) | [#870] |
 | `understat_team_season_breakdowns` | FREE (same `getTeamData` responses required by consumed `understat_player_team_season_stats`) | source-faithful long form across seven dimensions with `against_*`; seven-table scope DQ requires it | **(b) keep** (unique source data; requested production contract) | — (§3) |
+| `whoscored_event_type_dictionary` | FREE (sibling `matchCentreEventTypeJson` of the match page already fetched for `whoscored_events`) | 219 name→code rows per dictionary version (`dictionary_sha256`); appended only when the digest is new | **(b) keep** (source dictionary for event codes; added 2026-10-30) | [#1483] |
+| `whoscored_player_characteristics` | FREE (`.character-card` of the profile page already fetched for `whoscored_player_profile_versions`) | strengths/weaknesses/style per profile snapshot (`_profile_batch_id`) | **(b) keep** (unique source data; added 2026-10-30) | [#1483] |
 
 ### Resolved since the 2026-06-11 inventory
 
@@ -235,3 +237,4 @@ gap tracked as followup [#738].
 [#736]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/736
 [#870]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/870
 [#738]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/738
+[#1483]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/1483

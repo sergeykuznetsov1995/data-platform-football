@@ -103,7 +103,7 @@ WHOSCORED_OPERATIONAL_HIGH_CHURN: Tuple[str, ...] = (
 )
 
 WHOSCORED_HIGH_CHURN: Tuple[str, ...] = (
-    # All 25 business datasets, five commit manifests, and durable operational
+    # All 27 business datasets, five commit manifests, and durable operational
     # relations. Mapped writers can create many snapshots even when payloads
     # are append-only.
     "whoscored_competitions",
@@ -131,6 +131,8 @@ WHOSCORED_HIGH_CHURN: Tuple[str, ...] = (
     "whoscored_preview_sections",
     "whoscored_player_profile_versions",
     "whoscored_player_stage_participations",
+    "whoscored_player_characteristics",
+    "whoscored_event_type_dictionary",
     "whoscored_catalog_manifest",
     "whoscored_scope_ingest_manifest",
     "whoscored_match_ingest_manifest",

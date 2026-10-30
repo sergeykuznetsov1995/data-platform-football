@@ -1516,7 +1516,7 @@ def execute_restore_drill(
         "manifest_sha256": runtime.get("manifest_sha256"),
         "parser_version": runtime.get("parser_version"),
     }
-    if runtime_release["parser_version"] != "whoscored-parser-v8" or any(
+    if runtime_release["parser_version"] != "whoscored-parser-v9" or any(
         not isinstance(runtime_release[field], str)
         or _SHA256_RE.fullmatch(runtime_release[field]) is None
         for field in ("manifest_sha256", "code_tree_sha256")
