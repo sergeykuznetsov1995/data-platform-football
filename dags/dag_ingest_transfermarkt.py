@@ -84,8 +84,9 @@ def _current_qualification() -> dict[str, Any] | None:
     if not CURRENT_QUALIFICATION_PATH.exists():
         return None
     from dags.scripts.run_transfermarkt_current import validate_qualification
+    from scrapers.transfermarkt.signal_qualification import load_qualification_wrapper
 
-    return validate_qualification(json.loads(CURRENT_QUALIFICATION_PATH.read_text()))
+    return validate_qualification(load_qualification_wrapper(CURRENT_QUALIFICATION_PATH))
 
 
 def _current_schedule():

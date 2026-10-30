@@ -160,8 +160,13 @@ def test_deployment_pool_preflight_rejects_overlapping_exits_without_secret_outp
     validate_history_pool_files(current, history)
 
 
-def test_real_current_qualification_missing_blocks_history_without_new_activation_file():
+def test_missing_current_qualification_blocks_history(monkeypatch):
     from utils.transfermarkt_backfill_runtime import current_signal_qualification, BackfillRuntimeError
+
+    def missing(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr('scrapers.transfermarkt.signal_qualification.load_qualification_wrapper', missing)
     with pytest.raises(BackfillRuntimeError, match='qualification is required'):
         current_signal_qualification()
 

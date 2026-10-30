@@ -1676,7 +1676,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
     if not preflight.get('paid_io_allowed') or preflight.get('write_mode') not in {'dual', 'native-only'}:
         raise CurrentPortionError('reader preflight did not authorize current collection')
     if qualification is None and os.environ.get('TM_CURRENT_QUALIFICATION_PATH'):
-        qualification = json.loads(Path(os.environ['TM_CURRENT_QUALIFICATION_PATH']).read_text())
+        from scrapers.transfermarkt.signal_qualification import load_qualification_wrapper
+        qualification = load_qualification_wrapper(os.environ['TM_CURRENT_QUALIFICATION_PATH'])
     qualification = validate_qualification(qualification)
     bootstrap_entries = {}
     bundle_path, bundle_hash = qualification.get('baseline_bundle_path'), qualification.get('baseline_bundle_sha256')

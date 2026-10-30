@@ -433,6 +433,39 @@ def _install_airflow_stubs() -> None:
     airflow_mod.DAG = _StubDAG
     models_mod.DAG = _StubDAG
 
+    # ---- airflow.timetables + pendulum -----------------------------------
+    # Only enough for dags/utils/transfermarkt_current_timetable.py to define
+    # its class, so a delivered TM qualification selects it as in production.
+    # Its scheduling methods are never called by DAG tests. ``Timetable`` is
+    # deliberately absent: whoscored_bootstrap keeps its own no-Airflow fallback.
+    timetables_mod = types.ModuleType("airflow.timetables")
+    timetables_base_mod = types.ModuleType("airflow.timetables.base")
+    timetables_simple_mod = types.ModuleType("airflow.timetables.simple")
+
+    class _StubDataInterval:
+        pass
+
+    class _StubDagRunInfo:
+        pass
+
+    class _StubTimeRestriction:
+        pass
+
+    class _StubContinuousTimetable:
+        pass
+
+    timetables_base_mod.DataInterval = _StubDataInterval
+    timetables_base_mod.DagRunInfo = _StubDagRunInfo
+    timetables_base_mod.TimeRestriction = _StubTimeRestriction
+    timetables_simple_mod.ContinuousTimetable = _StubContinuousTimetable
+    airflow_mod.timetables = timetables_mod
+    timetables_mod.base = timetables_base_mod
+    timetables_mod.simple = timetables_simple_mod
+    try:
+        import pendulum  # noqa: F401
+    except ModuleNotFoundError:
+        sys.modules["pendulum"] = types.ModuleType("pendulum")
+
     # ---- register --------------------------------------------------------
     # Use direct assignment (not setdefault) — there may be a stale namespace
     # package already in sys.modules; we want our stubs to win.
@@ -451,6 +484,9 @@ def _install_airflow_stubs() -> None:
     sys.modules["airflow.sensors.python"] = sensors_python_mod
     sys.modules["airflow.utils"] = utils_mod
     sys.modules["airflow.utils.task_group"] = utils_tg_mod
+    sys.modules["airflow.timetables"] = timetables_mod
+    sys.modules["airflow.timetables.base"] = timetables_base_mod
+    sys.modules["airflow.timetables.simple"] = timetables_simple_mod
 
     # Cross-link so `from airflow.decorators import dag` works through
     # both the ``airflow`` package and the explicit submodule path.
