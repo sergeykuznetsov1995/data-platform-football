@@ -41,6 +41,7 @@ from utils.fbref_current_windows import (
     HISTORY_MAX_BATCHES,
     HISTORY_SLICE_HOURS_UTC,
     HISTORY_WAVE_DEADLINE_SECONDS,
+    RECOVERY_WAVE_DEADLINE_SECONDS,
     current_window_reservations,
     history_slice_window,
 )
@@ -1965,9 +1966,12 @@ def run_recovery_wave(
     byte_limit_mb=DEFAULT_BYTE_LIMIT // MIB,
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    deadline_seconds: float = RECOVERY_WAVE_DEADLINE_SECONDS,
 ) -> dict:
     """Parse reusable successful raw before any live transport is opened."""
 
+    if deadline_seconds <= 0:
+        raise ValueError("recovery deadline must be positive")
     settings = _settings(
         run_type=run_type,
         request_limit=request_limit,
@@ -1981,7 +1985,23 @@ def run_recovery_wave(
     )
     aggregate: dict[str, object] = {"batches": 0}
     history_slice = dag_id == "dag_fbref_history_controller"
+    started = time.monotonic()
     while True:
+        # Checked before the call so no batch starts past the budget; the
+        # first batch always runs.  Остаток когорты — следующему рану (#2001).
+        elapsed = time.monotonic() - started if aggregate["batches"] else 0.0
+        if elapsed >= deadline_seconds:
+            aggregate["recovery_budget_exhausted"] = True
+            aggregate["recovery_budget_seconds"] = deadline_seconds
+            logger.warning(
+                "FBref raw recovery budget exhausted after %s batch(es) in "
+                "%.0fs (budget %ss) — оставляю остаток когорты следующему "
+                "рану и перехожу к живым волнам",
+                aggregate["batches"],
+                elapsed,
+                deadline_seconds,
+            )
+            break
         result = pipeline.recover_unprocessed_wave(
             control_run_id,
             page_kinds=list(page_kinds),
@@ -2029,6 +2049,7 @@ def run_recovery_wave(
     aggregate.setdefault("cohort_size", 0)
     aggregate.setdefault("parsed", 0)
     aggregate.setdefault("recovery_stalled", False)
+    aggregate.setdefault("recovery_budget_exhausted", False)
     logger.info(
         "FBref raw recovery drain: %s",
         json.dumps(aggregate, sort_keys=True),
