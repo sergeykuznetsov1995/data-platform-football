@@ -124,6 +124,7 @@ def offline(monkeypatch, tmp_path):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", _FakeClient)
+    monkeypatch.setattr(refresh, "with_registry_refresh", lambda snapshot: snapshot)
     calls = {"fetch": [], "writes": []}
 
     def partitions(window_hours):
@@ -3459,3 +3460,23 @@ def test_fresh_overdue_continuation_survives_beside_deep_queue(offline, monkeypa
     assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
     seed = next(call for call in calls["fetch"] if call["start_pages"])
     assert seed["start_pages"] == {pair: 7}
+
+
+@pytest.mark.unit
+def test_main_sweeps_the_daily_registry_leagues(offline, monkeypatch):
+    # #1370: the daily leagues join the sweep under the same campaign snapshot.
+    from scrapers.sofascore.all_mens_campaign import with_registry_refresh
+
+    monkeypatch.setattr(refresh, "with_registry_refresh", with_registry_refresh)
+    seen = []
+    real = refresh.current_season_targets
+    monkeypatch.setattr(
+        refresh, "current_season_targets",
+        lambda snapshot, *a, **k: seen.append(snapshot) or real(snapshot, *a, **k),
+    )
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    keys = {row["capture_key"] for row in seen[0]["tournaments"]}
+    assert {"SS-8", "SS-16", "SS-17", "SS-34", "SS-35", "SS-203"} <= keys
+    assert seen[0]["campaign_id"] == SNAPSHOT["campaign_id"]

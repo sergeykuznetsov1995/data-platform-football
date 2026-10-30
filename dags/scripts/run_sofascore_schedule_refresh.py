@@ -62,6 +62,7 @@ from dags.utils.sofascore_all_mens_state import (  # noqa: E402
     SeasonTarget,
     current_season_targets,
 )
+from scrapers.sofascore.all_mens_campaign import with_registry_refresh  # noqa: E402
 from scrapers.sofascore.raw_store import RawPayloadStore  # noqa: E402
 from scrapers.sofascore.schedule_refresh import (  # noqa: E402
     MAX_BACKTRACK_PAGES,
@@ -1323,7 +1324,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise ValueError("--page-budget must be positive")
         if args.budget_cap_bytes < 0:
             raise ValueError("--budget-cap-bytes cannot be negative")
-        snapshot = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+        # #1370: the daily registry leagues join the sweep as ``SS-<id>``.
+        snapshot = with_registry_refresh(
+            json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+        )
         snapshot_id = str(snapshot.get("snapshot_id") or "")
         raw_store = (
             RawPayloadStore.from_uri(args.raw_store_uri)
