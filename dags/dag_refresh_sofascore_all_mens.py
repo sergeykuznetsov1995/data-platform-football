@@ -250,14 +250,6 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, 
         conn.close()
 
 
-def _configured_tournament_ids() -> frozenset[int]:
-    """Source ids of the leagues the daily ingest already covers."""
-
-    from scrapers.sofascore.catalog import SofaScoreCatalog
-
-    return frozenset(SofaScoreCatalog.load().tournament_map(enabled_only=True).values())
-
-
 def _dag_run_type_name(dag_run: Any) -> str:
     """Normalize Airflow's enum and string DagRun type representations."""
 
@@ -312,7 +304,6 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
         raise AirflowException("refresh evidence needs a qualified delivered code revision")
     denominator = load_denominator()
-    daily = _configured_tournament_ids()
     native = {(int(str(r[0])[3:]), int(r[5])): r for r in rows}
     selected = []
     for env in planned:
@@ -332,7 +323,7 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
     # #1751: the evidence keeps its six-column census shape.
     document = planning_snapshot(identity, [tuple(r[:6]) for r in rows], selected,
         core_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 1],
-        daily_ids=daily, excluded_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 0],
+        excluded_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 0],
         disputed_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 9],
         input_complete=True, observed_at=observed_at)
     document.update(stage=stage, task_try_number=int(getattr(context.get("ti"), "try_number", 1)))
@@ -347,7 +338,7 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
 
 def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     queue_mode = _refresh_queue_mode(context)
-    snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+    snapshot = state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     rows = _pending_refresh_partitions()
     observed_at = datetime.now(timezone.utc).isoformat()
     planned = state.plan_refresh_batch(
@@ -355,7 +346,6 @@ def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
         rows,
         batch_size=REFRESH_BATCH_SIZE,
         queue_mode=queue_mode,
-        exclude_tournament_ids=_configured_tournament_ids(),
         snapshot_path=SNAPSHOT_PATH,
         policy_path=POLICY_PATH,
         result_dir=RESULT_DIR,
@@ -459,6 +449,7 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
         "--expected-snapshot-id", env["SOFASCORE_EXPECTED_SNAPSHOT_ID"],
         "--expected-campaign-id", env["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
         "--phase", "matches", "--season-evidence", "bronze", "--allow-pending-season",
+        "--registry-overlay",
         "--output-dir", env["SOFASCORE_SCOPE_OUTPUT_DIR"],
         "--output", env["SOFASCORE_SCOPE_RESULT_PATH"],
         "--workload-artifact", env["SOFASCORE_WORKLOAD_ARTIFACT"],
@@ -595,16 +586,15 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
         rows = _pending_refresh_partitions()
         pending_state.update(number=pending_state["number"] + 1, rows=rows,
                              observed_at=datetime.now(timezone.utc).isoformat(),
-                             snapshot=state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH))
+                             snapshot=state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH))
         _capture_refresh_evidence(context, pending_state["snapshot"], rows, [],
             f"pending-{pending_state['number']}", pending_state["observed_at"])
         return rows
 
     def plan(rows, budget, round_number):
-        snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+        snapshot = state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
         planned = state.plan_refresh_batch(
             snapshot, rows, batch_size=1, queue_mode=queue_mode,
-            exclude_tournament_ids=_configured_tournament_ids(),
             snapshot_path=SNAPSHOT_PATH, policy_path=POLICY_PATH,
             result_dir=RESULT_DIR, workload_artifact=WORKLOAD_ARTIFACT,
             dag_run_id=f"{run_id}:refill:{round_number}", task_env=REFRESH_TASK_ENV,
@@ -826,6 +816,7 @@ started=$(date +%s)
   --phase matches \
   --season-evidence bronze \
   --allow-pending-season \
+  --registry-overlay \
   --output-dir "${SOFASCORE_SCOPE_OUTPUT_DIR}" \
   --output "${SOFASCORE_SCOPE_RESULT_PATH}" \
   --workload-artifact "${SOFASCORE_WORKLOAD_ARTIFACT}" \

@@ -38,3 +38,18 @@ def test_optional_enrichment_contracts_are_documented_separately():
     for contract in ENRICHMENT_CONTRACTS:
         spec = yaml.safe_load((DESCRIPTIONS / f"bronze_{contract.table_name}.yaml").read_text())
         assert {c["name"] for c in spec["columns"]} == set(contract.required_columns) | BRONZE_METADATA_COLUMNS
+
+
+def test_source_caveats_reach_the_openmetadata_patch():
+    from configs.openmetadata.apply_descriptions import build_patch
+
+    def patch_text(table):
+        spec = yaml.safe_load((DESCRIPTIONS / f"bronze_{table}.yaml").read_text())
+        current = {"columns": [{"name": c["name"]} for c in spec["columns"]]}
+        return str(build_patch(spec, current))
+
+    schedule = patch_text("understat_schedule")
+    for caveat in ("UTC", "±1 ч", "#902", "0.33", "27930"):
+        assert caveat in schedule, caveat
+    for table in ("understat_shots", "understat_player_match_stats"):
+        assert "#1438" in patch_text(table), table

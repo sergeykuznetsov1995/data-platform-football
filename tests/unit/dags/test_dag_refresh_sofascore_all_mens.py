@@ -46,7 +46,6 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
                             for n in range(1, 22)})
     monkeypatch.setattr(denominator, "load_denominator", lambda: registry)
     monkeypatch.setattr(denominator, "denominator_path", lambda: artifact)
-    monkeypatch.setattr(module, "_configured_tournament_ids", lambda: frozenset())
     rows = [(f"SS-{n}", "2627", 2, 1792024800, 1, n + 100) for n in range(1, 22)]
     selected = [{"SOFASCORE_TOURNAMENT_ID": str(n), "SOFASCORE_SOURCE_SEASON_ID": str(n + 100),
                  "SOFASCORE_SCOPE_KEY": f"c:{n}:{n + 100}", "SOFASCORE_SCOPE_TIMEOUT_S": "300"}
@@ -58,7 +57,7 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     snapshot = {"snapshot_id": "d" * 64, "campaign_id": "e" * 64}
     calls = []
     monkeypatch.setattr(module, "_pending_refresh_partitions", lambda: calls.append("existing_read") or rows)
-    monkeypatch.setattr(module.state, "read_snapshot", lambda *a, **k: snapshot)
+    monkeypatch.setattr(module.state, "read_refresh_snapshot", lambda *a, **k: snapshot)
     monkeypatch.setattr(module.state, "plan_refresh_batch", lambda snapshot, pending, **kwargs:
                         selected if pending is rows else pytest.fail("planner input changed"))
     assert len(module._plan_refresh_batch(**context)) == 8
@@ -66,6 +65,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     [path] = (tmp_path / "evidence").glob("*/*.json")
     saved = json.loads(path.read_text())
     assert saved["due_core_scopes"] == 21 and len(saved["selected"]) == 8
+    # #1370: 8, 16 and 17 are enabled in the daily registry and stay core here.
+    assert {p["classification"] for p in saved["partitions"]} == {"core"}
     assert saved["due_core_matches"] == 42 and saved["overdue_core_matches"] == 21
     assert saved["identity"]["code_revision"] == "a" * 40
     window = saved["capture_window"]
@@ -220,6 +221,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         "--phase matches",
         "--season-evidence bronze",
         "--allow-pending-season",
+        "--registry-overlay",
         '--run-id "${SOFASCORE_SCOPE_RUN_ID}"',
         '--expected-snapshot-id "${SOFASCORE_EXPECTED_SNAPSHOT_ID}"',
     ):
@@ -361,14 +363,11 @@ def _planner_kwargs(module, monkeypatch, **context):
         return []
 
     monkeypatch.setattr(
-        module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
+        module.state, "read_refresh_snapshot", lambda *a, **k: {"campaign_id": "c"}
     )
     monkeypatch.setattr(
         module, "_pending_refresh_partitions",
         lambda: [("SS-17", "2627", 4, 1_787_788_800)],
-    )
-    monkeypatch.setattr(
-        module, "_configured_tournament_ids", lambda: frozenset({17, 8})
     )
     monkeypatch.setattr(module.state, "plan_refresh_batch", _plan)
     assert module._plan_refresh_batch(run_id="manual__1", **context) == []
@@ -376,7 +375,7 @@ def _planner_kwargs(module, monkeypatch, **context):
 
 
 @pytest.mark.unit
-def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
+def test_plan_task_feeds_bronze_partitions_without_daily_exclusions(
     clean_env, monkeypatch
 ):
     module = _load_dag_module(monkeypatch)
@@ -391,7 +390,8 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
     assert kwargs["pending_partitions"] == [
         ("SS-17", "2627", 4, 1_787_788_800)
     ]
-    assert kwargs["exclude_tournament_ids"] == frozenset({17, 8})
+    # #1370: the daily registry leagues are planned here as well.
+    assert "exclude_tournament_ids" not in kwargs
     # #1358: the batch size (128) is only the upper bound on the number of
     # scopes; the planner fills the 2 h scope window by their estimates.
     assert kwargs["batch_size"] == 128
@@ -892,10 +892,9 @@ def test_validate_refresh_scope_accepts_a_partial_scope(
 def test_plan_task_maps_each_scope_with_its_own_timeout(clean_env, monkeypatch):
     module = _load_dag_module(monkeypatch)
     monkeypatch.setattr(
-        module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
+        module.state, "read_refresh_snapshot", lambda *a, **k: {"campaign_id": "c"}
     )
     monkeypatch.setattr(module, "_pending_refresh_partitions", lambda: [])
-    monkeypatch.setattr(module, "_configured_tournament_ids", lambda: frozenset())
     monkeypatch.setattr(
         module.state, "plan_refresh_batch",
         lambda *a, **k: [{"SOFASCORE_SCOPE_TIMEOUT_S": "1030", "X": "1"}],

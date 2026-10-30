@@ -126,19 +126,20 @@ def _cycle_argv(tmp_path, *extra):
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "extra_argv, allow_pending, evidence",
+    "extra_argv, allow_pending, evidence, overlay",
     [
-        (["--phase", "matches"], False, "pages"),
+        (["--phase", "matches"], False, "pages", False),
         (
             ["--phase", "matches", "--season-evidence", "bronze",
-             "--allow-pending-season"],
+             "--allow-pending-season", "--registry-overlay"],
             True,
             "bronze",
+            True,
         ),
     ],
 )
 def test_cycle_forwards_the_refresh_lane_flags(
-    tmp_path, monkeypatch, extra_argv, allow_pending, evidence
+    tmp_path, monkeypatch, extra_argv, allow_pending, evidence, overlay
 ):
     seen = {}
 
@@ -161,6 +162,7 @@ def test_cycle_forwards_the_refresh_lane_flags(
     assert cycle.main(_cycle_argv(tmp_path, *extra_argv)) == 0
 
     assert seen["load"]["allow_pending_season"] is allow_pending
+    assert seen["load"]["registry_overlay"] is overlay
     assert seen["phase"] == ("matches", evidence)
 
 

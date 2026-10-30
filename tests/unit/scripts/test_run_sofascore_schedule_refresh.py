@@ -37,15 +37,6 @@ SNAPSHOT = {
             ],
         },
         {
-            "capture_key": "SS-17",
-            "unique_tournament_id": 17,
-            "metadata_status": "ready",
-            "seasons": [
-                {"source_season_id": 76986, "start_year": 2025,
-                 "canonical_season": "2526", "metadata_status": "ready"},
-            ],
-        },
-        {
             "capture_key": "SS-23",
             "unique_tournament_id": 23,
             "metadata_status": "ready",
@@ -133,7 +124,7 @@ def offline(monkeypatch, tmp_path):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", _FakeClient)
-    monkeypatch.setattr(refresh, "_configured_tournament_ids", lambda: frozenset({17}))
+    monkeypatch.setattr(refresh, "with_registry_refresh", lambda snapshot: snapshot)
     calls = {"fetch": [], "writes": []}
 
     def partitions(window_hours):
@@ -275,7 +266,7 @@ def _argv(offline, *extra):
     ]
 
 
-def _digest(exclude=frozenset({17})):
+def _digest(exclude=frozenset()):
     return refresh.targets_digest(refresh.current_season_targets(SNAPSHOT, exclude))
 
 
@@ -678,6 +669,31 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
     # only readable next to the size of the class itself.
     assert report["class_members"] == {"backlog": 0, "overdue": 0, "due": 1, "stale": 0, "seed": 1}
     assert report["idle_runs"] == 0
+
+
+@pytest.mark.unit
+def test_daily_registry_leagues_are_swept_alongside_the_daily(offline):
+    # #1370: Eredivisie (37) is enabled in the daily registry, yet the all-men
+    # lane sweeps and writes it too — both run side by side until the daily goes.
+    snapshot = json.loads(offline["snapshot"].read_text())
+    snapshot["tournaments"].append({
+        "capture_key": "SS-37",
+        "unique_tournament_id": 37,
+        "metadata_status": "ready",
+        "seasons": [
+            {"source_season_id": 77012, "start_year": 2025,
+             "canonical_season": "2526", "metadata_status": "ready"},
+        ],
+    })
+    offline["snapshot"].write_text(json.dumps(snapshot))
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    assert (37, 77012) in _fetch_by_class(offline)["seed"]["targets"]
+    assert {frozenset(exclude) for _, _, exclude in offline["calls"]["rows"]} == {frozenset()}
+    report = json.loads(offline["output"].read_text())
+    assert report["excluded_tournaments"] == 0
 
 
 @pytest.mark.unit
@@ -1124,14 +1140,14 @@ def test_current_season_targets_take_the_newest_season_that_is_not_excluded():
 
 @pytest.mark.unit
 def test_current_season_targets_skip_configured_and_unready_tournaments():
-    targets = refresh.current_season_targets(SNAPSHOT, frozenset({17}))
+    targets = refresh.current_season_targets(SNAPSHOT, frozenset({23}))
 
-    assert [target.pair for target in targets] == [(7, 96518), (23, 88001)]
+    assert [target.pair for target in targets] == [(7, 96518)]
 
 
 @pytest.mark.unit
 def test_targets_digest_changes_with_the_sequence():
-    first = refresh.current_season_targets(SNAPSHOT, frozenset({17}))
+    first = refresh.current_season_targets(SNAPSHOT, frozenset({23}))
     second = refresh.current_season_targets(SNAPSHOT, frozenset())
 
     assert refresh.targets_digest(first) == refresh.targets_digest(list(first))
@@ -3444,3 +3460,23 @@ def test_fresh_overdue_continuation_survives_beside_deep_queue(offline, monkeypa
     assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
     seed = next(call for call in calls["fetch"] if call["start_pages"])
     assert seed["start_pages"] == {pair: 7}
+
+
+@pytest.mark.unit
+def test_main_sweeps_the_daily_registry_leagues(offline, monkeypatch):
+    # #1370: the daily leagues join the sweep under the same campaign snapshot.
+    from scrapers.sofascore.all_mens_campaign import with_registry_refresh
+
+    monkeypatch.setattr(refresh, "with_registry_refresh", with_registry_refresh)
+    seen = []
+    real = refresh.current_season_targets
+    monkeypatch.setattr(
+        refresh, "current_season_targets",
+        lambda snapshot, *a, **k: seen.append(snapshot) or real(snapshot, *a, **k),
+    )
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    keys = {row["capture_key"] for row in seen[0]["tournaments"]}
+    assert {"SS-8", "SS-16", "SS-17", "SS-34", "SS-35", "SS-203"} <= keys
+    assert seen[0]["campaign_id"] == SNAPSHOT["campaign_id"]

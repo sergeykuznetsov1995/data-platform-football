@@ -136,7 +136,7 @@ def load_scope(path: Path | None = None) -> tuple[tuple[str, int], ...]:
     """``allow`` of the scope file: ``(slug, year)`` pairs; empty = all targets."""
 
     data = json.loads(Path(path or DEFAULT_SCOPE_PATH).read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) != {"allow"} or not isinstance(
+    if not isinstance(data, dict) or set(data) not in ({"allow"}, {"allow", "excluded"}) or not isinstance(
         data["allow"], list
     ):
         raise ValueError("history scope must be {\"allow\": [[slug, year], ...]}")
@@ -152,7 +152,20 @@ def load_scope(path: Path | None = None) -> tuple[tuple[str, int], ...]:
         pairs.append((item[0], item[1]))
     if len(set(pairs)) != len(pairs):
         raise ValueError("history scope repeats a season")
-    return tuple(pairs)
+    excluded = data.get("excluded", [])
+    if not isinstance(excluded, list):
+        raise ValueError("history excluded must be a list of [slug, year, reason]")
+    omitted = set()
+    for item in excluded:
+        if (not isinstance(item, list) or len(item) != 3
+                or not isinstance(item[0], str) or type(item[1]) is not int
+                or not isinstance(item[2], str) or not item[2].strip()
+                or tuple(item[:2]) not in pairs or tuple(item[:2]) in omitted):
+            raise ValueError("history exclusion needs a unique allowed pair and reason")
+        omitted.add(tuple(item[:2]))
+    if omitted and len(omitted) == len(pairs):
+        raise ValueError("history exclusions cannot empty the scope")
+    return tuple(pair for pair in pairs if pair not in omitted)
 
 
 def history_years(listed: Iterable[int], current: int) -> tuple[int, ...]:

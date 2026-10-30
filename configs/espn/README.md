@@ -149,3 +149,96 @@ Production depth coverage, API field shapes and actual cost still require source
 acceptance after the active measurement/windows; offline tests use synthetic
 core responses and recorded Summary fixtures. Delivery remains the existing
 cron process and its current/history active-run guard.
+
+## Tier A history acceptance (#1511)
+
+`history_scope.json` pins the 2016–2025 window: ten past seasons for the five
+major leagues and Champions/Europa League, Conference League 2021–2025, World
+Cup 2018/2022 and Euro 2016/2020/2024 (2020 is the edition played in 2021).
+The denominator is **80 pairs**, not 100 hypothetical editions. `allow` stays
+nonempty: an empty list opens the whole target registry. `excluded` may contain
+`[slug, year, reason]` only for an explicitly agreed, confirmed unavailable
+edition already in `allow`; exclusions reduce both collection and denominator.
+The initial exclusions list is empty. Changing it requires recording the
+confirmation and owner's decision in the reason.
+
+The checked-in registry is a snapshot: it still says current=2025 for the
+three European club cups and current=2024 for Euro. Before delivery, verify
+current season years through the established registry procedure. No source
+requests were made for this implementation. The history lane retains its
+`year < current_season_year` guard: with this snapshot it will mark the three
+2025 cup pairs and Euro 2024 red, rather than collect them. Such exhausted
+queue rows need the established retry procedure after the registry is corrected;
+this change does not reset retries or silently advance registry years.
+
+`scrapers.espn.history_acceptance` provides read-only report builders, separate
+from the existing morning report and live-debt API:
+
+```python
+from scrapers.espn.history import load_scope
+from scrapers.espn.history_acceptance import (
+    core_evidence, render_acceptance_sql, render_acceptance,
+    render_parity_sql, render_parity, render_legacy_parts_sql,
+)
+
+scope = load_scope()  # active pinned pairs, after explicit exclusions
+# Saved season JSON + all saved event-list pages of every type; no HTTP here.
+# pages_by_type = {type_id: [page_1_bytes, ..., page_N_bytes]}
+# evidence[(slug, year)] = core_evidence(season_json, pages_by_type)
+# quality_results[(slug, year)] = True / False / None  # pass / defect / unknown
+# acceptance_sql = render_acceptance_sql(scope, evidence, quality_results)
+# report = render_acceptance(rows_returned_by_read_only_query)
+parity_sql = render_parity_sql(scope)
+parts_sql = render_legacy_parts_sql(scope)
+```
+
+Supply evidence for every pair, sourced from the same saved core season/list
+bodies used by the history lane (raw cache/export). `core_evidence` validates
+all declared types, pages, original counts and within-type unique event IDs.
+Do not reconstruct evidence from `queue.matches`: it has already lost cross-type
+duplicates. The report shows sum of core counts, union of IDs, cross-type
+repetitions, physical Bronze duplicate rows and missing/extra published Bronze IDs.
+Physical duplicates make a pair red, including unpublished duplicate rows. Confirmed terminal nonplayed
+Bronze rows also count as completed IDs even without `first_published_at`.
+Missing evidence blocks non-red pairs. The required `quality_results` mapping
+records each pair as True (checked, no defects), False (confirmed defects), or
+None (unknown). Missing/unknown assessments block acceptance, including for red
+pairs. Include capability-aware defects from `history_report` (valid-empty parts
+are defects only where the season actually has that capability). Persist the
+scope, raw evidence references, confirmed quality findings and report together;
+an omitted quality assessment is not proof that quality was checked.
+
+The acceptance SELECT LEFT JOINs from scope, not queue. Any red type makes its pair red once; failed inventory makes only the
+not-yet-inventoried (absent) pairs red; an inventory failure does not add
+a separate denominator row. Absent/pending/listed pairs and incomplete type
+evidence block completion. Terminal red pairs count against the strict
+`red * 5 < N` threshold; retryable red rows (`attempts < MAX_ATTEMPTS`)
+still block completion; failed discovery may explain absent evidence for a red
+pair. A completed pair with missing/extra published IDs is red even if queue
+counts agree. The renderer includes every pair and its discrepancy fields.
+
+Parity covers the six legacy leagues (top five + World Cup; the legacy DAG
+uses `INT-World Cup`, not Champions League). World Cup uses the four-digit
+calendar year as its legacy season label. It joins
+native `event_id` to schedule `game_id` within competition, across legacy season
+labels; dates and scores are checked separately. Output contains native-only,
+legacy-only, duplicate/ambiguous links, NULL comparisons and wrong season labels.
+Native parity includes confirmed terminal nonplayed rows without publication.
+Unmatched legacy rows are selected by label or date: July-to-July for leagues,
+calendar year for World Cups. The appended `date_seasons` column lists date-based
+candidate years; a conflict with the label marks an unmatched row ambiguous.
+These calendar hints do not prove season membership for extended seasons.
+`ITA-Serie A/2021` is explicitly excluded as the known copy of 2019/20 and
+counted in the parts report. Lineup/matchsheet coverage follows schedule links
+by native event ID, schedule dates or season labels, retaining the original
+legacy label. Rows without exactly one schedule
+link are uncomparable. Their scores are not a parity reference; score comparison
+uses schedule's `home_goals/away_goals` and leaves NULL as unknown. Legacy is
+never the completeness baseline. SQL is SELECT-only over Bronze/ops, no Silver
+or Gold transforms and no Bronze schema/parser/batch-identity changes.
+
+Delivery and actual issue acceptance remain operational steps after #1510's
+measurement window under the source protocol. Do not deliver during the window,
+change gate/workers, reset retries, or bypass the automatic delivery lock. The
+existing history lane's live-debt pause, budgets, stop file and quality gates
+continue to apply; no new DAG or manual queue population is needed.

@@ -152,7 +152,9 @@ def test_run_uses_the_history_lane_scope_budget_and_stop_file(dag_module, monkey
 
     assert result["reason"] == "idle" and result["matches"] == 380
     assert seen["client"] is client and seen["conn"] == "conn" and seen["stop_file"] == stop
-    assert seen["scope"] == (("eng.1", 2015),) and seen["run_id"] == "scheduled__1"
+    from scrapers.espn.history import load_scope
+
+    assert seen["scope"] == load_scope() and seen["run_id"] == "scheduled__1"
     assert seen["task_id"] == "run_history"
     assert timedelta(minutes=11) < seen["deadline"] - before <= timedelta(minutes=12, seconds=5)
     assert closed == [True]
