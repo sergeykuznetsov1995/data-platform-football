@@ -950,10 +950,10 @@ def test_cli_executes_promoted_registry_daily_select(tmp_path, monkeypatch, caps
         assert output["summary"] == measure.format_daily_summary(report)
 
 
-def execute_history(scopes=(), attempts=(), batches=()):
+def execute_history(scopes=(), attempts=(), batches=(), *, day=DAY):
     from dags.utils import transfermarkt_backfill_state as backfill
 
-    sql, params = measure.build_history_day_sql(DAY, as_of=AS_OF)
+    sql, params = measure.build_history_day_sql(day, as_of=AS_OF)
     con = duckdb.connect()
     con.execute("CREATE SCHEMA ops")
     for ddl in backfill.ddl_statements():
@@ -995,7 +995,16 @@ def test_history_day_counts_completed_editions_new_requests_and_streams():
     assert (report["editions"], report["requests"], report["streams"]) == (2, 4, 2)
     summary = measure.format_history_summary({**report, "report_day": DAY})
     assert summary == (f"Transfermarkt история {DAY} МСК: изданий 2 (цель ≥ 57), "
-                       "запросов 4 (ориентир 16,5 тыс.), потоков активных 2")
+                       "запросов 4 (ориентир 16,5 тыс.; ±1 попытка на границе суток), потоков активных 2")
+
+
+def test_history_day_dates_a_midnight_straddling_attempt_by_its_last_request():
+    # Known bound: "m1" was sent at 23:55 МСК, "m2" at 00:05; the attempt carries only
+    # its latest request time, so both count on the next day.
+    midnight = START + timedelta(days=1)
+    attempt = (["m1", "m2"], midnight + timedelta(minutes=5), midnight + timedelta(minutes=10))
+    assert execute_history(attempts=[attempt])["requests"] == 0
+    assert execute_history(attempts=[attempt], day="2026-10-09")["requests"] == 2
 
 
 @pytest.mark.parametrize("fault", [None, "sql", "two"])

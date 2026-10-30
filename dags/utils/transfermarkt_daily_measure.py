@@ -199,6 +199,9 @@ def build_history_day_sql(day: date | str, *, as_of: datetime | str) -> tuple[st
     attempt that references them.  Per-envelope request time lives only in the
     raw store, not in Trino; the attempt's ``source_observed_at`` (its latest
     request) is the closest time there, ``finished_at`` only when it is NULL.
+    Error bound: an attempt runs within one history portion (MAX_PORTION_SECONDS,
+    45 min), so at most one attempt per stream straddles Moscow midnight and its
+    earlier requests (<= ~45 min of ~24 h) move to the next day.
     Streams: distinct history streams of batches claimed that day.
     """
     start, end = day_bounds(day)
@@ -238,7 +241,7 @@ def format_history_summary(report: Mapping[str, Any]) -> str:
     target = f'{HISTORY_REQUESTS_TARGET / 1000:.1f}'.replace('.', ',')
     return (f'Transfermarkt история {report.get("report_day", "?")} МСК: изданий {report.get("editions", 0)} '
             f'(цель ≥ {HISTORY_EDITIONS_TARGET}), запросов {report.get("requests", 0)} '
-            f'(ориентир {target} тыс.), потоков активных {report.get("streams", 0)}')
+            f'(ориентир {target} тыс.; ±1 попытка на границе суток), потоков активных {report.get("streams", 0)}')
 
 
 def format_daily_summary(report: Mapping[str, Any], *, dq_status: str = 'unknown',

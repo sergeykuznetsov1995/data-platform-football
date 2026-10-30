@@ -261,8 +261,14 @@ class BackfillStateRepository:
                 self.execute(mark_sql(target, status='pending', at=now))
         return {str(item['scope_id']) for item in self.query(f"SELECT scope_id FROM {TABLE} WHERE status <> 'complete'")}
 
-    def select_queue_campaign(self, *, now: datetime, allowed_ids=None, registry_targets=None) -> state.BackfillCampaign | None:
-        """Recover one busy batch first; otherwise pick oldest runnable entry."""
+    def select_queue_campaign(self, *, now: datetime, allowed_ids=None, registry_targets=None,
+                              denominator: Denominator | None = None) -> state.BackfillCampaign | None:
+        """Recover one busy batch first; otherwise pick the runnable campaign.
+
+        With a denominator and registry targets the campaign holding the best
+        history claim key wins (#1402), ties keep the oldest; otherwise the
+        oldest runnable campaign.
+        """
         latest_identities = ({_semantic_target_identity(target) for target in registry_targets}
                              if registry_targets is not None else None)
         campaigns = self.load_campaigns()
@@ -280,17 +286,26 @@ class BackfillStateRepository:
             raise BackfillRuntimeError("more than one campaign has a recoverable batch")
         if busy:
             return busy[0]
+        key = (history_claim_key(denominator, registry_targets)
+               if denominator is not None and registry_targets is not None else None)
+        best = None
         for campaign in opened:
             scopes = self.load_scopes(campaign.campaign_id)
             held_ids = {scope_id for batch in self.load_batches(campaign.campaign_id)
                         if batch.status is state.BatchStatus.WAITING_POLICY for scope_id in batch.scope_ids}
-            if any(item.target.scope_id not in held_ids and
-                   (latest_identities is None or _semantic_target_identity(item.target) in latest_identities) and (allowed_ids is None or item.target.scope_id in allowed_ids) and
-                   (item.status is state.ScopeStatus.PENDING or
-                   (item.status is state.ScopeStatus.RETRYABLE_ERROR and item.next_retry_at is not None
-                    and item.next_retry_at <= now)) for item in scopes):
+            ready = [item for item in scopes if item.target.scope_id not in held_ids and
+                     (latest_identities is None or _semantic_target_identity(item.target) in latest_identities) and (allowed_ids is None or item.target.scope_id in allowed_ids) and
+                     (item.status is state.ScopeStatus.PENDING or
+                     (item.status is state.ScopeStatus.RETRYABLE_ERROR and item.next_retry_at is not None
+                      and item.next_retry_at <= now))]
+            if not ready:
+                continue
+            if key is None:
                 return campaign
-        return None
+            rank = min(key(item) for item in ready)
+            if best is None or rank < best[0]:
+                best = (rank, campaign)
+        return best[1] if best else None
 
     def latest_campaign(self) -> state.BackfillCampaign | None:
         rows = self.query(
