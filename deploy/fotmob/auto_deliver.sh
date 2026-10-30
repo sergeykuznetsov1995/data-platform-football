@@ -915,9 +915,9 @@ import sys
 
 header = re.compile(r\"\[ERROR\] __main__: (.*)\")
 logger = re.compile(r\"\d{4}-\d\d-\d\d .*?\[(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\] \")
-exception = re.compile(r\"^([A-Za-z_][\w.]*):\s*(.*)\")
-network = {\"TrinoConnectionError\", \"ReadTimeout\", \"ReadTimeoutError\", \"ConnectTimeout\", \"ConnectTimeoutError\", \"ConnectionError\", \"NewConnectionError\", \"OperationalError\"}
-host = re.compile(r\"(?:host=|host |server at )[^A-Za-z0-9_]*(?:trino|metadb|postgres)(?=[^A-Za-z0-9_.-]|$)\")
+exception = re.compile(r\"^([A-Za-z_][\w.]*)(?::\s*(.*)|$)\")
+network = {\"TrinoConnectionError\", \"ReadTimeout\", \"ReadTimeoutError\", \"ConnectTimeout\", \"ConnectTimeoutError\", \"ConnectionError\", \"NewConnectionError\", \"MaxRetryError\", \"ConnectionRefusedError\", \"OperationalError\"}
+host = re.compile(r\"(?:host=|host |server at )[^A-Za-z0-9_]*(?:trino|metadb|postgres|fotmob-airflow-metadb)(?=[^A-Za-z0-9_.-]|$)\")
 transport = re.compile(r\"timed? out|timeout|connection refused|could not connect|failed to establish a new connection\", re.I)
 errors = []
 unsafe = False
@@ -953,13 +953,17 @@ def check(lines):
         if match:
             waiting = False
             kind, detail = match.groups()
+            detail = detail or \"\"
             kind = kind.rsplit(\".\", 1)[-1]
             contextual = bool(host.search(detail) and transport.search(detail))
             proven |= kind in network and contextual
             terminal_infra = contextual and (kind in network or kind == \"TrinoError\" and proven)
             low_level_timeout = kind == \"TimeoutError\" and bool(re.fullmatch(
                 r\"The read operation timed out|_ssl[.]c:\d+: The handshake operation timed out\", detail))
-            if not terminal_infra and not low_level_timeout:
+            # Low-level TCP errors gain host context only in a later wrapper.
+            # Accept the chain only when its terminal exception proves that host.
+            tcp_error = kind in {\"ConnectionRefusedError\", \"NewConnectionError\", \"MaxRetryError\"} and bool(transport.search(detail))
+            if not terminal_infra and not low_level_timeout and not tcp_error:
                 unsafe = True
     incomplete |= waiting or not seen
     unsafe |= not (terminal_infra and proven)

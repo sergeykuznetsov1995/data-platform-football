@@ -1578,11 +1578,29 @@ def _infra_traceback(host: str = "trino", kind: str = "ReadTimeout") -> str:
     detail = f"HTTPSConnectionPool(host='{host}', port=8443): Read timed out. (read timeout=5)"
     if kind == "OperationalError":
         detail = f'connection to server at "{host}", port 5432 failed: Connection refused'
+    if kind == "ConnectionError":
+        detail = (
+            f"HTTPSConnectionPool(host='{host}', port=8443): Max retries exceeded with url: /v1/statement "
+            "(Caused by NewConnectionError: Failed to establish a new connection: [Errno 111] Connection refused)"
+        )
     chain = (
         'Traceback (most recent call last):\n'
         + '  File "/opt/airflow/scrapers/base/trino_manager.py", line 335, in _execute\n' * 8
         + f"requests.exceptions.{kind}: {detail}\n"
     )
+    if kind == "ConnectionError":
+        chain = (
+            'Traceback (most recent call last):\n  File ignored\n'
+            'ConnectionRefusedError: [Errno 111] Connection refused\n\n'
+            'The above exception was the direct cause of the following exception:\n\n'
+            'Traceback (most recent call last):\n  File ignored\n'
+            'urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPSConnection object at 0x123>: '
+            'Failed to establish a new connection: [Errno 111] Connection refused\n\n'
+            'The above exception was the direct cause of the following exception:\n\n'
+            'Traceback (most recent call last):\n  File ignored\n'
+            f'urllib3.exceptions.MaxRetryError: {detail}\n\n'
+            'During handling of the above exception, another exception occurred:\n\n'
+        ) + chain
     if host == "trino":
         chain += (
             '\nThe above exception was the direct cause of the following exception:\n\n'
@@ -1606,7 +1624,10 @@ def _attempt_path(tmp_path: Path, run: str, attempt: int = 1) -> Path:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("host,kind", [("trino", "ReadTimeout"), ("metadb", "OperationalError")])
+@pytest.mark.parametrize("host,kind", [
+    ("trino", "ReadTimeout"), ("metadb", "OperationalError"),
+    ("fotmob-airflow-metadb", "OperationalError"), ("trino", "ConnectionError"),
+])
 def test_phase2_defers_infrastructure_failure_then_accepts_green(
     tmp_path: Path, host: str, kind: str,
 ) -> None:
@@ -1635,10 +1656,18 @@ def test_phase2_defers_infrastructure_failure_then_accepts_green(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("case", ["source", "mixed", "previous_attempt", "truncated", "missing_traceback", "terminal_timeout", "custom_exception", "wrapper_only", "prior_timeout"])
+@pytest.mark.parametrize("case", ["source", "mixed", "previous_attempt", "truncated", "missing_traceback", "terminal_timeout", "custom_exception", "wrapper_only", "prior_timeout", "bare_assertion", "refused_with_code", "source_refused"])
 def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, case: str) -> None:
     run = "fotmob_orchestrated__bad"
     text = _infra_traceback("fotmob.com" if case == "source" else "trino")
+    if case in {"refused_with_code", "source_refused"}:
+        text = _infra_traceback("fotmob.com" if case == "source_refused" else "trino", "ConnectionError")
+    if case in {"bare_assertion", "refused_with_code"}:
+        assertion = (
+            "Traceback (most recent call last):\n  File ignored\nAssertionError\n\n"
+            "During handling of the above exception, another exception occurred:\n\n"
+        )
+        text = text.replace("Traceback (most recent call last):\n", assertion + "Traceback (most recent call last):\n", 1)
     if case == "mixed":
         text += "2026-10-30 06:29:05 [ERROR] __main__: ValueError: broken contract\n"
     if case == "truncated":
