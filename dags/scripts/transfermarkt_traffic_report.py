@@ -11,6 +11,7 @@ On the host: ``--ledger-dir <runtime>/gateway-state --no-trino``.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -69,20 +70,23 @@ def execute_trino(run_ids, campaign):
 
 def main(argv=None) -> int:
     from dags.utils import transfermarkt_traffic_report as traffic
-    from dags.utils.transfermarkt_daily_measure import day_bounds
+    from dags.utils.transfermarkt_daily_measure import day_bounds, utc
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--day', required=True, help='YYYY-MM-DD, Moscow calendar day')
     parser.add_argument('--ledger-dir', type=Path, default=Path('/opt/airflow/gateway-state'))
     parser.add_argument('--current-state-dir', type=Path, default=Path(os.environ.get(
         'TM_CURRENT_STATE_DIR', '/opt/airflow/logs/transfermarkt-native-v2/current')))
+    parser.add_argument('--as-of', help='ISO8601 with timezone; default now UTC. Runs with bytes '
+                        'younger than the lease TTL at as_of are not reconciled')
     parser.add_argument('--campaign', help='history campaign_id; default: every campaign')
     parser.add_argument('--no-trino', action='store_true', help='ledger and receipts only')
     parser.add_argument('--json', type=Path, help='also write the full report to this file')
     args = parser.parse_args(argv)
     start, end = day_bounds(args.day)
+    as_of = utc(args.as_of) if args.as_of else datetime.now(timezone.utc)
     try:
-        ledger = traffic.read_ledger(args.ledger_dir, start, end)
+        ledger = traffic.read_ledger(args.ledger_dir, start, end, as_of)
     except (OSError, traffic.TrafficReportError):
         print(json.dumps({'report': None, 'status': 'not_measured',
                           'summary': f'Transfermarkt трафик {args.day} МСК: не измерено — ошибка чтения леджера шлюза'},
@@ -98,7 +102,8 @@ def main(argv=None) -> int:
         ops, sources, editions = execute_trino(run_ids, args.campaign)
     sources['current_receipts'] = receipts['status']
     report = {'report_version': traffic.VERSION, 'report_day': args.day,
-              'day_start': start.isoformat(), 'day_end': end.isoformat(), 'ledger': ledger,
+              'day_start': start.isoformat(), 'day_end': end.isoformat(), 'as_of': as_of.isoformat(),
+              'ledger': ledger,
               'ops_sources': sources,
               'current_receipts': {key: value for key, value in receipts.items() if key != 'rows'},
               **traffic.merge_ops(ledger, ops, receipts, sources), 'history_editions': editions}

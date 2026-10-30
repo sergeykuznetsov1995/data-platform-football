@@ -8,7 +8,7 @@ No Trino or Airflow imports here: SQL builders return ``(sql, params)``.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import gzip
 import json
 from pathlib import Path
@@ -22,6 +22,10 @@ from dags.utils.transfermarkt_daily_measure import MeasurementError, utc
 
 VERSION = 'traffic-report-v1'
 TRAFFIC_RECONCILIATION_TOLERANCE_PCT = 2.0
+# ok needs at least this share of the covered lanes' day bytes in settled runs.
+TRAFFIC_RECONCILIATION_MIN_COVERAGE_PCT = 98.0
+# A run is unsettled while its last bytes are younger than the gateway lease TTL.
+LEASE_TTL = timedelta(seconds=3600)
 LANES = {'dag_discover_transfermarkt_registry': 'registry', 'dag_ingest_transfermarkt': 'current',
          'dag_backfill_transfermarkt': 'history'}
 # The registry lane has no ops writer by design: outside the ±2 % reconciliation.
@@ -42,12 +46,19 @@ class TrafficReportError(ValueError):
     """The gateway ledger cannot be read; there is no report without it."""
 
 
-# One entity under different names: ledger/receipt labels (client.py), events_v1, proxy_traffic_runs.
+# Label/name -> output entity group, so the ledger, receipts and ops tables meet.
+# Sources: _ENTITY_LABELS (run_transfermarkt_current.py, client labels = ledger and
+# receipt entity, client.py:1014), ENTITY_OUTPUTS (run_transfermarkt_scope_cycle.py,
+# events_v1 entity), proxy_traffic_runs entity (run_transfermarkt_scraper.py: the
+# group names), scraper labels listing/club_staff (scraper.py). Drift is guarded by
+# tests; run scripts are not imported here.
 ENTITY_GROUPS = {
-    'coaches': {'coach_history', 'coach_profile', 'coach_profiles', 'coaches'},
-    'transfers': {'transfer_events', 'transfers'},
-    'market_values': {'market_value_points', 'market_value_history'},
-    'squads': {'participants_api', 'squad', 'squad_memberships', 'players', 'current_players', 'teilnehmer'},
+    'players': {'players', 'listing', 'participants_api', 'teilnehmer', 'squad', 'current_players',
+                'current_injury', 'squad_memberships', 'player_attribute_observations',
+                'player_contract_observations'},
+    'market_value_history': {'market_value_history', 'market_value_points', 'mv_history'},
+    'transfers': {'transfers', 'transfer_events'},
+    'coaches': {'coaches', 'coach_history', 'coach_profile', 'club_staff', 'coach_profiles', 'coach_stints'},
 }
 _ENTITY_GROUP = {name: group for group, names in ENTITY_GROUPS.items() for name in names}
 
@@ -76,15 +87,19 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
     ``stats``; the current file is mandatory. Malformed lines are counted.
     """
     stats = {} if stats is None else stats
-    stats.update(malformed_lines=0, files_read=[], archives_unreadable=[])
+    stats.update(malformed_lines=0, files_read=[], archives_unreadable=[], older_archive=False, earliest_at=None)
     directory = Path(ledger_dir)
     if not directory.is_dir():
         raise TrafficReportError('ledger directory is missing')
     archives = []
     for path in sorted(directory.iterdir()):
         match = _ARCHIVE.match(path.name)
-        if match and datetime.strptime(match.group(1), '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc) >= day_start:
+        if not match:
+            continue
+        if datetime.strptime(match.group(1), '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc) >= day_start:
             archives.append(path)
+        else:
+            stats['older_archive'] = True
     current = directory / LEDGER_FILE
     if not current.is_file() and not archives:
         raise TrafficReportError('ledger file is missing')
@@ -103,6 +118,8 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
                     except (ValueError, TypeError, KeyError, MeasurementError):
                         stats['malformed_lines'] += 1
                         continue
+                    if stats['earliest_at'] is None or event['_at'] < stats['earliest_at']:
+                        stats['earliest_at'] = event['_at']
                     yield event
         except (OSError, EOFError, zlib.error) as exc:
             if path is current:
@@ -111,15 +128,16 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
 
 
 def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
-                     day_end: datetime) -> dict[str, Any]:
+                     day_end: datetime, as_of: datetime) -> dict[str, Any]:
     """Day totals plus every run of the day over all opened files.
 
     Paid bytes come from ``bytes`` events only: leases cross midnight. Day
     totals (``by_lane``, ``by_stream``, ``by_lane_entity``) are strictly the
     day. ``runs`` holds each run with bytes in the day; its ``bytes_window`` is
     every ``bytes`` event of the opened files, so a run started before the first
-    opened file is counted only partly. ``in_progress`` marks bytes at or after
-    ``day_end``. A gateway counter (``dagrun_total_bytes``) is not used: it lives
+    opened file is counted only partly. ``in_progress`` marks a run whose last bytes are younger than
+    ``LEASE_TTL`` at ``as_of``: bytes after ``day_end`` alone do not, since a
+    past day's files are read whole. A gateway counter (``dagrun_total_bytes``) is not used: it lives
     in gateway memory and resets on restart.
     """
     provider = {'total': 0, 'up': 0, 'down': 0}
@@ -128,11 +146,12 @@ def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
     by_lane_entity: dict[str, dict[str, int]] = {}
     tunnels_by_lane: dict[str, int] = {}
     rejected: dict[str, int] = {}
-    opened = closed = 0
+    opened = closed = events_in_day = 0
     window: dict[str, dict[str, Any]] = {}
     for event in events:
         kind, name, at = event.get('event_type'), lane(event.get('dag_id')), event['_at']
         in_day = day_start <= at < day_end
+        events_in_day += in_day
         run_id = str(event.get('run_id') or '')
         if kind == 'bytes':
             size, entity = _int(event.get('bytes')), entity_group(event.get('entity'))
@@ -143,7 +162,6 @@ def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
             run['groups'][entity] = run['groups'].get(entity, 0) + size
             run['first_at'], run['last_at'] = min(run['first_at'], at), max(run['last_at'], at)
             run['started_before_day'] |= at < day_start
-            run['in_progress'] |= at >= day_end
             if not in_day:
                 continue
             run['bytes_in_day'] += size
@@ -166,7 +184,8 @@ def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
         elif kind == 'connect_rejected' and in_day:
             reason = str(event.get('reason') or 'unknown')
             rejected[reason] = rejected.get(reason, 0) + 1
-    runs = {run_id: {**run, 'first_at': run['first_at'].isoformat(), 'last_at': run['last_at'].isoformat()}
+    runs = {run_id: {**run, 'in_progress': run['last_at'] > as_of - LEASE_TTL,
+                     'first_at': run['first_at'].isoformat(), 'last_at': run['last_at'].isoformat()}
             for run_id, run in sorted(window.items()) if run['bytes_in_day']}
     run_ids: dict[str, list[str]] = {}
     for run_id, run in runs.items():
@@ -177,15 +196,25 @@ def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
             'leases_closed': closed, 'tunnels': tunnels, 'tunnels_by_lane': tunnels_by_lane,
             'connect_rejected': rejected,
             'bytes_per_tunnel': provider['total'] / tunnels if tunnels else None,
-            'run_ids': run_ids}
+            'run_ids': run_ids, 'events_in_day': events_in_day}
 
 
-def read_ledger(ledger_dir: Path | str, day_start: datetime, day_end: datetime) -> dict[str, Any]:
-    """Ledger summary with file stats; ``complete`` is False when an archive was unreadable."""
+def read_ledger(ledger_dir: Path | str, day_start: datetime, day_end: datetime,
+                as_of: datetime) -> dict[str, Any]:
+    """Ledger summary with file stats; ``complete`` is False on an unreadable
+    archive or when the files do not reach back to the day."""
     stats: dict[str, Any] = {}
-    summary = summarize_ledger(iter_ledger_events(ledger_dir, day_start, stats), day_start, day_end)
+    summary = summarize_ledger(iter_ledger_events(ledger_dir, day_start, stats), day_start, day_end, as_of)
+    earliest = stats.pop('earliest_at')
+    older = stats.pop('older_archive')
     summary.update(stats)
-    summary['complete'] = not stats['archives_unreadable']
+    summary['earliest_event_at'] = earliest.isoformat() if earliest else None
+    reason = None
+    if stats['archives_unreadable']:
+        reason = 'archives_unreadable'
+    elif not summary['events_in_day'] and (earliest is None or (not older and earliest > day_start)):
+        reason = 'day_not_covered'
+    summary['complete'], summary['incomplete_reason'] = reason is None, reason
     return summary
 
 
@@ -288,9 +317,10 @@ def merge_ops(ledger_summary: Mapping[str, Any], ops_rows: Iterable[Mapping[str,
     """Lane/entity table plus run-level reconciliation.
 
     Ops counters belong to the day's runs as a whole, so they are compared with
-    each run's ``bytes_window``; runs still spending after the day end and the
-    registry lane (no ops writer) are excluded. ``ops_sources`` maps each source
-    to ok|empty|not_available.
+    each run's ``bytes_window``; unsettled runs and the registry lane (no ops
+    writer) are excluded. ``ok`` also needs settled runs to carry at least
+    ``TRAFFIC_RECONCILIATION_MIN_COVERAGE_PCT`` of the covered lanes' day bytes.
+    ``ops_sources`` maps each source to ok|empty|not_available.
     """
     runs = ledger_summary['runs']
     # Names of one group sum within a source; across sources the first present wins.
@@ -311,7 +341,7 @@ def merge_ops(ledger_summary: Mapping[str, Any], ops_rows: Iterable[Mapping[str,
     def slot(table, name):
         return table.setdefault(name, {
             'ledger_provider_bytes': 0, 'runs_ledger_bytes': 0, 'ops_provider_bytes': 0,
-            'reconciliation_ledger_bytes': 0, 'reconciliation_ops_bytes': 0,
+            'reconciliation_ledger_bytes': 0, 'reconciliation_ops_bytes': 0, 'reconciled_day_bytes': 0,
             **{item: 0 for item in _COUNTERS if item != 'provider_metered_bytes'},
             **{item: None for item in _OPTIONAL}})
 
@@ -327,6 +357,8 @@ def merge_ops(ledger_summary: Mapping[str, Any], ops_rows: Iterable[Mapping[str,
     for run_id, run in runs.items():
         lane_slot = slot(lanes, run['lane'])
         lane_slot['runs_tunnels'] = lane_slot.get('runs_tunnels', 0) + run['tunnels_window']
+        if reconciled(run_id):
+            lane_slot['reconciled_day_bytes'] += run['bytes_in_day']
         for entity, value in run['groups'].items():
             for target in (lane_slot, slot(entities.setdefault(run['lane'], {}), entity)):
                 target['runs_ledger_bytes'] += value
@@ -352,26 +384,35 @@ def merge_ops(ledger_summary: Mapping[str, Any], ops_rows: Iterable[Mapping[str,
     trino_down = [item for item in ('events_v1', 'proxy_traffic_runs') if ops_sources.get(item) != 'ok']
     available = [item for item, value in ops_sources.items() if value in ('ok', 'empty')]
     if not ledger_summary.get('complete', True):
-        forced, reason = 'not_measured', 'ledger_incomplete'
+        forced = ('not_measured', 'ledger_incomplete')
     elif not available:
-        forced, reason = 'not_measured', 'no_ops_sources'
-    elif trino_down:
-        forced, reason = 'partial', 'unavailable: ' + ', '.join(trino_down)
+        forced = ('not_measured', 'no_ops_sources')
     else:
-        forced, reason = None, None
+        forced = None
 
-    def status_of(ledger_bytes, ops_bytes):
+    def status_of(day_bytes, settled_day_bytes, ledger_bytes, ops_bytes):
+        """(delta_pct, coverage_pct, status, reason) for one lane or the covered total."""
         delta = ((ops_bytes - ledger_bytes) / ledger_bytes * 100 if ledger_bytes
                  else (0.0 if not ops_bytes else None))
+        coverage = settled_day_bytes / day_bytes * 100 if day_bytes else None
         if forced:
-            return delta, forced
+            return (delta, coverage, *forced)
+        if not day_bytes:
+            return delta, coverage, 'not_measured', 'no_covered_traffic'
+        if not settled_day_bytes:
+            return delta, coverage, 'not_measured', 'no_settled_runs'
+        if trino_down:
+            return delta, coverage, 'partial', 'unavailable: ' + ', '.join(trino_down)
+        if coverage < TRAFFIC_RECONCILIATION_MIN_COVERAGE_PCT:
+            return delta, coverage, 'partial', 'coverage_below_threshold'
         ok = delta is not None and abs(delta) <= TRAFFIC_RECONCILIATION_TOLERANCE_PCT
-        return delta, 'ok' if ok else 'gap'
+        return delta, coverage, 'ok' if ok else 'gap', None
 
     covered = [name for name in ('current', 'history', 'other') if name in lanes]
     for name, values in lanes.items():
-        values['reconciliation_status'] = ('not_covered' if name in NOT_COVERED_LANES else status_of(
-            values['reconciliation_ledger_bytes'], values['reconciliation_ops_bytes'])[1])
+        values['reconciliation_status'] = 'not_covered' if name in NOT_COVERED_LANES else status_of(
+            values['ledger_provider_bytes'], values['reconciled_day_bytes'],
+            values['reconciliation_ledger_bytes'], values['reconciliation_ops_bytes'])[2]
     unexplained = sorted(
         ({'lane': run['lane'], 'entity': entity, 'run_id': run_id, 'ledger_bytes': value}
          for run_id, run in runs.items() if reconciled(run_id)
@@ -379,13 +420,16 @@ def merge_ops(ledger_summary: Mapping[str, Any], ops_rows: Iterable[Mapping[str,
         key=lambda item: (-item['ledger_bytes'], item['lane'], item['run_id'], item['entity']))
     in_progress = [{'run_id': run_id, 'lane': run['lane'], 'bytes_in_day': run['bytes_in_day']}
                    for run_id, run in runs.items() if run['in_progress'] and run['lane'] not in NOT_COVERED_LANES]
-    ledger_total = sum(lanes[name]['reconciliation_ledger_bytes'] for name in covered)
-    ops_total = sum(lanes[name]['reconciliation_ops_bytes'] for name in covered)
-    delta, status = status_of(ledger_total, ops_total)
+    total = {key: sum(lanes[name][key] for name in covered) for key in (
+        'ledger_provider_bytes', 'reconciled_day_bytes', 'reconciliation_ledger_bytes', 'reconciliation_ops_bytes')}
+    delta, coverage, status, reason = status_of(*total.values())
     return {'lanes': lanes, 'entities': entities, 'reconciliation': {
-        'ledger_provider_bytes': ledger_total, 'ops_provider_bytes': ops_total, 'delta_pct': delta,
+        'ledger_provider_bytes': total['reconciliation_ledger_bytes'],
+        'ops_provider_bytes': total['reconciliation_ops_bytes'], 'delta_pct': delta,
+        'day_covered_bytes': total['ledger_provider_bytes'], 'reconciled_ledger_bytes': total['reconciled_day_bytes'],
+        'coverage_pct': coverage, 'min_coverage_pct': TRAFFIC_RECONCILIATION_MIN_COVERAGE_PCT,
         'tolerance_pct': TRAFFIC_RECONCILIATION_TOLERANCE_PCT, 'status': status, 'reason': reason,
-        'unavailable_sources': trino_down if forced == 'partial' else [],
+        'unavailable_sources': trino_down if forced is None else [],
         'covered_lanes': covered, 'not_covered_lanes': list(NOT_COVERED_LANES),
         'in_progress_runs': in_progress,
         'unexplained_bytes': sum(item['ledger_bytes'] for item in unexplained),
@@ -482,6 +526,10 @@ def _number(value: float | None) -> str:
     return '—' if value is None else f'{value:.1f}'.replace('.', ',')
 
 
+_NOT_MEASURED = {'ledger_incomplete': ' (леджер неполный)', 'no_settled_runs': ' (нет завершённых ранов)',
+                 'no_covered_traffic': ' (нет трафика актуалки и истории)', 'no_ops_sources': ' (нет ops-источников)'}
+
+
 def format_traffic_summary(report: Mapping[str, Any]) -> str:
     ledger, lanes = report['ledger'], report['lanes']
     order = [name for name in ('registry', 'current', 'history', 'other')
@@ -492,17 +540,22 @@ def format_traffic_summary(report: Mapping[str, Any]) -> str:
     per_request = ', '.join(f'{LANE_NAMES[name]} {_number(lanes.get(name, {}).get("kib_per_request"))}'
                             for name in order)
     rejected = ', '.join(f'{reason}: {count}' for reason, count in sorted(ledger['connect_rejected'].items()))
+    settled = f'сверено {_number(rec["coverage_pct"])} % байт дня'
     if rec['status'] == 'not_measured':
-        coverage = 'ops не измерено' + (' (леджер неполный)' if rec['reason'] == 'ledger_incomplete' else '')
+        coverage = 'ops не измерено' + _NOT_MEASURED.get(rec['reason'], '')
+    elif rec['status'] == 'partial' and rec['unavailable_sources']:
+        coverage = f'ops частично (недоступно: {", ".join(rec["unavailable_sources"])}); {settled}'
     elif rec['status'] == 'partial':
-        coverage = f'ops частично (недоступно: {", ".join(rec["unavailable_sources"])})'
+        coverage = f'ops частично: {settled} (нужно ≥ {_number(rec["min_coverage_pct"])} %)'
     else:
         share = _ratio(rec['ops_provider_bytes'] * 100, rec['ledger_provider_bytes'])
         coverage = (f'ops покрывает {_number(share)} % актуалки и истории '
-                    f'({"ok" if rec["status"] == "ok" else "разрыв"}); реестр в ops не пишется')
+                    f'({"ok" if rec["status"] == "ok" else "разрыв"}), {settled}; реестр в ops не пишется')
     lines = [f'Transfermarkt трафик {report["report_day"]} МСК: оплачено {_mib(ledger["provider_bytes"]["total"])} МиБ '
              f'({split}), запросов {requests}, КиБ/запрос: {per_request}, туннелей {ledger["tunnels"]} '
              f'(CONNECT-отказы {rejected or "нет"}), {coverage}']
+    if ledger.get('incomplete_reason') == 'day_not_covered':
+        lines.append('ТРЕВОГА: леджер не покрывает день')
     if ledger.get('archives_unreadable'):
         lines.append('ТРЕВОГА: леджер: нечитаемые архивы: ' + ', '.join(ledger['archives_unreadable']))
     if ledger.get('malformed_lines'):
