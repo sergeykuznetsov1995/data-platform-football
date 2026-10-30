@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -137,7 +138,7 @@ class CurrentSQL:
         self.sql = []
         for table, columns in self.columns.items():
             definitions = ", ".join(
-                f"{column} {'TIMESTAMP' if column == 'fetched_at' else 'VARCHAR'}"
+                f"{column} {'TIMESTAMP' if column in {'fetched_at', 'completed_at'} else 'VARCHAR'}"
                 for column in columns
             )
             self.db.execute(f"CREATE TABLE {table} ({definitions})")
@@ -177,10 +178,13 @@ class CurrentSQL:
         fetched_at=None,
         capabilities=None,
     ):
+        completed_at = datetime(2026, 1, 1) + timedelta(
+            days=int((time or batch).split("-")[0])
+        )
         self.db.execute(
             "INSERT INTO fotmob_ingest_manifest VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
-                batch, batch, version, status, kind, cid, season, entity, time or batch,
+                batch, batch, version, status, kind, cid, season, entity, completed_at,
                 fetched_at, json.dumps(capabilities or {}),
             ),
         )

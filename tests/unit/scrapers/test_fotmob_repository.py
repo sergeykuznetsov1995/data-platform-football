@@ -862,7 +862,7 @@ def test_current_view_rolls_from_last_good_v1_to_v2_replacement_or_tombstone():
     ) in sql
     assert (
         f"ORDER BY CASE WHEN parser_version = '{PARSER_VERSION}' "
-        "THEN 1 ELSE 0 END DESC, completed_at DESC"
+        "THEN 1 ELSE 0 END DESC, COALESCE("
     ) in sql
     assert "WHERE target_rn = 1 AND status IN ('success', 'not_modified')" in sql
 

@@ -153,6 +153,7 @@ class StubTransport:
             raw_uri=f"memory://{target.target_key}.json.gz",
             content_hash=hashlib.sha256(body).hexdigest(),
             fetched_at="2026-07-11T10:00:00+00:00",
+            validated_at=service_module.utc_now().isoformat(),
             encoded_bytes=0 if replay else len(body),
             decoded_bytes=len(body),
             direct_bytes=0 if replay else len(body),
@@ -169,7 +170,13 @@ class StubTransport:
     def replay_json(self, endpoint, params=None):
         return self._get(endpoint, params, True)
 
-    def alias_cached_json(self, source, target):
+    def replay_target_key(self, target_key, *, observation):
+        capabilities = observation.get("capabilities_json") or {}
+        if isinstance(capabilities, str):
+            capabilities = json.loads(capabilities)
+        return self.replay_json(capabilities["canonical_url"])
+
+    def alias_cached_json(self, source, target, **kwargs):
         self.aliases.append((source, target))
         return None
 
@@ -2089,6 +2096,7 @@ def test_backfill_refetches_periodic_children_but_reuses_verified_player_card():
                 entity_id=entity_id,
                 content_hash="a" * 64,
                 raw_uri=f"memory://{target.target_key}.json.gz",
+                fetched_at=now - age,
                 completed_at=now - age,
             )
         )
@@ -2140,6 +2148,7 @@ def test_stale_raw_replay_does_not_count_as_freshness_validation():
                 content_hash="a" * 64,
                 raw_uri=f"memory://{target.target_key}.json.gz",
                 stale=True,
+                fetched_at=datetime.now(timezone.utc),
                 completed_at=datetime.now(timezone.utc),
             )
         )
@@ -2177,6 +2186,7 @@ def test_player_freshness_survives_build_id_rotation():
             entity_id="10",
             content_hash="a" * 64,
             raw_uri=f"memory://{old_target.target_key}.json.gz",
+            fetched_at=datetime.now(timezone.utc),
             completed_at=datetime.now(timezone.utc),
         )
     )
@@ -2420,6 +2430,7 @@ def test_player_no_data_tombstone_remains_retryable_under_once_policy():
             status=ManifestStatus.NOT_AVAILABLE,
             entity_id="10",
             error_code="source_player_no_data",
+            fetched_at=datetime.now(timezone.utc) - timedelta(days=400),
             completed_at=datetime.now(timezone.utc) - timedelta(days=400),
         )
     )
@@ -3040,6 +3051,7 @@ def test_leaderboard_freshness_is_keyed_by_url_not_category_name():
             entity_id="goals",
             content_hash="a" * 64,
             raw_uri="memory://own.json.gz",
+            fetched_at=datetime.now(timezone.utc),
             completed_at=datetime.now(timezone.utc),
         )
     )
@@ -3153,6 +3165,7 @@ def test_player_card_is_collected_once_per_identity():
             entity_id="10",
             content_hash="a" * 64,
             raw_uri=f"memory://{target.target_key}.json.gz",
+            fetched_at=datetime.now(timezone.utc) - timedelta(days=400),
             completed_at=datetime.now(timezone.utc) - timedelta(days=400),
         )
     )

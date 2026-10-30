@@ -18,7 +18,7 @@ import zlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol
 from urllib.parse import urlparse
 
 from pyarrow import fs
@@ -268,6 +268,8 @@ class FotMobRawStore:
         self,
         source: CanonicalTargetLike,
         target: CanonicalTargetLike,
+        *,
+        observation: Optional[Mapping[str, Any]] = None,
     ) -> RawJsonRecord:
         """Publish ``target`` as a durable alias of a validated raw response.
 
@@ -279,7 +281,10 @@ class FotMobRawStore:
         """
 
         # Loading first verifies the manifest, gzip payload, hash and lengths.
-        _, source_record = self.load(source)
+        _, source_record = (
+            self.load_observation(observation, canonical_url=source.canonical_url)
+            if observation is not None else self.load(source)
+        )
         # Validate the destination key even when source and target happen to
         # be identical.
         target_manifest_key = self._manifest_key(target.target_key)
@@ -307,6 +312,53 @@ class FotMobRawStore:
             # publishing the small target manifest is the only write.
             self._write_bytes(target_manifest_key, manifest)
         return record
+
+    def load_observation(
+        self, observation: Mapping[str, Any], *, canonical_url: Optional[str] = None,
+    ) -> tuple[bytes, RawJsonRecord]:
+        """Read the selected immutable blob; never borrow pointer provenance."""
+        target_key = str(observation.get("target_key") or "")
+        self._manifest_key(target_key)
+        capabilities = observation.get("capabilities_json") or {}
+        if isinstance(capabilities, str):
+            capabilities = json.loads(capabilities)
+        url = canonical_url or capabilities.get("canonical_url") or observation.get("url")
+        if not url:
+            # Legacy manifests omitted the URL. Only recover that identity from
+            # the pointer, never its body/hash or validation timestamp.
+            pointer = json.loads(self._read_bytes(self._manifest_key(target_key)))
+            url = pointer.get("canonical_url")
+        content_hash = str(observation.get("content_hash") or "")
+        if (not isinstance(url, str)
+            or hashlib.sha256(url.encode("utf-8")).hexdigest() != target_key
+            or len(content_hash) != 64
+            or any(c not in "0123456789abcdef" for c in content_hash)):
+            raise RawTargetCorrupt("Invalid selected raw observation identity")
+        blob_key = self._blob_key(content_hash)
+        if observation.get("raw_uri") != self._uri(blob_key):
+            raise RawTargetCorrupt("Selected raw observation URI differs from hash")
+        try:
+            compressed = self._read_bytes(blob_key)
+            body = gzip.decompress(compressed)
+            if hashlib.sha256(body).hexdigest() != content_hash:
+                raise RawTargetCorrupt("Selected raw observation hash differs")
+            json.loads(body)
+        except (gzip.BadGzipFile, EOFError, zlib.error, UnicodeDecodeError,
+                json.JSONDecodeError) as exc:
+            raise RawTargetCorrupt("Invalid selected raw JSON blob") from exc
+        fetched = observation.get("fetched_at")
+        fetched = fetched.isoformat() if isinstance(fetched, datetime) else fetched
+        validated = (observation.get("validated_at") or capabilities.get("validated_at")
+                     or capabilities.get("source_observed_at") or fetched)
+        validated = validated.isoformat() if isinstance(validated, datetime) else validated
+        return body, RawJsonRecord(
+            manifest_version=RAW_MANIFEST_VERSION, source="fotmob",
+            target_key=target_key, canonical_url=url, content_hash=content_hash,
+            hash_algorithm="sha256", blob_key=blob_key, raw_uri=self._uri(blob_key),
+            compression="gzip", fetched_at=fetched, validated_at=validated,
+            etag=None, last_modified=None, decoded_bytes=len(body),
+            source_encoded_bytes=None, stored_bytes=len(compressed),
+        )
 
     def load_target_key(self, target_key: str) -> tuple[bytes, RawJsonRecord]:
         """Load a committed target by its durable manifest identity.

@@ -84,6 +84,7 @@ class FetchResult:
     error: Optional[str] = None
     retry_after: Optional[timedelta] = None
     source_observed_at: Optional[str] = None
+    validated_at: Optional[str] = None
     stop_reason: Optional[str] = None
     blocked_until: Optional[datetime] = None
 
@@ -587,7 +588,7 @@ class FotMobTransport:
                 FetchOutcome.STALE_REPLAY,
             }
         ):
-            stale_null_replay = outcome == FetchOutcome.STALE_REPLAY and stale
+            stale_null_replay = stale
             outcome = FetchOutcome.NOT_AVAILABLE
             body = None
             if stale_null_replay:
@@ -598,6 +599,12 @@ class FotMobTransport:
                 terminal = True
             error = error or "FotMob returned a null JSON body"
         fields = self._cache_fields(record)
+        observed_at = (
+            source_observed_at or (record.validated_at if record is not None else datetime.now(timezone.utc).isoformat())
+            if not stale and outcome in {
+                FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED, FetchOutcome.NOT_AVAILABLE,
+            } else None
+        )
         return FetchResult(
             outcome=outcome,
             target_key=target.target_key,
@@ -616,11 +623,8 @@ class FotMobTransport:
             proxy_bytes=0,
             error=error,
             retry_after=retry_after,
-            source_observed_at=(
-                source_observed_at or (record.validated_at if record is not None else datetime.now(timezone.utc).isoformat())
-                if not stale and outcome in {FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED}
-                else None
-            ),
+            validated_at=observed_at or (record.validated_at if record is not None else None),
+            source_observed_at=observed_at,
             **fields,
         )
 
@@ -771,7 +775,9 @@ class FotMobTransport:
             )
         )
 
-    def replay_target_key(self, target_key: str) -> FetchResult:
+    def replay_target_key(
+        self, target_key: str, *, observation: Optional[Mapping[str, Any]] = None,
+    ) -> FetchResult:
         """Replay the exact raw target recorded by an ingest manifest.
 
         This is primarily for Next.js player payloads: their canonical URL
@@ -806,7 +812,12 @@ class FotMobTransport:
                 )
             )
         try:
-            body, record = self.raw_store.load_target_key(normalized)
+            body, record = (
+                self.raw_store.load_observation(observation)
+                if observation is not None else self.raw_store.load_target_key(normalized)
+            )
+            if record.target_key != normalized:
+                raise ValueError("selected observation target key differs")
             target = canonicalize_target(record.canonical_url)
             if target.target_key != normalized:
                 raise ValueError("raw target canonical URL digest differs")
@@ -838,6 +849,7 @@ class FotMobTransport:
                 network_bytes=0,
                 cache_hit=True,
                 record=record,
+                stale=bool(observation and observation.get("stale")),
             )
         )
 
@@ -848,6 +860,7 @@ class FotMobTransport:
         *,
         source_params: Optional[Params] = None,
         target_params: Optional[Params] = None,
+        observation: Optional[FetchResult] = None,
     ) -> Optional[RawJsonRecord]:
         """Alias one validated cached JSON target without network accounting.
 
@@ -861,7 +874,12 @@ class FotMobTransport:
             return None
         source = canonicalize_target(source_url_or_endpoint, source_params)
         target = canonicalize_target(target_url_or_endpoint, target_params)
-        return self.raw_store.alias(source, target)
+        selected = None if observation is None else {
+            "target_key": observation.target_key, "content_hash": observation.content_hash,
+            "raw_uri": observation.raw_uri, "fetched_at": observation.fetched_at,
+            "validated_at": observation.validated_at or observation.source_observed_at,
+        }
+        return self.raw_store.alias(source, target, observation=selected)
 
     def fetch_document(self, url: str = "https://www.fotmob.com/") -> FetchResult:
         """Fetch a small allowlisted non-JSON discovery document.
