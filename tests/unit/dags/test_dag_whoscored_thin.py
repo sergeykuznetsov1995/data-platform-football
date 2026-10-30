@@ -140,7 +140,6 @@ def test_runtime_root_drives_cd_and_pythonpath(monkeypatch, module_name, task_id
 
     monkeypatch.setenv("WHOSCORED_RUNTIME_ROOT", "/opt/whoscored-src")
     module = _reload(module_name)
-    # Order is load-bearing: runtime_contract wants (root, root/dags).
     assert (
         module._TASK_ENV["PYTHONPATH"]
         == "/opt/whoscored-src:/opt/whoscored-src/dags"
@@ -503,7 +502,7 @@ def test_history_and_current_share_activation_flag():
         command = _bash(task)._init_kwargs["bash_command"]
         assert "--split-lanes" in command
         assert "var.value.get('whoscored_history_enabled', 'false')" in command
-    assert _bash("run_backfill_chunk")._init_kwargs["execution_timeout"] == timedelta(hours=8)
+    assert _bash("run_backfill_chunk")._init_kwargs["execution_timeout"] == timedelta(minutes=45)
     assert _bash("run_backfill_chunk")._init_kwargs["retries"] == 0
 
 
@@ -515,3 +514,62 @@ def test_current_validation_leaves_old_debt_to_history(ingest, tmp_path, trino):
     cutoff = (ingest._utc_now() - timedelta(days=7) + timedelta(hours=DEADLINE_HOURS)).strftime("%Y-%m-%d")
     assert "current_overdue WHERE deadline >= TIMESTAMP" in sql
     assert cutoff in sql
+
+
+# ---------------------- parallel history workers (#1481) ------------------
+
+def _history_context(tmp_path, history):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    context = _budget_context(tmp_path, {"schema_version": 3, "command": "history",
+        "status": "success", "history": history, "errors": []})
+    context["dag_run"] = SimpleNamespace(get_task_instance=lambda task: SimpleNamespace(state="success"))
+    context["ti"] = MagicMock()
+    return context
+
+
+def test_history_workers_come_from_a_variable_in_one_unmapped_task(backfill):
+    # One task instance keeps the host auto-deliver busy query (task_id, no
+    # map_index) and the single ingest pool slot unchanged.
+    chunk = _bash("run_backfill_chunk")
+    assert "--workers {{ var.value.get('whoscored_history_workers', '3') | int }}" in (
+        chunk._init_kwargs["bash_command"])
+    assert chunk.is_mapped is False
+
+
+def test_history_finalize_accepts_three_full_workers(backfill, tmp_path):
+    workers = [{"worker": i, "attempted": 25, "did_work": True} for i in range(3)]
+    context = _history_context(tmp_path, {"workers": workers, "attempted": 75, "did_work": True})
+    backfill.finalize_chunk(**context)
+    context["ti"].xcom_push.assert_called_once()
+
+
+@pytest.mark.parametrize("history", [
+    {"workers": [{"attempted": 26}], "attempted": 26},
+    {"workers": [{"attempted": 25}, {"attempted": 25}], "attempted": 25},
+    {"workers": [{"attempted": 0}] * 5, "attempted": 0},
+    {"workers": [], "attempted": 0},
+])
+def test_history_finalize_bounds_every_worker(backfill, tmp_path, history):
+    with pytest.raises(Exception, match="history chunk"):
+        backfill.finalize_chunk(**_history_context(tmp_path, history))
+
+
+def test_current_collection_wins_the_shared_slot_within_one_history_chunk(ingest):
+    # #1481: history holds the one ingest pool slot for at most 45 minutes,
+    # and every current-collection task outranks it when the slot frees.
+    from datetime import timedelta
+    from airflow.operators.bash import BashOperator
+    from airflow.operators.python import PythonOperator
+
+    tasks = [t for t in BashOperator._instances + PythonOperator._instances
+             if t.task_id in {"discover_catalog", "ingest_matches", "ingest_stages",
+                              "validate_data", "validate_bronze_freshness"}]
+    assert len(tasks) == 5
+    for task in tasks:
+        assert task._init_kwargs["priority_weight"] == 100
+        assert task._init_kwargs["weight_rule"] == "absolute"
+    _reload("dag_backfill_whoscored")
+    chunk = _bash("run_backfill_chunk")._init_kwargs
+    assert chunk["execution_timeout"] == timedelta(minutes=45)
+    assert chunk.get("priority_weight", 1) < 100

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Execute/render a daily SELECT or import exported evidence.
 
---execute reads Trino using the native connection; no site requests or writes.
+--execute/--history read Trino using the native connection; no site requests or writes.
 SQL mode needs promoted-registry rows; report mode needs the SELECT result.
 """
 from __future__ import annotations
@@ -41,6 +41,36 @@ def policy_expiry_warnings():
             warnings.append(f'ТРЕВОГА: {name}: {status}; expires_at={policy.expires_at.isoformat()}')
     return warnings
 
+def _read(cur):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+
+    rows = list(cur.fetchall())
+    columns = [item[0] for item in (cur.description or ())]
+    if not columns or len(set(columns)) != len(columns):
+        raise MeasurementError('invalid SQL result columns')
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def execute_history(day, as_of):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError, build_history_day_sql
+    from dags.utils import transfermarkt_native_v2 as native
+
+    sql, params = build_history_day_sql(day, as_of=as_of)
+    connection = native.connect()
+    try:
+        cur = connection.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = _read(cur)
+            if len(rows) != 1:
+                raise MeasurementError('history measure must return exactly one row')
+            return rows[0]
+        finally:
+            cur.close()
+    finally:
+        connection.close()
+
+
 def execute_measure(day, as_of, path):
     from dags.utils.transfermarkt_daily_measure import (
         MeasurementError, build_daily_measure_sql, daily_denominator,
@@ -49,26 +79,19 @@ def execute_measure(day, as_of, path):
     from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
     from scrapers.transfermarkt.denominator import load_denominator
 
-    def read(cur):
-        rows = list(cur.fetchall())
-        columns = [item[0] for item in (cur.description or ())]
-        if not columns or len(set(columns)) != len(columns):
-            raise MeasurementError('invalid SQL result columns')
-        return [dict(zip(columns, row, strict=True)) for row in rows]
-
     connection = native.connect()
     try:
         cur = connection.cursor()
         try:
             cur.execute(build_promoted_registry_query(current_only=True))
-            registry = read(cur)
+            registry = _read(cur)
             if not registry:
                 raise MeasurementError('no promoted registry available')
             denominator = daily_denominator(load_denominator(path).rows.values(), registry,
                                             denominator_version=hashlib.sha256(path.read_bytes()).hexdigest())
             sql, params = build_daily_measure_sql(denominator, day, as_of=as_of)
             cur.execute(sql, params)
-            rows = read(cur)
+            rows = _read(cur)
             if len(rows) != 1:
                 raise MeasurementError('daily measure must return exactly one row')
             return rows[0]
@@ -90,14 +113,29 @@ def main(argv=None) -> int:
     parser.add_argument('--as-of', required=True, help='ISO8601 including timezone')
     parser.add_argument('--registry-json', type=Path, help='promoted scope query rows; SQL mode')
     parser.add_argument('--execute', action='store_true', help='read promoted registry and execute daily SELECT in Trino')
+    parser.add_argument('--history', action='store_true', help='read the history ops journal for --day in Trino')
     parser.add_argument('--denominator', type=Path, default=None)
     parser.add_argument('--report-json', type=Path, help='one daily SELECT result object')
     parser.add_argument('--samples-json', type=Path, help='offline sample list; paths relative to its directory')
     parser.add_argument('--dq-json', type=Path, help='same-day daily Bronze DQ result')
     parser.add_argument('--dq-state-root', type=Path, help='read existing daily DQ result; does not run DQ')
     args = parser.parse_args(argv)
-    if sum((bool(args.registry_json), bool(args.report_json), args.execute)) != 1:
-        parser.error('choose exactly one of --registry-json, --report-json and --execute')
+    if sum((bool(args.registry_json), bool(args.report_json), args.execute, args.history)) != 1:
+        parser.error('choose exactly one of --registry-json, --report-json, --execute and --history')
+    if args.history:
+        from dags.utils.transfermarkt_daily_measure import format_history_summary
+        try:
+            report = execute_history(args.day, args.as_of)
+        except Exception:
+            # Query errors can include connection details; never export them to the summary.
+            print(json.dumps({'report': None, 'status': 'not_measured',
+                              'summary': f'Transfermarkt история {args.day} МСК: не измерено — ошибка чтения журнала истории'},
+                             ensure_ascii=False))
+            return 1
+        report['report_day'] = args.day
+        print(json.dumps({'report': report, 'summary': format_history_summary(report)},
+                         default=str, ensure_ascii=False))
+        return 0
     if args.registry_json:
         path = args.denominator or denominator_path()
         denominator = daily_denominator(load_denominator(path).rows.values(), json.loads(args.registry_json.read_text()),

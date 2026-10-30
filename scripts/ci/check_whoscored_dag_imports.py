@@ -22,8 +22,6 @@ def main() -> None:
     expected = {
         "dag_ingest_whoscored",
         "dag_backfill_whoscored",
-        "dag_canary_whoscored_proxy",
-        "dag_backup_whoscored_storage",
     }
     actual = set(dag_bag.dag_ids)
     if actual != expected:

@@ -22,6 +22,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
 
+from scrapers.transfermarkt.denominator import load_denominator
 from scrapers.transfermarkt.models import (
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
@@ -472,9 +473,12 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
                 if delta is not None:
                     repository.initialise_campaign(delta)
                 blocked_scope_ids = repository.register_season_handoffs(latest_rows, now=now)
-                available_ids = {target.scope_id for target in historical_targets_from_registry(latest_rows)} - blocked_scope_ids
+                denominator = load_denominator()
+                registry_targets = historical_targets_from_registry(latest_rows, denominator=denominator)
+                available_ids = {target.scope_id for target in registry_targets} - blocked_scope_ids
                 campaign = repository.select_queue_campaign(now=now, allowed_ids=available_ids,
-                                                            registry_targets=historical_targets_from_registry(latest_rows))
+                                                            registry_targets=registry_targets,
+                                                            denominator=denominator)
                 if campaign is None:
                     _publish_next_poll(ti, now=now, idle=True)
                     return []

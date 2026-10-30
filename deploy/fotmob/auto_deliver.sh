@@ -896,15 +896,16 @@ wave_guard(){ # $1 = путь маркера фазы
   set_off
   exit 1
 }
-# Ошибка раннера в task-логе волны. Отвечает строкой ошибки, пустотой (её нет) или
-# X (лог не прочитан — вслепую не судим). Различать обязательно: «не прочитал» под
-# видом «ошибки нет» превращает красную волну с нашей ошибкой в «краснота истории,
-# не откат», и следующая зелёная актуалка приняла бы забракованный код (ревью Sol,
-# раунд 1). Код возврата берём у docker exec, а не у хвоста конвейера: с `| head`
-# статус всегда нулевой. Отсутствие файлов лога — тоже «не прочитал», поэтому
-# существование проверяем внутри контейнера отдельным кодом выхода: grep без
-# совпадений выходит единицей штатно и от сбоя неотличим. Лог волны — до 35 тыс.
-# строк, одна JSON-строка отчёта доходит до 650 КБ: режем на стороне контейнера.
+# Ошибка раннера в task-логе волны. Отвечает строкой ошибки, пустотой (её нет),
+# INFRA или X (лог не прочитан — вслепую не судим). Различать обязательно: «не
+# прочитал» под видом «ошибки нет» превращает красную волну с нашей ошибкой в
+# «краснота истории, не откат», и следующая зелёная актуалка приняла бы
+# забракованный код (ревью Sol, раунд 1). Лог волны — до 35 тыс. строк, одна
+# JSON-строка отчёта доходит до 650 КБ: разбираем на стороне контейнера.
+# INFRA (#1978) — только когда в КАЖДОЙ попытке итоговый отчёт раннера (`errors[]`,
+# верхнее исключение) целиком состоит из отказа HTTP-транспорта к Trino: таймаут
+# чтения, таймаут или отказ соединения. Traceback не разбираем — его формат зависит
+# от библиотек. Нет отчёта или любая другая ошибка — прежний путь (откат).
 runner_error(){ # $1 = run_id
   local out logs
   case "$1" in
@@ -913,12 +914,27 @@ runner_error(){ # $1 = run_id
       echo X; return ;;
   esac
   logs="/opt/airflow/logs/dag_id=dag_ingest_fotmob/run_id=$1/task_id=scrape_fotmob_data/attempt=*.log"
-  # Внутри контейнера: pipefail обязателен — без него код `grep` теряется в конвейере,
-  # и сбой ЧТЕНИЯ существующего лога (grep=2: нет прав, каталог вместо файла, битый
-  # том) выглядел бы как «совпадений нет» (ревью Sol, раунд 2). Единица grep-а — это
-  # штатное «не нашёл», всё, что больше, — «не прочитал».
-  if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc \
-      "set -o pipefail; ls $logs >/dev/null 2>&1 || exit 3; grep -m1 -h -E '\[ERROR\] __main__:' $logs | cut -c1-300; rc=\$?; [ \"\$rc\" -le 1 ] || exit 4" 2>/dev/null); then
+  if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc "ls $logs >/dev/null 2>&1 || exit 3; python3 -c '
+import json, re, sys
+infra = re.compile(r\"TrinoError: SQL execution failed: failed to fetch: HTTPSConnectionPool\(host=.trino., port=\d+\): (Read timed out\..*|Max retries exceeded with url: .*\(Caused by (ConnectTimeoutError|NewConnectionError)\(.*)\")
+first, all_infra = \"\", True
+for path in sys.argv[1:]:
+    errors = None
+    with open(path, errors=\"replace\") as stream:
+        for raw in stream:
+            line = raw.rstrip(\"\n\").split(\" INFO - \", 1)[-1]
+            if not first and \"[ERROR] __main__:\" in line:
+                first = line.split(\"[ERROR] __main__:\", 1)[1].strip()
+            if line.startswith(\"{\") and \"\\\"errors\\\"\" in line:
+                try:
+                    report = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(report, dict) and isinstance(report.get(\"errors\"), list):
+                    errors = report[\"errors\"]
+    all_infra = all_infra and bool(errors) and all(isinstance(e, str) and infra.fullmatch(e) for e in errors)
+print(\"INFRA\" if all_infra else first[:300])
+' $logs" 2>/dev/null); then
     echo X; return
   fi
   printf '%s' "$out" | head -n 1 | cut -c1-300
@@ -1010,7 +1026,7 @@ wave_rollback(){ # $1 = pending-маркер, $2 = маркер вердикта
   exit 1
 }
 wave_acceptance(){
-  local t_file wave_t wave_tc verdict pending rows run st started mode err from_log
+  local t_file wave_t wave_tc verdict pending rows run st started mode err from_log infra_count infra_marker
   # --- Момент доставки T: от него отсчитываются «волны на новом коде» ---
   t_file="$STATE/fotmob-delivered-at-$head_now"
   wave_guard "$t_file"
@@ -1067,6 +1083,7 @@ wave_acceptance(){
     return 0
   fi
   [ -n "$rows" ] || return 0
+  infra_count=0
   while IFS='|' read -r run st started mode; do
     [ -n "$run" ] || continue
     case "$run" in
@@ -1086,6 +1103,23 @@ wave_acceptance(){
         mark_said "$STATE/fotmob-wave-log-unread-$(date -u +%F)"
       fi
       return 0
+    fi
+    if [ "$err" = INFRA ]; then
+      infra_count=$((infra_count + 1))
+      if [ "$infra_count" -le 3 ]; then
+        infra_marker="$STATE/fotmob-wave-infra-$head_now-$wave_tc-$run"
+        wave_guard "$infra_marker"
+        if ! is_plain "$infra_marker"; then
+          log "вторая фаза приёмки: $run — подтверждённый отказ инфраструктуры ($infra_count/3), жду следующую волну"
+          tg_durable "⚠️ FotMob $head_now: красная волна \`$run\` — отказ соединения/таймаут Trino ($infra_count/3). Вердикт откладываю до следующей волны. Лог: $LOG"
+          # Без следа предупреждения следующую волну пока не принимаем.
+          mk_marker "$infra_marker" || return 0
+        fi
+        continue
+      fi
+      err="четвёртая подряд волна с отказом инфраструктуры"
+    else
+      infra_count=0
     fi
     # Ошибка раннера — наш код, в какой бы полосе он ни лёг.
     if [ -n "$err" ]; then

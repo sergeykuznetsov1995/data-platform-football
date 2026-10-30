@@ -403,3 +403,29 @@ def test_renewal_does_not_extend_frozen_batch_policy():
         validate_batch_policy(original, current, now=original.expires_at, **kwargs)
     from dags.scripts.run_transfermarkt_scope_cycle import standing_policy_for_hash
     assert standing_policy_for_hash(current, original.policy_hash) is None
+
+
+def test_queue_picks_campaign_with_best_history_key_after_recovery():
+    from scrapers.transfermarkt.denominator import load_denominator
+
+    def campaign_with(edition, snapshot, at):
+        target = state.HistoricalScopeTarget(f'GB1__{edition}', 'GB1', edition, 'TM-GB1', edition, snapshot)
+        built = state.BackfillCampaign.build(registry_snapshot_id=snapshot, policy_sha256='a' * 64,
+            parser_revision='v2', schema_revision='2', targets=[target], now=at)
+        built = built.transition(state.CampaignStatus.ACTIVE, now=at)
+        return built, state.BackfillScopeState.initial(built, target, now=at)
+
+    old, old_scope = campaign_with('2015', 'old', NOW - timedelta(days=1))
+    new, new_scope = campaign_with('2025', 'new', NOW)
+    batches = {old.campaign_id: (), new.campaign_id: ()}
+    repo = object.__new__(BackfillStateRepository)
+    repo.load_campaigns = lambda: (old, new)
+    repo.load_scopes = lambda id: (old_scope,) if id == old.campaign_id else (new_scope,)
+    repo.load_batches = lambda id: batches[id]
+    targets = [old_scope.target, new_scope.target]
+    denominator = load_denominator()
+    assert repo.select_queue_campaign(now=NOW, registry_targets=targets, denominator=denominator) == new
+    # Without a denominator the oldest runnable campaign wins, as before.
+    assert repo.select_queue_campaign(now=NOW, registry_targets=targets) == old
+    batches[old.campaign_id] = (state.claim_scopes(old, [old_scope], lease_owner='offline', now=NOW).batch,)
+    assert repo.select_queue_campaign(now=NOW, registry_targets=targets, denominator=denominator) == old

@@ -459,7 +459,8 @@ def test_runner_records_each_scope_after_skipped_feeds(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "HistoryState", lambda path: kwargs["checkpoint"])
     monkeypatch.setattr(state, "current_running", lambda: False)
     monkeypatch.setenv("WHOSCORED_SCHEMA_READY", "0")
-    args = SimpleNamespace(split_lanes="true", output=str(tmp_path / "report.json"))
+    args = SimpleNamespace(split_lanes="true", output=str(tmp_path / "report.json"),
+                           worker=None, workers=1)
     report = runner._new_report("history", [])
 
     assert runner._run_history(args, kwargs["service_cls"], report) == 0

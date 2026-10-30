@@ -22,6 +22,7 @@ from scrapers.transfermarkt.registry import (
     SeasonFormat,
     TeamType,
     canonical_season,
+    deterministic_scope_id,
 )
 
 
@@ -674,6 +675,32 @@ def test_claimed_payload_is_campaign_stable_and_batch_bounded():
     assert payloads[0]["resume_cycle_id"] == campaign.campaign_id
     assert payloads[0]["parent_cycle_id"] == claim.batch.batch_id
     assert payloads[0]["edition_record"]["current"] is False
+
+
+def test_claim_takes_previous_top_league_edition_before_deeper_history():
+    # Scope-id order would claim ES2 editions before GB1/2025 (#1402).
+    gb1 = _competition()
+    es2 = replace(gb1, competition_id="ES2", slug="laliga2", name="LaLiga2",
+                  source_url="https://www.transfermarkt.com/es2", canonical_competition_id="TM-ES2")
+    rows = [_row(gb1, _edition("2025", current=False))] + [
+        _row(es2, replace(_edition(year, current=False), competition_id="ES2",
+                          source_url=f"https://www.transfermarkt.com/es2/{year}"))
+        for year in ("2005", "2024")
+    ]
+    waiting = runtime.build_campaign_from_registry(rows, policy_sha256=POLICY_HASH, now=NOW)
+    campaign = waiting.transition(state.CampaignStatus.ACTIVE, now=NOW)
+    scopes = tuple(state.BackfillScopeState.initial(campaign, item, now=NOW) for item in campaign.targets)
+    assert sorted(item.target.scope_id for item in scopes)[-1] == deterministic_scope_id("GB1", "2025")
+
+    claim, payloads = runtime.claim_and_plan(
+        campaign, scopes, registry_rows=rows, run_id="scheduled__batch-1",
+        lease_owner="worker-1", now=NOW, limit=3,
+    )
+
+    assert claim.batch.scope_ids == tuple(
+        deterministic_scope_id(cid, year) for cid, year in (("GB1", "2025"), ("ES2", "2024"), ("ES2", "2005"))
+    )
+    assert payloads[0]["edition_record"]["edition_id"] == "2025"
 
 
 def test_interrupted_batch_is_selected_before_any_new_claim_and_replanned_stably():

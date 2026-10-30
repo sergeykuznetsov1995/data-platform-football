@@ -1516,7 +1516,7 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
-            *is_active=true*) echo 6 ;;
+            *is_active=true*) echo 7 ;;
             *"pool='sofascore_history_pool'"*) echo 3 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;

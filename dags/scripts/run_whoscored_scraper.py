@@ -21,49 +21,7 @@ Only these workflow commands are public.  Entity-level compatibility commands
 were removed after the resumable backfill/replay paths superseded them.
 """
 
-# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
-
 from __future__ import annotations
-
-import sys as _whoscored_bootstrap_sys
-
-_whoscored_source = __file__
-if not _whoscored_source.startswith("/"):
-    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
-_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
-_whoscored_root = (
-    "/opt/airflow"
-    if _whoscored_production
-    else _whoscored_source.rsplit("/dags/", 1)[0]
-)
-if _whoscored_production:
-    if (
-        getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None)
-        != 2
-    ):
-        raise RuntimeError("image-baked WhoScored startup anchor is required")
-elif (
-    getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None)
-    != _whoscored_root
-):
-    _whoscored_anchor_path = (
-        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
-    )
-    _whoscored_anchor_globals = {
-        "__builtins__": __builtins__,
-        "sys": _whoscored_bootstrap_sys,
-        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
-        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
-    }
-    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
-        _whoscored_anchor_source = _whoscored_anchor_handle.read()
-    exec(
-        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
-        _whoscored_anchor_globals,
-    )
-_WHOSCORED_RUNTIME_CONTRACT = _whoscored_bootstrap_sys._load_whoscored_runtime_contract(
-    _whoscored_root
-)
 
 import argparse
 import datetime as datetime_lib
@@ -72,8 +30,10 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -119,16 +79,7 @@ _PRODUCER_COMMIT_PATTERNS = {
     "profile_not_available": re.compile(r"^wsprna2-[0-9a-f]{64}$"),
 }
 _PRODUCER_ATTEMPT_KINDS = ("match", "preview", "profile")
-TRANSPORT_POLICIES = ("direct_only", "direct_then_paid")
-PROXY_CAMPAIGN_CLI_ENV = {
-    "proxy_approval_path": "WHOSCORED_PROXY_APPROVAL_PATH",
-    "proxy_approval_id": "WHOSCORED_PROXY_APPROVAL_ID",
-    "proxy_approval_sha256": "WHOSCORED_PROXY_APPROVAL_SHA256",
-    "proxy_allocation_id": "WHOSCORED_PROXY_ALLOCATION_ID",
-    "proxy_attempt_id": "WHOSCORED_PROXY_ATTEMPT_ID",
-}
-PAID_GATEWAY_URL_ENV = "WHOSCORED_PAID_GATEWAY_URL"
-PAID_GATEWAY_TOKEN_ENV = "WHOSCORED_PAID_GATEWAY_TOKEN"
+TRANSPORT_POLICIES = ("direct_only",)
 _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
@@ -149,6 +100,7 @@ _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES = (
     "WHOSCORED_PAID_ALERT_SECRET_PATH",
     "WHOSCORED_PAID_ALERT_BINDING_PATH",
     "WHOSCORED_PAID_ALERT_RECEIPT_ROOT",
+    "WHOSCORED_PAID_GATEWAY_TOKEN",
 )
 _CANONICAL_SEASON_RE = re.compile(
     r"^[0-9]{4}(?:-(?:single|split|multi)-ws[1-9][0-9]*)?$"
@@ -214,6 +166,29 @@ def _parse_run_slot(value: str) -> datetime_lib.datetime:
     if slot.tzinfo is None:
         slot = slot.replace(tzinfo=datetime_lib.timezone.utc)
     return slot.astimezone(datetime_lib.timezone.utc)
+
+
+HISTORY_STATE_PATH = "/opt/airflow/logs/whoscored-history.sqlite3"
+HISTORY_MAX_WORKERS = 4
+
+
+def _history_workers(value: str) -> int:
+    """Clamp the Airflow Variable to 1..4; anything unreadable means one."""
+    try:
+        return min(HISTORY_MAX_WORKERS, max(1, int(str(value).strip())))
+    except ValueError:
+        return 1
+
+
+def _history_worker(value: str) -> tuple[int, int]:
+    index, _, total = str(value).partition("/")
+    try:
+        worker = int(index), int(total)
+    except ValueError:
+        worker = (-1, 0)
+    if not (1 <= worker[1] <= HISTORY_MAX_WORKERS and 0 <= worker[0] < worker[1]):
+        raise argparse.ArgumentTypeError("--worker must be INDEX/COUNT, COUNT in 1..4")
+    return worker
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -290,7 +265,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transport-policy",
         choices=TRANSPORT_POLICIES,
         default=None,
-        help="Explicit route policy; paid mode also requires a signed allocation",
+        help="Route policy; only direct_only exists (#1487)",
     )
     parser.add_argument(
         "--direct-only",
@@ -299,22 +274,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Compatibility alias for --transport-policy direct_only",
     )
-    parser.add_argument(
-        "--allow-paid-proxy",
-        dest="legacy_allow_paid_proxy",
-        action="store_true",
-        default=False,
-        help=(
-            "Removed unsafe boolean opt-in; use --transport-policy "
-            "direct_then_paid with a signed approval"
-        ),
-    )
-    parser.add_argument("--proxy-approval-path", default=None)
-    parser.add_argument("--proxy-approval-id", default=None)
-    parser.add_argument("--proxy-approval-sha256", default=None)
-    parser.add_argument("--proxy-allocation-id", default=None)
-    parser.add_argument("--proxy-attempt-id", default=None)
-    parser.add_argument("--proxy-work-item-id", default=None)
     parser.add_argument(
         "--full-history",
         action="store_true",
@@ -339,6 +298,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-matches", type=int, default=None)
     parser.add_argument("--split-lanes", choices=("true", "false"), default="false")
+    parser.add_argument("--workers", type=_history_workers, default=1,
+                        help="history: parallel worker processes (1..4, clamped)")
+    parser.add_argument("--worker", type=_history_worker, default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         "--daily-part",
         choices=DAILY_PARTS,
@@ -394,122 +357,17 @@ def _resolve_scopes(
     return scopes
 
 
-def _expected_paid_work_item_id(
-    args: argparse.Namespace,
-    scopes: Sequence[RunnerScope],
-    *,
-    task_id: str,
-) -> str:
-    """Derive paid authority from immutable CLI work, never from its selector."""
-
-    from scrapers.whoscored.proxy_campaign import (
-        WHOSCORED_CANARY_CAPTURE_WORK_ITEM_ID,
-        WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID,
-        WHOSCORED_CANARY_FIXED_SCOPES,
-        WHOSCORED_CANARY_TASK_ID,
-    )
-
-    scope_specs = sorted(scope.spec for scope in scopes)
-    if task_id == "discover_whoscored_catalog":
-        if args.command != "discover" or args.full_history or scope_specs:
-            raise ValueError(
-                "paid catalog discovery selector differs from its immutable work item"
-            )
-        return "catalog-discovery"
-    if task_id == "ingest_active_scope":
-        if (
-            args.command != "daily"
-            or not args.skip_profiles
-            or args.profiles_only
-            or len(scope_specs) != 1
-            or not args.catalog_batch_id
-        ):
-            raise ValueError(
-                "paid daily scope selector differs from its immutable work item"
-            )
-        return "scope-" + hashlib.sha256(scope_specs[0].encode("utf-8")).hexdigest()
-    if task_id == "refresh_whoscored_profiles":
-        if (
-            args.command != "daily"
-            or not args.profiles_only
-            or args.skip_profiles
-            or not scope_specs
-            or not args.catalog_batch_id
-        ):
-            raise ValueError(
-                "paid profile selector differs from its immutable work item"
-            )
-        # The signed scheduled authority intentionally gives the single global
-        # profile task one stable work item. Exact catalog/scopes/candidates are
-        # bound separately by the v3 authority and runner arguments.
-        return "profiles-daily"
-    if task_id == WHOSCORED_CANARY_TASK_ID:
-        if args.command == "discover":
-            if not args.full_history or scope_specs:
-                raise ValueError(
-                    "paid canary discovery selector differs from release policy"
-                )
-            return WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID
-        if args.command == "backfill":
-            if (
-                tuple(scope_specs) != tuple(WHOSCORED_CANARY_FIXED_SCOPES)
-                or args.all_catalog
-                or args.full_history
-                or args.plan_id
-                or args.game_id
-                or args.date_from
-                or args.date_to
-                or int(args.max_work_items) != 100
-            ):
-                raise ValueError(
-                    "paid canary capture selector differs from release policy"
-                )
-            return WHOSCORED_CANARY_CAPTURE_WORK_ITEM_ID
-    raise ValueError(f"paid source task {task_id!r} has no immutable work-item policy")
-
-
 def _validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> list[RunnerScope]:
     scopes = _resolve_scopes(parser, args.scope)
-    if args.legacy_allow_paid_proxy:
-        parser.error(
-            "--allow-paid-proxy cannot authorize paid traffic; use a signed "
-            "--transport-policy direct_then_paid campaign"
-        )
-    policy = args.transport_policy or "direct_only"
-    if args.direct_only and policy != "direct_only":
-        parser.error("--direct-only conflicts with --transport-policy direct_then_paid")
-    args.transport_policy = policy
-    args.direct_only = policy == "direct_only"
-    proxy_values = {
-        attribute: str(getattr(args, attribute) or "").strip()
-        for attribute in PROXY_CAMPAIGN_CLI_ENV
-    }
-    if policy == "direct_then_paid":
-        required = (
-            "proxy_approval_path",
-            "proxy_approval_id",
-            "proxy_approval_sha256",
-        )
-        missing = [name for name in required if not proxy_values[name]]
-        if missing:
-            parser.error(
-                "direct_then_paid requires all signed proxy arguments: "
-                + ", ".join("--" + name.replace("_", "-") for name in missing)
-            )
-        if _SHA256.fullmatch(proxy_values["proxy_approval_sha256"]) is None:
-            parser.error("--proxy-approval-sha256 must be 64 lowercase hex")
-        if proxy_values["proxy_allocation_id"]:
-            parser.error(
-                "--proxy-allocation-id is internal and cannot select paid authority"
-            )
-        if not args.proxy_work_item_id:
-            parser.error("direct_then_paid requires --proxy-work-item-id")
-    elif any(proxy_values.values()) or args.proxy_work_item_id:
-        parser.error("proxy approval arguments require direct_then_paid")
+    args.transport_policy = args.transport_policy or "direct_only"
+    args.direct_only = True
     if args.command == "history" and (scopes or args.max_matches is not None):
         parser.error("history uses its computed queue and fixed match limit")
+    if (args.workers != 1 or args.worker is not None) and (
+            args.command != "history" or args.transport_policy != "direct_only"):
+        parser.error("--workers/--worker are valid only for direct_only history")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be positive")
     if args.command == "backfill" and args.chunk_size != DEFAULT_BACKFILL_CHUNK_SIZE:
@@ -646,23 +504,6 @@ def _validate_args(
         )
     if args.command not in {"backfill", "replay"} and args.game_id:
         parser.error("match selectors are valid only for backfill or replay")
-    if policy == "direct_then_paid":
-        task_id = os.environ.get("AIRFLOW_CTX_TASK_ID", "").strip()
-        if not task_id:
-            parser.error("direct_then_paid requires AIRFLOW_CTX_TASK_ID")
-        try:
-            expected_work_item_id = _expected_paid_work_item_id(
-                args,
-                scopes,
-                task_id=task_id,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-        if str(args.proxy_work_item_id) != expected_work_item_id:
-            parser.error(
-                "--proxy-work-item-id differs from the immutable CLI work item"
-            )
-        args.expected_proxy_work_item_id = expected_work_item_id
     return scopes
 
 
@@ -670,169 +511,10 @@ def _configure_transport_environment(args: argparse.Namespace) -> None:
     """Project validated CLI authority into the transport's process env."""
 
     os.environ["WHOSCORED_TRANSPORT_POLICY"] = str(args.transport_policy)
-    # Populated only from a verified schema-v3 approval below. Keeping the
-    # binding on the process-local Namespace lets the runner freeze exact due
-    # IDs before the schedule refresh can mutate repository eligibility.
-    args.scheduled_scope_workload = None
-    from scrapers.whoscored.proxy_campaign import (
-        SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV,
-    )
-
-    # This value is derived again from the verified scheduled authority below;
-    # a caller-controlled inherited value can never enlarge the scope runtime.
-    os.environ.pop(SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV, None)
     # The runner has no filtering-proxy or signing authority.  Remove legacy
-    # origins and authority secrets before any mutable runtime module or source
-    # transport can observe them.
+    # origins and authority secrets before any source transport can observe them.
     for name in _RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES:
         os.environ.pop(name, None)
-    if args.direct_only:
-        # Paid credentials may be mounted on every worker, but a direct task
-        # removes the gateway authority and all campaign selectors before any
-        # transport is constructed.
-        os.environ.pop(PAID_GATEWAY_URL_ENV, None)
-        os.environ.pop(PAID_GATEWAY_TOKEN_ENV, None)
-        for name in PROXY_CAMPAIGN_CLI_ENV.values():
-            os.environ.pop(name, None)
-        return
-    if not os.environ.get(PAID_GATEWAY_URL_ENV, "").strip():
-        raise ValueError(
-            "direct_then_paid requires the isolated paid application gateway URL"
-        )
-    if len(os.environ.get(PAID_GATEWAY_TOKEN_ENV, "").strip()) < 32:
-        raise ValueError(
-            f"{PAID_GATEWAY_TOKEN_ENV} must contain at least 32 characters"
-        )
-    identity = {
-        "dag_id": os.environ.get("AIRFLOW_CTX_DAG_ID", "").strip(),
-        "run_id": os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", "").strip(),
-        "task_id": os.environ.get("AIRFLOW_CTX_TASK_ID", "").strip(),
-    }
-    attempt_id = str(args.proxy_attempt_id or "").strip()
-    expected_attempt_id = ""
-    if all(identity.values()):
-        from scrapers.whoscored.proxy_campaign import deterministic_proxy_attempt_id
-
-        expected_attempt_id = deterministic_proxy_attempt_id(
-            **identity,
-            map_index=int(os.environ.get("AIRFLOW_CTX_MAP_INDEX", "-1")),
-            try_number=int(os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "0")),
-        )
-    if attempt_id:
-        if expected_attempt_id and attempt_id != expected_attempt_id:
-            raise ValueError(
-                "--proxy-attempt-id differs from the current Airflow task attempt"
-            )
-    else:
-        if not expected_attempt_id:
-            raise ValueError("paid work outside Airflow requires --proxy-attempt-id")
-        attempt_id = expected_attempt_id
-    if not identity["task_id"]:
-        raise ValueError("--proxy-work-item-id requires AIRFLOW_CTX_TASK_ID")
-    expected_work_item_id = str(getattr(args, "expected_proxy_work_item_id", "") or "")
-    if not expected_work_item_id:
-        raise ValueError("paid runner has no independently derived work-item identity")
-    if str(args.proxy_work_item_id) != expected_work_item_id:
-        raise ValueError(
-            "--proxy-work-item-id differs from the independently derived work item"
-        )
-    from scrapers.whoscored.proxy_campaign import (
-        WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT,
-        load_proxy_campaign_context,
-    )
-
-    metadata = load_proxy_campaign_context(
-        str(args.proxy_approval_path),
-        expected_approval_id=str(args.proxy_approval_id),
-        expected_approval_sha256=str(args.proxy_approval_sha256),
-        run_id=identity["run_id"],
-        task_id=identity["task_id"],
-        work_item_id=str(args.proxy_work_item_id),
-        attempt_id=attempt_id,
-    )
-    approval_payload = metadata.get("proxy_campaign_approval")
-    if not isinstance(approval_payload, Mapping):
-        raise ValueError("paid runner has no verified approval payload")
-    scheduled_authority = approval_payload.get("scheduled_authority")
-    if identity["task_id"] == "ingest_active_scope" and isinstance(
-        scheduled_authority, Mapping
-    ):
-        workloads = scheduled_authority.get("scope_workloads")
-        matching_workloads = (
-            [
-                item
-                for item in workloads
-                if isinstance(item, Mapping)
-                and item.get("work_item_id") == args.proxy_work_item_id
-            ]
-            if isinstance(workloads, list)
-            else []
-        )
-        if len(matching_workloads) != 1:
-            raise ValueError(
-                "paid daily scope has no unique signed pagination authority"
-            )
-        pagination_limit = matching_workloads[0].get("player_pagination_target_limit")
-        if (
-            isinstance(pagination_limit, bool)
-            or not isinstance(pagination_limit, int)
-            or not 0 <= pagination_limit <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT
-        ):
-            raise ValueError("paid daily scope pagination authority is invalid")
-        os.environ[SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV] = str(
-            pagination_limit
-        )
-        args.scheduled_scope_workload = dict(matching_workloads[0])
-    elif (
-        identity["task_id"] == "ingest_active_scope"
-        and approval_payload.get("schema_version") == 3
-    ):
-        raise ValueError("scheduled paid scope has no pagination authority")
-    args.proxy_runtime_sha256 = str(approval_payload.get("runtime_sha256") or "")
-    args.proxy_classifier_sha256 = str(approval_payload.get("classifier_sha256") or "")
-    if (
-        _SHA256.fullmatch(args.proxy_runtime_sha256) is None
-        or _SHA256.fullmatch(args.proxy_classifier_sha256) is None
-    ):
-        raise ValueError("paid approval has invalid release pins")
-    allocation_id = str(metadata["proxy_allocation_id"])
-    if (
-        identity["task_id"] == "run_whoscored_proxy_canary"
-        and getattr(args, "command", None) == "backfill"
-    ):
-        campaign_hash = hashlib.sha256(
-            str(metadata["proxy_campaign_id"]).encode("utf-8")
-        ).hexdigest()
-        if str(getattr(args, "queue_id", "") or "") != (
-            f"proxy-canary-{campaign_hash[:32]}"
-        ):
-            raise ValueError("canary queue id differs from the signed campaign")
-    values = {
-        "proxy_approval_path": args.proxy_approval_path,
-        "proxy_approval_id": args.proxy_approval_id,
-        "proxy_approval_sha256": args.proxy_approval_sha256,
-        "proxy_allocation_id": allocation_id,
-        "proxy_attempt_id": attempt_id,
-    }
-    for attribute, name in PROXY_CAMPAIGN_CLI_ENV.items():
-        os.environ[name] = str(values[attribute])
-    args.proxy_allocation_id = allocation_id
-    args.proxy_attempt_id = attempt_id
-
-    # Verify the exact pinned document/allocation before loading mutable runtime
-    # modules or constructing a source service.
-    from scrapers.whoscored.proxy_campaign import assert_paid_runtime_available
-    from scrapers.whoscored.transport import TransportContext
-
-    context = TransportContext.from_env()
-    assert_paid_runtime_available(context.as_dict())
-    allocation = context.proxy_campaign.get("proxy_allocation")
-    if (
-        identity["task_id"]
-        and isinstance(allocation, Mapping)
-        and allocation.get("task_id") != identity["task_id"]
-    ):
-        raise ValueError("signed proxy allocation belongs to another Airflow task")
 
 
 def _load_runtime() -> Any:
@@ -840,23 +522,6 @@ def _load_runtime() -> Any:
     from scrapers.whoscored.service import WhoScoredIngestService
 
     return WhoScoredIngestService
-
-
-def _validate_paid_release_pins(
-    args: argparse.Namespace, runtime: Mapping[str, Any]
-) -> None:
-    """Bind each paid subprocess to the release hashes in its approval."""
-
-    if args.direct_only:
-        return
-    if runtime.get("code_tree_sha256") != args.proxy_runtime_sha256:
-        raise ValueError("paid approval is pinned to another WhoScored runtime release")
-    from dags.scripts.whoscored_proxy_runtime import classifier_code_sha256
-
-    if classifier_code_sha256() != args.proxy_classifier_sha256:
-        raise ValueError(
-            "paid approval is pinned to another WhoScored catalog classifier"
-        )
 
 
 def _new_repository() -> Any:
@@ -868,164 +533,6 @@ def _new_repository() -> Any:
     from scrapers.whoscored.repository import WhoScoredRepository
 
     return WhoScoredRepository()
-
-
-def _freeze_scheduled_scope_targets(
-    repository: Any,
-    selected: Sequence[tuple[RunnerScope, Any]],
-    args: argparse.Namespace,
-) -> None:
-    """Freeze exact signed match/preview IDs before the first source request.
-
-    ``sync_schedule`` intentionally refreshes Bronze before preview and match
-    ingestion. Without this process-local snapshot, that refresh could make a
-    different candidate set eligible after the signed workload was checked,
-    allowing paid traffic outside the owner-approved target identity.
-    """
-
-    workload = getattr(args, "scheduled_scope_workload", None)
-    if workload is None:
-        return
-    if not isinstance(workload, Mapping):
-        raise ValueError("scheduled paid scope workload is invalid")
-    if args.command != "daily" or len(selected) != 1:
-        raise ValueError("scheduled paid workload requires exactly one daily scope")
-
-    from scrapers.whoscored.proxy_campaign import (
-        scheduled_scope_player_pagination_target_limit,
-        scheduled_scope_schedule_target_limit,
-        scheduled_target_ids_sha256,
-    )
-    from scrapers.whoscored.repository import entity_id_payload_sha256
-
-    scope, runtime_scope = selected[0]
-    expected_work_item_id = (
-        "scope-" + hashlib.sha256(scope.spec.encode("utf-8")).hexdigest()
-    )
-    if (
-        workload.get("scope") != scope.spec
-        or workload.get("work_item_id") != expected_work_item_id
-        or workload.get("work_item_id") != args.proxy_work_item_id
-    ):
-        raise ValueError("scheduled paid workload belongs to another scope")
-
-    match_count = workload.get("match_target_count")
-    preview_count = workload.get("preview_target_count")
-    schedule_limit = workload.get("schedule_target_limit")
-    schedule_sha256 = workload.get("schedule_targets_sha256")
-    pagination_limit = workload.get("player_pagination_target_limit")
-    match_sha256 = workload.get("match_targets_sha256")
-    preview_sha256 = workload.get("preview_targets_sha256")
-    if (
-        type(schedule_limit) is not int
-        or schedule_limit <= 0
-        or not isinstance(schedule_sha256, str)
-        or _SHA256.fullmatch(schedule_sha256) is None
-        or type(pagination_limit) is not int
-        or pagination_limit < 0
-        or type(match_count) is not int
-        or not 0 <= match_count <= 100
-        or type(preview_count) is not int
-        or not 0 <= preview_count <= 256
-        or not isinstance(match_sha256, str)
-        or _SHA256.fullmatch(match_sha256) is None
-        or not isinstance(preview_sha256, str)
-        or _SHA256.fullmatch(preview_sha256) is None
-    ):
-        raise ValueError("scheduled paid target identity is invalid")
-
-    stage_ids = tuple(
-        sorted({int(value) for value in getattr(runtime_scope, "stage_ids", ())})
-    )
-    start = getattr(runtime_scope, "start", None)
-    end = getattr(runtime_scope, "end", None)
-    if not stage_ids or start is None or end is None or end < start:
-        raise ValueError("scheduled paid scope has no bounded frozen schedule")
-    season_month_count = (end.year - start.year) * 12 + end.month - start.month + 1
-    expected_schedule_limit = scheduled_scope_schedule_target_limit(
-        stage_count=len(stage_ids), season_month_count=season_month_count
-    )
-    expected_schedule_sha256 = scheduled_target_ids_sha256(
-        [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
-    )
-    expected_pagination_limit = scheduled_scope_player_pagination_target_limit(
-        stage_count=len(stage_ids),
-        non_pagination_target_count=(
-            expected_schedule_limit + match_count + preview_count
-        ),
-    )
-    if (
-        schedule_limit != expected_schedule_limit
-        or schedule_sha256 != expected_schedule_sha256
-        or pagination_limit != expected_pagination_limit
-    ):
-        raise ValueError(
-            "scheduled paid schedule target identity drifted before network"
-        )
-
-    matches = repository.list_match_candidates(
-        scope.competition_id,
-        scope.season_id,
-        limit=101,
-        include_exact_count=True,
-    )
-    observed_match_count = (
-        int(matches[0].exact_candidate_count)
-        if matches and matches[0].exact_candidate_count is not None
-        else len(matches)
-    )
-    match_ids = tuple(sorted({int(candidate.game_id) for candidate in matches}))
-    previews = repository.list_preview_candidates(
-        scope.competition_id,
-        scope.season_id,
-        limit=257,
-    )
-    preview_ids = tuple(sorted({int(candidate["game_id"]) for candidate in previews}))
-    if (
-        observed_match_count != len(match_ids)
-        or observed_match_count != match_count
-        or scheduled_target_ids_sha256(match_ids) != match_sha256
-        or len(previews) != len(preview_ids)
-        or len(preview_ids) != preview_count
-        or scheduled_target_ids_sha256(preview_ids) != preview_sha256
-    ):
-        raise ValueError("scheduled paid due target identity drifted before network")
-
-    args._match_ids = match_ids
-    args._preview_ids = preview_ids
-    args._scheduled_scope_attempts = {
-        "scope": scope.spec,
-        "match": {
-            "schema_version": 1,
-            "scope": scope.spec,
-            "count": len(match_ids),
-            "payload_sha256": entity_id_payload_sha256(match_ids),
-        },
-        "preview": {
-            "schema_version": 1,
-            "scope": scope.spec,
-            "count": len(preview_ids),
-            "payload_sha256": entity_id_payload_sha256(preview_ids),
-        },
-    }
-
-
-def _validate_scheduled_scope_attempts(
-    report: Mapping[str, Any], args: argparse.Namespace
-) -> None:
-    """Require service attempts to equal the immutable pre-schedule snapshot."""
-
-    expected = getattr(args, "_scheduled_scope_attempts", None)
-    if expected is None:
-        return
-    producer_attempts = report.get("producer_attempts")
-    if not isinstance(expected, Mapping) or not isinstance(producer_attempts, Mapping):
-        raise ValueError("scheduled paid attempted-target evidence is unavailable")
-    for kind in ("match", "preview"):
-        if producer_attempts.get(kind) != [expected[kind]]:
-            raise ValueError(
-                f"scheduled paid {kind} attempts differ from the signed target set"
-            )
 
 
 def _scope_value(value: Any) -> RunnerScope:
@@ -1210,7 +717,6 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
         "tables_by_entity": {},
         "traffic": {},
         "traffic_by_scope": {},
-        "paid_proxy_bytes": 0,
         "queue": None,
         "catalog_batch_id": None,
         "catalog_payload_sha256": None,
@@ -1239,23 +745,16 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
             "profile": [],
         },
         "transport_policy": "direct_only",
-        "proxy_approval_id": None,
-        "proxy_approval_sha256": None,
     }
 
 
 def _bind_report_transport_identity(
     report: MutableMapping[str, Any], args: argparse.Namespace
 ) -> None:
-    """Preserve paid identity whenever catalog selection rebuilds a report."""
+    """Preserve the transport identity whenever catalog selection rebuilds a report."""
 
     report["direct_only"] = bool(args.direct_only)
     report["transport_policy"] = args.transport_policy
-    report["proxy_approval_id"] = args.proxy_approval_id
-    report["proxy_approval_sha256"] = args.proxy_approval_sha256
-    report["proxy_allocation_id"] = args.proxy_allocation_id
-    report["proxy_work_item_id"] = args.proxy_work_item_id
-    report["proxy_attempt_id"] = args.proxy_attempt_id
     report["catalog_batch_id"] = args.catalog_batch_id
 
 
@@ -1536,25 +1035,6 @@ def _merge_traffic(target: MutableMapping[str, Any], source: Mapping[str, Any]) 
             target[key] = value
 
 
-def _paid_proxy_bytes(traffic: Mapping[str, Any]) -> int:
-    """Read the canonical paid byte counter without double-counting children."""
-    for key in ("paid_proxy_bytes", "paid_bytes"):
-        value = traffic.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return max(0, int(value))
-    routes = traffic.get("routes")
-    if isinstance(routes, Mapping):
-        total = 0
-        for route, counters in routes.items():
-            if not str(route).startswith("paid_") or not isinstance(counters, Mapping):
-                continue
-            value = counters.get("wire_bytes", counters.get("response_bytes", 0))
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                total += max(0, int(value))
-        return total
-    return 0
-
-
 def _operations(command: str, daily_part: str = "matches") -> tuple[str, ...]:
     if command == "daily":
         if daily_part == "stages":
@@ -1801,7 +1281,6 @@ def _finish(report: dict[str, Any], output: str) -> int:
         report["status"] = "success"
         exit_code = 0
     report["finished_at"] = _utc_now_iso()
-    report["paid_proxy_bytes"] = _paid_proxy_bytes(report.get("traffic", {}))
     _write_report(output, report)
     match_backlog = report.get("match_candidates") or {}
     logger.info(
@@ -1996,7 +1475,7 @@ def _run_service_operations(
                                 # Schedule is a hard prerequisite for preview
                                 # and match candidate selection.  Continuing
                                 # after any entity failure can scrape stale
-                                # candidates and spend paid budget needlessly.
+                                # candidates and spend source requests needlessly.
                                 break
                         except proxy_unavailable:
                             _collect_traffic(report, scope, service)
@@ -2149,45 +1628,27 @@ def _validate_cli_backfill_deadline(plan: Mapping[str, Any]) -> None:
 
 
 def _run_history(args, service_cls, report):
-    from scrapers.whoscored import history, history_state
+    """One history pass: in-process, or ``--workers`` processes (#1481).
+
+    Schema DDL and SQLite migrations run here once, before any worker starts.
+    """
+    from scrapers.whoscored import history_state
 
     if args.split_lanes != "true":
         report["history"] = {"reason": "disabled", "attempted": 0}
         return _finish(report, args.output)
     try:
         repository = _new_repository()
-        repository.ensure_schema()
-        os.environ["WHOSCORED_SCHEMA_READY"] = "1"
-        generation, catalog = repository.load_catalog_generation_snapshot()
-        report["catalog_batch_id"] = str(generation["catalog_batch_id"])
-        checkpoint = history_state.HistoryState("/opt/airflow/logs/whoscored-history.sqlite3")
-
-        def consume(result):
-            scope = RunnerScope.parse(result.scope)
-            if not any(item["scope"] == scope.spec for item in report["scopes"]):
-                report["scopes"].extend(_new_report("history", [scope])["scopes"])
-            record = _scope_record(report, scope)
-            _merge_result(report, result, scope_record=record)
-            _record_result_state(report, record, scope, result.entity, result)
-            _set_scope_status(record)
-            if record["errors"]:
-                raise RuntimeError("; ".join(e["message"] for e in record["errors"]))
-
-        @contextmanager
-        def scoped_service(season, **kwargs):
-            with _transport_scope_environment(_scope_value(season.scope), "history"):
-                with service_cls(season, **kwargs) as service:
-                    yield service
-
-        report["history"] = history.run_chunk(
-            catalog=catalog, repository=repository, checkpoint=checkpoint,
-            service_cls=scoped_service, enabled=lambda: args.split_lanes == "true",
-            current_running=history_state.current_running, consume=consume,
-            collect_traffic=lambda service, scope: _collect_traffic(report, _scope_value(scope), service),
-        )
-        pace = report["history"].get("pace")
-        if pace:
-            logger.log(logging.WARNING if pace["alert"] else logging.INFO, pace["text"])
+        if args.worker is None or os.environ.get("WHOSCORED_SCHEMA_READY") != "1":
+            repository.ensure_schema()
+            os.environ["WHOSCORED_SCHEMA_READY"] = "1"
+        checkpoint = history_state.HistoryState(HISTORY_STATE_PATH)
+        count = _history_workers_for_pool(args.workers) if args.worker is None else 1
+        if count > 1:
+            _run_history_workers(args, report, count)
+        else:
+            _run_history_chunk(args, service_cls, report, repository, checkpoint,
+                               args.worker or (0, 1))
     except Exception as exc:
         report["errors"].append(f"history: {exc}")
         report["error_details"].append({"scope": None, "entity": "history",
@@ -2195,12 +1656,181 @@ def _run_history(args, service_cls, report):
     return _finish(report, args.output)
 
 
+def _run_history_chunk(args, service_cls, report, repository, checkpoint, worker):
+    from scrapers.whoscored import history, history_state
+
+    index, count = worker
+    if index > 0 and checkpoint.degraded(now=time.time()):
+        report["history"] = {"reason": "degraded", "attempted": 0}
+        return
+    if count > 1:
+        # Pool lines j with j % count == index belong to this worker only,
+        # rotation included; the start line moves between runs.
+        run_id = os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", "")
+        offset = int(hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8], 16)
+        os.environ["WHOSCORED_PROXY_WORKER"] = f"{index}/{count}"
+        os.environ["WHOSCORED_PROXY_MEMBER"] = str(offset)
+    generation, catalog = repository.load_catalog_generation_snapshot()
+    report["catalog_batch_id"] = str(generation["catalog_batch_id"])
+
+    def consume(result):
+        scope = RunnerScope.parse(result.scope)
+        if not any(item["scope"] == scope.spec for item in report["scopes"]):
+            report["scopes"].extend(_new_report("history", [scope])["scopes"])
+        record = _scope_record(report, scope)
+        _merge_result(report, result, scope_record=record)
+        _record_result_state(report, record, scope, result.entity, result)
+        _set_scope_status(record)
+        if record["errors"]:
+            raise RuntimeError("; ".join(e["message"] for e in record["errors"]))
+
+    @contextmanager
+    def scoped_service(season, **kwargs):
+        with _transport_scope_environment(_scope_value(season.scope), "history"):
+            with service_cls(season, **kwargs) as service:
+                yield service
+
+    def collect_traffic(service, scope):
+        runner_scope = _scope_value(scope)
+        _collect_traffic(report, runner_scope, service)
+        traffic = report["traffic_by_scope"].get(runner_scope.spec)
+        failures = traffic.get("failures") if isinstance(traffic, Mapping) else None
+        # Owner decision: any Cloudflare challenge, even one the browser
+        # solved, cuts history to one worker.
+        if isinstance(failures, Mapping) and failures.get("cloudflare"):
+            checkpoint.trip_degraded(now=time.time())
+            logger.warning("WhoScored history: Cloudflare challenge; one worker for %d s",
+                           history_state.DEGRADED_SECONDS)
+
+    flag = {"read_at": float("-inf"), "degraded": False}
+
+    def owns(key):
+        # run_chunk asks for every eligible scope; re-read the flag at most
+        # every few seconds instead of opening SQLite per scope.
+        now = time.time()
+        if now - flag["read_at"] >= 5:
+            flag.update(read_at=now, degraded=checkpoint.degraded(now=now))
+        if flag["degraded"]:
+            return index == 0
+        return history_state.share(key, count) == index
+
+    report["history"] = history.run_chunk(
+        catalog=catalog, repository=repository, checkpoint=checkpoint,
+        service_cls=scoped_service, enabled=lambda: args.split_lanes == "true",
+        current_running=history_state.current_running, consume=consume,
+        collect_traffic=collect_traffic, owns=owns,
+    )
+    pace = report["history"].get("pace")
+    if pace:
+        logger.log(logging.WARNING if pace["alert"] else logging.INFO, pace["text"])
+
+
+def _spawn_history_worker(args, index: int, count: int, output: str):
+    return subprocess.Popen([
+        sys.executable, os.path.abspath(__file__), "history",
+        "--split-lanes", args.split_lanes, "--transport-policy", args.transport_policy,
+        "--worker", f"{index}/{count}", "--output", output,
+    ])
+
+
+def _history_workers_for_pool(requested: int) -> int:
+    """Each worker needs its own pool lines: never more workers than lines."""
+    path = os.environ.get("WHOSCORED_PROXY_FILE", "").strip()
+    if requested <= 1 or not path:
+        return requested
+    from scrapers.utils.proxy_manager import ProxyManager
+
+    manager = ProxyManager(rotation_strategy="random")
+    manager.load_from_file_custom_format(path)
+    count = max(1, min(requested, manager.total_count))
+    if count < requested:
+        logger.warning("WhoScored history: %d workers requested, proxy pool has %d "
+                       "lines; running %d", requested, manager.total_count, count)
+    return count
+
+
+def _run_history_workers(args, report, count):
+    """Wait for every worker; one failure never discards the others' work."""
+    outputs = [f"{args.output}.worker-{index}.json" for index in range(count)]
+    for output in outputs:
+        Path(output).unlink(missing_ok=True)
+    # Keep each started child as soon as it exists: a later spawn failure
+    # must still wait for, and merge, the workers already running.
+    processes = []
+    spawn_error = None
+    for index, output in enumerate(outputs):
+        try:
+            processes.append(_spawn_history_worker(args, index, count, output))
+        except Exception as exc:
+            spawn_error = (index, exc)
+            break
+    workers = []
+    for index, (process, output) in enumerate(zip(processes, outputs)):
+        code = process.wait()
+        try:
+            child = json.loads(Path(output).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            child = None
+        if not isinstance(child, dict) or child.get("command") != "history":
+            _worker_failed(report, f"history worker {index} exited {code} without a report")
+            workers.append({"worker": index, "reason": "no_report", "attempted": 0})
+            continue
+        # A worker that raised has no "history" part, but its error, scopes
+        # and producer commits are real and stay in the pass report.
+        _merge_history_worker(report, child)
+        part = child.get("history")
+        if not isinstance(part, dict):
+            part = {"reason": "failed", "attempted": 0}
+            if child.get("status") == "success":
+                _worker_failed(report, f"history worker {index} report has no history")
+        if code != 0 and child.get("status") == "success":
+            _worker_failed(report, f"history worker {index} exited {code} after a green report")
+        workers.append({"worker": index, **part})
+    if spawn_error is not None:
+        index, exc = spawn_error
+        _worker_failed(report, f"history worker {index} could not start: "
+                               f"{type(exc).__name__}: {exc}")
+        workers.append({"worker": index, "reason": "spawn_failed", "attempted": 0})
+    attempted = [w.get("attempted") for w in workers]
+    report["history"] = {
+        "workers": workers,
+        "attempted": sum(a for a in attempted if type(a) is int),
+        "did_work": any(w.get("did_work") is True for w in workers),
+    }
+    pace = next((w["pace"] for w in workers if isinstance(w.get("pace"), dict)), None)
+    if pace is not None:
+        report["history"]["pace"] = pace
+
+
+def _worker_failed(report, message):
+    report["errors"].append(message)
+    report["error_details"].append({"scope": None, "entity": "history",
+        "type": "WorkerFailed", "message": message, "retryable": False})
+
+
+def _merge_history_worker(report, child):
+    report["scopes"].extend(child.get("scopes") or [])
+    report["errors"].extend(child.get("errors") or [])
+    report["error_details"].extend(child.get("error_details") or [])
+    report["rows"] += int(child.get("rows") or 0)
+    report["row_counts_complete"] = (report["row_counts_complete"]
+                                     and child.get("row_counts_complete") is not False)
+    for key in ("entities", "traffic"):
+        _merge_traffic(report[key], child.get(key) or {})
+    report["traffic_by_scope"].update(child.get("traffic_by_scope") or {})
+    report["tables"] = sorted(set(report["tables"]) | set(child.get("tables") or []))
+    for key in ("producer_commits", "producer_attempts"):
+        for name, values in (child.get(key) or {}).items():
+            if isinstance(values, list) and isinstance(report[key].get(name), list):
+                report[key][name].extend(values)
+    if child.get("source_unavailable") and not report.get("source_unavailable"):
+        report["source_unavailable"] = child["source_unavailable"]
+    report["catalog_batch_id"] = report["catalog_batch_id"] or child.get("catalog_batch_id")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
-        operation="WhoScored scraper entrypoint"
-    )
     _merge_json_selectors(parser, args)
     scopes = _validate_args(parser, args)
     report = _new_report(args.command, scopes)
@@ -2218,12 +1848,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         _configure_transport_environment(args)
         _bind_report_transport_identity(report, args)
-        # Recheck inside every mapped Bash process. A scheduler preflight alone
-        # cannot protect mutable bind mounts from deployment between tasks.
-        runtime = _WHOSCORED_RUNTIME_CONTRACT.validate_runtime_contract(
-            report_schema_version=REPORT_SCHEMA_VERSION
-        )
-        _validate_paid_release_pins(args, runtime)
         service_cls = _load_runtime()
     except Exception as exc:
         for scope in scopes:
@@ -2412,32 +2036,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["catalog_batch_id"] = str(catalog_generation["catalog_batch_id"])
         if backfill_discovery_result is not None:
             _merge_unscoped_result(report, backfill_discovery_result)
-        try:
-            _freeze_scheduled_scope_targets(repository, selected, args)
-        except Exception as exc:
-            if selected:
-                owner = selected[0][0]
-                record = _scope_record(report, owner)
-                _record_error(
-                    report,
-                    record,
-                    owner,
-                    "scheduled-workload-preflight",
-                    exc,
-                )
-                _set_scope_status(record)
-            else:
-                report["errors"].append(f"scheduled-workload-preflight: {exc}")
-                report["error_details"].append(
-                    {
-                        "scope": None,
-                        "entity": "scheduled-workload-preflight",
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                        "retryable": False,
-                    }
-                )
-            return _finish(report, args.output)
         logger.info(
             "Starting WhoScored workflow: command=%s scopes=%s",
             args.command,
@@ -2486,19 +2084,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args=args,
                     operations=_operations("daily", args.daily_part),
                 )
-                try:
-                    _validate_scheduled_scope_attempts(report, args)
-                except Exception as exc:
-                    owner = selected[0][0]
-                    record = _scope_record(report, owner)
-                    _record_error(
-                        report,
-                        record,
-                        owner,
-                        "scheduled-workload-attempts",
-                        exc,
-                    )
-                    _set_scope_status(record)
             if not args.skip_profiles and not report["error_details"]:
                 _run_global_profiles(
                     service_cls=service_cls,

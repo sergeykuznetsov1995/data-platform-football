@@ -14,7 +14,7 @@
 | `.airflowignore` | белый список DagBag: только `dag_ingest_whoscored.py` и `dag_backfill_whoscored.py` (RE2, дополнением — см. шапку файла) |
 | `whoscored.env.example` | имена переменных compose, без значений |
 | `auto_deliver.sh` | автомат доставки (ниже) |
-| `gateway.compose.yaml`, `systemd/` | платный шлюз #954 и выдача daily — **к контуру не относятся**, этой задачей не тронуты |
+| `gateway.compose.yaml` | платный шлюз #954 — **к контуру не относится**; скрипт шлюза и выдача daily (`systemd/`) удалены в #1487, сам файл уходит в PR-C (#1489) |
 
 ## Раскладка контура
 
@@ -25,12 +25,10 @@ $RUNTIME/dags     КОПИИ двух DAG + .airflowignore → /opt/airflow/dags
 $RUNTIME/{logs,spool,circuit}   состояние контура
 ```
 
-**Почему дерево в `/opt/whoscored-src`, а не в `/opt/airflow`** (как у FotMob/SofaScore и как написано
-в тексте #1473): `dags/scripts/run_whoscored_scraper.py` при `__file__` под `/opt/airflow` требует
-вшитого в образ `.pth`-якоря, которого в образе `fbref-590579…` нет, а `runtime_contract.py` при
-корне `/opt/airflow` роняет чтение `configs/medallion/competitions.yaml` (`RuntimeContractError`),
-потому что `validate_runtime_contract` в master — no-op. Вне `/opt/airflow` раннер ставит мягкий якорь
-сам. Смена точки монтирования — только вместе с пересборкой образа, не в этой задаче.
+**Почему дерево в `/opt/whoscored-src`, а не в `/opt/airflow`** (как у FotMob/SofaScore): так
+сложилось до #1487 — раннер под `/opt/airflow` требовал вшитого в образ `.pth`-якоря. С #1487 раннеры
+и `scrapers/whoscored` якоря и `runtime_contract` не используют, коммитов evidence/lock больше нет.
+Перенос точки монтирования — вместе с образом и общим стеком (PR-C, #1489), не раньше.
 
 **Почему DAG — копией, а не файловым bind-mount:** `git checkout` пишет новый файл (новый инод), а
 файловый маунт остаётся на старом — контейнер молча видит прежний DAG (мина #1263). Каталог `dags/`

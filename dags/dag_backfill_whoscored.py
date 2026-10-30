@@ -25,13 +25,17 @@ RESULT_PATH = "/tmp/whoscored_backfill_{{ ts_nodash }}.json"
 # /opt/airflow and sets WHOSCORED_RUNTIME_ROOT.
 RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
 
+# Each history worker touches at most 25 match pages; the runner clamps the
+# whoscored_history_workers Variable to 1..4 (1 = off switch, #1481).
+CHUNK_MATCH_LIMIT = 25
+MAX_WORKERS = 4
+CHUNK_TIMEOUT = timedelta(minutes=45)
+
 # Cooldown between continuous runs: short while draining, long while idle.
 ACTIVE_COOLDOWN = timedelta(seconds=30)
 IDLE_COOLDOWN = timedelta(minutes=15)
 
 _TASK_ENV = {
-    # Order matters: runtime_contract requires PYTHONPATH to be an ordered
-    # subsequence of the anchored sys.path (root, root/dags).
     "PYTHONPATH": f"{RUNTIME_ROOT}:{RUNTIME_ROOT}/dags",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",
@@ -41,7 +45,11 @@ _TASK_ENV = {
 
 
 def finalize_chunk(**context: Any) -> None:
-    """Read the chunk report, log progress and schedule the next poll."""
+    """Read the chunk report, log progress and schedule the next poll.
+
+    With parallel workers the report lists each worker's history; every one
+    is bounded separately and the total must match.
+    """
     result_path = context["templates_dict"]["result_path"]
     try:
         with Path(result_path).open("r", encoding="utf-8") as handle:
@@ -55,10 +63,19 @@ def finalize_chunk(**context: Any) -> None:
     task = context["dag_run"].get_task_instance("run_backfill_chunk")
     if task is None or task.state != "success":
         raise AirflowException("history chunk process failed")
-    attempted = report["history"].get("attempted")
-    if type(attempted) is not int or not 0 <= attempted <= 25:
-        raise AirflowException("history chunk exceeds match limit")
-    did_work = report["history"].get("did_work", attempted > 0) is True
+    workers = report["history"].get("workers", [report["history"]])
+    if not isinstance(workers, list) or not 1 <= len(workers) <= MAX_WORKERS:
+        raise AirflowException("history chunk has an invalid worker list")
+    total = 0
+    for worker in workers:
+        attempted = worker.get("attempted") if isinstance(worker, dict) else None
+        if type(attempted) is not int or not 0 <= attempted <= CHUNK_MATCH_LIMIT:
+            raise AirflowException("history chunk exceeds match limit")
+        total += attempted
+    if report["history"].get("attempted") != total:
+        raise AirflowException("history chunk total differs from its workers")
+    did_work = any(worker.get("did_work", worker["attempted"] > 0) is True
+                   for worker in workers)
     logger.info("WhoScored history chunk: %s", report["history"])
     now = datetime.now(timezone.utc)
     target = now + (ACTIVE_COOLDOWN if did_work else IDLE_COOLDOWN)
@@ -92,6 +109,7 @@ with DAG(
             "cd {root} && rm -f {result} && "
             "python {runner} history "
             "--split-lanes {{{{ var.value.get('whoscored_history_enabled', 'false') | lower }}}} "
+            "--workers {{{{ var.value.get('whoscored_history_workers', '3') | int }}}} "
             "--transport-policy direct_only "
             "--output {result}"
         ).format(
@@ -99,9 +117,10 @@ with DAG(
         ),
         env=_TASK_ENV,
         append_env=True,
-        # Schedule/feed collection can outlast the 25-match portion. Record
-        # duration_seconds in every report to tune this bound after activation.
-        execution_timeout=timedelta(hours=8),
+        # The chunk holds the single ingest pool slot that current collection
+        # waits for (#1481): 45 min bounds that wait. Live chunks before
+        # #1481 took 5 min median, 32 min max end to end.
+        execution_timeout=CHUNK_TIMEOUT,
         retries=0,
     )
 

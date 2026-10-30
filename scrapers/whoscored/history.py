@@ -51,11 +51,13 @@ def final_feeds(repository, season, *, moment) -> bool:
 
 
 def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
-              current_running, consume, collect_traffic=None, now=None):
+              current_running, consume, collect_traffic=None, now=None, owns=None):
     """Scan deferred/closed scopes without source calls; run one due scope.
 
     Leases remember scheduling only. Neither an empty due query nor a green
     result can mark a scope complete. Every new chunk reselects from Bronze.
+    ``owns(key)`` is re-read before every reservation, so a worker leaves at
+    a scope boundary once its share changes (#1481).
     """
     if not enabled():
         return {"reason": "disabled", "attempted": 0}
@@ -71,7 +73,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
     eligible = [s for s in scopes if s["wave"] == 1 or
                 (gate and (s["wave"] == 2 or second_ready))]
     while eligible:
-        reservation = checkpoint.reserve(eligible, now=clock().timestamp())
+        mine = [s for s in eligible if owns is None or owns(s["key"])]
+        if not mine:
+            break
+        reservation = checkpoint.reserve(mine, now=clock().timestamp())
         if reservation is None:
             break
         item, token = reservation
