@@ -896,15 +896,9 @@ wave_guard(){ # $1 = путь маркера фазы
   set_off
   exit 1
 }
-# Ошибка раннера в task-логе волны. Отвечает строкой ошибки, пустотой (её нет) или
-# X (лог не прочитан — вслепую не судим). Различать обязательно: «не прочитал» под
-# видом «ошибки нет» превращает красную волну с нашей ошибкой в «краснота истории,
-# не откат», и следующая зелёная актуалка приняла бы забракованный код (ревью Sol,
-# раунд 1). Код возврата берём у docker exec, а не у хвоста конвейера: с `| head`
-# статус всегда нулевой. Отсутствие файлов лога — тоже «не прочитал», поэтому
-# существование проверяем внутри контейнера отдельным кодом выхода: grep без
-# совпадений выходит единицей штатно и от сбоя неотличим. Лог волны — до 35 тыс.
-# строк, одна JSON-строка отчёта доходит до 650 КБ: режем на стороне контейнера.
+# Ошибка раннера: короткая причина, INFRA (подтверждённый отказ соединения)
+# или X (лог не прочитан/traceback оборван). Все попытки проверяются целиком:
+# смешанная ошибка кода не должна скрыться за инфраструктурной ошибкой.
 runner_error(){ # $1 = run_id
   local out logs
   case "$1" in
@@ -913,15 +907,87 @@ runner_error(){ # $1 = run_id
       echo X; return ;;
   esac
   logs="/opt/airflow/logs/dag_id=dag_ingest_fotmob/run_id=$1/task_id=scrape_fotmob_data/attempt=*.log"
-  # Внутри контейнера: pipefail обязателен — без него код `grep` теряется в конвейере,
-  # и сбой ЧТЕНИЯ существующего лога (grep=2: нет прав, каталог вместо файла, битый
-  # том) выглядел бы как «совпадений нет» (ревью Sol, раунд 2). Единица grep-а — это
-  # штатное «не нашёл», всё, что больше, — «не прочитал».
-  if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc \
-      "set -o pipefail; ls $logs >/dev/null 2>&1 || exit 3; grep -m1 -h -E '\[ERROR\] __main__:' $logs | cut -c1-300; rc=\$?; [ \"\$rc\" -le 1 ] || exit 4" 2>/dev/null); then
+  # Разбираем все попытки внутри контейнера: наружу идут только класс и короткая
+  # причина. Непрочитанный/оборванный traceback не разрешает принять следующую волну.
+  if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc "python3 -c '
+import re
+import sys
+
+header = re.compile(r\"\[ERROR\] __main__: (.*)\")
+logger = re.compile(r\"\d{4}-\d\d-\d\d .*?\[(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\] \")
+exception = re.compile(r\"^([A-Za-z_][\w.]*):\s*(.*)\")
+network = {\"TrinoConnectionError\", \"ReadTimeout\", \"ReadTimeoutError\", \"ConnectTimeout\", \"ConnectTimeoutError\", \"ConnectionError\", \"NewConnectionError\", \"OperationalError\"}
+host = re.compile(r\"(?:host=|host |server at )[^A-Za-z0-9_]*(?:trino|metadb|postgres)(?=[^A-Za-z0-9_.-]|$)\")
+transport = re.compile(r\"timed? out|timeout|connection refused|could not connect|failed to establish a new connection\", re.I)
+errors = []
+unsafe = False
+incomplete = False
+
+def check(lines):
+    global unsafe, incomplete
+    if not lines:
+        return
+    title = lines[0]
+    errors.append(title)
+    if title not in {\"Unexpected FotMob runner failure\", \"salvage flush after runner failure also failed\"}:
+        unsafe = True
+        return
+    terminal_infra = False
+    proven = False
+    chained = False
+    waiting = False
+    seen = False
+    for line in lines[1:]:
+        if line in {\"During handling of the above exception, another exception occurred:\", \"The above exception was the direct cause of the following exception:\"}:
+            chained = True
+        if line == \"Traceback (most recent call last):\":
+            if seen and not chained:
+                unsafe |= not (terminal_infra and proven)
+                proven = False
+            chained = False
+            if waiting:
+                incomplete = True
+            waiting = True
+            seen = True
+        match = exception.match(line)
+        if match:
+            waiting = False
+            kind, detail = match.groups()
+            kind = kind.rsplit(\".\", 1)[-1]
+            contextual = bool(host.search(detail) and transport.search(detail))
+            proven |= kind in network and contextual
+            terminal_infra = contextual and (kind in network or kind == \"TrinoError\" and proven)
+            low_level_timeout = kind == \"TimeoutError\" and bool(re.fullmatch(
+                r\"The read operation timed out|_ssl[.]c:\d+: The handshake operation timed out\", detail))
+            if not terminal_infra and not low_level_timeout:
+                unsafe = True
+    incomplete |= waiting or not seen
+    unsafe |= not (terminal_infra and proven)
+
+for path in sys.argv[1:]:
+    block = []
+    size = 0
+    with open(path) as stream:
+        for raw in stream:
+            line = raw.rstrip(\"\n\").split(\" INFO - \", 1)[-1]
+            match = header.search(line)
+            if match or logger.search(line):
+                check(block)
+                block = []
+                size = 0
+            if match:
+                block = [match.group(1)]
+            elif block:
+                size += len(line)
+                if size > 2000000:
+                    raise ValueError(\"diagnostic block too large\")
+                block.append(line)
+    check(block)
+print(\"X\" if incomplete else \"INFRA\" if errors and not unsafe else errors[0][:300] if errors else \"\")
+' $logs" 2>/dev/null); then
     echo X; return
   fi
-  printf '%s' "$out" | head -n 1 | cut -c1-300
+  printf '%s' "$out"
 }
 # Откат по красной первой волне ПОВТОРЯЕМ, а не разов: паузы между волнами почти нет
 # (замер 6 суток: следующая стартует через 18–80 с после конца предыдущей), поэтому в
@@ -1010,7 +1076,7 @@ wave_rollback(){ # $1 = pending-маркер, $2 = маркер вердикта
   exit 1
 }
 wave_acceptance(){
-  local t_file wave_t wave_tc verdict pending rows run st started mode err from_log
+  local t_file wave_t wave_tc verdict pending rows run st started mode err from_log infra_count infra_marker
   # --- Момент доставки T: от него отсчитываются «волны на новом коде» ---
   t_file="$STATE/fotmob-delivered-at-$head_now"
   wave_guard "$t_file"
@@ -1067,6 +1133,7 @@ wave_acceptance(){
     return 0
   fi
   [ -n "$rows" ] || return 0
+  infra_count=0
   while IFS='|' read -r run st started mode; do
     [ -n "$run" ] || continue
     case "$run" in
@@ -1086,6 +1153,23 @@ wave_acceptance(){
         mark_said "$STATE/fotmob-wave-log-unread-$(date -u +%F)"
       fi
       return 0
+    fi
+    if [ "$err" = INFRA ]; then
+      infra_count=$((infra_count + 1))
+      if [ "$infra_count" -le 3 ]; then
+        infra_marker="$STATE/fotmob-wave-infra-$head_now-$wave_tc-$run"
+        wave_guard "$infra_marker"
+        if ! is_plain "$infra_marker"; then
+          log "вторая фаза приёмки: $run — подтверждённый отказ инфраструктуры ($infra_count/3), жду следующую волну"
+          tg_durable "⚠️ FotMob $head_now: красная волна \`$run\` — отказ соединения/таймаут Trino или метабазы ($infra_count/3). Вердикт откладываю до следующей волны. Лог: $LOG"
+          # Без следа предупреждения следующую волну пока не принимаем.
+          mk_marker "$infra_marker" || return 0
+        fi
+        continue
+      fi
+      err="четвёртая подряд волна с отказом инфраструктуры"
+    else
+      infra_count=0
     fi
     # Ошибка раннера — наш код, в какой бы полосе он ни лёг.
     if [ -n "$err" ]; then
