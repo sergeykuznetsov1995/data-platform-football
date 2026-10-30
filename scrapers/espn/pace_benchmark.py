@@ -31,6 +31,21 @@ class IsolatedManager:
     def arrow_schema_to_trino(self, schema):
         return self.trino.arrow_schema_to_trino(schema)
 
+    def execute_query(self, sql):
+        # The production writer now re-reads its rows under the edition lock.
+        # Route only that exact read shape; benchmark must never read Bronze.
+        for table, schema in TABLES.items():
+            columns = ', '.join(schema.names)
+            prefix = f'SELECT {columns} FROM iceberg.bronze.{table} WHERE '
+            if sql.startswith(prefix):
+                scope = sql[len(prefix):]
+                if re.fullmatch(r"competition_slug = '[a-z0-9_.-]+' AND season_year = \d+ "
+                                r"AND event_id IN \([\d, ]+\)", scope) is None:
+                    raise ValueError('unsafe benchmark read scope')
+                return self.trino.execute_query(
+                    f'SELECT {columns} FROM iceberg.{self.schema}.{table} WHERE {scope}')
+        raise ValueError('benchmark read outside native ESPN table set')
+
     def insert_dataframe_atomic(self, database, table, frame, **kwargs):
         if database != BRONZE_DATABASE or table not in TABLES:
             raise ValueError('benchmark write outside native ESPN table set')

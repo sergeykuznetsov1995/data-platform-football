@@ -101,3 +101,51 @@ A 403 is never retried on another origin inside the same request: the request
 fails with `OriginBlocked` (`AllOriginsBlocked` when the cluster has no open
 origin), is journaled as `blocked_deferred`, and the caller retries it in a
 later wave.
+
+### Deep core: first stage (#1513)
+
+The existing `dag_espn_history.run_history` first gives deep at most two minutes
+of the shared twelve-minute run budget, then runs history until the original
+deadline. It uses the same `espn_history` pool, with no additional workers or DAG.
+The gate keeps `lane=history`, records `purpose=deep` in its locked permit state,
+and admits at most 20% of the history minute quota (10% of the total rate).
+Probes and retries consume that quota and the existing history daily fuse.
+Every admission and wait checks live debt, protection, deadline and `history.off`;
+missing live-debt evidence closes deep. No standalone live probe is provided.
+
+`iceberg.ops.espn_depth_v1` is the season registry, keyed by
+`(competition_slug, source_season_year)`; it does not change the league-wide
+`denominator.tsv.deep_level`. Targets are the current seasons of all denominator
+targets, independent of `history_scope.json`. A published played owner supplies
+the sample for `plays?limit=1`. Counts >=1000 mean full, 100–400 medium, <50 light;
+the gaps and failed probes remain unclassified. Seasons without a sample wait.
+A new season gets a new registry key and probe. The map stores count, sample id,
+checked time and raw response URI/SHA manifest. Only full editions collect data.
+
+Stage one publishes `iceberg.bronze.espn_plays`, partitioned by competition and
+integer source season, key `(event_id, play_id)`, plus team `deep_stats_json`.
+The dedicated parser is `espn-deep-v1`. Every actual plays page is checked for
+stable metadata, page order, total count and unique ids; no `limit=2000` assumption.
+Team envelopes keep the manifest of every response and `players_state=pending`;
+player statistics are a later stage. Raw bodies are flushed before publication.
+All Summary and deep publications serialize per edition on the gate state volume
+(`edition-locks/`), re-read Bronze under the lock and preserve first publication.
+Plays and team rows precede the `deep_state=completed` match marker. A failed
+stage remains resumable; Summary refreshes preserve existing deep JSON and plays.
+
+Support for xG comes from positive source statistics/shots, never count or a
+zero placeholder. Absent xG fields in complete content mean false; all-zero
+fields remain unknown. Unless support is confirmed true, xG/xA/xGOT values are
+NULL, including named statistics in JSON. A confirmed season retains real zeros;
+previously completed matches with unknown support are upgraded on a later run.
+
+The DAG result and log include requests, direct bytes, retries, cache hits,
+completed/failed matches and requests/KB per completed match. Attempts and bytes
+come from the durable attempt journal, including interrupted requests; when an
+interruption leaves the request ledger incomplete, retries are unknown (`NULL`)
+and `retry_attempts_lower_bound` is reported separately. Probe and failed-work
+costs are included, so these are run costs amortized over completed matches.
+Production depth coverage, API field shapes and actual cost still require source
+acceptance after the active measurement/windows; offline tests use synthetic
+core responses and recorded Summary fixtures. Delivery remains the existing
+cron process and its current/history active-run guard.

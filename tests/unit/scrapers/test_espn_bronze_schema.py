@@ -125,9 +125,12 @@ def test_ensure_bronze_tables_creates_each_table_with_partitions() -> None:
     ensure_bronze_tables(writer)
 
     calls = writer.create_table_if_not_exists.call_args_list
-    assert [call.args[:2] for call in calls] == [("bronze", name) for name in TABLES]
+    from scrapers.espn.deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
+
+    schemas = {**TABLES, PLAYS_TABLE: PLAYS_SCHEMA}
+    assert [call.args[:2] for call in calls] == [("bronze", name) for name in schemas]
     for call in calls:
-        assert call.args[2] is TABLES[call.args[1]]
+        assert call.args[2] is schemas[call.args[1]]
         assert call.kwargs["partition_spec"] == PARTITION_SPEC
 
 
@@ -148,7 +151,7 @@ def test_ensure_bronze_tables_emits_partitioned_ddl() -> None:
     ensure_bronze_tables(writer)
 
     created = manager.create_iceberg_table.call_args_list
-    assert len(created) == 4
+    assert len(created) == 5
     for call in created:
         assert call.kwargs["partition_columns"] == ["competition_slug", "season_year"]
         assert call.kwargs["schema"] == "bronze"

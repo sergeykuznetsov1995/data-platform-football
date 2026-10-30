@@ -251,6 +251,7 @@ class EspnHttpClient:
         """Independent Session, ledger and raw queue on the same VM gate/spool."""
         gate = TransportGate(
             policy=self.gate.policy, state_path=self.gate.state_path, lane=self.lane,
+            purpose=self.gate.purpose, admission_check=self.gate.admission_check,
             step_ceiling=self.gate.step_ceiling, utcnow_fn=self.gate.utcnow_fn,
             sleep_fn=sleep_fn or self.gate.sleep_fn,
         )

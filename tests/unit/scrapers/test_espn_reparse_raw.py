@@ -24,6 +24,8 @@ class Bronze(FakeTrino):
     fail_match = False
 
     def execute_query(self, sql, params=None):
+        if params is None and ", _source," in sql:
+            return super().execute_query(sql, params)
         if params is not None:
             ids = {
                 int(x)
@@ -539,3 +541,29 @@ def test_raw_presence_survives_malformed_neighbour(tmp_path):
     assert record["raw_any"]["lineup"]
     assert record["raw_any"]["commentary"]
     assert record["errors"][0]["disposition"] == "source_malformed"
+
+
+def test_replay_after_deep_publication_preserves_cells(tmp_path):
+    from datetime import datetime
+    from scrapers.espn.bronze_rows import RawRef
+    from scrapers.espn.deep import publish_deep
+    from scrapers.espn.deep_schema import PLAYS_TABLE
+    from tests.unit.scrapers.test_espn_deep import stats
+
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    bronze = Bronze()
+    bronze.tables[PLAYS_TABLE] = []
+    replay.run(manifest, editions, store=store, trino=bronze)
+    match = bronze.tables[MATCH_TABLE][0]
+    raw = RawRef(match["raw_uri"], match["raw_sha256"], datetime.now())
+    assert publish_deep(
+        trino=bronze, slug=match["competition_slug"], year=match["season_year"],
+        event_id=match["event_id"], plays=[({"id": str(i + 1)}, raw) for i in range(1000)],
+        teams={match[f"{side}_team_id"]: (stats(0.2), raw) for side in ("home", "away")},
+        manifest=[], has_xg=True)
+    plays = list(bronze.tables[PLAYS_TABLE])
+    result = replay.run(manifest, editions, store=store, trino=bronze)
+    assert result["matches"][0]["outcome"] == "written", result
+    assert bronze.tables[MATCH_TABLE][0]["deep_state"] == "completed"
+    assert bronze.tables[PLAYS_TABLE] == plays
+    assert all(row["deep_stats_json"] is not None for row in bronze.tables["espn_team_stats"])

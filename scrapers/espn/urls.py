@@ -164,3 +164,23 @@ __all__ = [
     "summary",
     "type_events",
 ]
+
+
+def plays(slug: str, event_id: int, page: int = 1, *, limit: int = 1000) -> EspnRequest:
+    event_metadata(slug, event_id)
+    if type(limit) is not int or limit < 1:
+        raise ValueError("plays limit must be positive")
+    return _core(
+        f"leagues/{slug}/events/{event_id}/competitions/{event_id}/plays",
+        EndpointType.PLAYS, ("limit", str(limit)), *_page(page),
+    )
+
+
+def team_statistics(slug: str, event_id: int, team_id: int) -> EspnRequest:
+    event_metadata(slug, event_id)
+    if type(team_id) is not int or team_id < 1:
+        raise ValueError("team id must be positive")
+    return _core(
+        f"leagues/{slug}/events/{event_id}/competitions/{event_id}/competitors/{team_id}/statistics",
+        EndpointType.TEAM_STATISTICS,
+    )
