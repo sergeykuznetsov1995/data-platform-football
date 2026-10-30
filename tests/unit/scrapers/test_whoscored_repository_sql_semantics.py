@@ -39,7 +39,7 @@ def _connection():
             batch_id VARCHAR, raw_uri VARCHAR, payload_sha256 VARCHAR,
             parser_version VARCHAR, availability_version VARCHAR,
             retry_after TIMESTAMP, attempt_no BIGINT,
-            fetched_at TIMESTAMP, completed_at TIMESTAMP
+            fetched_at TIMESTAMP, completed_at TIMESTAMP, failure_code VARCHAR
         )
         """
     )
@@ -67,7 +67,7 @@ def _attempt(con, game_id, state, fetched_days_ago):
     fetched = NOW - timedelta(days=fetched_days_ago)
     con.execute(
         "INSERT INTO iceberg.bronze.whoscored_match_ingest_manifest VALUES "
-        "(?, ?, ?, ?, ?, 's3://raw/x', 'sha', ?, NULL, NULL, 1, ?, ?)",
+        "(?, ?, ?, ?, ?, 's3://raw/x', 'sha', ?, NULL, NULL, 1, ?, ?, NULL)",
         [
             LEAGUE,
             SEASON,
@@ -283,7 +283,7 @@ def test_history_plan_freeze_drops_matches_past_the_retry_ceiling():
     for game_id, attempt_no in ((41, DAILY_RETRYABLE_MAX_ATTEMPTS), (42, 3)):
         con.execute(
             "INSERT INTO iceberg.bronze.whoscored_match_ingest_manifest VALUES "
-            "(?, ?, ?, 'retryable', ?, NULL, NULL, ?, NULL, NULL, ?, ?, ?)",
+            "(?, ?, ?, 'retryable', ?, NULL, NULL, ?, NULL, NULL, ?, ?, ?, NULL)",
             [LEAGUE, SEASON, game_id, f"ws2-{game_id}", PARSER_VERSION,
              attempt_no, fetched, fetched],
         )
@@ -542,3 +542,43 @@ def test_history_deferred_age_window_preserves_coverage(lineup, age, deferred):
         assert (row["closeable"], row["closed"], row["unknown_stages"], row["closed_day"]) == (2, 1, 1, 1)
     finally:
         con.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("lane", [None, "current", "history"])
+def test_truncated_retry_is_offered_once_due_and_terminal_truncated_never(lane):
+    # #1484: retryable/truncated rides the ordinary retryable branch and
+    # carries its failure_code; terminal/truncated leaves every lane.
+    con = _connection()
+    days_ago = 10 if lane == "history" else 1
+    for game_id in (1, 2, 3, 4):
+        _game(con, game_id, 100, days_ago)
+    _attempt(con, 1, "success", 0)
+    fetched = NOW - timedelta(hours=12)
+    for game_id, state, retry_after in (
+        (2, "retryable", NOW - timedelta(hours=1)),
+        (3, "terminal", None),
+        (4, "retryable", NOW + timedelta(hours=1)),
+    ):
+        con.execute(
+            "INSERT INTO iceberg.bronze.whoscored_match_ingest_manifest VALUES "
+            "(?, ?, ?, ?, ?, 's3://raw/x', 'sha', ?, NULL, ?, 2, ?, ?, 'truncated')",
+            [LEAGUE, SEASON, game_id, state, f"ws2-{game_id}-{state}",
+             PARSER_VERSION, retry_after, fetched, fetched],
+        )
+    kwargs = {"lane": lane} if lane else {}
+    assert _candidates(con, **kwargs) == [2]
+
+    trino = MagicMock()
+    trino.execute_query.side_effect = lambda sql: con.execute(
+        sqlglot.transpile(
+            sql.replace("CURRENT_TIMESTAMP", f"TIMESTAMP '{NOW.isoformat(sep=' ')}'"),
+            read="trino",
+            write="duckdb",
+        )[0]
+    ).fetchall()
+    (candidate,) = WhoScoredRepository(
+        writer=MagicMock(), trino=trino
+    ).list_match_candidates(LEAGUE, SEASON, **kwargs)
+    assert candidate.attempt_no == 3
+    assert candidate.previous_failure_code == "truncated"

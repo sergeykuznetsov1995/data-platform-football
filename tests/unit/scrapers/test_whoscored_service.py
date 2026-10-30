@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from contextlib import contextmanager
@@ -7,6 +8,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -33,6 +35,7 @@ from scrapers.whoscored.raw_store import (
 )
 from scrapers.whoscored.repository import (
     MatchCandidate,
+    WhoScoredRepository,
     catalog_payload_sha256,
     deterministic_match_not_available_batch_id,
     deterministic_preview_not_available_batch_id,
@@ -3167,28 +3170,96 @@ def test_present_but_unsupported_matchcentre_is_parse_failed(tmp_path):
     assert raw_store.has(match_page_target(123))
 
 
-def test_semantically_truncated_match_is_manifested_as_parse_failed(tmp_path):
-    service, repository, raw_store = _service(tmp_path)
-    candidate = replace(repository.list_match_candidates()[0], attempt_no=3)
+def _match_1995702_html() -> str:
+    fixture = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "whoscored"
+        / "match-1995702.raw.gz"
+    )
+    with gzip.open(fixture, "rt", encoding="utf-8") as handle:
+        return handle.read()
+
+
+@pytest.mark.parametrize(
+    ("previous_failure_code", "attempt_no", "state", "recorded_attempt", "has_retry_after"),
+    [
+        (None, 1, "retryable", 1, True),
+        ("truncated", 2, "retryable", 2, True),
+        ("truncated", 3, "terminal", 3, False),
+        # A transport retry streak (browser, attempt 5) does not count toward
+        # the truncation cap: the first truncation starts at attempt 1.
+        ("browser", 6, "retryable", 1, True),
+    ],
+)
+def test_truncated_final_match_is_retried_then_terminal(
+    tmp_path, previous_failure_code, attempt_no, state, recorded_attempt, has_retry_after
+):
+    # #1484: the real truncated page of game 1995702 (events end at 49' of a
+    # declared 95') with the schedule's is_opta=False goes through the real
+    # repository gate instead of being committed as a success.
+    service, repository, raw_store = _service(tmp_path, html=_match_1995702_html())
+    candidate = replace(
+        repository.list_match_candidates()[0],
+        game_id=1995702,
+        match_is_opta=False,
+        attempt_no=attempt_no,
+        previous_failure_code=previous_failure_code,
+    )
     repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
-
-    def reject(_commit):
-        raise ValueError("game 123 has incomplete final Opta events")
-
-    repository.validate_match_commit = reject
+    repository.validate_match_commit = WhoScoredRepository(
+        writer=MagicMock(), trino=MagicMock()
+    ).validate_match_commit
 
     result = service.sync_matches()
 
-    assert result.status == "failed"
+    # Published bronze rows stay untouched: only the journal gets a row.
     assert repository.commits == []
     assert len(repository.failures) == 1
     failure = repository.failures[0]
-    assert failure.state == "parse_failed"
-    assert failure.attempt_no == 3
-    assert failure.retry_after is None
+    assert failure.state == state
+    assert failure.failure_code == "truncated"
+    assert failure.attempt_no == recorded_attempt
+    assert (failure.retry_after is not None) is has_retry_after
     assert "incomplete final Opta events" in failure.error
     assert failure.raw_uri
-    assert raw_store.has(match_page_target(123))
+    assert raw_store.has(match_page_target(1995702))
+    assert not result.errors
+    if state == "retryable":
+        assert result.status == "retryable"
+        assert result.retryable == ["1995702"]
+    else:
+        assert result.terminal == ["1995702"]
+
+
+@pytest.mark.parametrize("historical_replay", [False, True])
+@pytest.mark.parametrize(
+    ("previous_failure_code", "network_calls"), [("truncated", 1), (None, 0)]
+)
+def test_only_a_truncated_retry_bypasses_the_fresh_raw_cache(
+    tmp_path, historical_replay, previous_failure_code, network_calls
+):
+    service, repository, raw_store = _service(tmp_path)
+    raw_store.store_bytes(
+        match_page_target(123),
+        _match_html().encode(),
+        content_type="text/html",
+    )
+    candidate = replace(
+        repository.list_match_candidates()[0],
+        previous_failure_code=previous_failure_code,
+    )
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+    transport = _RawCacheAwareTransport(_match_html().encode())
+    service.transport = transport
+
+    result = service.sync_matches(historical_replay=historical_replay)
+
+    assert result.status == "success", result.as_dict()
+    assert transport.network_calls == network_calls
+    assert repository.commits[0].transport_mode == (
+        "direct_http" if network_calls else "raw_cache"
+    )
 
 
 def test_match_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path):
