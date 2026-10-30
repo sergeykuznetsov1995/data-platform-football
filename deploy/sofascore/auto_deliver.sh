@@ -1,17 +1,19 @@
 #!/bin/bash
-# Автомат ночной доставки SofaScore: в окно между прогонами сам ставит master в бой,
-# принимает результат, при любой поломке ОТКАТЫВАЕТ и докладывает в Telegram.
+# Автомат доставки SofaScore: когда контур свободен и до ближайшего прогона по расписанию
+# хватает запаса, сам ставит master в бой, принимает результат, при любой поломке ОТКАТЫВАЕТ
+# и докладывает в Telegram. Часового окна нет (#1980, гриль 30.10: «доставка в любой час,
+# когда сбор не идёт»); ночное окно 03:30–06:00 UTC — лишь частный случай свободного контура.
 #
 # Заведён решением владельца 03.09 (гриль, решение №4: канарейку убрать, «любая правка
 # едет автоматом ночью»). До него доставка была привязана к живой сессии: код лежал в
 # master, а в бою стоял старый — иногда сутками.
 #
-# Cron: */5 * * * * <каталог установки>/auto_deliver.sh   (окно и одноразовость — внутри)
+# Cron: */5 * * * * <каталог установки>/auto_deliver.sh   (запас и одноразовость — внутри)
 # Все пути машины — из env-файла контура (deploy/sofascore/sofascore.env.example);
 # скрипт не правится ни под машину, ни под релиз.
 #
 # Чем это НЕ похоже на автомат FotMob, с которого скопирована машинерия (замок, очередь
-# алертов, суточная защёлка, выключатель, маркеры INFLIGHT/ACCEPTED):
+# алертов, защёлка, выключатель, маркеры INFLIGHT/ACCEPTED):
 #   * у FotMob одно неподвижное дерево, доставка = `git checkout -f` внутри него, цель и
 #     откат — короткие SHA в env-файле. У SofaScore — РОТАЦИЯ КАТАЛОГОВ: freeze_release.sh
 #     клонирует репозиторий в release-<gitsha8>, deploy.sh перепинивает три строки
@@ -85,14 +87,17 @@ ACCEPTED=$STATE/sofascore-accepted         # sha кода, приёмку кот
 SNAPSHOT=$STATE/sofascore-rollback.env     # состояние боя до доставки: цель отката
 LASTDRAIN=$STATE/last-drain.env            # доказательство учёта шага drain (#1245)
 TODAY=$(date -u +%F)
-ATTEMPTED=$STATE/sofascore-auto-deliver-attempted-$TODAY
-# Исход окна — одна запись на ночь (#1265, #1362): sofascore-window-<WINDOW_ID>.env, где
-# WINDOW_ID — календарная дата окна (UTC). Её читает утренняя сводка; серия провальных ночей
-# считается по этим записям (файла-счётчика sofascore-fail-nights больше нет).
-YESTERDAY=$(date -u -d "$TODAY -1 day" +%F)
-# Идентификатор окна, который автомат передаёт deploy.sh и по которому потом узнаёт
-# СВОЁ доказательство учёта среди чужих (ручной выкат пишет туда же).
-SOFASCORE_DEPLOY_WINDOW_ID_TODAY=$TODAY
+# Защёлка — на целевой sha (#1980), а не на сутки: одна попытка на коммит master; новый
+# коммит — новая попытка в ближайший свободный час. Путь известен после чтения master (шаг 2).
+ATTEMPTED=""
+# С какого момента бой не подтверждён на master (epoch): сигнал «бой отстаёт дольше суток»
+# заменил суточный сигнал «окно закрылось без доставки».
+BEHIND=$STATE/sofascore-behind-since
+# Исход попытки — одна запись на попытку (#1265, #1362, #1980): sofascore-window-<WINDOW_ID>.env,
+# WINDOW_ID = <UTC-дата>T<ЧЧММ> открытия попытки (старые записи — просто <дата>). Её читает
+# утренняя сводка; серия провалов считается по этим записям. WIN — текущая открытая запись;
+# это же имя автомат передаёт deploy.sh и по нему узнаёт СВОЁ доказательство учёта drain.
+WIN=""
 
 # Имена контейнеров, сервисов compose и unit'ов сторожей — те же значения, что в
 # deploy.sh:53-57. Литералами: это состав контура, а не настройка машины.
@@ -109,19 +114,22 @@ DAILY=dag_ingest_sofascore
 MAINT=dag_sofascore_manifest_maintenance
 COMPACT=dag_sofascore_schedule_maintenance
 
-# Окно и потолки. Переопределяются из окружения только для стенда.
-WINDOW_FROM=${WINDOW_FROM:-0330}   # 03:30 UTC: скоупы истории идут 8–81 мин (p90 остатка
-WINDOW_TO=${WINDOW_TO:-0600}       #   ≈ 75 мин), от 04:00 запаса не хватало бы в ~35 % ночей
-# Воскресного дедлайна 04:45 больше нет (решение владельца 07.09): он оставлял на осушение
-# 1020 с и в ночь 06.09 съел доставку при честно работавшем 62-минутном скоупе. Прогон
-# обслуживания манифеста в 05:00 не мешает, потому что deploy.sh паузит его на весь выкат,
-# а автомат снимает паузу после приёмки или отката (SNAPSHOT_VERSION=2).
+# Дедлайн попытки и потолки. Переопределяются из окружения только для стенда.
+# Дедлайн — ближайший запуск сбора по расписанию Airflow (dag.next_dagrun_create_after DAG не на
+# паузе): актуалка, триггеры дейли и её хвоста, обслуживание расписаний и манифеста. История
+# (@continuous) сюда не входит — её осушает шаг drain deploy.sh; dag_ingest_sofascore расписания
+# не имеет, его запускают триггеры. Пересоздание контейнеров после дедлайна оборвало бы прогон.
+NEXT_RUN_DAGS="'dag_refresh_sofascore_all_mens','dag_trigger_sofascore_daily','dag_trigger_sofascore_daily_tail','dag_sofascore_schedule_maintenance','dag_sofascore_manifest_maintenance'"
+# Не дальше 2,5 ч вперёд — длина бывшего окна 03:30–06:00: бюджет осушения deploy.sh (IDLE_WAIT)
+# не больше, чем был ночью (скоупы истории 8–81 мин, p90 остатка ≈ 75 мин).
+DEADLINE_MAX=${DEADLINE_MAX:-9000}
+LEGACY_WINDOW_TO=0600              # дедлайн старых записей окна (до #1980): <дата> 06:00 UTC
 DEPLOY_CEILING=${DEPLOY_CEILING:-3000}  # жёсткие потолки deploy.sh после drain + 30 % запаса
 ACCEPT_WAIT=${ACCEPT_WAIT:-480}    # dag_dir_list_interval = 300 с, 90 с не хватало (25.08)
 ACCEPT_POLL=${ACCEPT_POLL:-20}
 MIN_DRAIN=${MIN_DRAIN:-900}        # меньше 15 мин на осушение — не начинаем вовсе
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
-FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}
+FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}   # провальных попыток подряд до выключателя (имя — прежнее)
 HISTORY_SLOTS=${SOFASCORE_HISTORY_POOL_SLOTS:-3}
 PLAYERS_SLOTS=${SOFASCORE_PLAYERS_POOL_SLOTS:-1}
 
@@ -158,7 +166,7 @@ read_drain_accounted(){
   v=$(sed -n 's/^DRAIN_ACCOUNTED=//p' "$LASTDRAIN" 2>/dev/null | head -1)
   # Файл от чужого окна — след прошлой ночи или ручного выката: выдать его за сегодняшний
   # учёт значило бы отчитаться чужим замером.
-  [ "$w" = "$SOFASCORE_DEPLOY_WINDOW_ID_TODAY" ] || { printf 'неизвестен (файл от окна %s)' "${w:--}"; return 0; }
+  [ -n "$WIN" ] && [ "$w" = "$WIN" ] || { printf 'неизвестен (файл от окна %s)' "${w:--}"; return 0; }
   case "$v" in
     t) printf 'подтверждён' ;;
     f) printf 'НЕ подтверждён (оплаченный скоуп не доехал до state.json)' ;;
@@ -566,41 +574,81 @@ acceptance_rollback(){
   acceptance_seen "$1" "$started"
 }
 contour_busy(){
-  # Историю сюда НЕ включаем: ею занимается шаг drain внутри deploy.sh.
-  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT','$COMPACT') AND state IN ('queued','running');"
+  # Историю сюда НЕ включаем: ею занимается шаг drain внутри deploy.sh. Триггеры дейли и её
+  # хвоста — включаем: их прогон запускает $DAILY, а пересоздание scheduler'а его оборвало бы.
+  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT','$COMPACT','dag_trigger_sofascore_daily','dag_trigger_sofascore_daily_tail') AND state IN ('queued','running');"
 }
 
-# --- окно доставки ----------------------------------------------------------------------
-# Считается в одном месте, потому что спрашивают о нём двое: шаг «окно и запас» и ветка
-# «master недоступен» — она выходила из тика раньше всякого разговора об окне, и обещанный
-# ежесуточный сигнал не звучал ни разу за ночь, когда до master не дозвониться.
-set_window(){   # выставляет hm, end, now, deadline, in_window
+# --- дедлайн попытки (#1980) -------------------------------------------------------------
+# Выставляет now и deadline = min(ближайший запуск сбора по расписанию, now + DEADLINE_MAX).
+# 1 — метабаза не ответила: дедлайна нет, тик пропускается (это не провал попытки).
+set_deadline(){
+  local nxt
   now=$(date -u +%s)
-  hm=$((10#$(date -u +%H%M)))
-  end=$WINDOW_TO
-  deadline=$(date -u -d "$TODAY ${end:0:2}:${end:2:2}" +%s)
-  in_window=0
-  { [ "$hm" -ge "$((10#$WINDOW_FROM))" ] && [ "$hm" -le "$((10#$end))" ]; } && in_window=1
+  nxt=$(metadb "SELECT coalesce(min(extract(epoch FROM next_dagrun_create_after))::bigint, 0) FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS) AND NOT is_paused;")
+  case "$nxt" in ''|*[!0-9]*) return 1 ;; esac
+  deadline=$(( now + DEADLINE_MAX ))
+  if [ "$nxt" != 0 ] && [ "$nxt" -lt "$deadline" ]; then deadline=$nxt; fi
+  return 0
 }
-# Один суточный маркер на все причины: ночь без доставки — одна новость, а не три.
-announce_missed_window(){  # announce_missed_window <текст>
-  [ "$in_window" = 1 ] || return 0
-  [ "$(( deadline - $(date -u +%s) ))" -le 300 ] || return 0
+# Бой не подтверждён на master дольше суток — одна новость в сутки, на все причины сразу
+# (master недоступен, контур занят, попытка провалилась). Отсчёт — с первого тика, увидевшего
+# расхождение; бой = master его сбрасывает.
+announce_behind(){  # announce_behind <текст>
+  local since
+  if ! is_plain "$BEHIND"; then
+    { printf '%s\n' "$(date -u +%s)" > "$BEHIND"; } 2>/dev/null || log "не смог записать $BEHIND"
+    return 0
+  fi
+  since=$(head -1 "$BEHIND" 2>/dev/null)
+  case "$since" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$(( $(date -u +%s) - since ))" -ge 86400 ] || return 0
   said_today "$STATE/sofascore-window-missed-$TODAY" && return 0
   tg_durable "$1"
   mark_said "$STATE/sofascore-window-missed-$TODAY"
 }
 
-# --- запись окна (#1265 по плану 1245 §3.3, #1362) -------------------------------------------
-# Одна запись на окно: открывается первым тиком в окне независимо от цели, закрывается, когда
-# доставка завершена или попыток в этом окне больше не будет. Временные сбои до защёлки
-# ATTEMPTED запись не закрывают — пишутся в LAST_REASON, следующий тик может доставить.
-# Уведомлений внутри записи нет: tg_durable умеет делать exit 1 и оборвал бы откат.
-# Читается построчно, не `source`: файл лежит в каталоге состояния.
+# --- запись попытки (#1265 по плану 1245 §3.3, #1362, #1980) ----------------------------------
+# Одна запись на попытку: открывается тиком, который начинает попытку (цель есть, контур
+# свободен, запаса хватает), со своим дедлайном в поле DEADLINE (epoch); закрывается, когда
+# доставка завершена или эта попытка кончилась. Временные сбои до защёлки ATTEMPTED запись не
+# закрывают — пишутся в LAST_REASON, следующий тик до DEADLINE может доставить; после
+# DEADLINE запись закрывает close_overdue_windows. Уведомлений внутри записи нет: tg_durable
+# умеет делать exit 1 и оборвал бы откат. Читается построчно, не `source`.
 window_file(){ printf '%s/sofascore-window-%s.env' "$STATE" "$1"; }
 win_get(){ sed -n "s/^$2=//p" "$(window_file "$1")" 2>/dev/null | head -1; }
 win_closed(){ [ -n "$(win_get "$1" OUTCOME)" ]; }
-window_deadline(){ date -u -d "$1 ${WINDOW_TO:0:2}:${WINDOW_TO:2:2}" +%s; }
+# Дедлайн записи: поле DEADLINE; у старой записи (id = дата, до #1980) — 06:00 UTC той даты.
+window_deadline(){
+  local d
+  d=$(win_get "$1" DEADLINE)
+  case "$d" in ''|*[!0-9]*) ;; *) printf '%s' "$d"; return 0 ;; esac
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) date -u -d "$1 ${LEGACY_WINDOW_TO:0:2}:${LEGACY_WINDOW_TO:2:2}" +%s ;;
+    *) return 1 ;;
+  esac
+}
+# Самая свежая открытая запись (старого или нового формата) — продолжение прерванной попытки
+# (самоустановка автомата, сбой заморозки) или чужой незакрытый след.
+latest_open_window(){
+  local -a recs=("$STATE"/sofascore-window-*.env)
+  local i id
+  for (( i=${#recs[@]}-1; i>=0; i-- )); do
+    is_plain "${recs[$i]}" || continue
+    id=${recs[$i]##*/sofascore-window-}; id=${id%.env}
+    win_closed "$id" || { printf '%s' "$id"; return 0; }
+  done
+}
+# Новая запись на попытку: id = <UTC-дата>T<ЧЧММ>; занятое имя (ручной повтор в ту же минуту)
+# не переписывается — берётся с секундами.
+window_open(){  # window_open <TARGET> — выставляет WIN
+  local id
+  id=$(date -u +%FT%H%M)
+  { is_plain "$(window_file "$id")" || odd_path "$(window_file "$id")"; } && id=$(date -u +%FT%H%M%S)
+  win_write "$id" "WINDOW_ID=$id" "LIVE=${LIVE:--}" "TARGET=$1" "SCRIPT_SHA=$(script_sha)" \
+    "OPENED_AT=$(date -u +%FT%TZ)" "DEADLINE=$deadline" "LAST_REASON=" || return 1
+  WIN=$id
+}
 # win_write <id> KEY=VAL… — поля заменяются, остальные сохраняются; атомарно (tmp + mv).
 win_write(){
   local id="$1" f tmp kv keys=""
@@ -622,34 +670,36 @@ win_write(){
   return 1
 }
 script_sha(){ sha256sum "$SELF" 2>/dev/null | cut -c1-64; }
-# Открыть запись окна (первый тик в окне) или, пока попытка не начата, обновить цель:
-# `-` — бой = master, `?` — master недоступен или бой на master не проверен, sha — цель.
+# Пока попытка открытой записи не начата (нет ATTEMPT_AT), обновить её цель: `-` — бой = master,
+# `?` — master недоступен или бой на master не проверен, sha — цель. Записи нет — нечего.
 window_touch(){  # window_touch <TARGET> <LAST_REASON>
-  [ "${in_window:-0}" = 1 ] || return 0
-  if ! is_plain "$(window_file "$TODAY")"; then
-    win_write "$TODAY" "WINDOW_ID=$TODAY" "LIVE=${LIVE:--}" "TARGET=$1" "SCRIPT_SHA=$(script_sha)" \
-      "OPENED_AT=$(date -u +%FT%TZ)" "LAST_REASON=$2"
-    return
-  fi
-  win_closed "$TODAY" && return 0
-  is_plain "$ATTEMPTED" && return 0
+  [ -n "$WIN" ] || return 0
+  win_closed "$WIN" && return 0
+  [ -n "$(win_get "$WIN" ATTEMPT_AT)" ] && return 0
   # Пустая причина при той же цели не стирает прошлый сбой: «сбой заморозки → следующий тик
   # доставил» обязан остаться виден в записи. Сменилась цель — старая причина к ней не относится.
-  if [ -z "$2" ] && [ "$(win_get "$TODAY" TARGET)" = "$1" ]; then
-    win_write "$TODAY" "LIVE=${LIVE:--}"
+  if [ -z "$2" ] && [ "$(win_get "$WIN" TARGET)" = "$1" ]; then
+    win_write "$WIN" "LIVE=${LIVE:--}"
     return
   fi
-  win_write "$TODAY" "LIVE=${LIVE:--}" "TARGET=$1" "LAST_REASON=$2"
+  win_write "$WIN" "LIVE=${LIVE:--}" "TARGET=$1" "LAST_REASON=$2"
 }
-# Временный сбой в окне: запись остаётся открытой, причина — в LAST_REASON.
+# Временный сбой при открытой записи: она остаётся открытой, причина — в LAST_REASON.
 window_note(){  # window_note <причина>
-  [ "${in_window:-0}" = 1 ] || return 0
-  is_plain "$(window_file "$TODAY")" || return 0
-  win_closed "$TODAY" && return 0
-  win_write "$TODAY" "LAST_REASON=$1"
+  [ -n "$WIN" ] || return 0
+  is_plain "$(window_file "$WIN")" || return 0
+  win_closed "$WIN" && return 0
+  win_write "$WIN" "LAST_REASON=$1"
+}
+# Сбой до защёлки повторяется каждым свободным тиком до DEADLINE записи: в Telegram — только
+# первый раз подряд (та же причина уже в LAST_REASON — молчим), в запись — всегда.
+note_and_tell(){  # note_and_tell <причина> <сообщение>
+  [ -n "$WIN" ] && [ "$(win_get "$WIN" LAST_REASON)" = "$1" ] || tg_durable "$2"
+  window_note "$1"
 }
 # Серия провалов из записей: подряд идущие failed от самой свежей назад; delivered обрывает
-# счёт; unknown / needs-hands / no-target и открытые записи пропускаются.
+# счёт; unknown / needs-hands / no-target / busy и открытые записи пропускаются. Имена
+# записей сортируются по времени в обоих форматах (<дата> < <дата>T<ЧЧММ>).
 fail_streak(){
   local -a recs=("$STATE"/sofascore-window-*.env)
   local i o n=0
@@ -674,7 +724,7 @@ window_close(){  # window_close <id> <OUTCOME> <REASON> <RESTORED t|f> [force]
   fi
   local -a kv=("OUTCOME=$outcome" "REASON=$reason" "RESTORED=$restored")
   is_plain "$f" || kv=("WINDOW_ID=$id" "LIVE=${LIVE:--}" "TARGET=${WANT:-?}" "SCRIPT_SHA=$(script_sha)" \
-    "OPENED_AT=$(date -u +%FT%TZ)" "LAST_REASON=" "${kv[@]}")
+    "OPENED_AT=$(date -u +%FT%TZ)" "DEADLINE=${deadline:-}" "LAST_REASON=" "${kv[@]}")
   # Доказательство учёта drain — только своего окна: чужое (прошлая ночь, ручной выкат)
   # выдало бы чужой замер за свой.
   acc=unknown
@@ -689,17 +739,14 @@ window_close(){  # window_close <id> <OUTCOME> <REASON> <RESTORED t|f> [force]
   kv+=("ACCOUNTED=$acc" "CLOSED_AT=$(date -u +%FT%TZ)")
   win_write "$id" "${kv[@]}" || return 1
   n=$(fail_streak)
-  log "ИТОГ ОКНА $id: цель $(win_get "$id" TARGET | head -c 8), исход $outcome ($reason), учёт $acc, контур $restored, провальных ночей подряд $n из $FAIL_NIGHTS_MAX"
+  log "ИТОГ ПОПЫТКИ $id: цель $(win_get "$id" TARGET | head -c 8), исход $outcome ($reason), учёт $acc, контур $restored, провальных попыток подряд $n из $FAIL_NIGHTS_MAX"
   return 0
 }
-# Исход needs-hands (автомат выключен) — в окно разбираемой доставки или в сегодняшнее,
-# если тик идёт в окне. Вне окна записывать нечего: следующее окно закроется unknown.
+# Исход needs-hands (автомат выключен) — в запись разбираемой доставки, в открытую запись тика
+# или, если её нет, в новую: выключатель — новость для утренней сводки в любой час.
 hands_close(){  # hands_close <id|""> <причина> <RESTORED>
-  local id="$1"
-  if [ -z "$id" ]; then
-    [ "${in_window:-0}" = 1 ] || return 0
-    id=$TODAY
-  fi
+  local id="${1:-$WIN}"
+  [ -n "$id" ] || id=$(date -u +%FT%H%M)
   window_close "$id" needs-hands "$2" "$3" "${4:-}"
 }
 # После закрытия записи failed вызывающая сторона дописывает хвост к своему сообщению;
@@ -709,22 +756,22 @@ streak_tail(){
   n=$(fail_streak)
   if [ "$n" -ge "$FAIL_NIGHTS_MAX" ]; then
     set_off
-    printf ' Ночь %s из %s подряд. Больше не пробую — автомат заглушен, снять %s после разбора.' "$n" "$FAIL_NIGHTS_MAX" "$OFF"
+    printf ' Провал %s из %s подряд. Больше не пробую — автомат заглушен, снять %s после разбора.' "$n" "$FAIL_NIGHTS_MAX" "$OFF"
   else
-    printf ' Ночь %s из %s подряд.' "$n" "$FAIL_NIGHTS_MAX"
+    printf ' Провал %s из %s подряд.' "$n" "$FAIL_NIGHTS_MAX"
   fi
 }
 # Просроченное закрытие (только файловая запись; идёт до выключателя): открытая запись с
-# прошедшим дедлайном и без INFLIGHT своего окна. Записи за прошедшее окно нет вовсе —
-# закрытая unknown: текущее равенство master и боя не доказывает, что цели не было.
+# прошедшим дедлайном (поле DEADLINE; у старых записей — 06:00 их даты) и без INFLIGHT своей
+# попытки. Отсутствие записи — не новость (#1980): попытка открывается только при цели и
+# свободном контуре; отставание боя от master сторожит announce_behind.
 close_overdue_windows(){
-  local f id now_s infl="" last tgt oldest="" why
+  local f id now_s infl="" last tgt why
   now_s=$(date -u +%s)
   is_plain "$INFLIGHT" && infl=$(snap_get WINDOW_ID)
   for f in "$STATE"/sofascore-window-*.env; do
     is_plain "$f" || continue
     id=${f##*/sofascore-window-}; id=${id%.env}
-    { [ -z "$oldest" ] || [[ "$id" < "$oldest" ]]; } && oldest=$id
     win_closed "$id" && continue
     [ "$now_s" -gt "$(window_deadline "$id" 2>/dev/null || echo 9999999999)" ] || continue
     [ "$id" = "$infl" ] && continue
@@ -740,22 +787,9 @@ close_overdue_windows(){
       *)
         if window_close "$id" failed "окно истекло: ${last:-причина не записана}" t; then
           why=$(streak_tail)
-          is_plain "$OFF" && tg_durable "⛔ SofaScore: окно $id закрылось без доставки ${tgt:0:8} (${last:-причина не записана}).$why Лог: $LOG"
+          is_plain "$OFF" && tg_durable "⛔ SofaScore: попытка $id закрылась без доставки ${tgt:0:8} (${last:-причина не записана}).$why Лог: $LOG"
         fi ;;
     esac
-  done
-  # Прошлого не выдумываем: окно D без записи считается пропущенным, только если записывающая
-  # копия уже работала раньше D (есть запись старше). Иначе первая же ночь после установки
-  # дала бы «unknown» за вчера — ложную тревогу.
-  [ -n "$oldest" ] || return 0
-  why="автомат в окне не работал / замок был занят"
-  is_plain "$OFF" && why="автомат в окне не работал (стоял выключатель $OFF)"
-  for id in "$YESTERDAY" "$TODAY"; do
-    [[ "$oldest" < "$id" ]] || continue
-    is_plain "$(window_file "$id")" && continue
-    [ "$now_s" -gt "$(window_deadline "$id")" ] || continue
-    [ "$id" = "$infl" ] && continue
-    window_close "$id" unknown "$why" t
   done
 }
 
@@ -787,14 +821,14 @@ ensure_automat_matches_release(){  # ensure_automat_matches_release <дерев�
   r_run=$(md5_of "$new/deploy/sofascore/auto_deliver.sh"); r_env=$(md5_of "$new/deploy/sofascore/env.sh")
   if [ -n "$r_run" ] && [ -n "$r_env" ] && [ "$m_run" = "$r_run" ] && [ "$m_env" = "$r_env" ]; then
     log "автомат сверен с релизом $sha8: auto_deliver.sh $m_run, env.sh $m_env"
-    win_write "$TODAY" "AUTOMAT=ok" || true
+    win_write "$WIN" "AUTOMAT=ok" || true
     return 0
   fi
   # На диске уже релиз, а этот экземпляр загружен раньше замены: доставлять им нельзя, ставить
   # нечего. Выходим без защёлки и без отметок — следующий тик cron пойдёт копией с диска.
   if [ -n "$r_run" ] && [ -n "$r_env" ] && [ "$d_run" = "$r_run" ] && [ "$d_env" = "$r_env" ]; then
     log "работающий экземпляр автомата старше копии на диске (исполняется ${m_run:-?}/${m_env:-?}, на диске релиз $sha8) — тик без доставки, следующий пойдёт новой копией"
-    win_write "$TODAY" "LAST_REASON=экземпляр автомата старше копии на диске — доставка следующим тиком" || true
+    win_write "$WIN" "LAST_REASON=экземпляр автомата старше копии на диске — доставка следующим тиком" || true
     exit 0
   fi
   marker=$STATE/sofascore-automat-installed-$sha8
@@ -804,7 +838,7 @@ ensure_automat_matches_release(){  # ensure_automat_matches_release <дерев�
     if [ "$ok" = 1 ]; then
       mk_marker "$marker" || log "не смог поставить отметку $marker"
       log "автомат обновлён из релиза $sha8: auto_deliver.sh ${m_run:-?}→$r_run, env.sh ${m_env:-?}→$r_env"
-      win_write "$TODAY" "AUTOMAT=installed" "LAST_REASON=автомат обновлён из релиза $sha8 — доставка следующим тиком" || true
+      win_write "$WIN" "AUTOMAT=installed" "LAST_REASON=автомат обновлён из релиза $sha8 — доставка следующим тиком" || true
       exit 0
     fi
     why="установка копии из релиза не удалась ($(dirname "$SELF") недоступен на запись или md5 после замены не тот)"
@@ -813,13 +847,13 @@ ensure_automat_matches_release(){  # ensure_automat_matches_release <дерев�
   else
     why="копия уже ставилась из этого релиза (отметка $marker), а md5 снова не тот"
   fi
-  log "АВТОМАТ ≠ РЕЛИЗ $sha8: auto_deliver.sh ${m_run:-?} против ${r_run:-нет}, env.sh ${m_env:-?} против ${r_env:-нет} — $why; доставки в это окно нет"
+  log "АВТОМАТ ≠ РЕЛИЗ $sha8: auto_deliver.sh ${m_run:-?} против ${r_run:-нет}, env.sh ${m_env:-?} против ${r_env:-нет} — $why; доставки ${sha8} не будет"
   mk_marker "$STATE/sofascore-automat-mismatch-$TODAY" || log "не смог поставить красный маркер sofascore-automat-mismatch-$TODAY"
   mk_marker "$ATTEMPTED" || log "не смог поставить защёлку $ATTEMPTED"
-  win_write "$TODAY" "AUTOMAT=mismatch" || true
-  window_close "$TODAY" failed "автомат ≠ релиз: $why" t
+  win_write "$WIN" "AUTOMAT=mismatch" || true
+  window_close "$WIN" failed "автомат ≠ релиз: $why" t
   why="$why.$(streak_tail)"
-  tg_durable "⛔ SofaScore: работающая копия автомата ($SELF) не совпадает с релизом $sha8 по md5 — $why Доставки в это окно нет: смешанные версии автомата и рецепта небезопасны. Лечение — установка копии по рунбуку под замком автомата. Лог: $LOG"
+  tg_durable "⛔ SofaScore: работающая копия автомата ($SELF) не совпадает с релизом $sha8 по md5 — $why Доставки $sha8 не будет (защёлка на этот sha): смешанные версии автомата и рецепта небезопасны. Лечение — установка копии по рунбуку под замком автомата. Лог: $LOG"
   exit 0
 }
 
@@ -850,8 +884,8 @@ fi
 # У каждого своего пути ровно одно законное состояние: «обычный файл» или «ничего нет».
 # Symlink принимает запись с нулевым кодом и читается пустым; каталог рвёт перенаправление;
 # FIFO вешает чтение навсегда вместе с замком. Любой из них — руки, а не «маркера нет».
-for p in "$LOCK" "$PENDING" "$OFF" "$INFLIGHT" "$ACCEPTED" "$SNAPSHOT" "$ATTEMPTED" "$LASTDRAIN" \
-         "$(window_file "$TODAY")" "$(window_file "$YESTERDAY")"; do
+for p in "$LOCK" "$PENDING" "$OFF" "$INFLIGHT" "$ACCEPTED" "$SNAPSHOT" "$LASTDRAIN" "$BEHIND" \
+         "$STATE"/sofascore-auto-deliver-attempted-* "$STATE"/sofascore-window-*.env; do
   if odd_path "$p"; then
     log "НА МЕСТЕ $p НЕ ОБЫЧНЫЙ ФАЙЛ — состояние автомата недостоверно, глушу"
     tg "🆘 SofaScore: на месте $p не обычный файл — понять состояние автомата нельзя, писать туда опасно. Ничего не делаю. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
@@ -912,9 +946,9 @@ flush_pending
 # До выключателя (план 1245 §3.3, порядок тика): при .off разрешены только записи исходов и
 # диагностика. Контур здесь не трогается.
 close_overdue_windows
-# Окно считаем один раз на тик: исход needs-hands на путях выключателя пишется в сегодняшнюю
-# запись, только если тик идёт в окне.
-set_window
+# Открытая запись, пережившая просроченное закрытие, — продолжение попытки (самоустановка
+# автомата, сбой заморозки): исходы этого тика пишутся в неё.
+WIN=$(latest_open_window)
 
 # ---- 0д. Выключатель ----------------------------------------------------------------------
 if is_plain "$OFF"; then
@@ -997,7 +1031,7 @@ if is_plain "$INFLIGHT"; then
       log "НЕЗАКРЫТАЯ ДОСТАВКА, но бой целиком на $OLD — контейнеры не трогаю, env возвращён к снимку"
       infl_close failed "доставка оборвалась до пересоздания контейнеров, бой остался на $OLD" t
       why=$(streak_tail)
-      tg_durable "⚠️ SofaScore: прошлая доставка оборвалась на середине, но бой целиком остался на прежнем дереве ($OLD) — контейнеры не трогал, env-файл, паузы и пулы вернул к снимку.$why Следующая попытка — в ближайшее окно. Лог: $LOG"
+      tg_durable "⚠️ SofaScore: прошлая доставка оборвалась на середине, но бой целиком остался на прежнем дереве ($OLD) — контейнеры не трогал, env-файл, паузы и пулы вернул к снимку.$why Следующая попытка — с новым коммитом master. Лог: $LOG"
       rm -f "$INFLIGHT"
     else
       log "НЕЗАКРЫТАЯ ДОСТАВКА: бой на $OLD, но контур не вернулся в работу:$RESTORE_NOTE"
@@ -1022,7 +1056,7 @@ if is_plain "$INFLIGHT"; then
     else
       infl_close failed "откат после обрыва доставки подтверждён, бой на $OLD" t
       why=$(streak_tail)
-      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}$why Следующая попытка — в ближайшее окно. Лог: $LOG"
+      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}$why Следующая попытка — с новым коммитом master. Лог: $LOG"
     fi
   else
     infl_close needs-hands "обрыв доставки, откат на $OLD не подтверждён" f
@@ -1041,9 +1075,9 @@ is_sha40(){ case "$1" in *[!0-9a-f]*) return 1 ;; esac; [ "${#1}" = 40 ]; }
 if ! is_sha40 "$WANT"; then
   log "master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — вслепую не переключаемся"
   window_touch '?' "master недоступен (git ls-remote вернул '$WANT')"
-  # Молчаливый выход съедал бы обещанный ежесуточный сигнал: недоступный master держит бой на
-  # старом коде ровно так же, как неудачная доставка, и узнать об этом надо той же ночью.
-  announce_missed_window "⚠️ SofaScore: окно доставки закрывается, а master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — бой остаётся на ${LIVE:0:8}. Причина — в $LOG; следующая попытка завтра."
+  # Молчаливый выход съедал бы ежесуточный сигнал: недоступный master держит бой на старом
+  # коде ровно так же, как неудачная доставка, — отсчёт «бой не подтверждён на master» идёт.
+  announce_behind "⚠️ SofaScore: бой не подтверждён на master больше суток, сейчас master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — бой остаётся на ${LIVE:0:8}. Причина — в $LOG."
   exit 0
 fi
 if [ "$LIVE" = "$WANT" ]; then
@@ -1062,7 +1096,7 @@ if [ "$LIVE" = "$WANT" ]; then
     log "КОНТУР СМЕШАННЫЙ: env-файл говорит $LIVE_ROOT (это master), а контейнеры смонтированы с другого дерева"
     window_touch '?' "контур смешанный: env на master, контейнеры на другом дереве"
     if ! said_today "$STATE/sofascore-mixed-contour-$TODAY"; then
-      tg_durable "🆘 SofaScore: env-файл контура говорит $LIVE_ROOT (это master), но контейнеры смонтированы с ДРУГОГО дерева — контур смешанный. Похоже, выкат оборвался между перепином env и пересозданием контейнеров. Доставлять нечего, а чинить это автомат не берётся: пересоздание контейнеров вне окна оборвало бы идущие прогоны. НУЖНЫ РУКИ. Лог: $LOG"
+      tg_durable "🆘 SofaScore: env-файл контура говорит $LIVE_ROOT (это master), но контейнеры смонтированы с ДРУГОГО дерева — контур смешанный. Похоже, выкат оборвался между перепином env и пересозданием контейнеров. Доставлять нечего, а чинить это автомат не берётся: пересоздание контейнеров без осушения оборвало бы идущие прогоны. НУЖНЫ РУКИ. Лог: $LOG"
       mark_said "$STATE/sofascore-mixed-contour-$TODAY"
     fi
     exit 1
@@ -1092,12 +1126,21 @@ if [ "$LIVE" = "$WANT" ]; then
     fi
     printf '%s\n' "$WANT" > "$ACCEPTED" 2>/dev/null || log "маркер приёмки $ACCEPTED не записан"
   fi
-  # Бой = master: ночь без цели. Серию провалов это не сбрасывает (no-target её пропускает).
+  # Бой = master и принят: отставания нет. Серию провалов это не сбрасывает (no-target её
+  # пропускает); открытая запись без начатой попытки закроется no-target по своему дедлайну.
+  rm -f "$BEHIND" 2>/dev/null
   window_touch - "бой = master, доставлять нечего"
   exit 0
 fi
-# Цель есть: запись окна (если тик в окне) узнаёт её до любых проверок законности боя.
+# Цель есть: открытая запись узнаёт её до любых проверок законности боя. Запись с начатой
+# попыткой другого sha — чужой след (обрыв после снятия маркера доставки): её закроет
+# просроченное закрытие, исходы новой цели в неё не пишутся.
+if [ -n "$WIN" ] && [ -n "$(win_get "$WIN" ATTEMPT_AT)" ] && [ "$(win_get "$WIN" TARGET)" != "$WANT" ]; then
+  WIN=""
+fi
 window_touch "$WANT" ""
+ATTEMPTED=$STATE/sofascore-auto-deliver-attempted-${WANT:0:12}
+announce_behind "⚠️ SofaScore: бой стоит на ${LIVE:0:8}, а master ${WANT:0:8} — бой не на master больше суток. Причина — в $LOG (контур занят, мало запаса до прогонов или попытка этого sha уже была)."
 
 # ---- 3. Законность боя ----------------------------------------------------------------------
 # Спрашивается только когда доставка нужна: тогда мы собираемся ЗАПОМНИТЬ это дерево как
@@ -1120,19 +1163,26 @@ if [ -z "$LIVE" ] || [ -n "$DIRTY" ]; then
   exit 1
 fi
 
-# ---- 4. Окно и запас времени ------------------------------------------------------------------
-set_window
-[ "$in_window" = 1 ] || exit 0
-announce_missed_window "⚠️ SofaScore: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}). Причина — в $LOG; следующая попытка завтра."
-
+# ---- 4. Свободен ли контур и хватит ли запаса до ближайшего прогона (#1980) -------------------
+# Часов нет: попытка — когда контур свободен и до ближайшего запуска сбора по расписанию
+# хватает на осушение, выкат и приёмку. Попытка этого sha уже была — молчим до нового коммита.
+if odd_path "$ATTEMPTED"; then
+  log "НА МЕСТЕ $ATTEMPTED НЕ ОБЫЧНЫЙ ФАЙЛ — состояние автомата недостоверно, глушу"
+  set_off
+  hands_close "" "на месте защёлки не обычный файл" t
+  tg_durable "🆘 SofaScore: на месте защёлки $ATTEMPTED не обычный файл — понять, была ли попытка, нельзя. Ничего не делаю. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  exit 1
+fi
+is_plain "$ATTEMPTED" && exit 0
+if ! set_deadline; then
+  log "метабаза не ответила про ближайший запуск сбора — тик пропущен"
+  window_note "метабаза не ответила про ближайший запуск сбора"
+  exit 0
+fi
 IDLE_WAIT=$(( deadline - now - DEPLOY_CEILING - ACCEPT_WAIT ))
 if [ "$IDLE_WAIT" -lt "$MIN_DRAIN" ]; then
-  log "запаса нет ($IDLE_WAIT с до дедлайна за вычетом потолков) — сегодня не доставляем"
-  # Попыток в этом окне больше не будет — запись закрывается failed (уже закрытая — no-op).
-  if window_close "$TODAY" failed "запаса нет: $IDLE_WAIT с до дедлайна за вычетом потолков" t; then
-    why=$(streak_tail)
-    is_plain "$OFF" && tg_durable "⛔ SofaScore: доставка ${WANT:0:8} сегодня не состоялась — в окне не осталось запаса времени.$why Лог: $LOG"
-  fi
+  log "мало запаса: до ближайшего запуска сбора $(( (deadline - now) / 60 )) мин, на осушение осталось бы $IDLE_WAIT с (< $MIN_DRAIN) — доставка после прогона"
+  window_note "мало запаса до ближайшего запуска сбора: $IDLE_WAIT с на осушение"
   exit 0
 fi
 DELIVER_TIMEOUT=$(( IDLE_WAIT + DEPLOY_CEILING ))
@@ -1142,8 +1192,13 @@ if [ "$busy" != 0 ]; then
   window_note "контур занят (dag_run в работе: '$busy')"
   exit 0
 fi
-if is_plain "$ATTEMPTED"; then
-  exit 0
+log "контур свободен, до ближайшего запуска сбора $(( (deadline - now) / 60 )) мин, запас на осушение ${IDLE_WAIT}s — начинаю попытку ${WANT:0:8}"
+# Попытка начинается: открытая запись (продолжение) или новая.
+if [ -z "$WIN" ] && ! window_open "$WANT"; then
+  log "запись попытки не создаётся — доставку не начинаю"
+  set_off
+  tg_durable "🆘 SofaScore: не могу создать запись попытки в $STATE — исход доставки ${WANT:0:8} не попал бы в утреннюю сводку. Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  exit 1
 fi
 
 # ---- 5. Заморозка нового дерева ------------------------------------------------------------------
@@ -1162,8 +1217,8 @@ if [ -d "$NEW" ]; then
   [ -z "$(git -C "$NEW" --no-optional-locks status --porcelain 2>/dev/null)" ] || ok=0
   if [ "$ok" != 1 ]; then
     log "КАТАЛОГ $NEW УЖЕ ЕСТЬ И БИТЫЙ (logs/, права 755, HEAD=$WANT, чистота) — пересоздать его freeze_release.sh не даст"
-    window_note "каталог релиза $NEW уже есть и битый"
-    tg_durable "⚠️ SofaScore: каталог релиза $NEW уже существует и не годится (нет logs/, права не 755, HEAD не тот или дерево грязное). Пересоздать его freeze_release.sh откажется — убрать руками. Доставки сегодня не будет. Лог: $LOG"
+    note_and_tell "каталог релиза $NEW уже есть и битый" \
+      "⚠️ SofaScore: каталог релиза $NEW уже существует и не годится (нет logs/, права не 755, HEAD не тот или дерево грязное). Пересоздать его freeze_release.sh откажется — убрать руками. Доставки ${WANT:0:8} не будет, пока каталог на месте. Лог: $LOG"
     exit 1
   fi
   log "переиспользую целый каталог $NEW от прошлой попытки"
@@ -1171,32 +1226,29 @@ else
   log "замораживаю $WANT"
   if ! out=$(timeout -k 30 900 "$LIVE_ROOT/deploy/sofascore/freeze_release.sh" "$WANT" 2>&1); then
     printf '%s\n' "$out" >> "$LOG"
-    window_note "заморозка дерева ${WANT:0:8} не удалась"
-    tg_durable "⚠️ SofaScore: заморозка дерева $WANT не удалась — бой не тронут, доставки сегодня не будет. Лог: $LOG"
+    note_and_tell "заморозка дерева ${WANT:0:8} не удалась" \
+      "⚠️ SofaScore: заморозка дерева $WANT не удалась — бой не тронут, повторю следующим свободным тиком. Лог: $LOG"
     exit 1
   fi
   printf '%s\n' "$out" >> "$LOG"
   NEW=${out##*дерево заморожено: }
   NEW=${NEW%% (sha *}
   if [ ! -d "$NEW" ]; then
-    window_note "заморозка отчиталась несуществующим деревом"
-    tg_durable "⚠️ SofaScore: заморозка отчиталась деревом '$NEW', которого нет. Бой не тронут, доставки сегодня не будет. Лог: $LOG"
+    note_and_tell "заморозка отчиталась несуществующим деревом" \
+      "⚠️ SofaScore: заморозка отчиталась деревом '$NEW', которого нет. Бой не тронут, повторю следующим свободным тиком. Лог: $LOG"
     exit 1
   fi
 fi
 
 # Дедлайн держится по ЧАСАМ, а не по началу тика: заморозка дерева занимает до 900 с, и
-# воскресный старт в 03:30 уезжал бы к 05:00 против объявленного дедлайна 04:45 — прямо на
-# обслуживание манифеста. Пересчитываем ЗДЕСЬ, до снимка: дальше стоит RESTORE_PENDING=1, и
-# выход прошёл бы через trap restore_state, чья неудача осталась бы немой.
+# старт уезжал бы за ближайший запуск сбора. Пересчитываем ЗДЕСЬ, до снимка: дальше стоит
+# RESTORE_PENDING=1, и выход прошёл бы через trap restore_state, чья неудача осталась бы немой.
 IDLE_WAIT=$(( deadline - $(date -u +%s) - DEPLOY_CEILING - ACCEPT_WAIT ))
 if [ "$IDLE_WAIT" -lt "$MIN_DRAIN" ]; then
-  log "после заморозки запаса нет ($IDLE_WAIT с до дедлайна за вычетом потолков) — сегодня не доставляем"
-  announce_missed_window "⚠️ SofaScore: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}): заморозка дерева съела запас. Причина — в $LOG; следующая попытка завтра."
-  if window_close "$TODAY" failed "после заморозки запаса нет: $IDLE_WAIT с" t; then
-    why=$(streak_tail)
-    is_plain "$OFF" && tg_durable "⛔ SofaScore: доставка ${WANT:0:8} сегодня не состоялась — заморозка дерева съела запас окна.$why Лог: $LOG"
-  fi
+  log "после заморозки запаса нет ($IDLE_WAIT с до дедлайна за вычетом потолков) — доставка после прогона"
+  # Бой не тронут, защёлки нет: следующий свободный час доставит из этого же дерева. Это не
+  # провал кода — исход busy в серию провалов не идёт.
+  window_close "$WIN" busy "после заморозки запаса нет: $IDLE_WAIT с" t
   exit 0
 fi
 DELIVER_TIMEOUT=$(( IDLE_WAIT + DEPLOY_CEILING ))
@@ -1226,7 +1278,7 @@ fi
   printf 'OLD_ARTIFACT_HOST=%s\n' "${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:-}"
   printf 'OLD_ARTIFACT_ID=%s\n' "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:-}"
   printf 'SNAPSHOT_VERSION=2\n'
-  printf 'WINDOW_ID=%s\n' "$TODAY"
+  printf 'WINDOW_ID=%s\n' "$WIN"
   printf 'HIST_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$HIST';")"
   printf 'REFRESH_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$REFRESH';")"
   printf 'MAINT_PAUSED=%s\n' "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$MAINT';")"
@@ -1249,10 +1301,10 @@ RESTORE_PENDING=1
 
 # ---- 7. Доставка -----------------------------------------------------------------------------
 if ! mk_marker "$ATTEMPTED"; then
-  log "НЕ СМОГ создать суточную защёлку $ATTEMPTED — доставку не начинаю"
+  log "НЕ СМОГ создать защёлку попытки $ATTEMPTED — доставку не начинаю"
   set_off
-  hands_close "" "суточная защёлка не создаётся" t
-  tg_durable "🆘 SofaScore: не могу создать суточную защёлку ($ATTEMPTED) — без неё доставка повторялась бы каждые 5 минут. Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  hands_close "" "защёлка попытки не создаётся" t
+  tg_durable "🆘 SofaScore: не могу создать защёлку попытки ($ATTEMPTED) — без неё доставка повторялась бы каждые 5 минут. Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   exit 1
 fi
 if ! mk_marker "$INFLIGHT"; then
@@ -1262,10 +1314,11 @@ if ! mk_marker "$INFLIGHT"; then
   tg_durable "🆘 SofaScore: не могу создать маркер доставки ($INFLIGHT) — смерть между выкатом и приёмкой стала бы неотличима от успеха. Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   exit 1
 fi
-# Попытка начата: цель в записи окна зафиксирована и дальше не меняется.
-win_write "$TODAY" "TARGET=$WANT" "ATTEMPT_AT=$(date -u +%FT%TZ)" || true
-log "ОКНО ОТКРЫТО: доставляю ${WANT:0:8} ($NEW), запас на осушение ${IDLE_WAIT}s, потолок доставки ${DELIVER_TIMEOUT}s"
-tg "🚚 SofaScore: окно открыто, начинаю доставку ${WANT:0:8} (автомат)"
+# Попытка начата: цель в записи зафиксирована и дальше не меняется; DEADLINE — дедлайн этой
+# попытки (ближайший запуск сбора по расписанию или потолок DEADLINE_MAX).
+win_write "$WIN" "TARGET=$WANT" "ATTEMPT_AT=$(date -u +%FT%TZ)" "DEADLINE=$deadline" || true
+log "ПОПЫТКА $WIN: доставляю ${WANT:0:8} ($NEW), запас на осушение ${IDLE_WAIT}s, потолок доставки ${DELIVER_TIMEOUT}s"
+tg "🚚 SofaScore: контур свободен, начинаю доставку ${WANT:0:8} (автомат, запас на осушение $(( IDLE_WAIT / 60 )) мин)"
 
 # Группой процессов: timeout обязан доставать и потомков. `docker exec` шага
 # scheduler-health своего таймаута не имеет и пережил бы родителя, пересоздавая
@@ -1275,7 +1328,7 @@ tg "🚚 SofaScore: окно открыто, начинаю доставку ${W
 setsid env SOFASCORE_DEPLOY_IDLE_WAIT="$IDLE_WAIT" \
   SOFASCORE_DEPLOY_LOCK="$SOFASCORE_DEPLOY_LOCK" \
   SOFASCORE_DEPLOY_LOCK_FD=8 \
-  SOFASCORE_DEPLOY_WINDOW_ID="$TODAY" \
+  SOFASCORE_DEPLOY_WINDOW_ID="$WIN" \
   timeout -k 30 "$DELIVER_TIMEOUT" "$NEW/deploy/sofascore/deploy.sh" "$NEW" "$OLD" >> "$LOG" 2>&1 9>&- &
 dpid=$!
 wait "$dpid"; rc=$?
@@ -1287,9 +1340,11 @@ if [ "$rc" = 124 ]; then
 fi
 log "deploy.sh вернул $rc"
 
-# rc=4 — «контур занят, выкат не начат»: бой не тронут, откатывать нечего. Это провальная ночь
-# (#1362): запись окна закрывается failed и идёт в серию, защёлка остаётся — за ночь такая
-# попытка одна (IDLE_WAIT — весь запас до дедлайна).
+# rc=4 — «контур занят, выкат не начат»: бой не тронут, откатывать нечего. С #1980 это не
+# провал кода, а «не сейчас»: запись закрывается busy (в серию провалов не идёт), защёлка этого
+# sha снимается — следующий свободный час попробует снова (IDLE_WAIT — весь запас до дедлайна,
+# так что раньше ближайшего прогона по расписанию повтора не будет). Контур не вернулся —
+# авария: failed, защёлка остаётся, выключатель.
 if [ "$rc" = 4 ]; then
   log "контур не освободился за ${IDLE_WAIT}s — выкат не начинался, откатывать нечего"
   # Возврат контура проверяем ЗДЕСЬ, а не оставляем EXIT-trap'у: deploy.sh на этом коде уже
@@ -1299,17 +1354,19 @@ if [ "$rc" = 4 ]; then
   restore_state || restored=0
   restore_maint || restored=0
   rm -f "$INFLIGHT"
-  rtf=t; [ "$restored" = 1 ] || rtf=f
-  window_close "$TODAY" failed "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут" "$rtf"
+  if [ "$restored" = 1 ]; then
+    window_close "$WIN" busy "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут" t
+    rm -f "$ATTEMPTED"
+  else
+    window_close "$WIN" failed "контур не освободился за ${IDLE_WAIT}s (deploy.sh rc=4), бой не тронут, контур не вернулся" f
+  fi
   if [ "$restored" != 1 ]; then
     log "ВЫКАТ НЕ НАЧАЛСЯ, И КОНТУР НЕ ВЕРНУЛСЯ В РАБОТУ:$RESTORE_NOTE — глушу автомат"
     set_off
     tg_durable "🆘 SofaScore: доставка ${WANT:0:8} не состоялась (контур не освободился за ${IDLE_WAIT}s, бой не тронут), И контур не вернулся в рабочее состояние —$RESTORE_NOTE Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     exit 1
   fi
-  why=$(streak_tail)
-  is_plain "$OFF" || why="$why Следующая попытка завтра."
-  tg_durable "⚠️ SofaScore: доставка ${WANT:0:8} не состоялась — контур не освободился за ${IDLE_WAIT}s (выкат не начинался, бой не тронут).$why Лог: $LOG"
+  tg_durable "⚠️ SofaScore: доставка ${WANT:0:8} не состоялась — контур не освободился за ${IDLE_WAIT}s (выкат не начинался, бой не тронут). Повторю после ближайшего прогона, когда контур освободится. Лог: $LOG"
   exit 0
 fi
 
@@ -1355,7 +1412,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
     tg_durable "🆘 SofaScore: код ${WANT:0:8} доставлен и приёмка сошлась, НО контур не вернулся в рабочее состояние —$RESTORE_NOTE Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     rm -f "$INFLIGHT"
     set_off
-    window_close "$TODAY" failed "доставлено и принято, но контур не вернулся:$RESTORE_NOTE" f
+    window_close "$WIN" failed "доставлено и принято, но контур не вернулся:$RESTORE_NOTE" f
     exit 1
   fi
   # Доказательство учёта шага drain: оплаченный скоуп кампании либо доехал до state.json,
@@ -1370,14 +1427,14 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   fi
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8}), артефакт ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}"
   # Маркер снимаем ПОСЛЕ гарантированной отправки: смерть между снятием и сообщением
-  # оставила бы исход немым, а суточная защёлка — следующие тики молчаливыми.
+  # оставила бы исход немым, а защёлка sha — следующие тики молчаливыми.
   tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (пять DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s. Учёт оплаченного скоупа истории: $accounted.${extra}"
   # delivered пишется ПОСЛЕДНИМ (план 1245 §3.3): фаза finishing → снятие INFLIGHT → исход.
   # Обрыв до снятия маркера — следующий тик разберёт INFLIGHT (откат, failed); обрыв между
   # снятием и записью — просроченное закрытие даст unknown по DELIVERY_PHASE=finishing.
-  win_write "$TODAY" "DELIVERY_PHASE=finishing" || true
+  win_write "$WIN" "DELIVERY_PHASE=finishing" || true
   rm -f "$INFLIGHT"
-  window_close "$TODAY" delivered "приёмка подтверждена" t
+  window_close "$WIN" delivered "приёмка подтверждена" t
   exit 0
 fi
 
@@ -1387,13 +1444,13 @@ started_before=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
 # Запись — ДО отката, сообщение — после: откат рвать нельзя, а tg_durable умеет exit 1.
 # RESTORED=f до подтверждения отката; подтверждённый чистый откат меняет только это поле.
 # Запись не легла — считаем порог достигнутым (как раньше при незаписанном счётчике).
-window_close "$TODAY" failed "deploy.sh вернул $rc, приёмка '$seen' — откат на $OLD" f; wrc=$?
+window_close "$WIN" failed "deploy.sh вернул $rc, приёмка '$seen' — откат на $OLD" f; wrc=$?
 fails=$FAIL_NIGHTS_MAX
 [ "$wrc" = 1 ] || fails=$(fail_streak)
 if rollback_to_old "$OLD" "$started_before"; then
   log "ОТКАТ ПОДТВЕРЖДЁН: бой на $OLD"
   rm -f "$INFLIGHT"
-  [ -n "$RESTORE_NOTE" ] || win_write "$TODAY" "RESTORED=t" || true
+  [ -n "$RESTORE_NOTE" ] || win_write "$WIN" "RESTORED=t" || true
   if [ -n "$RESTORE_NOTE" ]; then
     # Откат сошёлся, но кампания стоит — это не ⛔ «попробуем завтра», а авария: следующий
     # коммит начал бы новую доставку на остановленном контуре.
@@ -1401,7 +1458,7 @@ if rollback_to_old "$OLD" "$started_before"; then
     tg_durable "🆘 SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'), откат на $OLD подтверждён, НО контур не вернулся в рабочее состояние —$RESTORE_NOTE${ROLLBACK_NOTE} Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     set_off
   else
-    msg="⛔ SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён теми же шестью признаками.${ROLLBACK_NOTE} Ночь $fails из $FAIL_NIGHTS_MAX подряд. Разбор: $LOG"
+    msg="⛔ SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён теми же шестью признаками.${ROLLBACK_NOTE} Провал $fails из $FAIL_NIGHTS_MAX подряд. Разбор: $LOG"
     if [ "$fails" -ge "$FAIL_NIGHTS_MAX" ]; then
       msg="$msg Больше не пробую — автомат заглушен, снять $OFF после разбора."
       set_off
