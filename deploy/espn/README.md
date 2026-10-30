@@ -423,7 +423,8 @@ Cron ждёт конца живого замера темпа #1510 (при не
 Шаг cron: `fetch` → самопроверка → цель = `origin/master`, если он потомок `accepted`
 (`merge-base --is-ancestor`; иначе стоп «нужны руки»), не в `rejected` и `git diff accepted..master`
 задевает пути контура (`deploy/espn`, `configs/espn` + замыкание импортов DAG из
-`deploy/espn/dags`, в т.ч. `scrapers/base/*` и относительные импорты) → окно: нет
+`deploy/espn/dags` и модуля замера `scrapers/espn/measure_pace.py`, в т.ч. `scrapers/base/*`,
+`scrapers/espn/pace_*` и относительные импорты) → окно: нет
 running/queued `dag_espn_current` и `dag_espn_history` (#1509; прогон истории ≤ 20 мин, между прогонами ≥ 10 мин окна) и до
 волны 00/06/12/18 UTC ≥ 10 мин → корень релиза →
 [`run --rm --no-deps -T airflow-init`] → `up -d --no-deps --force-recreate airflow-scheduler
