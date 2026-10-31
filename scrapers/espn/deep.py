@@ -36,12 +36,19 @@ from .transport_contracts import (AllOriginsBlocked, DailyCapExceeded, EndpointT
 from .wave import _fetch, _raw_ref
 
 _PLAYER_ENDPOINTS = (EndpointType.ROSTER, EndpointType.PLAYER_STATISTICS)
+# not_applicable is requeued once a later Summary captures the lineup.
 PLAYERS_PENDING_SQL = (
-    "SELECT event_id FROM iceberg.bronze.espn_team_stats "
-    "WHERE competition_slug = ? AND season_year = ? "
-    "AND json_extract_scalar(deep_stats_json, '$.players_state') = 'pending' "
-    "GROUP BY event_id HAVING count(*) = 2 ORDER BY event_id"
+    "SELECT t.event_id FROM iceberg.bronze.espn_team_stats t "
+    "JOIN iceberg.bronze.espn_match m ON m.competition_slug = t.competition_slug "
+    "AND m.season_year = t.season_year AND m.event_id = t.event_id "
+    "WHERE t.competition_slug = ? AND t.season_year = ? "
+    "AND (json_extract_scalar(t.deep_stats_json, '$.players_state') = 'pending' "
+    "OR json_extract_scalar(t.deep_stats_json, '$.players_state') = 'not_applicable' "
+    "AND m.lineup_state = 'captured') "
+    "GROUP BY t.event_id HAVING count(*) = 2 ORDER BY t.event_id"
 )
+# Raw bodies of an interrupted match are replayed; failures defer longer (1 day).
+PLAYER_RAW_TTL = timedelta(hours=12)
 
 
 def _manifest(result):
@@ -155,7 +162,9 @@ def publish_players(*, trino, slug, year, event_id, rosters, players, manifest, 
         if len(team_rows) != 2 or {row["team_id"] for row in team_rows} != expected:
             raise EspnParseError("player publication needs both team rows")
         envelopes = {row["team_id"]: json.loads(row["deep_stats_json"] or "{}") for row in team_rows}
-        if any(envelope.get("players_state") != "pending" for envelope in envelopes.values()):
+        states = {envelope.get("players_state") for envelope in envelopes.values()}
+        if states != {"pending"} and not (states == {"not_applicable"} and rosters is not None
+                                          and match["lineup_state"] == "captured"):
             return False
         stamp = BatchStamp(uuid.uuid4().hex, datetime.now(timezone.utc).replace(tzinfo=None))
         lineup = []
@@ -240,9 +249,19 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
     client.gate.admission_check = check
     client.sleep_fn = client.gate.sleep_fn = lambda seconds: interruptible_sleep(seconds, check)
 
-    def fetch(request):
+    def fetch(request, refresh=True):
         check()
-        return _fetch(client, request, force_refresh=True)
+        return _fetch(client, request, force_refresh=refresh)
+
+    def fetch_player(request):
+        result = fetch(request, refresh=False)
+        fetched = _raw_ref(result).fetched_at
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        if now_fn() - fetched > PLAYER_RAW_TTL:
+            result = fetch(request)
+        client.flush()  # each body survives an interruption of the match
+        return result
 
     def teams_for(slug, event_id, home, away, manifest):
         teams = {}
@@ -269,7 +288,7 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         manifest, rosters, players = [], {}, {}
         for side in ("home", "away"):
             team_id = int(match[f"{side}_team_id"])
-            result = fetch(urls.roster(slug, event_id, team_id))
+            result = fetch_player(urls.roster(slug, event_id, team_id))
             rosters[team_id] = parse_roster(result.json_data)
             manifest.append({"team_id": team_id, **_manifest(result)})
         # Identity first: a foreign roster spends no player requests.
@@ -277,7 +296,7 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         for team_id, roster in rosters.items():
             for athlete, played in roster.items():
                 if played:
-                    result = fetch(urls.player_statistics(slug, event_id, team_id, athlete))
+                    result = fetch_player(urls.player_statistics(slug, event_id, team_id, athlete))
                     players[(team_id, athlete)] = (player_statistics(result.json_data, athlete),
                                                    {"athlete_id": athlete, **_manifest(result)})
         support = xg_support([body for body, _ in players.values()])
@@ -447,14 +466,16 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                             if now_fn() < retry_after:
                                 continue
                         check()
+                        # No deferral on interruption: the next run resumes from raw.
                         try:
-                            save_retry(conn, slug, year, event_id, now_fn() + timedelta(days=1),
-                                       PLAYER_RETRY_TABLE)
                             depth = players_for(slug, year, event_id, depth)
-                            save_retry(conn, slug, year, event_id, None, PLAYER_RETRY_TABLE)
+                            if event_id in retries:
+                                save_retry(conn, slug, year, event_id, None, PLAYER_RETRY_TABLE)
                         except (LaneClosed, AllOriginsBlocked, DailyCapExceeded):
                             raise
                         except (EspnParseError, EspnTransportError) as exc:
+                            save_retry(conn, slug, year, event_id, now_fn() + timedelta(days=1),
+                                       PLAYER_RETRY_TABLE)
                             report["players_failed"] += 1
                             errors.append(f"{slug}:{year}:{event_id}: players: {type(exc).__name__}: {exc}")
                 except ProbeBudgetExhausted:

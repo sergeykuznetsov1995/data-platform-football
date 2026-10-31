@@ -214,9 +214,13 @@ def runner(tmp_path, monkeypatch):
                 return conn.execute(sql, params).fetchall()
             if sql == deep.PLAYERS_PENDING_SQL:
                 pending = {}
+                lineup = {row["event_id"]: row["lineup_state"] for row in self.tables["espn_match"]
+                          if (row["competition_slug"], row["season_year"]) == params}
                 for row in self.tables["espn_team_stats"]:
-                    state = json.loads(row["deep_stats_json"] or "{}").get("players_state")
-                    if (row["competition_slug"], row["season_year"]) == params and state == "pending":
+                    value = row["deep_stats_json"]
+                    state = json.loads(value).get("players_state") if isinstance(value, str) else None
+                    if row["event_id"] in lineup and (state == "pending" or state == "not_applicable"
+                                                      and lineup[row["event_id"]] == "captured"):
                         pending[row["event_id"]] = pending.get(row["event_id"], 0) + 1
                 return [(event_id,) for event_id, count in sorted(pending.items()) if count == 2]
             if sql.startswith("SELECT event_id, home_team_id"):
@@ -239,7 +243,13 @@ def runner(tmp_path, monkeypatch):
         gate = TransportGate(state_path=tmp_path / "gate.json", lane="history", purpose="deep",
                              utcnow_fn=lambda: now)
 
-        def fetch_json(self, url, endpoint, params, **kwargs):
+        raw = {}
+
+        def fetch_json(self, url, endpoint, params, force_refresh=True, **kwargs):
+            # Raw-store replay: no gate attempt and no request, like the transport.
+            key = (url, tuple(sorted(params.items())))
+            if not force_refresh and key in self.raw:
+                return self.raw[key]
             self.before_attempt()
             self.calls.append((url, params))
             if url.endswith("/roster"):
@@ -258,9 +268,10 @@ def runner(tmp_path, monkeypatch):
                     data = page(int(params.get("page", "1")))
             else:
                 data = stats(0.2)
-            return SimpleNamespace(json_data=data, raw_uri=payload.raw.raw_uri,
-                                   content_hash=payload.raw.raw_sha256,
-                                   fetched_at=now.isoformat())
+            self.raw[key] = SimpleNamespace(json_data=data, raw_uri=payload.raw.raw_uri,
+                                            content_hash=payload.raw.raw_sha256,
+                                            fetched_at=now.isoformat())
+            return self.raw[key]
 
         def flush(self):
             self.flushes += 1
@@ -786,12 +797,12 @@ def test_player_identity_errors_defer_without_marker(runner, fault):
     assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
 
 
-def test_interrupted_players_stay_pending_and_resume_without_duplicates(runner):
+def test_interrupted_players_resume_from_raw_without_deferral(runner):
     original = runner.client.fetch_json
     seen = []
 
     def interrupted(url, endpoint, params, **kwargs):
-        if "/roster/" in url:
+        if "/roster/" in url and url not in seen:
             seen.append(url)
             if len(seen) == 5:
                 raise LaneClosed("deadline during players")
@@ -802,13 +813,49 @@ def test_interrupted_players_stay_pending_and_resume_without_duplicates(runner):
     assert all(json.loads(row["deep_stats_json"])["players_state"] == "pending"
                for row in runner.bronze.tables["espn_team_stats"])
     assert not any(_deep(row) for row in runner.bronze.tables["espn_match_lineup"])
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
     lineup_rows = len(runner.bronze.tables["espn_match_lineup"])
-    later = runner.args["now_fn"]() + timedelta(days=1)
-    runner.args.update(now_fn=lambda: later, deadline=later + timedelta(minutes=12))
-    runner.client.fetch_json = original
+    # The very next run (no day passes) finishes the match from raw plus the rest.
+    flushes = runner.client.flushes
     assert deep.run_deep(**runner.args)["players_completed"] == 1
+    urls_ = _player_urls(runner.client.calls)
+    assert len(urls_) == len(set(urls_)) == 2 + len(_played(runner.bronze))
+    assert runner.client.flushes - flushes >= len(_played(runner.bronze))
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
     assert len(runner.bronze.tables["espn_match_lineup"]) == lineup_rows
     assert len(runner.bronze.tables["espn_team_stats"]) == 2
+
+
+def test_stale_player_raw_is_fetched_again(runner):
+    deep.run_deep(**runner.args)
+    for row in runner.bronze.tables["espn_team_stats"]:
+        envelope = json.loads(row["deep_stats_json"])
+        row["deep_stats_json"] = json.dumps({**envelope, "players_state": "pending"})
+    runner.client.calls.clear()
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert not _player_urls(runner.client.calls)
+    later = runner.args["now_fn"]() + deep.PLAYER_RAW_TTL + timedelta(minutes=1)
+    runner.args.update(now_fn=lambda: later, deadline=later + timedelta(minutes=12))
+    for row in runner.bronze.tables["espn_team_stats"]:
+        envelope = json.loads(row["deep_stats_json"])
+        row["deep_stats_json"] = json.dumps({**envelope, "players_state": "pending"})
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert len(_player_urls(runner.client.calls)) == 2 + len(_played(runner.bronze))
+
+
+def test_not_applicable_players_requeue_after_lineup_is_captured(runner):
+    runner.bronze.tables["espn_match"][0]["lineup_state"] = "valid_empty"
+    assert deep.run_deep(**runner.args)["players_not_applicable"] == 1
+    # A recheck Summary captures the lineup; carry keeps not_applicable.
+    write_tournament_batch(_batch(_match(1, "aa")), trino=runner.bronze)
+    assert runner.bronze.tables["espn_match"][0]["lineup_state"] == "captured"
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "not_applicable"
+               for row in runner.bronze.tables["espn_team_stats"])
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "completed"
+               for row in runner.bronze.tables["espn_team_stats"])
+    assert {(row["team_id"], row["athlete_id"]) for row in runner.bronze.tables["espn_match_lineup"]
+            if _deep(row)} == _played(runner.bronze)
 
 
 def test_players_publication_repeat_and_summary_preserve_lineup_statistics():

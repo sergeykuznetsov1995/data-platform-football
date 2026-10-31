@@ -248,13 +248,16 @@ continue to apply; no new DAG or manual queue population is needed.
 The second stage runs inside the same `run_deep`, per full current-season edition,
 after every first-stage match of that edition; the same gate, 20% deep quota and
 `check()` apply. Its queue is matches with `deep_state=completed` whose two team
-envelopes have `players_state=pending`. A match without `lineup_state=captured`
-becomes `players_state=not_applicable` without requests. Otherwise both core
+envelopes have `players_state=pending`, or `not_applicable` once a later Summary
+captured the lineup. A match without `lineup_state=captured` becomes
+`players_state=not_applicable` without requests. Otherwise both core
 rosters are read; statistics (`.../roster/{athlete}/statistics/0`) are requested
 only for players who started or came on. Played roster ids must be lineup athletes
 of the same team, roster duplicates and a foreign athlete in a statistics answer
-are errors; failed matches go to `iceberg.ops.espn_deep_player_retry_v1` for a day,
-recorded before I/O. Raw bodies are flushed before publication.
+are errors; such failures go to `iceberg.ops.espn_deep_player_retry_v1` for a day.
+An interruption (deadline, stop, live debt, gate) leaves no deferral: every roster
+and player body is flushed to raw at once, and the next run replays bodies younger
+than 12 hours from raw without requests, so a match spanning several runs completes.
 
 Under the edition lock, played rows of `espn_match_lineup.deep_stats_json` receive
 `{parser_version, has_xg, statistics, manifest}`, then both team envelopes get
