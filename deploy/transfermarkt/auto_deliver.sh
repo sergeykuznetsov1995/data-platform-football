@@ -90,6 +90,8 @@ ACCEPT_POLL=${ACCEPT_POLL:-20}
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}   # провальных попыток подряд до выключателя (имя — прежнее)
 DRAIN_MAX=${DRAIN_MAX:-3600}       # дренаж дольше часа (порция 45 мин + запас) — прерывается
+DRAIN_POLL=${DRAIN_POLL:-240}      # внутри тика ждём конца порции до 4 мин (тик — раз в 5 мин)
+DRAIN_POLL_STEP=${DRAIN_POLL_STEP:-15}
 ROLLBACK_RESERVE=${ROLLBACK_RESERVE:-600}  # зазор до прогона registry сверх NEED_BUDGET (в нём уже откат)
 BUSY_RETRY=${BUSY_RETRY:-21600}    # полоса не освободилась / rc=4: тот же sha — не раньше чем через 6 ч
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
@@ -364,6 +366,23 @@ outer_busy(){
 }
 
 # --- дренаж полосы (#2039) ---------------------------------------------------------------
+# Флаг для расписания TM (TransfermarktCurrentTimetable.DRAIN_FLAG, в контейнерах —
+# /opt/airflow/gateway-state/delivery-drain-until): epoch «до когда» новые порции не стартуют;
+# идущая дорабатывает свой допуск. Просрочка — страховка на случай смерти автомата.
+drain_flag(){ printf '%s/gateway-state/delivery-drain-until' "${TRANSFERMARKT_RUNTIME_DIR:-}"; }
+flag_until(){ head -c 32 "$(drain_flag)" 2>/dev/null | tr -cd '0-9'; }
+flag_set(){  # атомарно: tmp + mv, 0644 — планировщик читает его под uid 50000
+  local f
+  f=$(drain_flag)
+  if odd_path "$f" || odd_path "$f.tmp"; then log "на месте флага дренажа $f не обычный файл"; return 1; fi
+  if { printf '%s\n' "$(( $(date -u +%s) + DRAIN_MAX ))" > "$f.tmp" && chmod 0644 "$f.tmp" && mv -f "$f.tmp" "$f"; } 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$f.tmp" 2>/dev/null
+  log "флаг дренажа $f не записан"
+  return 1
+}
+flag_clear(){ is_plain "$(drain_flag)" && { rm -f "$(drain_flag)" 2>/dev/null || log "флаг дренажа $(drain_flag) не убран — истечёт сам"; }; return 0; }
 # Файл $DRAIN: TARGET, STARTED_AT (epoch), PAUSED_<dag>=t|f — паузы полосы ДО дренажа. Пишется
 # ДО паузы, убирается после возврата пауз или когда снимок отката уже несёт эти значения.
 drain_get(){ sed -n "s/^$1=//p" "$DRAIN" 2>/dev/null | head -1; }
@@ -383,6 +402,7 @@ drain_release(){  # вернуть паузы полосы из файла и у
 # Прервать дренаж (если он идёт): паузы полосы — как до него. Не вернулись — сбор стоял бы
 # молча: выключатель и руки.
 drain_abort(){  # drain_abort <причина>
+  flag_clear
   is_plain "$DRAIN" || return 0
   if drain_release; then
     log "дренаж прерван ($1): паузы полосы возвращены"
@@ -794,6 +814,7 @@ fi
 
 # ============================ Шаг 3: незакрытая доставка ============================
 if is_plain "$INFLIGHT"; then
+  flag_clear   # дренаж кончился вместе с оборванной доставкой
   OLD=$(snap_get OLD_RELEASE_ROOT)
   WIN_INFL=$(snap_get WINDOW_ID)
   infl_close(){ [ -n "$WIN_INFL" ] || return 0; window_close "$WIN_INFL" "$1" "$2" "$3" force; }
@@ -993,7 +1014,7 @@ else
     window_note "метабаза не ответила про ближайший прогон registry"
     exit 0
   fi
-  if is_plain "$DRAIN"; then
+  if is_plain "$DRAIN" || is_plain "$(drain_flag)"; then
     outer=$(outer_busy)
     if [ "$outer" = X ] || [ -z "$outer" ]; then
       log "метабаза не ответила про прогоны registry/silver — дренаж ждёт следующего тика"
@@ -1006,6 +1027,7 @@ else
     fi
     started=$(drain_get STARTED_AT)
     case "$started" in ''|*[!0-9]*) started=0 ;; esac
+    is_plain "$DRAIN" || started=$(( $(flag_until) + 0 - DRAIN_MAX ))
     why=""
     [ $(( now - started )) -ge "$DRAIN_MAX" ] && why="полоса не освободилась за ${DRAIN_MAX}s"
     [ -z "$why" ] && [ $(( deadline - now )) -lt "$NEED_BUDGET" ] \
@@ -1026,20 +1048,32 @@ else
     window_note "мало запаса до ближайшего прогона registry: $(( deadline - now )) с"
     exit 0
   fi
-  # Пауза — только на границе порций: Airflow 2 не двигает прогон паузного DAG, и пауза
-  # посреди порции заморозила бы её до распаузы. Пока порция идёт — ждём без паузы.
-  busy=$(contour_busy)
-  if [ "$busy" != 0 ]; then
-    log "контур занят (running-прогонов и задач TM в работе: '$busy'; X = метабаза недоступна) — жду конца порции"
-    window_note "контур занят (running-прогонов и задач TM в работе: '$busy')"
-    exit 0
-  fi
   # Попытка начинается: открытая запись (продолжение) или новая.
   if [ -z "$WIN" ] && ! window_open "$WANT"; then
     log "запись попытки не создаётся — доставку не начинаю"
     set_off
     tg_durable "Transfermarkt: не могу создать запись попытки в $STATE — исход доставки ${WANT:0:8} потерялся бы. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     exit 1
+  fi
+  # Пауза — только на границе порций: Airflow 2 не двигает прогон паузного DAG, и пауза
+  # посреди порции заморозила бы её до распаузы. Флаг дренажа не даёт стартовать новой
+  # порции; конец идущей ловим опросом внутри тика, не пойман — продолжит следующий тик.
+  busy=$(contour_busy)
+  if [ "$busy" != 0 ]; then
+    if ! is_plain "$DRAIN" && ! is_plain "$(drain_flag)"; then
+      flag_set || { window_note "флаг дренажа не записан"; exit 0; }
+      log "ДРЕНАЖ: флаг до $(flag_until) — новые порции не стартуют, жду конца идущей"
+    fi
+    poll_end=$(( $(date -u +%s) + DRAIN_POLL ))
+    while [ "$busy" != 0 ] && [ "$(date -u +%s)" -lt "$poll_end" ]; do
+      sleep "$DRAIN_POLL_STEP"
+      busy=$(contour_busy)
+    done
+  fi
+  if [ "$busy" != 0 ]; then
+    log "контур занят (running-прогонов и задач TM в работе: '$busy'; X = метабаза недоступна) — жду конца порции"
+    window_note "контур занят (running-прогонов и задач TM в работе: '$busy')"
+    exit 0
   fi
   if ! is_plain "$DRAIN"; then
     drain_start || exit 0
@@ -1192,6 +1226,7 @@ if [ "$rc" = 124 ]; then
   kill -KILL -"$dpid" 2>/dev/null
 fi
 log "deploy.sh вернул $rc"
+flag_clear   # выкат кончился (успех, провал или rc=4): новые порции снова допускаются
 
 # ============================ Шаг 10: исход ============================
 # rc=4 — «контур занят или замок занят, выкат не начат»: не провал кода, а «не сейчас»

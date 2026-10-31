@@ -54,7 +54,11 @@ case "$cmd" in
         *last_parsed_time*) cat "$S/dags" ;;
         *import_error*) cat "$S/import_errors" 2>/dev/null || echo 0 ;;
         *next_dagrun_create_after*) cat "$S/next_run" 2>/dev/null || echo 0 ;;
-        *task_instance*) cat "$S/busy" 2>/dev/null || echo 0 ;;
+        *task_instance*)
+          # busy_countdown: порция идёт ещё N опросов простоя, потом контур пуст.
+          if [ -e "$S/busy_countdown" ]; then
+            n=$(cat "$S/busy_countdown"); [ "$n" -gt 0 ] && { echo $(( n - 1 )) > "$S/busy_countdown"; echo 1; } || echo 0
+          else cat "$S/busy" 2>/dev/null || echo 0; fi ;;
         *"state IN ('queued','running')"*) cat "$S/registry_busy" 2>/dev/null || echo 0 ;;
         *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" ;;
         *slot_pool*) pool=${sql#*pool=\'}; pool=${pool%%\'*}
@@ -179,11 +183,12 @@ class Stand:
             f"{tree}/{p}" for p in ("dags", "deploy/transfermarkt/.airflowignore", "scrapers", "scripts", "configs")))
         self.put(f"mounts_{GW}", str(tree))
 
-    def run(self) -> subprocess.CompletedProcess[str]:
+    def run(self, **extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(self.automat)],
             env={"PATH": os.environ["PATH"], "TRANSFERMARKT_ENV_FILE": str(self.env_file),
-                 "ACCEPT_WAIT": "2", "ACCEPT_POLL": "1"},
+                 "ACCEPT_WAIT": "2", "ACCEPT_POLL": "1", "DRAIN_POLL": "2", "DRAIN_POLL_STEP": "1",
+                 **extra},
             capture_output=True, text=True, timeout=120,
         )
 
@@ -699,6 +704,7 @@ class Delivery(Stand):
         for dag in DAGS:
             self.put(f"paused_{dag}", "f" if "ingest" in dag or "discover" in dag else "t")
         self.next_run(6 * 3600)
+        (self.runtime / "gateway-state").mkdir()
 
     def next_run(self, seconds: int) -> None:
         self.put("next_run", str(int(time.time()) + seconds))
@@ -708,6 +714,12 @@ class Delivery(Stand):
 
     def drain(self) -> Path:
         return self.auto / "transfermarkt-drain.env"
+
+    def flag(self) -> Path:
+        return self.runtime / "gateway-state" / "delivery-drain-until"
+
+    def put_flag(self, until_in: int) -> None:
+        self.flag().write_text(f"{int(time.time()) + until_in}\n", encoding="utf-8")
 
     def latch(self, sha: str | None = None) -> Path:
         return self.auto / f"transfermarkt-auto-deliver-attempted-{(sha or self.new_sha)[:8]}"
@@ -753,20 +765,78 @@ def test_any_hour_with_a_free_lane_delivers(delivery: Delivery) -> None:
 
 
 @pytest.mark.unit
-def test_a_running_portion_is_not_paused_the_lane_is_drained_at_its_end(delivery: Delivery) -> None:
-    # Пауза посреди порции заморозила бы её прогон (Airflow 2): ждём границы без паузы.
+def test_a_running_portion_is_not_paused_the_flag_stops_new_ones_and_the_next_tick_delivers(
+    delivery: Delivery,
+) -> None:
+    # Пауза посреди порции заморозила бы её прогон (Airflow 2): флаг для расписания, без паузы.
     delivery.put("busy", "1")
     result = delivery.run()
     assert result.returncode == 0, result.stderr
     assert not delivery.deployed() and not delivery.drain().exists()
     assert delivery.paused("dag_ingest_transfermarkt") == "f"
     assert "жду конца порции" in delivery.log()
+    until = int(delivery.flag().read_text())
+    assert 3500 < until - time.time() <= 3600
+    assert delivery.flag().stat().st_mode & 0o777 == 0o644
     delivery.put("busy", "0")
     result = delivery.run()
     assert result.returncode == 0, result.stderr + delivery.log()
-    assert delivery.deployed()
+    assert delivery.deployed() and not delivery.flag().exists()
     assert "ДРЕНАЖ: ставлю на паузу" in delivery.log()
     _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_the_end_of_the_portion_is_caught_by_polling_inside_the_tick(delivery: Delivery) -> None:
+    delivery.put("busy_countdown", "2")
+    result = delivery.run(DRAIN_POLL="10")
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert delivery.deployed() and not delivery.flag().exists()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("deploy_rc", ["0", "4", "6"])
+def test_the_flag_is_removed_after_every_deploy_outcome(delivery: Delivery, deploy_rc: str) -> None:
+    delivery.put("busy_countdown", "1")
+    delivery.put("deploy_rc", deploy_rc)
+    delivery.run(DRAIN_POLL="10")
+    assert delivery.deployed(), delivery.log()
+    assert not delivery.flag().exists()
+
+
+@pytest.mark.unit
+def test_an_expired_flag_with_a_busy_lane_is_a_drain_timeout(delivery: Delivery) -> None:
+    delivery.put_flag(-10)
+    delivery.put("busy", "1")
+    assert delivery.run().returncode == 0
+    assert not delivery.flag().exists() and not delivery.deployed()
+    assert delivery.latch().read_text().startswith("busy ")
+    [rec] = delivery.records().values()
+    assert rec["OUTCOME"] == "failed", rec
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("abort", ["off", "registry", "live_is_master", "headroom", "interrupted_delivery"])
+def test_every_drain_abort_removes_the_flag(delivery: Delivery, abort: str) -> None:
+    delivery.put_flag(1800)
+    delivery.put("busy", "1")
+    if abort == "off":
+        (delivery.auto / "transfermarkt-auto-deliver.off").write_text("")
+    elif abort == "registry":
+        delivery.put("registry_busy", "1")
+    elif abort == "live_is_master":
+        _git(delivery.source, "update-ref", "refs/heads/master", delivery.old_sha)
+    elif abort == "headroom":
+        delivery.next_run(3600)
+    else:
+        delivery.put_drain(started_ago=60)
+        snapshot = [f"OLD_RELEASE_ROOT={delivery.live}", f"NEW_RELEASE_ROOT={delivery.target}",
+                    "WINDOW_ID=2026-09-24"] + [f"PAUSED_{d}=t" for d in DAGS]
+        (delivery.auto / "transfermarkt-rollback.env").write_text("\n".join(snapshot) + "\n")
+        (delivery.auto / "transfermarkt-inflight").write_text("")
+    delivery.run()
+    assert not delivery.flag().exists(), delivery.log()
 
 
 @pytest.mark.unit
