@@ -140,3 +140,106 @@ class TestFallbackFilesExcluded:
         assert 'sofifa_player_profile' in stems
         # No `*_empty` stem leaks through the filter.
         assert not any(s.endswith(mod.FALLBACK_SUFFIX) for s in stems)
+
+
+# ---- Charter §8: FotMob core schema (#2016) --------------------------------
+
+_FOTMOB_CORE = {
+    'context_columns': ['competition_id', 'source_season_key'],
+    'lineage_columns': [{'name': '_bronze_ingested_at', 'type': 'TIMESTAMP(6)'}],
+    'tables': {
+        'fotmob_matches': {
+            'scope': 'context',
+            'columns': [
+                {'name': 'competition_id', 'type': 'BIGINT'},
+                {'name': 'source_season_key', 'type': 'VARCHAR'},
+                {'name': 'match_id', 'type': 'BIGINT'},
+                {'name': 'kickoff_utc', 'type': 'TIMESTAMP(6) WITH TIME ZONE'},
+            ],
+            'raw_json': [{'name': 'h2h_json'}],
+        },
+        'fotmob_players': {
+            'scope': 'global',
+            'columns': [{'name': 'player_id', 'type': 'BIGINT'}],
+        },
+    },
+}
+
+_MATCHES_OK = [('competition_id', 'bigint'), ('source_season_key', 'varchar'),
+               ('match_id', 'bigint'), ('kickoff_utc', 'timestamp(6) with time zone'),
+               ('h2h_json', 'varchar'), ('_bronze_ingested_at', 'timestamp(6)'),
+               ('_silver_created_at', 'timestamp(6)')]
+
+
+_CORES = {'fotmob': _FOTMOB_CORE}
+
+
+def _schema(table, cols, cores=_CORES):
+    return mod.audit_schema(_FakeCursor(cols), table, cores)
+
+
+class TestFotmobCoreSchema:
+    def test_declared_context_table_without_league_season_is_clean(self):
+        assert _schema('fotmob_matches', _MATCHES_OK) == []
+
+    def test_global_profile_needs_no_context_columns(self):
+        cols = [('player_id', 'bigint'), ('_bronze_ingested_at', 'timestamp(6)'),
+                ('_silver_created_at', 'timestamp(6)')]
+        assert _schema('fotmob_players', cols) == []
+
+    def test_missing_context_column_is_error(self):
+        cols = [c for c in _MATCHES_OK if c[0] != 'source_season_key']
+        rules = {(f['rule'], f['sev']) for f in _schema('fotmob_matches', cols)}
+        assert ('S1', 'ERROR') in rules and ('S4', 'ERROR') in rules
+
+    def test_type_drift_is_error(self):
+        cols = [(n, 'varchar' if n == 'competition_id' else t) for n, t in _MATCHES_OK]
+        found = _schema('fotmob_matches', cols)
+        assert [f['sev'] for f in found if f['rule'] == 'S4'] == ['ERROR']
+
+    def test_undeclared_column_is_warn(self):
+        found = _schema('fotmob_matches', _MATCHES_OK + [('extra_col', 'varchar')])
+        assert [(f['rule'], f['sev']) for f in found] == [('S4', 'WARN')]
+
+    def test_other_sources_keep_league_season_and_bare_id_rules(self):
+        # The FotMob rules must not weaken the charter for any other source.
+        found = _schema('sofascore_shots', [('shot_id', 'bigint'),
+                                            ('_silver_created_at', 'timestamp(6)')])
+        rules = {(f['rule'], f['sev']) for f in found}
+        assert ('S1', 'ERROR') in rules and ('S3', 'WARN') in rules
+
+    def test_undeclared_fotmob_table_falls_back_to_standard_rules(self):
+        found = _schema('fotmob_shots', [('shot_id', 'bigint'),
+                                         ('_silver_created_at', 'timestamp(6)')])
+        assert {f['rule'] for f in found} >= {'S1', 'S3'}
+
+
+class TestFotmobCoreLayerA:
+    def _audit(self, tmp_path, stem):
+        f = tmp_path / f'{stem}.sql.j2'
+        f.write_text('SELECT match_id FROM iceberg.bronze.fotmob_matches_current\n')
+        return mod.audit_file(f, _CORES)
+
+    def test_undeclared_fotmob_file_is_unsanctioned_error(self, tmp_path):
+        found = self._audit(tmp_path, 'fotmob_match_extras')
+        assert [f['rule'] for f in found if f['sev'] == 'ERROR'] == ['R7']
+        assert mod.has_unsanctioned_error('fotmob_match_extras', found)
+
+    def test_declared_fotmob_file_skips_naming_heuristic(self, tmp_path):
+        # 'fotmob_players' has a grain token anyway; use a declared name without one.
+        cores = {'fotmob': {'tables': {'fotmob_standings': {'scope': 'context'}}}}
+        f = tmp_path / 'fotmob_standings.sql'
+        f.write_text('SELECT 1 AS x FROM iceberg.bronze.fotmob_standings_current\n')
+        assert mod.audit_file(f, cores) == []
+
+    def test_non_fotmob_naming_rule_unchanged(self, tmp_path):
+        f = tmp_path / 'sofascore_standings.sql'
+        f.write_text('SELECT 1 AS x FROM iceberg.bronze.sofascore_standings\n')
+        assert [f_['rule'] for f_ in mod.audit_file(f, _CORES)] == ['R5']
+
+    def test_only_fotmob_is_a_core_schema_source(self):
+        # #2016 registers FotMob only; other sources opt in with their own schema file.
+        assert set(mod.CORE_SCHEMAS) == {'fotmob'}
+
+    def test_missing_schema_file_loads_empty(self, tmp_path):
+        assert mod._load_yaml(tmp_path / 'absent.yaml') == {}

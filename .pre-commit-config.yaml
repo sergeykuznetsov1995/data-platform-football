@@ -13,5 +13,5 @@ repos:
         name: Silver Charter audit (Layer A)
         entry: python scripts/audit_silver_charter.py --check
         language: system
-        files: ^dags/sql/silver/.*\.sql(\.j2)?$
+        files: ^(dags/sql/silver/.*\.sql(\.j2)?|configs/medallion/fotmob_silver/core_schema\.yaml)$
         pass_filenames: false

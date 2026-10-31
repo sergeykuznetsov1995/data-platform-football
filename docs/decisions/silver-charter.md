@@ -79,6 +79,9 @@ many rows is a derivation (forbidden). `100*acc/total` on a match-row = OK;
 
 Every Silver table MUST have:
 
+> Sources with a declared core schema (§8; today only FotMob) replace the partition/season/
+> key-naming rules below with §8. Everything else in this section applies to them unchanged.
+
 - **Partition keys** (last in SELECT): `league` (varchar), `season` (varchar slug `'2425'`).
   Partitioning `ARRAY['league','season']` is applied by `run_silver_transform` — do **not**
   write it in SQL.
@@ -106,7 +109,7 @@ in `_build_silver_checks()` (`dags/utils/silver_tasks.py`).
 
 - Resolved canonical id → **`{entity}_id_canonical`** (`player_id_canonical`, `team_id_canonical`).
 - Raw passthrough id → **`{entity}_id_raw`** (precedent: `whoscored_events_spadl`).
-- Bare `*_id` is ambiguous (raw or canonical?) → checker S4 warns.
+- Bare `*_id` is ambiguous (raw or canonical?) → checker S3 warns.
 - Reserved-word / digit-leading column names → double-quoted (`"int"`, `"off"`, `"2crdy"`).
 
 ---
@@ -136,8 +139,10 @@ The checker `scripts/audit_silver_charter.py` runs two layers:
   - `R4 CROSS_SOURCE_JOIN` (WARN) — ≥2 distinct `{source}_` prefixes in FROM/JOIN (xref excepted).
   - `R5 NAMING` (WARN) — file name not matching `{source}_{entity}_{grain}`.
   - `R6 NO_DDL` (ERROR) — file contains `CREATE TABLE`/`INSERT`.
+  - `R7 CORE_SCHEMA` (ERROR) — file of a §8 source not declared in its core schema.
 - **Layer B (schema, Trino `DESCRIBE`):** presence of `_silver_created_at` / `league` /
   `season`; `season` is varchar not bigint; bare `*_id` naming drift.
+  §8 core-schema tables: `S4` columns/types vs the schema instead (§8).
 
 **Verdicts:** `COMPLIANT` · `EXCEPTION` (rule-violating but sanctioned in §7, stays) ·
 `VIOLATOR` (issue filed for Gold migration, not done yet).
@@ -197,7 +202,44 @@ FotMob / MatchHistory branches.
 
 ---
 
-## 8. Changelog
+## 8. Source core schemas (amendment, #2016)
+
+A source may declare its Silver core table-by-table in `configs/medallion/<source>_silver/core_schema.yaml`
+(registered in `CORE_SCHEMAS` of the checker). For such a source — and **only** for the tables its
+schema declares — the rules below replace the §4 partition/season/key-naming rules. Every other
+source keeps §4 unchanged. Registered: **FotMob** (#2016, owner decisions 2026-10-31,
+`docs/legacy-root/FOTMOB-SILVER-GRILL-2026-10-31.md`, epic #1677).
+
+1. **Source context instead of the `(league, season)` slug.** Context-scoped tables are keyed and
+   partitioned by the schema's `context_columns` — the source's own competition and season keys.
+   No `league` / `season` column; the slug is derived where the source meets other sources (Gold /
+   xref). *FotMob:* `(competition_id BIGINT, source_season_key VARCHAR)` — the exact FotMob season
+   string (`'2026 - Apertura'`). Split seasons: a match is stored **once**, under the most precise
+   key; the parent key lives in `fotmob_competition_seasons.parent_season_key`. Standings and
+   leaderboards stay under the key FotMob served them with.
+2. **Global profiles** (`scope: global` — e.g. `fotmob_players`, `fotmob_teams`, careers, market
+   values, squads, transfers) carry no context columns and are unpartitioned.
+3. **Raw remainder columns `*_json` are allowed** (VARCHAR holding JSON): sections or array
+   elements the core does not decompose stay in the table they belong to, so no source field is
+   lost. New typed tables/columns are added on analyst request through the core schema.
+4. **Ids are source ids.** Without xref enrichment in this layer, bare `*_id` columns mean the
+   source id (S3 not applied). *FotMob:* an unusable player id (0 / missing) becomes NULL with
+   `opta_id` + `local_player_key` alongside; the row is kept.
+5. **Optional-field conform failures** → NULL in the column plus `{column, raw, reason}` in the
+   row's `_conform_issues_json` (FotMob owner decision 2026-10-09 #2).
+
+Unchanged: pure SELECT (R6), dedup canon (§4; FotMob orders by `_observed_at` then
+`_ingested_at`), the Silver/Gold boundary (§2, R1), R2/R4, and the xref predicate (R3) whenever
+xref is joined. FotMob Silver reads only the confirmed `bronze.fotmob_*_current` views.
+
+Checker: **R7** (Layer A, ERROR) — a SQL file of a registered source not declared in its core
+schema; declared names are exempt from R5. **S4** (Layer B) — a declared table's columns and types
+must match the schema (missing/mistyped = ERROR, undeclared = WARN); S1 requires the context
+columns for context-scoped tables instead of `league`/`season`.
+
+---
+
+## 9. Changelog
 
 | Date | Change | Ref |
 |---|---|---|
@@ -206,3 +248,4 @@ FotMob / MatchHistory branches.
 | 2026-06-08 | `sofascore_team_match` R2 resolved (#367): the cross-entity `minutes`/`assists` rollup from `silver.sofascore_player_match_aggregate` was dropped (it never matched on team_id — always NULL); columns kept as NULL placeholders to preserve the downstream schema. Table is now COMPLIANT single-source conform. | #367 |
 | 2026-06-08 | `match_cards` / `match_substitutions` moved REVIEW→EXCEPTION (cross-source E3/E4 facts feeding thin `gold.fct_card` / `fct_substitution`); Gold migration tracked separately. | #368 / #382 |
 | 2026-06-08 | #370 team-wave: 4 `*_team_season` rollups migrated Silver→Gold (`gold.*_team_season`, Stage 1.5 of `dag_transform_fbref_gold`); `fct_team_season_stats` + audit repointed; `fbref_team_season_profile` reclassified COMPLIANT; R1 detector tightened to require a match/event source. | #370 |
+| 2026-10-31 | §8 source core schemas (first: FotMob): source context instead of the slug, global profiles, raw `*_json` remainder, source ids; checker R7 + S4. | #2016 |
