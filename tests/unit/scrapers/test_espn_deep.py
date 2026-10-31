@@ -52,6 +52,19 @@ def test_xg_placeholder_and_real_zero(count, support, value, expected):
     assert parser.play_values({"id": "1", "expectedGoals": value}, support)["xg"] == expected
 
 
+@pytest.mark.parametrize("support,value,expected", [
+    (None, 0.0, None), (False, 0.0, None), (True, 0.0, 0.0), (True, 0.4, 0.4)])
+def test_derived_xg_statistics_are_masked(support, value, expected):
+    body = {"splits": {"categories": [{"name": "goalKeeping", "stats": [
+        {"name": "expectedGoalsConceded", "value": value, "displayValue": str(value)}]}]},
+        "expectedAssistsSetPlay": value}
+    masked = parser.mask_xg(parser.statistics(body), support)
+    stat = masked["splits"]["categories"][0]["stats"][0]
+    assert (stat["value"], masked["expectedAssistsSetPlay"]) == (expected, expected)
+    assert stat["displayValue"] == (None if expected is None else str(value))
+    assert parser.xg_support([body]) is (True if value else None)
+
+
 def test_xg_requires_content_evidence():
     assert parser.xg_support([stats(0.0)]) is None
     assert parser.xg_support([stats()]) is False

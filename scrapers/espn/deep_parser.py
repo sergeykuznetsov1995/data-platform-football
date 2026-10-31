@@ -10,7 +10,9 @@ from .core_lists import _count, raise_on_error_body
 from .parser_common import EspnParseError, canonical_json, native_id, required_mapping
 
 PARSER_VERSION = "espn-deep-v1"
-_XG = frozenset({"expectedgoals", "expectedassists", "expectedgoalsontarget", "xg", "xa", "xgot"})
+# Derived names (expectedGoalsConceded, expectedAssistsSetPlay, ...) share the prefixes.
+_XG_PREFIXES = ("expectedgoals", "expectedassists")
+_XG_SHORT = frozenset({"xg", "xa", "xgot"})
 
 
 def deep_level(count: int) -> str | None:
@@ -25,7 +27,8 @@ def deep_level(count: int) -> str | None:
 
 
 def _xg_key(key: str) -> bool:
-    return re.sub(r"[^a-z]", "", key.lower()) in _XG
+    name = re.sub(r"[^a-z]", "", key.lower())
+    return name in _XG_SHORT or name.startswith(_XG_PREFIXES)
 
 
 def number(value):
