@@ -32,7 +32,7 @@ from .journal import flush_journal, journal_rows
 from .parallel import interruptible_sleep, protected
 from .parser_common import EspnParseError, canonical_json
 from .transport_contracts import (AllOriginsBlocked, DailyCapExceeded, EndpointType,
-                                  LaneClosed, EspnTransportError)
+                                  InvalidJsonError, LaneClosed, EspnTransportError)
 from .wave import _fetch, _raw_ref
 
 _PLAYER_ENDPOINTS = (EndpointType.ROSTER, EndpointType.PLAYER_STATISTICS)
@@ -253,15 +253,23 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         check()
         return _fetch(client, request, force_refresh=refresh)
 
-    def fetch_player(request):
-        result = fetch(request, refresh=False)
-        fetched = _raw_ref(result).fetched_at
-        if fetched.tzinfo is None:
-            fetched = fetched.replace(tzinfo=timezone.utc)
-        if now_fn() - fetched > PLAYER_RAW_TTL:
-            result = fetch(request)
-        client.flush()  # each body survives an interruption of the match
-        return result
+    def fetch_player(request, parse):
+        """Raw replay first; a stale or unreadable cached body is requested once more."""
+        try:
+            result = fetch(request, refresh=False)
+            fetched = _raw_ref(result).fetched_at
+            if fetched.tzinfo is None:
+                fetched = fetched.replace(tzinfo=timezone.utc)
+            if now_fn() - fetched <= PLAYER_RAW_TTL:
+                value = parse(result.json_data)
+                client.flush()  # each body survives an interruption of the match
+                return result, value
+        except (InvalidJsonError, EspnParseError):
+            # A corrupt cached body must not defer the match every day.
+            pass
+        result = fetch(request)
+        client.flush()
+        return result, parse(result.json_data)
 
     def teams_for(slug, event_id, home, away, manifest):
         teams = {}
@@ -288,17 +296,17 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         manifest, rosters, players = [], {}, {}
         for side in ("home", "away"):
             team_id = int(match[f"{side}_team_id"])
-            result = fetch_player(urls.roster(slug, event_id, team_id))
-            rosters[team_id] = parse_roster(result.json_data)
+            result, rosters[team_id] = fetch_player(urls.roster(slug, event_id, team_id), parse_roster)
             manifest.append({"team_id": team_id, **_manifest(result)})
         # Identity first: a foreign roster spends no player requests.
         _check_roster(rosters, lineup)
         for team_id, roster in rosters.items():
             for athlete, played in roster.items():
                 if played:
-                    result = fetch_player(urls.player_statistics(slug, event_id, team_id, athlete))
-                    players[(team_id, athlete)] = (player_statistics(result.json_data, athlete),
-                                                   {"athlete_id": athlete, **_manifest(result)})
+                    result, body = fetch_player(
+                        urls.player_statistics(slug, event_id, team_id, athlete),
+                        lambda data, athlete=athlete: player_statistics(data, athlete))
+                    players[(team_id, athlete)] = (body, {"athlete_id": athlete, **_manifest(result)})
         support = xg_support([body for body, _ in players.values()])
         has_xg = True if depth.has_xg is True or support is True else depth.has_xg
         if has_xg is True and depth.has_xg is not True:

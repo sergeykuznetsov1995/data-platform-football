@@ -1028,3 +1028,31 @@ def test_players_wait_for_first_stage_marker_and_raw_flush(runner):
     assert deep.run_deep(**runner.args)["players_completed"] == 1
     lineup = events.index("espn_match_lineup")
     assert "flush" in events[events.index("espn_match") + 1:lineup]
+
+
+@pytest.mark.parametrize("corruption", ["invalid_json", "unparsable"])
+def test_unreadable_cached_player_body_is_fetched_again(runner, corruption):
+    from scrapers.espn.transport_contracts import InvalidJsonError
+    original = runner.client.fetch_json
+    target = []
+
+    def poisoned(url, endpoint, params, force_refresh=True, **kwargs):
+        if "/roster/" in url and not target:
+            target.append(url)
+        if url in target and not force_refresh and any(key[0] == url for key in runner.client.raw):
+            if corruption == "invalid_json":
+                raise InvalidJsonError("Cached ESPN raw body is not valid JSON")
+            runner.client.raw[next(key for key in runner.client.raw if key[0] == url)].json_data = {"splits": None}
+        return original(url, endpoint, params, force_refresh=force_refresh, **kwargs)
+
+    runner.client.fetch_json = poisoned
+    # A fresh cached body, unreadable on replay: the stage requests it again at once.
+    first = deep.run_deep(**runner.args)
+    assert first["players_completed"] == 1
+    for row in runner.bronze.tables["espn_team_stats"]:
+        row["deep_stats_json"] = json.dumps({**json.loads(row["deep_stats_json"]), "players_state": "pending"})
+    runner.client.calls.clear()
+    report = deep.run_deep(**runner.args)
+    assert report["players_completed"] == 1 and report["players_failed"] == 0
+    assert _player_urls(runner.client.calls) == target
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
