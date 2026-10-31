@@ -53,13 +53,16 @@ case "$cmd" in
       case "$sql" in
         *last_parsed_time*) cat "$S/dags" ;;
         *import_error*) cat "$S/import_errors" 2>/dev/null || echo 0 ;;
+        *timetable_description*) cat "$S/lane" 2>/dev/null || echo "Ldag_backfill_transfermarkt,dag_ingest_transfermarkt" ;;
         *next_dagrun_create_after*) cat "$S/next_run" 2>/dev/null || echo 0 ;;
         *task_instance*)
           # busy_countdown: порция идёт ещё N опросов простоя, потом контур пуст.
           if [ -e "$S/busy_countdown" ]; then
             n=$(cat "$S/busy_countdown"); [ "$n" -gt 0 ] && { echo $(( n - 1 )) > "$S/busy_countdown"; echo 1; } || echo 0
           else cat "$S/busy" 2>/dev/null || echo 0; fi ;;
-        *"state IN ('queued','running')"*) cat "$S/registry_busy" 2>/dev/null || echo 0 ;;
+        *"state IN ('queued','running')"*)
+          case "$sql" in *dag_ingest_transfermarkt*) [ -e "$S/ingest_running" ] && { echo 1; exit 0; } ;; esac
+          cat "$S/registry_busy" 2>/dev/null || echo 0 ;;
         *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" ;;
         *slot_pool*) pool=${sql#*pool=\'}; pool=${pool%%\'*}
           [ ! -e "$S/pool_query_fails_$pool" ] || exit 1
@@ -734,11 +737,18 @@ class Delivery(Stand):
                 line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
         return out
 
-    def put_drain(self, started_ago: int) -> None:
-        self.drain().write_text(
-            f"TARGET={self.new_sha}\nSTARTED_AT={int(time.time()) - started_ago}\n"
-            "PAUSED_dag_ingest_transfermarkt=f\nPAUSED_dag_backfill_transfermarkt=t\n", encoding="utf-8")
-        self.put("paused_dag_ingest_transfermarkt", "t")
+    def put_drain(self, started_ago: int, paused: bool = True) -> None:
+        """Дренаж, начатый прошлым тиком: файл, флаг, открытая запись; paused — полоса уже на паузе."""
+        body = (f"TARGET={self.new_sha}\nSTARTED_AT={int(time.time()) - started_ago}\n"
+                "LANE=dag_backfill_transfermarkt dag_ingest_transfermarkt\n")
+        if paused:
+            body += "PAUSED=1\nPAUSED_dag_ingest_transfermarkt=f\nPAUSED_dag_backfill_transfermarkt=t\n"
+            self.put("paused_dag_ingest_transfermarkt", "t")
+        self.drain().write_text(body, encoding="utf-8")
+        self.put_flag(3600 - started_ago)
+        (self.auto / "transfermarkt-window-2026-10-31T0000.env").write_text(
+            f"WINDOW_ID=2026-10-31T0000\nTARGET={self.new_sha}\nDEADLINE={int(time.time()) + 9000}\n"
+            "LAST_REASON=\n", encoding="utf-8")
 
 
 @pytest.fixture
@@ -772,7 +782,7 @@ def test_a_running_portion_is_not_paused_the_flag_stops_new_ones_and_the_next_ti
     delivery.put("busy", "1")
     result = delivery.run()
     assert result.returncode == 0, result.stderr
-    assert not delivery.deployed() and not delivery.drain().exists()
+    assert not delivery.deployed() and "PAUSED=1" not in delivery.drain().read_text()
     assert delivery.paused("dag_ingest_transfermarkt") == "f"
     assert "жду конца порции" in delivery.log()
     until = int(delivery.flag().read_text())
@@ -807,19 +817,19 @@ def test_the_flag_is_removed_after_every_deploy_outcome(delivery: Delivery, depl
 
 @pytest.mark.unit
 def test_an_expired_flag_with_a_busy_lane_is_a_drain_timeout(delivery: Delivery) -> None:
-    delivery.put_flag(-10)
+    delivery.put_drain(started_ago=3700, paused=False)
     delivery.put("busy", "1")
     assert delivery.run().returncode == 0
-    assert not delivery.flag().exists() and not delivery.deployed()
+    assert not delivery.flag().exists() and not delivery.deployed() and not delivery.drain().exists()
     assert delivery.latch().read_text().startswith("busy ")
     [rec] = delivery.records().values()
-    assert rec["OUTCOME"] == "failed", rec
+    assert rec["OUTCOME"] == "busy", rec        # «не сейчас», не провал кода
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("abort", ["off", "registry", "live_is_master", "headroom", "interrupted_delivery"])
 def test_every_drain_abort_removes_the_flag(delivery: Delivery, abort: str) -> None:
-    delivery.put_flag(1800)
+    delivery.put_drain(started_ago=60, paused=False)
     delivery.put("busy", "1")
     if abort == "off":
         (delivery.auto / "transfermarkt-auto-deliver.off").write_text("")
@@ -830,23 +840,29 @@ def test_every_drain_abort_removes_the_flag(delivery: Delivery, abort: str) -> N
     elif abort == "headroom":
         delivery.next_run(3600)
     else:
-        delivery.put_drain(started_ago=60)
         snapshot = [f"OLD_RELEASE_ROOT={delivery.live}", f"NEW_RELEASE_ROOT={delivery.target}",
                     "WINDOW_ID=2026-09-24"] + [f"PAUSED_{d}=t" for d in DAGS]
         (delivery.auto / "transfermarkt-rollback.env").write_text("\n".join(snapshot) + "\n")
         (delivery.auto / "transfermarkt-inflight").write_text("")
     delivery.run()
     assert not delivery.flag().exists(), delivery.log()
+    if abort != "interrupted_delivery":
+        assert not delivery.drain().exists(), delivery.log()
+    # Нехватка запаса откладывает sha (busy), прочие прерывания — без защёлки.
+    if abort in ("off", "registry", "live_is_master"):
+        assert not delivery.latch().exists(), delivery.log()
 
 
 @pytest.mark.unit
-def test_the_drain_survives_a_failed_freeze_and_the_snapshot_keeps_pre_drain_pauses(delivery: Delivery) -> None:
+def test_a_failed_freeze_returns_the_lane_and_the_next_tick_drains_again(delivery: Delivery) -> None:
     delivery.put("freeze_fails", "1")
     result = delivery.run()
     assert result.returncode == 1, result.stderr
-    assert delivery.drain().exists()
-    assert delivery.paused("dag_ingest_transfermarkt") == "t"
-    assert "PAUSED_dag_ingest_transfermarkt=f" in delivery.drain().read_text()
+    assert not delivery.drain().exists() and not delivery.flag().exists()
+    assert not delivery.latch().exists()
+    _assert_pauses_as_before(delivery)
+    [rec] = delivery.records().values()
+    assert "OUTCOME" not in rec and "заморозка" in rec["LAST_REASON"], rec
     (delivery.state / "freeze_fails").unlink()
     result = delivery.run()
     assert result.returncode == 0, result.stderr + delivery.log()
@@ -866,7 +882,7 @@ def test_a_drain_timeout_restores_pauses_and_defers_the_sha(delivery: Delivery) 
     _assert_pauses_as_before(delivery)
     assert delivery.latch().read_text().startswith("busy ")
     [rec] = delivery.records().values()
-    assert rec["OUTCOME"] == "failed" and "не освободилась" in rec["REASON"], rec
+    assert rec["OUTCOME"] == "busy" and "не освободилась" in rec["REASON"], rec
     delivery.put("busy", "0")
     assert delivery.run().returncode == 0
     assert not delivery.deployed() and not delivery.drain().exists()
@@ -938,5 +954,50 @@ def test_overdue_records_close_by_deadline_and_legacy_ones_at_0300(delivery: Del
                        "LAST_REASON=контур занят\n")
     assert delivery.run().returncode == 0
     recs = delivery.records()
-    assert recs["2026-09-24"]["OUTCOME"] == "failed", recs
+    # Запись старой копии без начатой попытки — не провал; новая с истёкшим DEADLINE — провал.
+    assert recs["2026-09-24"]["OUTCOME"] == "busy", recs
     assert recs["2026-10-01T1200"]["OUTCOME"] == "failed", recs
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("started_ago", [60, 4000])
+def test_an_unreachable_master_mid_drain_returns_the_lane(delivery: Delivery, started_ago: int) -> None:
+    import shutil
+
+    delivery.put_drain(started_ago=started_ago)
+    shutil.rmtree(delivery.source)
+    assert delivery.run().returncode == 0
+    assert not delivery.drain().exists() and not delivery.flag().exists(), delivery.log()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_a_cron_ingest_is_external_its_run_blocks_the_drain_and_only_backfill_is_drained(
+    delivery: Delivery,
+) -> None:
+    delivery.put("lane", "Ldag_backfill_transfermarkt")   # ingest без квалификации — cron 04:00
+    delivery.put("ingest_running", "1")
+    delivery.put("busy", "1")
+    assert delivery.run().returncode == 0
+    assert not delivery.drain().exists() and not delivery.flag().exists()
+    assert "идёт внешний прогон" in delivery.log()
+    (delivery.state / "ingest_running").unlink()
+    delivery.put("busy", "0")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert delivery.deployed()
+    assert "ставлю на паузу dag_backfill_transfermarkt (" in delivery.log()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_a_stuck_lane_under_the_off_switch_is_reported_once_a_day(delivery: Delivery) -> None:
+    delivery.put_drain(started_ago=60)
+    delivery.put("pause_fails_dag_ingest_transfermarkt", "1")
+    (delivery.auto / "transfermarkt-auto-deliver.off").write_text("")
+    assert delivery.run().returncode == 1
+    assert delivery.run().returncode == 1
+    pending = (delivery.auto / "transfermarkt-pending-alert").read_text(encoding="utf-8")
+    assert pending.count("дренаж полосы прерван") == 1, pending
+    hands = [r for r in delivery.records().values() if r.get("OUTCOME") == "needs-hands"]
+    assert len(hands) == 1, delivery.records()

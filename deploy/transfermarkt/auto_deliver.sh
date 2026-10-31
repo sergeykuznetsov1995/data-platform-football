@@ -79,9 +79,12 @@ CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_back
 # Полоса — непрерывный сбор порциями (TransfermarktCurrentTimetable): у неё next_dagrun ≈ now,
 # дедлайну она не годится — её закрывает пауза дренажа.
 LANE_DAGS="dag_ingest_transfermarkt dag_backfill_transfermarkt"
-# Дедлайн — ближайший запуск DAG вне полосы по расписанию (silver — trigger-only, расписания нет).
+# Дедлайн — ближайший запуск внешних DAG по расписанию (registry и DAG полосы не на непрерывном
+# расписании — их добавляет lane_refresh; silver — trigger-only, расписания нет).
 NEXT_RUN_DAGS="'dag_discover_transfermarkt_registry'"
 NEXT_RUN_COUNT=1
+LANE=""
+OUTER_DAGS_SQL=""
 DEADLINE_MAX=${DEADLINE_MAX:-10800}  # не дальше 3 ч вперёд; не меньше DRAIN_MAX + NEED_BUDGET
 LEGACY_WINDOW_TO=0300                # дедлайн старых записей окна (до #2039): <дата> 03:00 UTC
 DEPLOY_CEILING=${DEPLOY_CEILING:-1800}  # потолок deploy.sh: шлюз 300 + пулы 150 + DAG 600 + scheduler 300 + запас
@@ -360,9 +363,10 @@ snapshot_ok(){
 contour_busy(){
   metadb "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($CORE_DAGS_SQL) AND state='running') + (SELECT count(*) FROM task_instance WHERE dag_id IN ($CORE_DAGS_SQL) AND state IN ('queued','running','restarting'));"
 }
-# Прогоны DAG вне полосы (registry, silver): дренаж их не закрывает, выкат оборвал бы их.
-outer_busy(){
-  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('dag_discover_transfermarkt_registry','dag_transform_transfermarkt_silver') AND state IN ('queued','running');"
+# Прогоны внешних DAG (registry, silver, полоса не на непрерывном расписании): дренаж их не
+# закрывает, выкат оборвал бы их.
+outer_busy(){  # OUTER_DAGS_SQL — из lane_refresh
+  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ($OUTER_DAGS_SQL) AND state IN ('queued','running');"
 }
 
 # --- дренаж полосы (#2039) ---------------------------------------------------------------
@@ -383,59 +387,95 @@ flag_set(){  # атомарно: tmp + mv, 0644 — планировщик чи�
   return 1
 }
 flag_clear(){ is_plain "$(drain_flag)" && { rm -f "$(drain_flag)" 2>/dev/null || log "флаг дренажа $(drain_flag) не убран — истечёт сам"; }; return 0; }
-# Файл $DRAIN: TARGET, STARTED_AT (epoch), PAUSED_<dag>=t|f — паузы полосы ДО дренажа. Пишется
-# ДО паузы, убирается после возврата пауз или когда снимок отката уже несёт эти значения.
-drain_get(){ sed -n "s/^$1=//p" "$DRAIN" 2>/dev/null | head -1; }
-drain_release(){  # вернуть паузы полосы из файла и убрать его; 1 — не вернулись (файл остаётся)
-  local d want
-  RESTORE_NOTE=""
+# Дренируемая часть полосы — DAG на непрерывном расписании TM (флаг выше останавливает только
+# его). DAG полосы на другом расписании (ingest без квалификации — cron 04:00, прогоны 4–12 ч)
+# считается внешним: его прогон не дренируем, а ждём, его ближайший запуск входит в дедлайн.
+# Выставляет LANE, OUTER_DAGS_SQL, NEXT_RUN_DAGS, NEXT_RUN_COUNT; 1 — метабаза не ответила.
+lane_refresh(){
+  local got d sql=""
+  for d in $LANE_DAGS; do sql="$sql,'$d'"; done
+  got=$(metadb "SELECT 'L' || coalesce(string_agg(dag_id, ',' ORDER BY dag_id), '') FROM dag WHERE dag_id IN (${sql#,}) AND timetable_description LIKE 'Continuous Transfermarkt current%';")
+  case "$got" in L*) ;; *) return 1 ;; esac
+  LANE=${got#L}; LANE=${LANE//,/ }
+  OUTER_DAGS_SQL="'dag_discover_transfermarkt_registry','dag_transform_transfermarkt_silver'"
+  NEXT_RUN_DAGS="'dag_discover_transfermarkt_registry'"; NEXT_RUN_COUNT=1
   for d in $LANE_DAGS; do
-    want=$(drain_get "$(paused_key "$d")")
-    case "$want" in
-      t|f) restore_pause "$d" "$want" || true ;;
-      *) RESTORE_NOTE="$RESTORE_NOTE пауза $d до дренажа не прочитана из $DRAIN;" ;;
-    esac
+    case " $LANE " in *" $d "*) continue ;; esac
+    OUTER_DAGS_SQL="$OUTER_DAGS_SQL,'$d'"; NEXT_RUN_DAGS="$NEXT_RUN_DAGS,'$d'"
+    NEXT_RUN_COUNT=$(( NEXT_RUN_COUNT + 1 ))
   done
+}
+# Файл $DRAIN: TARGET, STARTED_AT (epoch), LANE (дренируемые DAG); после паузы — PAUSED=1 и
+# PAUSED_<dag>=t|f — паузы ДО неё. Пишется вместе с флагом, убирается после возврата пауз или
+# когда снимок отката уже несёт эти значения.
+drain_get(){ sed -n "s/^$1=//p" "$DRAIN" 2>/dev/null | head -1; }
+drain_write(){  # drain_write KEY=VAL… — файл целиком, атомарно
+  if { printf '%s\n' "$@" > "$DRAIN.tmp" && mv -f "$DRAIN.tmp" "$DRAIN"; } 2>/dev/null; then return 0; fi
+  rm -f "$DRAIN.tmp" 2>/dev/null
+  log "файл дренажа $DRAIN не записан"
+  return 1
+}
+drain_release(){  # флаг убрать, паузы полосы вернуть из файла, файл убрать; 1 — не вернулись
+  local d want
+  flag_clear
+  RESTORE_NOTE=""
+  if [ "$(drain_get PAUSED)" = 1 ]; then
+    for d in $(drain_get LANE); do
+      want=$(drain_get "$(paused_key "$d")")
+      case "$want" in
+        t|f) restore_pause "$d" "$want" || true ;;
+        *) RESTORE_NOTE="$RESTORE_NOTE пауза $d до дренажа не прочитана из $DRAIN;" ;;
+      esac
+    done
+  fi
   [ -z "$RESTORE_NOTE" ] || return 1
   rm -f "$DRAIN"
 }
-# Прервать дренаж (если он идёт): паузы полосы — как до него. Не вернулись — сбор стоял бы
-# молча: выключатель и руки.
+# Прервать дренаж (если он идёт): флаг убрать, паузы полосы — как до него. Не вернулись — сбор
+# стоял бы молча: выключатель и руки (запись и алерт — раз в сутки: под выключателем каждый тик
+# повторяет попытку).
 drain_abort(){  # drain_abort <причина>
-  flag_clear
-  is_plain "$DRAIN" || return 0
+  local m="$STATE/transfermarkt-drain-stuck-$TODAY"
+  is_plain "$DRAIN" || { flag_clear; return 0; }
   if drain_release; then
-    log "дренаж прерван ($1): паузы полосы возвращены"
+    log "дренаж прерван ($1): флаг убран, паузы полосы возвращены"
     return 0
   fi
   log "ДРЕНАЖ ПРЕРВАН ($1), НО ПАУЗЫ ПОЛОСЫ НЕ ВЕРНУЛИСЬ:$RESTORE_NOTE — глушу автомат"
   set_off
+  said_today "$m" && exit 1
   hands_close "" "дренаж прерван ($1), паузы полосы не вернулись:$RESTORE_NOTE" f
   tg_durable "Transfermarkt: дренаж полосы прерван ($1), но паузы ingest/backfill не вернулись к прежним —$RESTORE_NOTE Сбор стоит. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  mark_said "$m"
   exit 1
 }
-# Начать дренаж: записать паузы полосы, затем паузу на ingest и backfill с проверкой по метабазе.
-# 1 — не начат (паузы, если менялись, возвращены).
-drain_start(){
+# Начать дренаж: файл (цель, старт, дренируемые DAG), затем флаг для расписания.
+drain_begin(){
+  drain_write "TARGET=$WANT" "STARTED_AT=$(date -u +%s)" "LANE=$LANE" || { window_note "файл дренажа не записан"; return 1; }
+  if ! flag_set; then
+    rm -f "$DRAIN"
+    window_note "флаг дренажа не записан"
+    return 1
+  fi
+  log "ДРЕНАЖ: флаг до $(flag_until) — новые порции ($LANE) не стартуют, цель ${WANT:0:8}"
+}
+# Пауза дренируемой полосы на границе порций: паузы ДО неё — в файл, затем пауза с проверкой по
+# метабазе. 1 — не встала (дренаж прерван, всё возвращено).
+drain_pause(){
   local d v kv=()
-  for d in $LANE_DAGS; do
+  for d in $(drain_get LANE); do
     v=$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")
     case "$v" in
       t|f) kv+=("$(paused_key "$d")=$v") ;;
-      *) log "метабаза не ответила про паузу $d ('$v') — дренаж не начат"
-         window_note "пауза $d не прочитана — дренаж не начат"
+      *) drain_abort "пауза $d не прочитана ('$v')"
+         window_note "пауза $d не прочитана — дренаж прерван"
          return 1 ;;
     esac
   done
-  if ! { printf '%s\n' "TARGET=$WANT" "STARTED_AT=$(date -u +%s)" "${kv[@]}" > "$DRAIN.tmp" \
-         && mv -f "$DRAIN.tmp" "$DRAIN"; } 2>/dev/null; then
-    rm -f "$DRAIN.tmp" 2>/dev/null
-    log "файл дренажа $DRAIN не записан — дренаж не начат"
-    window_note "файл дренажа не записан"
-    return 1
-  fi
-  log "ДРЕНАЖ: ставлю на паузу $LANE_DAGS (до дренажа: ${kv[*]}), цель ${WANT:0:8}"
-  for d in $LANE_DAGS; do
+  drain_write "TARGET=$(drain_get TARGET)" "STARTED_AT=$(drain_get STARTED_AT)" "LANE=$(drain_get LANE)" \
+    "PAUSED=1" "${kv[@]}" || { drain_abort "файл дренажа не записан"; return 1; }
+  log "ДРЕНАЖ: ставлю на паузу $(drain_get LANE) (до дренажа: ${kv[*]})"
+  for d in $(drain_get LANE); do
     sched airflow dags pause "$d"
     [ "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")" = t ] && continue
     drain_abort "$d не встал на паузу"
@@ -664,6 +704,11 @@ close_overdue_windows(){
       -) window_close "$id" no-target "бой = master, доставлять нечего" t ;;
       '?'|'') window_close "$id" unknown "master недоступен или бой не проверен${last:+: $last}" t ;;
       *)
+        # Запись старой копии (<дата>) без начатой попытки — окно закрылось без попытки: не провал.
+        if [[ "$id" != *T* ]] && [ -z "$(win_get "$id" ATTEMPT_AT)" ]; then
+          window_close "$id" busy "окно закрылось без попытки: ${last:-причина не записана}" t
+          continue
+        fi
         if window_close "$id" failed "дедлайн попытки истёк: ${last:-причина не записана}" t; then
           why=$(streak_tail)
           is_plain "$OFF" && tg_durable "Transfermarkt: попытка $id закрылась без доставки ${tgt:0:8} (${last:-причина не записана}).$why Лог: $LOG"
@@ -895,6 +940,26 @@ if is_plain "$INFLIGHT"; then
   exit 1
 fi
 
+# ============================ Шаг 3а: просрочка дренажа ============================
+# До любых ранних выходов (master недоступен, метабаза молчит): полоса не стоит дольше DRAIN_MAX.
+if is_plain "$DRAIN"; then
+  started=$(drain_get STARTED_AT)
+  case "$started" in ''|*[!0-9]*) started=0 ;; esac
+  if [ $(( $(date -u +%s) - started )) -ge "$DRAIN_MAX" ]; then
+    why="полоса не освободилась за ${DRAIN_MAX}s"
+    tgt=$(drain_get TARGET)
+    log "$why — прерываю дренаж, sha ${tgt:0:8} откладываю на ${BUSY_RETRY}s"
+    drain_abort "$why"
+    # Не провал кода, а «не сейчас»: исход busy в серию провалов не идёт.
+    case "$tgt" in *[!0-9a-f]*|'') ;; *) ATTEMPTED=$STATE/transfermarkt-auto-deliver-attempted-${tgt:0:8}; odd_path "$ATTEMPTED" || latch_busy ;; esac
+    [ -n "$WIN" ] && window_close "$WIN" busy "$why" t
+    tg_durable "Transfermarkt: доставка ${tgt:0:8} не состоялась — $why; флаг убран, паузы полосы возвращены, бой не тронут. Повторю не раньше чем через $(( BUSY_RETRY / 3600 )) ч. Лог: $LOG"
+    exit 0
+  fi
+else
+  flag_clear   # флаг без файла дренажа — след оборванного тика
+fi
+
 # ============================ Шаг 4: что в бою и что в master ============================
 LIVE=$(git -C "$LIVE_ROOT" --no-optional-locks rev-parse HEAD 2>/dev/null)
 is_sha40(){ case "$1" in *[!0-9a-f]*) return 1 ;; esac; [ "${#1}" = 40 ]; }
@@ -910,6 +975,7 @@ else
   if ! is_sha40 "$WANT"; then
     log "master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — вслепую не переключаемся"
     window_touch '?' "master недоступен (git ls-remote вернул '$WANT')"
+    drain_abort "master недоступен"
     announce_behind "Transfermarkt: бой не на master больше суток, сейчас master недоступен — бой остаётся на ${LIVE:0:8}. Лог: $LOG"
     exit 0
   fi
@@ -1009,43 +1075,38 @@ else
       exit 0
     fi
   fi
-  if ! set_deadline; then
-    log "метабаза не ответила про ближайший прогон registry (или он не вычислен: DAG пропал, идёт прогон) — тик пропущен"
-    window_note "метабаза не ответила про ближайший прогон registry"
+  if ! lane_refresh || ! set_deadline; then
+    log "метабаза не ответила про расписания или ближайший внешний прогон (или он не вычислен: DAG пропал, идёт прогон) — тик пропущен"
+    drain_abort "метабаза не ответила про расписания"
+    window_note "метабаза не ответила про ближайший внешний прогон"
     exit 0
   fi
-  if is_plain "$DRAIN" || is_plain "$(drain_flag)"; then
-    outer=$(outer_busy)
-    if [ "$outer" = X ] || [ -z "$outer" ]; then
-      log "метабаза не ответила про прогоны registry/silver — дренаж ждёт следующего тика"
-      exit 0
-    fi
-    if [ "$outer" != 0 ]; then
-      drain_abort "стартовал прогон registry/silver ($outer)"
-      window_note "дренаж прерван: стартовал прогон registry/silver"
-      exit 0
-    fi
-    started=$(drain_get STARTED_AT)
-    case "$started" in ''|*[!0-9]*) started=0 ;; esac
-    is_plain "$DRAIN" || started=$(( $(flag_until) + 0 - DRAIN_MAX ))
-    why=""
-    [ $(( now - started )) -ge "$DRAIN_MAX" ] && why="полоса не освободилась за ${DRAIN_MAX}s"
-    [ -z "$why" ] && [ $(( deadline - now )) -lt "$NEED_BUDGET" ] \
-      && why="до прогона registry осталось $(( deadline - now ))s (< $NEED_BUDGET), полоса не освободилась"
-    if [ -n "$why" ]; then
+  outer=$(outer_busy)
+  if [ "$outer" = X ] || [ -z "$outer" ]; then
+    log "метабаза не ответила про внешние прогоны — тик пропущен"
+    drain_abort "метабаза не ответила про внешние прогоны"
+    exit 0
+  fi
+  if [ "$outer" != 0 ]; then
+    # registry/silver или полоса не на непрерывном расписании (cron-ingest): его не дренируем.
+    log "идёт внешний прогон ($outer: registry/silver или DAG полосы не на непрерывном расписании) — дренаж не начинаю"
+    drain_abort "идёт внешний прогон ($outer)"
+    window_note "идёт внешний прогон (registry/silver или cron-полоса)"
+    exit 0
+  fi
+  if is_plain "$DRAIN"; then
+    if [ $(( deadline - now )) -lt "$NEED_BUDGET" ]; then
+      why="до ближайшего внешнего прогона осталось $(( deadline - now ))s (< $NEED_BUDGET), полоса не освободилась"
       log "$why — прерываю дренаж, sha ${WANT:0:8} откладываю на ${BUSY_RETRY}s"
       drain_abort "$why"
       latch_busy
-      [ -n "$WIN" ] || WIN=$(date -u +%FT%H%M)
-      if window_close "$WIN" failed "$why" t; then
-        w=$(streak_tail)
-        tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — $why; паузы полосы возвращены, бой не тронут. Повторю не раньше чем через $(( BUSY_RETRY / 3600 )) ч.$w Лог: $LOG"
-      fi
+      [ -n "$WIN" ] && window_close "$WIN" busy "$why" t
+      tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — $why; флаг убран, паузы полосы возвращены, бой не тронут. Повторю не раньше чем через $(( BUSY_RETRY / 3600 )) ч. Лог: $LOG"
       exit 0
     fi
   elif [ $(( deadline - now )) -lt $(( DRAIN_MAX + NEED_BUDGET )) ]; then
-    log "мало запаса: до ближайшего прогона registry $(( (deadline - now) / 60 )) мин (нужно $(( (DRAIN_MAX + NEED_BUDGET) / 60 ))) — доставка после него"
-    window_note "мало запаса до ближайшего прогона registry: $(( deadline - now )) с"
+    log "мало запаса: до ближайшего внешнего прогона $(( (deadline - now) / 60 )) мин (нужно $(( (DRAIN_MAX + NEED_BUDGET) / 60 ))) — доставка после него"
+    window_note "мало запаса до ближайшего внешнего прогона: $(( deadline - now )) с"
     exit 0
   fi
   # Попытка начинается: открытая запись (продолжение) или новая.
@@ -1055,28 +1116,25 @@ else
     tg_durable "Transfermarkt: не могу создать запись попытки в $STATE — исход доставки ${WANT:0:8} потерялся бы. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     exit 1
   fi
-  # Пауза — только на границе порций: Airflow 2 не двигает прогон паузного DAG, и пауза
-  # посреди порции заморозила бы её до распаузы. Флаг дренажа не даёт стартовать новой
-  # порции; конец идущей ловим опросом внутри тика, не пойман — продолжит следующий тик.
-  busy=$(contour_busy)
-  if [ "$busy" != 0 ]; then
-    if ! is_plain "$DRAIN" && ! is_plain "$(drain_flag)"; then
-      flag_set || { window_note "флаг дренажа не записан"; exit 0; }
-      log "ДРЕНАЖ: флаг до $(flag_until) — новые порции не стартуют, жду конца идущей"
-    fi
-    poll_end=$(( $(date -u +%s) + DRAIN_POLL ))
-    while [ "$busy" != 0 ] && [ "$(date -u +%s)" -lt "$poll_end" ]; do
-      sleep "$DRAIN_POLL_STEP"
-      busy=$(contour_busy)
-    done
+  # Флаг дренажа не даёт стартовать новой порции; конец идущей ловим опросом внутри тика, не
+  # пойман — продолжит следующий тик. Пауза — только на границе порций: Airflow 2 не двигает
+  # прогон паузного DAG, пауза посреди порции заморозила бы её до распаузы.
+  if ! is_plain "$DRAIN"; then
+    drain_begin || exit 0
   fi
+  busy=$(contour_busy)
+  poll_end=$(( $(date -u +%s) + DRAIN_POLL ))
+  while [ "$busy" != 0 ] && [ "$(date -u +%s)" -lt "$poll_end" ]; do
+    sleep "$DRAIN_POLL_STEP"
+    busy=$(contour_busy)
+  done
   if [ "$busy" != 0 ]; then
     log "контур занят (running-прогонов и задач TM в работе: '$busy'; X = метабаза недоступна) — жду конца порции"
     window_note "контур занят (running-прогонов и задач TM в работе: '$busy')"
     exit 0
   fi
-  if ! is_plain "$DRAIN"; then
-    drain_start || exit 0
+  if [ "$(drain_get PAUSED)" != 1 ]; then
+    drain_pause || exit 0
     # Порция могла стартовать между проверкой и паузой: её не морозим — паузы назад.
     busy=$(contour_busy)
     if [ "$busy" != 0 ]; then
@@ -1085,7 +1143,7 @@ else
       exit 0
     fi
   fi
-  log "полоса на паузе и пуста, до ближайшего прогона registry $(( (deadline - now) / 60 )) мин — начинаю попытку ${WANT:0:8}"
+  log "полоса на паузе и пуста, до ближайшего внешнего прогона $(( (deadline - now) / 60 )) мин — начинаю попытку ${WANT:0:8}"
 fi
 
 # ============================ Шаг 7: дерево цели ============================
@@ -1108,6 +1166,7 @@ else
     [ -z "$(git -C "$NEW" --no-optional-locks status --porcelain 2>/dev/null)" ] || ok=0
     if [ "$ok" != 1 ]; then
       log "КАТАЛОГ $NEW УЖЕ ЕСТЬ И БИТЫЙ (права 755, HEAD=$WANT, чистота)"
+      drain_abort "каталог релиза битый"
       note_and_tell "каталог релиза $NEW уже есть и битый" \
         "Transfermarkt: каталог релиза $NEW уже существует и не годится (права, HEAD или правки). Убрать руками. Доставки ${WANT:0:8} не будет, пока каталог на месте. Лог: $LOG"
       exit 1
@@ -1117,6 +1176,7 @@ else
     log "замораживаю $WANT"
     if ! out=$(timeout -k 30 900 "$LIVE_ROOT/deploy/transfermarkt/freeze_release.sh" "$WANT" 2>&1 8>&- 9>&-); then
       printf '%s\n' "$out" >> "$LOG"
+      drain_abort "заморозка не удалась"
       note_and_tell "заморозка дерева ${WANT:0:8} не удалась" \
         "Transfermarkt: заморозка дерева $WANT не удалась — бой не тронут, повторю следующим тиком. Лог: $LOG"
       exit 1
@@ -1125,6 +1185,7 @@ else
     NEW=${out##*дерево заморожено: }
     NEW=${NEW%% (sha *}
     if [ ! -d "$NEW" ]; then
+      drain_abort "заморозка отчиталась несуществующим деревом"
       note_and_tell "заморозка отчиталась несуществующим деревом" \
         "Transfermarkt: заморозка отчиталась деревом '$NEW', которого нет. Бой не тронут, повторю следующим тиком. Лог: $LOG"
       exit 1
@@ -1148,6 +1209,7 @@ OLD="$LIVE_ROOT"
 SCHED_CREATED_BEFORE=$(inspect -f '{{.Created}}' "$SCHED")
 if [ -z "$SCHED_CREATED_BEFORE" ]; then
   log "не читается .Created контейнера $SCHED — приёмке не на что опереться"
+  drain_abort "не читается .Created scheduler'а"
   window_note "не читается .Created контейнера $SCHED"
   tg_durable "Transfermarkt: не читается .Created контейнера $SCHED — факт пересоздания недоказуем. Бой не тронут. Лог: $LOG"
   exit 1
@@ -1166,7 +1228,7 @@ fi
   # Паузы полосы — из файла дренажа (значения ДО него), не текущие `t`: иначе выкат и откат
   # вернули бы полосу на паузу навсегда.
   for d in $CORE_DAGS; do
-    if is_plain "$DRAIN" && case " $LANE_DAGS " in *" $d "*) true ;; *) false ;; esac; then
+    if [ "$(drain_get PAUSED)" = 1 ] && case " $(drain_get LANE) " in *" $d "*) true ;; *) false ;; esac; then
       printf '%s=%s\n' "$(paused_key "$d")" "$(drain_get "$(paused_key "$d")")"
     else
       printf '%s=%s\n' "$(paused_key "$d")" "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")"
