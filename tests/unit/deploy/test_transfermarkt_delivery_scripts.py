@@ -992,7 +992,7 @@ def test_a_cron_ingest_is_external_its_run_blocks_the_drain_and_only_backfill_is
 
 @pytest.mark.unit
 def test_a_stuck_lane_under_the_off_switch_is_reported_once_a_day(delivery: Delivery) -> None:
-    delivery.put_drain(started_ago=60)
+    delivery.put_drain(started_ago=4000)     # срок дренажа истёк, паузы не возвращаются
     delivery.put("pause_fails_dag_ingest_transfermarkt", "1")
     (delivery.auto / "transfermarkt-auto-deliver.off").write_text("")
     assert delivery.run().returncode == 1
@@ -1001,3 +1001,32 @@ def test_a_stuck_lane_under_the_off_switch_is_reported_once_a_day(delivery: Deli
     assert pending.count("дренаж полосы прерван") == 1, pending
     hands = [r for r in delivery.records().values() if r.get("OUTCOME") == "needs-hands"]
     assert len(hands) == 1, delivery.records()
+
+
+@pytest.mark.unit
+def test_a_metadb_blip_mid_drain_neither_aborts_nor_turns_the_automat_off(delivery: Delivery) -> None:
+    delivery.put_drain(started_ago=60)
+    delivery.put("lane", "X")                                  # метабаза молчит
+    delivery.put("pause_fails_dag_ingest_transfermarkt", "1")  # и вернуть паузу нечем
+    assert delivery.run().returncode == 0, delivery.log()
+    off = delivery.auto / "transfermarkt-auto-deliver.off"
+    assert not off.exists() and delivery.drain().exists(), delivery.log()
+    (delivery.state / "lane").unlink()
+    (delivery.state / "pause_fails_dag_ingest_transfermarkt").unlink()
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert not off.exists() and delivery.deployed() and not delivery.drain().exists()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_a_failed_pause_restore_within_the_drain_term_is_retried_not_escalated(delivery: Delivery) -> None:
+    delivery.put_drain(started_ago=60)
+    delivery.put("pause_fails_dag_ingest_transfermarkt", "1")
+    _git(delivery.source, "update-ref", "refs/heads/master", delivery.old_sha)   # бой = master → прервать
+    assert delivery.run().returncode == 0, delivery.log()
+    assert not (delivery.auto / "transfermarkt-auto-deliver.off").exists() and delivery.drain().exists()
+    (delivery.state / "pause_fails_dag_ingest_transfermarkt").unlink()
+    assert delivery.run().returncode == 0
+    assert not delivery.drain().exists()
+    _assert_pauses_as_before(delivery)
