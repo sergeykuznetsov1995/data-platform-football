@@ -80,6 +80,12 @@ def _split(url: str) -> tuple[str, dict[str, str]]:
         # Summary of a match (#1504): site.web.api, only ``event``.
         ("summary_eng1_2020.json", urls.summary("eng.1", 578281)),
         ("summary_ucl_2010.json", urls.summary("uefa.champions", 307787)),
+        # Deep core players (#1513): roster and player statistics.
+        ("core_roster_eng1_401879300_384.json", urls.roster("eng.1", 401879300, 384)),
+        (
+            "core_player_statistics_eng1_401879300_384_241187.json",
+            urls.player_statistics("eng.1", 401879300, 384, 241187),
+        ),
     ],
 )
 def test_addresses_match_the_recorded_probe_urls(fixture, request_) -> None:

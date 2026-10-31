@@ -2,7 +2,8 @@
 
 Only published, played, non-duplicate matches enter the queue. Registry probes
 and retries use the same history gate and its atomic 20% deep sub-quota.
-The first stage completes plays + both teams; players remain pending.
+The first stage completes plays + both teams; the second one, per edition after
+the first, fills played lineup rows from core rosters and player statistics.
 """
 from __future__ import annotations
 
@@ -17,21 +18,30 @@ import pyarrow as pa
 
 from . import urls
 from .bronze_rows import BatchStamp, _lineage
-from .bronze_schema import MATCH_TABLE, TEAM_STATS_TABLE, TABLES
+from .bronze_schema import LINEUP_TABLE, MATCH_TABLE, TEAM_STATS_TABLE, TABLES
 from .bronze_writer import BronzeBatchError, delete_filter, stored_rows
-from .deep_parser import (PARSER_VERSION, collect_plays, deep_level, mask_xg,
-                          parse_page, play_values, statistics, xg_support)
+from .deep_parser import (PARSER_VERSION, collect_plays, deep_level, mask_xg, parse_page,
+                          parse_roster, play_values, player_statistics, statistics,
+                          xg_support)
 from .deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
-from .deep_store import (Depth, client_state_dir, edition_lock, load_depth, save_depth,
-                         load_retries, save_retry)
+from .deep_store import (PLAYER_RETRY_TABLE, Depth, client_state_dir, edition_lock,
+                         load_depth, save_depth, load_retries, save_retry)
 from .history import history_stopped
 from .history_report import render_live_debt_sql
 from .journal import flush_journal, journal_rows
 from .parallel import interruptible_sleep, protected
 from .parser_common import EspnParseError, canonical_json
-from .transport_contracts import (AllOriginsBlocked, DailyCapExceeded, LaneClosed,
-                                  EspnTransportError)
+from .transport_contracts import (AllOriginsBlocked, DailyCapExceeded, EndpointType,
+                                  LaneClosed, EspnTransportError)
 from .wave import _fetch, _raw_ref
+
+_PLAYER_ENDPOINTS = (EndpointType.ROSTER, EndpointType.PLAYER_STATISTICS)
+PLAYERS_PENDING_SQL = (
+    "SELECT event_id FROM iceberg.bronze.espn_team_stats "
+    "WHERE competition_slug = ? AND season_year = ? "
+    "AND json_extract_scalar(deep_stats_json, '$.players_state') = 'pending' "
+    "GROUP BY event_id HAVING count(*) = 2 ORDER BY event_id"
+)
 
 
 def _manifest(result):
@@ -119,6 +129,74 @@ def publish_deep(*, trino, slug, year, event_id, plays, teams, manifest, has_xg,
         return True
 
 
+def _check_roster(rosters, lineup):
+    """Played roster players must be Summary lineup athletes of the same team."""
+    for team_id, roster in rosters.items():
+        known = {row["athlete_id"] for row in lineup if row["team_id"] == team_id}
+        if not {athlete for athlete, played in roster.items() if played} <= known:
+            raise EspnParseError("roster player is not in the Summary lineup")
+
+
+def publish_players(*, trino, slug, year, event_id, rosters, players, manifest, has_xg,
+                    state_dir=None):
+    """Lineup statistics before the team marker, under the edition lock.
+
+    ``rosters=None`` marks a match without a captured lineup as not applicable.
+    Lineup rows outside the roster are kept as they are; a repeat is a no-op.
+    """
+    scope = delete_filter(slug, year, [event_id])
+    with edition_lock(slug, year, state_dir):
+        matches = stored_rows(trino, MATCH_TABLE, scope)
+        if len(matches) != 1 or matches[0]["deep_state"] != "completed":
+            raise EspnParseError("player publication needs a completed first stage")
+        match = matches[0]
+        team_rows = stored_rows(trino, TEAM_STATS_TABLE, scope)
+        expected = {match["home_team_id"], match["away_team_id"]}
+        if len(team_rows) != 2 or {row["team_id"] for row in team_rows} != expected:
+            raise EspnParseError("player publication needs both team rows")
+        envelopes = {row["team_id"]: json.loads(row["deep_stats_json"] or "{}") for row in team_rows}
+        if any(envelope.get("players_state") != "pending" for envelope in envelopes.values()):
+            return False
+        stamp = BatchStamp(uuid.uuid4().hex, datetime.now(timezone.utc).replace(tzinfo=None))
+        lineup = []
+        if rosters is None:
+            if match["lineup_state"] == "captured":
+                raise EspnParseError("captured lineup needs player statistics")
+            states = dict.fromkeys(expected, {"players_state": "not_applicable"})
+        else:
+            if match["lineup_state"] != "captured" or set(rosters) != expected:
+                raise EspnParseError("rosters differ from the Summary match")
+            lineup = stored_rows(trino, LINEUP_TABLE, scope)
+            _check_roster(rosters, lineup)
+            played = {(team_id, athlete) for team_id, roster in rosters.items()
+                      for athlete, flag in roster.items() if flag}
+            if set(players) != played:
+                raise EspnParseError("player statistics are incomplete")
+            for row in lineup:
+                player = players.get((row["team_id"], row["athlete_id"]))
+                if player is not None:
+                    body, entry = player
+                    row["deep_stats_json"] = canonical_json({
+                        "parser_version": PARSER_VERSION, "has_xg": has_xg,
+                        "statistics": mask_xg(body, has_xg), "manifest": entry,
+                    })
+                    row["_batch_id"], row["_ingested_at"] = stamp.batch_id, stamp.ingested_at
+            # Unused substitutes are absent by definition, not a gap.
+            states = {team_id: {"players_state": "completed",
+                                "unused": sorted(athlete for athlete, flag in roster.items() if not flag),
+                                "roster_manifest": [entry for entry in manifest if entry["team_id"] == team_id]}
+                      for team_id, roster in rosters.items()}
+            pa.Table.from_pylist(lineup, schema=TABLES[LINEUP_TABLE])
+        for row in team_rows:
+            row["deep_stats_json"] = canonical_json({**envelopes[row["team_id"]], **states[row["team_id"]]})
+            row["_batch_id"], row["_ingested_at"] = stamp.batch_id, stamp.ingested_at
+        pa.Table.from_pylist(team_rows, schema=TABLES[TEAM_STATS_TABLE])
+        if lineup:
+            _replace(trino, LINEUP_TABLE, TABLES[LINEUP_TABLE], lineup, scope, stamp)
+        _replace(trino, TEAM_STATS_TABLE, TABLES[TEAM_STATS_TABLE], team_rows, scope, stamp)
+        return True
+
+
 def run_deep(*, client, trino, conn, denominator, run_id, deadline,
              stop_file: Path | None, now_fn=lambda: datetime.now(timezone.utc)):
     """Serial runner on the shared background pool; no extra workers."""
@@ -127,7 +205,8 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
     if client.gate.lane != "history" or client.gate.purpose != "deep":
         raise ValueError("deep requires a history gate with purpose=deep")
     client.run_id, client.task_id = run_id, "run_deep"
-    report = {"completed": 0, "failed": 0, "mapped": 0, "waiting": 0, "reason": "idle"}
+    report = {"completed": 0, "failed": 0, "mapped": 0, "waiting": 0, "reason": "idle",
+              "players_completed": 0, "players_failed": 0, "players_not_applicable": 0}
     errors = []
     offset = len(client.ledger)
     started_at = now_fn()
@@ -172,6 +251,51 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
             teams[int(team_id)] = statistics(result.json_data), _raw_ref(result)
             manifest.append({"team_id": int(team_id), **_manifest(result)})
         return teams
+
+    def players_for(slug, year, event_id, depth):
+        scope = delete_filter(slug, year, [event_id])
+        matches = stored_rows(trino, MATCH_TABLE, scope)
+        if len(matches) != 1:
+            raise EspnParseError("player stage needs one stored match")
+        match = matches[0]
+        state_dir = client_state_dir(client)
+        if match["lineup_state"] != "captured":
+            check()
+            report["players_not_applicable"] += int(publish_players(
+                trino=trino, slug=slug, year=year, event_id=event_id, rosters=None,
+                players={}, manifest=[], has_xg=depth.has_xg, state_dir=state_dir))
+            return depth
+        lineup = stored_rows(trino, LINEUP_TABLE, scope)
+        manifest, rosters, players = [], {}, {}
+        for side in ("home", "away"):
+            team_id = int(match[f"{side}_team_id"])
+            result = fetch(urls.roster(slug, event_id, team_id))
+            rosters[team_id] = parse_roster(result.json_data)
+            manifest.append({"team_id": team_id, **_manifest(result)})
+        # Identity first: a foreign roster spends no player requests.
+        _check_roster(rosters, lineup)
+        for team_id, roster in rosters.items():
+            for athlete, played in roster.items():
+                if played:
+                    result = fetch(urls.player_statistics(slug, event_id, team_id, athlete))
+                    players[(team_id, athlete)] = (player_statistics(result.json_data, athlete),
+                                                   {"athlete_id": athlete, **_manifest(result)})
+        support = xg_support([body for body, _ in players.values()])
+        has_xg = True if depth.has_xg is True or support is True else depth.has_xg
+        if has_xg is True and depth.has_xg is not True:
+            depth = replace(depth, has_xg=True, manifest_json=canonical_json([
+                *json.loads(depth.manifest_json or "[]"),
+                *({"event_id": event_id, **entry} for entry in manifest),
+                *({"event_id": event_id, **entry} for _, entry in players.values()),
+            ]))
+            client.flush()
+            save_depth(conn, depth)
+        client.flush()  # raw-before-Bronze for every roster and player body
+        check()
+        report["players_completed"] += int(publish_players(
+            trino=trino, slug=slug, year=year, event_id=event_id, rosters=rosters,
+            players=players, manifest=manifest, has_xg=has_xg, state_dir=state_dir))
+        return depth
 
     try:
         check()
@@ -255,6 +379,7 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                                    if confirmed.get(event_id, []) != [True, True]}
                     candidates = [row for row in candidates
                                   if row[3] != "completed" or int(row[0]) in upgrade]
+                    done = set(completed)
                     retries = load_retries(trino, slug, year)
                     # Unattempted matches precede due retries, even after a restart.
                     candidates.sort(key=lambda row: (row[0] in retries,
@@ -302,11 +427,36 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
                                 state_dir=client_state_dir(client),
                             ))
                             save_retry(conn, slug, year, event_id, None)
+                            done.add(int(event_id))
                         except (LaneClosed, AllOriginsBlocked, DailyCapExceeded):
                             raise
                         except (EspnParseError, EspnTransportError) as exc:
                             report["failed"] += 1
                             errors.append(f"{slug}:{year}:{event_id}: {type(exc).__name__}: {exc}")
+                    # Players only after every first-stage match of this edition.
+                    pending = [int(row[0]) for row in trino.execute_query(PLAYERS_PENDING_SQL, (slug, year))
+                               if int(row[0]) in done]
+                    retries = load_retries(trino, slug, year, PLAYER_RETRY_TABLE)
+                    pending.sort(key=lambda event_id: (event_id in retries,
+                                                       retries.get(event_id) or datetime.min, event_id))
+                    for event_id in pending:
+                        retry_after = retries.get(event_id)
+                        if retry_after is not None:
+                            if retry_after.tzinfo is None:
+                                retry_after = retry_after.replace(tzinfo=timezone.utc)
+                            if now_fn() < retry_after:
+                                continue
+                        check()
+                        try:
+                            save_retry(conn, slug, year, event_id, now_fn() + timedelta(days=1),
+                                       PLAYER_RETRY_TABLE)
+                            depth = players_for(slug, year, event_id, depth)
+                            save_retry(conn, slug, year, event_id, None, PLAYER_RETRY_TABLE)
+                        except (LaneClosed, AllOriginsBlocked, DailyCapExceeded):
+                            raise
+                        except (EspnParseError, EspnTransportError) as exc:
+                            report["players_failed"] += 1
+                            errors.append(f"{slug}:{year}:{event_id}: players: {type(exc).__name__}: {exc}")
                 except ProbeBudgetExhausted:
                     break
                 except (LaneClosed, AllOriginsBlocked, DailyCapExceeded):
@@ -330,7 +480,10 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         if hasattr(client, "flush_attempts"):
             client.flush_attempts(conn)
         flush_journal(conn, journal_rows(entries, run_id=run_id, task_id="run_deep"))
+    players = [entry for entry in entries if entry.endpoint in _PLAYER_ENDPOINTS]
     report.update(
+        players_requests=sum(entry.attempts for entry in players),
+        players_direct_bytes=sum(entry.direct_bytes for entry in players),
         errors=errors, requests=sum(entry.attempts for entry in entries),
         direct_bytes=sum(entry.direct_bytes for entry in entries),
         retries=sum(max(0, entry.attempts - 1) for entry in entries),
@@ -343,6 +496,9 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         ledger_complete = len(attempts) == report["requests"]
         report["requests"] = len(attempts)
         report["direct_bytes"] = sum(row["direct_bytes"] for row in attempts)
+        players = [row for row in attempts if row["endpoint"] in _PLAYER_ENDPOINTS]
+        report["players_requests"] = len(players)
+        report["players_direct_bytes"] = sum(row["direct_bytes"] for row in players)
         report["retry_attempts_lower_bound"] = report["retries"]
         report["request_ledger_complete"] = ledger_complete
         if not ledger_complete:
@@ -350,4 +506,7 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
     completed = report["completed"]
     report["requests_per_completed_match"] = report["requests"] / completed if completed else None
     report["kb_per_completed_match"] = report["direct_bytes"] / 1024 / completed if completed else None
+    completed = report["players_completed"]
+    report["requests_per_players_match"] = report["players_requests"] / completed if completed else None
+    report["kb_per_players_match"] = report["players_direct_bytes"] / 1024 / completed if completed else None
     return report

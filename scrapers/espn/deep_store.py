@@ -12,6 +12,7 @@ from .journal import _execute, _literal
 
 DEPTH_TABLE = "iceberg.ops.espn_depth_v1"
 RETRY_TABLE = "iceberg.ops.espn_deep_retry_v1"
+PLAYER_RETRY_TABLE = "iceberg.ops.espn_deep_player_retry_v1"
 DEPTH_COLUMNS = (
     ("competition_slug", "varchar"), ("source_season_year", "integer"),
     ("plays_count", "integer"), ("deep_level", "varchar"), ("has_xg", "boolean"),
@@ -37,25 +38,26 @@ def ensure_depth_table(conn):
     _execute(conn, "CREATE SCHEMA IF NOT EXISTS iceberg.ops")
     columns = ", ".join(f"{name} {kind}" for name, kind in DEPTH_COLUMNS)
     _execute(conn, f"CREATE TABLE IF NOT EXISTS {DEPTH_TABLE} ({columns})")
-    _execute(conn, f"CREATE TABLE IF NOT EXISTS {RETRY_TABLE} (competition_slug varchar, "
-             "source_season_year integer, event_id bigint, retry_after timestamp(6))")
+    for table in (RETRY_TABLE, PLAYER_RETRY_TABLE):
+        _execute(conn, f"CREATE TABLE IF NOT EXISTS {table} (competition_slug varchar, "
+                 "source_season_year integer, event_id bigint, retry_after timestamp(6))")
 
 
-def load_retries(trino, slug, year):
+def load_retries(trino, slug, year, table=RETRY_TABLE):
     return dict(trino.execute_query(
-        f"SELECT event_id, retry_after FROM {RETRY_TABLE} "
+        f"SELECT event_id, retry_after FROM {table} "
         "WHERE competition_slug = ? AND source_season_year = ?", (slug, year)))
 
 
-def save_retry(conn, slug, year, event_id, retry_after):
+def save_retry(conn, slug, year, event_id, retry_after, table=RETRY_TABLE):
     scope = (f"competition_slug = {_literal(slug, 'varchar')} "
              f"AND source_season_year = {int(year)} AND event_id = {int(event_id)}")
     if retry_after is None:
-        _execute(conn, f"DELETE FROM {RETRY_TABLE} WHERE {scope}")
+        _execute(conn, f"DELETE FROM {table} WHERE {scope}")
         return
     values = (f"{_literal(slug, 'varchar')}, {int(year)}, {int(event_id)}, "
               f"{_literal(retry_after, 'timestamp(6)')}")
-    _execute(conn, f"MERGE INTO {RETRY_TABLE} t USING (VALUES ({values})) "
+    _execute(conn, f"MERGE INTO {table} t USING (VALUES ({values})) "
              "s (competition_slug, source_season_year, event_id, retry_after) "
              "ON t.competition_slug = s.competition_slug "
              "AND t.source_season_year = s.source_season_year AND t.event_id = s.event_id "

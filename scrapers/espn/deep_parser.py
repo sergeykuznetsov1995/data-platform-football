@@ -1,4 +1,4 @@
-"""Strict core plays/statistics parsing for the first deep stage (#1513)."""
+"""Strict core plays/roster/statistics parsing for the deep stages (#1513)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,9 +7,10 @@ import re
 from typing import Callable
 
 from .core_lists import _count, raise_on_error_body
-from .parser_common import EspnParseError, canonical_json, native_id, required_mapping
+from .parser_common import (EspnParseError, canonical_json, native_id, required_list,
+                            required_mapping)
 
-PARSER_VERSION = "espn-deep-v1"
+PARSER_VERSION = "espn-deep-v2"
 # Derived names (expectedGoalsConceded, expectedAssistsSetPlay, ...) share the prefixes.
 _XG_PREFIXES = ("expectedgoals", "expectedassists")
 _XG_SHORT = frozenset({"xg", "xa", "xgot"})
@@ -140,6 +141,35 @@ def statistics(payload) -> dict:
             seen.add(key)
             number(stat.get("value"))
     return dict(payload)
+
+
+def player_statistics(payload, athlete_id: int) -> dict:
+    body = statistics(payload)
+    if _ref_id(body.get("athlete"), "athletes") != athlete_id:
+        raise EspnParseError("player statistics belong to another athlete")
+    return body
+
+
+def parse_roster(payload) -> dict[int, bool]:
+    """Athlete id -> played (starter or substituted in); duplicates are errors."""
+    raise_on_error_body(payload, "roster")
+    entries = required_list(required_mapping(payload, "roster").get("entries"), "roster.entries")
+    if not entries:
+        raise EspnParseError("roster has no entries")
+    roster = {}
+    for entry in entries:
+        entry = required_mapping(entry, "roster entry")
+        athlete = entry.get("playerId")
+        if type(athlete) is not int or athlete < 1:
+            raise EspnParseError("roster playerId must be a positive integer")
+        flags = [entry.get("starter"), *(required_mapping(entry.get(key), f"roster.{key}").get("didSub")
+                                         for key in ("subbedIn", "subbedOut"))]
+        if any(type(flag) is not bool for flag in flags):
+            raise EspnParseError("roster starter/didSub must be boolean")
+        if athlete in roster:
+            raise EspnParseError("duplicate roster player")
+        roster[athlete] = flags[0] or flags[1]
+    return roster
 
 
 def _ref_id(node, kind):
