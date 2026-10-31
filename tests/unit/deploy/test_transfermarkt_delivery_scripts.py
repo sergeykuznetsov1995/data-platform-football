@@ -585,3 +585,28 @@ def test_a_hung_scheduler_does_not_confirm_the_rollback(stand: Stand) -> None:
     assert "OUTCOME=needs-hands" in window and "RESTORED=t" not in window
     assert (stand.auto / "transfermarkt-inflight").exists()
     assert (stand.auto / "transfermarkt-auto-deliver.off").exists()
+
+
+@pytest.mark.unit
+def test_history_preflight_runs_without_the_scrapers_package_imports(tmp_path: Path) -> None:
+    """#2030: системный python3 хоста без pandas — валидатор пула истории запускается файлом,
+    а не `-m` (импорт пакета scrapers.transfermarkt тянул pandas и ронял preflight)."""
+    _state, runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    pkg = release / "scrapers" / "transfermarkt"
+    pkg.mkdir(parents=True)
+    for init in (release / "scrapers" / "__init__.py", pkg / "__init__.py"):
+        init.write_text("raise ModuleNotFoundError(\"No module named 'pandas'\")\n", encoding="utf-8")
+    (pkg / "history_pool.py").write_text(
+        (ROOT / "scrapers" / "transfermarkt" / "history_pool.py").read_text(encoding="utf-8"),
+        encoding="utf-8")
+    row = '[{{"host":"{}","port":10001,"username":"u","password":"p"}}]'
+    (runtime / "proxy-pool.json").write_text(row.format("current.example"), encoding="utf-8")
+    history = runtime / "proxy-pool.history.json"
+    history.write_text(row.format("history.example"), encoding="utf-8")
+    with env_file.open("a", encoding="utf-8") as fh:
+        fh.write(f"TM_HISTORY_STREAMS=2\nTM_PROXY_CONTROL_TOKEN={'c' * 32}\n"
+                 f"TM_BACKFILL_PROXY_CONTROL_TOKEN={'h' * 32}\n"
+                 f"TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE={history}\n")
+    result = _run_deploy(release, stubs, env_file)
+    assert "pandas" not in result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
