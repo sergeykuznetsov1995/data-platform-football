@@ -4,16 +4,24 @@ UTC 01:00–03:00 is reserved for delivery (04:00–06:00 Moscow). New portions
 stop at 00:15 to leave their full 45-minute budget before delivery. Runtime
 admission must also call ``work_deadline``: a queued run can start later than
 the scheduler's decision, and a timetable alone cannot bound task execution.
+
+Delivery drain (#2039): the delivery automat writes ``DRAIN_FLAG`` (epoch
+seconds "until") to stop admitting new portions at any hour. The flag applies
+from its mtime, so a portion that started earlier keeps its full budget; any
+read error, garbage or expiry means "no flag" so collection never stalls on it.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import math
+import os
 from typing import Any
 
 MAX_PORTION_SECONDS = 45 * 60
 IDLE_POLL_SECONDS = 5 * 60
+# Host: ${TRANSFERMARKT_RUNTIME_DIR}/gateway-state, bind-mounted read-only into Airflow.
+DRAIN_FLAG = "/opt/airflow/gateway-state/delivery-drain-until"
 
 
 def _utc(value: datetime) -> datetime:
@@ -31,12 +39,31 @@ def _budget(max_seconds: float) -> float:
     return budget
 
 
-def next_admitted_time(now: datetime) -> datetime:
-    """Return now, or 03:00 UTC if starting a portion is currently forbidden."""
-    current = _utc(now)
+def drain_until(now: datetime) -> datetime | None:
+    """End of an active delivery drain at ``now``; fail-open to None."""
+    current = _utc(now).timestamp()
+    try:
+        since = os.stat(DRAIN_FLAG).st_mtime
+        with open(DRAIN_FLAG, encoding="ascii") as fh:
+            until = int(fh.read(32).strip())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not since <= current < until:
+        return None
+    return datetime.fromtimestamp(until, tz=timezone.utc)
+
+
+def _quiet_window_admission(current: datetime) -> datetime:
     cutoff = current.replace(hour=0, minute=15, second=0, microsecond=0)
     resume = current.replace(hour=3, minute=0, second=0, microsecond=0)
     return resume if cutoff <= current < resume else current
+
+
+def next_admitted_time(now: datetime) -> datetime:
+    """Return now, or when a portion may start (03:00 UTC, end of a delivery drain)."""
+    admitted = _quiet_window_admission(_utc(now))
+    drained = drain_until(admitted)
+    return admitted if drained is None else _quiet_window_admission(drained)
 
 
 def available_work_seconds(now: datetime, max_seconds: float = MAX_PORTION_SECONDS) -> float:

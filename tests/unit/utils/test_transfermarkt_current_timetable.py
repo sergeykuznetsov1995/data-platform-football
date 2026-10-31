@@ -84,3 +84,50 @@ def test_source_plugin_recipe_is_isolated() -> None:
     files = list(plugins.glob("*.py"))
     assert [file.name for file in files] == ["current_timetable.py"]
     assert "whoscored" not in files[0].read_text().lower()
+
+
+def _drain_flag(tmp_path, monkeypatch, body: str, written: datetime):
+    import os
+    from dags.utils import transfermarkt_current_timetable as tt
+
+    flag = tmp_path / "delivery-drain-until"
+    flag.write_text(body, encoding="ascii")
+    os.utime(flag, (written.timestamp(), written.timestamp()))
+    monkeypatch.setattr(tt, "DRAIN_FLAG", str(flag))
+    return flag
+
+
+def test_delivery_drain_flag_stops_new_portions_until_it_expires(tmp_path, monkeypatch) -> None:
+    until = _at("12:30:00")
+    _drain_flag(tmp_path, monkeypatch, f"{int(until.timestamp())}\n", _at("12:00:00"))
+    assert available_work_seconds(_at("12:10:00")) == 0
+    assert next_admitted_time(_at("12:10:00")) == until
+    assert work_deadline(_at("12:10:00")) == _at("12:10:00")
+    # Expired flag: no drain.
+    assert available_work_seconds(_at("12:30:00")) == 2700
+    # A portion that started before the flag keeps its whole budget (not cut).
+    assert work_deadline(_at("11:50:00")) == _at("12:35:00")
+    assert remaining_work_seconds(work_deadline(_at("11:50:00")), _at("12:10:00")) == 1500
+
+
+def test_delivery_drain_ending_inside_the_quiet_window_waits_for_0300(tmp_path, monkeypatch) -> None:
+    _drain_flag(tmp_path, monkeypatch, str(int(_at("00:40:00").timestamp())), _at("00:00:00"))
+    assert next_admitted_time(_at("00:05:00")) == _at("03:00:00")
+
+
+@pytest.mark.parametrize("body", ["", "garbage", "12.5", "\xff"])
+def test_a_broken_drain_flag_is_ignored(tmp_path, monkeypatch, body: str) -> None:
+    from dags.utils import transfermarkt_current_timetable as tt
+
+    flag = tmp_path / "delivery-drain-until"
+    flag.write_bytes(body.encode("latin-1"))
+    monkeypatch.setattr(tt, "DRAIN_FLAG", str(flag))
+    assert available_work_seconds(_at("12:10:00")) == 2700
+
+
+def test_a_missing_drain_flag_is_ignored(tmp_path, monkeypatch) -> None:
+    from dags.utils import transfermarkt_current_timetable as tt
+
+    monkeypatch.setattr(tt, "DRAIN_FLAG", str(tmp_path / "absent"))
+    assert available_work_seconds(_at("12:10:00")) == 2700
+    assert next_admitted_time(_at("12:10:00")) == _at("12:10:00")

@@ -215,8 +215,9 @@ def test_deploy_script_order_and_pool_handling() -> None:
 @pytest.mark.unit
 def test_auto_deliver_window_and_contract() -> None:
     text = (DEPLOY / "auto_deliver.sh").read_text(encoding="utf-8")
-    assert "WINDOW_FROM=${WINDOW_FROM:-0100}" in text
-    assert "WINDOW_TO=${WINDOW_TO:-0300}" in text
+    # #2039: часового окна нет — дедлайн по ближайшему прогону registry.
+    assert "WINDOW_FROM" not in text and "set_window" not in text
+    assert "NEXT_RUN_DAGS=\"'dag_discover_transfermarkt_registry'\"" in text
     assert "FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}" in text
     assert "--drill-rollback" in text
     assert '"$old/deploy/transfermarkt/deploy.sh" "$old"' in text
@@ -226,9 +227,10 @@ def test_auto_deliver_window_and_contract() -> None:
     assert tail.index("restore_state new || restored=0") < tail.index('seen=$(acceptance_seen "$NEW"')
     # Запас окна (доставка + откат) пересчитывается после заморозки, перед снимком.
     assert "NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + 30 + ACCEPT_WAIT + ACCEPT_POLL) + BUDGET_RESERVE ))" in text
-    # Бюджет по умолчанию (доставка + откат + резерв) влезает в окно 01:00–03:00.
+    # Дренаж и бюджет по умолчанию (доставка + откат + резерв) влезают в DEADLINE_MAX.
     need = 2 * (1800 + 30 + 480 + 20) + 600
-    assert need < 7200 - 300, need
+    assert "DEADLINE_MAX=${DEADLINE_MAX:-10800}" in text and "DRAIN_MAX=${DRAIN_MAX:-3600}" in text
+    assert 3600 + need <= 10800, need
     assert text.index('freeze_release.sh" "$WANT"') < text.rindex('-lt "$NEED_BUDGET"') < text.index("Шаг 8")
     # Приёмка требует живого SchedulerJob.
     assert '[ "$got" = healthy ] || { acceptance_result 0 scheduler_health' in text
