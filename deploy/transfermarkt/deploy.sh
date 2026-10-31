@@ -102,7 +102,8 @@ if [ "${TM_HISTORY_STREAMS:-0}" != 0 ] || [ -n "${TM_BACKFILL_PROXY_CONTROL_TOKE
     && [ -f "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE" ] \
     && [ -s "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE" ] \
     || { echo "history requires its separate proxy pool file" >&2; exit 2; }
-  PYTHONPATH="$RELEASE" python3 -m scrapers.transfermarkt.history_pool \
+  # By path, not `-m`: importing the scrapers package pulls pandas, absent from host python3 (#2030).
+  python3 "$RELEASE/scrapers/transfermarkt/history_pool.py" \
     "$TRANSFERMARKT_PROXY_POOL_FILE" "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE" || exit 2
   HISTORY_POOL_JSON=$(cat "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE")
 fi
