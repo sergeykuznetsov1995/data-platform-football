@@ -1,0 +1,762 @@
+# FotMob Silver — аналитическое ядро (#2016, эпик #1677). Генерируется; правила — README.md рядом.
+# Читают: SQL dags/sql/silver/fotmob_*.sql.j2 (#2017–#2019) и аудит Charter (scripts/audit_silver_charter.py).
+# from: <view>.<column> | <view>.<json_column>:<JSONPath внутри колонки> | derived: <правило>.
+# В путях к элементам массивов указан представитель (homeTeam/starters/Periods.All); полный список — row_source/notes.
+# conform: try — приведение строки к числу/дате/времени может не удаться -> NULL + запись в _conform_issues_json.
+# registry — registry_id модели 1.1, которые колонка закрывает (полное сопоставление — field_assignment.tsv).
+version: 1
+source: fotmob
+context_columns: [competition_id, source_season_key]
+lineage_columns:            # общие для всех таблиц, в tables.*.columns не повторяются
+  - {name: _bronze_batch_id, type: VARCHAR, from: _target_batch_id}
+  - {name: _bronze_observed_at, type: "TIMESTAMP(6)", from: _observed_at}
+  - {name: _bronze_ingested_at, type: "TIMESTAMP(6)", from: _ingested_at}
+  - {name: _parser_version, type: VARCHAR, from: _parser_version}
+  - {name: _conform_issues_json, type: VARCHAR, from: derived}   # JSON-массив {column, raw, reason}; NULL, если проблем нет (README: правило NULL)
+tables:
+  fotmob_matches:
+    scope: context
+    task: 2017
+    grain: "один матч FotMob, один раз — в самом точном сезоне (Apertura/Clausura вместо родителя)"
+    natural_key: [competition_id, source_season_key, match_id]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_matches_current, fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_matches_current (календарь, все матчи, в т.ч. без карточки) LEFT JOIN fotmob_match_payloads_current по (competition_id, source_season_key, match_id); затем правило самого точного сезона"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_matches_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_matches_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_matches_current.match_id", registry: [E0302, E0335, E0362, M0278, M0495, M1055]}
+      - {name: parent_season_key, type: VARCHAR, nullable: true, from: "derived: regexp_extract(source_season_key, '^(.+?) - (.+)$', 1), если такой ключ есть в fotmob_competition_seasons_current того же competition_id; иначе NULL"}
+      - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_matches_current.scope_stage_id"}
+      - {name: kickoff_utc, type: "TIMESTAMP(6) WITH TIME ZONE", nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.matchTimeUTCDate", conform: try, registry: [M0449, M1059, M1249]}
+      - {name: calendar_kickoff_utc, type: "TIMESTAMP(6) WITH TIME ZONE", nullable: true, from: "fotmob_matches_current.utc_time", conform: try, registry: [E0320, E0354, E0380]}
+      - {name: is_date_correct, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox[\"Match Date\"].isDateCorrect", registry: [M0448]}
+      - {name: timezone, type: VARCHAR, nullable: true, from: "fotmob_matches_current.timezone", registry: [E0319, E0379]}
+      - {name: round_id, type: VARCHAR, nullable: true, from: "fotmob_matches_current.round_id", registry: [E0304, E0364]}
+      - {name: round_name, type: VARCHAR, nullable: true, from: "fotmob_matches_current.round_name", registry: [E0305, E0365]}
+      - {name: stage_id, type: VARCHAR, nullable: true, from: "fotmob_matches_current.stage_id"}
+      - {name: group_name, type: VARCHAR, nullable: true, from: "fotmob_matches_current.group_name"}
+      - {name: payload_league_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.leagueId", registry: [M0472, M1052]}
+      - {name: payload_parent_league_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.parentLeagueId", registry: [M0475, M1060]}
+      - {name: payload_league_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.leagueName", registry: [M0473, M1053]}
+      - {name: payload_round, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.matchRound", registry: [M0476, M1057]}
+      - {name: payload_round_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.leagueRoundName", registry: [M0477, M1054]}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.countryCode", registry: [M0285, M1046]}
+      - {name: gender, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.gender", registry: [M1049]}
+      - {name: coverage_level, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.coverageLevel", registry: [M1047]}
+      - {name: home_team_id, type: BIGINT, nullable: true, from: "fotmob_matches_current.home_team_id", registry: [E0299, E0332, E0359]}
+      - {name: home_team_name, type: VARCHAR, nullable: true, from: "fotmob_matches_current.home_team_name", registry: [E0300, E0333, E0360]}
+      - {name: home_team_short_name, type: VARCHAR, nullable: true, from: "fotmob_matches_current.home_team_short_name", registry: [E0301, E0361]}
+      - {name: away_team_id, type: BIGINT, nullable: true, from: "fotmob_matches_current.away_team_id", registry: [E0296, E0328, E0356]}
+      - {name: away_team_name, type: VARCHAR, nullable: true, from: "fotmob_matches_current.away_team_name", registry: [E0297, E0329, E0357]}
+      - {name: away_team_short_name, type: VARCHAR, nullable: true, from: "fotmob_matches_current.away_team_short_name", registry: [E0298, E0358]}
+      - {name: home_score, type: INTEGER, nullable: true, from: "fotmob_matches_current.home_score", registry: [E0334]}
+      - {name: away_score, type: INTEGER, nullable: true, from: "fotmob_matches_current.away_score", registry: [E0330]}
+      - {name: score_text, type: VARCHAR, nullable: true, from: "fotmob_matches_current.score_text", registry: [E0317, E0352, E0377, M1247]}
+      - {name: home_penalty_score, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.status.reason.penalties[0]", registry: [M1244]}
+      - {name: away_penalty_score, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.status.reason.penalties[1]"}
+      - {name: aggregate_score_text, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.status.aggregatedStr", registry: [M1229]}
+      - {name: home_red_cards, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.status.numberOfHomeRedCards", registry: [M1241]}
+      - {name: away_red_cards, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.status.numberOfAwayRedCards", registry: [M1240]}
+      - {name: finished, type: BOOLEAN, nullable: true, from: "fotmob_matches_current.finished", registry: [E0308, E0343, E0368, M1048, M1232]}
+      - {name: started, type: BOOLEAN, nullable: true, from: "fotmob_matches_current.started", registry: [E0318, E0353, E0378, M1061, M1248]}
+      - {name: cancelled, type: BOOLEAN, nullable: true, from: "fotmob_matches_current.cancelled", registry: [E0307, E0342, E0367, M1231]}
+      - {name: awarded, type: BOOLEAN, nullable: true, from: "fotmob_matches_current.awarded", registry: [E0306, E0341, E0366, M1230]}
+      - {name: postponed, type: BOOLEAN, nullable: true, from: "fotmob_matches_current.postponed", conform: try}
+      - {name: status_short, type: VARCHAR, nullable: true, from: "fotmob_matches_current.status_reason_short", registry: [E0315, E0350, E0375, M1245]}
+      - {name: status_short_key, type: VARCHAR, nullable: true, from: "fotmob_matches_current.status_reason_short_key", registry: [E0316, E0351, E0376, M1246]}
+      - {name: status_long, type: VARCHAR, nullable: true, from: "fotmob_matches_current.status_reason_long", registry: [E0313, E0348, E0373, M1242]}
+      - {name: status_long_key, type: VARCHAR, nullable: true, from: "fotmob_matches_current.status_reason_long_key", registry: [E0314, E0349, E0374, M1243]}
+      - {name: has_pending_var, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.hasPendingVAR", registry: [M1070]}
+      - {name: has_playoff, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.content.hasPlayoff", registry: [M0054]}
+      - {name: venue_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.name", registry: [M0470]}
+      - {name: venue_city, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.city", registry: [M0466]}
+      - {name: venue_country, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.country", registry: [M0467]}
+      - {name: venue_capacity, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.capacity", registry: [M0465]}
+      - {name: venue_latitude, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.lat", registry: [M0468]}
+      - {name: venue_longitude, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.long", registry: [M0469]}
+      - {name: venue_surface, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Stadium.surface", registry: [M0471]}
+      - {name: attendance, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Attendance", registry: [M0447]}
+      - {name: referee_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Referee.id", conform: try, registry: [M0452]}
+      - {name: referee_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Referee.text", registry: [M0464]}
+      - {name: referee_country_code, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox.Referee.countryCode", registry: [M0451]}
+      - {name: player_of_the_match_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.playerOfTheMatch.id", registry: [M0507]}
+      - {name: lineup_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.lineupType", registry: [M0277]}
+      - {name: lineup_source, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.source", registry: [M0279]}
+      - {name: weather_description, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.content.weather.description", registry: [M1033]}
+      - {name: weather_temperature, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.content.weather.temperature", registry: [M1040]}
+      - {name: weather_wind_speed, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.content.weather.windSpeed", registry: [M1043]}
+      - {name: weather_relative_humidity, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.content.weather.relativeHumidity", registry: [M1038]}
+      - {name: weather_precipitation, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.content.weather.precipitation", registry: [M1037]}
+      - {name: has_payload, type: BOOLEAN, nullable: false, from: "derived: есть строка fotmob_match_payloads_current для матча"}
+      - {name: has_match_facts, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.available_sections_json:$.matchFacts"}
+      - {name: has_lineup, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.available_sections_json:$.lineup", registry: [M0063]}
+      - {name: has_stats, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.available_sections_json:$.stats", registry: [M0931]}
+      - {name: has_shotmap, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.available_sections_json:$.shotmap"}
+      - {name: has_player_stats, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.available_sections_json:$.playerStats", registry: [M0681, M0725]}
+      - {name: has_momentum, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.available_sections_json:$.momentum", registry: [M0676]}
+      - {name: missing_expected_sections, type: "ARRAY(VARCHAR)", nullable: true, from: "fotmob_match_payloads_current.missing_expected_sections_json:$"}
+      - {name: page_url, type: VARCHAR, nullable: true, from: "fotmob_matches_current.page_url", registry: [E0303, E0340, E0363]}
+    raw_json:
+      - {name: general_json, from: "fotmob_match_payloads_current.payload_json:$.general", holds: "секция general целиком (имя матча, цвета команд и пр.)"}
+      - {name: header_status_json, from: "fotmob_match_payloads_current.payload_json:$.header.status", holds: "header.status целиком (halfs-часы, liveTime, whoLost*)"}
+      - {name: info_box_json, from: "fotmob_match_payloads_current.match_facts_json:$.infoBox", holds: "infoBox целиком (статистика судьи, legInfo, Tournament)"}
+      - {name: h2h_json, from: "fotmob_match_payloads_current.h2h_json", holds: "секция h2h целиком"}
+      - {name: insights_json, from: "fotmob_match_payloads_current.match_facts_json:$.insights", holds: "matchFacts.insights"}
+      - {name: qa_data_json, from: "fotmob_match_payloads_current.match_facts_json:$.QAData", holds: "matchFacts.QAData (вопрос-ответ)"}
+      - {name: poll_json, from: "fotmob_match_payloads_current.match_facts_json:$.poll", holds: "matchFacts.poll (опрос, odds-poll)"}
+      - {name: team_form_json, from: "fotmob_match_payloads_current.match_facts_json:$.teamForm", holds: "matchFacts.teamForm (форма команд перед матчем)"}
+      - {name: top_players_json, from: "fotmob_match_payloads_current.match_facts_json:$.topPlayers", holds: "matchFacts.topPlayers"}
+      - {name: top_scorers_json, from: "fotmob_match_payloads_current.match_facts_json:$.topScorers", holds: "matchFacts.topScorers"}
+      - {name: player_of_the_match_json, from: "fotmob_match_payloads_current.match_facts_json:$.playerOfTheMatch", holds: "matchFacts.playerOfTheMatch целиком"}
+      - {name: highlights_json, from: "fotmob_match_payloads_current.match_facts_json:$.highlights", holds: "matchFacts.highlights (видео)"}
+      - {name: pre_review_json, from: "fotmob_match_payloads_current.match_facts_json:$.preReview", holds: "matchFacts.preReview"}
+      - {name: post_review_json, from: "fotmob_match_payloads_current.match_facts_json:$.postReview", holds: "matchFacts.postReview"}
+      - {name: match_insights_config_json, from: "fotmob_match_payloads_current.match_facts_json:$.matchInsightsConfig", holds: "matchFacts.matchInsightsConfig"}
+      - {name: weather_json, from: "fotmob_match_payloads_current.payload_json:$.content.weather", holds: "content.weather целиком"}
+      - {name: league_table_ref_json, from: "fotmob_match_payloads_current.payload_json:$.content.table", holds: "content.table (ссылка на таблицу турнира)"}
+      - {name: momentum_alternate_models_json, from: "fotmob_match_payloads_current.momentum_json:$.alternateModels", holds: "momentum.alternateModels"}
+  fotmob_match_teams:
+    scope: context
+    task: 2017
+    grain: "одна сторона (home/away) матча"
+    natural_key: [competition_id, source_season_key, match_id, side]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_matches_current, fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "2 строки на матч: home и away; side-объекты lineup_json:$.homeTeam/$.awayTeam, header.teams[0]/[1]"
+    notes: "пути с homeTeam/home/[0] — представитель; для away те же пути с awayTeam/away/[1]"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: side, type: VARCHAR, nullable: false, from: "derived: 'home' | 'away'"}
+      - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.homeTeam.id", registry: [M0079, M0185, M1044, M1050, M1253]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.homeTeam.name", registry: [M0080, M0186, M1045, M1051, M1255]}
+      - {name: score, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.teams[*].score", registry: [M1257]}
+      - {name: fifa_rank, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.header.teams[*].fifaRank", registry: [M1252]}
+      - {name: formation, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.formation", registry: [M0078, M0184]}
+      - {name: team_rating, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.rating", registry: [M0081, M0187]}
+      - {name: average_starter_age, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.averageStarterAge", registry: [M0066, M0172]}
+      - {name: total_starter_market_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.totalStarterMarketValue", registry: [M0155, M0260]}
+      - {name: total_starter_market_value_currency, type: VARCHAR, nullable: true, from: "derived: NULL — FotMob не передаёт валюту в этой секции (по подписи «€» в карточке игрока вероятно EUR; не подтверждено — вопрос в следующий гриль)"}
+      - {name: coach_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.coach.id", registry: [M0071, M0177]}
+      - {name: coach_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.coach.name", registry: [M0074, M0180]}
+      - {name: coach_country_code, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.coach.countryCode", registry: [M0068, M0174]}
+    raw_json:
+      - {name: coach_json, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.coach", holds: "объект тренера стороны целиком"}
+      - {name: unavailable_json, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.unavailable", holds: "травмированные/дисквалифицированные игроки стороны"}
+      - {name: attacking_zones_json, from: "fotmob_match_payloads_current.payload_json:$.content.attackingZones.home", holds: "зоны атак стороны по периодам"}
+  fotmob_match_team_stats:
+    scope: context
+    task: 2017
+    grain: "одно значение командной статистики матча: период x группа x показатель x сторона"
+    natural_key: [competition_id, source_season_key, match_id, period, stat_group, stat_key, side]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_match_payloads_current.stats_json:$.Periods.<period>.stats[*].stats[*], элемент stats[] = [home, away] -> 2 строки"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: period, type: VARCHAR, nullable: false, from: "derived: имя ключа $.Periods.<period> (All, FirstHalf, SecondHalf, FirstExtraHalf, SecondExtraHalf)"}
+      - {name: stat_group, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].key", registry: [M0932, M0951, M0967, M0986, M1002]}
+      - {name: stat_group_title, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].title", registry: [M0942, M0958, M0977, M0993, M1012]}
+      - {name: stat_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*].key", registry: [M0935, M0954, M0970, M0989, M1005]}
+      - {name: stat_title, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*].title", registry: [M0940, M0956, M0975, M0991, M1010]}
+      - {name: side, type: VARCHAR, nullable: false, from: "derived: 'home' для stats[0], 'away' для stats[1]"}
+      - {name: team_id, type: BIGINT, nullable: true, from: "derived: fotmob_matches.home_team_id / away_team_id по side"}
+      - {name: stat_value_raw, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*].stats[*]", registry: [M0939, M0955, M0974, M0990, M1009]}
+      - {name: stat_value, type: DOUBLE, nullable: true, from: "derived: первое число из stat_value_raw (\"401 (82%)\" -> 401)", conform: try}
+      - {name: stat_value_pct, type: DOUBLE, nullable: true, from: "derived: число в скобках с % из stat_value_raw (\"401 (82%)\" -> 82)", conform: try}
+      - {name: stat_format, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*].format", registry: [M0933, M0952, M0968, M0987, M1003]}
+      - {name: stat_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*].type", registry: [M0941, M0957, M0976, M0992, M1011]}
+      - {name: highlighted, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*].highlighted", registry: [M0934, M0953, M0969, M0988, M1004]}
+    raw_json:
+      - {name: stat_json, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].stats[*]", holds: "элемент показателя целиком (вкл. rawStats)"}
+  fotmob_match_lineups:
+    scope: context
+    task: 2017
+    grain: "один игрок в заявке стороны на матч (основа или запас)"
+    natural_key: [competition_id, source_season_key, match_id, local_player_key]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*], $.homeTeam.subs[*], $.awayTeam.starters[*], $.awayTeam.subs[*]"
+    notes: "пути с homeTeam.starters — представитель; те же поля в homeTeam.subs[*], awayTeam.starters[*], awayTeam.subs[*]"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: local_player_key, type: VARCHAR, nullable: false, from: "derived: '<side>:<role>:<index>' — side home|away, role starter|sub, index — порядковый номер в массиве starters/subs с 1 (стабилен в одной версии карточки)"}
+      - {name: side, type: VARCHAR, nullable: false, from: "derived: 'home' | 'away'"}
+      - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.id"}
+      - {name: lineup_role, type: VARCHAR, nullable: false, from: "derived: 'starter' (starters[]) | 'sub' (subs[])"}
+      - {name: lineup_index, type: INTEGER, nullable: false, from: "derived: порядковый номер в массиве с 1"}
+      - {name: player_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].id", rule: "id 0 или отсутствует -> NULL; строка сохраняется (см. opta_id и local_player_key)", registry: [M0090, M0127, M0196, M0233]}
+      - {name: opta_id, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].optaId", registry: [M0095, M0131, M0201, M0237]}
+      - {name: player_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].name", registry: [M0094, M0130, M0200, M0236]}
+      - {name: shirt_number, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].shirtNumber", conform: try, registry: [M0116, M0152, M0222, M0257]}
+      - {name: position_id, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].positionId", registry: [M0108, M0214]}
+      - {name: usual_playing_position_id, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].usualPlayingPositionId", registry: [M0118, M0154, M0224, M0259]}
+      - {name: is_captain, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].isCaptain", registry: [M0091, M0197]}
+      - {name: age, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].age", registry: [M0082, M0123, M0188, M0229]}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].countryCode", registry: [M0083, M0124, M0189, M0230]}
+      - {name: market_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].marketValue", registry: [M0093, M0129, M0199, M0235]}
+      - {name: market_value_currency, type: VARCHAR, nullable: true, from: "derived: NULL — FotMob не передаёт валюту в этой секции (по подписи «€» в карточке игрока вероятно EUR; не подтверждено — вопрос в следующий гриль)"}
+      - {name: rating, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].performance.rating", registry: [M0099, M0136, M0205, M0241]}
+      - {name: fantasy_score, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].performance.fantasyScore", conform: try, registry: [M0097, M0134, M0203, M0240]}
+      - {name: is_player_of_the_match, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].performance.playerOfTheMatch", registry: [M0098, M0135, M0204]}
+      - {name: sub_in_minute, type: INTEGER, nullable: true, from: "derived: time элемента performance.substitutionEvents[*] с type='subIn'", registry: [M0104, M0105, M0141, M0142, M0210, M0211, M0246, M0247]}
+      - {name: sub_out_minute, type: INTEGER, nullable: true, from: "derived: time элемента performance.substitutionEvents[*] с type='subOut'"}
+      - {name: top_speed, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].performance.topSpeed", registry: [M0106, M0143, M0212, M0248]}
+      - {name: total_distance_covered, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*].performance.totalDistanceCovered", registry: [M0107, M0144, M0213, M0249]}
+    raw_json:
+      - {name: player_json, from: "fotmob_match_payloads_current.lineup_json:$.homeTeam.starters[*]", holds: "элемент игрока целиком (performance, rankings, layout, сезонные цифры)"}
+  fotmob_match_player_stats:
+    scope: context
+    task: 2017
+    grain: "одно значение статистики игрока в матче: игрок x группа x показатель"
+    natural_key: [competition_id, source_season_key, match_id, local_player_key, stat_group, stat_key]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_match_payloads_current.player_stats_json:$.<player_key>.stats[*].stats.<title>"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: local_player_key, type: VARCHAR, nullable: false, from: "derived: local_player_key строки состава, найденной по id (или по optaId, если id=0/нет); если игрока нет в составе — 'stats:' || ключ словаря playerStats"}
+      - {name: side, type: VARCHAR, nullable: true, from: "derived: 'home'/'away' по teamId против home/away team_id матча"}
+      - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.teamId", registry: [M0734]}
+      - {name: player_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.id", rule: "id 0 или отсутствует -> NULL; строка сохраняется (см. opta_id и local_player_key)", registry: [M0689]}
+      - {name: opta_id, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.optaId", registry: [M0693]}
+      - {name: player_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.name", registry: [M0692]}
+      - {name: is_goalkeeper, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.isGoalkeeper", registry: [M0690]}
+      - {name: stat_group, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].key", registry: [M0726]}
+      - {name: stat_group_title, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].title", registry: [M0733]}
+      - {name: stat_title, type: VARCHAR, nullable: true, from: "derived: имя ключа словаря stats[*].stats.<title>"}
+      - {name: stat_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.key", registry: [M0728]}
+      - {name: stat_value, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.stat.value", registry: [M0732]}
+      - {name: stat_total, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.stat.total", registry: [M0730]}
+      - {name: stat_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.stat.type", registry: [M0731]}
+    raw_json:
+      - {name: stat_json, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*", holds: "элемент показателя целиком"}
+  fotmob_match_events:
+    scope: context
+    task: 2017
+    grain: "одно событие ленты матча (гол, карточка, замена, VAR, перерыв, удар серии пенальти)"
+    natural_key: [competition_id, source_season_key, match_id, event_section, event_index]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_match_payloads_current.match_facts_json:$.events.events[*] (event_section='events') и $.events.penaltyShootoutEvents[*] (event_section='penalty_shootout')"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: event_section, type: VARCHAR, nullable: false, from: "derived: 'events' | 'penalty_shootout'"}
+      - {name: event_index, type: INTEGER, nullable: false, from: "derived: порядковый номер в массиве с 1"}
+      - {name: event_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].eventId", registry: [M0305, M0383]}
+      - {name: event_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].type", registry: [M0376, M0442]}
+      - {name: minute, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].time", registry: [M0374, M0440]}
+      - {name: minute_added, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].overloadTime", registry: [M0323, M0395]}
+      - {name: is_home, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].isHome", registry: [M0315, M0390]}
+      - {name: side, type: VARCHAR, nullable: true, from: "derived: 'home' если is_home, 'away' если NOT is_home"}
+      - {name: team_id, type: BIGINT, nullable: true, from: "derived: home_team_id/away_team_id матча по side"}
+      - {name: player_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].player.id", rule: "id 0 или отсутствует -> NULL; строка сохраняется (см. opta_id и local_player_key)", registry: [M0329, M0399]}
+      - {name: player_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].nameStr", registry: [M0321, M0393]}
+      - {name: assist_player_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].assistPlayerId", registry: [M0293]}
+      - {name: assist_player_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].assistInput", registry: [M0291]}
+      - {name: home_score, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].homeScore", registry: [M0312, M0388]}
+      - {name: away_score, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].awayScore", registry: [M0296, M0381]}
+      - {name: card, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].card", registry: [M0298]}
+      - {name: card_reason_key, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].cardReason.localizedKey", registry: [M0304]}
+      - {name: goal_description_key, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].goalDescriptionKey", registry: [M0309, M0387]}
+      - {name: is_own_goal, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].ownGoal", registry: [M0325, M0397]}
+      - {name: is_penalty_shootout, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].isPenaltyShootoutEvent", registry: [M0316, M0391]}
+      - {name: minutes_added, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].minutesAddedInput", registry: [M0318]}
+      - {name: shot_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].shotmapEvent.id", registry: [M0346, M0415]}
+    raw_json:
+      - {name: event_json, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*]", holds: "элемент события целиком (swap замены, VAR, shotmapEvent, newScore)"}
+  fotmob_shots:
+    scope: context
+    task: 2017
+    grain: "один удар матча (вкл. удары серии пенальти)"
+    natural_key: [competition_id, source_season_key, match_id, shot_id]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_match_payloads_current.shotmap_json:$.shots[*]"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: shot_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].id", registry: [M0908]}
+      - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].teamId", registry: [M0928]}
+      - {name: side, type: VARCHAR, nullable: true, from: "derived: 'home'/'away' по team_id против home/away team_id матча"}
+      - {name: player_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].playerId", rule: "id 0 или отсутствует -> NULL; строка сохраняется (см. opta_id и local_player_key)", registry: [M0922]}
+      - {name: player_name, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].playerName", registry: [M0923]}
+      - {name: event_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].eventType", registry: [M0901]}
+      - {name: period, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].period", registry: [M0921]}
+      - {name: minute, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].min", registry: [M0916]}
+      - {name: minute_added, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].minAdded", registry: [M0917]}
+      - {name: x, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].x", registry: [M0929]}
+      - {name: y, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].y", registry: [M0930]}
+      - {name: blocked_x, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].blockedX", registry: [M0899]}
+      - {name: blocked_y, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].blockedY", registry: [M0900]}
+      - {name: goal_crossed_y, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].goalCrossedY", registry: [M0906]}
+      - {name: goal_crossed_z, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].goalCrossedZ", registry: [M0907]}
+      - {name: on_goal_x, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].onGoalShot.x", registry: [M0918]}
+      - {name: on_goal_y, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].onGoalShot.y", registry: [M0919]}
+      - {name: expected_goals, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].expectedGoals", registry: [M0902]}
+      - {name: expected_goals_on_target, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].expectedGoalsOnTarget", registry: [M0903]}
+      - {name: shot_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].shotType", registry: [M0925]}
+      - {name: situation, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].situation", registry: [M0926]}
+      - {name: is_blocked, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].isBlocked", registry: [M0909]}
+      - {name: is_on_target, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].isOnTarget", registry: [M0911]}
+      - {name: is_own_goal, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].isOwnGoal", registry: [M0912]}
+      - {name: is_saved_off_line, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].isSavedOffLine", registry: [M0913]}
+      - {name: is_from_inside_box, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].isFromInsideBox", registry: [M0910]}
+      - {name: keeper_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].keeperId", registry: [M0914]}
+      - {name: is_penalty_shootout, type: BOOLEAN, nullable: false, from: "derived: period = 'PenaltyShootout'"}
+    raw_json:
+      - {name: shot_json, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*]", holds: "элемент удара целиком (onGoalShot.zoomRatio, имена, цвет)"}
+  fotmob_match_momentum:
+    scope: context
+    task: 2017
+    grain: "одна точка графика давления (momentum) матча"
+    natural_key: [competition_id, source_season_key, match_id, minute]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_match_payloads_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_match_payloads_current.momentum_json:$.main.data[*]"
+    notes: "элемент {minute, value} раскладывается полностью — отдельная колонка сырого элемента не нужна"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
+      - {name: minute, type: DOUBLE, nullable: false, from: "fotmob_match_payloads_current.momentum_json:$.main.data[*].minute", registry: [M0678]}
+      - {name: momentum_value, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.momentum_json:$.main.data[*].value", registry: [M0679]}
+      - {name: model_title, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.momentum_json:$.main.debugTitle", registry: [M0680]}
+    raw_json: []
+  fotmob_competitions:
+    scope: global
+    context_as_key: true
+    task: 2018
+    grain: "один турнир FotMob"
+    natural_key: [competition_id]
+    partitioning: []
+    sources: [fotmob_competitions_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_competitions_current.competition_id", registry: [E0001]}
+      - {name: competition_name, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.name", registry: [E0002]}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.country_code", registry: [E0004]}
+      - {name: country_name, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.country_name"}
+      - {name: gender, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.gender", registry: [E0005]}
+      - {name: competition_type, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.competition_type", registry: [E0006]}
+      - {name: age_group, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.age_group"}
+      - {name: page_url, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.page_url"}
+      - {name: source_slug, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.source_slug", registry: [E0007]}
+      - {name: presentation_slug, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.presentation_slug"}
+      - {name: scope_decision, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.scope_decision"}
+      - {name: scope_reason, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.scope_reason"}
+      - {name: scope_policy_rule, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.scope_policy_rule"}
+      - {name: has_catalog_conflict, type: BOOLEAN, nullable: true, from: "fotmob_competitions_current.has_catalog_conflict"}
+      - {name: is_tombstoned, type: BOOLEAN, nullable: true, from: "fotmob_competitions_current.is_tombstoned"}
+      - {name: tombstone_reason, type: VARCHAR, nullable: true, from: "fotmob_competitions_current.tombstone_reason"}
+      - {name: discovery_date, type: DATE, nullable: true, from: "fotmob_competitions_current.discovery_date", conform: try}
+    raw_json:
+      - {name: conflict_fields_json, from: "fotmob_competitions_current.conflict_fields_json", holds: "поля, по которым каталог расходится"}
+      - {name: source_paths_json, from: "fotmob_competitions_current.source_paths", holds: "пути каталога, где турнир встречен"}
+  fotmob_competition_seasons:
+    scope: global
+    context_as_key: true
+    task: 2018
+    grain: "один сезон турнира под точным ключом FotMob (в т.ч. родительский 2026 и дочерние Apertura/Clausura)"
+    natural_key: [competition_id, source_season_key]
+    partitioning: []
+    sources: [fotmob_competition_seasons_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_competition_seasons_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_competition_seasons_current.source_season_key", registry: [E0008]}
+      - {name: parent_season_key, type: VARCHAR, nullable: true, from: "derived: regexp_extract(source_season_key, '^(.+?) - (.+)$', 1), если такой ключ есть в fotmob_competition_seasons_current того же competition_id; иначе NULL"}
+      - {name: season_part, type: VARCHAR, nullable: true, from: "derived: regexp_extract(source_season_key, '^(.+?) - (.+)$', 2) при непустом parent_season_key"}
+      - {name: has_child_seasons, type: BOOLEAN, nullable: false, from: "derived: есть ключ этого же competition_id вида source_season_key || ' - ' || <часть>"}
+      - {name: is_selected, type: BOOLEAN, nullable: true, from: "fotmob_competition_seasons_current.is_selected", registry: [E0009]}
+      - {name: is_latest, type: BOOLEAN, nullable: true, from: "fotmob_competition_seasons_current.is_latest", registry: [E0010]}
+      - {name: source_order, type: INTEGER, nullable: true, from: "fotmob_competition_seasons_current.source_order"}
+      - {name: source_slug, type: VARCHAR, nullable: true, from: "fotmob_competition_seasons_current.source_slug"}
+      - {name: winner_team_id, type: BIGINT, nullable: true, from: "fotmob_competition_seasons_current.winner_id"}
+      - {name: winner_team_name, type: VARCHAR, nullable: true, from: "fotmob_competition_seasons_current.winner_name"}
+      - {name: runner_up_team_id, type: BIGINT, nullable: true, from: "fotmob_competition_seasons_current.runner_up_id"}
+      - {name: runner_up_team_name, type: VARCHAR, nullable: true, from: "fotmob_competition_seasons_current.runner_up_name"}
+      - {name: stat_tournament_id, type: BIGINT, nullable: true, from: "fotmob_competition_seasons_current.stat_link_json:$.TournamentId", registry: [E0016]}
+    raw_json:
+      - {name: season_history_json, from: "fotmob_competition_seasons_current.season_history_json", holds: "элемент seasons[] страницы турнира (победитель/финалист)"}
+      - {name: stat_link_json, from: "fotmob_competition_seasons_current.stat_link_json", holds: "элемент stats.seasonStatLinks[] (ссылка на статистику сезона)"}
+  fotmob_competition_season_history:
+    scope: global
+    context_as_key: true
+    task: 2018
+    grain: "одна строка истории победителей турнира (метка сезона FotMob из seasons[])"
+    natural_key: [competition_id, history_season_label]
+    partitioning: []
+    sources: [fotmob_competition_season_history_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_competition_season_history_current.competition_id"}
+      - {name: history_season_label, type: VARCHAR, nullable: false, from: "fotmob_competition_season_history_current.history_season_label", registry: [E0021]}
+      - {name: winner_team_id, type: BIGINT, nullable: true, from: "fotmob_competition_season_history_current.winner_id", registry: [E0022]}
+      - {name: winner_team_name, type: VARCHAR, nullable: true, from: "fotmob_competition_season_history_current.winner_name", registry: [E0023]}
+      - {name: runner_up_team_id, type: BIGINT, nullable: true, from: "fotmob_competition_season_history_current.runner_up_id", registry: [E0024]}
+      - {name: runner_up_team_name, type: VARCHAR, nullable: true, from: "fotmob_competition_season_history_current.runner_up_name", registry: [E0025]}
+    raw_json:
+      - {name: season_history_json, from: "fotmob_competition_season_history_current.season_history_json", holds: "элемент seasons[] целиком"}
+  fotmob_season_stages:
+    scope: context
+    task: 2018
+    grain: "одна стадия сезона (тур календаря, таблица, раунд плей-офф, срез статистики)"
+    natural_key: [competition_id, source_season_key, stage_id]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_season_stages_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_season_stages_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_season_stages_current.source_season_key"}
+      - {name: stage_id, type: VARCHAR, nullable: false, from: "fotmob_season_stages_current.stage_id"}
+      - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_season_stages_current.scope_stage_id"}
+      - {name: source_stage_id, type: BIGINT, nullable: true, from: "fotmob_season_stages_current.source_stage_id", registry: [E0026]}
+      - {name: stage_name, type: VARCHAR, nullable: true, from: "fotmob_season_stages_current.stage_name"}
+      - {name: stage_type, type: VARCHAR, nullable: true, from: "fotmob_season_stages_current.stage_type"}
+      - {name: localized_key, type: VARCHAR, nullable: true, from: "fotmob_season_stages_current.localized_key", registry: [E0027]}
+      - {name: is_active, type: BOOLEAN, nullable: true, from: "fotmob_season_stages_current.is_active"}
+      - {name: template_id, type: BIGINT, nullable: true, from: "fotmob_season_stages_current.template_id"}
+      - {name: tournament_id, type: BIGINT, nullable: true, from: "fotmob_season_stages_current.tournament_id"}
+      - {name: participant_count, type: INTEGER, nullable: true, from: "fotmob_season_stages_current.participant_count", conform: try}
+      - {name: source_order, type: INTEGER, nullable: true, from: "fotmob_season_stages_current.source_order"}
+      - {name: relative_path, type: VARCHAR, nullable: true, from: "fotmob_season_stages_current.relative_path"}
+      - {name: page_url, type: VARCHAR, nullable: true, from: "fotmob_season_stages_current.page_url", registry: [E0032, E0402, E0864]}
+    raw_json:
+      - {name: legend_json, from: "fotmob_season_stages_current.legend", holds: "легенда таблицы (цвета/зоны квалификации)"}
+  fotmob_standings:
+    scope: context
+    task: 2018
+    grain: "одна строка турнирной таблицы: таблица x вид (all/home/away/...) x команда"
+    natural_key: [competition_id, source_season_key, table_id, table_type, team_id]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_standings_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_standings_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_standings_current.source_season_key"}
+      - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_standings_current.scope_stage_id"}
+      - {name: table_id, type: BIGINT, nullable: false, from: "fotmob_standings_current.table_id", registry: [E0028, E0396, E0858]}
+      - {name: table_name, type: VARCHAR, nullable: true, from: "fotmob_standings_current.table_name", registry: [E0029, E0030, E0031, E0397, E0859]}
+      - {name: table_type, type: VARCHAR, nullable: false, from: "fotmob_standings_current.table_type"}
+      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_standings_current.team_id", registry: [E0039, E0407, E0423, E0439, E0455, E0869, E0885, E0901, E0917]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_standings_current.team_name", registry: [E0040, E0410, E0426, E0442, E0458, E0872, E0888, E0904, E0920]}
+      - {name: team_short_name, type: VARCHAR, nullable: true, from: "fotmob_standings_current.team_short_name", registry: [E0041, E0417, E0433, E0449, E0465, E0879, E0895, E0911, E0927]}
+      - {name: team_page_url, type: VARCHAR, nullable: true, from: "fotmob_standings_current.team_page_url", registry: [E0412, E0428, E0444, E0460, E0874, E0890, E0906, E0922]}
+      - {name: position, type: INTEGER, nullable: true, from: "fotmob_standings_current.position", registry: [E0042, E0408, E0424, E0440, E0456, E0870, E0886, E0902, E0918]}
+      - {name: played, type: INTEGER, nullable: true, from: "fotmob_standings_current.played", registry: [E0043, E0413, E0429, E0445, E0461, E0875, E0891, E0907, E0923]}
+      - {name: wins, type: INTEGER, nullable: true, from: "fotmob_standings_current.wins", registry: [E0044, E0418, E0434, E0450, E0466, E0880, E0896, E0912, E0928]}
+      - {name: draws, type: INTEGER, nullable: true, from: "fotmob_standings_current.draws", registry: [E0045, E0405, E0420, E0435, E0452, E0867, E0882, E0897, E0914]}
+      - {name: losses, type: INTEGER, nullable: true, from: "fotmob_standings_current.losses", registry: [E0046, E0409, E0425, E0441, E0457, E0871, E0887, E0903, E0919]}
+      - {name: goals_for, type: INTEGER, nullable: true, from: "fotmob_standings_current.goals_for", registry: [E0047, E0049, E0416, E0432, E0448, E0464, E0878, E0894, E0910, E0926]}
+      - {name: goals_against, type: INTEGER, nullable: true, from: "fotmob_standings_current.goals_against", registry: [E0048]}
+      - {name: goal_difference, type: INTEGER, nullable: true, from: "fotmob_standings_current.goal_difference", registry: [E0050, E0406, E0421, E0437, E0453, E0868, E0883, E0899, E0915]}
+      - {name: points, type: INTEGER, nullable: true, from: "fotmob_standings_current.points", registry: [E0051, E0414, E0430, E0446, E0462, E0876, E0892, E0908, E0924]}
+      - {name: deduction, type: INTEGER, nullable: true, from: "fotmob_standings_current.deduction", conform: try, registry: [E0052, E0404, E0419, E0451, E0866, E0881, E0913]}
+      - {name: ongoing, type: VARCHAR, nullable: true, from: "fotmob_standings_current.ongoing", registry: [E0053, E0411, E0427, E0443, E0459, E0873, E0889, E0905, E0921]}
+      - {name: form, type: VARCHAR, nullable: true, from: "fotmob_standings_current.form", registry: [E0054]}
+      - {name: qualification_color, type: VARCHAR, nullable: true, from: "fotmob_standings_current.qualification_color", registry: [E0055, E0415, E0431, E0447, E0463, E0877, E0893, E0909, E0925]}
+      - {name: qualification_title, type: VARCHAR, nullable: true, from: "fotmob_standings_current.qualification_title", registry: [E0056]}
+      - {name: qualification_key, type: VARCHAR, nullable: true, from: "fotmob_standings_current.qualification_key", registry: [E0057]}
+    raw_json: []
+  fotmob_season_teams:
+    scope: context
+    task: 2018
+    grain: "одна команда-участник сезона"
+    natural_key: [competition_id, source_season_key, team_id]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_season_teams_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_season_teams_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_season_teams_current.source_season_key"}
+      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_season_teams_current.team_id", registry: [E0034]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_season_teams_current.team_name", registry: [E0035]}
+      - {name: team_short_name, type: VARCHAR, nullable: true, from: "fotmob_season_teams_current.team_short_name"}
+      - {name: scope_stage_ids, type: "ARRAY(VARCHAR)", nullable: true, from: "derived: array_agg(DISTINCT scope_stage_id) по ключу (команда может быть в нескольких стадиях)"}
+    raw_json:
+      - {name: team_name_variants_json, from: "fotmob_season_teams_current.team_name_variants", holds: "варианты имени команды"}
+      - {name: team_short_name_variants_json, from: "fotmob_season_teams_current.team_short_name_variants", holds: "варианты короткого имени"}
+      - {name: source_paths_json, from: "fotmob_season_teams_current.source_paths", holds: "пути страницы, где команда встречена"}
+  fotmob_leaderboards:
+    scope: context
+    task: 2018
+    grain: "одна позиция рейтинга сезона: тип участника (player/team) x участник x команда x показатель"
+    natural_key: [competition_id, source_season_key, participant_type, participant_id, team_id, stat_name]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_leaderboards_current, fotmob_leaderboard_categories_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_leaderboards_current LEFT JOIN fotmob_leaderboard_categories_current по (competition_id, source_season_key, participant_type, stat_name = name)"
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_leaderboards_current.competition_id", registry: [E0085]}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_leaderboards_current.source_season_key", registry: [E0086]}
+      - {name: participant_type, type: VARCHAR, nullable: false, from: "fotmob_leaderboards_current.participant_type", registry: [E0087]}
+      - {name: participant_id, type: BIGINT, nullable: false, from: "fotmob_leaderboards_current.participant_id", registry: [E0088]}
+      - {name: participant_name, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.participant_name", registry: [E0089]}
+      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_leaderboards_current.team_id", registry: [E0090]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.team_name", registry: [E0091]}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.country_code"}
+      - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.scope_stage_id"}
+      - {name: stat_name, type: VARCHAR, nullable: false, from: "fotmob_leaderboards_current.stat_name", registry: [E0078, E0093, E0105, E0106, E0107, E0108, E0109, E0110, E0799, E0829]}
+      - {name: rank, type: INTEGER, nullable: true, from: "fotmob_leaderboards_current.rank", registry: [E0092]}
+      - {name: stat_value, type: DOUBLE, nullable: true, from: "fotmob_leaderboards_current.stat_value", registry: [E0097]}
+      - {name: sub_stat_value, type: DOUBLE, nullable: true, from: "fotmob_leaderboards_current.sub_stat_value", registry: [E0098]}
+      - {name: stat_value_count, type: BIGINT, nullable: true, from: "fotmob_leaderboards_current.stat_value_count", registry: [E0099]}
+      - {name: matches_played, type: INTEGER, nullable: true, from: "fotmob_leaderboards_current.matches_played", registry: [E0100]}
+      - {name: minutes_played, type: INTEGER, nullable: true, from: "fotmob_leaderboards_current.minutes_played", registry: [E0101]}
+      - {name: stat_category_header, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.stat_category_header", registry: [E0094]}
+      - {name: stat_category_group, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.stat_category_group", registry: [E0095]}
+      - {name: top_list_index, type: INTEGER, nullable: true, from: "fotmob_leaderboards_current.top_list_index", registry: [E0096]}
+      - {name: source_item_index, type: INTEGER, nullable: true, from: "fotmob_leaderboards_current.source_item_index"}
+      - {name: category_header, type: VARCHAR, nullable: true, from: "fotmob_leaderboard_categories_current.header", registry: [E0079, E0797, E0827]}
+      - {name: category, type: VARCHAR, nullable: true, from: "fotmob_leaderboard_categories_current.category", registry: [E0080, E0795, E0825]}
+      - {name: localized_title_id, type: VARCHAR, nullable: true, from: "fotmob_leaderboard_categories_current.localized_title_id", registry: [E0082, E0798, E0828]}
+      - {name: category_order, type: INTEGER, nullable: true, from: "fotmob_leaderboard_categories_current.source_order", registry: [E0083, E0800, E0830]}
+      - {name: fetch_all_url, type: VARCHAR, nullable: true, from: "fotmob_leaderboard_categories_current.fetch_all_url", registry: [E0081, E0796, E0826]}
+    raw_json: []
+  fotmob_playoff_brackets:
+    scope: context
+    task: 2018
+    grain: "одна пара (матчап) сетки плей-офф"
+    natural_key: [competition_id, source_season_key, stage_id, matchup_key]
+    partitioning: [competition_id, source_season_key]
+    sources: [fotmob_playoff_brackets_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_playoff_brackets_current.competition_id"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_playoff_brackets_current.source_season_key"}
+      - {name: stage_id, type: VARCHAR, nullable: false, from: "fotmob_playoff_brackets_current.stage_id", registry: [E0059]}
+      - {name: matchup_key, type: VARCHAR, nullable: false, from: "derived: coalesce(draw_order,'-') || ':' || coalesce(home_team_id,'tbd') || ':' || coalesce(away_team_id,'tbd') (home/away/draw_order бывают NULL у пар TBD; проверено уникальным на всём bronze 31.10)", registry: [E0077, E0789]}
+      - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_playoff_brackets_current.scope_stage_id"}
+      - {name: source_stage_id, type: BIGINT, nullable: true, from: "fotmob_playoff_brackets_current.source_stage_id", conform: try}
+      - {name: round_kind, type: VARCHAR, nullable: true, from: "fotmob_playoff_brackets_current.round_kind"}
+      - {name: draw_order, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.draw_order", registry: [E0061]}
+      - {name: participant_count, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.participant_count", registry: [E0060]}
+      - {name: best_of, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.best_of", registry: [E0062]}
+      - {name: home_team_id, type: BIGINT, nullable: true, from: "fotmob_playoff_brackets_current.home_team_id", registry: [E0063]}
+      - {name: home_team_name, type: VARCHAR, nullable: true, from: "fotmob_playoff_brackets_current.home_team_name", registry: [E0065]}
+      - {name: away_team_id, type: BIGINT, nullable: true, from: "fotmob_playoff_brackets_current.away_team_id", registry: [E0064]}
+      - {name: away_team_name, type: VARCHAR, nullable: true, from: "fotmob_playoff_brackets_current.away_team_name", registry: [E0066]}
+      - {name: home_score, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.home_score", registry: [E0067]}
+      - {name: away_score, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.away_score", registry: [E0068]}
+      - {name: winner_team_id, type: BIGINT, nullable: true, from: "fotmob_playoff_brackets_current.winner_team_id", registry: [E0069]}
+      - {name: aggregate_home_score, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.aggregate_home_score", registry: [E0074]}
+      - {name: aggregate_away_score, type: INTEGER, nullable: true, from: "fotmob_playoff_brackets_current.aggregate_away_score", registry: [E0075]}
+      - {name: aggregate_winner_team_id, type: BIGINT, nullable: true, from: "fotmob_playoff_brackets_current.aggregate_winner_team_id", registry: [E0070]}
+      - {name: aggregate_loser_team_id, type: BIGINT, nullable: true, from: "fotmob_playoff_brackets_current.aggregate_loser_team_id", registry: [E0071]}
+      - {name: is_home_tbd, type: BOOLEAN, nullable: true, from: "fotmob_playoff_brackets_current.tbd_home", registry: [E0072]}
+      - {name: is_away_tbd, type: BOOLEAN, nullable: true, from: "fotmob_playoff_brackets_current.tbd_away", registry: [E0073]}
+      - {name: match_ids, type: "ARRAY(BIGINT)", nullable: true, from: "fotmob_playoff_brackets_current.match_ids", conform: try, registry: [E0076]}
+    raw_json: []
+  fotmob_players:
+    scope: global
+    task: 2019
+    grain: "один игрок или тренер FotMob (последний подтверждённый снимок профиля)"
+    natural_key: [player_id]
+    partitioning: []
+    sources: [fotmob_player_snapshots_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: player_id, type: BIGINT, nullable: false, from: "fotmob_player_snapshots_current.player_id", registry: [E0148]}
+      - {name: player_name, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.name", registry: [E0149]}
+      - {name: birth_date, type: DATE, nullable: true, from: "fotmob_player_snapshots_current.birth_date:$.utcTime", conform: try, registry: [E0150]}
+      - {name: is_coach, type: BOOLEAN, nullable: true, from: "fotmob_player_snapshots_current.is_coach", registry: [E0151]}
+      - {name: is_captain, type: BOOLEAN, nullable: true, from: "fotmob_player_snapshots_current.is_captain", registry: [E0152]}
+      - {name: gender, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.gender", registry: [E0153]}
+      - {name: status, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.payload_json:$.status", registry: [E0159]}
+      - {name: data_provider, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.payload_json:$.dataProvider", registry: [E0160]}
+      - {name: primary_team_id, type: BIGINT, nullable: true, from: "fotmob_player_snapshots_current.primary_team_id", registry: [E0154]}
+      - {name: primary_team_name, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.primary_team_name", registry: [E0155]}
+      - {name: is_on_loan, type: BOOLEAN, nullable: true, from: "fotmob_player_snapshots_current.payload_json:$.primaryTeam.onLoan", registry: [E1418]}
+      - {name: position_description, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.position_description", registry: [E1417]}
+      - {name: primary_position_key, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.payload_json:$.positionDescription.primaryPosition.key", registry: [E1416]}
+      - {name: main_league_id, type: BIGINT, nullable: true, from: "fotmob_player_snapshots_current.main_league_id", registry: [E0156]}
+      - {name: main_league_name, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.main_league_name", registry: [E0157]}
+      - {name: contract_end, type: DATE, nullable: true, from: "fotmob_player_snapshots_current.contract_end", conform: try, registry: [E0158]}
+      - {name: height_cm, type: INTEGER, nullable: true, from: "fotmob_player_snapshots_current.player_information_json:$[?(@.translationKey=='height_sentencecase')].value.numberValue"}
+      - {name: preferred_foot, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.player_information_json:$[?(@.translationKey=='preferred_foot')].value.key"}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.player_information_json:$[?(@.translationKey=='country_sentencecase')].countryCode"}
+      - {name: shirt_number, type: INTEGER, nullable: true, from: "fotmob_player_snapshots_current.player_information_json:$[?(@.translationKey=='shirt')].value.numberValue"}
+      - {name: injury_key, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.injury_information_json:$.key", registry: [E0213]}
+      - {name: injury_name, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.injury_information_json:$.name", registry: [E0214]}
+      - {name: injury_expected_return, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.injury_information_json:$.expectedReturn.expectedReturnFallback"}
+      - {name: snapshot_date, type: DATE, nullable: true, from: "fotmob_player_snapshots_current.snapshot_date", conform: try}
+    raw_json:
+      - {name: player_information_json, from: "fotmob_player_snapshots_current.player_information_json", holds: "playerInformation (рост, нога, страна, стоимость, контракт)"}
+      - {name: injury_information_json, from: "fotmob_player_snapshots_current.injury_information_json", holds: injuryInformation}
+      - {name: trophies_json, from: "fotmob_player_snapshots_current.trophies_json", holds: "trophies (игрока и тренера)"}
+      - {name: career_history_json, from: "fotmob_player_snapshots_current.career_history_json", holds: "careerHistory целиком (seasonEntries по сезонам/турнирам)"}
+      - {name: stat_seasons_json, from: "fotmob_player_snapshots_current.stat_seasons_json", holds: "statSeasons (каталог сезонов статистики)"}
+      - {name: first_season_stats_json, from: "fotmob_player_snapshots_current.first_season_stats_json", holds: "firstSeasonStats (карточка сезона, шотмэп, хитмэп)"}
+      - {name: recent_matches_json, from: "fotmob_player_snapshots_current.recent_matches_json", holds: recentMatches}
+      - {name: traits_json, from: "fotmob_player_snapshots_current.traits_json", holds: traits}
+      - {name: meta_json, from: "fotmob_player_snapshots_current.meta_json", holds: "meta (JSON-LD, SEO)"}
+      - {name: coach_stats_json, from: "fotmob_player_snapshots_current.coach_stats_json", holds: "coachStats (тренерская карьера)"}
+      - {name: next_match_json, from: "fotmob_player_snapshots_current.next_match_json", holds: nextMatch}
+      - {name: position_description_json, from: "fotmob_player_snapshots_current.payload_json:$.positionDescription", holds: "positionDescription целиком"}
+      - {name: primary_team_json, from: "fotmob_player_snapshots_current.payload_json:$.primaryTeam", holds: "primaryTeam (цвета, аренда)"}
+      - {name: main_league_json, from: "fotmob_player_snapshots_current.payload_json:$.mainLeague", holds: "mainLeague со статистикой"}
+      - {name: related_links_json, from: "fotmob_player_snapshots_current.payload_json:$.relatedLinksData", holds: "relatedLinksData (одноклубники, сборные)"}
+      - {name: international_duty_json, from: "fotmob_player_snapshots_current.payload_json:$.internationalDuty", holds: internationalDuty}
+  fotmob_player_career:
+    scope: global
+    task: 2019
+    grain: "одна запись карьеры игрока в клубе/сборной (teamEntries раздела карьеры)"
+    natural_key: [player_id, career_section, entry_index]
+    partitioning: []
+    sources: [fotmob_player_snapshots_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_player_snapshots_current.career_history_json:$.careerItems.<section>.teamEntries[*] для каждого раздела (senior, national team, youth ...)"
+    columns:
+      - {name: player_id, type: BIGINT, nullable: false, from: "fotmob_player_snapshots_current.player_id", registry: [E0169]}
+      - {name: career_section, type: VARCHAR, nullable: false, from: "derived: имя ключа $.careerItems.<section>"}
+      - {name: entry_index, type: INTEGER, nullable: false, from: "derived: порядковый номер в teamEntries с 1"}
+      - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].teamId", registry: [E1271]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].team", registry: [E1269]}
+      - {name: team_gender, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].teamGender", registry: [E1270]}
+      - {name: start_date, type: DATE, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].startDate", conform: try, registry: [E0170]}
+      - {name: end_date, type: DATE, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].endDate", conform: try, registry: [E0171]}
+      - {name: is_active, type: BOOLEAN, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].active", registry: [E0172]}
+      - {name: appearances, type: INTEGER, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].appearances", conform: try, registry: [E1265]}
+      - {name: goals, type: INTEGER, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].goals", conform: try, registry: [E1267]}
+      - {name: assists, type: INTEGER, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].assists", conform: try, registry: [E1266]}
+      - {name: transfer_type, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].transferType", registry: [E0174]}
+      - {name: role, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].role", registry: [E0173]}
+      - {name: has_uncertain_data, type: BOOLEAN, nullable: true, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*].hasUncertainData", registry: [E0175]}
+    raw_json:
+      - {name: career_entry_json, from: "fotmob_player_snapshots_current.career_history_json:$.careerItems.senior.teamEntries[*]", holds: "элемент teamEntries целиком"}
+  fotmob_player_market_values:
+    scope: global
+    task: 2019
+    grain: "одна оценка рыночной стоимости игрока на дату"
+    natural_key: [player_id, value_date]
+    partitioning: []
+    sources: [fotmob_player_snapshots_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    row_source: "fotmob_player_snapshots_current.market_values_json:$.values[*]"
+    columns:
+      - {name: player_id, type: BIGINT, nullable: false, from: "fotmob_player_snapshots_current.player_id"}
+      - {name: value_date, type: DATE, nullable: false, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].date", registry: [E0192]}
+      - {name: market_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].value", registry: [E0193]}
+      - {name: lower_bound, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].lowerBound", registry: [E0194]}
+      - {name: upper_bound, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].upperBound", registry: [E0195]}
+      - {name: currency, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].currency", registry: [E0196]}
+      - {name: value_source, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].source", registry: [E0197]}
+      - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].teamId", registry: [E0198]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].teamName", registry: [E0199]}
+      - {name: is_period_start, type: BOOLEAN, nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].isPeriodStart", registry: [E0200]}
+    raw_json:
+      - {name: market_value_json, from: "fotmob_player_snapshots_current.market_values_json:$.values[*]", holds: "элемент values[] целиком"}
+  fotmob_teams:
+    scope: global
+    task: 2019
+    grain: "одна команда FotMob (последний подтверждённый снимок профиля)"
+    natural_key: [team_id]
+    partitioning: []
+    sources: [fotmob_team_snapshots_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_team_snapshots_current.team_id", registry: [E0111]}
+      - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.team_name", registry: [E0112]}
+      - {name: short_name, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.details_json:$.shortName", registry: [E0113]}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.country_code", registry: [E0114]}
+      - {name: gender, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.details_json:$.gender", registry: [E0115]}
+      - {name: team_type, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.details_json:$.type", registry: [E0116]}
+      - {name: primary_league_id, type: BIGINT, nullable: true, from: "fotmob_team_snapshots_current.details_json:$.primaryLeagueId", registry: [E0117]}
+      - {name: primary_league_name, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.details_json:$.primaryLeagueName", registry: [E0118]}
+      - {name: latest_season, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.details_json:$.latestSeason", registry: [E0119]}
+      - {name: page_url, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.page_url"}
+      - {name: venue_name, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.venue_name", registry: [E0121]}
+      - {name: venue_city, type: VARCHAR, nullable: true, from: "fotmob_team_snapshots_current.venue_city", registry: [E0122]}
+      - {name: venue_capacity, type: INTEGER, nullable: true, from: "fotmob_team_snapshots_current.venue_capacity", conform: try}
+      - {name: venue_latitude, type: DOUBLE, nullable: true, from: "fotmob_team_snapshots_current.overview_json:$.venue.widget.location[0]", conform: try, registry: [E2557]}
+      - {name: venue_longitude, type: DOUBLE, nullable: true, from: "fotmob_team_snapshots_current.overview_json:$.venue.widget.location[1]", conform: try}
+      - {name: snapshot_date, type: DATE, nullable: true, from: "fotmob_team_snapshots_current.snapshot_date", conform: try}
+    raw_json:
+      - {name: details_json, from: "fotmob_team_snapshots_current.details_json", holds: "details целиком (JSON-LD, цвета, сборная)"}
+      - {name: overview_json, from: "fotmob_team_snapshots_current.overview_json", holds: "overview целиком (таблица, форма, тренеры, трансферы, стадион)"}
+      - {name: history_json, from: "fotmob_team_snapshots_current.history_json", holds: "history целиком (трофеи, история таблиц, тренеры)"}
+  fotmob_team_squads:
+    scope: global
+    task: 2019
+    grain: "один член текущего состава команды (игрок или тренер)"
+    natural_key: [team_id, member_type, member_id]
+    partitioning: []
+    sources: [fotmob_squad_snapshots_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_squad_snapshots_current.team_id"}
+      - {name: member_type, type: VARCHAR, nullable: false, from: "fotmob_squad_snapshots_current.member_type", registry: [E0139]}
+      - {name: member_id, type: BIGINT, nullable: false, from: "fotmob_squad_snapshots_current.member_id", registry: [E0125]}
+      - {name: member_name, type: VARCHAR, nullable: true, from: "fotmob_squad_snapshots_current.member_name", registry: [E0126]}
+      - {name: role_key, type: VARCHAR, nullable: true, from: "fotmob_squad_snapshots_current.member_json:$.role.key", registry: [E0131]}
+      - {name: position_id, type: INTEGER, nullable: true, from: "fotmob_squad_snapshots_current.member_json:$.positionId", registry: [E0133]}
+      - {name: position_ids_desc, type: VARCHAR, nullable: true, from: "fotmob_squad_snapshots_current.member_json:$.positionIdsDesc", registry: [E0135]}
+      - {name: shirt_number, type: INTEGER, nullable: true, from: "fotmob_squad_snapshots_current.shirt_number", conform: try, registry: [E0127]}
+      - {name: date_of_birth, type: DATE, nullable: true, from: "fotmob_squad_snapshots_current.date_of_birth", conform: try, registry: [E0128]}
+      - {name: age, type: INTEGER, nullable: true, from: "fotmob_squad_snapshots_current.member_json:$.age", registry: [E2560]}
+      - {name: height_cm, type: INTEGER, nullable: true, from: "fotmob_squad_snapshots_current.height_cm", conform: try, registry: [E0129]}
+      - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_squad_snapshots_current.country_code", registry: [E0130]}
+      - {name: transfer_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_squad_snapshots_current.member_json:$.transferValue", registry: [E0146]}
+      - {name: transfer_value_currency, type: VARCHAR, nullable: true, from: "derived: NULL — FotMob не передаёт валюту в этой секции (по подписи «€» в карточке игрока вероятно EUR; не подтверждено — вопрос в следующий гриль)"}
+      - {name: is_injured, type: BOOLEAN, nullable: true, from: "fotmob_squad_snapshots_current.member_json:$.injured", registry: [E2563]}
+      - {name: section, type: VARCHAR, nullable: true, from: "fotmob_squad_snapshots_current.section", registry: [E0136, E2567]}
+      - {name: section_index, type: INTEGER, nullable: true, from: "fotmob_squad_snapshots_current.section_index", registry: [E0137]}
+      - {name: member_index, type: INTEGER, nullable: true, from: "fotmob_squad_snapshots_current.member_index", registry: [E0138]}
+      - {name: snapshot_date, type: DATE, nullable: true, from: "fotmob_squad_snapshots_current.snapshot_date", conform: try}
+    raw_json:
+      - {name: member_json, from: "fotmob_squad_snapshots_current.member_json", holds: "элемент members[] целиком (сезонные цифры, травма, рейтинг)"}
+      - {name: position_description_json, from: "fotmob_squad_snapshots_current.position_description_json", holds: "positionDescription члена состава"}
+  fotmob_transfers:
+    scope: global
+    task: 2019
+    grain: "одно трансферное событие FotMob (один раз на transfer_event_id, из всех лент турниров)"
+    natural_key: [transfer_event_id]
+    partitioning: []
+    sources: [fotmob_transfer_events_current]
+    dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
+    columns:
+      - {name: transfer_event_id, type: VARCHAR, nullable: false, from: "fotmob_transfer_events_current.transfer_event_id", registry: [E0247]}
+      - {name: player_id, type: BIGINT, nullable: true, from: "fotmob_transfer_events_current.player_id", registry: [E0230]}
+      - {name: player_name, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.player_name", registry: [E0231]}
+      - {name: position_label, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.position_label", registry: [E0245]}
+      - {name: position_key, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.position_key", registry: [E0246]}
+      - {name: transfer_date, type: DATE, nullable: true, from: "fotmob_transfer_events_current.transfer_date", conform: try, rule: "DATE из первых 10 символов (YYYY-MM-DD); есть у всех строк, с зоной и без"}
+      - {name: transfer_at_utc, type: "TIMESTAMP(6) WITH TIME ZONE", nullable: true, from: "fotmob_transfer_events_current.transfer_date", conform: try, rule: "только если в строке есть зона (Z/смещение); без зоны -> NULL без записи в _conform_issues_json (≈1/3 строк, 31.10), дата — в transfer_date", registry: [E0232]}
+      - {name: transfer_date_raw, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.transfer_date"}
+      - {name: from_team_id, type: BIGINT, nullable: true, from: "fotmob_transfer_events_current.from_club_id", registry: [E0233, E3293]}
+      - {name: from_team_name, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.from_club", registry: [E0234, E3289]}
+      - {name: from_team_full_name, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.from_club_full_name", registry: [E3292]}
+      - {name: to_team_id, type: BIGINT, nullable: true, from: "fotmob_transfer_events_current.to_club_id", registry: [E0235, E3299]}
+      - {name: to_team_name, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.to_club", registry: [E0236, E3295]}
+      - {name: to_team_full_name, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.to_club_full_name", registry: [E3298]}
+      - {name: fee_text, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.fee_text", registry: [E0240, E3287]}
+      - {name: localized_fee_text, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.localized_fee_text", registry: [E3288]}
+      - {name: fee_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_transfer_events_current.fee_value", registry: [E0241, E0242]}
+      - {name: market_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_transfer_events_current.market_value", registry: [E0244]}
+      - {name: money_currency, type: VARCHAR, nullable: true, from: "derived: NULL — FotMob не передаёт валюту в этой секции (по подписи «€» в карточке игрока вероятно EUR; не подтверждено — вопрос в следующий гриль)"}
+      - {name: is_on_loan, type: BOOLEAN, nullable: true, from: "fotmob_transfer_events_current.on_loan", registry: [E0239]}
+      - {name: transfer_type_key, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.transfer_type_key", registry: [E0237]}
+      - {name: transfer_type_text, type: VARCHAR, nullable: true, from: "fotmob_transfer_events_current.transfer_type_text", registry: [E0238]}
+      - {name: event_year, type: INTEGER, nullable: true, from: "fotmob_transfer_events_current.event_year"}
+      - {name: source_competition_ids, type: "ARRAY(BIGINT)", nullable: true, from: "derived: array_agg(DISTINCT CAST(fotmob_transfer_events_current.competition_id AS BIGINT)) — ленты турниров, где событие встречено", conform: try, registry: [E0248]}
+    raw_json: []

@@ -217,8 +217,10 @@ source keeps §4 unchanged. Registered: **FotMob** (#2016, owner decisions 2026-
    string (`'2026 - Apertura'`). Split seasons: a match is stored **once**, under the most precise
    key; the parent key lives in `fotmob_competition_seasons.parent_season_key`. Standings and
    leaderboards stay under the key FotMob served them with.
-2. **Global profiles** (`scope: global` — e.g. `fotmob_players`, `fotmob_teams`, careers, market
-   values, squads, transfers) carry no context columns and are unpartitioned.
+2. **Global tables** (`scope: global`) are unpartitioned and carry no context columns: profiles
+   (e.g. `fotmob_players`, `fotmob_teams`, careers, market values, squads, transfers). Reference
+   lists keyed by the context itself (`fotmob_competitions`, `fotmob_competition_seasons`,
+   `fotmob_competition_season_history`) are global too and say so with `context_as_key: true`.
 3. **Raw remainder columns `*_json` are allowed** (VARCHAR holding JSON): sections or array
    elements the core does not decompose stay in the table they belong to, so no source field is
    lost. New typed tables/columns are added on analyst request through the core schema.
