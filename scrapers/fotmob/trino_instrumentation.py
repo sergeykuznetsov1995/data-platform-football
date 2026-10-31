@@ -44,6 +44,19 @@ SQL_LOG_CHARS = 400
 
 _HISTORY_RUN_PREFIX = "fotmob-hist-"
 
+# Read timeout HTTP-клиента Trino (#2014): общий координатор под нагрузкой
+# отвечает дольше 5 с, и волна падала на первом же медленном ответе. Connect
+# остаётся 3 с, ``max_attempts=1`` — тоже: повтор POST клиентом запрещён (#1289).
+FOTMOB_TRINO_READ_TIMEOUT_S = 30
+
+# Читающий SQL повторяем при сетевых сбоях и таймаутах (#2014); изменяющий —
+# никогда: ответ мог потеряться после фиксации (#1289). Паузы перед 2-й и 3-й
+# попытками.
+_RETRYABLE_READ_ERRORS = TrinoTableManager._CONNECTION_ERRORS + (
+    "Read timed out", "failed to fetch")
+_READ_RETRY_BACKOFF = (5, 15)
+_sleep = time.sleep
+
 _WHITESPACE_RE = re.compile(r"\s+")
 _IN_LIST_RE = re.compile(r"\bIN\s*\(([^()]*)\)", re.IGNORECASE)
 
@@ -52,6 +65,14 @@ def _now_seconds() -> float:
     """Часы слоу-лога (монотонные); отдельной функцией — чтобы их подменяли тесты."""
 
     return time.perf_counter()
+
+
+def _is_read_only(sql: str) -> bool:
+    """Чтение или план без исполнения; ведущие комментарии не маскируют запись."""
+
+    statement = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", sql, flags=re.S)
+    return bool(re.match(r"(?:SELECT|SHOW|DESCRIBE|DESC|WITH)\b", statement, re.I)
+                or re.match(r"EXPLAIN\b(?!\s+ANALYZE\b)", statement, re.I))
 
 
 def fotmob_query_source(run_id: str) -> str:
@@ -158,7 +179,7 @@ class FotMobTrinoTableManager(TrinoTableManager):
         # Internal HTTP retries can replay a POST after a lost response without
         # another lease check. The repository owns uncertain-write reconciliation.
         extra: dict[str, Any] = {"source": self._source, "max_attempts": 1,
-                                 "request_timeout": (3, 5)}
+                                 "request_timeout": (3, FOTMOB_TRINO_READ_TIMEOUT_S)}
         if self._session_properties:
             extra["session_properties"] = dict(self._session_properties)
 
@@ -225,40 +246,56 @@ class FotMobTrinoTableManager(TrinoTableManager):
         base.TrinoTableManager._trino_unreachable = True
         raise base.TrinoError(f"Failed to connect to Trino: {last_error}")
 
+    def _run_with_read_retries(self, sql, attempt_fn):
+        """Одна попытка для записи; до трёх для чтения при сетевом сбое/таймауте."""
+
+        retryable = _is_read_only(sql)
+        with self._conn_lock:
+            for attempt in range(len(_READ_RETRY_BACKOFF) + 1):
+                if attempt:
+                    self._check_write_authority()
+                try:
+                    return attempt_fn()
+                except WriterLockLost:
+                    raise
+                except Exception as exc:
+                    if (not retryable or attempt == len(_READ_RETRY_BACKOFF)
+                            or not any(msg in str(exc) for msg in _RETRYABLE_READ_ERRORS)):
+                        raise
+                    pause = _READ_RETRY_BACKOFF[attempt]
+                    logger.warning("FotMob read SQL retry: attempt=%d pause=%ds sql=%s",
+                                   attempt + 2, pause, normalize_sql_for_log(sql)[:80])
+                    self._reset_connection()
+                    _sleep(pause)
+
     def _execute_guarded(self, sql, fetch, params):
         from scrapers.base import trino_manager as base
 
-        with self._conn_lock:
-            for attempt in range(2):
+        self._check_write_authority()
+        cursor = self.connection.cursor()
+        self._active_cursor = cursor
+        self._active_cancelled = False
+        try:
+            with self._write_authority.watch(self.cancel_active_query):
                 self._check_write_authority()
-                cursor = self.connection.cursor()
-                self._active_cursor = cursor
-                self._active_cancelled = False
-                try:
-                    with self._write_authority.watch(self.cancel_active_query):
-                        self._check_write_authority()
-                        cursor.execute(sql, params) if params else cursor.execute(sql)
-                        rows = cursor.fetchall()
-                    return rows if fetch else None
-                except WriterLockLost as exc:
-                    self._write_failure = exc
-                    raise
-                except Exception as exc:
-                    self._check_write_authority()
-                    read = re.match(r"\s*(?:SELECT|SHOW|DESCRIBE|DESC|WITH)\b", sql, re.I)
-                    if read and attempt == 0 and any(msg in str(exc) for msg in self._CONNECTION_ERRORS):
-                        self._reset_connection()
-                        continue
-                    raise base.TrinoError(f"SQL execution failed: {exc}") from exc
-                except BaseException:
-                    # Handled TERM/KeyboardInterrupt can be followed by an
-                    # interrupted-manifest write under a fresh intact lease.
-                    self.cancel_active_query()
-                    self._reset_connection()
-                    raise
-                finally:
-                    self._active_cursor = None
-                    self._close_cursor(cursor)
+                cursor.execute(sql, params) if params else cursor.execute(sql)
+                rows = cursor.fetchall()
+            return rows if fetch else None
+        except WriterLockLost as exc:
+            self._write_failure = exc
+            raise
+        except Exception as exc:
+            self._check_write_authority()
+            raise base.TrinoError(f"SQL execution failed: {exc}") from exc
+        except BaseException:
+            # Handled TERM/KeyboardInterrupt can be followed by an
+            # interrupted-manifest write under a fresh intact lease.
+            self.cancel_active_query()
+            self._reset_connection()
+            raise
+        finally:
+            self._active_cursor = None
+            self._close_cursor(cursor)
 
     def insert_dataframe_atomic(self, schema, table, df, *args, **kwargs):
         """Extend the sealed base's stage lifecycle to handled interruptions.
@@ -299,13 +336,8 @@ class FotMobTrinoTableManager(TrinoTableManager):
         try:
             self._check_write_authority()
             if self._authority_required and self._write_authority is None:
-                # Fail closed for unknown statements. Strip leading comments so
-                # a comment cannot disguise a physical mutation as a read.
-                statement = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", sql,
-                                   flags=re.S)
-                read = re.match(r"(?:SELECT|SHOW|DESCRIBE|DESC|WITH)\b", statement, re.I)
-                explain = re.match(r"EXPLAIN\b(?!\s+ANALYZE\b)", statement, re.I)
-                if not (read or explain):
+                # Fail closed for unknown statements.
+                if not _is_read_only(sql):
                     raise WriterLockBusy("FotMob mutation requires an active writer lease")
             state = getattr(self._stage_state, "current", None)
             drop = None
@@ -318,9 +350,12 @@ class FotMobTrinoTableManager(TrinoTableManager):
                     state["target_started"] = True
                 drop = re.match(r"\s*DROP TABLE(?: IF EXISTS)? ([\w.]+)\b", sql, re.I)
             if self._write_authority is None:
-                result = super()._execute(sql, fetch=fetch, params=params)
+                result = self._run_with_read_retries(
+                    sql, lambda: super(FotMobTrinoTableManager, self)._execute(
+                        sql, fetch=fetch, params=params))
             else:
-                result = self._execute_guarded(sql, fetch, params)
+                result = self._run_with_read_retries(
+                    sql, lambda: self._execute_guarded(sql, fetch, params))
             if state is not None and drop:
                 state["stages"].discard(drop.group(1))
             return result

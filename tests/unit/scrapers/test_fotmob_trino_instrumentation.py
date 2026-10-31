@@ -485,7 +485,65 @@ def test_fotmob_http_transport_has_no_hidden_statement_retries(monkeypatch):
     manager = FotMobTrinoTableManager(source="fotmob:test")
     manager._create_connection()
     assert calls[-1]["max_attempts"] == 1
-    assert calls[-1]["request_timeout"] == (3, 5)
+    assert calls[-1]["request_timeout"] == (3, 30)
+
+
+_READ_TIMEOUT = ("failed to fetch: HTTPSConnectionPool(host='trino', port=8443): "
+                 "Read timed out. (read timeout=30)")
+
+
+def _timing_out_manager(monkeypatch, timeouts, guarded=True):
+    """Manager whose cursor raises a read timeout on the first ``timeouts`` runs."""
+    from scrapers.fotmob import trino_instrumentation as mod
+    sleeps = []
+    monkeypatch.setattr(mod, "_sleep", sleeps.append)
+    left = [timeouts]
+    def failure(sql):
+        if sql != "SELECT 1" and left[0] > 0:
+            left[0] -= 1
+            raise OSError(_READ_TIMEOUT)
+    manager, lease, calls = _guarded_manager(monkeypatch, failure)
+    if not guarded:
+        manager.set_write_authority(None)
+        manager._authority_required = False
+    return manager, lease, calls, sleeps
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_read_query_is_retried_after_read_timeout(monkeypatch, guarded):
+    sql = "SELECT id FROM iceberg.bronze.fotmob_t"
+    manager, lease, calls, sleeps = _timing_out_manager(monkeypatch, 1, guarded)
+    checks = []
+    if guarded:
+        monkeypatch.setattr("scrapers.fotmob.trino_instrumentation._sleep",
+                            lambda pause: (sleeps.append(pause), checks.append(lease.checks)))
+    assert manager._execute(sql, fetch=True) == [[1]]
+    assert calls.count(sql) == 2
+    assert sleeps == [5]
+    if guarded:
+        assert lease.checks > checks[0]
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_mutation_is_not_retried_after_read_timeout(monkeypatch, guarded):
+    from scrapers.base.trino_manager import TrinoError
+    sql = "INSERT INTO iceberg.bronze.fotmob_t VALUES (1)"
+    manager, _, calls, sleeps = _timing_out_manager(monkeypatch, 1, guarded)
+    with pytest.raises(TrinoError, match="Read timed out"):
+        manager._execute(sql)
+    assert calls == [sql]
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_read_query_gives_up_after_three_read_timeouts(monkeypatch, guarded):
+    from scrapers.base.trino_manager import TrinoError
+    sql = "SELECT id FROM iceberg.bronze.fotmob_t"
+    manager, _, calls, sleeps = _timing_out_manager(monkeypatch, 3, guarded)
+    with pytest.raises(TrinoError, match="Read timed out"):
+        manager._execute(sql, fetch=True)
+    assert calls.count(sql) == 3
+    assert sleeps == [5, 15]
 
 
 @pytest.mark.parametrize('failure_check', [1, 2])
