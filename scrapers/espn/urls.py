@@ -184,3 +184,22 @@ def team_statistics(slug: str, event_id: int, team_id: int) -> EspnRequest:
         f"leagues/{slug}/events/{event_id}/competitions/{event_id}/competitors/{team_id}/statistics",
         EndpointType.TEAM_STATISTICS,
     )
+
+
+def roster(slug: str, event_id: int, team_id: int) -> EspnRequest:
+    team_statistics(slug, event_id, team_id)
+    return _core(
+        f"leagues/{slug}/events/{event_id}/competitions/{event_id}/competitors/{team_id}/roster",
+        EndpointType.ROSTER,
+    )
+
+
+def player_statistics(slug: str, event_id: int, team_id: int, athlete_id: int) -> EspnRequest:
+    team_statistics(slug, event_id, team_id)
+    if type(athlete_id) is not int or athlete_id < 1:
+        raise ValueError("athlete id must be positive")
+    return _core(
+        f"leagues/{slug}/events/{event_id}/competitions/{event_id}/competitors/{team_id}"
+        f"/roster/{athlete_id}/statistics/0",
+        EndpointType.PLAYER_STATISTICS,
+    )

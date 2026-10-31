@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,27 @@ def stats(value=None):
     return {"splits": {"categories": [{"name": "general", "stats": values}]}}
 
 
+PROBES = Path(__file__).resolve().parents[2] / "fixtures" / "espn" / "probes"
+
+
+def probe(name):
+    return json.loads((PROBES / name).read_text())
+
+
+def player_body(athlete, name="core_player_statistics_eng1_401879300_384_241187.json"):
+    body = probe(name)
+    body["athlete"] = {"$ref": f"http://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/"
+                               f"seasons/2026/athletes/{athlete}?lang=en&region=us"}
+    return body
+
+
+def roster_body(lineup):
+    entries = probe("core_roster_eng1_401879300_384.json")["entries"]
+    return {"entries": [{**entries[0], "playerId": row["athlete_id"], "starter": row["starter"],
+                         "subbedIn": {"didSub": row["subbed_in"]},
+                         "subbedOut": {"didSub": row["subbed_out"]}} for row in lineup]}
+
+
 def page(index=1, count=1000, size=500):
     return {"count": count, "pageIndex": index, "pageCount": (count + size - 1) // size,
             "items": [{"id": str(i + 1), "expectedGoals": 0.0} for i in
@@ -50,6 +72,19 @@ def test_xg_placeholder_and_real_zero(count, support, value, expected):
     masked = parser.mask_xg(body, support if parser.deep_level(count) == "full" else None)
     assert masked["splits"]["categories"][0]["stats"][1]["value"] == expected
     assert parser.play_values({"id": "1", "expectedGoals": value}, support)["xg"] == expected
+
+
+@pytest.mark.parametrize("support,value,expected", [
+    (None, 0.0, None), (False, 0.0, None), (True, 0.0, 0.0), (True, 0.4, 0.4)])
+def test_derived_xg_statistics_are_masked(support, value, expected):
+    body = {"splits": {"categories": [{"name": "goalKeeping", "stats": [
+        {"name": "expectedGoalsConceded", "value": value, "displayValue": str(value)}]}]},
+        "expectedAssistsSetPlay": value}
+    masked = parser.mask_xg(parser.statistics(body), support)
+    stat = masked["splits"]["categories"][0]["stats"][0]
+    assert (stat["value"], masked["expectedAssistsSetPlay"]) == (expected, expected)
+    assert stat["displayValue"] == (None if expected is None else str(value))
+    assert parser.xg_support([body]) is (True if value else None)
 
 
 def test_xg_requires_content_evidence():
@@ -175,8 +210,19 @@ def runner(tmp_path, monkeypatch):
         def execute_query(self, sql, params=None):
             if "AS debt" in sql:
                 return self.debt
-            if "espn_depth_v1" in sql or "espn_deep_retry_v1" in sql:
+            if "espn_depth_v1" in sql or "_retry_v1" in sql:
                 return conn.execute(sql, params).fetchall()
+            if sql == deep.PLAYERS_PENDING_SQL:
+                pending = {}
+                lineup = {row["event_id"]: row["lineup_state"] for row in self.tables["espn_match"]
+                          if (row["competition_slug"], row["season_year"]) == params}
+                for row in self.tables["espn_team_stats"]:
+                    value = row["deep_stats_json"]
+                    state = json.loads(value).get("players_state") if isinstance(value, str) else None
+                    if row["event_id"] in lineup and (state == "pending" or state == "not_applicable"
+                                                      and lineup[row["event_id"]] == "captured"):
+                        pending[row["event_id"]] = pending.get(row["event_id"], 0) + 1
+                return [(event_id,) for event_id, count in sorted(pending.items()) if count == 2]
             if sql.startswith("SELECT event_id, home_team_id"):
                 return [(row["event_id"], row["home_team_id"], row["away_team_id"], row["deep_state"])
                         for row in self.tables["espn_match"]]
@@ -197,10 +243,23 @@ def runner(tmp_path, monkeypatch):
         gate = TransportGate(state_path=tmp_path / "gate.json", lane="history", purpose="deep",
                              utcnow_fn=lambda: now)
 
-        def fetch_json(self, url, endpoint, params, **kwargs):
+        raw = {}
+
+        def fetch_json(self, url, endpoint, params, force_refresh=True, **kwargs):
+            # Raw-store replay: no gate attempt and no request, like the transport.
+            key = (url, tuple(sorted(params.items())))
+            if not force_refresh and key in self.raw:
+                return self.raw[key]
             self.before_attempt()
             self.calls.append((url, params))
-            if "plays" in url:
+            if url.endswith("/roster"):
+                event, team = (int(url.split(f"/{part}/")[1].split("/")[0])
+                               for part in ("events", "competitors"))
+                data = roster_body([row for row in bronze.tables["espn_match_lineup"]
+                                    if (row["event_id"], row["team_id"]) == (event, team)])
+            elif "/roster/" in url:
+                data = player_body(int(url.split("/roster/")[1].split("/")[0]))
+            elif "plays" in url:
                 if params["limit"] == "1":
                     data = page(1, size=1)
                 elif self.failed_page and params.get("page") == "2":
@@ -209,9 +268,10 @@ def runner(tmp_path, monkeypatch):
                     data = page(int(params.get("page", "1")))
             else:
                 data = stats(0.2)
-            return SimpleNamespace(json_data=data, raw_uri=payload.raw.raw_uri,
-                                   content_hash=payload.raw.raw_sha256,
-                                   fetched_at=now.isoformat())
+            self.raw[key] = SimpleNamespace(json_data=data, raw_uri=payload.raw.raw_uri,
+                                            content_hash=payload.raw.raw_sha256,
+                                            fetched_at=now.isoformat())
+            return self.raw[key]
 
         def flush(self):
             self.flushes += 1
@@ -656,3 +716,343 @@ def test_completed_prefix_never_starves_new_matches_across_bounded_runs(runner):
     assert completed == [1, 1, 1, 1]
     stored = {row["event_id"]: row["deep_state"] for row in runner.bronze.tables["espn_match"]}
     assert stored == dict.fromkeys(range(1, 8), "completed")
+
+
+def _deep(row):
+    value = row["deep_stats_json"]
+    return json.loads(value) if isinstance(value, str) else None
+
+
+def _played(trino, event_id=1):
+    return {(row["team_id"], row["athlete_id"]) for row in trino.tables["espn_match_lineup"]
+            if row["event_id"] == event_id and (row["starter"] or row["subbed_in"])}
+
+
+def _player_urls(calls):
+    return [url for url, _ in calls if "/roster" in url]
+
+
+def test_players_follow_first_stage_and_only_played_are_requested(runner):
+    report = deep.run_deep(**runner.args)
+    assert report["completed"] == 1 and report["players_completed"] == 1
+    urls_ = [url for url, _ in runner.client.calls]
+    first_player = min(index for index, url in enumerate(urls_) if "/roster" in url)
+    assert all("/roster" not in url for url in urls_[:first_player])
+    assert any(url.endswith("statistics") for url in urls_[:first_player])
+    played = _played(runner.bronze)
+    requested = {int(url.split("/roster/")[1].split("/")[0]) for url in urls_ if "/roster/" in url}
+    assert requested == {athlete for _, athlete in played}
+    assert sum(url.endswith("/roster") for url in urls_) == 2
+    lineup = runner.bronze.tables["espn_match_lineup"]
+    filled = {(row["team_id"], row["athlete_id"]) for row in lineup if _deep(row)}
+    assert filled == played
+    envelope = next(_deep(row) for row in lineup if _deep(row))
+    assert envelope["parser_version"] == "espn-deep-v2" and envelope["has_xg"] is True
+    assert envelope["manifest"]["raw_uri"]
+    for row in runner.bronze.tables["espn_team_stats"]:
+        team = json.loads(row["deep_stats_json"])
+        assert team["players_state"] == "completed"
+        assert team["unused"] == sorted(r["athlete_id"] for r in lineup if r["team_id"] == row["team_id"]
+                                        and not (r["starter"] or r["subbed_in"]))
+        assert len(team["roster_manifest"]) == 1
+    before = len(runner.client.calls)
+    assert deep.run_deep(**runner.args)["players_completed"] == 0
+    assert len(runner.client.calls) == before
+
+
+@pytest.mark.parametrize("fault", ["foreign", "duplicate", "other_athlete"])
+def test_player_identity_errors_defer_without_marker(runner, fault):
+    original = runner.client.fetch_json
+
+    def content(url, endpoint, params, **kwargs):
+        result = original(url, endpoint, params, **kwargs)
+        if url.endswith("/roster") and "/competitors/359/" in url:
+            entries = result.json_data["entries"]
+            if fault == "foreign":
+                entries[0]["playerId"] = 999999
+            elif fault == "duplicate":
+                entries.append(entries[0])
+        if fault == "other_athlete" and "/roster/" in url:
+            result.json_data = player_body(999999)
+        return result
+
+    runner.client.fetch_json = content
+    report = deep.run_deep(**runner.args)
+    assert report["completed"] == 1
+    assert report["players_failed"] == 1 and report["players_completed"] == 0
+    assert not any(_deep(row) for row in runner.bronze.tables["espn_match_lineup"])
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "pending"
+               for row in runner.bronze.tables["espn_team_stats"])
+    assert runner.conn.execute("SELECT event_id FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == [(1,)]
+    if fault != "other_athlete":
+        assert not any("/roster/" in url for url, _ in runner.client.calls)
+    # Deferred for a day, then a repaired source completes.
+    runner.client.calls.clear()
+    deep.run_deep(**runner.args)
+    assert not _player_urls(runner.client.calls)
+    later = runner.args["now_fn"]() + timedelta(days=1)
+    runner.args.update(now_fn=lambda: later, deadline=later + timedelta(minutes=12))
+    runner.client.fetch_json = original
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
+
+
+def test_interrupted_players_resume_from_raw_without_deferral(runner):
+    original = runner.client.fetch_json
+    seen = []
+
+    def interrupted(url, endpoint, params, **kwargs):
+        if "/roster/" in url and url not in seen:
+            seen.append(url)
+            if len(seen) == 5:
+                raise LaneClosed("deadline during players")
+        return original(url, endpoint, params, **kwargs)
+
+    runner.client.fetch_json = interrupted
+    assert deep.run_deep(**runner.args)["reason"] == "deadline during players"
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "pending"
+               for row in runner.bronze.tables["espn_team_stats"])
+    assert not any(_deep(row) for row in runner.bronze.tables["espn_match_lineup"])
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
+    lineup_rows = len(runner.bronze.tables["espn_match_lineup"])
+    # The very next run (no day passes) finishes the match from raw plus the rest.
+    flushes = runner.client.flushes
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    urls_ = _player_urls(runner.client.calls)
+    assert len(urls_) == len(set(urls_)) == 2 + len(_played(runner.bronze))
+    assert runner.client.flushes - flushes >= len(_played(runner.bronze))
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
+    assert len(runner.bronze.tables["espn_match_lineup"]) == lineup_rows
+    assert len(runner.bronze.tables["espn_team_stats"]) == 2
+
+
+def test_stale_player_raw_is_fetched_again(runner):
+    deep.run_deep(**runner.args)
+    for row in runner.bronze.tables["espn_team_stats"]:
+        envelope = json.loads(row["deep_stats_json"])
+        row["deep_stats_json"] = json.dumps({**envelope, "players_state": "pending"})
+    runner.client.calls.clear()
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert not _player_urls(runner.client.calls)
+    later = runner.args["now_fn"]() + deep.PLAYER_RAW_TTL + timedelta(minutes=1)
+    runner.args.update(now_fn=lambda: later, deadline=later + timedelta(minutes=12))
+    for row in runner.bronze.tables["espn_team_stats"]:
+        envelope = json.loads(row["deep_stats_json"])
+        row["deep_stats_json"] = json.dumps({**envelope, "players_state": "pending"})
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert len(_player_urls(runner.client.calls)) == 2 + len(_played(runner.bronze))
+
+
+def test_not_applicable_players_requeue_after_lineup_is_captured(runner):
+    runner.bronze.tables["espn_match"][0]["lineup_state"] = "valid_empty"
+    assert deep.run_deep(**runner.args)["players_not_applicable"] == 1
+    # A recheck Summary captures the lineup; carry keeps not_applicable.
+    write_tournament_batch(_batch(_match(1, "aa")), trino=runner.bronze)
+    assert runner.bronze.tables["espn_match"][0]["lineup_state"] == "captured"
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "not_applicable"
+               for row in runner.bronze.tables["espn_team_stats"])
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "completed"
+               for row in runner.bronze.tables["espn_team_stats"])
+    assert {(row["team_id"], row["athlete_id"]) for row in runner.bronze.tables["espn_match_lineup"]
+            if _deep(row)} == _played(runner.bronze)
+
+
+def test_players_publication_repeat_and_summary_preserve_lineup_statistics():
+    trino, payload = fixture_bronze()
+    publish(trino, payload)
+    lineup = trino.tables["espn_match_lineup"]
+    rosters = {team: {row["athlete_id"]: bool(row["starter"] or row["subbed_in"])
+                      for row in lineup if row["team_id"] == team} for team in {r["team_id"] for r in lineup}}
+    players = {key: (parser.player_statistics(player_body(key[1]), key[1]), {"athlete_id": key[1]})
+               for key in _played(trino)}
+    manifest = [{"team_id": team, "raw_uri": "s3://roster"} for team in rosters]
+    arguments = dict(trino=trino, slug="eng.1", year=2020, event_id=1, rosters=rosters,
+                     players=players, manifest=manifest, has_xg=True)
+    assert deep.publish_players(**arguments)
+    assert [call["table"] for call in trino.calls[-2:]] == ["espn_match_lineup", "espn_team_stats"]
+    rows = deepcopy(trino.tables["espn_match_lineup"])
+    assert not deep.publish_players(**arguments)
+    assert trino.tables["espn_match_lineup"] == rows
+    write_tournament_batch(_batch(payload), trino=trino)
+    after = {(row["team_id"], row["athlete_id"]): _deep(row) for row in trino.tables["espn_match_lineup"]}
+    assert after == {(row["team_id"], row["athlete_id"]): _deep(row) for row in rows}
+    assert len(after) == len(rows) and sum(map(bool, after.values())) == len(_played(trino))
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "completed"
+               for row in trino.tables["espn_team_stats"])
+
+
+def _expected_values(body):
+    return [stat["value"] for category in body["splits"]["categories"] for stat in category["stats"]
+            if stat["name"].startswith("expected")]
+
+
+@pytest.mark.parametrize("has_xg", [None, False, True])
+def test_player_expected_statistics_follow_season_support(has_xg):
+    trino, payload = fixture_bronze()
+    publish(trino, payload, support=has_xg)
+    lineup = trino.tables["espn_match_lineup"]
+    rosters = {team: {row["athlete_id"]: bool(row["starter"] or row["subbed_in"])
+                      for row in lineup if row["team_id"] == team} for team in {r["team_id"] for r in lineup}}
+    def body(athlete):
+        # One real zero next to positive source values.
+        source = player_body(athlete)
+        next(stat for category in source["splits"]["categories"] for stat in category["stats"]
+             if stat["name"] == "expectedAssistsOpenPlay")["value"] = 0.0
+        return source
+
+    real = _expected_values(body(1))
+    assert len(real) == 10 and 0.0 in real and any(value > 0 for value in real)
+    players = {key: (parser.player_statistics(body(key[1]), key[1]), {"athlete_id": key[1]})
+               for key in _played(trino)}
+    assert deep.publish_players(trino=trino, slug="eng.1", year=2020, event_id=1, rosters=rosters,
+                                players=players, manifest=[], has_xg=has_xg)
+    for row in trino.tables["espn_match_lineup"]:
+        if _deep(row):
+            stored = _expected_values(_deep(row)["statistics"])
+            assert stored == (real if has_xg is True else [None] * len(real))
+
+
+def test_unused_substitute_probe_and_players_confirm_xg(runner):
+    from scrapers.espn.deep_store import Depth, save_depth
+    unused = parser.player_statistics(
+        probe("core_player_statistics_eng1_740642_370_228298_unused.json"), 228298)
+    assert parser.xg_support([unused]) is False
+    roster = parser.parse_roster(probe("core_roster_eng1_401879300_384.json"))
+    assert len(roster) == 20 and sum(roster.values()) == 16
+    # Team bodies carry only placeholders; positive player xG proves season support.
+    save_depth(runner.conn, Depth("eng.1", 2020, 1000, "full", checked_at=runner.args["now_fn"]()))
+    original = runner.client.fetch_json
+
+    def content(url, endpoint, params, **kwargs):
+        result = original(url, endpoint, params, **kwargs)
+        if url.endswith("statistics"):
+            result.json_data = stats(0.0)
+        return result
+
+    runner.client.fetch_json = content
+    report = deep.run_deep(**runner.args)
+    assert report["players_completed"] == 1
+    assert runner.conn.execute("SELECT has_xg FROM iceberg.ops.espn_depth_v1").fetchall() == [(True,)]
+    stored = [_deep(row) for row in runner.bronze.tables["espn_match_lineup"] if _deep(row)]
+    assert all(entry["has_xg"] is True and any(_expected_values(entry["statistics"])) for entry in stored)
+
+
+def test_match_without_captured_lineup_is_not_applicable_without_requests(runner):
+    runner.bronze.tables["espn_match"][0]["lineup_state"] = "valid_empty"
+    report = deep.run_deep(**runner.args)
+    assert report["completed"] == 1 and report["players_not_applicable"] == 1
+    assert not _player_urls(runner.client.calls)
+    assert all(json.loads(row["deep_stats_json"])["players_state"] == "not_applicable"
+               for row in runner.bronze.tables["espn_team_stats"])
+
+
+@pytest.mark.parametrize("stop", ["debt", "stop_file", "deadline"])
+def test_players_respect_check(runner, stop):
+    original = runner.client.fetch_json
+    now = runner.args["now_fn"]()
+
+    def content(url, endpoint, params, **kwargs):
+        result = original(url, endpoint, params, **kwargs)
+        if url.endswith("/roster"):
+            if stop == "debt":
+                runner.bronze.debt = [(1,)]
+            elif stop == "stop_file":
+                runner.args["stop_file"].touch()
+            else:
+                runner.args["now_fn"] = lambda: now + timedelta(hours=1)
+        return result
+
+    runner.client.fetch_json = content
+    runner.args["now_fn"] = lambda: now
+    arguments = dict(runner.args)
+    arguments["now_fn"] = lambda: runner.args["now_fn"]()
+    report = deep.run_deep(**arguments)
+    assert report["completed"] == 1 and report["players_completed"] == 0
+    assert sum(url.endswith("/roster") for url in _player_urls(runner.client.calls)) == 1
+    assert not any("/roster/" in url for url, _ in runner.client.calls)
+    assert report["reason"] in ("live debt or unknown live state", "stop file", "deadline")
+
+
+def test_report_counts_player_stage_requests_and_bytes(runner):
+    from scrapers.espn.transport_contracts import EndpointType, RequestLedgerEntry
+    runner.client.ledger = []
+    original = runner.client.fetch_json
+
+    def content(url, endpoint, params, **kwargs):
+        result = original(url, endpoint, params, **kwargs)
+        runner.client.ledger.append(RequestLedgerEntry(
+            "fp", EndpointType.parse(endpoint), 1, 200, 2048, 0, 1.0, None, None, "fetched"))
+        return result
+
+    runner.client.fetch_json = content
+    report = deep.run_deep(**runner.args)
+    stage = sum("/roster" in url for url, _ in runner.client.calls)
+    assert stage == 2 + len(_played(runner.bronze))
+    assert report["players_requests"] == stage
+    assert report["players_direct_bytes"] == stage * 2048
+    assert report["requests_per_players_match"] == stage
+    assert report["kb_per_players_match"] == stage * 2
+    assert report["requests"] == len(runner.client.calls)
+
+
+def test_players_wait_for_first_stage_marker_and_raw_flush(runner):
+    trino = runner.bronze
+    original_insert = trino.insert_dataframe_atomic
+
+    def no_marker(schema, table, frame, **kwargs):
+        if table == "espn_match":
+            raise RuntimeError("interrupted marker")
+        return original_insert(schema, table, frame, **kwargs)
+
+    trino.insert_dataframe_atomic = no_marker
+    with pytest.raises(RuntimeError):
+        publish(trino, fixture_bronze()[1])
+    trino.insert_dataframe_atomic = original_insert
+    runner.client.failed_page = True
+    assert deep.run_deep(**runner.args)["failed"] == 1
+    # Team rows say players pending, but the match marker is not completed.
+    assert not _player_urls(runner.client.calls)
+    events = []
+    original_flush = runner.client.flush
+    runner.client.flush = lambda: events.append("flush") or original_flush()
+
+    def recorded(schema, table, frame, **kwargs):
+        events.append(table)
+        return original_insert(schema, table, frame, **kwargs)
+
+    trino.insert_dataframe_atomic = recorded
+    runner.client.failed_page = False
+    later = runner.args["now_fn"]() + timedelta(days=1)
+    runner.args.update(now_fn=lambda: later, deadline=later + timedelta(minutes=12))
+    assert deep.run_deep(**runner.args)["players_completed"] == 1
+    lineup = events.index("espn_match_lineup")
+    assert "flush" in events[events.index("espn_match") + 1:lineup]
+
+
+@pytest.mark.parametrize("corruption", ["invalid_json", "unparsable"])
+def test_unreadable_cached_player_body_is_fetched_again(runner, corruption):
+    from scrapers.espn.transport_contracts import InvalidJsonError
+    original = runner.client.fetch_json
+    target = []
+
+    def poisoned(url, endpoint, params, force_refresh=True, **kwargs):
+        if "/roster/" in url and not target:
+            target.append(url)
+        if url in target and not force_refresh and any(key[0] == url for key in runner.client.raw):
+            if corruption == "invalid_json":
+                raise InvalidJsonError("Cached ESPN raw body is not valid JSON")
+            runner.client.raw[next(key for key in runner.client.raw if key[0] == url)].json_data = {"splits": None}
+        return original(url, endpoint, params, force_refresh=force_refresh, **kwargs)
+
+    runner.client.fetch_json = poisoned
+    # A fresh cached body, unreadable on replay: the stage requests it again at once.
+    first = deep.run_deep(**runner.args)
+    assert first["players_completed"] == 1
+    for row in runner.bronze.tables["espn_team_stats"]:
+        row["deep_stats_json"] = json.dumps({**json.loads(row["deep_stats_json"]), "players_state": "pending"})
+    runner.client.calls.clear()
+    report = deep.run_deep(**runner.args)
+    assert report["players_completed"] == 1 and report["players_failed"] == 0
+    assert _player_urls(runner.client.calls) == target
+    assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []

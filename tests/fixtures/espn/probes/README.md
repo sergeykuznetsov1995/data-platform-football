@@ -147,3 +147,15 @@
 - Сезоны eng.1 2005 и ЧМ 2010 (глубина: без формаций; пустые составы при полной статистике)
   в тестах — синтетические списки одного матча вокруг записанных summary
   `summary_eng1_2005.json` и `summary_fifaworld_2010.json`.
+
+## Deep core: составы и статистика игроков (#1513)
+
+Сняты 31.10.2026 напрямую с хоста (замер второй стадии deep). Используются
+`test_espn_deep.py` и `test_espn_urls.py`. Первые два — full-матч eng.1 401879300 с xG
+(117 показателей); третий — не вышедший запасной матча eng.1 740642 без xG (94 показателя, все 0).
+
+| Файл | Байт | URL |
+|---|---|---|
+| `core_roster_eng1_401879300_384.json` | 14605 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events/401879300/competitions/401879300/competitors/384/roster?lang=en&region=us |
+| `core_player_statistics_eng1_401879300_384_241187.json` | 26062 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events/401879300/competitions/401879300/competitors/384/roster/241187/statistics/0?lang=en&region=us |
+| `core_player_statistics_eng1_740642_370_228298_unused.json` | 19764 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events/740642/competitions/740642/competitors/370/roster/228298/statistics/0?lang=en&region=us |

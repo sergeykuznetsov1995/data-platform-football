@@ -124,10 +124,9 @@ checked time and raw response URI/SHA manifest. Only full editions collect data.
 
 Stage one publishes `iceberg.bronze.espn_plays`, partitioned by competition and
 integer source season, key `(event_id, play_id)`, plus team `deep_stats_json`.
-The dedicated parser is `espn-deep-v1`. Every actual plays page is checked for
+The dedicated parser is `espn-deep-v2`. Every actual plays page is checked for
 stable metadata, page order, total count and unique ids; no `limit=2000` assumption.
-Team envelopes keep the manifest of every response and `players_state=pending`;
-player statistics are a later stage. Raw bodies are flushed before publication.
+Team envelopes keep the manifest of every response and `players_state=pending`. Raw bodies are flushed before publication.
 All Summary and deep publications serialize per edition on the gate state volume
 (`edition-locks/`), re-read Bronze under the lock and preserve first publication.
 Plays and team rows precede the `deep_state=completed` match marker. A failed
@@ -136,7 +135,8 @@ stage remains resumable; Summary refreshes preserve existing deep JSON and plays
 Support for xG comes from positive source statistics/shots, never count or a
 zero placeholder. Absent xG fields in complete content mean false; all-zero
 fields remain unknown. Unless support is confirmed true, xG/xA/xGOT values are
-NULL, including named statistics in JSON. A confirmed season retains real zeros;
+NULL, including named statistics in JSON and every derived name starting with
+`expectedGoals`/`expectedAssists` (`expectedGoalsConceded`, `expectedAssistsSetPlay`, ...). A confirmed season retains real zeros;
 previously completed matches with unknown support are upgraded on a later run.
 
 The DAG result and log include requests, direct bytes, retries, cache hits,
@@ -242,3 +242,31 @@ measurement window under the source protocol. Do not deliver during the window,
 change gate/workers, reset retries, or bypass the automatic delivery lock. The
 existing history lane's live-debt pause, budgets, stop file and quality gates
 continue to apply; no new DAG or manual queue population is needed.
+
+### Deep core: player statistics (#1513)
+
+The second stage runs inside the same `run_deep`, per full current-season edition,
+after every first-stage match of that edition; the same gate, 20% deep quota and
+`check()` apply. Its queue is matches with `deep_state=completed` whose two team
+envelopes have `players_state=pending`, or `not_applicable` once a later Summary
+captured the lineup. A match without `lineup_state=captured` becomes
+`players_state=not_applicable` without requests. Otherwise both core
+rosters are read; statistics (`.../roster/{athlete}/statistics/0`) are requested
+only for players who started or came on. Played roster ids must be lineup athletes
+of the same team, roster duplicates and a foreign athlete in a statistics answer
+are errors; such failures go to `iceberg.ops.espn_deep_player_retry_v1` for a day.
+An interruption (deadline, stop, live debt, gate) leaves no deferral: every roster
+and player body is flushed to raw at once, and the next run replays bodies younger
+than 12 hours from raw without requests, so a match spanning several runs completes.
+
+Under the edition lock, played rows of `espn_match_lineup.deep_stats_json` receive
+`{parser_version, has_xg, statistics, manifest}`, then both team envelopes get
+`players_state=completed`, `unused` (substitutes who did not play: absent by
+definition, not a gap) and `roster_manifest` (marker last). Other lineup rows stay
+as they are; a repeat is a no-op and Summary refreshes keep the player JSON. The
+same xG mask applies; positive player xG confirms season support in the depth
+registry. A later first-stage xG upgrade resets `players_state=pending`, so players
+are collected again with the confirmed mask. The report adds `players_completed`,
+`players_failed`, `players_not_applicable`, `players_requests`,
+`players_direct_bytes`, `requests_per_players_match` and `kb_per_players_match`
+(roster + player statistics endpoints only); the general fields still cover the run.
