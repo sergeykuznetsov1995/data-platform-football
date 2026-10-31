@@ -168,3 +168,23 @@ def test_yaml_registry_matches_assignment(assignment_rows, tables):
                 assert (row['assignment'], row['core_table'], row['core_column']) == ('column', name, c['name']), rid
     in_tsv = {r['registry_id'] for r in assignment_rows if r['assignment'] == 'column'}
     assert in_tsv == seen, sorted(in_tsv ^ seen)[:10]
+
+
+def test_match_family_takes_season_from_calendar_not_payload(tables):
+    # Split seasons (112): the payload sits under the parent key, the calendar under
+    # Apertura/Clausura. Every match table must take the key from the calendar
+    # mapping, and the payload joins without source_season_key (review #2016 D1).
+    for name, t in tables.items():
+        if t['task'] != 2017:
+            continue
+        frm = _columns(t)['source_season_key']['from']
+        assert frm.startswith('derived:') and 'календар' in frm, name
+    assert 'БЕЗ source_season_key' in tables['fotmob_matches']['row_source']
+
+
+def test_match_stat_keys_are_never_null_in_source(tables):
+    # top_stats.Shotmap has key=null for every player (D3); stats title rows reuse
+    # the data row's key (D2).
+    ps = tables['fotmob_match_player_stats']
+    assert 'stat_key' not in ps['natural_key'] and 'stat_title' in ps['natural_key']
+    assert "type='title'" in tables['fotmob_match_team_stats']['row_source']

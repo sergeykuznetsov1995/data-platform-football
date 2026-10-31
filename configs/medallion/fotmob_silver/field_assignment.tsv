@@ -3867,7 +3867,7 @@ M0323	match	match_events	silver.fotmob_match_events	additional_minute	$.content.
 M0324	match		match_model_annotations	source_json_text	$.content.matchFacts.events.events[*].overloadTimeStr	fotmob_match_payloads.payload_json	raw	fotmob_match_events	event_json	
 M0325	match	match_events	silver.fotmob_match_events	is_own_goal	$.content.matchFacts.events.events[*].ownGoal	fotmob_match_payloads.payload_json	column	fotmob_match_events	is_own_goal	
 M0326	match	match_events	silver.fotmob_match_events	shootout_score	$.content.matchFacts.events.events[*].penShootoutScore	fotmob_match_payloads.payload_json	raw	fotmob_match_events	event_json	
-M0327	match	match_events	silver.fotmob_match_events	is_penalty	$.content.matchFacts.events.events[*].penalty	fotmob_match_payloads.payload_json	raw	fotmob_match_events	event_json	
+M0327	match	match_events	silver.fotmob_match_events	is_penalty	$.content.matchFacts.events.events[*].penalty	fotmob_match_payloads.payload_json	column	fotmob_match_events	is_penalty	
 M0328	match	match_events	silver.fotmob_match_events	penalty_summary_score	$.content.matchFacts.events.events[*].penaltyScore[*]	fotmob_match_payloads.payload_json	raw	fotmob_match_events	event_json	
 M0329	match	match_event_participants	silver.fotmob_match_event_participants	source_player_id	$.content.matchFacts.events.events[*].player.id	fotmob_match_payloads.payload_json	column	fotmob_match_events	player_id	
 M0330	match	match_event_participants	silver.fotmob_match_event_participants	name	$.content.matchFacts.events.events[*].player.name	fotmob_match_payloads.payload_json	raw	fotmob_match_events	event_json	

@@ -22,10 +22,10 @@ tables:
     partitioning: [competition_id, source_season_key]
     sources: [fotmob_matches_current, fotmob_match_payloads_current]
     dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
-    row_source: "fotmob_matches_current (календарь, все матчи, в т.ч. без карточки) LEFT JOIN fotmob_match_payloads_current по (competition_id, source_season_key, match_id); затем правило самого точного сезона"
+    row_source: "fotmob_matches_current (календарь, все матчи, в т.ч. без карточки), свёрнутый до одной строки на (competition_id, match_id) по правилу самого точного сезона (source_season_key), LEFT JOIN fotmob_match_payloads_current по (competition_id, match_id) — БЕЗ source_season_key: карточка split-сезона лежит под родителем (112: 960 из 1005 матчей Apertura/Clausura, 31.10); если у матча карточки под несколькими ключами — последняя по _observed_at. Все матчевые таблицы берут ключ отсюда же"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_matches_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_matches_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_matches_current.match_id", registry: [E0302, E0335, E0362, M0278, M0495, M1055]}
       - {name: parent_season_key, type: VARCHAR, nullable: true, from: "derived: regexp_extract(source_season_key, '^(.+?) - (.+)$', 1), если такой ключ есть в fotmob_competition_seasons_current того же competition_id; иначе NULL"}
       - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_matches_current.scope_stage_id"}
@@ -129,7 +129,7 @@ tables:
     notes: "пути с homeTeam/home/[0] — представитель; для away те же пути с awayTeam/away/[1]"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: side, type: VARCHAR, nullable: false, from: "derived: 'home' | 'away'"}
       - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.payload_json:$.general.homeTeam.id", registry: [M0079, M0185, M1044, M1050, M1253]}
@@ -156,10 +156,10 @@ tables:
     partitioning: [competition_id, source_season_key]
     sources: [fotmob_match_payloads_current]
     dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
-    row_source: "fotmob_match_payloads_current.stats_json:$.Periods.<period>.stats[*].stats[*], элемент stats[] = [home, away] -> 2 строки"
+    row_source: "fotmob_match_payloads_current.stats_json:$.Periods.<period>.stats[*].stats[*], элемент stats[] = [home, away] -> 2 строки; элементы type='title' (заголовок группы, stats [null, null], тот же key, что у строки данных) пропускаются — иначе дубль ключа"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: period, type: VARCHAR, nullable: false, from: "derived: имя ключа $.Periods.<period> (All, FirstHalf, SecondHalf, FirstExtraHalf, SecondExtraHalf)"}
       - {name: stat_group, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.stats_json:$.Periods.All.stats[*].key", registry: [M0932, M0951, M0967, M0986, M1002]}
@@ -188,7 +188,7 @@ tables:
     notes: "пути с homeTeam.starters — представитель; те же поля в homeTeam.subs[*], awayTeam.starters[*], awayTeam.subs[*]"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: local_player_key, type: VARCHAR, nullable: false, from: "derived: '<side>:<role>:<index>' — side home|away, role starter|sub, index — порядковый номер в массиве starters/subs с 1 (стабилен в одной версии карточки)"}
       - {name: side, type: VARCHAR, nullable: false, from: "derived: 'home' | 'away'"}
@@ -219,14 +219,14 @@ tables:
     scope: context
     task: 2017
     grain: "одно значение статистики игрока в матче: игрок x группа x показатель"
-    natural_key: [competition_id, source_season_key, match_id, local_player_key, stat_group, stat_key]
+    natural_key: [competition_id, source_season_key, match_id, local_player_key, stat_group, stat_title]
     partitioning: [competition_id, source_season_key]
     sources: [fotmob_match_payloads_current]
     dedup_order: ["_observed_at DESC", "_ingested_at DESC"]
     row_source: "fotmob_match_payloads_current.player_stats_json:$.<player_key>.stats[*].stats.<title>"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: local_player_key, type: VARCHAR, nullable: false, from: "derived: local_player_key строки состава, найденной по id (или по optaId, если id=0/нет); если игрока нет в составе — 'stats:' || ключ словаря playerStats"}
       - {name: side, type: VARCHAR, nullable: true, from: "derived: 'home'/'away' по teamId против home/away team_id матча"}
@@ -237,8 +237,8 @@ tables:
       - {name: is_goalkeeper, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.isGoalkeeper", registry: [M0690]}
       - {name: stat_group, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].key", registry: [M0726]}
       - {name: stat_group_title, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].title", registry: [M0733]}
-      - {name: stat_title, type: VARCHAR, nullable: true, from: "derived: имя ключа словаря stats[*].stats.<title>"}
-      - {name: stat_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.key", registry: [M0728]}
+      - {name: stat_title, type: VARCHAR, nullable: false, from: "derived: имя ключа словаря stats[*].stats.<title> (уникально в группе; ключ строки)"}
+      - {name: stat_key, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.key", rule: "бывает NULL (top_stats.Shotmap у каждого игрока), поэтому не в ключе", registry: [M0728]}
       - {name: stat_value, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.stat.value", registry: [M0732]}
       - {name: stat_total, type: DOUBLE, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.stat.total", registry: [M0730]}
       - {name: stat_type, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.player_stats_json:$.*.stats[*].stats.*.stat.type", registry: [M0731]}
@@ -255,7 +255,7 @@ tables:
     row_source: "fotmob_match_payloads_current.match_facts_json:$.events.events[*] (event_section='events') и $.events.penaltyShootoutEvents[*] (event_section='penalty_shootout')"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: event_section, type: VARCHAR, nullable: false, from: "derived: 'events' | 'penalty_shootout'"}
       - {name: event_index, type: INTEGER, nullable: false, from: "derived: порядковый номер в массиве с 1"}
@@ -276,6 +276,7 @@ tables:
       - {name: card_reason_key, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].cardReason.localizedKey", registry: [M0304]}
       - {name: goal_description_key, type: VARCHAR, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].goalDescriptionKey", registry: [M0309, M0387]}
       - {name: is_own_goal, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].ownGoal", registry: [M0325, M0397]}
+      - {name: is_penalty, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].penalty", registry: [M0327]}
       - {name: is_penalty_shootout, type: BOOLEAN, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].isPenaltyShootoutEvent", registry: [M0316, M0391]}
       - {name: minutes_added, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].minutesAddedInput", registry: [M0318]}
       - {name: shot_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.match_facts_json:$.events.events[*].shotmapEvent.id", registry: [M0346, M0415]}
@@ -292,7 +293,7 @@ tables:
     row_source: "fotmob_match_payloads_current.shotmap_json:$.shots[*]"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: shot_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].id", registry: [M0908]}
       - {name: team_id, type: BIGINT, nullable: true, from: "fotmob_match_payloads_current.shotmap_json:$.shots[*].teamId", registry: [M0928]}
@@ -336,7 +337,7 @@ tables:
     notes: "элемент {minute, value} раскладывается полностью — отдельная колонка сырого элемента не нужна"
     columns:
       - {name: competition_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.competition_id"}
-      - {name: source_season_key, type: VARCHAR, nullable: false, from: "fotmob_match_payloads_current.source_season_key"}
+      - {name: source_season_key, type: VARCHAR, nullable: false, from: "derived: ключ матча = самый точный ключ календаря. По fotmob_matches_current строится отображение (competition_id, match_id) -> ключ: если match_id есть у турнира под P и под C = P || ' - ' || <часть> (regexp '^(.+?) - (.+)$', группа 1 = P), берётся C; иначе единственный ключ календаря. Строка под родителем не теряется, а переназначается на C. Матча нет в календаре -> ключ карточки"}
       - {name: match_id, type: BIGINT, nullable: false, from: "fotmob_match_payloads_current.match_id"}
       - {name: minute, type: DOUBLE, nullable: false, from: "fotmob_match_payloads_current.momentum_json:$.main.data[*].minute", registry: [M0678]}
       - {name: momentum_value, type: INTEGER, nullable: true, from: "fotmob_match_payloads_current.momentum_json:$.main.data[*].value", registry: [M0679]}
@@ -512,7 +513,7 @@ tables:
       - {name: participant_type, type: VARCHAR, nullable: false, from: "fotmob_leaderboards_current.participant_type", registry: [E0087]}
       - {name: participant_id, type: BIGINT, nullable: false, from: "fotmob_leaderboards_current.participant_id", registry: [E0088]}
       - {name: participant_name, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.participant_name", registry: [E0089]}
-      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_leaderboards_current.team_id", registry: [E0090]}
+      - {name: team_id, type: BIGINT, nullable: false, from: "fotmob_leaderboards_current.team_id", rule: "команда в строке рейтинга как её отдал FotMob; для participant_type='team' может не совпадать с participant_id (47+112: 12 973 строк, 31.10) — не подменять", registry: [E0090]}
       - {name: team_name, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.team_name", registry: [E0091]}
       - {name: country_code, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.country_code"}
       - {name: scope_stage_id, type: VARCHAR, nullable: true, from: "fotmob_leaderboards_current.scope_stage_id"}
@@ -655,7 +656,7 @@ tables:
     row_source: "fotmob_player_snapshots_current.market_values_json:$.values[*]"
     columns:
       - {name: player_id, type: BIGINT, nullable: false, from: "fotmob_player_snapshots_current.player_id"}
-      - {name: value_date, type: DATE, nullable: false, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].date", registry: [E0192]}
+      - {name: value_date, type: DATE, nullable: false, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].date", rule: "DATE из первых 10 символов ('2016-12-31T00:00:00+00:00' -> 2016-12-31)", registry: [E0192]}
       - {name: market_value, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].value", registry: [E0193]}
       - {name: lower_bound, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].lowerBound", registry: [E0194]}
       - {name: upper_bound, type: "DECIMAL(38,8)", nullable: true, from: "fotmob_player_snapshots_current.market_values_json:$.values[*].upperBound", registry: [E0195]}
