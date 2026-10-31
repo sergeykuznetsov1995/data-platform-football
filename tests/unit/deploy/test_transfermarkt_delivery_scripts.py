@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -50,9 +51,12 @@ case "$cmd" in
     if [ "$c" = transfermarkt-airflow-metadb ]; then
       sql=${@: -1}
       case "$sql" in
-        *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" ;;
         *last_parsed_time*) cat "$S/dags" ;;
         *import_error*) cat "$S/import_errors" 2>/dev/null || echo 0 ;;
+        *next_dagrun_create_after*) cat "$S/next_run" 2>/dev/null || echo 0 ;;
+        *task_instance*) cat "$S/busy" 2>/dev/null || echo 0 ;;
+        *"state IN ('queued','running')"*) cat "$S/registry_busy" 2>/dev/null || echo 0 ;;
+        *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" ;;
         *slot_pool*) pool=${sql#*pool=\'}; pool=${pool%%\'*}
           [ ! -e "$S/pool_query_fails_$pool" ] || exit 1
           cat "$S/pool_$pool" ;;
@@ -610,3 +614,259 @@ def test_history_preflight_runs_without_the_scrapers_package_imports(tmp_path: P
     result = _run_deploy(release, stubs, env_file)
     assert "pandas" not in result.stdout + result.stderr
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --------------------------- #2039: доставка в любой час с дренажом полосы ---------------------------
+
+FREEZE_STUB = r"""#!/bin/bash
+set -e
+S=__STATE__
+[ -e "$S/freeze_fails" ] && { echo "заморозка не удалась" >&2; exit 1; }
+rel=$(sed -n 's/^TRANSFERMARKT_RELEASES_DIR=//p' "$TRANSFERMARKT_ENV_FILE" | head -1)
+src=$(sed -n 's/^TRANSFERMARKT_SOURCE_REPO=//p' "$TRANSFERMARKT_ENV_FILE" | head -1)
+tree="$rel/release-${1:0:8}"
+git clone -q "$src" "$tree"
+git -C "$tree" checkout -q --detach "$1"
+chmod 755 "$tree"
+echo "дерево заморожено: $tree (sha ${1:0:8})"
+"""
+
+# deploy.sh релиза: перепин env, пересоздание (монты, .Created), TM-пулы по streams. Паузы, как
+# настоящий deploy.sh, оставляет такими, какими их видел (полоса после дренажа — на паузе).
+RELEASE_DEPLOY_STUB = r"""#!/bin/bash
+S=__STATE__
+new=$1
+echo "$*" >> "$S/deploy_calls"
+rc=$(cat "$S/deploy_rc" 2>/dev/null || echo 0)
+[ "$rc" = 0 ] || exit "$rc"
+sed -i "s#^TRANSFERMARKT_RELEASE_ROOT=.*#TRANSFERMARKT_RELEASE_ROOT=$new#" "$TRANSFERMARKT_ENV_FILE"
+printf '%s/dags\n%s/deploy/transfermarkt/.airflowignore\n%s/scrapers\n%s/scripts\n%s/configs\n' \
+  "$new" "$new" "$new" "$new" "$new" > "$S/mounts___SCHED__"
+echo "$new" > "$S/mounts___GW__"
+echo "created-$new" > "$S/created___SCHED__"
+echo 2026-09-24T03:00:00Z > "$S/started___SCHED__"
+for p in transfermarkt_control transfermarkt_proxy; do echo 1 > "$S/pool_$p"; done
+for p in transfermarkt_backfill_control transfermarkt_backfill_proxy; do echo 0 > "$S/pool_$p"; done
+exit 0
+"""
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+class Delivery(Stand):
+    """Стенд полной доставки: бой — клон тестового репозитория на первом коммите, master —
+    второй. Незакрытой доставки нет; паузы — как в бою (ingest/discover f, backfill/silver t)."""
+
+    def __init__(self, tmp: Path) -> None:
+        super().__init__(tmp)
+        (self.auto / "transfermarkt-rollback.env").unlink()
+        (self.auto / "transfermarkt-inflight").unlink()
+        self.source = tmp / "source"
+        self.source.mkdir()
+        _git(self.source, "init", "-q", "-b", "master")
+        d = self.source / "deploy" / "transfermarkt"
+        d.mkdir(parents=True)
+        for name, body in (("freeze_release.sh", FREEZE_STUB), ("deploy.sh", RELEASE_DEPLOY_STUB)):
+            (d / name).write_text(body.replace("__STATE__", str(self.state)).replace(
+                "__SCHED__", SCHED).replace("__GW__", GW), encoding="utf-8")
+            (d / name).chmod(0o755)
+        # Релиз несёт ровно установленную копию автомата: сверка по md5 (#1362).
+        (d / "auto_deliver.sh").write_text(self.automat.read_text(encoding="utf-8"), encoding="utf-8")
+        (d / "env.sh").write_text((DEPLOY / "env.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (self.source / "marker.txt").write_text("one\n", encoding="utf-8")
+        _git(self.source, "add", "-A")
+        _git(self.source, "commit", "-q", "-m", "one")
+        self.old_sha = _git(self.source, "rev-parse", "HEAD")
+        (self.source / "marker.txt").write_text("two\n", encoding="utf-8")
+        _git(self.source, "commit", "-q", "-am", "two")
+        self.new_sha = _git(self.source, "rev-parse", "HEAD")
+        self.live = self.releases / f"release-{self.old_sha[:8]}"
+        subprocess.run(["git", "clone", "-q", str(self.source), str(self.live)], check=True)
+        _git(self.live, "checkout", "-q", "--detach", self.old_sha)
+        self.live.chmod(0o755)
+        self.target = self.releases / f"release-{self.new_sha[:8]}"
+        text = self.env_file.read_text(encoding="utf-8")
+        text = text.replace(f"TRANSFERMARKT_RELEASE_ROOT={self.new}", f"TRANSFERMARKT_RELEASE_ROOT={self.live}")
+        text = text.replace(f"TRANSFERMARKT_SOURCE_REPO={tmp}/no-repo", f"TRANSFERMARKT_SOURCE_REPO={self.source}")
+        self.env_file.write_text(text, encoding="utf-8")
+        self.mounts_on(self.live)
+        self.put(f"created_{SCHED}", "created-old")
+        for dag in DAGS:
+            self.put(f"paused_{dag}", "f" if "ingest" in dag or "discover" in dag else "t")
+        self.next_run(6 * 3600)
+
+    def next_run(self, seconds: int) -> None:
+        self.put("next_run", str(int(time.time()) + seconds))
+
+    def paused(self, dag: str) -> str:
+        return (self.state / f"paused_{dag}").read_text().strip()
+
+    def drain(self) -> Path:
+        return self.auto / "transfermarkt-drain.env"
+
+    def latch(self, sha: str | None = None) -> Path:
+        return self.auto / f"transfermarkt-auto-deliver-attempted-{(sha or self.new_sha)[:8]}"
+
+    def deployed(self) -> bool:
+        return (self.state / "deploy_calls").exists()
+
+    def records(self) -> dict[str, dict[str, str]]:
+        out = {}
+        for path in sorted(self.auto.glob("transfermarkt-window-*.env")):
+            out[path.name[len("transfermarkt-window-"):-len(".env")]] = dict(
+                line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
+        return out
+
+    def put_drain(self, started_ago: int) -> None:
+        self.drain().write_text(
+            f"TARGET={self.new_sha}\nSTARTED_AT={int(time.time()) - started_ago}\n"
+            "PAUSED_dag_ingest_transfermarkt=f\nPAUSED_dag_backfill_transfermarkt=t\n", encoding="utf-8")
+        self.put("paused_dag_ingest_transfermarkt", "t")
+
+
+@pytest.fixture
+def delivery(tmp_path: Path) -> Delivery:
+    return Delivery(tmp_path)
+
+
+def _assert_pauses_as_before(d: Delivery) -> None:
+    for dag in DAGS:
+        assert d.paused(dag) == ("f" if "ingest" in dag or "discover" in dag else "t"), dag
+
+
+@pytest.mark.unit
+def test_any_hour_with_a_free_lane_delivers(delivery: Delivery) -> None:
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert delivery.deployed(), delivery.log()
+    assert delivery.env_root() == str(delivery.target)
+    [(win, rec)] = delivery.records().items()
+    assert "T" in win and rec["OUTCOME"] == "delivered" and rec["DEADLINE"].isdigit(), rec
+    assert not delivery.drain().exists()
+    assert delivery.latch().exists()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_a_running_portion_is_not_paused_the_lane_is_drained_at_its_end(delivery: Delivery) -> None:
+    # Пауза посреди порции заморозила бы её прогон (Airflow 2): ждём границы без паузы.
+    delivery.put("busy", "1")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr
+    assert not delivery.deployed() and not delivery.drain().exists()
+    assert delivery.paused("dag_ingest_transfermarkt") == "f"
+    assert "жду конца порции" in delivery.log()
+    delivery.put("busy", "0")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert delivery.deployed()
+    assert "ДРЕНАЖ: ставлю на паузу" in delivery.log()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_the_drain_survives_a_failed_freeze_and_the_snapshot_keeps_pre_drain_pauses(delivery: Delivery) -> None:
+    delivery.put("freeze_fails", "1")
+    result = delivery.run()
+    assert result.returncode == 1, result.stderr
+    assert delivery.drain().exists()
+    assert delivery.paused("dag_ingest_transfermarkt") == "t"
+    assert "PAUSED_dag_ingest_transfermarkt=f" in delivery.drain().read_text()
+    (delivery.state / "freeze_fails").unlink()
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert delivery.deployed() and not delivery.drain().exists()
+    [rec] = delivery.records().values()
+    assert rec["OUTCOME"] == "delivered", rec
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_a_drain_timeout_restores_pauses_and_defers_the_sha(delivery: Delivery) -> None:
+    delivery.put_drain(started_ago=4000)
+    delivery.put("busy", "1")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert not delivery.deployed() and not delivery.drain().exists()
+    _assert_pauses_as_before(delivery)
+    assert delivery.latch().read_text().startswith("busy ")
+    [rec] = delivery.records().values()
+    assert rec["OUTCOME"] == "failed" and "не освободилась" in rec["REASON"], rec
+    delivery.put("busy", "0")
+    assert delivery.run().returncode == 0
+    assert not delivery.deployed() and not delivery.drain().exists()
+
+
+@pytest.mark.unit
+def test_the_off_switch_during_a_drain_returns_the_lane(delivery: Delivery) -> None:
+    delivery.put_drain(started_ago=60)
+    (delivery.auto / "transfermarkt-auto-deliver.off").write_text("")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert not delivery.drain().exists() and not delivery.deployed()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_a_registry_run_blocks_the_drain_and_aborts_a_started_one(delivery: Delivery) -> None:
+    delivery.put("busy", "1")            # прогон registry — тоже прогон TM
+    delivery.put("registry_busy", "1")
+    assert delivery.run().returncode == 0
+    assert not delivery.drain().exists() and delivery.paused("dag_ingest_transfermarkt") == "f"
+    delivery.put_drain(started_ago=60)
+    assert delivery.run().returncode == 0
+    assert not delivery.drain().exists() and not delivery.deployed()
+    assert not delivery.latch().exists()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_short_headroom_before_the_registry_run_starts_nothing(delivery: Delivery) -> None:
+    delivery.next_run(2 * 3600)          # меньше DRAIN_MAX + NEED_BUDGET + резерв
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr
+    assert not delivery.deployed() and not delivery.drain().exists()
+    assert "мало запаса" in delivery.log()
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_an_attempted_sha_is_not_retried_and_a_new_sha_is(delivery: Delivery) -> None:
+    delivery.latch().write_text("")
+    assert delivery.run().returncode == 0
+    assert not delivery.deployed()
+    delivery.latch().unlink()
+    delivery.latch("0" * 40).write_text("")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    assert delivery.deployed()
+
+
+@pytest.mark.unit
+def test_rc4_is_busy_not_a_failure_and_defers_the_sha(delivery: Delivery) -> None:
+    delivery.put("deploy_rc", "4")
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr + delivery.log()
+    [rec] = delivery.records().values()
+    assert rec["OUTCOME"] == "busy", rec
+    assert delivery.latch().read_text().startswith("busy ")
+    _assert_pauses_as_before(delivery)
+
+
+@pytest.mark.unit
+def test_overdue_records_close_by_deadline_and_legacy_ones_at_0300(delivery: Delivery) -> None:
+    delivery.put("busy", "1")
+    legacy = delivery.auto / "transfermarkt-window-2026-09-24.env"
+    legacy.write_text(f"WINDOW_ID=2026-09-24\nTARGET={delivery.new_sha}\nLAST_REASON=контур занят\n")
+    overdue = delivery.auto / "transfermarkt-window-2026-10-01T1200.env"
+    overdue.write_text(f"WINDOW_ID=2026-10-01T1200\nTARGET={delivery.new_sha}\nDEADLINE={int(time.time()) - 60}\n"
+                       "LAST_REASON=контур занят\n")
+    assert delivery.run().returncode == 0
+    recs = delivery.records()
+    assert recs["2026-09-24"]["OUTCOME"] == "failed", recs
+    assert recs["2026-10-01T1200"]["OUTCOME"] == "failed", recs

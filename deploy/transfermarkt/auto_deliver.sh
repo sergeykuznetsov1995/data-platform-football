@@ -1,11 +1,16 @@
 #!/bin/bash
-# Автомат ночной доставки Transfermarkt (#1387): в окно 01:00–03:00 UTC сам ставит master
-# в бой своего контура (transfermarkt-airflow / transfermarkt-gw), принимает результат,
-# при любой поломке ОТКАТЫВАЕТ и докладывает в Telegram.
-# Логика — копия deploy/sofascore/auto_deliver.sh (замок, очередь алертов, суточная
-# защёлка, выключатель .off, маркеры INFLIGHT/ACCEPTED, записи окон, самообновление копии)
-# с заменами #1387:
-#   * драйна нет: доставка только когда в своей метабазе нет running-прогона TM-DAG;
+# Автомат доставки Transfermarkt (#1387, #2039): в любой час, когда полоса сбора свободна и до
+# ближайшего прогона по расписанию хватает запаса, сам ставит master в бой своего контура
+# (transfermarkt-airflow / transfermarkt-gw), принимает результат, при любой поломке ОТКАТЫВАЕТ
+# и докладывает в Telegram. Часового окна нет (гриль TM 30.10, решение 3: «в любой час с паузой
+# полосы»); ночное окно — лишь частный случай свободной полосы.
+# Логика — копия deploy/sofascore/auto_deliver.sh (замок, очередь алертов, защёлка на sha,
+# выключатель .off, маркеры INFLIGHT/ACCEPTED, записи попыток, самообновление копии)
+# с заменами #1387/#2039:
+#   * дренаж полосы (ingest + backfill): на паузу — только на границе порций, когда в контуре
+#     нет running-прогона и задач в работе (пауза посреди порции заморозила бы её прогон —
+#     Airflow 2 не двигает прогоны паузного DAG). Паузы ДО дренажа — в $DRAIN; дренаж
+#     многотиковый (заморозка, самоустановка), его прерывание возвращает паузы из файла;
 #   * откат — deploy.sh СТАРОГО дерева (он принимает любое дерево контура) плюс возврат
 #     пауз четырёх DAG и слотов пулов из снимка;
 #   * приёмка — 4 DAG + 1 шлюз, привязана к факту пересоздания scheduler'а (.Created);
@@ -13,7 +18,7 @@
 #     dags/dag_ingest_transfermarkt.py (только в копии, не в git) проходит штатную
 #     доставку, приёмка падает, откат обязан подтвердиться — «откат проверен».
 #
-# Cron: */5 * * * * /usr/local/libexec/transfermarkt/auto_deliver.sh
+# Cron: */5 * * * * /usr/local/libexec/transfermarkt/auto_deliver.sh   (запас и одноразовость — внутри)
 # Все пути машины — из env-файла контура (deploy/transfermarkt/transfermarkt.env.example).
 set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -62,19 +67,33 @@ INFLIGHT=$STATE/transfermarkt-inflight         # доставка начата �
 ACCEPTED=$STATE/transfermarkt-accepted         # sha кода, приёмку которого подтвердили
 SNAPSHOT=$STATE/transfermarkt-rollback.env     # состояние боя до доставки: цель отката
 TODAY=$(date -u +%F)
-ATTEMPTED=$STATE/transfermarkt-auto-deliver-attempted-$TODAY
-YESTERDAY=$(date -u -d "$TODAY -1 day" +%F)
+# Защёлка — на целевой sha (#2039, как SofaScore #1980): одна попытка на коммит master; путь
+# известен после чтения master (шаг 4).
+ATTEMPTED=""
+BEHIND=$STATE/transfermarkt-behind-since       # с какого момента бой не на master (epoch)
+DRAIN=$STATE/transfermarkt-drain.env           # дренаж полосы идёт: паузы полосы ДО него
+# Запись попытки: transfermarkt-window-<UTC-дата>T<ЧЧММ>.env (старые — <дата>); WIN — открытая.
+WIN=""
 POOLS="transfermarkt_control transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
 CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
-WINDOW_FROM=${WINDOW_FROM:-0100}   # TM-DAG идут в 04:00 UTC; окно 01:00–03:00 (решение 9 #1387)
-WINDOW_TO=${WINDOW_TO:-0300}
+# Полоса — непрерывный сбор порциями (TransfermarktCurrentTimetable): у неё next_dagrun ≈ now,
+# дедлайну она не годится — её закрывает пауза дренажа.
+LANE_DAGS="dag_ingest_transfermarkt dag_backfill_transfermarkt"
+# Дедлайн — ближайший запуск DAG вне полосы по расписанию (silver — trigger-only, расписания нет).
+NEXT_RUN_DAGS="'dag_discover_transfermarkt_registry'"
+NEXT_RUN_COUNT=1
+DEADLINE_MAX=${DEADLINE_MAX:-10800}  # не дальше 3 ч вперёд; не меньше DRAIN_MAX + NEED_BUDGET
+LEGACY_WINDOW_TO=0300                # дедлайн старых записей окна (до #2039): <дата> 03:00 UTC
 DEPLOY_CEILING=${DEPLOY_CEILING:-1800}  # потолок deploy.sh: шлюз 300 + пулы 150 + DAG 600 + scheduler 300 + запас
 ACCEPT_WAIT=${ACCEPT_WAIT:-480}
 ACCEPT_POLL=${ACCEPT_POLL:-20}
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
-FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}
+FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}   # провальных попыток подряд до выключателя (имя — прежнее)
+DRAIN_MAX=${DRAIN_MAX:-3600}       # дренаж дольше часа (порция 45 мин + запас) — прерывается
+ROLLBACK_RESERVE=${ROLLBACK_RESERVE:-600}  # зазор до прогона registry сверх NEED_BUDGET (в нём уже откат)
+BUSY_RETRY=${BUSY_RETRY:-21600}    # полоса не освободилась / rc=4: тот же sha — не раньше чем через 6 ч
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
-# Запас до конца окна: доставка и откат — каждый с потолком deploy.sh, его `timeout -k 30`
+# Запас до дедлайна: доставка и откат — каждый с потолком deploy.sh, его `timeout -k 30`
 # и приёмкой (плюс один опрос сверх её дедлайна), и общий резерв на снимок, возврат
 # пауз/пулов, сбор логов и запросы к метабазе с их таймаутами.
 BUDGET_RESERVE=${BUDGET_RESERVE:-600}
@@ -334,8 +353,83 @@ snapshot_ok(){
   done
   return 0
 }
-contour_busy(){  # число running-прогонов TM-DAG; X — метабаза не ответила
-  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ($CORE_DAGS_SQL) AND state='running';"
+# Контур пуст — тот же предикат, что idle-проверка deploy.sh: running-прогонов TM нет и задач
+# в queued/running/restarting нет. Число; X — метабаза не ответила.
+contour_busy(){
+  metadb "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($CORE_DAGS_SQL) AND state='running') + (SELECT count(*) FROM task_instance WHERE dag_id IN ($CORE_DAGS_SQL) AND state IN ('queued','running','restarting'));"
+}
+# Прогоны DAG вне полосы (registry, silver): дренаж их не закрывает, выкат оборвал бы их.
+outer_busy(){
+  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('dag_discover_transfermarkt_registry','dag_transform_transfermarkt_silver') AND state IN ('queued','running');"
+}
+
+# --- дренаж полосы (#2039) ---------------------------------------------------------------
+# Файл $DRAIN: TARGET, STARTED_AT (epoch), PAUSED_<dag>=t|f — паузы полосы ДО дренажа. Пишется
+# ДО паузы, убирается после возврата пауз или когда снимок отката уже несёт эти значения.
+drain_get(){ sed -n "s/^$1=//p" "$DRAIN" 2>/dev/null | head -1; }
+drain_release(){  # вернуть паузы полосы из файла и убрать его; 1 — не вернулись (файл остаётся)
+  local d want
+  RESTORE_NOTE=""
+  for d in $LANE_DAGS; do
+    want=$(drain_get "$(paused_key "$d")")
+    case "$want" in
+      t|f) restore_pause "$d" "$want" || true ;;
+      *) RESTORE_NOTE="$RESTORE_NOTE пауза $d до дренажа не прочитана из $DRAIN;" ;;
+    esac
+  done
+  [ -z "$RESTORE_NOTE" ] || return 1
+  rm -f "$DRAIN"
+}
+# Прервать дренаж (если он идёт): паузы полосы — как до него. Не вернулись — сбор стоял бы
+# молча: выключатель и руки.
+drain_abort(){  # drain_abort <причина>
+  is_plain "$DRAIN" || return 0
+  if drain_release; then
+    log "дренаж прерван ($1): паузы полосы возвращены"
+    return 0
+  fi
+  log "ДРЕНАЖ ПРЕРВАН ($1), НО ПАУЗЫ ПОЛОСЫ НЕ ВЕРНУЛИСЬ:$RESTORE_NOTE — глушу автомат"
+  set_off
+  hands_close "" "дренаж прерван ($1), паузы полосы не вернулись:$RESTORE_NOTE" f
+  tg_durable "Transfermarkt: дренаж полосы прерван ($1), но паузы ingest/backfill не вернулись к прежним —$RESTORE_NOTE Сбор стоит. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  exit 1
+}
+# Начать дренаж: записать паузы полосы, затем паузу на ingest и backfill с проверкой по метабазе.
+# 1 — не начат (паузы, если менялись, возвращены).
+drain_start(){
+  local d v kv=()
+  for d in $LANE_DAGS; do
+    v=$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")
+    case "$v" in
+      t|f) kv+=("$(paused_key "$d")=$v") ;;
+      *) log "метабаза не ответила про паузу $d ('$v') — дренаж не начат"
+         window_note "пауза $d не прочитана — дренаж не начат"
+         return 1 ;;
+    esac
+  done
+  if ! { printf '%s\n' "TARGET=$WANT" "STARTED_AT=$(date -u +%s)" "${kv[@]}" > "$DRAIN.tmp" \
+         && mv -f "$DRAIN.tmp" "$DRAIN"; } 2>/dev/null; then
+    rm -f "$DRAIN.tmp" 2>/dev/null
+    log "файл дренажа $DRAIN не записан — дренаж не начат"
+    window_note "файл дренажа не записан"
+    return 1
+  fi
+  log "ДРЕНАЖ: ставлю на паузу $LANE_DAGS (до дренажа: ${kv[*]}), цель ${WANT:0:8}"
+  for d in $LANE_DAGS; do
+    sched airflow dags pause "$d"
+    [ "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")" = t ] && continue
+    drain_abort "$d не встал на паузу"
+    window_note "$d не встал на паузу — дренаж отменён"
+    return 1
+  done
+}
+# Защёлка sha с пометкой busy: повтор того же sha — только после BUSY_RETRY. Атомарно: пустая
+# защёлка после обрыва записи заперла бы этот sha навсегда.
+latch_busy(){
+  if ! { printf 'busy %s\n' "$(date -u +%s)" > "$ATTEMPTED.tmp" && mv -f "$ATTEMPTED.tmp" "$ATTEMPTED"; } 2>/dev/null; then
+    log "не смог пометить защёлку $ATTEMPTED как busy — снимаю её, повтор со следующего свободного тика"
+    rm -f "$ATTEMPTED" "$ATTEMPTED.tmp"
+  fi
 }
 # Откат: deploy.sh СТАРОГО дерева (перепин env, шлюз, scheduler, пулы, приёмка внутри),
 # затем паузы и пулы из снимка и собственная приёмка автомата по старому дереву.
@@ -376,32 +470,74 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
   done
   return 1
 }
-set_window(){   # выставляет hm, now, deadline, in_window
+# Выставляет now и deadline = min(ближайший запуск DAG вне полосы − ROLLBACK_RESERVE,
+# now + DEADLINE_MAX). 1 — метабаза не ответила или DAG пропал/неактивен, или у DAG не на
+# паузе следующий запуск не вычислен (fail-closed): тик пропускается, это не провал попытки.
+set_deadline(){
+  local nxt
   now=$(date -u +%s)
-  hm=$((10#$(date -u +%H%M)))
-  deadline=$(date -u -d "$TODAY ${WINDOW_TO:0:2}:${WINDOW_TO:2:2}" +%s)
-  in_window=0
-  { [ "$hm" -ge "$((10#$WINDOW_FROM))" ] && [ "$hm" -le "$((10#$WINDOW_TO))" ]; } && in_window=1
+  nxt=$(metadb "SELECT CASE WHEN count(*) FILTER (WHERE is_active) < $NEXT_RUN_COUNT OR count(*) FILTER (WHERE NOT is_paused AND next_dagrun_create_after IS NULL) > 0 THEN -1 ELSE coalesce(min(extract(epoch FROM next_dagrun_create_after)) FILTER (WHERE NOT is_paused), 0)::bigint END FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS);")
+  case "$nxt" in ''|*[!0-9]*) return 1 ;; esac
+  deadline=$(( now + DEADLINE_MAX ))
+  if [ "$nxt" != 0 ] && [ $(( nxt - ROLLBACK_RESERVE )) -lt "$deadline" ]; then
+    deadline=$(( nxt - ROLLBACK_RESERVE ))
+  fi
+  return 0
 }
-announce_missed_window(){  # announce_missed_window <текст>
-  [ "$in_window" = 1 ] || return 0
-  [ "$(( deadline - $(date -u +%s) ))" -le 300 ] || return 0
+# Бой не на master дольше суток — одна новость в сутки на все причины (master недоступен,
+# полоса занята, попытка провалилась). Отсчёт — с первого тика, увидевшего расхождение.
+announce_behind(){  # announce_behind <текст>
+  local since
+  if ! is_plain "$BEHIND"; then
+    { printf '%s\n' "$(date -u +%s)" > "$BEHIND"; } 2>/dev/null || log "не смог записать $BEHIND"
+    return 0
+  fi
+  since=$(head -1 "$BEHIND" 2>/dev/null)
+  case "$since" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$(( $(date -u +%s) - since ))" -ge 86400 ] || return 0
   said_today "$STATE/transfermarkt-window-missed-$TODAY" && return 0
   tg_durable "$1"
   mark_said "$STATE/transfermarkt-window-missed-$TODAY"
 }
 
-# --- Записи окон: одна на сутки, исход и причина; по ним считается серия провалов ---
+# --- Записи попыток: одна на попытку (<дата>T<ЧЧММ>, DEADLINE); по ним считается серия провалов ---
 window_file(){ printf '%s/transfermarkt-window-%s.env' "$STATE" "$1"; }
 win_get(){ sed -n "s/^$2=//p" "$(window_file "$1")" 2>/dev/null | head -1; }
 win_closed(){ [ -n "$(win_get "$1" OUTCOME)" ]; }
-window_deadline(){ date -u -d "$1 ${WINDOW_TO:0:2}:${WINDOW_TO:2:2}" +%s; }
+# Дедлайн записи: поле DEADLINE; у старой записи (id = дата, до #2039) — 03:00 UTC той даты.
+window_deadline(){
+  local d
+  d=$(win_get "$1" DEADLINE)
+  case "$d" in ''|*[!0-9]*) ;; *) printf '%s' "$d"; return 0 ;; esac
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) date -u -d "$1 ${LEGACY_WINDOW_TO:0:2}:${LEGACY_WINDOW_TO:2:2}" +%s ;;
+    *) return 1 ;;
+  esac
+}
+# Самая свежая открытая запись — продолжение прерванной попытки (дренаж, самоустановка, заморозка).
+latest_open_window(){
+  local -a recs=("$STATE"/transfermarkt-window-*.env)
+  local i id
+  for (( i=${#recs[@]}-1; i>=0; i-- )); do
+    is_plain "${recs[$i]}" || continue
+    id=${recs[$i]##*/transfermarkt-window-}; id=${id%.env}
+    win_closed "$id" || { printf '%s' "$id"; return 0; }
+  done
+}
+window_open(){  # window_open <TARGET> — новая запись попытки, выставляет WIN
+  local id
+  id=$(date -u +%FT%H%M)
+  { is_plain "$(window_file "$id")" || odd_path "$(window_file "$id")"; } && id=$(date -u +%FT%H%M%S)
+  win_write "$id" "WINDOW_ID=$id" "LIVE=${LIVE:--}" "TARGET=$1" "SCRIPT_SHA=$(script_sha)" \
+    "OPENED_AT=$(date -u +%FT%TZ)" "DEADLINE=$deadline" "LAST_REASON=" || return 1
+  WIN=$id
+}
 win_write(){
   local id="$1" f tmp kv keys=""
   shift
   f=$(window_file "$id"); tmp="$f.tmp"
   if odd_path "$f" || odd_path "$tmp"; then
-    log "на месте записи окна $f не обычный файл — не пишу туда ничего"
+    log "на месте записи попытки $f не обычный файл — не пишу туда ничего"
     return 1
   fi
   for kv in "$@"; do keys="$keys|${kv%%=*}"; done
@@ -412,30 +548,32 @@ win_write(){
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
-  log "ЗАПИСЬ ОКНА $f НЕ ЗАПИСАНА"
+  log "ЗАПИСЬ ПОПЫТКИ $f НЕ ЗАПИСАНА"
   return 1
 }
 script_sha(){ sha256sum "$SELF" 2>/dev/null | cut -c1-64; }
+# Пока попытка открытой записи не начата (нет ATTEMPT_AT), обновить её цель: `-` — бой = master,
+# `?` — master недоступен или бой не проверен, sha — цель. Записи нет — нечего.
 window_touch(){  # window_touch <TARGET> <LAST_REASON>
-  [ "${in_window:-0}" = 1 ] || return 0
-  if ! is_plain "$(window_file "$TODAY")"; then
-    win_write "$TODAY" "WINDOW_ID=$TODAY" "LIVE=${LIVE:--}" "TARGET=$1" "SCRIPT_SHA=$(script_sha)" \
-      "OPENED_AT=$(date -u +%FT%TZ)" "LAST_REASON=$2"
+  [ -n "$WIN" ] || return 0
+  win_closed "$WIN" && return 0
+  [ -n "$(win_get "$WIN" ATTEMPT_AT)" ] && return 0
+  if [ -z "$2" ] && [ "$(win_get "$WIN" TARGET)" = "$1" ]; then
+    win_write "$WIN" "LIVE=${LIVE:--}"
     return
   fi
-  win_closed "$TODAY" && return 0
-  is_plain "$ATTEMPTED" && return 0
-  if [ -z "$2" ] && [ "$(win_get "$TODAY" TARGET)" = "$1" ]; then
-    win_write "$TODAY" "LIVE=${LIVE:--}"
-    return
-  fi
-  win_write "$TODAY" "LIVE=${LIVE:--}" "TARGET=$1" "LAST_REASON=$2"
+  win_write "$WIN" "LIVE=${LIVE:--}" "TARGET=$1" "LAST_REASON=$2"
 }
 window_note(){  # window_note <причина>
-  [ "${in_window:-0}" = 1 ] || return 0
-  is_plain "$(window_file "$TODAY")" || return 0
-  win_closed "$TODAY" && return 0
-  win_write "$TODAY" "LAST_REASON=$1"
+  [ -n "$WIN" ] || return 0
+  is_plain "$(window_file "$WIN")" || return 0
+  win_closed "$WIN" && return 0
+  win_write "$WIN" "LAST_REASON=$1"
+}
+# Сбой до защёлки повторяется каждым тиком: в Telegram — только первый раз подряд.
+note_and_tell(){  # note_and_tell <причина> <сообщение>
+  [ -n "$WIN" ] && [ "$(win_get "$WIN" LAST_REASON)" = "$1" ] || tg_durable "$2"
+  window_note "$1"
 }
 fail_streak(){
   local -a recs=("$STATE"/transfermarkt-window-*.env)
@@ -455,24 +593,22 @@ window_close(){  # window_close <id> <OUTCOME> <REASON> <RESTORED t|f> [force]
   case "$id" in drill-*) log "учения $id: исход $outcome ($reason)"; return 0 ;; esac
   f=$(window_file "$id")
   if win_closed "$id" && [ -z "$force" ]; then
-    log "окно $id уже закрыто ($(win_get "$id" OUTCOME)) — повторное закрытие ($outcome: $reason) пропущено"
+    log "попытка $id уже закрыта ($(win_get "$id" OUTCOME)) — повторное закрытие ($outcome: $reason) пропущено"
     return 2
   fi
   local -a kv=("OUTCOME=$outcome" "REASON=$reason" "RESTORED=$restored")
   is_plain "$f" || kv=("WINDOW_ID=$id" "LIVE=${LIVE:--}" "TARGET=${WANT:-?}" "SCRIPT_SHA=$(script_sha)" \
-    "OPENED_AT=$(date -u +%FT%TZ)" "LAST_REASON=" "${kv[@]}")
+    "OPENED_AT=$(date -u +%FT%TZ)" "DEADLINE=${deadline:-}" "LAST_REASON=" "${kv[@]}")
   kv+=("CLOSED_AT=$(date -u +%FT%TZ)")
   win_write "$id" "${kv[@]}" || return 1
   n=$(fail_streak)
-  log "ИТОГ ОКНА $id: цель $(win_get "$id" TARGET | head -c 8), исход $outcome ($reason), контур $restored, провальных ночей подряд $n из $FAIL_NIGHTS_MAX"
+  log "ИТОГ ПОПЫТКИ $id: цель $(win_get "$id" TARGET | head -c 8), исход $outcome ($reason), контур $restored, провальных попыток подряд $n из $FAIL_NIGHTS_MAX"
   return 0
 }
+# needs-hands — в запись разбираемой доставки, в открытую запись тика или в новую.
 hands_close(){  # hands_close <id|""> <причина> <RESTORED>
-  local id="$1"
-  if [ -z "$id" ]; then
-    [ "${in_window:-0}" = 1 ] || return 0
-    id=$TODAY
-  fi
+  local id="${1:-$WIN}"
+  [ -n "$id" ] || id=$(date -u +%FT%H%M)
   window_close "$id" needs-hands "$2" "$3" "${4:-}"
 }
 streak_tail(){
@@ -480,19 +616,21 @@ streak_tail(){
   n=$(fail_streak)
   if [ "$n" -ge "$FAIL_NIGHTS_MAX" ]; then
     set_off
-    printf ' Ночь %s из %s подряд. Больше не пробую — автомат заглушен, снять %s после разбора.' "$n" "$FAIL_NIGHTS_MAX" "$OFF"
+    printf ' Провал %s из %s подряд. Больше не пробую — автомат заглушен, снять %s после разбора.' "$n" "$FAIL_NIGHTS_MAX" "$OFF"
   else
-    printf ' Ночь %s из %s подряд.' "$n" "$FAIL_NIGHTS_MAX"
+    printf ' Провал %s из %s подряд.' "$n" "$FAIL_NIGHTS_MAX"
   fi
 }
+# Просроченное закрытие: открытая запись с прошедшим дедлайном (DEADLINE; у старых — 03:00 их
+# даты) и без INFLIGHT своей попытки. Отсутствие записи — не новость (#2039): попытка
+# открывается только при цели и свободной полосе; отставание боя сторожит announce_behind.
 close_overdue_windows(){
-  local f id now_s infl="" last tgt oldest="" why
+  local f id now_s infl="" last tgt why
   now_s=$(date -u +%s)
   is_plain "$INFLIGHT" && infl=$(snap_get WINDOW_ID)
   for f in "$STATE"/transfermarkt-window-*.env; do
     is_plain "$f" || continue
     id=${f##*/transfermarkt-window-}; id=${id%.env}
-    { [ -z "$oldest" ] || [[ "$id" < "$oldest" ]]; } && oldest=$id
     win_closed "$id" && continue
     [ "$now_s" -gt "$(window_deadline "$id" 2>/dev/null || echo 9999999999)" ] || continue
     [ "$id" = "$infl" ] && continue
@@ -506,21 +644,11 @@ close_overdue_windows(){
       -) window_close "$id" no-target "бой = master, доставлять нечего" t ;;
       '?'|'') window_close "$id" unknown "master недоступен или бой не проверен${last:+: $last}" t ;;
       *)
-        if window_close "$id" failed "окно истекло: ${last:-причина не записана}" t; then
+        if window_close "$id" failed "дедлайн попытки истёк: ${last:-причина не записана}" t; then
           why=$(streak_tail)
-          is_plain "$OFF" && tg_durable "Transfermarkt: окно $id закрылось без доставки ${tgt:0:8} (${last:-причина не записана}).$why Лог: $LOG"
+          is_plain "$OFF" && tg_durable "Transfermarkt: попытка $id закрылась без доставки ${tgt:0:8} (${last:-причина не записана}).$why Лог: $LOG"
         fi ;;
     esac
-  done
-  [ -n "$oldest" ] || return 0
-  why="автомат в окне не работал / замок был занят"
-  is_plain "$OFF" && why="автомат в окне не работал (стоял выключатель $OFF)"
-  for id in "$YESTERDAY" "$TODAY"; do
-    [[ "$oldest" < "$id" ]] || continue
-    is_plain "$(window_file "$id")" && continue
-    [ "$now_s" -gt "$(window_deadline "$id")" ] || continue
-    [ "$id" = "$infl" ] && continue
-    window_close "$id" unknown "$why" t
   done
 }
 install_copy(){  # install_copy <источник> <цель>
@@ -546,12 +674,12 @@ ensure_automat_matches_release(){  # ensure_automat_matches_release <дерев�
   r_run=$(md5_of "$new/deploy/transfermarkt/auto_deliver.sh"); r_env=$(md5_of "$new/deploy/transfermarkt/env.sh")
   if [ -n "$r_run" ] && [ -n "$r_env" ] && [ "$m_run" = "$r_run" ] && [ "$m_env" = "$r_env" ]; then
     log "автомат сверен с релизом $sha8: auto_deliver.sh $m_run, env.sh $m_env"
-    win_write "$TODAY" "AUTOMAT=ok" || true
+    win_write "$WIN" "AUTOMAT=ok" || true
     return 0
   fi
   if [ -n "$r_run" ] && [ -n "$r_env" ] && [ "$d_run" = "$r_run" ] && [ "$d_env" = "$r_env" ]; then
     log "работающий экземпляр автомата старше копии на диске — тик без доставки, следующий пойдёт новой копией"
-    win_write "$TODAY" "LAST_REASON=экземпляр автомата старше копии на диске — доставка следующим тиком" || true
+    win_write "$WIN" "LAST_REASON=экземпляр автомата старше копии на диске — доставка следующим тиком" || true
     exit 0
   fi
   marker=$STATE/transfermarkt-automat-installed-$sha8
@@ -561,7 +689,7 @@ ensure_automat_matches_release(){  # ensure_automat_matches_release <дерев�
     if [ "$ok" = 1 ]; then
       mk_marker "$marker" || log "не смог поставить отметку $marker"
       log "автомат обновлён из релиза $sha8: auto_deliver.sh ${m_run:-?}→$r_run, env.sh ${m_env:-?}→$r_env"
-      win_write "$TODAY" "AUTOMAT=installed" "LAST_REASON=автомат обновлён из релиза $sha8 — доставка следующим тиком" || true
+      win_write "$WIN" "AUTOMAT=installed" "LAST_REASON=автомат обновлён из релиза $sha8 — доставка следующим тиком" || true
       exit 0
     fi
     why="установка копии из релиза не удалась ($(dirname "$SELF") недоступен на запись или md5 после замены не тот)"
@@ -570,12 +698,13 @@ ensure_automat_matches_release(){  # ensure_automat_matches_release <дерев�
   else
     why="копия уже ставилась из этого релиза (отметка $marker), а md5 снова не тот"
   fi
-  log "АВТОМАТ ≠ РЕЛИЗ $sha8 — $why; доставки в это окно нет"
+  log "АВТОМАТ ≠ РЕЛИЗ $sha8 — $why; доставки $sha8 не будет"
   mk_marker "$ATTEMPTED" || log "не смог поставить защёлку $ATTEMPTED"
-  win_write "$TODAY" "AUTOMAT=mismatch" || true
-  window_close "$TODAY" failed "автомат ≠ релиз: $why" t
+  drain_abort "автомат ≠ релиз"
+  win_write "$WIN" "AUTOMAT=mismatch" || true
+  window_close "$WIN" failed "автомат ≠ релиз: $why" t
   why="$why.$(streak_tail)"
-  tg_durable "Transfermarkt: работающая копия автомата ($SELF) не совпадает с релизом $sha8 по md5 — $why Доставки в это окно нет. Лог: $LOG"
+  tg_durable "Transfermarkt: работающая копия автомата ($SELF) не совпадает с релизом $sha8 по md5 — $why Доставки $sha8 не будет (защёлка на этот sha). Лог: $LOG"
   exit 0
 }
 
@@ -595,8 +724,8 @@ if odd_path "$LOG"; then
   set_off
   exit 1
 fi
-for p in "$LOCK" "$PENDING" "$OFF" "$INFLIGHT" "$ACCEPTED" "$SNAPSHOT" "$ATTEMPTED" \
-         "$(window_file "$TODAY")" "$(window_file "$YESTERDAY")"; do
+for p in "$LOCK" "$PENDING" "$OFF" "$INFLIGHT" "$ACCEPTED" "$SNAPSHOT" "$BEHIND" "$DRAIN" "$DRAIN.tmp" \
+         "$STATE"/transfermarkt-auto-deliver-attempted-* "$STATE"/transfermarkt-window-*.env; do
   if odd_path "$p"; then
     log "НА МЕСТЕ $p НЕ ОБЫЧНЫЙ ФАЙЛ — состояние автомата недостоверно, глушу"
     tg "Transfermarkt: на месте $p не обычный файл — состояние автомата недостоверно. Ничего не делаю. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
@@ -640,11 +769,14 @@ transfermarkt_deploy_lock_init
   exit 1
 }
 
-# ============================ Шаг 2: очередь, окна, выключатель ============================
+# ============================ Шаг 2: очередь, записи, выключатель ============================
 flush_pending
 close_overdue_windows
-set_window
+# Открытая запись, пережившая просроченное закрытие, — продолжение попытки.
+WIN=$(latest_open_window)
 if is_plain "$OFF"; then
+  # Паузы полосы — ДО выхода: иначе выключатель оставил бы сбор на паузе навсегда.
+  drain_abort "стоит выключатель $OFF"
   [ "$DRILL" = 1 ] && echo "автомат заглушен ($OFF) — учения не начаты" >&2
   if is_plain "$INFLIGHT" && ! said_today "$STATE/transfermarkt-off-reminded-$TODAY"; then
     tg_durable "Transfermarkt: автомат заглушен ($OFF), а незакрытая доставка ещё висит ($INFLIGHT). Бой: $LIVE_ROOT. НУЖНЫ РУКИ."
@@ -757,10 +889,11 @@ else
   if ! is_sha40 "$WANT"; then
     log "master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — вслепую не переключаемся"
     window_touch '?' "master недоступен (git ls-remote вернул '$WANT')"
-    announce_missed_window "Transfermarkt: окно доставки закрывается, а master недоступен — бой остаётся на ${LIVE:0:8}. Лог: $LOG"
+    announce_behind "Transfermarkt: бой не на master больше суток, сейчас master недоступен — бой остаётся на ${LIVE:0:8}. Лог: $LOG"
     exit 0
   fi
   if [ "$LIVE" = "$WANT" ]; then
+    drain_abort "бой уже на master"
     live_mounts=$(mounts_all_in "$LIVE_ROOT")
     if [ "$live_mounts" = X ]; then
       window_touch '?' "бой на master, монты проверить нечем (docker не отвечает)"
@@ -794,10 +927,17 @@ else
       fi
       printf '%s\n' "$WANT" > "$ACCEPTED" 2>/dev/null || log "маркер приёмки $ACCEPTED не записан"
     fi
+    rm -f "$BEHIND" 2>/dev/null
     window_touch - "бой = master, доставлять нечего"
     exit 0
   fi
+  # Запись с начатой попыткой другого sha — чужой след: исходы новой цели в неё не пишутся.
+  if [ -n "$WIN" ] && [ -n "$(win_get "$WIN" ATTEMPT_AT)" ] && [ "$(win_get "$WIN" TARGET)" != "$WANT" ]; then
+    WIN=""
+  fi
   window_touch "$WANT" ""
+  ATTEMPTED=$STATE/transfermarkt-auto-deliver-attempted-${WANT:0:8}
+  announce_behind "Transfermarkt: бой стоит на ${LIVE:0:8}, а master ${WANT:0:8} — бой не на master больше суток. Причина — в $LOG (полоса занята, мало запаса до прогона registry или попытка этого sha уже была)."
 fi
 
 # ============================ Шаг 5: боевое дерево законно ============================
@@ -819,31 +959,99 @@ if [ -z "$LIVE" ] || [ -n "$DIRTY" ]; then
   exit 1
 fi
 
-# ============================ Шаг 6: окно, запас, занятость ============================
-set_window
+# ============================ Шаг 6: защёлка, запас, дренаж полосы ============================
 if [ "$DRILL" = 1 ]; then
-  WINDOW_ID="drill-$(date -u +%Y%m%dT%H%M%SZ)"
+  WIN="drill-$(date -u +%Y%m%dT%H%M%SZ)"
   now=$(date -u +%s)
-else
-  [ "$in_window" = 1 ] || exit 0
-  WINDOW_ID=$TODAY
-  announce_missed_window "Transfermarkt: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}). Лог: $LOG"
-  if [ $(( deadline - now )) -lt "$NEED_BUDGET" ]; then
-    log "запаса нет ($(( deadline - now )) с до конца окна) — сегодня не доставляем"
-    if window_close "$TODAY" failed "запаса нет: $(( deadline - now )) с до конца окна" t; then
-      why=$(streak_tail)
-      is_plain "$OFF" && tg_durable "Transfermarkt: доставка ${WANT:0:8} сегодня не состоялась — в окне не осталось запаса времени.$why Лог: $LOG"
-    fi
+  busy=$(contour_busy)
+  if [ "$busy" != 0 ]; then
+    log "контур занят (running-прогонов и задач TM в работе: '$busy'; X = метабаза недоступна) — учения не начаты"
+    echo "учения не начаты: контур занят ('$busy')" >&2
     exit 0
   fi
-  is_plain "$ATTEMPTED" && exit 0
-fi
-busy=$(contour_busy)
-if [ "$busy" != 0 ]; then
-  log "контур занят (running-прогонов TM: '$busy'; X = метабаза недоступна) — тик пропущен"
-  window_note "контур занят (running-прогонов TM: '$busy')"
-  [ "$DRILL" = 1 ] && echo "учения не начаты: контур занят ('$busy')" >&2
-  exit 0
+else
+  if odd_path "$ATTEMPTED"; then
+    log "НА МЕСТЕ $ATTEMPTED НЕ ОБЫЧНЫЙ ФАЙЛ — состояние автомата недостоверно, глушу"
+    set_off
+    hands_close "" "на месте защёлки не обычный файл" t
+    tg_durable "Transfermarkt: на месте защёлки $ATTEMPTED не обычный файл — понять, была ли попытка, нельзя. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+    exit 1
+  fi
+  if is_plain "$ATTEMPTED"; then
+    # «busy <epoch>» — полоса не освободилась или rc=4: повтор того же sha после BUSY_RETRY.
+    read -r mark since < "$ATTEMPTED" || true
+    if [ "${mark:-}" = busy ] && [ "${since:-x}" -eq "${since:-x}" ] 2>/dev/null \
+       && [ $(( $(date -u +%s) - since )) -ge "$BUSY_RETRY" ]; then
+      rm -f "$ATTEMPTED"
+    else
+      drain_abort "попытка ${WANT:0:8} уже была"
+      exit 0
+    fi
+  fi
+  if ! set_deadline; then
+    log "метабаза не ответила про ближайший прогон registry (или он не вычислен: DAG пропал, идёт прогон) — тик пропущен"
+    window_note "метабаза не ответила про ближайший прогон registry"
+    exit 0
+  fi
+  if is_plain "$DRAIN"; then
+    outer=$(outer_busy)
+    if [ "$outer" = X ] || [ -z "$outer" ]; then
+      log "метабаза не ответила про прогоны registry/silver — дренаж ждёт следующего тика"
+      exit 0
+    fi
+    if [ "$outer" != 0 ]; then
+      drain_abort "стартовал прогон registry/silver ($outer)"
+      window_note "дренаж прерван: стартовал прогон registry/silver"
+      exit 0
+    fi
+    started=$(drain_get STARTED_AT)
+    case "$started" in ''|*[!0-9]*) started=0 ;; esac
+    why=""
+    [ $(( now - started )) -ge "$DRAIN_MAX" ] && why="полоса не освободилась за ${DRAIN_MAX}s"
+    [ -z "$why" ] && [ $(( deadline - now )) -lt "$NEED_BUDGET" ] \
+      && why="до прогона registry осталось $(( deadline - now ))s (< $NEED_BUDGET), полоса не освободилась"
+    if [ -n "$why" ]; then
+      log "$why — прерываю дренаж, sha ${WANT:0:8} откладываю на ${BUSY_RETRY}s"
+      drain_abort "$why"
+      latch_busy
+      [ -n "$WIN" ] || WIN=$(date -u +%FT%H%M)
+      if window_close "$WIN" failed "$why" t; then
+        w=$(streak_tail)
+        tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — $why; паузы полосы возвращены, бой не тронут. Повторю не раньше чем через $(( BUSY_RETRY / 3600 )) ч.$w Лог: $LOG"
+      fi
+      exit 0
+    fi
+  elif [ $(( deadline - now )) -lt $(( DRAIN_MAX + NEED_BUDGET )) ]; then
+    log "мало запаса: до ближайшего прогона registry $(( (deadline - now) / 60 )) мин (нужно $(( (DRAIN_MAX + NEED_BUDGET) / 60 ))) — доставка после него"
+    window_note "мало запаса до ближайшего прогона registry: $(( deadline - now )) с"
+    exit 0
+  fi
+  # Пауза — только на границе порций: Airflow 2 не двигает прогон паузного DAG, и пауза
+  # посреди порции заморозила бы её до распаузы. Пока порция идёт — ждём без паузы.
+  busy=$(contour_busy)
+  if [ "$busy" != 0 ]; then
+    log "контур занят (running-прогонов и задач TM в работе: '$busy'; X = метабаза недоступна) — жду конца порции"
+    window_note "контур занят (running-прогонов и задач TM в работе: '$busy')"
+    exit 0
+  fi
+  # Попытка начинается: открытая запись (продолжение) или новая.
+  if [ -z "$WIN" ] && ! window_open "$WANT"; then
+    log "запись попытки не создаётся — доставку не начинаю"
+    set_off
+    tg_durable "Transfermarkt: не могу создать запись попытки в $STATE — исход доставки ${WANT:0:8} потерялся бы. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+    exit 1
+  fi
+  if ! is_plain "$DRAIN"; then
+    drain_start || exit 0
+    # Порция могла стартовать между проверкой и паузой: её не морозим — паузы назад.
+    busy=$(contour_busy)
+    if [ "$busy" != 0 ]; then
+      drain_abort "между проверкой и паузой стартовала порция ('$busy')"
+      window_note "между проверкой и паузой стартовала порция"
+      exit 0
+    fi
+  fi
+  log "полоса на паузе и пуста, до ближайшего прогона registry $(( (deadline - now) / 60 )) мин — начинаю попытку ${WANT:0:8}"
 fi
 
 # ============================ Шаг 7: дерево цели ============================
@@ -866,8 +1074,8 @@ else
     [ -z "$(git -C "$NEW" --no-optional-locks status --porcelain 2>/dev/null)" ] || ok=0
     if [ "$ok" != 1 ]; then
       log "КАТАЛОГ $NEW УЖЕ ЕСТЬ И БИТЫЙ (права 755, HEAD=$WANT, чистота)"
-      window_note "каталог релиза $NEW уже есть и битый"
-      tg_durable "Transfermarkt: каталог релиза $NEW уже существует и не годится (права, HEAD или правки). Убрать руками. Доставки сегодня не будет. Лог: $LOG"
+      note_and_tell "каталог релиза $NEW уже есть и битый" \
+        "Transfermarkt: каталог релиза $NEW уже существует и не годится (права, HEAD или правки). Убрать руками. Доставки ${WANT:0:8} не будет, пока каталог на месте. Лог: $LOG"
       exit 1
     fi
     log "переиспользую целый каталог $NEW от прошлой попытки"
@@ -875,16 +1083,16 @@ else
     log "замораживаю $WANT"
     if ! out=$(timeout -k 30 900 "$LIVE_ROOT/deploy/transfermarkt/freeze_release.sh" "$WANT" 2>&1 8>&- 9>&-); then
       printf '%s\n' "$out" >> "$LOG"
-      window_note "заморозка дерева ${WANT:0:8} не удалась"
-      tg_durable "Transfermarkt: заморозка дерева $WANT не удалась — бой не тронут, доставки сегодня не будет. Лог: $LOG"
+      note_and_tell "заморозка дерева ${WANT:0:8} не удалась" \
+        "Transfermarkt: заморозка дерева $WANT не удалась — бой не тронут, повторю следующим тиком. Лог: $LOG"
       exit 1
     fi
     printf '%s\n' "$out" >> "$LOG"
     NEW=${out##*дерево заморожено: }
     NEW=${NEW%% (sha *}
     if [ ! -d "$NEW" ]; then
-      window_note "заморозка отчиталась несуществующим деревом"
-      tg_durable "Transfermarkt: заморозка отчиталась деревом '$NEW', которого нет. Бой не тронут. Лог: $LOG"
+      note_and_tell "заморозка отчиталась несуществующим деревом" \
+        "Transfermarkt: заморозка отчиталась деревом '$NEW', которого нет. Бой не тронут, повторю следующим тиком. Лог: $LOG"
       exit 1
     fi
   fi
@@ -892,13 +1100,12 @@ else
 fi
 
 # Заморозка могла съесть до 900 с: запас пересчитывается непосредственно перед доставкой.
+# Бой не тронут, защёлки нет: это не провал кода — исход busy в серию провалов не идёт.
 if [ "$DRILL" != 1 ] && [ $(( deadline - $(date -u +%s) )) -lt "$NEED_BUDGET" ]; then
   left=$(( deadline - $(date -u +%s) ))
-  log "после заморозки запаса нет ($left с до конца окна, нужно $NEED_BUDGET) — сегодня не доставляем"
-  if window_close "$TODAY" failed "после заморозки запаса нет: $left с" t; then
-    why=$(streak_tail)
-    is_plain "$OFF" && tg_durable "Transfermarkt: доставка ${WANT:0:8} сегодня не состоялась — заморозка дерева съела запас окна.$why Лог: $LOG"
-  fi
+  log "после заморозки запаса нет ($left с до дедлайна, нужно $NEED_BUDGET) — доставка позже"
+  drain_abort "после заморозки запаса нет"
+  window_close "$WIN" busy "после заморозки запаса нет: $left с" t
   exit 0
 fi
 
@@ -921,8 +1128,16 @@ fi
   printf 'OLD_RELEASE_ROOT=%s\n' "$OLD"
   printf 'NEW_RELEASE_ROOT=%s\n' "$NEW"
   printf 'SNAPSHOT_VERSION=2\n'
-  printf 'WINDOW_ID=%s\n' "$WINDOW_ID"
-  for d in $CORE_DAGS; do printf '%s=%s\n' "$(paused_key "$d")" "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")"; done
+  printf 'WINDOW_ID=%s\n' "$WIN"
+  # Паузы полосы — из файла дренажа (значения ДО него), не текущие `t`: иначе выкат и откат
+  # вернули бы полосу на паузу навсегда.
+  for d in $CORE_DAGS; do
+    if is_plain "$DRAIN" && case " $LANE_DAGS " in *" $d "*) true ;; *) false ;; esac; then
+      printf '%s=%s\n' "$(paused_key "$d")" "$(drain_get "$(paused_key "$d")")"
+    else
+      printf '%s=%s\n' "$(paused_key "$d")" "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")"
+    fi
+  done
   old_pools=""
   for p in ingest_scraper_pool $POOLS; do
     slots=$(metadb "SELECT slots FROM slot_pool WHERE pool='$p';")
@@ -949,8 +1164,8 @@ fi
 RESTORE_PENDING=1
 if [ "$DRILL" != 1 ] && ! mk_marker "$ATTEMPTED"; then
   set_off
-  hands_close "" "суточная защёлка не создаётся" t
-  tg_durable "Transfermarkt: не могу создать суточную защёлку ($ATTEMPTED). Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  hands_close "" "защёлка попытки не создаётся" t
+  tg_durable "Transfermarkt: не могу создать защёлку попытки ($ATTEMPTED). Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   exit 1
 fi
 if ! mk_marker "$INFLIGHT"; then
@@ -959,11 +1174,13 @@ if ! mk_marker "$INFLIGHT"; then
   tg_durable "Transfermarkt: не могу создать маркер доставки ($INFLIGHT). Доставки не будет. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   exit 1
 fi
+# Паузы полосы до дренажа теперь в снимке (возврат — restore_state), файл больше не нужен.
+rm -f "$DRAIN"
 
 # ============================ Шаг 9: доставка ============================
-[ "$DRILL" = 1 ] || win_write "$TODAY" "TARGET=$WANT" "ATTEMPT_AT=$(date -u +%FT%TZ)" || true
+[ "$DRILL" = 1 ] || win_write "$WIN" "TARGET=$WANT" "ATTEMPT_AT=$(date -u +%FT%TZ)" "DEADLINE=$deadline" || true
 log "ДОСТАВЛЯЮ ${WANT:0:8} ($NEW), бой сейчас $OLD, потолок ${DEPLOY_CEILING}s"
-[ "$DRILL" = 1 ] || tg "Transfermarkt: окно открыто, начинаю доставку ${WANT:0:8} (автомат)"
+[ "$DRILL" = 1 ] || tg "Transfermarkt: начинаю доставку ${WANT:0:8} (автомат)"
 setsid env TRANSFERMARKT_DEPLOY_LOCK="$TRANSFERMARKT_DEPLOY_LOCK" TRANSFERMARKT_DEPLOY_LOCK_FD=8 \
   timeout -k 30 "$DEPLOY_CEILING" "$NEW/deploy/transfermarkt/deploy.sh" "$NEW" "$OLD" >> "$LOG" 2>&1 9>&- &
 dpid=$!
@@ -977,22 +1194,28 @@ fi
 log "deploy.sh вернул $rc"
 
 # ============================ Шаг 10: исход ============================
+# rc=4 — «контур занят или замок занят, выкат не начат»: не провал кода, а «не сейчас»
+# (как SofaScore #2000): запись busy (в серию провалов не идёт), защёлка sha — busy до
+# BUSY_RETRY. Контур не вернулся — авария: failed, выключатель.
 if [ "$rc" = 4 ]; then
   log "контур занят или замок занят — выкат не начинался, откатывать нечего"
   restored=1
   restore_state || restored=0
   rm -f "$INFLIGHT"
   [ "$DRILL" = 1 ] && rm -rf "$NEW"
-  rtf=t; [ "$restored" = 1 ] || rtf=f
-  window_close "$WINDOW_ID" failed "deploy.sh rc=4, бой не тронут" "$rtf"
+  if [ "$restored" = 1 ]; then
+    window_close "$WIN" busy "deploy.sh rc=4, бой не тронут" t
+    [ "$DRILL" = 1 ] || latch_busy
+  else
+    window_close "$WIN" failed "deploy.sh rc=4, бой не тронут, контур не вернулся" f
+  fi
   if [ "$restored" != 1 ]; then
     set_off
     tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась (deploy.sh rc=4, бой не тронут), И контур не вернулся в рабочее состояние —$RESTORE_NOTE НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     exit 1
   fi
   [ "$DRILL" = 1 ] && { tg_durable "Transfermarkt: учения отката не состоялись — контур занят (deploy.sh rc=4), бой не тронут. Лог: $LOG"; exit 1; }
-  why=$(streak_tail)
-  tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — контур занят (deploy.sh rc=4, бой не тронут).$why Лог: $LOG"
+  tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — контур занят (deploy.sh rc=4, бой не тронут). Повторю не раньше чем через $(( BUSY_RETRY / 3600 )) ч. Лог: $LOG"
   exit 0
 fi
 # NEW сохраняет TM-пулы deploy.sh по streams; ДО приёмки возвращаем исходные паузы
@@ -1032,7 +1255,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
     tg_durable "Transfermarkt: код ${WANT:0:8} доставлен и приёмка сошлась, НО паузы/пулы не вернулись к снимку —$RESTORE_NOTE НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     rm -f "$INFLIGHT"
     set_off
-    window_close "$TODAY" failed "доставлено и принято, но контур не вернулся:$RESTORE_NOTE" f
+    window_close "$WIN" failed "доставлено и принято, но контур не вернулся:$RESTORE_NOTE" f
     exit 1
   fi
   extra=""
@@ -1041,16 +1264,16 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   [ "$orphans" = 0 ] || extra=" Осиротевших freeze.* — $orphans (убрать руками)."
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8})"
   tg_durable "Transfermarkt: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (4 DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, шлюз healthy в transfermarkt-gw, монты в новом дереве, /health transfermarkt-only, TM-пулы по streams, исходные паузы). Деревьев release-*: $n.${extra}"
-  win_write "$TODAY" "DELIVERY_PHASE=finishing" || true
+  win_write "$WIN" "DELIVERY_PHASE=finishing" || true
   rm -f "$INFLIGHT"
-  window_close "$TODAY" delivered "приёмка подтверждена" t
+  window_close "$WIN" delivered "приёмка подтверждена" t
   exit 0
 fi
 log "ПРОВАЛ доставки (rc=$rc, приёмка '$seen') — откатываю бой на $OLD"
 started_before=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
 fails=0
 if [ "$DRILL" != 1 ]; then
-  window_close "$TODAY" failed "deploy.sh вернул $rc, приёмка '$seen' — откат на $OLD" f; wrc=$?
+  window_close "$WIN" failed "deploy.sh вернул $rc, приёмка '$seen' — откат на $OLD" f; wrc=$?
   fails=$FAIL_NIGHTS_MAX
   [ "$wrc" = 1 ] || fails=$(fail_streak)
 fi
@@ -1067,12 +1290,12 @@ if rollback_to_old "$OLD" "$started_before"; then
     tg_durable "Transfermarkt: откат проверен — дерево с намеренной ошибкой импорта не прошло приёмку (deploy.sh rc=$rc), бой возвращён на $OLD и принят заново.${ROLLBACK_NOTE} Лог: $LOG"
     exit 0
   fi
-  [ -n "$RESTORE_NOTE" ] || win_write "$TODAY" "RESTORED=t" || true
+  [ -n "$RESTORE_NOTE" ] || win_write "$WIN" "RESTORED=t" || true
   if [ -n "$RESTORE_NOTE" ]; then
     tg_durable "Transfermarkt: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'), откат на $OLD подтверждён, НО паузы/пулы не вернулись —$RESTORE_NOTE${ROLLBACK_NOTE} НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     set_off
   else
-    msg="Transfermarkt: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён.${ROLLBACK_NOTE} Ночь $fails из $FAIL_NIGHTS_MAX подряд. Лог: $LOG"
+    msg="Transfermarkt: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён.${ROLLBACK_NOTE} Провал $fails из $FAIL_NIGHTS_MAX подряд. Лог: $LOG"
     if [ "$fails" -ge "$FAIL_NIGHTS_MAX" ]; then
       msg="$msg Больше не пробую — автомат заглушен, снять $OFF после разбора."
       set_off
