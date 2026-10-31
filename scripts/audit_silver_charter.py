@@ -11,10 +11,14 @@ Two layers:
     R4 CROSS_SOURCE    WARN   — ≥2 distinct source prefixes referenced (xref excepted).
     R5 NAMING          WARN   — file name not {source}_{entity}_{grain}.
     R6 NO_DDL          ERROR  — file contains CREATE TABLE / INSERT.
+    R7 CORE_SCHEMA     ERROR  — file of a core-schema source (charter §8) not declared in its schema.
   Layer B (schema, Trino DESCRIBE; only with --schema) — runs inside the airflow container.
     S1 presence of _silver_created_at / league / season.
     S2 season is varchar (not bigint).
     S3 bare *_id naming drift (no _raw / _canonical suffix).
+    S4 core-schema tables: columns/types match configs/medallion/<source>_silver/core_schema.yaml
+       (charter §8 replaces S1 league/season with the schema's context columns and skips
+       S3 — ids are source ids, there is no xref in this layer).
 
 Verdicts come from findings + the SANCTIONED registry (kept in sync with charter §7):
     COMPLIANT  — no findings.
@@ -38,7 +42,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SILVER_SQL_DIR = Path(__file__).resolve().parent.parent / 'dags' / 'sql' / 'silver'
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SILVER_SQL_DIR = REPO_ROOT / 'dags' / 'sql' / 'silver'
+# Charter §8: sources whose Silver core is declared table-by-table in a schema file.
+# The §8 rules apply to exactly these sources; every other source keeps §4 as is.
+CORE_SCHEMAS = {
+    'fotmob': REPO_ROOT / 'configs' / 'medallion' / 'fotmob_silver' / 'core_schema.yaml',  # #2016
+}
 
 # Fallback files (`*_empty.sql`) materialize an *existing* Silver table with a
 # typed 0-row spine when its Bronze source is absent (e.g. SoFIFA Cloudflare
@@ -108,6 +118,31 @@ _ANY_REF = re.compile(r'iceberg\.(?:bronze|silver)\.([a-z0-9_]+)', re.IGNORECASE
 _XREF_JOIN = re.compile(r'iceberg\.silver\.(xref_[a-z]+)', re.IGNORECASE)
 
 
+def _load_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    import yaml  # lazy: only core-schema sources need it
+    return yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+
+
+def load_core_schemas() -> dict[str, dict]:
+    """source → core schema (charter §8); a missing file loads as ``{}``."""
+    return {src: _load_yaml(path) for src, path in CORE_SCHEMAS.items()}
+
+
+def core_tables(cores: dict[str, dict], source: str | None) -> dict:
+    return (cores.get(source) or {}).get('tables') or {}
+
+
+def core_expected_columns(core: dict, table: str) -> dict[str, str]:
+    """Column name → declared type (lower-case, as Trino DESCRIBE prints it)."""
+    spec = core['tables'][table]
+    cols = {c['name']: c['type'] for c in spec.get('columns', [])}
+    cols.update({c['name']: c.get('type', 'VARCHAR') for c in spec.get('raw_json', [])})
+    cols.update({c['name']: c['type'] for c in core.get('lineage_columns', [])})
+    return {k: v.lower() for k, v in cols.items()}
+
+
 def strip_sql(text: str) -> str:
     """Remove comments so doc prose ('we PIVOT', 'GROUP BY ...') is not analysed."""
     text = _COMMENT_BLOCK.sub(' ', text)
@@ -131,7 +166,7 @@ def grain_of(stem: str) -> str:
     return 'other'
 
 
-def audit_file(path: Path) -> list[dict]:
+def audit_file(path: Path, cores: dict[str, dict] | None = None) -> list[dict]:
     """Layer A static findings for one SQL file."""
     stem = path.name.replace('.sql.j2', '').replace('.sql', '')
     raw = path.read_text(encoding='utf-8')
@@ -180,8 +215,18 @@ def audit_file(path: Path) -> list[dict]:
             findings.append({'rule': 'R4', 'sev': 'WARN',
                              'detail': f'cross-source refs: {", ".join(sorted(srcs))}'})
 
+    # R7 CORE_SCHEMA — charter §8: a table of a core-schema source exists only if the
+    # schema declares it (new tables on analyst request, via the schema). Declared
+    # names are sanctioned there, so R5's grain-token heuristic is skipped.
+    cores = load_core_schemas() if cores is None else cores
+    src = source_of(stem)
+    is_core = src in CORE_SCHEMAS and stem in core_tables(cores, src)
+    if src in CORE_SCHEMAS and not is_core:
+        findings.append({'rule': 'R7', 'sev': 'ERROR',
+                         'detail': f'not declared in {CORE_SCHEMAS[src].relative_to(REPO_ROOT)}'})
+
     # R5 NAMING — {source}_{...}_{grain-token}.
-    if not is_xref:
+    if not is_xref and not is_core:
         src = source_of(stem)
         if src is None:
             findings.append({'rule': 'R5', 'sev': 'WARN', 'detail': 'unknown source prefix'})
@@ -213,9 +258,35 @@ def has_unsanctioned_error(stem: str, findings: list[dict]) -> bool:
 
 # ---- Layer B (schema, optional) --------------------------------------------
 
-def audit_schema(cur, table: str) -> list[dict]:
+def audit_core_schema(cols: dict[str, str], core: dict, table: str) -> list[dict]:
+    """Charter §8: core-schema table vs its declaration."""
+    spec = core['tables'][table]
+    findings: list[dict] = []
+    required = ['_silver_created_at']
+    if spec.get('scope') == 'context':
+        required += list(core.get('context_columns', []))
+    for col in required:
+        if col not in cols:
+            findings.append({'rule': 'S1', 'sev': 'ERROR', 'detail': f'missing column {col}'})
+    expected = core_expected_columns(core, table)
+    for col, dtype in expected.items():
+        if col not in cols:
+            findings.append({'rule': 'S4', 'sev': 'ERROR', 'detail': f'missing declared column {col}'})
+        elif cols[col].lower() != dtype:
+            findings.append({'rule': 'S4', 'sev': 'ERROR',
+                             'detail': f'{col} is {cols[col]}, declared {dtype}'})
+    for col in sorted(set(cols) - set(expected) - {'_silver_created_at'}):
+        findings.append({'rule': 'S4', 'sev': 'WARN', 'detail': f'undeclared column {col}'})
+    return findings
+
+
+def audit_schema(cur, table: str, cores: dict[str, dict] | None = None) -> list[dict]:
     cur.execute(f'DESCRIBE iceberg.silver.{table}')
     cols = {r[0]: r[1] for r in cur.fetchall()}
+    cores = load_core_schemas() if cores is None else cores
+    src = source_of(table)
+    if src in CORE_SCHEMAS and table in core_tables(cores, src):
+        return audit_core_schema(cols, cores[src], table)
     findings: list[dict] = []
     for required in ('_silver_created_at', 'league', 'season'):
         if required not in cols:
@@ -288,10 +359,11 @@ def main() -> None:
         if not files:
             sys.exit(f'no silver SQL file for table {args.table!r}')
 
+    cores = load_core_schemas()
     per_table: dict[str, list[dict]] = {}
     for f in files:
         stem = f.name.replace('.sql.j2', '').replace('.sql', '')
-        per_table[stem] = audit_file(f)
+        per_table[stem] = audit_file(f, cores)
 
     # --check: Layer A gate (no Trino, no report file). Exit 1 on unsanctioned ERROR.
     if args.check:
@@ -317,7 +389,7 @@ def main() -> None:
         cur = _get_trino_connection().cursor()
         for stem in per_table:
             try:
-                per_table[stem] += audit_schema(cur, stem)
+                per_table[stem] += audit_schema(cur, stem, cores)
             except Exception as e:
                 per_table[stem].append({'rule': 'S?', 'sev': 'WARN',
                                         'detail': f'schema check skipped: {type(e).__name__}'})
