@@ -64,6 +64,8 @@ class PaceWindow:
     loaded_intervals: int | None = None
     hold_active: bool = False
     cooldown_active: bool = False
+    # Explained slow-SQL pauses (#2049) never count towards the window length.
+    paused_seconds: float = 0
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,10 @@ def evaluate(window: PaceWindow, baseline_p95_ms: float | None, policy) -> Decis
     if type(window.step) is not int or window.step not in (0, 1, 2):
         return no('no_higher_step')
     start, end = utc(window.started_at), utc(window.ended_at)
-    if (end - start).total_seconds() < policy.minimum_window_seconds[window.step]:
+    paused = window.paused_seconds
+    if type(paused) not in (int, float) or not math.isfinite(paused) or paused < 0:
+        return no('unknown_metrics')
+    if (end - start).total_seconds() - paused < policy.minimum_window_seconds[window.step]:
         return no('window_too_short')
     counts = (window.attempts, window.count_429, window.error_attempts, window.reset_count)
     if any(type(v) is not int or v < 0 for v in counts):

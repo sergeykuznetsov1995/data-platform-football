@@ -114,7 +114,12 @@ SQL_UNKNOWN_TOTAL = 72 * 60
 
 
 def sql_unknown(observations, start, end, *, query_started_at=None, maximum_gap=30):
-    """Only a running/completed SQL query can explain a missing observation."""
+    """Only a running/completed SQL query can explain a missing observation.
+
+    A closed run explained by SQL lag (#2049) and bracketed by known zero-debt
+    observations is a pause: it is bounded by the continuous limit, excluded
+    from the total limit and from the covered window length.
+    """
     observations = sorted(observations, key=lambda o: o['at'])
     intervals = []
     allowed = bool(observations) and observations[0]['at'] <= start
@@ -122,7 +127,9 @@ def sql_unknown(observations, start, end, *, query_started_at=None, maximum_gap=
         begin = a.get('observed_at', a['at']) + maximum_gap
         if not a.get('known') or b['at'] > begin or not b.get('known'):
             allowed = allowed and b.get('sql_lag_safe') is True
-            intervals.append([max(start, min(begin, a['at']) if not a.get('known') else begin), b['at']])
+            pause = b.get('sql_lag_safe') is True and not a.get('debt') and not b.get('debt')
+            intervals.append([max(start, min(begin, a['at']) if not a.get('known') else begin), b['at'],
+                              pause, a.get('known') is True, b.get('known') is True])
     open_since = None
     if observations:
         last = observations[-1]
@@ -132,23 +139,28 @@ def sql_unknown(observations, start, end, *, query_started_at=None, maximum_gap=
                       0 <= query_started_at - last['at'] <= maximum_gap)
             allowed = allowed and (active or (not last.get('known') and last.get('sql_lag_safe') is True))
             open_since = max(start, min(begin, last['at']) if not last.get('known') else begin)
-            intervals.append([open_since, end])
+            intervals.append([open_since, end, False, False, False])
     merged = []
-    for begin, finish in intervals:
+    for begin, finish, pause, first_known, last_known in intervals:
         begin, finish = max(start, begin), min(end, finish)
         if finish <= begin:
             continue
         if merged and begin <= merged[-1][1]:
             merged[-1][1] = max(finish, merged[-1][1])
+            merged[-1][2] = merged[-1][2] and pause
+            merged[-1][4] = last_known
         else:
-            merged.append([begin, finish])
-    total = sum(b - a for a, b in merged)
-    longest = max((b - a for a, b in merged), default=0)
+            merged.append([begin, finish, pause, first_known, last_known])
+    pauses = [[a, b] for a, b, pause, first, last in merged if pause and first and last]
+    counted = [[a, b] for a, b, pause, first, last in merged if not (pause and first and last)]
+    total = sum(b - a for a, b in counted)
+    longest = max((b - a for a, b, *_ in merged), default=0)
     return dict(allowed=bool(allowed and longest <= SQL_UNKNOWN_CONTINUOUS and total <= SQL_UNKNOWN_TOTAL),
-                count=len(merged), seconds=total, longest_seconds=longest,
+                count=len(counted), seconds=total, longest_seconds=longest,
                 open_since=merged[-1][0] if open_since is not None and merged else None,
                 continuous_limit_seconds=SQL_UNKNOWN_CONTINUOUS, total_limit_seconds=SQL_UNKNOWN_TOTAL,
-                intervals=merged)
+                intervals=counted, pause_count=len(pauses), pause_seconds=sum(b - a for a, b in pauses),
+                pause_intervals=pauses)
 
 
 def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=30):
@@ -171,6 +183,9 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
         bucket = math.floor(at / interval) * interval
         buckets[bucket] = buckets.get(bucket, 0) + 1
     observation_times = [o['at'] for o in observations]
+    sql = sql_unknown(observations, start, end, maximum_gap=maximum_gap)
+    def overlaps(spans, begin, finish):
+        return any(a < finish and b > begin for a, b in spans)
     bins = []
     for begin in range(math.ceil(start / interval) * interval, math.floor(end / interval) * interval, interval):
         finish = begin + interval
@@ -180,7 +195,12 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
         known = left >= 0 and right < len(observations) and all(o.get('known') is True for o in selected)
         known = known and all(b['at'] - a.get('observed_at', a['at']) <= maximum_gap for a, b in zip(selected, selected[1:]))
         count = buckets.get(begin, 0)
-        if not known:
+        if (not known and step == 2 and left >= 0 and right < len(observations)
+                and overlaps(sql['pause_intervals'], begin, finish)
+                and not overlaps(sql['intervals'], begin, finish)):
+            paused += 1  # Explained slow-SQL pause (#2049), never an unknown gap.
+            status = 'paused'
+        elif not known:
             unknown += 1
             status = 'unknown'
         elif any(o.get('debt', 0) or o.get('protected') or o.get('step') != step for o in selected):
@@ -191,7 +211,6 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
             loaded += count >= threshold
             status = 'loaded' if count >= threshold else 'underloaded'
         bins.append(dict(start=begin, attempts=count, status=status))
-    sql = sql_unknown(observations, start, end, maximum_gap=maximum_gap)
     if step == 2:
         eligible += unknown  # Unknown bins remain in the denominator, never loaded.
     return dict(continuous=bool(continuous and unknown == 0), sql_unknown=sql,
@@ -219,7 +238,7 @@ def format_measurement(report):
                         if publication.get('error') else [])
     if not report or report.get('stale'):
         sql = (report or {}).get('load', {}).get('sql_unknown', {})
-        unknown_note = ([f"  SQL unknown (stale): {sql['count']}; всего {sql['seconds']} с; максимум {sql['longest_seconds']} с; открыто {sql['open_since']}; лимиты {sql['continuous_limit_seconds']}/{sql['total_limit_seconds']} с"]
+        unknown_note = ([f"  SQL unknown (stale): {sql['count']}; всего {sql['seconds']} с; максимум {sql['longest_seconds']} с; открыто {sql['open_since']}; лимиты {sql['continuous_limit_seconds']}/{sql['total_limit_seconds']} с; паузы медленного SQL {sql.get('pause_count', 0)}, всего {sql.get('pause_seconds', 0):.0f} с"]
                         if sql else [])
         return ['• ESPN темп: нет свежих данных контроллера ⚠️'] + unknown_note + publication_note
     completed = report.get('completed')
@@ -249,7 +268,7 @@ def format_measurement(report):
         f"  попытки A/B {m.get('attempts_a', '?')}/{m.get('attempts_b', '?')}; 403 {m.get('count_403', '?')}; 429 {m.get('count_429', '?')}; 5xx/timeout {number(share, '%')}",
         f"  HTTP p95 {number(m.get('http_p95_ms'), ' мс')}; профиль {number(report.get('profile_p95_ms'), ' мс')}; S0 {number(report.get('baseline_p95_ms'), ' мс')}; сбросов {report.get('resets', '?')}",
         f"  нагрузка {load.get('loaded_intervals', 0)}/{load.get('eligible_intervals', 0)} интервалов; пауз {load.get('paused_intervals', 0)}, неизвестных {load.get('unknown_intervals', 0)}; квота истории {report.get('history_quota_per_minute', '?')}/мин",
-        f"  SQL unknown: {sql.get('count', 0)}; всего {sql.get('seconds', 0)} с; максимум {sql.get('longest_seconds', 0)} с; открыто {sql.get('open_since')}; лимиты {sql.get('continuous_limit_seconds', SQL_UNKNOWN_CONTINUOUS)}/{sql.get('total_limit_seconds', SQL_UNKNOWN_TOTAL)} с",
+        f"  SQL unknown: {sql.get('count', 0)}; всего {sql.get('seconds', 0)} с; максимум {sql.get('longest_seconds', 0)} с; открыто {sql.get('open_since')}; лимиты {sql.get('continuous_limit_seconds', SQL_UNKNOWN_CONTINUOUS)}/{sql.get('total_limit_seconds', SQL_UNKNOWN_TOTAL)} с; паузы медленного SQL {sql.get('pause_count', 0)}, всего {sql.get('pause_seconds', 0):.0f} с",
         f"  Iceberg: {write_text}; свежесть {fresh.get('ok', '?')}/{fresh.get('due', '?')} за {fresh.get('day', '?')} UTC",
         f"  изолированный стенд: p95 {isolated_text}; замер {isolated.get('measured_at', '?') if isolated else '?'}; массовая запись — проверка #1511",
         f"  повышение: {report.get('reason', 'нет данных ⚠️')}; измерительные чтения не увеличивают охват истории",
