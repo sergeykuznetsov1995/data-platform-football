@@ -2032,7 +2032,9 @@ def run_recovery_wave(
         if history_slice:
             break
         # A failed incomplete match leaves raw recovery for a fresh fetch.
-        refetches = int(result.get("incomplete_match_refetches") or 0)
+        refetches = int(result.get("incomplete_match_refetches") or 0) + int(
+            result.get("incomplete_match_settled") or 0
+        )
         if parsed == 0 and retired == 0 and refetches == 0:
             # Расчистка сырья идёт ПЕРЕД живыми волнами, поэтому её тупик
             # раньше убивал весь ран: 31.07 три мёртвые season-страницы

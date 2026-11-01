@@ -1668,6 +1668,36 @@ def test_recovery_drain_counts_a_retired_target_as_progress(monkeypatch):
 
 
 @pytest.mark.unit
+def test_recovery_drain_counts_settled_match_shells_as_progress(monkeypatch):
+    settled = MagicMock()
+    settled.as_dict.return_value = {
+        "cohort_size": 2, "claimed": 2, "parsed": 0,
+        "incomplete_match_settled": 2,
+    }
+    drained = MagicMock()
+    drained.as_dict.return_value = {"cohort_size": 0, "parsed": 0}
+    pipeline = MagicMock()
+    pipeline.recover_unprocessed_wave.side_effect = [settled, drained]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    # Shells owned by a newer fetch leave the cohort without a new request.
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__settled-shell-recovery",
+        dag_id="dag_ingest_fbref",
+        page_kinds=["match"],
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+    )
+
+    assert recovered["recovery_stalled"] is False
+    assert pipeline.recover_unprocessed_wave.call_count == 2
+
+
+@pytest.mark.unit
 def test_recovery_drain_counts_exhausted_match_shells_as_progress(monkeypatch):
     exhausted = MagicMock()
     exhausted.as_dict.return_value = {

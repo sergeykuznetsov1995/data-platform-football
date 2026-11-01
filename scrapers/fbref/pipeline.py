@@ -828,6 +828,7 @@ class WaveResult:
     dead_lettered: int = 0
     incomplete_match_refetches: int = 0
     incomplete_match_exhausted: int = 0
+    incomplete_match_settled: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -927,6 +928,7 @@ class _ProcessedObservation:
     dead_lettered: int = 0
     incomplete_match_refetches: int = 0
     incomplete_match_exhausted: int = 0
+    incomplete_match_settled: int = 0
     deferred_parse_failures: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
@@ -6311,13 +6313,21 @@ class FBrefPipeline:
                 f"{record.target_id}:observation_fence:"
                 f"{type(fence_exc).__name__}:{fence_exc}"
             )
-        if (refetch_scheduled or shell_verdict in {"scheduled", "superseded"}) and not failures:
+        if refetch_scheduled and not failures:
             # The page stays failed and cannot publish, but a fresh request
             # now owns its recovery. Let the drain reach the next raw batch.
             return _ProcessedObservation(
                 typed_promoted=typed_promoted,
                 stale_typed_observations_skipped=stale_typed_observations_skipped,
                 incomplete_match_refetches=1,
+            )
+        if shell_verdict in {"scheduled", "superseded"} and not failures:
+            # Nothing new was requested or retired: an earlier refetch or a
+            # newer fetch owns this raw.
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=stale_typed_observations_skipped,
+                incomplete_match_settled=1,
             )
         if shell_verdict == "exhausted" and not failures:
             logger.warning(
@@ -7229,6 +7239,7 @@ class FBrefPipeline:
         result.dead_lettered += outcome.dead_lettered
         result.incomplete_match_refetches += outcome.incomplete_match_refetches
         result.incomplete_match_exhausted += outcome.incomplete_match_exhausted
+        result.incomplete_match_settled += outcome.incomplete_match_settled
         result.deferred_parse_failures.extend(outcome.deferred_parse_failures)
         result.failures.extend(outcome.failures)
 

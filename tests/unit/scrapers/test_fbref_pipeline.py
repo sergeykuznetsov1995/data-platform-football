@@ -16176,8 +16176,8 @@ def test_schedule_recovery_seeds_europa_league_qualifiers(tmp_path):
 
 
 @pytest.mark.parametrize(("verdict", "counter"), [
-    ("scheduled", "incomplete_match_refetches"),
-    ("superseded", "incomplete_match_refetches"),
+    ("scheduled", "incomplete_match_settled"),
+    ("superseded", "incomplete_match_settled"),
     ("exhausted", "incomplete_match_exhausted"),
 ])
 def test_unscheduled_incomplete_match_settles_instead_of_failing_the_wave(
@@ -16211,6 +16211,9 @@ def test_unscheduled_incomplete_match_settles_instead_of_failing_the_wave(
     assert result.failures == []
     assert result.parsed == 0
     assert getattr(result, counter) == 1
+    # A refetch is counted only when one was scheduled, a retirement only once.
+    assert result.incomplete_match_refetches == 0
+    assert result.incomplete_match_exhausted == (verdict == "exhausted")
     observation = next(iter(control.observations.values()))
     assert observation["status"] == "failed"
     assert observation["error_class"] == "IncompleteMatchPageError"
