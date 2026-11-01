@@ -72,6 +72,9 @@ class MemoryDailyStore:
     def results_present(self, rating_date):
         return any(r["rating_date"] == rating_date for r in self.results.values())
 
+    def fixtures_present(self, rating_date):
+        return bool(self.fixtures.get(rating_date))
+
 
 def _manifest_closed_except(open_slugs):
     return [{"slug": s, "status": "done", "fetched_at": T0, "_ingested_at": T0}
@@ -183,6 +186,7 @@ def test_same_rating_date_is_a_replace_without_alert_or_new_slugs():
 def test_same_date_with_stored_results_does_not_fetch_results_again():
     store = MemoryDailyStore()
     _run(store=store)
+    store.fixtures[RATING_DATE] = [{"rating_date": RATING_DATE}]  # fixtures of the date stored
     result, store, _, session, sent, _ = _run(store=store)
     assert [c["path"] for c in session.calls] == ["/Ranking"]
     assert result["results_skipped"] is True and result["results_rows"] == 0
@@ -520,3 +524,45 @@ def test_external_results_unknown_markup_prevents_all_parsed_writes():
     assert result["written"] is False and result["check"].startswith("C3 result team")
     assert store.snapshot == {} and store.results == {}
     assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking", "/Results"]
+
+
+def test_same_date_refetches_fixtures_while_none_are_stored():
+    # 01.11: the first fetch of the date got the page without its match table
+    # (0 rows); the next run of the same date fetches /Fixtures again
+    day = date(2026, 10, 30)
+    ranking = lambda: _ranking_with_date("2026-10-30")
+    results = lambda: _results_with_date("2026-10-30")
+    store = MemoryDailyStore()
+    # the default /Fixtures is the empty page of 24.09
+    first, *_ = _run(_answers(**{"/Ranking": ranking(), "/Results": results()}), store=store)
+    assert first["fixtures_rows"] == 0 and day not in store.fixtures
+    result, store, _, session, *_ = _run(
+        _answers(**{"/Ranking": ranking(), "/Fixtures": _live_fixtures()}), store=store)
+    assert [c["path"] for c in session.calls] == ["/Ranking", "/Fixtures"]
+    assert result["results_skipped"] is True and daily.exit_code(result) == 0
+    assert result["fixtures_rows"] == 50 and len(store.fixtures[day]) == 50
+    # stored now: the third run of the date fetches /Ranking only
+    result, store, _, session, *_ = _run(
+        _answers(**{"/Ranking": ranking(), "/Fixtures": _live_fixtures()}), store=store)
+    assert [c["path"] for c in session.calls] == ["/Ranking"]
+    assert result["fixtures_raw"] is False and len(store.fixtures[day]) == 50
+
+
+def test_fixtures_presence_check_failure_never_reddens_the_run(caplog):
+    store = MemoryDailyStore()
+    _run(store=store)
+    store.fixtures_present = MagicMock(side_effect=RuntimeError("trino down"))
+    result, *_ = _run(store=store)
+    assert daily.exit_code(result) == 0 and result["written"] is True
+    assert "trino down" in result["fixtures_error"]
+
+
+def test_store_fixtures_present_by_rating_date():
+    writer = MagicMock(catalog="iceberg")
+    trino = writer._get_trino_manager.return_value
+    trino.execute_query.return_value = [[1]]
+    assert daily.IcebergDailyStore(writer).fixtures_present(RATING_DATE) is True
+    sql = trino.execute_query.call_args[0][0]
+    assert "iceberg.bronze.clubelo_fixture" in sql and "rating_date = DATE '2026-09-22'" in sql
+    trino.execute_query.return_value = []
+    assert daily.IcebergDailyStore(writer).fixtures_present(RATING_DATE) is False

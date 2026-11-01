@@ -28,9 +28,11 @@ One run, in this order:
    today's /Ranking but absent from the history manifest go through the
    history run (``history.collect_new_slugs``). Its failure makes the run red
    but does not roll back the written snapshot.
-7. Together with a /Results fetch only (once per rating date): ``/Fixtures``
-   → raw row, parse (``parse_fixtures``), ``bronze.clubelo_fixture``: the
-   partition of the page's h1 date is replaced (one row per match, the
+7. Together with a /Results fetch, and on every re-run of the same rating
+   date while ``clubelo_fixture`` holds no rows of it (01.11: the site served
+   the page without its match table — one fetch per date lost the day):
+   ``/Fixtures`` → raw row, parse (``parse_fixtures``),
+   ``bronze.clubelo_fixture``: the partition of the page's h1 date is replaced (one row per match, the
    site's forecast as of that fetch; #1982). Best effort: a failure lands in
    ``fixtures_error`` and never reddens the run or touches the other tables;
    a layout change writes no parsed fixture rows.
@@ -246,6 +248,15 @@ class IcebergDailyStore:
         )
         return bool(rows)
 
+    def fixtures_present(self, rating_date: date) -> bool:
+        """Whether ``clubelo_fixture`` already holds rows of this rating date."""
+
+        table = f"{self.writer.catalog}.{self.database}.{FIXTURE_TABLE}"
+        rows = self.writer._get_trino_manager().execute_query(
+            f"SELECT 1 FROM {table} WHERE rating_date = DATE '{rating_date.isoformat()}' LIMIT 1"
+        )
+        return bool(rows)
+
     def replace_snapshot(self, rating_date: date, rows: List[Dict[str, Any]]) -> int:
         return self._replace_by_rating_date(SNAPSHOT_TABLE, SNAPSHOT_SCHEMA, rating_date, rows)
 
@@ -350,9 +361,15 @@ class _Daily:
             f"after {retries + 1} attempts"
         )
 
-    def fixtures(self) -> None:
-        """#1982: /Fixtures raw, parse, replace; a failure never reddens the run."""
+    def fixtures(self, refetch_date: Optional[date] = None) -> None:
+        """#1982: /Fixtures raw, parse, replace; a failure never reddens the run.
+
+        ``refetch_date``: a re-run of this rating date — fetch only while no
+        fixture rows of it are stored.
+        """
         try:
+            if refetch_date is not None and self.store.fixtures_present(refetch_date):
+                return
             page, html = self.fetch("/Fixtures")
             self.result["fixtures_raw"] = True
             self.result["fixtures_wire_bytes"] = page.wire_bytes
@@ -480,8 +497,7 @@ def run_daily(
             daily.run.rating_date = ranking.rating_date
             result.update(history.collect_new_slugs(daily.run, ranking.linked_slugs,
                                                     limit=new_slugs_limit))
-        if not result["results_skipped"]:
-            daily.fixtures()
+        daily.fixtures(ranking.rating_date if result["results_skipped"] else None)
     except ClubEloBlocked as exc:
         result["blocked"] = str(exc)
         logger.error("ClubElo blocked us, daily run stopped: %s", exc)
