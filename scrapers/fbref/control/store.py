@@ -941,6 +941,90 @@ _DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
 )"""
 
 
+# Raw already parsed successfully by an older parser generation (#2050). The
+# callers exclude exact current-version successes first, so any remaining full
+# success is a prior version.  A failure recorded after it (a current parser
+# refusing the same bytes) is a real error, not version lag.
+_PARSER_VERSION_LAG_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS prior
+    WHERE prior.logical_refresh_id = attempt.logical_refresh_id
+      AND prior.status = 'succeeded'
+      AND prior.generic_status = 'succeeded'
+      AND prior.typed_status IN ('succeeded', 'skipped')
+      AND prior.stateful_status IN ('succeeded', 'skipped')
+      AND prior.validation_status = 'succeeded'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM fbref_control.observation_processing AS later_failed
+        WHERE later_failed.logical_refresh_id = attempt.logical_refresh_id
+          AND later_failed.status = 'failed'
+          AND later_failed.updated_at > prior.updated_at
+      )
+)"""
+
+# A scored match shell on the current parsers whose recovery a fresh request
+# owns (#2051): a refetch is scheduled/in flight, or a newer fetch landed.
+# A shell whose refetch was lost stays visible.  Params: three parser versions.
+_OWNED_MATCH_SHELL_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS shell
+    WHERE shell.logical_refresh_id = attempt.logical_refresh_id
+      AND shell.parser_version = %s
+      AND shell.typed_parser_version = %s
+      AND shell.stateful_parser_version = %s
+      AND shell.status = 'failed'
+      AND shell.error_class = 'IncompleteMatchPageError'
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM fbref_control.fetch_attempt AS refetched
+          WHERE refetched.target_id = attempt.target_id
+            AND refetched.lease_epoch > attempt.lease_epoch
+            AND refetched.status = 'succeeded'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM fbref_control.incomplete_match_refetch AS refetch
+          JOIN fbref_control.page_frontier AS refetch_owner
+            ON refetch_owner.target_id = refetch.target_id
+          WHERE refetch.target_id = attempt.target_id
+            AND (refetch_owner.state IN ('queued', 'retry', 'leased')
+                 OR (refetch.exhausted_at IS NOT NULL
+                     AND refetch_owner.last_error_class = 'IncompleteMatchExhausted'))
+        )
+      )
+)"""
+
+# Reason prefix of a shell parked after its refetch window (#2051).
+INCOMPLETE_MATCH_EXHAUSTED_REASON = "incomplete_match_exhausted"
+# FBref fills a shell within hours to a day; growing intervals (1 h, 3 h,
+# 9 h, then daily) keep about ten requests per match inside the window, and
+# the window caps competitions that never publish lineups (#2057).
+INCOMPLETE_MATCH_REFETCH_WINDOW_DAYS = 7
+INCOMPLETE_MATCH_MAX_REFETCH_INTERVAL_HOURS = 24
+
+# A new window starts when the previous one was parked or a full page landed
+# after the raw that opened it.  References the upsert target ``retry``.
+_INCOMPLETE_MATCH_WINDOW_RESET_SQL = """(
+    retry.exhausted_at IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM fbref_control.fetch_attempt AS full_page
+      JOIN fbref_control.observation_processing AS full_observed
+        ON full_observed.logical_refresh_id = full_page.logical_refresh_id
+      WHERE full_page.target_id = retry.target_id
+        AND full_observed.status = 'succeeded'
+        AND full_page.lease_epoch > (
+          SELECT max(shell_raw.lease_epoch)
+          FROM fbref_control.fetch_attempt AS shell_raw
+          WHERE shell_raw.target_id = retry.target_id
+            AND shell_raw.logical_refresh_id = retry.logical_refresh_id
+        )
+    )
+)"""
+
+
 # One definition of a historically eligible competition (#1949): current
 # male rows plus source-proven discontinued ones. Callers alias the registry
 # as ``competition``.
@@ -6274,36 +6358,124 @@ class ControlStore:
     def schedule_incomplete_match_refetch(
         self, target_id: object, *, content_hash: object, logical_refresh_id: object,
     ) -> bool:
-        """At most three fresh requests; stale raw replay cannot spend retries."""
+        """Request fresh raw inside a bounded window.
+
+        A replay of the same raw spends nothing while its refetch is armed;
+        if that refetch was lost (target no longer queued/retry, not parked)
+        it re-arms.
+        """
         target = _text(target_id, "target_id")
         digest = _text(content_hash, "content_hash")
         refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        reset = _INCOMPLETE_MATCH_WINDOW_RESET_SQL
         with self._transaction() as cursor:
             if self._latest_content_verdict(cursor, target, digest, refresh) is not True:
                 return False
-            cursor.execute("""INSERT INTO fbref_control.incomplete_match_refetch AS retry
+            cursor.execute(f"""INSERT INTO fbref_control.incomplete_match_refetch AS retry
                     (target_id, attempts, logical_refresh_id)
                 SELECT target_id, 1, %s FROM fbref_control.page_frontier
                 WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')
-                ON CONFLICT (target_id) DO UPDATE SET attempts = retry.attempts + 1,
+                ON CONFLICT (target_id) DO UPDATE SET
+                    attempts = CASE WHEN {reset} THEN 1 ELSE retry.attempts + 1 END,
+                    window_started_at = CASE WHEN {reset}
+                        THEN clock_timestamp() ELSE retry.window_started_at END,
+                    exhausted_at = NULL,
                     logical_refresh_id = EXCLUDED.logical_refresh_id
-                WHERE retry.attempts < 3
-                    AND retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
-                RETURNING attempts""", (refresh, target))
+                WHERE (retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                       OR retry.exhausted_at IS NULL AND NOT EXISTS (
+                         SELECT 1 FROM fbref_control.page_frontier AS armed
+                         WHERE armed.target_id = retry.target_id
+                           AND armed.state IN ('queued', 'retry')))
+                    AND ({reset} OR retry.window_started_at
+                         > clock_timestamp() - %s * interval '1 day')
+                RETURNING attempts""",
+                (refresh, target, INCOMPLETE_MATCH_REFETCH_WINDOW_DAYS))
             row = _fetchone(cursor)
             if row is None:
                 return False
+            delay_hours = min(
+                INCOMPLETE_MATCH_MAX_REFETCH_INTERVAL_HOURS,
+                3 ** min(int(row["attempts"]) - 1, 3),
+            )
             cursor.execute("""UPDATE fbref_control.page_frontier
                 SET state = 'retry',
-                    next_fetch_at = clock_timestamp() + %s * interval '5 minutes',
-                    retry_after = clock_timestamp() + %s * interval '5 minutes',
+                    next_fetch_at = clock_timestamp() + %s * interval '1 hour',
+                    retry_after = clock_timestamp() + %s * interval '1 hour',
                     last_etag = NULL, last_modified = NULL,
                     last_error_class = 'IncompleteMatchPageError',
                     last_error_message = 'scored_match_incomplete',
                     updated_at = clock_timestamp()
                 WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
-                (2 ** (row["attempts"] - 1), 2 ** (row["attempts"] - 1), target))
+                (delay_hours, delay_hours, target))
             return bool(cursor.rowcount)
+
+    def settle_unscheduled_incomplete_match(
+        self, target_id: object, *, content_hash: object, logical_refresh_id: object,
+    ) -> Optional[str]:
+        """Classify a shell whose refetch was not scheduled (#2051).
+
+        ``scheduled``: this exact raw already owns a pending refetch (replay
+        of the same bytes).  ``superseded``: a newer fetch landed and owns the
+        target.  ``exhausted``: the refetch window is spent; the target is
+        parked as fetched with ``IncompleteMatchExhausted`` -- not terminal:
+        only a later fetch opens a new window, i.e. a manual requeue --
+        reconcile does not reopen it.
+        ``already_exhausted``: a replay of the raw that was parked.
+        ``None`` leaves the failure loud for the caller.
+        """
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        with self._transaction() as cursor:
+            verdict = self._latest_content_verdict(cursor, target, digest, refresh)
+            if verdict is None:
+                return None
+            if verdict is False:
+                cursor.execute("""SELECT 1 FROM fbref_control.fetch_attempt AS current_raw
+                    JOIN fbref_control.fetch_attempt AS newer
+                      ON newer.target_id = current_raw.target_id
+                     AND newer.lease_epoch > current_raw.lease_epoch
+                     AND newer.status = 'succeeded'
+                    WHERE current_raw.target_id = %s
+                      AND current_raw.logical_refresh_id = %s
+                    LIMIT 1""", (target, refresh))
+                return "superseded" if _fetchone(cursor) is not None else None
+            cursor.execute("""SELECT retry.attempts, retry.logical_refresh_id,
+                       retry.exhausted_at IS NOT NULL AS exhausted,
+                       retry.window_started_at
+                           <= clock_timestamp() - %s * interval '1 day' AS window_spent,
+                       frontier.state
+                FROM fbref_control.incomplete_match_refetch AS retry
+                JOIN fbref_control.page_frontier AS frontier USING (target_id)
+                WHERE retry.target_id = %s FOR UPDATE OF retry""",
+                (INCOMPLETE_MATCH_REFETCH_WINDOW_DAYS, target))
+            row = _fetchone(cursor)
+            if row is None:
+                return None
+            if str(row["logical_refresh_id"]) == refresh:
+                if row["exhausted"]:
+                    return "already_exhausted"
+                if row["state"] in ("queued", "retry"):
+                    return "scheduled"
+            if row["exhausted"] or not row["window_spent"]:
+                return None
+            cursor.execute("""UPDATE fbref_control.page_frontier
+                SET state = 'fetched', next_fetch_at = NULL,
+                    retry_after = NULL,
+                    last_error_class = 'IncompleteMatchExhausted',
+                    last_error_message = %s,
+                    updated_at = clock_timestamp()
+                WHERE target_id = %s
+                  AND last_content_hash = %s
+                  AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
+                (f"{INCOMPLETE_MATCH_EXHAUSTED_REASON}:attempts={int(row['attempts'])}",
+                 target, digest))
+            if not cursor.rowcount:
+                return None
+            cursor.execute("""UPDATE fbref_control.incomplete_match_refetch
+                SET exhausted_at = clock_timestamp(), logical_refresh_id = %s
+                WHERE target_id = %s""", (refresh, target))
+            return "exhausted"
 
     def quarantine_contract_rejected_target(
         self,
@@ -7910,6 +8082,10 @@ class ControlStore:
                     manifest.validation_status = 'failed'
                     AND ({deferred_manifest_sql})
                   )
+                  AND NOT (
+                    manifest.validation_status = 'failed'
+                    AND {_OWNED_MATCH_SHELL_SQL}
+                  )
                   AND (
                     %s::text IS NULL
                     OR (
@@ -7932,6 +8108,9 @@ class ControlStore:
                     run,
                     deferred_json,
                     deferred_json,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     parser,
                     typed_parser,
@@ -7956,6 +8135,7 @@ class ControlStore:
                       AND attempt.status = 'succeeded'
                       AND frontier.state <> 'quarantined'
                       AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
+                      AND NOT {_OWNED_MATCH_SHELL_SQL}
                       AND (
                         (
                           %s::text IS NULL
@@ -7997,6 +8177,9 @@ class ControlStore:
                 (
                     run,
                     deferred_json,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     parser,
                     parser,
@@ -8547,6 +8730,7 @@ class ControlStore:
                        ) AS lane_count,
                        count(*) FILTER (
                            WHERE source_run.run_type = %s
+                             AND NOT version_lag.lagging
                              AND COALESCE(
                                attempt.finished_at, attempt.started_at
                              ) < clock_timestamp()
@@ -8554,7 +8738,8 @@ class ControlStore:
                        ) AS lane_sla_overdue_count,
                        count(*) AS global_count,
                        count(*) FILTER (
-                           WHERE COALESCE(
+                           WHERE NOT version_lag.lagging
+                             AND COALESCE(
                                attempt.finished_at, attempt.started_at
                            ) < clock_timestamp()
                                - (%s * interval '1 second')
@@ -8572,12 +8757,22 @@ class ControlStore:
                        ) AS lane_oldest_raw_at,
                        min(COALESCE(
                            attempt.finished_at, attempt.started_at
-                       )) AS global_oldest_raw_at
+                       )) AS global_oldest_raw_at,
+                       count(*) FILTER (
+                           WHERE source_run.run_type = %s
+                             AND version_lag.lagging
+                       ) AS lane_version_lag_count,
+                       count(*) FILTER (
+                           WHERE version_lag.lagging
+                       ) AS global_version_lag_count
                 FROM fbref_control.fetch_attempt AS attempt
                 JOIN fbref_control.crawl_run AS source_run
                   ON source_run.run_id = attempt.run_id
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = attempt.target_id
+                CROSS JOIN LATERAL (
+                    SELECT {_PARSER_VERSION_LAG_SQL} AS lagging
+                ) AS version_lag
                 WHERE attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
@@ -8586,6 +8781,7 @@ class ControlStore:
                   -- cohort.  Without this the run would clear recovery and
                   -- then fail its own unprocessed-raw gate on the same bytes.
                   AND frontier.state <> 'quarantined'
+                  AND NOT {_OWNED_MATCH_SHELL_SQL}
                   AND (
                     (
                       %s::text IS NULL
@@ -8671,6 +8867,10 @@ class ControlStore:
                     run,
                     deferred_json,
                     recovery_lane_run_type,
+                    recovery_lane_run_type,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     parser,
                     parser,
@@ -8747,6 +8947,41 @@ class ControlStore:
             # the explicit lane key; the unqualified legacy key stays global.
             summary["unprocessed_raw_sla_overdue_count"] = global_sla_overdue
             summary["raw_processing_sla_seconds"] = raw_sla
+            # Raw parsed by an older parser generation: re-parse backlog,
+            # reported apart from the SLA counts above (#2050).
+            summary["parser_version_lag_raw_by_page_kind"] = {
+                str(row["page_kind"]): int(row.get("lane_version_lag_count") or 0)
+                for row in raw_rows
+                if int(row.get("lane_version_lag_count") or 0) > 0
+            }
+            summary["parser_version_lag_raw_count"] = sum(
+                summary["parser_version_lag_raw_by_page_kind"].values()
+            )
+            summary["global_parser_version_lag_raw_count"] = sum(
+                int(row.get("global_version_lag_count") or 0)
+                for row in raw_rows
+            )
+            cursor.execute(
+                """
+                SELECT count(*) FILTER (
+                           WHERE frontier.state IN ('queued', 'retry', 'leased')
+                       ) AS pending_count,
+                       count(*) FILTER (
+                           WHERE refetch.exhausted_at IS NOT NULL
+                             AND frontier.last_error_class = 'IncompleteMatchExhausted'
+                       ) AS exhausted_count
+                FROM fbref_control.incomplete_match_refetch AS refetch
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = refetch.target_id
+                """
+            )
+            shells = _fetchone(cursor) or {}
+            summary["incomplete_match_refetch_pending_count"] = int(
+                shells.get("pending_count") or 0
+            )
+            summary["incomplete_match_exhausted_count"] = int(
+                shells.get("exhausted_count") or 0
+            )
 
             cursor.execute(
                 _FRONTIER_SCOPE_CTE
@@ -9411,8 +9646,14 @@ class ControlStore:
 
         Selection is intentionally independent of the source crawl-run status:
         a successful immutable raw commit remains recoverable when a later task
-        made its parent run fail or get cancelled.  Oldest raw is drained first
-        so repeated bounded calls cannot starve earlier observations.
+        made its parent run fail or get cancelled.  Raw without any successful
+        parse comes before parser-version lag; within each, oldest raw is
+        drained first so repeated bounded calls cannot starve earlier
+        observations.
+
+        A scored match shell is excluded only while a fresh request owns it
+        (the same rule as the run gate, #2051); a shell nobody owns is
+        selected again so its re-parse schedules a refetch or parks it.
 
         Quarantined targets are excluded: their raw is out of scope by the same
         decision that retired them, and without this a page the parser has
@@ -9505,8 +9746,7 @@ class ControlStore:
                         AND failed_observed.typed_parser_version = %s
                         AND failed_observed.stateful_parser_version = %s
                         AND failed_observed.status = 'failed'
-                        AND (failed_observed.error_class = 'IncompleteMatchPageError'
-                             OR EXISTS (
+                        AND (EXISTS (
                       SELECT 1
                       FROM fbref_control.fetch_attempt AS newer_attempt
                       JOIN fbref_control.observation_processing
@@ -9531,7 +9771,9 @@ class ControlStore:
                              ))
                     )
                   )
-                ORDER BY COALESCE(
+                  AND NOT """ + _OWNED_MATCH_SHELL_SQL + """
+                ORDER BY """ + _PARSER_VERSION_LAG_SQL + """,
+                    COALESCE(
                     attempt.finished_at, attempt.started_at
                 ), attempt.attempt_id
                 LIMIT %s
@@ -9543,6 +9785,9 @@ class ControlStore:
                     kinds,
                     history_run_id,
                     history_run_id,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     typed_parser,
                     stateful_parser,

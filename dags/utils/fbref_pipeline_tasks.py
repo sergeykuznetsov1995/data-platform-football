@@ -2015,8 +2015,10 @@ def run_recovery_wave(
         # good, so it is progress even though nothing was parsed.  A
         # dead-lettered record retires the same way (#1317), so the drain must
         # count it too or a cohort that only dead-letters looks stalled.
-        retired = int(result.get("contract_quarantined") or 0) + int(
-            result.get("dead_lettered") or 0
+        retired = (
+            int(result.get("contract_quarantined") or 0)
+            + int(result.get("dead_lettered") or 0)
+            + int(result.get("incomplete_match_exhausted") or 0)
         )
         aggregate["batches"] = int(aggregate["batches"]) + 1
         for key, value in result.items():
@@ -2030,7 +2032,9 @@ def run_recovery_wave(
         if history_slice:
             break
         # A failed incomplete match leaves raw recovery for a fresh fetch.
-        refetches = int(result.get("incomplete_match_refetches") or 0)
+        refetches = int(result.get("incomplete_match_refetches") or 0) + int(
+            result.get("incomplete_match_settled") or 0
+        )
         if parsed == 0 and retired == 0 and refetches == 0:
             # Расчистка сырья идёт ПЕРЕД живыми волнами, поэтому её тупик
             # раньше убивал весь ран: 31.07 три мёртвые season-страницы

@@ -1231,6 +1231,23 @@ MIGRATIONS = (
                 logical_refresh_id uuid NOT NULL)""",
         ),
     ),
+    Migration(
+        version=16,
+        name="incomplete_match_refetch_window",
+        statements=(
+            "SET LOCAL lock_timeout = '2s'",
+            "SET LOCAL statement_timeout = '25s'",
+            # Refetches are bounded by a time window, not three tries (#2051).
+            # Existing rows start their window at migration time.
+            """ALTER TABLE fbref_control.incomplete_match_refetch
+                DROP CONSTRAINT incomplete_match_refetch_attempts_check,
+                ADD CONSTRAINT incomplete_match_refetch_attempts_check
+                    CHECK (attempts >= 1),
+                ADD COLUMN window_started_at timestamptz NOT NULL
+                    DEFAULT clock_timestamp(),
+                ADD COLUMN exhausted_at timestamptz""",
+        ),
+    ),
 )
 
 

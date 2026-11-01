@@ -2833,12 +2833,13 @@ def test_incomplete_match_refetch_fences_refresh_hash_and_new_lease(state, newer
             return [{"logical_refresh_id": str(uuid.uuid4()) if newer else refresh,
                      "content_hash": "a"}], 1
         if "INSERT INTO fbref_control.incomplete_match_refetch" in sql:
-            assert "retry.attempts < 3" in sql
             assert "retry.logical_refresh_id <> EXCLUDED.logical_refresh_id" in sql
+            assert "retry.window_started_at > clock_timestamp() - %s * interval '1 day'" in sql
+            assert params[-1] == 7
             return [{"attempts": 2}], 1
         if "UPDATE fbref_control.page_frontier" in sql:
             assert "last_etag = NULL, last_modified = NULL" in sql
-            assert params == (2, 2, "match")
+            assert params == (3, 3, "match")
             return [], 1
         pytest.fail(sql)
     factory = FakeFactory(handler)
@@ -3048,3 +3049,71 @@ def test_history_campaign_counts_parked_redirect_as_done_not_remaining():
             "AND frontier.last_error_class = 'RedirectUnresolved')") in remaining
     assert remaining.index("RedirectUnresolved") < remaining.index("frontier.state <> 'fetched'")
     assert "bool_or(frontier.page_kind='season'" in health
+
+
+@pytest.mark.parametrize(("attempts", "hours"), [(1, 1), (2, 3), (3, 9), (4, 24), (12, 24)])
+def test_incomplete_match_refetch_backs_off_inside_a_window(attempts, hours):
+    """#2051 R2: no three-try cap; intervals grow, a 7-day window bounds them,
+    and a parked or completed target opens a fresh window."""
+    refresh = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        if "SELECT state, last_content_hash" in sql:
+            return [{"state": "fetched", "last_content_hash": "a"}], 1
+        if "SELECT logical_refresh_id, content_hash" in sql:
+            return [{"logical_refresh_id": refresh, "content_hash": "a"}], 1
+        if "INSERT INTO fbref_control.incomplete_match_refetch" in sql:
+            captured["upsert"] = sql
+            return [{"attempts": attempts}], 1
+        if "UPDATE fbref_control.page_frontier" in sql:
+            captured["params"] = params
+            return [], 1
+        pytest.fail(sql)
+
+    store = ControlStore("postgresql://unused/db", connection_factory=FakeFactory(handler))
+    assert store.schedule_incomplete_match_refetch("match", content_hash="a", logical_refresh_id=refresh)
+    assert captured["params"] == (hours, hours, "match")
+    upsert = captured["upsert"]
+    assert "retry.attempts < 3" not in upsert
+    assert "retry.exhausted_at IS NOT NULL" in upsert
+    assert "full_observed.status = 'succeeded'" in upsert
+    assert "exhausted_at = NULL" in upsert
+
+
+def test_migration_16_lifts_the_three_try_cap_and_adds_the_window():
+    migration = next(m for m in MIGRATIONS if m.version == 16)
+    sql = " ".join(" ".join(migration.statements).split())
+    assert "DROP CONSTRAINT incomplete_match_refetch_attempts_check" in sql
+    assert "CHECK (attempts >= 1)" in sql
+    assert "ADD COLUMN window_started_at timestamptz NOT NULL DEFAULT clock_timestamp()" in sql
+    assert "ADD COLUMN exhausted_at timestamptz" in sql
+
+
+def test_incomplete_match_refetch_rearms_a_lost_refetch_of_the_same_raw():
+    """#2051 R3: a replay of the same shell raw spends nothing while its
+    refetch is armed, but re-arms one that was lost (target fetched)."""
+    refresh = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        if "SELECT state, last_content_hash" in sql:
+            return [{"state": "fetched", "last_content_hash": "a"}], 1
+        if "SELECT logical_refresh_id, content_hash" in sql:
+            return [{"logical_refresh_id": refresh, "content_hash": "a"}], 1
+        if "INSERT INTO fbref_control.incomplete_match_refetch" in sql:
+            captured["upsert"] = sql
+            return [{"attempts": 4}], 1
+        if "UPDATE fbref_control.page_frontier" in sql:
+            return [], 1
+        pytest.fail(sql)
+
+    store = ControlStore("postgresql://unused/db", connection_factory=FakeFactory(handler))
+    assert store.schedule_incomplete_match_refetch("match", content_hash="a", logical_refresh_id=refresh)
+    assert (
+        "WHERE (retry.logical_refresh_id <> EXCLUDED.logical_refresh_id "
+        "OR retry.exhausted_at IS NULL AND NOT EXISTS ( "
+        "SELECT 1 FROM fbref_control.page_frontier AS armed "
+        "WHERE armed.target_id = retry.target_id "
+        "AND armed.state IN ('queued', 'retry')))"
+    ) in captured["upsert"]

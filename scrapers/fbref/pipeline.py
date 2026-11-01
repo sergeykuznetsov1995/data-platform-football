@@ -827,6 +827,8 @@ class WaveResult:
     contract_quarantined: int = 0
     dead_lettered: int = 0
     incomplete_match_refetches: int = 0
+    incomplete_match_exhausted: int = 0
+    incomplete_match_settled: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -925,6 +927,8 @@ class _ProcessedObservation:
     contract_quarantined: int = 0
     dead_lettered: int = 0
     incomplete_match_refetches: int = 0
+    incomplete_match_exhausted: int = 0
+    incomplete_match_settled: int = 0
     deferred_parse_failures: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
@@ -6277,12 +6281,21 @@ class FBrefPipeline:
         # transaction fails, recovery must still retry scheduling this raw.
         refetch_error = None
         refetch_scheduled = False
+        shell_verdict = None
         if isinstance(exc, IncompleteMatchPageError):
             try:
                 refetch_scheduled = self.control.schedule_incomplete_match_refetch(
                     record.target_id, content_hash=record.content_hash,
                     logical_refresh_id=record.logical_refresh_id,
                 )
+                if not refetch_scheduled:
+                    # Stale bytes, a replay of the same raw, or the last fresh
+                    # request spent: each has an owner or a terminal verdict,
+                    # none is a wave failure (#2051). Anything else stays loud.
+                    shell_verdict = self.control.settle_unscheduled_incomplete_match(
+                        record.target_id, content_hash=record.content_hash,
+                        logical_refresh_id=record.logical_refresh_id,
+                    )
             except Exception as refetch_exc:
                 refetch_error = refetch_exc
                 failures.append(
@@ -6307,6 +6320,25 @@ class FBrefPipeline:
                 typed_promoted=typed_promoted,
                 stale_typed_observations_skipped=stale_typed_observations_skipped,
                 incomplete_match_refetches=1,
+            )
+        if (shell_verdict in {"scheduled", "superseded", "already_exhausted"}
+                and not failures):
+            # Nothing new was requested or retired: an earlier refetch, a
+            # newer fetch or an earlier parking verdict owns this raw.
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=stale_typed_observations_skipped,
+                incomplete_match_settled=1,
+            )
+        if shell_verdict == "exhausted" and not failures:
+            logger.warning(
+                "Parked %s: scored match still has no events or lineups "
+                "after its refetch window", record.target_id,
+            )
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=stale_typed_observations_skipped,
+                incomplete_match_exhausted=1,
             )
         if isinstance(exc, SourceContractRejected):
             retired = False
@@ -7207,6 +7239,8 @@ class FBrefPipeline:
         result.contract_quarantined += outcome.contract_quarantined
         result.dead_lettered += outcome.dead_lettered
         result.incomplete_match_refetches += outcome.incomplete_match_refetches
+        result.incomplete_match_exhausted += outcome.incomplete_match_exhausted
+        result.incomplete_match_settled += outcome.incomplete_match_settled
         result.deferred_parse_failures.extend(outcome.deferred_parse_failures)
         result.failures.extend(outcome.failures)
 
@@ -8243,6 +8277,19 @@ class FBrefPipeline:
                         run_id,
                         other_lane_overdue,
                         summary_run_type,
+                    )
+            # Re-parse backlog and match shells are reported, not enforced:
+            # each has an owner (re-parse / fresh request) or a verdict.
+            for backlog_metric in (
+                "parser_version_lag_raw_count",
+                "incomplete_match_refetch_pending_count",
+                "incomplete_match_exhausted_count",
+            ):
+                backlog = int(summary.get(backlog_metric) or 0)
+                if backlog:
+                    warnings[backlog_metric] = backlog
+                    logger.warning(
+                        "Run %s reports %s=%d", run_id, backlog_metric, backlog
                     )
 
         if not isolated_acceptance:
