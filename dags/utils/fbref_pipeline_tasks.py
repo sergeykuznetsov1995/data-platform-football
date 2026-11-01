@@ -2015,8 +2015,10 @@ def run_recovery_wave(
         # good, so it is progress even though nothing was parsed.  A
         # dead-lettered record retires the same way (#1317), so the drain must
         # count it too or a cohort that only dead-letters looks stalled.
-        retired = int(result.get("contract_quarantined") or 0) + int(
-            result.get("dead_lettered") or 0
+        retired = (
+            int(result.get("contract_quarantined") or 0)
+            + int(result.get("dead_lettered") or 0)
+            + int(result.get("incomplete_match_exhausted") or 0)
         )
         aggregate["batches"] = int(aggregate["batches"]) + 1
         for key, value in result.items():

@@ -533,6 +533,9 @@ class FakeControl:
     def record_match_report_observations(self, **kwargs):
         self.report_observations.append(kwargs)
 
+    def settle_unscheduled_incomplete_match(self, *_args, **_kwargs):
+        return None
+
     def __init__(self, raw_store=None):
         self.raw_store = raw_store
         self.events = []
@@ -16170,6 +16173,50 @@ def test_schedule_recovery_seeds_europa_league_qualifiers(tmp_path):
     assert result["reason"] == "qualification_histories_seeded"
     assert result["competition_ids"] == ["86"]
     assert control.frontier["fbref:competition:86"]["state"] == "queued"
+
+
+@pytest.mark.parametrize(("verdict", "counter"), [
+    ("scheduled", "incomplete_match_refetches"),
+    ("superseded", "incomplete_match_refetches"),
+    ("exhausted", "incomplete_match_exhausted"),
+])
+def test_unscheduled_incomplete_match_settles_instead_of_failing_the_wave(
+    tmp_path, monkeypatch, verdict, counter,
+):
+    """#2051: a shell past its last refetch, a replay of the same raw, or
+    stale bytes behind a newer fetch has an owner or a verdict."""
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218",)
+    )
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    control.schedule_incomplete_match_refetch = lambda *_args, **_kwargs: False
+    settled = []
+
+    def settle(target_id, **kwargs):
+        settled.append((target_id, kwargs))
+        return verdict
+
+    control.settle_unscheduled_incomplete_match = settle
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+
+    record = records[0]
+    assert settled == [(record.target_id, {
+        "content_hash": record.content_hash,
+        "logical_refresh_id": record.logical_refresh_id,
+    })]
+    assert result.failures == []
+    assert result.parsed == 0
+    assert getattr(result, counter) == 1
+    observation = next(iter(control.observations.values()))
+    assert observation["status"] == "failed"
+    assert observation["error_class"] == "IncompleteMatchPageError"
+    # Never published as a complete match.
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
 
 
 def test_validation_reports_version_lag_and_match_shells_without_gating(tmp_path):

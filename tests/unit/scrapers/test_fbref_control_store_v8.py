@@ -3367,3 +3367,68 @@ def test_run_summary_splits_version_lag_from_lane_sla_and_hides_owned_shells():
     assert summary["incomplete_match_exhausted_count"] == 5
     assert captured["shells"] == ("incomplete_match_exhausted",)
 
+
+def _settle_store(state, refetch_row, latest_refresh, newer=True):
+    executions = []
+    refresh = "11111111-1111-1111-1111-111111111111"
+
+    def handler(sql, params):
+        executions.append((sql, params))
+        if sql.startswith("SELECT state, last_content_hash FROM fbref_control.page_frontier"):
+            return [{"state": state, "last_content_hash": "h"}], 1
+        if sql.startswith("SELECT logical_refresh_id, content_hash FROM fbref_control.fetch_attempt"):
+            return [{"logical_refresh_id": latest_refresh, "content_hash": "h"}], 1
+        if "JOIN fbref_control.fetch_attempt AS newer" in sql:
+            return ([{"?column?": 1}], 1) if newer else ([], 0)
+        if "FROM fbref_control.incomplete_match_refetch AS retry" in sql:
+            return ([refetch_row], 1) if refetch_row else ([], 0)
+        if sql.startswith("UPDATE fbref_control.page_frontier SET state = 'quarantined'"):
+            return [], 1
+        raise AssertionError(sql)
+
+    store, _ = make_store(handler)
+    verdict = store.settle_unscheduled_incomplete_match(
+        "fbref:match:98c42514", content_hash="h", logical_refresh_id=refresh,
+    )
+    return verdict, executions
+
+
+def test_settle_unscheduled_shell_retires_after_last_fresh_request():
+    refresh = "11111111-1111-1111-1111-111111111111"
+    verdict, executions = _settle_store(
+        "retry", {"attempts": 3, "logical_refresh_id": "22222222-2222-2222-2222-222222222222",
+                  "state": "fetched"}, refresh,
+    )
+    assert verdict == "exhausted"
+    update_sql, update_params = executions[-1]
+    assert "state = 'quarantined'" in update_sql
+    assert "last_content_hash = %s" in update_sql
+    assert update_params == (
+        "incomplete_match_exhausted:attempts=3", "fbref:match:98c42514", "h",
+    )
+
+
+@pytest.mark.parametrize(("case", "expected"), [
+    ("replay_of_scheduled_raw", "scheduled"),
+    ("newer_fetch", "superseded"),
+    ("stale_without_newer_fetch", None),
+    ("refetches_left", None),
+    ("no_refetch_row", None),
+    ("leased", None),
+])
+def test_settle_unscheduled_shell_owners_and_loud_cases(case, expected):
+    refresh = "11111111-1111-1111-1111-111111111111"
+    other = "22222222-2222-2222-2222-222222222222"
+    state, row, latest, newer = {
+        "replay_of_scheduled_raw": ("retry", {"attempts": 1, "logical_refresh_id": refresh,
+                                              "state": "retry"}, refresh, False),
+        "newer_fetch": ("fetched", None, other, True),
+        "stale_without_newer_fetch": ("fetched", None, other, False),
+        "refetches_left": ("fetched", {"attempts": 2, "logical_refresh_id": other,
+                                       "state": "fetched"}, refresh, False),
+        "no_refetch_row": ("fetched", None, refresh, False),
+        "leased": ("leased", None, refresh, False),
+    }[case]
+    verdict, executions = _settle_store(state, row, latest, newer)
+    assert verdict == expected
+    assert not any(sql.startswith("UPDATE") for sql, _ in executions)
