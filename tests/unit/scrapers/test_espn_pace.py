@@ -40,6 +40,17 @@ def test_exact_window_and_thresholds(step, hours):
     assert evaluate(replace(w, error_attempts=4), 500, POLICY).eligible
 
 
+@pytest.mark.parametrize('paused', [0, 3545.5])
+def test_s2_explained_sql_pauses_extend_required_window(paused):
+    # Pause time is not covered evidence (#2049): S2 needs 24 h plus all pauses.
+    w = window(step=2, started_at=NOW-timedelta(hours=24, seconds=paused), http_p95_ms=750,
+               eligible_intervals=10, loaded_intervals=9, paused_seconds=paused)
+    assert evaluate(w, 500, POLICY).eligible
+    short = replace(w, started_at=w.started_at+timedelta(microseconds=1))
+    assert evaluate(short, 500, POLICY).reason == 'window_too_short'
+    assert evaluate(replace(w, paused_seconds=-1), 500, POLICY).reason == 'unknown_metrics'
+
+
 def test_aware_time_required():
     with pytest.raises(ValueError):
         evaluate(window(ended_at=NOW.replace(tzinfo=None)), 500, POLICY)

@@ -312,7 +312,8 @@ class Controller:
                             metrics['count_429'], metrics['error_attempts'], p95, resets,
                             bool(fresh_ok), bool(complete), load['eligible_intervals'],
                             load['loaded_intervals'], current < snapshot['hold_until'],
-                            current < max(snapshot['cooldown_until'], snapshot['history_frozen_until']))
+                            current < max(snapshot['cooldown_until'], snapshot['history_frozen_until']),
+                            load['sql_unknown']['pause_seconds'] if self.state['step'] == 2 else 0)
         decision = evaluate(window, baseline, self.gate.policy)
         writes = self.store.rows('write', start, end)
         report = dict(step=window.step, start=begin.isoformat(), end=finish.isoformat(),

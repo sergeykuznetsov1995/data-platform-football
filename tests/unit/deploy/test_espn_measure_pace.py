@@ -2,6 +2,8 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import math
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 
@@ -11,7 +13,7 @@ from scrapers.espn.attempts import AttemptJournal
 from scrapers.espn.gate import TransportGate, load_transport_policy
 from scrapers.espn.measure_pace import (Controller, MeasurementStopped, accepted_ids, digest,
                                       main, read_status, validate_state)
-from scrapers.espn.pace_report import format_measurement, load_evidence
+from scrapers.espn.pace_report import SQL_UNKNOWN_TOTAL, format_measurement, load_evidence, sql_unknown
 from scrapers.espn.pace_store import ControllerBusy, PaceStore
 from scrapers.espn.transport_contracts import LaneClosed
 
@@ -1313,7 +1315,8 @@ def s2_sql_lane(c):
     return query
 
 
-def test_s2_slow_trino_preserves_window_and_accepts_durable_sql_gaps(controller):
+@pytest.mark.parametrize('extra', [0, 240])
+def test_s2_slow_trino_preserves_window_and_accepts_durable_sql_gaps(controller, extra):
     c = controller
     query = s2_sql_lane(c)
     start = c.state['start']
@@ -1330,14 +1333,16 @@ def test_s2_slow_trino_preserves_window_and_accepts_durable_sql_gaps(controller)
     c.check()
     assert c.state['start'] == start
     sql = c.state['sql_unknown']
-    assert sql['count'] == 2
-    assert sql['seconds'] == 230 + 8
+    # Explained by SQL lag between known zero-debt observations: pauses (#2049).
+    assert (sql['count'], sql['seconds']) == (0, 0)
+    assert sql['pause_count'] == 2
+    assert sql['pause_seconds'] == 230 + 8
     assert sql['longest_seconds'] == 230
     assert sql['open_since'] is None
     recovered_at = c.now().timestamp()
     with c.store.db() as db:
         last_id = db.execute('SELECT MAX(id) FROM evidence').fetchone()[0]
-    fill_window(c, 86400)
+    fill_window(c, 86400 + extra)  # Pauses extend the required 24 h of covered time.
     with c.store.db() as db:
         db.execute("DELETE FROM evidence WHERE id > ? AND kind='observation' AND at <= ?",
                    (last_id, recovered_at))
@@ -1350,10 +1355,12 @@ def test_s2_slow_trino_preserves_window_and_accepts_durable_sql_gaps(controller)
         c.io.values['freshness'].update(sequence=2, observed_at=c.now().timestamp())
     c.io.wakes['freshness'] = SimpleNamespace(set=fresh)
     report = c.decide()
-    assert report['reason'] == 'accepted_s2'
+    assert report['reason'] == ('accepted_s2' if extra else 'window_too_short')
     assert not report['load']['continuous']
     assert report['load']['sql_gap_allowed']
-    assert report['load']['unknown_intervals'] > 0
+    assert report['load']['unknown_intervals'] == 0
+    # Partially paused bins stay in the denominator with a prorated quota.
+    assert report['load']['paused_intervals'] == 0
     assert report['load']['eligible_intervals'] == 288
 
 
@@ -1370,15 +1377,128 @@ def test_s2_open_sql_unknown_limit_checked_without_query_completion(controller, 
         c.check()
 
 
-def test_s2_total_sql_unknown_limit(controller):
+@pytest.mark.parametrize('debt', [0, 1])
+def test_s2_total_sql_unknown_limit(controller, debt):
     c = controller
     query = s2_sql_lane(c)
     start = c.state['start']
     for _ in range(4):
         query(1200)
         c.clock.now += timedelta(seconds=1)
-        query(0)
-    assert c.state['start'] > start  # 4 * (1201 - 30) > 72 minutes.
+        query(0, debt=debt)
+    # 4 * (1201 - 30) > 72 minutes; only zero-debt brackets make them pauses (#2049).
+    assert (c.state['start'] > start) is bool(debt)
+    assert c.state['sql_unknown']['pause_count'] == (0 if debt else 4)
+
+
+SLOW_SQL = Path(__file__).parents[2] / 'fixtures' / 'espn' / 'pace_window_20261031_slow_sql.json'
+
+
+def recorded_slow_sql(c, tiles):
+    """Real 20-minute excerpt of the 31.10 window (#2049), repeated after the current start."""
+    rows = json.loads(SLOW_SQL.read_text())['observations']
+    base, period = rows[0]['at'], rows[-1]['at'] - rows[0]['at'] + 10
+    result = []
+    for tile in range(tiles):
+        shift = c.state['start'] + 10 + tile * period - base
+        result.extend(dict(r, at=r['at'] + shift, observed_at=r['observed_at'] + shift,
+                           revision=c.state['revision']) for r in rows)
+    return result
+
+
+def test_recorded_slow_sql_excerpt_is_only_pauses():
+    rows = json.loads(SLOW_SQL.read_text())['observations']
+    sql = sql_unknown(rows, rows[0]['at'], rows[-1]['at'])
+    assert sql['allowed']
+    assert (sql['count'], sql['seconds']) == (0, 0)
+    assert sql['pause_count'] == 5 and 0 < sql['longest_seconds'] < 60
+    rows[-1]['debt'] = 1  # Real debt after the lag is the existing debt pause, not a slow-SQL pause.
+    stale = sql_unknown(rows, rows[0]['at'], rows[-1]['at'])
+    assert stale['count'] == 1 and stale['pause_count'] == 4
+
+
+def slow_sql_bins(count, attempts, *, full_pause=False):
+    """Bins with a short slow-SQL pause each; attempts(k, covered) history attempts per bin."""
+    t0 = 1793400000
+    observations, rows = [], []
+    def observe(at, observed_at):
+        observations.append(dict(at=at, observed_at=observed_at, known=True, debt=0,
+                                 sql_lag_safe=True, protected=False, step=2))
+    if full_pause:  # Pause [t0 + 294, t0 + 610] covers the whole second bin.
+        for t in [*range(t0, t0 + 261, 10), t0 + 265, t0 + 610, *range(t0 + 620, t0 + count * 300 + 1, 10)]:
+            observe(t, t - 1)
+    for k in range(0 if full_pause else count):
+        b = t0 + k * 300
+        for t in [*range(b, b + 91, 10), b + 140, *range(b + 150, b + 291, 10)]:
+            observe(t, b + 90 if t == b + 140 else t - 1)  # Query started at b + 90, took 50 s.
+    sql = sql_unknown(observations, t0, t0 + count * 300)
+    for k in range(count):
+        b = t0 + k * 300
+        covered = sum(max(0, min(y, b + 300) - max(x, b)) for x, y in sql['pause_intervals'])
+        rows.extend(dict(lane='history', step=2, requested_at=datetime.fromtimestamp(
+            b + j * 0.01, timezone.utc).isoformat()) for j in range(attempts(k, covered)))
+    return load_evidence(rows, observations, datetime.fromtimestamp(t0, timezone.utc),
+                         datetime.fromtimestamp(t0 + count * 300, timezone.utc), step=2,
+                         policy=load_transport_policy())
+
+
+def test_partially_paused_bins_need_prorated_load():
+    policy = load_transport_policy()
+    threshold = policy.steps[2] * (1 - policy.live_share) * 5 * policy.pace.history_quota_fraction
+    need = lambda covered: math.ceil(threshold * (1 - covered / 300))
+    # Review #2049: 9 of 10 bins idle around a ~20 s pause must not prove load.
+    idle = slow_sql_bins(30, lambda k, covered: need(0) if k % 10 == 0 else 0)
+    assert idle['sql_gap_allowed'] and idle['sql_unknown']['pause_count'] == 30
+    assert idle['paused_intervals'] == 0
+    assert idle['loaded_intervals'] == 3 and idle['eligible_intervals'] >= 30
+    assert idle['load_fraction'] < policy.pace.loaded_interval_fraction
+    prorated = slow_sql_bins(30, lambda k, covered: need(covered))
+    assert prorated['loaded_intervals'] == prorated['eligible_intervals'] - prorated['unknown_intervals']
+    short = slow_sql_bins(30, lambda k, covered: need(covered) - 1 if covered else need(0))
+    assert short['loaded_intervals'] == 0
+    full = slow_sql_bins(4, lambda k, covered: need(covered), full_pause=True)
+    assert [b['status'] for b in full['bins']][:3] == ['loaded', 'paused', 'loaded']
+
+
+@pytest.mark.parametrize('unexplained', [False, True])
+def test_s2_recorded_slow_sql_window_pauses_instead_of_restarting(controller, unexplained):
+    c = controller
+    s2_sql_lane(c)
+    start = c.state['start']
+    rows = recorded_slow_sql(c, 31)
+    if unexplained:
+        next(r for r in rows if not r['known'])['sql_lag_safe'] = False
+    with c.store.db() as db:
+        db.executemany('INSERT INTO evidence(kind, at, payload) VALUES (?, ?, ?)',
+            [('observation', r['at'], json.dumps({k: v for k, v in r.items() if k != 'at'})) for r in rows])
+    c.clock.now = datetime.fromtimestamp(rows[-1]['at'], timezone.utc) + timedelta(seconds=1)
+    c.io.values['debt'] = dict(rows[-1], epoch=c.state['epoch'], restart_at=start,
+                              mandatory_restart_at=start, sequence=99)
+    c.observe()
+    sql = c.state['sql_unknown']
+    assert sql['seconds'] + sql['pause_seconds'] > SQL_UNKNOWN_TOTAL  # Restarted before #2049.
+    restarted = any(row.get('event') == 'window_restarted'
+                    for row in c.store.rows('lifecycle', start, c.now().timestamp()))
+    assert restarted is unexplained
+    assert (c.state['start'] == start) is not unexplained
+    if not unexplained:
+        assert sql['allowed'] and sql['seconds'] == 0 and sql['pause_count'] == 155
+        text = '\n'.join(format_measurement(dict(step=2, load=dict(sql_unknown=sql))))
+        assert f"SQL unknown: 0; всего 0 с; максимум {sql['longest_seconds']} с" in text
+        assert f"паузы медленного SQL 155, всего {sql['pause_seconds']:.0f} с" in text
+
+
+@pytest.mark.parametrize('seconds', [1500, 1501])
+def test_s2_closed_slow_sql_pause_keeps_continuous_limit(controller, seconds):
+    c = controller
+    query = s2_sql_lane(c)
+    start = c.state['start']
+    query(29 + seconds)
+    c.clock.now += timedelta(seconds=1)
+    query(0)  # Known zero debt closes a pause of exactly `seconds`.
+    assert (c.state['start'] == start) is (seconds == 1500)
+    if seconds == 1500:
+        assert c.state['sql_unknown']['pause_seconds'] == 1500
 
 
 class TrinoError(Exception):
