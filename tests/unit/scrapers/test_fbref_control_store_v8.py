@@ -797,7 +797,15 @@ def test_lane_unprocessed_raw_includes_failed_source_runs_oldest_first():
     assert "observed.parser_version = %s" in sql
     assert "observed.typed_parser_version = %s" in sql
     assert "observed.stateful_parser_version = %s" in sql
-    assert "ORDER BY COALESCE( attempt.finished_at, attempt.started_at )" in sql
+    # Raw never parsed successfully comes before parser-version lag (#2050).
+    order_by = sql.split("ORDER BY ", 1)[1]
+    assert order_by.startswith(
+        "EXISTS ( SELECT 1 FROM fbref_control.observation_processing AS prior"
+    )
+    assert order_by.endswith(
+        "), COALESCE( attempt.finished_at, attempt.started_at ), "
+        "attempt.attempt_id LIMIT %s"
+    )
     assert captured["params"] == (
         "fbref",
         "current",

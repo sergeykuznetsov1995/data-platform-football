@@ -9461,8 +9461,10 @@ class ControlStore:
 
         Selection is intentionally independent of the source crawl-run status:
         a successful immutable raw commit remains recoverable when a later task
-        made its parent run fail or get cancelled.  Oldest raw is drained first
-        so repeated bounded calls cannot starve earlier observations.
+        made its parent run fail or get cancelled.  Raw without any successful
+        parse comes before parser-version lag; within each, oldest raw is
+        drained first so repeated bounded calls cannot starve earlier
+        observations.
 
         Quarantined targets are excluded: their raw is out of scope by the same
         decision that retired them, and without this a page the parser has
@@ -9581,7 +9583,8 @@ class ControlStore:
                              ))
                     )
                   )
-                ORDER BY COALESCE(
+                ORDER BY """ + _PARSER_VERSION_LAG_SQL + """,
+                    COALESCE(
                     attempt.finished_at, attempt.started_at
                 ), attempt.attempt_id
                 LIMIT %s
