@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -145,6 +146,8 @@ def test_season_close_requires_new_current_edition_and_preserves_old_scope():
             {'competition_id': 'GB1', 'edition_id': '2026', 'is_current': True, 'registry_snapshot_id': 'new'}]
     assert closed_targets(prior, rows)[0].scope_id == 'GB1__2025'
     assert not closed_targets(prior, rows[:1])
+    # An untiered competition is stored with tier null and still ranks last (#2052).
+    assert closed_targets([{**prior[0], 'tier': None}], rows)[0].tier == math.inf
 
 
 def test_deployment_pool_preflight_rejects_overlapping_exits_without_secret_output(tmp_path):
