@@ -1,0 +1,309 @@
+-- silver.fotmob_match_player_stats — значение статистики игрока в матче: игрок x группа x показатель
+-- (#2017, эпик #1677). Схема-истина: core_schema.yaml (tables.fotmob_match_player_stats) + README.
+-- player_stats_json:$.<player_key>.stats[*].stats.<title>. local_player_key — ключ строки состава
+-- той же карточки (разбор состава — как в fotmob_match_lineups.sql.j2): по id, а если id 0/нет —
+-- по optaId; игрока нет в составе -> 'stats:' || <player_key>. side — по teamId против команд матча.
+-- Пустой stat_group -> строка отбрасывается.
+-- Pure SELECT; заполнители fotmob_calendar_scope / fotmob_payload_scope — см. fotmob_matches.sql.j2.
+WITH
+-- fotmob_match_key:begin
+-- Общий блок матчевого семейства FotMob (#2017). Текст между маркерами побайтно одинаков во всех
+-- 8 файлах fotmob_{matches,match_teams,match_team_stats,match_lineups,match_player_stats,
+-- match_events,shots,match_momentum}.sql.j2 — тест test_fotmob_match_silver_sql это проверяет.
+--   cal        календарь, дедуп по (competition_id, source_season_key, match_id);
+--   match_key  одна строка на (competition_id, match_id): ключ самого точного сезона — дочерний
+--              «P - <часть>», если в календаре есть и родитель P; иначе единственный ключ;
+--              несколько несвязанных ключей -> самый длинный, при равенстве лексикографически
+--              больший (multi_key_unrelated — для сверки, в выход не идёт);
+--   card_pick  одна карточка на (competition_id, match_id) БЕЗ сезона: у split-сезонов она лежит
+--              под родительским ключом; последняя по _observed_at, _ingested_at, _target_batch_id
+--              (только лёгкие колонки; секции card_body присоединяются в match_base);
+--   match_base календарь FULL JOIN выбранная карточка: единственный источник ключа сезона и
+--              карточки для всех таблиц; карточка без календаря — под ключом своей карточки.
+-- Пустой/неприводимый competition_id, match_id или ключ сезона -> строка отбрасывается.
+cal AS (
+    SELECT
+        competition_id, source_season_key, match_id, scope_stage_id, utc_time, timezone,
+        postponed, score_text, status_reason_short, status_reason_short_key,
+        status_reason_long, status_reason_long_key, home_team_id, home_team_name,
+        home_team_short_name, away_team_id, away_team_name, away_team_short_name,
+        home_score, away_score, finished, started, cancelled, awarded, round_id, round_name,
+        stage_id, group_name, page_url,
+        _target_batch_id, _observed_at, _ingested_at, _parser_version
+    FROM (
+        SELECT
+            c.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key, match_id
+                ORDER BY _observed_at DESC, _ingested_at DESC
+            ) AS cal_rn
+        FROM iceberg.bronze.fotmob_matches_current c
+        WHERE
+            {{ fotmob_calendar_scope }}
+    ) d
+    WHERE cal_rn = 1
+      AND competition_id IS NOT NULL
+      AND match_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+),
+cal_key AS (
+    SELECT
+        c.*,
+        CASE WHEN p.source_season_key IS NOT NULL THEN 1 ELSE 0 END AS is_child_key
+    FROM cal c
+    LEFT JOIN cal p
+      ON p.competition_id = c.competition_id
+     AND p.match_id = c.match_id
+     AND p.source_season_key = regexp_extract(c.source_season_key, '^(.+?) - (.+)$', 1)
+),
+match_key AS (
+    SELECT *
+    FROM (
+        SELECT
+            k.*,
+            COUNT(*) OVER (PARTITION BY competition_id, match_id)
+                - SUM(is_child_key) OVER (PARTITION BY competition_id, match_id) > 1
+                AS multi_key_unrelated,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, match_id
+                ORDER BY is_child_key DESC, length(source_season_key) DESC, source_season_key DESC
+            ) AS key_rn
+        FROM cal_key k
+    ) r
+    WHERE key_rn = 1
+),
+card_pick AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id_raw AS BIGINT) AS competition_id,
+            competition_id_raw, card_season_key, match_id, home_team_id, away_team_id,
+            page_url, utc_time, _target_batch_id, _observed_at, _ingested_at, _parser_version,
+            ROW_NUMBER() OVER (
+                PARTITION BY TRY_CAST(competition_id_raw AS BIGINT), match_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC
+            ) AS card_rn
+        FROM (
+            SELECT
+                competition_id AS competition_id_raw,
+                source_season_key AS card_season_key,
+                match_id, home_team_id, away_team_id, page_url, utc_time,
+                _target_batch_id, _observed_at, _ingested_at, _parser_version
+            FROM iceberg.bronze.fotmob_match_payloads_current
+            WHERE
+                {{ fotmob_payload_scope }}
+        ) s
+    ) d
+    WHERE card_rn = 1
+      AND competition_id IS NOT NULL
+      AND match_id IS NOT NULL
+),
+card_body AS (
+    SELECT
+        competition_id AS competition_id_raw,
+        source_season_key AS card_season_key,
+        match_id,
+        COALESCE(_target_batch_id, '') AS card_batch_key,
+        available_sections_json, missing_expected_sections_json, match_facts_json, stats_json,
+        player_stats_json, lineup_json, shotmap_json, h2h_json, momentum_json, payload_json
+    FROM iceberg.bronze.fotmob_match_payloads_current
+    WHERE
+        {{ fotmob_payload_scope }}
+),
+match_light AS (
+    SELECT *
+    FROM (
+        SELECT
+            COALESCE(k.competition_id, cd.competition_id) AS competition_id,
+            COALESCE(k.source_season_key, cd.card_season_key) AS source_season_key,
+            COALESCE(k.match_id, cd.match_id) AS match_id,
+            k.match_id IS NOT NULL AS has_calendar,
+            cd.match_id IS NOT NULL AS has_payload,
+            k.multi_key_unrelated,
+            cd.competition_id_raw AS card_competition_id_raw,
+            cd.card_season_key,
+            COALESCE(cd._target_batch_id, '') AS card_batch_key,
+            COALESCE(k.home_team_id, cd.home_team_id) AS home_team_id,
+            COALESCE(k.away_team_id, cd.away_team_id) AS away_team_id,
+            COALESCE(k.page_url, cd.page_url) AS page_url,
+            COALESCE(k.utc_time, cd.utc_time) AS calendar_utc_time,
+            k.scope_stage_id, k.timezone, k.postponed, k.score_text,
+            k.status_reason_short, k.status_reason_short_key,
+            k.status_reason_long, k.status_reason_long_key,
+            k.home_team_name, k.home_team_short_name, k.away_team_name, k.away_team_short_name,
+            k.home_score, k.away_score, k.finished, k.started, k.cancelled, k.awarded,
+            k.round_id, k.round_name, k.stage_id, k.group_name,
+            CASE WHEN cd.match_id IS NOT NULL THEN cd._target_batch_id
+                 ELSE k._target_batch_id END AS _bronze_batch_id,
+            CASE WHEN cd.match_id IS NOT NULL THEN cd._observed_at
+                 ELSE k._observed_at END AS _bronze_observed_at,
+            CASE WHEN cd.match_id IS NOT NULL THEN cd._ingested_at
+                 ELSE k._ingested_at END AS _bronze_ingested_at,
+            CASE WHEN cd.match_id IS NOT NULL THEN cd._parser_version
+                 ELSE k._parser_version END AS _parser_version
+        FROM match_key k
+        FULL OUTER JOIN card_pick cd
+          ON cd.competition_id = k.competition_id
+         AND cd.match_id = k.match_id
+    ) b
+    WHERE source_season_key IS NOT NULL
+      AND source_season_key <> ''
+),
+-- Тяжёлые секции карточки присоединяются к лёгкому выбору (match_light) по её identity:
+-- окно и сторона построения JOIN не держат JSON карточек в памяти Trino.
+match_base AS (
+    SELECT
+        l.*,
+        h.available_sections_json, h.missing_expected_sections_json, h.match_facts_json,
+        h.stats_json, h.player_stats_json, h.lineup_json, h.shotmap_json, h.h2h_json,
+        h.momentum_json, h.payload_json
+    FROM card_body h
+    JOIN match_light l
+      ON l.card_competition_id_raw = h.competition_id_raw
+     AND l.card_season_key = h.card_season_key
+     AND l.match_id = h.match_id
+     AND l.card_batch_key = h.card_batch_key
+    UNION ALL
+    SELECT
+        l.*,
+        CAST(NULL AS VARCHAR) AS available_sections_json,
+        CAST(NULL AS VARCHAR) AS missing_expected_sections_json,
+        CAST(NULL AS VARCHAR) AS match_facts_json,
+        CAST(NULL AS VARCHAR) AS stats_json,
+        CAST(NULL AS VARCHAR) AS player_stats_json,
+        CAST(NULL AS VARCHAR) AS lineup_json,
+        CAST(NULL AS VARCHAR) AS shotmap_json,
+        CAST(NULL AS VARCHAR) AS h2h_json,
+        CAST(NULL AS VARCHAR) AS momentum_json,
+        CAST(NULL AS VARCHAR) AS payload_json
+    FROM match_light l
+    WHERE NOT l.has_payload
+),
+-- fotmob_match_key:end
+lineup_teams AS (
+    SELECT
+        b.competition_id, b.source_season_key, b.match_id,
+        b._bronze_batch_id, b._bronze_observed_at, b._bronze_ingested_at, b._parser_version,
+        CAST(t.side AS VARCHAR) AS side,
+        CASE WHEN t.side = 'home' THEN json_extract(b.lineup_json, '$.homeTeam')
+             ELSE json_extract(b.lineup_json, '$.awayTeam') END AS team_j
+    FROM match_base b
+    CROSS JOIN (VALUES ('home'), ('away')) AS t(side)
+    WHERE b.has_payload
+),
+lineup_players AS (
+    SELECT
+        r.*,
+        CAST(p.player_index AS INTEGER) AS lineup_index,
+        CAST(r.side || ':' || r.lineup_role || ':' || CAST(p.player_index AS VARCHAR) AS VARCHAR)
+            AS local_player_key,
+        p.player_j
+    FROM (
+        SELECT
+            t.*,
+            CAST(l.lineup_role AS VARCHAR) AS lineup_role,
+            TRY_CAST(CASE WHEN l.lineup_role = 'starter' THEN json_extract(t.team_j, '$.starters')
+                          ELSE json_extract(t.team_j, '$.subs') END AS ARRAY(JSON)) AS players
+        FROM lineup_teams t
+        CROSS JOIN (VALUES ('starter'), ('sub')) AS l(lineup_role)
+    ) r
+    CROSS JOIN UNNEST(r.players) WITH ORDINALITY AS p(player_j, player_index)
+),
+lineup_ids AS (
+    SELECT
+        p.competition_id,
+        p.match_id,
+        p.local_player_key,
+        NULLIF(TRY_CAST(json_extract_scalar(p.player_j, '$.id') AS BIGINT), 0) AS player_id,
+        json_extract_scalar(p.player_j, '$.optaId') AS opta_id
+    FROM lineup_players p
+),
+stat_players AS (
+    SELECT
+        x.*,
+        NULLIF(TRY_CAST(json_extract_scalar(x.player_j, '$.id') AS BIGINT), 0) AS player_id,
+        json_extract_scalar(x.player_j, '$.optaId') AS opta_id,
+        TRY_CAST(json_extract_scalar(x.player_j, '$.teamId') AS BIGINT) AS team_id
+    FROM (
+        SELECT
+            m.competition_id, m.source_season_key, m.match_id, m.home_team_id, m.away_team_id,
+            m._bronze_batch_id, m._bronze_observed_at, m._bronze_ingested_at, m._parser_version,
+            CAST(k.player_key AS VARCHAR) AS player_key,
+            element_at(m.player_stats_map, k.player_key) AS player_j
+        FROM (
+            SELECT
+                b.competition_id, b.source_season_key, b.match_id, b.home_team_id, b.away_team_id,
+                b._bronze_batch_id, b._bronze_observed_at, b._bronze_ingested_at, b._parser_version,
+                TRY_CAST(json_extract(b.player_stats_json, '$') AS MAP(VARCHAR, JSON)) AS player_stats_map
+            FROM match_base b
+            WHERE b.has_payload
+        ) m
+        CROSS JOIN UNNEST(map_keys(m.player_stats_map)) AS k(player_key)
+    ) x
+),
+keyed_players AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            l.local_player_key AS lineup_player_key,
+            ROW_NUMBER() OVER (
+                PARTITION BY s.competition_id, s.match_id, s.player_key
+                ORDER BY l.local_player_key
+            ) AS lineup_rn
+        FROM stat_players s
+        LEFT JOIN lineup_ids l
+          ON l.competition_id = s.competition_id
+         AND l.match_id = s.match_id
+         AND (
+                (s.player_id IS NOT NULL AND l.player_id = s.player_id)
+             OR (s.player_id IS NULL AND s.opta_id IS NOT NULL AND l.opta_id = s.opta_id)
+         )
+    ) j
+    WHERE lineup_rn = 1
+),
+stat_groups AS (
+    SELECT
+        p.*,
+        json_extract_scalar(g.group_j, '$.key') AS stat_group,
+        json_extract_scalar(g.group_j, '$.title') AS stat_group_title,
+        TRY_CAST(json_extract(g.group_j, '$.stats') AS MAP(VARCHAR, JSON)) AS group_stats_map
+    FROM keyed_players p
+    CROSS JOIN UNNEST(TRY_CAST(json_extract(p.player_j, '$.stats') AS ARRAY(JSON))) AS g(group_j)
+),
+stat_values AS (
+    SELECT
+        g.*,
+        CAST(t.stat_title AS VARCHAR) AS stat_title,
+        element_at(g.group_stats_map, t.stat_title) AS stat_j
+    FROM stat_groups g
+    CROSS JOIN UNNEST(map_keys(g.group_stats_map)) AS t(stat_title)
+    WHERE g.stat_group IS NOT NULL AND g.stat_group <> ''
+)
+SELECT
+    v.competition_id,
+    v.source_season_key,
+    v.match_id,
+    COALESCE(v.lineup_player_key, CAST('stats:' || v.player_key AS VARCHAR)) AS local_player_key,
+    CAST(CASE WHEN v.team_id = v.home_team_id THEN 'home'
+              WHEN v.team_id = v.away_team_id THEN 'away' END AS VARCHAR) AS side,
+    v.team_id,
+    v.player_id,
+    v.opta_id,
+    json_extract_scalar(v.player_j, '$.name') AS player_name,
+    TRY_CAST(json_extract_scalar(v.player_j, '$.isGoalkeeper') AS BOOLEAN) AS is_goalkeeper,
+    v.stat_group,
+    v.stat_group_title,
+    v.stat_title,
+    json_extract_scalar(v.stat_j, '$.key') AS stat_key,
+    TRY_CAST(json_extract_scalar(v.stat_j, '$.stat.value') AS DOUBLE) AS stat_value,
+    TRY_CAST(json_extract_scalar(v.stat_j, '$.stat.total') AS DOUBLE) AS stat_total,
+    json_extract_scalar(v.stat_j, '$.stat.type') AS stat_type,
+    json_format(v.stat_j) AS stat_json,
+    v._bronze_batch_id,
+    v._bronze_observed_at,
+    v._bronze_ingested_at,
+    v._parser_version,
+    CAST(NULL AS VARCHAR) AS _conform_issues_json
+FROM stat_values v
