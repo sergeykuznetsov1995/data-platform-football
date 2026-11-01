@@ -784,6 +784,7 @@ class FakeControl:
         typed_parser_version=None,
         stateful_parser_version=None,
         include_quarantined=True,
+        owned_shells_only=False,
     ):
         rows = [
             item for item in self.fetches if item["page_kind"] in page_kinds
@@ -804,10 +805,16 @@ class FakeControl:
                     str(typed_parser_version),
                     str(stateful_parser_version),
                 ), {}).get("status") != "succeeded"
-                and self.observations.get((
-                    str(item["logical_refresh_id"]), str(parser_version),
-                    str(typed_parser_version), str(stateful_parser_version),
-                ), {}).get("error_class") != "IncompleteMatchPageError"
+                and not (
+                    self.observations.get((
+                        str(item["logical_refresh_id"]), str(parser_version),
+                        str(typed_parser_version), str(stateful_parser_version),
+                    ), {}).get("error_class") == "IncompleteMatchPageError"
+                    # Recovery mirrors the store: only an owned shell is skipped.
+                    and (not owned_shells_only or self.frontier.get(
+                        str(item["target_id"]), {}
+                    ).get("state") in {"queued", "retry", "leased"})
+                )
             ]
         return rows[:limit]
 
@@ -850,6 +857,7 @@ class FakeControl:
             page_kinds=page_kinds,
             limit=limit,
             only_unparsed=True,
+            owned_shells_only=True,
             parser_version=parser_version,
             typed_parser_version=typed_parser_version,
             stateful_parser_version=stateful_parser_version,
@@ -16245,3 +16253,41 @@ def test_validation_reports_version_lag_and_match_shells_without_gating(tmp_path
         "incomplete_match_exhausted_count": 5,
     }
     assert "finish:True" in control.events
+
+
+def test_recovery_reparses_an_unowned_shell_and_schedules_its_refetch(tmp_path, monkeypatch):
+    """#2051 R3: a shell left fetched with no pending refetch (the old
+    three-try cap) is picked up again and gets a refetch, not overdue raw."""
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218",)
+    )
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    record = records[0]
+    # First pass: the shell fails, but the refetch is refused (cap reached).
+    control.schedule_incomplete_match_refetch = lambda *_a, **_k: False
+    with pytest.raises(ParseWaveError):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+        )
+    assert control.frontier[record.target_id]["state"] == "fetched"
+    scheduled = []
+
+    def refetch(target_id, **kwargs):
+        scheduled.append(target_id)
+        control.frontier[target_id]["state"] = "retry"
+        return True
+
+    control.schedule_incomplete_match_refetch = refetch
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+    assert result.cohort_size == 1
+    assert result.incomplete_match_refetches == 1
+    assert scheduled == [record.target_id]
+    # Owned now: the next recovery does not select it again.
+    assert pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    ).cohort_size == 0
+    assert typed.calls == []

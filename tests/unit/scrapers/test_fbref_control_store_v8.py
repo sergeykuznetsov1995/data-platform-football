@@ -822,6 +822,9 @@ def test_lane_unprocessed_raw_includes_failed_source_runs_oldest_first():
         "page-v2",
         "typed-v3",
         "stateful-v4",
+        "page-v2",
+        "typed-v3",
+        "stateful-v4",
         10,
     )
 
@@ -968,9 +971,9 @@ def test_unprocessed_fetches_skip_only_provably_superseded_failed_observation():
     assert "newer_attempt.content_hash <> attempt.content_hash" not in sql
     # Exact parser triples are required for both the current failure and the
     # newer success. A different-version success must remain visible.
-    assert captured["params"].count("page-v2") == 3
-    assert captured["params"].count("typed-v3") == 3
-    assert captured["params"].count("stateful-v4") == 3
+    assert captured["params"].count("page-v2") == 4
+    assert captured["params"].count("typed-v3") == 4
+    assert captured["params"].count("stateful-v4") == 4
 
 
 def test_unprocessed_list_and_summary_use_the_same_superseded_rule():
@@ -2732,11 +2735,18 @@ def test_season_reconcile_releases_claimed_urls_before_it_upserts_them():
 
 
 def test_incomplete_match_raw_is_not_replayed_before_its_fresh_fetch():
-    # Reuse the current-version failure fence; other failed raw still requires
-    # newer successful processing before it disappears from recovery.
+    # Recovery skips a shell only while a fresh request owns it -- the same
+    # rule as the run gate (#2051 R3). A shell nobody owns (fetched, no
+    # pending refetch, e.g. after the old three-try cap) is selected again,
+    # so its re-parse schedules a refetch or parks it instead of going
+    # overdue for ever. Other failed raw still needs a newer success.
+    from scrapers.fbref.control.store import _OWNED_MATCH_SHELL_SQL
+
     recovery = ' '.join(inspect.getsource(ControlStore.list_unprocessed_fetches).split())
-    assert "AND (failed_observed.error_class = 'IncompleteMatchPageError' OR EXISTS (" in recovery
+    assert "failed_observed.error_class = 'IncompleteMatchPageError'" not in recovery
+    assert 'AND NOT """ + _OWNED_MATCH_SHELL_SQL + """' in recovery
     assert "failed_observed.typed_parser_version = %s" in recovery
+    assert "refetch_owner.state IN ('queued', 'retry', 'leased')" in _OWNED_MATCH_SHELL_SQL
     replay = ' '.join(inspect.getsource(ControlStore.list_run_fetches).split())
     assert "OR (observed.status = 'failed' AND observed.error_class = 'IncompleteMatchPageError')" in replay
     frontier = inspect.getsource(ControlStore.get_frontier_target)

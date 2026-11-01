@@ -6358,7 +6358,12 @@ class ControlStore:
     def schedule_incomplete_match_refetch(
         self, target_id: object, *, content_hash: object, logical_refresh_id: object,
     ) -> bool:
-        """Request fresh raw inside a bounded window; stale replay cannot spend it."""
+        """Request fresh raw inside a bounded window.
+
+        A replay of the same raw spends nothing while its refetch is armed;
+        if that refetch was lost (target no longer queued/retry, not parked)
+        it re-arms.
+        """
         target = _text(target_id, "target_id")
         digest = _text(content_hash, "content_hash")
         refresh = _uuid(logical_refresh_id, "logical_refresh_id")
@@ -6376,7 +6381,11 @@ class ControlStore:
                         THEN clock_timestamp() ELSE retry.window_started_at END,
                     exhausted_at = NULL,
                     logical_refresh_id = EXCLUDED.logical_refresh_id
-                WHERE retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                WHERE (retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                       OR retry.exhausted_at IS NULL AND NOT EXISTS (
+                         SELECT 1 FROM fbref_control.page_frontier AS armed
+                         WHERE armed.target_id = retry.target_id
+                           AND armed.state IN ('queued', 'retry')))
                     AND ({reset} OR retry.window_started_at
                          > clock_timestamp() - %s * interval '1 day')
                 RETURNING attempts""",
@@ -9641,6 +9650,10 @@ class ControlStore:
         drained first so repeated bounded calls cannot starve earlier
         observations.
 
+        A scored match shell is excluded only while a fresh request owns it
+        (the same rule as the run gate, #2051); a shell nobody owns is
+        selected again so its re-parse schedules a refetch or parks it.
+
         Quarantined targets are excluded: their raw is out of scope by the same
         decision that retired them, and without this a page the parser has
         already proven unusable would be re-selected by every later run.
@@ -9732,8 +9745,7 @@ class ControlStore:
                         AND failed_observed.typed_parser_version = %s
                         AND failed_observed.stateful_parser_version = %s
                         AND failed_observed.status = 'failed'
-                        AND (failed_observed.error_class = 'IncompleteMatchPageError'
-                             OR EXISTS (
+                        AND (EXISTS (
                       SELECT 1
                       FROM fbref_control.fetch_attempt AS newer_attempt
                       JOIN fbref_control.observation_processing
@@ -9758,6 +9770,7 @@ class ControlStore:
                              ))
                     )
                   )
+                  AND NOT """ + _OWNED_MATCH_SHELL_SQL + """
                 ORDER BY """ + _PARSER_VERSION_LAG_SQL + """,
                     COALESCE(
                     attempt.finished_at, attempt.started_at
@@ -9771,6 +9784,9 @@ class ControlStore:
                     kinds,
                     history_run_id,
                     history_run_id,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     typed_parser,
                     stateful_parser,
