@@ -3049,7 +3049,8 @@ def _count_deferred_match_manifests(run_id, control):
             for row in json.loads(haystack)
         )))
         tables = {
-            "fetch_attempt": [{**row, "status": "succeeded"} for row in evidence],
+            "fetch_attempt": [{**row, "status": "succeeded", "lease_epoch": 1}
+                              for row in evidence],
             "page_frontier": [{"target_id": row["target_id"], "state": "fetched"}
                               for row in evidence],
             "observation_processing": [{
@@ -3058,6 +3059,8 @@ def _count_deferred_match_manifests(run_id, control):
             }],
             "dataset_manifest": control.manifests,
         }
+        db.execute("CREATE TABLE fbref_control.incomplete_match_refetch "
+                   "(target_id TEXT, attempts TEXT, logical_refresh_id TEXT)")
         for name, rows in tables.items():
             columns = sorted(set().union(*(row.keys() for row in rows)))
             db.execute(f"CREATE TABLE fbref_control.{name} (" +
@@ -3261,7 +3264,56 @@ def test_parser_version_lag_is_prior_success_without_later_failure():
     assert rows == {"lag": 1, "never-parsed": 0, "fresh-failed": 0, "refused": 0}
 
 
-def test_run_summary_splits_version_lag_from_lane_sla():
+def test_owned_match_shell_requires_live_refetch_or_newer_fetch():
+    """#2051: a shell is settled only while a fresh request owns its target."""
+    from scrapers.fbref.control.store import _OWNED_MATCH_SHELL_SQL
+
+    current = ("page-v4", "typed-v5", "disc-v6")
+    database = _shell_lag_db()
+    cases = {
+        # refresh: (frontier state, refetch row, newer succeeded fetch, error)
+        "scheduled": ("retry", True, False, "IncompleteMatchPageError"),
+        "superseded": ("fetched", False, True, "IncompleteMatchPageError"),
+        "lost": ("fetched", True, False, "IncompleteMatchPageError"),
+        "never_scheduled": ("retry", False, False, "IncompleteMatchPageError"),
+        "other_error": ("retry", True, False, "TypedBronzeError"),
+    }
+    for refresh, (state, refetch, newer, error) in cases.items():
+        target = "t-" + refresh
+        database.execute("INSERT INTO fbref_control.page_frontier VALUES (?,?)",
+                         (target, state))
+        database.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?)",
+                         (target, refresh, 1, "succeeded"))
+        if refetch:
+            database.execute(
+                "INSERT INTO fbref_control.incomplete_match_refetch VALUES (?,?,?)",
+                (target, 1, refresh),
+            )
+        if newer:
+            database.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?)",
+                             (target, refresh + "-newer", 2, "succeeded"))
+        _observe(database, refresh, current, "failed", error_class=error)
+    # The same shell on an older parser generation is not this run's verdict.
+    database.execute("INSERT INTO fbref_control.page_frontier VALUES ('t-old', 'retry')")
+    database.execute("INSERT INTO fbref_control.fetch_attempt VALUES ('t-old', 'old', 1, 'succeeded')")
+    database.execute("INSERT INTO fbref_control.incomplete_match_refetch VALUES ('t-old', 1, 'old')")
+    _observe(database, "old", ("page-v4", "typed-v4", "disc-v6"), "failed",
+             error_class="IncompleteMatchPageError")
+    rows = dict(database.execute(
+        "SELECT attempt.logical_refresh_id, "
+        + _OWNED_MATCH_SHELL_SQL.replace("%s", "?")
+        + " FROM fbref_control.fetch_attempt AS attempt WHERE attempt.lease_epoch = 1",
+        current,
+    ).fetchall())
+    database.close()
+
+    assert rows == {
+        "scheduled": 1, "superseded": 1, "lost": 0, "never_scheduled": 0,
+        "other_error": 0, "old": 0,
+    }
+
+
+def test_run_summary_splits_version_lag_from_lane_sla_and_hides_owned_shells():
     run_id = str(uuid.uuid4())
     captured = {}
 
@@ -3270,7 +3322,10 @@ def test_run_summary_splits_version_lag_from_lane_sla():
         if "SELECT * FROM fbref_control.crawl_run" in sql:
             return [{"run_id": run_id, "run_type": "current"}], 1
         if ") AS missing" in sql:
+            captured["missing"] = sql
             return [{"count": 0}], 1
+        if "SELECT manifest.validation_status" in sql:
+            captured["manifest"] = sql
         if "AS global_sla_overdue_count" in sql:
             captured["raw"] = (sql, params)
             return [{
@@ -3280,6 +3335,9 @@ def test_run_summary_splits_version_lag_from_lane_sla():
                 "lane_oldest_raw_at": None, "global_oldest_raw_at": None,
                 "lane_version_lag_count": 51_058, "global_version_lag_count": 63_118,
             }], 1
+        if sql.startswith("SELECT count(*) FILTER ( WHERE frontier.state IN"):
+            captured["shells"] = params
+            return [{"pending_count": 35, "exhausted_count": 5}], 1
         return [], 0
 
     store, _ = make_store(handler)
@@ -3298,9 +3356,14 @@ def test_run_summary_splits_version_lag_from_lane_sla():
     assert "NOT version_lag.lagging" in lane_sla
     assert "NOT version_lag.lagging" in global_sla
     assert "CROSS JOIN LATERAL ( SELECT EXISTS ( SELECT 1 FROM fbref_control.observation_processing AS prior" in raw_sql
-    assert raw_params.count("typed-v5") == 3
+    assert raw_params.count("typed-v5") == 4
+    for sql in (raw_sql, captured["missing"], captured["manifest"]):
+        assert "shell.error_class = 'IncompleteMatchPageError'" in sql
     assert summary["parser_version_lag_raw_count"] == 51_058
     assert summary["parser_version_lag_raw_by_page_kind"] == {"match": 51_058}
     assert summary["global_parser_version_lag_raw_count"] == 63_118
     assert summary["lane_unprocessed_raw_sla_overdue_count"] == 0
+    assert summary["incomplete_match_refetch_pending_count"] == 35
+    assert summary["incomplete_match_exhausted_count"] == 5
+    assert captured["shells"] == ("incomplete_match_exhausted",)
 

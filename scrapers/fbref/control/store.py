@@ -963,6 +963,40 @@ _PARSER_VERSION_LAG_SQL = """EXISTS (
       )
 )"""
 
+# A scored match shell on the current parsers whose recovery a fresh request
+# owns (#2051): a refetch is scheduled/in flight, or a newer fetch landed.
+# A shell whose refetch was lost stays visible.  Params: three parser versions.
+_OWNED_MATCH_SHELL_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS shell
+    WHERE shell.logical_refresh_id = attempt.logical_refresh_id
+      AND shell.parser_version = %s
+      AND shell.typed_parser_version = %s
+      AND shell.stateful_parser_version = %s
+      AND shell.status = 'failed'
+      AND shell.error_class = 'IncompleteMatchPageError'
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM fbref_control.fetch_attempt AS refetched
+          WHERE refetched.target_id = attempt.target_id
+            AND refetched.lease_epoch > attempt.lease_epoch
+            AND refetched.status = 'succeeded'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM fbref_control.incomplete_match_refetch AS refetch
+          JOIN fbref_control.page_frontier AS refetch_owner
+            ON refetch_owner.target_id = refetch.target_id
+          WHERE refetch.target_id = attempt.target_id
+            AND refetch_owner.state IN ('queued', 'retry', 'leased')
+        )
+      )
+)"""
+
+# Reason prefix of a shell retired after its last fresh request (#2051).
+INCOMPLETE_MATCH_EXHAUSTED_REASON = "incomplete_match_exhausted"
+
 
 # One definition of a historically eligible competition (#1949): current
 # male rows plus source-proven discontinued ones. Callers alias the registry
@@ -7933,6 +7967,10 @@ class ControlStore:
                     manifest.validation_status = 'failed'
                     AND ({deferred_manifest_sql})
                   )
+                  AND NOT (
+                    manifest.validation_status = 'failed'
+                    AND {_OWNED_MATCH_SHELL_SQL}
+                  )
                   AND (
                     %s::text IS NULL
                     OR (
@@ -7955,6 +7993,9 @@ class ControlStore:
                     run,
                     deferred_json,
                     deferred_json,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     parser,
                     typed_parser,
@@ -7979,6 +8020,7 @@ class ControlStore:
                       AND attempt.status = 'succeeded'
                       AND frontier.state <> 'quarantined'
                       AND NOT ({_DEFERRED_PARSE_ATTEMPT_SQL})
+                      AND NOT {_OWNED_MATCH_SHELL_SQL}
                       AND (
                         (
                           %s::text IS NULL
@@ -8020,6 +8062,9 @@ class ControlStore:
                 (
                     run,
                     deferred_json,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     parser,
                     parser,
@@ -8621,6 +8666,7 @@ class ControlStore:
                   -- cohort.  Without this the run would clear recovery and
                   -- then fail its own unprocessed-raw gate on the same bytes.
                   AND frontier.state <> 'quarantined'
+                  AND NOT {_OWNED_MATCH_SHELL_SQL}
                   AND (
                     (
                       %s::text IS NULL
@@ -8707,6 +8753,9 @@ class ControlStore:
                     deferred_json,
                     recovery_lane_run_type,
                     recovery_lane_run_type,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     parser,
                     parser,
@@ -8796,6 +8845,28 @@ class ControlStore:
             summary["global_parser_version_lag_raw_count"] = sum(
                 int(row.get("global_version_lag_count") or 0)
                 for row in raw_rows
+            )
+            cursor.execute(
+                """
+                SELECT count(*) FILTER (
+                           WHERE frontier.state IN ('queued', 'retry', 'leased')
+                       ) AS pending_count,
+                       count(*) FILTER (
+                           WHERE frontier.state = 'quarantined'
+                             AND split_part(frontier.last_error_message, ':', 1) = %s
+                       ) AS exhausted_count
+                FROM fbref_control.incomplete_match_refetch AS refetch
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = refetch.target_id
+                """,
+                (INCOMPLETE_MATCH_EXHAUSTED_REASON,),
+            )
+            shells = _fetchone(cursor) or {}
+            summary["incomplete_match_refetch_pending_count"] = int(
+                shells.get("pending_count") or 0
+            )
+            summary["incomplete_match_exhausted_count"] = int(
+                shells.get("exhausted_count") or 0
             )
 
             cursor.execute(

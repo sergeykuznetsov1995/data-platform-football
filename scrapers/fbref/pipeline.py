@@ -8244,10 +8244,12 @@ class FBrefPipeline:
                         other_lane_overdue,
                         summary_run_type,
                     )
-            # Re-parse backlog is reported, not enforced: the recovery drain
-            # owns it (#2050).
+            # Re-parse backlog and match shells are reported, not enforced:
+            # each has an owner (re-parse / fresh request) or a verdict.
             for backlog_metric in (
                 "parser_version_lag_raw_count",
+                "incomplete_match_refetch_pending_count",
+                "incomplete_match_exhausted_count",
             ):
                 backlog = int(summary.get(backlog_metric) or 0)
                 if backlog:
