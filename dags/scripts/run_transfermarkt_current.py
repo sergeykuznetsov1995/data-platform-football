@@ -362,6 +362,36 @@ def _existing_bronze_roster(scraper, competition_id, edition_id):
         connection.close()
 
 
+def _bronze_player_rows(scraper, table, columns, player_ids):
+    """Read per-player career Bronze evidence; only a genuinely absent table is empty."""
+    rows, ids = [], sorted(player_ids, key=int)
+    connection = scraper._bronze_connection()
+    cursor = connection.cursor()
+    try:
+        for offset in range(0, len(ids), 300):
+            packet = ids[offset:offset + 300]
+            placeholders = ','.join('?' for _ in packet)
+            execute_statement(cursor, f'SELECT {columns} FROM iceberg.bronze.{table} '
+                           f'WHERE player_id IN ({placeholders}) GROUP BY player_id', packet)
+            rows.extend(cursor.fetchall())
+    except Exception as exc:
+        if not any(marker in str(exc).lower() for marker in ('table_not_found', 'table not found', 'does not exist')):
+            raise CurrentPortionError('existing career Bronze cannot be verified') from exc
+    finally:
+        cursor.close()
+        connection.close()
+    return rows
+
+
+def _bronze_career_value_dates(scraper, player_ids):
+    return {str(player_id): str(latest) for player_id, latest in _bronze_player_rows(
+        scraper, 'transfermarkt_market_value_points', 'player_id, MAX(mv_date)', player_ids) if latest is not None}
+
+
+def _bronze_career_players(scraper, endpoint, player_ids):
+    return {str(row[0]) for row in _bronze_player_rows(scraper, 'transfermarkt_' + endpoint, 'player_id', player_ids)}
+
+
 def seed_current_baseline(scraper, entry, preflight, verify_complete_scope):
     """Qualify an activation bundle with read-only physical/ops evidence.
 
@@ -427,25 +457,7 @@ def seed_current_baseline(scraper, entry, preflight, verify_complete_scope):
                          'rows_signature': semantic_signature([dict(row) for row in club.rows])}
                 for club_id, club in snapshot.clubs.items() if club.bronze_manifest == receipt['bronze_manifest']}
         pinned_receipts.append({**dict(receipt), 'club_receipts': pins})
-    career_value_dates = {}
-    ids = sorted({row['player_id'] for row in snapshot.rows}, key=int)
-    connection = scraper._bronze_connection()
-    cursor = connection.cursor()
-    try:
-        for offset in range(0, len(ids), 300):
-            packet = ids[offset:offset + 300]
-            placeholders = ','.join('?' for _ in packet)
-            execute_statement(cursor, 'SELECT player_id, MAX(mv_date) FROM iceberg.bronze.transfermarkt_market_value_points '
-                           f'WHERE player_id IN ({placeholders}) GROUP BY player_id', packet)
-            for player_id, latest in cursor.fetchall():
-                if latest is not None:
-                    career_value_dates[str(player_id)] = str(latest)
-    except Exception as exc:
-        if not any(marker in str(exc).lower() for marker in ('table_not_found', 'table not found', 'does not exist')):
-            raise CurrentPortionError('baseline_required: existing value dates cannot be verified') from exc
-    finally:
-        cursor.close()
-        connection.close()
+    career_value_dates = _bronze_career_value_dates(scraper, {row['player_id'] for row in snapshot.rows})
     return {'snapshot': snapshot.as_dict(), 'roster_receipts': pinned_receipts, 'roster_proof': roster_proof,
             'signals': signals, 'coaches_checked_at': at.isoformat(),
             'career_value_dates': career_value_dates, 'warm_baseline': True,
@@ -1188,9 +1200,19 @@ class _Scope:
         self.validate_player_business(snapshot)
         previous_rows = ([row for row in self.snapshot.rows if row['club_id'] in set(snapshot.expected_team_ids)]
                          if self.snapshot else [])
-        for player_id, change in player_changes(previous_rows, snapshot.rows).items():
+        changes = player_changes(previous_rows, snapshot.rows)
+        present = {}
+        if self.snapshot is None and self.data.get('bronze_warm_activation'):
+            # Owner decision #2060: trust existing Bronze careers; fetch only absent players.
+            present = {endpoint: _bronze_career_players(self.scraper, endpoint, changes)
+                       for endpoint in ('market_value_points', 'transfer_events')}
+            self.data['career_value_dates'] = _bronze_career_value_dates(self.scraper, changes)
+            self.data['warm_baseline'] = True
+            self.data.pop('bronze_warm_activation')
+        for player_id, change in changes.items():
             for endpoint in change.endpoints:
-                self.resume.setdefault('careers', {}).setdefault(endpoint, []).append(player_id)
+                if player_id not in present.get(endpoint, ()):
+                    self.resume.setdefault('careers', {}).setdefault(endpoint, []).append(player_id)
         # Persist pending careers before the write, so a lost commit ack cannot
         # discard the work discovered from this full-roster difference.
         self.persist()
@@ -1870,8 +1892,10 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         data.update(seed_current_baseline(scraper, bootstrap_entries[target.scope_id],
                                                           preflight, bootstrap_verifier))
                         save()
-                    elif _existing_bronze_roster(scraper, target.competition_id, target.edition_id):
-                        raise CurrentPortionError('baseline_required: existing Bronze scope has no qualified activation seed')
+                    elif (not data.get('bronze_warm_activation')
+                          and _existing_bronze_roster(scraper, target.competition_id, target.edition_id)):
+                        data['bronze_warm_activation'] = {'started_at': now().isoformat()}
+                        save()
                 scope = _Scope(target, rows[target.competition_id, target.edition_id], data, scraper,
                                cycle_id, denominator_hash, save, now, clock, deadline, preflight,
                                roster_writer, career_writer, coach_writer, player_facts, store.save_player_packet,
