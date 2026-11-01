@@ -2508,8 +2508,8 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
     assert table == "bronze.sofascore_schedule"
     assert events == [
         ("scraper", {}),
-        "lock:enter",
         ("metadata", "schedule", 2),
+        "lock:enter",
         ("save", "sofascore_schedule", ["league", "season", "game_id"],
          ["league", "season"], 2),
         ("merge", "bronze", "sofascore_schedule", {
@@ -2532,12 +2532,14 @@ def test_schedule_merge_batches_bound_scope_and_stop_on_failure(monkeypatch, fai
     locked = False
     merges, batches, metadata = [], [], []
     staged_count = 0
+    lock_spans = []
 
     @contextmanager
     def lock():
         nonlocal locked
         assert not locked
         locked = True
+        lock_spans.append(len(batches))
         try:
             yield True
         finally:
@@ -2607,6 +2609,8 @@ def test_schedule_merge_batches_bound_scope_and_stop_on_failure(monkeypatch, fai
     assert metadata == [("schedule", 500)]
     assert len(merges) == (2 if fail_second else 3)
     assert [len(batch) for batch in batches] == ([200, 200] if fail_second else [200, 200, 100])
+    # #2062: one lock span per batch (bounded hold), not one for all batches.
+    assert lock_spans == list(range(len(batches)))
     for index, (sql, batch) in enumerate(zip(merges, batches)):
         expected_pairs = pairs[index * 100:(index + 1) * 100]
         assert list(batch[["league", "season"]].drop_duplicates().itertuples(

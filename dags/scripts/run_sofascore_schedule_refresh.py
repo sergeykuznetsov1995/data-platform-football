@@ -667,7 +667,7 @@ def write_schedule_rows(rows: list[dict]) -> str:
                 merge_partition_cols=["league", "season"], **kwargs,
             )
 
-    with SofaScoreScraper() as scraper, bronze_writer_lock():
+    with SofaScoreScraper() as scraper:
         # Keep the shared writer and its metadata/schema/atomic-write guards.
         # Only this dedicated schedule writer uses a scoped MERGE (#1836).
         writer = scraper._iceberg_writer
@@ -687,13 +687,16 @@ def write_schedule_rows(rows: list[dict]) -> str:
             )
         # Keep whole partitions together and stop on the first failed batch.
         # Earlier batches can be retried safely by the same natural-key upsert.
+        # The lock is held per batch (one bounded MERGE), never across all of
+        # them: the global key has a hold limit (#2062).
         for batch in batches:
-            table = scraper.save_to_iceberg(
-                df=batch,
-                table_name="sofascore_schedule",
-                partition_cols=["league", "season"],
-                natural_keys=["league", "season", "game_id"],
-            )
+            with bronze_writer_lock():
+                table = scraper.save_to_iceberg(
+                    df=batch,
+                    table_name="sofascore_schedule",
+                    partition_cols=["league", "season"],
+                    natural_keys=["league", "season", "game_id"],
+                )
         return table
 
 
