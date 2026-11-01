@@ -85,6 +85,7 @@ class Offline:
         self.records = {}
         self.professional_clubs = {}
         self.bronze_exists = False
+        self.bronze_careers, self.bronze_career_error = {}, None
         self.retired_national_players = set()
         self.assignment_override = {}
         self.mv_payloads = {}
@@ -193,6 +194,12 @@ class Offline:
                             if endpoint == self.params[0]]
                 if outer.bronze_exists and self.statement.startswith('SELECT 1 FROM iceberg.bronze.transfermarkt_squad_memberships'):
                     return [(1,)]
+                for endpoint, players in outer.bronze_careers.items():
+                    if self.statement.startswith('SELECT player_id') and f'transfermarkt_{endpoint} ' in self.statement:
+                        if outer.bronze_career_error:
+                            raise RuntimeError(outer.bronze_career_error)
+                        return [(player, *([players[player]] if 'MAX(mv_date)' in self.statement else []))
+                                for player in self.params if player in players]
                 return []
             def close(self):
                 pass
@@ -857,11 +864,31 @@ def test_storage_v1_migrates_to_small_index_and_independent_scope_journal(offlin
     assert all(data['snapshot'] for data in offline.state()['scopes'].values())
 
 
-def test_existing_bronze_scope_without_qualified_seed_is_not_recrawled(offline):
+def test_existing_bronze_scope_without_seed_activates_warm_with_only_absent_careers(offline):
     offline.bronze_exists = True
+    offline.bronze_careers = {'market_value_points': {'110': '2026-05-01', '120': None}, 'transfer_events': {'110': None}}
+    for endpoint in ('market_value_points', 'transfer_events'):
+        offline.fetch_state[(endpoint, '110')] = offline.fetch_state[(endpoint, '120')] = ('success', 'old', offline.clock.wall)
     report = offline.run('needs-baseline')
-    assert all(item['status'] == 'baseline_required' for item in report['scopes'])
-    assert offline.calls == [] and offline.careers == [] and offline.writes == []
+    assert all(item['status'] != 'baseline_required' for item in report['scopes']), report['scopes']
+    assert len(offline.writes) == 1
+    assert [(endpoint, ids) for endpoint, ids, _ in offline.careers] == [('transfer_events', ('120',))]
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['warm_baseline'] is True and 'bronze_warm_activation' not in data
+    assert data['career_value_dates'] == {'110': '2026-05-01'}
+
+
+def test_existing_bronze_scope_career_read_failure_queues_nothing(offline):
+    offline.bronze_exists = True
+    offline.bronze_careers = {'market_value_points': {}, 'transfer_events': {}}
+    offline.bronze_career_error = 'trino unavailable'
+    report = offline.run('needs-baseline')
+    assert any('existing career Bronze cannot be verified' in (item.get('error') or '') for item in report['scopes'])
+    assert all(item['status'] != 'baseline_required' for item in report['scopes'])
+    assert offline.careers == [] and offline.writes == []
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['bronze_warm_activation'] and not data.get('warm_baseline')
+    assert not json.loads(data['cursor'].get('resume_json') or '{}').get('careers')
 
 
 def test_real_trino_poll_chain_rechecks_shared_deadline_each_request():
