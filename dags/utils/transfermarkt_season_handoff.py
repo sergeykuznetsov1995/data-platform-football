@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import timezone
 
 TABLE = 'iceberg.ops.transfermarkt_season_close_v1'
@@ -42,6 +43,11 @@ def mark_sql(target, *, status, at, proof=None):
       s.detected_at,s.completed_at,s.proof_json)'''
 
 
+def _tier(value):
+    # State keeps an untiered (last-ranked) competition as null, not inf.
+    return math.inf if value is None else float(value)
+
+
 def closed_targets(previous, registry_rows):
     """Require a proven new current edition before treating an old one as closed."""
     from .transfermarkt_current_state import CurrentTarget
@@ -56,5 +62,5 @@ def closed_targets(previous, registry_rows):
         row = rows.get((competition, edition))
         if competition in current and edition not in current[competition] and row and row.get('is_current') is False:
             result.append(CurrentTarget(record['scope_id'], competition, edition,
-                                        str(row['registry_snapshot_id']), float(record.get('tier', 0)), 0))
+                                        str(row['registry_snapshot_id']), _tier(record.get('tier', 0)), 0))
     return tuple(result)
