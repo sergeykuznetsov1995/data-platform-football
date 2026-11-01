@@ -452,6 +452,10 @@ def _side_by_team(team_id, b):
 
 
 def _num_raw(raw):
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
     m = re.search(r'-?[0-9]+(\.[0-9]+)?', raw or '')
     return float(m.group(0)) if m else None
 
@@ -884,6 +888,17 @@ def test_bad_optional_value_is_null_with_conform_issue():
     assert {i['column'] for i in json.loads(match['_conform_issues_json'])} == {'referee_id', 'postponed'}
     clean = [r for r in bronze.rows('fotmob_match_lineups') if r['local_player_key'] != 'home:starter:1']
     assert all(r['_conform_issues_json'] is None for r in clean)
+
+
+def test_team_stat_value_in_e_notation():
+    # Trino renders JSON doubles < 1e-3 / >= 1e7 as '5.0E-4' once they pass through json_extract.
+    card = copy.deepcopy(CARDS[RICH])
+    stat = card['content']['stats']['Periods']['All']['stats'][0]['stats'][1]
+    stat['stats'] = ['5.0E-4', '1.20000005E7']
+    bronze = Bronze(calendar=[calendar_row(9806, '2024/2025', card)], payloads=[payload_row(9806, '2024/2025', card)])
+    _assert_all_tables(bronze)
+    rows = _by(bronze.rows('fotmob_match_team_stats'), period='All', stat_key=stat['key'])
+    assert {r['side']: r['stat_value'] for r in rows} == {'home': 0.0005, 'away': 12000000.5}
 
 
 def test_bad_keys_drop_only_their_rows():

@@ -230,7 +230,9 @@ value_rows AS (
 conv AS (
     SELECT
         r.*,
-        TRY_CAST(regexp_extract(r.stat_value_raw, '-?[0-9]+(\.[0-9]+)?') AS DOUBLE) AS stat_value,
+        -- a plain number first: Trino renders JSON doubles < 1e-3 / >= 1e7 as '5.0E-4'
+        COALESCE(TRY_CAST(r.stat_value_raw AS DOUBLE),
+                 TRY_CAST(regexp_extract(r.stat_value_raw, '-?[0-9]+(\.[0-9]+)?') AS DOUBLE)) AS stat_value,
         TRY_CAST(regexp_extract(r.stat_value_raw, '\((-?[0-9]+(\.[0-9]+)?)\s*%\)', 1) AS DOUBLE)
             AS stat_value_pct
     FROM value_rows r
