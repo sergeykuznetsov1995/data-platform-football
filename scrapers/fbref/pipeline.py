@@ -6321,9 +6321,10 @@ class FBrefPipeline:
                 stale_typed_observations_skipped=stale_typed_observations_skipped,
                 incomplete_match_refetches=1,
             )
-        if shell_verdict in {"scheduled", "superseded"} and not failures:
-            # Nothing new was requested or retired: an earlier refetch or a
-            # newer fetch owns this raw.
+        if (shell_verdict in {"scheduled", "superseded", "already_exhausted"}
+                and not failures):
+            # Nothing new was requested or retired: an earlier refetch, a
+            # newer fetch or an earlier parking verdict owns this raw.
             return _ProcessedObservation(
                 typed_promoted=typed_promoted,
                 stale_typed_observations_skipped=stale_typed_observations_skipped,
@@ -6331,8 +6332,8 @@ class FBrefPipeline:
             )
         if shell_verdict == "exhausted" and not failures:
             logger.warning(
-                "Retired %s: scored match still has no events or lineups "
-                "after its last fresh request", record.target_id,
+                "Parked %s: scored match still has no events or lineups "
+                "after its refetch window", record.target_id,
             )
             return _ProcessedObservation(
                 typed_promoted=typed_promoted,

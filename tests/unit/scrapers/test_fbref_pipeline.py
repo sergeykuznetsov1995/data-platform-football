@@ -16178,6 +16178,7 @@ def test_schedule_recovery_seeds_europa_league_qualifiers(tmp_path):
 @pytest.mark.parametrize(("verdict", "counter"), [
     ("scheduled", "incomplete_match_settled"),
     ("superseded", "incomplete_match_settled"),
+    ("already_exhausted", "incomplete_match_settled"),
     ("exhausted", "incomplete_match_exhausted"),
 ])
 def test_unscheduled_incomplete_match_settles_instead_of_failing_the_wave(

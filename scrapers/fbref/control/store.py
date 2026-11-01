@@ -989,15 +989,40 @@ _OWNED_MATCH_SHELL_SQL = """EXISTS (
           JOIN fbref_control.page_frontier AS refetch_owner
             ON refetch_owner.target_id = refetch.target_id
           WHERE refetch.target_id = attempt.target_id
-            AND refetch_owner.state IN ('queued', 'retry', 'leased')
+            AND (refetch_owner.state IN ('queued', 'retry', 'leased')
+                 OR (refetch.exhausted_at IS NOT NULL
+                     AND refetch_owner.last_error_class = 'IncompleteMatchExhausted'))
         )
       )
 )"""
 
-# Reason prefix of a shell retired after its last fresh request (#2051).
+# Reason prefix of a shell parked after its refetch window (#2051).
 INCOMPLETE_MATCH_EXHAUSTED_REASON = "incomplete_match_exhausted"
-# Mirrors the CHECK on incomplete_match_refetch.attempts (migration 15).
-INCOMPLETE_MATCH_MAX_REFETCHES = 3
+# FBref fills a shell within hours to a day; growing intervals (1 h, 3 h,
+# 9 h, then daily) keep about ten requests per match inside the window, and
+# the window caps competitions that never publish lineups (#2057).
+INCOMPLETE_MATCH_REFETCH_WINDOW_DAYS = 7
+INCOMPLETE_MATCH_MAX_REFETCH_INTERVAL_HOURS = 24
+
+# A new window starts when the previous one was parked or a full page landed
+# after the raw that opened it.  References the upsert target ``retry``.
+_INCOMPLETE_MATCH_WINDOW_RESET_SQL = """(
+    retry.exhausted_at IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM fbref_control.fetch_attempt AS full_page
+      JOIN fbref_control.observation_processing AS full_observed
+        ON full_observed.logical_refresh_id = full_page.logical_refresh_id
+      WHERE full_page.target_id = retry.target_id
+        AND full_observed.status = 'succeeded'
+        AND full_page.lease_epoch > (
+          SELECT max(shell_raw.lease_epoch)
+          FROM fbref_control.fetch_attempt AS shell_raw
+          WHERE shell_raw.target_id = retry.target_id
+            AND shell_raw.logical_refresh_id = retry.logical_refresh_id
+        )
+    )
+)"""
 
 
 # One definition of a historically eligible competition (#1949): current
@@ -6333,35 +6358,46 @@ class ControlStore:
     def schedule_incomplete_match_refetch(
         self, target_id: object, *, content_hash: object, logical_refresh_id: object,
     ) -> bool:
-        """At most three fresh requests; stale raw replay cannot spend retries."""
+        """Request fresh raw inside a bounded window; stale replay cannot spend it."""
         target = _text(target_id, "target_id")
         digest = _text(content_hash, "content_hash")
         refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        reset = _INCOMPLETE_MATCH_WINDOW_RESET_SQL
         with self._transaction() as cursor:
             if self._latest_content_verdict(cursor, target, digest, refresh) is not True:
                 return False
-            cursor.execute("""INSERT INTO fbref_control.incomplete_match_refetch AS retry
+            cursor.execute(f"""INSERT INTO fbref_control.incomplete_match_refetch AS retry
                     (target_id, attempts, logical_refresh_id)
                 SELECT target_id, 1, %s FROM fbref_control.page_frontier
                 WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')
-                ON CONFLICT (target_id) DO UPDATE SET attempts = retry.attempts + 1,
+                ON CONFLICT (target_id) DO UPDATE SET
+                    attempts = CASE WHEN {reset} THEN 1 ELSE retry.attempts + 1 END,
+                    window_started_at = CASE WHEN {reset}
+                        THEN clock_timestamp() ELSE retry.window_started_at END,
+                    exhausted_at = NULL,
                     logical_refresh_id = EXCLUDED.logical_refresh_id
-                WHERE retry.attempts < 3
-                    AND retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
-                RETURNING attempts""", (refresh, target))
+                WHERE retry.logical_refresh_id <> EXCLUDED.logical_refresh_id
+                    AND ({reset} OR retry.window_started_at
+                         > clock_timestamp() - %s * interval '1 day')
+                RETURNING attempts""",
+                (refresh, target, INCOMPLETE_MATCH_REFETCH_WINDOW_DAYS))
             row = _fetchone(cursor)
             if row is None:
                 return False
+            delay_hours = min(
+                INCOMPLETE_MATCH_MAX_REFETCH_INTERVAL_HOURS,
+                3 ** min(int(row["attempts"]) - 1, 3),
+            )
             cursor.execute("""UPDATE fbref_control.page_frontier
                 SET state = 'retry',
-                    next_fetch_at = clock_timestamp() + %s * interval '5 minutes',
-                    retry_after = clock_timestamp() + %s * interval '5 minutes',
+                    next_fetch_at = clock_timestamp() + %s * interval '1 hour',
+                    retry_after = clock_timestamp() + %s * interval '1 hour',
                     last_etag = NULL, last_modified = NULL,
                     last_error_class = 'IncompleteMatchPageError',
                     last_error_message = 'scored_match_incomplete',
                     updated_at = clock_timestamp()
                 WHERE target_id = %s AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
-                (2 ** (row["attempts"] - 1), 2 ** (row["attempts"] - 1), target))
+                (delay_hours, delay_hours, target))
             return bool(cursor.rowcount)
 
     def settle_unscheduled_incomplete_match(
@@ -6371,8 +6407,10 @@ class ControlStore:
 
         ``scheduled``: this exact raw already owns a pending refetch (replay
         of the same bytes).  ``superseded``: a newer fetch landed and owns the
-        target.  ``exhausted``: the last fresh request is spent; the target is
-        retired with an explicit, reversible verdict instead of looping.
+        target.  ``exhausted``: the refetch window is spent; the target is
+        parked as fetched with ``IncompleteMatchExhausted`` -- not terminal:
+        a later fetch (manual requeue, reconcile) opens a new window.
+        ``already_exhausted``: a replay of the raw that was parked.
         ``None`` leaves the failure loud for the caller.
         """
         target = _text(target_id, "target_id")
@@ -6392,30 +6430,42 @@ class ControlStore:
                       AND current_raw.logical_refresh_id = %s
                     LIMIT 1""", (target, refresh))
                 return "superseded" if _fetchone(cursor) is not None else None
-            cursor.execute("""SELECT retry.attempts, retry.logical_refresh_id, frontier.state
+            cursor.execute("""SELECT retry.attempts, retry.logical_refresh_id,
+                       retry.exhausted_at IS NOT NULL AS exhausted,
+                       retry.window_started_at
+                           <= clock_timestamp() - %s * interval '1 day' AS window_spent,
+                       frontier.state
                 FROM fbref_control.incomplete_match_refetch AS retry
                 JOIN fbref_control.page_frontier AS frontier USING (target_id)
-                WHERE retry.target_id = %s FOR UPDATE OF retry""", (target,))
+                WHERE retry.target_id = %s FOR UPDATE OF retry""",
+                (INCOMPLETE_MATCH_REFETCH_WINDOW_DAYS, target))
             row = _fetchone(cursor)
             if row is None:
                 return None
-            if (str(row["logical_refresh_id"]) == refresh
-                    and row["state"] in ("queued", "retry")):
-                return "scheduled"
-            if int(row["attempts"]) < INCOMPLETE_MATCH_MAX_REFETCHES:
+            if str(row["logical_refresh_id"]) == refresh:
+                if row["exhausted"]:
+                    return "already_exhausted"
+                if row["state"] in ("queued", "retry"):
+                    return "scheduled"
+            if row["exhausted"] or not row["window_spent"]:
                 return None
             cursor.execute("""UPDATE fbref_control.page_frontier
-                SET state = 'quarantined', next_fetch_at = NULL,
+                SET state = 'fetched', next_fetch_at = NULL,
                     retry_after = NULL,
-                    last_error_class = 'ParseContractQuarantined',
+                    last_error_class = 'IncompleteMatchExhausted',
                     last_error_message = %s,
                     updated_at = clock_timestamp()
                 WHERE target_id = %s
                   AND last_content_hash = %s
-                  AND state NOT IN ('leased', 'dead')""",
+                  AND state NOT IN ('leased', 'dead', 'skipped', 'quarantined')""",
                 (f"{INCOMPLETE_MATCH_EXHAUSTED_REASON}:attempts={int(row['attempts'])}",
                  target, digest))
-            return "exhausted" if cursor.rowcount else None
+            if not cursor.rowcount:
+                return None
+            cursor.execute("""UPDATE fbref_control.incomplete_match_refetch
+                SET exhausted_at = clock_timestamp(), logical_refresh_id = %s
+                WHERE target_id = %s""", (refresh, target))
+            return "exhausted"
 
     def quarantine_contract_rejected_target(
         self,
@@ -8907,14 +8957,13 @@ class ControlStore:
                            WHERE frontier.state IN ('queued', 'retry', 'leased')
                        ) AS pending_count,
                        count(*) FILTER (
-                           WHERE frontier.state = 'quarantined'
-                             AND split_part(frontier.last_error_message, ':', 1) = %s
+                           WHERE refetch.exhausted_at IS NOT NULL
+                             AND frontier.last_error_class = 'IncompleteMatchExhausted'
                        ) AS exhausted_count
                 FROM fbref_control.incomplete_match_refetch AS refetch
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = refetch.target_id
-                """,
-                (INCOMPLETE_MATCH_EXHAUSTED_REASON,),
+                """
             )
             shells = _fetchone(cursor) or {}
             summary["incomplete_match_refetch_pending_count"] = int(

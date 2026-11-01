@@ -107,7 +107,7 @@ def competition_entry(index, *, gender="male", crawl_state=None, metadata=None):
 
 def test_v8_is_append_only_schema_for_provenance_aliases_and_cancellation():
     assert tuple(migration.version for migration in MIGRATIONS) == tuple(
-        range(1, 16)
+        range(1, 17)
     )
     migration = next(item for item in MIGRATIONS if item.version == 8)
     assert migration.version == 8
@@ -3051,8 +3051,8 @@ def _count_deferred_match_manifests(run_id, control):
         tables = {
             "fetch_attempt": [{**row, "status": "succeeded", "lease_epoch": 1}
                               for row in evidence],
-            "page_frontier": [{"target_id": row["target_id"], "state": "fetched"}
-                              for row in evidence],
+            "page_frontier": [{"target_id": row["target_id"], "state": "fetched",
+                               "last_error_class": None} for row in evidence],
             "observation_processing": [{
                 **evidence[0], **next(iter(control.observations.values())),
                 "updated_at": evidence[0]["failed_updated_at"],
@@ -3060,7 +3060,7 @@ def _count_deferred_match_manifests(run_id, control):
             "dataset_manifest": control.manifests,
         }
         db.execute("CREATE TABLE fbref_control.incomplete_match_refetch "
-                   "(target_id TEXT, attempts TEXT, logical_refresh_id TEXT)")
+                   "(target_id TEXT, attempts TEXT, logical_refresh_id TEXT, exhausted_at TEXT)")
         for name, rows in tables.items():
             columns = sorted(set().union(*(row.keys() for row in rows)))
             db.execute(f"CREATE TABLE fbref_control.{name} (" +
@@ -3221,11 +3221,12 @@ def _shell_lag_db():
         "logical_refresh_id TEXT, lease_epoch INTEGER, status TEXT)"
     )
     database.execute(
-        "CREATE TABLE fbref_control.page_frontier (target_id TEXT, state TEXT)"
+        "CREATE TABLE fbref_control.page_frontier (target_id TEXT, state TEXT, "
+        "last_error_class TEXT)"
     )
     database.execute(
         "CREATE TABLE fbref_control.incomplete_match_refetch (target_id TEXT, "
-        "attempts INTEGER, logical_refresh_id TEXT)"
+        "attempts INTEGER, logical_refresh_id TEXT, exhausted_at TEXT)"
     )
     return database
 
@@ -3277,26 +3278,31 @@ def test_owned_match_shell_requires_live_refetch_or_newer_fetch():
         "lost": ("fetched", True, False, "IncompleteMatchPageError"),
         "never_scheduled": ("retry", False, False, "IncompleteMatchPageError"),
         "other_error": ("retry", True, False, "TypedBronzeError"),
+        # Parked after its refetch window: an explicit verdict, not a failure.
+        "parked": ("fetched", "exhausted", False, "IncompleteMatchPageError"),
     }
     for refresh, (state, refetch, newer, error) in cases.items():
         target = "t-" + refresh
-        database.execute("INSERT INTO fbref_control.page_frontier VALUES (?,?)",
-                         (target, state))
+        database.execute("INSERT INTO fbref_control.page_frontier VALUES (?,?,?)", (
+            target, state,
+            "IncompleteMatchExhausted" if refetch == "exhausted" else None,
+        ))
         database.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?)",
                          (target, refresh, 1, "succeeded"))
         if refetch:
             database.execute(
-                "INSERT INTO fbref_control.incomplete_match_refetch VALUES (?,?,?)",
-                (target, 1, refresh),
+                "INSERT INTO fbref_control.incomplete_match_refetch VALUES (?,?,?,?)",
+                (target, 1, refresh,
+                 "2026-11-01" if refetch == "exhausted" else None),
             )
         if newer:
             database.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?)",
                              (target, refresh + "-newer", 2, "succeeded"))
         _observe(database, refresh, current, "failed", error_class=error)
     # The same shell on an older parser generation is not this run's verdict.
-    database.execute("INSERT INTO fbref_control.page_frontier VALUES ('t-old', 'retry')")
+    database.execute("INSERT INTO fbref_control.page_frontier VALUES ('t-old', 'retry', NULL)")
     database.execute("INSERT INTO fbref_control.fetch_attempt VALUES ('t-old', 'old', 1, 'succeeded')")
-    database.execute("INSERT INTO fbref_control.incomplete_match_refetch VALUES ('t-old', 1, 'old')")
+    database.execute("INSERT INTO fbref_control.incomplete_match_refetch VALUES ('t-old', 1, 'old', NULL)")
     _observe(database, "old", ("page-v4", "typed-v4", "disc-v6"), "failed",
              error_class="IncompleteMatchPageError")
     rows = dict(database.execute(
@@ -3309,7 +3315,7 @@ def test_owned_match_shell_requires_live_refetch_or_newer_fetch():
 
     assert rows == {
         "scheduled": 1, "superseded": 1, "lost": 0, "never_scheduled": 0,
-        "other_error": 0, "old": 0,
+        "other_error": 0, "parked": 1, "old": 0,
     }
 
 
@@ -3365,7 +3371,8 @@ def test_run_summary_splits_version_lag_from_lane_sla_and_hides_owned_shells():
     assert summary["lane_unprocessed_raw_sla_overdue_count"] == 0
     assert summary["incomplete_match_refetch_pending_count"] == 35
     assert summary["incomplete_match_exhausted_count"] == 5
-    assert captured["shells"] == ("incomplete_match_exhausted",)
+    assert captured["shells"] is None
+
 
 
 def _settle_store(state, refetch_row, latest_refresh, newer=True):
@@ -3381,8 +3388,11 @@ def _settle_store(state, refetch_row, latest_refresh, newer=True):
         if "JOIN fbref_control.fetch_attempt AS newer" in sql:
             return ([{"?column?": 1}], 1) if newer else ([], 0)
         if "FROM fbref_control.incomplete_match_refetch AS retry" in sql:
+            assert params == (7, "fbref:match:98c42514")
             return ([refetch_row], 1) if refetch_row else ([], 0)
-        if sql.startswith("UPDATE fbref_control.page_frontier SET state = 'quarantined'"):
+        if sql.startswith("UPDATE fbref_control.page_frontier SET state = 'fetched'"):
+            return [], 1
+        if sql.startswith("UPDATE fbref_control.incomplete_match_refetch SET exhausted_at"):
             return [], 1
         raise AssertionError(sql)
 
@@ -3393,41 +3403,52 @@ def _settle_store(state, refetch_row, latest_refresh, newer=True):
     return verdict, executions
 
 
-def test_settle_unscheduled_shell_retires_after_last_fresh_request():
-    refresh = "11111111-1111-1111-1111-111111111111"
-    verdict, executions = _settle_store(
-        "retry", {"attempts": 3, "logical_refresh_id": "22222222-2222-2222-2222-222222222222",
-                  "state": "fetched"}, refresh,
-    )
+REFRESH = "11111111-1111-1111-1111-111111111111"
+OTHER = "22222222-2222-2222-2222-222222222222"
+
+
+def _refetch(refresh=OTHER, *, exhausted=False, window_spent=False, state="fetched"):
+    return {"attempts": 9, "logical_refresh_id": refresh, "exhausted": exhausted,
+            "window_spent": window_spent, "state": state}
+
+
+def test_settle_parks_shell_after_refetch_window_as_non_terminal_verdict():
+    """#2051 R2: no terminal quarantine; the next fetch opens a new window."""
+    verdict, executions = _settle_store("retry", _refetch(window_spent=True), REFRESH)
     assert verdict == "exhausted"
-    update_sql, update_params = executions[-1]
-    assert "state = 'quarantined'" in update_sql
-    assert "last_content_hash = %s" in update_sql
-    assert update_params == (
-        "incomplete_match_exhausted:attempts=3", "fbref:match:98c42514", "h",
+    (park_sql, park_params), (mark_sql, mark_params) = executions[-2:]
+    assert "state = 'fetched', next_fetch_at = NULL" in park_sql
+    assert "last_error_class = 'IncompleteMatchExhausted'" in park_sql
+    assert "quarantined" not in park_sql.split("WHERE", 1)[0]
+    assert "last_content_hash = %s" in park_sql
+    assert park_params == (
+        "incomplete_match_exhausted:attempts=9", "fbref:match:98c42514", "h",
     )
+    assert "exhausted_at = clock_timestamp(), logical_refresh_id = %s" in mark_sql
+    assert mark_params == (REFRESH, "fbref:match:98c42514")
 
 
 @pytest.mark.parametrize(("case", "expected"), [
     ("replay_of_scheduled_raw", "scheduled"),
+    ("replay_of_parked_raw", "already_exhausted"),
     ("newer_fetch", "superseded"),
     ("stale_without_newer_fetch", None),
-    ("refetches_left", None),
+    ("window_open", None),
+    ("parked_other_raw", None),
     ("no_refetch_row", None),
     ("leased", None),
 ])
 def test_settle_unscheduled_shell_owners_and_loud_cases(case, expected):
-    refresh = "11111111-1111-1111-1111-111111111111"
-    other = "22222222-2222-2222-2222-222222222222"
     state, row, latest, newer = {
-        "replay_of_scheduled_raw": ("retry", {"attempts": 1, "logical_refresh_id": refresh,
-                                              "state": "retry"}, refresh, False),
-        "newer_fetch": ("fetched", None, other, True),
-        "stale_without_newer_fetch": ("fetched", None, other, False),
-        "refetches_left": ("fetched", {"attempts": 2, "logical_refresh_id": other,
-                                       "state": "fetched"}, refresh, False),
-        "no_refetch_row": ("fetched", None, refresh, False),
-        "leased": ("leased", None, refresh, False),
+        "replay_of_scheduled_raw": ("retry", _refetch(REFRESH, state="retry"), REFRESH, False),
+        "replay_of_parked_raw": ("fetched", _refetch(REFRESH, exhausted=True, window_spent=True),
+                                 REFRESH, False),
+        "newer_fetch": ("fetched", None, OTHER, True),
+        "stale_without_newer_fetch": ("fetched", None, OTHER, False),
+        "window_open": ("fetched", _refetch(), REFRESH, False),
+        "parked_other_raw": ("fetched", _refetch(exhausted=True, window_spent=True), REFRESH, False),
+        "no_refetch_row": ("fetched", None, REFRESH, False),
+        "leased": ("leased", None, REFRESH, False),
     }[case]
     verdict, executions = _settle_store(state, row, latest, newer)
     assert verdict == expected
