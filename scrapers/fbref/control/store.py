@@ -941,6 +941,29 @@ _DEFERRED_PARSE_ATTEMPT_SQL = """EXISTS (
 )"""
 
 
+# Raw already parsed successfully by an older parser generation (#2050). The
+# callers exclude exact current-version successes first, so any remaining full
+# success is a prior version.  A failure recorded after it (a current parser
+# refusing the same bytes) is a real error, not version lag.
+_PARSER_VERSION_LAG_SQL = """EXISTS (
+    SELECT 1
+    FROM fbref_control.observation_processing AS prior
+    WHERE prior.logical_refresh_id = attempt.logical_refresh_id
+      AND prior.status = 'succeeded'
+      AND prior.generic_status = 'succeeded'
+      AND prior.typed_status IN ('succeeded', 'skipped')
+      AND prior.stateful_status IN ('succeeded', 'skipped')
+      AND prior.validation_status = 'succeeded'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM fbref_control.observation_processing AS later_failed
+        WHERE later_failed.logical_refresh_id = attempt.logical_refresh_id
+          AND later_failed.status = 'failed'
+          AND later_failed.updated_at > prior.updated_at
+      )
+)"""
+
+
 # One definition of a historically eligible competition (#1949): current
 # male rows plus source-proven discontinued ones. Callers alias the registry
 # as ``competition``.
@@ -8547,6 +8570,7 @@ class ControlStore:
                        ) AS lane_count,
                        count(*) FILTER (
                            WHERE source_run.run_type = %s
+                             AND NOT version_lag.lagging
                              AND COALESCE(
                                attempt.finished_at, attempt.started_at
                              ) < clock_timestamp()
@@ -8554,7 +8578,8 @@ class ControlStore:
                        ) AS lane_sla_overdue_count,
                        count(*) AS global_count,
                        count(*) FILTER (
-                           WHERE COALESCE(
+                           WHERE NOT version_lag.lagging
+                             AND COALESCE(
                                attempt.finished_at, attempt.started_at
                            ) < clock_timestamp()
                                - (%s * interval '1 second')
@@ -8572,12 +8597,22 @@ class ControlStore:
                        ) AS lane_oldest_raw_at,
                        min(COALESCE(
                            attempt.finished_at, attempt.started_at
-                       )) AS global_oldest_raw_at
+                       )) AS global_oldest_raw_at,
+                       count(*) FILTER (
+                           WHERE source_run.run_type = %s
+                             AND version_lag.lagging
+                       ) AS lane_version_lag_count,
+                       count(*) FILTER (
+                           WHERE version_lag.lagging
+                       ) AS global_version_lag_count
                 FROM fbref_control.fetch_attempt AS attempt
                 JOIN fbref_control.crawl_run AS source_run
                   ON source_run.run_id = attempt.run_id
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = attempt.target_id
+                CROSS JOIN LATERAL (
+                    SELECT {_PARSER_VERSION_LAG_SQL} AS lagging
+                ) AS version_lag
                 WHERE attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
@@ -8671,6 +8706,7 @@ class ControlStore:
                     run,
                     deferred_json,
                     recovery_lane_run_type,
+                    recovery_lane_run_type,
                     parser,
                     parser,
                     parser,
@@ -8747,6 +8783,20 @@ class ControlStore:
             # the explicit lane key; the unqualified legacy key stays global.
             summary["unprocessed_raw_sla_overdue_count"] = global_sla_overdue
             summary["raw_processing_sla_seconds"] = raw_sla
+            # Raw parsed by an older parser generation: re-parse backlog,
+            # reported apart from the SLA counts above (#2050).
+            summary["parser_version_lag_raw_by_page_kind"] = {
+                str(row["page_kind"]): int(row.get("lane_version_lag_count") or 0)
+                for row in raw_rows
+                if int(row.get("lane_version_lag_count") or 0) > 0
+            }
+            summary["parser_version_lag_raw_count"] = sum(
+                summary["parser_version_lag_raw_by_page_kind"].values()
+            )
+            summary["global_parser_version_lag_raw_count"] = sum(
+                int(row.get("global_version_lag_count") or 0)
+                for row in raw_rows
+            )
 
             cursor.execute(
                 _FRONTIER_SCOPE_CTE

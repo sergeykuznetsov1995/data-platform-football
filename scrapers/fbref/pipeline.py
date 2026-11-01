@@ -8244,6 +8244,17 @@ class FBrefPipeline:
                         other_lane_overdue,
                         summary_run_type,
                     )
+            # Re-parse backlog is reported, not enforced: the recovery drain
+            # owns it (#2050).
+            for backlog_metric in (
+                "parser_version_lag_raw_count",
+            ):
+                backlog = int(summary.get(backlog_metric) or 0)
+                if backlog:
+                    warnings[backlog_metric] = backlog
+                    logger.warning(
+                        "Run %s reports %s=%d", run_id, backlog_metric, backlog
+                    )
 
         if not isolated_acceptance:
             crawlable_scope = summary.get("crawlable_frontier_scope_counts")

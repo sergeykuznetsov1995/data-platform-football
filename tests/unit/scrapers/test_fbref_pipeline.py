@@ -16170,3 +16170,23 @@ def test_schedule_recovery_seeds_europa_league_qualifiers(tmp_path):
     assert result["reason"] == "qualification_histories_seeded"
     assert result["competition_ids"] == ["86"]
     assert control.frontier["fbref:competition:86"]["state"] == "queued"
+
+
+def test_validation_reports_version_lag_without_gating(tmp_path):
+    """#2050: re-parse backlog is a warning, not an SLA breach."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary.update({
+        "lane_unprocessed_raw_sla_overdue_count": 0,
+        "parser_version_lag_raw_count": 51_058,
+    })
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert result["warnings"] == {
+        "parser_version_lag_raw_count": 51_058,
+    }
+    assert "finish:True" in control.events

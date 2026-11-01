@@ -3193,3 +3193,106 @@ def test_deadline_second_wave_error_keeps_first_wave_typed_manifests_exempt(
             pipeline.validate_and_finish(run_id, publication_eligible=False)
     else:
         pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+
+def _shell_lag_db():
+    """SQLite tables for the plain-SQL #2050/#2051 predicates."""
+    database = sqlite3.connect(":memory:")
+    database.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    database.execute(
+        "CREATE TABLE fbref_control.observation_processing (logical_refresh_id TEXT, "
+        "parser_version TEXT, typed_parser_version TEXT, stateful_parser_version TEXT, "
+        "status TEXT, generic_status TEXT, typed_status TEXT, stateful_status TEXT, "
+        "validation_status TEXT, error_class TEXT, updated_at TEXT)"
+    )
+    database.execute(
+        "CREATE TABLE fbref_control.fetch_attempt (target_id TEXT, "
+        "logical_refresh_id TEXT, lease_epoch INTEGER, status TEXT)"
+    )
+    database.execute(
+        "CREATE TABLE fbref_control.page_frontier (target_id TEXT, state TEXT)"
+    )
+    database.execute(
+        "CREATE TABLE fbref_control.incomplete_match_refetch (target_id TEXT, "
+        "attempts INTEGER, logical_refresh_id TEXT)"
+    )
+    return database
+
+
+def _observe(database, refresh, versions, status, *, error_class=None, at="2026-10-01"):
+    database.execute(
+        "INSERT INTO fbref_control.observation_processing VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (refresh, *versions, status,
+         *(("succeeded", "succeeded", "skipped", "succeeded") if status == "succeeded"
+           else ("failed", "failed", "failed", "failed")),
+         error_class, at),
+    )
+
+
+def test_parser_version_lag_is_prior_success_without_later_failure():
+    """#2050: only raw an older parser already parsed is version lag."""
+    from scrapers.fbref.control.store import _PARSER_VERSION_LAG_SQL
+
+    old, new = ("page-v4", "typed-v4", "disc-v6"), ("page-v4", "typed-v5", "disc-v6")
+    database = _shell_lag_db()
+    _observe(database, "lag", old, "succeeded")
+    _observe(database, "fresh-failed", old, "failed")
+    _observe(database, "refused", old, "succeeded", at="2026-10-01")
+    _observe(database, "refused", new, "failed", at="2026-10-31")
+    for refresh in ("lag", "never-parsed", "fresh-failed", "refused"):
+        database.execute(
+            "INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?)",
+            ("t-" + refresh, refresh, 1, "succeeded"),
+        )
+    rows = dict(database.execute(
+        "SELECT attempt.logical_refresh_id, " + _PARSER_VERSION_LAG_SQL
+        + " FROM fbref_control.fetch_attempt AS attempt"
+    ).fetchall())
+    database.close()
+
+    assert rows == {"lag": 1, "never-parsed": 0, "fresh-failed": 0, "refused": 0}
+
+
+def test_run_summary_splits_version_lag_from_lane_sla():
+    run_id = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        assert sql.count("%s") == len(params or ())
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if ") AS missing" in sql:
+            return [{"count": 0}], 1
+        if "AS global_sla_overdue_count" in sql:
+            captured["raw"] = (sql, params)
+            return [{
+                "page_kind": "match", "run_count": 0, "lane_count": 51_060,
+                "lane_sla_overdue_count": 0, "global_count": 63_120,
+                "global_sla_overdue_count": 2, "run_oldest_raw_at": None,
+                "lane_oldest_raw_at": None, "global_oldest_raw_at": None,
+                "lane_version_lag_count": 51_058, "global_version_lag_count": 63_118,
+            }], 1
+        return [], 0
+
+    store, _ = make_store(handler)
+    summary = store.get_run_summary(
+        run_id, parser_version="page-v4", typed_parser_version="typed-v5",
+        stateful_parser_version="disc-v6",
+    )
+
+    raw_sql, raw_params = captured["raw"]
+    select_list = raw_sql.split(" FROM fbref_control.fetch_attempt AS attempt", 1)[0]
+    run_filter = select_list.split("AS run_count", 1)[0]
+    lane_sla = select_list.split("AS lane_count,", 1)[1].split("AS lane_sla_overdue_count", 1)[0]
+    global_sla = select_list.split("AS global_count,", 1)[1].split("AS global_sla_overdue_count", 1)[0]
+    # The run's own raw stays an error; only the SLA counts drop version lag.
+    assert "version_lag" not in run_filter
+    assert "NOT version_lag.lagging" in lane_sla
+    assert "NOT version_lag.lagging" in global_sla
+    assert "CROSS JOIN LATERAL ( SELECT EXISTS ( SELECT 1 FROM fbref_control.observation_processing AS prior" in raw_sql
+    assert raw_params.count("typed-v5") == 3
+    assert summary["parser_version_lag_raw_count"] == 51_058
+    assert summary["parser_version_lag_raw_by_page_kind"] == {"match": 51_058}
+    assert summary["global_parser_version_lag_raw_count"] == 63_118
+    assert summary["lane_unprocessed_raw_sla_overdue_count"] == 0
+
