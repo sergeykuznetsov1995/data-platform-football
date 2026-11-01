@@ -22,10 +22,13 @@ carries in ``AIRFLOW__DATABASE__SQL_ALCHEMY_CONN``.
 
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import json
 import logging
 import os
+import sys
+import threading
 import time
 from contextlib import contextmanager
 from typing import Callable, Iterator, Mapping, Optional
@@ -36,6 +39,12 @@ WRITER_LOCK_ENV = "SOFASCORE_WRITER_LOCK"
 WRITER_LOCK_TIMEOUT_ENV = "SOFASCORE_WRITER_LOCK_TIMEOUT_SECONDS"
 WRITER_LOCK_DSN_ENV = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"
 DEFAULT_WRITER_LOCK_TIMEOUT_SECONDS = 1800
+# #2062: the longest a process may hold the global Bronze key. A hold beyond
+# the waiters' own timeout already fails every other SofaScore writer, so a
+# stuck holder is dumped and killed instead (legit holds: p99 306s, max 1316s).
+WRITER_LOCK_MAX_HOLD_ENV = "SOFASCORE_WRITER_LOCK_MAX_HOLD_SECONDS"
+DEFAULT_WRITER_LOCK_MAX_HOLD_SECONDS = 1800
+WRITER_LOCK_HOLD_EXIT_CODE = 75
 WRITER_LOCK_POLL_SECONDS = 5.0
 WRITER_LOCK_KEY = int.from_bytes(
     hashlib.blake2b(b"sofascore-bronze-writer", digest_size=8).digest(),
@@ -47,6 +56,20 @@ _SQLALCHEMY_PREFIX = "postgresql+psycopg2://"
 
 class WriterLockTimeout(RuntimeError):
     """Another SofaScore writer held the Bronze lock for the whole timeout."""
+
+
+def _abort_stuck_holder(message: str) -> None:
+    """Dump every thread's stack and exit, which closes the PG session."""
+
+    logger.critical(message)
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    sys.stderr.flush()
+    os._exit(WRITER_LOCK_HOLD_EXIT_CODE)
 
 
 def _writer_lock_dsn(env: Mapping[str, str]) -> str:
@@ -68,6 +91,8 @@ def bronze_writer_lock(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     _lock_key: int = WRITER_LOCK_KEY,
+    _abort: Callable[[str], None] = _abort_stuck_holder,
+    _timer: Callable[..., threading.Timer] = threading.Timer,
 ) -> Iterator[bool]:
     """Hold the SofaScore Bronze writer lock for the duration of the block.
 
@@ -91,12 +116,20 @@ def bronze_writer_lock(
         env.get(WRITER_LOCK_TIMEOUT_ENV, DEFAULT_WRITER_LOCK_TIMEOUT_SECONDS)
     )
 
+    # Only the global key is bounded: a season key legitimately spans capture.
+    max_hold = (
+        float(env.get(WRITER_LOCK_MAX_HOLD_ENV, DEFAULT_WRITER_LOCK_MAX_HOLD_SECONDS))
+        if _lock_key == WRITER_LOCK_KEY else None
+    )
+
     import psycopg2
 
     connection = psycopg2.connect(dsn)
+    watchdog = None
     try:
         connection.autocommit = True
         started = clock()
+        warned = False
         while True:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_try_advisory_lock(%s)", (_lock_key,))
@@ -105,7 +138,8 @@ def bronze_writer_lock(
             if acquired:
                 if waited:
                     logger.info(
-                        "SofaScore bronze writer lock acquired after %.0fs", waited
+                        "SofaScore bronze writer lock (key %s) acquired after %.0fs",
+                        _lock_key, waited,
                     )
                 break
             if waited >= timeout:
@@ -113,13 +147,25 @@ def bronze_writer_lock(
                     "another SofaScore writer held the bronze writer lock "
                     f"(key {_lock_key}) for {timeout}s; giving up"
                 )
-            if not waited:
+            if not warned:
+                warned = True
                 logger.warning(
-                    "SofaScore bronze writer lock is busy; waiting up to %ss", timeout
+                    "SofaScore bronze writer lock (key %s) is busy; waiting up to %ss",
+                    _lock_key, timeout,
                 )
             sleep(WRITER_LOCK_POLL_SECONDS)
+        if max_hold is not None and max_hold > 0:
+            watchdog = _timer(max_hold, _abort, args=(
+                f"SofaScore bronze writer lock hold limit exceeded: key {_lock_key} "
+                f"held for {max_hold:.0f}s ({WRITER_LOCK_MAX_HOLD_ENV}); dumping "
+                "stacks and exiting to release it",
+            ))
+            watchdog.daemon = True
+            watchdog.start()
         yield True
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         # Closing the session releases the advisory lock; an explicit UNLOCK
         # would not run when the process dies.
         connection.close()
