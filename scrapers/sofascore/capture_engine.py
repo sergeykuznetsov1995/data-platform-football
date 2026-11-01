@@ -209,6 +209,20 @@ class EndpointSpec:
     def raw_target(self) -> PayloadTarget:
         return PayloadTarget(**self.key.__dict__)
 
+    def raw_replays_offline(self, http_status: int) -> bool:
+        """Whether a retained raw with ``http_status`` is terminal offline.
+
+        Mirrors ``SofaScoreCaptureEngine.capture``: a declared 404/204 replays
+        to ``not_supported``/``legitimate_empty`` and a 2xx body replays as
+        data, so none of them needs another paid request (#2053).
+        """
+
+        return (
+            http_status in self.not_supported_http_statuses
+            or http_status in self.legitimate_empty_http_statuses
+            or (200 <= http_status < 300 and http_status != 204)
+        )
+
 
 @dataclass(frozen=True)
 class RetryPolicy:

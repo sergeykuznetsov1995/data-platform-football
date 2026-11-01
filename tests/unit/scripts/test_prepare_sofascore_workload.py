@@ -1929,3 +1929,30 @@ def test_explicit_history_ids_cannot_be_silently_sliced_by_scope_cap(tmp_path, m
             competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
             artifact_path=tmp_path / "artifact.json", season_evidence="bronze", explicit_match_ids=["2", "900"],
         )
+
+
+@pytest.mark.parametrize(
+    ("http_status", "needs_network"),
+    [(200, False), (204, False), (404, False), (403, True), (429, True), (500, True)],
+)
+def test_needs_network_treats_retained_404_204_as_offline_terminal(http_status, needs_network):
+    # #2053: the planner must agree with the engine's offline replay rule; a
+    # retained 404/204 is terminal evidence, not a target to pay for again.
+    from dags.scripts.prepare_sofascore_workload import _needs_network
+    from scrapers.sofascore.capture_engine import EndpointSpec
+
+    spec = EndpointSpec(
+        key=ManifestKey("17", "76986", "event", "1", "shotmap", "final"),
+        url="https://www.sofascore.com/api/v1/event/1/shotmap",
+        schema_validator=lambda payload: True,
+        empty_predicate=lambda payload: False,
+        parsers={"items": lambda payload: payload},
+    )
+    runtime = SimpleNamespace(
+        manifest_store=SimpleNamespace(get=lambda key: None),
+        raw_store=SimpleNamespace(
+            load_bytes=lambda target: (b"", SimpleNamespace(http_status=http_status))
+        ),
+    )
+
+    assert _needs_network(runtime, spec) is needs_network

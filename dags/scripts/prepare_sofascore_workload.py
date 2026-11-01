@@ -393,7 +393,7 @@ def _needs_network(runtime, spec) -> bool:
         _, raw = runtime.raw_store.load_bytes(spec.raw_target)
     except RawPayloadNotFound:
         return True
-    return not (200 <= raw.http_status < 300 and raw.http_status != 204)
+    return not spec.raw_replays_offline(raw.http_status)
 
 
 def _pending_targets(runtime, ids: Iterable[str], build_specs) -> tuple[str, ...]:
