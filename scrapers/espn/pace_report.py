@@ -195,21 +195,26 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
         known = left >= 0 and right < len(observations) and all(o.get('known') is True for o in selected)
         known = known and all(b['at'] - a.get('observed_at', a['at']) <= maximum_gap for a, b in zip(selected, selected[1:]))
         count = buckets.get(begin, 0)
+        covered = 0
         if (not known and step == 2 and left >= 0 and right < len(observations)
-                and overlaps(sql['pause_intervals'], begin, finish)
                 and not overlaps(sql['intervals'], begin, finish)):
-            paused += 1  # Explained slow-SQL pause (#2049), never an unknown gap.
+            # Explained slow-SQL pauses (#2049): only a fully paused bin leaves the
+            # denominator; a partial one needs the quota of its open share.
+            covered = sum(max(0, min(b, finish) - max(a, begin)) for a, b in sql['pause_intervals'])
+        if covered >= interval:
+            paused += 1
             status = 'paused'
-        elif not known:
+        elif not known and not covered:
             unknown += 1
             status = 'unknown'
         elif any(o.get('debt', 0) or o.get('protected') or o.get('step') != step for o in selected):
             paused += 1
             status = 'paused'
         else:
+            needed = math.ceil(threshold * (1 - covered / interval))
             eligible += 1
-            loaded += count >= threshold
-            status = 'loaded' if count >= threshold else 'underloaded'
+            loaded += count >= needed
+            status = 'loaded' if count >= needed else 'underloaded'
         bins.append(dict(start=begin, attempts=count, status=status))
     if step == 2:
         eligible += unknown  # Unknown bins remain in the denominator, never loaded.
