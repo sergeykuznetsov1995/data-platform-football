@@ -6418,7 +6418,8 @@ class ControlStore:
         of the same bytes).  ``superseded``: a newer fetch landed and owns the
         target.  ``exhausted``: the refetch window is spent; the target is
         parked as fetched with ``IncompleteMatchExhausted`` -- not terminal:
-        a later fetch (manual requeue, reconcile) opens a new window.
+        only a later fetch opens a new window, i.e. a manual requeue --
+        reconcile does not reopen it.
         ``already_exhausted``: a replay of the raw that was parked.
         ``None`` leaves the failure loud for the caller.
         """
