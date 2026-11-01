@@ -445,6 +445,48 @@ def test_valid_retained_raw_replays_without_lease_or_browser(tmp_path):
     assert traffic["browser_sessions"] == 0
 
 
+@pytest.mark.parametrize(
+    ("http_status", "body", "expected"),
+    [(404, b'{"error":{"code":404}}', "not_supported"), (204, b"", "legitimate_empty")],
+)
+def test_retained_terminal_non_2xx_raw_replays_without_lease(
+    tmp_path, http_status, body, expected
+):
+    # #2053: a retry whose try 1 saved a 404/204 raw but died before the
+    # manifest commit must replay it offline, not ask for a lease on an
+    # allocation the gateway already completed (HTTP 409).
+    from scrapers.sofascore.manifest import ManifestStatus
+
+    runtime, _ = _runtime(tmp_path)
+    spec = _spec(1, "shotmap")
+    runtime.raw_store.store_bytes(
+        spec.raw_target,
+        body,
+        request_url=spec.url,
+        http_status=http_status,
+        response_headers={"content-type": "application/json"},
+    )
+    assert runtime.manifest_store.get(spec.key) is None
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("terminal raw replay opened a paid transport")
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [spec],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=forbidden,
+    )
+
+    assert len(results) == 1
+    assert results[0].replay_hit is True
+    assert results[0].manifest.status == ManifestStatus(expected)
+    assert traffic["paid_proxy_bytes"] == 0
+    assert traffic["browser_sessions"] == 0
+
+
 def test_initial_stats_failure_closes_lease_before_any_browser(tmp_path):
     runtime, _ = _runtime(tmp_path)
     client = _LeaseClient([1], final_total=1)

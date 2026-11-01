@@ -1259,7 +1259,7 @@ def capture_live_specs(
                     raw = None
                 else:
                     raise
-            replayable = bool(raw and 200 <= raw.http_status < 300 and raw.http_status != 204)
+            replayable = bool(raw and spec.raw_replays_offline(raw.http_status))
         if replayable:
             result = engine.capture(spec)
             _require_publishable(result, tolerate_schema_error=tolerate_schema_error)
