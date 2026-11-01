@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -117,6 +118,11 @@ def _utc(value):
     if not isinstance(parsed, datetime) or parsed.tzinfo is None:
         raise CurrentPortionError('timezone-aware timestamp required')
     return parsed.astimezone(timezone.utc)
+
+
+def _tier_json(tier):
+    # An untiered competition ranks last as math.inf, which strict JSON state cannot hold.
+    return tier if math.isfinite(tier) else None
 
 
 def _atomic(path, value):
@@ -1764,7 +1770,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         for target in closing.values():
             pending_closures.setdefault(target.scope_id, {
                 'scope_id': target.scope_id, 'competition_id': target.competition_id,
-                'edition_id': target.edition_id, 'tier': target.tier})
+                'edition_id': target.edition_id, 'tier': _tier_json(target.tier)})
         production_handoff = roster_writer.__module__ == 'dags.utils.transfermarkt_current_write'
         if production_handoff:
             from dags.utils import transfermarkt_native_v2 as season_control
@@ -1783,7 +1789,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 connection.close()
         closing = {target.scope_id: target for target in closed_targets(pending_closures.values(), registry_rows)}
         state['current_targets'] = [{'scope_id': target.scope_id, 'competition_id': target.competition_id,
-                                    'edition_id': target.edition_id, 'tier': target.tier}
+                                    'edition_id': target.edition_id, 'tier': _tier_json(target.tier)}
                                    for target in targets.targets]
         ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes, turn=state['turn'],
                                      staff_enabled=staff_writer is not None)

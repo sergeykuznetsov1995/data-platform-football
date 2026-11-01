@@ -1770,3 +1770,21 @@ def test_unchanged_warm_roster_enqueues_expired_global_careers(offline):
     count = len(offline.careers)
     offline.run('ttl-unchanged')
     assert len(offline.careers) == count
+
+
+def test_untiered_competition_state_saves_and_reloads(offline):
+    """A denominator row without a tier ranks last (math.inf); the strict JSON
+    state must still save and the next portion must read it back."""
+    rows = [_joined_row(_competition('GB1'), _edition('GB1', '2026'))]
+    for cycle in ('untiered-1', 'untiered-2'):
+        report = current.run_current_portion(
+            rows, {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, cycle,
+            denominator_rows=[{'competition_id': 'GB1', 'live': True, 'competition_class': 'core_club'}],
+            state_dir=offline.root / 'state', qualification=offline.qualification,
+            max_seconds=2400, max_scopes=8, scraper_factory=offline.factory,
+            roster_writer=offline.roster_writer, career_writer=offline.career_writer,
+            coach_writer=offline.coach_writer,
+            now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed,
+        )
+        assert 'fatal_error' not in report
+        assert offline.state()['current_targets'][0]['tier'] is None
