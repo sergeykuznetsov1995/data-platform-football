@@ -39,11 +39,11 @@ WRITER_LOCK_ENV = "SOFASCORE_WRITER_LOCK"
 WRITER_LOCK_TIMEOUT_ENV = "SOFASCORE_WRITER_LOCK_TIMEOUT_SECONDS"
 WRITER_LOCK_DSN_ENV = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"
 DEFAULT_WRITER_LOCK_TIMEOUT_SECONDS = 1800
-# #2062: the longest a process may hold the global Bronze key. A hold beyond
-# the waiters' own timeout already fails every other SofaScore writer, so a
-# stuck holder is dumped and killed instead (legit holds: p99 306s, max 1316s).
+# #2062: the longest a process may hold the global Bronze key. Below the
+# waiters' own timeout, so a stuck holder is dumped and killed before it fails
+# every other SofaScore writer (measured legit holds: p99 306s, max 1316s).
 WRITER_LOCK_MAX_HOLD_ENV = "SOFASCORE_WRITER_LOCK_MAX_HOLD_SECONDS"
-DEFAULT_WRITER_LOCK_MAX_HOLD_SECONDS = 1800
+DEFAULT_WRITER_LOCK_MAX_HOLD_SECONDS = 1500
 WRITER_LOCK_HOLD_EXIT_CODE = 75
 WRITER_LOCK_POLL_SECONDS = 5.0
 WRITER_LOCK_KEY = int.from_bytes(
@@ -61,15 +61,18 @@ class WriterLockTimeout(RuntimeError):
 def _abort_stuck_holder(message: str) -> None:
     """Dump every thread's stack and exit, which closes the PG session."""
 
-    logger.critical(message)
-    for handler in logging.getLogger().handlers:
-        try:
-            handler.flush()
-        except Exception:
-            pass
-    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-    sys.stderr.flush()
-    os._exit(WRITER_LOCK_HOLD_EXIT_CODE)
+    try:
+        logger.critical(message)
+        for handler in logging.getLogger().handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        sys.stderr.flush()
+    finally:
+        # Diagnostics must never keep a stuck holder (and its lock) alive.
+        os._exit(WRITER_LOCK_HOLD_EXIT_CODE)
 
 
 def _writer_lock_dsn(env: Mapping[str, str]) -> str:
@@ -92,7 +95,7 @@ def bronze_writer_lock(
     clock: Callable[[], float] = time.monotonic,
     _lock_key: int = WRITER_LOCK_KEY,
     _abort: Callable[[str], None] = _abort_stuck_holder,
-    _timer: Callable[..., threading.Timer] = threading.Timer,
+    _timer: Optional[Callable[..., threading.Timer]] = None,
 ) -> Iterator[bool]:
     """Hold the SofaScore Bronze writer lock for the duration of the block.
 
@@ -155,7 +158,7 @@ def bronze_writer_lock(
                 )
             sleep(WRITER_LOCK_POLL_SECONDS)
         if max_hold is not None and max_hold > 0:
-            watchdog = _timer(max_hold, _abort, args=(
+            watchdog = (_timer or threading.Timer)(max_hold, _abort, args=(
                 f"SofaScore bronze writer lock hold limit exceeded: key {_lock_key} "
                 f"held for {max_hold:.0f}s ({WRITER_LOCK_MAX_HOLD_ENV}); dumping "
                 "stacks and exiting to release it",

@@ -310,3 +310,25 @@ def test_abort_dumps_all_stacks_and_exits_with_the_hold_code(monkeypatch):
 
     assert dumps and dumps[0]["all_threads"] is True
     assert exits == [writer_lock.WRITER_LOCK_HOLD_EXIT_CODE]
+
+
+@pytest.mark.unit
+def test_abort_exits_even_when_the_stack_dump_fails(monkeypatch):
+    exits = []
+
+    def broken(**kwargs):
+        raise ValueError("stderr has no fileno")
+
+    monkeypatch.setattr(writer_lock.faulthandler, "dump_traceback", broken)
+    monkeypatch.setattr(writer_lock.os, "_exit", exits.append)
+
+    with pytest.raises(ValueError):
+        writer_lock._abort_stuck_holder("hold limit exceeded")
+
+    assert exits == [writer_lock.WRITER_LOCK_HOLD_EXIT_CODE]
+
+
+@pytest.mark.unit
+def test_default_hold_limit_is_below_the_waiters_timeout():
+    assert (writer_lock.DEFAULT_WRITER_LOCK_MAX_HOLD_SECONDS
+            < writer_lock.DEFAULT_WRITER_LOCK_TIMEOUT_SECONDS)
