@@ -1223,6 +1223,9 @@ class _Scope:
                        for endpoint in ('market_value_points', 'transfer_events')}
             self.data['career_value_dates'] = _bronze_career_value_dates(self.scraper, changes)
             self.data['warm_baseline'] = True
+            # #2068: the TTL queue counts these Bronze careers as fetched now.
+            self.data['warm_present'] = {endpoint: sorted(ids, key=int) for endpoint, ids in present.items()}
+            self.data['warm_baseline_at'] = self.now().isoformat()
             self.data.pop('bronze_warm_activation')
         for player_id, change in changes.items():
             for endpoint in change.endpoints:
@@ -1489,14 +1492,21 @@ class _Scope:
             return
         from dags.scripts import run_transfermarkt_scraper as run
         pending = self.resume.setdefault('careers', {})
+        warm_at = _utc(self.data['warm_baseline_at']) if self.data.get('warm_baseline_at') else None
         for endpoint in ('market_value_points', 'transfer_events'):
             committed = run._load_fetch_state(self.scraper, endpoint)
+            warm = set(self.data.get('warm_present', {}).get(endpoint, ())) if warm_at is not None else set()
             due = []
             for player in {str(row['player_id']) for row in self.snapshot.rows}:
                 prior = committed.get(player, {})
                 stamp = run._as_utc(prior.get('last_success_at'))
-                if (prior.get('status') not in run.SUCCESS_STATUSES or stamp is None
-                    or not self.now() - run.CAREER_TTL < stamp <= self.now()):
+                if prior.get('status') not in run.SUCCESS_STATUSES:
+                    stamp = None
+                # A Bronze-present warm player was trusted at activation (#2060);
+                # its weekly TTL runs from then, without an ops fetch_state row.
+                if player in warm and (stamp is None or stamp < warm_at):
+                    stamp = warm_at
+                if stamp is None or not self.now() - run.CAREER_TTL < stamp <= self.now():
                     due.append(player)
             pending[endpoint] = sorted(set(pending.get(endpoint, [])) | set(due), key=int)
         self.persist()

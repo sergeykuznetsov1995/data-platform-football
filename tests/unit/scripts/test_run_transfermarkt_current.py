@@ -953,6 +953,26 @@ def test_existing_bronze_scope_without_seed_activates_warm_with_only_absent_care
     assert data['career_value_dates'] == {'110': '2026-05-01'}
 
 
+def test_warm_activation_without_fetch_state_queues_only_absent_players_until_ttl(offline):
+    # #2068: no ops fetch_state rows; Bronze already has careers of 110 and 120.
+    offline.bronze_exists = True
+    offline.squad_players = {'10': ['110', '111']}
+    offline.bronze_careers = {'market_value_points': {'110': None, '120': None},
+                              'transfer_events': {'110': None, '120': None}}
+    offline.run_cold('warm')
+    assert [(endpoint, ids) for endpoint, ids, _ in offline.careers] == [
+        ('market_value_points', ('111',)), ('transfer_events', ('111',))]
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['warm_present'] == {'market_value_points': ['110', '120'], 'transfer_events': ['110', '120']}
+    assert data['cursor']['cold_complete']
+    offline.careers.clear()
+    offline.clock.advance(8 * 24 * 3600)
+    offline.run('weekly')  # weekly roster queues TTL refreshes for the next portion
+    data = next(iter(offline.state()['scopes'].values()))
+    careers = json.loads(data['cursor']['resume_json'])['careers']
+    assert careers == {'market_value_points': ['110', '111', '120'], 'transfer_events': ['110', '111', '120']}
+
+
 def test_existing_bronze_scope_career_read_failure_queues_nothing(offline):
     offline.bronze_exists = True
     offline.bronze_careers = {'market_value_points': {}, 'transfer_events': {}}
