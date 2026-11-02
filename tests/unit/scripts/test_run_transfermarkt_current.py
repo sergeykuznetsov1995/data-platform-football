@@ -542,6 +542,23 @@ def test_due_signals_do_not_consume_single_cold_slot(offline):
         assert [item['kind'] for item in report['scopes']] == ['signals', 'cold_roster'], cycle
 
 
+def test_detected_club_change_marks_cursor_until_the_roster_applies_it(offline):
+    offline.run_cold('cold')
+    assert next(iter(offline.state()['scopes'].values()))['cursor']['cold_complete']
+    offline.clock.advance(21 * 3600)
+    offline.values['10'] = offline.squad_values['10'] = '€2.0m'
+    offline.player_values['110'] = 2000000
+    report = offline.run('detect')
+    assert [item['kind'] for item in report['scopes']] == ['signals']
+    cursor = next(iter(offline.state()['scopes'].values()))['cursor']
+    assert cursor['change_pending'] and cursor['roster_completed_at']
+    report = offline.run('apply')
+    assert [item['kind'] for item in report['scopes']] == ['resume']
+    data = next(iter(offline.state()['scopes'].values()))
+    assert not data['cursor']['change_pending']
+    assert data['signals']['club:10']['status'] == 'applied'
+
+
 def test_deadline_inside_careers_is_retained_not_failed(offline):
     offline.run('cold')
     writer = offline.career_writer

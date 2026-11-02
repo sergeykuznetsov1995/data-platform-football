@@ -236,10 +236,11 @@ def test_cursor_roundtrip_and_policy_resume_validation():
     cursor = state.ScopeCursor(SCOPE_ID, generation='club-signature',
                                resume_json='{"verified_raw_refs":["raw-1"]}', listing_checked_at=NOW)
     assert state.ScopeCursor.from_mapping(cursor.as_dict()) == cursor
-    failed = replace(cursor, last_error_at=NOW)
+    failed = replace(cursor, last_error_at=NOW, change_pending=True)
     assert state.ScopeCursor.from_mapping(failed.as_dict()) == failed
-    legacy = {key: value for key, value in cursor.as_dict().items() if key != 'last_error_at'}
+    legacy = {key: value for key, value in cursor.as_dict().items() if key not in {'last_error_at', 'change_pending'}}
     assert state.ScopeCursor.from_mapping(legacy).last_error_at is None
+    assert state.ScopeCursor.from_mapping(legacy).change_pending is False
     with pytest.raises(state.CurrentStateError, match='migration'):
         replace(cursor, policy_version='old-mode')
     with pytest.raises(state.CurrentStateError, match='generation'):
@@ -347,6 +348,18 @@ def test_closed_top_scope_pending_work_does_not_overtake_unfinished_lower_scope(
                by_id['LOW4']: _started(by_id['LOW4'], last_work_at=NOW - timedelta(minutes=1), **checked)}
     works = state.plan_current_work(targets, cursors, now=NOW)
     assert [(work.kind, work.target.competition_id) for work in works] == [('resume', 'LOW4'), ('resume', 'GB1')]
+
+
+def test_detected_change_is_applied_before_cold_work_then_returns_to_its_phase():
+    targets = state.current_scope_targets(denominator(('GB1', 1), ('LOW4', 4)), registry('GB1', 'LOW4')).targets
+    by_id = {target.competition_id: target.scope_id for target in targets}
+    checked = {f'{name}_checked_at': NOW for name in state.DAILY_CHECKS}
+    changed = _started(by_id['LOW4'], cold_complete=True, change_pending=True, last_work_at=NOW, **checked)
+    works = state.plan_current_work(targets, {by_id['LOW4']: changed}, now=NOW)
+    assert [(work.kind, work.target.competition_id) for work in works] == [('resume', 'LOW4'), ('cold_roster', 'GB1')]
+    applied = replace(changed, change_pending=False)
+    works = state.plan_current_work(targets, {by_id['LOW4']: applied}, now=NOW)
+    assert [(work.kind, work.target.competition_id) for work in works] == [('cold_roster', 'GB1'), ('resume', 'LOW4')]
 
 
 def test_scope_without_committed_roster_gets_no_signal_work():

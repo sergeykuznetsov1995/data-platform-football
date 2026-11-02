@@ -496,14 +496,15 @@ def test_current_hook_labels_cold_then_change_and_preserves_raw_clocks(
     superseded = json.loads(club["superseded_evidence"][0])
     assert superseded["measurement_kind"] == "cold"
     assert superseded["raw_capture_id"]
-    # #2068: the committed roster, not cold_complete, is the comparison base;
-    # a player whose first career is still queued has none yet.
+    # #2068: the committed roster, not cold_complete, is the club comparison
+    # base. A player change is acknowledged only with the scope's whole career
+    # tail, so before cold_complete it stays 'cold' even with his own career.
     assert not data["cursor"]["cold_complete"]
     offline.clock.advance(21 * 3600)
     offline.player_values.update({"110": 3000000, "120": 3000000})
     offline.run("player-change")
     signals = next(iter(offline.state()["scopes"].values()))["signals"]
-    assert signals["player:110"]["measurement_kind"] == "change"
+    assert signals["player:110"]["measurement_kind"] == "cold"
     assert signals["player:120"]["measurement_kind"] == "cold"
 
 

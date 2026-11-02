@@ -569,8 +569,18 @@ class _Scope:
     def persist(self):
         for endpoint, ids in self.resume.get('careers', {}).items():
             self.resume['careers'][endpoint] = sorted(set(ids), key=int)
+        # #2068: the planner applies a detected change before cold work: clubs
+        # to refetch, or unacknowledged club/listing signals (the roster commit
+        # acknowledges them); players count once the scope is closed, before
+        # that they are acknowledged only with the whole career tail.
+        change = self.snapshot is not None and (
+            bool(self.resume.get('required')) and self.resume.get('reason') == 'change'
+            or any(state.pending and (state.observation.entity in {'club', 'listing'}
+                                      or (state.observation.entity == 'player' and self.cursor.cold_complete))
+                   for state in self.signals.values()))
         self.cursor = replace(self.cursor, resume_json=json.dumps(self.resume, sort_keys=True,
-                                                               default=lambda value: value.isoformat()))
+                                                               default=lambda value: value.isoformat()),
+                              change_pending=change)
         self.data['cursor'] = self.cursor.as_dict()
         self.data['signals'] = {key: value.as_dict() for key, value in self.signals.items()}
         if self.snapshot is not None:
@@ -624,10 +634,10 @@ class _Scope:
                 first_detected_at=min(committed_at, observation.checked_at), status='applied', result='baseline_verified',
                 bronze_manifest=manifest, committed_at=committed_at, measurement_kind='baseline')
         else:
-            # #2068: a committed roster is the comparison base, long before
-            # cold_complete; a player still awaiting his first career has none.
-            awaiting = entity == 'player' and any(str(entity_id) in ids for ids in self.resume.get('careers', {}).values())
-            based = self.cursor.cold_complete or (self.snapshot is not None and not awaiting)
+            # #2068: a committed roster is the club comparison base, long before
+            # cold_complete. A player change is acknowledged only with the whole
+            # career tail, so it is a measured 'change' once the scope is closed.
+            based = self.cursor.cold_complete or (self.snapshot is not None and entity != 'player')
             self.signals[key] = mark_seen(self.signals.get(key), observation,
                                          measurement_kind='change' if based else 'cold')
         if write:

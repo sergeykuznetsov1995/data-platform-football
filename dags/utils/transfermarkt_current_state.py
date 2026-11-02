@@ -476,6 +476,7 @@ class ScopeCursor:
     staff_completed_at: datetime | None = None
     staff_pending: bool = False
     last_error_at: datetime | None = None
+    change_pending: bool = False
 
     def __post_init__(self) -> None:
         _text('scope_id', self.scope_id)
@@ -485,6 +486,8 @@ class ScopeCursor:
             raise CurrentStateError('cold_complete must be boolean')
         if not isinstance(self.staff_pending, bool):
             raise CurrentStateError('staff_pending must be boolean')
+        if not isinstance(self.change_pending, bool):
+            raise CurrentStateError('change_pending must be boolean')
         for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at',
                      'roster_completed_at', 'last_work_at', 'staff_completed_at', 'last_error_at'):
             if getattr(self, name) is not None:
@@ -503,7 +506,8 @@ class ScopeCursor:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'ScopeCursor':
-        values = {'staff_completed_at': None, 'staff_pending': False, 'last_error_at': None, **value}
+        values = {'staff_completed_at': None, 'staff_pending': False, 'last_error_at': None,
+                  'change_pending': False, **value}
         cursor = cls(**_mapping(cls, values))
         resume = json.loads(cursor.resume_json)
         if isinstance(resume, dict) and resume.pop('staff_pending', False):
@@ -663,7 +667,8 @@ def plan_current_work(
     Signals need a committed roster: without the snapshot the player check
     cannot have a denominator; a cold roster re-proves only a due listing.
     All due signals are planned, since the daily checks of every target must
-    fit a day; limit bounds only the other work. Cold rosters of every target
+    fit a day; limit bounds only the other work. A detected, unapplied change
+    (cursor.change_pending) is applied next, by attempt fairness. Cold rosters of every target
     precede careers of unfinished scopes; both follow cold_priority, not
     last_work_at, so a scope keeps its turn until it is cold complete. Pending
     work of closed scopes, then weekly work, keep attempt fairness. A real
@@ -708,21 +713,25 @@ def plan_current_work(
                                               'squad_generations', 'required', 'careers',
                                               'coaches_pending', 'coach_club_ids'})
         if cursor.roster_due(timestamp) and staff_metadata:
-            queue(3, 'weekly_roster', (last_work, target.cold_priority))
+            queue(4, 'weekly_roster', (last_work, target.cold_priority))
+        elif cursor.change_pending and cursor.roster_completed_at is not None:
+            # A detected source change is applied in the next portion (<= 24h),
+            # ahead of all cold work; its resume acknowledges the signals.
+            queue(0, 'resume', (last_work, target.cold_priority))
         elif not cursor.cold_complete and cursor.roster_completed_at is None:
             # A due listing still re-proves membership of an unfinished capture.
-            queue(0, 'cold_roster', (minimum, target.cold_priority), tuple(name for name in due if name == 'listing'))
+            queue(1, 'cold_roster', (minimum, target.cold_priority), tuple(name for name in due if name == 'listing'))
         elif not cursor.cold_complete:
-            queue(1, 'resume', (minimum, target.cold_priority))
+            queue(2, 'resume', (minimum, target.cold_priority))
         elif pending:
-            # A closed scope's change/TTL continuation shares capacity in turn;
+            # A closed scope's TTL continuation shares capacity in turn;
             # by priority it would starve every unfinished lower scope.
-            queue(2, 'resume', (last_work, target.cold_priority))
+            queue(3, 'resume', (last_work, target.cold_priority))
         elif cursor.roster_due(timestamp):
-            queue(3, 'weekly_roster', (last_work, target.cold_priority))
+            queue(4, 'weekly_roster', (last_work, target.cold_priority))
         elif staff_enabled and (cursor.staff_pending or cursor.staff_completed_at is None
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
-            queue(3, 'weekly_staff', (last_work, target.cold_priority))
+            queue(4, 'weekly_staff', (last_work, target.cold_priority))
     chosen = [item[1] for item in sorted(fresh, key=lambda pair: pair[0])]
     chosen += [item[1] for item in sorted(resume, key=lambda pair: pair[0])][:limit]
     return tuple(chosen)
