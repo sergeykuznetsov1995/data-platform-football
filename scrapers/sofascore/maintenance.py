@@ -55,7 +55,8 @@ def literal(value):
 
 
 def optimize_sql(partitions):
-    if not partitions or len(partitions) > MAX_PARTITIONS:
+    if (not partitions or len(partitions) > MAX_PARTITIONS
+            or len({season for _league, season in partitions}) != 1):
         raise ValueError("invalid compaction chunk")
     predicate = " OR ".join(
         f"(league = {literal(league)} AND season = {literal(season)})"
@@ -67,7 +68,10 @@ def optimize_sql(partitions):
 
 def plan_chunks(rows):
     chunks, skipped = [], []
-    chunk, files, size = [], 0, 0
+    # One season per chunk: Trino optimize accepts only a predicate that maps
+    # to a per-column domain, and (league, season) pairs across seasons do not
+    # ("Unexpected FilterNode found in plan").
+    open_chunks = {}
     # Garbage-heavy partitions first; completed partitions disappear from the
     # next plan, so subsequent daily runs continue without a mutable cursor.
     for league, season, count, nbytes, deletes, small in sorted(
@@ -84,15 +88,14 @@ def plan_chunks(rows):
             skipped.append({"partition": partition, "files": count, "bytes": nbytes,
                             "reason": "partition_over_limit"})
             continue
+        chunk, files, size = open_chunks.get(season, ([], 0, 0))
         if chunk and (len(chunk) == MAX_PARTITIONS or files + count > MAX_FILES
                       or size + nbytes > MAX_BYTES):
             chunks.append(chunk)
             chunk, files, size = [], 0, 0
         chunk.append(partition)
-        files += count
-        size += nbytes
-    if chunk:
-        chunks.append(chunk)
+        open_chunks[season] = (chunk, files + count, size + nbytes)
+    chunks.extend(chunk for chunk, _files, _size in open_chunks.values())
     return chunks, skipped
 
 

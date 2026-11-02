@@ -89,6 +89,19 @@ def test_pack_partitions_and_escape_literals():
     assert m.plan_chunks([(*PARTITION, 2, 100, 0, 2)])[0] == [[PARTITION]]
 
 
+def test_chunks_never_mix_seasons():
+    # Trino optimize fails with "Unexpected FilterNode" on a cross-season OR.
+    rows = [("SS-1", "2026", 2, 100, 5, 1), ("SS-2", "2627", 2, 100, 4, 1),
+            ("SS-3", "2026", 2, 100, 3, 1), ("SS-4", "2627", 2, 100, 2, 1)]
+    chunks, _ = m.plan_chunks(rows)
+    assert sorted(chunks) == [[("SS-1", "2026"), ("SS-3", "2026")],
+                              [("SS-2", "2627"), ("SS-4", "2627")]]
+    for chunk in chunks:
+        m.optimize_sql(chunk)
+    with pytest.raises(ValueError):
+        m.optimize_sql([("SS-1", "2026"), ("SS-2", "2627")])
+
+
 def test_sizes_rechecked_under_lock():
     queries = Queries()
 
