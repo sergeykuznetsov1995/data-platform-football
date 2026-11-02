@@ -102,6 +102,14 @@ def test_chunks_never_mix_seasons():
         m.optimize_sql([("SS-1", "2026"), ("SS-2", "2627")])
 
 
+def test_chunk_order_keeps_garbage_heavy_first_across_seasons():
+    rows = [("SS-A", "2627", 2, 100, 1000, 1)]
+    rows += [(f"SS-{n}", "2026", 2, 100, 500 - n, 1) for n in range(40)]
+    chunks, _ = m.plan_chunks(rows)
+    assert chunks[0] == [("SS-A", "2627")]
+    assert [len(chunk) for chunk in chunks] == [1, 32, 8]
+
+
 def test_sizes_rechecked_under_lock():
     queries = Queries()
 

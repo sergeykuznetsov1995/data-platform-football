@@ -74,9 +74,9 @@ def plan_chunks(rows):
     open_chunks = {}
     # Garbage-heavy partitions first; completed partitions disappear from the
     # next plan, so subsequent daily runs continue without a mutable cursor.
-    for league, season, count, nbytes, deletes, small in sorted(
+    for rank, (league, season, count, nbytes, deletes, small) in enumerate(sorted(
         rows, key=lambda row: (-row[4], str(row[0]), str(row[1]))
-    ):
+    )):
         literal(league)
         literal(season)
         if min(count, nbytes, deletes, small) < 0 or count == 0:
@@ -88,15 +88,16 @@ def plan_chunks(rows):
             skipped.append({"partition": partition, "files": count, "bytes": nbytes,
                             "reason": "partition_over_limit"})
             continue
-        chunk, files, size = open_chunks.get(season, ([], 0, 0))
+        first, chunk, files, size = open_chunks.get(season, (rank, [], 0, 0))
         if chunk and (len(chunk) == MAX_PARTITIONS or files + count > MAX_FILES
                       or size + nbytes > MAX_BYTES):
-            chunks.append(chunk)
-            chunk, files, size = [], 0, 0
+            chunks.append((first, chunk))
+            first, chunk, files, size = rank, [], 0, 0
         chunk.append(partition)
-        open_chunks[season] = (chunk, files + count, size + nbytes)
-    chunks.extend(chunk for chunk, _files, _size in open_chunks.values())
-    return chunks, skipped
+        open_chunks[season] = (first, chunk, files + count, size + nbytes)
+    chunks.extend((first, chunk) for first, chunk, _files, _size in open_chunks.values())
+    # Across seasons too: a chunk runs in the order of its most garbage-heavy partition.
+    return [chunk for _first, chunk in sorted(chunks, key=lambda item: item[0])], skipped
 
 
 class Queries:
