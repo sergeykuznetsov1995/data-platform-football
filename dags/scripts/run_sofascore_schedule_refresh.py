@@ -30,6 +30,10 @@ The cursor walks a stable target sequence, so consecutive runs cover the
 campaign and then start over.  Rows are MERGEd into Bronze under the writer
 lock; the JSON report carries the row counters and the discovery client's byte
 accounting.  Any failure exits 1.
+
+``visits`` (#2094) lists, per Bronze partition whose rows were written, when
+its tail pages were first read, how many and the oldest kick-off on them, so a
+match that shows up late can be blamed on the source or on this sweep.
 """
 
 from __future__ import annotations
@@ -649,6 +653,40 @@ def overdue_partitions(*, recent: bool = False) -> dict[tuple[str, str], Optiona
             )
         )
     }
+
+
+def sweep_visits(
+    events: Iterable[Any],
+    partitions_by_pair: Mapping[tuple[int, int], tuple[str, str]],
+) -> dict[str, dict[str, list]]:
+    """Tail pages read per partition: ``[first fetched_at, pages, oldest start]``.
+
+    Only ``last-*`` pages (finished matches) count; calendar pages and items
+    without a raw record are skipped (#2094).
+    """
+
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in events:
+        raw = getattr(item, "raw", None)
+        if raw is None or not str(raw.target_id).startswith("last-"):
+            continue
+        pair = (int(raw.source_tournament_id), int(raw.source_season_id))
+        if pair not in partitions_by_pair:
+            continue
+        visit = seen.setdefault(
+            partitions_by_pair[pair], {"at": raw.fetched_at, "pages": set(), "oldest": None},
+        )
+        visit["at"] = min(visit["at"], raw.fetched_at)
+        visit["pages"].add(raw.target_id)
+        start = item.event.get("startTimestamp") if isinstance(item.event, Mapping) else None
+        if isinstance(start, int) and not isinstance(start, bool):
+            visit["oldest"] = start if visit["oldest"] is None else min(visit["oldest"], start)
+    visits: dict[str, dict[str, list]] = {}
+    for (league, season), visit in seen.items():
+        visits.setdefault(league, {})[season] = [
+            visit["at"], len(visit["pages"]), visit["oldest"],
+        ]
+    return visits
 
 
 def write_schedule_rows(rows: list[dict]) -> str:
@@ -1865,6 +1903,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if rows:
                 report["table"] = write_schedule_rows(rows)
                 rows_written += len(rows)
+                # #2094: only what reached Bronze counts as a visit.
+                partitions_by_pair = {target.pair: target.partition for target in plan[name]}
+                for league, seasons in sweep_visits(events, partitions_by_pair).items():
+                    report.setdefault("visits", {}).setdefault(league, {}).update(seasons)
             # The resume queue may only move forward on evidence that is IN
             # Bronze.  A class that read pages and wrote no row (a verdict about
             # its events, the DQ gate) must leave its chains where they were:
@@ -2075,5 +2117,6 @@ __all__ = [
     "MAX_CHAIN_ATTEMPTS",
     "sweep_predicates",
     "bronze_partitions",
+    "sweep_visits",
     "write_schedule_rows",
 ]
