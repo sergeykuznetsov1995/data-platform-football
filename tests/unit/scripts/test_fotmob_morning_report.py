@@ -404,11 +404,28 @@ def test_future_inputs_are_updated_before_their_day_opens(db, monkeypatch):
 
 def test_physical_partition_predicates_match_trino_types():
     sql = c1.candidates_sql({("1", "2026")}, pinned(), date(2026, 10, 20))
-    assert "competition_id=1 AND source_season_key='2026'" in sql
+    assert "source_season_key='2026' AND competition_id IN (1)" in sql
     assert "inc.competition_id=CAST(m.competition_id AS varchar)" in sql
     assert "s.competition_id=CAST(m.competition_id AS varchar)" in sql
     with pytest.raises(ValueError):
         c1.pairs_sql({("bad", "2026")}, physical=True)
+
+
+def test_pairs_predicate_stays_one_term_per_season_for_bootstrap_size():
+    # 02.11 bootstrap: 3 667 pairs as one OR term each hit Trino
+    # QUERY_EXCEEDED_COMPILER_LIMIT; grouping keeps the same row set.
+    import sqlite3
+
+    pairs = {(str(cid), sk) for cid in range(1, 1501) for sk in ("2024", "2025", "2024/2025")}
+    sql = c1.pairs_sql(pairs, physical=True)
+    assert sql.count(" OR ") == 2
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE t (competition_id INTEGER, source_season_key TEXT)")
+    rows = [(cid, sk) for cid in range(0, 1503) for sk in ("2024", "2025", "2024/2025", "2026")]
+    con.executemany("INSERT INTO t VALUES (?, ?)", rows)
+    got = {(str(cid), sk) for cid, sk in con.execute(f"SELECT * FROM t WHERE {sql}")}
+    assert got == pairs
+    assert c1.pairs_sql(set()) == "false"
 
 
 def test_refresh_staging_is_owned_by_standard_cleanup(db, monkeypatch):

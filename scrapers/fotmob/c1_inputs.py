@@ -54,9 +54,14 @@ def literal(value):
 def pairs_sql(pairs, *, physical=False):
     if not pairs:
         return "false"
+    # One OR term per season key, not per pair: thousands of pairs (bootstrap)
+    # exceed Trino's compiler limit; literal IN lists keep partition pruning.
+    by_season = {}
+    for cid, sk in sorted(pairs):
+        by_season.setdefault(sk, []).append(literal(int(cid) if physical else cid))
     return "(" + " OR ".join(
-        f"(competition_id={literal(int(cid) if physical else cid)} AND source_season_key={literal(sk)})"
-        for cid, sk in sorted(pairs)
+        f"(source_season_key={literal(sk)} AND competition_id IN ({','.join(cids)}))"
+        for sk, cids in by_season.items()
     ) + ")"
 
 
