@@ -59,6 +59,25 @@ class CurrentPortionError(RuntimeError):
     """An unqualified detector or invalid recovery evidence blocks paid I/O."""
 
 
+class PortionDeadlineError(CurrentPortionError):
+    """The shared portion deadline ends work; the journal keeps the remainder."""
+
+
+class SignalRefreshRequired(CurrentPortionError):
+    """A recovered write waits for fresh signals; not a scope failure (#2068)."""
+
+
+def _deadline_retained(exc):
+    """#2068: a portion tail, also when a writer wraps it, is not a scope failure."""
+    from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+    while exc is not None:
+        # The current writer refuses a new connection with this marker.
+        if isinstance(exc, (PortionDeadlineError, CurrentPortionDeadlineExceeded)) or 'deadline prohibits' in str(exc):
+            return True
+        exc = exc.__cause__
+    return False
+
+
 _ENTITY_LABELS = {
     'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury'),
     'market_value_history': ('market_value_points', 'mv_history'),
@@ -477,7 +496,7 @@ def _bound_connection(connection, deadline, clock):
     """Clamp every Trino HTTP poll, preserving this connection's auth/session."""
     remaining = deadline - clock() - 30
     if remaining <= 0:
-        raise CurrentPortionError('deadline prohibits a new Bronze request')
+        raise PortionDeadlineError('deadline prohibits a new Bronze request')
     configured = getattr(connection, 'request_timeout', getattr(connection, '_request_timeout', 30))
     configured = max(configured) if isinstance(configured, tuple) else configured
     connection.request_timeout = min(float(configured), remaining)
@@ -490,7 +509,7 @@ def _bound_connection(connection, deadline, clock):
         def bounded_request(method, url, **kwargs):
             left = deadline - clock() - 30
             if left <= 0:
-                raise CurrentPortionError('deadline prohibits another Trino query poll')
+                raise PortionDeadlineError('deadline prohibits another Trino query poll')
             timeout = kwargs.get('timeout', connection.request_timeout)
             if isinstance(timeout, tuple):
                 kwargs['timeout'] = tuple(min(float(value), left / len(timeout)) if value is not None
@@ -554,8 +573,18 @@ class _Scope:
     def persist(self):
         for endpoint, ids in self.resume.get('careers', {}).items():
             self.resume['careers'][endpoint] = sorted(set(ids), key=int)
+        # #2068: the planner applies a detected change before cold work: clubs
+        # to refetch, or unacknowledged club/listing signals (the roster commit
+        # acknowledges them); players count once the scope is closed, before
+        # that they are acknowledged only with the whole career tail.
+        change = self.snapshot is not None and (
+            bool(self.resume.get('required')) and self.resume.get('reason') == 'change'
+            or any(state.pending and (state.observation.entity in {'club', 'listing'}
+                                      or (state.observation.entity == 'player' and self.cursor.cold_complete))
+                   for state in self.signals.values()))
         self.cursor = replace(self.cursor, resume_json=json.dumps(self.resume, sort_keys=True,
-                                                               default=lambda value: value.isoformat()))
+                                                               default=lambda value: value.isoformat()),
+                              change_pending=change)
         self.data['cursor'] = self.cursor.as_dict()
         self.data['signals'] = {key: value.as_dict() for key, value in self.signals.items()}
         if self.snapshot is not None:
@@ -564,7 +593,7 @@ class _Scope:
 
     def admission(self, reserve=60):
         if self.clock() + reserve >= self.deadline:
-            raise CurrentPortionError('portion deadline: pending work retained')
+            raise PortionDeadlineError('portion deadline: pending work retained')
         used = self.data.get('traffic_used', {})
         current = self.scraper.get_traffic_stats()
         total = used.get('requests', 0) + current.get('request_attempts', current.get('requests', 0))
@@ -609,9 +638,12 @@ class _Scope:
                 first_detected_at=min(committed_at, observation.checked_at), status='applied', result='baseline_verified',
                 bronze_manifest=manifest, committed_at=committed_at, measurement_kind='baseline')
         else:
-            warm = self.cursor.cold_complete or bool(self.data.get('warm_baseline'))
+            # #2068: a committed roster is the club comparison base, long before
+            # cold_complete. A player change is acknowledged only with the whole
+            # career tail, so it is a measured 'change' once the scope is closed.
+            based = self.cursor.cold_complete or (self.snapshot is not None and entity != 'player')
             self.signals[key] = mark_seen(self.signals.get(key), observation,
-                                         measurement_kind='change' if warm else 'cold')
+                                         measurement_kind='change' if based else 'cold')
         if write:
             _sql(self.scraper, build_signal_merge(self.signals[key]))
         if persist:
@@ -1027,10 +1059,12 @@ class _Scope:
             _sql(self.scraper, build_signal_merge(state))
             self.persist()
 
-    def acknowledge(self, proof, *, include_players=False, expected_signatures=None):
+    def acknowledge(self, proof, *, include_players=False, expected_signatures=None, players=None):
         manifest, at = _proof(proof)
         pending = [(key, state) for key, state in self.signals.items()
                    if state.pending and (include_players or state.observation.entity != 'player')
+                   and (players is None or (state.observation.entity == 'player'
+                                            and state.observation.entity_id in players))
                    and (expected_signatures is None or expected_signatures.get(key) == state.observation.signature)
                    and (state.observation.entity != 'player' or self.data.get('player_roster_applied', {}).get(
                        state.observation.entity_id) == state.observation.signature)]
@@ -1208,6 +1242,9 @@ class _Scope:
                        for endpoint in ('market_value_points', 'transfer_events')}
             self.data['career_value_dates'] = _bronze_career_value_dates(self.scraper, changes)
             self.data['warm_baseline'] = True
+            # #2068: the TTL queue counts these Bronze careers as fetched now.
+            self.data['warm_present'] = {endpoint: sorted(ids, key=int) for endpoint, ids in present.items()}
+            self.data['warm_baseline_at'] = self.now().isoformat()
             self.data.pop('bronze_warm_activation')
         for player_id, change in changes.items():
             for endpoint in change.endpoints:
@@ -1411,7 +1448,7 @@ class _Scope:
         for kind in required:
             stamp = getattr(self.cursor, kind + '_checked_at')
             if stamp is None or (boundary is not None and stamp < boundary):
-                raise CurrentPortionError('write recovery requires fresh signals before roster or careers')
+                raise SignalRefreshRequired('write recovery requires fresh signals before roster or careers')
         self.data.pop('recovery_signal_refresh_required')
         self.persist()
 
@@ -1474,28 +1511,57 @@ class _Scope:
             return
         from dags.scripts import run_transfermarkt_scraper as run
         pending = self.resume.setdefault('careers', {})
+        warm_at = _utc(self.data['warm_baseline_at']) if self.data.get('warm_baseline_at') else None
         for endpoint in ('market_value_points', 'transfer_events'):
             committed = run._load_fetch_state(self.scraper, endpoint)
+            warm = set(self.data.get('warm_present', {}).get(endpoint, ())) if warm_at is not None else set()
             due = []
             for player in {str(row['player_id']) for row in self.snapshot.rows}:
                 prior = committed.get(player, {})
                 stamp = run._as_utc(prior.get('last_success_at'))
-                if (prior.get('status') not in run.SUCCESS_STATUSES or stamp is None
-                    or not self.now() - run.CAREER_TTL < stamp <= self.now()):
+                if prior.get('status') not in run.SUCCESS_STATUSES:
+                    stamp = None
+                # A Bronze-present warm player was trusted at activation (#2060);
+                # its weekly TTL runs from then, without an ops fetch_state row.
+                if player in warm and (stamp is None or stamp < warm_at):
+                    stamp = warm_at
+                if stamp is None or not self.now() - run.CAREER_TTL < stamp <= self.now():
                     due.append(player)
             pending[endpoint] = sorted(set(pending.get(endpoint, [])) | set(due), key=int)
         self.persist()
 
-    def careers(self):
+    def migrate_warm_present(self):
+        """#2068: scopes warmed before warm_present queued every Bronze-present career."""
+        if (not self.data.get('warm_baseline') or 'warm_present' in self.data
+                or self.cursor.cold_complete or self.snapshot is None):
+            return
+        players = {str(row['player_id']) for row in self.snapshot.rows}
+        present = {endpoint: _bronze_career_players(self.scraper, endpoint, players)
+                   for endpoint in ('market_value_points', 'transfer_events')}
+        self.data['warm_present'] = {endpoint: sorted(ids, key=int) for endpoint, ids in present.items()}
+        self.data['warm_baseline_at'] = self.now().isoformat()
+        pending = self.resume.setdefault('careers', {})
+        for endpoint, ids in present.items():
+            # A pending player signal is a real change; its career stays queued.
+            pending[endpoint] = [player for player in pending.get(endpoint, []) if player not in ids
+                                 or getattr(self.signals.get(f'player:{player}'), 'pending', False)]
+        self.persist()
+
+    def careers(self, only=None):
+        """Fetch queued careers; ``only`` limits them to those players (#2068)."""
         self._require_reconciled_signals()
         if self.data.get('authoritative_empty_scope'):
             return
-        self.queue_career_refreshes()
+        if only is None:
+            self.migrate_warm_present()
+            self.queue_career_refreshes()
         pending = self.resume.setdefault('careers', {})
         for endpoint in ('market_value_points', 'transfer_events'):
-            ids = sorted(set(pending.get(endpoint, [])), key=int)
+            ids = sorted(set(pending.get(endpoint, [])) & (set(only) if only is not None else set(pending.get(endpoint, []))), key=int)
             if not ids:
                 continue
+            # The rest of the queue keeps its place for its own phase.
+            rest = set(pending.get(endpoint, [])) - set(ids)
             self.admission()
             entity = 'market_value_history' if endpoint == 'market_value_points' else 'transfers'
             budget = PRODUCTION_ENTITY_BUDGETS[entity]
@@ -1557,7 +1623,7 @@ class _Scope:
             processed, deferred = window.get('processed_player_ids', []), window.get('deferred_player_ids', [])
             if set(processed) & set(deferred) or set(processed) | set(deferred) != set(ids):
                 raise CurrentPortionError('career window does not partition requested players')
-            pending[endpoint] = list(deferred)
+            pending[endpoint] = sorted(rest | set(deferred), key=int)
             stale_generation_ids = [player for player in processed
                 if proof.get('signal_generations', {}).get(player) is not None
                 and proof['signal_generations'][player] != self.scraper._current_career_signal_generations.get(player)]
@@ -1588,16 +1654,19 @@ class _Scope:
                                     signal = mark_failed(signal, 'source_mismatch: CEAPI latest point differs from tmapi')
                                     _sql(self.scraper, build_signal_merge(signal))
                                     self.signals[key] = signal
-            pending[endpoint] = sorted(set(deferred) | set(mismatched_ids), key=int)
+            pending[endpoint] = sorted(rest | set(deferred) | set(mismatched_ids), key=int)
             proof = {**dict(proof), 'collector_window': {
                 'requested_player_ids': ids,
                 'processed_player_ids': [player_id for player_id in processed if player_id not in mismatched_ids],
-                'deferred_player_ids': list(pending[endpoint]), 'source_mismatch_ids': [player for player in mismatched_ids if player not in stale_generation_ids],
+                'deferred_player_ids': sorted(set(deferred) | set(mismatched_ids), key=int), 'source_mismatch_ids': [player for player in mismatched_ids if player not in stale_generation_ids],
                 'stale_generation_ids': stale_generation_ids}}
             self.data.setdefault('career_proofs', {})[endpoint] = dict(proof)
             self.data.setdefault('career_receipts', []).append(dict(proof))
             self.persist()
-        if not any(pending.values()) and self.snapshot is not None:
+        if only is not None:
+            self._acknowledge_players({player for player in only
+                                       if not any(player in ids for ids in pending.values())})
+        elif not any(pending.values()) and self.snapshot is not None:
             proofs = list(self.data.get('career_proofs', {}).values())
             if self.data.get('roster_proof'):
                 proofs.append(self.data['roster_proof'])
@@ -1608,6 +1677,41 @@ class _Scope:
                 eligible = [state for state in self.signals.values() if state.pending]
                 if all(_proof(proof)[1] >= state.first_detected_at for state in eligible):
                     self.acknowledge(proof, include_players=True)
+
+    def _acknowledge_players(self, players):
+        """#2068: acknowledge changed players by their own committed careers."""
+        if self.snapshot is None:
+            return
+        proofs = list(self.data.get('career_proofs', {}).values())
+        if self.data.get('roster_proof'):
+            proofs.append(self.data['roster_proof'])
+        eligible = [state for state in self.signals.values() if state.pending
+                    and state.observation.entity == 'player' and state.observation.entity_id in players]
+        if not proofs or not eligible:
+            return
+        proof = max(proofs, key=lambda item: _proof(item)[1])
+        if all(_proof(proof)[1] >= state.first_detected_at for state in eligible):
+            self.acknowledge(proof, include_players=True, players=players)
+
+    def apply_change(self):
+        """#2068: apply a detected change only: its roster and its players' careers."""
+        self.roster(weekly=False)
+        # A committed roster whose ops acknowledgement was lost settles here,
+        # not through the career tail; a later change has no proof yet.
+        proof = self.data.get('roster_proof')
+        stale = [state for state in self.signals.values() if state.pending and state.observation.entity != 'player']
+        if (proof and stale and self.snapshot is not None and not self.resume.get('required')
+                and all(_proof(proof)[1] >= state.first_detected_at for state in stale)):
+            self.acknowledge(proof)
+        # An unfinished scope acknowledges players only with its whole career
+        # tail (see persist); its changed players stay in that cold queue.
+        changed = {state.observation.entity_id for state in self.signals.values()
+                   if state.pending and state.observation.entity == 'player'}
+        if changed and self.cursor.cold_complete:
+            self.careers(only=changed)
+        if (self.cursor.cold_complete and not self.resume.get('required')
+                and not any(self.resume.get('careers', {}).values()) and not self.resume.get('coaches_pending')):
+            self.resume = {}
 
     def staff(self, writer):
         """An independent weekly full sweep; acknowledge each club after read-back."""
@@ -1813,18 +1917,22 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         state['current_targets'] = [{'scope_id': target.scope_id, 'competition_id': target.competition_id,
                                     'edition_id': target.edition_id, 'tier': _tier_json(target.tier)}
                                    for target in targets.targets]
-        ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes, turn=state['turn'],
+        ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes,
                                      staff_enabled=staff_writer is not None)
         closing_work = tuple(CurrentWork(target, 'season_close') for target in sorted(
             closing.values(), key=lambda target: (
                 cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
                 target.cold_priority)))
+        # #2068: due signals are cheap and must cover every target daily; only
+        # the portion deadline bounds them. Slots apply to the other work.
+        signals = tuple(item for item in ordinary if item.kind == 'signals')
+        ordinary = tuple(item for item in ordinary if item.kind != 'signals')
         # A failed close cannot occupy every current slot on every portion.
         close_quota = max(1, max_scopes // 2) if ordinary else max_scopes
         if max_scopes == 1 and ordinary and state['turn'] % 2 and not newly_detected_close:
-            work = ordinary[:1]
+            work = signals + ordinary[:1]
         else:
-            work = closing_work[:close_quota] + ordinary[:max_scopes - min(close_quota, len(closing_work))]
+            work = closing_work[:close_quota] + signals + ordinary[:max_scopes - min(close_quota, len(closing_work))]
 
         state['turn'] += 1
         save = store.save
@@ -1914,6 +2022,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             error = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
                             result.setdefault('check_failures', {})[kind] = error
                             scope.check(kind, [], 0, 0, status='uncertain', result=error)
+                elif item.kind == 'apply_change':
+                    scope.apply_change()
                 elif item.kind == 'weekly_staff':
                     scope.staff(staff_writer)
                     if (not scope.resume.get('required')
@@ -1937,27 +2047,35 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             data['season_close_roster_captured'] = True
                             scope.persist()
                     else:
+                        # An unfinished cold capture re-proves a due listing;
+                        # a fresh one gets it from roster(), a recovered write needs none.
+                        if (item.kind == 'cold_roster' and 'listing' in item.checks_due
+                            and scope.snapshot is None and scope.resume.get('clubs')):
+                            scope.listing()
                         scope.roster(weekly=item.kind == 'weekly_roster')
                         scope.staff(staff_writer)
+                    # #2068: a cold roster only commits the roster; its careers
+                    # and coaches remain in resume_json for continuation work.
+                    roster_only = item.kind == 'cold_roster' and not data.get('authoritative_empty_scope')
                     # Weekly roster capture queues global debt/TTL jobs;
                     # the next portion keeps their own endpoint byte budgets.
                     if item.kind == 'weekly_roster':
                         scope.queue_career_refreshes()
-                    else:
+                    elif not roster_only:
                         scope.careers()
                     coach_checked = data.get('coaches_checked_at')
-                    if (not scope.cursor.cold_complete or scope.resume.get('coaches_pending')
+                    if not roster_only and (not scope.cursor.cold_complete or scope.resume.get('coaches_pending')
                         or coach_checked is None or now() - _utc(coach_checked) >= timedelta(days=28)):
                         scope.coaches()
-                    if (not any(scope.resume.get('careers', {}).values()) and not scope.resume.get('required')
-                        and not scope.resume.get('coaches_pending')):
+                    if (not roster_only and not any(scope.resume.get('careers', {}).values())
+                        and not scope.resume.get('required') and not scope.resume.get('coaches_pending')):
                         scope.cursor = replace(scope.cursor, cold_complete=True)
                         scope.resume = {}
-                scope.cursor = replace(scope.cursor, last_work_at=now())
+                scope.cursor = replace(scope.cursor, last_work_at=now(), last_error_at=None)
                 scope.persist()
                 if daily_complete(scope.cursor, now()):
                     report['daily_complete_scope_ids'].append(target.scope_id)
-                result['status'] = 'complete' if not scope.resume else 'pending'
+                result['status'] = 'complete' if not scope.resume and item.kind != 'cold_roster' else 'pending'
                 if item.kind == 'season_close' and result['status'] == 'complete':
                     if not data.get('season_close_roster_captured'):
                         raise CurrentPortionError('season close requires a final committed full roster')
@@ -1984,15 +2102,25 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 if result.get('check_failures'):
                     result['status'] = 'uncertain'
             except Exception as exc:
-                result['status'], result['error'] = 'failed', type(exc).__name__ + ': ' + redact_sensitive(str(exc))
-                if 'baseline_required:' in str(exc):
-                    result['status'] = 'baseline_required'
+                message = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
+                # #2068: the remainder retained at the deadline keeps its turn;
+                # a real error is recorded and backs the scope off.
+                changes = {'last_work_at': now()}
+                # A recovered write awaiting fresh signals must not back off:
+                # backoff withholds exactly those signals.
+                if _deadline_retained(exc) or isinstance(exc, SignalRefreshRequired):
+                    result['status'], result['retained'] = 'retained', message
+                else:
+                    result['status'], result['error'] = 'failed', message
+                    if 'baseline_required:' in str(exc):
+                        result['status'] = 'baseline_required'
+                    changes['last_error_at'] = changes['last_work_at']
                 if scope is not None:
-                    scope.cursor = replace(scope.cursor, last_work_at=now())
+                    scope.cursor = replace(scope.cursor, **changes)
                     scope.persist()
                 else:
                     cursor = ScopeCursor.from_mapping(data['cursor']) if data.get('cursor') else ScopeCursor(target.scope_id)
-                    data['cursor'] = replace(cursor, last_work_at=now()).as_dict()
+                    data['cursor'] = replace(cursor, **changes).as_dict()
                     save()
             finally:
                 try:
@@ -2094,7 +2222,7 @@ def _portion_alarm(seconds):
     started = time.monotonic()
 
     def expired(signum, frame):
-        raise CurrentPortionError('whole current portion reached its absolute deadline')
+        raise PortionDeadlineError('whole current portion reached its absolute deadline')
 
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, float(seconds))
