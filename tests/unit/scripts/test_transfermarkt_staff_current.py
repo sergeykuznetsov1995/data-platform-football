@@ -198,9 +198,11 @@ def test_old_staff_pending_migration_preserves_membership_removal(offline):
     offline.calls.clear()
     writer, writes = writer_for(offline)
     report = offline.run('participants-continue', staff_writer=writer)
-    assert report['scopes'][0]['kind'] == 'resume'
+    # #2068: the membership removal is a detected change, applied first.
+    assert report['scopes'][0]['kind'] == 'apply_change'
     assert report['scopes'][0]['status'] == 'complete'
     assert offline.writes[-1].expected_team_ids == offline.club_ids
+    offline.run('staff', staff_writer=writer)
     assert not any('/kader/' in url for _, url in offline.calls)
     assert writes == list(offline.club_ids)
 

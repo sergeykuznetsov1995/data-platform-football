@@ -553,10 +553,70 @@ def test_detected_club_change_marks_cursor_until_the_roster_applies_it(offline):
     cursor = next(iter(offline.state()['scopes'].values()))['cursor']
     assert cursor['change_pending'] and cursor['roster_completed_at']
     report = offline.run('apply')
-    assert [item['kind'] for item in report['scopes']] == ['resume']
+    assert [item['kind'] for item in report['scopes']] == ['apply_change']
     data = next(iter(offline.state()['scopes'].values()))
     assert not data['cursor']['change_pending']
     assert data['signals']['club:10']['status'] == 'applied'
+
+
+def test_apply_change_fetches_only_changed_player_careers_of_closed_scope(offline):
+    others = [str(player) for player in range(1000, 1050)]
+    offline.squad_players = {'20': ['120'] + others}
+    offline.run_cold('cold')
+    assert next(iter(offline.state()['scopes'].values()))['cursor']['cold_complete']
+    stale = offline.clock.wall - timedelta(days=8)
+    offline.fetch_state = {key: (status, run, stale) for key, (status, run, _) in offline.fetch_state.items()}
+    offline.clock.advance(21 * 3600)
+    offline.player_values['110'] = 2000000
+    offline.squad_values['10'] = '€2.0m'
+    offline.run('detect')
+    assert next(iter(offline.state()['scopes'].values()))['cursor']['change_pending']
+    offline.calls.clear()
+    offline.careers.clear()
+    report = offline.run('apply')
+    assert [item['kind'] for item in report['scopes']] == ['apply_change']
+    assert {ids for _, ids, _ in offline.careers} == {('110',)}
+    assert {url.rsplit('/', 1)[-1] for _, url in offline.calls if '/ceapi/' in url} == {'110'}
+    data = next(iter(offline.state()['scopes'].values()))
+    assert not data['cursor']['change_pending']
+    assert data['signals']['player:110']['status'] == 'applied'
+    offline.careers.clear()
+    offline.clock.advance(21 * 3600)
+    offline.run('next-day')  # the daily listing reopens the closed scope's continuation
+    report = offline.run('ttl')  # the TTL refresh keeps its own fair phase
+    assert [item['kind'] for item in report['scopes']] == ['resume']
+    assert {player for _, ids, _ in offline.careers for player in ids} >= set(others)
+
+
+def test_apply_change_of_unfinished_scope_commits_roster_without_cold_careers(offline):
+    from scrapers.transfermarkt.registry import deterministic_scope_id
+    competitions = ('GB1', 'ES1')
+    offline.run('cold', competitions=competitions, max_scopes=2)
+    offline.clock.advance(21 * 3600)
+    offline.values['10'] = offline.squad_values['10'] = '€2.0m'
+    offline.player_values['110'] = 2000000
+    # One slot: GB1 continues its cold careers; ES1 only detects its change.
+    offline.run('detect', competitions=competitions, max_scopes=1)
+    es1 = deterministic_scope_id('ES1', '2026')
+    assert offline.state()['scopes'][es1]['cursor']['change_pending']
+    writes = len(offline.writes)
+    offline.calls.clear()
+    report = offline.run('apply', competitions=competitions, max_scopes=1)
+    assert [(item['kind'], item['scope_id']) for item in report['scopes']][0] == ('apply_change', es1)
+    assert len(offline.writes) == writes + 1 and offline.writes[-1].scope_id == es1
+    assert not any('/ceapi/' in url for scope, url in offline.calls if scope == es1)
+    data = offline.state()['scopes'][es1]
+    assert not data['cursor']['change_pending'] and not data['cursor']['cold_complete']
+    assert '110' in json.loads(data['cursor']['resume_json'])['careers']['market_value_points']
+    plan = current.plan_current_work(
+        current.current_scope_targets([{'competition_id': cid, 'live': True, 'competition_class': 'core_club', 'tier': 1}
+                                       for cid in competitions],
+                                      [_joined_row(_competition(cid), _edition(cid, '2026')) for cid in competitions]).targets,
+        {key: current.ScopeCursor.from_mapping(value['cursor']) for key, value in offline.state()['scopes'].items()},
+        now=offline.clock.wall)
+    # Back in phase 1: unfinished careers by cold_priority, no longer apply_change.
+    assert [(work.kind, work.target.competition_id) for work in plan if work.target.competition_id == 'ES1'] == [
+        ('resume', 'ES1')]
 
 
 def test_deadline_inside_careers_is_retained_not_failed(offline):
@@ -1549,7 +1609,13 @@ def test_verified_replacement_is_durable_before_ops_ack_failure(offline, monkeyp
     assert 'roster_write_intent' not in data
     assert any(value['status'] != 'applied' for value in data['signals'].values())
     offline.calls.clear()
-    offline.run('ack-retry')
+    report = offline.run('ack-retry')
+    # #2068: the unacknowledged roster is a pending change, settled first.
+    assert [item['kind'] for item in report['scopes']] == ['apply_change']
+    data = next(iter(offline.state()['scopes'].values()))
+    assert all(value['status'] == 'applied' for key, value in data['signals'].items() if not key.startswith('player:'))
+    assert not data['cursor']['change_pending']
+    offline.run('ack-retry-careers')
     assert len(offline.writes) == 1
     assert not any('/kader/' in url for _, url in offline.calls)
     data = next(iter(offline.state()['scopes'].values()))

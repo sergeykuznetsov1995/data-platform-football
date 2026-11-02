@@ -356,7 +356,7 @@ def test_detected_change_is_applied_before_cold_work_then_returns_to_its_phase()
     checked = {f'{name}_checked_at': NOW for name in state.DAILY_CHECKS}
     changed = _started(by_id['LOW4'], cold_complete=True, change_pending=True, last_work_at=NOW, **checked)
     works = state.plan_current_work(targets, {by_id['LOW4']: changed}, now=NOW)
-    assert [(work.kind, work.target.competition_id) for work in works] == [('resume', 'LOW4'), ('cold_roster', 'GB1')]
+    assert [(work.kind, work.target.competition_id) for work in works] == [('apply_change', 'LOW4'), ('cold_roster', 'GB1')]
     applied = replace(changed, change_pending=False)
     works = state.plan_current_work(targets, {by_id['LOW4']: applied}, now=NOW)
     assert [(work.kind, work.target.competition_id) for work in works] == [('cold_roster', 'GB1'), ('resume', 'LOW4')]

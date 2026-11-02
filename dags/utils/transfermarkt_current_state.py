@@ -718,8 +718,8 @@ def plan_current_work(
             queue(4, 'weekly_roster', (last_work, target.cold_priority))
         elif cursor.change_pending and cursor.roster_completed_at is not None:
             # A detected source change is applied in the next portion (<= 24h),
-            # ahead of all cold work; its resume acknowledges the signals.
-            queue(0, 'resume', (last_work, target.cold_priority))
+            # ahead of all cold work: its roster and changed players only.
+            queue(0, 'apply_change', (last_work, target.cold_priority))
         elif not cursor.cold_complete and cursor.roster_completed_at is None:
             # A due listing still re-proves membership of an unfinished capture.
             queue(1, 'cold_roster', (minimum, target.cold_priority), tuple(name for name in due if name == 'listing'))
