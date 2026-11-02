@@ -723,3 +723,14 @@ def test_real_history_parallel_workers_write_on_main_thread(conn, tmp_path):
     timing = PaceStore(tmp_path / 'pace.sqlite3').rows('write', 0, NOW.timestamp())[0]
     assert timing['matches'] == 380 and timing['step'] == 2
     assert 0 <= timing['write_seconds'] <= timing['batch_seconds']
+
+
+def test_history_attempt_publication_never_waits_for_the_publish_lock():
+    from types import SimpleNamespace
+
+    calls = []
+    client = SimpleNamespace(ledger=(), flush_attempts=lambda conn, **kwargs: calls.append(kwargs) or 0)
+    runner = SimpleNamespace(client=client, conn=object(), _journalled=0, _workers=(),
+                             _worker_journalled={})
+    history._Runner.flush_journal(runner)
+    assert calls == [dict(blocking=False)]

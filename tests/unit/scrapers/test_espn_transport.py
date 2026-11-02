@@ -1349,3 +1349,20 @@ def test_history_dag_flush_skips_measurement_rows(monkeypatch, tmp_path):
     _seed_outbox(journal, "live", 2)
     assert client.flush_attempts(Connection()) == 3
     assert journal.pending() == 252
+
+
+@pytest.mark.unit
+def test_nonblocking_flush_returns_while_another_publisher_holds_the_lock(monkeypatch, tmp_path):
+    import fcntl
+    import os
+    from tests.unit.scrapers.test_espn_pace_report import Connection
+    client, _, _, _ = _client(monkeypatch, tmp_path, [], gate=_gate(tmp_path, lane="history"))
+    journal = client.attempt_journal
+    _seed_outbox(journal, "history", 3)
+    descriptor = os.open(str(journal.path) + ".publish.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        assert client.flush_attempts(Connection(), blocking=False) == 0
+    finally:
+        os.close(descriptor)
+    assert journal.pending() == 3

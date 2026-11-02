@@ -507,7 +507,9 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         client.flush()
         entries = client.ledger[offset:]
         if hasattr(client, "flush_attempts"):
-            client.flush_attempts(conn)
+            # A busy lock means a long background MERGE: never spend the deep
+            # window waiting; the history publisher sweeps these rows later.
+            client.flush_attempts(conn, blocking=False)
         flush_journal(conn, journal_rows(entries, run_id=run_id, task_id="run_deep"))
     players = [entry for entry in entries if entry.endpoint in _PLAYER_ENDPOINTS]
     report.update(
