@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import errno
+import logging
 import math
 import fcntl
 import os
 import socket
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -21,6 +23,8 @@ from pathlib import Path
 
 from .journal import _execute, _literal
 from .pace import utc
+
+logger = logging.getLogger(__name__)
 
 ATTEMPT_TABLE = 'iceberg.ops.espn_http_attempt_v1'
 ATTEMPT_COLUMNS = (
@@ -180,13 +184,17 @@ class AttemptJournal:
             r['complete'] and r['http_ms'] is not None and (r['status'] is not None or r['timeout']) for r in rows
         )
 
-    def flush(self, conn, *, max_batches=None, blocking=True, before=None):
-        """Recover all workers' dirty starts/results, idempotently, in batches.
+    def flush(self, conn, *, max_batches=None, blocking=True, before=None, lane=None,
+              measured=None, batch_size=200):
+        """Recover dirty starts/results, idempotently, in batches.
 
-        A separate flock serializes publishers without blocking HTTP recording. If Trino commits and
-        the caller dies before SQLite acknowledgement, replay updates that id.
+        ``lane``/``measured`` select one owner's rows (None = every worker's rows); an
+        owner never drains another lane's tail. A separate flock serializes publishers
+        without blocking HTTP recording. If Trino commits and the caller dies before
+        SQLite acknowledgement, replay updates that id.
         Incomplete starts are published too and subsequently updated on finish.
         """
+        timer = time.monotonic()
         descriptor = os.open(str(self.path) + '.publish.lock', os.O_CREAT | os.O_RDWR, 0o600)
         try:
             try:
@@ -196,20 +204,32 @@ class AttemptJournal:
             _execute(conn, 'CREATE SCHEMA IF NOT EXISTS iceberg.ops')
             columns = ', '.join(f'{name} {kind}' for name, kind in ATTEMPT_COLUMNS)
             _execute(conn, f'CREATE TABLE IF NOT EXISTS {ATTEMPT_TABLE} ({columns})')
-            return self._flush_locked(conn, max_batches=max_batches, before=before)
+            count = self._flush_locked(conn, max_batches=max_batches, before=before, lane=lane,
+                                       measured=measured, batch_size=batch_size)
+            logger.info('ESPN attempts published: %d rows, lane=%s, %.1fs',
+                        count, lane or 'all', time.monotonic() - timer)
+            return count
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def _flush_locked(self, conn, *, max_batches=None, before=None):
+    def _flush_locked(self, conn, *, max_batches=None, before=None, lane=None, measured=None,
+                      batch_size=200):
+        where, args = ['dirty=1'], []
+        if before is not None:
+            where.append('requested_at<?')
+            args.append(utc(before).isoformat())
+        if lane is not None:
+            where.append("json_extract(payload, '$.lane')=?")
+            args.append(lane)
+        if measured is not None:
+            where.append("json_extract(payload, '$.measurement_id') IS "
+                         + ('NOT NULL' if measured else 'NULL'))
+        select = 'SELECT id, payload FROM attempts WHERE ' + ' AND '.join(where) + ' LIMIT ?'
         count = batches = 0
         while max_batches is None or batches < max_batches:
             with self._db() as db:
-                pending = db.execute(
-                    'SELECT id, payload FROM attempts WHERE dirty=1'
-                    + (' AND requested_at<?' if before is not None else '') + ' LIMIT 200',
-                    (utc(before).isoformat(),) if before is not None else (),
-                ).fetchall()
+                pending = db.execute(select, (*args, batch_size)).fetchall()
             if not pending:
                 return count
             rows = [json.loads(payload) for _, payload in pending]

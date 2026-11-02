@@ -11,6 +11,11 @@ import time
 from .history import live_debt
 from .parallel import protected
 
+# Rows per background MERGE. Cost is dominated by the target-table scan, not the
+# VALUES list, so larger batches publish more per minute; ~285 SQL characters a
+# row keeps 2000 rows (~0.6 MB) under Trino's default query.max-length (1,000,000).
+PUBLISH_BATCH = 2000
+
 
 class PaceIO:
     def __init__(self, *, factory, gate, journal, store, targets, now,
@@ -56,6 +61,21 @@ class PaceIO:
         for thread in self.threads:
             thread.join()
 
+    def _publish(self, manager):
+        """Sweep every lane's tail: full batches back to back within one interval.
+
+        Each batch takes the shared lock non-blocking; a busy lock, a short batch
+        or the spent interval ends the tick.
+        """
+        published, timer = 0, time.monotonic()
+        while not self.stop.is_set():
+            count = self.journal.flush(manager.connection, max_batches=1, blocking=False,
+                                       batch_size=PUBLISH_BATCH)
+            published += count
+            if count < PUBLISH_BATCH or time.monotonic() - timer >= self.intervals['publication']:
+                break
+        return published
+
     def _run(self, name):
         manager = None
         try:
@@ -80,8 +100,7 @@ class PaceIO:
                     elif name == 'freshness':
                         result = self.read_freshness(manager, self.targets, started)
                     else:
-                        result = dict(published=self.journal.flush(manager.connection, max_batches=1,
-                                                                  blocking=False),
+                        result = dict(published=self._publish(manager),
                                       total_pending=self.journal.pending())
                 except Exception as exc:
                     error = type(exc).__name__
@@ -164,8 +183,9 @@ def drain_publication(journal, manager, store, now, before):
     published, error = 0, None
     pending = journal.pending(before=before)
     try:
-        published = journal.flush(manager.connection, max_batches=(pending + 199) // 200,
-                                  blocking=False, before=before) if pending else 0
+        published = journal.flush(manager.connection, max_batches=-(-pending // PUBLISH_BATCH),
+                                  blocking=False, before=before,
+                                  batch_size=PUBLISH_BATCH) if pending else 0
     except Exception as exc:
         error = type(exc).__name__
     pending = journal.pending(before=before)

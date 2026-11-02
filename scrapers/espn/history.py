@@ -494,7 +494,8 @@ class _Runner:
 
     def flush_journal(self) -> None:
         if hasattr(self.client, "flush_attempts"):
-            self.client.flush_attempts(self.conn)
+            # Same lane as the measurement publisher: never queue behind its MERGE.
+            self.client.flush_attempts(self.conn, blocking=False)
         entries = self.client.ledger
         new = entries[self._journalled :]
         if new:

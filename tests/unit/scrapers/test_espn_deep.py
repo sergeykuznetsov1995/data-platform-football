@@ -1056,3 +1056,10 @@ def test_unreadable_cached_player_body_is_fetched_again(runner, corruption):
     assert report["players_completed"] == 1 and report["players_failed"] == 0
     assert _player_urls(runner.client.calls) == target
     assert runner.conn.execute("SELECT * FROM iceberg.ops.espn_deep_player_retry_v1").fetchall() == []
+
+
+def test_deep_attempt_publication_never_waits_for_the_publish_lock(runner):
+    calls = []
+    runner.client.flush_attempts = lambda conn, **kwargs: calls.append(kwargs) or 0
+    deep.run_deep(**runner.args)
+    assert calls == [dict(blocking=False)]

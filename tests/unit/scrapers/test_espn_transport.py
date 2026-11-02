@@ -1312,3 +1312,57 @@ def test_recycled_history_keeps_read_timeout_when_response_close_also_fails(monk
     assert row['session_sequence'] == 1 and row['session_recycled'] is True
     assert not any(n['type'] == 'ConnectionError' for n in row['error_chain'])
     client.close()
+
+
+def _seed_outbox(journal, lane, count, *, measurement_id=None):
+    for index in range(count):
+        identity = journal.begin(
+            run_id="r", task_id="t", requested_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+            origin=WEB, endpoint="summary", lane=lane, step=0, measurement_id=measurement_id,
+        )
+        journal.finish(identity, status=200, timeout=False, http_ms=1, direct_bytes=1)
+
+
+@pytest.mark.unit
+def test_live_flush_publishes_only_its_lane_and_leaves_measurement_tail(monkeypatch, tmp_path):
+    from tests.unit.scrapers.test_espn_pace_report import Connection
+    client, _, _, _ = _client(monkeypatch, tmp_path, [])
+    journal = client.attempt_journal
+    _seed_outbox(journal, "history", 450, measurement_id="m1")
+    _seed_outbox(journal, "history", 3)
+    _seed_outbox(journal, "live", 5)
+    conn = Connection()
+    assert client.flush_attempts(conn) == 5
+    assert sum(sql.startswith("MERGE") for sql in conn.statements) == 1
+    assert journal.pending() == 453
+    published = conn.db.execute("SELECT lane, COUNT(*) FROM iceberg.ops.espn_http_attempt_v1 GROUP BY lane").fetchall()
+    assert published == [("live", 5)]
+
+
+@pytest.mark.unit
+def test_history_dag_flush_skips_measurement_rows(monkeypatch, tmp_path):
+    from tests.unit.scrapers.test_espn_pace_report import Connection
+    client, _, _, _ = _client(monkeypatch, tmp_path, [], gate=_gate(tmp_path, lane="history"))
+    journal = client.attempt_journal
+    _seed_outbox(journal, "history", 250, measurement_id="m1")
+    _seed_outbox(journal, "history", 3)
+    _seed_outbox(journal, "live", 2)
+    assert client.flush_attempts(Connection()) == 3
+    assert journal.pending() == 252
+
+
+@pytest.mark.unit
+def test_nonblocking_flush_returns_while_another_publisher_holds_the_lock(monkeypatch, tmp_path):
+    import fcntl
+    import os
+    from tests.unit.scrapers.test_espn_pace_report import Connection
+    client, _, _, _ = _client(monkeypatch, tmp_path, [], gate=_gate(tmp_path, lane="history"))
+    journal = client.attempt_journal
+    _seed_outbox(journal, "history", 3)
+    descriptor = os.open(str(journal.path) + ".publish.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        assert client.flush_attempts(Connection(), blocking=False) == 0
+    finally:
+        os.close(descriptor)
+    assert journal.pending() == 3

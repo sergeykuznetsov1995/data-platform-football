@@ -1160,7 +1160,9 @@ def finish_requests(client, conn, *, run_id: str, task_id: str) -> None:
     """Journal of the task's requests, then the queued raw bodies."""
 
     if hasattr(client, "flush_attempts"):
-        client.flush_attempts(conn)
+        # One MERGE takes minutes on the shared table: a busy lock means another
+        # publisher, which (or the next task) sweeps these rows; never queue here.
+        client.flush_attempts(conn, blocking=False)
     flush_journal(conn, journal_rows(client.ledger, run_id=run_id, task_id=task_id))
     client.flush()
 
