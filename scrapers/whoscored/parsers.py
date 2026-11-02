@@ -4164,6 +4164,17 @@ def _validate_player_stats_page_metadata(
 
     first_index = metadata.first_record_index
     last_index = metadata.last_record_index
+    # A stage without player statistics answers with a one-based empty page:
+    # no rows, zero totals and pages, and the range 1..0. Keep the exception exact.
+    if (
+        records_count == 0
+        and total_results == 0
+        and metadata.total_pages == 0
+        and current_page == 1
+        and first_index == 1
+        and last_index == 0
+    ):
+        return None
     if (first_index is None) != (last_index is None):
         raise WhoScoredParseError(
             "player statistics record range must contain both endpoints"
@@ -4311,7 +4322,7 @@ def parse_player_stage_statistics_page(
         expected_page=int(expected_page),
         records_count=len(records),
     )
-    if metadata.total_pages is None or metadata.total_pages == 1:
+    if metadata.total_pages in (None, 0, 1):
         return parse_player_stage_statistics(
             decoded,
             scope=scope,

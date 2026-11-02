@@ -1434,6 +1434,57 @@ def test_player_statistics_keep_zero_paging_guard_strict():
         parse_player_stage_statistics(payload, scope=SCOPE, stage_id=700)
 
 
+_ONE_BASED_EMPTY_PLAYER_PAGING = {
+    "currentPage": 1,
+    "totalPages": 0,
+    "resultsPerPage": 5000,
+    "totalResults": 0,
+    "firstRecordIndex": 1,
+    "lastRecordIndex": 0,
+}
+
+
+@pytest.mark.unit
+def test_player_statistics_accept_live_one_based_empty_page():
+    # Live xg-stats answer for stage 19177 (WS-247-721, 2021/22), 02.11.2026.
+    payload = {
+        "playerTableStats": [],
+        "paging": dict(_ONE_BASED_EMPTY_PLAYER_PAGING),
+        "statColumns": ["apps", "subOn", "minsPlayed"],
+    }
+
+    result = parse_player_stage_statistics_page(
+        payload, scope=SCOPE, stage_id=19177, expected_page=1
+    )
+
+    assert result.status is DatasetStatus.EMPTY
+    assert len(result.rows) == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("paging_update", "rows", "message"),
+    (
+        ({}, [{"playerId": 11, "teamId": 26, "apps": 1}], "record range is invalid"),
+        ({"totalResults": 1}, [], "record range is invalid"),
+        ({"currentPage": 2}, [], "returned page 2"),
+        ({"firstRecordIndex": 2}, [], "record range is invalid"),
+        ({"totalPages": 1}, [], "record range is invalid"),
+    ),
+)
+def test_player_statistics_one_based_empty_exception_stays_exact(
+    paging_update, rows, message
+):
+    paging = dict(_ONE_BASED_EMPTY_PLAYER_PAGING)
+    paging.update(paging_update)
+    payload = {"playerTableStats": rows, "paging": paging}
+
+    with pytest.raises(WhoScoredParseError, match=message):
+        parse_player_stage_statistics_page(
+            payload, scope=SCOPE, stage_id=19177, expected_page=1
+        )
+
+
 @pytest.mark.unit
 def test_team_zero_paging_accepts_official_xg_current_page_one_sentinel():
     payload = {
