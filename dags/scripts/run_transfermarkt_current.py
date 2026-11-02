@@ -1845,6 +1845,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             child_cycle_id = 'tm-current-' + semantic_signature([cycle_id, target.scope_id, item.kind, work_index])[:32]
             result['child_cycle_id'] = child_cycle_id
             previous_child_cycle = os.environ.get('TM_CHILD_CYCLE_ID')
+            previous_records = os.environ.get('TM_COMPETITION_RECORDS_JSON')
             scraper, scope = None, None
             try:
                 if data.get('in_flight'):
@@ -1864,6 +1865,11 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 os.environ['TM_CHILD_CYCLE_ID'] = child_cycle_id
                 scraper = factory(target, rows[target.competition_id, target.edition_id], cache,
                                   deadline - 60, data.get('traffic_used', {}))
+                if scraper._competition_records is not None:
+                    # #2067: writer helpers resolve the scope through this env, as
+                    # in a scope-cycle child; give them the scraper's registry rows.
+                    os.environ['TM_COMPETITION_RECORDS_JSON'] = json.dumps(
+                        [record.as_dict() for record in scraper._competition_records], sort_keys=True)
                 scraper._current_deadline_monotonic = deadline
                 scraper._current_child_cycle_id = child_cycle_id
                 scraper._current_monotonic_fn = clock
@@ -2026,6 +2032,10 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         os.environ.pop('TM_CHILD_CYCLE_ID', None)
                     else:
                         os.environ['TM_CHILD_CYCLE_ID'] = previous_child_cycle
+                    if previous_records is None:
+                        os.environ.pop('TM_COMPETITION_RECORDS_JSON', None)
+                    else:
+                        os.environ['TM_COMPETITION_RECORDS_JSON'] = previous_records
             if data.get('roster_reconciliations'):
                 result['roster_reconciliations'] = data['roster_reconciliations'][-1:]
             if data.get('recovery_signal_refresh_required'):

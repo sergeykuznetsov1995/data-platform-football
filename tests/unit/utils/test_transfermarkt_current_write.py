@@ -61,6 +61,9 @@ class MemoryCursor:
             raise RuntimeError('injected late physical SQL failure')
         sql = re.sub(r'iceberg\.(?:bronze|ops)\.', '', sql).strip()
         sql = sql.replace('json_extract_scalar(', 'json_extract(')
+        # Trino addresses arbitrary keys as $["k"]; SQLite JSON paths spell it $."k".
+        params = tuple(re.sub(r'^\$\["(.*)"\]$', r'$."\1"', item) if isinstance(item, str) else item
+                       for item in params)
         if '$snapshots' in sql:
             target = re.search(r'FROM "?(\w+)\$snapshots', sql).group(1)
             if not self.db.sql.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (target,)).fetchone():
@@ -2045,3 +2048,34 @@ def test_enriched_contract_carries_api_lineage_and_observation_stamp(scraper):
     new = after.loc[after.team_id == '10'].iloc[0]
     for column in ('source_url', 'source_body_hash', 'fetched_at', 'observed_at', 'contract_until'):
         assert new[column] == old[column], column
+
+
+def test_career_reuse_queries_bind_bracketed_json_path_for_numeric_ids(monkeypatch):
+    # #2066: Trino rejects '$."175014"'; numeric source IDs need '$["175014"]'.
+    run = current.run
+    spec = run._spec_for_write_mode(run.ENTITY_SPECS[run.ENTITY_TRANSFERS], 'native-only')
+    stamp = datetime.now(timezone.utc) - timedelta(hours=1)
+    status = next(iter(run.SUCCESS_STATUSES))
+    paths = []
+
+    def execute(_conn, sql, params=(), fetch=False):
+        if 'capture_times_json' in sql:
+            paths.append(params[1])
+        return []
+
+    class Connection:
+        def cursor(self):
+            return type('Cursor', (), {'close': lambda self: None})()
+
+        def close(self):
+            pass
+
+    scraper = type('Scraper', (), {'_current_career_signal_generations': {'175014': 'g1'},
+                                   '_bronze_connection': lambda self: Connection()})()
+    monkeypatch.setattr(run, '_execute_cursor', execute)
+    monkeypatch.setattr(run, '_load_fetch_state', lambda *a, **k: {'175014': {'status': status, 'last_success_at': stamp}})
+    monkeypatch.setattr(run, '_load_career_changes', lambda *a: {})
+    assert current._global_career_captures(scraper, spec, ['175014'], {'scope_id': 's'}) == {}
+    with pytest.raises(RuntimeError, match='lacks original typed proof'):
+        run._load_cached_empty_career_ref(scraper, spec, '175014', {'last_success_at': stamp})
+    assert paths == ['$["175014"]', '$["175014"]']

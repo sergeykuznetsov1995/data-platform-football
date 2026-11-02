@@ -1815,3 +1815,22 @@ def test_untiered_competition_state_saves_and_reloads(offline):
         )
         assert 'fatal_error' not in report
         assert offline.state()['current_targets'][0]['tier'] is None
+
+
+def test_registry_only_competition_resolves_in_writer_helpers(offline, monkeypatch):
+    # #2067: THA1 is in the registry row but not in BOOTSTRAP_COMPETITIONS; the
+    # dual career writer resolves it through run._scope_season.
+    from dags.scripts import run_transfermarkt_scraper as run
+    monkeypatch.delenv('TM_COMPETITION_RECORDS_JSON', raising=False)
+    seasons = []
+    career_writer = offline.career_writer
+
+    def writer(scraper, endpoint, ids, scope, *args, **kwargs):
+        seasons.append(run._scope_season(scope['competition_id'], scope['edition_id'])['canonical_season'])
+        return career_writer(scraper, endpoint, ids, scope, *args, **kwargs)
+
+    offline.career_writer = writer
+    report = offline.run('cold', competitions=('THA1',))
+    assert report['scopes'] and all(item.get('error') is None for item in report['scopes'])
+    assert seasons and set(seasons) == {'2627'}
+    assert 'TM_COMPETITION_RECORDS_JSON' not in current.os.environ

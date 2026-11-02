@@ -657,7 +657,7 @@ def _global_career_captures(scraper, spec, selected, scope):
         candidates = run._execute_cursor(scraper._bronze_connection(),
             f'SELECT cycle_id, entity, native_batch_id FROM {TABLE} '
             'WHERE native_table = ? AND json_extract_scalar(capture_times_json, ?) IS NOT NULL '
-            'ORDER BY committed_at DESC', (native.table_name, '$."' + player + '"'), fetch=True) or []
+            'ORDER BY committed_at DESC', (native.table_name, '$["' + player + '"]'), fetch=True) or []
         for cycle, entity, batch in candidates:
             archived = completed_capture(cycle, entity, batch)
             if archived is None:

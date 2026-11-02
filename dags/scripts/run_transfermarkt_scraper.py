@@ -2170,7 +2170,7 @@ def _load_cached_empty_career_ref(scraper, spec, player, state):
         candidates = _execute_cursor(connection,
             f'SELECT cycle_id, entity, native_batch_id FROM {TABLE} '
             'WHERE native_table = ? AND json_extract_scalar(capture_times_json, ?) IS NOT NULL '
-            'ORDER BY committed_at DESC', (native.table_name, '$."' + player + '"'), fetch=True) or []
+            'ORDER BY committed_at DESC', (native.table_name, '$["' + player + '"]'), fetch=True) or []
         stamp = _as_utc(state.get('last_success_at'))
         for cycle, entity, batch in candidates:
             capture = physical_predicate(cursor, cycle, entity, native.table_name, batch_id=batch)
