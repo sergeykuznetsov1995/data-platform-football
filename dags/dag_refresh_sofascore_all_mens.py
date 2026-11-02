@@ -798,7 +798,7 @@ cd /opt/airflow
   --dag-id "${AIRFLOW_CTX_DAG_ID}" \
   --run-id "${AIRFLOW_CTX_DAG_RUN_ID}" \
   --task-id "${AIRFLOW_CTX_TASK_ID}" \
-  --output "${SOFASCORE_REFRESH_RESULT_DIR}/schedule-refresh-{{ ts_nodash }}.json"
+  --output "${SOFASCORE_REFRESH_RESULT_DIR}/schedule-refresh-{{ ts_nodash }}{{ '-try%d' % ti.try_number if ti.try_number > 1 else '' }}.json"
 """
 
 RUN_SCOPE_COMMAND = """
@@ -876,15 +876,16 @@ with DAG(
         pool=REFRESH_POOL,
         priority_weight=5,
         do_xcom_push=False,
-        # NO retry, unlike every other task here.  A second attempt keeps the
-        # same DagRun, so it walks up to the same paid plan again while the
-        # gateway hands it only what the first attempt left of the run budget —
-        # the anti-pattern of lesson #7 (#1044: three retries of one task ate
-        # the DagRun budget and killed the wave without a single source hole).
-        # The lane does not need it: every class commits its own cursor and its
-        # own unfinished chains as it finishes, so the next scheduled run picks
-        # up exactly where this one stopped, 8 h later at worst.
-        retries=0,
+        # #2107: ONE retry, 10 min later.  A short contour failure (lease
+        # meter, a lease without an exit) used to cost the whole 8 h until the
+        # next run.  Every class commits its own cursor and unfinished chains
+        # as it finishes, so the retry resumes where the first try stopped.
+        # Lesson #7 (#1044: retries ate the DagRun budget) does not bite here:
+        # the gateway gives discovery leases 64 MiB per DagRun and a full sweep
+        # costs <= 10 MB.  ``plan_refresh_batch`` (all_done) waits for the
+        # retry; its report gets a ``-tryN`` suffix so the first one survives.
+        retries=1,
+        retry_delay=timedelta(minutes=10),
         # The class slices are cut to REFRESH_PAGE_BUDGET worst-case pages
         # (the fixture page of every stale and seeded season and the step-back
         # allowance count too): at the lane's 20/min that is 80 % of this

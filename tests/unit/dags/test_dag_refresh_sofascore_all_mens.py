@@ -183,11 +183,17 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     )
     assert fetch.append_env is True
     assert fetch._init_kwargs["pool"] == "ingest_scraper_pool"
-    # Sol r12 #2: a second attempt shares the DagRun's paid budget with the
-    # first while the preflight sizes the full plan again — lesson #7.  The
-    # sweep saves its state class by class, so the next scheduled run resumes
-    # it instead.
-    assert fetch._init_kwargs["retries"] == 0
+    # #2107: a short contour failure costs 10 minutes, not the 8 h until the
+    # next run — the retry resumes from the cursors each class committed, and
+    # the discovery leases have 64 MiB per DagRun against <= 10 MB a sweep.
+    assert fetch._init_kwargs["retries"] == 1
+    assert fetch._init_kwargs["retry_delay"] == timedelta(minutes=10)
+    # The retry's report must not overwrite the first try's (``visits``).
+    assert (
+        "schedule-refresh-{{ ts_nodash }}"
+        "{{ '-try%d' % ti.try_number if ti.try_number > 1 else '' }}.json"
+    ) in fetch.bash_command
+    assert operators["plan_refresh_batch"]._init_kwargs["trigger_rule"] == "all_done"
     assert fetch._init_kwargs["execution_timeout"] == timedelta(minutes=150)
     # #1358: 7 h hold the sweep, the scopes' shared window, the reserve for
     # their retries and the metadata enrichment: 150 min + 2 h + 2 h + 25 min.
