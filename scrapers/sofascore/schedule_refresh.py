@@ -29,7 +29,11 @@ from typing import Any, Collection, Iterable, Mapping, Optional
 
 from dags.utils.sofascore_dq import validate_schedule_rows
 from scrapers.sofascore.camoufox_capture import normalize_event
-from scrapers.sofascore.discovery import DiscoveryHTTPError, DiscoverySchemaError
+from scrapers.sofascore.discovery import (
+    DiscoveryError,
+    DiscoveryHTTPError,
+    DiscoverySchemaError,
+)
 from scrapers.sofascore.raw_store import (
     PayloadTarget,
     RawPayloadRecord,
@@ -137,7 +141,7 @@ class ScheduleSweepError(SweepVerdictError):
 
 
 class SweepRefusedError(DiscoveryHTTPError):
-    """``_FAILED_STREAK_LIMIT`` seasons in a row refused (#1359).
+    """The walk was cut short: a refusal streak (#1359) or the contour failed (#2107).
 
     NOT a verdict: the walk was cut short and the slice must be walked again,
     so the caller keeps its cursor.  But it carries what the walk had already
@@ -159,8 +163,9 @@ class SweepRefusedError(DiscoveryHTTPError):
         self.fetched = list(fetched)
         self.counters = dict(counters)
         self.incomplete = list(incomplete or [])
-        # Exact tail targets reached, including the refusing target.  The
-        # runner may retire completed chains without touching the unread tail.
+        # Exact tail targets reached, including a refusing target but not the
+        # one a contour failure cut (#2107).  The runner may retire completed
+        # chains without touching the unread tail.
         self.visited = list(visited or [])
 
 
@@ -226,13 +231,19 @@ def fetch_season_fixtures(
         path = fixture_page_path(tournament_id, season_id)
         try:
             body, payload = client.get_json_bytes(path)
-        except DiscoveryHTTPError as exc:
+        except DiscoveryError as exc:
+            if not isinstance(exc, DiscoveryHTTPError) or not _is_target_failure(exc):
+                # #2107: the contour failed, not this season — the calendars
+                # already read travel with the error instead of being lost.
+                raise SweepRefusedError(
+                    f"sweep interrupted: {exc}",
+                    status_code=getattr(exc, "status_code", None),
+                    fetched=fetched, counters=counters,
+                ) from exc
             if exc.status_code == 404:
                 counters["missing"] += 1
                 failed_streak = 0
                 continue
-            if not _is_target_failure(exc):
-                raise
             # #1359: one refused calendar costs its season, not the class.
             counters["failed"] += 1
             _record_failure(failures, tournament_id, season_id, exc)
@@ -635,9 +646,25 @@ def fetch_season_schedules(
             # The source answered: a broken page ends a refusal streak.
             failed_streak = 0
             continue
-        except DiscoveryHTTPError as exc:
-            if not _is_target_failure(exc):
-                raise
+        except DiscoveryError as exc:
+            if not isinstance(exc, DiscoveryHTTPError) or not _is_target_failure(exc):
+                # #2107: the contour failed mid-class (gateway, lease meter, a
+                # lease without an exit).  Only this season is rolled back, as
+                # below; the seasons read whole travel with the error and the
+                # caller banks them (01.11: 41 paid pages were thrown away).
+                # The season is not the culprit, so it leaves ``visited`` and
+                # is not queued: its retry chain stays as it was instead of
+                # ageing towards ``MAX_CHAIN_ATTEMPTS`` on gateway outages.
+                del fetched[collected:]
+                counters.clear()
+                counters.update(counters_before)
+                visited.pop()
+                raise SweepRefusedError(
+                    f"sweep interrupted: {exc}",
+                    status_code=getattr(exc, "status_code", None),
+                    fetched=fetched, counters=counters, incomplete=incomplete,
+                    visited=visited,
+                ) from exc
             # #1359: the source refused this season (403 in ``overdue`` froze
             # the whole lane on 27.09).  It is dropped exactly like a broken
             # page above — rows, counters, and a resumed chain back on the

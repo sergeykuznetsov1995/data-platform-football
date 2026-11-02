@@ -24,7 +24,7 @@ from scrapers.sofascore.schedule_refresh import (
     schedule_page_path,
     schedule_rows_from_events,
 )
-from scrapers.sofascore.discovery import DiscoveryHTTPError
+from scrapers.sofascore.discovery import DiscoveryError, DiscoveryHTTPError
 from scrapers.sofascore.raw_store import PayloadTarget, RawPayloadStore
 
 
@@ -820,18 +820,86 @@ def test_fetch_propagates_a_transport_failure_that_is_not_a_missing_season(tmp_p
 
     client.get_json_bytes = explode
 
-    with pytest.raises(DiscoveryHTTPError, match="gateway"):
+    with pytest.raises(DiscoveryHTTPError, match="gateway") as caught:
         fetch_season_schedules(
             client, [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET],
             _store(tmp_path),
         )
+    # #2107: a failure on the very first request has paid for nothing.
+    assert caught.value.fetched == []
 
     def lease_lost(path):
         raise DiscoveryHTTPError("lease closed")
 
     client.get_json_bytes = lease_lost
-    with pytest.raises(DiscoveryHTTPError, match="lease"):
+    with pytest.raises(DiscoveryHTTPError, match="lease") as caught:
         fetch_season_schedules(client, [READY_TARGET], _store(tmp_path))
+    assert caught.value.fetched == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", [
+    DiscoveryError("SofaScore discovery lease meter unavailable: Read timed out"),
+    DiscoveryHTTPError("HTTP 502 from the gateway", status_code=502),
+])
+def test_a_run_level_failure_carries_the_seasons_already_read(tmp_path, failure):
+    # #2107 (01.11): the lease meter timed out after 41 paid pages of
+    # ``overdue`` and the walk threw all of them away.  The seasons read whole
+    # travel with the error; the season it broke in is rolled back and left
+    # out of ``visited``, so its retry chain is neither retired nor aged.
+    from scrapers.sofascore.schedule_refresh import SweepRefusedError
+
+    payloads = _sweep_payloads()
+    first, _ = _fixture_events()
+    payloads[schedule_page_path(*PREVIOUS_TARGET, 1)] = _page(
+        _event(first, event_id=8, tournament_id=READY_TOURNAMENT,
+               season_id=READY_PREVIOUS_SEASON),
+        has_next=True,
+    )
+    broken = schedule_page_path(*PREVIOUS_TARGET, 2)
+
+    class _Contour(_Client):
+        def get_json(self, path):
+            if path == broken:
+                raise failure
+            return super().get_json(path)
+
+    targets = [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET]
+    with pytest.raises(SweepRefusedError, match="sweep interrupted") as caught:
+        fetch_season_schedules(
+            _Contour(payloads), targets, _store(tmp_path),
+            start_pages={PREVIOUS_TARGET: 2}, resume_anchors={PREVIOUS_TARGET: 77},
+            max_pages=2,
+        )
+
+    error = caught.value
+    assert [item.event["id"] for item in error.fetched] == [1, 2]
+    assert error.counters["events"] == 3 and error.counters["pages"] == 2
+    assert error.incomplete == []
+    assert error.visited == targets[:2]
+    assert error.status_code == getattr(failure, "status_code", None)
+
+
+@pytest.mark.unit
+def test_a_run_level_calendar_failure_carries_the_calendars_already_read(tmp_path):
+    from scrapers.sofascore.schedule_refresh import SweepRefusedError
+
+    payloads = _fixture_payloads()
+    lost = fixture_page_path(*CONFIGURED_TARGET)
+
+    class _Contour(_Client):
+        def get_json(self, path):
+            if path == lost:
+                raise DiscoveryError("SofaScore discovery lease meter unavailable")
+            return super().get_json(path)
+
+    with pytest.raises(SweepRefusedError, match="sweep interrupted") as caught:
+        fetch_season_fixtures(
+            _Contour(payloads), [READY_TARGET, CONFIGURED_TARGET], _store(tmp_path),
+        )
+
+    assert [item.event["id"] for item in caught.value.fetched] == [11]
+    assert caught.value.counters["events"] == 2
 
 
 def test_fetch_skips_a_refused_season_and_walks_the_rest(tmp_path):

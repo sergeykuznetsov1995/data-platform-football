@@ -368,6 +368,23 @@ def read_interrupted_runs(path: Path) -> dict[str, int]:
     }
 
 
+def read_interrupted_by(path: Path) -> dict[str, str]:
+    """The DagRun that last cut each class short (#2107): its Airflow retry
+    must not count the same interruption twice.  Malformed reads as empty.
+    """
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    runs = value.get("interrupted_by") if isinstance(value, Mapping) else None
+    if not isinstance(runs, Mapping):
+        return {}
+    return {
+        name: runs[name] for name in SWEEP_CLASSES if isinstance(runs.get(name), str)
+    }
+
+
 def read_idle_runs(path: Path) -> int:
     """How many committed runs in a row have written no schedule row at all.
 
@@ -1414,6 +1431,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         full_cursor = read_cursor(cursor_path, classes=("stale_full",))["stale_full"]
         idle_runs = read_idle_runs(cursor_path)
         interrupted_runs = read_interrupted_runs(cursor_path)
+        interrupted_by = read_interrupted_by(cursor_path)
         known, due, played = bronze_partitions(args.window_hours)
         overdue = overdue_partitions()
         if overdue:
@@ -1662,6 +1680,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for name, pair in cursors.items()
             },
         }
+        if interrupted_by:
+            cursor_state["interrupted_by"] = dict(interrupted_by)
         if stale_probes or full_cursor is not None:
             cursor_state["index"]["stale_full"] = list(full_cursor) if full_cursor else None
         attempted: set[tuple[int, int]] = set()
@@ -1972,7 +1992,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 held = 0
             else:
-                held += 1
+                # #2107: an Airflow retry of the same DagRun counts once.  A
+                # bare ``manual`` id is not unique, so it always counts.
+                if args.run_id == "manual" or interrupted_by.get(name) != args.run_id:
+                    held += 1
+                cursor_state.setdefault("interrupted_by", {})[name] = args.run_id
                 if held >= MAX_INTERRUPTED_RUNS:
                     # The walk keeps being cut short in the same slice: holding
                     # the anchor any longer starves every class after this one
