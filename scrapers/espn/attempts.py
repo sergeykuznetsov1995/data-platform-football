@@ -185,7 +185,7 @@ class AttemptJournal:
         )
 
     def flush(self, conn, *, max_batches=None, blocking=True, before=None, lane=None,
-              measured=None):
+              measured=None, batch_size=200):
         """Recover dirty starts/results, idempotently, in batches.
 
         ``lane``/``measured`` select one owner's rows (None = every worker's rows); an
@@ -205,7 +205,7 @@ class AttemptJournal:
             columns = ', '.join(f'{name} {kind}' for name, kind in ATTEMPT_COLUMNS)
             _execute(conn, f'CREATE TABLE IF NOT EXISTS {ATTEMPT_TABLE} ({columns})')
             count = self._flush_locked(conn, max_batches=max_batches, before=before, lane=lane,
-                                       measured=measured)
+                                       measured=measured, batch_size=batch_size)
             logger.info('ESPN attempts published: %d rows, lane=%s, %.1fs',
                         count, lane or 'all', time.monotonic() - timer)
             return count
@@ -213,7 +213,8 @@ class AttemptJournal:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def _flush_locked(self, conn, *, max_batches=None, before=None, lane=None, measured=None):
+    def _flush_locked(self, conn, *, max_batches=None, before=None, lane=None, measured=None,
+                      batch_size=200):
         where, args = ['dirty=1'], []
         if before is not None:
             where.append('requested_at<?')
@@ -224,11 +225,11 @@ class AttemptJournal:
         if measured is not None:
             where.append("json_extract(payload, '$.measurement_id') IS "
                          + ('NOT NULL' if measured else 'NULL'))
-        select = 'SELECT id, payload FROM attempts WHERE ' + ' AND '.join(where) + ' LIMIT 200'
+        select = 'SELECT id, payload FROM attempts WHERE ' + ' AND '.join(where) + ' LIMIT ?'
         count = batches = 0
         while max_batches is None or batches < max_batches:
             with self._db() as db:
-                pending = db.execute(select, args).fetchall()
+                pending = db.execute(select, (*args, batch_size)).fetchall()
             if not pending:
                 return count
             rows = [json.loads(payload) for _, payload in pending]

@@ -712,7 +712,7 @@ def test_async_observer_survives_blocked_publication_freshness_and_aggregation(c
         return manager
     def publish(connection, **kwargs):
         assert connection.owner == threading.get_ident()
-        assert kwargs == dict(max_batches=1, blocking=False)
+        assert kwargs == dict(max_batches=1, blocking=False, batch_size=2000)
         publishing.set()
         assert release.wait(5)
         return 0
@@ -1658,3 +1658,62 @@ def test_s2_pending_sql_boundary_does_not_block_recovery_on_s0(controller):
     assert 'sql_restart_pending' not in c.state
     c.check()
     assert c._debt_valid(c.state['start'])
+
+
+def _seed_tail(journal, count, *, lane='history', measurement_id='m1'):
+    with journal._db() as db:
+        rows = []
+        for index in range(count):
+            identity = f'{lane}{index:028d}'
+            payload = dict(attempt_id=identity, run_id='scheduled__2026-11-02T13:00:00+00:00',
+                           task_id='run_tournament[35]', requested_at=START.isoformat(),
+                           origin='https://site.web.api.espn.com', endpoint='summary', lane=lane,
+                           step=3, status=200, timeout=False, http_ms=12345.678901234,
+                           direct_bytes=123456789, complete=True, measurement_id=measurement_id)
+            rows.append((identity, payload['requested_at'], json.dumps(payload)))
+        db.executemany('INSERT INTO attempts VALUES (?, ?, ?, 1)', rows)
+
+
+def _publisher(journal, publish_seconds=60):
+    from scrapers.espn.pace_io import PaceIO
+    return PaceIO(factory=None, gate=None, journal=journal, store=None, targets=(), now=None,
+                  read_freshness=None, publish_seconds=publish_seconds)
+
+
+def test_background_publication_sweeps_large_tail_in_bounded_batches(tmp_path, monkeypatch):
+    from scrapers.espn import attempts
+    journal = AttemptJournal(tmp_path / 'outbox.sqlite3', utcnow_fn=lambda: START)
+    _seed_tail(journal, 4500)
+    _seed_tail(journal, 3, lane='live', measurement_id=None)
+    merges = []
+    def execute(conn, sql):
+        if sql.startswith('MERGE'):
+            merges.append(sql)
+    monkeypatch.setattr(attempts, '_execute', execute)
+    assert _publisher(journal)._publish(SimpleNamespace(connection=object())) == 4503
+    assert [sql.count("'summary'") for sql in merges] == [2000, 2000, 503]
+    assert max(len(sql) for sql in merges) < 1_000_000  # Trino default query.max-length
+    assert journal.pending() == 0
+
+
+def test_background_publication_stops_when_interval_is_spent(tmp_path, monkeypatch):
+    from scrapers.espn import attempts
+    journal = AttemptJournal(tmp_path / 'outbox.sqlite3', utcnow_fn=lambda: START)
+    _seed_tail(journal, 4500)
+    monkeypatch.setattr(attempts, '_execute', lambda conn, sql: None)
+    assert _publisher(journal, publish_seconds=0)._publish(SimpleNamespace(connection=object())) == 2000
+    assert journal.pending() == 2500
+
+
+def test_final_drain_uses_large_batches(tmp_path, monkeypatch):
+    from scrapers.espn import attempts
+    from scrapers.espn.pace_io import drain_publication
+    journal = AttemptJournal(tmp_path / 'outbox.sqlite3', utcnow_fn=lambda: START)
+    _seed_tail(journal, 2500)
+    merges = []
+    monkeypatch.setattr(attempts, '_execute',
+                        lambda conn, sql: merges.append(sql) if sql.startswith('MERGE') else None)
+    result = drain_publication(journal, SimpleNamespace(connection=object()),
+                               PaceStore(tmp_path / 'pace.sqlite3'), lambda: START + timedelta(seconds=10),
+                               START + timedelta(seconds=10))
+    assert result['published'] == 2500 and result['pending'] == 0 and len(merges) == 2
