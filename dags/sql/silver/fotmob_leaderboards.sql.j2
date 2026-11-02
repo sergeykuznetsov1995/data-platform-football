@@ -1,0 +1,129 @@
+-- silver.fotmob_leaderboards — одна позиция рейтинга сезона: тип участника (player/team) x участник
+-- x команда x показатель (#2018, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_leaderboards) + README.
+-- Строка = fotmob_leaderboards_current LEFT JOIN fotmob_leaderboard_categories_current по
+-- (competition_id, source_season_key, participant_type, stat_name = name); ключ сезона — тот, под
+-- которым рейтинг отдал FotMob.
+--   cat  категории: competition_id (varchar в bronze) -> BIGINT, одна строка на
+--        (competition_id, source_season_key, participant_type, name) — последняя, затем меньший
+--        source_order (identity bronze шире: source_order), чтобы JOIN не размножал рейтинги;
+--   lb   рейтинги: у participant_type = 'team' пустой participant_id -> 0 (команда остаётся в team_id,
+--        не подменяется); у игрока пустой или 0 participant_id — ошибка ключа, строка отбрасывается.
+--        Identity bronze шире ключа Silver (rank, top_list_index): повтор -> одна строка, последняя по
+--        _observed_at, _ingested_at, затем меньшие rank, top_list_index, source_item_index.
+-- Рейтинг без категории остаётся, category_* = NULL.
+-- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
+-- Заполнитель fotmob_season_scope (отдельные строки, одно выражение на рейтинги и категории) —
+-- булево выражение над competition_id (BIGINT) и source_season_key (VARCHAR); полный прогон — TRUE.
+WITH
+cat_src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            source_season_key, participant_type, name, header, category, localized_title_id,
+            source_order, fetch_all_url, _observed_at, _ingested_at
+        FROM iceberg.bronze.fotmob_leaderboard_categories_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+      AND participant_type IS NOT NULL
+      AND name IS NOT NULL
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+cat AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key, participant_type, name
+                ORDER BY _observed_at DESC, _ingested_at DESC, source_order ASC
+            ) AS cat_rn
+        FROM cat_src s
+    ) d
+    WHERE cat_rn = 1
+),
+lb_src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            source_season_key, participant_type,
+            CASE WHEN participant_type = 'team' THEN COALESCE(participant_id, 0)
+                 ELSE participant_id END AS participant_id,
+            participant_name, team_id, team_name, country_code, scope_stage_id, stat_name, rank,
+            stat_value, sub_stat_value, stat_value_count, matches_played, minutes_played,
+            stat_category_header, stat_category_group, top_list_index, source_item_index,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_leaderboards_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+      AND participant_type IS NOT NULL
+      AND participant_type <> ''
+      AND participant_id IS NOT NULL
+      AND (participant_type = 'team' OR participant_id <> 0)
+      AND team_id IS NOT NULL
+      AND stat_name IS NOT NULL
+      AND stat_name <> ''
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+lb AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key, participant_type, participant_id,
+                             team_id, stat_name
+                ORDER BY _observed_at DESC, _ingested_at DESC, rank ASC, top_list_index ASC,
+                         source_item_index ASC
+            ) AS lb_rn
+        FROM lb_src s
+    ) d
+    WHERE lb_rn = 1
+)
+SELECT
+    l.competition_id,
+    l.source_season_key,
+    l.participant_type,
+    l.participant_id,
+    l.participant_name,
+    l.team_id,
+    l.team_name,
+    l.country_code,
+    l.scope_stage_id,
+    l.stat_name,
+    CAST(l.rank AS INTEGER) AS rank,
+    l.stat_value,
+    l.sub_stat_value,
+    l.stat_value_count,
+    CAST(l.matches_played AS INTEGER) AS matches_played,
+    CAST(l.minutes_played AS INTEGER) AS minutes_played,
+    l.stat_category_header,
+    l.stat_category_group,
+    CAST(l.top_list_index AS INTEGER) AS top_list_index,
+    CAST(l.source_item_index AS INTEGER) AS source_item_index,
+    c.header AS category_header,
+    c.category,
+    c.localized_title_id,
+    CAST(c.source_order AS INTEGER) AS category_order,
+    c.fetch_all_url,
+    l._target_batch_id AS _bronze_batch_id,
+    l._observed_at AS _bronze_observed_at,
+    l._ingested_at AS _bronze_ingested_at,
+    l._parser_version,
+    CAST(NULL AS VARCHAR) AS _conform_issues_json
+FROM lb l
+LEFT JOIN cat c
+  ON c.competition_id = l.competition_id
+ AND c.source_season_key = l.source_season_key
+ AND c.participant_type = l.participant_type
+ AND c.name = l.stat_name
