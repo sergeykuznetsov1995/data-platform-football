@@ -663,9 +663,9 @@ def plan_current_work(
     Signals need a committed roster: without the snapshot the player check
     cannot have a denominator; a cold roster re-proves only a due listing. Cold rosters of every
     target precede careers of started scopes; both follow cold_priority, not
-    last_work_at, so a scope keeps its turn until it is cold complete. A real
-    error moves the scope behind the others for ERROR_BACKOFF. Weekly work keeps
-    attempt fairness. Neither a batch count nor this planner replaces the
+    last_work_at, so a scope keeps its turn until it is cold complete. Pending
+    work of closed scopes, then weekly work, keep attempt fairness. A real
+    error moves the scope behind the others for ERROR_BACKOFF. Neither a batch count nor this planner replaces the
     runtime 45-minute limit.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -705,17 +705,21 @@ def plan_current_work(
                                               'squad_generations', 'required', 'careers',
                                               'coaches_pending', 'coach_club_ids'})
         if cursor.roster_due(timestamp) and staff_metadata:
-            queue(2, 'weekly_roster', (last_work, target.cold_priority))
+            queue(3, 'weekly_roster', (last_work, target.cold_priority))
         elif not cursor.cold_complete and cursor.roster_completed_at is None:
             # A due listing still re-proves membership of an unfinished capture.
             queue(0, 'cold_roster', (minimum, target.cold_priority), tuple(name for name in due if name == 'listing'))
-        elif not cursor.cold_complete or pending:
+        elif not cursor.cold_complete:
             queue(1, 'resume', (minimum, target.cold_priority))
+        elif pending:
+            # A closed scope's change/TTL continuation shares capacity in turn;
+            # by priority it would starve every unfinished lower scope.
+            queue(2, 'resume', (last_work, target.cold_priority))
         elif cursor.roster_due(timestamp):
-            queue(2, 'weekly_roster', (last_work, target.cold_priority))
+            queue(3, 'weekly_roster', (last_work, target.cold_priority))
         elif staff_enabled and (cursor.staff_pending or cursor.staff_completed_at is None
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
-            queue(2, 'weekly_staff', (last_work, target.cold_priority))
+            queue(3, 'weekly_staff', (last_work, target.cold_priority))
     chosen = [item[1] for item in sorted(fresh, key=lambda pair: pair[0])]
     chosen += [item[1] for item in sorted(resume, key=lambda pair: pair[0])]
     return tuple(chosen[:limit])

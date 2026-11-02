@@ -339,6 +339,16 @@ def test_cold_rosters_precede_started_careers_and_both_follow_cold_priority():
     ]
 
 
+def test_closed_top_scope_pending_work_does_not_overtake_unfinished_lower_scope():
+    targets = state.current_scope_targets(denominator(('GB1', 1), ('LOW4', 4)), registry('GB1', 'LOW4')).targets
+    by_id = {target.competition_id: target.scope_id for target in targets}
+    checked = {f'{name}_checked_at': NOW for name in state.DAILY_CHECKS}
+    cursors = {by_id['GB1']: _started(by_id['GB1'], cold_complete=True, last_work_at=NOW - timedelta(days=2), **checked),
+               by_id['LOW4']: _started(by_id['LOW4'], last_work_at=NOW - timedelta(minutes=1), **checked)}
+    works = state.plan_current_work(targets, cursors, now=NOW)
+    assert [(work.kind, work.target.competition_id) for work in works] == [('resume', 'LOW4'), ('resume', 'GB1')]
+
+
 def test_scope_without_committed_roster_gets_no_signal_work():
     targets, by_id = _gb_es_it()
     cursors = {by_id['GB1']: state.ScopeCursor(by_id['GB1'], last_work_at=NOW - timedelta(days=1))}
