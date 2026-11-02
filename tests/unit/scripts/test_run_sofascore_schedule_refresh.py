@@ -3140,6 +3140,7 @@ def test_a_refusal_streak_keeps_the_seed_chains_it_never_reached(
 
 def _real_refusal_sweep(
     offline, monkeypatch, *, completed_prefix=False, overdue=False, status=403,
+    interrupt_at=None, interruption=None,
 ):
     """Exercise real fetch/parse/row conversion with only I/O boundaries fake."""
     import re
@@ -3164,7 +3165,12 @@ def _real_refusal_sweep(
     }
     offline["snapshot"].write_text(json.dumps(snapshot))
     offline["calls"]["known"] = {(f"SS-{i}", "2627") for i in ids}
-    if overdue:
+    if interrupt_at is not None:
+        # #2107: the whole slice is ``overdue`` and the contour fails mid-class.
+        offline["calls"]["overdue"] = {
+            (f"SS-{i}", "2627"): 1_000_000 for i in ids
+        }
+    elif overdue:
         offline["calls"]["overdue"] = {("SS-1", "2627"): 1_000_000}
     else:
         offline["incomplete"].write_text(json.dumps({
@@ -3179,7 +3185,9 @@ def _real_refusal_sweep(
             match = re.search(r"unique-tournament/(\d+)/season/(\d+)", path)
             tid, sid = map(int, match.groups())
             visited.append((tid, path))
-            refused_ids = {1} if overdue else (
+            if tid == interrupt_at:
+                raise interruption
+            refused_ids = set() if interrupt_at is not None else {1} if overdue else (
                 {2, 3, 4} if completed_prefix else {1, 2, 3}
             )
             if tid in refused_ids:
@@ -3200,6 +3208,59 @@ def _real_refusal_sweep(
         refresh, "schedule_rows_from_events", real.schedule_rows_from_events,
     )
     return visited
+
+
+def _contour_failure_report(offline):
+    cursor_start = (
+        json.loads(offline["cursor"].read_text())["index"]
+        if offline["cursor"].exists() else {}
+    )
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    report = json.loads(offline["output"].read_text())
+    cursor = json.loads(offline["cursor"].read_text())
+    assert report["status"] == "failed"
+    assert cursor["index"].get("overdue") == cursor_start.get("overdue")
+    assert cursor["interrupted_runs"]["overdue"] == 1
+    written = {
+        row["league"] for batch in offline["calls"]["writes"] for row in batch
+    }
+    return report, written
+
+
+@pytest.mark.unit
+def test_a_gateway_failure_mid_class_banks_the_seasons_already_read(
+    offline, monkeypatch
+):
+    # #2107 (01.11): the lease meter timed out after 41 paid ``overdue``
+    # pages; the run wrote nothing.  The seasons read whole go to Bronze and
+    # into ``visits``, the step still fails and the cursor stays.
+    _real_refusal_sweep(
+        offline, monkeypatch, interrupt_at=3,
+        interruption=DiscoveryError(
+            "SofaScore discovery lease meter unavailable: Read timed out"
+        ),
+    )
+    report, written = _contour_failure_report(offline)
+    assert report["errors"][0].startswith(
+        "SweepRefusedError: sweep interrupted: SofaScore discovery lease meter"
+    )
+    assert report["overdue_rows"] > 0 and report["rows_written"] > 0
+    assert written == {"SS-1", "SS-2"}
+    visits = json.dumps(report["visits"])
+    assert "SS-1" in visits and "SS-2" in visits and "SS-3" not in visits
+
+
+@pytest.mark.unit
+def test_a_gateway_failure_on_the_first_request_still_fails_with_nothing(
+    offline, monkeypatch
+):
+    # #2107 (02.11): twelve leases without a working exit, nothing navigated.
+    _real_refusal_sweep(
+        offline, monkeypatch, interrupt_at=1,
+        interruption=DiscoveryHTTPError("lease has no exit", status_code=None),
+    )
+    report, written = _contour_failure_report(offline)
+    assert report["rows_written"] == 0 and written == set()
 
 
 @pytest.mark.unit
@@ -3259,7 +3320,9 @@ def test_infrastructure_error_keeps_all_retry_chains(offline, monkeypatch, statu
     )
     initial = json.loads(offline["incomplete"].read_text())["seasons"]
     assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
-    assert json.loads(offline["incomplete"].read_text())["seasons"] == initial
+    # #2107: chain 1 was read whole before the failure and is banked, so it
+    # retires; the chain the failure cut and the unread tail are kept unaged.
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == initial[1:]
     report = json.loads(offline["output"].read_text())
     assert any(f"HTTP {status}" in error for error in report["errors"])
     assert "seed_failed_targets" not in report
