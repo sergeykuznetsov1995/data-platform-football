@@ -3484,3 +3484,122 @@ def test_main_sweeps_the_daily_registry_leagues(offline, monkeypatch):
     keys = {row["capture_key"] for row in seen[0]["tournaments"]}
     assert {"SS-8", "SS-16", "SS-17", "SS-34", "SS-35", "SS-203"} <= keys
     assert seen[0]["campaign_id"] == SNAPSHOT["campaign_id"]
+
+
+def _fetched(pair, target_id, fetched_at, start):
+    from scrapers.sofascore.raw_store import RawPayloadRecord
+    from scrapers.sofascore.schedule_refresh import FetchedEvent
+
+    raw = RawPayloadRecord(
+        manifest_version="1", source="sofascore",
+        source_tournament_id=str(pair[0]), source_season_id=str(pair[1]),
+        target_type="t", target_id=target_id, endpoint="e", freshness_key="f",
+        request_url="u", http_status=200, response_headers={}, content_type=None,
+        content_hash="h", hash_algorithm="sha256", blob_key="b", compression="none",
+        fetched_at=fetched_at, fetcher_version="v", decoded_bytes=1, encoded_bytes=1,
+    )
+    return FetchedEvent(event={"id": start, "startTimestamp": start}, raw=raw)
+
+
+def _visit_events(offline, monkeypatch):
+    # The due class reads two tail pages of SS-7 and only the calendar of SS-23.
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["due"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    stub = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        events, counters, cut_short = stub(client, targets, raw_store, **kwargs)
+        if list(targets) == [(7, 96518), (23, 88001)]:
+            events = [
+                _fetched((7, 96518), "last-0", "2026-11-02T08:41:05Z", 300),
+                _fetched((7, 96518), "last-1", "2026-11-02T08:41:03Z", 200),
+                _fetched((23, 88001), "next-0", "2026-11-02T08:41:00Z", 100),
+            ]
+        return events, counters, cut_short
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+
+
+@pytest.mark.unit
+def test_report_lists_banked_visits_per_partition(offline, monkeypatch):
+    # #2094: when each partition's tail pages were read, how deep, and how far
+    # back they reached — the evidence for "who was late with a match".
+    _visit_events(offline, monkeypatch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    report = json.loads(offline["output"].read_text())
+    assert report["visits"] == {
+        "SS-7": {"2627": ["2026-11-02T08:41:03Z", 2, 200]},
+    }
+
+
+@pytest.mark.unit
+def test_visits_are_not_reported_for_a_class_whose_rows_were_not_written(
+    offline, monkeypatch,
+):
+    # A page the source served but Bronze never got would read as the source
+    # being late, so an unwritten class reports no visit.
+    _visit_events(offline, monkeypatch)
+    real = refresh.schedule_rows_from_events
+
+    def refuse(events, snapshot, exclude):
+        if any(hasattr(item, "raw") for item in events):
+            raise ScheduleSweepError("events of this slice broke the contract")
+        return real(events, snapshot, exclude)
+
+    monkeypatch.setattr(refresh, "schedule_rows_from_events", refuse)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert "visits" not in report
+
+
+@pytest.mark.unit
+def test_a_visit_covers_only_the_unbroken_chain_from_the_head_page(offline, monkeypatch):
+    # Review r1 #1: a resumed chain starts deep (last-6), so its old kick-offs
+    # say nothing about the head page.  Only last-0, last-1, ... in a row prove
+    # that a match newer than their oldest kick-off was not served.
+    _visit_events(offline, monkeypatch)
+    stub = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        events, counters, cut_short = stub(client, targets, raw_store, **kwargs)
+        if list(targets) == [(7, 96518), (23, 88001)]:
+            events = [
+                _fetched((7, 96518), "last-0", "2026-11-02T08:41:03Z", 300),
+                _fetched((7, 96518), "last-2", "2026-11-02T08:41:04Z", 100),
+                _fetched((23, 88001), "last-6", "2026-11-02T08:41:05Z", 50),
+            ]
+        return events, counters, cut_short
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    report = json.loads(offline["output"].read_text())
+    assert report["visits"] == {
+        "SS-7": {"2627": ["2026-11-02T08:41:03Z", 1, 300]},
+        "SS-23": {"2627": ["2026-11-02T08:41:05Z", 0, None]},
+    }
+
+
+@pytest.mark.unit
+def test_a_partition_of_two_source_seasons_proves_no_coverage(offline, monkeypatch):
+    # Review r1 #2: SS-155/2025-like partitions hold two source seasons; a
+    # visit to one of them says nothing about a match of the other.
+    snapshot = json.loads(offline["snapshot"].read_text())
+    snapshot["tournaments"][0]["seasons"].append(
+        {"source_season_id": 96000, "start_year": 2025,
+         "canonical_season": "2627", "metadata_status": "ready"},
+    )
+    offline["snapshot"].write_text(json.dumps(snapshot))
+    _visit_events(offline, monkeypatch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    report = json.loads(offline["output"].read_text())
+    assert report["visits"] == {
+        "SS-7": {"2627": ["2026-11-02T08:41:03Z", 2, None]},
+    }

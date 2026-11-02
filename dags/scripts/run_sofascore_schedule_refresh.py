@@ -30,6 +30,10 @@ The cursor walks a stable target sequence, so consecutive runs cover the
 campaign and then start over.  Rows are MERGEd into Bronze under the writer
 lock; the JSON report carries the row counters and the discovery client's byte
 accounting.  Any failure exits 1.
+
+``visits`` (#2094) lists, per Bronze partition whose rows were written, when
+its tail pages were first read, how many and the oldest kick-off on them, so a
+match that shows up late can be blamed on the source or on this sweep.
 """
 
 from __future__ import annotations
@@ -649,6 +653,68 @@ def overdue_partitions(*, recent: bool = False) -> dict[tuple[str, str], Optiona
             )
         )
     }
+
+
+def shared_partitions(snapshot: Mapping[str, Any]) -> set[tuple[str, str]]:
+    """Partitions that more than one source season of the snapshot writes into."""
+
+    owners: dict[tuple[str, str], set[Any]] = {}
+    for tournament in snapshot.get("tournaments") or ():
+        if not isinstance(tournament, Mapping):
+            continue
+        for season in tournament.get("seasons") or ():
+            if isinstance(season, Mapping) and season.get("canonical_season"):
+                owners.setdefault(
+                    (str(tournament.get("capture_key")), str(season["canonical_season"])), set(),
+                ).add(season.get("source_season_id"))
+    return {partition for partition, seasons in owners.items() if len(seasons) > 1}
+
+
+def sweep_visits(
+    events: Iterable[Any],
+    partitions_by_pair: Mapping[tuple[int, int], tuple[str, str]],
+    shared: Collection[tuple[str, str]] = (),
+) -> dict[str, dict[str, list]]:
+    """Tail pages read per partition: ``[first fetched_at, pages, oldest start]``.
+
+    Only ``last-*`` pages (finished matches) count; calendar pages and items
+    without a raw record are skipped (#2094).  ``pages`` and ``oldest start``
+    describe only the unbroken run ``last-0, last-1, ...``: a resumed chain
+    starting deep says nothing about the head.  A partition of several source
+    seasons proves no coverage at all, so its oldest start is ``None``.
+    """
+
+    by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+    for item in events:
+        raw = getattr(item, "raw", None)
+        if raw is None or not str(raw.target_id).startswith("last-"):
+            continue
+        pair = (int(raw.source_tournament_id), int(raw.source_season_id))
+        if pair not in partitions_by_pair:
+            continue
+        visit = by_pair.setdefault(pair, {"at": raw.fetched_at, "pages": {}})
+        visit["at"] = min(visit["at"], raw.fetched_at)
+        page = int(str(raw.target_id)[len("last-"):])
+        oldest = visit["pages"].setdefault(page, None)
+        start = item.event.get("startTimestamp") if isinstance(item.event, Mapping) else None
+        if isinstance(start, int) and not isinstance(start, bool):
+            visit["pages"][page] = start if oldest is None else min(oldest, start)
+    pairs_of: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    for pair in by_pair:
+        pairs_of.setdefault(partitions_by_pair[pair], []).append(pair)
+    visits: dict[str, dict[str, list]] = {}
+    for (league, season), pairs in pairs_of.items():
+        pages = by_pair[pairs[0]]["pages"]
+        head = 0
+        while head in pages:
+            head += 1
+        starts = [pages[page] for page in range(head) if pages[page] is not None]
+        covered = head and len(pairs) == 1 and (league, season) not in shared
+        visits.setdefault(league, {})[season] = [
+            min(by_pair[pair]["at"] for pair in pairs), head,
+            min(starts) if covered and starts else None,
+        ]
+    return visits
 
 
 def write_schedule_rows(rows: list[dict]) -> str:
@@ -1865,6 +1931,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if rows:
                 report["table"] = write_schedule_rows(rows)
                 rows_written += len(rows)
+                # #2094: only what reached Bronze counts as a visit.
+                partitions_by_pair = {target.pair: target.partition for target in plan[name]}
+                for league, seasons in sweep_visits(
+                    events, partitions_by_pair, shared_partitions(snapshot),
+                ).items():
+                    report.setdefault("visits", {}).setdefault(league, {}).update(seasons)
             # The resume queue may only move forward on evidence that is IN
             # Bronze.  A class that read pages and wrote no row (a verdict about
             # its events, the DQ gate) must leave its chains where they were:
@@ -2075,5 +2147,7 @@ __all__ = [
     "MAX_CHAIN_ATTEMPTS",
     "sweep_predicates",
     "bronze_partitions",
+    "shared_partitions",
+    "sweep_visits",
     "write_schedule_rows",
 ]
