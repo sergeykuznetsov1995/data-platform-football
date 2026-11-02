@@ -1123,6 +1123,44 @@ def test_drained_incomplete_window_restarts_then_healthy_traffic_promotes(contro
     assert c.journal.rows()[0]['attempt_id'] == bad
 
 
+def test_recorded_connection_breaks_do_not_reject_window(controller):
+    """#2090: the two ConnectionError rows that rejected the 2026-11-02 S2 window."""
+    from tests.unit.scrapers.test_espn_pace_report import CONNECTION_BREAKS_2026_11_02, CONNECTION_BREAK_CHAIN
+    c = controller
+    durable_window(c)
+    rows = c.journal.rows()
+    for attempt, good in zip(CONNECTION_BREAKS_2026_11_02, rows[1:]):
+        identity = c.journal.begin(run_id='r', task_id='measure_pace',
+            requested_at=datetime.fromisoformat(good['requested_at']), origin=good['origin'],
+            endpoint='summary', lane='history', step=good['step'], measurement_id=good['measurement_id'])
+        c.journal.finish(identity, status=None, timeout=False, http_ms=attempt['http_ms'],
+                         direct_bytes=0, complete=False, error_type='ConnectionError',
+                         error_phase='request', error_chain=CONNECTION_BREAK_CHAIN)
+    original = dict(c.state)
+    report = c.decide()
+    assert report['reason'] != 'incomplete_coverage'
+    assert report['metrics']['error_attempts'] == 2
+    c.tick()
+    c.finish_boundary()
+    assert c.store.latest('rejected_window') is None
+    assert c.state['start'] == original['start'] and 'restart_pending' not in c.state
+
+
+def test_unfinished_attempt_still_blocks_window_without_retiring_it(controller):
+    """A start without finish (no http_ms) is lost evidence, never a covered error."""
+    c = controller
+    durable_window(c)
+    good = c.journal.rows()[1]
+    c.journal.begin(run_id='r', task_id='measure_pace',
+        requested_at=datetime.fromisoformat(good['requested_at']), origin=good['origin'],
+        endpoint='summary', lane='history', step=good['step'], measurement_id=good['measurement_id'])
+    assert c.decide()['reason'] == 'incomplete_coverage'
+    c.tick()
+    c.finish_boundary()
+    assert c.store.latest('rejected_window') is None  # in-flight start is awaited, not retired
+    assert c.gate.snapshot()['confirmed_ceiling'] == 0
+
+
 @pytest.mark.parametrize('mode', ['live_inflight', '500', 'timeout', 'stop', 'complete'])
 def test_boundary_does_not_retire_inflight_errors_or_terminal_state(controller, mode):
     c = controller

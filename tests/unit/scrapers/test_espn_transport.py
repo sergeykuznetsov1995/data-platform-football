@@ -966,7 +966,8 @@ def test_transport_failure_diagnostics_survive_restart_and_publication(monkeypat
         restarted = AttemptJournal(client.attempt_journal.path)
         assert restarted.rows() == [row]
         end = start + timedelta(minutes=1)
-        assert not restarted.coverage(start, end)
+        # #2090: a request-phase break is a recorded failed request, not lost evidence.
+        assert restarted.coverage(start, end) is (phase == 'request')
         conn = Connection()
         assert restarted.flush(conn) == 1
         assert restarted.pending() == 0 and restarted.flush(conn) == 0

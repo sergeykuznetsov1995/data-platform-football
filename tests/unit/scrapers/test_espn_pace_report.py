@@ -168,7 +168,7 @@ def test_error_chain_is_sanitized_at_journal_boundary(tmp_path):
         {'type': 'OtherTransportError', 'errno': None},
         {'type': 'OSError', 'errno': None}, {'type': 'OSError', 'errno': None}]
     assert 'secret' not in json.dumps(row) and 'private' not in json.dumps(row)
-    assert not journal.coverage(START, START+timedelta(minutes=1))
+    assert journal.coverage(START, START+timedelta(minutes=1))  # #2090: recorded failed request
 
 
 def test_exception_chain_is_bounded_and_handles_cycles_without_rendering_messages():
@@ -315,3 +315,47 @@ def test_session_diagnostics_absent_for_legacy_and_hostile_values(tmp_path):
     finish(journal, begin(journal))
     assert 'session_sequence' not in AttemptJournal(journal.path).rows()[0]
     assert journal.coverage(START, START+timedelta(minutes=1))
+
+
+# Real outbox rows of the S2 window rejected on 2026-11-02 14:03:57 UTC (#2090).
+CONNECTION_BREAKS_2026_11_02 = [
+    dict(attempt_id='02355d3f9e', requested_at='2026-11-02T14:03:07.665499+00:00', http_ms=4003.151342039928),
+    dict(attempt_id='7c1cf1328d', requested_at='2026-11-02T14:03:07.403790+00:00', http_ms=4002.640362130478),
+]
+CONNECTION_BREAK_CHAIN = [
+    {'type': 'ConnectionError', 'errno': None}, {'type': 'MaxRetryError', 'errno': None},
+    {'type': 'NewConnectionError', 'errno': None}, {'type': 'gaierror', 'errno': -2}]
+
+
+def record_connection_breaks(journal):
+    for attempt in CONNECTION_BREAKS_2026_11_02:
+        identity = begin(journal, datetime.fromisoformat(attempt['requested_at']))
+        journal.finish(identity, status=None, timeout=False, http_ms=attempt['http_ms'],
+                       direct_bytes=0, complete=False, error_type='ConnectionError',
+                       error_phase='request', error_chain=CONNECTION_BREAK_CHAIN)
+
+
+def test_recorded_connection_break_is_covered_and_counted_as_error(tmp_path):
+    from scrapers.espn.pace_report import attempt_metrics
+    start = datetime(2026, 11, 2, 14, tzinfo=timezone.utc)
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: start)
+    finish(journal, begin(journal, start))
+    record_connection_breaks(journal)
+    end = start + timedelta(minutes=5)
+    assert journal.coverage(start, end)
+    metrics = attempt_metrics(journal.rows(start, end))
+    assert metrics['attempts'] == 3 and metrics['error_attempts'] == 2
+
+
+@pytest.mark.parametrize('loss', ['start_only', 'no_error_type', 'unknown_error_type', 'no_http_ms'])
+def test_lost_attempt_evidence_still_blocks_coverage(tmp_path, loss):
+    start = datetime(2026, 11, 2, 14, tzinfo=timezone.utc)
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: start)
+    finish(journal, begin(journal, start))
+    identity = begin(journal, start + timedelta(seconds=1))
+    if loss != 'start_only':
+        journal.finish(identity, status=None, timeout=False,
+                       http_ms=None if loss == 'no_http_ms' else 5, direct_bytes=0, complete=False,
+                       error_type={'no_error_type': None, 'unknown_error_type': 'MeasurementStopped'}.get(
+                           loss, 'ConnectionError'), error_phase='request')
+    assert not journal.coverage(start, start + timedelta(minutes=1))

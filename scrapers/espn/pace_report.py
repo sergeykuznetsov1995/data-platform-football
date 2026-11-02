@@ -7,7 +7,7 @@ must be supplied independently; aggregate rows alone never prove eligibility.
 """
 from __future__ import annotations
 
-from .attempts import ATTEMPT_TABLE
+from .attempts import ATTEMPT_TABLE, transport_error
 from .journal import _literal
 from .pace import utc
 
@@ -102,7 +102,7 @@ def attempt_metrics(rows):
         'count_403': sum(r['status'] == 403 for r in rows),
         'count_429': sum(r['status'] == 429 for r in rows),
         'error_attempts': sum(r['status'] == 403 or 500 <= (r['status'] or 0) <= 599
-                              or r['timeout'] for r in rows),
+                              or r['timeout'] or transport_error(r) for r in rows),
         'server_timeout_attempts': sum(500 <= (r['status'] or 0) <= 599 or r['timeout']
                                        for r in rows),
         'http_p95_ms': percentile([r['http_ms'] for r in rows if r['http_ms'] is not None]),
