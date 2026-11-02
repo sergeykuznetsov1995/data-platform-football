@@ -93,6 +93,8 @@ def load_silver_sql(sql_path: Path) -> str:
             referee_aliases_values_sql=mc.get_referee_alias_sql_values(),
             manager_aliases_values_sql=mc.get_manager_alias_sql_values(),
             clubelo_in_scope_leagues=clubelo_leagues,
+            fotmob_calendar_scope="TRUE",
+            fotmob_payload_scope="TRUE",
         )
     return sql_path.read_text()
 
