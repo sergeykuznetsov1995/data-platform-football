@@ -1372,3 +1372,14 @@ def test_moved_metadata_failure_keeps_existing_kickoff_and_unpublished_debt(tmp_
     assert any(outcome['state'] == wave.RED for outcome in _run(plan, client, trino))
     assert _matches(trino)[900002] == old
     assert not any('event=900002' in key for key, _ in client.calls)
+
+
+def test_finish_requests_never_waits_for_the_attempt_publish_lock(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+    client = SimpleNamespace(ledger=(), flush=lambda: None,
+                             flush_attempts=lambda conn, **kwargs: calls.append(kwargs) or 0)
+    monkeypatch.setattr(wave, "flush_journal", lambda conn, rows: 0)
+    wave.finish_requests(client, object(), run_id="r", task_id="run_tournament[1]")
+    assert calls == [dict(blocking=False)]
