@@ -1242,6 +1242,27 @@
         "source_season_id": "varchar"
       }
     },
+    "bronze.fotmob_competition_season_history_current": {
+      "columns": {
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_observed_at": "timestamp(6)",
+        "_parser_version": "varchar",
+        "_payload_sha256": "varchar",
+        "_raw_uri": "varchar",
+        "_source": "varchar",
+        "_target_batch_id": "varchar",
+        "competition_id": "varchar",
+        "discovered_at": "timestamp(6)",
+        "discovery_run_id": "varchar",
+        "history_season_label": "varchar",
+        "runner_up_id": "bigint",
+        "runner_up_name": "varchar",
+        "season_history_json": "varchar",
+        "winner_id": "bigint",
+        "winner_name": "varchar"
+      }
+    },
     "bronze.fotmob_competition_seasons_current": {
       "columns": {
         "_entity_type": "varchar",
@@ -1266,6 +1287,60 @@
         "stat_link_json": "varchar",
         "winner_id": "bigint",
         "winner_name": "varchar"
+      }
+    },
+    "bronze.fotmob_competitions_current": {
+      "columns": {
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_observed_at": "timestamp(6)",
+        "_parser_version": "varchar",
+        "_payload_sha256": "varchar",
+        "_raw_uri": "varchar",
+        "_source": "varchar",
+        "_target_batch_id": "varchar",
+        "age_group": "varchar",
+        "competition_id": "varchar",
+        "competition_type": "varchar",
+        "conflict_fields_json": "varchar",
+        "country_code": "varchar",
+        "country_name": "varchar",
+        "discovery_date": "varchar",
+        "discovery_run_id": "varchar",
+        "gender": "varchar",
+        "has_catalog_conflict": "boolean",
+        "is_tombstoned": "boolean",
+        "name": "varchar",
+        "page_url": "varchar",
+        "presentation_slug": "varchar",
+        "scope_decision": "varchar",
+        "scope_policy_rule": "varchar",
+        "scope_reason": "varchar",
+        "source_paths": "varchar",
+        "source_slug": "varchar",
+        "tombstone_reason": "varchar"
+      }
+    },
+    "bronze.fotmob_leaderboard_categories_current": {
+      "columns": {
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_observed_at": "timestamp(6)",
+        "_parser_version": "varchar",
+        "_payload_sha256": "varchar",
+        "_raw_uri": "varchar",
+        "_source": "varchar",
+        "_target_batch_id": "varchar",
+        "category": "varchar",
+        "competition_id": "varchar",
+        "fetch_all_url": "varchar",
+        "header": "varchar",
+        "localized_title_id": "varchar",
+        "name": "varchar",
+        "participant_type": "varchar",
+        "preview_count": "bigint",
+        "source_order": "bigint",
+        "source_season_key": "varchar"
       }
     },
     "bronze.fotmob_leaderboards_current": {
@@ -1498,6 +1573,44 @@
         "team_name": "varchar"
       }
     },
+    "bronze.fotmob_playoff_brackets_current": {
+      "columns": {
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_observed_at": "timestamp(6)",
+        "_parser_version": "varchar",
+        "_payload_sha256": "varchar",
+        "_raw_uri": "varchar",
+        "_source": "varchar",
+        "_target_batch_id": "varchar",
+        "aggregate_away_score": "bigint",
+        "aggregate_home_score": "bigint",
+        "aggregate_loser_team_id": "bigint",
+        "aggregate_winner_team_id": "bigint",
+        "away_score": "bigint",
+        "away_team_id": "bigint",
+        "away_team_name": "varchar",
+        "away_team_short_name": "varchar",
+        "best_of": "bigint",
+        "competition_id": "bigint",
+        "draw_order": "bigint",
+        "home_score": "bigint",
+        "home_team_id": "bigint",
+        "home_team_name": "varchar",
+        "home_team_short_name": "varchar",
+        "match_ids": "varchar",
+        "participant_count": "bigint",
+        "round_kind": "varchar",
+        "scope_stage_id": "varchar",
+        "source_path": "varchar",
+        "source_season_key": "varchar",
+        "source_stage_id": "varchar",
+        "stage_id": "varchar",
+        "tbd_away": "boolean",
+        "tbd_home": "boolean",
+        "winner_team_id": "bigint"
+      }
+    },
     "bronze.fotmob_schedule": {
       "columns": {
         "_batch_id": "varchar",
@@ -1519,6 +1632,35 @@
         "season": "bigint"
       }
     },
+    "bronze.fotmob_season_stages_current": {
+      "columns": {
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_observed_at": "timestamp(6)",
+        "_parser_version": "varchar",
+        "_payload_sha256": "varchar",
+        "_raw_uri": "varchar",
+        "_source": "varchar",
+        "_target_batch_id": "varchar",
+        "competition_id": "bigint",
+        "is_active": "boolean",
+        "legend": "varchar",
+        "localized_key": "varchar",
+        "page_url": "varchar",
+        "participant_count": "double",
+        "relative_path": "varchar",
+        "scope_stage_id": "varchar",
+        "source_order": "bigint",
+        "source_path": "varchar",
+        "source_season_key": "varchar",
+        "source_stage_id": "bigint",
+        "stage_id": "varchar",
+        "stage_name": "varchar",
+        "stage_type": "varchar",
+        "template_id": "bigint",
+        "tournament_id": "bigint"
+      }
+    },
     "bronze.fotmob_season_teams_current": {
       "columns": {
         "_entity_type": "varchar",
@@ -1535,6 +1677,7 @@
         "source_season_key": "varchar",
         "team_id": "bigint",
         "team_name": "varchar",
+        "team_name_variants": "varchar",
         "team_short_name": "varchar",
         "team_short_name_variants": "varchar"
       }

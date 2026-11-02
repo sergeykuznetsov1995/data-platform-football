@@ -1,0 +1,85 @@
+-- silver.fotmob_competitions — один турнир FotMob (#2018, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_competitions) + README.
+-- Глобальная таблица (context_as_key): без партиций, ключ — competition_id.
+-- competition_id в bronze — varchar: приводится к BIGINT один раз на входе; пустой/неприводимый
+-- id -> строка отбрасывается (правило NULL для ключа).
+-- discovery_date (varchar в bronze) -> DATE через TRY_CAST; неразбор -> NULL + _conform_issues_json.
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
+-- и source_season_key (VARCHAR); у этой таблицы сезона нет, source_season_key здесь всегда NULL,
+-- поэтому скоуп задаётся по турниру; полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            CAST(NULL AS VARCHAR) AS source_season_key,
+            name, country_code, country_name, gender, competition_type, age_group, page_url,
+            source_slug, presentation_slug, scope_decision, scope_reason, scope_policy_rule,
+            has_catalog_conflict, is_tombstoned, tombstone_reason, discovery_date,
+            conflict_fields_json, source_paths,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_competitions_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id
+                ORDER BY _observed_at DESC, _ingested_at DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        d.*,
+        NULLIF(d.discovery_date, '') AS discovery_date_raw,
+        TRY_CAST(d.discovery_date AS DATE) AS discovery_date_value
+    FROM dedup d
+)
+SELECT
+    c.competition_id,
+    c.name AS competition_name,
+    c.country_code,
+    c.country_name,
+    c.gender,
+    c.competition_type,
+    c.age_group,
+    c.page_url,
+    c.source_slug,
+    c.presentation_slug,
+    c.scope_decision,
+    c.scope_reason,
+    c.scope_policy_rule,
+    c.has_catalog_conflict,
+    c.is_tombstoned,
+    c.tombstone_reason,
+    c.discovery_date_value AS discovery_date,
+    NULLIF(c.conflict_fields_json, 'null') AS conflict_fields_json,
+    NULLIF(c.source_paths, 'null') AS source_paths_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.discovery_date_raw IS NOT NULL AND v.discovery_date_value IS NULL
+                 THEN CAST(ROW('discovery_date', v.discovery_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

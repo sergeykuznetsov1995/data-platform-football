@@ -1,0 +1,82 @@
+-- silver.fotmob_competition_seasons — один сезон турнира под точным ключом FotMob (#2018, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_competition_seasons)
+-- + README («Правило самого точного сезона»).
+-- Глобальная таблица (context_as_key): без партиций, ключ — (competition_id, source_season_key).
+-- Строки хранятся под всеми ключами: родитель «2026» и дочерние «2026 - Apertura» — разные строки.
+--   parent_season_key  группа 1 regexp '^(.+?) - (.+)$', если такой ключ есть у того же турнира;
+--   season_part        группа 2 того же regexp при непустом parent_season_key;
+--   has_child_seasons  у турнира есть ключ, чья группа 1 равна этому ключу.
+-- Родитель/дети ищутся среди строк, прошедших скоуп: скоуп должен брать турнир целиком.
+-- competition_id в bronze — varchar: приводится к BIGINT один раз на входе; пустой/неприводимый
+-- ключ -> строка отбрасывается.
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
+-- и source_season_key (VARCHAR); полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            source_season_key, is_selected, is_latest, source_order, source_slug,
+            winner_id, winner_name, runner_up_id, runner_up_name,
+            season_history_json, stat_link_json,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_competition_seasons_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+seas AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key
+                ORDER BY _observed_at DESC, _ingested_at DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+child_parents AS (
+    SELECT DISTINCT
+        competition_id,
+        regexp_extract(source_season_key, '^(.+?) - (.+)$', 1) AS parent_key
+    FROM seas
+)
+SELECT
+    s.competition_id,
+    s.source_season_key,
+    p.source_season_key AS parent_season_key,
+    CASE WHEN p.source_season_key IS NOT NULL
+         THEN regexp_extract(s.source_season_key, '^(.+?) - (.+)$', 2) END AS season_part,
+    ch.parent_key IS NOT NULL AS has_child_seasons,
+    s.is_selected,
+    s.is_latest,
+    CAST(s.source_order AS INTEGER) AS source_order,
+    s.source_slug,
+    s.winner_id AS winner_team_id,
+    s.winner_name AS winner_team_name,
+    s.runner_up_id AS runner_up_team_id,
+    s.runner_up_name AS runner_up_team_name,
+    TRY_CAST(json_extract_scalar(s.stat_link_json, '$.TournamentId') AS BIGINT) AS stat_tournament_id,
+    NULLIF(s.season_history_json, 'null') AS season_history_json,
+    NULLIF(s.stat_link_json, 'null') AS stat_link_json,
+    s._target_batch_id AS _bronze_batch_id,
+    s._observed_at AS _bronze_observed_at,
+    s._ingested_at AS _bronze_ingested_at,
+    s._parser_version,
+    CAST(NULL AS VARCHAR) AS _conform_issues_json
+FROM seas s
+LEFT JOIN seas p
+  ON p.competition_id = s.competition_id
+ AND p.source_season_key = regexp_extract(s.source_season_key, '^(.+?) - (.+)$', 1)
+LEFT JOIN child_parents ch
+  ON ch.competition_id = s.competition_id
+ AND ch.parent_key = s.source_season_key

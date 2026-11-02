@@ -1,0 +1,97 @@
+-- silver.fotmob_standings — одна строка турнирной таблицы: таблица x вид (all/home/away/form/...)
+-- x команда (#2018, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_standings) + README.
+-- Ключ (competition_id, source_season_key, table_id, table_type, team_id) уже identity
+-- standings_current (там ещё table_name, position): повтор на ключе Silver -> одна строка, последняя
+-- по _observed_at, _ingested_at, затем меньшая position, затем table_name (детерминированно).
+-- Ключ сезона — тот, под которым таблицу отдал FotMob. Пустой/неприводимый ключ -> строка
+-- отбрасывается. deduction в bronze — varchar: TRY_CAST в INTEGER, неразбор -> NULL + issue.
+-- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
+-- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
+-- и source_season_key (VARCHAR); полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            source_season_key, scope_stage_id, table_id, table_name, table_type, team_id,
+            team_name, team_short_name, team_page_url, position, played, wins, draws, losses,
+            goals_for, goals_against, goal_difference, points, deduction, ongoing, form,
+            qualification_color, qualification_title, qualification_key,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_standings_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+      AND table_id IS NOT NULL
+      AND table_type IS NOT NULL
+      AND table_type <> ''
+      AND team_id IS NOT NULL
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key, table_id, table_type, team_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, position ASC, table_name ASC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        d.*,
+        NULLIF(d.deduction, '') AS deduction_raw,
+        TRY_CAST(d.deduction AS INTEGER) AS deduction_value
+    FROM dedup d
+)
+SELECT
+    c.competition_id,
+    c.source_season_key,
+    c.scope_stage_id,
+    c.table_id,
+    c.table_name,
+    c.table_type,
+    c.team_id,
+    c.team_name,
+    c.team_short_name,
+    c.team_page_url,
+    CAST(c.position AS INTEGER) AS position,
+    CAST(c.played AS INTEGER) AS played,
+    CAST(c.wins AS INTEGER) AS wins,
+    CAST(c.draws AS INTEGER) AS draws,
+    CAST(c.losses AS INTEGER) AS losses,
+    CAST(c.goals_for AS INTEGER) AS goals_for,
+    CAST(c.goals_against AS INTEGER) AS goals_against,
+    CAST(c.goal_difference AS INTEGER) AS goal_difference,
+    CAST(c.points AS INTEGER) AS points,
+    c.deduction_value AS deduction,
+    c.ongoing,
+    c.form,
+    c.qualification_color,
+    c.qualification_title,
+    c.qualification_key,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.deduction_raw IS NOT NULL AND v.deduction_value IS NULL
+                 THEN CAST(ROW('deduction', v.deduction_raw, 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

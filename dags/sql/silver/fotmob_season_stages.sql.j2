@@ -1,0 +1,85 @@
+-- silver.fotmob_season_stages — одна стадия сезона: тур календаря, таблица, раунд плей-офф,
+-- срез статистики (#2018, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_season_stages) + README.
+-- Ключ (competition_id, source_season_key, stage_id); ключ сезона — тот, под которым стадию отдал
+-- FotMob (без перекладывания на дочерний/родительский). Пустой/неприводимый ключ -> строка
+-- отбрасывается.
+-- participant_count в bronze — double: в INTEGER только целое значение в диапазоне INTEGER,
+-- иначе NULL + _conform_issues_json.
+-- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
+-- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
+-- и source_season_key (VARCHAR); полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            source_season_key, stage_id, scope_stage_id, source_stage_id, stage_name, stage_type,
+            localized_key, is_active, template_id, tournament_id, participant_count, source_order,
+            relative_path, page_url, legend,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_season_stages_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+      AND stage_id IS NOT NULL
+      AND stage_id <> ''
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key, stage_id
+                ORDER BY _observed_at DESC, _ingested_at DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        d.*,
+        CASE WHEN d.participant_count = floor(d.participant_count)
+             THEN TRY_CAST(d.participant_count AS INTEGER) END AS participant_count_value
+    FROM dedup d
+)
+SELECT
+    c.competition_id,
+    c.source_season_key,
+    c.stage_id,
+    c.scope_stage_id,
+    c.source_stage_id,
+    c.stage_name,
+    c.stage_type,
+    c.localized_key,
+    c.is_active,
+    c.template_id,
+    c.tournament_id,
+    c.participant_count_value AS participant_count,
+    CAST(c.source_order AS INTEGER) AS source_order,
+    c.relative_path,
+    c.page_url,
+    NULLIF(c.legend, 'null') AS legend_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.participant_count IS NOT NULL AND v.participant_count_value IS NULL
+                 THEN CAST(ROW('participant_count', CAST(v.participant_count AS VARCHAR), 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

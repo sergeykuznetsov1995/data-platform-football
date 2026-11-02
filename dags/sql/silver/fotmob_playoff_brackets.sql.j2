@@ -1,0 +1,104 @@
+-- silver.fotmob_playoff_brackets — одна пара (матчап) сетки плей-офф (#2018, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_playoff_brackets) + README.
+-- Ключ (competition_id, source_season_key, stage_id, matchup_key); ключ сезона — тот, под которым
+-- сетку отдал FotMob. matchup_key = <draw_order|'-'>:<home_team_id|'tbd'>:<away_team_id|'tbd'>
+-- считается до дедупа. Identity bronze шире (match_ids вместо matchup_key): повтор -> одна строка,
+-- последняя по _observed_at, _ingested_at, затем больший _target_batch_id, меньший match_ids.
+-- Пустой/неприводимый ключ -> строка отбрасывается.
+-- match_ids (JSON-текст в bronze) -> ARRAY(BIGINT); source_stage_id (varchar в bronze) -> BIGINT;
+-- неразбор -> NULL + _conform_issues_json.
+-- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
+-- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
+-- и source_season_key (VARCHAR); полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            source_season_key, stage_id,
+            COALESCE(CAST(draw_order AS VARCHAR), '-') || ':'
+                || COALESCE(CAST(home_team_id AS VARCHAR), 'tbd') || ':'
+                || COALESCE(CAST(away_team_id AS VARCHAR), 'tbd') AS matchup_key,
+            scope_stage_id, source_stage_id, round_kind, draw_order, participant_count, best_of,
+            home_team_id, home_team_name, away_team_id, away_team_name, home_score, away_score,
+            winner_team_id, aggregate_home_score, aggregate_away_score, aggregate_winner_team_id,
+            aggregate_loser_team_id, tbd_home, tbd_away, match_ids,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_playoff_brackets_current
+    ) s
+    WHERE competition_id IS NOT NULL
+      AND source_season_key IS NOT NULL
+      AND source_season_key <> ''
+      AND stage_id IS NOT NULL
+      AND stage_id <> ''
+      AND (
+        {{ fotmob_season_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, source_season_key, stage_id, matchup_key
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC, match_ids ASC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        d.*,
+        NULLIF(d.source_stage_id, '') AS source_stage_id_raw,
+        TRY_CAST(d.source_stage_id AS BIGINT) AS source_stage_id_value,
+        NULLIF(d.match_ids, '') AS match_ids_raw,
+        TRY_CAST(TRY(json_extract(d.match_ids, '$')) AS ARRAY(BIGINT)) AS match_ids_value
+    FROM dedup d
+)
+SELECT
+    c.competition_id,
+    c.source_season_key,
+    c.stage_id,
+    c.matchup_key,
+    c.scope_stage_id,
+    c.source_stage_id_value AS source_stage_id,
+    c.round_kind,
+    CAST(c.draw_order AS INTEGER) AS draw_order,
+    CAST(c.participant_count AS INTEGER) AS participant_count,
+    CAST(c.best_of AS INTEGER) AS best_of,
+    c.home_team_id,
+    c.home_team_name,
+    c.away_team_id,
+    c.away_team_name,
+    CAST(c.home_score AS INTEGER) AS home_score,
+    CAST(c.away_score AS INTEGER) AS away_score,
+    c.winner_team_id,
+    CAST(c.aggregate_home_score AS INTEGER) AS aggregate_home_score,
+    CAST(c.aggregate_away_score AS INTEGER) AS aggregate_away_score,
+    c.aggregate_winner_team_id,
+    c.aggregate_loser_team_id,
+    c.tbd_home AS is_home_tbd,
+    c.tbd_away AS is_away_tbd,
+    c.match_ids_value AS match_ids,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.source_stage_id_raw IS NOT NULL AND v.source_stage_id_value IS NULL
+                 THEN CAST(ROW('source_stage_id', v.source_stage_id_raw, 'not an integer id')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.match_ids_raw IS NOT NULL AND v.match_ids_value IS NULL
+                 THEN CAST(ROW('match_ids', v.match_ids_raw, 'not a JSON array of integer ids')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c
