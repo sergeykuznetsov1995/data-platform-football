@@ -404,14 +404,16 @@ def test_limit_bounds_cold_work_but_never_due_signals():
     assert [work.kind for work in works] == ['signals'] * 30 + ['cold_roster'] * 8
 
 
-def test_backed_off_scope_moves_to_the_tail_of_due_signals():
+def test_backed_off_scope_gets_no_signal_work_until_the_backoff_ends():
     targets, by_id = _gb_es_it()
     cursors = {scope_id: state.ScopeCursor(scope_id, roster_completed_at=NOW - timedelta(days=1), cold_complete=True)
                for scope_id in by_id.values()}
     cursors[by_id['GB1']] = replace(cursors[by_id['GB1']], last_error_at=NOW - timedelta(hours=1))
     works = state.plan_current_work(targets, cursors, now=NOW)
+    assert [(work.kind, work.target.competition_id) for work in works] == [('signals', 'ES1'), ('signals', 'IT1')]
+    works = state.plan_current_work(targets, cursors, now=NOW + timedelta(hours=3))
     assert [(work.kind, work.target.competition_id) for work in works] == [
-        ('signals', 'ES1'), ('signals', 'IT1'), ('signals', 'GB1')]
+        ('signals', 'GB1'), ('signals', 'ES1'), ('signals', 'IT1')]
 
 
 def test_failed_first_check_cannot_starve_due_successful_scope():

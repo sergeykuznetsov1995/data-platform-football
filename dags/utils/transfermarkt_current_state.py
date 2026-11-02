@@ -693,11 +693,13 @@ def plan_current_work(
         last_work = cursor.last_work_at or minimum
         backing_off = cursor.last_error_at is not None and timestamp - cursor.last_error_at < ERROR_BACKOFF
         rank = (1, cursor.last_error_at) if backing_off else (0, minimum)
-        if due and cursor.roster_completed_at is not None:
+        # A scope backing off from a real error gets no signal work until the
+        # backoff ends: all signals run before cold work in every portion.
+        if due and cursor.roster_completed_at is not None and not backing_off:
             oldest = min(getattr(cursor, f'{name}_checked_at') or minimum for name in due)
             # A never-successful scope must move behind due healthy scopes
             # after an attempted check, rather than owning datetime.min forever.
-            fresh.append(((*rank, max(oldest, last_work), oldest, target.cold_priority),
+            fresh.append(((max(oldest, last_work), oldest, target.cold_priority),
                           CurrentWork(target, 'signals', due)))
 
         def queue(phase: int, kind: str, order: tuple[Any, ...], checks: tuple[str, ...] = ()) -> None:

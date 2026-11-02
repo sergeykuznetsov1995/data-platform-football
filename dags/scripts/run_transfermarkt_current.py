@@ -63,6 +63,10 @@ class PortionDeadlineError(CurrentPortionError):
     """The shared portion deadline ends work; the journal keeps the remainder."""
 
 
+class SignalRefreshRequired(CurrentPortionError):
+    """A recovered write waits for fresh signals; not a scope failure (#2068)."""
+
+
 def _deadline_retained(exc):
     """#2068: a portion tail, also when a writer wraps it, is not a scope failure."""
     from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
@@ -1442,7 +1446,7 @@ class _Scope:
         for kind in required:
             stamp = getattr(self.cursor, kind + '_checked_at')
             if stamp is None or (boundary is not None and stamp < boundary):
-                raise CurrentPortionError('write recovery requires fresh signals before roster or careers')
+                raise SignalRefreshRequired('write recovery requires fresh signals before roster or careers')
         self.data.pop('recovery_signal_refresh_required')
         self.persist()
 
@@ -2056,7 +2060,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 # #2068: the remainder retained at the deadline keeps its turn;
                 # a real error is recorded and backs the scope off.
                 changes = {'last_work_at': now()}
-                if _deadline_retained(exc):
+                # A recovered write awaiting fresh signals must not back off:
+                # backoff withholds exactly those signals.
+                if _deadline_retained(exc) or isinstance(exc, SignalRefreshRequired):
                     result['status'], result['retained'] = 'retained', message
                 else:
                     result['status'], result['error'] = 'failed', message

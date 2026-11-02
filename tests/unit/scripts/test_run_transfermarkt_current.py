@@ -1628,6 +1628,8 @@ def test_physical_replacement_lost_readback_recovers_original_write_intent(offli
     offline.run('recover', max_scopes=1, baseline_verifier=write.verify_current_roster_baseline)
     after = next(iter(offline.state()['scopes'].values()))
     assert 'roster_write_intent' not in after
+    # #2068: waiting for fresh signals after a recovered write is not a new error.
+    assert after['cursor']['last_error_at'] == pending['cursor']['last_error_at']
     assert after['snapshot']['clubs']['10']['rows'][0]['market_value_eur'] == 2000000
     assert write_cycles[-1] == write_cycles[-2]  # original cycle and physical batch
     assert offline.calls == []
@@ -1641,6 +1643,7 @@ def test_physical_replacement_lost_readback_recovers_original_write_intent(offli
     state = offline.state()
     state['turn'] = 0
     offline.write_state(state)
+    offline.clock.advance(4 * 3600)  # #2068: the injected readback failure withholds signals for 4 h
     offline.run('fresh-after-repair', baseline_verifier=write.verify_current_roster_baseline)
     after = next(iter(offline.state()['scopes'].values()))
     assert 'recovery_signal_refresh_required' not in after
