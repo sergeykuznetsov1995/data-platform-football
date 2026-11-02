@@ -486,6 +486,7 @@ def test_current_hook_labels_cold_then_change_and_preserves_raw_clocks(
         assert measure.utc(check["checked_at"]) == min(
             measure.utc(stamp) for stamp in original
         )
+    offline.run("cold-careers")  # #2068: the cold phase ends after its careers portion
     offline.clock.advance(21 * 3600)
     offline.values["10"] = "€2.0m"
     offline.run("change")

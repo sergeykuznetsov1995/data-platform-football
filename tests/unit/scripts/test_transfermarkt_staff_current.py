@@ -45,7 +45,7 @@ def test_production_current_wires_independent_staff_sweep(offline, production_cu
 
 def test_staff_runs_on_seventh_day_independently_of_roster_and_coach_ttl(offline):
     writer, writes = writer_for(offline)
-    offline.run('cold', staff_writer=writer)
+    offline.run_cold('cold', staff_writer=writer)
     assert writes == ['10', '20']
     assert data(offline)['cursor']['staff_completed_at']
     assert data(offline)['cursor']['resume_json'] == '{}'
@@ -76,7 +76,7 @@ def test_first_failed_club_does_not_block_second_and_restarts_only_pending(offli
         def writer(*args, **kwargs):
             proof = good_writer(*args, **kwargs)
             return {**proof, 'verified': kwargs['club_id'] != '10'}
-    offline.run('partial', staff_writer=writer)
+    offline.run_cold('partial', staff_writer=writer)
     saved = data(offline)
     assert saved['staff_sweep']['pending'] == ['10']
     assert saved['staff_sweep']['deferred']['10']
@@ -129,7 +129,7 @@ def test_old_cursor_migrates_additive_staff_clock_without_losing_resume():
 @pytest.mark.parametrize('fresh_roster', [False, True])
 def test_permanent_staff_failure_does_not_block_weekly_roster_or_full_staff_sweep(offline, fresh_roster):
     writer, writes = writer_for(offline, fail='10')
-    offline.run('partial', staff_writer=writer)
+    offline.run_cold('partial', staff_writer=writer)
     assert writes == ['20']
     offline.clock.advance(7 * 86400)
     if fresh_roster:
@@ -149,7 +149,7 @@ def test_permanent_staff_failure_does_not_block_weekly_roster_or_full_staff_swee
 
 
 def test_old_staff_pending_does_not_displace_weekly_roster(offline):
-    offline.run('cold')
+    offline.run_cold('cold')
     offline.clock.advance(7 * 86400)
     state = offline.state()
     saved = next(iter(state['scopes'].values()))
@@ -182,7 +182,7 @@ def test_old_staff_pending_migration_preserves_roster_continuation(work):
 
 def test_old_staff_pending_migration_preserves_membership_removal(offline):
     offline.club_ids = tuple(str(club) for club in range(10, 20))
-    offline.run('cold')
+    offline.run_cold('cold')
     offline.club_ids = offline.club_ids[:-1]
     offline.clock.advance(21 * 3600)
     offline.run('participants')

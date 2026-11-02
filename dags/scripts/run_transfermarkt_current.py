@@ -59,6 +59,21 @@ class CurrentPortionError(RuntimeError):
     """An unqualified detector or invalid recovery evidence blocks paid I/O."""
 
 
+class PortionDeadlineError(CurrentPortionError):
+    """The shared portion deadline ends work; the journal keeps the remainder."""
+
+
+def _deadline_retained(exc):
+    """#2068: a portion tail, also when a writer wraps it, is not a scope failure."""
+    from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+    while exc is not None:
+        # The current writer refuses a new connection with this marker.
+        if isinstance(exc, (PortionDeadlineError, CurrentPortionDeadlineExceeded)) or 'deadline prohibits' in str(exc):
+            return True
+        exc = exc.__cause__
+    return False
+
+
 _ENTITY_LABELS = {
     'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury'),
     'market_value_history': ('market_value_points', 'mv_history'),
@@ -477,7 +492,7 @@ def _bound_connection(connection, deadline, clock):
     """Clamp every Trino HTTP poll, preserving this connection's auth/session."""
     remaining = deadline - clock() - 30
     if remaining <= 0:
-        raise CurrentPortionError('deadline prohibits a new Bronze request')
+        raise PortionDeadlineError('deadline prohibits a new Bronze request')
     configured = getattr(connection, 'request_timeout', getattr(connection, '_request_timeout', 30))
     configured = max(configured) if isinstance(configured, tuple) else configured
     connection.request_timeout = min(float(configured), remaining)
@@ -490,7 +505,7 @@ def _bound_connection(connection, deadline, clock):
         def bounded_request(method, url, **kwargs):
             left = deadline - clock() - 30
             if left <= 0:
-                raise CurrentPortionError('deadline prohibits another Trino query poll')
+                raise PortionDeadlineError('deadline prohibits another Trino query poll')
             timeout = kwargs.get('timeout', connection.request_timeout)
             if isinstance(timeout, tuple):
                 kwargs['timeout'] = tuple(min(float(value), left / len(timeout)) if value is not None
@@ -564,7 +579,7 @@ class _Scope:
 
     def admission(self, reserve=60):
         if self.clock() + reserve >= self.deadline:
-            raise CurrentPortionError('portion deadline: pending work retained')
+            raise PortionDeadlineError('portion deadline: pending work retained')
         used = self.data.get('traffic_used', {})
         current = self.scraper.get_traffic_stats()
         total = used.get('requests', 0) + current.get('request_attempts', current.get('requests', 0))
@@ -1944,25 +1959,28 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             scope.listing()
                         scope.roster(weekly=item.kind == 'weekly_roster')
                         scope.staff(staff_writer)
+                    # #2068: a cold roster only commits the roster; its careers
+                    # and coaches remain in resume_json for continuation work.
+                    roster_only = item.kind == 'cold_roster' and not data.get('authoritative_empty_scope')
                     # Weekly roster capture queues global debt/TTL jobs;
                     # the next portion keeps their own endpoint byte budgets.
                     if item.kind == 'weekly_roster':
                         scope.queue_career_refreshes()
-                    else:
+                    elif not roster_only:
                         scope.careers()
                     coach_checked = data.get('coaches_checked_at')
-                    if (not scope.cursor.cold_complete or scope.resume.get('coaches_pending')
+                    if not roster_only and (not scope.cursor.cold_complete or scope.resume.get('coaches_pending')
                         or coach_checked is None or now() - _utc(coach_checked) >= timedelta(days=28)):
                         scope.coaches()
-                    if (not any(scope.resume.get('careers', {}).values()) and not scope.resume.get('required')
-                        and not scope.resume.get('coaches_pending')):
+                    if (not roster_only and not any(scope.resume.get('careers', {}).values())
+                        and not scope.resume.get('required') and not scope.resume.get('coaches_pending')):
                         scope.cursor = replace(scope.cursor, cold_complete=True)
                         scope.resume = {}
-                scope.cursor = replace(scope.cursor, last_work_at=now())
+                scope.cursor = replace(scope.cursor, last_work_at=now(), last_error_at=None)
                 scope.persist()
                 if daily_complete(scope.cursor, now()):
                     report['daily_complete_scope_ids'].append(target.scope_id)
-                result['status'] = 'complete' if not scope.resume else 'pending'
+                result['status'] = 'complete' if not scope.resume and item.kind != 'cold_roster' else 'pending'
                 if item.kind == 'season_close' and result['status'] == 'complete':
                     if not data.get('season_close_roster_captured'):
                         raise CurrentPortionError('season close requires a final committed full roster')
@@ -1989,15 +2007,23 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 if result.get('check_failures'):
                     result['status'] = 'uncertain'
             except Exception as exc:
-                result['status'], result['error'] = 'failed', type(exc).__name__ + ': ' + redact_sensitive(str(exc))
-                if 'baseline_required:' in str(exc):
-                    result['status'] = 'baseline_required'
+                message = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
+                # #2068: the remainder retained at the deadline keeps its turn;
+                # a real error is recorded and backs the scope off.
+                changes = {'last_work_at': now()}
+                if _deadline_retained(exc):
+                    result['status'], result['retained'] = 'retained', message
+                else:
+                    result['status'], result['error'] = 'failed', message
+                    if 'baseline_required:' in str(exc):
+                        result['status'] = 'baseline_required'
+                    changes['last_error_at'] = changes['last_work_at']
                 if scope is not None:
-                    scope.cursor = replace(scope.cursor, last_work_at=now())
+                    scope.cursor = replace(scope.cursor, **changes)
                     scope.persist()
                 else:
                     cursor = ScopeCursor.from_mapping(data['cursor']) if data.get('cursor') else ScopeCursor(target.scope_id)
-                    data['cursor'] = replace(cursor, last_work_at=now()).as_dict()
+                    data['cursor'] = replace(cursor, **changes).as_dict()
                     save()
             finally:
                 try:
@@ -2099,7 +2125,7 @@ def _portion_alarm(seconds):
     started = time.monotonic()
 
     def expired(signum, frame):
-        raise CurrentPortionError('whole current portion reached its absolute deadline')
+        raise PortionDeadlineError('whole current portion reached its absolute deadline')
 
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, float(seconds))

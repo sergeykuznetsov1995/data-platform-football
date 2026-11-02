@@ -248,6 +248,11 @@ class Offline:
             now_fn=lambda: self.clock.wall, monotonic_fn=lambda: self.clock.elapsed, **kwargs,
         )
 
+    def run_cold(self, cycle, **kwargs):
+        """#2068: a cold roster portion, then its careers continuation."""
+        self.run(cycle, **kwargs)
+        return self.run(cycle + '-careers', **kwargs)
+
     def state(self):
         index = json.loads((self.root / 'state' / 'cursor-v1.json').read_text())
         index['scopes'] = {scope_id: json.loads((self.root / 'state' / entry['scope_file']).read_text())
@@ -330,8 +335,10 @@ def test_production_current_staff_policy_preserves_other_work(offline, productio
         policy['allowed_write_tables'].append(STAFF_RECEIPTS_TABLE)
     production_current.policy_path.write_text(json.dumps(policy))
 
-    cold = production_current.run('cold')
-    assert any(item['kind'] == 'cold_roster' and item['status'] == 'complete' for item in cold['scopes']), [
+    roster = production_current.run('cold')
+    assert [(item['kind'], item['status']) for item in roster['scopes']] == [('cold_roster', 'pending')]
+    cold = production_current.run('cold-careers')
+    assert any(item['kind'] == 'resume' and item['status'] == 'complete' for item in cold['scopes']), [
         (item['kind'], item['status'], item.get('error')) for item in cold['scopes']]
     assert all(item['status'] != 'failed' for item in cold['scopes'])
     saved = next(iter(offline.state()['scopes'].values()))
@@ -401,7 +408,7 @@ def test_corrupt_qualification_file_refuses_before_client(offline):
 
 
 def test_cold_real_raw_parser_and_career_pipeline_records_complete_roster(offline):
-    report = offline.run('cold')
+    report = offline.run_cold('cold')
     assert len(offline.writes) == 1
     snapshot = offline.writes[0]
     assert snapshot.expected_team_ids == ('10', '20')
@@ -415,9 +422,9 @@ def test_cold_real_raw_parser_and_career_pipeline_records_complete_roster(offlin
     data = next(iter(offline.state()['scopes'].values()))
     assert data['cursor']['cold_complete']
     assert data['cursor']['resume_json'] == '{}'
-    assert len(data['traffic_receipts']) == 1  # #2068: no signal work before the cold roster
+    assert len(data['traffic_receipts']) == 3  # #2068: cold roster, then signals and careers
     assert data['traffic_used']['requests'] > 0
-    assert data['grant_cycle_id'] == 'cold'
+    assert data['grant_cycle_id'] == 'cold-careers'
     assert report['full_scope_completed'] is False
     assert any('transfermarkt_current_signals_v1' in sql for sql in offline.sql)
 
@@ -474,7 +481,7 @@ def test_player_signal_change_refetches_only_affected_full_club_and_value_career
 def test_interrupted_full_roster_resumes_verified_paid_pages_under48h(offline, cache_version):
     offline.stop_after_club = '10'
     first = offline.run('first')
-    assert any(item['status'] == 'failed' for item in first['scopes'])
+    assert [item['status'] for item in first['scopes']] == ['retained'] and first['status'] == 'pending'
     assert offline.writes == []
     data = next(iter(offline.state()['scopes'].values()))
     original = json.loads(data['cursor']['resume_json'])['captured']['10']
@@ -503,7 +510,7 @@ def test_interrupted_full_roster_resumes_verified_paid_pages_under48h(offline, c
 
 def test_adaptive_career_exact_remainder_survives_next_portion(offline):
     offline.partial_careers = True
-    offline.run('first')
+    offline.run_cold('first')
     data = next(iter(offline.state()['scopes'].values()))
     pending = json.loads(data['cursor']['resume_json'])['careers']
     assert pending == {'market_value_points': ['120'], 'transfer_events': ['120']}
@@ -513,6 +520,72 @@ def test_adaptive_career_exact_remainder_survives_next_portion(offline):
     offline.run('second')
     assert all('110' not in url for _, url in offline.calls if '/ceapi/' in url)
     assert next(iter(offline.state()['scopes'].values()))['cursor']['cold_complete']
+
+
+def test_cold_roster_commits_roster_without_career_requests(offline):
+    report = offline.run('cold')
+    assert [(item['kind'], item['status']) for item in report['scopes']] == [('cold_roster', 'pending')]
+    assert len(offline.writes) == 1 and offline.careers == []
+    assert not any('/ceapi/' in url for _, url in offline.calls)
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['cursor']['roster_completed_at'] and not data['cursor']['cold_complete']
+    assert json.loads(data['cursor']['resume_json'])['careers'] == {
+        'market_value_points': ['110', '120'], 'transfer_events': ['110', '120']}
+
+
+def test_deadline_inside_careers_is_retained_not_failed(offline):
+    offline.run('cold')
+    writer = offline.career_writer
+
+    def slow_writer(*args, **kwargs):
+        proof = writer(*args, **kwargs)
+        offline.clock.advance(2350)  # the next endpoint meets the portion deadline
+        return proof
+
+    offline.career_writer = slow_writer
+    report = offline.run('careers')
+    resume, = [item for item in report['scopes'] if item['kind'] == 'resume']
+    assert resume['status'] == 'retained' and 'portion deadline' in resume['retained']
+    assert 'error' not in resume and report['status'] == 'pending'
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['cursor']['last_error_at'] is None
+    assert json.loads(data['cursor']['resume_json'])['careers']['transfer_events'] == ['110', '120']
+
+
+def test_real_error_records_backoff_and_success_clears_it(offline):
+    offline.run('cold')
+    writer = offline.career_writer
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('career backend broken')
+
+    offline.career_writer = broken
+    report = offline.run('broken')
+    resume, = [item for item in report['scopes'] if item['kind'] == 'resume']
+    assert resume['status'] == 'failed' and report['status'] == 'failed'
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['cursor']['last_error_at'] == offline.clock.wall.isoformat()
+    offline.career_writer = writer
+    offline.clock.advance(4 * 3600)
+    report = offline.run('fixed')
+    assert [item['status'] for item in report['scopes'] if item['kind'] == 'resume'] == ['complete']
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['cursor']['last_error_at'] is None and data['cursor']['cold_complete']
+
+
+def test_writer_connection_deadline_is_retained():
+    from dags.utils.transfermarkt_current_write import CurrentWriteError
+    from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+    assert current._deadline_retained(CurrentWriteError('current deadline prohibits another writer connection'))
+    assert current._deadline_retained(CurrentPortionDeadlineExceeded('Transfermarkt permit reached portion tail'))
+    try:
+        try:
+            raise current.PortionDeadlineError('deadline prohibits another Trino query poll')
+        except current.PortionDeadlineError as exc:
+            raise CurrentWriteError('read-back failed') from exc
+    except CurrentWriteError as wrapped:
+        assert current._deadline_retained(wrapped)
+    assert not current._deadline_retained(current.CurrentPortionError('scope attempt budget reached'))
 
 
 def test_scope_failure_keeps_other_scope_write_and_traffic(offline):
@@ -600,6 +673,7 @@ def test_changed_listing_invalidates_unfinished_club_page_only(offline):
     offline.calls.clear()
     offline.values['10'] = '€2.0m'
     offline.squad_values['10'] = '€2.0m'
+    offline.player_values['110'] = 2000000  # #2068: the daily player check now follows the roster
     offline.clock.advance(21 * 3600)
     offline.run('changed')
     offline.run('changed-continue')
@@ -649,7 +723,8 @@ def test_injury_removal_updates_previous_affected_club(offline):
 def test_write_time_consumes_whole_deadline_and_preserves_pending_careers(offline):
     offline.stop_in_writer = True
     report = offline.run('write-tail')
-    assert any(item['status'] == 'failed' for item in report['scopes'])
+    # #2068: a cold roster portion stops after the roster; careers stay queued.
+    assert [item['status'] for item in report['scopes']] == ['pending'] and report['status'] == 'pending'
     assert offline.careers == []
     data = next(iter(offline.state()['scopes'].values()))
     assert data['snapshot']
@@ -704,7 +779,7 @@ def test_new_portion_grant_keeps_old_cap_receipts_and_resumes_exact_work(offline
     after = next(iter(offline.state()['scopes'].values()))
     assert after['cursor']['cold_complete']
     assert after['closed_grants'][0]['cycle_id'] == 'first'
-    assert after['closed_grants'][0]['traffic']['requests'] == current.SCOPE_REQUEST_LIMIT
+    assert after['closed_grants'][-1]['traffic']['requests'] == current.SCOPE_REQUEST_LIMIT
     assert after['closed_grants'][0]['traffic']['provider_metered_bytes'] == current.SCOPE_HARD_PROVIDER_BYTE_CAP
     assert after['grant_cycle_id'] == 'second'
     assert all(item['status'] != 'failed' for item in report['scopes'])
@@ -763,7 +838,7 @@ def test_actual_decoded_cap_preserves_first_page_and_next_grant_finishes_full_ro
 
 
 def test_large_career_queue_keeps_exact_remainder_across_new_grants(offline):
-    offline.run('cold')
+    offline.run_cold('cold')
     state = offline.state()
     data = next(iter(state['scopes'].values()))
     ids = [str(value) for value in range(1000, 21000)]
@@ -776,7 +851,7 @@ def test_large_career_queue_keeps_exact_remainder_across_new_grants(offline):
     offline.run('portion-2')
     after = next(iter(offline.state()['scopes'].values()))
     assert json.loads(after['cursor']['resume_json'])['careers']['market_value_points'] == ids[1:]
-    assert after['closed_grants'][0]['traffic']['requests'] == current.SCOPE_REQUEST_LIMIT
+    assert after['closed_grants'][-1]['traffic']['requests'] == current.SCOPE_REQUEST_LIMIT
     offline.run('portion-3')
     after = next(iter(offline.state()['scopes'].values()))
     assert json.loads(after['cursor']['resume_json'])['careers']['market_value_points'] == ids[2:]
@@ -813,7 +888,7 @@ def test_player_packets_100_and_exact_partial_cursor_resume_in_same_signal_cycle
 
 
 def test_global_player_packet_is_paid_once_and_secondary_scope_keeps_primary_proof(offline):
-    offline.run('cold', competitions=('GB1', 'FR1'))
+    offline.run_cold('cold', competitions=('GB1', 'FR1'))
     offline.calls.clear()
     offline.clock.advance(21 * 3600)
     report = offline.run('signals', competitions=('GB1', 'FR1'))
@@ -869,7 +944,7 @@ def test_existing_bronze_scope_without_seed_activates_warm_with_only_absent_care
     offline.bronze_careers = {'market_value_points': {'110': '2026-05-01', '120': None}, 'transfer_events': {'110': None}}
     for endpoint in ('market_value_points', 'transfer_events'):
         offline.fetch_state[(endpoint, '110')] = offline.fetch_state[(endpoint, '120')] = ('success', 'old', offline.clock.wall)
-    report = offline.run('needs-baseline')
+    report = offline.run_cold('needs-baseline')
     assert all(item['status'] != 'baseline_required' for item in report['scopes']), report['scopes']
     assert len(offline.writes) == 1
     assert [(endpoint, ids) for endpoint, ids, _ in offline.careers] == [('transfer_events', ('120',))]
@@ -1042,7 +1117,7 @@ def test_lagging_squad_cannot_ack_player_change_and_only_bad_club_is_refetched(o
 
 
 def test_warm_same_value_unknown_or_changed_native_date_queues_only_mv(offline):
-    offline.run('cold')
+    offline.run_cold('cold')
     state = offline.state()
     data = next(iter(state['scopes'].values()))
     data['warm_baseline'] = True
@@ -1085,7 +1160,7 @@ def test_stale_nonempty_value_graph_retains_exact_pending_id_until_current_date(
 def test_warm_unpriced_player_with_old_value_history_does_not_redownload_history(offline):
     offline.squad_values['10'] = '-'
     offline.unpriced_players.add('110')
-    offline.run('cold')
+    offline.run_cold('cold')
     state = offline.state()
     data = next(iter(state['scopes'].values()))
     data['warm_baseline'] = True
@@ -1103,7 +1178,7 @@ def test_warm_unpriced_player_with_old_value_history_does_not_redownload_history
 def test_zero_value_baseline_and_absent_signal_do_not_refetch(offline):
     offline.squad_values['10'] = '-'
     offline.player_values['110'] = 0
-    offline.run('cold')
+    offline.run_cold('cold')
     offline.calls.clear()
     offline.careers.clear()
     offline.clock.advance(21 * 3600)
@@ -1121,12 +1196,13 @@ def test_zero_value_baseline_and_absent_signal_do_not_refetch(offline):
 
 
 def test_zero_value_does_not_block_ack_of_real_roster_change(offline):
-    offline.run('cold')
+    offline.run_cold('cold')
     offline.run('baseline')
     offline.squad_values['10'] = '-'
     offline.player_values['110'] = 0
     offline.clock.advance(21 * 3600)
     offline.run('becomes-unpriced')
+    offline.run('becomes-unpriced-apply')  # #2068: the roster change follows its signal portion
     data = next(iter(offline.state()['scopes'].values()))
     assert data['signals']['player:110']['status'] == 'applied'
     assert data['cursor']['resume_json'] == '{}'
@@ -1458,7 +1534,7 @@ def test_physical_replacement_lost_readback_recovers_original_write_intent(offli
     monkeypatch.setattr(write.run, '_authorize_write_mode', lambda mode, revision: {'write_mode': mode, 'expected_revision': revision})
     monkeypatch.setattr(write, '_read_back', readback)
     offline.factory, offline.roster_writer = physical_factory, roster_writer
-    offline.run('baseline', baseline_verifier=write.verify_current_roster_baseline)
+    offline.run_cold('baseline', baseline_verifier=write.verify_current_roster_baseline)
     before = next(iter(offline.state()['scopes'].values()))
     assert before['snapshot']
     offline.values['10'], offline.squad_values['10'], offline.player_values['110'] = '€2.0m', '€2.0m', 2000000
@@ -1726,7 +1802,7 @@ def test_season_rollover_captures_old_roster_once_before_history_handoff(offline
 def test_season_close_retains_pending_careers_after_terminal_or_deferred_backend(offline, backend_status):
     from scrapers.transfermarkt.registry import deterministic_scope_id
 
-    offline.run('cold')
+    offline.run_cold('cold')
     scope_id = deterministic_scope_id('GB1', '2026')
     saved = offline.state()
     data = saved['scopes'][scope_id]
@@ -1777,6 +1853,9 @@ def test_season_close_retains_pending_careers_after_terminal_or_deferred_backend
     # A later complete job can finish the pending careers and hand off the
     # original final roster; the terminal/deferred result itself never does.
     offline.calls.clear()
+    state = offline.state()
+    state['turn'] = 0  # the single slot alternates close and ordinary work by turn
+    offline.write_state(state)
     finished = close('close-completed', offline.career_writer)['scopes'][0]
     assert finished['historical_handoff'] is True
     assert not offline.state()['season_closures']
@@ -1838,7 +1917,7 @@ def test_registry_only_competition_resolves_in_writer_helpers(offline, monkeypat
         return career_writer(scraper, endpoint, ids, scope, *args, **kwargs)
 
     offline.career_writer = writer
-    report = offline.run('cold', competitions=('THA1',))
+    report = offline.run_cold('cold', competitions=('THA1',))
     assert report['scopes'] and all(item.get('error') is None for item in report['scopes'])
     assert seasons and set(seasons) == {'2627'}
     assert 'TM_COMPETITION_RECORDS_JSON' not in current.os.environ
