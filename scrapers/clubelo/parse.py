@@ -730,7 +730,7 @@ FIXTURE_PCT_SUM = (99.0, 101.0)  # 1 + X + 2 of one match, rounding of three val
 _UTC_KICKOFF = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})Z$")
 # 02.11: a game already played when the page was built shows its status and
 # score ("FT<br/>3-1") in the date cell instead of the kick-off.
-_GAME_STATUS = re.compile(r"^[A-Za-z0-9'+]{1,6} ?\d{1,3}-\d{1,3}$")
+_GAME_STATUS = re.compile(r"^(?:[A-Za-z]{1,4}|\d{1,3}(?:\+\d{1,2})?') ?\d{1,3}-\d{1,3}$")
 # Stake cells show a bound below the display precision ("<0.1") and an
 # impossible outcome as "0%" (narrow layout "⨉"): kept as text without "%".
 _STAKE_PCT = re.compile(r"^(<?\d+(?:\.\d+)?)%?$")
@@ -815,9 +815,10 @@ def parse_fixtures(html: str) -> FixturesPage:
     """Parse the main ``/Fixtures`` table: one row per match (two ``tr``).
 
     A match is a home ``tr`` of 11 cells — the date cell carries the site's
-    game id and the UTC kick-off (a game played by the page build: its status
-    and score, ``kickoff_utc`` NULL), "X" spans both rows — followed by an away
-    ``tr`` of 9 cells; a side with nothing at stake may lack empty stake cells. Section rows (2 cells) name the competition/stage and
+    game id and the UTC kick-off (a game played by the page build: its
+    status and score, ``kickoff_utc`` NULL), "X" spans both rows — followed
+    by an away ``tr`` of 9 cells; a side with nothing at stake may lack empty
+    stake cells. Section rows (2 cells) name the competition/stage and
     the unit of "So Far"; the header repeats inside the table. The country
     accordion after the table is not read. An empty table is data truth (24.09).
     Anything else raises ``LayoutChanged`` and nothing parsed is written.
@@ -885,7 +886,8 @@ def parse_fixtures(html: str) -> FixturesPage:
             raise LayoutChanged(f"F3 fixtures game {game}: 1/X/2 {shares} do not sum to 100")
         row = {
             "game_id": int(game),
-            "kickoff_utc": datetime.strptime(kickoff.group(1), "%Y-%m-%dT%H:%M") if kickoff else None,
+            "kickoff_utc": (datetime.strptime(kickoff.group(1), "%Y-%m-%dT%H:%M")
+                            if kickoff else None),
             "competition": competition,
             "so_far_unit": unit,
             "row_seq": len(rows),
