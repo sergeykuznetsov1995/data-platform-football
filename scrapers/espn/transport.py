@@ -241,8 +241,14 @@ class EspnHttpClient:
         self.raw_writer.flush()
 
     def flush_attempts(self, conn) -> int:
-        """Publish/recover the durable shared attempt outbox."""
-        return self.attempt_journal.flush(conn)
+        """Publish/recover this owner's rows of the shared attempt outbox.
+
+        The owner is the lane plus measurement/non-measurement traffic: crashed
+        workers of the same owner are recovered, other owners' tails are not.
+        """
+        return self.attempt_journal.flush(
+            conn, lane=self.lane, measured=self.measurement_id is not None
+        )
 
     def close(self) -> None:
         self.raw_writer.close()
