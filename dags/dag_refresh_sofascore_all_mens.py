@@ -59,6 +59,10 @@ RESULT_DIR = (
 # batch runs SERIALLY on one pool slot (``max_active_tasks`` is 1).
 REFRESH_DAGRUN_TIMEOUT = timedelta(hours=7)
 REFRESH_FETCH_TIMEOUT = timedelta(minutes=150)
+# #2107: the sweep retries once after this delay.  The retry shares the first
+# try's window (counted from the DagRun start) instead of getting its own, so
+# the sweep phase costs at most REFRESH_FETCH_TIMEOUT + this delay.
+REFRESH_FETCH_RETRY_DELAY = timedelta(minutes=10)
 # Ceiling of one scope task; its real timeout is its own estimate x 1.5.
 REFRESH_SCOPE_TIMEOUT = timedelta(seconds=state.REFRESH_MAX_SCOPE_TIMEOUT_SECONDS)
 # Season metadata enrichment (#1354) runs after the scopes inside the same
@@ -79,17 +83,19 @@ METADATA_TIMEOUT = timedelta(minutes=25)
 REFRESH_SCOPE_BUDGET = timedelta(hours=2)
 # #1751: transport-only scope losses in one run before it is red.
 MAX_INITIAL_TRANSIENT_FAILURES = 3
-REFRESH_RETRY_RESERVE = timedelta(hours=2)
+# 5 min short of 2 h: they pay for the sweep's retry delay (#2107).
+REFRESH_RETRY_RESERVE = timedelta(hours=1, minutes=55)
 if (
     REFRESH_FETCH_TIMEOUT
+    + REFRESH_FETCH_RETRY_DELAY
     + REFRESH_SCOPE_BUDGET
     + REFRESH_RETRY_RESERVE
     + METADATA_TIMEOUT
     > REFRESH_DAGRUN_TIMEOUT
 ):
     raise AirflowException(
-        "refresh window does not fit the DagRun: sweep + scope budget + "
-        "retry reserve + metadata > dagrun_timeout"
+        "refresh window does not fit the DagRun: sweep + its retry delay + "
+        "scope budget + retry reserve + metadata > dagrun_timeout"
     )
 # Pace of the match phase, re-measured 29-30.09 on the refresh lane (~12 s a
 # match, ``state.DEFAULT_REFRESH_SECONDS_PER_MATCH``); an env override retunes
@@ -781,11 +787,25 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
 FETCH_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
-/opt/legacy-scraper-venv/bin/python \
+page_budget="${SOFASCORE_REFRESH_PAGE_BUDGET}"
+run_limit=""
+if [ "{{ ti.try_number }}" -gt 1 ]; then
+  # #2107: the retry walks only what is left of the sweep window counted from
+  # the DagRun start, so the scopes keep theirs: pages cut to that share and a
+  # hard stop at its end.
+  left=$(( {{ dag_run.start_date.timestamp() | int }} + SOFASCORE_REFRESH_FETCH_WINDOW_S - $(date +%s) ))
+  if [ "${left}" -lt 600 ]; then
+    echo "SofaScore sweep retry: ${left}s left of the sweep window, too little to walk (#2107)"
+    exit 1
+  fi
+  page_budget=$(( SOFASCORE_REFRESH_PAGE_BUDGET * left / SOFASCORE_REFRESH_FETCH_WINDOW_S ))
+  run_limit="timeout ${left}"
+fi
+${run_limit} /opt/legacy-scraper-venv/bin/python \
   dags/scripts/run_sofascore_schedule_refresh.py \
   --snapshot "${SOFASCORE_CAMPAIGN_SNAPSHOT}" \
   --budget-cap-bytes "${SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES}" \
-  --page-budget "${SOFASCORE_REFRESH_PAGE_BUDGET}" \
+  --page-budget "${page_budget}" \
   --max-due "${SOFASCORE_REFRESH_MAX_DUE}" \
   --max-stale "${SOFASCORE_REFRESH_MAX_STALE}" \
   --chase-pages "${SOFASCORE_REFRESH_CHASE_PAGES}" \
@@ -864,6 +884,9 @@ with DAG(
             ),
             "SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES": str(REFRESH_PER_LEASE_MAX_BYTES),
             "SOFASCORE_REFRESH_PAGE_BUDGET": str(REFRESH_PAGE_BUDGET),
+            "SOFASCORE_REFRESH_FETCH_WINDOW_S": str(
+                int(REFRESH_FETCH_TIMEOUT.total_seconds())
+            ),
             "SOFASCORE_REFRESH_MAX_DUE": str(REFRESH_MAX_DUE),
             "SOFASCORE_REFRESH_MAX_STALE": str(REFRESH_MAX_STALE),
             "SOFASCORE_REFRESH_CHASE_PAGES": str(REFRESH_CHASE_PAGES),
@@ -884,8 +907,9 @@ with DAG(
         # the gateway gives discovery leases 64 MiB per DagRun and a full sweep
         # costs <= 10 MB.  ``plan_refresh_batch`` (all_done) waits for the
         # retry; its report gets a ``-tryN`` suffix so the first one survives.
+        # The retry fits the first try's window (FETCH_COMMAND), not its own.
         retries=1,
-        retry_delay=timedelta(minutes=10),
+        retry_delay=REFRESH_FETCH_RETRY_DELAY,
         # The class slices are cut to REFRESH_PAGE_BUDGET worst-case pages
         # (the fixture page of every stale and seeded season and the step-back
         # allowance count too): at the lane's 20/min that is 80 % of this

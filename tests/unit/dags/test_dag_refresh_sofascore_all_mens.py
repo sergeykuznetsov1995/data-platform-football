@@ -73,8 +73,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     assert datetime.fromisoformat(window["started_at"]) > context["dag_run"].start_date
     assert datetime.fromisoformat(window["deadline_at"]).timestamp() == int(
         selected[0]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
-    assert 14399 <= (datetime.fromisoformat(window["deadline_at"])
-                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 14400
+    assert 14099 <= (datetime.fromisoformat(window["deadline_at"])
+                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 14100
 
 
 def test_disabled_evidence_has_no_input_or_filesystem_effect(clean_env, monkeypatch):
@@ -164,7 +164,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         assert flag in fetch.bash_command
     # #1358: the sweep is sized in pages — 150 min x 20/min x 0.8 — and the
     # byte cap is derived from them by the run (0 = derive, no fixed 64 MiB).
-    assert '--page-budget "${SOFASCORE_REFRESH_PAGE_BUDGET}"' in fetch.bash_command
+    assert 'page_budget="${SOFASCORE_REFRESH_PAGE_BUDGET}"' in fetch.bash_command
     assert fetch.env["SOFASCORE_REFRESH_PAGE_BUDGET"] == "2400"
     assert module.REFRESH_PAGE_BUDGET == 2400
     assert fetch.env["SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES"] == "0"
@@ -188,6 +188,19 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     # the discovery leases have 64 MiB per DagRun against <= 10 MB a sweep.
     assert fetch._init_kwargs["retries"] == 1
     assert fetch._init_kwargs["retry_delay"] == timedelta(minutes=10)
+    assert module.REFRESH_FETCH_RETRY_DELAY == fetch._init_kwargs["retry_delay"]
+    # The retry shares the first try's sweep window, counted from the DagRun
+    # start, and stops at its end (``timeout``) with a page budget cut to what
+    # is left of it, so a late retry cannot eat the scopes' window.
+    assert fetch.env["SOFASCORE_REFRESH_FETCH_WINDOW_S"] == "9000"
+    for part in (
+        "{{ dag_run.start_date.timestamp() | int }}",
+        'run_limit="timeout ${left}"',
+        "page_budget=$(( SOFASCORE_REFRESH_PAGE_BUDGET * left / SOFASCORE_REFRESH_FETCH_WINDOW_S ))",
+        '${run_limit} /opt/legacy-scraper-venv/bin/python',
+        '--page-budget "${page_budget}"',
+    ):
+        assert part in fetch.bash_command
     # The retry's report must not overwrite the first try's (``visits``).
     assert (
         "schedule-refresh-{{ ts_nodash }}"
@@ -196,11 +209,13 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     assert operators["plan_refresh_batch"]._init_kwargs["trigger_rule"] == "all_done"
     assert fetch._init_kwargs["execution_timeout"] == timedelta(minutes=150)
     # #1358: 7 h hold the sweep, the scopes' shared window, the reserve for
-    # their retries and the metadata enrichment: 150 min + 2 h + 2 h + 25 min.
+    # their retries and the metadata enrichment; #2107 adds the sweep's retry
+    # delay: 150 min + 10 min + 2 h + 1 h 55 min + 25 min.
     assert module.REFRESH_SCOPE_BUDGET == timedelta(hours=2)
-    assert module.REFRESH_RETRY_RESERVE == timedelta(hours=2)
+    assert module.REFRESH_RETRY_RESERVE == timedelta(hours=1, minutes=55)
     assert (
         module.REFRESH_FETCH_TIMEOUT
+        + module.REFRESH_FETCH_RETRY_DELAY
         + module.REFRESH_SCOPE_BUDGET
         + module.REFRESH_RETRY_RESERVE
         + module.METADATA_TIMEOUT
@@ -914,12 +929,12 @@ def test_plan_task_maps_each_scope_with_its_own_timeout(clean_env, monkeypatch):
     )
 
     # Every scope, and every retry of it, stops by the batch's own deadline:
-    # plan time + the 2 h window + the 2 h retry reserve.
+    # plan time + the 2 h window + the 1 h 55 min retry reserve (#2107).
     assert items == [{
         "env": {
             "SOFASCORE_SCOPE_TIMEOUT_S": "1030",
             "X": "1",
-            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600),
+            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600 - 300),
         },
         "execution_timeout": timedelta(seconds=1030),
     }]
