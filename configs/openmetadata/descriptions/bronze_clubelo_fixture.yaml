@@ -21,7 +21,7 @@ columns:
   - name: game_id
     description: Id матча на сайте (data-live-status-game-id). Ключ строки внутри партиции.
   - name: kickoff_utc
-    description: Начало матча, UTC (data-utc-time).
+    description: Начало матча, UTC (data-utc-time). NULL — матч уже сыгран к сборке страницы (вместо времени статус и счёт, напр. «FT 3-1»).
   - name: competition
     description: "Строка-секция над матчем: лига/стадия, как на странице (бывает без страны, напр. 'Regular Season')."
   - name: so_far_unit

@@ -666,6 +666,49 @@ def test_live_fixtures_parse_every_match():
     assert {"<0.1", "0"} <= shown and not any(v and v.endswith("%") for v in shown)
 
 
+LIVE_FIXTURES_1102 = LIVE_FIXTURES.parents[1] / "20261102" / "Fixtures.html.gz"
+
+
+def _fixtures_1102_html() -> str:
+    with gzip.open(LIVE_FIXTURES_1102, "rt", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_fixtures_with_a_played_game_and_sides_without_stake_parse_every_match():
+    # 02.11: the page failed closed on both variants — the day's 50 matches lost
+    from scrapers.clubelo.parse import parse_fixtures
+
+    page = parse_fixtures(_fixtures_1102_html())
+    assert page.rating_date == date(2026, 11, 1) and len(page.rows) == 50
+    played = next(r for r in page.rows if r["game_id"] == 1736307)
+    assert played["kickoff_utc"] is None
+    assert (played["home_key"], played["away_slug"]) == ("Palermo", "l-r-vicenza")
+    assert (played["home_win_pct"], played["draw_pct"], played["away_win_pct"]) == (57.9, 26.0, 16.1)
+    assert sum(r["kickoff_utc"] is None for r in page.rows) == 1
+    no_stake = next(r for r in page.rows if r["game_id"] == 1556399)
+    assert all(no_stake[f"home_stake{n}"] is None
+               for n in ("", "_chance", "_if_win", "_if_draw", "_if_loss"))
+    assert (no_stake["away_stake"], no_stake["away_stake_chance"]) == ("Top 2", "0.1")
+    assert sum(r["home_stake"] is None for r in page.rows) == 3
+    assert sum(r["away_stake"] is None for r in page.rows) == 1
+
+
+@pytest.mark.parametrize("old, new, check", [
+    # a played game's cell that is not "<status> <score>"
+    ('rowspan="2">FT<br/>3-1</td>', 'rowspan="2">FT<br/>3:1</td>', "F3 fixtures game 1736307: kick-off"),
+    # a short home row whose stake cells are not empty
+    ('<td></td><td></td><td></td><td></td></tr>', '<td>Top 2</td><td></td><td></td><td></td></tr>',
+     "F2 fixtures row"),
+])
+def test_fixtures_new_variants_still_fail_closed(old, new, check):
+    from scrapers.clubelo.parse import parse_fixtures
+
+    html = _fixtures_1102_html()
+    assert old in html
+    with pytest.raises(LayoutChanged, match=check):
+        parse_fixtures(html.replace(old, new, 1))
+
+
 def test_empty_fixtures_page_is_data_truth():
     from scrapers.clubelo.parse import parse_fixtures
 
