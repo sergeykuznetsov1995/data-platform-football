@@ -18,6 +18,7 @@ import time
 import uuid
 
 from . import urls
+from .attempts import attempt_covered
 from .criterion import meets, render_daily_criterion_sql
 from .gate import TransportGate, default_state_path
 from .history import live_debt
@@ -500,7 +501,8 @@ class Controller:
 
         begin() has no HTTP duration; finish() records one even for an abort.
         A live/current in-flight start must be allowed to finish, not mistaken
-        for permanent evidence loss. Ordinary complete HTTP errors never reset.
+        for permanent evidence loss. Ordinary complete HTTP errors and recorded
+        transport errors (#2090) never reset.
         """
         self._main_thread()
         state = self.state
@@ -515,8 +517,7 @@ class Controller:
             return
         rows = self.journal.rows(datetime.fromisoformat(report['start']),
                                  datetime.fromisoformat(report['end']))
-        incomplete = [r for r in rows if not r['complete'] or r['http_ms'] is None
-                      or (r['status'] is None and not r['timeout'])]
+        incomplete = [r for r in rows if not attempt_covered(r)]
         if not incomplete or any(r['http_ms'] is None for r in incomplete):
             return
         at = self.now().timestamp()

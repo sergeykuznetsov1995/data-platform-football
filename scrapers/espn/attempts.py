@@ -61,6 +61,23 @@ def safe_error_type(value):
     return value if type(value) is str and value in _ERROR_TYPES else 'OtherTransportError'
 
 
+def transport_error(row):
+    """A finished request that failed before any response, with a known transport error.
+
+    Owner decision #2090: such a connection break is an ordinary failed request,
+    counted in the error share; it never resets the window. finish() alone
+    writes ``error_type``, so a lost start (no finish) never matches.
+    """
+    return (row['status'] is None and not row['timeout'] and row['http_ms'] is not None
+            and row.get('error_phase') == 'request' and row.get('error_type') in _ERROR_TYPES)
+
+
+def attempt_covered(row):
+    """Durable evidence of one attempt: an HTTP status, a timeout or a transport error."""
+    return transport_error(row) or (row['complete'] and row['http_ms'] is not None
+                                    and (row['status'] is not None or row['timeout']))
+
+
 def safe_error_chain(value):
     """Keep only bounded class labels and known numeric error codes."""
     if type(value) not in (list, tuple):
@@ -180,9 +197,7 @@ class AttemptJournal:
         with self._db() as db:
             created = datetime.fromisoformat(db.execute("SELECT value FROM metadata WHERE key='created_at'").fetchone()[0])
             rows = [json.loads(r[0]) for r in db.execute('SELECT payload FROM attempts WHERE requested_at>=? AND requested_at<?', (start.isoformat(), end.isoformat()))]
-        return created <= start < end and bool(rows) and all(
-            r['complete'] and r['http_ms'] is not None and (r['status'] is not None or r['timeout']) for r in rows
-        )
+        return created <= start < end and bool(rows) and all(attempt_covered(r) for r in rows)
 
     def flush(self, conn, *, max_batches=None, blocking=True, before=None, lane=None,
               measured=None, batch_size=200):
