@@ -1993,6 +1993,24 @@ def test_a_bug_in_the_row_builder_is_not_dressed_up_as_a_verdict(offline, monkey
 
 
 @pytest.mark.unit
+def test_an_airflow_retry_counts_its_dagrun_interruption_once(offline):
+    # #2107: ``refresh_season_schedules`` retries once in the same DagRun; a
+    # second cut-short walk of that DagRun must not age the class twice
+    # towards MAX_INTERRUPTED_RUNS.
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["fixtures_transport"] = {(7, 96518)}
+
+    def interrupted_after(run_id):
+        argv = _argv(offline, "--control-url", "http://gw", "--run-id", run_id)
+        assert refresh.main(argv) == 1
+        return json.loads(offline["cursor"].read_text())["interrupted_runs"]["stale"]
+
+    assert interrupted_after("scheduled__a") == 1
+    assert interrupted_after("scheduled__a") == 1
+    assert interrupted_after("scheduled__b") == 2
+
+
+@pytest.mark.unit
 def test_a_class_stuck_on_a_cut_short_walk_eventually_moves_on(offline):
     # Audit after Sol r28: holding the anchor is right for a wobble, but with no
     # bound one season whose calendar answers 403 every run pins ``stale`` on
