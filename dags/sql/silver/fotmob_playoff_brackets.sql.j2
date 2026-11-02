@@ -5,7 +5,8 @@
 -- считается до дедупа. Identity bronze шире (match_ids вместо matchup_key): повтор -> одна строка,
 -- последняя по _observed_at, _ingested_at, затем больший _target_batch_id, меньший match_ids.
 -- Пустой/неприводимый ключ -> строка отбрасывается.
--- match_ids (JSON-текст в bronze) -> ARRAY(BIGINT); source_stage_id (varchar в bronze) -> BIGINT;
+-- match_ids (JSON-текст в bronze) -> ARRAY(BIGINT); source_stage_id (varchar в bronze) -> BIGINT:
+-- целое без точки — напрямую, '17.0' — через DOUBLE, если значение целое;
 -- неразбор -> NULL + _conform_issues_json.
 -- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
 -- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
@@ -51,12 +52,20 @@ dedup AS (
 ),
 conv AS (
     SELECT
-        d.*,
-        NULLIF(d.source_stage_id, '') AS source_stage_id_raw,
-        TRY_CAST(d.source_stage_id AS BIGINT) AS source_stage_id_value,
-        NULLIF(d.match_ids, '') AS match_ids_raw,
-        TRY_CAST(TRY(json_extract(d.match_ids, '$')) AS ARRAY(BIGINT)) AS match_ids_value
-    FROM dedup d
+        n.*,
+        CASE WHEN regexp_like(n.source_stage_id, '^-?[0-9]+$')
+             THEN TRY_CAST(n.source_stage_id AS BIGINT)
+             WHEN n.source_stage_id_double = floor(n.source_stage_id_double)
+             THEN TRY_CAST(n.source_stage_id_double AS BIGINT) END AS source_stage_id_value
+    FROM (
+        SELECT
+            d.*,
+            NULLIF(d.source_stage_id, '') AS source_stage_id_raw,
+            TRY_CAST(d.source_stage_id AS DOUBLE) AS source_stage_id_double,
+            NULLIF(d.match_ids, '') AS match_ids_raw,
+            TRY_CAST(TRY(json_extract(d.match_ids, '$')) AS ARRAY(BIGINT)) AS match_ids_value
+        FROM dedup d
+    ) n
 )
 SELECT
     c.competition_id,

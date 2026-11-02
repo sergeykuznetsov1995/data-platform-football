@@ -381,6 +381,22 @@ def _text(v):
     return str(v)
 
 
+INT_RANGE = {'integer': (-2 ** 31, 2 ** 31 - 1), 'bigint': (-2 ** 63, 2 ** 63 - 1)}
+
+
+def _int_text(v: str, dtype: str):
+    """conform: try integer from a varchar column: a number whose value is integral ('-8', '-8.0')
+    -> int within the type range; anything else -> None (SQL: via DOUBLE + floor check)."""
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    if not math.isfinite(f) or not f.is_integer():
+        return None
+    lo, hi = INT_RANGE[dtype]
+    return int(f) if lo <= int(f) <= hi else None
+
+
 def _date(v):
     if isinstance(v, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', v):
         try:
@@ -489,6 +505,8 @@ def _row(table: str, ctx: dict, derived: dict) -> dict:
         assert not str(col['from']).startswith('derived'), f'{table}.{name} needs a derived rule'
         raw = resolve(col['from'], ctx)
         value = convert(raw, col['type'])
+        if col.get('conform') == 'try' and col['type'].lower() in INT_RANGE and isinstance(raw, str):
+            value = _int_text(raw, col['type'].lower())
         if col.get('conform') == 'try' and value is None and _valid(raw):
             issues.append({'column': name, 'raw': raw if isinstance(raw, str) else str(raw)})
         out[name] = value
@@ -893,9 +911,12 @@ def test_duplicate_category_name_does_not_fan_out():
 
 
 def test_bad_optional_values_are_null_with_conform_issue():
-    # Values chosen so Trino and DuckDB agree: 'x', 'n/a', 'bad', 'abc' fail both engines' casts;
-    # participant_count 3.5 (DOUBLE) is rejected by the explicit integrality check in SQL rather than
-    # by the engine cast (both engines would round 3.5); '-3' / 4.0 / '17' must parse.
+    # Values chosen so Trino and DuckDB agree: 'x', 'n/a', 'bad', 'abc' fail both engines' casts.
+    # Integers from DOUBLE/varchar go through DOUBLE + an explicit integrality check in SQL, so the
+    # engines cannot differ: DuckDB's TRY_CAST('1.5' AS INTEGER) rounds to 2 and Trino's
+    # TRY_CAST('-8.0' AS INTEGER) is NULL (live bronze deduction holds '-8.0'). Checked: deduction
+    # '-8.0' / '-8' / '0' -> -8 / -8 / 0, 'x' / '1.5' -> NULL + issue; participant_count 3.5 -> NULL
+    # + issue, 4.0 -> 4; source_stage_id '17' / '5.0' -> 17 / 5, 'abc' / '2.5' -> NULL + issue.
     # The raw text of a DOUBLE in the issue is json_format(CAST(x AS JSON)): '3.5' in both Trino
     # (checked live 02.11; CAST(double AS VARCHAR) there gives '3.5E0') and DuckDB.
     views = bundle_rows(PAGE_335, 335, KEY_335)
@@ -903,11 +924,13 @@ def test_bad_optional_values_are_null_with_conform_issue():
     standings = views['fotmob_standings_current']
     stages = views['fotmob_season_stages_current']
     competitions = competition_rows(CATALOG)
-    standings[0]['deduction'], standings[1]['deduction'] = 'x', '-3'
+    for row, value in zip(standings, ('x', '-8.0', '-8', '0', '1.5')):
+        row['deduction'] = value
     stages[0]['participant_count'], stages[1]['participant_count'] = 3.5, 4.0
     competitions[0]['discovery_date'] = 'n/a'
     playoff[1]['match_ids'], playoff[2]['source_stage_id'] = 'bad', 'abc'
-    playoff[3]['source_stage_id'] = '17'
+    playoff[3]['source_stage_id'], playoff[0]['source_stage_id'] = '17', '5.0'
+    playoff[1]['source_stage_id'] = '2.5'
     bronze = Bronze(fotmob_standings_current=standings, fotmob_season_stages_current=stages,
                     fotmob_competitions_current=competitions, fotmob_playoff_brackets_current=playoff)
     _assert_all_tables(bronze)
@@ -919,7 +942,11 @@ def test_bad_optional_values_are_null_with_conform_issue():
     bad_st = st[(standings[0]['table_type'], standings[0]['team_id'])]
     assert bad_st['deduction'] is None
     assert issues(bad_st) == [{'column': 'deduction', 'raw': 'x', 'reason': 'not an integer'}]
-    assert st[(standings[1]['table_type'], standings[1]['team_id'])]['deduction'] == -3
+    parsed = [st[(r['table_type'], r['team_id'])] for r in standings[1:4]]
+    assert [(r['deduction'], r['_conform_issues_json']) for r in parsed] == [(-8, None), (-8, None), (0, None)]
+    half = st[(standings[4]['table_type'], standings[4]['team_id'])]
+    assert half['deduction'] is None
+    assert issues(half) == [{'column': 'deduction', 'raw': '1.5', 'reason': 'not an integer'}]
     sg = {r['stage_id']: r for r in bronze.rows('fotmob_season_stages')}
     assert sg[stages[0]['stage_id']]['participant_count'] is None
     assert issues(sg[stages[0]['stage_id']]) == [
@@ -930,12 +957,14 @@ def test_bad_optional_values_are_null_with_conform_issue():
     assert bad_comp['discovery_date'] is None
     assert [i['column'] for i in issues(bad_comp)] == ['discovery_date']
     pb = {r['matchup_key']: r for r in bronze.rows('fotmob_playoff_brackets')}
-    assert pb['2:164739:164720']['match_ids'] is None
-    assert issues(pb['2:164739:164720'])[0]['raw'] == 'bad'
+    assert pb['2:164739:164720']['match_ids'] is None and pb['2:164739:164720']['source_stage_id'] is None
+    assert {i['column']: i['raw'] for i in issues(pb['2:164739:164720'])} == {
+        'match_ids': 'bad', 'source_stage_id': '2.5'}
+    assert pb['-:tbd:tbd']['source_stage_id'] == 5 and issues(pb['-:tbd:tbd']) is None
     assert pb['4:162196:4427']['source_stage_id'] is None
     assert issues(pb['4:162196:4427'])[0]['column'] == 'source_stage_id'
     assert pb['-1:162196:164720']['source_stage_id'] == 17
-    clean = [r for r in bronze.rows('fotmob_standings') if r is not bad_st]
+    clean = [r for r in bronze.rows('fotmob_standings') if r is not bad_st and r is not half]
     assert all(r['_conform_issues_json'] is None for r in clean)
 
 

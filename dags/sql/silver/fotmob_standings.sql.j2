@@ -5,7 +5,8 @@
 -- standings_current (там ещё table_name, position): повтор на ключе Silver -> одна строка, последняя
 -- по _observed_at, _ingested_at, затем меньшая position, затем table_name (детерминированно).
 -- Ключ сезона — тот, под которым таблицу отдал FotMob. Пустой/неприводимый ключ -> строка
--- отбрасывается. deduction в bronze — varchar: TRY_CAST в INTEGER, неразбор -> NULL + issue.
+-- отбрасывается. deduction в bronze — varchar с числом, в т.ч. '-8.0': через DOUBLE, целое ->
+-- INTEGER; не число, не целое или вне INTEGER -> NULL + issue с сырым текстом.
 -- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
 -- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
 -- и source_season_key (VARCHAR); полный прогон — TRUE.
@@ -48,10 +49,16 @@ dedup AS (
 ),
 conv AS (
     SELECT
-        d.*,
-        NULLIF(d.deduction, '') AS deduction_raw,
-        TRY_CAST(d.deduction AS INTEGER) AS deduction_value
-    FROM dedup d
+        n.*,
+        CASE WHEN n.deduction_double = floor(n.deduction_double)
+             THEN TRY_CAST(n.deduction_double AS INTEGER) END AS deduction_value
+    FROM (
+        SELECT
+            d.*,
+            NULLIF(d.deduction, '') AS deduction_raw,
+            TRY_CAST(d.deduction AS DOUBLE) AS deduction_double
+        FROM dedup d
+    ) n
 )
 SELECT
     c.competition_id,
