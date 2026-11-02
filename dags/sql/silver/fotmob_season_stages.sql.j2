@@ -5,7 +5,8 @@
 -- FotMob (без перекладывания на дочерний/родительский). Пустой/неприводимый ключ -> строка
 -- отбрасывается.
 -- participant_count в bronze — double: в INTEGER только целое значение в диапазоне INTEGER,
--- иначе NULL + _conform_issues_json.
+-- иначе NULL + _conform_issues_json; сырое значение — JSON-текст числа (json_format: '3.5';
+-- CAST(double AS VARCHAR) в Trino дал бы '3.5E0').
 -- Pure SELECT: CREATE OR REPLACE / партиции (competition_id, source_season_key) добавляет раннер.
 -- Заполнитель fotmob_season_scope (отдельная строка) — булево выражение над competition_id (BIGINT)
 -- и source_season_key (VARCHAR); полный прогон — TRUE.
@@ -78,7 +79,7 @@ FROM (
         v.*,
         filter(ARRAY[
             CASE WHEN v.participant_count IS NOT NULL AND v.participant_count_value IS NULL
-                 THEN CAST(ROW('participant_count', CAST(v.participant_count AS VARCHAR), 'not an integer')
+                 THEN CAST(ROW('participant_count', json_format(CAST(v.participant_count AS JSON)), 'not an integer')
                            AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
         ], x -> x IS NOT NULL) AS issues
     FROM conv v

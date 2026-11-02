@@ -891,7 +891,9 @@ def test_duplicate_category_name_does_not_fan_out():
 def test_bad_optional_values_are_null_with_conform_issue():
     # Values chosen so Trino and DuckDB agree: 'x', 'n/a', 'bad', 'abc' fail both engines' casts;
     # participant_count 3.5 (DOUBLE) is rejected by the explicit integrality check in SQL rather than
-    # by the engine cast (both engines would round 3.5); '4' / '-3' / '2026-10-01' must parse.
+    # by the engine cast (both engines would round 3.5); '-3' / 4.0 / '17' must parse.
+    # The raw text of a DOUBLE in the issue is json_format(CAST(x AS JSON)): '3.5' in both Trino
+    # (checked live 02.11; CAST(double AS VARCHAR) there gives '3.5E0') and DuckDB.
     views = bundle_rows(PAGE_335, 335, KEY_335)
     playoff = bundle_rows(PAGE_8974, 8974, '2022')['fotmob_playoff_brackets_current']
     standings = views['fotmob_standings_current']
