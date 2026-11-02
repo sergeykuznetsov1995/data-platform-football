@@ -331,7 +331,7 @@ def test_production_current_staff_policy_preserves_other_work(offline, productio
     production_current.policy_path.write_text(json.dumps(policy))
 
     cold = production_current.run('cold')
-    assert any(item['kind'] == 'resume' and item['status'] == 'complete' for item in cold['scopes']), [
+    assert any(item['kind'] == 'cold_roster' and item['status'] == 'complete' for item in cold['scopes']), [
         (item['kind'], item['status'], item.get('error')) for item in cold['scopes']]
     assert all(item['status'] != 'failed' for item in cold['scopes'])
     saved = next(iter(offline.state()['scopes'].values()))
@@ -415,7 +415,7 @@ def test_cold_real_raw_parser_and_career_pipeline_records_complete_roster(offlin
     data = next(iter(offline.state()['scopes'].values()))
     assert data['cursor']['cold_complete']
     assert data['cursor']['resume_json'] == '{}'
-    assert len(data['traffic_receipts']) == 2
+    assert len(data['traffic_receipts']) == 1  # #2068: no signal work before the cold roster
     assert data['traffic_used']['requests'] > 0
     assert data['grant_cycle_id'] == 'cold'
     assert report['full_scope_completed'] is False
@@ -1266,6 +1266,7 @@ def test_legacy_zero_migration_does_not_ack_or_reset_unfinished_work(status):
 
 def test_initial_empty_injury_signal_has_explicit_raw_durable_ack(offline):
     offline.run('cold')
+    offline.run('signals')  # #2068: signals start once the cold roster is committed
     data = next(iter(offline.state()['scopes'].values()))
     signal = data['signals']['injury:GB1']
     assert signal['status'] == 'applied' and signal['result'] == 'raw_durable'
@@ -1471,6 +1472,13 @@ def test_physical_replacement_lost_readback_recovers_original_write_intent(offli
         write.verify_current_roster_baseline(offline.clients[-1], current.FullRosterSnapshot.from_mapping(before['snapshot']),
                                             before['roster_receipts'], {'write_mode': 'dual', 'revision': 1})
     offline.clock.advance(recovery_hours * 3600)
+    if recovery_hours:
+        # #2068: due signals always precede continuation; keep them fresh so
+        # this single-slot portion is the write recovery alone.
+        state = offline.state()
+        for name in ('listing', 'players', 'injury'):
+            state['scopes'][before['cursor']['scope_id']]['cursor'][name + '_checked_at'] = offline.clock.wall.isoformat()
+        offline.write_state(state)
     offline.calls.clear()
     offline.run('recover', max_scopes=1, baseline_verifier=write.verify_current_roster_baseline)
     after = next(iter(offline.state()['scopes'].values()))

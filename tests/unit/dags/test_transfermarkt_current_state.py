@@ -236,6 +236,10 @@ def test_cursor_roundtrip_and_policy_resume_validation():
     cursor = state.ScopeCursor(SCOPE_ID, generation='club-signature',
                                resume_json='{"verified_raw_refs":["raw-1"]}', listing_checked_at=NOW)
     assert state.ScopeCursor.from_mapping(cursor.as_dict()) == cursor
+    failed = replace(cursor, last_error_at=NOW)
+    assert state.ScopeCursor.from_mapping(failed.as_dict()) == failed
+    legacy = {key: value for key, value in cursor.as_dict().items() if key != 'last_error_at'}
+    assert state.ScopeCursor.from_mapping(legacy).last_error_at is None
     with pytest.raises(state.CurrentStateError, match='migration'):
         replace(cursor, policy_version='old-mode')
     with pytest.raises(state.CurrentStateError, match='generation'):
@@ -310,36 +314,86 @@ def test_conflicting_registry_rows_block_only_their_competition():
     assert dict(result.blocked_competitions)['GB1'] == 'conflicting current registry rows'
 
 
-def test_single_slot_turn_prevents_signal_or_cold_starvation():
-    targets = state.current_scope_targets(denominator(('GB1', 1), ('ES1', 1)), registry('GB1', 'ES1')).targets
-    assert state.plan_current_work(targets, {}, now=NOW, limit=1, turn=0)[0].kind == 'signals'
-    assert state.plan_current_work(targets, {}, now=NOW, limit=1, turn=1)[0].kind == 'resume'
-    first = state.plan_current_work(targets, {}, now=NOW, limit=4)
-    assert [(work.kind, work.target.competition_id) for work in first] == [
-        ('signals', 'GB1'), ('resume', 'GB1'), ('signals', 'ES1'), ('resume', 'ES1'),
+def _gb_es_it():
+    targets = state.current_scope_targets(denominator(('GB1', 1), ('ES1', 1), ('IT1', 1)),
+                                          registry('GB1', 'ES1', 'IT1')).targets
+    return targets, {target.competition_id: target.scope_id for target in targets}
+
+
+def _started(scope_id, **changes):
+    return state.ScopeCursor(scope_id, generation='generation-1', roster_completed_at=NOW - timedelta(hours=1),
+                             resume_json='{"careers":{"transfer_events":["101"]}}', **changes)
+
+
+def test_cold_rosters_precede_started_careers_and_both_follow_cold_priority():
+    # #2068: a started scope worked a minute ago keeps its place; LRU cannot
+    # send it behind every untouched scope.
+    targets, by_id = _gb_es_it()
+    cursors = {by_id['GB1']: _started(by_id['GB1'], last_work_at=NOW - timedelta(minutes=1),
+                                      **{f'{name}_checked_at': NOW for name in state.DAILY_CHECKS}),
+               by_id['ES1']: _started(by_id['ES1'], last_work_at=NOW - timedelta(days=3),
+                                      **{f'{name}_checked_at': NOW for name in state.DAILY_CHECKS})}
+    works = state.plan_current_work(targets, cursors, now=NOW, limit=8)
+    assert [(work.kind, work.target.competition_id) for work in works] == [
+        ('cold_roster', 'IT1'), ('resume', 'GB1'), ('resume', 'ES1'),
     ]
+
+
+def test_scope_without_committed_roster_gets_no_signal_work():
+    targets, by_id = _gb_es_it()
+    cursors = {by_id['GB1']: state.ScopeCursor(by_id['GB1'], last_work_at=NOW - timedelta(days=1))}
+    works = state.plan_current_work(targets, cursors, now=NOW, limit=8)
+    assert {work.kind for work in works} == {'cold_roster'}
+    assert [work.target.competition_id for work in works] == ['GB1', 'ES1', 'IT1']
+
+
+def test_real_error_backs_off_for_four_hours_then_regains_priority():
+    targets, by_id = _gb_es_it()
+    recent = {by_id['GB1']: state.ScopeCursor(by_id['GB1'], last_error_at=NOW - timedelta(hours=3, minutes=59))}
+    assert [work.target.competition_id for work in state.plan_current_work(targets, recent, now=NOW)] == [
+        'ES1', 'IT1', 'GB1']
+    old = {by_id['GB1']: state.ScopeCursor(by_id['GB1'], last_error_at=NOW - timedelta(hours=4))}
+    assert [work.target.competition_id for work in state.plan_current_work(targets, old, now=NOW)] == [
+        'GB1', 'ES1', 'IT1']
+    both = {**recent, by_id['ES1']: state.ScopeCursor(by_id['ES1'], last_error_at=NOW - timedelta(hours=1))}
+    assert [work.target.competition_id for work in state.plan_current_work(targets, both, now=NOW)] == [
+        'IT1', 'GB1', 'ES1']
+
+
+def test_due_signals_precede_cold_work_even_with_one_slot():
+    targets, by_id = _gb_es_it()
+    cursors = {by_id['IT1']: state.ScopeCursor(by_id['IT1'], roster_completed_at=NOW - timedelta(hours=1),
+                                               last_work_at=NOW)}
+    for limit in (1, 4):
+        works = state.plan_current_work(targets, cursors, now=NOW, limit=limit)
+        assert [(work.kind, work.target.competition_id) for work in works] == [
+            ('signals', 'IT1'), ('cold_roster', 'GB1'), ('cold_roster', 'ES1'), ('resume', 'IT1'),
+        ][:limit]
 
 
 def test_failed_first_check_cannot_starve_due_successful_scope():
     targets = state.current_scope_targets(denominator(('GB1', 1), ('ES1', 1)), registry('GB1', 'ES1')).targets
     by_id = {target.competition_id: target.scope_id for target in targets}
     cursors = {
-        by_id['GB1']: state.ScopeCursor(by_id['GB1'], last_work_at=NOW),
+        by_id['GB1']: state.ScopeCursor(by_id['GB1'], last_work_at=NOW, roster_completed_at=NOW),
         by_id['ES1']: state.ScopeCursor(
             by_id['ES1'], listing_checked_at=NOW - timedelta(hours=23),
             players_checked_at=NOW - timedelta(hours=23), injury_checked_at=NOW - timedelta(hours=23),
-            last_work_at=NOW - timedelta(hours=23),
+            last_work_at=NOW - timedelta(hours=23), roster_completed_at=NOW - timedelta(days=1),
         ),
     }
-    work, = state.plan_current_work(targets, cursors, now=NOW, limit=1, turn=0)
+    work, = state.plan_current_work(targets, cursors, now=NOW, limit=1)
     assert work.target.competition_id == 'ES1'
 
 
 def test_failed_scope_attempt_does_not_starve_others():
     targets = state.current_scope_targets(denominator(('GB1', 1), ('ES1', 1)), registry('GB1', 'ES1')).targets
-    failed_cursor = state.record_check(state.ScopeCursor(SCOPE_ID), check(status='failed'))
-    works = state.plan_current_work(targets, {SCOPE_ID: failed_cursor}, now=NOW, limit=2)
-    assert [(work.kind, work.target.competition_id) for work in works] == [('signals', 'ES1'), ('resume', 'ES1')]
+    by_id = {target.competition_id: target.scope_id for target in targets}
+    rostered = {scope_id: state.ScopeCursor(scope_id, roster_completed_at=NOW - timedelta(days=1))
+                for scope_id in by_id.values()}
+    failed_cursor = state.record_check(rostered[SCOPE_ID], check(status='failed'))
+    works = state.plan_current_work(targets, {**rostered, SCOPE_ID: failed_cursor}, now=NOW, limit=2)
+    assert [(work.kind, work.target.competition_id) for work in works] == [('signals', 'ES1'), ('signals', 'GB1')]
 
 
 def test_successful_daily_checks_do_not_remove_weekly_roster_work():

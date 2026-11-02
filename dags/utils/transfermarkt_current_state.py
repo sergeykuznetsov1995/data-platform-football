@@ -22,6 +22,7 @@ CHECKS_TABLE = 'iceberg.ops.transfermarkt_current_checks_v1'
 CURRENT_POLICY_VERSION = 'change-signals-v1'
 DAILY_INTERVAL = timedelta(hours=20)
 WEEKLY_INTERVAL = timedelta(days=7)
+ERROR_BACKOFF = timedelta(hours=4)
 TOP_LEAGUES = ('GB1', 'ES1', 'IT1', 'L1', 'FR1')
 DAILY_CHECKS = ('listing', 'players', 'injury')
 
@@ -474,6 +475,7 @@ class ScopeCursor:
     resume_json: str = '{}'
     staff_completed_at: datetime | None = None
     staff_pending: bool = False
+    last_error_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _text('scope_id', self.scope_id)
@@ -484,7 +486,7 @@ class ScopeCursor:
         if not isinstance(self.staff_pending, bool):
             raise CurrentStateError('staff_pending must be boolean')
         for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at',
-                     'roster_completed_at', 'last_work_at', 'staff_completed_at'):
+                     'roster_completed_at', 'last_work_at', 'staff_completed_at', 'last_error_at'):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _time(getattr(self, name)))
         try:
@@ -501,7 +503,7 @@ class ScopeCursor:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'ScopeCursor':
-        values = {'staff_completed_at': None, 'staff_pending': False, **value}
+        values = {'staff_completed_at': None, 'staff_pending': False, 'last_error_at': None, **value}
         cursor = cls(**_mapping(cls, values))
         resume = json.loads(cursor.resume_json)
         if isinstance(resume, dict) and resume.pop('staff_pending', False):
@@ -654,18 +656,20 @@ class CurrentWork:
 
 def plan_current_work(
     targets: Iterable[CurrentTarget], cursors: Mapping[str, ScopeCursor], *,
-    now: datetime, limit: int = 8, turn: int = 0, staff_enabled: bool = False,
+    now: datetime, limit: int = 8, staff_enabled: bool = False,
 ) -> tuple[CurrentWork, ...]:
-    """Interleave fresh checks and continuation, including limit=1 via turn.
+    """Cheap due signals first, then a converging cold/continuation queue (#2068).
 
-    A successfully served scope advances its last_work_at; an error is recorded
-    by the caller with that attempt time, so it cannot block all other scopes.
-    Neither a batch count nor this planner replaces the runtime 45-minute limit.
+    Signals need a committed roster: without the snapshot the player check
+    cannot have a denominator; a cold roster re-proves only a due listing. Cold rosters of every
+    target precede careers of started scopes; both follow cold_priority, not
+    last_work_at, so a scope keeps its turn until it is cold complete. A real
+    error moves the scope behind the others for ERROR_BACKOFF. Weekly work keeps
+    attempt fairness. Neither a batch count nor this planner replaces the
+    runtime 45-minute limit.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise CurrentStateError('limit must be a positive integer')
-    if isinstance(turn, bool) or not isinstance(turn, int) or turn < 0:
-        raise CurrentStateError('turn must be a nonnegative integer')
     timestamp = _time(now)
     fresh: list[tuple[tuple[Any, ...], CurrentWork]] = []
     resume: list[tuple[tuple[Any, ...], CurrentWork]] = []
@@ -680,11 +684,17 @@ def plan_current_work(
             raise CurrentStateError('cursor belongs to another scope')
         due = cursor.daily_due(timestamp)
         last_work = cursor.last_work_at or minimum
-        if due:
+        if due and cursor.roster_completed_at is not None:
             oldest = min(getattr(cursor, f'{name}_checked_at') or minimum for name in due)
             # A never-successful scope must move behind due healthy scopes
             # after an attempted check, rather than owning datetime.min forever.
             fresh.append(((max(oldest, last_work), oldest, target.cold_priority), CurrentWork(target, 'signals', due)))
+        backing_off = cursor.last_error_at is not None and timestamp - cursor.last_error_at < ERROR_BACKOFF
+        rank = (1, cursor.last_error_at) if backing_off else (0, minimum)
+
+        def queue(phase: int, kind: str, order: tuple[Any, ...], checks: tuple[str, ...] = ()) -> None:
+            resume.append(((*rank, phase, order), CurrentWork(target, kind, checks)))
+
         pending = json.loads(cursor.resume_json)
         # Old staff cursors contain roster metadata even without roster work.
         # Keep it for membership reconciliation, but allow a due full roster.
@@ -695,20 +705,17 @@ def plan_current_work(
                                               'squad_generations', 'required', 'careers',
                                               'coaches_pending', 'coach_club_ids'})
         if cursor.roster_due(timestamp) and staff_metadata:
-            resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_roster')))
+            queue(2, 'weekly_roster', (last_work, target.cold_priority))
+        elif not cursor.cold_complete and cursor.roster_completed_at is None:
+            # A due listing still re-proves membership of an unfinished capture.
+            queue(0, 'cold_roster', (minimum, target.cold_priority), tuple(name for name in due if name == 'listing'))
         elif not cursor.cold_complete or pending:
-            resume.append(((last_work, target.cold_priority), CurrentWork(target, 'resume')))
+            queue(1, 'resume', (minimum, target.cold_priority))
         elif cursor.roster_due(timestamp):
-            resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_roster')))
+            queue(2, 'weekly_roster', (last_work, target.cold_priority))
         elif staff_enabled and (cursor.staff_pending or cursor.staff_completed_at is None
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
-            resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_staff')))
-    queues = [[item[1] for item in sorted(fresh, key=lambda pair: pair[0])],
-              [item[1] for item in sorted(resume, key=lambda pair: pair[0])]]
-    chosen: list[CurrentWork] = []
-    index = turn % 2
-    while len(chosen) < limit and any(queues):
-        selected = index if queues[index] else 1 - index
-        chosen.append(queues[selected].pop(0))
-        index = 1 - index
-    return tuple(chosen)
+            queue(2, 'weekly_staff', (last_work, target.cold_priority))
+    chosen = [item[1] for item in sorted(fresh, key=lambda pair: pair[0])]
+    chosen += [item[1] for item in sorted(resume, key=lambda pair: pair[0])]
+    return tuple(chosen[:limit])

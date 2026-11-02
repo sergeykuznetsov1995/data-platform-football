@@ -1813,7 +1813,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         state['current_targets'] = [{'scope_id': target.scope_id, 'competition_id': target.competition_id,
                                     'edition_id': target.edition_id, 'tier': _tier_json(target.tier)}
                                    for target in targets.targets]
-        ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes, turn=state['turn'],
+        ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes,
                                      staff_enabled=staff_writer is not None)
         closing_work = tuple(CurrentWork(target, 'season_close') for target in sorted(
             closing.values(), key=lambda target: (
@@ -1937,6 +1937,11 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             data['season_close_roster_captured'] = True
                             scope.persist()
                     else:
+                        # An unfinished cold capture re-proves a due listing;
+                        # a fresh one gets it from roster(), a recovered write needs none.
+                        if (item.kind == 'cold_roster' and 'listing' in item.checks_due
+                            and scope.snapshot is None and scope.resume.get('clubs')):
+                            scope.listing()
                         scope.roster(weekly=item.kind == 'weekly_roster')
                         scope.staff(staff_writer)
                     # Weekly roster capture queues global debt/TTL jobs;
