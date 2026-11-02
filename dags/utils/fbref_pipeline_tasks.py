@@ -2006,6 +2006,9 @@ def run_recovery_wave(
             control_run_id,
             page_kinds=list(page_kinds),
             settings=settings,
+            # Inside the batch too: one batch of 25 heavy pages ran 88 min
+            # past a 30-min budget (#2071).
+            deadline=started + deadline_seconds,
         ).as_dict()
         cohort_size = int(result.get("cohort_size") or 0)
         if cohort_size == 0:
@@ -2029,6 +2032,20 @@ def run_recovery_wave(
                 aggregate[key] = bool(aggregate.get(key, False)) or value
             elif isinstance(value, int):
                 aggregate[key] = int(aggregate.get(key, 0)) + value
+        budget_returned = int(result.get("budget_returned") or 0)
+        if budget_returned:
+            # The batch stopped at the deadline, so its untried pages say
+            # nothing about a stall; they go back to the next run (#2071).
+            aggregate["recovery_budget_exhausted"] = True
+            aggregate["recovery_budget_seconds"] = deadline_seconds
+            logger.warning(
+                "FBref raw recovery budget (%ss) ran out inside batch %s — "
+                "%s непочатых страниц(ы) возвращено следующему рану",
+                deadline_seconds,
+                aggregate["batches"],
+                budget_returned,
+            )
+            break
         if history_slice:
             break
         # A failed incomplete match leaves raw recovery for a fresh fetch.
@@ -2054,6 +2071,7 @@ def run_recovery_wave(
     aggregate.setdefault("parsed", 0)
     aggregate.setdefault("recovery_stalled", False)
     aggregate.setdefault("recovery_budget_exhausted", False)
+    aggregate.setdefault("budget_returned", 0)
     logger.info(
         "FBref raw recovery drain: %s",
         json.dumps(aggregate, sort_keys=True),

@@ -16291,3 +16291,41 @@ def test_recovery_reparses_an_unowned_shell_and_schedules_its_refetch(tmp_path, 
         str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
     ).cohort_size == 0
     assert typed.calls == []
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_recovery_deadline_returns_unclaimed_pages_inside_the_batch(
+    tmp_path, batch,
+):
+    """#2071: past the deadline no new page is claimed; the first page always
+    runs, the untried rest stays selectable without a lease or a verdict."""
+    import time as time_module
+
+    pipeline, control, records, _generic, _typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218", "a071faa8", "b1c2d3e4")
+    )
+    pipeline.batch_persist_enabled = batch
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["match"],
+        settings=_settings(),
+        deadline=time_module.monotonic() - 1,
+    )
+
+    assert result.cohort_size == 3
+    assert result.claimed == result.parsed == 1
+    assert result.budget_returned == 2
+    assert result.failures == []
+    assert result.deferred_parse_failures == []
+    assert result.contract_quarantined == result.dead_lettered == 0
+    assert len(control.observation_claim_calls) == 1
+    returned = [record.target_id for record in records[1:]]
+    assert all(control.frontier[t]["state"] == "fetched" for t in returned)
+
+    # Without a deadline the next wave takes exactly the returned pages.
+    rest = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+    assert rest.cohort_size == rest.parsed == 2
+    assert rest.budget_returned == 0
