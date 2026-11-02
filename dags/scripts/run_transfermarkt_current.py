@@ -624,9 +624,12 @@ class _Scope:
                 first_detected_at=min(committed_at, observation.checked_at), status='applied', result='baseline_verified',
                 bronze_manifest=manifest, committed_at=committed_at, measurement_kind='baseline')
         else:
-            warm = self.cursor.cold_complete or bool(self.data.get('warm_baseline'))
+            # #2068: a committed roster is the comparison base, long before
+            # cold_complete; a player still awaiting his first career has none.
+            awaiting = entity == 'player' and any(str(entity_id) in ids for ids in self.resume.get('careers', {}).values())
+            based = self.cursor.cold_complete or (self.snapshot is not None and not awaiting)
             self.signals[key] = mark_seen(self.signals.get(key), observation,
-                                         measurement_kind='change' if warm else 'cold')
+                                         measurement_kind='change' if based else 'cold')
         if write:
             _sql(self.scraper, build_signal_merge(self.signals[key]))
         if persist:
