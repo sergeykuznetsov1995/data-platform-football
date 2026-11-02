@@ -16329,3 +16329,44 @@ def test_recovery_deadline_returns_unclaimed_pages_inside_the_batch(
     )
     assert rest.cohort_size == rest.parsed == 2
     assert rest.budget_returned == 0
+
+
+def test_recovery_deadline_reached_during_a_batch_write_stops_the_next_group(
+    tmp_path, monkeypatch,
+):
+    """#2071 R2: in production the 25-page buffer was claimed in seconds and
+    then written for an hour; with a deadline the buffer is a small group and
+    the clock is read before the next group is claimed."""
+    from scrapers.fbref import pipeline as pipeline_module
+
+    pipeline, control, records, generic, _typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218", "a071faa8", "b1c2d3e4", "c2d3e4f5", "d3e4f5a6",
+                   "e4f5a6b7"),
+    )
+    pipeline.batch_persist_matches = 25
+    clock = {"now": 0.0}
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: clock["now"])
+    original_persist_pages = generic.persist_pages
+
+    def slow_write(items):
+        # The deadline passes while the first group is being written.
+        clock["now"] = 2000.0
+        return original_persist_pages(items)
+
+    generic.persist_pages = slow_write
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["match"],
+        settings=replace(_settings(), shard_size=25),
+        deadline=1500.0,
+    )
+
+    group = pipeline_module.FBREF_DEADLINE_PERSIST_PAGES
+    assert result.cohort_size == 6
+    assert result.claimed == result.parsed == group
+    assert result.budget_returned == 6 - group
+    assert result.failures == []
+    assert len(control.observation_claim_calls) == group
+    returned = [record.target_id for record in records[group:]]
+    assert all(control.frontier[t]["state"] == "fetched" for t in returned)

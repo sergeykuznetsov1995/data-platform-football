@@ -407,6 +407,11 @@ FBREF_BATCH_PERSIST = os.environ.get("FBREF_BATCH_PERSIST", "0") == "1"
 FBREF_BATCH_PERSIST_MATCHES = _bounded_int(
     "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
 )
+# With a deadline, recovery claims and writes this many pages at a time and
+# checks the clock before the next group: a write costs 7-16 min almost
+# regardless of size (2026-11-02), so a 25-page buffer would run far past the
+# budget before any claim check fires (#2071).
+FBREF_DEADLINE_PERSIST_PAGES = 4
 FBREF_BATCH_PERSIST_MAX_CELLS = _bounded_int(
     "FBREF_BATCH_PERSIST_MAX_CELLS",
     default=150000,
@@ -7887,6 +7892,13 @@ class FBrefPipeline:
         else:
             match_buffer = []
             generic_buffer = []
+            persist_pages = (
+                self.batch_persist_matches
+                if _deadline is None
+                else min(
+                    self.batch_persist_matches, FBREF_DEADLINE_PERSIST_PAGES
+                )
+            )
 
             def flush_buffers(*, matches: bool, generic: bool) -> None:
                 nonlocal match_buffer, generic_buffer
@@ -7903,12 +7915,12 @@ class FBrefPipeline:
                     # cohort order stays the selection order.
                     flush_buffers(matches=False, generic=True)
                     match_buffer.append(item)
-                    if len(match_buffer) == self.batch_persist_matches:
+                    if len(match_buffer) == persist_pages:
                         flush_buffers(matches=True, generic=False)
                     continue
                 flush_buffers(matches=True, generic=False)
                 generic_buffer.append(item)
-                if len(generic_buffer) == self.batch_persist_matches:
+                if len(generic_buffer) == persist_pages:
                     flush_buffers(matches=False, generic=True)
             flush_buffers(matches=True, generic=True)
         for item in fetches:
