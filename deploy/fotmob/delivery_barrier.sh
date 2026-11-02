@@ -103,20 +103,26 @@ barrier_ignore_md5() {
   host_sum=$(md5sum -- "$source") || return 1
   container_sum=$(timeout -k 5 "${METADB_TIMEOUT:-30}" docker exec "$FOTMOB_SCHEDULER_CONTAINER" md5sum /opt/airflow/dags/.airflowignore) || return 1
   host_sum=${host_sum%% *}; container_sum=${container_sum%% *}
-  [[ "$host_sum" =~ ^[0-9a-f]{32}$ ]] && [ "$host_sum" = "$container_sum" ] || return 1
+  [[ "$host_sum" =~ ^[0-9a-f]{32}$ ]] || return 1
+  # 2 — контейнер видит не эталон: лечится рестартом scheduler.
+  [ "$host_sum" = "$container_sum" ] || return 2
   printf '%s\n' "$container_sum"
 }
-# Рестарт scheduler под удержанным барьером заново резолвит bind на эталон.
+# Эталон в BARRIER_MD5. Отвязанный bind лечится рестартом scheduler под
+# удержанным барьером: рестарт заново резолвит bind на эталон.
 barrier_rebind_ignore() {
-  local before=$1 now deadline
+  local deadline rc=0
+  BARRIER_MD5=$(barrier_ignore_md5) || rc=$?
+  [ "$rc" = 0 ] && return 0
+  [ "$rc" = 2 ] || return 1
   barrier_idle || return 1
   timeout -k 5 "${RESTART_TIMEOUT:-120}" docker restart "$FOTMOB_SCHEDULER_CONTAINER" >/dev/null || return 1
   deadline=$(($(date -u +%s) + ${REBIND_WAIT:-120}))
-  until now=$(barrier_ignore_md5) && [ "$now" = "$before" ]; do
+  until BARRIER_MD5=$(barrier_ignore_md5); do
     [ "$(date -u +%s)" -lt "$deadline" ] || return 1
     sleep 5
   done
-  echo "BARRIER: блок-лист отвязан checkout-ом — рестарт scheduler, эталон восстановлен ($now)"
+  echo "BARRIER: блок-лист отвязан $1 — рестарт scheduler, эталон восстановлен ($BARRIER_MD5)"
 }
 barrier_checkout() {
   local before after hm hms safe_left
@@ -132,13 +138,13 @@ barrier_checkout() {
     safe_left=$((86400 - 10#${hms:0:2} * 3600 - 10#${hms:2:2} * 60 - 10#${hms:4:2} - 1800))
     [ "$hm" -ge 1945 ] && [ "$hm" -le 2320 ] && [ "$safe_left" -gt 0 ] || return 1
   fi
-  before=$(barrier_ignore_md5) || return 1
+  # До checkout bind мог остаться отвязанным оборванной прошлой попыткой.
+  barrier_rebind_ignore 'до checkout' || return 1
+  before=$BARRIER_MD5
   git -C "$TREE" checkout "$@" || return 1
-  if ! after=$(barrier_ignore_md5); then
-    # Checkout заменил файл дерева: файловый bind контейнера смотрит на старый inode.
-    barrier_rebind_ignore "$before" || return 1
-    after=$before
-  fi
+  # Checkout заменил файл дерева: файловый bind контейнера смотрит на старый inode.
+  barrier_rebind_ignore 'checkout-ом' || return 1
+  after=$BARRIER_MD5
   [ "$before" = "$after" ] || return 1
   echo "BARRIER: AIRFLOWIGNORE md5 до/после checkout = $after"
 }

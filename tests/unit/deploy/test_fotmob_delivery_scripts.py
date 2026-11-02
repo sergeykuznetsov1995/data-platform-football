@@ -1471,7 +1471,8 @@ def test_checkout_barrier_rechecks_window_and_external_ignore(tmp_path: Path, fa
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("case", ["rebound", "still-foreign", "live", "unchanged", "dry-run"])
+@pytest.mark.parametrize("case", ["rebound", "still-foreign", "live", "unchanged", "dry-run",
+                                  "unbound-before", "unbound-before-stuck"])
 def test_checkout_barrier_rebinds_ignore_unbound_by_checkout(tmp_path: Path, case: str) -> None:
     """Инцидент 01.11: checkout подменил dags/.airflowignore, контейнер увидел файл дерева."""
     w = _phase2_world(tmp_path, "")
@@ -1484,10 +1485,13 @@ def test_checkout_barrier_rebinds_ignore_unbound_by_checkout(tmp_path: Path, cas
         f'  *"md5sum /opt/airflow/dags/.airflowignore"*) if [ -e "{unbound}" ]; then '
         f'md5sum "{w["repo"] / "dags/.airflowignore"}"; else md5sum "{tmp_path / "external.airflowignore"}"; fi ;;\n'
         f'  "restart stub-scheduler") echo restart >> "{events}"; '
-        + ('' if case == "still-foreign" else f'rm -f "{unbound}"; ') + 'echo stub-scheduler ;;\n'
+        + ('' if case in ("still-foreign", "unbound-before-stuck") else f'rm -f "{unbound}"; ') + 'echo stub-scheduler ;;\n'
         + (f'  *"FROM task_instance"*) if [ -e "{unbound}" ]; then echo 1; exit 0; fi; echo 0 ;;\n'
            if case == "live" else ''), 1))
-    if case != "unchanged":
+    if case.startswith("unbound-before"):
+        # Оборванная прошлая попытка оставила bind отвязанным; checkout файл не меняет.
+        unbound.touch()
+    elif case != "unchanged":
         git = w["stubs"] / "git"
         git.write_text(git.read_text().replace('  echo checkout', f'  touch "{unbound}"\n  echo checkout'))
     tree = w["repo"]
@@ -1500,11 +1504,13 @@ def test_checkout_barrier_rebinds_ignore_unbound_by_checkout(tmp_path: Path, cas
     proc = _run(script, env_file=w["env_file"], stubs=w["stubs"],
                 extra_env={**w["values"], "TREE": str(tree), "REBIND_WAIT": "2"})
     rows = events.read_text().splitlines()
-    assert "checkout" in rows
-    assert ("restart" in rows) == (case in ("rebound", "still-foreign")), rows
-    assert proc.returncode == (0 if case in ("rebound", "unchanged", "dry-run") else 1), proc.stdout + proc.stderr
-    assert ("рестарт scheduler, эталон восстановлен" in proc.stdout) == (case == "rebound")
-    if case == "rebound":
+    assert ("checkout" in rows) == (case != "unbound-before-stuck"), rows
+    assert rows.count("restart") == (case in ("rebound", "still-foreign", "unbound-before", "unbound-before-stuck")), rows
+    assert proc.returncode == (0 if case in ("rebound", "unchanged", "dry-run", "unbound-before") else 1), \
+        proc.stdout + proc.stderr
+    healed = case in ("rebound", "unbound-before")
+    assert ("рестарт scheduler, эталон восстановлен" in proc.stdout) == healed
+    if healed:
         assert "AIRFLOWIGNORE md5 до/после checkout" in proc.stdout
     if case != "dry-run":
         assert (w["state"] / "fotmob-delivery-pauses").is_file(), "паузы держит барьер до release"
