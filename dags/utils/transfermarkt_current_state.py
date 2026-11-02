@@ -658,15 +658,17 @@ def plan_current_work(
     targets: Iterable[CurrentTarget], cursors: Mapping[str, ScopeCursor], *,
     now: datetime, limit: int = 8, staff_enabled: bool = False,
 ) -> tuple[CurrentWork, ...]:
-    """Cheap due signals first, then a converging cold/continuation queue (#2068).
+    """Every due signal first, then a converging cold/continuation queue (#2068).
 
     Signals need a committed roster: without the snapshot the player check
-    cannot have a denominator; a cold roster re-proves only a due listing. Cold rosters of every
-    target precede careers of started scopes; both follow cold_priority, not
+    cannot have a denominator; a cold roster re-proves only a due listing.
+    All due signals are planned, since the daily checks of every target must
+    fit a day; limit bounds only the other work. Cold rosters of every target
+    precede careers of unfinished scopes; both follow cold_priority, not
     last_work_at, so a scope keeps its turn until it is cold complete. Pending
     work of closed scopes, then weekly work, keep attempt fairness. A real
-    error moves the scope behind the others for ERROR_BACKOFF. Neither a batch count nor this planner replaces the
-    runtime 45-minute limit.
+    error moves the scope behind the others for ERROR_BACKOFF. Neither a batch
+    count nor this planner replaces the runtime 45-minute limit.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise CurrentStateError('limit must be a positive integer')
@@ -684,13 +686,14 @@ def plan_current_work(
             raise CurrentStateError('cursor belongs to another scope')
         due = cursor.daily_due(timestamp)
         last_work = cursor.last_work_at or minimum
+        backing_off = cursor.last_error_at is not None and timestamp - cursor.last_error_at < ERROR_BACKOFF
+        rank = (1, cursor.last_error_at) if backing_off else (0, minimum)
         if due and cursor.roster_completed_at is not None:
             oldest = min(getattr(cursor, f'{name}_checked_at') or minimum for name in due)
             # A never-successful scope must move behind due healthy scopes
             # after an attempted check, rather than owning datetime.min forever.
-            fresh.append(((max(oldest, last_work), oldest, target.cold_priority), CurrentWork(target, 'signals', due)))
-        backing_off = cursor.last_error_at is not None and timestamp - cursor.last_error_at < ERROR_BACKOFF
-        rank = (1, cursor.last_error_at) if backing_off else (0, minimum)
+            fresh.append(((*rank, max(oldest, last_work), oldest, target.cold_priority),
+                          CurrentWork(target, 'signals', due)))
 
         def queue(phase: int, kind: str, order: tuple[Any, ...], checks: tuple[str, ...] = ()) -> None:
             resume.append(((*rank, phase, order), CurrentWork(target, kind, checks)))
@@ -721,5 +724,5 @@ def plan_current_work(
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
             queue(3, 'weekly_staff', (last_work, target.cold_priority))
     chosen = [item[1] for item in sorted(fresh, key=lambda pair: pair[0])]
-    chosen += [item[1] for item in sorted(resume, key=lambda pair: pair[0])]
-    return tuple(chosen[:limit])
+    chosen += [item[1] for item in sorted(resume, key=lambda pair: pair[0])][:limit]
+    return tuple(chosen)

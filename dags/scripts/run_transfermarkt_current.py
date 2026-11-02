@@ -1844,12 +1844,16 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             closing.values(), key=lambda target: (
                 cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
                 target.cold_priority)))
+        # #2068: due signals are cheap and must cover every target daily; only
+        # the portion deadline bounds them. Slots apply to the other work.
+        signals = tuple(item for item in ordinary if item.kind == 'signals')
+        ordinary = tuple(item for item in ordinary if item.kind != 'signals')
         # A failed close cannot occupy every current slot on every portion.
         close_quota = max(1, max_scopes // 2) if ordinary else max_scopes
         if max_scopes == 1 and ordinary and state['turn'] % 2 and not newly_detected_close:
-            work = ordinary[:1]
+            work = signals + ordinary[:1]
         else:
-            work = closing_work[:close_quota] + ordinary[:max_scopes - min(close_quota, len(closing_work))]
+            work = closing_work[:close_quota] + signals + ordinary[:max_scopes - min(close_quota, len(closing_work))]
 
         state['turn'] += 1
         save = store.save

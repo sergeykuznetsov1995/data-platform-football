@@ -533,6 +533,15 @@ def test_cold_roster_commits_roster_without_career_requests(offline):
         'market_value_points': ['110', '120'], 'transfer_events': ['110', '120']}
 
 
+def test_due_signals_do_not_consume_single_cold_slot(offline):
+    competitions = ('GB1', 'ES1', 'IT1')
+    first = offline.run('cold', competitions=competitions, max_scopes=1)
+    assert [item['kind'] for item in first['scopes']] == ['cold_roster']
+    for cycle in ('second', 'third'):
+        report = offline.run(cycle, competitions=competitions, max_scopes=1)
+        assert [item['kind'] for item in report['scopes']] == ['signals', 'cold_roster'], cycle
+
+
 def test_deadline_inside_careers_is_retained_not_failed(offline):
     offline.run('cold')
     writer = offline.career_writer
