@@ -144,7 +144,9 @@ CATALOG = {
 }
 TOMBSTONE_ID = 9999
 TEAM_TOP = {'TopLists': [{'StatName': 'rating_team', 'Title': 'FotMob rating', 'StatList': [
-    {'ParticipantName': 'Arsenal', 'TeamId': 9825, 'StatValue': 7.31, 'Rank': 1, 'MatchesPlayed': 9},
+    # As in live bronze: team rows carry participant id 0, or no id at all (NULL).
+    {'ParticipantName': 'Arsenal', 'ParticiantId': 0, 'TeamId': 9825, 'StatValue': 7.31, 'Rank': 1,
+     'MatchesPlayed': 9},
     {'ParticipantName': 'Liverpool', 'TeamId': 8650, 'StatValue': 7.12, 'Rank': 2, 'MatchesPlayed': 9},
 ]}]}
 
@@ -509,7 +511,7 @@ def oracle(table: str, bronze: Bronze) -> list[dict]:
         for r in rows:  # lead decision 4: team boards carry participant_id 0; a player needs an id
             if r['participant_type'] == 'team' and r['participant_id'] is None:
                 r['participant_id'] = 0
-            elif r['participant_id'] == 0:
+            elif r['participant_type'] != 'team' and r['participant_id'] == 0:
                 r['participant_id'] = None
     if table == 'fotmob_playoff_brackets':
         for r in rows:
@@ -864,7 +866,7 @@ def test_latest_version_wins_and_wide_identity_collapses_deterministically():
 
 def test_team_leaderboard_participant_zero_and_player_without_id_dropped():
     team = leaderboard_rows(TEAM_TOP, 'team', 47, KEY_47)
-    assert all(r['participant_id'] is None for r in team)
+    assert {r['team_id']: r['participant_id'] for r in team} == {9825: 0, 8650: None}
     players = leaderboard_rows(TOP_ASSISTS, 'player', 47, KEY_47)
     bad = [dict(players[0], participant_id=None), dict(players[1], participant_id=0)]
     bronze = Bronze(fotmob_leaderboards_current=team + players[2:] + bad)
@@ -872,6 +874,8 @@ def test_team_leaderboard_participant_zero_and_player_without_id_dropped():
     rows = bronze.rows('fotmob_leaderboards')
     assert {(r['participant_id'], r['team_id'], r['participant_name'])
             for r in _by(rows, participant_type='team')} == {(0, 9825, 'Arsenal'), (0, 8650, 'Liverpool')}
+    # The team row whose bronze participant_id is 0 (not NULL) is kept, not treated as a key error.
+    assert len(_by(rows, participant_type='team', team_id=9825, participant_id=0)) == 1
     assert len(_by(rows, participant_type='player')) == len(players) - 2
 
 
