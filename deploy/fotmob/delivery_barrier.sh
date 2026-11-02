@@ -39,8 +39,21 @@ barrier_release() {
   [ "$restored" = "$(grep -c '|f$' "$BARRIER_JOURNAL" || true)" ] || return 1
   rm -f -- "$BARRIER_JOURNAL"
 }
+# Живая работа: 0 — нет, 1 — есть, 2 — проверка не удалась.
+barrier_idle() {
+  local active host_rc container_rc
+  active=$(barrier_sql "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($BARRIER_DAGS,'dag_ingest_fotmob') AND state IN ('running','queued')) + (SELECT count(*) FROM task_instance WHERE dag_id IN ($BARRIER_DAGS,'dag_ingest_fotmob') AND state IN ('running','queued','scheduled','restarting','deferred','up_for_retry','up_for_reschedule'));") || return 2
+  pgrep -f "dags/scripts/run_fotmob_scrape[r].py|$FOTMOB_CAMPAIGN_DIR/[d]river.sh|run-id fotmob-his[t]-" >/dev/null 2>&1
+  host_rc=$?
+  [ "$host_rc" -le 1 ] || return 2
+  timeout -k 5 "${METADB_TIMEOUT:-30}" docker exec "$FOTMOB_SCHEDULER_CONTAINER" \
+    pgrep -f 'run_fotmob_scrape[r].py|run-id fotmob-his[t]-' >/dev/null 2>&1
+  container_rc=$?
+  [ "$container_rc" -le 1 ] || return 2
+  [ "$active" = 0 ] && [ "$host_rc" = 1 ] && [ "$container_rc" = 1 ] || return 1
+}
 barrier_acquire() {
-  local snapshot tmp paused active host_busy host_rc container_rc deadline left dag owned="''"
+  local snapshot tmp paused idle deadline left dag owned="''"
   barrier_init
   if [ ! -e "$BARRIER_JOURNAL" ] && [ ! -L "$BARRIER_JOURNAL" ]; then
     snapshot=$(barrier_sql "SELECT dag_id, is_paused FROM dag WHERE dag_id IN ($BARRIER_DAGS) ORDER BY dag_id;") || return 1
@@ -66,17 +79,10 @@ barrier_acquire() {
     paused=$(barrier_sql "BEGIN; SELECT dag_id FROM dag WHERE dag_id IN ($BARRIER_DAGS) FOR UPDATE; UPDATE dag SET is_paused=true WHERE dag_id IN ($BARRIER_DAGS) AND NOT EXISTS (SELECT 1 FROM dag_run WHERE dag_run.dag_id=dag.dag_id AND state IN ('running','queued')); UPDATE dag SET is_paused=false WHERE dag_id IN ($owned) AND EXISTS (SELECT 1 FROM dag_run WHERE dag_run.dag_id=dag.dag_id AND state IN ('running','queued')); SELECT CASE WHEN count(*) FILTER (WHERE dag_id <> 'dag_refresh_fotmob_c1') = 5 AND bool_and(is_paused) THEN 0 ELSE 1 END FROM dag WHERE dag_id IN ($BARRIER_DAGS); COMMIT;") || return 1
     paused=${paused##*$'\n'}
     case "$paused" in 0|1) ;; *) return 1 ;; esac
-    active=$(barrier_sql "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($BARRIER_DAGS,'dag_ingest_fotmob') AND state IN ('running','queued')) + (SELECT count(*) FROM task_instance WHERE dag_id IN ($BARRIER_DAGS,'dag_ingest_fotmob') AND state IN ('running','queued','scheduled','restarting','deferred','up_for_retry','up_for_reschedule'));") || return 1
-    host_busy=0
-    pgrep -f "dags/scripts/run_fotmob_scrape[r].py|$FOTMOB_CAMPAIGN_DIR/[d]river.sh|run-id fotmob-his[t]-" >/dev/null 2>&1
-    host_rc=$?
-    [ "$host_rc" -le 1 ] || return 1
-    [ "$host_rc" = 1 ] || host_busy=1
-    timeout -k 5 "${METADB_TIMEOUT:-30}" docker exec "$FOTMOB_SCHEDULER_CONTAINER" \
-      pgrep -f 'run_fotmob_scrape[r].py|run-id fotmob-his[t]-' >/dev/null 2>&1
-    container_rc=$?
-    [ "$container_rc" -le 1 ] || return 1
-    if [ "$paused" = 0 ] && [ "$active" = 0 ] && [ "$host_busy" = 0 ] && [ "$container_rc" = 1 ]; then
+    idle=0
+    barrier_idle || idle=$?
+    [ "$idle" -le 1 ] || return 1
+    if [ "$paused" = 0 ] && [ "$idle" = 0 ]; then
       echo 'BARRIER: пауза производителей подтверждена'
       echo 'BARRIER: живая работа завершена'
       return 0
@@ -100,6 +106,18 @@ barrier_ignore_md5() {
   [[ "$host_sum" =~ ^[0-9a-f]{32}$ ]] && [ "$host_sum" = "$container_sum" ] || return 1
   printf '%s\n' "$container_sum"
 }
+# Рестарт scheduler под удержанным барьером заново резолвит bind на эталон.
+barrier_rebind_ignore() {
+  local before=$1 now deadline
+  barrier_idle || return 1
+  timeout -k 5 "${RESTART_TIMEOUT:-120}" docker restart "$FOTMOB_SCHEDULER_CONTAINER" >/dev/null || return 1
+  deadline=$(($(date -u +%s) + ${REBIND_WAIT:-120}))
+  until now=$(barrier_ignore_md5) && [ "$now" = "$before" ]; do
+    [ "$(date -u +%s)" -lt "$deadline" ] || return 1
+    sleep 5
+  done
+  echo "BARRIER: блок-лист отвязан checkout-ом — рестарт scheduler, эталон восстановлен ($now)"
+}
 barrier_checkout() {
   local before after hm hms safe_left
   if [ "$(realpath -m "$TREE")" != "$(realpath -m "$FOTMOB_RELEASE_ROOT")" ]; then
@@ -116,7 +134,11 @@ barrier_checkout() {
   fi
   before=$(barrier_ignore_md5) || return 1
   git -C "$TREE" checkout "$@" || return 1
-  after=$(barrier_ignore_md5) || return 1
+  if ! after=$(barrier_ignore_md5); then
+    # Checkout заменил файл дерева: файловый bind контейнера смотрит на старый inode.
+    barrier_rebind_ignore "$before" || return 1
+    after=$before
+  fi
   [ "$before" = "$after" ] || return 1
   echo "BARRIER: AIRFLOWIGNORE md5 до/после checkout = $after"
 }
