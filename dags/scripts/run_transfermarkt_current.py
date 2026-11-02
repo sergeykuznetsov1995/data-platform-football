@@ -1511,10 +1511,28 @@ class _Scope:
             pending[endpoint] = sorted(set(pending.get(endpoint, [])) | set(due), key=int)
         self.persist()
 
+    def migrate_warm_present(self):
+        """#2068: scopes warmed before warm_present queued every Bronze-present career."""
+        if (not self.data.get('warm_baseline') or 'warm_present' in self.data
+                or self.cursor.cold_complete or self.snapshot is None):
+            return
+        players = {str(row['player_id']) for row in self.snapshot.rows}
+        present = {endpoint: _bronze_career_players(self.scraper, endpoint, players)
+                   for endpoint in ('market_value_points', 'transfer_events')}
+        self.data['warm_present'] = {endpoint: sorted(ids, key=int) for endpoint, ids in present.items()}
+        self.data['warm_baseline_at'] = self.now().isoformat()
+        pending = self.resume.setdefault('careers', {})
+        for endpoint, ids in present.items():
+            # A pending player signal is a real change; its career stays queued.
+            pending[endpoint] = [player for player in pending.get(endpoint, []) if player not in ids
+                                 or getattr(self.signals.get(f'player:{player}'), 'pending', False)]
+        self.persist()
+
     def careers(self):
         self._require_reconciled_signals()
         if self.data.get('authoritative_empty_scope'):
             return
+        self.migrate_warm_present()
         self.queue_career_refreshes()
         pending = self.resume.setdefault('careers', {})
         for endpoint in ('market_value_points', 'transfer_events'):

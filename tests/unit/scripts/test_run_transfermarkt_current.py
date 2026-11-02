@@ -982,6 +982,29 @@ def test_warm_activation_without_fetch_state_queues_only_absent_players_until_tt
     assert careers == {'market_value_points': ['110', '111', '120'], 'transfer_events': ['110', '111', '120']}
 
 
+def test_scope_warmed_before_warm_present_drops_bronze_present_careers_once(offline):
+    offline.bronze_exists = True
+    offline.squad_players = {'10': ['110', '111']}
+    offline.bronze_careers = {'market_value_points': {'110': None, '120': None},
+                              'transfer_events': {'110': None, '120': None}}
+    offline.run('cold')
+    # The state of a scope warmed by 3f9b201a: full career queue, no warm_present.
+    state = offline.state()
+    data = next(iter(state['scopes'].values()))
+    data.pop('warm_present')
+    data.pop('warm_baseline_at')
+    resume = json.loads(data['cursor']['resume_json'])
+    resume['careers'] = {'market_value_points': ['110', '111', '120'], 'transfer_events': ['110', '111', '120']}
+    data['cursor']['resume_json'] = json.dumps(resume)
+    offline.write_state(state)
+    offline.run('resume')
+    assert [(endpoint, ids) for endpoint, ids, _ in offline.careers] == [
+        ('market_value_points', ('111',)), ('transfer_events', ('111',))]
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['warm_present'] == {'market_value_points': ['110', '120'], 'transfer_events': ['110', '120']}
+    assert data['cursor']['cold_complete']
+
+
 def test_existing_bronze_scope_career_read_failure_queues_nothing(offline):
     offline.bronze_exists = True
     offline.bronze_careers = {'market_value_points': {}, 'transfer_events': {}}
