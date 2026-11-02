@@ -407,6 +407,11 @@ FBREF_BATCH_PERSIST = os.environ.get("FBREF_BATCH_PERSIST", "0") == "1"
 FBREF_BATCH_PERSIST_MATCHES = _bounded_int(
     "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
 )
+# With a deadline, recovery claims and writes this many pages at a time and
+# checks the clock before the next group: a write costs 7-16 min almost
+# regardless of size (2026-11-02), so a 25-page buffer would run far past the
+# budget before any claim check fires (#2071).
+FBREF_DEADLINE_PERSIST_PAGES = 4
 FBREF_BATCH_PERSIST_MAX_CELLS = _bounded_int(
     "FBREF_BATCH_PERSIST_MAX_CELLS",
     default=150000,
@@ -832,6 +837,9 @@ class WaveResult:
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
+    # Selected pages left unclaimed because the caller's deadline passed;
+    # the next wave selects them again (#2071).
+    budget_returned: int = 0
     # "{target_id}:{error_class}" of target-local fetch failures handed back
     # to the next run instead of failing the wave (#1324).
     deferred_target_failures: list[str] = field(default_factory=list)
@@ -1458,7 +1466,7 @@ def _is_mass_deferred_parse_failures(result: "WaveResult") -> bool:
     deferred = len(result.deferred_parse_failures)
     return (
         deferred > MAX_ROUTINE_CONTRACT_QUARANTINES
-        and deferred * 2 > result.cohort_size
+        and deferred * 2 > result.cohort_size - result.budget_returned
     )
 
 
@@ -2316,7 +2324,7 @@ def _is_mass_contract_rejection(result: "WaveResult") -> bool:
     retired = result.contract_quarantined + result.dead_lettered
     return (
         retired > MAX_ROUTINE_CONTRACT_QUARANTINES
-        and retired * 2 > result.cohort_size
+        and retired * 2 > result.cohort_size - result.budget_returned
     )
 
 
@@ -7612,6 +7620,7 @@ class FBrefPipeline:
         source_run_id: Optional[str] = None,
         acceptance_replay: bool = False,
         _recover_cross_run: bool = False,
+        _deadline: Optional[float] = None,
     ) -> WaveResult:
         """Parse raw under a database-held publication-generation fence."""
 
@@ -7624,6 +7633,7 @@ class FBrefPipeline:
                 source_run_id=source_run_id,
                 acceptance_replay=acceptance_replay,
                 _recover_cross_run=_recover_cross_run,
+                _deadline=_deadline,
             )
 
     def _parse_wave_under_publication_guard(
@@ -7635,6 +7645,7 @@ class FBrefPipeline:
         source_run_id: Optional[str] = None,
         acceptance_replay: bool = False,
         _recover_cross_run: bool = False,
+        _deadline: Optional[float] = None,
     ) -> WaveResult:
         """Parse and persist a bounded handoff using raw storage only."""
 
@@ -7714,7 +7725,22 @@ class FBrefPipeline:
                 )
             return item_stateful_run_id, item_stateful_run_type
 
+        def returned_at_deadline() -> bool:
+            # Checked before each claim, so a page past the deadline is never
+            # leased and needs no release; the first claimed page always runs
+            # (#2071).
+            if (
+                _deadline is None
+                or not result.claimed
+                or time.monotonic() < _deadline
+            ):
+                return False
+            result.budget_returned += 1
+            return True
+
         def process_sequential_item(item):
+            if returned_at_deadline():
+                return
             work_started = self.stage_clock()
             try:
                 claimed = self._load_and_claim_observation(item)
@@ -7759,6 +7785,8 @@ class FBrefPipeline:
         def flush_match_items(buffer):
             prepared: list[_ClaimedMatchObservation] = []
             for item in buffer:
+                if returned_at_deadline():
+                    continue
                 work_started = self.stage_clock()
                 try:
                     claimed = self._load_and_claim_observation(item)
@@ -7812,6 +7840,8 @@ class FBrefPipeline:
         def flush_generic_items(buffer):
             prepared: list[_ClaimedGenericObservation] = []
             for item in buffer:
+                if returned_at_deadline():
+                    continue
                 work_started = self.stage_clock()
                 try:
                     claimed = self._load_and_claim_observation(item)
@@ -7862,6 +7892,13 @@ class FBrefPipeline:
         else:
             match_buffer = []
             generic_buffer = []
+            persist_pages = (
+                self.batch_persist_matches
+                if _deadline is None
+                else min(
+                    self.batch_persist_matches, FBREF_DEADLINE_PERSIST_PAGES
+                )
+            )
 
             def flush_buffers(*, matches: bool, generic: bool) -> None:
                 nonlocal match_buffer, generic_buffer
@@ -7878,12 +7915,12 @@ class FBrefPipeline:
                     # cohort order stays the selection order.
                     flush_buffers(matches=False, generic=True)
                     match_buffer.append(item)
-                    if len(match_buffer) == self.batch_persist_matches:
+                    if len(match_buffer) == persist_pages:
                         flush_buffers(matches=True, generic=False)
                     continue
                 flush_buffers(matches=True, generic=False)
                 generic_buffer.append(item)
-                if len(generic_buffer) == self.batch_persist_matches:
+                if len(generic_buffer) == persist_pages:
                     flush_buffers(matches=False, generic=True)
             flush_buffers(matches=True, generic=True)
         for item in fetches:
@@ -7919,12 +7956,15 @@ class FBrefPipeline:
         *,
         page_kinds: Sequence[str],
         settings: PipelineSettings,
+        deadline: Optional[float] = None,
     ) -> WaveResult:
         """Drain committed raw left unprocessed by this lane's source runs.
 
         This is deliberately invoked before a current/backfill fetch wave so
         parse failure can never strand immutable S3 raw behind a terminal
-        parent run or trigger a needless paid re-fetch.
+        parent run or trigger a needless paid re-fetch.  ``deadline`` is a
+        ``time.monotonic()`` instant: past it no further page is claimed and
+        the rest of the cohort counts as ``budget_returned`` (#2071).
         """
 
         return self.parse_wave(
@@ -7932,6 +7972,7 @@ class FBrefPipeline:
             page_kinds=page_kinds,
             settings=settings,
             _recover_cross_run=True,
+            _deadline=deadline,
         )
 
     def validate_and_finish(

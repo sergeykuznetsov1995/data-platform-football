@@ -1853,6 +1853,43 @@ def test_recovery_drain_runs_first_batch_before_checking_budget(monkeypatch):
 
 
 @pytest.mark.unit
+def test_recovery_drain_passes_its_deadline_into_the_batch(monkeypatch):
+    """#2071: the budget binds inside a batch; pages it returned are not a stall."""
+
+    cut = MagicMock()
+    cut.as_dict.return_value = {
+        "cohort_size": 25,
+        "claimed": 1,
+        "parsed": 0,
+        "budget_returned": 24,
+    }
+    pipeline = MagicMock()
+    # Finite on purpose: a drain that ignores the cut asks for a second batch.
+    pipeline.recover_unprocessed_wave.side_effect = [cut]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+    monkeypatch.setattr(fbref_pipeline_tasks.time, "monotonic", lambda: 100.0)
+
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__cut-recovery",
+        dag_id="dag_ingest_fbref",
+        page_kinds=["season"],
+        run_type="current",
+        shard_size=25,
+        deadline_seconds=1800,
+    )
+
+    call = pipeline.recover_unprocessed_wave.call_args
+    assert call.kwargs["deadline"] == 1900.0
+    assert recovered["budget_returned"] == 24
+    assert recovered["recovery_budget_exhausted"] is True
+    assert recovered["recovery_stalled"] is False
+    assert recovered["batches"] == 1
+    pipeline.fetch_wave.assert_not_called()
+
+
+@pytest.mark.unit
 def test_recovery_drain_rejects_non_positive_budget(monkeypatch):
     pipeline = MagicMock()
     monkeypatch.setattr(
