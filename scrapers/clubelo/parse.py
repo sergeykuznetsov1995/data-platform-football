@@ -728,6 +728,9 @@ FIXTURES_HEADERS = (
 FIXTURE_HOME_CELLS, FIXTURE_AWAY_CELLS = 11, 9
 FIXTURE_PCT_SUM = (99.0, 101.0)  # 1 + X + 2 of one match, rounding of three values
 _UTC_KICKOFF = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})Z$")
+# 02.11: a game already played when the page was built shows its status and
+# score ("FT<br/>3-1") in the date cell instead of the kick-off.
+_GAME_STATUS = re.compile(r"^(?:[A-Za-z]{1,4}|\d{1,3}(?:\+\d{1,2})?') ?\d{1,3}-\d{1,3}$")
 # Stake cells show a bound below the display precision ("<0.1") and an
 # impossible outcome as "0%" (narrow layout "⨉"): kept as text without "%".
 _STAKE_PCT = re.compile(r"^(<?\d+(?:\.\d+)?)%?$")
@@ -798,12 +801,24 @@ def _fixture_side(team_td, cells, so_far, win, stake) -> Dict[str, Any]:
     }
 
 
+def _no_stake_padded(cells: List[Any], stake: int, full: int) -> List[Any]:
+    """02.11: a side with nothing at stake may come with fewer, empty stake
+    cells (home 4 instead of 5, away none) — padded with empty cells; a short
+    row with any stake text is left short and fails closed."""
+
+    if stake <= len(cells) < full and not any(_text(c) for c in cells[stake:]):
+        return cells + [lxml_html.Element("td") for _ in range(full - len(cells))]
+    return cells
+
+
 def parse_fixtures(html: str) -> FixturesPage:
     """Parse the main ``/Fixtures`` table: one row per match (two ``tr``).
 
     A match is a home ``tr`` of 11 cells — the date cell carries the site's
-    game id and the UTC kick-off, "X" spans both rows — followed by an away
-    ``tr`` of 9 cells. Section rows (2 cells) name the competition/stage and
+    game id and the UTC kick-off (a game played by the page build: its
+    status and score, ``kickoff_utc`` NULL), "X" spans both rows — followed
+    by an away ``tr`` of 9 cells; a side with nothing at stake may lack empty
+    stake cells. Section rows (2 cells) name the competition/stage and
     the unit of "So Far"; the header repeats inside the table. The country
     accordion after the table is not read. An empty table is data truth (24.09).
     Anything else raises ``LayoutChanged`` and nothing parsed is written.
@@ -844,9 +859,10 @@ def parse_fixtures(html: str) -> FixturesPage:
                 raise LayoutChanged("F2 fixtures section row without a name")
             continue
         game = cells[0].get("data-live-status-game-id") if cells else None
+        cells = _no_stake_padded(cells, 6, FIXTURE_HOME_CELLS) if game else cells
         if len(cells) != FIXTURE_HOME_CELLS or not game:
             raise LayoutChanged(f"F2 fixtures row {len(rows)} has {len(cells)} cells")
-        away = trs[i].xpath("./td") if i < len(trs) else []
+        away = _no_stake_padded(trs[i].xpath("./td"), 4, FIXTURE_AWAY_CELLS) if i < len(trs) else []
         i += 1
         if len(away) != FIXTURE_AWAY_CELLS:
             raise LayoutChanged(f"F2 fixtures game {game}: away row has {len(away)} cells")
@@ -857,7 +873,8 @@ def parse_fixtures(html: str) -> FixturesPage:
         seen.add(game)
         kickoffs = set(cells[0].xpath(".//@data-utc-time"))
         kickoff = _UTC_KICKOFF.match(next(iter(kickoffs))) if len(kickoffs) == 1 else None
-        if not kickoff:
+        played = not kickoffs and _GAME_STATUS.match(_text(cells[0]))
+        if not kickoff and not played:
             raise LayoutChanged(f"F3 fixtures game {game}: kick-off {sorted(kickoffs)}")
         if _text(cells[5]) or _text(away[2]):
             raise LayoutChanged(f"F3 fixtures game {game}: '1'/'2' cell of the wrong side filled")
@@ -869,7 +886,8 @@ def parse_fixtures(html: str) -> FixturesPage:
             raise LayoutChanged(f"F3 fixtures game {game}: 1/X/2 {shares} do not sum to 100")
         row = {
             "game_id": int(game),
-            "kickoff_utc": datetime.strptime(kickoff.group(1), "%Y-%m-%dT%H:%M"),
+            "kickoff_utc": (datetime.strptime(kickoff.group(1), "%Y-%m-%dT%H:%M")
+                            if kickoff else None),
             "competition": competition,
             "so_far_unit": unit,
             "row_seq": len(rows),
