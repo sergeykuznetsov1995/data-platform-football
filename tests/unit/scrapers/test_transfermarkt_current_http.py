@@ -399,3 +399,33 @@ def test_other_lease_refusal_is_not_retried():
         acquire(provider)
     assert not isinstance(caught.value, LeaseConcurrencyLimited)
     assert clock.sleeps == []
+
+
+def busy_on_second_lease(provider):
+    """The replacement lease meets a held stream slot; later ones would succeed."""
+    from dataclasses import replace
+    acquire = provider.acquire
+    def acquire_busy_once(**kwargs):
+        if len(provider.acquired) == 1 and not getattr(provider, 'refused', False):
+            provider.refused = True
+            raise LeaseConcurrencyLimited('proxy lease API rejected POST /v1/leases (HTTP 429): busy')
+        lease = acquire(**kwargs)
+        if len(provider.acquired) == 1:
+            lease = replace(lease, expires_at=120)
+            provider.acquired[-1] = (lease, *provider.acquired[-1][1:])
+        return lease
+    provider.acquire = acquire_busy_once
+
+
+@pytest.mark.parametrize('rotation', ['stream_pause', 'planned'])
+def test_busy_slot_on_lease_rotation_reaches_the_runner(rotation):
+    clock = Clock()
+    if rotation == 'stream_pause':
+        provider = PausingProvider(clock, [100])
+    else:
+        provider = Provider(clock, permit_duration=65)
+    busy_on_second_lease(provider)
+    instance, factory = client(clock, [_FakeResp(b'ok')], deadline=300, provider=provider)
+    with pytest.raises(LeaseConcurrencyLimited):
+        instance.fetch(URL, as_json=False)
+    assert all(not item.get_calls for item in factory.clients)

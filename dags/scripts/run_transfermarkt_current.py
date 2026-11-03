@@ -1753,7 +1753,7 @@ class _Scope:
                 if (proof.get('club_id') != club_id or proof.get('raw_capture_id') != outcome.raw_capture_id
                     or proof.get('source_body_hash') != outcome.raw_body_hash):
                     raise CurrentPortionError('staff receipt differs from club capture')
-            except (CurrentPortionDeadlineExceeded, TrafficBudgetExceeded, TrafficMeterError):
+            except (CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited, TrafficBudgetExceeded, TrafficMeterError):
                 raise
             except Exception as exc:
                 sweep['deferred'][club_id] = type(exc).__name__ + ': ' + redact_sensitive(str(exc))

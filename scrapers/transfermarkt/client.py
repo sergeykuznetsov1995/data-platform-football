@@ -973,7 +973,7 @@ class TransfermarktHttpClient:
                         self._request_deadline_monotonic - self._monotonic()
                         - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
                     )
-        except CurrentPortionDeadlineExceeded:
+        except (CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited):
             raise
         except TrafficMeterError:
             raise
@@ -2123,7 +2123,8 @@ class TransfermarktHttpClient:
                             url=url, label=label, context=context,
                             retry=attempt > 1,
                         )
-                    except (TrafficBudgetExceeded, TrafficMeterError, CurrentPortionDeadlineExceeded):
+                    except (TrafficBudgetExceeded, TrafficMeterError, CurrentPortionDeadlineExceeded,
+                            LeaseConcurrencyLimited):
                         raise
                     except Exception as exc:  # noqa: BLE001 - adapter errors vary
                         raise LeaseRotationError(
