@@ -326,3 +326,21 @@ def test_legacy_default_has_original_timeout_and_backoff():
     assert instance.fetch(URL, as_json=False).value == 'ok'
     assert factory.clients[0].get_calls[0][1]['timeout'] == 12
     assert clock.sleeps == [0.5]
+
+
+def test_current_lease_ttl_never_outlives_portion():
+    # #2068: a 3600 s lease from a 45 min portion held current-0 for an hour.
+    clock = Clock()
+    provider = Provider(clock)
+    instance, _ = client(clock, [_FakeResp(b'ok')], deadline=300, provider=provider, lease_ttl_seconds=3600)
+    assert instance.fetch(URL, as_json=False).is_success
+    assert [ttl for _, ttl, _ in provider.acquired] == [300]
+
+
+def test_current_lease_not_acquired_in_portion_tail():
+    clock = Clock()
+    provider = Provider(clock)
+    instance, _ = client(clock, [], deadline=20, provider=provider, lease_ttl_seconds=3600)
+    with pytest.raises(CurrentPortionDeadlineExceeded, match='lease acquire'):
+        instance._ensure_client(url=URL, label='squad', context={}, retry=False)
+    assert provider.acquired == []

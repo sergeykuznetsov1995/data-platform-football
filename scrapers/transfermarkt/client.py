@@ -1022,10 +1022,20 @@ class TransfermarktHttpClient:
                 raise TrafficBudgetExceeded(
                     "Transfermarkt provider hard byte budget exhausted"
                 )
+            from .history_portion import enabled as history_enabled, remaining_seconds
+            if history_enabled():
+                ttl_seconds = min(self._lease_ttl_seconds, max(1, int(remaining_seconds())))
+            elif self._request_deadline_monotonic is not None:
+                # #2068: a lease that outlives the portion holds the single
+                # current stream until the gateway reaper expires it.
+                portion_left = self._request_deadline_monotonic - self._monotonic()
+                if portion_left - CURRENT_PORTION_SETTLE_SECONDS <= CURRENT_PORTION_MIN_REQUEST_SECONDS:
+                    raise CurrentPortionDeadlineExceeded("Transfermarkt lease acquire reached portion tail")
+                ttl_seconds = min(self._lease_ttl_seconds, max(1, int(portion_left)))
+            else:
+                ttl_seconds = self._lease_ttl_seconds
             self._lease_acquired_at = self._time()
             self._lease_provider_bytes = 0
-            from .history_portion import enabled as history_enabled, remaining_seconds
-            ttl_seconds = min(self._lease_ttl_seconds, max(1, int(remaining_seconds()))) if history_enabled() else self._lease_ttl_seconds
             self._lease = self._lease_provider.acquire(
                 max_bytes=min(remaining, SCOPE_HARD_PROVIDER_BYTE_CAP),
                 ttl_seconds=ttl_seconds,
