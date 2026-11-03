@@ -193,3 +193,12 @@ def test_cli_in_window_runs_dry_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr(direct, "_maintenance_ready", lambda *_: False)
     assert cli.main(_cli_args(tmp_path, "--apply")) == 1
     assert len(calls) == 1
+
+
+def test_cli_default_budget_leaves_room_for_bronze_compaction():
+    """Review of #2135: ops cleanup must not eat the whole 00:00-02:00 UTC window."""
+    import re
+    from pathlib import Path
+
+    src = Path(cli.__file__).read_text()
+    assert re.search(r'"--seconds", type=int, default=45 \* 60', src)

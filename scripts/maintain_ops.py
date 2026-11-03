@@ -24,7 +24,9 @@ def main(argv=None):
     parser.add_argument("--table", action="append", help="limit to these ops tables")
     parser.add_argument("--journal", type=Path, required=True)
     parser.add_argument("--stop-file", type=Path, required=True)
-    parser.add_argument("--seconds", type=int, default=2 * 60 * 60)
+    # Default leaves the second half of the 00:00-02:00 UTC window to the bronze
+    # compaction that follows in the same night (review of #2135).
+    parser.add_argument("--seconds", type=int, default=45 * 60)
     args = parser.parse_args(argv)
     if not args.journal.is_absolute() or not args.stop_file.is_absolute():
         parser.error("--journal and --stop-file must be absolute")
