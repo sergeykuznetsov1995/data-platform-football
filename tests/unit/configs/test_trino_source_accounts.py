@@ -133,3 +133,21 @@ def test_memory_sizing_fits_compose_limit():
     assert per_node + headroom <= xmx
     assert headroom >= 3, "planning memory of 100k-file bronze tables lives in headroom"
     assert props["query.min-expire-age"] == "10s" and props["task.info.max-age"] == "10s"
+
+
+@pytest.mark.unit
+def test_native_memory_guards_present():
+    """#2122: the 01.11/03.11.2026 restarts were memcg OOM kills with a 10g heap —
+    native memory must be capped (glibc arenas) and measurable (NMT)."""
+    compose = (ROOT / "compose.yaml").read_text()
+    trino_block = compose[compose.index("\n  trino:\n"):compose.index("\n  superset:\n")]
+    assert re.search(r"^\s+- MALLOC_ARENA_MAX=2$", trino_block, re.M)
+    jvm = (TRINO / "jvm.config").read_text()
+    assert "-XX:NativeMemoryTracking=summary" in jvm.splitlines()
+    log_levels = (TRINO / "log.properties").read_text()
+    assert "DEBUG" not in [
+        line.split("=", 1)[1] for line in log_levels.splitlines() if "=" in line and not line.startswith("#")
+    ], "DEBUG http/security logging wrote 2.6M lines in 3 days on the shared server"
+    for catalog in ("iceberg", "lakekeeper"):
+        text = (TRINO / "catalog" / f"{catalog}.properties").read_text()
+        assert "fs.s3.enabled=true" in text and "fs.native-s3.enabled" not in text
