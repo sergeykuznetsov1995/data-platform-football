@@ -791,6 +791,17 @@ md5sum /usr/local/libexec/sofascore/run_from_release.sh "$SOFASCORE_RELEASE_ROOT
 Измеритель вехи 1 из сводки: `/usr/local/libexec/sofascore/run_from_release.sh veha1_measure.py report`
 (состояние по-прежнему в `/root/watchdog/state/sofascore_veha1/`).
 
+**Ночь без данных — красная.** Строки сводки «кампания SofaScore за <день> (UTC)» и «ожидание пула
+актуалкой» считает [`campaign_day.py`](../../deploy/sofascore/campaign_day.py) из релиза:
+`run_from_release.sh campaign_day.py --day <вчера UTC> --trino ~/.claude/bin/trino-ro.sh [--runtime DIR]`
+(каталог all-men по умолчанию — `SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR` из env-файла). Красный (код 3), если за
+UTC-сутки в Bronze `distinct match_id` < `SS_DAY_MIN_MATCHES` = 1000, у полосы истории < `SS_DAY_MIN_SCOPES` = 1
+скоупа со строками или доля красных попыток не «ok» по порогу #1356. Доля истории слотов считается по квитанциям
+и отчётам скоупов (`red_share_sql(scope_reports=True)` + `history_scope_counts`, как `pipeline_watchdog --collect`),
+поэтому строка «история недоступна (нужны отчёты скоупов)» появляется только без финальной квитанции. Trino или
+метабаза недоступны — `⚠️` в строке, не красный; сбой самого сторожа — код 2. Код 0 — зелёный. Разбор
+`SOFASCORE-STALL-<день>.md` по коду 3 заводит сводка (`morning_report.py`), не модуль.
+
 ## Книга аллокаций: журнал + снимок (#1350)
 
 **Что было.** `AllocationLedger.consume` на каждый 64-КиБ чанк платного ответа читал и
