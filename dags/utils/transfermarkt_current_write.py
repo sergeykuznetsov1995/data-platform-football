@@ -945,6 +945,9 @@ def verify_current_roster_baseline(scraper, snapshot: FullRosterSnapshot, receip
             predicate, params = 'league = ? AND season = ?', [scope['compatibility_league'], scope['canonical_season']]
         else:
             predicate, params = 'competition_id = ? AND edition_id = ?', [scope['competition_id'], scope['edition_id']]
+        if proof.get('batch_id'):
+            # #2068: older append batches of the scope stay; the receipt hashed its own batch only.
+            predicate, params = predicate + ' AND _batch_id = ?', params + [str(proof['batch_id'])]
         try:
             proof_columns = proof.get('columns', [column for column in frame.columns if column not in _LATE_ROSTER_COLUMNS])
             if (not isinstance(proof_columns, list) or len(proof_columns) != len(set(proof_columns))
