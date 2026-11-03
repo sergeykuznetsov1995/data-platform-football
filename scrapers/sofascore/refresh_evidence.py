@@ -134,6 +134,11 @@ def _validate_snapshot(doc, revision, identity=None):
             or doc["overdue_core_matches"] != sum(_integer(r["overdue_matches"]) for r in due)):
         raise ValueError("census aggregates differ from retained rows")
     consumed_open, previous_deadline = set(), None
+    # #2117: a plan that declares a debt reserve may run its debt tier while
+    # core open deadlines are left (the open tier filled its part of the
+    # window), but nothing open may follow a debt scope.
+    reserved = _integer((doc.get("capture_window") or {}).get("debt_reserve_s", 0)) > 0
+    debt_seen = False
     for selected in doc["selected"]:
         key = selected["tournament_id"], selected["source_season_id"]
         if key not in native:
@@ -148,9 +153,13 @@ def _validate_snapshot(doc, revision, identity=None):
         phase = selected.get("phase", "open")
         if phase not in {"open", "debt"}:
             raise ValueError("unknown scope phase")
-        if phase == "debt" or row["classification"] == "disputed":
+        if phase == "debt" and reserved:
+            debt_seen = True
+        elif phase == "debt" or row["classification"] == "disputed":
             if open_due:
                 raise ValueError("debt/disputed scope overtakes core deadline")
+        elif debt_seen:
+            raise ValueError("open scope after the reserved debt tier")
         else:
             deadline = row["nearest_open_deadline"]
             if deadline is None or (open_due and deadline != min(r["nearest_open_deadline"] for r in open_due.values())):

@@ -75,6 +75,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
         selected[0]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
     assert 14099 <= (datetime.fromisoformat(window["deadline_at"])
                      - datetime.fromisoformat(window["started_at"])).total_seconds() <= 14100
+    # #2117: the plan declares the debt reserve the evidence contract checks.
+    assert window["scope_budget_s"] == 7200 and window["debt_reserve_s"] == 1800
 
 
 def test_disabled_evidence_has_no_input_or_filesystem_effect(clean_env, monkeypatch):
@@ -323,6 +325,7 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     # the shared window decides how many actually go.
     assert kwargs["batch_size"] == 3
     assert kwargs["scope_budget_s"] == 2 * 3600
+    assert kwargs["debt_reserve_s"] == 1800
     assert kwargs["seconds_per_match"] == 15
     assert kwargs["result_dir"] == "/tmp/refresh"
     assert kwargs["task_env"] == {

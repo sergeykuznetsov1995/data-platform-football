@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -84,6 +85,12 @@ REFRESH_MAX_SCOPE_TIMEOUT_SECONDS = 2 * 3600
 REFRESH_RUNNER_STOP_MARGIN_SECONDS = 300
 REFRESH_ALLOCATION_MATCHES = 25
 REFRESH_ALLOCATION_OVERRUN_FACTOR = 2
+# #2117: a deadline missed this recently is fresh debt.  While there is any, the
+# open tier of a deadline plan leaves this part of the window to the debt tier:
+# 31.10-02.11 the open tier of 107-163 seasons took 7065-7170 s of the 7200 s
+# window in six plans running, and no missed deadline was re-collected.
+REFRESH_FRESH_DEBT_SECONDS = 48 * 3600
+REFRESH_DEBT_RESERVE_SECONDS = 1800
 
 
 def refresh_timeout_headroom(seconds_per_match: int) -> int:
@@ -741,6 +748,8 @@ def plan_refresh_batch(
     denominator: Denominator | None = None,
     scope_budget_s: int | None = None,
     seconds_per_match: int = DEFAULT_REFRESH_SECONDS_PER_MATCH,
+    debt_reserve_s: int = 0,
+    now: float | None = None,
 ) -> list[dict[str, str]]:
     """Select a deadline-ordered refresh batch (#1359).
 
@@ -775,6 +784,13 @@ def plan_refresh_batch(
     ``SOFASCORE_SCOPE_MAX_MATCHES``, ``SOFASCORE_SCOPE_BYTE_CAP``,
     ``SOFASCORE_SCOPE_TIMEOUT_S`` (the task's execution timeout) and
     ``SOFASCORE_SCOPE_ESTIMATE_S``.
+
+    #2117: while a ``deadline`` plan with a window has fresh debt (a deadline
+    missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``), the open
+    tier plans into the window minus ``debt_reserve_s``; its closing slice
+    then closes only the open tier, and the debt tier gets what is left plus
+    the reserve (its scopes of seasons with open deadlines take only the
+    passed ones).  Without a reserve the closing slice closes the batch.
     """
 
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
@@ -790,6 +806,15 @@ def plan_refresh_batch(
         or scope_budget_s < 1
     ):
         raise CampaignPlanningError("scope_budget_s must be a positive integer")
+    if (
+        isinstance(debt_reserve_s, bool)
+        or not isinstance(debt_reserve_s, int)
+        or debt_reserve_s < 0
+        or (scope_budget_s is not None and debt_reserve_s >= scope_budget_s)
+    ):
+        raise CampaignPlanningError(
+            "debt_reserve_s must be a non-negative integer under scope_budget_s"
+        )
     if (
         isinstance(batch_size, bool)
         or not isinstance(batch_size, int)
@@ -910,9 +935,25 @@ def plan_refresh_batch(
             else (item[6], -(item[2] - item[7]))
         ) + (item[0], item[1], int(item[5]["source_season_id"])),
     )
+    now = time.time() if now is None else now
+    fresh_debt = [
+        item for item in debt_tier
+        if item[8] is not None and item[8] >= now - REFRESH_FRESH_DEBT_SECONDS
+    ]
+    reserve = (
+        debt_reserve_s
+        if queue_mode == "deadline" and scope_budget_s is not None and fresh_debt
+        else 0
+    )
+    if reserve:
+        logger.info(
+            "refresh window reserves %s s for fresh debt: %s partitions, "
+            "newest miss %.1f h ago",
+            reserve, len(fresh_debt),
+            (now - max(item[8] for item in fresh_debt)) / 3600,
+        )
     entries: list[tuple[tuple, str, int]] = []
-    opened: set[tuple[str, str, int]] = set()
-    left = scope_budget_s
+    left = None if scope_budget_s is None else scope_budget_s - reserve
     closed = False
     headroom = refresh_timeout_headroom(seconds_per_match)
     # A scope whose estimate plus that headroom passes the 2 h task ceiling
@@ -927,7 +968,7 @@ def plan_refresh_batch(
     )
 
     def _fit(item: tuple, wanted: int) -> int | None:
-        """Matches of ``wanted`` that fit; ``None`` closes the batch."""
+        """Matches of ``wanted`` that fit; ``None`` closes the tier."""
 
         nonlocal left
         overhead = REFRESH_SCOPE_OVERHEAD_SECONDS
@@ -956,6 +997,8 @@ def plan_refresh_batch(
         ("open", open_tier), ("debt", debt_tier),
     ]
     for tier, items in tiers:
+        if tier == "debt" and reserve:
+            left += reserve
         for position, item in enumerate(items):
             if len(entries) == batch_size:
                 logger.warning(
@@ -970,11 +1013,13 @@ def plan_refresh_batch(
             wanted = item[7] if tier == "open" else item[2] - item[7]
             fits = _fit(item, min(wanted, scope_capacity))
             if fits is None:
-                closed = True
+                # A plan without a reserve keeps every open deadline ahead of
+                # the debt: the refill and the evidence contract rely on it.
+                closed = not reserve
                 break
-            part = "debt" if tier == "debt" and key in opened else ""
-            if tier == "open":
-                opened.add(key)
+            # A season whose open part the closed open tier did not reach
+            # still runs only its passed deadlines here (#2117).
+            part = "debt" if tier == "debt" and item[3] is not None else ""
             entries.append((item, part, fits))
         if closed:
             break

@@ -1464,6 +1464,66 @@ def test_refresh_batch_bound_never_closes_the_window_before_the_budget():
     assert state.DEFAULT_REFRESH_BATCH_SIZE * smallest >= 2 * 3600
 
 
+_NOW = 1_787_900_000
+
+
+def _open_flood(overdue_ts):
+    # Three open seasons that overfill a 2 h window (the third with 40 matches
+    # of debt), and one season with debt only (#2117: the 31.10-02.11 plans
+    # of 107-163 open seasons).
+    return [
+        (*_refresh_pending("SS-17", "2627", 200, _NOW + 1_000), 200, 1726, None),
+        (*_refresh_pending("SS-8", "2627", 200, _NOW + 2_000), 200, 826, None),
+        (*_refresh_pending("SS-17", "2526", 140, _NOW + 3_000), 100, 1725, overdue_ts),
+        (*_refresh_pending("SS-8", "2526", 50, None), 0, 825, overdue_ts),
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_window_reserves_a_quarter_for_fresh_debt_under_an_open_flood():
+    planned = _window_plan(_open_flood(_NOW - 3600), debt_reserve_s=1800, now=_NOW)
+
+    # The open tier plans into 7200 - 1800 s: 200 x 15 + 45 = 3045 s, then a
+    # slice of (2355 - 45) // 15 = 154; the third open season does not fit
+    # and closes only the open tier.  The debt tier gets the reserve, the
+    # smaller debt first; the third season runs only its passed deadlines.
+    assert _parts(planned) == [
+        ("campaign-test:17:1726", False, 200),
+        ("campaign-test:8:826", False, 154),
+        ("campaign-test:17:1725", True, 40),
+        ("campaign-test:8:825", False, 50),
+    ]
+    assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) <= 7200
+
+
+@pytest.mark.unit
+def test_refresh_window_keeps_no_reserve_for_stale_debt():
+    planned = _window_plan(
+        _open_flood(_NOW - 3 * 86400), debt_reserve_s=1800, now=_NOW
+    )
+
+    # 7200 - 2 x 3045 = 1110 s -> a slice of (1110 - 45) // 15 = 71.
+    assert _parts(planned) == [
+        ("campaign-test:17:1726", False, 200),
+        ("campaign-test:8:826", False, 200),
+        ("campaign-test:17:1725", False, 71),
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_reserve_does_not_apply_to_backlog_or_refill_sized_budget():
+    fresh = [(*_refresh_pending("SS-8", "2526", 50, None), 0, 825, _NOW - 3600),
+             (*_refresh_pending("SS-17", "2526", 900, None), 0, 1725, _NOW - 7200)]
+    for kwargs in ({"queue_mode": "backlog"}, {"scope_budget_s": None}):
+        assert _parts(_window_plan(fresh, debt_reserve_s=1800, now=_NOW, **kwargs)) == (
+            _parts(_window_plan(fresh, now=_NOW, **kwargs))
+        )
+    # A refill window shorter than the reserve takes no reserve at all.
+    assert _parts(_window_plan(fresh, scope_budget_s=1500, now=_NOW))
+    with pytest.raises(CampaignPlanningError, match="debt_reserve_s"):
+        _window_plan(fresh, scope_budget_s=1500, debt_reserve_s=1800, now=_NOW)
+
+
 def test_refresh_preserves_native_seasons_sharing_a_canonical_year():
     snapshot = _snapshot()
     tournament = snapshot['tournaments'][1]
