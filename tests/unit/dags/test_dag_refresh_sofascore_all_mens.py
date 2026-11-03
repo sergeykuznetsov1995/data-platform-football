@@ -48,7 +48,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     monkeypatch.setattr(denominator, "denominator_path", lambda: artifact)
     rows = [(f"SS-{n}", "2627", 2, 1792024800, 1, n + 100) for n in range(1, 22)]
     selected = [{"SOFASCORE_TOURNAMENT_ID": str(n), "SOFASCORE_SOURCE_SEASON_ID": str(n + 100),
-                 "SOFASCORE_SCOPE_KEY": f"c:{n}:{n + 100}", "SOFASCORE_SCOPE_TIMEOUT_S": "300"}
+                 "SOFASCORE_SCOPE_KEY": f"c:{n}:{n + 100}", "SOFASCORE_SCOPE_TIMEOUT_S": "300",
+                 "SOFASCORE_REFRESH_DEBT_RESERVE_S": "90"}
                 for n in range(1, 9)]
     context = dict(run_id="scheduled__fixture", dag_run=SimpleNamespace(
         logical_date=datetime(2026, 10, 15, tzinfo=timezone.utc),
@@ -75,8 +76,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
         selected[0]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
     assert 14099 <= (datetime.fromisoformat(window["deadline_at"])
                      - datetime.fromisoformat(window["started_at"])).total_seconds() <= 14100
-    # #2117: the plan declares the debt reserve the evidence contract checks.
-    assert window["scope_budget_s"] == 7200 and window["debt_reserve_s"] == 1800
+    # #2117: the plan declares the debt reserve it applied, not the ceiling.
+    assert window["scope_budget_s"] == 7200 and window["debt_reserve_s"] == 90
 
 
 def test_disabled_evidence_has_no_input_or_filesystem_effect(clean_env, monkeypatch):

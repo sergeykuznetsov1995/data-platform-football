@@ -1496,6 +1496,8 @@ def test_refresh_window_reserves_a_quarter_for_fresh_debt_under_an_open_flood():
         ("campaign-test:8:825", False, 50),
     ]
     assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) <= 7200
+    # The applied reserve goes to the evidence (review #2117 r1 D2).
+    assert {env["SOFASCORE_REFRESH_DEBT_RESERVE_S"] for env in planned} == {"1440"}
 
 
 def _flood_with_old_debt(*fresh_rows):
@@ -1552,6 +1554,7 @@ def test_refresh_window_keeps_no_reserve_for_stale_debt():
         ("campaign-test:8:826", False, 200),
         ("campaign-test:17:1725", False, 71),
     ]
+    assert not any("SOFASCORE_REFRESH_DEBT_RESERVE_S" in env for env in planned)
 
 
 @pytest.mark.unit

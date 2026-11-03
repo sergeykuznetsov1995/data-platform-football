@@ -373,13 +373,18 @@ def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     )
     for env in planned:
         env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"] = str(window_deadline)
+    # #2117: the reserve the planner applied (0 without fresh debt).
+    debt_reserve_s = max(
+        (int(env.get("SOFASCORE_REFRESH_DEBT_RESERVE_S", 0)) for env in planned),
+        default=0,
+    )
     _capture_refresh_evidence(context, snapshot, rows, planned, "initial", observed_at,
         capture_window={"started_at": datetime.fromtimestamp(window_started, timezone.utc).isoformat(),
                         "deadline_at": datetime.fromtimestamp(window_deadline, timezone.utc).isoformat(),
                         # The evidence contract lets the debt tier follow an
                         # unfinished open tier only in a plan that declares it.
                         "scope_budget_s": int(REFRESH_SCOPE_BUDGET.total_seconds()),
-                        "debt_reserve_s": state.REFRESH_DEBT_RESERVE_SECONDS})
+                        "debt_reserve_s": debt_reserve_s})
     # One mapped task per scope, each with the timeout of its OWN estimate
     # (``expand_kwargs`` below): the timeout is part of the mapped kwargs.
     return [

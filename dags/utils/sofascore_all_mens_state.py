@@ -783,7 +783,8 @@ def plan_refresh_batch(
     closes the batch.  Every scope carries its own ceilings in its env:
     ``SOFASCORE_SCOPE_MAX_MATCHES``, ``SOFASCORE_SCOPE_BYTE_CAP``,
     ``SOFASCORE_SCOPE_TIMEOUT_S`` (the task's execution timeout) and
-    ``SOFASCORE_SCOPE_ESTIMATE_S``.
+    ``SOFASCORE_SCOPE_ESTIMATE_S``; a plan with a debt reserve (below) also
+    ``SOFASCORE_REFRESH_DEBT_RESERVE_S``.
 
     #2117: while a ``deadline`` plan with a window has fresh debt (a deadline
     missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``) that its
@@ -1090,6 +1091,9 @@ def plan_refresh_batch(
             # Its open-deadline matches belong to the season's urgent scope
             # of this batch; this one takes only the passed deadlines.
             env["SOFASCORE_SCOPE_DEBT_ONLY"] = "1"
+        if reserve:
+            # The reserve this plan applied, for its evidence (#2117).
+            env["SOFASCORE_REFRESH_DEBT_RESERVE_S"] = str(reserve)
         planned.append(env)
     return planned
 
