@@ -370,6 +370,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             collect_current_slot = ShortCircuitOperator(
                 task_id="collect_current_slot",
                 python_callable=collect_fbref_current_slot,
+                # Light and decisive at 00:00: never wait behind re-parse for
+                # the single fbref_scraper_pool slot.
+                pool="default_pool",
                 retries=0,
                 trigger_rule="all_success",
             )

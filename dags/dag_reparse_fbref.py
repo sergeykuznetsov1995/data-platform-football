@@ -20,6 +20,7 @@ from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
+    FBREF_REPARSE_DAG_ID,
     FBREF_REPARSE_PAGE_KINDS,
     FBREF_SCRAPER_POOL,
     drain_fbref_reparse,
@@ -44,7 +45,7 @@ DAG_ID = "{{ dag.dag_id }}"
 
 
 with DAG(
-    dag_id="dag_reparse_fbref",
+    dag_id=FBREF_REPARSE_DAG_ID,
     default_args={**DEFAULT_ARGS, "pool": FBREF_SCRAPER_POOL,
                   "priority_weight": 1, "weight_rule": "absolute"},
     description="Raw-only, zero-network FBref parser-version re-parse",

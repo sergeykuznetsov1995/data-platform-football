@@ -109,6 +109,10 @@ class TestFBrefCurrentTopology:
         assert tasks["collect_current_slot"].python_callable.__name__ == (
             "collect_fbref_current_slot"
         )
+        # Decides at 00:00, never behind re-parse in the one-slot pool.
+        assert tasks["collect_current_slot"]._captured_kwargs["pool"] == (
+            "default_pool"
+        )
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"
         }

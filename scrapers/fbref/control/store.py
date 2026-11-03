@@ -2749,6 +2749,25 @@ class ControlStore:
                                (normalized_source, normalized_run_id))
             return {**replaced, "acquired": True, "idempotent": False}
 
+    def current_publication_waiter_pending(self, source: str = "fbref") -> bool:
+        """True while a running current run waits in the lock queue (#1332)."""
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM fbref_control.publication_waiter AS waiter
+                JOIN fbref_control.crawl_run AS queued_run
+                  ON queued_run.run_id = waiter.run_id
+                WHERE waiter.source = %s
+                  AND queued_run.status = 'running'
+                  AND queued_run.run_type = 'current'
+                LIMIT 1
+                """,
+                (_text(source, "source"),),
+            )
+            return _fetchone(cursor) is not None
+
     def release_publication_lock(
         self,
         run_id: object,

@@ -2701,6 +2701,7 @@ FBREF_REPARSE_PAGE_KINDS = (
 # is given to re-parse.  Off unless the Variable says so.
 FBREF_REPARSE_NIGHT_SLOT_VARIABLE = "fbref_reparse_night_slot"
 FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC = 0
+FBREF_REPARSE_DAG_ID = "dag_reparse_fbref"
 
 
 def fbref_reparse_night_slot_enabled() -> bool:
@@ -2717,6 +2718,12 @@ def fbref_reparse_night_slot_enabled() -> bool:
 
         value = Variable.get(FBREF_REPARSE_NIGHT_SLOT_VARIABLE, default_var="0")
         if str(value).strip().casefold() not in {"1", "true", "on"}:
+            return False
+        from airflow.models import DagModel
+
+        # A paused re-parse DAG would leave the handed-over slot empty.
+        reparse_dag = DagModel.get_dagmodel(FBREF_REPARSE_DAG_ID)
+        if reparse_dag is None or reparse_dag.is_paused:
             return False
         return bool(_control_store().list_version_lagging_fetches(
             parser_version=PAGE_DOCUMENT_VERSION,
@@ -2812,6 +2819,15 @@ def _fbref_reparse_stop_at(now: datetime, lock_ttl_seconds) -> datetime:
     )
 
 
+def _fbref_reparse_must_yield(night_slot: bool) -> bool:
+    """Between groups: give the lock back to a queued current run, or when
+    the night slot this run was planned on is no longer handed over."""
+
+    if _control_store().current_publication_waiter_pending():
+        return True
+    return night_slot and not fbref_reparse_night_slot_enabled()
+
+
 def wait_fbref_reparse_lock(*, airflow_run_id, dag_id, ttl_seconds, **context):
     """Queue for the lock only once a first group fits in the night window.
 
@@ -2856,12 +2872,18 @@ def drain_fbref_reparse(
         airflow_run_id=airflow_run_id, dag_id=dag_id
     )
     now = datetime.now(timezone.utc)
+    night_slot = fbref_reparse_night_slot_enabled()
     stop_at = _fbref_reparse_stop_at(now, lock_ttl_seconds)
     deadline = time.monotonic() + (stop_at - now).total_seconds()
     totals: dict[str, object] = {"waves": 0}
     status = "window_closed"
+    # The slowest group so far, never below the first-group bound: one fast
+    # generic group says nothing about the 100 matches that may follow.
     group_seconds = FBREF_REPARSE_FIRST_GROUP_SECONDS
     while time.monotonic() + group_seconds < deadline:
+        if totals["waves"] and _fbref_reparse_must_yield(night_slot):
+            status = "yielded"
+            break
         group_started = time.monotonic()
         wave = pipeline.reparse_version_lag_wave(
             processing_run_id,
@@ -2869,7 +2891,7 @@ def drain_fbref_reparse(
             settings=settings,
             deadline=deadline,
         ).as_dict()
-        group_seconds = time.monotonic() - group_started
+        group_seconds = max(group_seconds, time.monotonic() - group_started)
         if int(wave.get("cohort_size") or 0) == 0:
             status = "drained"
             break

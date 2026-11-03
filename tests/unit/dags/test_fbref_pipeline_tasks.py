@@ -4241,6 +4241,9 @@ def _reparse_pipeline(monkeypatch, *waves, window_seconds=3 * 3600):
     monkeypatch.setattr(
         fbref_pipeline_tasks, "fbref_reparse_night_slot_enabled", lambda: False
     )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_fbref_reparse_must_yield", lambda night: False
+    )
     return pipeline
 
 
@@ -4434,10 +4437,11 @@ def test_reparse_finalizer_releases_and_reports_validation(
     [
         # Below the 70-minute first-group estimate: nothing is claimed.
         (50, 0),
-        # Groups take 30 min: 70 then 40 min remain -> both fit; 10 -> stop.
-        (100, 3),
-        # 50 min remain -> fits; then 20 min remain -> no further group.
-        (80, 2),
+        # Groups take 30 min, but the estimate never drops below 70 min
+        # (R2-2): 70 min left after the first group -> no second one.
+        (100, 1),
+        # 100 min left after the first group -> a second one; then 70 -> no.
+        (130, 2),
     ],
 )
 def test_reparse_drain_starts_a_group_only_if_it_fits_before_stop(
@@ -4467,8 +4471,19 @@ def test_reparse_drain_starts_a_group_only_if_it_fits_before_stop(
     assert result["status"] == "window_closed"
 
 
-def _night_slot(monkeypatch, *, variable="1", lagging=1, error=None):
+def _night_slot(
+    monkeypatch, *, variable="1", lagging=1, error=None, paused=False
+):
+    import airflow.models
     from airflow.models import Variable
+
+    dag_model = SimpleNamespace(
+        get_dagmodel=lambda dag_id: (
+            SimpleNamespace(is_paused=paused)
+            if dag_id == "dag_reparse_fbref" else None
+        )
+    )
+    monkeypatch.setattr(airflow.models, "DagModel", dag_model, raising=False)
 
     store = MagicMock()
     if error is not None:
@@ -4508,8 +4523,10 @@ def test_night_slot_is_handed_to_reparse_while_lag_remains(monkeypatch):
         ({}, _slot(0, run_type="manual")),
         ({"lagging": 0}, _slot(0)),
         ({"error": RuntimeError("control down")}, _slot(0)),
+        ({"paused": True}, _slot(0)),
     ],
-    ids=["variable_off", "other_slot", "manual_run", "no_lag", "check_error"],
+    ids=["variable_off", "other_slot", "manual_run", "no_lag", "check_error",
+         "reparse_paused"],
 )
 def test_current_slot_collects_unless_every_condition_holds(
     monkeypatch, kwargs, slot
@@ -4565,7 +4582,11 @@ def test_reparse_drain_passes_the_night_slot_into_stop_at(monkeypatch):
 
 @pytest.mark.unit
 def test_handed_over_night_is_used_whole_by_chained_reparse_runs(monkeypatch):
-    """Lock free from 22:55 UTC: >= 4 h of groups, none ending past 03:45."""
+    """Lock free from 22:55 UTC: no group ends past 03:45, night is used.
+
+    30-min groups under the 70-min floor (R2-2): 23:00-01:00 and
+    01:08-02:38, 3 h 30 min.  Each run end leaves up to 70 min unclaimed.
+    """
 
     from dags import dag_reparse_fbref  # noqa: F401 - TTL comes from the DAG
     import dag_reparse_fbref as reparse_dag
@@ -4593,6 +4614,9 @@ def test_handed_over_night_is_used_whole_by_chained_reparse_runs(monkeypatch):
     )
     monkeypatch.setattr(
         fbref_pipeline_tasks, "wait_fbref_publication_lock", lambda **_: True
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_fbref_reparse_must_yield", lambda night: False
     )
     groups = []
 
@@ -4640,7 +4664,7 @@ def test_handed_over_night_is_used_whole_by_chained_reparse_runs(monkeypatch):
         run_started = clock["now"]
 
     worked = sum((end - began for began, end in groups), timedelta())
-    assert worked >= timedelta(hours=4)
+    assert worked >= timedelta(hours=3, minutes=30)
     assert all(end <= stop for _began, end in groups)
     # Each run (groups back to back) stays within the lock TTL less 15 min.
     runs = [[groups[0]]]
@@ -4676,3 +4700,94 @@ def test_reparse_lock_wait_is_unchanged_without_the_night_slot(monkeypatch):
     assert fbref_pipeline_tasks.fbref_reparse_stop_at(
         day + timedelta(hours=1), night_max_seconds=9900
     ) == day + timedelta(hours=3)
+
+
+def _timed_groups(monkeypatch, durations, *, window_minutes=300):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    pending = list(durations)
+
+    def group(*_args, **_kwargs):
+        clock["now"] += pending.pop(0) * 60
+        result = MagicMock()
+        result.as_dict.return_value = {
+            "cohort_size": 100, "claimed": 100, "parsed": 100,
+        }
+        return result
+
+    pipeline = _reparse_pipeline(monkeypatch, window_seconds=window_minutes * 60)
+    pipeline.reparse_version_lag_wave.side_effect = group
+    return pipeline
+
+
+@pytest.mark.unit
+def test_reparse_estimate_keeps_the_slowest_group_not_the_last(monkeypatch):
+    """R2-2: a fast generic group must not license a 70-min match group."""
+
+    # 80-min group, then a 5-min one with 80 min left: the last (5) or the
+    # floor (70) would start a third group; the slowest (80) does not.
+    pipeline = _timed_groups(monkeypatch, [80, 5, 5], window_minutes=165)
+
+    _drain_reparse()
+
+    assert pipeline.reparse_version_lag_wave.call_count == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("waiter", "night_at_start", "night_now", "groups"),
+    [
+        (True, False, False, 1),
+        (False, True, False, 1),
+        (False, True, True, 4),
+        (False, False, False, 4),
+    ],
+    ids=["current_queued", "slot_switched_off", "slot_still_on", "day"],
+)
+def test_reparse_yields_between_groups_to_current_or_a_withdrawn_slot(
+    monkeypatch, waiter, night_at_start, night_now, groups
+):
+    """R2-1: the 'slot is ours' decision is re-checked before each group."""
+
+    must_yield = fbref_pipeline_tasks._fbref_reparse_must_yield
+    pipeline = _timed_groups(monkeypatch, [10] * 5, window_minutes=110)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_fbref_reparse_must_yield", must_yield
+    )
+    store = MagicMock()
+    store.current_publication_waiter_pending.return_value = waiter
+    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", lambda: store)
+    answers = iter([night_at_start] + [night_now] * 10)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "fbref_reparse_night_slot_enabled",
+        lambda: next(answers),
+    )
+
+    result = _drain_reparse()
+
+    assert pipeline.reparse_version_lag_wave.call_count == groups
+    if groups == 1:
+        assert result["status"] == "yielded"
+
+
+@pytest.mark.unit
+def test_current_waiter_query_reads_only_running_current_runs():
+    from tests.unit.scrapers.test_fbref_control_store_v8 import make_store
+
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"], captured["params"] = sql, params
+        return [{"?column?": 1}], 1
+
+    store, _ = make_store(handler)
+
+    assert store.current_publication_waiter_pending() is True
+    assert "queued_run.status = 'running'" in captured["sql"]
+    assert "queued_run.run_type = 'current'" in captured["sql"]
+    assert captured["params"] == ("fbref",)
