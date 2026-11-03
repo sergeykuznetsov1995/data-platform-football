@@ -4222,7 +4222,7 @@ def test_history_campaign_repairs_schedules_before_completion_and_cohort_selecti
     pipeline.seed_historical_seasons.assert_not_called()
 
 
-def _reparse_pipeline(monkeypatch, *waves, window_seconds=3600):
+def _reparse_pipeline(monkeypatch, *waves, window_seconds=3 * 3600):
     results = []
     for wave in waves:
         result = MagicMock()
@@ -4423,3 +4423,42 @@ def test_reparse_finalizer_releases_and_reports_validation(
             dag_run=run,
         )["status"] == "released_after_version_reparse"
     release.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("window_minutes", "groups"),
+    [
+        # Below the 70-minute first-group estimate: nothing is claimed.
+        (50, 0),
+        # Groups take 30 min: 70 then 40 min remain -> both fit; 10 -> stop.
+        (100, 3),
+        # 50 min remain -> fits; then 20 min remain -> no further group.
+        (80, 2),
+    ],
+)
+def test_reparse_drain_starts_a_group_only_if_it_fits_before_stop(
+    monkeypatch, window_minutes, groups
+):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+
+    def group(*_args, **_kwargs):
+        clock["now"] += 30 * 60
+        result = MagicMock()
+        result.as_dict.return_value = {
+            "cohort_size": 100, "claimed": 100, "parsed": 100,
+        }
+        return result
+
+    pipeline = _reparse_pipeline(monkeypatch, window_seconds=window_minutes * 60)
+    pipeline.reparse_version_lag_wave.side_effect = group
+
+    result = _drain_reparse()
+
+    assert pipeline.reparse_version_lag_wave.call_count == groups
+    assert result["status"] == "window_closed"

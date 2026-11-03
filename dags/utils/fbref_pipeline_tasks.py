@@ -2681,6 +2681,10 @@ def drain_fbref_replay(
 FBREF_REPARSE_MAX_SECONDS = 2 * 60 * 60
 FBREF_REPARSE_STOP_MARGIN_SECONDS = 45 * 60
 FBREF_REPARSE_CURRENT_START_GRACE_SECONDS = 30 * 60
+# A group already claimed is written to the end, so a new group starts only
+# if it fits before stop_at.  Until this run measured one: up to four writes
+# of 16 min plus parsing.
+FBREF_REPARSE_FIRST_GROUP_SECONDS = 70 * 60
 
 
 def fbref_reparse_stop_at(now: datetime) -> datetime:
@@ -2739,13 +2743,16 @@ def drain_fbref_reparse(
     deadline = time.monotonic() + (stop_at - now).total_seconds()
     totals: dict[str, object] = {"waves": 0}
     status = "window_closed"
-    while time.monotonic() < deadline:
+    group_seconds = FBREF_REPARSE_FIRST_GROUP_SECONDS
+    while time.monotonic() + group_seconds < deadline:
+        group_started = time.monotonic()
         wave = pipeline.reparse_version_lag_wave(
             processing_run_id,
             page_kinds=list(page_kinds),
             settings=settings,
             deadline=deadline,
         ).as_dict()
+        group_seconds = time.monotonic() - group_started
         if int(wave.get("cohort_size") or 0) == 0:
             status = "drained"
             break
