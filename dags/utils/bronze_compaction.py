@@ -13,6 +13,7 @@ from threading import Event, Thread
 import time
 
 from utils import maintenance_tasks as maintenance
+from utils import maintenance_window
 
 logger = logging.getLogger(__name__)
 MAX_PORTIONS = 120
@@ -95,10 +96,7 @@ BRONZE_COMPACTION_TABLES = (
 
 
 def nightly_deadline(now=None):
-    now = now or datetime.now(timezone.utc)
-    if not 2 <= now.hour < 5:
-        raise TimeoutError("Bronze compaction is permitted only at 02:00–05:00 UTC")
-    return now.replace(hour=5, minute=0, second=0, microsecond=0)
+    return maintenance_window.nightly_deadline(now)
 
 
 class _DeadlineConnection:

@@ -158,8 +158,11 @@ def test_bytes_dry_run_and_no_progress(runner, monkeypatch):
 
 
 def test_deadline_stop_and_window():
-    with pytest.raises(TimeoutError, match="02:00"):
-        compaction.nightly_deadline(datetime(2026, 10, 28, 5, tzinfo=timezone.utc))
+    with pytest.raises(TimeoutError, match="03:00–05:00 MSK"):
+        compaction.nightly_deadline(datetime(2026, 10, 28, 2, tzinfo=timezone.utc))
+    assert compaction.nightly_deadline(
+        datetime(2026, 10, 28, 0, 30, tzinfo=timezone.utc)
+    ) == datetime(2026, 10, 28, 2, tzinfo=timezone.utc)
     stop = Event()
     conn = compaction._DeadlineConnection(
         None, datetime.now(timezone.utc) - timedelta(seconds=1), stop, lambda: None
@@ -310,7 +313,7 @@ def test_catchup_cli_queues_instead_of_bypassing_pool(monkeypatch, tmp_path):
     class Clock:
         @staticmethod
         def now(_tz):
-            return datetime(2026, 10, 28, 2, tzinfo=timezone.utc)
+            return datetime(2026, 10, 28, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(cli, "datetime", Clock)
     calls = []
@@ -342,7 +345,7 @@ def test_catchup_cli_queues_instead_of_bypassing_pool(monkeypatch, tmp_path):
     ]
     conf = json.loads(command[-1])
     assert conf["apply"] is False
-    assert conf["deadline"] == "2026-10-28T02:30:00+00:00"
+    assert conf["deadline"] == "2026-10-28T00:30:00+00:00"
     assert kwargs == {"check": True}
     assert cli.main(["--stop-file", str(stop), "--stop"]) == 0
     assert stop.exists()
