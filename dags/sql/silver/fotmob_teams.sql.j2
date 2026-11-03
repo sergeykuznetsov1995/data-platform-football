@@ -1,0 +1,109 @@
+-- silver.fotmob_teams — одна команда FotMob, последний подтверждённый снимок профиля
+-- (#2019, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_teams) + README.
+-- Глобальная таблица: без турнира и сезона, без партиций; карточка одна, по сезонам не размножается.
+-- Ключ team_id: varchar в bronze -> BIGINT один раз на входе; пустой/неприводимый id -> строка
+-- отбрасывается (правило NULL для ключа). Повтор -> одна строка, последняя по _observed_at,
+-- _ingested_at, затем больший _target_batch_id.
+-- venue_capacity (varchar) -> INTEGER через DOUBLE, только целое; venue_latitude/longitude — строки
+-- overview.venue.widget.location[0|1] -> DOUBLE; snapshot_date — DATE из первых 10 символов;
+-- неразбор -> NULL + _conform_issues_json. venue_capacity и page_url в bronze сейчас пусты у всех
+-- команд (парсер bronze читает пути, которых FotMob не отдаёт) — здесь NULL без записи.
+-- Литерал 'null' в bronze (секция FotMob = null) -> NULL в сыром остатке.
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над team_id (BIGINT);
+-- полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(team_id AS BIGINT) AS team_id,
+            team_name, country_code, page_url, venue_name, venue_city, venue_capacity,
+            details_json, overview_json, history_json, snapshot_date,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_team_snapshots_current
+    ) s
+    WHERE team_id IS NOT NULL
+      AND (
+        {{ fotmob_entity_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY team_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        n.*,
+        CASE WHEN n.venue_capacity_double = floor(n.venue_capacity_double)
+             THEN TRY_CAST(n.venue_capacity_double AS INTEGER) END AS venue_capacity_value,
+        TRY_CAST(n.venue_latitude_raw AS DOUBLE) AS venue_latitude_value,
+        TRY_CAST(n.venue_longitude_raw AS DOUBLE) AS venue_longitude_value,
+        CASE WHEN regexp_like(n.snapshot_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.snapshot_date_raw, 1, 10) AS DATE) END AS snapshot_date_value
+    FROM (
+        SELECT
+            d.*,
+            NULLIF(d.venue_capacity, '') AS venue_capacity_raw,
+            TRY_CAST(d.venue_capacity AS DOUBLE) AS venue_capacity_double,
+            NULLIF(json_extract_scalar(d.overview_json, '$.venue.widget.location[0]'), '') AS venue_latitude_raw,
+            NULLIF(json_extract_scalar(d.overview_json, '$.venue.widget.location[1]'), '') AS venue_longitude_raw,
+            NULLIF(d.snapshot_date, '') AS snapshot_date_raw
+        FROM dedup d
+    ) n
+)
+SELECT
+    c.team_id,
+    c.team_name,
+    json_extract_scalar(c.details_json, '$.shortName') AS short_name,
+    c.country_code,
+    json_extract_scalar(c.details_json, '$.gender') AS gender,
+    json_extract_scalar(c.details_json, '$.type') AS team_type,
+    TRY_CAST(json_extract_scalar(c.details_json, '$.primaryLeagueId') AS BIGINT) AS primary_league_id,
+    json_extract_scalar(c.details_json, '$.primaryLeagueName') AS primary_league_name,
+    json_extract_scalar(c.details_json, '$.latestSeason') AS latest_season,
+    c.page_url,
+    c.venue_name,
+    c.venue_city,
+    c.venue_capacity_value AS venue_capacity,
+    c.venue_latitude_value AS venue_latitude,
+    c.venue_longitude_value AS venue_longitude,
+    c.snapshot_date_value AS snapshot_date,
+    NULLIF(c.details_json, 'null') AS details_json,
+    NULLIF(c.overview_json, 'null') AS overview_json,
+    NULLIF(c.history_json, 'null') AS history_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.venue_capacity_raw IS NOT NULL AND v.venue_capacity_value IS NULL
+                 THEN CAST(ROW('venue_capacity', v.venue_capacity_raw, 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.venue_latitude_raw IS NOT NULL AND v.venue_latitude_value IS NULL
+                 THEN CAST(ROW('venue_latitude', v.venue_latitude_raw, 'not a number')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.venue_longitude_raw IS NOT NULL AND v.venue_longitude_value IS NULL
+                 THEN CAST(ROW('venue_longitude', v.venue_longitude_raw, 'not a number')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.snapshot_date_raw IS NOT NULL AND v.snapshot_date_value IS NULL
+                 THEN CAST(ROW('snapshot_date', v.snapshot_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

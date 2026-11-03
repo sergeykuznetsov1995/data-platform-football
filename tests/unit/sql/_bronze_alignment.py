@@ -96,6 +96,7 @@ def load_silver_sql(sql_path: Path) -> str:
             fotmob_calendar_scope="TRUE",
             fotmob_payload_scope="TRUE",
             fotmob_season_scope="TRUE",
+            fotmob_entity_scope="TRUE",
         )
     return sql_path.read_text()
 

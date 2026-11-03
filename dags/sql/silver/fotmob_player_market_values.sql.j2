@@ -1,0 +1,96 @@
+-- silver.fotmob_player_market_values — одна оценка рыночной стоимости игрока на дату: элемент
+-- marketValues.values[] карточки игрока (#2019, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_player_market_values)
+-- + README. Глобальная таблица, без партиций. Ключ (player_id, value_date).
+-- Источник — тот же выбранный снимок игрока, что у fotmob_players: player_id varchar -> BIGINT на
+-- входе (пустой/неприводимый -> строка отбрасывается), одна строка на игрока — последняя по
+-- _observed_at, _ingested_at, затем больший _target_batch_id; развёртка values[] — после выбора
+-- снимка. value_date — DATE из первых 10 символов date ('2016-12-31T00:00:00+00:00' -> 2016-12-31);
+-- элемент без разбираемой даты — ошибка ключа, отбрасывается. Две оценки на одну дату (в данных
+-- нет) -> одна, с меньшим номером в values[].
+-- Литерал 'null' / пустая строка в market_values_json (у игрока нет стоимости) -> строк нет.
+-- Суммы — DECIMAL(38,8) из JSON-числа, валюта — из элемента.
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над player_id (BIGINT);
+-- полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(player_id AS BIGINT) AS player_id,
+            market_values_json,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_player_snapshots_current
+    ) s
+    WHERE player_id IS NOT NULL
+      AND (
+        {{ fotmob_entity_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+value_rows AS (
+    SELECT
+        k.*,
+        CASE WHEN regexp_like(k.value_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(k.value_date_raw, 1, 10) AS DATE) END AS value_date
+    FROM (
+        SELECT
+            m.player_id, m._target_batch_id, m._observed_at, m._ingested_at, m._parser_version,
+            CAST(v.value_index AS INTEGER) AS value_index,
+            v.value_j,
+            json_extract_scalar(v.value_j, '$.date') AS value_date_raw
+        FROM (
+            SELECT
+                d.*,
+                TRY_CAST(json_extract(NULLIF(NULLIF(d.market_values_json, 'null'), ''), '$.values')
+                         AS ARRAY(JSON)) AS value_items
+            FROM dedup d
+        ) m
+        CROSS JOIN UNNEST(m.value_items) WITH ORDINALITY AS v(value_j, value_index)
+    ) k
+),
+value_dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            r.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, value_date
+                ORDER BY value_index ASC
+            ) AS value_rn
+        FROM value_rows r
+        WHERE r.value_date IS NOT NULL
+    ) d
+    WHERE value_rn = 1
+)
+SELECT
+    c.player_id,
+    c.value_date,
+    TRY_CAST(json_extract_scalar(c.value_j, '$.value') AS DECIMAL(38,8)) AS market_value,
+    TRY_CAST(json_extract_scalar(c.value_j, '$.lowerBound') AS DECIMAL(38,8)) AS lower_bound,
+    TRY_CAST(json_extract_scalar(c.value_j, '$.upperBound') AS DECIMAL(38,8)) AS upper_bound,
+    json_extract_scalar(c.value_j, '$.currency') AS currency,
+    json_extract_scalar(c.value_j, '$.source') AS value_source,
+    TRY_CAST(json_extract_scalar(c.value_j, '$.teamId') AS BIGINT) AS team_id,
+    json_extract_scalar(c.value_j, '$.teamName') AS team_name,
+    TRY_CAST(json_extract_scalar(c.value_j, '$.isPeriodStart') AS BOOLEAN) AS is_period_start,
+    json_format(c.value_j) AS market_value_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CAST(NULL AS VARCHAR) AS _conform_issues_json
+FROM value_dedup c

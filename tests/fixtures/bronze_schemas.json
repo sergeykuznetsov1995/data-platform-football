@@ -1,8 +1,7 @@
 {
   "snapshot_at": "2026-08-08T15:31:19+00:00",
   "missing_tables": [
-    "fbref_shot_events",
-    "fotmob_transfer_events_current"
+    "fbref_shot_events"
   ],
   "tables": {
     "bronze.capology_contract_extensions": {
@@ -1875,6 +1874,41 @@
         "team_id": "bigint",
         "team_name": "varchar",
         "wins": "bigint"
+      }
+    },
+    "bronze.fotmob_transfer_events_current": {
+      "columns": {
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_observed_at": "timestamp(6)",
+        "_parser_version": "varchar",
+        "_payload_sha256": "varchar",
+        "_raw_uri": "varchar",
+        "_source": "varchar",
+        "_target_batch_id": "varchar",
+        "competition_id": "varchar",
+        "event_year": "bigint",
+        "fee_text": "varchar",
+        "fee_value": "double",
+        "from_club": "varchar",
+        "from_club_full_name": "varchar",
+        "from_club_id": "bigint",
+        "localized_fee_text": "varchar",
+        "market_value": "double",
+        "on_loan": "boolean",
+        "player_id": "bigint",
+        "player_name": "varchar",
+        "position_key": "varchar",
+        "position_label": "varchar",
+        "source_item_index": "bigint",
+        "source_page": "bigint",
+        "to_club": "varchar",
+        "to_club_full_name": "varchar",
+        "to_club_id": "bigint",
+        "transfer_date": "varchar",
+        "transfer_event_id": "varchar",
+        "transfer_type_key": "varchar",
+        "transfer_type_text": "varchar"
       }
     },
     "bronze.fotmob_transfers": {
