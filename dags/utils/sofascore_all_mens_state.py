@@ -790,7 +790,10 @@ def plan_refresh_batch(
     tier plans into the window minus ``debt_reserve_s``; its closing slice
     then closes only the open tier, and the debt tier gets what is left plus
     the reserve (its scopes of seasons with open deadlines take only the
-    passed ones).  Without a reserve the closing slice closes the batch.
+    passed ones).  Without a reserve the closing slice closes the batch.  An
+    open scope also takes its own season's debt when that is at most one
+    allocation (``REFRESH_ALLOCATION_MATCHES``); a bigger debt stays the
+    season's ``--debt`` scope.
     """
 
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
@@ -953,6 +956,7 @@ def plan_refresh_batch(
             (now - max(item[8] for item in fresh_debt)) / 3600,
         )
     entries: list[tuple[tuple, str, int]] = []
+    absorbed: set[tuple[str, str, int]] = set()
     left = None if scope_budget_s is None else scope_budget_s - reserve
     closed = False
     headroom = refresh_timeout_headroom(seconds_per_match)
@@ -1010,7 +1014,17 @@ def plan_refresh_batch(
                 closed = True
                 break
             key = (item[0], item[1], int(item[5]["source_season_id"]))
+            if key in absorbed:
+                continue
             wanted = item[7] if tier == "open" else item[2] - item[7]
+            # #2117: a season's small debt rides in its open scope (the runner
+            # takes the open deadlines first, then the debt, up to the scope's
+            # MAX_MATCHES) instead of waiting for a debt tier the open flood
+            # never left room for; it costs at most one allocation's time.
+            # A bigger debt keeps its own ``--debt`` scope (Astra #1359 r3).
+            absorb = tier == "open" and 0 < item[2] - item[7] <= REFRESH_ALLOCATION_MATCHES
+            if absorb:
+                wanted = item[2]
             fits = _fit(item, min(wanted, scope_capacity))
             if fits is None:
                 # A plan without a reserve keeps every open deadline ahead of
@@ -1020,6 +1034,8 @@ def plan_refresh_batch(
             # A season whose open part the closed open tier did not reach
             # still runs only its passed deadlines here (#2117).
             part = "debt" if tier == "debt" and item[3] is not None else ""
+            if absorb:
+                absorbed.add(key)
             entries.append((item, part, fits))
         if closed:
             break

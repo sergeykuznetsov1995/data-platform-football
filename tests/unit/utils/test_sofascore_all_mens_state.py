@@ -1511,6 +1511,23 @@ def test_refresh_window_keeps_no_reserve_for_stale_debt():
 
 
 @pytest.mark.unit
+def test_refresh_open_scope_absorbs_its_seasons_small_debt():
+    stale = _NOW - 3 * 86400
+    planned = _window_plan([
+        (*_refresh_pending("SS-8", "2627", 22, _NOW + 1_000), 19, 826, stale),
+        (*_refresh_pending("SS-17", "2627", 1_000, _NOW + 2_000), 1, 1726, stale),
+    ], now=_NOW)
+
+    # 3 matches of debt ride in the open scope; 999 keep their own scope
+    # (capped at one task's 2 h: 432 matches).
+    assert _parts(planned) == [
+        ("campaign-test:8:826", False, 22),
+        ("campaign-test:17:1726", False, 1),
+        ("campaign-test:17:1726", True, 432),
+    ]
+
+
+@pytest.mark.unit
 def test_refresh_reserve_does_not_apply_to_backlog_or_refill_sized_budget():
     fresh = [(*_refresh_pending("SS-8", "2526", 50, None), 0, 825, _NOW - 3600),
              (*_refresh_pending("SS-17", "2526", 900, None), 0, 1725, _NOW - 7200)]
