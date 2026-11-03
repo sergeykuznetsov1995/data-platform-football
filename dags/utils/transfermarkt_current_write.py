@@ -557,7 +557,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         if player in cached:
             source = cached[player]
             bundle = run._merge_career_cache_frames(scraper, spec, {},
-                {source['native_key']: source['frame']}, resolved['competition_id'], int(resolved['edition_id']))
+                {source['native_key']: source['frame']}, resolved['compatibility_league'], int(resolved['edition_id']))
             # The current writer commits a new local bundle from verified raw,
             # rather than a scope-runner reference to an old native batch.
             for frame in bundle.values():
@@ -575,7 +575,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
             stop_reason = 'decoded_body_soft_stop'
             break
         try:
-            bundle, authoritative, _ = run._read_frames(scraper, spec, resolved['competition_id'], int(resolved['edition_id']),
+            bundle, authoritative, _ = run._read_frames(scraper, spec, resolved['compatibility_league'], int(resolved['edition_id']),
                 None, 0, [player], mode == 'dual', write_mode=mode,
                 decoded_body_soft_stop_bytes=decoded_body_soft_stop_bytes)
         except CurrentPortionDeadlineExceeded:
@@ -692,7 +692,7 @@ def _write_cached_supersession(scraper, spec, scope, mode, revision, cycle_id, s
     source_frame.attrs = {}
     empty = [player for player in ids if cached[player]['state'][0] in {'authoritative_empty', 'valid_empty'}]
     frames = run._merge_career_cache_frames(scraper, spec, {native.key: source_frame.iloc[:0]},
-        {native.key: source_frame}, scope['competition_id'], int(scope['edition_id']))
+        {native.key: source_frame}, scope['compatibility_league'], int(scope['edition_id']))
     unit = hashlib.sha256(json.dumps({'cycle': cycle_id, 'scope': scope['scope_id'], 'entity': spec.name,
         'sources': {player: cached[player]['raw']['capture_id'] for player in ids}}, sort_keys=True).encode()).hexdigest()[:32]
     scraper._batch_id = unit

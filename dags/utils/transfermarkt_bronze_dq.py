@@ -56,7 +56,8 @@ observability-only and must never gate.
   truths from one crawl) is ERROR (``tm_*_intra_batch_conflicts``);
   identical repeats of the same row are WARNING-only dirt
   (``tm_*_intra_batch_duplicates``) — the deterministic Silver dedup
-  collapses them without information loss.
+  collapses them without information loss.  Legacy ``transfermarkt_transfers``
+  conflicts are WARNING: its key is coarser than the source (#1399).
 - ``tm_bronze_cross_batch_duplicates[*]`` counts identical contract-PK rows
   across ``_batch_id`` values: after the carry-forward fix (issue #948,
   phase F5, ``observed_at`` is carried forward on idempotent re-crawls)
@@ -73,7 +74,10 @@ observability-only and must never gate.
   referencing a historical coach without a profile row is a consequence of
   the bounded crawl policy, not corruption.  Referential strictness stays
   ERROR for attribute/contract observations and market-value/transfer
-  facts against same-scope memberships.
+  facts against same-scope memberships.  A roster write supersedes the
+  scope's membership rows while those facts are appended, so only rows not
+  older than the scope's latest roster write are checked: earlier history of a departed player is
+  not an orphan.
 - ``tm_scope_set_bronze_presence`` vs append-only Bronze: once a scope has
   rows, a later manifest transition ``ok -> authoritative_empty`` makes the
   presence check permanently red — Bronze never deletes, so clearing it is
@@ -683,7 +687,12 @@ def build_membership_orphans_sql(
     pins: Mapping[str, Any] | None = None,
     scope_pairs: Sequence[Sequence[str]] | None = None,
 ) -> str:
-    """Scoped entity rows without their same-scope membership/profile parent."""
+    """Scoped entity rows without their same-scope membership/profile parent.
+
+    Player relations count only rows ingested no earlier than the scope's
+    latest membership write: older appended history of a player who has
+    since left the replaced roster is legitimate, not an orphan.
+    """
 
     memberships = _pinned(MEMBERSHIPS_BRONZE_TABLE, pins)
     comp, ed = _entity_scope_columns(table)
@@ -692,6 +701,20 @@ def build_membership_orphans_sql(
         scoped = _scope_pairs_predicate(table, scope_pairs, alias='b')
     else:
         scoped = f'b.{comp} IS NOT NULL\n  AND b.{ed} IS NOT NULL'
+    roster = ''
+    if table in _MEMBERSHIP_CLUB_COLUMNS or table in _MEMBERSHIP_PLAYER_TABLES:
+        # A roster write supersedes the scope's memberships, history is
+        # appended: only rows not older than the scope's latest roster write
+        # can miss their membership.
+        roster = f"""
+LEFT JOIN (
+    SELECT competition_id, edition_id, MAX(_ingested_at) AS roster_at
+    FROM {memberships}
+    GROUP BY competition_id, edition_id
+) r
+  ON r.competition_id = b.{comp}
+ AND r.edition_id = b.{ed}"""
+        scoped += '\n  AND (r.roster_at IS NULL OR b._ingested_at >= r.roster_at)'
     if table in _MEMBERSHIP_CLUB_COLUMNS:
         own_club, member_club = _MEMBERSHIP_CLUB_COLUMNS[table]
         exists = f"""SELECT 1
@@ -713,7 +736,7 @@ def build_membership_orphans_sql(
     else:
         raise ValueError(f'{table}: no membership-orphan contract')
     return f"""SELECT COUNT(*)
-FROM {_pinned(table, pins)} b
+FROM {_pinned(table, pins)} b{roster}
 WHERE {scoped}
   AND NOT EXISTS (
       {exists}
@@ -1019,8 +1042,9 @@ def run_bronze_dq(
 
     def run_intra_batch_split(
         prefix: str, table: str, sqls: Sequence[str],
+        conflict_severity: str = 'ERROR',
     ) -> None:
-        """Split queries -> ERROR (conflicts) + WARNING (identical) results."""
+        """Split queries -> conflict_severity (conflicts) + WARNING (identical) results."""
 
         display = _display(table)
         try:
@@ -1050,7 +1074,7 @@ def run_bronze_dq(
             results.append(BronzeCheckResult(
                 name=f'{prefix}_intra_batch_conflicts[{display}]',
                 kind=f'{prefix.removeprefix("tm_")}_intra_batch_conflicts',
-                severity='ERROR', passed=False, error=str(exc),
+                severity=conflict_severity, passed=False, error=str(exc),
             ))
             results.append(BronzeCheckResult(
                 name=f'{prefix}_intra_batch_duplicates[{display}]',
@@ -1061,7 +1085,7 @@ def run_bronze_dq(
         results.append(BronzeCheckResult(
             name=f'{prefix}_intra_batch_conflicts[{display}]',
             kind=f'{prefix.removeprefix("tm_")}_intra_batch_conflicts',
-            severity='ERROR', passed=conflicts == 0,
+            severity=conflict_severity, passed=conflicts == 0,
             details=f'{conflicts} conflicting duplicate groups',
             value=conflicts,
         ))
@@ -1088,9 +1112,13 @@ def run_bronze_dq(
                 )),
             )
         for table in LEGACY_BRONZE_KEYS:
+            # The legacy transfer key is coarser than the source (see
+            # CAREER_WRITE_TABLE_KEYS, #1399; frozen by #1409).
             run_intra_batch_split(
                 'tm_legacy', table,
                 [build_legacy_intra_batch_duplicates_sql(table, pins=pins)],
+                'WARNING' if table == 'iceberg.bronze.transfermarkt_transfers'
+                else 'ERROR',
             )
 
     if zone == 'legacy':

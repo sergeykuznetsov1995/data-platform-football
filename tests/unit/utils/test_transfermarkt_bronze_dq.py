@@ -47,6 +47,9 @@ def _default_rows(sql: str):
         return [(10253,)]
     if 'duplicate_keys' in sql or 'WITH capture_references AS' in sql:
         return [(0,)]
+    if 'roster_at' in sql:
+        # Membership-orphan scalar joins a grouped latest-roster subquery.
+        return [(0,)]
     if 'GROUP BY' in sql:
         return []
     return [(0,)]
@@ -346,6 +349,21 @@ def test_intra_batch_conflicts_gate_only_on_conflicting_payload():
     assert not identical.passed and identical.value == 5
 
 
+def test_legacy_transfer_conflicts_are_warning_only():
+    # Legacy transfer key is coarser than the source (#1399): two real
+    # transfers may share date and clubs, so conflicts there never gate.
+    cur = StubCursor(overrides=[(
+        lambda sql: 'payload_variants' in sql and 'FROM iceberg.bronze.transfermarkt_' in sql, [(2, 0)],
+    )])
+    results = dq.run_bronze_dq(
+        cur, registry_snapshot_id='snap-1', zone='legacy', legacy_allowlist=[],
+    )
+    conflicts = {r.name: r.severity for r in results
+                 if r.name.startswith('tm_legacy_intra_batch_conflicts')}
+    assert conflicts.pop('tm_legacy_intra_batch_conflicts[transfermarkt_transfers]') == 'WARNING'
+    assert set(conflicts.values()) == {'ERROR'} and len(conflicts) == 3
+
+
 def test_cross_batch_duplicates_are_warning_only():
     cur = StubCursor(overrides=[(
         lambda sql: 'COUNT(DISTINCT _batch_id) > 1' in sql,
@@ -408,6 +426,45 @@ def test_coach_stint_orphans_are_warning_only():
     assert all(r.severity == 'ERROR' for r in orphans.values())
     assert len(orphans) == 4
     assert dq.BronzeDqReport(results).errors == []
+
+
+@pytest.mark.parametrize('table', [ATTR_OBS, MV_POINTS])
+def test_membership_orphans_skip_history_older_than_current_roster(table):
+    import duckdb
+    import sqlglot
+    from sqlglot import exp
+
+    sql = dq.build_membership_orphans_sql(table)
+    # Equi-join on both scope columns keeps it a hash join in Trino (#1971).
+    comp, ed = dq._entity_scope_columns(table)
+    assert 'MAX(_ingested_at) AS roster_at' in sql
+    assert f'ON r.competition_id = b.{comp}\n AND r.edition_id = b.{ed}' in sql
+    assert 'IS NOT DISTINCT FROM' not in sql
+    club = 'club_id' if table == ATTR_OBS else None
+    with duckdb.connect() as conn:
+        conn.execute('CREATE TABLE m (competition_id VARCHAR, edition_id VARCHAR, club_id VARCHAR, '
+                     'player_id VARCHAR, _ingested_at TIMESTAMP)')
+        conn.execute(f'CREATE TABLE b ({comp} VARCHAR, {ed} VARCHAR, '
+                     + ('club_id VARCHAR, ' if club else '')
+                     + 'player_id VARCHAR, _ingested_at TIMESTAMP)')
+        # Current roster of GB1/2026 was rewritten at 10:00 without player 2.
+        conn.execute("INSERT INTO m VALUES ('GB1', '2026', 'c', '1', '2026-11-02 10:00')")
+        rows = [
+            ('GB1', '2026', '1', '2026-11-02 11:00'),  # member: fine
+            ('GB1', '2026', '2', '2026-11-01 09:00'),  # departed history: not an orphan
+            ('GB1', '2026', '3', '2026-11-02 11:00'),  # newer than roster, no member: orphan
+            ('ES1', '2026', '4', '2026-11-01 09:00'),  # scope without any roster: orphan
+        ]
+        for c, e, player, at in rows:
+            values = [c, e, *(['c'] if club else []), player, at]
+            conn.execute('INSERT INTO b VALUES (' + ', '.join('?' for _ in values) + ')', values)
+        expression = sqlglot.parse_one(sql, read='trino')
+        for relation in expression.find_all(exp.Table):
+            name = 'm' if relation.name == dq.MEMBERSHIPS_BRONZE_TABLE.rsplit('.', 1)[1] else 'b'
+            relation.set('catalog', None)
+            relation.set('db', None)
+            relation.set('this', exp.to_identifier(name))
+        assert conn.execute(expression.sql(dialect='duckdb')).fetchone() == (2,)
 
 
 def test_partial_scope_rows_fail_closed():
