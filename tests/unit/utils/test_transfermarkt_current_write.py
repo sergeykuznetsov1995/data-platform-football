@@ -614,6 +614,42 @@ def test_baseline_verifier_detects_old_source_timestamp_changed_within_day(scrap
         current.verify_current_roster_baseline(scraper, committed(original, receipt), [receipt], PREFLIGHT)
 
 
+def _append_old_scope_batch(scraper, receipt, batch_id='old-batch', **changes):
+    # #2068: a scope batch the replace did not delete stays beside the receipt batch.
+    tables = [proof['table'].rsplit('.', 1)[-1] for key, proof in receipt['outputs'].items()
+              if key != 'attribute_observations' and proof['rows']]
+    for table in tables:
+        _table(scraper, table).assign(_batch_id=batch_id, **changes).to_sql(
+            table, scraper.test_db.sql, if_exists='append', index=False)
+    return tables
+
+
+def test_baseline_verifier_reads_only_receipt_batch_of_a_multi_batch_scope(scraper):
+    original = snapshot(changed=('10', '20'))
+    receipt = current.write_current_roster(scraper, original, PREFLIGHT, 'same-cycle')
+    assert {'transfermarkt_squad_memberships', 'transfermarkt_players'} <= set(_append_old_scope_batch(scraper, receipt))
+    assert current.verify_current_roster_baseline(scraper, committed(original, receipt), [receipt], PREFLIGHT)['verified']
+
+
+def test_baseline_verifier_rejects_scope_batch_newer_than_receipt(scraper):
+    original = snapshot(changed=('10', '20'))
+    receipt = current.write_current_roster(scraper, original, PREFLIGHT, 'same-cycle')
+    newer = (pd.Timestamp(receipt['committed_at']) + pd.Timedelta(hours=1)).tz_convert('UTC').tz_localize(None)
+    _append_old_scope_batch(scraper, receipt, batch_id='new-batch', _ingested_at=newer.isoformat(timespec='microseconds'))
+    with pytest.raises(current.CurrentWriteError, match='superseded by a newer scope batch'):
+        current.verify_current_roster_baseline(scraper, committed(original, receipt), [receipt], PREFLIGHT)
+
+
+def test_baseline_verifier_still_detects_changed_receipt_batch_beside_old_batch(scraper):
+    original = snapshot(changed=('10', '20'))
+    receipt = current.write_current_roster(scraper, original, PREFLIGHT, 'same-cycle')
+    _append_old_scope_batch(scraper, receipt)
+    scraper.test_db.sql.execute("UPDATE transfermarkt_squad_memberships SET fetched_at = '2026-10-08T02:00:00.000000' "
+                                "WHERE club_id = '20' AND _batch_id <> 'old-batch'")
+    with pytest.raises(current.CurrentWriteError, match='physical checksum differs'):
+        current.verify_current_roster_baseline(scraper, committed(original, receipt), [receipt], PREFLIGHT)
+
+
 def test_json_roundtrip_restores_date_arrow_schema_nullable_numbers_and_nulls(scraper):
     import pyarrow as pa
     from datetime import date

@@ -180,7 +180,8 @@ def test_old_unfinished_capture_is_reparsed_before_new_write(tmp_path, monkeypat
     assert result.clubs['10'].rows[0]['contract_until'] is None
 
 
-def test_current_cycle_rejects_two_known_conflicting_dates(tmp_path, monkeypatch):
+def test_current_cycle_keeps_squad_date_when_tmapi_date_differs(tmp_path, monkeypatch):
+    # #2068 (03.11): the contract is the squad page's field; tmapi does not prove it.
     from tests.unit.scripts import test_run_transfermarkt_current as fixtures
     offline = fixtures.Offline(tmp_path, monkeypatch)
     offline.run('cold')
@@ -195,14 +196,17 @@ def test_current_cycle_rejects_two_known_conflicting_dates(tmp_path, monkeypatch
     offline.clock.advance(21 * 3600)
     offline.run('conflict')
     offline.run('conflict-apply')
-    assert len(offline.writes) == initial_writes
-    assert any('source_mismatch' in line for line in offline.sql)
+    assert len(offline.writes) > initial_writes
+    assert not any('source_mismatch' in line for line in offline.sql)
+    row = next(row for row in offline.writes[-1].rows if row['player_id'] == '110')
+    assert str(row['contract_until']) == '2029-06-30'
 
 
-@pytest.mark.parametrize('html_contract,api_contract', [
-    ('bad date', '2028-06-30'), ('Jun 30, 2028', None),
+@pytest.mark.parametrize('html_contract,api_contract,written', [
+    ('bad date', '2028-06-30', 'None'), ('Jun 30, 2028', None, '2028-06-30'),
 ])
-def test_current_cycle_rejects_contract_null_mismatch(tmp_path, monkeypatch, html_contract, api_contract):
+def test_current_cycle_writes_squad_contract_despite_null_mismatch(tmp_path, monkeypatch, html_contract,
+                                                                   api_contract, written):
     from tests.unit.scripts import test_run_transfermarkt_current as fixtures
     offline = fixtures.Offline(tmp_path, monkeypatch)
     offline.squad_players['10'] = ['110', '111']
@@ -229,8 +233,9 @@ def test_current_cycle_rejects_contract_null_mismatch(tmp_path, monkeypatch, htm
     offline.clock.advance(21 * 3600)
     offline.run('contract-change')
     report = offline.run('contract-apply')
-    assert len(offline.writes) == initial_writes
+    assert len(offline.writes) > initial_writes
     state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
-    assert state['status'] == 'failed' and 'source_mismatch' in state['result']
-    assert state['applied_signature'] != state['observation']['signature']
-    assert any('source_mismatch' in item.get('error', '') for item in report['scopes'])
+    assert state['status'] == 'applied'
+    assert not any('source_mismatch' in item.get('error', '') for item in report['scopes'])
+    row = next(row for row in offline.writes[-1].rows if row['player_id'] == '110')
+    assert str(row['contract_until']) == written

@@ -90,6 +90,7 @@ class Offline:
         self.assignment_override = {}
         self.mv_payloads = {}
         self.unpriced_players = set()
+        self.player_contracts = {}
         from tests.unit.scrapers.test_transfermarkt_signal_qualification import qualified_fixture
         self.qualification = qualified_fixture(tmp_path)
         monkeypatch.delenv('TM_PROXY_CONTROL_URL', raising=False)
@@ -120,6 +121,8 @@ class Offline:
                         outer.clock.advance(2330)
                         outer.stop_after_first_packet = False
                     for row in value['data']:
+                        if row['id'] in outer.player_contracts:
+                            row['attributes']['contractUntil'] = outer.player_contracts[row['id']]
                         if row['id'] in outer.unpriced_players:
                             row['marketValueDetails'] = None
                         if row['marketValueDetails'] is not None:
@@ -1284,6 +1287,58 @@ def test_lagging_squad_cannot_ack_player_change_and_only_bad_club_is_refetched(o
     assert not any('/kader/verein/20/' in url for _, url in offline.calls)
     state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
     assert state['status'] == 'applied'
+
+
+@pytest.mark.parametrize('contract', [None, '2027-06-30'])
+def test_tmapi_contract_disagreeing_with_squad_page_does_not_block_player_change(offline, contract):
+    # #2068: the contract is the squad page's field; tmapi still triggers the refetch.
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    offline.player_contracts['110'] = contract
+    offline.clock.advance(21 * 3600)
+    offline.calls.clear()
+    report = offline.run('contract')
+    offline.run('contract-continue')
+    assert sum('/kader/verein/10/' in url for _, url in offline.calls) == 1
+    assert not any('source_mismatch' in item.get('error', '') for item in report['scopes'])
+    state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
+    assert state['status'] == 'applied'
+
+
+def test_contract_difference_does_not_hide_value_mismatch_and_failed_signal_recovers(offline):
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    offline.player_contracts['110'] = None
+    offline.player_values['110'] = 2000000
+    offline.clock.advance(21 * 3600)
+    offline.run('api-ahead')
+    offline.run('api-ahead-continue')
+    state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
+    assert state['status'] == 'failed' and 'source_mismatch' in state['result']
+    # The failed signal stays pending: once the page shows the value, the
+    # remaining contract difference no longer blocks its apply_change.
+    offline.squad_values['10'] = '€2.0m'
+    offline.run('html-current')
+    offline.run('html-current-continue')
+    state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
+    assert state['status'] == 'applied'
+
+
+@pytest.mark.parametrize('contract', [None, '2027-06-30'])
+def test_first_sample_with_only_contract_difference_is_baseline(offline, contract):
+    offline.player_contracts['110'] = contract
+    offline.run('cold')
+    offline.calls.clear()
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    assert not any('/kader/' in url for _, url in offline.calls)
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['signals']['player:110']['result'] == 'baseline_verified'
 
 
 def test_warm_same_value_unknown_or_changed_native_date_queues_only_mv(offline):

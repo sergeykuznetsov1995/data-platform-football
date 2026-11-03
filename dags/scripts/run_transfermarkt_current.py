@@ -952,7 +952,6 @@ class _Scope:
                         self.data.get('roster_proof')
                         and signal_roster_clubs == memberships[player_id]
                         and all(tmapi.normalize_market_value(row.get('market_value_eur')) == tmapi.normalize_market_value(signal.market_value_eur)
-                                and (national or (str(row['contract_until']) if row.get('contract_until') is not None else None) == signal.contract_until)
                                 and (row.get('market_value_date') is None or str(row['market_value_date']) == signal.market_value_date)
                                 for row in player_rows))
                     if comparable_matches:
@@ -1134,11 +1133,10 @@ class _Scope:
             memberships = {row['club_id'] for row in rows}
             expected = set(values['club_ids']) & set(snapshot.expected_team_ids)
             changed = memberships if national else memberships | expected
+            # Contract is the squad page's field (supplement_contracts); tmapi does not prove it (#2068).
             inconsistent = (not national and memberships != expected) or any(
                 tmapi.normalize_market_value(row['market_value_eur']) != tmapi.normalize_market_value(values['market_value_eur'])
-                or (not national and str(row['contract_until']) != str(values['contract_until'])
-                    and not (row['contract_until'] is None
-                             and row.get('_contract_status') in {'unknown', 'not_rendered'})) for row in rows)
+                for row in rows)
             if inconsistent:
                 mismatches.update(changed)
                 failed.append((key, mark_failed(state, 'source_mismatch: tmapi and complete squad fields disagree')))

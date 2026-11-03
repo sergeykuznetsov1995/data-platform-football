@@ -945,17 +945,29 @@ def verify_current_roster_baseline(scraper, snapshot: FullRosterSnapshot, receip
             predicate, params = 'league = ? AND season = ?', [scope['compatibility_league'], scope['canonical_season']]
         else:
             predicate, params = 'competition_id = ? AND edition_id = ?', [scope['competition_id'], scope['edition_id']]
+        newer = None
+        if proof.get('batch_id'):
+            # #2068: a scope replace must delete older rows, but in production it sometimes
+            # does not (separate bug). Until fixed, verify the receipt's own batch and refuse
+            # any other batch of the scope ingested after the receipt.
+            newer = (f'SELECT MAX(_ingested_at) FROM {proof["table"]} WHERE {predicate} AND _batch_id <> ?',
+                     params + [str(proof['batch_id'])])
+            predicate, params = predicate + ' AND _batch_id = ?', params + [str(proof['batch_id'])]
         try:
             proof_columns = proof.get('columns', [column for column in frame.columns if column not in _LATE_ROSTER_COLUMNS])
             if (not isinstance(proof_columns, list) or len(proof_columns) != len(set(proof_columns))
                     or set(proof_columns) - set(frame.columns) - {'first_seen_at'}):
                 raise CurrentWriteError('retained output physical columns differ from contract')
             physical = run._query_dataframe(conn, f'SELECT {", ".join(proof_columns)} FROM {proof["table"]} WHERE {predicate}', params)
+            newest = run._query_dataframe(conn, *newer).iloc[0, 0] if newer else None
         except Exception as exc:
             if frame.empty and any(marker in str(exc).lower() for marker in ('table_not_found', 'table not found', 'does not exist')):
-                physical = frame
+                physical, newest = frame, None
             else:
                 raise CurrentWriteError('retained full-roster output is unavailable') from exc
+        if (newest is not None and not pd.isna(newest)
+                and pd.Timestamp(_cell('_ingested_at', newest)) > pd.Timestamp(_cell('_ingested_at', latest['committed_at']))):
+            raise CurrentWriteError('retained full-roster superseded by a newer scope batch')
         covered = _receipt_columns(proof_columns, frame)
         digest = hashlib.sha256(json.dumps(_rows(physical), sort_keys=True).encode()).hexdigest()
         if len(physical) != proof['rows'] or digest != proof['physical_hash']:
