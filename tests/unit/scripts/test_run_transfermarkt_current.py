@@ -1307,7 +1307,7 @@ def test_tmapi_contract_disagreeing_with_squad_page_does_not_block_player_change
     assert state['status'] == 'applied'
 
 
-def test_contract_difference_does_not_hide_value_mismatch(offline):
+def test_contract_difference_does_not_hide_value_mismatch_and_failed_signal_recovers(offline):
     offline.run('cold')
     offline.clock.advance(21 * 3600)
     offline.run('baseline')
@@ -1319,6 +1319,13 @@ def test_contract_difference_does_not_hide_value_mismatch(offline):
     offline.run('api-ahead-continue')
     state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
     assert state['status'] == 'failed' and 'source_mismatch' in state['result']
+    # The failed signal stays pending: once the page shows the value, the
+    # remaining contract difference no longer blocks its apply_change.
+    offline.squad_values['10'] = '€2.0m'
+    offline.run('html-current')
+    offline.run('html-current-continue')
+    state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
+    assert state['status'] == 'applied'
 
 
 @pytest.mark.parametrize('contract', [None, '2027-06-30'])
