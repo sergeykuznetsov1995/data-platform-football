@@ -100,6 +100,15 @@ class CurrentPortionDeadlineExceeded(RuntimeError):
     """End a current work portion without treating its tail as a source failure."""
 
 
+class LeaseConcurrencyLimited(ProxyRequiredError):
+    """The gateway kept refusing a lease because the stream slot is busy."""
+
+
+# #2068: a lease left over from the previous portion frees the slot only when
+# it expires; wait briefly, then give the portion back instead of churning.
+_LEASE_CONCURRENCY_RETRY_DELAYS = (2.0, 5.0, 10.0, 15.0, 15.0)
+
+
 class SourceStreamPaused(CurrentPortionDeadlineExceeded):
     """A known site cooldown defers work; it is not a platform incident."""
 
@@ -408,6 +417,10 @@ class ProxyFilterLeaseProvider:
         payload: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         status, body = self._exchange(method, path, token=token, payload=payload)
+        return self._accepted(method, path, status, body)
+
+    @staticmethod
+    def _accepted(method: str, path: str, status: int, body: Any) -> Mapping[str, Any]:
         if status < 200 or status >= 300 or not isinstance(body, dict):
             error = redact_sensitive(
                 body.get("error", "unknown error")
@@ -553,7 +566,21 @@ class ProxyFilterLeaseProvider:
         from .history_portion import reconcile_leases, journal_lease
         scope = str(metadata.get('scope') or metadata.get('scope_id') or '')
         reconcile_leases(self, scope)
-        body = self._request("POST", "/v1/leases", payload=request)
+        for delay in (*_LEASE_CONCURRENCY_RETRY_DELAYS, None):
+            status, body = self._exchange("POST", "/v1/leases", payload=request)
+            if not (status == 429 and isinstance(body, dict) and body.get("code") == "concurrency_limited"):
+                break
+            if delay is None or (
+                self.request_deadline_monotonic is not None
+                and delay >= self.request_deadline_monotonic - self._monotonic()
+                - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS
+            ):
+                raise LeaseConcurrencyLimited(
+                    "proxy lease API rejected POST /v1/leases (HTTP 429): "
+                    f"{redact_sensitive(body.get('error', 'concurrency_limited'))}"
+                )
+            self._sleep(delay)
+        body = self._accepted("POST", "/v1/leases", status, body)
         try:
             lease = ProxyLease(
                 lease_id=str(body["id"]),

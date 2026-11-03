@@ -4,10 +4,12 @@ from datetime import datetime, timezone
 import pytest
 
 from scrapers.transfermarkt.client import (
-    CurrentPortionDeadlineExceeded, ProxyFilterLeaseProvider, SourceStreamPaused,
+    CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited, ProxyFilterLeaseProvider, SourceStreamPaused,
     TransfermarktHttpClient,
 )
-from scrapers.transfermarkt.models import LeaseTrafficSnapshot, ProxyLease, SharedTrafficLedger, TrafficMeterError
+from scrapers.transfermarkt.models import (
+    LeaseTrafficSnapshot, ProxyLease, ProxyRequiredError, SharedTrafficLedger, TrafficMeterError,
+)
 from scrapers.transfermarkt.raw_store import RawResponseStore
 from tests.unit.scrapers.test_transfermarkt_traffic import _ClientFactory, _FakeResp, _manager
 from tests.unit.scrapers.test_transfermarkt_proxy_transport_v2 import (
@@ -344,3 +346,56 @@ def test_current_lease_not_acquired_in_portion_tail():
     with pytest.raises(CurrentPortionDeadlineExceeded, match='lease acquire'):
         instance._ensure_client(url=URL, label='squad', context={}, retry=False)
     assert provider.acquired == []
+
+
+BUSY = {'code': 'concurrency_limited', 'error': 'lease concurrency limit reached'}
+GRANT = dict(id='lease', token='lease-secret', proxy_url='http://gateway:8900', max_bytes=1000, expires_at=1000)
+
+
+def lease_provider(clock, responses, deadline=None):
+    control = _ControlClient([_ControlResponse(*response) for response in responses])
+    provider = ProxyFilterLeaseProvider(
+        'http://control.invalid', control_client=control, control_token='x' * 32,
+        request_deadline_monotonic=deadline, monotonic_fn=clock.read,
+        time_fn=clock.read, sleep_fn=clock.sleep,
+    )
+    return provider, control
+
+
+def acquire(provider):
+    return provider.acquire(max_bytes=1000, ttl_seconds=60, metadata={**_metadata(), 'canonical_url': URL})
+
+
+def test_lease_waits_out_a_busy_stream_slot():
+    clock = Clock()
+    provider, control = lease_provider(clock, [(429, BUSY), (429, BUSY), (201, GRANT)])
+    assert acquire(provider).lease_id == 'lease'
+    assert clock.sleeps == [2.0, 5.0]
+    assert len(control.calls) == 3
+
+
+def test_lease_slot_busy_past_retries_is_concurrency_limited():
+    clock = Clock()
+    provider, control = lease_provider(clock, [(429, BUSY)] * 6)
+    with pytest.raises(LeaseConcurrencyLimited, match='HTTP 429'):
+        acquire(provider)
+    assert clock.sleeps == [2.0, 5.0, 10.0, 15.0, 15.0]
+    assert len(control.calls) == 6
+
+
+def test_lease_slot_busy_near_portion_tail_gives_up_without_sleep():
+    clock = Clock()
+    provider, control = lease_provider(clock, [(429, BUSY)], deadline=37)
+    with pytest.raises(LeaseConcurrencyLimited):
+        acquire(provider)
+    assert clock.sleeps == []
+    assert len(control.calls) == 1
+
+
+def test_other_lease_refusal_is_not_retried():
+    clock = Clock()
+    provider, _ = lease_provider(clock, [(429, {'code': 'budget_exceeded', 'error': 'budget'})])
+    with pytest.raises(ProxyRequiredError) as caught:
+        acquire(provider)
+    assert not isinstance(caught.value, LeaseConcurrencyLimited)
+    assert clock.sleeps == []
