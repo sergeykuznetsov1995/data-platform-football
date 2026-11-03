@@ -274,6 +274,33 @@ def test_1291_team_json_fragment_preserves_source_scalar(value):
     assert row["history_json"] == value
 
 
+def test_2138_team_venue_capacity_and_page_url_from_real_paths():
+    # Shape of /api/teams?id=8643 (03.11.2026): capacity only in venue.statPairs,
+    # details carry seopath and no pageUrl.
+    payload = {
+        "details": {"id": 8643, "name": "Spartak Moscow", "country": "RUS",
+                    "seopath": "spartak-moscow"},
+        "overview": {"venue": {
+            "widget": {"name": "Lukoil Arena", "location": ["55.81", "37.44"],
+                       "city": "Moskva"},
+            "statPairs": [["Surface", "Grass"], ["Capacity", 45360], ["Opened", 2014]],
+        }},
+    }
+    row, _, _ = FotMobIngestService._team_rows(
+        8643, payload, datetime(2026, 11, 3, tzinfo=timezone.utc),
+    )
+    assert row["venue_capacity"] == "45360"
+    assert row["page_url"] == "/teams/8643/overview/spartak-moscow"
+    assert (row["venue_name"], row["venue_city"]) == ("Lukoil Arena", "Moskva")
+
+    del payload["details"]["seopath"]
+    payload["overview"]["venue"]["statPairs"] = [["Surface", "Grass"]]
+    row, _, _ = FotMobIngestService._team_rows(
+        8643, payload, datetime(2026, 11, 3, tzinfo=timezone.utc),
+    )
+    assert row["venue_capacity"] is None and row["page_url"] is None
+
+
 def _competition_payload(
     competition_id,
     name,

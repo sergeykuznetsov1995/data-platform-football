@@ -3058,16 +3058,28 @@ class FotMobIngestService:
         )
         overview_value = payload.get("overview")
         overview = overview_value if isinstance(overview_value, Mapping) else {}
-        venue = (overview.get("venue") or {}).get("widget") or {}
+        venue_root = overview.get("venue") or {}
+        venue = venue_root.get("widget") or {}
+        # FotMob gives capacity only as a statPairs entry, e.g. ["Capacity", 45360].
+        stat_pairs = venue_root.get("statPairs")
+        venue_capacity = next(
+            (pair[1] for pair in (stat_pairs if isinstance(stat_pairs, list) else [])
+             if isinstance(pair, list) and len(pair) == 2 and pair[0] == "Capacity"),
+            None,
+        )
+        # Team details carry only the slug; build the same relative path FotMob
+        # uses for teams elsewhere (/teams/<id>/overview/<seopath>).
+        seopath = details.get("seopath")
         snapshot_date = observed_at.date().isoformat()
         team_row = {
             "team_id": str(team_id),
             "team_name": details.get("name") or overview.get("name"),
             "country_code": details.get("country") or details.get("countryCode"),
-            "page_url": details.get("pageUrl"),
+            "page_url": f"/teams/{team_id}/overview/{seopath}" if seopath else None,
             "venue_name": venue.get("name"),
             "venue_city": venue.get("city"),
-            "venue_capacity": venue.get("capacity"),
+            # Bronze column is VARCHAR; keep the source number as its text.
+            "venue_capacity": None if venue_capacity is None else str(venue_capacity),
             "details_json": details,
             "overview_json": overview_value,
             "history_json": payload.get("history"),

@@ -7,8 +7,8 @@
 -- _ingested_at, затем больший _target_batch_id.
 -- venue_capacity (varchar) -> INTEGER через DOUBLE, только целое; venue_latitude/longitude — строки
 -- overview.venue.widget.location[0|1] -> DOUBLE; snapshot_date — DATE из первых 10 символов;
--- неразбор -> NULL + _conform_issues_json. venue_capacity и page_url в bronze сейчас пусты у всех
--- команд (парсер bronze читает пути, которых FotMob не отдаёт) — здесь NULL без записи.
+-- неразбор -> NULL + _conform_issues_json. venue_capacity и page_url bronze берёт из
+-- overview.venue.statPairs и details.seopath (#2138); снимки до починки — NULL без записи.
 -- Литерал 'null' в bronze (секция FotMob = null) -> NULL в сыром остатке.
 -- Pure SELECT: CREATE OR REPLACE добавляет раннер.
 -- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над team_id (BIGINT);
