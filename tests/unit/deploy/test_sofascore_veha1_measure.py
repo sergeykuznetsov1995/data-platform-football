@@ -126,3 +126,11 @@ def test_status_debt_parses_double_start_timestamp(monkeypatch):
     rows = measure.status_debt(now)
     assert int(rows[0][1]) == start
     db.close()
+
+
+@pytest.mark.parametrize("name", ["observe", "closure", "unmarked", "c1"])
+def test_sql_templates_ship_with_the_measurer(name):
+    # Шаблоны жили только в /root/watchdog/tools/ — из релиза измеритель падал FileNotFoundError.
+    sql = measure._sql(name, since="1", until="2", terminal="'success'", ids="'1'", statuses="'notstarted'")
+    assert "__sentinel__" in sql and "{" not in sql
+    assert len((measure.TOOLS / "sofascore_veha1_c1_noncore.txt").read_text().split()) == 211

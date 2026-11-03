@@ -19,6 +19,7 @@
 Матч → турнир: партиция SS-<id> (полоса SS) или tournament_unique_tournament_id расписания
 для партиций реестра дейли (ENG-… и т. п., полоса daily). Trino — только trino-ro.sh.
 Пишет только в /root/watchdog/state/sofascore_veha1/.
+SQL-шаблоны sofascore_veha1_*.sql и sofascore_veha1_c1_noncore.txt лежат рядом в deploy/sofascore/.
 """
 from __future__ import annotations
 
