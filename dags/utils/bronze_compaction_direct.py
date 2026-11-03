@@ -13,6 +13,7 @@ import tempfile
 import time
 
 from utils import bronze_compaction as compaction
+from utils.maintenance_window import WINDOW_START_HOUR_UTC
 
 
 def _now():
@@ -93,7 +94,12 @@ def _load(path, tables, window):
 
 
 def _maintenance_ready(dsn, now):
-    """The scheduled daily for this night must have finished; fail closed."""
+    """No maintenance DAG may run, and tonight's in-window daily (if scheduled)
+    must have finished; fail closed.
+
+    Until the 00:00 UTC schedule is delivered, the production daily still runs
+    at 02:00 UTC (after the window), so a missing in-window run admits.
+    """
     import psycopg2
 
     conn = psycopg2.connect(
@@ -104,15 +110,15 @@ def _maintenance_ready(dsn, now):
         conn.set_session(readonly=True, autocommit=True)
         with conn.cursor() as cursor:
             logical_date = (now - timedelta(days=1)).replace(
-                hour=2, minute=0, second=0, microsecond=0
+                hour=WINDOW_START_HOUR_UTC, minute=0, second=0, microsecond=0
             )
             cursor.execute(
                 "SELECT NOT EXISTS (SELECT 1 FROM public.dag_run "
                 "WHERE dag_id IN ('dag_iceberg_maintenance_daily', "
                 "'dag_iceberg_maintenance') AND state = 'running') "
-                "AND EXISTS (SELECT 1 FROM public.dag_run "
+                "AND NOT EXISTS (SELECT 1 FROM public.dag_run "
                 "WHERE dag_id = 'dag_iceberg_maintenance_daily' "
-                "AND execution_date = %s AND state IN ('success', 'failed'))",
+                "AND execution_date = %s AND state NOT IN ('success', 'failed'))",
                 (logical_date,),
             )
             return cursor.fetchone()[0] is True

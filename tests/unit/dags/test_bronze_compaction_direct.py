@@ -18,9 +18,9 @@ from utils import bronze_compaction_direct as direct
 
 @pytest.fixture
 def host(tmp_path, monkeypatch):
-    now = datetime(2026, 10, 28, 2, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 28, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(direct, "_now", lambda: now)
-    monkeypatch.setattr(compaction, "nightly_deadline", lambda: now.replace(hour=5))
+    monkeypatch.setattr(compaction, "nightly_deadline", lambda: now.replace(hour=2))
     # The executor's watchdog uses wall time independently of the driver clock.
     monkeypatch.setattr(compaction.time, "time", lambda: now.timestamp())
     for key in ("TRINO_USER", "TRINO_PASSWORD", "FBREF_CONTROL_DB_URI"):
@@ -55,7 +55,7 @@ def host(tmp_path, monkeypatch):
     args = SimpleNamespace(table=["espn_match"], apply=True, portions=2, bytes=1000,
                            state_file=tmp_path / "state.json", journal=tmp_path / "journal",
                            stop_file=tmp_path / "stop")
-    return args, now.replace(hour=5), connections, alters, offsets
+    return args, now.replace(hour=2), connections, alters, offsets
 
 
 def summary(args):
@@ -71,9 +71,9 @@ def test_apply_restart_budget_and_next_night_keep_positions(host, monkeypatch):
     assert len(alters) == 2
     assert summary(args)["stop_reason"] == "budget"
     tomorrow = deadline + timedelta(days=1)
-    monkeypatch.setattr(direct, "_now", lambda: tomorrow.replace(hour=2))
+    monkeypatch.setattr(direct, "_now", lambda: tomorrow.replace(hour=0))
     monkeypatch.setattr(compaction, "nightly_deadline", lambda: tomorrow)
-    monkeypatch.setattr(compaction.time, "time", lambda: tomorrow.replace(hour=2).timestamp())
+    monkeypatch.setattr(compaction.time, "time", lambda: tomorrow.replace(hour=0).timestamp())
     assert direct.run_direct(args, tomorrow) == 0
     assert offsets == [None, "32", "64", "96"]
     assert all(c == dict(host="127.0.0.1", port=8082) for c in connections)
@@ -199,12 +199,12 @@ def test_maintenance_query_requires_exact_daily_and_no_running(monkeypatch):
         return connection
 
     monkeypatch.setitem(sys.modules, "psycopg2", SimpleNamespace(connect=connect))
-    assert direct._maintenance_ready("dsn", datetime(2026, 10, 28, 3, tzinfo=timezone.utc))
+    assert direct._maintenance_ready("dsn", datetime(2026, 10, 28, 1, tzinfo=timezone.utc))
     sql, params = statements[0]
-    assert "NOT EXISTS" in sql and "AND EXISTS" in sql
-    assert "'success', 'failed'" in sql and "state = 'running'" in sql
+    assert sql.count("NOT EXISTS") == 2 and "AND EXISTS" not in sql
+    assert "NOT IN ('success', 'failed')" in sql and "state = 'running'" in sql
     assert "dag_iceberg_maintenance'" in sql
-    assert params == (datetime(2026, 10, 27, 2, tzinfo=timezone.utc),)
+    assert params == (datetime(2026, 10, 27, 0, tzinfo=timezone.utc),)
     assert settings == [dict(readonly=True, autocommit=True)]
 
 
@@ -233,7 +233,7 @@ def test_cli_direct_uses_full_window_by_default(host, monkeypatch):
     class Clock:
         @staticmethod
         def now(_):
-            return deadline.replace(hour=2)
+            return deadline.replace(hour=0)
 
     monkeypatch.setattr(cli, "datetime", Clock)
     calls = []
@@ -269,7 +269,7 @@ c.nightly_deadline = lambda: end
 class Clock:
     @staticmethod
     def now(_):
-        return now.replace(hour=2)
+        return now.replace(hour=0)
 cli.datetime = Clock
 d._maintenance_ready = lambda *_: True
 c.maintenance._get_trino_connection = lambda **kw: SimpleNamespace(close=lambda: None)

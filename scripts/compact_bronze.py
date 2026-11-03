@@ -8,7 +8,13 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 import uuid
+
+# Host checkouts run this script without Airflow; make dags/utils importable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dags"))
+from utils.maintenance_window import nightly_deadline  # noqa: E402
 
 
 def main(argv=None):
@@ -42,18 +48,12 @@ def main(argv=None):
     ):
         parser.error("limits exceed the approved profile")
     now = datetime.now(timezone.utc)
-    if not 2 <= now.hour < 5:
-        parser.error("catch-up is permitted only at 02:00–05:00 UTC")
-    deadline = min(
-        now.replace(hour=5, minute=0, second=0, microsecond=0),
-        now + timedelta(seconds=args.seconds),
-    )
+    try:
+        window_end = nightly_deadline(now)
+    except TimeoutError as exc:
+        parser.error(f"catch-up: {exc}")
+    deadline = min(window_end, now + timedelta(seconds=args.seconds))
     if args.direct:
-        # Support execution as a script from the host checkout, without Airflow.
-        import sys
-
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dags"))
         from utils.bronze_compaction_direct import run_direct
 
         return run_direct(args, deadline)

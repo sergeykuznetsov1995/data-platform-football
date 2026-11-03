@@ -21,7 +21,7 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
 
     assert mod.dag._dag_kwargs["max_active_runs"] == 1
     assert mod.dag._dag_kwargs["max_active_tasks"] == 1
-    assert mod.dag._dag_kwargs["schedule"] == "0 2 * * *"
+    assert mod.dag._dag_kwargs["schedule"] == "0 0 * * *"
     assert tasks["janitor_fbref_generic_stages"]._init_kwargs[
         "execution_timeout"
     ] == timedelta(minutes=120)
@@ -31,7 +31,7 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert all(
         "execution_timeout" not in task._init_kwargs
         for task_id, task in tasks.items()
-        if task_id not in {"janitor_fbref_generic_stages", "compact_bronze"}
+        if task_id not in {"janitor_fbref_generic_stages", "compact_bronze", "maintain_ops"}
     )
     assert set(tasks) == {
         "compact_bronze",
@@ -39,8 +39,12 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
         "cleanup_whoscored_dq_stage_partitions",
         "maintain_whoscored_bronze",
         "maintain_other_high_churn_bronze",
+        "maintain_ops",
         "check_maintenance_run",
     }
+    assert tasks["maintain_ops"].upstream_task_ids == {"maintain_other_high_churn_bronze"}
+    assert tasks["maintain_ops"]._init_kwargs["trigger_rule"] == "all_done"
+    assert tasks["maintain_ops"]._init_kwargs["execution_timeout"] == timedelta(hours=1)
     assert tasks["maintain_whoscored_bronze"].upstream_task_ids == {
         "cleanup_whoscored_dq_stage_partitions"
     }
@@ -154,3 +158,23 @@ def test_compaction_failure_cannot_be_hidden_by_successful_cleanup():
     for ti in instances:
         ti.state = "success"
     mod._check_maintenance_run(**context)
+
+
+def test_daily_ops_task_tolerates_busy_and_fails_on_failure(monkeypatch) -> None:
+    import utils.ops_maintenance as ops
+
+    mod = _load_module()
+    calls = []
+
+    def _fake(factory, **kwargs):
+        calls.append(kwargs)
+        return result
+
+    monkeypatch.setattr(ops, "maintain_ops_tables", _fake)
+    result = {"exit_code": 0, "stop_reason": "exhausted", "busy": 2, "failed": 0}
+    assert mod._maintain_ops() is result
+    assert calls[0]["dry_run"] is False
+    assert calls[0]["deadline"] - datetime.now(timezone.utc) <= timedelta(minutes=55)
+    result = {"exit_code": 1, "stop_reason": "exhausted", "busy": 0, "failed": 1}
+    with pytest.raises(Exception, match="1 failed"):
+        mod._maintain_ops()

@@ -4,9 +4,11 @@ Iceberg Maintenance — Daily (high-churn bronze)
 
 Daily `expire_snapshots` and `remove_orphan_files` for a curated allow-list of
 high-churn Bronze tables (delete-then-insert pattern from daily ingest DAGs).
-A separate serial pass compacts physical Bronze tables at 02:00–05:00 UTC,
-with at most 120 portions / 8 GiB. Other feeds retain 3d; WhoScored retains
-14d for rollback. Compaction does not repeat retention.
+A separate serial pass compacts physical Bronze tables at 00:00–02:00 UTC
+(03:00–05:00 MSK, owner decision 29.10), with at most 120 portions / 8 GiB. Other feeds retain 3d; WhoScored retains
+14d for rollback. Compaction does not repeat retention. The `iceberg.ops` source journals get a
+full `optimize` + `expire_snapshots('3d')` (never orphan cleanup: live writers)
+via `maintain_ops`; a table that stays commit-busy is skipped, not failed.
 Any per-table failure fails its Airflow task and reaches the normal alerting
 callback instead of producing a false-green maintenance run.
 
@@ -14,7 +16,7 @@ The full bronze/silver/gold sweep stays weekly (`dag_iceberg_maintenance.py`,
 retention 30d) — this DAG is a tighter loop only for the worst offenders
 identified during the 2026-04-30 disk-fill incident.
 
-Schedule: 02:00 UTC daily — well before the 14:00 UTC master pipeline.
+Schedule: 00:00 UTC (03:00 MSK) daily — well before the 14:00 UTC master pipeline.
 """
 
 from __future__ import annotations
@@ -105,6 +107,28 @@ def _compact_bronze(**context):
     return PokeReturnValue(is_done=True, xcom_value=result)
 
 
+def _maintain_ops(**_ctx) -> Dict[str, Any]:
+    from datetime import timezone
+
+    from utils.maintenance_tasks import _get_trino_connection
+    from utils.ops_maintenance import maintain_ops_tables
+
+    # Stay inside the task's 1 h execution_timeout; busy tables do not fail.
+    result = maintain_ops_tables(
+        _get_trino_connection,
+        deadline=datetime.now(timezone.utc) + timedelta(minutes=55),
+        dry_run=False,
+    )
+    if result["exit_code"]:
+        from airflow.exceptions import AirflowFailException
+
+        raise AirflowFailException(
+            f"ops maintenance failed: {result['stop_reason']}, "
+            f"{result.get('failed', 0)} failed / {result.get('busy', 0)} busy table(s)"
+        )
+    return result
+
+
 def _maintain_fbref_stages(*, reschedule_on_busy=False, **_ctx):
     from utils.fbref_maintenance import maintain_fbref_stages_with_lock_wait
 
@@ -121,7 +145,7 @@ with DAG(
     dag_id="dag_iceberg_maintenance_daily",
     default_args=SILVER_ARGS,
     description="Daily expire_snapshots+remove_orphan_files for high-churn bronze",
-    schedule="0 2 * * *",
+    schedule="0 0 * * *",  # 03:00 MSK, owner window 03:00–05:00 MSK
     start_date=datetime(2026, 5, 1),
     catchup=False,
     max_active_runs=1,
@@ -163,6 +187,14 @@ with DAG(
         trigger_rule="all_done",
     )
 
+    maintain_ops = PythonOperator(
+        task_id="maintain_ops",
+        python_callable=_maintain_ops,
+        execution_timeout=timedelta(hours=1),
+        # Ops journals are independent of Bronze retention outcomes.
+        trigger_rule="all_done",
+    )
+
     fbref_stage_janitor = PythonSensor(
         task_id="janitor_fbref_generic_stages",
         python_callable=_maintain_fbref_stages,
@@ -181,6 +213,7 @@ with DAG(
     fbref_stage_janitor >> cleanup_whoscored_dq_stage
     fbref_stage_janitor >> maintain_other_high_churn
     cleanup_whoscored_dq_stage >> maintain_whoscored
+    maintain_other_high_churn >> maintain_ops
 
     compact_bronze >> fbref_stage_janitor
 
@@ -195,5 +228,6 @@ with DAG(
         cleanup_whoscored_dq_stage,
         maintain_whoscored,
         maintain_other_high_churn,
+        maintain_ops,
     ):
         task >> check_maintenance_run
