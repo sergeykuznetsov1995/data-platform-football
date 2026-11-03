@@ -487,6 +487,14 @@ def test_full_transfer_career_keeps_source_season_and_clears_exact_global_key(sc
     assert _table(scraper, 'transfermarkt_transfers').empty
 
 
+def test_current_career_legacy_rows_carry_compatibility_league_not_raw_competition(scraper):
+    # #1971: legacy rows keyed by raw 'GB1' had no xref pair (tm_legacy_phantom_pair).
+    http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000}]}])
+    result = current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'current-1', decoded_body_soft_stop_bytes=100000)
+    assert result['verified']
+    assert _table(scraper, 'transfermarkt_market_value_history').league.tolist() == ['ENG-Premier League']
+
+
 def test_real_runner_wrapper_does_not_expand_request_budget_per_player(scraper):
     from dags.scripts import run_transfermarkt_current as lane
     from scrapers.transfermarkt.models import PRODUCTION_ENTITY_BUDGETS, TrafficBudgetExceeded
