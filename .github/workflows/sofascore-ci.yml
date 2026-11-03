@@ -94,6 +94,7 @@ jobs:
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
             scripts/sofascore_runtime_preflight.py \
+            deploy/sofascore/campaign_day.py \
             deploy/sofascore/pipeline_watchdog.py \
             deploy/sofascore/pipeline_metrics.py \
             deploy/sofascore/pipeline_issues.py \
@@ -129,6 +130,7 @@ jobs:
             tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
             tests/unit/dags/test_maintenance_tasks.py \
+            tests/unit/deploy/test_sofascore_campaign_day.py \
             tests/unit/deploy/test_sofascore_contour_recipe.py \
             tests/unit/deploy/test_sofascore_delivery_scripts.py \
             tests/unit/deploy/test_sofascore_deploy_script.py \
