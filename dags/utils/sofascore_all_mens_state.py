@@ -786,11 +786,13 @@ def plan_refresh_batch(
     ``SOFASCORE_SCOPE_ESTIMATE_S``.
 
     #2117: while a ``deadline`` plan with a window has fresh debt (a deadline
-    missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``), the open
-    tier plans into the window minus ``debt_reserve_s``; its closing slice
-    then closes only the open tier, and the debt tier gets what is left plus
-    the reserve (its scopes of seasons with open deadlines take only the
-    passed ones).  Without a reserve the closing slice closes the batch.  An
+    missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``) that its
+    open scopes do not absorb, the open tier plans into the window minus a
+    reserve: ``debt_reserve_s`` or that fresh debt's estimate, the smaller.
+    Its closing slice then closes only the open tier; the fresh debt runs
+    first on what is left plus the reserve, the older debt only when no tier
+    was cut (its scopes of seasons with open deadlines take only the passed
+    ones).  Without a reserve the closing slice closes the batch.  An
     open scope also takes its own season's debt when that is at most one
     allocation (``REFRESH_ALLOCATION_MATCHES``); a bigger debt stays the
     season's ``--debt`` scope.
@@ -938,27 +940,6 @@ def plan_refresh_batch(
             else (item[6], -(item[2] - item[7]))
         ) + (item[0], item[1], int(item[5]["source_season_id"])),
     )
-    now = time.time() if now is None else now
-    fresh_debt = [
-        item for item in debt_tier
-        if item[8] is not None and item[8] >= now - REFRESH_FRESH_DEBT_SECONDS
-    ]
-    reserve = (
-        debt_reserve_s
-        if queue_mode == "deadline" and scope_budget_s is not None and fresh_debt
-        else 0
-    )
-    if reserve:
-        logger.info(
-            "refresh window reserves %s s for fresh debt: %s partitions, "
-            "newest miss %.1f h ago",
-            reserve, len(fresh_debt),
-            (now - max(item[8] for item in fresh_debt)) / 3600,
-        )
-    entries: list[tuple[tuple, str, int]] = []
-    absorbed: set[tuple[str, str, int]] = set()
-    left = None if scope_budget_s is None else scope_budget_s - reserve
-    closed = False
     headroom = refresh_timeout_headroom(seconds_per_match)
     # A scope whose estimate plus that headroom passes the 2 h task ceiling
     # would have its last allocations refused by its own runner.
@@ -970,6 +951,41 @@ def plan_refresh_batch(
             - headroom
         ) // seconds_per_match,
     )
+
+    def _absorbs(item: tuple) -> bool:
+        # #2117: a season's small debt rides in its open scope (the runner
+        # takes the open deadlines first, then the debt, up to the scope's
+        # MAX_MATCHES) instead of waiting for a debt tier the open flood
+        # never left room for; it costs at most one allocation's time.
+        # A bigger debt keeps its own ``--debt`` scope (Astra #1359 r3).
+        return item[3] is not None and 0 < item[2] - item[7] <= REFRESH_ALLOCATION_MATCHES
+
+    now = time.time() if now is None else now
+    fresh_debt, stale_debt = [], []
+    for item in debt_tier:
+        fresh = item[8] is not None and item[8] >= now - REFRESH_FRESH_DEBT_SECONDS
+        (fresh_debt if fresh else stale_debt).append(item)
+    # The reserve is no bigger than the fresh debt the debt tier will run
+    # (an absorbed debt goes with its open scope), and only that debt spends
+    # it: the older debt keeps what the open tier leaves, as without a reserve.
+    reserve = 0
+    if queue_mode == "deadline" and scope_budget_s is not None:
+        reserve = min(debt_reserve_s, sum(
+            min(item[2] - item[7], scope_capacity) * seconds_per_match
+            + REFRESH_SCOPE_OVERHEAD_SECONDS
+            for item in fresh_debt if not _absorbs(item)
+        ))
+    if reserve:
+        logger.info(
+            "refresh window reserves %s s for fresh debt: %s partitions, "
+            "newest miss %.1f h ago",
+            reserve, len(fresh_debt),
+            (now - max(item[8] for item in fresh_debt)) / 3600,
+        )
+    entries: list[tuple[tuple, str, int]] = []
+    absorbed: set[tuple[str, str, int]] = set()
+    left = None if scope_budget_s is None else scope_budget_s - reserve
+    closed = cut = False
 
     def _fit(item: tuple, wanted: int) -> int | None:
         """Matches of ``wanted`` that fit; ``None`` closes the tier."""
@@ -1000,9 +1016,13 @@ def plan_refresh_batch(
     tiers = [("debt", debt_tier)] if queue_mode == "backlog" else [
         ("open", open_tier), ("debt", debt_tier),
     ]
+    if reserve:
+        tiers = [("open", open_tier), ("debt", fresh_debt), ("stale debt", stale_debt)]
     for tier, items in tiers:
         if tier == "debt" and reserve:
             left += reserve
+        if tier == "stale debt" and cut:
+            break
         for position, item in enumerate(items):
             if len(entries) == batch_size:
                 logger.warning(
@@ -1017,23 +1037,20 @@ def plan_refresh_batch(
             if key in absorbed:
                 continue
             wanted = item[7] if tier == "open" else item[2] - item[7]
-            # #2117: a season's small debt rides in its open scope (the runner
-            # takes the open deadlines first, then the debt, up to the scope's
-            # MAX_MATCHES) instead of waiting for a debt tier the open flood
-            # never left room for; it costs at most one allocation's time.
-            # A bigger debt keeps its own ``--debt`` scope (Astra #1359 r3).
-            absorb = tier == "open" and 0 < item[2] - item[7] <= REFRESH_ALLOCATION_MATCHES
+            absorb = tier == "open" and _absorbs(item)
             if absorb:
                 wanted = item[2]
             fits = _fit(item, min(wanted, scope_capacity))
             if fits is None:
                 # A plan without a reserve keeps every open deadline ahead of
                 # the debt: the refill and the evidence contract rely on it.
+                # With one, a cut leaves only the fresh debt its reserve.
+                cut = True
                 closed = not reserve
                 break
             # A season whose open part the closed open tier did not reach
             # still runs only its passed deadlines here (#2117).
-            part = "debt" if tier == "debt" and item[3] is not None else ""
+            part = "debt" if tier != "open" and item[3] is not None else ""
             if absorb:
                 absorbed.add(key)
             entries.append((item, part, fits))

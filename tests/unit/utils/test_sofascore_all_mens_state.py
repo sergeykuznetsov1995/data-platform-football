@@ -1483,17 +1483,61 @@ def _open_flood(overdue_ts):
 def test_refresh_window_reserves_a_quarter_for_fresh_debt_under_an_open_flood():
     planned = _window_plan(_open_flood(_NOW - 3600), debt_reserve_s=1800, now=_NOW)
 
-    # The open tier plans into 7200 - 1800 s: 200 x 15 + 45 = 3045 s, then a
-    # slice of (2355 - 45) // 15 = 154; the third open season does not fit
-    # and closes only the open tier.  The debt tier gets the reserve, the
-    # smaller debt first; the third season runs only its passed deadlines.
+    # The reserve is the fresh debt's estimate, 40 x 15 + 45 + 50 x 15 + 45 =
+    # 1440 s (under 1800).  The open tier plans into 7200 - 1440 s: 200 x 15
+    # + 45 = 3045 s, then a slice of (2715 - 45) // 15 = 178; the third open
+    # season does not fit and closes only the open tier.  The debt tier gets
+    # the reserve, the smaller debt first; the third season runs only its
+    # passed deadlines.
     assert _parts(planned) == [
         ("campaign-test:17:1726", False, 200),
-        ("campaign-test:8:826", False, 154),
+        ("campaign-test:8:826", False, 178),
         ("campaign-test:17:1725", True, 40),
         ("campaign-test:8:825", False, 50),
     ]
     assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) <= 7200
+
+
+def _flood_with_old_debt(*fresh_rows):
+    return [
+        (*_refresh_pending("SS-8", "2627", 200, _NOW + 2_000), 200, 826, None),
+        (*_refresh_pending("SS-17", "2526", 140, _NOW + 3_000), 140, 1725, None),
+        (*_refresh_pending("SS-8", "2526", 500, None), 0, 825, _NOW - 5 * 86400),
+        *fresh_rows,
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_reserve_is_sized_to_the_fresh_debt_and_never_feeds_the_old():
+    # Review #2117 r1 D1: three fresh matches reserved all 1800 s, and the
+    # 5-day-old debt took the rest of them from the open deadlines.
+    planned = _window_plan(_flood_with_old_debt(
+        (*_refresh_pending("SS-17", "2627", 200, _NOW + 1_000), 200, 1726, None),
+        (*_refresh_pending("SS-17", "2425", 3, None), 0, 1724, _NOW - 3600),
+    ), debt_reserve_s=1800, now=_NOW)
+
+    # The reserve is 3 x 15 + 45 = 90 s: the open tier loses exactly that
+    # (a slice of 65 instead of 71), and the old debt gets nothing, as it
+    # does without a reserve when the open tier fills the window.
+    assert _parts(planned) == [
+        ("campaign-test:17:1726", False, 200),
+        ("campaign-test:8:826", False, 200),
+        ("campaign-test:17:1725", False, 65),
+        ("campaign-test:17:1724", False, 3),
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_reserve_ignores_fresh_debt_its_open_scope_absorbs():
+    rows = _flood_with_old_debt(
+        (*_refresh_pending("SS-17", "2627", 205, _NOW + 1_000), 200, 1726, _NOW - 3600),
+    )
+
+    assert _parts(_window_plan(rows, debt_reserve_s=1800, now=_NOW)) == [
+        ("campaign-test:17:1726", False, 205),
+        ("campaign-test:8:826", False, 200),
+        ("campaign-test:17:1725", False, 66),
+    ]
 
 
 @pytest.mark.unit
@@ -1535,8 +1579,6 @@ def test_refresh_reserve_does_not_apply_to_backlog_or_refill_sized_budget():
         assert _parts(_window_plan(fresh, debt_reserve_s=1800, now=_NOW, **kwargs)) == (
             _parts(_window_plan(fresh, now=_NOW, **kwargs))
         )
-    # A refill window shorter than the reserve takes no reserve at all.
-    assert _parts(_window_plan(fresh, scope_budget_s=1500, now=_NOW))
     with pytest.raises(CampaignPlanningError, match="debt_reserve_s"):
         _window_plan(fresh, scope_budget_s=1500, debt_reserve_s=1800, now=_NOW)
 
