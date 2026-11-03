@@ -1,0 +1,154 @@
+-- silver.fotmob_player_career — одна запись карьеры игрока в клубе/сборной: элемент teamEntries
+-- раздела карьеры (#2019, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_player_career) + README.
+-- Глобальная таблица, без партиций. Ключ (player_id, career_section, entry_index).
+-- Источник — тот же выбранный снимок игрока, что у fotmob_players: player_id varchar -> BIGINT на
+-- входе (пустой/неприводимый -> строка отбрасывается), одна строка на игрока — последняя по
+-- _observed_at, _ingested_at, затем больший _target_batch_id; развёртка JSON — после выбора снимка,
+-- поэтому ключ уникален по построению (дедуп на гране формальный, затем меньший entry_index).
+-- career_section — имя ключа careerItems (senior, national team, youth, coach ...); entry_index —
+-- номер элемента teamEntries с 1. Раздел без teamEntries (null или []) строк не даёт.
+-- start_date/end_date — DATE из первых 10 символов; appearances/goals/assists — строки FotMob ('77'):
+-- целое через DOUBLE; неразбор -> NULL + _conform_issues_json. transfer_type/role: скаляр -> текст,
+-- объект -> его JSON-текст, null -> NULL (элемент целиком — в career_entry_json).
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над player_id (BIGINT);
+-- полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(player_id AS BIGINT) AS player_id,
+            career_history_json,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_player_snapshots_current
+    ) s
+    WHERE player_id IS NOT NULL
+      AND (
+        {{ fotmob_entity_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+sections AS (
+    SELECT
+        m.player_id, m._target_batch_id, m._observed_at, m._ingested_at, m._parser_version,
+        CAST(k.career_section AS VARCHAR) AS career_section,
+        TRY_CAST(json_extract(element_at(m.career_items, k.career_section), '$.teamEntries') AS ARRAY(JSON))
+            AS team_entries
+    FROM (
+        SELECT
+            d.*,
+            TRY_CAST(TRY(json_extract(NULLIF(d.career_history_json, 'null'), '$.careerItems'))
+                     AS MAP(VARCHAR, JSON)) AS career_items
+        FROM dedup d
+    ) m
+    CROSS JOIN UNNEST(map_keys(m.career_items)) AS k(career_section)
+),
+entries AS (
+    SELECT *
+    FROM (
+        SELECT
+            x.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, career_section, entry_index
+                ORDER BY entry_index ASC
+            ) AS entry_rn
+        FROM (
+            SELECT
+                s.player_id, s._target_batch_id, s._observed_at, s._ingested_at, s._parser_version,
+                s.career_section,
+                CAST(e.entry_index AS INTEGER) AS entry_index,
+                e.entry_j
+            FROM sections s
+            CROSS JOIN UNNEST(s.team_entries) WITH ORDINALITY AS e(entry_j, entry_index)
+        ) x
+    ) y
+    WHERE entry_rn = 1
+),
+conv AS (
+    SELECT
+        n.*,
+        CASE WHEN regexp_like(n.start_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.start_date_raw, 1, 10) AS DATE) END AS start_date_value,
+        CASE WHEN regexp_like(n.end_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.end_date_raw, 1, 10) AS DATE) END AS end_date_value,
+        CASE WHEN n.appearances_double = floor(n.appearances_double)
+             THEN TRY_CAST(n.appearances_double AS INTEGER) END AS appearances_value,
+        CASE WHEN n.goals_double = floor(n.goals_double)
+             THEN TRY_CAST(n.goals_double AS INTEGER) END AS goals_value,
+        CASE WHEN n.assists_double = floor(n.assists_double)
+             THEN TRY_CAST(n.assists_double AS INTEGER) END AS assists_value
+    FROM (
+        SELECT
+            e.*,
+            NULLIF(json_extract_scalar(e.entry_j, '$.startDate'), '') AS start_date_raw,
+            NULLIF(json_extract_scalar(e.entry_j, '$.endDate'), '') AS end_date_raw,
+            NULLIF(json_extract_scalar(e.entry_j, '$.appearances'), '') AS appearances_raw,
+            NULLIF(json_extract_scalar(e.entry_j, '$.goals'), '') AS goals_raw,
+            NULLIF(json_extract_scalar(e.entry_j, '$.assists'), '') AS assists_raw,
+            TRY_CAST(json_extract_scalar(e.entry_j, '$.appearances') AS DOUBLE) AS appearances_double,
+            TRY_CAST(json_extract_scalar(e.entry_j, '$.goals') AS DOUBLE) AS goals_double,
+            TRY_CAST(json_extract_scalar(e.entry_j, '$.assists') AS DOUBLE) AS assists_double
+        FROM entries e
+    ) n
+)
+SELECT
+    c.player_id,
+    c.career_section,
+    c.entry_index,
+    TRY_CAST(json_extract_scalar(c.entry_j, '$.teamId') AS BIGINT) AS team_id,
+    json_extract_scalar(c.entry_j, '$.team') AS team_name,
+    json_extract_scalar(c.entry_j, '$.teamGender') AS team_gender,
+    c.start_date_value AS start_date,
+    c.end_date_value AS end_date,
+    TRY_CAST(json_extract_scalar(c.entry_j, '$.active') AS BOOLEAN) AS is_active,
+    c.appearances_value AS appearances,
+    c.goals_value AS goals,
+    c.assists_value AS assists,
+    COALESCE(json_extract_scalar(c.entry_j, '$.transferType'),
+             NULLIF(json_format(json_extract(c.entry_j, '$.transferType')), 'null')) AS transfer_type,
+    COALESCE(json_extract_scalar(c.entry_j, '$.role'),
+             NULLIF(json_format(json_extract(c.entry_j, '$.role')), 'null')) AS role,
+    TRY_CAST(json_extract_scalar(c.entry_j, '$.hasUncertainData') AS BOOLEAN) AS has_uncertain_data,
+    json_format(c.entry_j) AS career_entry_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.start_date_raw IS NOT NULL AND v.start_date_value IS NULL
+                 THEN CAST(ROW('start_date', v.start_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.end_date_raw IS NOT NULL AND v.end_date_value IS NULL
+                 THEN CAST(ROW('end_date', v.end_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.appearances_raw IS NOT NULL AND v.appearances_value IS NULL
+                 THEN CAST(ROW('appearances', v.appearances_raw, 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.goals_raw IS NOT NULL AND v.goals_value IS NULL
+                 THEN CAST(ROW('goals', v.goals_raw, 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.assists_raw IS NOT NULL AND v.assists_value IS NULL
+                 THEN CAST(ROW('assists', v.assists_raw, 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

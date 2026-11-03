@@ -1,0 +1,128 @@
+-- silver.fotmob_transfers — одно трансферное событие FotMob, один раз на transfer_event_id из всех
+-- лент турниров (#2019, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_transfers) + README.
+-- Глобальная таблица, без партиций. Ключ transfer_event_id (sha256 в bronze, VARCHAR); пустой ->
+-- строка отбрасывается (правило NULL для ключа). Событие из нескольких лент -> одна строка,
+-- последняя по _observed_at, _ingested_at, затем больший _target_batch_id, меньшие competition_id,
+-- source_page, source_item_index. source_competition_ids — отсортированный массив DISTINCT
+-- competition_id (varchar в bronze -> BIGINT) по всем строкам события; неприводимый competition_id в
+-- массив не входит -> _conform_issues_json; без лент -> NULL.
+-- transfer_date — DATE из первых 10 символов; transfer_at_utc — только если в строке есть зона
+-- (Z или смещение): без зоны -> NULL без записи (дата остаётся в transfer_date), с зоной и
+-- неразбором -> NULL + запись. transfer_date_raw — строка bronze как есть.
+-- Свободный агент: FotMob отдаёт «Free agent» как клуб с id 2 — это не команда, поэтому
+-- from_team_id/to_team_id = NULL при id 2, а имена (from_team_name, *_full_name = «Free agent»)
+-- остаются как есть (решение лида #2019, по образцу «id игрока 0 -> NULL, строка сохраняется»).
+-- Суммы fee_value/market_value (DOUBLE в bronze) -> DECIMAL(38,8); NULL остаётся NULL, нулём не
+-- становится; валюту FotMob не передаёт (money_currency = NULL).
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над transfer_event_id
+-- (VARCHAR); полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            transfer_event_id,
+            TRY_CAST(competition_id AS BIGINT) AS competition_id,
+            NULLIF(competition_id, '') AS competition_id_raw,
+            player_id, player_name, position_label, position_key, transfer_date,
+            from_club, from_club_full_name, from_club_id, to_club, to_club_full_name, to_club_id,
+            fee_text, localized_fee_text, fee_value, market_value, on_loan,
+            transfer_type_key, transfer_type_text, event_year, source_page, source_item_index,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_transfer_events_current
+    ) s
+    WHERE transfer_event_id IS NOT NULL
+      AND transfer_event_id <> ''
+      AND (
+        {{ fotmob_entity_scope }}
+      )
+),
+ids AS (
+    SELECT
+        transfer_event_id,
+        array_sort(filter(array_agg(DISTINCT competition_id), x -> x IS NOT NULL)) AS competition_ids,
+        array_sort(filter(array_agg(DISTINCT CASE WHEN competition_id IS NULL THEN competition_id_raw END),
+                          x -> x IS NOT NULL)) AS bad_competition_ids
+    FROM src
+    GROUP BY transfer_event_id
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY transfer_event_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC,
+                         competition_id ASC, source_page ASC, source_item_index ASC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        d.*,
+        NULLIF(d.transfer_date, '') AS transfer_date_text,
+        CASE WHEN regexp_like(d.transfer_date, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(d.transfer_date, 1, 10) AS DATE) END AS transfer_date_value,
+        regexp_like(d.transfer_date, '(Z|[+-][0-9]{2}:?[0-9]{2})$') AS has_zone,
+        CASE WHEN regexp_like(d.transfer_date, '(Z|[+-][0-9]{2}:?[0-9]{2})$')
+             THEN CAST(TRY(from_iso8601_timestamp(d.transfer_date)) AS TIMESTAMP(6) WITH TIME ZONE)
+        END AS transfer_at_utc_value,
+        CASE WHEN cardinality(i.competition_ids) > 0 THEN i.competition_ids END AS source_competition_ids,
+        i.bad_competition_ids
+    FROM dedup d
+    LEFT JOIN ids i
+      ON i.transfer_event_id = d.transfer_event_id
+)
+SELECT
+    c.transfer_event_id,
+    c.player_id,
+    c.player_name,
+    c.position_label,
+    c.position_key,
+    c.transfer_date_value AS transfer_date,
+    c.transfer_at_utc_value AS transfer_at_utc,
+    c.transfer_date AS transfer_date_raw,
+    NULLIF(c.from_club_id, 2) AS from_team_id,
+    c.from_club AS from_team_name,
+    c.from_club_full_name AS from_team_full_name,
+    NULLIF(c.to_club_id, 2) AS to_team_id,
+    c.to_club AS to_team_name,
+    c.to_club_full_name AS to_team_full_name,
+    c.fee_text,
+    c.localized_fee_text,
+    CAST(c.fee_value AS DECIMAL(38,8)) AS fee_value,
+    CAST(c.market_value AS DECIMAL(38,8)) AS market_value,
+    CAST(NULL AS VARCHAR) AS money_currency,
+    c.on_loan AS is_on_loan,
+    c.transfer_type_key,
+    c.transfer_type_text,
+    CAST(c.event_year AS INTEGER) AS event_year,
+    c.source_competition_ids,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.transfer_date_text IS NOT NULL AND v.transfer_date_value IS NULL
+                 THEN CAST(ROW('transfer_date', v.transfer_date_text, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.has_zone AND v.transfer_at_utc_value IS NULL
+                 THEN CAST(ROW('transfer_at_utc', v.transfer_date_text, 'not an ISO-8601 timestamp')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN cardinality(v.bad_competition_ids) > 0
+                 THEN CAST(ROW('source_competition_ids', array_join(v.bad_competition_ids, ','),
+                               'not an integer competition id')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

@@ -1,0 +1,154 @@
+-- silver.fotmob_players — один игрок или тренер FotMob, последний подтверждённый снимок профиля
+-- (#2019, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_players) + README.
+-- Глобальная таблица: без турнира и сезона, без партиций; карточка одна, по сезонам не размножается.
+-- Ключ player_id: varchar в bronze -> BIGINT один раз на входе; пустой/неприводимый id -> строка
+-- отбрасывается (правило NULL для ключа). Повтор -> одна строка, последняя по _observed_at,
+-- _ingested_at, затем больший _target_batch_id.
+-- Даты (birth_date из JSON {"utcTime": ...}, contract_end, snapshot_date) — DATE из первых 10 символов
+-- (YYYY-MM-DD); неразбор -> NULL + _conform_issues_json. Рост и номер — элементы playerInformation по
+-- translationKey; целое — через DOUBLE, только целое значение.
+-- Литерал 'null' в bronze (секция FotMob = null: injuryInformation, coachStats ...) -> NULL в сыром
+-- остатке, скаляры из такой секции — NULL без записи в _conform_issues_json.
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над player_id (BIGINT);
+-- полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(player_id AS BIGINT) AS player_id,
+            name, birth_date, is_coach, is_captain, gender, primary_team_id, primary_team_name,
+            position_description, main_league_id, main_league_name, contract_end,
+            player_information_json, injury_information_json, trophies_json, career_history_json,
+            stat_seasons_json, first_season_stats_json, recent_matches_json, traits_json, meta_json,
+            coach_stats_json, next_match_json, payload_json, snapshot_date,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_player_snapshots_current
+    ) s
+    WHERE player_id IS NOT NULL
+      AND (
+        {{ fotmob_entity_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+info AS (
+    SELECT
+        i.*,
+        element_at(filter(i.info_items, e -> json_extract_scalar(e, '$.translationKey') = 'height_sentencecase'), 1)
+            AS height_item,
+        element_at(filter(i.info_items, e -> json_extract_scalar(e, '$.translationKey') = 'preferred_foot'), 1)
+            AS foot_item,
+        element_at(filter(i.info_items, e -> json_extract_scalar(e, '$.translationKey') = 'country_sentencecase'), 1)
+            AS country_item,
+        element_at(filter(i.info_items, e -> json_extract_scalar(e, '$.translationKey') = 'shirt'), 1)
+            AS shirt_item
+    FROM (
+        SELECT
+            d.*,
+            TRY_CAST(TRY(json_extract(NULLIF(d.player_information_json, 'null'), '$')) AS ARRAY(JSON))
+                AS info_items,
+            NULLIF(d.injury_information_json, 'null') AS injury_j
+        FROM dedup d
+    ) i
+),
+conv AS (
+    SELECT
+        n.*,
+        CASE WHEN regexp_like(n.birth_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.birth_date_raw, 1, 10) AS DATE) END AS birth_date_value,
+        CASE WHEN regexp_like(n.contract_end_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.contract_end_raw, 1, 10) AS DATE) END AS contract_end_value,
+        CASE WHEN regexp_like(n.snapshot_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.snapshot_date_raw, 1, 10) AS DATE) END AS snapshot_date_value,
+        CASE WHEN n.height_double = floor(n.height_double)
+             THEN TRY_CAST(n.height_double AS INTEGER) END AS height_cm_value,
+        CASE WHEN n.shirt_double = floor(n.shirt_double)
+             THEN TRY_CAST(n.shirt_double AS INTEGER) END AS shirt_number_value
+    FROM (
+        SELECT
+            f.*,
+            NULLIF(json_extract_scalar(f.birth_date, '$.utcTime'), '') AS birth_date_raw,
+            NULLIF(f.contract_end, '') AS contract_end_raw,
+            NULLIF(f.snapshot_date, '') AS snapshot_date_raw,
+            TRY_CAST(json_extract_scalar(f.height_item, '$.value.numberValue') AS DOUBLE) AS height_double,
+            TRY_CAST(json_extract_scalar(f.shirt_item, '$.value.numberValue') AS DOUBLE) AS shirt_double
+        FROM info f
+    ) n
+)
+SELECT
+    c.player_id,
+    c.name AS player_name,
+    c.birth_date_value AS birth_date,
+    c.is_coach,
+    c.is_captain,
+    c.gender,
+    json_extract_scalar(c.payload_json, '$.status') AS status,
+    json_extract_scalar(c.payload_json, '$.dataProvider') AS data_provider,
+    c.primary_team_id,
+    c.primary_team_name,
+    TRY_CAST(json_extract_scalar(c.payload_json, '$.primaryTeam.onLoan') AS BOOLEAN) AS is_on_loan,
+    c.position_description,
+    json_extract_scalar(c.payload_json, '$.positionDescription.primaryPosition.key') AS primary_position_key,
+    c.main_league_id,
+    c.main_league_name,
+    c.contract_end_value AS contract_end,
+    c.height_cm_value AS height_cm,
+    json_extract_scalar(c.foot_item, '$.value.key') AS preferred_foot,
+    json_extract_scalar(c.country_item, '$.countryCode') AS country_code,
+    c.shirt_number_value AS shirt_number,
+    json_extract_scalar(c.injury_j, '$.key') AS injury_key,
+    json_extract_scalar(c.injury_j, '$.name') AS injury_name,
+    json_extract_scalar(c.injury_j, '$.expectedReturn.expectedReturnFallback') AS injury_expected_return,
+    c.snapshot_date_value AS snapshot_date,
+    NULLIF(c.player_information_json, 'null') AS player_information_json,
+    c.injury_j AS injury_information_json,
+    NULLIF(c.trophies_json, 'null') AS trophies_json,
+    NULLIF(c.career_history_json, 'null') AS career_history_json,
+    NULLIF(c.stat_seasons_json, 'null') AS stat_seasons_json,
+    NULLIF(c.first_season_stats_json, 'null') AS first_season_stats_json,
+    NULLIF(c.recent_matches_json, 'null') AS recent_matches_json,
+    NULLIF(c.traits_json, 'null') AS traits_json,
+    NULLIF(c.meta_json, 'null') AS meta_json,
+    NULLIF(c.coach_stats_json, 'null') AS coach_stats_json,
+    NULLIF(c.next_match_json, 'null') AS next_match_json,
+    NULLIF(json_format(json_extract(c.payload_json, '$.positionDescription')), 'null') AS position_description_json,
+    NULLIF(json_format(json_extract(c.payload_json, '$.primaryTeam')), 'null') AS primary_team_json,
+    NULLIF(json_format(json_extract(c.payload_json, '$.mainLeague')), 'null') AS main_league_json,
+    NULLIF(json_format(json_extract(c.payload_json, '$.relatedLinksData')), 'null') AS related_links_json,
+    NULLIF(json_format(json_extract(c.payload_json, '$.internationalDuty')), 'null') AS international_duty_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.birth_date_raw IS NOT NULL AND v.birth_date_value IS NULL
+                 THEN CAST(ROW('birth_date', v.birth_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.contract_end_raw IS NOT NULL AND v.contract_end_value IS NULL
+                 THEN CAST(ROW('contract_end', v.contract_end_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.snapshot_date_raw IS NOT NULL AND v.snapshot_date_value IS NULL
+                 THEN CAST(ROW('snapshot_date', v.snapshot_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c

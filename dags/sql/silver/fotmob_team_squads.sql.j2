@@ -1,0 +1,121 @@
+-- silver.fotmob_team_squads — один член текущего состава команды, игрок или тренер
+-- (#2019, эпик #1677).
+-- Схема-истина: configs/medallion/fotmob_silver/core_schema.yaml (tables.fotmob_team_squads) + README.
+-- Глобальная таблица, без партиций. Ключ (team_id, member_type, member_id): team_id и member_id —
+-- varchar в bronze -> BIGINT один раз на входе; пустой/неприводимый id или пустой member_type ->
+-- строка отбрасывается (правило NULL для ключа). Повтор -> одна строка, последняя по _observed_at,
+-- _ingested_at, затем больший _target_batch_id.
+-- shirt_number, height_cm (DOUBLE в bronze) -> INTEGER только при целом значении; date_of_birth,
+-- snapshot_date — DATE из первых 10 символов; неразбор -> NULL + _conform_issues_json (сырое число —
+-- JSON-текстом). position_id/age из member_json — целое через DOUBLE, без записи. section_index и
+-- member_index — как в bronze, с 0. transfer_value — DECIMAL(38,8), валюту FotMob не передаёт (NULL).
+-- Литерал 'null' в bronze (position_description_json) -> NULL в сыром остатке.
+-- Pure SELECT: CREATE OR REPLACE добавляет раннер.
+-- Заполнитель fotmob_entity_scope (отдельная строка) — булево выражение над team_id (BIGINT);
+-- полный прогон — TRUE.
+WITH
+src AS (
+    SELECT *
+    FROM (
+        SELECT
+            TRY_CAST(team_id AS BIGINT) AS team_id,
+            member_type,
+            TRY_CAST(member_id AS BIGINT) AS member_id,
+            member_name, position_description_json, shirt_number, date_of_birth, height_cm,
+            country_code, member_json, section, section_index, member_index, snapshot_date,
+            _target_batch_id, _observed_at, _ingested_at, _parser_version
+        FROM iceberg.bronze.fotmob_squad_snapshots_current
+    ) s
+    WHERE team_id IS NOT NULL
+      AND member_type IS NOT NULL
+      AND member_type <> ''
+      AND member_id IS NOT NULL
+      AND (
+        {{ fotmob_entity_scope }}
+      )
+),
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY team_id, member_type, member_id
+                ORDER BY _observed_at DESC, _ingested_at DESC, _target_batch_id DESC
+            ) AS rn
+        FROM src s
+    ) d
+    WHERE rn = 1
+),
+conv AS (
+    SELECT
+        n.*,
+        CASE WHEN n.shirt_number = floor(n.shirt_number)
+             THEN TRY_CAST(n.shirt_number AS INTEGER) END AS shirt_number_value,
+        CASE WHEN n.height_cm = floor(n.height_cm)
+             THEN TRY_CAST(n.height_cm AS INTEGER) END AS height_cm_value,
+        CASE WHEN n.position_id_double = floor(n.position_id_double)
+             THEN TRY_CAST(n.position_id_double AS INTEGER) END AS position_id_value,
+        CASE WHEN n.age_double = floor(n.age_double)
+             THEN TRY_CAST(n.age_double AS INTEGER) END AS age_value,
+        CASE WHEN regexp_like(n.date_of_birth_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.date_of_birth_raw, 1, 10) AS DATE) END AS date_of_birth_value,
+        CASE WHEN regexp_like(n.snapshot_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+             THEN TRY_CAST(substr(n.snapshot_date_raw, 1, 10) AS DATE) END AS snapshot_date_value
+    FROM (
+        SELECT
+            d.*,
+            TRY_CAST(json_extract_scalar(d.member_json, '$.positionId') AS DOUBLE) AS position_id_double,
+            TRY_CAST(json_extract_scalar(d.member_json, '$.age') AS DOUBLE) AS age_double,
+            NULLIF(d.date_of_birth, '') AS date_of_birth_raw,
+            NULLIF(d.snapshot_date, '') AS snapshot_date_raw
+        FROM dedup d
+    ) n
+)
+SELECT
+    c.team_id,
+    c.member_type,
+    c.member_id,
+    c.member_name,
+    json_extract_scalar(c.member_json, '$.role.key') AS role_key,
+    c.position_id_value AS position_id,
+    json_extract_scalar(c.member_json, '$.positionIdsDesc') AS position_ids_desc,
+    c.shirt_number_value AS shirt_number,
+    c.date_of_birth_value AS date_of_birth,
+    c.age_value AS age,
+    c.height_cm_value AS height_cm,
+    c.country_code,
+    TRY_CAST(json_extract_scalar(c.member_json, '$.transferValue') AS DECIMAL(38,8)) AS transfer_value,
+    CAST(NULL AS VARCHAR) AS transfer_value_currency,
+    TRY_CAST(json_extract_scalar(c.member_json, '$.injured') AS BOOLEAN) AS is_injured,
+    c.section,
+    CAST(c.section_index AS INTEGER) AS section_index,
+    CAST(c.member_index AS INTEGER) AS member_index,
+    c.snapshot_date_value AS snapshot_date,
+    NULLIF(c.member_json, 'null') AS member_json,
+    NULLIF(c.position_description_json, 'null') AS position_description_json,
+    c._target_batch_id AS _bronze_batch_id,
+    c._observed_at AS _bronze_observed_at,
+    c._ingested_at AS _bronze_ingested_at,
+    c._parser_version,
+    CASE WHEN cardinality(c.issues) > 0 THEN json_format(CAST(c.issues AS JSON)) END
+        AS _conform_issues_json
+FROM (
+    SELECT
+        v.*,
+        filter(ARRAY[
+            CASE WHEN v.shirt_number IS NOT NULL AND v.shirt_number_value IS NULL
+                 THEN CAST(ROW('shirt_number', json_format(CAST(v.shirt_number AS JSON)), 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.date_of_birth_raw IS NOT NULL AND v.date_of_birth_value IS NULL
+                 THEN CAST(ROW('date_of_birth', v.date_of_birth_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.height_cm IS NOT NULL AND v.height_cm_value IS NULL
+                 THEN CAST(ROW('height_cm', json_format(CAST(v.height_cm AS JSON)), 'not an integer')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
+            CASE WHEN v.snapshot_date_raw IS NOT NULL AND v.snapshot_date_value IS NULL
+                 THEN CAST(ROW('snapshot_date', v.snapshot_date_raw, 'not an ISO date')
+                           AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END
+        ], x -> x IS NOT NULL) AS issues
+    FROM conv v
+) c
