@@ -8,7 +8,8 @@
 -- поэтому ключ уникален по построению (дедуп на гране формальный, затем меньший entry_index).
 -- career_section — имя ключа careerItems (senior, national team, youth, coach ...); entry_index —
 -- номер элемента teamEntries с 1. Раздел без teamEntries (null или []) строк не даёт.
--- start_date/end_date — DATE из первых 10 символов; appearances/goals/assists — строки FotMob ('77'):
+-- start_date/end_date — строка ISO -> DATE из первых 10 символов; число (миллисекунды эпохи,
+-- 1719792000000; в JSON-тексте 11–14 цифр) -> дата в UTC; appearances/goals/assists — строки FotMob ('77'):
 -- целое через DOUBLE; неразбор -> NULL + _conform_issues_json. transfer_type/role: скаляр -> текст,
 -- объект -> его JSON-текст, null -> NULL (элемент целиком — в career_entry_json).
 -- Pure SELECT: CREATE OR REPLACE добавляет раннер.
@@ -82,9 +83,15 @@ conv AS (
     SELECT
         n.*,
         CASE WHEN regexp_like(n.start_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
-             THEN TRY_CAST(substr(n.start_date_raw, 1, 10) AS DATE) END AS start_date_value,
+             THEN TRY_CAST(substr(n.start_date_raw, 1, 10) AS DATE)
+             WHEN regexp_like(n.start_date_raw, '^[0-9]{11,14}$')
+             THEN CAST(from_unixtime(CAST(n.start_date_raw AS DOUBLE) / 1000) AT TIME ZONE 'UTC' AS DATE)
+        END AS start_date_value,
         CASE WHEN regexp_like(n.end_date_raw, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
-             THEN TRY_CAST(substr(n.end_date_raw, 1, 10) AS DATE) END AS end_date_value,
+             THEN TRY_CAST(substr(n.end_date_raw, 1, 10) AS DATE)
+             WHEN regexp_like(n.end_date_raw, '^[0-9]{11,14}$')
+             THEN CAST(from_unixtime(CAST(n.end_date_raw AS DOUBLE) / 1000) AT TIME ZONE 'UTC' AS DATE)
+        END AS end_date_value,
         CASE WHEN n.appearances_double = floor(n.appearances_double)
              THEN TRY_CAST(n.appearances_double AS INTEGER) END AS appearances_value,
         CASE WHEN n.goals_double = floor(n.goals_double)
@@ -135,10 +142,10 @@ FROM (
         v.*,
         filter(ARRAY[
             CASE WHEN v.start_date_raw IS NOT NULL AND v.start_date_value IS NULL
-                 THEN CAST(ROW('start_date', v.start_date_raw, 'not an ISO date')
+                 THEN CAST(ROW('start_date', v.start_date_raw, 'not an ISO date or epoch milliseconds')
                            AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
             CASE WHEN v.end_date_raw IS NOT NULL AND v.end_date_value IS NULL
-                 THEN CAST(ROW('end_date', v.end_date_raw, 'not an ISO date')
+                 THEN CAST(ROW('end_date', v.end_date_raw, 'not an ISO date or epoch milliseconds')
                            AS ROW("column" VARCHAR, raw VARCHAR, reason VARCHAR)) END,
             CASE WHEN v.appearances_raw IS NOT NULL AND v.appearances_value IS NULL
                  THEN CAST(ROW('appearances', v.appearances_raw, 'not an integer')

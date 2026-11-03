@@ -85,6 +85,8 @@ TRANSFER_ORDER = BASE_ORDER + (('competition_id', 'asc'), ('source_page', 'asc')
 ZONE = re.compile(r'(Z|[+-]\d{2}:?\d{2})$')
 # Lead decision 9: transferType/role of a career entry — scalar -> text, object -> its JSON text.
 OBJECT_AS_TEXT = {('fotmob_player_career', 'transfer_type'), ('fotmob_player_career', 'role')}
+# Career dates also come as epoch milliseconds (JSON number or digit string; pilot 03.11, ~4 % of rows).
+EPOCH_MS_DATES = {('fotmob_player_career', 'start_date'), ('fotmob_player_career', 'end_date')}
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -348,6 +350,15 @@ def _ts(v):
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
 
 
+def _career_date(v):
+    """ISO text -> first 10 characters; epoch milliseconds (int, or 11-14 digits as text) -> UTC date."""
+    if isinstance(v, int) and not isinstance(v, bool):
+        v = str(v)
+    if isinstance(v, str) and re.fullmatch(r'\d{11,14}', v):
+        return datetime.fromtimestamp(int(v) / 1000, tz=timezone.utc).date()
+    return _date(v)
+
+
 def _decimal(v):
     return None if _text(v) is None else Decimal(_text(v))
 
@@ -452,6 +463,8 @@ def _row(table: str, ctx: dict, derived: dict, *, element=None, extra_issues=())
             out[name] = raw
             continue
         value = convert(raw, dtype)
+        if (table, name) in EPOCH_MS_DATES:
+            value = _career_date(raw)
         if col.get('conform') == 'try' and dtype in INT_RANGE and isinstance(raw, str):
             value = _int_text(raw, dtype)
         if col.get('conform') == 'try' and value is None and _valid(raw):
@@ -650,12 +663,20 @@ _DATE_FROM_PREFIX = re.compile(r'TRY_CAST\(\s*substr\(\s*[\w.]+\s*,\s*1\s*,\s*10
                                re.IGNORECASE)
 
 
+_DATE_FROM_EPOCH_MS = re.compile(
+    r"CAST\(\s*from_unixtime\(\s*CAST\(\s*\w+\.(start_date|end_date)_raw\s+AS\s+DOUBLE\s*\)\s*/\s*1000\s*\)"
+    r"\s+AT\s+TIME\s+ZONE\s+'UTC'\s+AS\s+DATE\s*\)", re.IGNORECASE)
+
+
 @pytest.mark.parametrize('table', TABLES)
 def test_dates_cast_from_first_10_characters(table):
     # Lead decision 4. DuckDB's TRY_CAST('2016-12-31T00:00:00+00:00' AS DATE) succeeds, Trino's is
     # NULL — so the data tests cannot catch a cast of the whole string; the text check does.
+    # The only other DATE cast allowed: career start/end_date from epoch milliseconds, in UTC.
     code = AUDIT.strip_sql(_text_of(table))
-    assert len(_DATE_CAST.findall(code)) == len(_DATE_FROM_PREFIX.findall(code))
+    epoch = _DATE_FROM_EPOCH_MS.findall(code)
+    assert sorted(epoch) == (['end_date', 'start_date'] if table == 'fotmob_player_career' else [])
+    assert len(_DATE_CAST.findall(code)) == len(_DATE_FROM_PREFIX.findall(code)) + len(epoch)
 
 
 @pytest.mark.parametrize('field, column', (('transferType', 'transfer_type'), ('role', 'role')))
@@ -1052,3 +1073,19 @@ def test_transfer_type_object_and_coach_card():
     assert (career[2]['transfer_type'], career[2]['role']) == ('loan', 'captain')
     coach_row, = _by(bronze.rows('fotmob_players'), player_id=1000009)
     assert coach_row['is_coach'] is True and coach_row['player_name'] == 'Some Coach'
+
+
+def test_career_dates_from_epoch_milliseconds():
+    """Career start/end dates sent as epoch milliseconds (JSON number or digit string) -> UTC date,
+    no issue; other text still -> NULL + issue."""
+    page = player_page()
+    senior = _data(page)['careerHistory']['careerItems']['senior']['teamEntries']
+    senior[0].update(startDate=1719792000000, endDate='1767139200000')
+    senior[1].update(startDate='x', endDate=1767225599999)   # 2025-12-31T23:59:59.999Z
+    bronze = Bronze(**player_rows(page))
+    _assert_all_tables(bronze)
+    career = {r['entry_index']: r for r in _by(bronze.rows('fotmob_player_career'), career_section='senior')}
+    assert (career[1]['start_date'], career[1]['end_date'], career[1]['_conform_issues_json']) == (
+        date(2024, 7, 1), date(2025, 12, 31), None)
+    assert (career[2]['start_date'], career[2]['end_date']) == (None, date(2025, 12, 31))
+    assert [(i['column'], i['raw']) for i in _issues(career[2])] == [('start_date', 'x')]
