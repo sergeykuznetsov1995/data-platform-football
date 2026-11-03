@@ -52,7 +52,7 @@ from scrapers.transfermarkt.models import (
     SCOPE_REQUEST_LIMIT, SCOPE_RETRY_LIMIT,
 )
 from scrapers.transfermarkt import tmapi
-from scrapers.transfermarkt.client import redact_sensitive
+from scrapers.transfermarkt.client import LeaseConcurrencyLimited, redact_sensitive
 
 
 class CurrentPortionError(RuntimeError):
@@ -1753,7 +1753,7 @@ class _Scope:
                 if (proof.get('club_id') != club_id or proof.get('raw_capture_id') != outcome.raw_capture_id
                     or proof.get('source_body_hash') != outcome.raw_body_hash):
                     raise CurrentPortionError('staff receipt differs from club capture')
-            except (CurrentPortionDeadlineExceeded, TrafficBudgetExceeded, TrafficMeterError):
+            except (CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited, TrafficBudgetExceeded, TrafficMeterError):
                 raise
             except Exception as exc:
                 sweep['deferred'][club_id] = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
@@ -2018,6 +2018,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     for kind in item.checks_due:
                         try:
                             getattr(scope, {'listing': 'listing', 'players': 'players', 'injury': 'injuries'}[kind])()
+                        except LeaseConcurrencyLimited:
+                            raise
                         except Exception as exc:
                             error = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
                             result.setdefault('check_failures', {})[kind] = error
@@ -2101,6 +2103,10 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     result['historical_handoff'] = True
                 if result.get('check_failures'):
                     result['status'] = 'uncertain'
+            except LeaseConcurrencyLimited as exc:
+                # #2068: a lease from an earlier portion still holds the stream
+                # slot. Keep every cursor and give the rest of the portion back.
+                result['status'], result['error'] = 'blocked', type(exc).__name__ + ': ' + redact_sensitive(str(exc))
             except Exception as exc:
                 message = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
                 # #2068: the remainder retained at the deadline keeps its turn;
@@ -2169,7 +2175,11 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             if data.get('recovery_signal_refresh_required'):
                 result['fresh_signals_required'] = data['recovery_signal_refresh_required']
             report['scopes'].append(result)
+            if result['status'] == 'blocked':
+                break
         report['status'] = 'failed' if any(item['status'] in {'failed', 'baseline_required'} for item in report['scopes']) else 'pending'
+        if report['status'] == 'pending' and any(item['status'] == 'blocked' for item in report['scopes']):
+            report['status'] = 'blocked'
         report['daily_complete_scope_ids'] = list(dict.fromkeys(report['daily_complete_scope_ids']))
         report['finished_at'] = now().isoformat()
         report_path = directory / ('portion-' + hashlib.sha256(cycle_id.encode()).hexdigest()[:24] + '.json')

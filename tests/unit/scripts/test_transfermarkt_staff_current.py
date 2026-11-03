@@ -115,6 +115,19 @@ def test_budget_exhaustion_keeps_all_unwritten_clubs(offline):
     assert data(offline)['cursor']['staff_completed_at'] is None
 
 
+def test_busy_lease_slot_stops_staff_sweep_and_portion(offline):
+    # #2068: a held stream slot is not a per-club staff failure.
+    from scrapers.transfermarkt.client import LeaseConcurrencyLimited
+
+    def writer(*args, **kwargs):
+        raise LeaseConcurrencyLimited('proxy lease API rejected POST /v1/leases (HTTP 429): busy')
+    report = offline.run('busy', staff_writer=writer)
+    assert report['status'] == 'blocked'
+    assert staff_calls(offline) == ['10']
+    assert data(offline)['staff_sweep']['pending'] == ['10', '20']
+    assert data(offline)['staff_sweep']['deferred'] == {}
+
+
 def test_old_cursor_migrates_additive_staff_clock_without_losing_resume():
     cursor = current.ScopeCursor('scope', generation='old', resume_json='{"clubs": {}}')
     old = cursor.as_dict()

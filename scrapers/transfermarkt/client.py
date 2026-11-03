@@ -100,6 +100,15 @@ class CurrentPortionDeadlineExceeded(RuntimeError):
     """End a current work portion without treating its tail as a source failure."""
 
 
+class LeaseConcurrencyLimited(ProxyRequiredError):
+    """The gateway kept refusing a lease because the stream slot is busy."""
+
+
+# #2068: a lease left over from the previous portion frees the slot only when
+# it expires; wait briefly, then give the portion back instead of churning.
+_LEASE_CONCURRENCY_RETRY_DELAYS = (2.0, 5.0, 10.0, 15.0, 15.0)
+
+
 class SourceStreamPaused(CurrentPortionDeadlineExceeded):
     """A known site cooldown defers work; it is not a platform incident."""
 
@@ -408,6 +417,10 @@ class ProxyFilterLeaseProvider:
         payload: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         status, body = self._exchange(method, path, token=token, payload=payload)
+        return self._accepted(method, path, status, body)
+
+    @staticmethod
+    def _accepted(method: str, path: str, status: int, body: Any) -> Mapping[str, Any]:
         if status < 200 or status >= 300 or not isinstance(body, dict):
             error = redact_sensitive(
                 body.get("error", "unknown error")
@@ -553,7 +566,21 @@ class ProxyFilterLeaseProvider:
         from .history_portion import reconcile_leases, journal_lease
         scope = str(metadata.get('scope') or metadata.get('scope_id') or '')
         reconcile_leases(self, scope)
-        body = self._request("POST", "/v1/leases", payload=request)
+        for delay in (*_LEASE_CONCURRENCY_RETRY_DELAYS, None):
+            status, body = self._exchange("POST", "/v1/leases", payload=request)
+            if not (status == 429 and isinstance(body, dict) and body.get("code") == "concurrency_limited"):
+                break
+            if delay is None or (
+                self.request_deadline_monotonic is not None
+                and delay >= self.request_deadline_monotonic - self._monotonic()
+                - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS
+            ):
+                raise LeaseConcurrencyLimited(
+                    "proxy lease API rejected POST /v1/leases (HTTP 429): "
+                    f"{redact_sensitive(body.get('error', 'concurrency_limited'))}"
+                )
+            self._sleep(delay)
+        body = self._accepted("POST", "/v1/leases", status, body)
         try:
             lease = ProxyLease(
                 lease_id=str(body["id"]),
@@ -946,7 +973,7 @@ class TransfermarktHttpClient:
                         self._request_deadline_monotonic - self._monotonic()
                         - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
                     )
-        except CurrentPortionDeadlineExceeded:
+        except (CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited):
             raise
         except TrafficMeterError:
             raise
@@ -1022,10 +1049,20 @@ class TransfermarktHttpClient:
                 raise TrafficBudgetExceeded(
                     "Transfermarkt provider hard byte budget exhausted"
                 )
+            from .history_portion import enabled as history_enabled, remaining_seconds
+            if history_enabled():
+                ttl_seconds = min(self._lease_ttl_seconds, max(1, int(remaining_seconds())))
+            elif self._request_deadline_monotonic is not None:
+                # #2068: a lease that outlives the portion holds the single
+                # current stream until the gateway reaper expires it.
+                portion_left = self._request_deadline_monotonic - self._monotonic()
+                if portion_left - CURRENT_PORTION_SETTLE_SECONDS <= CURRENT_PORTION_MIN_REQUEST_SECONDS:
+                    raise CurrentPortionDeadlineExceeded("Transfermarkt lease acquire reached portion tail")
+                ttl_seconds = min(self._lease_ttl_seconds, max(1, int(portion_left)))
+            else:
+                ttl_seconds = self._lease_ttl_seconds
             self._lease_acquired_at = self._time()
             self._lease_provider_bytes = 0
-            from .history_portion import enabled as history_enabled, remaining_seconds
-            ttl_seconds = min(self._lease_ttl_seconds, max(1, int(remaining_seconds()))) if history_enabled() else self._lease_ttl_seconds
             self._lease = self._lease_provider.acquire(
                 max_bytes=min(remaining, SCOPE_HARD_PROVIDER_BYTE_CAP),
                 ttl_seconds=ttl_seconds,
@@ -2086,7 +2123,8 @@ class TransfermarktHttpClient:
                             url=url, label=label, context=context,
                             retry=attempt > 1,
                         )
-                    except (TrafficBudgetExceeded, TrafficMeterError, CurrentPortionDeadlineExceeded):
+                    except (TrafficBudgetExceeded, TrafficMeterError, CurrentPortionDeadlineExceeded,
+                            LeaseConcurrencyLimited):
                         raise
                     except Exception as exc:  # noqa: BLE001 - adapter errors vary
                         raise LeaseRotationError(

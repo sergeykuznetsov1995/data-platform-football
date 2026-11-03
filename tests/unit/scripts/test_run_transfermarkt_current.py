@@ -778,6 +778,47 @@ def test_stale48h_page_is_refetched_not_promoted(offline):
     assert sum('/kader/verein/10/' in url for _, url in offline.calls) == 1
 
 
+def _busy_lease_slot(offline):
+    """#2068: every lease acquire answers a held current stream slot."""
+    from scrapers.transfermarkt.client import LeaseConcurrencyLimited
+
+    original, built = offline.factory, []
+
+    def factory(*args):
+        scraper = original(*args)
+        built.append(scraper)
+
+        def refuse(**kwargs):
+            raise LeaseConcurrencyLimited('proxy lease API rejected POST /v1/leases (HTTP 429): busy')
+        scraper._http_client._ensure_client = refuse
+        return scraper
+    offline.factory = factory
+    return built
+
+
+@pytest.mark.parametrize('warm', [False, True])
+def test_busy_lease_slot_stops_portion_without_touching_cursors(offline, warm):
+    competitions = ('GB1', 'FR1')
+    if warm:
+        offline.run_cold('cold', competitions=competitions)
+        offline.clock.advance(21 * 3600)
+    before = {scope_id: data.get('cursor') for scope_id, data in offline.state()['scopes'].items()} if warm else {}
+    built = _busy_lease_slot(offline)
+    report = offline.run('busy', competitions=competitions)
+    assert report['status'] == 'blocked'
+    assert [item['status'] for item in report['scopes']] == ['blocked']
+    assert report['scopes'][0]['kind'] == ('signals' if warm else 'cold_roster')
+    assert 'LeaseConcurrencyLimited' in report['scopes'][0]['error']
+    assert 'check_failures' not in report['scopes'][0]
+    assert len(built) == 1
+    after = offline.state()['scopes']
+    assert all(not data.get('in_flight') for data in after.values())
+    assert {scope_id: data.get('cursor') for scope_id, data in after.items() if scope_id in before} == before
+    if not warm:
+        cursor = after[report['scopes'][0]['scope_id']].get('cursor') or {}
+        assert not cursor.get('last_work_at') and not cursor.get('last_error_at')
+
+
 def test_partial_tmapi_packet_does_not_claim_daily_player_check(offline):
     offline.run('cold')
     offline.clock.advance(21 * 3600)

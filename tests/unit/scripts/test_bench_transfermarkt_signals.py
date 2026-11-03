@@ -826,7 +826,8 @@ def test_fresh_lease_405_rotates_inside_one_endpoint_try(tmp_path, monkeypatch):
     result = bench.run(args(tmp_path, ids="8198"))
     assert result == 0, (tmp_path / "day1/report.json").read_text()
     assert factory.calls == [url, url]
-    assert factory.lease_ttls == [3600, 3600]
+    # #2068: a lease never outlives the measurement portion.
+    assert len(factory.lease_ttls) == 2 and all(ttl <= bench.MAX_PORTION_SECONDS for ttl in factory.lease_ttls)
     state = json.loads((tmp_path / "day1/state.json").read_text())
     report = json.loads((tmp_path / "day1/report.json").read_text())
     assert state["endpoint_tries"]["probe"] == 2
