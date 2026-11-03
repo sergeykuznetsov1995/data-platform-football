@@ -784,8 +784,9 @@ def test_team_and_squad_8643(saved):
     assert (t['primary_league_id'], t['primary_league_name'], t['latest_season']) == (63, 'Premier League', '2026/2027')
     assert (t['venue_name'], t['venue_city'], t['venue_latitude'], t['venue_longitude']) == (
         'Lukoil Arena', 'Moskva', 55.817875386, 37.440323731)
-    # Lead decision 10: bronze reads paths FotMob does not send -> NULL, no issue.
-    assert t['venue_capacity'] is None and t['page_url'] is None and t['_conform_issues_json'] is None
+    # #2138: bronze reads venue.statPairs and details.seopath (was NULL by lead decision 10).
+    assert (t['venue_capacity'], t['page_url'], t['_conform_issues_json']) == (
+        45360, '/teams/8643/overview/spartak-moscow', None)
     squad = saved.rows('fotmob_team_squads')
     assert {mt: len(_by(squad, member_type=mt)) for mt in ('player', 'coach')} == {'player': 29, 'coach': 1}
     coach, = _by(squad, member_type='coach')
@@ -1000,7 +1001,8 @@ def test_bad_optional_values_are_null_with_conform_issue():
     entry = _data(page)['careerHistory']['careerItems']['senior']['teamEntries'][0]
     entry.update(appearances='abc', goals='1.5', assists='4.0', startDate='n/a', endDate='x')
     team = team_page()
-    team['overview']['venue']['widget'].update(capacity='n/a', location=['x', 'x'])
+    team['overview']['venue']['widget'].update(location=['x', 'x'])
+    team['overview']['venue']['statPairs'] = [['Capacity', 'n/a']]
     members = team['squad']['squad'][1]['members']
     members[0].update(shirtNumber=7.5, height=180.5, dateOfBirth='n/a')
     members[0].pop('dateOfBirthUTC', None)
