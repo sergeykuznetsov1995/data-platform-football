@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -4220,3 +4220,206 @@ def test_history_campaign_repairs_schedules_before_completion_and_cohort_selecti
     assert result['selected'] == selected
     assert result['schedule_recovery'] == {'results': []}
     pipeline.seed_historical_seasons.assert_not_called()
+
+
+def _reparse_pipeline(monkeypatch, *waves, window_seconds=3600):
+    results = []
+    for wave in waves:
+        result = MagicMock()
+        result.as_dict.return_value = wave
+        results.append(result)
+    pipeline = MagicMock()
+    pipeline.reparse_version_lag_wave.side_effect = results
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "fbref_reparse_stop_at",
+        lambda now: now + timedelta(seconds=window_seconds),
+    )
+    return pipeline
+
+
+def _drain_reparse():
+    return fbref_pipeline_tasks.drain_fbref_reparse(
+        airflow_run_id="scheduled__reparse",
+        dag_id="dag_reparse_fbref",
+        page_kinds=["match"],
+        shard_size=25,
+    )
+
+
+@pytest.mark.unit
+def test_reparse_drain_runs_groups_until_drained_without_transport(
+    monkeypatch,
+):
+    pipeline = _reparse_pipeline(
+        monkeypatch,
+        {"cohort_size": 100, "claimed": 100, "parsed": 100},
+        {"cohort_size": 40, "claimed": 40, "parsed": 39, "dead_lettered": 1},
+        {"cohort_size": 0, "claimed": 0, "parsed": 0},
+    )
+
+    result = _drain_reparse()
+
+    assert result["status"] == "drained"
+    assert result["waves"] == 2
+    assert result["parsed"] == 139
+    settings = pipeline.reparse_version_lag_wave.call_args.kwargs["settings"]
+    assert (settings.run_type, settings.request_limit, settings.byte_limit) == (
+        "replay", 0, 0
+    )
+    pipeline.fetch_wave.assert_not_called()
+    pipeline.run_live_waves.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("wave", "status"),
+    [
+        ({"cohort_size": 5, "claimed": 0, "parsed": 0}, "stalled"),
+        ({"cohort_size": 5, "claimed": 1, "parsed": 1, "budget_returned": 4},
+         "window_closed"),
+    ],
+)
+def test_reparse_drain_stops_on_stall_or_deadline(monkeypatch, wave, status):
+    pipeline = _reparse_pipeline(monkeypatch, wave)
+
+    assert _drain_reparse()["status"] == status
+    assert pipeline.reparse_version_lag_wave.call_count == 1
+
+
+@pytest.mark.unit
+def test_reparse_drain_does_nothing_when_no_window_remains(monkeypatch):
+    pipeline = _reparse_pipeline(monkeypatch, window_seconds=0)
+
+    result = _drain_reparse()
+
+    assert result["status"] == "window_closed"
+    assert result["waves"] == 0
+    pipeline.reparse_version_lag_wave.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("now", "stop"),
+    [
+        # Current at 00:00 queues first: no work in its first 30 minutes.
+        ("00:10", "00:10"),
+        # After current: capped at 2 h.
+        ("01:00", "03:00"),
+        # Stops 45 min before the 04:30 history slice.
+        ("02:30", "03:45"),
+        # Inside the history admission window.
+        ("04:40", "04:40"),
+        # Stops 45 min before the 06:00 current window.
+        ("05:00", "05:15"),
+        ("05:30", "05:30"),
+        # Late evening: 45 min before the next day's 00:00 current.
+        ("23:00", "23:15"),
+    ],
+)
+def test_reparse_stop_yields_to_current_and_history_windows(now, stop):
+    day = datetime(2026, 11, 3, tzinfo=timezone.utc)
+
+    def at(clock):
+        hours, minutes = map(int, clock.split(":"))
+        return day + timedelta(hours=hours, minutes=minutes)
+
+    assert fbref_pipeline_tasks.fbref_reparse_stop_at(at(now)) == at(stop)
+
+
+@pytest.mark.unit
+def test_initialize_version_reparse_records_its_own_execution_mode(
+    monkeypatch,
+):
+    pipeline = MagicMock()
+    pipeline.initialize_run.return_value = (
+        "22222222-2222-4222-8222-222222222222"
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    fbref_pipeline_tasks.initialize_fbref_run(
+        airflow_run_id="scheduled__reparse",
+        dag_id="dag_reparse_fbref",
+        run_type="replay",
+        request_limit=0,
+        byte_limit_mb=0,
+        shard_size=25,
+        version_reparse=True,
+    )
+
+    evidence = pipeline.initialize_run.call_args.kwargs["execution_metadata"]
+    assert evidence["execution_mode"] == "version_reparse"
+    assert pipeline.initialize_run.call_args.kwargs["settings"].run_type == (
+        "replay"
+    )
+    with pytest.raises(ValueError, match="requires run_type=replay"):
+        fbref_pipeline_tasks.initialize_fbref_run(
+            airflow_run_id="scheduled__reparse",
+            dag_id="dag_ingest_fbref",
+            run_type="current",
+            version_reparse=True,
+        )
+
+
+def _states(**states):
+    return SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=task_id, state=state)
+            for task_id, state in states.items()
+        ]
+    )
+
+
+@pytest.mark.unit
+def test_reparse_finalizer_aborts_a_run_that_yielded_the_lock(monkeypatch):
+    abort = MagicMock(return_value={"status": "failed"})
+    release = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", abort)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+
+    result = fbref_pipeline_tasks.finalize_fbref_reparse_lock(
+        airflow_run_id="scheduled__reparse",
+        dag_id="dag_reparse_fbref",
+        dag_run=_states(acquire_publication_lock="skipped"),
+    )
+
+    assert result == {"released": False, "status": "not_acquired"}
+    abort.assert_called_once()
+    release.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("validate", "fails"), [("success", False),
+                                                  ("failed", True)])
+def test_reparse_finalizer_releases_and_reports_validation(
+    monkeypatch, validate, fails
+):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    run = _states(acquire_publication_lock="success", validate_run=validate)
+
+    if fails:
+        with pytest.raises(AirflowException, match="validate_run=failed"):
+            fbref_pipeline_tasks.finalize_fbref_reparse_lock(
+                airflow_run_id="scheduled__reparse",
+                dag_id="dag_reparse_fbref",
+                dag_run=run,
+            )
+    else:
+        assert fbref_pipeline_tasks.finalize_fbref_reparse_lock(
+            airflow_run_id="scheduled__reparse",
+            dag_id="dag_reparse_fbref",
+            dag_run=run,
+        )["status"] == "released_after_version_reparse"
+    release.assert_called_once()

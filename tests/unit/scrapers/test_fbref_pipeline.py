@@ -6,6 +6,7 @@ import gc
 import json
 import logging
 import re
+import time
 import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -562,6 +563,7 @@ class FakeControl:
         self.observation_claim_calls = []
         self.replay_control_runs = []
         self.recovery_run_types = []
+        self.reparse_limits = []
         self.eligible_competition_calls = 0
         self.run = {
             "run_type": "current",
@@ -875,6 +877,35 @@ class FakeControl:
             if self.frontier.get(
                 str(item["target_id"]), {}
             ).get("state") != "quarantined"
+        ]
+
+    def list_version_lagging_fetches(
+        self,
+        *,
+        parser_version,
+        typed_parser_version,
+        stateful_parser_version,
+        page_kinds,
+        limit,
+    ):
+        self.reparse_limits.append(limit)
+        rows = self.list_run_fetches(
+            "all-runs",
+            page_kinds=page_kinds,
+            limit=limit,
+            only_unparsed=True,
+            include_quarantined=False,
+            parser_version=parser_version,
+            typed_parser_version=typed_parser_version,
+            stateful_parser_version=stateful_parser_version,
+        )
+        return [
+            {
+                "run_id": item.get("run_id", str(uuid.UUID(int=1))),
+                "source_run_type": item.get("source_run_type", "current"),
+                **item,
+            }
+            for item in rows
         ]
 
     def quarantine_contract_rejected_target(
@@ -5077,6 +5108,120 @@ def test_generic_cohort_stops_at_the_configured_size(tmp_path):
     assert result.parsed == 5
 
 
+def _reparse_case(tmp_path, monkeypatch, competition_ids, group_pages=10):
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, competition_ids
+    )
+    # Real sampling path: re-parse must not spend a lone sample write.
+    del pipeline._process_prepared_observations
+    pipeline.batch_persist_matches = 2
+    monkeypatch.setattr(
+        pipeline_module, "FBREF_REPARSE_GROUP_PAGES", group_pages
+    )
+    control.run = {
+        **control.run,
+        "run_type": "replay",
+        "status": "running",
+        "request_limit": 0,
+        "byte_limit": 0,
+        "metadata": {"execution_mode": "version_reparse"},
+    }
+    source_run_id = str(uuid.uuid4())
+    for item in control.fetches:
+        item.update(run_id=source_run_id, source_run_type="backfill")
+    return pipeline, control, generic, source_run_id
+
+
+def _replay_settings():
+    return replace(_settings("replay"), request_limit=0, byte_limit=0)
+
+
+def test_version_reparse_writes_one_group_offline_with_source_identity(
+    tmp_path, monkeypatch
+):
+    """#1332: a whole selection is one write; identity is the fetching run's."""
+
+    pipeline, control, generic, source_run_id = _reparse_case(
+        tmp_path, monkeypatch, ["9", "12", "13", "14", "15"]
+    )
+    stateful = []
+    pipeline._apply_stateful_effects = (
+        lambda stateful_run_id, _html, _record, *, run_type, historical: (
+            stateful.append((stateful_run_id, run_type, historical)) or (0, 0)
+        )
+    )
+
+    result = pipeline.reparse_version_lag_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_replay_settings(),
+        # A deadline shrinks recovery groups to 4 pages; not re-parse groups.
+        deadline=time.monotonic() + 3600,
+    )
+
+    assert control.reparse_limits == [10]
+    assert generic.batch_sizes == [5]
+    assert result.claimed == result.parsed == 5
+    assert set(stateful) == {(source_run_id, "backfill", True)}
+
+
+def test_version_reparse_group_still_splits_at_the_cell_cap(
+    tmp_path, monkeypatch
+):
+    pipeline, _control, generic, _source = _reparse_case(
+        tmp_path, monkeypatch, ["9", "12", "13", "14"]
+    )
+    cells = pipeline._generic_item_cells
+    pipeline._generic_item_cells = lambda item: max(cells(item), 1)
+    pipeline.batch_persist_max_cells = 2
+
+    result = pipeline.reparse_version_lag_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_replay_settings(),
+    )
+
+    assert result.parsed == 4
+    assert len(generic.batch_sizes) > 1
+    assert max(generic.batch_sizes) < 4
+
+
+@pytest.mark.parametrize(
+    ("settings", "kwargs", "metadata", "error"),
+    [
+        (_settings("current"), {}, "version_reparse", "sourceless_replay"),
+        (
+            _replay_settings(), {"source_run_id": str(uuid.uuid4())},
+            "version_reparse", "sourceless_replay",
+        ),
+        (
+            _replay_settings(), {"_recover_cross_run": True},
+            "version_reparse", "sourceless_replay",
+        ),
+        (_replay_settings(), {}, "replay", "run_profile_invalid"),
+    ],
+)
+def test_version_reparse_rejects_every_other_selector_and_profile(
+    tmp_path, monkeypatch, settings, kwargs, metadata, error
+):
+    pipeline, control, generic, _source = _reparse_case(
+        tmp_path, monkeypatch, ["9"]
+    )
+    control.run["metadata"] = {"execution_mode": metadata}
+
+    with pytest.raises(ParseWaveError, match=error):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=settings,
+            _reparse_lag=True,
+            **kwargs,
+        )
+
+    assert control.reparse_limits == []
+    assert generic.batch_sizes == []
+
+
 def test_generic_batch_failure_reuses_claims_and_raw_without_network(tmp_path):
     pipeline, control, generic = _pipeline_with_saved_generic_pages(
         tmp_path, ["9", "12"]
@@ -7655,6 +7800,46 @@ def test_strict_acceptance_passes_explicit_absence_and_ignores_global_backlog(
     assert "finish:True" in control.events
     marker = control.run["metadata"]["bronze_acceptance"]
     assert marker["strict_gates"]["warm_http_success_rate"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("source_run_id", "network_attempts", "error"),
+    [
+        (None, 0, None),
+        (None, 1, "replay_generated_proxy_traffic"),
+        (str(uuid.uuid4()), 0, "version_reparse_source_run_id_forbidden"),
+    ],
+)
+def test_version_reparse_validates_without_a_source_run(
+    tmp_path, source_run_id, network_attempts, error
+):
+    """#1332: no source run to check, but still zero network."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.uuid4())
+    summary = _strict_acceptance_summary(control, run_id)
+    summary.update(
+        run_type="replay",
+        request_limit=0,
+        byte_limit=0,
+        requests_used=0,
+        bytes_used=0,
+        target_counts={},
+        metadata={"execution_mode": "version_reparse", "shard_size": 25},
+        traffic_totals={**summary["traffic_totals"],
+                        "network_attempts": network_attempts},
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    if error is None:
+        pipeline.validate_and_finish(run_id)
+        assert "finish:True" in control.events
+        return
+    with pytest.raises(RunValidationError, match=error):
+        pipeline.validate_and_finish(run_id, replay_source_run_id=source_run_id)
+    assert "finish:True" not in control.events
 
 
 @pytest.mark.parametrize(
