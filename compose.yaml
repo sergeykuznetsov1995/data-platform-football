@@ -1014,6 +1014,11 @@ services:
       - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:?}
       # Фикс. ключ шифрования refresh-токенов (иначе рестарт Trino разлогинивает людей)
       - TRINO_OAUTH2_REFRESH_KEY=${TRINO_OAUTH2_REFRESH_KEY}
+      # #2122: glibc creates up to 8×cores malloc arenas; with ~800 JVM threads doing
+      # native allocations (FFM zstd/lz4, S3 client) the arenas fragment to several GB
+      # outside the Java heap and the kernel kills the container at the 20G cgroup
+      # ceiling (01.11, 03.11.2026). Two arenas is the standard JVM-in-container cap.
+      - MALLOC_ARENA_MAX=2
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
