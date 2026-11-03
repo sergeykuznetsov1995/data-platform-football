@@ -51,7 +51,7 @@ sections AS (
     FROM (
         SELECT
             d.*,
-            TRY_CAST(TRY(json_extract(NULLIF(d.career_history_json, 'null'), '$.careerItems'))
+            TRY_CAST(json_extract(NULLIF(d.career_history_json, 'null'), '$.careerItems')
                      AS MAP(VARCHAR, JSON)) AS career_items
         FROM dedup d
     ) m

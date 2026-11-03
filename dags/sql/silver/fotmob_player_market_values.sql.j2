@@ -55,7 +55,7 @@ value_rows AS (
         FROM (
             SELECT
                 d.*,
-                TRY_CAST(TRY(json_extract(NULLIF(NULLIF(d.market_values_json, 'null'), ''), '$.values'))
+                TRY_CAST(json_extract(NULLIF(NULLIF(d.market_values_json, 'null'), ''), '$.values')
                          AS ARRAY(JSON)) AS value_items
             FROM dedup d
         ) m
