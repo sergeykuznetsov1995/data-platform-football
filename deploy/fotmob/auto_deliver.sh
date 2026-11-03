@@ -332,8 +332,8 @@ warn_airflowignore_change(){
     0) return 0 ;;
     1)
       log "AIRFLOWIGNORE: пин меняет dags/.airflowignore: $stat"
-      log "AIRFLOWIGNORE: после доставки нужен рестарт scheduler в паузе между волнами"
-      tg_durable "⚠️ FotMob: пин $TARGET меняет dags/.airflowignore; после доставки нужен рестарт scheduler в паузе между волнами. Лог: $LOG"
+      log "AIRFLOWIGNORE: барьер перезапустит scheduler под паузой производителей"
+      tg_durable "⚠️ FotMob: пин $TARGET меняет dags/.airflowignore; барьер перезапустит scheduler под паузой производителей. Лог: $LOG"
       ;;
     *) log "AIRFLOWIGNORE: изменение dags/.airflowignore не проверено (git diff rc=$rc, пин $TARGET); сверю mount после apply" ;;
   esac
