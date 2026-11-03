@@ -349,6 +349,21 @@ def test_intra_batch_conflicts_gate_only_on_conflicting_payload():
     assert not identical.passed and identical.value == 5
 
 
+def test_legacy_transfer_conflicts_are_warning_only():
+    # Legacy transfer key is coarser than the source (#1399): two real
+    # transfers may share date and clubs, so conflicts there never gate.
+    cur = StubCursor(overrides=[(
+        lambda sql: 'payload_variants' in sql and 'FROM iceberg.bronze.transfermarkt_' in sql, [(2, 0)],
+    )])
+    results = dq.run_bronze_dq(
+        cur, registry_snapshot_id='snap-1', zone='legacy', legacy_allowlist=[],
+    )
+    conflicts = {r.name: r.severity for r in results
+                 if r.name.startswith('tm_legacy_intra_batch_conflicts')}
+    assert conflicts.pop('tm_legacy_intra_batch_conflicts[transfermarkt_transfers]') == 'WARNING'
+    assert set(conflicts.values()) == {'ERROR'} and len(conflicts) == 3
+
+
 def test_cross_batch_duplicates_are_warning_only():
     cur = StubCursor(overrides=[(
         lambda sql: 'COUNT(DISTINCT _batch_id) > 1' in sql,

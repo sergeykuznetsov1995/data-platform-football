@@ -56,7 +56,8 @@ observability-only and must never gate.
   truths from one crawl) is ERROR (``tm_*_intra_batch_conflicts``);
   identical repeats of the same row are WARNING-only dirt
   (``tm_*_intra_batch_duplicates``) — the deterministic Silver dedup
-  collapses them without information loss.
+  collapses them without information loss.  Legacy ``transfermarkt_transfers``
+  conflicts are WARNING: its key is coarser than the source (#1399).
 - ``tm_bronze_cross_batch_duplicates[*]`` counts identical contract-PK rows
   across ``_batch_id`` values: after the carry-forward fix (issue #948,
   phase F5, ``observed_at`` is carried forward on idempotent re-crawls)
@@ -1040,6 +1041,7 @@ def run_bronze_dq(
 
     def run_intra_batch_split(
         prefix: str, table: str, sqls: Sequence[str],
+        conflict_severity: str = 'ERROR',
     ) -> None:
         """Split queries -> ERROR (conflicts) + WARNING (identical) results."""
 
@@ -1071,7 +1073,7 @@ def run_bronze_dq(
             results.append(BronzeCheckResult(
                 name=f'{prefix}_intra_batch_conflicts[{display}]',
                 kind=f'{prefix.removeprefix("tm_")}_intra_batch_conflicts',
-                severity='ERROR', passed=False, error=str(exc),
+                severity=conflict_severity, passed=False, error=str(exc),
             ))
             results.append(BronzeCheckResult(
                 name=f'{prefix}_intra_batch_duplicates[{display}]',
@@ -1082,7 +1084,7 @@ def run_bronze_dq(
         results.append(BronzeCheckResult(
             name=f'{prefix}_intra_batch_conflicts[{display}]',
             kind=f'{prefix.removeprefix("tm_")}_intra_batch_conflicts',
-            severity='ERROR', passed=conflicts == 0,
+            severity=conflict_severity, passed=conflicts == 0,
             details=f'{conflicts} conflicting duplicate groups',
             value=conflicts,
         ))
@@ -1109,9 +1111,13 @@ def run_bronze_dq(
                 )),
             )
         for table in LEGACY_BRONZE_KEYS:
+            # The legacy transfer key is coarser than the source (see
+            # CAREER_WRITE_TABLE_KEYS, #1399; frozen by #1409).
             run_intra_batch_split(
                 'tm_legacy', table,
                 [build_legacy_intra_batch_duplicates_sql(table, pins=pins)],
+                'WARNING' if table == 'iceberg.bronze.transfermarkt_transfers'
+                else 'ERROR',
             )
 
     if zone == 'legacy':
