@@ -108,4 +108,14 @@ Dry-run по умолчанию пишет **только свой state**, по
 Публикация включается только `--collect --publish-issues --pauses POLICY --state STATE`.
 Она запрещена с replay, snapshot, подменой времени или dry-run. Процесс не должен
 запускаться из deployment-дерева с записью Python bytecode: использовать
-`PYTHONDONTWRITEBYTECODE=1`. Доставка/регистрация cron в этот PR не входят.
+`PYTHONDONTWRITEBYTECODE=1`.
+
+Фактическая установка (#1376): cron зовёт сторожа из текущего релиза через обёртку
+`/usr/local/libexec/sofascore/run_from_release.sh` (она сама ставит `PYTHONPATH` релиза и
+`PYTHONDONTWRITEBYTECODE=1`), без дерева `release-<sha>` литералом:
+
+```
+*/15 * * * * PATH=/usr/local/bin:/usr/bin:/bin /usr/local/libexec/sofascore/run_from_release.sh pipeline_watchdog.py --collect --publish-issues --pauses /root/data-platform-football/.local/runtime/sofascore-pipeline-watchdog/pauses.json --state /root/data-platform-football/.local/runtime/sofascore-pipeline-watchdog/state.json >> /root/data-platform-football/.local/runtime/sofascore-pipeline-watchdog/watchdog.log 2>&1
+```
+
+Установка обёртки и правила её обновления — `sofascore-production.md`, «Сторожа из текущего релиза».

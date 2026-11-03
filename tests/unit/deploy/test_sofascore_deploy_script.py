@@ -1534,14 +1534,17 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         bin_dir / "systemctl",
         """\
         #!/usr/bin/env bash
+        # ExecStart — как отдаёт systemd: шаблон юнита, ${SOFASCORE_RELEASE_ROOT} не раскрыт.
+        # Живые аргументы — только у процесса MainPID (настоящий /proc/<pid>/cmdline).
         case "$*" in
-          *show*)
+          *MainPID*)
             case "$*" in
-              *-history.service*) c=$WD_HISTORY_CONTAINER; s=$WD_HISTORY_STATE ;;
-              *-players.service*) c=$WD_PLAYERS_CONTAINER; s=$WD_PLAYERS_STATE ;;
-              *) c=$WD_MAIN_CONTAINER; s=$WD_MAIN_STATE ;;
-            esac
-            echo "ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container $c --state-dir $s --expected-mount $EXPECTED_MOUNT --alert-command /a ; ignore_errors=no }" ;;
+              *-history.service*) echo "$WD_HISTORY_PID" ;;
+              *-players.service*) echo "$WD_PLAYERS_PID" ;;
+              *) echo "$WD_MAIN_PID" ;;
+            esac ;;
+          *show*)
+            echo 'ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container sofascore_gw_951 --state-dir ${SOFASCORE_GATEWAY_STATE_HOST_DIR} --expected-mount ${SOFASCORE_RELEASE_ROOT} --alert-command /a ; ignore_errors=no }' ;;
           *) echo active ;;
         esac
         """,
@@ -1595,7 +1598,6 @@ def _run_postdeploy(
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
         "SOFASCORE_ENV_FILE": str(env_file),
-        "EXPECTED_MOUNT": str(release),
         "WD_MAIN_CONTAINER": "sofascore_gw_951",
         "WD_MAIN_STATE": f"{runtime}/gateway-state",
         "WD_HISTORY_CONTAINER": "sofascore_gw_history",
@@ -1604,9 +1606,24 @@ def _run_postdeploy(
         "WD_PLAYERS_STATE": f"{runtime}/gateway-state-players",
         **(watchdogs or {}),
     }
-    return subprocess.run(
-        ["bash", str(DEPLOY / "postdeploy_checks.sh")], env=env, capture_output=True, text=True, timeout=60
-    )
+    # Сторожа — настоящие процессы с аргументами полосы в /proc/<pid>/cmdline.
+    procs = []
+    for lane in ("MAIN", "HISTORY", "PLAYERS"):
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 60", "gw-lease-watchdog", "--container", env[f"WD_{lane}_CONTAINER"],
+             "--state-dir", env[f"WD_{lane}_STATE"], "--expected-mount", str(release)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        procs.append(proc)
+        env[f"WD_{lane}_PID"] = str(proc.pid)
+    try:
+        return subprocess.run(
+            ["bash", str(DEPLOY / "postdeploy_checks.sh")], env=env, capture_output=True, text=True, timeout=60
+        )
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait()
 
 
 def _expected_mounts(tmp_path: Path) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
@@ -1673,6 +1690,18 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
         ("ingest_scraper_pool", 1), ("sofascore_history_pool", 3), ("sofascore_players_pool", 1)
     ):
         assert f"✓ пул {pool} slots={slots}" in proc.stdout, proc.stdout
+
+
+@pytest.mark.unit
+def test_postdeploy_section_6_reads_the_live_cmdline_not_the_unit_template(tmp_path: Path) -> None:
+    # `systemctl show -p ExecStart` отдаёт литерал ${SOFASCORE_RELEASE_ROOT} — раздел 6 был ✗
+    # на любом выкате (#1376). Дерево и полоса сверяются по живому процессу MainPID.
+    scheduler, gateways = _expected_mounts(tmp_path)
+    proc = _run_postdeploy(tmp_path, scheduler, gateways)
+    section = proc.stdout.split("== 6.", 1)[1].split("== 7.", 1)[0]
+    assert "✗" not in section and "SOFASCORE_RELEASE_ROOT" not in section, section
+    release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
+    assert section.count(f"--expected-mount {release}") == 6, section
 
 
 @pytest.mark.unit

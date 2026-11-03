@@ -262,7 +262,10 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    несошедшейся проверке: healthy и память шлюза, env кампании, точные пары
    «destination → source» всех монтов scheduler'а и шлюза (и ни одного лишнего монта
    поверх `dags/`), `import_error=0`, пять активных DAG контура, состояние кампании, пин
-   и статус сторожа (`systemctl show -p ExecStart`), `/health` шлюза.
+   и статус сторожа (живой процесс: `MainPID` → `/proc/<pid>/cmdline`, как приёмка автомата;
+   до #1376 читался `systemctl show -p ExecStart` — шаблон с литералом `${SOFASCORE_RELEASE_ROOT}`,
+   и раздел 6 был ✗ на любом выкате), `/health` шлюза. Это ручная диагностика: машинная
+   приёмка — шесть признаков `auto_deliver.sh`, автомат `postdeploy_checks.sh` сознательно не зовёт.
 
 Всегда `--no-deps`: без него `depends_on` пересоздаст `airflow-init` (см.
 `/root/SHARED-STACK-PROTOCOL.md`). Общий compose-проект `data-platform` эти команды не
@@ -421,8 +424,8 @@ start_date > <момент доставки> GROUP BY 1;` — должны бы�
 и `429 concurrency` не должно появиться в свежих файлах результатов.
 
 **Чего автомат НЕ делает:** не удаляет старые деревья релизов (только пишет в ✅, что
-`release-*` больше пяти или появились осиротевшие `freeze.*`); не чинит ложные ✗ раздела 6
-`postdeploy_checks.sh` — он этот скрипт вообще не зовёт; не запрещает ручной выкат (но
+`release-*` больше пяти или появились осиротевшие `freeze.*`); не зовёт `postdeploy_checks.sh`
+(ручная диагностика, раздел 6 починен в #1376; приёмка автомата — свои шесть признаков); не запрещает ручной выкат (но
 делит с ним замок выката: чей замок — того и ночь); не
 судит о том, собирает ли кампания данные.
 
@@ -695,9 +698,9 @@ python3 -c "import json,collections as c;d=json.load(open('/root/sofascore-runti
 
 **Что меряет.** Критерий вехи 1 (решение 2 гриля 22.09): доля завершённых матчей ядра, у которых все пять
 эндпоинтов (`event`, `lineups`, `statistics`, `shotmap`, `incidents`) в терминальном статусе не позже 24 ч
-после окончания матча. Порог — ≥ 99 %; веха — три суток подряд. Живёт на хосте, вне git:
-`/root/watchdog/tools/sofascore_veha1_measure.py` + SQL-шаблоны `sofascore_veha1_{observe,closure,unmarked,c1}.sql`
-рядом; Trino — только `~/.claude/bin/trino-ro.sh` (сентинел `__sentinel__`, `timeout=600`, id чанками по 2 000).
+после окончания матча. Порог — ≥ 99 %; веха — три суток подряд. Код — в релизе (#1376):
+`deploy/sofascore/veha1_measure.py` + SQL-шаблоны `sofascore_veha1_{observe,closure,unmarked,c1}.sql` и
+`sofascore_veha1_c1_noncore.txt` рядом; запуск — через обёртку `run_from_release.sh` (ниже); Trino — только `~/.claude/bin/trino-ro.sh` (сентинел `__sentinel__`, `timeout=600`, id чанками по 2 000).
 
 **Определения.**
 - Ядро — `class == core` в `<SOFASCORE_RELEASE_ROOT>/configs/sofascore/denominator.tsv` (#1353; путь берётся из
@@ -717,7 +720,9 @@ python3 -c "import json,collections as c;d=json.load(open('/root/sofascore-runti
   был позже старт + 24 ч и матча `finished` не видел. Число справочное: матч **остаётся в знаменателе**. Это не
   доказывает позднюю разметку источником (мог отстать наш сбор афиши, а `changes_change_timestamp` — время последней
   правки записи, не перехода в `finished`); времени перехода статуса у источника в данных нет, поэтому исключение
-  «размеченных источником позже 24 ч» из критерия пока не применяется.
+  «размеченных источником позже 24 ч» из критерия пока не применяется. Улика «кто опоздал» (#2094) — `late_verdict`
+  записи (`source_late` / `our_sweep_late` / `unknown`) по ключу `visits` артефактов обхода афиши
+  `<SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR>/refresh-results/schedule-refresh-*.json`; в строке — разбивка по вердиктам.
 - «Не размечено» (R-38) — матчи ядра со стартом 1–7 суток назад в статусе `notstarted/inprogress/postponed/
   canceled/interrupted/suspended`.
 
@@ -726,8 +731,8 @@ observe (дописать журнал), потом итог суток D = вч
 ещё не отчитанные (плюс записи с `reported_day` дня, итога которого нет в `daily.jsonl`, — след оборванного
 прогона любого дня). Итог — одна строка сводки
 `• веха 1 SofaScore за <дд.мм> (UTC): ядро ≤ 24 ч M/N = x,x % ✅|⛔ (порог ≥ 99 %; SS a/b, дейли c/d); …`
-(`✅` только при ≥ 99 % и N > 0; вместо «поздно размечено k» строка печатает «finished увиден позже 24 ч после старта k (в знаменателе)»), запись в `daily.jsonl` (разрезы, топ-10 турниров по пропускам) и нарушители
-`state/sofascore_veha1/<D>.tsv` (`game_id, league, season, start, deadline, closed_at, missing_endpoints`).
+(`✅` только при ≥ 99 % и N > 0; вместо «поздно размечено k» строка печатает «finished увиден позже 24 ч после старта k (в знаменателе; источник опоздал a, наш обход b, неизвестно c)»), запись в `daily.jsonl` (разрезы, топ-10 турниров по пропускам) и нарушители
+`state/sofascore_veha1/<D>.tsv` (`game_id, league, season, start, deadline, closed_at, missing_endpoints, late_verdict, last_sweep_without`).
 Запись: нарушители → журнал → `daily.jsonl` (точка фиксации, атомарная перезапись; битые строки пропускаются). Повторный запуск за тот же D печатает
 сохранённую строку; `--dry-run` ничего не создаёт и замок не берёт. Сбой — строка
 `⚠️ измеритель вехи 1: <причина>`, сводка не падает.
@@ -737,12 +742,7 @@ observe (дописать журнал), потом итог суток D = вч
 эндпоинт, истории нет); сузить окно можно только более частым observe — отдельное решение. Окончание (`end_ts`) фиксируется при первом наблюдении. До доставки релиза с
 `denominator.tsv` строка — `⚠️ … файла знаменателя нет`.
 
-**Кандидат #1867 (установка измерителя отдельно лидом).**
-[Версия в репозитории](../../deploy/sofascore/veha1_measure.py) основана на host-копии.
-Её устанавливают вместо `tools/sofascore_veha1_measure.py` рядом с существующими
-`sofascore_veha1_{observe,closure,unmarked,c1}.sql` и `sofascore_veha1_c1_noncore.txt`;
-эти host-ресурсы не входят в данный пакет. Наличие файла в git не доказывает установку.
-Новый запрос текущего долга находится в Python и выбирает последнюю natural-key строку,
+**Текущий долг (#1867).** Новый запрос текущего долга находится в Python и выбирает последнюю natural-key строку,
 затем предпочитает daily-партицию матча перед SS. Текущие сезоны — календарный год,
 прошлый/текущий и текущий/следующий год (`2026`, `2526`, `2627` для 2026).
 
@@ -760,11 +760,36 @@ observe (дописать журнал), потом итог суток D = вч
 полосе daily/SS и времени последнего чтения расписания. Ошибка запроса прерывает замер,
 а не превращается в нулевой долг. Схема `core_in24/core_total` для watchdog сохранена.
 
-**Воспроизведение C1.** `python3 /root/watchdog/tools/sofascore_veha1_measure.py --c1 2026-09-14 2026-09-21
+**Воспроизведение C1.** `/usr/local/libexec/sofascore/run_from_release.sh veha1_measure.py --c1 2026-09-14 2026-09-21
 --denominator <tsv>` — окно старта без журнала, окончание = старт + 7200, закрытие = любая строка capture_status;
 ядро по старому правилу (211 ключей `sofascore_veha1_c1_noncore.txt`) и по файлу. Замер 23.09: finished 3 082
 (C1 22.09 — 3 074), ≤ 24 ч 186, ядро 136/2 755 по обоим правилам. Сухой `report` 23.09 (файл из #1418):
 ядро 116/2 431 = 4,8 % (SS 12/2 297, дейли 104/134).
+
+### Сторожа из текущего релиза (#1376)
+
+Код сторожей SofaScore едет обычной доставкой: на хосте только обёртка
+[`run_from_release.sh`](../../deploy/sofascore/run_from_release.sh). Она читает `SOFASCORE_RELEASE_ROOT` из
+env-файла контура (общим загрузчиком `env.sh`) при каждом запуске и делает
+`exec env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=<релиз> /usr/bin/python3 <релиз>/deploy/sofascore/<скрипт> …`;
+нет env-файла, корня или скрипта — код 2. Новый релиз подхватывается без правки cron; дерево `release-<sha>`
+литералом в cron и в сводке не пишется.
+
+```bash
+# Установка рядом с env.sh автомата. В md5-сверку auto_deliver.sh обёртка НЕ входит:
+# при изменении run_from_release.sh в релизе — переустановить так же.
+install -m 0755 "$SOFASCORE_RELEASE_ROOT/deploy/sofascore/run_from_release.sh" /usr/local/libexec/sofascore/
+md5sum /usr/local/libexec/sofascore/run_from_release.sh "$SOFASCORE_RELEASE_ROOT/deploy/sofascore/run_from_release.sh"
+```
+
+Сторож полос (crontab root, каждые 15 минут):
+
+```
+*/15 * * * * PATH=/usr/local/bin:/usr/bin:/bin /usr/local/libexec/sofascore/run_from_release.sh pipeline_watchdog.py --collect --publish-issues --pauses /root/data-platform-football/.local/runtime/sofascore-pipeline-watchdog/pauses.json --state /root/data-platform-football/.local/runtime/sofascore-pipeline-watchdog/state.json >> /root/data-platform-football/.local/runtime/sofascore-pipeline-watchdog/watchdog.log 2>&1
+```
+
+Измеритель вехи 1 из сводки: `/usr/local/libexec/sofascore/run_from_release.sh veha1_measure.py report`
+(состояние по-прежнему в `/root/watchdog/state/sofascore_veha1/`).
 
 ## Книга аллокаций: журнал + снимок (#1350)
 

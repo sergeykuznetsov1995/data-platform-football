@@ -18,7 +18,10 @@
 (из /etc/data-platform/sofascore.env читается только строка SOFASCORE_RELEASE_ROOT=).
 Матч → турнир: партиция SS-<id> (полоса SS) или tournament_unique_tournament_id расписания
 для партиций реестра дейли (ENG-… и т. п., полоса daily). Trino — только trino-ro.sh.
+Вердикт позднего finished (#2094) — по ключу visits артефактов обхода афиши
+<SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR>/refresh-results/schedule-refresh-*.json.
 Пишет только в /root/watchdog/state/sofascore_veha1/.
+SQL-шаблоны sofascore_veha1_*.sql и sofascore_veha1_c1_noncore.txt лежат рядом в deploy/sofascore/.
 """
 from __future__ import annotations
 
@@ -71,7 +74,7 @@ def trino_rows(sql: str, ncols: int) -> list[list[str | None]]:
     if len(sql.encode()) > 120_000:
         raise MeasureError("SQL длиннее 120 КБ (MAX_ARG_STRLEN)")
     try:
-        r = subprocess.run([TRINO, sql], capture_output=True, text=True, timeout=600)
+        r = subprocess.run([TRINO, sql.lstrip()], capture_output=True, text=True, timeout=600)  # 30.10: trino-ro.sh смотрит первую строку — ведущий перевод строки ронял запрос
     except subprocess.TimeoutExpired:
         raise MeasureError("trino: таймаут 600 с") from None
     if r.returncode != 0:
@@ -161,6 +164,91 @@ def _iso(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+def release_runtime_dir() -> Path | None:
+    """Каталог артефактов обхода афиши; нет строки — None (вердикты станут unknown, замер идёт)."""
+    try:
+        for line in Path(SS_ENV).read_text(encoding="utf-8").splitlines():
+            if line.startswith("SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR="):
+                root = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return Path(root) / "refresh-results"
+    except OSError:
+        pass
+    return None
+
+
+def _ts(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def load_visits(since_ts: float) -> tuple[dict[tuple[str, str], list], list[float]]:
+    """(league, season) → [(fetched_at, pages, oldest_start, banked_at)] из артефактов обхода с
+    mtime ≥ since_ts, и mtime всех артефактов, где ключ visits есть (улика «обход вёл журнал»).
+    Битый JSON, артефакт без visits и запись не вида [iso, int, int|None] пропускаются: содержимое
+    артефакта не должно ронять замер."""
+    index: dict[tuple[str, str], list] = {}
+    logs: list[float] = []
+    folder = release_runtime_dir()
+    if folder is None:
+        return index, logs
+    try:
+        paths = list(folder.glob("schedule-refresh-*.json"))
+    except OSError:
+        return index, logs
+    for path in paths:
+        try:
+            banked = path.stat().st_mtime
+            if banked < since_ts:
+                continue
+            visits = json.loads(path.read_text(encoding="utf-8")).get("visits")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(visits, dict):
+            continue
+        logs.append(banked)
+        for league, seasons in visits.items():
+            if not isinstance(seasons, dict):
+                continue
+            for season, entry in seasons.items():
+                try:
+                    fetched_at, pages, oldest = entry
+                    _ts(fetched_at)
+                    if not isinstance(pages, int) or not (oldest is None or isinstance(oldest, int)):
+                        continue
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                index.setdefault((league, season), []).append((fetched_at, pages, oldest, banked))
+    return index, logs
+
+
+def sweep_verdict(rec: dict, visits: dict[tuple[str, str], list], logs: list[float]) -> dict:
+    """Кто опоздал с поздним finished (#2094): source_late / our_sweep_late / unknown.
+    Без матча гарантированно прошли только визиты, легшие (banked_at) до T0 = prev_observe_at;
+    L — последний из них в окне [старт, T0]. Недоказанное — на наш обход. Обход пишет визиты под
+    SS-<tournament_id> и для лиг дейли тоже. oldest_start = None (цепочка не от last-0 или в партиции
+    несколько сезонов источника) покрытия не доказывает → unknown."""
+    start, t0 = rec["start_ts"], rec["prev_observe_at"]
+    out = {"late_verdict": "unknown", "late_reason": "no_visit_log", "last_sweep_without_at": None,
+           "next_sweep_at": None, "sweep_pages": None, "sweep_oldest_start": None}
+    if not any(start <= banked <= t0 for banked in logs):
+        return out
+    if rec.get("tournament_id") is None:
+        return {**out, "late_reason": "no_tournament"}
+    key = (f"SS-{rec['tournament_id']}", rec["season"])
+    seen = sorted(visits.get(key, []), key=lambda v: (v[3], _ts(v[0])))
+    before = [v for v in seen if start <= v[3] <= t0]
+    if not before:
+        return {**out, "late_verdict": "our_sweep_late", "late_reason": "not_visited"}
+    fetched_at, pages, oldest, _banked = last = before[-1]
+    out.update(last_sweep_without_at=fetched_at, sweep_pages=pages, sweep_oldest_start=oldest)
+    if _ts(fetched_at) >= start + 86400:
+        if oldest is not None and oldest <= start:
+            return {**out, "late_verdict": "source_late", "late_reason": "page_covered"}
+        return {**out, "late_reason": "beyond_pages"}
+    after = [v[0] for v in seen[seen.index(last) + 1:] if _ts(v[0]) > _ts(fetched_at)]
+    return {**out, "late_verdict": "our_sweep_late", "late_reason": "visit_before_24h",
+            "next_sweep_at": min(after, key=_ts) if after else None}
+
+
 # ---------------------------------------------------------------- observe
 def read_last_observe() -> int | None:
     try:
@@ -214,6 +302,7 @@ def observe(journal: dict[str, dict], now: datetime, *, debt_rows=None) -> tuple
     since = until - OBSERVE_DAYS * 86400
     rows = trino_rows(_sql("observe", since=str(since), until=str(until)), 8)
     added = 0
+    visits = None
     for gid, st, change, ss_league, ss_season, reg_league, reg_season, tut in rows:
         if st is None:
             continue
@@ -248,6 +337,13 @@ def observe(journal: dict[str, dict], now: datetime, *, debt_rows=None) -> tuple
             journal[gid]["first_seen_finished_at"] = previous.get("first_seen_finished_at", until)
         else:
             added += 1
+        if seen_late(journal[gid]) and "late_verdict" not in journal[gid]:
+            try:  # улика справочная: никакой сбой в ней не должен отнять цифру вехи
+                if visits is None:
+                    visits = load_visits(since - 86400)
+                journal[gid].update(sweep_verdict(journal[gid], *visits))
+            except Exception as exc:  # noqa: BLE001
+                journal[gid].update(late_verdict="unknown", late_reason=f"verdict_error: {type(exc).__name__}")
     for gid, st, ss_league, ss_season, reg_league, reg_season, tut, status, ingested in (
         status_debt(now) if debt_rows is None else debt_rows
     ):
@@ -280,8 +376,9 @@ def seen_late(rec: dict) -> bool:
     """finished увиден НАМИ позже 24 ч после старта: прошлый observe был позже старт + 24 ч и матча
     finished в bronze не видел. Это не доказывает позднюю разметку ИСТОЧНИКОМ (мог отстать наш сбор
     афиши; changes_change_timestamp — время последней правки, не перехода в finished), поэтому матч
-    ОСТАЁТСЯ в знаменателе, а число печатается справочно (Astra #1355, круг 3). Исключать из критерия
-    можно будет только по улике времени перехода статуса у источника — её в данных нет."""
+    ОСТАЁТСЯ в знаменателе, а число печатается справочно (Astra #1355, круг 3). Улика «кто опоздал» —
+    late_verdict в записи (#2094, sweep_verdict по визитам обхода афиши); решение о знаменателе —
+    за владельцем по недельной сводке вердиктов."""
     prev = rec.get("prev_observe_at")
     return (rec.get("first_seen_finished_at") is not None
             and prev is not None and prev - rec["start_ts"] > 86400)
@@ -369,6 +466,11 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
            and (not rec.get("reported_day") or rec["reported_day"] not in done_days)]
     core = [rec for rec in due if classes.get(rec["tournament_id"]) == "core"]
     late = [rec for rec in core if seen_late(rec)]
+    # Записи до #2094 вердикта не имеют — считаются «неизвестно», задним числом не пересчитываются.
+    verdicts = Counter(rec.get("late_verdict", "unknown") for rec in late)
+    verdicts_by_league: dict[str, Counter] = {}
+    for rec in late:
+        verdicts_by_league.setdefault(rec["league"] or "?", Counter())[rec.get("late_verdict", "unknown")] += 1
     population = core
     lanes = {"SS": [0, 0], "daily": [0, 0]}
     misses: Counter = Counter()
@@ -398,7 +500,9 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
             ) or "terminal after deadline"
         violators.append([rec["game_id"], rec["league"], rec["season"] or "-",
                           _iso(rec["start_ts"]), _iso(rec["deadline_ts"]),
-                          _iso(closed_at), missing])
+                          _iso(closed_at), missing,
+                          rec.get("late_verdict", "-") if seen_late(rec) else "-",
+                          rec.get("last_sweep_without_at") or "-"])
     debt = Counter(rec["status_first_seen"] for rec in core if rec.get("status_debt"))
     n = len(population)
     share = 100.0 * ok / n if n else 0.0
@@ -410,7 +514,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         f"• веха 1 SofaScore за {day:%d.%m} (UTC): ядро ≤ 24 ч {ok}/{n} = "
         f"{share_txt} % {mark} (порог ≥ 99 %; "
         f"SS {lanes['SS'][0]}/{lanes['SS'][1]}, дейли {lanes['daily'][0]}/{lanes['daily'][1]}); "
-        f"finished увиден позже 24 ч после старта {len(late)} (в знаменателе); не размечено: notstarted {un['notstarted']}, "
+        f"finished увиден позже 24 ч после старта {len(late)} (в знаменателе; источник опоздал {verdicts['source_late']}, "
+        f"наш обход {verdicts['our_sweep_late']}, неизвестно {verdicts['unknown']}); не размечено: notstarted {un['notstarted']}, "
         f"inprogress {un['inprogress']}, postponed {un['postponed']}, "
         f"canceled {un['canceled']}; долг статусов в знаменателе {sum(debt.values())}: "
         f"{dict(debt)}; текущий долг {len(current_debt)}/{current_total} = "
@@ -423,7 +528,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
     # Обрыв до daily.jsonl: следующий прогон (в любой день) берёт эти записи снова — см. due выше.
     _atomic_write(vfile, "".join(
         "\t".join(str(c) for c in row) + "\n" for row in
-        [["game_id", "league", "season", "start", "deadline", "closed_at", "missing_endpoints"],
+        [["game_id", "league", "season", "start", "deadline", "closed_at", "missing_endpoints",
+          "late_verdict", "last_sweep_without"],
          *violators]
     ))
     summary = {
@@ -432,6 +538,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         "share": round(share, 2), "pass": mark == "✅", "threshold": THRESHOLD,
         "lanes": {k: {"in24": v[0], "total": v[1]} for k, v in lanes.items()},
         "seen_finished_late_in_denominator": len(late), "unmarked": dict(un),
+        "late_verdicts": {k: verdicts[k] for k in ("source_late", "our_sweep_late", "unknown")},
+        "late_verdicts_by_league": {k: dict(v) for k, v in sorted(verdicts_by_league.items())},
         "top_misses": [[tid, cnt] for tid, cnt in misses.most_common(10)],
         "status_debt_current": dict(current_statuses),
         "status_debt_current_total": current_total,

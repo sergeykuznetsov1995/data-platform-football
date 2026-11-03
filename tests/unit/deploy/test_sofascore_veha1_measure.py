@@ -1,4 +1,6 @@
 """Offline journal migration and status-debt accounting for milestone one."""
+import json
+import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +28,7 @@ def test_status_debt_counts_once_then_finished_keeps_identity(
     # Actual observe layout: id, start, change, SS league/season, daily league/season, tournament.
     finished[0][2] = str(start + 7200)
     monkeypatch.setattr(measure, "_sql", lambda name, **_: name)
+    monkeypatch.setattr(measure, "SS_ENV", str(tmp_path / "absent.env"))  # вердикт #2094 — без хоста
     monkeypatch.setattr(measure, "trino_rows", lambda *_: finished)
     monkeypatch.setattr(measure, "closures", lambda _: {"1": [start + 8000]})
     monkeypatch.setattr(measure, "unmarked", lambda *_: Counter({status: 1}))
@@ -39,7 +42,7 @@ def test_status_debt_counts_once_then_finished_keeps_identity(
     line = measure._report_locked(*args)
     assert "1/2 = 50,0" in line
     expected_late = int(prev_observe_delay is not None)
-    assert f"finished увиден позже 24 ч после старта {expected_late} (в знаменателе)" in line
+    assert f"finished увиден позже 24 ч после старта {expected_late} (в знаменателе; " in line
     assert measure._report_locked(*args) == line
     journal = measure.read_journal()
     assert len(journal) == 2
@@ -126,3 +129,56 @@ def test_status_debt_parses_double_start_timestamp(monkeypatch):
     rows = measure.status_debt(now)
     assert int(rows[0][1]) == start
     db.close()
+
+
+@pytest.mark.parametrize("name", ["observe", "closure", "unmarked", "c1"])
+def test_sql_templates_ship_with_the_measurer(name):
+    # Шаблоны жили только в /root/watchdog/tools/ — из релиза измеритель падал FileNotFoundError.
+    sql = measure._sql(name, since="1", until="2", terminal="'success'", ids="'1'", statuses="'notstarted'")
+    assert "__sentinel__" in sql and "{" not in sql
+    assert len((measure.TOOLS / "sofascore_veha1_c1_noncore.txt").read_text().split()) == 211
+
+
+def test_sweep_verdict_source_late_vs_our_sweep_late(tmp_path, monkeypatch):
+    # Логика #2094 жила только в копии хоста /root/watchdog/tools/ — из релиза вердикта не было.
+    start = int(datetime(2026, 10, 20, 18, tzinfo=timezone.utc).timestamp())
+
+    def iso(ts):
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    results = tmp_path / "runtime" / "refresh-results"
+    results.mkdir(parents=True)
+    env = tmp_path / "sofascore.env"
+    env.write_text(f'SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR="{tmp_path / "runtime"}"\n', encoding="utf-8")
+    monkeypatch.setattr(measure, "SS_ENV", str(env))
+
+    def bank(name, banked, payload):
+        path = results / f"schedule-refresh-{name}.json"
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+        os.utime(path, (banked, banked))
+
+    # Визит SS-8 до старт + 24 ч и следующий — уже после T0; SS-7 — страница после 24 ч и покрыла старт.
+    bank("early", start + 7200, {"visits": {"SS-8": {"2627": [iso(start + 7000), 2, start - 86400]}}})
+    bank("late", start + 30 * 3600, {"visits": {"SS-7": {"2627": [iso(start + 30 * 3600 - 60), 3, start - 3600]}}})
+    bank("after", start + 4 * 86400, {"visits": {"SS-8": {"2627": [iso(start + 4 * 86400 - 60), 1, start]}}})
+    bank("broken", start + 3600, "{not json")
+    bank("novisits", start + 3600, {"games": []})
+    bank("badentry", start + 3600, {"visits": {"SS-9": {"2627": ["not-a-date", 1, None]}, "SS-10": []}})
+
+    visits, logs = measure.load_visits(start - 86400)
+    assert sorted(visits) == [("SS-7", "2627"), ("SS-8", "2627")]
+    t0 = start + 3 * 86400
+
+    def verdict(tid):
+        rec = {"start_ts": start, "prev_observe_at": t0, "tournament_id": tid, "season": "2627"}
+        return measure.sweep_verdict(rec, visits, logs)
+
+    assert verdict(7)["late_verdict"] == "source_late"
+    assert verdict(7)["late_reason"] == "page_covered"
+    ours = verdict(8)
+    assert (ours["late_verdict"], ours["late_reason"]) == ("our_sweep_late", "visit_before_24h")
+    assert ours["next_sweep_at"] == iso(start + 4 * 86400 - 60)
+    assert verdict(11)["late_reason"] == "not_visited"
+    assert verdict(None)["late_reason"] == "no_tournament"
+    rec = {"start_ts": start + 10 * 86400, "prev_observe_at": start + 11 * 86400, "tournament_id": 7, "season": "2627"}
+    assert measure.sweep_verdict(rec, visits, logs)["late_reason"] == "no_visit_log"

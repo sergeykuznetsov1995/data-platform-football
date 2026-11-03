@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Приёмка выката на контур SofaScore. Только чтение; код выхода 1, если хоть одна
-# проверка не сошлась (монты не на ожидаемом дереве, import_error, неактивные DAG,
+# Ручная диагностика выката на контур SofaScore. Машинная приёмка — шесть признаков
+# auto_deliver.sh; этот скрипт автомат не зовёт. Только чтение; код выхода честный: 1, если
+# хоть одна проверка не сошлась (монты не на ожидаемом дереве, import_error, неактивные DAG,
 # сторож не на дереве или не active, /health не отвечает).
 # Использование: bash deploy/sofascore/postdeploy_checks.sh [release-root]
 #   (по умолчанию — SOFASCORE_RELEASE_ROOT из $SOFASCORE_ENV_FILE)
@@ -119,15 +120,20 @@ echo
 echo "== 6. Вотчдоги аренд (по одному на шлюз) =="
 # Сверяем не только дерево, но и пару «контейнер / каталог состояния»: сторож,
 # перепутавший полосу, был бы active и рестартовал бы чужой шлюз по чужому WAL.
+# Аргументы — из живого процесса (MainPID → /proc/<pid>/cmdline), как в приёмке
+# auto_deliver.sh: `systemctl show -p ExecStart` отдаёт шаблон юнита с литералом
+# ${SOFASCORE_RELEASE_ROOT}, и раздел был ✗ на любом выкате (#1376).
 for i in "${!WATCHDOG_UNITS[@]}"; do
   unit="${WATCHDOG_UNITS[$i]}"
-  exec_start=$(systemctl show -p ExecStart "$unit" 2>/dev/null || true)
-  echo "$unit: $(printf '%s' "$exec_start" | grep -o -- "--container [^ ;]* --state-dir [^ ;]* --expected-mount [^ ;]*" || echo "(ExecStart не разобран)")"
+  pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
+  cmdline=""
+  case "$pid" in ''|0|*[!0-9]*) ;; *) cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true) ;; esac
+  echo "$unit (MainPID ${pid:-?}): $(printf '%s' "$cmdline" | grep -o -- "--container .*" || echo "(процесс не найден)")"
   for expected in "--container ${GATEWAY_CONTAINERS[$i]}" \
                   "--state-dir ${GATEWAY_STATE_DIRS[$i]}" \
                   "--expected-mount $RELEASE"; do
     flag=${expected%% *}
-    got=$(printf '%s' "$exec_start" | grep -o -- "$flag [^ ;]*" | head -1 || true)
+    got=$(printf '%s' "$cmdline" | grep -o -- "$flag [^ ]*" | head -1 || true)
     [ "$got" = "$expected" ] && ok "$unit $expected" || fail "$unit: '${got:-<нет $flag>}' (ожидалось $expected)"
   done
   [ "$(systemctl is-active "$unit")" = "active" ] && ok "$unit active" || fail "$unit не active"
