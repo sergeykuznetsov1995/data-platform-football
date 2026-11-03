@@ -713,3 +713,35 @@ def test_schedule_refresh_migrates_checkpoint_and_isolates_seasons(tmp_path):
     with pytest.raises(RuntimeError, match="lease was lost"):
         checkpoint.reserve_deferred_refresh("A", new_token,
                                             now=state.DEFERRED_REFRESH_SECONDS + state.LEASE_SECONDS)
+
+
+def test_unscheduled_scope_is_not_starved_behind_busy_scopes(tmp_path):
+    # A wave-1 scope without a schedule sat behind current seasons that always
+    # had match work; it was never reserved and wave 2 never opened (#2140).
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    busy, late = season(league="busy", source=200), season(league="late", source=1)
+    kwargs["catalog"] = catalog(("busy", 2, [busy]), ("late", 9, [late]))
+    repo.history_coverage.return_value = {("busy", "2526"): coverage()}
+    result = history.run_chunk(**kwargs)
+    assert result["scope"] == "late=2526"
+    service.sync_schedule.assert_called_once_with()
+    service.sync_matches.assert_not_called()
+    # Still unscheduled after the pass: cooled down, so busy scopes get the worker.
+    kwargs["now"] = NOW + timedelta(seconds=60)
+    assert history.run_chunk(**kwargs)["scope"] == "busy=2526"
+    kwargs["now"] = NOW + timedelta(seconds=state.COOLDOWN_SECONDS + 1)
+    assert history.run_chunk(**kwargs)["scope"] == "late=2526"
+
+
+def test_scheduled_wave_one_gate_blocker_keeps_priority(tmp_path):
+    # With its schedule in, the blocker still has unknown stages: its matches
+    # must not starve behind busy scopes either, or the gate stays shut (#2140).
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    busy, late = season(league="busy", source=200), season(league="late", source=1)
+    kwargs["catalog"] = catalog(("busy", 2, [busy]), ("late", 9, [late]))
+    repo.history_coverage.return_value = {("busy", "2526"): coverage(),
+                                          ("late", "2526"): coverage(unknown_stages=1)}
+    assert history.run_chunk(**kwargs)["scope"] == "late=2526"
+    service.sync_matches.assert_called_once_with(limit=1, lane="history")
+    kwargs["now"] = NOW + timedelta(seconds=60)
+    assert history.run_chunk(**kwargs)["scope"] == "late=2526"

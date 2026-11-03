@@ -73,6 +73,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                        and c["closed"] == c["closeable"] for c in second)
     eligible = [s for s in scopes if s["wave"] == 1 or
                 (gate and (s["wave"] == 2 or second_ready))]
+    # Missing schedules and wave-1 gate blockers first: a scope after ever-busy
+    # current seasons is never reached, and one keeps the wave gate shut (#2140).
+    eligible.sort(key=lambda s: s["coverage"]["schedule_ready"] and not (
+        s["wave"] == 1 and s["coverage"]["unknown_stages"]))
     while eligible:
         mine = [s for s in eligible if owns is None or owns(s["key"])]
         if not mine:
@@ -86,7 +90,7 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
         league, slug = season.scope.competition_id, season.scope.season_id
         started = time.monotonic()
         failed, did_work, attempted = True, False, 0
-        refresh_deferred = False
+        refresh_deferred = schedule_due = False
         try:
             if current_running() or not enabled():
                 failed = False
@@ -173,6 +177,6 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
         finally:
             checkpoint.release(item["key"], token,
                                now=clock().timestamp(),
-                               failed=failed, idle=not did_work or refresh_deferred, duration=time.monotonic() - started)
+                               failed=failed, idle=not did_work or schedule_due, duration=time.monotonic() - started)
     return {"reason": "idle", "attempted": 0,
             "pace": state.pace(scopes, parked=checkpoint.parked(now=clock().timestamp()))}
