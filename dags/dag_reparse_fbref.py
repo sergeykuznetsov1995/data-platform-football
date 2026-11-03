@@ -20,6 +20,7 @@ from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
+    FBREF_REPARSE_PAGE_KINDS,
     FBREF_SCRAPER_POOL,
     drain_fbref_reparse,
     fbref_dag_failure_callback,
@@ -31,18 +32,7 @@ from utils.fbref_pipeline_tasks import (
 )
 
 
-# Players are out of every lane (decision 3 of the 21.09 grill).
-REPARSE_PAGE_KINDS = (
-    "competition_index",
-    "competition",
-    "season",
-    "season_stats",
-    "schedule",
-    "standings",
-    "squad",
-    "matchlog",
-    "match",
-)
+REPARSE_PAGE_KINDS = FBREF_REPARSE_PAGE_KINDS
 
 REPARSE_SHARD_SIZE = 25
 REPARSE_LOCK_TTL_SECONDS = 3 * 60 * 60

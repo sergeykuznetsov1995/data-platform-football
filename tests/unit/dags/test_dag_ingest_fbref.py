@@ -102,7 +102,13 @@ class TestFBrefCurrentTopology:
         )
         assert factory.CURRENT_MAX_BATCHES == 20
         assert module.CURRENT_MAX_BATCHES == 20
-        assert len(tasks) == 15
+        assert len(tasks) == 16
+        assert tasks["collect_current_slot"].downstream_task_ids == {
+            "validate_production_readiness"
+        }
+        assert tasks["collect_current_slot"].python_callable.__name__ == (
+            "collect_fbref_current_slot"
+        )
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"
         }

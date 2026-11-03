@@ -28,7 +28,7 @@ def fbref_dags():
 
     bag = DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
     expected = {
-        "dag_ingest_fbref": 15,
+        "dag_ingest_fbref": 16,
         "dag_bootstrap_fbref": 11,
         "dag_backfill_fbref": 17,
         "dag_fbref_history_controller": 18,

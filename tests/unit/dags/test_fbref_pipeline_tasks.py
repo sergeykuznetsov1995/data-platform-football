@@ -4236,7 +4236,10 @@ def _reparse_pipeline(monkeypatch, *waves, window_seconds=3 * 3600):
     monkeypatch.setattr(
         fbref_pipeline_tasks,
         "fbref_reparse_stop_at",
-        lambda now: now + timedelta(seconds=window_seconds),
+        lambda now, **_: now + timedelta(seconds=window_seconds),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "fbref_reparse_night_slot_enabled", lambda: False
     )
     return pipeline
 
@@ -4462,3 +4465,97 @@ def test_reparse_drain_starts_a_group_only_if_it_fits_before_stop(
 
     assert pipeline.reparse_version_lag_wave.call_count == groups
     assert result["status"] == "window_closed"
+
+
+def _night_slot(monkeypatch, *, variable="1", lagging=1, error=None):
+    from airflow.models import Variable
+
+    store = MagicMock()
+    if error is not None:
+        store.list_version_lagging_fetches.side_effect = error
+    else:
+        store.list_version_lagging_fetches.return_value = [{}] * lagging
+    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", lambda: store)
+    monkeypatch.setattr(
+        Variable, "get", staticmethod(lambda name, default_var=None: variable)
+    )
+    return store
+
+
+def _slot(hour, run_type="scheduled"):
+    return {
+        "dag_run": SimpleNamespace(run_type=run_type),
+        "data_interval_end": datetime(2026, 11, 6, hour, tzinfo=timezone.utc),
+    }
+
+
+@pytest.mark.unit
+def test_night_slot_is_handed_to_reparse_while_lag_remains(monkeypatch):
+    store = _night_slot(monkeypatch)
+
+    assert fbref_pipeline_tasks.collect_fbref_current_slot(**_slot(0)) is False
+    call = store.list_version_lagging_fetches.call_args.kwargs
+    assert call["limit"] == 1
+    assert call["page_kinds"] == fbref_pipeline_tasks.FBREF_REPARSE_PAGE_KINDS
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("kwargs", "slot"),
+    [
+        ({"variable": "0"}, _slot(0)),
+        ({}, _slot(6)),
+        ({}, _slot(0, run_type="manual")),
+        ({"lagging": 0}, _slot(0)),
+        ({"error": RuntimeError("control down")}, _slot(0)),
+    ],
+    ids=["variable_off", "other_slot", "manual_run", "no_lag", "check_error"],
+)
+def test_current_slot_collects_unless_every_condition_holds(
+    monkeypatch, kwargs, slot
+):
+    _night_slot(monkeypatch, **kwargs)
+
+    assert fbref_pipeline_tasks.collect_fbref_current_slot(**slot) is True
+
+
+@pytest.mark.unit
+def test_reparse_stop_ignores_the_handed_over_night_current_start():
+    day = datetime(2026, 11, 3, tzinfo=timezone.utc)
+    stop = fbref_pipeline_tasks.fbref_reparse_stop_at
+
+    # 00:10 is a current start grace, unless the slot is re-parse's.
+    assert stop(day + timedelta(minutes=10)) == day + timedelta(minutes=10)
+    assert stop(day + timedelta(minutes=10), night_slot=True) == (
+        day + timedelta(hours=2, minutes=10)
+    )
+    # 23:00: next boundary is the 04:30 history slice, capped at 2 h.
+    assert stop(day + timedelta(hours=23), night_slot=True) == (
+        day + timedelta(days=1, hours=1)
+    )
+    # 03:00: history 04:30 minus 45 min stays a boundary.
+    assert stop(day + timedelta(hours=3), night_slot=True) == (
+        day + timedelta(hours=3, minutes=45)
+    )
+    # The 06:00 current window stays a boundary too.
+    assert stop(day + timedelta(hours=5), night_slot=True) == (
+        day + timedelta(hours=5, minutes=15)
+    )
+
+
+@pytest.mark.unit
+def test_reparse_drain_passes_the_night_slot_into_stop_at(monkeypatch):
+    seen = {}
+    _reparse_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "fbref_reparse_night_slot_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "fbref_reparse_stop_at",
+        lambda now, *, night_slot: seen.setdefault("night", night_slot) and now,
+    )
+
+    _drain_reparse()
+
+    assert seen == {"night": True}

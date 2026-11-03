@@ -2685,16 +2685,83 @@ FBREF_REPARSE_CURRENT_START_GRACE_SECONDS = 30 * 60
 # if it fits before stop_at.  Until this run measured one: up to four writes
 # of 16 min plus parsing.
 FBREF_REPARSE_FIRST_GROUP_SECONDS = 70 * 60
+# Players are out of every lane (decision 3 of the 21.09 grill).
+FBREF_REPARSE_PAGE_KINDS = (
+    "competition_index",
+    "competition",
+    "season",
+    "season_stats",
+    "schedule",
+    "standings",
+    "squad",
+    "matchlog",
+    "match",
+)
+# Owner decision 03.11: while lagging raw remains, the 00:00 UTC current slot
+# is given to re-parse.  Off unless the Variable says so.
+FBREF_REPARSE_NIGHT_SLOT_VARIABLE = "fbref_reparse_night_slot"
+FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC = 0
 
 
-def fbref_reparse_stop_at(now: datetime) -> datetime:
-    """Return when a version re-parse acquiring the lock ``now`` must stop."""
+def fbref_reparse_night_slot_enabled() -> bool:
+    """Variable on and lagging raw left; any error keeps current collecting."""
+
+    try:
+        from airflow.models import Variable
+
+        from scrapers.fbref.policy import (
+            DISCOVERY_PARSER_VERSION,
+            PAGE_DOCUMENT_VERSION,
+            TYPED_BRONZE_PARSER_VERSION,
+        )
+
+        value = Variable.get(FBREF_REPARSE_NIGHT_SLOT_VARIABLE, default_var="0")
+        if str(value).strip().casefold() not in {"1", "true", "on"}:
+            return False
+        return bool(_control_store().list_version_lagging_fetches(
+            parser_version=PAGE_DOCUMENT_VERSION,
+            typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+            stateful_parser_version=DISCOVERY_PARSER_VERSION,
+            page_kinds=FBREF_REPARSE_PAGE_KINDS,
+            limit=1,
+        ))
+    except Exception:  # noqa: BLE001 - fail open towards collection
+        logger.exception("FBref re-parse night-slot check failed; slot stays current")
+        return False
+
+
+def collect_fbref_current_slot(*, dag_run=None, data_interval_end=None, **_context) -> bool:
+    """ShortCircuit: False hands the scheduled 00:00 UTC slot to re-parse."""
+
+    if dag_run is None or str(getattr(dag_run, "run_type", "")) != "scheduled":
+        return True
+    if data_interval_end is None:
+        return True
+    end = data_interval_end
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end.astimezone(timezone.utc).hour != FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC:
+        return True
+    if fbref_reparse_night_slot_enabled():
+        logger.warning("FBref 00:00 UTC current slot handed to version re-parse (#1332)")
+        return False
+    return True
+
+
+def fbref_reparse_stop_at(now: datetime, *, night_slot: bool = False) -> datetime:
+    """Return when a version re-parse acquiring the lock ``now`` must stop.
+
+    ``night_slot``: the 00:00 UTC current slot is re-parse's, not a boundary.
+    """
 
     at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     at = at.astimezone(timezone.utc)
     if history_slice_window(at) is not None:
         return at
-    current_starts = [start for start, _end in current_window_reservations(at)]
+    current_starts = [
+        start for start, _end in current_window_reservations(at)
+        if not (night_slot and start.hour == FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC)
+    ]
     for start in current_starts:
         if start <= at < start + timedelta(
             seconds=FBREF_REPARSE_CURRENT_START_GRACE_SECONDS
@@ -2739,7 +2806,9 @@ def drain_fbref_reparse(
         airflow_run_id=airflow_run_id, dag_id=dag_id
     )
     now = datetime.now(timezone.utc)
-    stop_at = fbref_reparse_stop_at(now)
+    stop_at = fbref_reparse_stop_at(
+        now, night_slot=fbref_reparse_night_slot_enabled()
+    )
     deadline = time.monotonic() + (stop_at - now).total_seconds()
     totals: dict[str, object] = {"waves": 0}
     status = "window_closed"
@@ -3045,6 +3114,7 @@ __all__ = [
     "drain_fbref_reparse",
     "finalize_fbref_reparse_lock",
     "fbref_reparse_stop_at",
+    "collect_fbref_current_slot",
     "parse_fbref_wave",
     "plan_fbref_backfill",
     "release_fbref_publication_lock",

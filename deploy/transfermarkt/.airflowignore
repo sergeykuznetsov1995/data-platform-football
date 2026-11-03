@@ -10,7 +10,7 @@
 ^scripts/
 ^sql/
 ^utils/
-^dag_(accept|backup|bootstrap|canary|collect|e3|iceberg|master|orchestrate|proxy|refresh|replay|sofascore|superset|trigger)_
+^dag_(accept|backup|bootstrap|canary|collect|e3|iceberg|master|orchestrate|proxy|refresh|reparse|replay|sofascore|superset|trigger)_
 ^dag_backfill_(fbref|fotmob|sofascore_all_mens|understat|whoscored)\.py$
 ^dag_ingest_(capology|clubelo|espn|fbref|fotmob|matchhistory|sofascore|sofifa|understat|whoscored)\.py$
 ^dag_transform_(capology|e3|e4|espn|fbref|fotmob|sofifa|xref)[_.]
