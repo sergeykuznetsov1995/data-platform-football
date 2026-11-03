@@ -82,10 +82,24 @@ def test_campaign_day_history_red_share_uses_scope_reports(tmp_path):
     out, bang = campaign_day.lines(DAY, matches=1500, scopes=1, rows=5, red_share=per_dag, pool_wait=None)
     assert "история 1/2, актуалка 0/10" in out[0] and "недоступна" not in out[0]
     assert not bang  # 1/12 < 20 %
-    # Квитанции слотов нет — история честно недоступна, и это красное.
+    # Квитанции слотов ещё нет (прогон идёт) — история недоступна: ⚠️, не красный.
     per_dag = campaign_day.red_share_day(tmp_path, DAY, _metabase("other-run"))
     out, bang = campaign_day.lines(DAY, matches=1500, scopes=1, rows=5, red_share=per_dag, pool_wait=None)
-    assert "история недоступна" in out[0] and bang
+    assert "⚠️ история недоступна" in out[0] and not bang
+
+
+@pytest.mark.unit
+def test_campaign_day_metabase_failure_is_a_warning_not_red(tmp_path, capsys):
+    _history_scope(tmp_path, "a", 50)
+
+    def down(sql):
+        raise KeyError("unexpected metabase failure")
+    rc = campaign_day.main(["--day", DAY.isoformat(), "--trino", _trino(tmp_path, 1500),
+                            "--runtime", str(tmp_path)], query=down)
+    printed = capsys.readouterr().out
+    assert rc == 0, printed
+    assert "красных run_*_scope TI не посчитаны ⚠️ (metadb)" in printed
+    assert "ожидание пула актуалкой не посчитано ⚠️ (metadb)" in printed
 
 
 @pytest.mark.unit

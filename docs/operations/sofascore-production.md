@@ -796,7 +796,7 @@ md5sum /usr/local/libexec/sofascore/run_from_release.sh "$SOFASCORE_RELEASE_ROOT
 `run_from_release.sh campaign_day.py --day <вчера UTC> --trino ~/.claude/bin/trino-ro.sh [--runtime DIR]`
 (каталог all-men по умолчанию — `SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR` из env-файла). Красный (код 3), если за
 UTC-сутки в Bronze `distinct match_id` < `SS_DAY_MIN_MATCHES` = 1000, у полосы истории < `SS_DAY_MIN_SCOPES` = 1
-скоупа со строками или доля красных попыток не «ok» по порогу #1356. Доля истории слотов считается по квитанциям
+скоупа со строками или доля красных попыток по порогу #1356 «red»/«no_data» («unavailable» — `⚠️`, не красный). Доля истории слотов считается по квитанциям
 и отчётам скоупов (`red_share_sql(scope_reports=True)` + `history_scope_counts`, как `pipeline_watchdog --collect`),
 поэтому строка «история недоступна (нужны отчёты скоупов)» появляется только без финальной квитанции. Trino или
 метабаза недоступны — `⚠️` в строке, не красный; сбой самого сторожа — код 2. Код 0 — зелёный. Разбор

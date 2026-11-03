@@ -100,7 +100,7 @@ def red_share_day(runtime: Path, day: date, query) -> dict | None:
     t0, t1 = bounds(day)
     try:
         per_dag = rs.parse_rows(query(rs.red_share_sql(t0, t1, scope_reports=True)))
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+    except Exception:  # noqa: BLE001 — любой сбой = ⚠️ (metadb), не код 2 на обе строки
         return None
     try:
         runs = set(query(rs.history_slot_runs_sql(t0, t1)).splitlines())
@@ -108,7 +108,7 @@ def red_share_day(runtime: Path, day: date, query) -> dict | None:
             counts = rs.history_scope_counts(runtime / "results", t0, t1, runs)
             old = per_dag.get(rs.HISTORY_DAG_ID, (0, 0))
             per_dag[rs.HISTORY_DAG_ID] = tuple(a + b for a, b in zip(old, counts))
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+    except Exception:  # noqa: BLE001 — история без доказательства = недоступна
         per_dag[rs.HISTORY_DAG_ID] = (-1, -1)
     return per_dag
 
@@ -118,7 +118,7 @@ def pool_wait_day(day: date, query):
     pw = metrics.pool_wait
     try:
         return pw.parse_rows(query(pw.pool_wait_sql(t0, t1)), query(pw.lane_overlap_sql(t0, t1)))
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+    except Exception:  # noqa: BLE001 — любой сбой = ⚠️ (metadb)
         return None
 
 
@@ -129,7 +129,9 @@ def lines(day: date, *, matches, scopes, rows, red_share, pool_wait) -> tuple[li
         r_txt = "красных run_*_scope TI не посчитаны ⚠️ (metadb)"
     else:
         r_txt = metrics.red_share.format_line(day.isoformat(), red_share)
-        bang = metrics.red_share.total_share(red_share).verdict != "ok"
+        # "unavailable" (история (-1,-1): нет финальной квитанции слотов или запрос упал) —
+        # ⚠️ в строке, не красный; как pipeline_watchdog.
+        bang = metrics.red_share.total_share(red_share).verdict in ("red", "no_data")
     if matches is None:
         m_txt = "матчей не посчитаны ⚠️ (trino)"
     elif matches < SS_DAY_MIN_MATCHES:
