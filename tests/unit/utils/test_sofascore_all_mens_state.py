@@ -1543,6 +1543,35 @@ def test_refresh_reserve_ignores_fresh_debt_its_open_scope_absorbs():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("rows, budget", [
+    # An open flood of core seasons: no core open match goes to disputed debt.
+    ([
+        (*_refresh_pending("SS-17", "2627", 200, _NOW + 1_000), 200, 1726, None),
+        (*_refresh_pending("SS-17", "2526", 200, _NOW + 2_000), 200, 1725, None),
+        (*_refresh_pending("SS-17", "2425", 140, _NOW + 3_000), 140, 1724, None),
+        (*_refresh_pending("SS-8", "2526", 60, None), 0, 825, _NOW - 3600),
+    ], 7200),
+    # No flood: a fresh disputed debt does not overtake an old core one.
+    ([
+        (*_refresh_pending("SS-17", "2627", 10, _NOW + 1_000), 10, 1726, None),
+        (*_refresh_pending("SS-17", "2526", 400, None), 0, 1725, _NOW - 5 * 86400),
+        (*_refresh_pending("SS-8", "2526", 60, None), 0, 825, _NOW - 3600),
+    ], 3000),
+])
+def test_refresh_reserve_never_puts_disputed_debt_ahead_of_core(rows, budget):
+    # Review #2117 r2 D3: disputed comes after every core scope (#1353).
+    denominator = _denominator(t17="core", t8="amateur")
+    plain = _window_plan(rows, denominator=denominator, scope_budget_s=budget, now=_NOW)
+    reserved = _window_plan(
+        rows, denominator=denominator, scope_budget_s=budget,
+        debt_reserve_s=1800, now=_NOW,
+    )
+
+    assert _parts(reserved) == _parts(plain)
+    assert not any("SOFASCORE_REFRESH_DEBT_RESERVE_S" in env for env in reserved)
+
+
+@pytest.mark.unit
 def test_refresh_window_keeps_no_reserve_for_stale_debt():
     planned = _window_plan(
         _open_flood(_NOW - 3 * 86400), debt_reserve_s=1800, now=_NOW

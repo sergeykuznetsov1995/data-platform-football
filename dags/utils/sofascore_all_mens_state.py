@@ -786,14 +786,14 @@ def plan_refresh_batch(
     ``SOFASCORE_SCOPE_ESTIMATE_S``; a plan with a debt reserve (below) also
     ``SOFASCORE_REFRESH_DEBT_RESERVE_S``.
 
-    #2117: while a ``deadline`` plan with a window has fresh debt (a deadline
-    missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``) that its
-    open scopes do not absorb, the open tier plans into the window minus a
-    reserve: ``debt_reserve_s`` or that fresh debt's estimate, the smaller.
-    Its closing slice then closes only the open tier; the fresh debt runs
-    first on what is left plus the reserve, the older debt only when no tier
-    was cut (its scopes of seasons with open deadlines take only the passed
-    ones).  Without a reserve the closing slice closes the batch.  An
+    #2117: while a ``deadline`` plan with a window has fresh core debt (a
+    deadline missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``)
+    that its open scopes do not absorb, the open tier plans into the window
+    minus a reserve: ``debt_reserve_s`` or that fresh debt's estimate, the
+    smaller.  Its closing slice then closes only the open tier; the fresh debt
+    runs first on what is left plus the reserve, the older debt only when no
+    tier was cut (its scopes of seasons with open deadlines take only the
+    passed ones).  Without a reserve the closing slice closes the batch.  An
     open scope also takes its own season's debt when that is at most one
     allocation (``REFRESH_ALLOCATION_MATCHES``); a bigger debt stays the
     season's ``--debt`` scope.
@@ -964,7 +964,13 @@ def plan_refresh_batch(
     now = time.time() if now is None else now
     fresh_debt, stale_debt = [], []
     for item in debt_tier:
-        fresh = item[8] is not None and item[8] >= now - REFRESH_FRESH_DEBT_SECONDS
+        # Only core debt (queue priority 1) is fresh for the reserve: a
+        # disputed debt never goes ahead of a core one (review #2117 r2).
+        fresh = (
+            item[6] == 1
+            and item[8] is not None
+            and item[8] >= now - REFRESH_FRESH_DEBT_SECONDS
+        )
         (fresh_debt if fresh else stale_debt).append(item)
     # The reserve is no bigger than the fresh debt the debt tier will run
     # (an absorbed debt goes with its open scope), and only that debt spends
