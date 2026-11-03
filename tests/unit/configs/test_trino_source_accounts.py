@@ -146,8 +146,11 @@ def test_native_memory_guards_present():
     assert "-XX:NativeMemoryTracking=summary" in jvm.splitlines()
     log_levels = (TRINO / "log.properties").read_text()
     assert "DEBUG" not in [
-        line.split("=", 1)[1] for line in log_levels.splitlines() if "=" in line and not line.startswith("#")
+        line.split("=", 1)[1].strip() for line in log_levels.splitlines() if "=" in line and not line.startswith("#")
     ], "DEBUG http/security logging wrote 2.6M lines in 3 days on the shared server"
+    assert "org.apache.iceberg.metrics.LoggingMetricsReporter=WARN" in log_levels.splitlines(), (
+        "Iceberg CommitReport/ScanReport INFO lines were 683k (~2 GB) in 3 days"
+    )
     for catalog in ("iceberg", "lakekeeper"):
         text = (TRINO / "catalog" / f"{catalog}.properties").read_text()
         assert "fs.s3.enabled=true" in text and "fs.native-s3.enabled" not in text
