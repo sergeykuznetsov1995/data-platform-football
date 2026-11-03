@@ -73,9 +73,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                        and c["closed"] == c["closeable"] for c in second)
     eligible = [s for s in scopes if s["wave"] == 1 or
                 (gate and (s["wave"] == 2 or second_ready))]
-    # Schedules first: a scope after ever-busy current seasons would never be
-    # reached, and one missing wave-1 schedule keeps the wave gate shut (#2140).
-    eligible.sort(key=lambda s: s["coverage"]["schedule_ready"])
+    # Missing schedules and wave-1 gate blockers first: a scope after ever-busy
+    # current seasons is never reached, and one keeps the wave gate shut (#2140).
+    eligible.sort(key=lambda s: s["coverage"]["schedule_ready"] and not (
+        s["wave"] == 1 and s["coverage"]["unknown_stages"]))
     while eligible:
         mine = [s for s in eligible if owns is None or owns(s["key"])]
         if not mine:

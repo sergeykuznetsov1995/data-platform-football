@@ -731,3 +731,17 @@ def test_unscheduled_scope_is_not_starved_behind_busy_scopes(tmp_path):
     assert history.run_chunk(**kwargs)["scope"] == "busy=2526"
     kwargs["now"] = NOW + timedelta(seconds=state.COOLDOWN_SECONDS + 1)
     assert history.run_chunk(**kwargs)["scope"] == "late=2526"
+
+
+def test_scheduled_wave_one_gate_blocker_keeps_priority(tmp_path):
+    # With its schedule in, the blocker still has unknown stages: its matches
+    # must not starve behind busy scopes either, or the gate stays shut (#2140).
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    busy, late = season(league="busy", source=200), season(league="late", source=1)
+    kwargs["catalog"] = catalog(("busy", 2, [busy]), ("late", 9, [late]))
+    repo.history_coverage.return_value = {("busy", "2526"): coverage(),
+                                          ("late", "2526"): coverage(unknown_stages=1)}
+    assert history.run_chunk(**kwargs)["scope"] == "late=2526"
+    service.sync_matches.assert_called_once_with(limit=1, lane="history")
+    kwargs["now"] = NOW + timedelta(seconds=60)
+    assert history.run_chunk(**kwargs)["scope"] == "late=2526"
