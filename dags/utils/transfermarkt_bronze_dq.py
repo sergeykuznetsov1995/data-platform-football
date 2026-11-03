@@ -74,9 +74,9 @@ observability-only and must never gate.
   referencing a historical coach without a profile row is a consequence of
   the bounded crawl policy, not corruption.  Referential strictness stays
   ERROR for attribute/contract observations and market-value/transfer
-  facts against same-scope memberships.  Memberships are replaced per scope
-  while those facts are appended, so only rows not older than the scope's
-  latest roster write are checked: earlier history of a departed player is
+  facts against same-scope memberships.  A roster write supersedes the
+  scope's membership rows while those facts are appended, so only rows not
+  older than the scope's latest roster write are checked: earlier history of a departed player is
   not an orphan.
 - ``tm_scope_set_bronze_presence`` vs append-only Bronze: once a scope has
   rows, a later manifest transition ``ok -> authoritative_empty`` makes the
@@ -703,8 +703,9 @@ def build_membership_orphans_sql(
         scoped = f'b.{comp} IS NOT NULL\n  AND b.{ed} IS NOT NULL'
     roster = ''
     if table in _MEMBERSHIP_CLUB_COLUMNS or table in _MEMBERSHIP_PLAYER_TABLES:
-        # Memberships are replaced per scope, history is appended: only rows
-        # not older than the scope's current roster can miss their membership.
+        # A roster write supersedes the scope's memberships, history is
+        # appended: only rows not older than the scope's latest roster write
+        # can miss their membership.
         roster = f"""
 LEFT JOIN (
     SELECT competition_id, edition_id, MAX(_ingested_at) AS roster_at
@@ -1043,7 +1044,7 @@ def run_bronze_dq(
         prefix: str, table: str, sqls: Sequence[str],
         conflict_severity: str = 'ERROR',
     ) -> None:
-        """Split queries -> ERROR (conflicts) + WARNING (identical) results."""
+        """Split queries -> conflict_severity (conflicts) + WARNING (identical) results."""
 
         display = _display(table)
         try:
