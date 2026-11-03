@@ -356,3 +356,38 @@ def test_null_final_snapshot_retains_failed_run_instead_of_crashing():
     result = evidence.assess_run(item)
     assert result["status"] == "fail"
     assert result["reasons"]
+
+
+def _debt_after_open_flood(reserve, *, open_after=False):
+    # #2117: seven of 21 core open seasons fit the open part of the window;
+    # the debt tier runs on the reserve while 14 core deadlines are left.
+    identity = bundle()["initial"]["identity"]
+    rows = [[f"SS-{n}", "2627", 2, 1792024800 + n, 1, n + 100] for n in range(1, 22)]
+    rows.append(["SS-22", "2627", 5, None, 0, 122])
+    selected = [dict(scope_key=f"scope-{n}", tournament_id=n, source_season_id=n + 100)
+                for n in range(1, 8)]
+    selected.append(dict(scope_key="scope-22", tournament_id=22, source_season_id=122,
+                         phase="debt"))
+    if open_after:
+        selected.append(dict(scope_key="scope-8", tournament_id=8, source_season_id=108))
+    doc = evidence.planning_snapshot(identity, rows, selected, core_ids=list(range(1, 23)),
+                                     input_complete=True, observed_at=identity["started_at"])
+    if reserve is not None:
+        doc["capture_window"] = dict(started_at=identity["started_at"],
+                                     deadline_at="2026-10-15T04:30:01+00:00",
+                                     scope_budget_s=7200, debt_reserve_s=reserve)
+        doc["digest"] = evidence._digest({k: v for k, v in doc.items() if k != "digest"})
+    return doc
+
+
+def test_debt_scope_with_declared_reserve_passes_with_core_open_left():
+    doc = _debt_after_open_flood(1800)
+    assert evidence._validate_snapshot(doc, "a" * 40)["run_id"] == "scheduled__night"
+    with pytest.raises(ValueError, match="open scope after the reserved debt tier"):
+        evidence._validate_snapshot(_debt_after_open_flood(1800, open_after=True), "a" * 40)
+
+
+@pytest.mark.parametrize("reserve", [None, 0])
+def test_debt_scope_without_reserve_still_overtakes(reserve):
+    with pytest.raises(ValueError, match="overtakes core deadline"):
+        evidence._validate_snapshot(_debt_after_open_flood(reserve), "a" * 40)

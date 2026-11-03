@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -84,6 +85,12 @@ REFRESH_MAX_SCOPE_TIMEOUT_SECONDS = 2 * 3600
 REFRESH_RUNNER_STOP_MARGIN_SECONDS = 300
 REFRESH_ALLOCATION_MATCHES = 25
 REFRESH_ALLOCATION_OVERRUN_FACTOR = 2
+# #2117: a deadline missed this recently is fresh debt.  While there is any, the
+# open tier of a deadline plan leaves this part of the window to the debt tier:
+# 31.10-02.11 the open tier of 107-163 seasons took 7065-7170 s of the 7200 s
+# window in six plans running, and no missed deadline was re-collected.
+REFRESH_FRESH_DEBT_SECONDS = 48 * 3600
+REFRESH_DEBT_RESERVE_SECONDS = 1800
 
 
 def refresh_timeout_headroom(seconds_per_match: int) -> int:
@@ -741,6 +748,8 @@ def plan_refresh_batch(
     denominator: Denominator | None = None,
     scope_budget_s: int | None = None,
     seconds_per_match: int = DEFAULT_REFRESH_SECONDS_PER_MATCH,
+    debt_reserve_s: int = 0,
+    now: float | None = None,
 ) -> list[dict[str, str]]:
     """Select a deadline-ordered refresh batch (#1359).
 
@@ -774,7 +783,20 @@ def plan_refresh_batch(
     closes the batch.  Every scope carries its own ceilings in its env:
     ``SOFASCORE_SCOPE_MAX_MATCHES``, ``SOFASCORE_SCOPE_BYTE_CAP``,
     ``SOFASCORE_SCOPE_TIMEOUT_S`` (the task's execution timeout) and
-    ``SOFASCORE_SCOPE_ESTIMATE_S``.
+    ``SOFASCORE_SCOPE_ESTIMATE_S``; a plan with a debt reserve (below) also
+    ``SOFASCORE_REFRESH_DEBT_RESERVE_S``.
+
+    #2117: while a ``deadline`` plan with a window has fresh core debt (a
+    deadline missed less than ``REFRESH_FRESH_DEBT_SECONDS`` before ``now``)
+    that its open scopes do not absorb, the open tier plans into the window
+    minus a reserve: ``debt_reserve_s`` or that fresh debt's estimate, the
+    smaller.  Its closing slice then closes only the open tier; the fresh debt
+    runs first on what is left plus the reserve, the older debt only when no
+    tier was cut (its scopes of seasons with open deadlines take only the
+    passed ones).  Without a reserve the closing slice closes the batch.  An
+    open scope also takes its own season's debt when that is at most one
+    allocation (``REFRESH_ALLOCATION_MATCHES``); a bigger debt stays the
+    season's ``--debt`` scope.
     """
 
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
@@ -790,6 +812,15 @@ def plan_refresh_batch(
         or scope_budget_s < 1
     ):
         raise CampaignPlanningError("scope_budget_s must be a positive integer")
+    if (
+        isinstance(debt_reserve_s, bool)
+        or not isinstance(debt_reserve_s, int)
+        or debt_reserve_s < 0
+        or (scope_budget_s is not None and debt_reserve_s >= scope_budget_s)
+    ):
+        raise CampaignPlanningError(
+            "debt_reserve_s must be a non-negative integer under scope_budget_s"
+        )
     if (
         isinstance(batch_size, bool)
         or not isinstance(batch_size, int)
@@ -910,10 +941,6 @@ def plan_refresh_batch(
             else (item[6], -(item[2] - item[7]))
         ) + (item[0], item[1], int(item[5]["source_season_id"])),
     )
-    entries: list[tuple[tuple, str, int]] = []
-    opened: set[tuple[str, str, int]] = set()
-    left = scope_budget_s
-    closed = False
     headroom = refresh_timeout_headroom(seconds_per_match)
     # A scope whose estimate plus that headroom passes the 2 h task ceiling
     # would have its last allocations refused by its own runner.
@@ -926,8 +953,49 @@ def plan_refresh_batch(
         ) // seconds_per_match,
     )
 
+    def _absorbs(item: tuple) -> bool:
+        # #2117: a season's small debt rides in its open scope (the runner
+        # takes the open deadlines first, then the debt, up to the scope's
+        # MAX_MATCHES) instead of waiting for a debt tier the open flood
+        # never left room for; it costs at most one allocation's time.
+        # A bigger debt keeps its own ``--debt`` scope (Astra #1359 r3).
+        return item[3] is not None and 0 < item[2] - item[7] <= REFRESH_ALLOCATION_MATCHES
+
+    now = time.time() if now is None else now
+    fresh_debt, stale_debt = [], []
+    for item in debt_tier:
+        # Only core debt (queue priority 1) is fresh for the reserve: a
+        # disputed debt never goes ahead of a core one (review #2117 r2).
+        fresh = (
+            item[6] == 1
+            and item[8] is not None
+            and item[8] >= now - REFRESH_FRESH_DEBT_SECONDS
+        )
+        (fresh_debt if fresh else stale_debt).append(item)
+    # The reserve is no bigger than the fresh debt the debt tier will run
+    # (an absorbed debt goes with its open scope), and only that debt spends
+    # it: the older debt keeps what the open tier leaves, as without a reserve.
+    reserve = 0
+    if queue_mode == "deadline" and scope_budget_s is not None:
+        reserve = min(debt_reserve_s, sum(
+            min(item[2] - item[7], scope_capacity) * seconds_per_match
+            + REFRESH_SCOPE_OVERHEAD_SECONDS
+            for item in fresh_debt if not _absorbs(item)
+        ))
+    if reserve:
+        logger.info(
+            "refresh window reserves %s s for fresh debt: %s partitions, "
+            "newest miss %.1f h ago",
+            reserve, len(fresh_debt),
+            (now - max(item[8] for item in fresh_debt)) / 3600,
+        )
+    entries: list[tuple[tuple, str, int]] = []
+    absorbed: set[tuple[str, str, int]] = set()
+    left = None if scope_budget_s is None else scope_budget_s - reserve
+    closed = cut = False
+
     def _fit(item: tuple, wanted: int) -> int | None:
-        """Matches of ``wanted`` that fit; ``None`` closes the batch."""
+        """Matches of ``wanted`` that fit; ``None`` closes the tier."""
 
         nonlocal left
         overhead = REFRESH_SCOPE_OVERHEAD_SECONDS
@@ -955,7 +1023,13 @@ def plan_refresh_batch(
     tiers = [("debt", debt_tier)] if queue_mode == "backlog" else [
         ("open", open_tier), ("debt", debt_tier),
     ]
+    if reserve:
+        tiers = [("open", open_tier), ("debt", fresh_debt), ("stale debt", stale_debt)]
     for tier, items in tiers:
+        if tier == "debt" and reserve:
+            left += reserve
+        if tier == "stale debt" and cut:
+            break
         for position, item in enumerate(items):
             if len(entries) == batch_size:
                 logger.warning(
@@ -967,14 +1041,25 @@ def plan_refresh_batch(
                 closed = True
                 break
             key = (item[0], item[1], int(item[5]["source_season_id"]))
+            if key in absorbed:
+                continue
             wanted = item[7] if tier == "open" else item[2] - item[7]
+            absorb = tier == "open" and _absorbs(item)
+            if absorb:
+                wanted = item[2]
             fits = _fit(item, min(wanted, scope_capacity))
             if fits is None:
-                closed = True
+                # A plan without a reserve keeps every open deadline ahead of
+                # the debt: the refill and the evidence contract rely on it.
+                # With one, a cut leaves only the fresh debt its reserve.
+                cut = True
+                closed = not reserve
                 break
-            part = "debt" if tier == "debt" and key in opened else ""
-            if tier == "open":
-                opened.add(key)
+            # A season whose open part the closed open tier did not reach
+            # still runs only its passed deadlines here (#2117).
+            part = "debt" if tier != "open" and item[3] is not None else ""
+            if absorb:
+                absorbed.add(key)
             entries.append((item, part, fits))
         if closed:
             break
@@ -1012,6 +1097,9 @@ def plan_refresh_batch(
             # Its open-deadline matches belong to the season's urgent scope
             # of this batch; this one takes only the passed deadlines.
             env["SOFASCORE_SCOPE_DEBT_ONLY"] = "1"
+        if reserve:
+            # The reserve this plan applied, for its evidence (#2117).
+            env["SOFASCORE_REFRESH_DEBT_RESERVE_S"] = str(reserve)
         planned.append(env)
     return planned
 
