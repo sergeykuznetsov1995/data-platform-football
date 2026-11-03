@@ -2748,20 +2748,33 @@ def collect_fbref_current_slot(*, dag_run=None, data_interval_end=None, **_conte
     return True
 
 
-def fbref_reparse_stop_at(now: datetime, *, night_slot: bool = False) -> datetime:
+def fbref_reparse_stop_at(
+    now: datetime,
+    *,
+    night_slot: bool = False,
+    night_max_seconds: Optional[int] = None,
+) -> datetime:
     """Return when a version re-parse acquiring the lock ``now`` must stop.
 
-    ``night_slot``: the 00:00 UTC current slot is re-parse's, not a boundary.
+    ``night_slot``: the 00:00 UTC current slot is re-parse's, not a boundary,
+    and a run that can reach that slot's reservation may last
+    ``night_max_seconds`` instead of the usual cap.
     """
 
     at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     at = at.astimezone(timezone.utc)
     if history_slice_window(at) is not None:
         return at
-    current_starts = [
-        start for start, _end in current_window_reservations(at)
-        if not (night_slot and start.hour == FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC)
-    ]
+    max_seconds = FBREF_REPARSE_MAX_SECONDS
+    current_starts = []
+    for start, end in current_window_reservations(at):
+        if night_slot and start.hour == FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC:
+            if night_max_seconds and start - timedelta(
+                seconds=night_max_seconds + FBREF_REPARSE_STOP_MARGIN_SECONDS
+            ) <= at < end:
+                max_seconds = max(max_seconds, int(night_max_seconds))
+            continue
+        current_starts.append(start)
     for start in current_starts:
         if start <= at < start + timedelta(
             seconds=FBREF_REPARSE_CURRENT_START_GRACE_SECONDS
@@ -2779,9 +2792,45 @@ def fbref_reparse_stop_at(now: datetime, *, night_slot: bool = False) -> datetim
         start for start in current_starts + history_starts if start > at
     )
     return max(at, min(
-        at + timedelta(seconds=FBREF_REPARSE_MAX_SECONDS),
+        at + timedelta(seconds=max_seconds),
         next_start - timedelta(seconds=FBREF_REPARSE_STOP_MARGIN_SECONDS),
     ))
+
+
+# Night runs may hold the lock up to its TTL less this margin.
+FBREF_REPARSE_LOCK_TTL_MARGIN_SECONDS = 15 * 60
+
+
+def _fbref_reparse_stop_at(now: datetime, lock_ttl_seconds) -> datetime:
+    return fbref_reparse_stop_at(
+        now,
+        night_slot=fbref_reparse_night_slot_enabled(),
+        night_max_seconds=(
+            None if lock_ttl_seconds is None
+            else int(lock_ttl_seconds) - FBREF_REPARSE_LOCK_TTL_MARGIN_SECONDS
+        ),
+    )
+
+
+def wait_fbref_reparse_lock(*, airflow_run_id, dag_id, ttl_seconds, **context):
+    """Queue for the lock only once a first group fits in the night window.
+
+    With the night slot handed over, a run started in a closed window (for
+    example the 22:30 history admission) waits for the window to open
+    instead of taking the lock for nothing and losing the hour.
+    """
+
+    if fbref_reparse_night_slot_enabled():
+        now = datetime.now(timezone.utc)
+        stop_at = _fbref_reparse_stop_at(now, ttl_seconds)
+        if (stop_at - now).total_seconds() <= FBREF_REPARSE_FIRST_GROUP_SECONDS:
+            return False
+    return wait_fbref_publication_lock(
+        airflow_run_id=airflow_run_id,
+        dag_id=dag_id,
+        ttl_seconds=ttl_seconds,
+        **context,
+    )
 
 
 def drain_fbref_reparse(
@@ -2791,6 +2840,7 @@ def drain_fbref_reparse(
     page_kinds: Sequence[str],
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    lock_ttl_seconds=None,
 ) -> dict:
     """Re-parse version-lagging raw in whole groups until the window ends."""
 
@@ -2806,9 +2856,7 @@ def drain_fbref_reparse(
         airflow_run_id=airflow_run_id, dag_id=dag_id
     )
     now = datetime.now(timezone.utc)
-    stop_at = fbref_reparse_stop_at(
-        now, night_slot=fbref_reparse_night_slot_enabled()
-    )
+    stop_at = _fbref_reparse_stop_at(now, lock_ttl_seconds)
     deadline = time.monotonic() + (stop_at - now).total_seconds()
     totals: dict[str, object] = {"waves": 0}
     status = "window_closed"
@@ -3115,6 +3163,7 @@ __all__ = [
     "finalize_fbref_reparse_lock",
     "fbref_reparse_stop_at",
     "collect_fbref_current_slot",
+    "wait_fbref_reparse_lock",
     "parse_fbref_wave",
     "plan_fbref_backfill",
     "release_fbref_publication_lock",

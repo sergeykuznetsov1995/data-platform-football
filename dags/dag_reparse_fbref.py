@@ -28,7 +28,7 @@ from utils.fbref_pipeline_tasks import (
     initialize_fbref_run,
     validate_fbref_production_readiness,
     validate_fbref_run,
-    wait_fbref_publication_lock,
+    wait_fbref_reparse_lock,
 )
 
 
@@ -96,7 +96,7 @@ with DAG(
 
     acquire_publication_lock = PythonSensor(
         task_id="acquire_publication_lock",
-        python_callable=wait_fbref_publication_lock,
+        python_callable=wait_fbref_reparse_lock,
         op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID,
                    "ttl_seconds": REPARSE_LOCK_TTL_SECONDS},
         retries=0,
@@ -115,6 +115,7 @@ with DAG(
             "page_kinds": REPARSE_PAGE_KINDS,
             "shard_size": REPARSE_SHARD_SIZE,
             "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+            "lock_ttl_seconds": REPARSE_LOCK_TTL_SECONDS,
         },
     )
 

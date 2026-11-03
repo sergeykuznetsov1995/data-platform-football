@@ -4553,9 +4553,126 @@ def test_reparse_drain_passes_the_night_slot_into_stop_at(monkeypatch):
     monkeypatch.setattr(
         fbref_pipeline_tasks,
         "fbref_reparse_stop_at",
-        lambda now, *, night_slot: seen.setdefault("night", night_slot) and now,
+        lambda now, *, night_slot, **_: (
+            seen.setdefault("night", night_slot) and now
+        ),
     )
 
     _drain_reparse()
 
     assert seen == {"night": True}
+
+
+@pytest.mark.unit
+def test_handed_over_night_is_used_whole_by_chained_reparse_runs(monkeypatch):
+    """Lock free from 22:55 UTC: >= 4 h of groups, none ending past 03:45."""
+
+    from dags import dag_reparse_fbref  # noqa: F401 - TTL comes from the DAG
+    import dag_reparse_fbref as reparse_dag
+
+    start = datetime(2026, 11, 5, 22, 55, tzinfo=timezone.utc)
+    stop = datetime(2026, 11, 6, 3, 45, tzinfo=timezone.utc)
+    clock = {"now": start}
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    def advance(minutes):
+        clock["now"] += timedelta(minutes=minutes)
+
+    monkeypatch.setattr(fbref_pipeline_tasks, "datetime", FakeDatetime)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "fbref_reparse_night_slot_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "wait_fbref_publication_lock", lambda **_: True
+    )
+    groups = []
+
+    def group(*_args, **_kwargs):
+        began = clock["now"]
+        advance(30)
+        groups.append((began, clock["now"]))
+        result = MagicMock()
+        result.as_dict.return_value = {
+            "cohort_size": 100, "claimed": 100, "parsed": 100,
+        }
+        return result
+
+    pipeline = MagicMock()
+    pipeline.reparse_version_lag_wave.side_effect = group
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+    ttl = reparse_dag.REPARSE_LOCK_TTL_SECONDS
+    run_started = clock["now"]
+    while clock["now"] < stop:
+        advance(3)  # readiness + initialize
+        waited = 0
+        while not fbref_pipeline_tasks.wait_fbref_reparse_lock(
+            airflow_run_id="r", dag_id="dag_reparse_fbref", ttl_seconds=ttl
+        ) and waited < reparse_dag.REPARSE_LOCK_WAIT_SECONDS // 60:
+            advance(1)
+            waited += 1
+        if waited < reparse_dag.REPARSE_LOCK_WAIT_SECONDS // 60:
+            fbref_pipeline_tasks.drain_fbref_reparse(
+                airflow_run_id="r",
+                dag_id="dag_reparse_fbref",
+                page_kinds=["match"],
+                shard_size=25,
+                lock_ttl_seconds=ttl,
+            )
+        # else: the soft-failing sensor gives the run up.
+        advance(5)  # validate + release
+        # max_active_runs=1: a :40 tick missed while running starts at once.
+        next_tick = run_started.replace(minute=40, second=0)
+        while next_tick <= run_started:
+            next_tick += timedelta(hours=1)
+        if clock["now"] < next_tick:
+            clock["now"] = next_tick
+        run_started = clock["now"]
+
+    worked = sum((end - began for began, end in groups), timedelta())
+    assert worked >= timedelta(hours=4)
+    assert all(end <= stop for _began, end in groups)
+    # Each run (groups back to back) stays within the lock TTL less 15 min.
+    runs = [[groups[0]]]
+    for previous, current in zip(groups, groups[1:]):
+        if current[0] == previous[1]:
+            runs[-1].append(current)
+        else:
+            runs.append([current])
+    assert len(runs) == 2
+    assert all(
+        run[-1][1] - run[0][0] <= timedelta(seconds=ttl - 15 * 60)
+        for run in runs
+    )
+
+
+@pytest.mark.unit
+def test_reparse_lock_wait_is_unchanged_without_the_night_slot(monkeypatch):
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "fbref_reparse_night_slot_enabled", lambda: False
+    )
+    wait = MagicMock(return_value=True)
+    monkeypatch.setattr(fbref_pipeline_tasks, "wait_fbref_publication_lock", wait)
+
+    assert fbref_pipeline_tasks.wait_fbref_reparse_lock(
+        airflow_run_id="r", dag_id="dag_reparse_fbref", ttl_seconds=10800
+    ) is True
+    wait.assert_called_once()
+    day = datetime(2026, 11, 3, tzinfo=timezone.utc)
+    # Off the night slot the 2 h cap stays even with a TTL given.
+    assert fbref_pipeline_tasks.fbref_reparse_stop_at(
+        day + timedelta(hours=23), night_max_seconds=9900
+    ) == day + timedelta(hours=23, minutes=15)
+    assert fbref_pipeline_tasks.fbref_reparse_stop_at(
+        day + timedelta(hours=1), night_max_seconds=9900
+    ) == day + timedelta(hours=3)
