@@ -40,6 +40,7 @@ from scrapers.fbref.settings import (
 from utils.fbref_current_windows import (
     HISTORY_MAX_BATCHES,
     HISTORY_SLICE_HOURS_UTC,
+    HISTORY_SLICE_START_MINUTE,
     HISTORY_WAVE_DEADLINE_SECONDS,
     RECOVERY_WAVE_DEADLINE_SECONDS,
     current_window_reservations,
@@ -1629,8 +1630,12 @@ def initialize_fbref_run(
     bootstrap_only=False,
     dag_run_type=None,
     publishing=True,
+    version_reparse=False,
 ) -> str:
     normalized_run_type = str(run_type).strip().casefold()
+    reparse = _boolean_parameter(version_reparse, name="version_reparse")
+    if reparse and normalized_run_type != "replay":
+        raise ValueError("FBref version re-parse requires run_type=replay")
     if normalized_run_type == "backfill":
         if str(dag_id) != "dag_fbref_history_controller":
             raise RuntimeError("Legacy history DAG/driver is retired; use the one authorized controller")
@@ -1685,7 +1690,11 @@ def initialize_fbref_run(
             # both refuse to soften for a run that did not declare itself
             # non-publishing here, before a single page was fetched.
             "execution_mode": (
-                normalized_run_type if publishes else "history_nonpublishing"
+                "version_reparse"
+                if reparse
+                else normalized_run_type
+                if publishes
+                else "history_nonpublishing"
             ),
             "publication_eligible": publishes,
             "profile": normalized_run_type,
@@ -2664,6 +2673,300 @@ def drain_fbref_replay(
     )
 
 
+# Version re-parse (#1332) yields the publication lock to current refresh and
+# history slices.  It does no work from a current window start until current
+# had time to queue for the lock, nor inside a history admission window, and
+# stops claiming pages early enough before the next of either for one group
+# write (7-16 min) and the DAG tail.
+FBREF_REPARSE_MAX_SECONDS = 2 * 60 * 60
+FBREF_REPARSE_STOP_MARGIN_SECONDS = 45 * 60
+FBREF_REPARSE_CURRENT_START_GRACE_SECONDS = 30 * 60
+# A group already claimed is written to the end, so a new group starts only
+# if it fits before stop_at.  Until this run measured one: up to four writes
+# of 16 min plus parsing.
+FBREF_REPARSE_FIRST_GROUP_SECONDS = 70 * 60
+# Players are out of every lane (decision 3 of the 21.09 grill).
+FBREF_REPARSE_PAGE_KINDS = (
+    "competition_index",
+    "competition",
+    "season",
+    "season_stats",
+    "schedule",
+    "standings",
+    "squad",
+    "matchlog",
+    "match",
+)
+# Owner decision 03.11: while lagging raw remains, the 00:00 UTC current slot
+# is given to re-parse.  Off unless the Variable says so.
+FBREF_REPARSE_NIGHT_SLOT_VARIABLE = "fbref_reparse_night_slot"
+FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC = 0
+FBREF_REPARSE_DAG_ID = "dag_reparse_fbref"
+
+
+def fbref_reparse_night_slot_enabled() -> bool:
+    """Variable on and lagging raw left; any error keeps current collecting."""
+
+    try:
+        from airflow.models import Variable
+
+        from scrapers.fbref.policy import (
+            DISCOVERY_PARSER_VERSION,
+            PAGE_DOCUMENT_VERSION,
+            TYPED_BRONZE_PARSER_VERSION,
+        )
+
+        value = Variable.get(FBREF_REPARSE_NIGHT_SLOT_VARIABLE, default_var="0")
+        if str(value).strip().casefold() not in {"1", "true", "on"}:
+            return False
+        from airflow.models import DagModel
+
+        # A paused re-parse DAG would leave the handed-over slot empty.
+        reparse_dag = DagModel.get_dagmodel(FBREF_REPARSE_DAG_ID)
+        if reparse_dag is None or reparse_dag.is_paused:
+            return False
+        return bool(_control_store().list_version_lagging_fetches(
+            parser_version=PAGE_DOCUMENT_VERSION,
+            typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+            stateful_parser_version=DISCOVERY_PARSER_VERSION,
+            page_kinds=FBREF_REPARSE_PAGE_KINDS,
+            limit=1,
+        ))
+    except Exception:  # noqa: BLE001 - fail open towards collection
+        logger.exception("FBref re-parse night-slot check failed; slot stays current")
+        return False
+
+
+def collect_fbref_current_slot(*, dag_run=None, data_interval_end=None, **_context) -> bool:
+    """ShortCircuit: False hands the scheduled 00:00 UTC slot to re-parse."""
+
+    if dag_run is None or str(getattr(dag_run, "run_type", "")) != "scheduled":
+        return True
+    if data_interval_end is None:
+        return True
+    end = data_interval_end
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end.astimezone(timezone.utc).hour != FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC:
+        return True
+    if fbref_reparse_night_slot_enabled():
+        logger.warning("FBref 00:00 UTC current slot handed to version re-parse (#1332)")
+        return False
+    return True
+
+
+def fbref_reparse_stop_at(
+    now: datetime,
+    *,
+    night_slot: bool = False,
+    night_max_seconds: Optional[int] = None,
+) -> datetime:
+    """Return when a version re-parse acquiring the lock ``now`` must stop.
+
+    ``night_slot``: the 00:00 UTC current slot is re-parse's, not a boundary,
+    and a run that can reach that slot's reservation may last
+    ``night_max_seconds`` instead of the usual cap.
+    """
+
+    at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    at = at.astimezone(timezone.utc)
+    if history_slice_window(at) is not None:
+        return at
+    max_seconds = FBREF_REPARSE_MAX_SECONDS
+    current_starts = []
+    for start, end in current_window_reservations(at):
+        if night_slot and start.hour == FBREF_REPARSE_NIGHT_SLOT_HOUR_UTC:
+            if night_max_seconds and start - timedelta(
+                seconds=night_max_seconds + FBREF_REPARSE_STOP_MARGIN_SECONDS
+            ) <= at < end:
+                max_seconds = max(max_seconds, int(night_max_seconds))
+            continue
+        current_starts.append(start)
+    for start in current_starts:
+        if start <= at < start + timedelta(
+            seconds=FBREF_REPARSE_CURRENT_START_GRACE_SECONDS
+        ):
+            return at
+    midnight = at.replace(hour=0, minute=0, second=0, microsecond=0)
+    history_starts = [
+        midnight + timedelta(
+            days=day, hours=hour, minutes=HISTORY_SLICE_START_MINUTE
+        )
+        for day in (0, 1)
+        for hour in HISTORY_SLICE_HOURS_UTC
+    ]
+    next_start = min(
+        start for start in current_starts + history_starts if start > at
+    )
+    return max(at, min(
+        at + timedelta(seconds=max_seconds),
+        next_start - timedelta(seconds=FBREF_REPARSE_STOP_MARGIN_SECONDS),
+    ))
+
+
+# Night runs may hold the lock up to its TTL less this margin.
+FBREF_REPARSE_LOCK_TTL_MARGIN_SECONDS = 15 * 60
+
+
+def _fbref_reparse_stop_at(now: datetime, lock_ttl_seconds) -> datetime:
+    return fbref_reparse_stop_at(
+        now,
+        night_slot=fbref_reparse_night_slot_enabled(),
+        night_max_seconds=(
+            None if lock_ttl_seconds is None
+            else int(lock_ttl_seconds) - FBREF_REPARSE_LOCK_TTL_MARGIN_SECONDS
+        ),
+    )
+
+
+def _fbref_reparse_must_yield(night_slot: bool) -> bool:
+    """Between groups: give the lock back to a queued current run, or when
+    the night slot this run was planned on is no longer handed over."""
+
+    if _control_store().current_publication_waiter_pending():
+        return True
+    return night_slot and not fbref_reparse_night_slot_enabled()
+
+
+def wait_fbref_reparse_lock(*, airflow_run_id, dag_id, ttl_seconds, **context):
+    """Queue for the lock only once a first group fits in the night window.
+
+    With the night slot handed over, a run started in a closed window (for
+    example the 22:30 history admission) waits for the window to open
+    instead of taking the lock for nothing and losing the hour.
+    """
+
+    if fbref_reparse_night_slot_enabled():
+        now = datetime.now(timezone.utc)
+        stop_at = _fbref_reparse_stop_at(now, ttl_seconds)
+        if (stop_at - now).total_seconds() <= FBREF_REPARSE_FIRST_GROUP_SECONDS:
+            return False
+    return wait_fbref_publication_lock(
+        airflow_run_id=airflow_run_id,
+        dag_id=dag_id,
+        ttl_seconds=ttl_seconds,
+        **context,
+    )
+
+
+def drain_fbref_reparse(
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    page_kinds: Sequence[str],
+    shard_size=DEFAULT_SHARD_SIZE,
+    reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    lock_ttl_seconds=None,
+) -> dict:
+    """Re-parse version-lagging raw in whole groups until the window ends."""
+
+    settings = _settings(
+        run_type="replay",
+        request_limit=0,
+        byte_limit_mb=0,
+        shard_size=shard_size,
+        reservation_mb=reservation_mb,
+    )
+    pipeline = _pipeline()
+    processing_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    now = datetime.now(timezone.utc)
+    night_slot = fbref_reparse_night_slot_enabled()
+    stop_at = _fbref_reparse_stop_at(now, lock_ttl_seconds)
+    deadline = time.monotonic() + (stop_at - now).total_seconds()
+    totals: dict[str, object] = {"waves": 0}
+    status = "window_closed"
+    # The slowest group so far, never below the first-group bound: one fast
+    # generic group says nothing about the 100 matches that may follow.
+    group_seconds = FBREF_REPARSE_FIRST_GROUP_SECONDS
+    while time.monotonic() + group_seconds < deadline:
+        if totals["waves"] and _fbref_reparse_must_yield(night_slot):
+            status = "yielded"
+            break
+        group_started = time.monotonic()
+        wave = pipeline.reparse_version_lag_wave(
+            processing_run_id,
+            page_kinds=list(page_kinds),
+            settings=settings,
+            deadline=deadline,
+        ).as_dict()
+        group_seconds = max(group_seconds, time.monotonic() - group_started)
+        if int(wave.get("cohort_size") or 0) == 0:
+            status = "drained"
+            break
+        totals["waves"] = int(totals["waves"]) + 1
+        for key, value in wave.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] = int(totals.get(key, 0)) + value
+        if int(wave.get("budget_returned") or 0):
+            status = "window_closed"
+            break
+        progress = sum(
+            int(wave.get(key) or 0)
+            for key in (
+                "parsed",
+                "contract_quarantined",
+                "dead_lettered",
+                "incomplete_match_exhausted",
+                "incomplete_match_refetches",
+                "incomplete_match_settled",
+            )
+        )
+        if progress == 0:
+            # Leased elsewhere or deferred: leave it to the next run.
+            status = "stalled"
+            break
+    result = {**totals, "status": status, "stop_at": stop_at.isoformat()}
+    logger.info("FBref version re-parse: %s", json.dumps(result, sort_keys=True))
+    return result
+
+
+def finalize_fbref_reparse_lock(
+    *, airflow_run_id: str, dag_id: str, **context
+) -> dict:
+    """Release the re-parse lock; the run's verdict is its validation.
+
+    A lock that was never acquired (the soft-failing sensor gave the hour to
+    current or history) aborts the control run, so its queue entry stops
+    counting and the next hourly run queues afresh.
+    """
+
+    from airflow.exceptions import AirflowException
+
+    dag_run = context.get("dag_run")
+    states = {
+        str(getattr(instance, "task_id", "")): str(
+            getattr(instance, "state", "") or ""
+        ).casefold()
+        for instance in (dag_run.get_task_instances() if dag_run else [])
+    }
+    acquire_state = states.get("acquire_publication_lock", "missing")
+    if acquire_state == "skipped":
+        abort_fbref_run(
+            airflow_run_id=airflow_run_id,
+            dag_id=dag_id,
+            error_class="PublicationLockNotAcquired",
+            error_message="FBref version re-parse yielded the lock",
+        )
+        return {"released": False, "status": "not_acquired"}
+    if acquire_state != "success":
+        raise AirflowException(
+            "FBref re-parse lock was not acquired "
+            f"(state={acquire_state})"
+        )
+    released = release_fbref_publication_lock(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    validate_state = states.get("validate_run", "missing")
+    if validate_state != "success":
+        raise AirflowException(
+            "FBref re-parse lock was released, but its verdict is red "
+            f"(validate_run={validate_state})"
+        )
+    return {**released, "status": "released_after_version_reparse"}
+
+
 def validate_fbref_run(
     *,
     airflow_run_id: str,
@@ -2878,6 +3181,11 @@ __all__ = [
     "fbref_dag_failure_callback",
     "initialize_fbref_run",
     "drain_fbref_replay",
+    "drain_fbref_reparse",
+    "finalize_fbref_reparse_lock",
+    "fbref_reparse_stop_at",
+    "collect_fbref_current_slot",
+    "wait_fbref_reparse_lock",
     "parse_fbref_wave",
     "plan_fbref_backfill",
     "release_fbref_publication_lock",

@@ -963,6 +963,20 @@ _PARSER_VERSION_LAG_SQL = """EXISTS (
       )
 )"""
 
+# The newest successful raw of its target (#1332).  Older raw of the same
+# target is superseded content: re-parsing it is wasted work at best.
+_LATEST_RAW_ATTEMPT_SQL = """NOT EXISTS (
+    SELECT 1
+    FROM fbref_control.fetch_attempt AS newer_raw
+    WHERE newer_raw.target_id = attempt.target_id
+      AND newer_raw.status = 'succeeded'
+      AND newer_raw.raw_manifest_key IS NOT NULL
+      AND newer_raw.content_hash IS NOT NULL
+      AND (newer_raw.lease_epoch > attempt.lease_epoch
+           OR (newer_raw.lease_epoch = attempt.lease_epoch
+               AND newer_raw.attempt_number > attempt.attempt_number))
+)"""
+
 # A scored match shell on the current parsers whose recovery a fresh request
 # owns (#2051): a refetch is scheduled/in flight, or a newer fetch landed.
 # A shell whose refetch was lost stays visible.  Params: three parser versions.
@@ -2734,6 +2748,25 @@ class ControlStore:
                 cursor.execute("DELETE FROM fbref_control.publication_waiter WHERE source=%s AND run_id=%s",
                                (normalized_source, normalized_run_id))
             return {**replaced, "acquired": True, "idempotent": False}
+
+    def current_publication_waiter_pending(self, source: str = "fbref") -> bool:
+        """True while a running current run waits in the lock queue (#1332)."""
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM fbref_control.publication_waiter AS waiter
+                JOIN fbref_control.crawl_run AS queued_run
+                  ON queued_run.run_id = waiter.run_id
+                WHERE waiter.source = %s
+                  AND queued_run.status = 'running'
+                  AND queued_run.run_type = 'current'
+                LIMIT 1
+                """,
+                (_text(source, "source"),),
+            )
+            return _fetchone(cursor) is not None
 
     def release_publication_lock(
         self,
@@ -9794,6 +9827,101 @@ class ControlStore:
                     parser,
                     typed_parser,
                     stateful_parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                    normalized_limit,
+                ),
+            )
+            return _fetchall(cursor)
+
+    def list_version_lagging_fetches(
+        self,
+        *,
+        parser_version: object,
+        typed_parser_version: object,
+        stateful_parser_version: object,
+        source: str = "fbref",
+        page_kinds: Optional[Sequence[str]] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return the newest raw of each target parsed only by older parsers.
+
+        Offline version re-parse (#1332) works both lanes at once, so the row
+        carries ``source_run_type`` for the stateful identity.  Superseded raw
+        and raw without any prior success (the recovery lanes' work) are not
+        selected.  Current lane first, then the newest season, grouped by page
+        kind so one selection fills one write group.
+        """
+
+        parser = _text(parser_version, "parser_version")
+        typed_parser = _text(typed_parser_version, "typed_parser_version")
+        stateful_parser = _text(
+            stateful_parser_version, "stateful_parser_version"
+        )
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        kinds = (
+            None
+            if page_kinds is None
+            else sorted({_text(kind, "page_kind") for kind in page_kinds})
+        )
+        if kinds == []:
+            return []
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT attempt.attempt_id, attempt.run_id,
+                       source_run.status AS source_run_status,
+                       source_run.run_type AS source_run_type,
+                       attempt.target_id, attempt.logical_refresh_id,
+                       attempt.content_hash, attempt.raw_manifest_key,
+                       attempt.http_status, attempt.started_at,
+                       attempt.finished_at, frontier.page_kind,
+                       frontier.canonical_url, frontier.source_ids
+                FROM fbref_control.fetch_attempt AS attempt
+                JOIN fbref_control.crawl_run AS source_run
+                  ON source_run.run_id = attempt.run_id
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = attempt.target_id
+                WHERE frontier.source = %s
+                  AND source_run.run_type IN ('current', 'backfill')
+                  AND frontier.state <> 'quarantined'
+                  AND attempt.status = 'succeeded'
+                  AND attempt.raw_manifest_key IS NOT NULL
+                  AND attempt.content_hash IS NOT NULL
+                  AND (%s::text[] IS NULL OR frontier.page_kind = ANY(%s))
+                  AND """ + _LATEST_RAW_ATTEMPT_SQL + """
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM fbref_control.observation_processing AS observed
+                    WHERE observed.logical_refresh_id =
+                          attempt.logical_refresh_id
+                      AND observed.parser_version = %s
+                      AND observed.typed_parser_version = %s
+                      AND observed.stateful_parser_version = %s
+                      AND observed.status = 'succeeded'
+                      AND observed.generic_status = 'succeeded'
+                      AND observed.typed_status IN ('succeeded', 'skipped')
+                      AND observed.stateful_status IN (
+                          'succeeded', 'skipped'
+                      )
+                      AND observed.validation_status = 'succeeded'
+                  )
+                  AND """ + _PARSER_VERSION_LAG_SQL + """
+                ORDER BY (source_run.run_type = 'current') DESC,
+                    frontier.source_ids->>'season_id' DESC NULLS LAST,
+                    frontier.page_kind,
+                    COALESCE(
+                    attempt.finished_at, attempt.started_at
+                ) DESC, attempt.attempt_id
+                LIMIT %s
+                """,
+                (
+                    _text(source, "source"),
+                    kinds,
+                    kinds,
                     parser,
                     typed_parser,
                     stateful_parser,

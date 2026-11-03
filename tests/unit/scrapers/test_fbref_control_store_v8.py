@@ -3463,3 +3463,91 @@ def test_settle_unscheduled_shell_owners_and_loud_cases(case, expected):
     verdict, executions = _settle_store(state, row, latest, newer)
     assert verdict == expected
     assert not any(sql.startswith("UPDATE") for sql, _ in executions)
+
+
+def test_version_reparse_takes_only_the_newest_raw_of_a_target():
+    """#1332: superseded raw of a target is never re-parsed."""
+    from scrapers.fbref.control.store import _LATEST_RAW_ATTEMPT_SQL
+
+    database = sqlite3.connect(":memory:")
+    database.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    database.execute(
+        "CREATE TABLE fbref_control.fetch_attempt (attempt_id TEXT, "
+        "target_id TEXT, lease_epoch INTEGER, attempt_number INTEGER, "
+        "status TEXT, raw_manifest_key TEXT, content_hash TEXT)"
+    )
+    rows = [
+        ("old", "a", 1, 1, "succeeded", "raw", "h"),
+        ("newest", "a", 2, 1, "succeeded", "raw", "h"),
+        ("failed-later", "a", 3, 1, "failed", None, None),
+        ("retry-1", "b", 5, 1, "succeeded", "raw", "h"),
+        ("retry-2", "b", 5, 2, "succeeded", "raw", "h"),
+        ("only", "c", 1, 1, "succeeded", "raw", "h"),
+    ]
+    database.executemany(
+        "INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?,?,?,?)", rows
+    )
+    latest = {
+        row[0]
+        for row in database.execute(
+            "SELECT attempt.attempt_id FROM fbref_control.fetch_attempt "
+            "AS attempt WHERE attempt.status = 'succeeded' AND "
+            + _LATEST_RAW_ATTEMPT_SQL
+        )
+    }
+    database.close()
+
+    assert latest == {"newest", "retry-2", "only"}
+
+
+def test_version_reparse_selector_orders_current_lane_and_newest_season_first():
+    from scrapers.fbref.control.store import (
+        _LATEST_RAW_ATTEMPT_SQL,
+        _PARSER_VERSION_LAG_SQL,
+    )
+
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"], captured["params"] = sql, params
+        return [], 0
+
+    store, _ = make_store(handler)
+    assert store.list_version_lagging_fetches(
+        parser_version="page-v4",
+        typed_parser_version="typed-v5",
+        stateful_parser_version="disc-v6",
+        page_kinds=["match", "squad"],
+        limit=100,
+    ) == []
+
+    sql = captured["sql"]
+    assert " ".join(_LATEST_RAW_ATTEMPT_SQL.split()) in sql
+    assert " ".join(_PARSER_VERSION_LAG_SQL.split()) in sql
+    assert "source_run.run_type AS source_run_type" in sql
+    assert "source_run.run_type IN ('current', 'backfill')" in sql
+    assert "frontier.state <> 'quarantined'" in sql
+    assert "observed.validation_status = 'succeeded'" in sql
+    assert sql.split("ORDER BY ", 1)[1] == (
+        "(source_run.run_type = 'current') DESC, "
+        "frontier.source_ids->>'season_id' DESC NULLS LAST, "
+        "frontier.page_kind, COALESCE( attempt.finished_at, "
+        "attempt.started_at ) DESC, attempt.attempt_id LIMIT %s"
+    )
+    assert captured["params"] == (
+        "fbref", ["match", "squad"], ["match", "squad"],
+        "page-v4", "typed-v5", "disc-v6", 100,
+    )
+    assert store.list_version_lagging_fetches(
+        parser_version="page-v4",
+        typed_parser_version="typed-v5",
+        stateful_parser_version="disc-v6",
+        page_kinds=[],
+    ) == []
+    with pytest.raises(ValueError, match="limit"):
+        store.list_version_lagging_fetches(
+            parser_version="page-v4",
+            typed_parser_version="typed-v5",
+            stateful_parser_version="disc-v6",
+            limit=1001,
+        )

@@ -6,7 +6,11 @@ from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
 from airflow.models.param import Param
-from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.operators.python import (
+    BranchPythonOperator,
+    PythonOperator,
+    ShortCircuitOperator,
+)
 
 from airflow.sensors.python import PythonSensor
 
@@ -36,6 +40,7 @@ from utils.fbref_pipeline_tasks import (
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
     choose_fbref_publication_path,
+    collect_fbref_current_slot,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
@@ -359,6 +364,19 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             trigger_rule="all_success",
         )
 
+        if not bootstrap_only:
+            # Before any control run or lock: a handed-over night slot
+            # (#1332) ends as a skipped, green run.
+            collect_current_slot = ShortCircuitOperator(
+                task_id="collect_current_slot",
+                python_callable=collect_fbref_current_slot,
+                # Light and decisive at 00:00: never wait behind re-parse for
+                # the single fbref_scraper_pool slot.
+                pool="default_pool",
+                retries=0,
+                trigger_rule="all_success",
+            )
+            collect_current_slot >> validate_production_readiness
         validate_production_readiness >> initialize_run
         initialize_run >> acquire_publication_lock >> seed_competition_index
         seed_competition_index >> capture_raw_baseline >> recover_raw

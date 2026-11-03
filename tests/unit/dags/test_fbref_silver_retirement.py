@@ -39,7 +39,7 @@ def test_ci_dagbag_counts_match_bronze_only_parent_topologies():
     )
 
     assert (
-        '"dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 15)'
+        '"dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 16)'
         in workflow
     )
     assert (

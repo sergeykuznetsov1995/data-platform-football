@@ -19,6 +19,7 @@ import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse, urlsplit
 
@@ -417,6 +418,12 @@ FBREF_BATCH_PERSIST_MAX_CELLS = _bounded_int(
     default=150000,
     lower=1000,
     upper=500000,
+)
+# Offline version re-parse selects and writes this many pages per wave (#1332).
+# A write costs about the same at any size, so the backlog drains in big
+# groups; the cell cap above still splits a group that is too wide.
+FBREF_REPARSE_GROUP_PAGES = _bounded_int(
+    "FBREF_REPARSE_GROUP_PAGES", default=100, lower=10, upper=400
 )
 
 
@@ -6771,7 +6778,10 @@ class FBrefPipeline:
         return sum(self._match_item_cells(item) for item in items)
 
     def _process_claimed_match_batch(
-        self, items: Sequence[_ClaimedMatchObservation]
+        self,
+        items: Sequence[_ClaimedMatchObservation],
+        *,
+        group_pages: Optional[int] = None,
     ) -> list[_ProcessedObservation]:
         materialized = tuple(items)
         if not materialized:
@@ -6813,7 +6823,7 @@ class FBrefPipeline:
                 )
                 continue
             if cohort and (
-                len(cohort) == self.batch_persist_matches
+                len(cohort) == (group_pages or self.batch_persist_matches)
                 or cohort_cells + item_cells
                 > self.batch_persist_max_cells
             ):
@@ -6828,7 +6838,10 @@ class FBrefPipeline:
         return len(item.page.cell_records())
 
     def _process_claimed_generic_batch(
-        self, items: Sequence[_ClaimedGenericObservation]
+        self,
+        items: Sequence[_ClaimedGenericObservation],
+        *,
+        group_pages: Optional[int] = None,
     ) -> list[_ProcessedObservation]:
         """Cohort non-match pages the way matches are already cohorted.
 
@@ -6879,7 +6892,7 @@ class FBrefPipeline:
                 )
                 continue
             if cohort and (
-                len(cohort) == self.batch_persist_matches
+                len(cohort) == (group_pages or self.batch_persist_matches)
                 or cohort_cells + item_cells > self.batch_persist_max_cells
             ):
                 flush_cohort()
@@ -7620,6 +7633,7 @@ class FBrefPipeline:
         source_run_id: Optional[str] = None,
         acceptance_replay: bool = False,
         _recover_cross_run: bool = False,
+        _reparse_lag: bool = False,
         _deadline: Optional[float] = None,
     ) -> WaveResult:
         """Parse raw under a database-held publication-generation fence."""
@@ -7633,6 +7647,7 @@ class FBrefPipeline:
                 source_run_id=source_run_id,
                 acceptance_replay=acceptance_replay,
                 _recover_cross_run=_recover_cross_run,
+                _reparse_lag=_reparse_lag,
                 _deadline=_deadline,
             )
 
@@ -7645,6 +7660,7 @@ class FBrefPipeline:
         source_run_id: Optional[str] = None,
         acceptance_replay: bool = False,
         _recover_cross_run: bool = False,
+        _reparse_lag: bool = False,
         _deadline: Optional[float] = None,
     ) -> WaveResult:
         """Parse and persist a bounded handoff using raw storage only."""
@@ -7660,7 +7676,24 @@ class FBrefPipeline:
         stateful_run_type = settings.run_type
         if acceptance_replay and settings.run_type != "replay":
             raise ParseWaveError("acceptance_replay_requires_replay_mode")
-        if settings.run_type == "replay":
+        if _reparse_lag:
+            # A sourceless zero-budget replay run: each page keeps the
+            # stateful identity of the run that fetched it (#1332).
+            if (
+                settings.run_type != "replay"
+                or source_run_id is not None
+                or acceptance_replay
+                or _recover_cross_run
+            ):
+                raise ParseWaveError(
+                    "version_reparse_requires_sourceless_replay"
+                )
+            run_metadata = (self.control.get_run(run_id) or {}).get(
+                "metadata"
+            ) or {}
+            if run_metadata.get("execution_mode") != "version_reparse":
+                raise ParseWaveError("version_reparse_run_profile_invalid")
+        elif settings.run_type == "replay":
             source_error = (
                 self._acceptance_replay_source_error(source_run_id)
                 if acceptance_replay
@@ -7685,6 +7718,14 @@ class FBrefPipeline:
                 limit=settings.shard_size,
                 **({"history_run_id": run_id} if (self.control.get_run(run_id) or {}).get(
                     "metadata", {}).get("history_campaign") else {}),
+            )
+        elif _reparse_lag:
+            fetches = self.control.list_version_lagging_fetches(
+                parser_version=PAGE_DOCUMENT_VERSION,
+                typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+                stateful_parser_version=DISCOVERY_PARSER_VERSION,
+                page_kinds=page_kinds,
+                limit=FBREF_REPARSE_GROUP_PAGES,
             )
         elif source_run_id:
             fetches = self.control.list_replay_fetches(
@@ -7714,7 +7755,7 @@ class FBrefPipeline:
         def stateful_identity(item):
             item_stateful_run_id = stateful_run_id
             item_stateful_run_type = stateful_run_type
-            if _recover_cross_run:
+            if _recover_cross_run or _reparse_lag:
                 item_stateful_run_id = str(item["run_id"])
                 item_stateful_run_type = str(
                     item.get("source_run_type")
@@ -7768,13 +7809,16 @@ class FBrefPipeline:
             )
             self._merge_processed_result(result, outcome)
 
-        timing_sampled = False
+        # Re-parse writes whole groups: a lone timing-sample write would cost
+        # as much as the group itself (#1332).
+        timing_sampled = _reparse_lag
+        group_pages = FBREF_REPARSE_GROUP_PAGES if _reparse_lag else None
 
         def process_prepared_items(prepared, process_batch):
             nonlocal timing_sampled
             outcomes = self._process_prepared_observations(
                 prepared,
-                process_batch,
+                partial(process_batch, group_pages=group_pages),
                 sample_timing=not timing_sampled and self.batch_persist_matches > 1,
             )
             if len(prepared) > 1:
@@ -7899,6 +7943,9 @@ class FBrefPipeline:
                     self.batch_persist_matches, FBREF_DEADLINE_PERSIST_PAGES
                 )
             )
+            if group_pages:
+                # Re-parse checks its deadline between whole groups instead.
+                persist_pages = group_pages
 
             def flush_buffers(*, matches: bool, generic: bool) -> None:
                 nonlocal match_buffer, generic_buffer
@@ -7972,6 +8019,29 @@ class FBrefPipeline:
             page_kinds=page_kinds,
             settings=settings,
             _recover_cross_run=True,
+            _deadline=deadline,
+        )
+
+    def reparse_version_lag_wave(
+        self,
+        run_id: str,
+        *,
+        page_kinds: Sequence[str],
+        settings: PipelineSettings,
+        deadline: Optional[float] = None,
+    ) -> WaveResult:
+        """Re-parse one group of raw parsed only by older parsers (#1332).
+
+        Zero-network: ``run_id`` is a sourceless replay run created with
+        ``execution_mode=version_reparse``; only the newest raw of a target is
+        taken, from either lane.  ``deadline`` works as in recovery.
+        """
+
+        return self.parse_wave(
+            run_id,
+            page_kinds=page_kinds,
+            settings=settings,
+            _reparse_lag=True,
             _deadline=deadline,
         )
 
@@ -8238,7 +8308,16 @@ class FBrefPipeline:
             or int(summary.get("bytes_used") or 0) != 0
         ):
             errors.append("replay_generated_proxy_traffic")
-        if str(summary.get("run_type")) == "replay":
+        version_reparse = (
+            str(summary.get("run_type")) == "replay"
+            and summary_metadata.get("execution_mode") == "version_reparse"
+        )
+        if version_reparse:
+            # A sourceless re-parse is bounded by its deadline, not by a
+            # source run's cohort, so no candidates-remaining gate (#1332).
+            if replay_source_run_id is not None:
+                errors.append("version_reparse_source_run_id_forbidden")
+        elif str(summary.get("run_type")) == "replay":
             source_summary = (
                 self.control.get_run_summary(replay_source_run_id)
                 if replay_source_run_id
