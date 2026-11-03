@@ -326,6 +326,14 @@ def test_rotation_scripts_take_every_host_path_from_the_env_file() -> None:
 
 
 @pytest.mark.unit
+def test_release_wrapper_has_no_host_tree_literal() -> None:
+    # Обёртка живёт вне md5-сверки автомата (#1376): дерево — только из env-файла.
+    text = _code_lines(DEPLOY / "run_from_release.sh")
+    assert not HOST_PATH_LITERAL.search(text) and "/opt/" not in text
+    assert 'sofascore_load_env "$ENV_FILE"' in text
+    subprocess.run(["bash", "-n", str(DEPLOY / "run_from_release.sh")], check=True)
+
+@pytest.mark.unit
 def test_env_example_covers_every_fail_closed_compose_variable() -> None:
     example_keys = {
         line.split("=", 1)[0]
