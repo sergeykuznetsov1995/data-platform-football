@@ -3061,8 +3061,9 @@ class FotMobIngestService:
         venue_root = overview.get("venue") or {}
         venue = venue_root.get("widget") or {}
         # FotMob gives capacity only as a statPairs entry, e.g. ["Capacity", 45360].
+        stat_pairs = venue_root.get("statPairs")
         venue_capacity = next(
-            (pair[1] for pair in venue_root.get("statPairs") or []
+            (pair[1] for pair in (stat_pairs if isinstance(stat_pairs, list) else [])
              if isinstance(pair, list) and len(pair) == 2 and pair[0] == "Capacity"),
             None,
         )
