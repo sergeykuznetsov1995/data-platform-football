@@ -4,8 +4,9 @@ Iceberg Maintenance DAG
 
 Weekly bounded Silver/Gold compaction plus `expire_snapshots` and
 `remove_orphan_files` over every table in `iceberg.{bronze,silver,gold}`.
-The high-churn `iceberg.ops.sofascore_capture_manifest` runs as an independent
-full-compaction + snapshot-expiry task and never performs orphan cleanup.
+The `iceberg.ops` journals (including `sofascore_capture_manifest`, formerly a
+separate weekly task here) are maintained daily by `maintain_ops` in
+`dag_iceberg_maintenance_daily.py` (full optimize + expire 3d, no orphan cleanup).
 
 Why
 ---
@@ -29,7 +30,7 @@ starts.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -42,7 +43,7 @@ def _maintain(**_ctx) -> Dict[str, Any]:
     # Lazy import so DAG parse stays cheap and never pulls scrapers/__init__.
     from utils.maintenance_tasks import maintain_iceberg_tables
 
-    # Bronze rewrites belong to the bounded 02:00–05:00 UTC nightly pass.
+    # Bronze rewrites belong to the bounded 00:00–02:00 UTC nightly pass.
     logical_date = _ctx.get("logical_date")
     rotation = logical_date.date().toordinal() // 7 if logical_date is not None else None
     result = maintain_iceberg_tables(
@@ -60,20 +61,10 @@ def _maintain(**_ctx) -> Dict[str, Any]:
     return result
 
 
-def _maintain_sofascore_capture_manifest(**_ctx) -> Dict[str, Any]:
-    # The ops manifest is outside the generic bronze/silver/gold sweep and has
-    # a dedicated no-orphan lifecycle contract while SofaScore writers run.
-    from utils.maintenance_tasks import maintain_sofascore_capture_manifest
-
-    return maintain_sofascore_capture_manifest()
-
-
 with DAG(
     dag_id="dag_iceberg_maintenance",
     default_args=SILVER_ARGS,
-    description=(
-        "Weekly generic Iceberg cleanup plus dedicated SofaScore manifest lifecycle"
-    ),
+    description="Weekly generic Iceberg cleanup for bronze/silver/gold",
     schedule="0 5 * * 0",  # Sunday 05:00 UTC — outside serve_predictions window
     start_date=datetime(2026, 5, 1),
     catchup=False,
@@ -84,8 +75,7 @@ with DAG(
     PythonOperator(
         task_id="maintain_iceberg_tables",
         python_callable=_maintain,
-    )
-    PythonOperator(
-        task_id="maintain_sofascore_capture_manifest",
-        python_callable=_maintain_sofascore_capture_manifest,
+        # One task sweeps ~400 tables incl. orphan scans; the 30 min
+        # SILVER_ARGS default is too short for it.
+        execution_timeout=timedelta(hours=3),
     )

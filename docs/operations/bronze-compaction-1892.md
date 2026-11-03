@@ -3,7 +3,8 @@
 Локальные код и проверки не доказывают доставку или production-приёмку.
 Разовый запуск на общем стеке выполняет лид после отдельного разрешения владельца.
 
-Ночной профиль: 02:00–05:00 UTC, один запрос одновременно, ≤1024 файлов / 512 МиБ
+Ночной профиль: 00:00–02:00 UTC (03:00–05:00 МСК, решение владельца 29.10; граница —
+`dags/utils/maintenance_window.py`), один запрос одновременно, ≤1024 файлов / 512 МиБ
 на порцию, ≤120 порций / 8 ГиБ за ночь. Каждая порция перечитывает `$files`;
 очередь таблиц и deadline сохраняются в Airflow Variable на DagRun/task.
 Общая Variable `bronze_compaction_shared_budget` хранит бюджет UTC-ночи для daily
@@ -141,7 +142,7 @@ Retention CLI не запускает.
 
 До следующего общего выпуска лид использует `--direct`: Airflow не импортируется,
 DAG не запускается. Cron устанавливает лид. Окно и ограничения те же; без `--seconds`
-один вызов работает до 05:00 UTC, бюджета, stop или исчерпания очереди. Airflow-режим
+один вызов работает до 02:00 UTC (05:00 МСК), бюджета, stop или исчерпания очереди. Airflow-режим
 без `--direct` по-прежнему имеет default 1800 с и admission через pool.
 
 ```bash
@@ -160,10 +161,12 @@ DAG не запускается. Cron устанавливает лид. Окн�
 FBref использует прежний publication lock с renew/assert и отменой Trino.
 
 Перед первой и каждой следующей порцией direct ждёт отсутствия running
-`dag_iceberg_maintenance_daily` / `dag_iceberg_maintenance`. Дополнительно требуется
-завершённый (success/failed) daily с `execution_date` предыдущего дня 02:00 UTC:
-это logical date сегодняшнего ночного запуска. Если запуск не завершился до 05:00,
-ночь пропускается (exit 0, `deadline` в журнале). Ошибка БД запрещает новую порцию
+`dag_iceberg_maintenance_daily` / `dag_iceberg_maintenance`. Если daily с
+`execution_date` предыдущего дня 00:00 UTC (logical date ночного запуска по
+расписанию `0 0 * * *`) существует, он должен быть завершён (success/failed).
+Пока прод-дерево держит старое расписание `0 2 * * *`, такого запуска в окне нет и
+direct допускается. Если ожидание не закончилось до 02:00 UTC, ночь пропускается
+(exit 0, `deadline` в журнале). Ошибка БД запрещает новую порцию
 и завершает CLI с exit 1. Weekly в воскресенье 05:00 находится за пределами окна.
 Проверка не является общей блокировкой: ручной запуск старого DAG после SELECT
 исключает лид по протоколу общего стека.
@@ -188,3 +191,56 @@ Stop-marker действует до и во время SQL; штатная ос�
 снимает cron.** Бюджеты Airflow и локального файла независимы; одновременный запуск
 недопустим. Первый боевой запуск лид показывает владельцу после dry-run согласно
 решению по #1892; эта документация не доказывает production-приёмку.
+
+## Обслуживание схемы ops (журналы источников)
+
+Таблицы `iceberg.ops.*` (журналы попыток, сигналы, манифесты) пишутся MERGE каждые
+30–60 с круглосуточно и копят мелкие data/delete-файлы и снапшоты. Склейка Bronze их
+не берёт: без партиций и с живыми delete-файлами таблица пропускается целиком.
+Поэтому для ops — отдельный проход `dags/utils/ops_maintenance.py::maintain_ops_tables`:
+
+1. список BASE TABLE схемы из `information_schema`, порядок — по убыванию числа
+   файлов в `$files`;
+2. по каждой таблице — полный `ALTER TABLE … EXECUTE optimize` (без `$path`,
+   применяет delete-файлы), затем `expire_snapshots(retention_threshold => '3d')`
+   (сессия выставляет `iceberg.expire_snapshots_min_retention = '1h'`);
+3. конфликт коммита с параллельным MERGE (`ICEBERG_COMMIT_ERROR`) — до 4 попыток с
+   backoff; если не вышло — таблица `busy`, проход идёт дальше;
+4. каждый ALTER ограничен `query_max_run_time` до deadline; deadline и stop-файл
+   проверяются между таблицами.
+
+`remove_orphan_files` на ops **не выполняется**: активные писатели могут владеть
+файлами, ещё не попавшими в закоммиченные метаданные (тот же контракт, что у
+`maintain_sofascore_capture_manifest`). Отдельная weekly-задача
+`maintain_sofascore_capture_manifest` из `dag_iceberg_maintenance` убрана — манифест
+теперь обслуживается ежедневно вместе с остальными ops-таблицами.
+
+В Airflow это задача `maintain_ops` в `dag_iceberg_maintenance_daily` (после
+`maintain_other_high_churn_bronze`, `execution_timeout` 1 ч). `busy`-таблицы задачу
+не валят; падает она при ошибке не-конфликтного типа или если все таблицы `busy`.
+
+### Прямой запуск с хоста
+
+До доставки DAG в общий планировщик:
+
+```bash
+/root/.venvs/dpf-test/bin/python scripts/maintain_ops.py --direct \
+  --journal /shared/maintenance/ops-direct.jsonl \
+  --stop-file /shared/maintenance/ops-direct.stop \
+  [--apply] [--seconds 3600] [--table espn_http_attempt_v1 ...]
+```
+
+Окно — то же 00:00–02:00 UTC (03:00–05:00 МСК); вне окна CLI завершается ошибкой
+аргументов (exit 2). По умолчанию dry-run: только метрики и план, без ALTER.
+Окружение: `TRINO_USER`, `TRINO_PASSWORD`, `FBREF_CONTROL_DB_URI` (CLI сам `.env` не
+читает); Trino `https://127.0.0.1:8082` (`verify=False`); перед стартом read-only
+проверка `public.dag_run`, как у direct-склейки: при running maintenance-DAG —
+exit 1 без ALTER. Запускать **последовательно** перед `compact_bronze.py --direct`
+(`maintain_ops.py … && compact_bronze.py …`), не параллельно.
+
+Журнал JSONL: событие `table` на таблицу (`before`/`after` = `{files, snapshots}`,
+`status` ok/busy/failed/planned/deadline) и итог `summary` (`maintained`, `busy`,
+`failed`, `stop_reason`, `exit_code`). Тексты исключений и секреты не пишутся —
+только тип ошибки. Остановка: `touch <stop-file>` — проход закончится после текущей
+таблицы. Exit 0 — хотя бы одна таблица обслужена или штатная остановка; exit 1 —
+ошибка или все таблицы `busy`.
