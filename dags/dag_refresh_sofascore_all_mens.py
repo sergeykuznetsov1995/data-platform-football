@@ -94,6 +94,11 @@ MAX_INITIAL_TRANSIENT_FAILURES = 3
 # its transport right at the deadline is retried 10 min later and its third
 # try ends at once past the deadline).
 REFRESH_RETRY_RESERVE = timedelta(hours=1, minutes=45)
+# #2134: the refill task's own timeout.  A census of the remaining work takes
+# 1-12 min (Trino), so the refill stops starting scopes REFILL_CENSUS_RESERVE
+# short of it and ends with its own stop reason instead of being killed.
+REFILL_TIMEOUT = REFRESH_SCOPE_BUDGET + timedelta(minutes=5)
+REFILL_CENSUS_RESERVE = timedelta(minutes=15)
 if (
     REFRESH_FETCH_TIMEOUT
     + REFRESH_FETCH_RETRY_DELAY
@@ -584,6 +589,7 @@ def _failed_initial_report(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def _refill_refresh_window(**context: Any) -> dict[str, Any]:
+    task_started = time.time()
     from utils.sofascore_refresh_window import refill_deadline, refill_window
     from dags.scripts.run_sofascore_scope_cycle import _atomic_json
 
@@ -599,6 +605,7 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     deadline = min(float(item["env"]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
                    for item in items)
     deadline = refill_deadline(deadline, getattr(dag_run, "start_date", None))
+    deadline = min(deadline, task_started + (REFILL_TIMEOUT - REFILL_CENSUS_RESERVE).total_seconds())
     run_id = str(context.get("run_id") or "manual")
     queue_mode = _refresh_queue_mode(context)
     report_path = _refill_report_path(run_id)
@@ -647,7 +654,8 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
             budget_s=REFRESH_SCOPE_BUDGET.total_seconds(), now=time.time,
             persist=lambda value: _atomic_json(report_path, {**value, "run_id": run_id}),
         )
-    except Exception as exc:
+    # #2134: also Airflow's task timeout, which is not an Exception.
+    except BaseException as exc:
         previous = json.loads(report_path.read_text())
         _atomic_json(report_path, {**previous, "status": "failed", "errors": [str(exc)]})
         raise
@@ -990,7 +998,7 @@ with DAG(
     refill = PythonOperator(
         task_id="refill_refresh_window", python_callable=_refill_refresh_window,
         trigger_rule="all_done", pool=REFRESH_POOL, priority_weight=5,
-        retries=0, execution_timeout=REFRESH_SCOPE_BUDGET + timedelta(minutes=5),
+        retries=0, execution_timeout=REFILL_TIMEOUT,
     )
     enrich = PythonOperator(
         task_id="enrich_season_metadata",

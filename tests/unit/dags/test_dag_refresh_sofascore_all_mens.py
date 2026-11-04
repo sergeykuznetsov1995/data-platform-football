@@ -211,6 +211,11 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     ) in fetch.bash_command
     assert operators["plan_refresh_batch"]._init_kwargs["trigger_rule"] == "all_done"
     assert fetch._init_kwargs["execution_timeout"] == timedelta(minutes=150)
+    # #2134: refill stops starting scopes 15 min short of its own timeout.
+    refill = operators["refill_refresh_window"]
+    assert refill._init_kwargs["execution_timeout"] == module.REFILL_TIMEOUT
+    assert module.REFILL_TIMEOUT == timedelta(hours=2, minutes=5)
+    assert module.REFILL_CENSUS_RESERVE == timedelta(minutes=15)
     # #1358: 7 h hold the sweep, the scopes' shared window, the reserve for
     # their retries and the metadata enrichment; #2107 adds the sweep's retry
     # delay, #2118 one scope retry delay past the window deadline:

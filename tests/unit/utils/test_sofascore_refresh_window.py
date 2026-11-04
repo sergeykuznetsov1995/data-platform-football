@@ -227,3 +227,52 @@ def test_persisted_report_is_red_right_after_a_failed_scope():
     refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
                   plan=plan, execute=execute, now=lambda: 1000, persist=saved.append)
     assert all(r['status'] == 'failed' and r['stop_reason'] == 'scope_failure' for r in saved)
+
+
+def _slow_census_harness(counts, durations, *, census_s, clock_start):
+    clock = [float(clock_start)]
+    calls = []
+    def pending():
+        clock[0] += census_s
+        count = counts.pop(0)
+        return [("SS-8", "2026", count, None, 0, 825)] if count else []
+    def plan(rows, budget, round_number):
+        calls.append(budget)
+        return {"SOFASCORE_SCOPE_KEY": "c:8:825", "SOFASCORE_TOURNAMENT_ID": "8",
+                "SOFASCORE_CANONICAL_SEASON": "2026", "SOFASCORE_SOURCE_SEASON_ID": "825"}
+    def execute(env):
+        elapsed = durations.pop(0)
+        clock[0] += elapsed
+        return {"status": "partial", "elapsed_s": elapsed}
+    return clock, calls, pending, plan, execute
+
+
+def test_slow_census_spends_the_window_budget_and_stops_before_the_task_timeout():
+    # #2134: every census takes 10 min; it is paid from the same 7200 s.
+    clock, calls, pending, plan, execute = _slow_census_harness(
+        [593, 500, 400, 300], [1000, 1000, 800], census_s=600, clock_start=1000)
+    result = refill_window(initial_elapsed_s=2539.3, deadline_epoch=15000,
+                           pending=pending, plan=plan, execute=execute, now=lambda: clock[0])
+    assert [round(budget, 1) for budget in calls] == [4060.7, 2460.7, 860.7]
+    assert result['stop_reason'] == 'time_budget'
+    assert result['wall_elapsed_s'] == 5200
+    assert result['elapsed_s'] == 2800
+
+
+def test_a_census_that_crosses_the_deadline_plans_nothing():
+    clock, calls, pending, plan, execute = _slow_census_harness(
+        [593], [], census_s=1500, clock_start=14000)
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000,
+                           pending=pending, plan=plan, execute=execute, now=lambda: clock[0])
+    assert calls == []
+    assert result['stop_reason'] == 'wall_deadline'
+
+
+def test_persisted_report_has_no_stop_reason_until_the_window_ends():
+    # #2134: a run killed mid-window must not leave a false round_cap behind.
+    clock, calls, pending, plan, execute = _harness([593, 400, 0], [1700, 1600])
+    saved = []
+    result = refill_window(initial_elapsed_s=2539.3, deadline_epoch=15000, pending=pending,
+                           plan=plan, execute=execute, now=lambda: clock[0], persist=saved.append)
+    assert [r['stop_reason'] for r in saved] == [None, None, 'empty_queue']
+    assert result['stop_reason'] == 'empty_queue'
