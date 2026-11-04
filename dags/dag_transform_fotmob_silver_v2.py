@@ -121,8 +121,8 @@ with DAG(
       the first two runs are full builds.
     * Empty input (nothing rebuilt) -> `switch_reader` still advances onto the build slot,
       which then equals bronze (an equal set). `mode=rollback` -> readers go back to the
-      other slot, nothing is built; run it before the next build (refused once a build wrote
-      into that slot), the abandoned slot is then rebuilt in full.
+      other slot, nothing is built; run it before the next build (refused once a build started
+      on that slot), the abandoned slot is then dropped and rebuilt in full by the next build.
     * No schedule until #2021; not triggered by ingest.
     """,
 ) as dag:

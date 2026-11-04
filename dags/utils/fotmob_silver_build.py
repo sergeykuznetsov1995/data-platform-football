@@ -125,6 +125,9 @@ _QUALIFIED = re.compile(r'[a-z0-9_]+\.[a-z0-9_]+\.[a-z0-9_]+')
 # A change signal: (max(_observed_at), max(_ingested_at) as Trino varchar or None, row count).
 Signal = tuple
 EMPTY_SIGNAL = (None, None, 0)
+# Build-state row marking "a build of this run touches the slot" (rollback guard).
+BUILD_MARKER = '__build__'
+ROLLED_BACK_SHA = 'rolled_back'
 
 
 @dataclass(frozen=True)
@@ -574,16 +577,40 @@ def build_global_table(cur, cfg: BuildConfig, table: str, slot: str, run_id: str
     return 1
 
 
+def mark_build(cur, cfg: BuildConfig, slot: str, run_id: str) -> None:
+    """Stamp the slot as touched by ``run_id`` before its first write (once per run).
+
+    A failed build may leave a hole (DELETE before INSERT, partial buckets, a
+    table dropped for a changed template) without any state row; the marker
+    is what the rollback guard sees.  Table state reads filter it out by name.
+    """
+    rows = _run(cur, f"""
+SELECT run_id
+FROM {cfg.build_state_table}
+WHERE slot = {_str(slot)}
+  AND table_name = {_str(BUILD_MARKER)}
+""".strip())
+    if [row[0] for row in rows] == [run_id]:
+        return
+    _delete_state(cur, cfg, slot, [BUILD_MARKER])
+    _run(cur, (
+        f'INSERT INTO {cfg.build_state_table} (slot, table_name, built_at, run_id)\n'
+        f'VALUES ({_str(slot)}, {_str(BUILD_MARKER)}, CURRENT_TIMESTAMP, {_str(run_id)})'
+    ))
+
+
 def build_family(cur, cfg: BuildConfig, family: str, slot: str, run_id: str, *,
                  expected_revision: int, log: Callable[[str], Any] = _LOG.info) -> int:
     """Build one family into ``slot``; stop if readers moved. Return units rebuilt."""
     spec = slot_spec(cfg)
     cache: dict = {}
     rebuilt = 0
-    for table in (t for t in FAMILIES[family] if t in cfg.tables):
+    for index, table in enumerate(t for t in FAMILIES[family] if t in cfg.tables):
         state = assert_reader_revision(cur, spec, expected_revision)
         if inactive_slot(state) != slot:
             raise RuntimeError(f'slot {slot} is not inactive (reader on {state.active_slot})')
+        if index == 0:
+            mark_build(cur, cfg, slot, run_id)
         if family == 'global':
             count = build_global_table(cur, cfg, table, slot, run_id, log=log, cache=cache)
         else:
@@ -597,7 +624,7 @@ def drop_slot(cur, cfg: BuildConfig, slot: str) -> None:
     """Forget a slot (``full_rebuild``): drop its tables and its build state."""
     for table in cfg.tables:
         _run(cur, f'DROP TABLE IF EXISTS {_relation(cfg, table, slot)}')
-    _delete_state(cur, cfg, slot, cfg.tables)
+    _delete_state(cur, cfg, slot, (*cfg.tables, BUILD_MARKER))
 
 
 def prepare_run(cur, cfg: BuildConfig) -> dict:
@@ -639,9 +666,10 @@ def switch_reader(cur, cfg: BuildConfig, *, mode: str, expected_revision: int,
     previous build (the production DAG always builds all competitions).
 
     ``rollback`` must run before the next build: it is refused once a build
-    has written into the target slot after the last switch (a DELETE may have
-    left a hole there).  After it the build state of the abandoned slot is
-    dropped, so the next build rebuilds that slot in full.
+    has started on the target slot after the last switch (its marker or state
+    rows are newer than the switch; a failed build may have left a hole).
+    After it the build state of the abandoned slot is invalidated (``sql_sha``
+    = ``rolled_back``), so the next build drops and rebuilds every table there.
     """
     spec = slot_spec(cfg)
     if mode == 'rollback':
@@ -651,11 +679,18 @@ def switch_reader(cur, cfg: BuildConfig, *, mode: str, expected_revision: int,
             (written,), = _run(cur, _written_since_switch_sql(cfg, target))
             if int(written):
                 raise RuntimeError(
-                    f'rollback refused: slot {target} was written by a build after the last '
+                    f'rollback refused: a build started on slot {target} after the last '
                     f'switch ({written} state rows); finish a build and advance instead'
                 )
         result = rollback(cur, spec, expected_revision=expected_revision, actor=actor)
-        _delete_state(cur, cfg, other_slot(result['to_slot']), ALL_TABLES)
+        # Invalidate, not delete: the next build drops and rebuilds every table of the
+        # abandoned slot (vanished partitions go with the DROP); rolling back again
+        # before that build still finds its tables intact.
+        _run(cur, (
+            f'UPDATE {cfg.build_state_table}\n'
+            f'SET sql_sha = {_str(ROLLED_BACK_SHA)}\n'
+            f'WHERE slot = {_str(other_slot(result["to_slot"]))}'
+        ))
         return result
     if mode != 'build':
         raise ValueError(f'mode must be build or rollback, got {mode!r}')
