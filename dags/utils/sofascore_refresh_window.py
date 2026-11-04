@@ -9,6 +9,15 @@ by the sum of its scopes (never less than it): each census of the remaining work
 and evidence) takes minutes, and a window that ignored it ran past its task
 timeout. ``elapsed_s`` stays the scopes' own time for readers of the window
 use; ``wall_elapsed_s`` is the continuation's wall time.
+
+#2160: a scope that lost only its transport is not written off for the run.
+It is put aside for ``retry_pause_s`` (a new lease then mostly lands on
+another exit) while other scopes use the window, and is planned again under
+a new round number, i.e. a new plan identity and lease. With nothing else to
+do the window sleeps until it is due, but only when at least ``min_scope_s``
+of the window is still left after the wait. A loss beyond
+``max_scope_retries`` blocks the scope for the run; every physical loss still
+counts towards the transport-failure limits.
 """
 from __future__ import annotations
 
@@ -82,12 +91,20 @@ def refill_window(
     now: Callable[[], float] = time.time,
     persist: Callable[[dict[str, Any]], None] | None = None,
     max_transient_failures: int = 3,
+    max_scope_retries: int = 1,
+    retry_pause_s: float = 600,
+    sleep: Callable[[float], None] = time.sleep,
+    # The smallest scope worth a wait: 20 matches x 15 s + 45 s.
+    min_scope_s: float = 345,
 ) -> dict[str, Any]:
     for value in (initial_elapsed_s, deadline_epoch, budget_s):
         if not math.isfinite(value) or value < 0:
             raise ValueError("refresh window accounting must be finite and nonnegative")
     outcomes: list[dict[str, Any]] = []
     blocked: dict[tuple[str, str, str], str] = {}
+    retries: dict[tuple[str, str, str], int] = {}
+    retry_after: dict[tuple[str, str, str], float] = {}
+    retried: dict[tuple[str, str, str], str] = {}
     started = now()
     scopes_s = 0.0
     transient = 0
@@ -105,6 +122,7 @@ def refill_window(
                 "elapsed_s": round(scopes_s, 3),
                 "wall_elapsed_s": round(now() - started, 3), "outcomes": list(outcomes),
                 "blocked_scopes": sorted(blocked.values()),
+                "retried_scopes": sorted(retried.values()),
                 "transient_failures": sum(o.get("status") == "transient_failure" for o in outcomes),
                 "window_deadline_epoch": deadline_epoch,
                 "window_budget_s": budget_s}
@@ -122,13 +140,28 @@ def refill_window(
             return "wall_deadline"
         return None
 
+    def ready(rows: list[tuple]) -> list[tuple]:
+        current = now()
+        return [row for row in rows if _partition(row) not in blocked
+                and retry_after.get(_partition(row), 0) <= current]
+
     rows: list[tuple] | None = None
     for round_number in range(1, max_rounds + 1):
         if stop := spent():
             reason = stop
             break
         rows = pending() if rows is None else rows
-        candidates = [row for row in rows if _partition(row) not in blocked]
+        candidates = ready(rows)
+        if not candidates:
+            waiting = {key: retry_after[key] for key in map(_partition, rows)
+                       if key in retry_after and key not in blocked}
+            if waiting:
+                wait = max(min(waiting.values()) - now(), 0)
+                if min(left()) - wait >= min_scope_s:
+                    sleep(wait)
+                else:
+                    blocked.update((key, retried[key]) for key in waiting)
+                candidates = ready(rows)
         if not candidates:
             reason = "no_progress" if rows else "empty_queue"
             status = "partial" if rows else "success"
@@ -156,10 +189,16 @@ def refill_window(
         key = (f"SS-{env['SOFASCORE_TOURNAMENT_ID']}",
                env['SOFASCORE_CANONICAL_SEASON'], env['SOFASCORE_SOURCE_SEASON_ID'])
         # #1751: a provider blip (502/522, captcha) costs one scope, not the
-        # window. The scope waits for the next run; only a streak means the
-        # transport itself is down, and that stays red.
+        # window; only a streak means the transport itself is down, and that
+        # stays red. #2160: the scope is retried once after a pause, then it
+        # waits for the next run.
         if outcome.get("status") == "transient_failure":
-            blocked[key] = env['SOFASCORE_SCOPE_KEY']
+            if retries.get(key, 0) < max_scope_retries:
+                retries[key] = retries.get(key, 0) + 1
+                retry_after[key] = now() + retry_pause_s
+                retried[key] = env['SOFASCORE_SCOPE_KEY']
+            else:
+                blocked[key] = env['SOFASCORE_SCOPE_KEY']
             transient += 1
             streak += 1
             if transient >= max_transient_failures:

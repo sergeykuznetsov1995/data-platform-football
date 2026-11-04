@@ -153,6 +153,22 @@ def test_refill_deadline_is_capped_by_its_own_task_timeout(tmp_path, monkeypatch
     assert plans[0]['scope_budget_s'] == 4660
 
 
+def test_refill_passes_its_retry_knobs_and_a_real_sleep(tmp_path, monkeypatch):
+    # #2160: a transport-only loss is retried once, 10 min later, in real time.
+    import utils.sofascore_refresh_window as window
+    module, _, context = _refill_context(
+        tmp_path, monkeypatch, execute=lambda env: pytest.fail('no scope expected'))
+    seen = {}
+    def refill_window(**kwargs):
+        seen.update(kwargs)
+        return {'status': 'success', 'stop_reason': 'empty_queue', 'outcomes': []}
+    monkeypatch.setattr(window, 'refill_window', refill_window)
+    module._refill_refresh_window(**context)
+    assert seen['max_scope_retries'] == module.REFILL_SCOPE_RETRIES == 1
+    assert seen['retry_pause_s'] == 600
+    assert seen['sleep'] is module.time.sleep
+
+
 def test_task_timeout_marks_the_refill_report_failed(tmp_path, monkeypatch):
     # #2134: Airflow's task timeout is not an Exception; the report must not
     # stay at its last intermediate point.

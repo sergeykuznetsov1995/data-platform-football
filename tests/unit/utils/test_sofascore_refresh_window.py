@@ -145,57 +145,120 @@ def test_stalled_scope_does_not_block_another_due_partition():
     assert result['blocked_scopes'] == ['c:8:825']
 
 
-def _scopes_harness(statuses):
+def _scopes_harness(statuses, durations=None, *, deadline=15000):
+    """A status per key, or a list of statuses per attempt of that key.
+
+    The injected sleep only moves the fake clock: no real time is spent.
+    """
     rows = [(f'SS-{tid}', '2026', 1, 1000, 1, tid * 100) for tid in range(1, len(statuses) + 1)]
-    visited = []
+    clock = [1000.0]
+    visited, sleeps, rounds, run_ids = [], [], [], []
+    attempts = {}
     def plan(current, budget, round_number):
         tid = current[0][0].split('-')[1]
+        rounds.append(round_number)
         return {'SOFASCORE_SCOPE_KEY': f'c:{tid}', 'SOFASCORE_TOURNAMENT_ID': tid,
-                'SOFASCORE_CANONICAL_SEASON': '2026', 'SOFASCORE_SOURCE_SEASON_ID': str(int(tid) * 100)}
+                'SOFASCORE_CANONICAL_SEASON': '2026', 'SOFASCORE_SOURCE_SEASON_ID': str(int(tid) * 100),
+                'SOFASCORE_SCOPE_RUN_ID': f'run:refill:{round_number}--{tid}'}
     def execute(env):
         tid = env['SOFASCORE_TOURNAMENT_ID']
         visited.append(tid)
-        status = statuses[int(tid) - 1]
+        run_ids.append(env['SOFASCORE_SCOPE_RUN_ID'])
+        planned = statuses[int(tid) - 1]
+        attempt = attempts.get(tid, 0)
+        attempts[tid] = attempt + 1
+        status = planned if isinstance(planned, str) else planned[attempt]
+        elapsed = (durations or {}).get(tid, 20)
+        clock[0] += elapsed
         if status != 'transient_failure':
             rows[:] = [row for row in rows if row[0] != f'SS-{tid}']
-        return {'status': status, 'elapsed_s': 20}
-    return rows, visited, plan, execute
+        return {'status': status, 'elapsed_s': elapsed}
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+    kwargs = dict(initial_elapsed_s=0, deadline_epoch=deadline, pending=lambda: list(rows),
+                  plan=plan, execute=execute, now=lambda: clock[0], sleep=sleep)
+    return kwargs, visited, sleeps, rounds, run_ids
 
 
-def test_provider_blip_skips_the_scope_and_keeps_filling_the_window():
-    rows, visited, plan, execute = _scopes_harness(['refreshed', 'transient_failure', 'refreshed'])
-    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                           plan=plan, execute=execute, now=lambda: 1000)
-    assert visited == ['1', '2', '3']
+def test_a_blip_is_retried_after_the_pause_while_other_scopes_fill_the_wait():
+    kwargs, visited, sleeps, rounds, run_ids = _scopes_harness(
+        ['refreshed', ['transient_failure', 'refreshed'], 'refreshed'], {'3': 700})
+    result = refill_window(**kwargs)
+    assert visited == ['1', '2', '3', '2']
+    assert sleeps == []
+    assert rounds == [1, 2, 3, 4]
+    assert run_ids[3] != run_ids[1]
+    assert result['status'] == 'success'
+    assert result['stop_reason'] == 'empty_queue'
+    assert result['transient_failures'] == 1
+    assert result['blocked_scopes'] == []
+    assert result['retried_scopes'] == ['c:2']
+
+
+def test_a_blip_with_nothing_else_to_do_waits_for_its_retry():
+    kwargs, visited, sleeps, rounds, _ = _scopes_harness([['transient_failure', 'refreshed']])
+    result = refill_window(**kwargs)
+    assert sleeps == [600]
+    assert visited == ['1', '1']
+    assert rounds == [1, 2]
+    assert result['stop_reason'] == 'empty_queue'
+
+
+def test_a_second_transport_loss_blocks_the_scope_for_the_run():
+    kwargs, visited, sleeps, _, _ = _scopes_harness([['transient_failure', 'transient_failure']])
+    result = refill_window(**kwargs)
+    assert sleeps == [600]
+    assert visited == ['1', '1']
+    assert result['blocked_scopes'] == ['c:1']
+    assert result['transient_failures'] == 2
     assert result['status'] == 'partial'
     assert result['stop_reason'] == 'no_progress'
-    assert result['blocked_scopes'] == ['c:2']
-    assert result['transient_failures'] == 1
+
+
+def test_the_retry_wait_is_skipped_when_no_scope_fits_after_it():
+    kwargs, visited, sleeps, _, _ = _scopes_harness([['transient_failure']], deadline=1000 + 600 + 300)
+    result = refill_window(**kwargs)
+    assert sleeps == []
+    assert visited == ['1']
+    assert result['blocked_scopes'] == ['c:1']
+    assert result['stop_reason'] == 'no_progress'
+
+
+def test_only_the_waiting_scope_is_blocked_when_its_wait_does_not_fit():
+    kwargs, visited, sleeps, _, _ = _scopes_harness(
+        [['transient_failure', 'refreshed'], 'refreshed', 'transient_failure'],
+        {'2': 700, '3': 100}, deadline=1000 + 20 + 700 + 20 + 100 + 900)
+    result = refill_window(**kwargs)
+    assert visited == ['1', '2', '1', '3']
+    assert sleeps == []
+    assert result['blocked_scopes'] == ['c:3']
+    assert result['retried_scopes'] == ['c:1', 'c:3']
 
 
 def test_a_streak_of_transport_failures_is_red():
-    rows, visited, plan, execute = _scopes_harness(['transient_failure'] * 4)
-    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                           plan=plan, execute=execute, now=lambda: 1000)
+    kwargs, visited, _, _, _ = _scopes_harness(['transient_failure'] * 4)
+    result = refill_window(**kwargs)
     assert visited == ['1', '2', '3']
     assert result['status'] == 'failed'
     assert result['stop_reason'] == 'transient_failures'
 
 
 def test_a_success_between_blips_resets_the_streak():
-    rows, visited, plan, execute = _scopes_harness(
+    # The retry of the first blip is the third loss in a row after the reset.
+    kwargs, visited, sleeps, _, _ = _scopes_harness(
         ['transient_failure', 'transient_failure', 'refreshed', 'transient_failure', 'transient_failure'])
-    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                           plan=plan, execute=execute, now=lambda: 1000)
-    assert visited == ['1', '2', '3', '4', '5']
-    assert result['status'] == 'partial'
-    assert result['transient_failures'] == 4
+    result = refill_window(**kwargs)
+    assert visited == ['1', '2', '3', '4', '5', '1']
+    assert sleeps == [520]
+    assert result['status'] == 'failed'
+    assert result['stop_reason'] == 'transient_failures'
+    assert result['transient_failures'] == 5
 
 
 def test_failed_scope_keeps_filling_the_window_and_stays_red():
-    rows, visited, plan, execute = _scopes_harness(['refreshed', 'failed', 'refreshed'])
-    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                           plan=plan, execute=execute, now=lambda: 1000)
+    kwargs, visited, _, _, _ = _scopes_harness(['refreshed', 'failed', 'refreshed'])
+    result = refill_window(**kwargs)
     assert visited == ['1', '2', '3']
     assert result['status'] == 'failed'
     assert result['stop_reason'] == 'scope_failure'
@@ -203,29 +266,26 @@ def test_failed_scope_keeps_filling_the_window_and_stays_red():
 
 
 def test_a_streak_of_failed_scopes_stops_the_window():
-    rows, visited, plan, execute = _scopes_harness(['failed'] * 4)
-    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                           plan=plan, execute=execute, now=lambda: 1000)
+    kwargs, visited, _, _, _ = _scopes_harness(['failed'] * 4)
+    result = refill_window(**kwargs)
     assert visited == ['1', '2', '3']
     assert result['status'] == 'failed'
     assert result['stop_reason'] == 'scope_failure'
 
 
 def test_alternating_blips_and_failed_scopes_still_stop_the_window():
-    rows, visited, plan, execute = _scopes_harness(
+    kwargs, visited, _, _, _ = _scopes_harness(
         ['transient_failure', 'failed', 'transient_failure', 'failed', 'refreshed'])
-    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                           plan=plan, execute=execute, now=lambda: 1000)
+    result = refill_window(**kwargs)
     assert visited == ['1', '2', '3']
     assert result['status'] == 'failed'
     assert result['stop_reason'] == 'scope_failure'
 
 
 def test_persisted_report_is_red_right_after_a_failed_scope():
-    rows, visited, plan, execute = _scopes_harness(['failed', 'refreshed'])
+    kwargs, visited, _, _, _ = _scopes_harness(['failed', 'refreshed'])
     saved = []
-    refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
-                  plan=plan, execute=execute, now=lambda: 1000, persist=saved.append)
+    refill_window(**kwargs, persist=saved.append)
     assert all(r['status'] == 'failed' and r['stop_reason'] == 'scope_failure' for r in saved)
 
 
