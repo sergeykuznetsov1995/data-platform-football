@@ -36,6 +36,10 @@ from scrapers.transfermarkt.models import (
 # The manifest module owns the scope-set size canon; readiness must not carry a
 # second copy of it that can silently drift from the builder's own limit.
 from utils.transfermarkt_scope_state import MAX_SCOPE_SET_SIZE
+from .silver_slots import (
+    inactive_slot as _shared_inactive_slot,
+    slotted_relation as _shared_slotted_relation,
+)
 
 
 STATE_KEY = 'canonical'
@@ -974,11 +978,11 @@ def inactive_slot(state: ReaderState) -> str:
     rollback followed by a new build still chooses the opposite physical
     slot.  A never-promoted deployment deterministically starts with slot A.
     """
-    return 'b' if state.active_slot == 'a' else 'a'
+    return _shared_inactive_slot(state)
 
 
 def slotted_relation(relation: str, slot: str) -> str:
-    return f'{relation}_{_normalise_slot(slot)}'
+    return _shared_slotted_relation(relation, slot)
 
 
 def contract_output_table(contract: ModelContract, slot: str) -> str:
