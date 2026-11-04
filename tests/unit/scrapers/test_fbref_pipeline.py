@@ -16555,3 +16555,32 @@ def test_recovery_deadline_reached_during_a_batch_write_stops_the_next_group(
     assert len(control.observation_claim_calls) == group
     returned = [record.target_id for record in records[group:]]
     assert all(control.frontier[t]["state"] == "fetched" for t in returned)
+
+
+@pytest.mark.parametrize("batch_persist_enabled", [False, True])
+def test_permanent_failure_drops_stale_transient_carryover(
+    tmp_path, monkeypatch, batch_persist_enabled,
+):
+    # Wave 1 deferred this raw on a transient Trino error; wave 2 found the
+    # match a shell and scheduled a refetch. The deadline must not hand the
+    # store the stale TrinoConnectionError it no longer has (#2150).
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, _typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218",),
+    )
+    pipeline.batch_persist_enabled = batch_persist_enabled
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    control.schedule_incomplete_match_refetch = lambda *_a, **_k: True
+    refresh = records[0].logical_refresh_id
+    pipeline._parse_carryovers[refresh] = {
+        "logical_refresh_id": refresh,
+        "error_class": "TrinoConnectionError",
+        "error_message": "failed to cancel query",
+        "deferred_errors": [],
+    }
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+    assert result.incomplete_match_refetches == 1
+    assert refresh not in pipeline._parse_carryovers
