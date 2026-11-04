@@ -15,6 +15,8 @@ SPEC = slots.SlotSpec(
 class FakeCursor:
     """DB-API stand-in that emulates the reader-state row and the CAS UPDATE.
 
+    A state row is ``[active_slot, revision, updated_by]``.
+
     ``built`` lists existing slot tables (default: every name asked for);
     ``hook(cur, sql)`` runs before each statement and may raise or mutate rows.
     A mutation result must be fetched before the next statement.
@@ -44,19 +46,20 @@ class FakeCursor:
             names = re.findall(r"'([a-z0-9_]+)'", sql.split(' IN ', 1)[1])
             self._result = [(n,) for n in names if self.built is None or n in self.built]
         elif head == 'SELECT':
-            self._result = [tuple(row) for row in self.rows]
+            self._result = [(slot, rev, None, by) for slot, rev, by in self.rows]
         elif head == 'UPDATE':
             expected = int(re.search(r'AND revision = (\d+)', sql).group(1))
             slot = re.search(r"SET active_slot = '([ab])'", sql).group(1)
+            actor = re.search(r"updated_by = '([^']*)'", sql).group(1)
             matched = 0
             for row in self.rows:
                 if not self.cas_fails and row[1] == expected and row[0] != slot:
-                    row[0], row[1] = slot, row[1] + 1
+                    row[:] = [slot, row[1] + 1, actor]
                     matched += 1
             self._result = [(matched,)]
         elif head == 'MERGE':
             if not self.rows:
-                self.rows.append([None, 0, None])
+                self.rows.append([None, 0, 'bootstrap'])
             self._result = [(len(self.rows),)]
         else:
             self._result = [(True,)]
@@ -75,7 +78,7 @@ class FakeCursor:
 
 
 def bootstrap_cursor(**kwargs):
-    return FakeCursor([[None, 0, None]], **kwargs)
+    return FakeCursor([[None, 0, 'bootstrap']], **kwargs)
 
 
 def fail_once(fragment):
@@ -117,7 +120,7 @@ def test_first_switch_from_bootstrap_row():
     assert cur.kinds() == SWITCH
     assert cur.sql[1] == slots.slot_tables_exist_sql(SPEC, 'a')
     assert cur.sql[4:6] == slots.reader_view_sql_all(SPEC, 'a')
-    assert cur.rows == [['a', 1, None]]
+    assert cur.rows == [['a', 1, 'silver_slots']]
 
 
 def test_missing_or_empty_state_table():
@@ -149,7 +152,7 @@ def test_advance_then_rollback():
     assert second == {'switched': True, 'from_slot': 'a', 'to_slot': 'b', 'revision': 2}
     back = slots.rollback(cur, SPEC, expected_revision=2)
     assert back == {'switched': True, 'from_slot': 'b', 'to_slot': 'a', 'revision': 3}
-    assert cur.rows == [['a', 3, None]]
+    assert cur.rows == [['a', 3, 'silver_slots']]
     assert cur.sql[-3:-1] == slots.reader_view_sql_all(SPEC, 'a')
 
 
@@ -164,23 +167,49 @@ def test_retry_onto_active_slot_rebuilds_views_without_update():
 def test_retry_after_failed_view_completes_the_switch():
     cur = FakeCursor([['a', 1, None]], hook=fail_once('VIEW iceberg.silver.lineup'))
     with pytest.raises(RuntimeError, match='boom'):
-        slots.advance(cur, SPEC, expected_revision=1)
-    assert cur.rows == [['b', 2, None]]
+        slots.advance(cur, SPEC, expected_revision=1, actor='run-1')
+    assert cur.rows == [['b', 2, 'run-1']]
     cur.sql.clear()
-    result = slots.advance(cur, SPEC, expected_revision=1)
-    assert result == {'switched': False, 'from_slot': 'b', 'to_slot': 'b', 'revision': 2}
+    result = slots.advance(cur, SPEC, expected_revision=1, actor='run-1')
+    assert result == {'switched': False, 'from_slot': 'a', 'to_slot': 'b', 'revision': 2}
     assert cur.kinds() == ['SELECT', 'CREATE', 'CREATE', 'SELECT']
     assert cur.sql[1:3] == slots.reader_view_sql_all(SPEC, 'b')
 
 
-def test_stale_advance_does_not_switch_back():
-    cur = FakeCursor([['b', 2, None]])
-    assert slots.advance(cur, SPEC, expected_revision=1)['to_slot'] == 'b'
-    assert slots.rollback(cur, SPEC, expected_revision=1)['to_slot'] == 'b'
-    assert 'UPDATE' not in cur.kinds() and cur.rows == [['b', 2, None]]
-    assert slots.switch_reader(cur, SPEC, to_slot='b', expected_revision=1)['switched'] is False
+def test_own_retry_does_not_switch_back():
+    cur = FakeCursor([['b', 2, 'run-1']])
+    assert slots.advance(cur, SPEC, expected_revision=1, actor='run-1')['to_slot'] == 'b'
+    assert slots.rollback(cur, SPEC, expected_revision=1, actor='run-1')['to_slot'] == 'b'
+    assert 'UPDATE' not in cur.kinds() and cur.rows == [['b', 2, 'run-1']]
+    retry = slots.switch_reader(cur, SPEC, to_slot='b', expected_revision=1, actor='run-1')
+    assert retry['switched'] is False
     with pytest.raises(slots.RevisionConflict, match='not a'):
-        slots.switch_reader(cur, SPEC, to_slot='a', expected_revision=1)
+        slots.switch_reader(cur, SPEC, to_slot='a', expected_revision=1, actor='run-1')
+
+
+def test_foreign_switch_at_next_revision_is_a_conflict():
+    # (a) someone else promoted b from bootstrap while our build went to a.
+    cur = bootstrap_cursor()
+    slots.switch_reader(cur, SPEC, to_slot='b', expected_revision=0, actor='other')
+    with pytest.raises(slots.RevisionConflict, match="expected=0, actual=1 switched by 'other'"):
+        slots.advance(cur, SPEC, expected_revision=0, actor='run-1')
+    # (b) a rollback from bootstrap cannot have landed: rev 1 is someone else's.
+    cur = FakeCursor([['a', 1, 'other']])
+    with pytest.raises(slots.RevisionConflict, match="switched by 'other'"):
+        slots.rollback(cur, SPEC, expected_revision=0)
+    assert cur.kinds() == ['SELECT'] and cur.rows == [['a', 1, 'other']]
+    # (c) same direction, different run: still a conflict, not a silent retry.
+    cur = FakeCursor([['b', 2, 'run-1']])
+    with pytest.raises(slots.RevisionConflict, match="not 'run-2'"):
+        slots.advance(cur, SPEC, expected_revision=1, actor='run-2')
+
+
+def test_assert_reader_revision_is_strict():
+    cur = FakeCursor([['b', 2, 'run-1']])
+    state = slots.assert_reader_revision(cur, SPEC, 2)
+    assert (state.active_slot, state.revision, state.updated_by) == ('b', 2, 'run-1')
+    with pytest.raises(slots.RevisionConflict):
+        slots.assert_reader_revision(cur, SPEC, 1)
 
 
 def test_unbuilt_slot_is_refused_before_update():
@@ -194,7 +223,7 @@ def test_unbuilt_slot_is_refused_before_update():
 def test_concurrent_switch_during_views_is_detected():
     def hook(cur, sql):
         if 'VIEW iceberg.silver.lineup' in sql:
-            cur.rows[0] = ['a', cur.rows[0][1] + 1, None]
+            cur.rows[0] = ['a', cur.rows[0][1] + 1, 'other']
     cur = FakeCursor([['a', 1, None]], hook=hook)
     with pytest.raises(slots.RevisionConflict, match='moved during the view rebuild'):
         slots.advance(cur, SPEC, expected_revision=1)
@@ -237,7 +266,7 @@ WHERE source = 'fotmob'
   AND active_slot IS DISTINCT FROM 'a'
 """.strip()
     assert slots.read_state_sql(SPEC) == """
-SELECT active_slot, revision, updated_at
+SELECT active_slot, revision, updated_at, updated_by
 FROM iceberg.ops.fotmob_reader_state
 WHERE source = 'fotmob'
   AND state_key = 'canonical'
@@ -246,6 +275,7 @@ WHERE source = 'fotmob'
 SELECT table_name
 FROM iceberg.information_schema.tables
 WHERE table_schema = 'silver'
+  AND table_type = 'BASE TABLE'
   AND table_name IN ('match_b', 'lineup_b')
 """.strip()
     assert slots.state_table_ddl(SPEC) == [

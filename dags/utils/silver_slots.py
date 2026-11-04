@@ -13,7 +13,11 @@ The model is two physical copies of each Silver table (``<table>_a`` and
   ``CREATE OR REPLACE VIEW <table>`` at the chosen slot;
 * a retry with the same ``expected_revision`` after the CAS landed (state is
   already at ``expected + 1``) skips the UPDATE and rebuilds the views on the
-  active slot, so a failed view step is completed, never reversed;
+  active slot, so a failed view step is completed, never reversed.  The retry
+  is honoured only when the landed CAS carries the caller's ``actor``
+  (``updated_by``): pass a unique ``actor`` per run (e.g. the Airflow run_id)
+  for safe retries; with a shared actor a retry is indistinguishable from
+  someone else's switch;
 * the state row is created by :func:`bootstrap`, never inferred by a switch.
 
 The reader state is the source of truth; views follow it.  The set is
@@ -54,6 +58,7 @@ class ReaderState:
     active_slot: str | None = None
     revision: int = 0
     updated_at: Any = None
+    updated_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -186,7 +191,7 @@ def bootstrap(cur, spec: SlotSpec) -> None:
 
 def read_state_sql(spec: SlotSpec) -> str:
     return f"""
-SELECT active_slot, revision, updated_at
+SELECT active_slot, revision, updated_at, updated_by
 FROM {spec.state_table}
 WHERE source = {_sql_literal(spec.source)}
   AND state_key = '{STATE_KEY}'
@@ -223,6 +228,7 @@ def slot_tables_exist_sql(spec: SlotSpec, slot: str) -> str:
 SELECT table_name
 FROM {catalog}.information_schema.tables
 WHERE table_schema = {_sql_literal(schema)}
+  AND table_type = 'BASE TABLE'
   AND table_name IN ({names})
 """.strip()
 
@@ -256,7 +262,7 @@ def read_reader_state(cur, spec: SlotSpec, *, allow_missing: bool = True) -> Rea
         raise StateInvariantError(
             f'{spec.source} reader state is not a singleton: rows={len(rows)}'
         )
-    active_slot, revision, updated_at = rows[0]
+    active_slot, revision, updated_at, updated_by = rows[0]
     if active_slot is not None and active_slot not in SLOTS:
         raise StateInvariantError(f'{spec.source} active_slot is malformed: {active_slot!r}')
     if revision is None or int(revision) < 0:
@@ -264,10 +270,17 @@ def read_reader_state(cur, spec: SlotSpec, *, allow_missing: bool = True) -> Rea
     return ReaderState(
         exists=True, source=spec.source, active_slot=active_slot,
         revision=int(revision), updated_at=updated_at,
+        updated_by=(str(updated_by) if updated_by is not None else None),
     )
 
 
 def assert_reader_revision(cur, spec: SlotSpec, expected_revision: int) -> ReaderState:
+    """Strict revision check, e.g. to pin a build slot under a revision.
+
+    No retry allowance: ``expected + 1`` is a conflict here.  The switch
+    operations use :func:`_read_for_switch`, which accepts the caller's own
+    landed CAS.
+    """
     expected = _normalise_revision(expected_revision)
     state = read_reader_state(cur, spec, allow_missing=(expected == 0))
     if state.revision != expected:
@@ -278,11 +291,19 @@ def assert_reader_revision(cur, spec: SlotSpec, expected_revision: int) -> Reade
     return state
 
 
-def _read_for_switch(cur, spec: SlotSpec, expected_revision: int) -> tuple[ReaderState, bool]:
+def _read_for_switch(
+    cur, spec: SlotSpec, expected_revision: int, actor: str,
+) -> tuple[ReaderState, bool]:
     """Return the state and whether this caller's CAS has already landed."""
     expected = _normalise_revision(expected_revision)
     state = read_reader_state(cur, spec, allow_missing=(expected == 0))
     if state.revision == expected + 1 and state.active_slot in SLOTS:
+        if state.updated_by != actor:
+            raise RevisionConflict(
+                f'{spec.source} reader revision drift: expected={expected}, '
+                f'actual={state.revision} switched by {state.updated_by!r}, '
+                f'not {actor!r}'
+            )
         return state, True
     if state.revision != expected:
         raise RevisionConflict(
@@ -336,7 +357,7 @@ def _switch_from(
         )
     return {
         'switched': switched,
-        'from_slot': state.active_slot,
+        'from_slot': other_slot(state.active_slot) if applied else state.active_slot,
         'to_slot': slot,
         'revision': revision,
     }
@@ -356,7 +377,7 @@ def switch_reader(
     landed, skips the UPDATE but still rebuilds the views.
     """
     slot = normalise_slot(to_slot)
-    state, applied = _read_for_switch(cur, spec, expected_revision)
+    state, applied = _read_for_switch(cur, spec, expected_revision, actor)
     if applied and state.active_slot != slot:
         raise RevisionConflict(
             f'{spec.source} reader moved to slot {state.active_slot}, not {slot}'
@@ -364,17 +385,21 @@ def switch_reader(
     return _switch_from(cur, spec, state, slot, applied=applied, actor=actor)
 
 
-def advance(cur, spec: SlotSpec, *, expected_revision: int) -> dict[str, Any]:
+def advance(
+    cur, spec: SlotSpec, *, expected_revision: int, actor: str = DEFAULT_ACTOR,
+) -> dict[str, Any]:
     """Promote a finished build in the inactive slot."""
-    state, applied = _read_for_switch(cur, spec, expected_revision)
+    state, applied = _read_for_switch(cur, spec, expected_revision, actor)
     slot = state.active_slot if applied else inactive_slot(state)
-    return _switch_from(cur, spec, state, slot, applied=applied, actor=DEFAULT_ACTOR)
+    return _switch_from(cur, spec, state, slot, applied=applied, actor=actor)
 
 
-def rollback(cur, spec: SlotSpec, *, expected_revision: int) -> dict[str, Any]:
+def rollback(
+    cur, spec: SlotSpec, *, expected_revision: int, actor: str = DEFAULT_ACTOR,
+) -> dict[str, Any]:
     """Return readers to the previously active slot."""
-    state, applied = _read_for_switch(cur, spec, expected_revision)
+    state, applied = _read_for_switch(cur, spec, expected_revision, actor)
     if state.active_slot is None:
         raise StateInvariantError(f'{spec.source}: nothing to roll back')
     slot = state.active_slot if applied else other_slot(state.active_slot)
-    return _switch_from(cur, spec, state, slot, applied=applied, actor=DEFAULT_ACTOR)
+    return _switch_from(cur, spec, state, slot, applied=applied, actor=actor)
