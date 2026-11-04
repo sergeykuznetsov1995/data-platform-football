@@ -24,9 +24,12 @@ import re
 from typing import NamedTuple
 
 WAIT_THRESHOLD_S = 60
-# retry_delay of the only retrying refresh task (run_refresh_scope, 2 min in
-# dags/dag_refresh_sofascore_all_mens.py); every other task has retries=0.
-RETRY_DELAY_S = 120
+# retry_delay of both retrying refresh tasks in
+# dags/dag_refresh_sofascore_all_mens.py, 10 min each:
+# refresh_season_schedules (REFRESH_FETCH_RETRY_DELAY, #2107) and
+# run_refresh_scope (REFRESH_SCOPE_RETRY_DELAY, #2118); every other task has
+# retries=0.
+RETRY_DELAY_S = 600
 
 REFRESH_DAG_ID = "dag_refresh_sofascore_all_mens"
 HISTORY_DAG_ID = "dag_backfill_sofascore_all_mens"

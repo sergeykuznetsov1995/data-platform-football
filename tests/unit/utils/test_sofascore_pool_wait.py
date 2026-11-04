@@ -107,10 +107,10 @@ def test_sixty_one_seconds_is_waiting(pool_wait, metadb):
 def test_a_retried_task_keeps_its_first_try_wait(pool_wait, metadb):
     _run(metadb, R, "r", "2026-09-24 15:30:00+00")
     # First try waited 10 min for the slot, failed; the retry started after the
-    # 2 min retry delay — that delay is not a pool wait.
+    # 10 min retry delay — that delay is not a pool wait.
     _ti(metadb, R, "r", "scope", "2026-09-24 15:40:00+00", "2026-09-24 16:00:00+00",
         state="failed", table="task_instance_history")
-    _ti(metadb, R, "r", "scope", "2026-09-24 16:02:00+00", "2026-09-24 16:30:00+00",
+    _ti(metadb, R, "r", "scope", "2026-09-24 16:10:00+00", "2026-09-24 16:30:00+00",
         try_number=2)
     # The next task is measured from the retry's end, not the first try's.
     _ti(metadb, R, "r", "validate", "2026-09-24 16:30:30+00", "2026-09-24 16:31:00+00")
@@ -119,11 +119,11 @@ def test_a_retried_task_keeps_its_first_try_wait(pool_wait, metadb):
 
 def test_a_retry_that_waits_for_the_slot_after_its_delay_is_waiting(pool_wait, metadb):
     # Astra r3: the first try started at once and failed at 16:00; after the
-    # 2 min retry delay the retry waited for the busy pool until 16:20.
+    # 10 min retry delay (#2118) the retry waited for the busy pool until 16:28.
     _run(metadb, R, "r", "2026-09-24 15:30:00+00")
     _ti(metadb, R, "r", "scope", "2026-09-24 15:30:20+00", "2026-09-24 16:00:00+00",
         state="failed", table="task_instance_history")
-    _ti(metadb, R, "r", "scope", "2026-09-24 16:20:00+00", "2026-09-24 16:40:00+00",
+    _ti(metadb, R, "r", "scope", "2026-09-24 16:28:00+00", "2026-09-24 16:48:00+00",
         try_number=2)
     assert _wait(pool_wait, metadb) == (1, 1, 1080.0, 1080.0)
 
