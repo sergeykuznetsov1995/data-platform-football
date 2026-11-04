@@ -3,6 +3,12 @@
 The initial estimate is only admission control. Replay can finish much sooner;
 new, separately identified plans spend the remaining actual allowance. An
 immutable wall deadline independently bounds queue waits and retries.
+
+#2134: the allowance is spent by the wall clock of the whole continuation, not
+by the sum of its scopes (never less than it): each census of the remaining work (``pending``: Trino
+and evidence) takes minutes, and a window that ignored it ran past its task
+timeout. ``elapsed_s`` stays the scopes' own time for readers of the window
+use; ``wall_elapsed_s`` is the continuation's wall time.
 """
 from __future__ import annotations
 
@@ -82,7 +88,8 @@ def refill_window(
             raise ValueError("refresh window accounting must be finite and nonnegative")
     outcomes: list[dict[str, Any]] = []
     blocked: dict[tuple[str, str, str], str] = {}
-    used = 0.0
+    started = now()
+    scopes_s = 0.0
     transient = 0
     streak = 0
     failed = False
@@ -93,21 +100,30 @@ def refill_window(
         # #1778: a red scope keeps the run red at every persisted point.
         return {"status": "failed" if failed else status,
                 "stop_reason": reason if status == "failed" or not failed else "scope_failure",
-                "elapsed_s": round(used, 3), "outcomes": list(outcomes),
+                "elapsed_s": round(scopes_s, 3),
+                "wall_elapsed_s": round(now() - started, 3), "outcomes": list(outcomes),
                 "blocked_scopes": sorted(blocked.values()),
                 "transient_failures": sum(o.get("status") == "transient_failure" for o in outcomes),
                 "window_deadline_epoch": deadline_epoch,
                 "window_budget_s": budget_s}
 
+    def left() -> tuple[float, float]:
+        current = now()
+        used = max(current - started, scopes_s)
+        return budget_s - initial_elapsed_s - used, deadline_epoch - current
+
+    def spent() -> str | None:
+        allowance, wall_left = left()
+        if allowance <= 0:
+            return "time_budget"
+        if wall_left <= 0:
+            return "wall_deadline"
+        return None
+
     rows: list[tuple] | None = None
     for round_number in range(1, max_rounds + 1):
-        allowance = budget_s - initial_elapsed_s - used
-        wall_left = deadline_epoch - now()
-        if allowance <= 0:
-            reason = "time_budget"
-            break
-        if wall_left <= 0:
-            reason = "wall_deadline"
+        if stop := spent():
+            reason = stop
             break
         rows = pending() if rows is None else rows
         candidates = [row for row in rows if _partition(row) not in blocked]
@@ -115,7 +131,12 @@ def refill_window(
             reason = "no_progress" if rows else "empty_queue"
             status = "partial" if rows else "success"
             break
-        env = plan(candidates, min(allowance, wall_left), round_number)
+        # #2134: the census itself can take minutes (Trino); it is paid from
+        # the same window before anything is planned.
+        if stop := spent():
+            reason = stop
+            break
+        env = plan(candidates, min(left()), round_number)
         if env is None:
             reason = "insufficient_headroom"
             break
@@ -123,12 +144,12 @@ def refill_window(
         if now() >= deadline_epoch:
             reason = "wall_deadline"
             break
-        started = now()
+        scope_started = now()
         outcome = execute(env)
-        elapsed = max(float(outcome.get("elapsed_s") or 0), now() - started)
+        elapsed = max(float(outcome.get("elapsed_s") or 0), now() - scope_started)
         if not math.isfinite(elapsed) or elapsed < 0:
             raise ValueError("invalid scope elapsed time")
-        used += elapsed
+        scopes_s += elapsed
         outcomes.append(outcome)
         key = (f"SS-{env['SOFASCORE_TOURNAMENT_ID']}",
                env['SOFASCORE_CANONICAL_SEASON'], env['SOFASCORE_SOURCE_SEASON_ID'])

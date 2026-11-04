@@ -79,7 +79,7 @@ def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):
                                   'source_season_id':825,'elapsed_s':2539.3}))
     env = {'SOFASCORE_CAMPAIGN_ACTION':'refresh','SOFASCORE_SCOPE_KEY':'c:8:825',
            'SOFASCORE_SCOPE_RESULT_PATH':str(initial),
-           'SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH':'15000'}
+           'SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH':'7000'}
     monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
     monkeypatch.setattr(module.time, 'time', lambda: 1000)
     monkeypatch.setattr(module.state, 'read_refresh_snapshot', lambda *a, **k: {'campaign_id':'c'})
@@ -106,9 +106,51 @@ def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):
     assert plans[0]['scope_budget_s'] == 4660
     assert plans[0]['dag_run_id'] == 'run:refill:1'
     assert 'exclude_tournament_ids' not in plans[0]  # #1370
-    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '15000'
+    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '7000'
     assert executed[0]['SOFASCORE_SCOPE_TIMEOUT_S'] == '3000'
     assert env['SOFASCORE_SCOPE_RESULT_PATH'] == str(initial)
+
+
+def _refill_context(tmp_path, monkeypatch, *, execute):
+    module = _module()
+    initial = tmp_path / 'initial.json'
+    initial.write_text(json.dumps({'status':'partial','campaign_id':'c','tournament_id':8,
+                                  'source_season_id':825,'elapsed_s':2539.3}))
+    env = {'SOFASCORE_CAMPAIGN_ACTION':'refresh','SOFASCORE_SCOPE_KEY':'c:8:825',
+           'SOFASCORE_SCOPE_RESULT_PATH':str(initial),
+           'SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH':'15000'}
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
+    monkeypatch.setattr(module.time, 'time', lambda: 1000)
+    monkeypatch.setattr(module.state, 'read_refresh_snapshot', lambda *a, **k: {'campaign_id':'c'})
+    rows = [[('SS-8','2026',593,None,0,825)], []]
+    monkeypatch.setattr(module, '_pending_refresh_partitions', lambda: rows.pop(0))
+    plans = []
+    def plan(snapshot, pending, **kwargs):
+        plans.append(kwargs)
+        return [{'SOFASCORE_SCOPE_KEY':'c:8:825','SOFASCORE_TOURNAMENT_ID':'8',
+                 'SOFASCORE_CANONICAL_SEASON':'2026','SOFASCORE_SOURCE_SEASON_ID':'825',
+                 'SOFASCORE_SCOPE_RUN_ID':kwargs['dag_run_id']+'--8-825',
+                 'SOFASCORE_SCOPE_TIMEOUT_S':'3000'}]
+    monkeypatch.setattr(module.state, 'plan_refresh_batch', plan)
+    monkeypatch.setattr(module, '_execute_refill_scope', execute)
+    context = dict(run_id='run',
+        dag_run=SimpleNamespace(run_type='scheduled', get_task_instances=lambda: [
+            SimpleNamespace(task_id='run_refresh_scope',state='success')]),
+        ti=SimpleNamespace(xcom_pull=lambda task_ids: [{'env':env}]))
+    return module, plans, context
+
+
+def test_refill_deadline_is_capped_by_its_own_task_timeout(tmp_path, monkeypatch):
+    # #2134: a later window deadline must not outlive the refill task itself.
+    executed = []
+    def execute(environment):
+        executed.append(environment)
+        return {'status':'refreshed','elapsed_s':1000,'scope_key':'c:8:825'}
+    module, plans, context = _refill_context(tmp_path, monkeypatch, execute=execute)
+    result = module._refill_refresh_window(**context)
+    assert result['stop_reason'] == 'empty_queue'
+    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '7600'
+    assert plans[0]['scope_budget_s'] == 4660
 
 
 def test_refill_child_timeout_terminates_process_group(monkeypatch):
