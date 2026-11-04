@@ -21,6 +21,10 @@ TS2 = '2026-11-05 03:54:00.000000'
 _TOKEN = re.compile(r"TIMESTAMP '[^']*'|'(?:[^']|'')*'|NULL|CURRENT_TIMESTAMP|-?\d+")
 
 
+def _signal(value):
+    return value if len(value) == 3 else (value[0], value[0], value[1])
+
+
 def _value(token):
     if token == 'NULL':
         return None
@@ -35,10 +39,12 @@ class FakeCursor:
     """Scripted Trino stand-in.
 
     ``calendar`` — ``{(comp, S): keys(S)}`` (answer of the calendar plan query);
-    ``signals`` — ``{view: {(comp, key): (max_observed_at, rows)}}``;
-    ``global_signals`` — ``{view: (max_observed_at, rows)}``.
+    ``signals`` — ``{view: {(comp, key): (max_observed_at[, max_ingested_at], rows)}}``;
+    ``global_signals`` — ``{view: (max_observed_at[, max_ingested_at], rows)}``
+    (a 2-tuple means ingested = observed). ``competition_id IN (…)`` filters apply.
     Emulates the reader-state row (as ``test_silver_slots``), the build-state table and
-    which tables exist; slot DELETE/INSERT are only logged. ``hook(cur, sql)`` may raise.
+    which tables exist; slot DELETE/INSERT are only logged. ``clock`` ticks per statement
+    and stamps ``built_at`` and the reader's ``updated_at``. ``hook(cur, sql)`` may raise.
     Every result must be fetched before the next statement.
     """
 
@@ -48,6 +54,8 @@ class FakeCursor:
         self.global_signals = global_signals or {}
         self.hook = hook
         self.reader = [None, 0, 'bootstrap']
+        self.reader_updated_at = 0
+        self.clock = 0
         self.state: list[dict] = []
         self.tables: set[str] = set()
         self.sql: list[str] = []
@@ -55,6 +63,7 @@ class FakeCursor:
 
     def execute(self, sql):
         assert self._result is None, 'previous result was not fetched'
+        self.clock += 1
         self.sql.append(sql)
         if self.hook:
             self.hook(self, sql)
@@ -76,18 +85,26 @@ class FakeCursor:
         if head == 'DROP':
             self.tables.discard(sql.split()[-1].rsplit('.', 1)[1])
             return [(0,)]
+        if 'built_at >' in sql:
+            slot = re.search(r"slot = '([ab])'", sql).group(1)
+            return [(sum(1 for r in self.state
+                         if r['slot'] == slot and r['built_at'] > self.reader_updated_at),)]
         if 'fotmob_reader_state' in sql:
             return self._reader(head, sql)
         if 'fotmob_silver_build_state' in sql:
             return self._state(head, sql)
-        if 'array_agg' in sql:
-            return [(c, s, sorted(keys)) for (c, s), keys in sorted(self.calendar.items())]
+        comps = re.search(r'competition_id IN \(([^)]*)\)', sql)
+        comps = {int(c.strip(" '")) for c in comps.group(1).split(',')} if comps else None
+        if 'card_key' in sql:
+            return [(c, s, k) for (c, s), keys in sorted(self.calendar.items()) for k in sorted(keys)
+                    if comps is None or c in comps]
         view = re.search(r'FROM iceberg\.bronze\.(\w+)', sql)
         if head == 'SELECT' and view:
             view = view.group(1)
             if 'GROUP BY' not in sql:
-                return [self.global_signals.get(view, (None, 0))]
-            return [(c, k, ts, n) for (c, k), (ts, n) in sorted(self.signals.get(view, {}).items())]
+                return [_signal(self.global_signals.get(view, (None, 0)))]
+            return [(c, k, *_signal(v)) for (c, k), v in sorted(self.signals.get(view, {}).items())
+                    if comps is None or c in comps]
         return [(0,)]
 
     def _reader(self, head, sql):
@@ -100,6 +117,7 @@ class FakeCursor:
             actor = re.search(r"updated_by = '([^']*)'", sql).group(1)
             if self.reader[1] == expected and self.reader[0] != slot:
                 self.reader = [slot, expected + 1, actor]
+                self.reader_updated_at = self.clock
         return [(1,)]
 
     def _state_filter(self, sql):
@@ -120,14 +138,17 @@ class FakeCursor:
         if head == 'SELECT':
             match = self._state_filter(sql)
             return [(r['competition_id'], r['source_season_key'], r['signal_max_observed_at'],
-                     r['signal_rows']) for r in self.state if match(r)]
+                     r['signal_max_ingested_at'], r['signal_rows'], r['sql_sha'])
+                    for r in self.state if match(r)]
         if head == 'DELETE':
             match = self._state_filter(sql)
             self.state = [r for r in self.state if not match(r)]
         if head == 'INSERT':
             cols = re.search(r'\(([^)]*)\)\s*VALUES', sql).group(1).replace(' ', '').split(',')
             for line in sql.split('VALUES', 1)[1].strip().splitlines():
-                self.state.append(dict(zip(cols, map(_value, _TOKEN.findall(line)))))
+                row = dict(zip(cols, map(_value, _TOKEN.findall(line))))
+                row['built_at'] = self.clock
+                self.state.append(row)
         return [(0,)]
 
     # --- views on the log -------------------------------------------------
@@ -158,6 +179,15 @@ def _match_cursor(**kwargs):
 
 def _cfg(tables=('fotmob_matches',), **kwargs):
     return build.BuildConfig(sql_dir=SQL_DIR, tables=tables, **kwargs)
+
+
+FULL = build.BuildConfig(sql_dir=SQL_DIR)
+
+
+def _switch(cur, revision, actor, slot):
+    """Advance with the full table set (the fake only knows the tables it built)."""
+    cur.tables |= {f'{t}_{slot}' for t in build.ALL_TABLES}
+    return build.switch_reader(cur, FULL, mode='build', expected_revision=revision, actor=actor)
 
 
 def _run_family(cur, cfg, family, run_id='run-1'):
@@ -193,6 +223,8 @@ def test_first_build_creates_slot_table_and_writes_partition_batch():
     rows = {r['source_season_key']: r for r in cur.state}
     assert rows['2026/2027']['signal_rows'] == 480  # payloads + calendar of keys(S)
     assert rows['2026/2027']['signal_max_observed_at'] == TS1
+    assert rows['2026/2027']['signal_max_ingested_at'] == TS1
+    assert rows['2026/2027']['sql_sha'] == build.template_sha(_cfg(), 'fotmob_matches')
     assert rows['2026/2027']['run_id'] == 'run-1'
 
 
@@ -263,9 +295,7 @@ def test_card_fix_same_count_newer_observed_rebuilds_partition_and_key_neighbour
 def test_other_slot_with_empty_state_is_built_in_full():
     cur = _match_cursor()
     _run_family(cur, _cfg(), 'match')
-    cur.tables |= {f'{t}_a' for t in build.ALL_TABLES}
-    assert build.switch_reader(cur, _cfg(), mode='build',
-                               expected_revision=0, actor='run-1')['to_slot'] == 'a'
+    assert _switch(cur, 0, 'run-1', 'a')['to_slot'] == 'a'
     cur.sql.clear()
     run, rebuilt = _run_family(cur, _cfg(), 'match', run_id='run-2')
 
@@ -290,11 +320,9 @@ def test_build_refuses_when_reader_moved():
 def test_empty_input_still_advances_onto_equal_slot():
     cur = _match_cursor()
     _run_family(cur, _cfg(), 'match')
-    cur.tables |= {f'{t}_a' for t in build.ALL_TABLES}
-    build.switch_reader(cur, _cfg(), mode='build', expected_revision=0, actor='run-1')
+    _switch(cur, 0, 'run-1', 'a')
     _run_family(cur, _cfg(), 'match', run_id='run-2')  # builds b in full
-    cur.tables |= {f'{t}_b' for t in build.ALL_TABLES}
-    build.switch_reader(cur, _cfg(), mode='build', expected_revision=1, actor='run-2')
+    _switch(cur, 1, 'run-2', 'b')
     assert cur.reader == ['b', 2, 'run-2']
 
     run = build.prepare_run(cur, _cfg())
@@ -302,7 +330,7 @@ def test_empty_input_still_advances_onto_equal_slot():
     rebuilt = build.build_family(cur, _cfg(), 'match', run['build_slot'], 'run-3',
                                  expected_revision=run['revision'])
     assert (run['build_slot'], rebuilt) == ('a', 0) and cur.writes() == []
-    result = build.switch_reader(cur, _cfg(), mode='build', expected_revision=2, actor='run-3')
+    result = _switch(cur, 2, 'run-3', 'a')
     assert result['to_slot'] == 'a' and result['switched'] is True
     assert cur.reader == ['a', 3, 'run-3']
 
@@ -313,7 +341,7 @@ def test_rollback_mode_uses_rollback():
     cur.reader = ['b', 4, 'run-0']
     cur.tables |= {f'{t}_a' for t in build.ALL_TABLES}
     cur.sql.clear()
-    result = build.switch_reader(cur, _cfg(), mode='rollback', expected_revision=4, actor='run-9')
+    result = build.switch_reader(cur, FULL, mode='rollback', expected_revision=4, actor='run-9')
     assert result['to_slot'] == 'a' and result['revision'] == 5
     assert cur.reader == ['a', 5, 'run-9']
     views = [s for s in cur.sql if 'VIEW' in s]
@@ -322,7 +350,7 @@ def test_rollback_mode_uses_rollback():
 
 def test_unknown_mode_is_rejected():
     with pytest.raises(ValueError):
-        build.switch_reader(FakeCursor(), _cfg(), mode='nope', expected_revision=0, actor='x')
+        build.switch_reader(FakeCursor(), FULL, mode='nope', expected_revision=0, actor='x')
 
 
 # 7. vanished partition -------------------------------------------------------------
@@ -511,7 +539,7 @@ def test_competition_filter_narrows_signals_and_plan():
     _run_family(cur, _cfg(competitions=(47,)), 'match')
     reads = [s for s in cur.sql if 'FROM iceberg.bronze' in s]
     assert any("competition_id IN ('47')" in s for s in reads)  # payloads: varchar
-    assert any('competition_id IN (47)' in s and 'array_agg' in s for s in reads)  # calendar: bigint
+    assert any('competition_id IN (47)' in s and 'card_key' in s for s in reads)  # calendar: bigint
 
 
 def test_config_rejects_unknown_tables_and_bad_buckets():
@@ -521,3 +549,135 @@ def test_config_rejects_unknown_tables_and_bad_buckets():
         build.BuildConfig(entity_buckets={'fotmob_competitions': 4})
     with pytest.raises(ValueError):
         build.BuildConfig(max_partitions_per_batch=0)
+    with pytest.raises(ValueError):
+        build.BuildConfig(tables=())
+
+
+# review round 1 ------------------------------------------------------------------
+
+def _two_competition_cursor():
+    cur = _match_cursor()
+    cur.calendar[(112, '2026')] = {'2026'}
+    cur.signals[CALENDAR][(112, '2026')] = (TS1, 10)
+    cur.signals[PAYLOADS][(112, '2026')] = (TS1, 10)
+    return cur
+
+
+def test_competition_subset_keeps_other_competitions_in_slot():
+    cur = _two_competition_cursor()
+    _run_family(cur, _cfg(), 'match')
+    cur.signals[PAYLOADS][(47, '2026/2027')] = (TS2, 120)
+    cur.sql.clear()
+    rebuilt = build.build_family(cur, _cfg(competitions=(47,)), 'match', 'a', 'run-2',
+                                 expected_revision=0)
+
+    assert rebuilt == 1
+    assert not any('competition_id = 112' in s for s in cur.writes('fotmob_matches'))
+    assert (112, '2026') in cur.state_keys('fotmob_matches')
+
+
+def test_missing_context_slot_table_resets_state_and_rebuilds():
+    cur = _match_cursor()
+    _run_family(cur, _cfg(), 'match')
+    cur.tables.discard('fotmob_matches_a')
+    cur.sql.clear()
+    rebuilt = build.build_family(cur, _cfg(), 'match', 'a', 'run-2', expected_revision=0)
+
+    assert rebuilt == 2
+    reset = next(i for i, s in enumerate(cur.sql)
+                 if s.startswith('DELETE FROM iceberg.ops.fotmob_silver_build_state')
+                 and 'competition_id' not in s)
+    create = next(i for i, s in enumerate(cur.sql) if s.startswith('CREATE TABLE IF NOT EXISTS'))
+    assert reset < create
+    assert _deletes_inserts(cur, 'fotmob_matches') == ['DELETE', 'INSERT']
+
+
+def test_global_signal_change_rebuilds_and_unchanged_writes_nothing():
+    cur = FakeCursor(global_signals={'fotmob_squad_snapshots_current': (TS1, 10)})
+    cfg = _cfg(('fotmob_team_squads',))
+    _run_family(cur, cfg, 'global')
+    cur.sql.clear()
+    assert build.build_family(cur, cfg, 'global', 'a', 'run-2', expected_revision=0) == 0
+    assert cur.writes() == []
+    cur.global_signals['fotmob_squad_snapshots_current'] = (TS2, 10)
+    assert build.build_family(cur, cfg, 'global', 'a', 'run-3', expected_revision=0) == 1
+    create, = cur.writes('fotmob_team_squads')
+    assert create.startswith('CREATE OR REPLACE TABLE iceberg.silver.fotmob_team_squads_a')
+
+
+def test_player_snapshot_signal_is_scanned_once_per_family():
+    cur = FakeCursor(global_signals={'fotmob_player_snapshots_current': (TS1, 1000)})
+    cfg = _cfg(('fotmob_players', 'fotmob_player_career', 'fotmob_player_market_values'))
+    _run_family(cur, cfg, 'global')
+    scans = [s for s in cur.sql if 'FROM iceberg.bronze.fotmob_player_snapshots_current' in s
+             and s.startswith('SELECT')]
+    assert len(scans) == 1
+
+
+def test_build_switch_refuses_partial_table_set():
+    cur = _match_cursor()
+    _run_family(cur, _cfg(), 'match')
+    cur.tables |= {f'{t}_a' for t in build.ALL_TABLES}
+    cur.sql.clear()
+    with pytest.raises(ValueError, match='all 22'):
+        build.switch_reader(cur, _cfg(), mode='build', expected_revision=0, actor='run-1')
+    assert cur.sql == [] and cur.reader == [None, 0, 'bootstrap']
+
+
+@pytest.mark.parametrize('table, family', [('fotmob_matches', 'match'), ('fotmob_team_squads', 'global')])
+def test_changed_template_drops_slot_table_and_rebuilds_in_full(table, family):
+    cur = _match_cursor()
+    cur.global_signals['fotmob_squad_snapshots_current'] = (TS1, 10)
+    _run_family(cur, _cfg((table,)), family)
+    for row in cur.state:
+        row['sql_sha'] = 'old'
+    cur.sql.clear()
+    rebuilt = build.build_family(cur, _cfg((table,)), family, 'a', 'run-2', expected_revision=0)
+
+    drop = cur.sql.index(f'DROP TABLE IF EXISTS iceberg.silver.{table}_a')
+    assert drop < cur.sql.index(cur.writes(table)[0])
+    assert rebuilt == (2 if family == 'match' else 1)
+    assert {r['sql_sha'] for r in cur.state} == {build.template_sha(_cfg(), table)}
+
+
+def test_rollback_refused_after_a_build_wrote_into_target_slot():
+    cur = _match_cursor()
+    _run_family(cur, _cfg(), 'match')
+    _switch(cur, 0, 'run-1', 'a')
+    _run_family(cur, _cfg(), 'match', run_id='run-2')
+    _switch(cur, 1, 'run-2', 'b')
+    cur.signals[PAYLOADS][(47, '2026/2027')] = (TS2, 120)
+    _run_family(cur, _cfg(), 'match', run_id='run-3')  # writes into a after the switch to b
+    with pytest.raises(RuntimeError, match='rollback refused: slot a'):
+        build.switch_reader(cur, FULL, mode='rollback', expected_revision=2, actor='run-4')
+    assert cur.reader == ['b', 2, 'run-2']
+
+
+def test_rollback_drops_state_of_abandoned_slot_so_next_build_is_full():
+    cur = _match_cursor()
+    _run_family(cur, _cfg(), 'match')
+    _switch(cur, 0, 'run-1', 'a')
+    _run_family(cur, _cfg(), 'match', run_id='run-2')
+    _switch(cur, 1, 'run-2', 'b')
+    result = build.switch_reader(cur, FULL, mode='rollback', expected_revision=2, actor='run-3')
+
+    assert result['to_slot'] == 'a' and cur.reader == ['a', 3, 'run-3']
+    assert cur.state_keys('fotmob_matches', 'b') == []
+    assert len(cur.state_keys('fotmob_matches', 'a')) == 2
+    cur.sql.clear()
+    run, rebuilt = _run_family(cur, _cfg(), 'match', run_id='run-4')
+    assert run['build_slot'] == 'b' and rebuilt == 2
+
+
+def test_only_ingested_at_change_rebuilds_partition():
+    cur = _match_cursor()
+    _run_family(cur, _cfg(), 'match')
+    cur.signals[PAYLOADS][(47, '2025/2026')] = (TS1, TS2, 380)
+    cur.sql.clear()
+    rebuilt = build.build_family(cur, _cfg(), 'match', 'a', 'run-2', expected_revision=0)
+
+    assert rebuilt == 1
+    delete, _ = cur.writes('fotmob_matches')
+    assert delete.endswith("source_season_key IN ('2025/2026')")
+    row = next(r for r in cur.state if r['source_season_key'] == '2025/2026')
+    assert (row['signal_max_observed_at'], row['signal_max_ingested_at']) == (TS1, TS2)

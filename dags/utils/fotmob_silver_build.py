@@ -13,18 +13,22 @@ one contract.
 * Context tables (13, partitioned by ``competition_id, source_season_key``) are
   rebuilt per partition with ``DELETE`` + ``INSERT``, in batches of one
   competition.  A partition is rebuilt when its change signal (max
-  ``_observed_at`` and row count of its bronze ``_current`` views) differs from
-  the signal recorded for *this slot* in the build-state table; a batch that
+  ``_observed_at``, max ``_ingested_at`` and row count of its bronze
+  ``_current`` views) differs from the signal recorded for *this slot* in the
+  build-state table; a batch that
   runs out of memory is split in half.  Match tables read the whole competition
   calendar and the cards of every season key the batch's matches carry
   (``keys(S)``: a split-season card lies under the parent key).
 * Global tables (9) are rebuilt whole when their signal changes, optionally in
   ``mod(<key>, N)`` buckets (players do not fit the 2 GB query limit).
 * Build state is written after each batch, so a failed run resumes where it
-  stopped.  Both slots start empty: the first two runs are full builds.
+  stopped.  Both slots start empty: the first two runs are full builds.  The
+  state carries the sha256 of the table's template: a changed template drops
+  the slot table and rebuilds it in full.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -37,6 +41,7 @@ from .silver_slots import (
     assert_reader_revision,
     bootstrap,
     inactive_slot,
+    other_slot,
     read_reader_state,
     rollback,
     slotted_relation,
@@ -117,8 +122,9 @@ _PLACEHOLDER = re.compile(r'\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}')
 _CATALOG_SCHEMA = re.compile(r'[a-z0-9_]+\.[a-z0-9_]+')
 _QUALIFIED = re.compile(r'[a-z0-9_]+\.[a-z0-9_]+\.[a-z0-9_]+')
 
-# A change signal: (max(_observed_at) as Trino varchar or None, row count).
+# A change signal: (max(_observed_at), max(_ingested_at) as Trino varchar or None, row count).
 Signal = tuple
+EMPTY_SIGNAL = (None, None, 0)
 
 
 @dataclass(frozen=True)
@@ -142,6 +148,8 @@ class BuildConfig:
         object.__setattr__(self, 'sql_dir', Path(self.sql_dir))
         object.__setattr__(self, 'competitions', tuple(int(c) for c in self.competitions))
         tables = tuple(self.tables)
+        if not tables:
+            raise ValueError('tables must name at least one FotMob Silver table')
         unknown = sorted(set(tables) - set(ALL_TABLES))
         if unknown:
             raise ValueError(f'unknown FotMob Silver tables: {unknown}')
@@ -248,18 +256,19 @@ WHERE table_schema = {_str(schema_name)}
 def _merge(a: Signal | None, b: Signal) -> Signal:
     if a is None:
         return b
-    stamps = [s for s in (a[0], b[0]) if s is not None]
-    return (max(stamps) if stamps else None, a[1] + b[1])
+
+    def latest(x, y):
+        stamps = [v for v in (x, y) if v is not None]
+        return max(stamps) if stamps else None
+    return (latest(a[0], b[0]), latest(a[1], b[1]), a[2] + b[2])
 
 
 def signal_sql(view: str, competitions: Iterable[int] = (), *, per_partition: bool = True) -> str:
     competitions = tuple(competitions)
+    stamps = 'CAST(max(_observed_at) AS VARCHAR), CAST(max(_ingested_at) AS VARCHAR), count(*)'
     if not per_partition:
         where = f'\nWHERE {_competition_filter(view, competitions)}' if competitions else ''
-        return (
-            'SELECT CAST(max(_observed_at) AS VARCHAR), count(*)\n'
-            f'FROM iceberg.bronze.{view}{where}'
-        )
+        return f'SELECT {stamps}\nFROM iceberg.bronze.{view}{where}'
     where = [
         'TRY_CAST(competition_id AS BIGINT) IS NOT NULL',
         '  AND source_season_key IS NOT NULL',
@@ -269,27 +278,40 @@ def signal_sql(view: str, competitions: Iterable[int] = (), *, per_partition: bo
         where.append(f'  AND {_competition_filter(view, competitions)}')
     return '\n'.join([
         'SELECT TRY_CAST(competition_id AS BIGINT), source_season_key,',
-        '       CAST(max(_observed_at) AS VARCHAR), count(*)',
+        f'       {stamps}',
         f'FROM iceberg.bronze.{view}',
         'WHERE ' + '\n'.join(where),
         'GROUP BY 1, 2',
     ])
 
 
-def read_signals(cur, table: str, competitions: Iterable[int] = ()) -> dict:
-    """``{(competition_id, season_key): signal}``; global tables: ``{(None, None): signal}``."""
-    competitions = tuple(competitions)
+def _view_signals(cur, view: str, competitions: tuple, per_partition: bool) -> dict:
+    if not per_partition:
+        (observed, ingested, rows), = _run(cur, signal_sql(view, competitions, per_partition=False))
+        return {(None, None): (observed, ingested, int(rows or 0))}
+    return {
+        (int(comp), str(key)): (observed, ingested, int(rows))
+        for comp, key, observed, ingested, rows in _run(cur, signal_sql(view, competitions))
+    }
+
+
+def read_signals(cur, table: str, competitions: Iterable[int] = (),
+                 cache: dict | None = None) -> dict:
+    """``{(competition_id, season_key): signal}``; global tables: ``{(None, None): signal}``.
+
+    ``cache`` keeps each bronze view's scan for the run (match tables share
+    their views; players/career/market values share one snapshot view).
+    """
+    cache = {} if cache is None else cache
+    per_partition = table not in GLOBAL_TABLES
+    scope = tuple(competitions) if per_partition or table in SEASON_GLOBAL_TABLES else ()
     signals: dict = {}
-    if table in GLOBAL_TABLES:
-        scope = competitions if table in SEASON_GLOBAL_TABLES else ()
-        for view in SIGNAL_SOURCES[table]:
-            (stamp, rows), = _run(cur, signal_sql(view, scope, per_partition=False))
-            signals[(None, None)] = _merge(signals.get((None, None)), (stamp, int(rows or 0)))
-        return signals
     for view in SIGNAL_SOURCES[table]:
-        for comp, key, stamp, rows in _run(cur, signal_sql(view, competitions)):
-            part = (int(comp), str(key))
-            signals[part] = _merge(signals.get(part), (stamp, int(rows)))
+        key = ('signal', view, per_partition, scope)
+        if key not in cache:
+            cache[key] = _view_signals(cur, view, scope, per_partition)
+        for part, signal in cache[key].items():
+            signals[part] = _merge(signals.get(part), signal)
     return signals
 
 
@@ -297,7 +319,8 @@ def plan_competitions(cur, competitions: Iterable[int] = ()) -> dict:
     """Calendar plan ``{competition_id: {S: keys(S)}}``.
 
     ``keys(S)`` is the union of the calendar keys of every match listed under
-    ``S``: the card of a split-season match may lie under any of them.
+    ``S``: the card of a split-season match may lie under any of them.  One
+    row per (S, key) pair, no ARRAY (the Trino CLI JSON output drops arrays).
     """
     competitions = tuple(competitions)
     scope = f'\n      AND {_competition_filter(CALENDAR_VIEW, competitions)}' if competitions else ''
@@ -310,17 +333,18 @@ WITH cal AS (
       AND source_season_key IS NOT NULL
       AND source_season_key <> ''{scope}
 )
-SELECT a.competition_id, a.source_season_key, array_agg(DISTINCT b.source_season_key)
+SELECT DISTINCT a.competition_id, a.source_season_key AS output_key,
+       b.source_season_key AS card_key
 FROM cal a
 JOIN cal b
   ON b.competition_id = a.competition_id
  AND b.match_id = a.match_id
-GROUP BY 1, 2
 """.strip())
     plan: dict = {}
-    for comp, key, keys in rows:
-        plan.setdefault(int(comp), {})[str(key)] = frozenset(str(k) for k in keys)
-    return plan
+    for comp, key, card_key in rows:
+        plan.setdefault(int(comp), {}).setdefault(str(key), set()).add(str(card_key))
+    return {comp: {key: frozenset(keys) for key, keys in parts.items()}
+            for comp, parts in plan.items()}
 
 
 def partition_signal(keys: Iterable[str], signals: dict, comp: int) -> Signal:
@@ -328,16 +352,13 @@ def partition_signal(keys: Iterable[str], signals: dict, comp: int) -> Signal:
     for key in sorted(keys):
         if (comp, key) in signals:
             signal = _merge(signal, signals[(comp, key)])
-    return signal if signal is not None else (None, 0)
+    return signal if signal is not None else EMPTY_SIGNAL
 
 
 def context_targets(cur, cfg: BuildConfig, table: str, cache: dict | None = None) -> dict:
     """``{competition_id: {S: (keys(S), signal)}}`` for one context table."""
     cache = {} if cache is None else cache
-    views = SIGNAL_SOURCES[table]
-    if views not in cache:
-        cache[views] = read_signals(cur, table, cfg.competitions)
-    signals = cache[views]
+    signals = read_signals(cur, table, cfg.competitions, cache)
     if table in MATCH_TABLES:
         if 'plan' not in cache:
             cache['plan'] = plan_competitions(cur, cfg.competitions)
@@ -364,24 +385,45 @@ CREATE TABLE IF NOT EXISTS {cfg.build_state_table} (
     competition_id bigint,
     source_season_key varchar,
     signal_max_observed_at timestamp(6),
+    signal_max_ingested_at timestamp(6),
     signal_rows bigint,
+    sql_sha varchar,
     built_at timestamp(6),
     run_id varchar
 ) WITH (format = 'PARQUET')
 """.strip()
 
 
-def read_build_state(cur, cfg: BuildConfig, slot: str, table: str) -> dict:
+def template_sha(cfg: BuildConfig, table: str) -> str:
+    return hashlib.sha256((cfg.sql_dir / f'{table}.sql.j2').read_bytes()).hexdigest()
+
+
+def read_build_state(cur, cfg: BuildConfig, slot: str, table: str) -> tuple[dict, set]:
+    """``({(competition_id, key): signal}, {sql_sha, ...})`` of one slot table."""
     rows = _run(cur, f"""
-SELECT competition_id, source_season_key, CAST(signal_max_observed_at AS VARCHAR), signal_rows
+SELECT competition_id, source_season_key, CAST(signal_max_observed_at AS VARCHAR),
+       CAST(signal_max_ingested_at AS VARCHAR), signal_rows, sql_sha
 FROM {cfg.build_state_table}
 WHERE slot = {_str(slot)}
   AND table_name = {_str(table)}
 """.strip())
-    return {
-        (None if comp is None else int(comp), key): (stamp, int(count))
-        for comp, key, stamp, count in rows
+    state = {
+        (None if comp is None else int(comp), key): (observed, ingested, int(count))
+        for comp, key, observed, ingested, count, _ in rows
     }
+    return state, {row[5] for row in rows}
+
+
+def _slot_state(cur, cfg: BuildConfig, table: str, slot: str,
+                log: Callable[[str], Any]) -> dict:
+    """Build state of a slot table; a changed template drops the table and its state."""
+    state, shas = read_build_state(cur, cfg, slot, table)
+    if shas - {template_sha(cfg, table)}:
+        log(f'{table}: template changed since slot {slot} was built, rebuilding in full')
+        _run(cur, f'DROP TABLE IF EXISTS {_relation(cfg, table, slot)}')
+        _delete_state(cur, cfg, slot, [table])
+        return {}
+    return state
 
 
 def _delete_state(cur, cfg: BuildConfig, slot: str, tables: Iterable[str],
@@ -396,19 +438,25 @@ def write_build_state(cur, cfg: BuildConfig, slot: str, table: str, comp: int | 
                       signals: dict, run_id: str) -> None:
     """Replace the state rows of ``signals`` (``{key: signal}``; global: ``{None: signal}``)."""
     _delete_state(cur, cfg, slot, [table], comp, [k for k in signals if k is not None])
+
+    def stamp(value):
+        return 'NULL' if value is None else f'TIMESTAMP {_str(value)}'
+    sha = _str(template_sha(cfg, table))
     values = ',\n'.join(
-        '    ({slot}, {table}, {comp}, {key}, {stamp}, {rows}, CURRENT_TIMESTAMP, {run})'.format(
+        '    ({slot}, {table}, {comp}, {key}, {observed}, {ingested}, {rows}, {sha}, '
+        'CURRENT_TIMESTAMP, {run})'.format(
             slot=_str(slot), table=_str(table),
             comp='NULL' if comp is None else _int(comp),
             key='NULL' if key is None else _str(key),
-            stamp='NULL' if stamp is None else f'TIMESTAMP {_str(stamp)}',
-            rows=_int(rows), run=_str(run_id),
+            observed=stamp(observed), ingested=stamp(ingested),
+            rows=_int(rows), sha=sha, run=_str(run_id),
         )
-        for key, (stamp, rows) in sorted(signals.items(), key=lambda kv: str(kv[0]))
+        for key, (observed, ingested, rows) in sorted(signals.items(), key=lambda kv: str(kv[0]))
     )
     _run(cur, (
         f'INSERT INTO {cfg.build_state_table} (slot, table_name, competition_id, '
-        'source_season_key, signal_max_observed_at, signal_rows, built_at, run_id)\n'
+        'source_season_key, signal_max_observed_at, signal_max_ingested_at, signal_rows, '
+        'sql_sha, built_at, run_id)\n'
         f'VALUES\n{values}'
     ))
 
@@ -419,10 +467,13 @@ def _relation(cfg: BuildConfig, table: str, slot: str) -> str:
     return f'{cfg.schema}.{slotted_relation(table, slot)}'
 
 
-def ensure_context_table(cur, cfg: BuildConfig, table: str, slot: str) -> None:
-    """Create the empty partitioned slot table; state without its table is stale."""
+def ensure_context_table(cur, cfg: BuildConfig, table: str, slot: str) -> bool:
+    """Create the empty partitioned slot table; state without its table is stale.
+
+    Returns True when the table had to be created (its state was cleared).
+    """
     if _table_exists(cur, cfg.schema, slotted_relation(table, slot)):
-        return
+        return False
     _delete_state(cur, cfg, slot, [table])
     sql = render_scoped_sql(
         table, cfg.sql_dir, calendar_scope='FALSE', payload_scope='FALSE',
@@ -434,6 +485,7 @@ def ensure_context_table(cur, cfg: BuildConfig, table: str, slot: str) -> None:
         f"WITH (format = 'PARQUET', partitioning = ARRAY[{partitioning}])\n"
         f'AS\n{wrap_select(sql, "FALSE")}\nWITH NO DATA'
     ))
+    return True
 
 
 def _batch_sql(cfg: BuildConfig, table: str, comp: int, batch: list, parts: dict) -> str:
@@ -471,9 +523,10 @@ def _build_batch(cur, cfg: BuildConfig, table: str, slot: str, comp: int, batch:
 def build_context_table(cur, cfg: BuildConfig, table: str, slot: str, run_id: str, *,
                         log: Callable[[str], Any] = _LOG.info, cache: dict | None = None) -> int:
     """Rebuild changed partitions of one context table; return partitions touched."""
-    ensure_context_table(cur, cfg, table, slot)
+    state = _slot_state(cur, cfg, table, slot, log)
+    if ensure_context_table(cur, cfg, table, slot):
+        state = {}
     targets = context_targets(cur, cfg, table, cache)
-    state = read_build_state(cur, cfg, slot, table)
     in_scope = (lambda c: c in cfg.competitions) if cfg.competitions else (lambda c: True)
     rebuilt = 0
     for comp in sorted(set(targets) | {c for c, _ in state if c is not None and in_scope(c)}):
@@ -495,11 +548,12 @@ def build_context_table(cur, cfg: BuildConfig, table: str, slot: str, run_id: st
 
 
 def build_global_table(cur, cfg: BuildConfig, table: str, slot: str, run_id: str, *,
-                       log: Callable[[str], Any] = _LOG.info) -> int:
+                       log: Callable[[str], Any] = _LOG.info, cache: dict | None = None) -> int:
     """Rebuild one global table whole (in buckets) if its signal changed; return 0 or 1."""
-    signal = read_signals(cur, table, cfg.competitions)[(None, None)]
+    signal = read_signals(cur, table, cfg.competitions, cache)[(None, None)]
+    state = _slot_state(cur, cfg, table, slot, log)
     exists = _table_exists(cur, cfg.schema, slotted_relation(table, slot))
-    if exists and read_build_state(cur, cfg, slot, table).get((None, None)) == signal:
+    if exists and state.get((None, None)) == signal:
         return 0
     season_scope = 'TRUE'
     if table in SEASON_GLOBAL_TABLES and cfg.competitions:
@@ -531,7 +585,7 @@ def build_family(cur, cfg: BuildConfig, family: str, slot: str, run_id: str, *,
         if inactive_slot(state) != slot:
             raise RuntimeError(f'slot {slot} is not inactive (reader on {state.active_slot})')
         if family == 'global':
-            count = build_global_table(cur, cfg, table, slot, run_id, log=log)
+            count = build_global_table(cur, cfg, table, slot, run_id, log=log, cache=cache)
         else:
             count = build_context_table(cur, cfg, table, slot, run_id, log=log, cache=cache)
         log(f'{table}: rebuilt {count} in slot {slot}')
@@ -558,17 +612,56 @@ def prepare_run(cur, cfg: BuildConfig) -> dict:
     return {'active_slot': state.active_slot, 'revision': state.revision, 'build_slot': slot}
 
 
+def _written_since_switch_sql(cfg: BuildConfig, slot: str) -> str:
+    spec = slot_spec(cfg)
+    return f"""
+SELECT count(*)
+FROM {cfg.build_state_table}
+WHERE slot = {_str(slot)}
+  AND built_at > (
+    SELECT updated_at
+    FROM {spec.state_table}
+    WHERE source = {_str(spec.source)}
+      AND state_key = 'canonical'
+  )
+""".strip()
+
+
 def switch_reader(cur, cfg: BuildConfig, *, mode: str, expected_revision: int,
                   actor: str) -> dict:
     """Advance onto the build slot or roll back.
 
     ``build`` always advances: with nothing rebuilt the build slot already
     matches bronze, so it is not older than the active one; ``advance``
-    refuses a slot with a missing table.
+    refuses a slot with a missing table.  It requires ``cfg.tables`` to be all
+    22 tables; a ``competitions`` subset is allowed here and is the caller's
+    responsibility: the slot then holds the other competitions from its
+    previous build (the production DAG always builds all competitions).
+
+    ``rollback`` must run before the next build: it is refused once a build
+    has written into the target slot after the last switch (a DELETE may have
+    left a hole there).  After it the build state of the abandoned slot is
+    dropped, so the next build rebuilds that slot in full.
     """
     spec = slot_spec(cfg)
     if mode == 'rollback':
-        return rollback(cur, spec, expected_revision=expected_revision, actor=actor)
+        state = read_reader_state(cur, spec, allow_missing=False)
+        if state.active_slot is not None and state.revision == int(expected_revision):
+            target = other_slot(state.active_slot)
+            (written,), = _run(cur, _written_since_switch_sql(cfg, target))
+            if int(written):
+                raise RuntimeError(
+                    f'rollback refused: slot {target} was written by a build after the last '
+                    f'switch ({written} state rows); finish a build and advance instead'
+                )
+        result = rollback(cur, spec, expected_revision=expected_revision, actor=actor)
+        _delete_state(cur, cfg, other_slot(result['to_slot']), ALL_TABLES)
+        return result
     if mode != 'build':
         raise ValueError(f'mode must be build or rollback, got {mode!r}')
+    if set(cfg.tables) != set(ALL_TABLES):
+        raise ValueError(
+            'switch refused: a build switch needs all 22 FotMob Silver tables, '
+            f'this run built {len(cfg.tables)}: {", ".join(cfg.tables)}'
+        )
     return advance(cur, spec, expected_revision=expected_revision, actor=actor)

@@ -54,8 +54,7 @@ def test_trigger_only_dag_runs_five_tasks_in_order():
     assert kwargs["max_active_runs"] == 1
     assert kwargs["max_active_tasks"] == 1
     assert set(kwargs["params"]) == {
-        "competitions", "tables", "max_partitions_per_batch", "entity_buckets",
-        "full_rebuild", "mode",
+        "max_partitions_per_batch", "entity_buckets", "full_rebuild", "mode",
     }
     assert kwargs["params"]["mode"].default == "build"
     order = ["bootstrap_reader", "build_match_tables", "build_season_tables",
@@ -69,11 +68,11 @@ def test_trigger_only_dag_runs_five_tasks_in_order():
         assert tasks[task_id]._init_kwargs["execution_timeout"] == timedelta(hours=6)
 
 
-def test_config_from_params_defaults_to_all_tables():
+def test_config_always_builds_all_competitions_and_tables():
     module = _reload()
-    cfg = module._config({"competitions": [47, 112], "tables": [], "entity_buckets": {},
+    cfg = module._config({"competitions": [47], "tables": ["fotmob_matches"], "entity_buckets": {},
                           "full_rebuild": True, "mode": "rollback"})
-    assert cfg.competitions == (47, 112)
+    assert cfg.competitions == ()
     assert cfg.tables == module.build.ALL_TABLES
     assert cfg.entity_buckets is None and cfg.full_rebuild is False
     assert cfg.sql_dir.is_dir()
@@ -84,9 +83,12 @@ def _patch_cursor(monkeypatch, module, calls):
     def cursor():
         yield "cur"
 
+    def switch_reader(cur, cfg, *, mode, **kw):
+        calls.append(("advance" if mode == "build" else mode, kw))
+        return kw
+
     monkeypatch.setattr(module, "_cursor", cursor)
-    monkeypatch.setattr(module.build, "advance", lambda cur, spec, **kw: calls.append(("advance", kw)) or kw)
-    monkeypatch.setattr(module.build, "rollback", lambda cur, spec, **kw: calls.append(("rollback", kw)) or kw)
+    monkeypatch.setattr(module.build, "switch_reader", switch_reader)
 
 
 def test_switch_advances_on_empty_input(monkeypatch):
