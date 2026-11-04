@@ -94,7 +94,9 @@ def refill_window(
     streak = 0
     failed = False
     status = "partial"
-    reason = "round_cap"
+    # #2134: no stop reason until the window really stops; a run killed
+    # mid-window must not leave a false one in its persisted report.
+    reason: str | None = None
 
     def report():
         # #1778: a red scope keeps the run red at every persisted point.
@@ -194,6 +196,8 @@ def refill_window(
         rows = refreshed
         if persist:
             persist(report())
+    else:
+        reason = "round_cap"
     result = report()
     if persist:
         persist(result)

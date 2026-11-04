@@ -266,3 +266,13 @@ def test_a_census_that_crosses_the_deadline_plans_nothing():
                            pending=pending, plan=plan, execute=execute, now=lambda: clock[0])
     assert calls == []
     assert result['stop_reason'] == 'wall_deadline'
+
+
+def test_persisted_report_has_no_stop_reason_until_the_window_ends():
+    # #2134: a run killed mid-window must not leave a false round_cap behind.
+    clock, calls, pending, plan, execute = _harness([593, 400, 0], [1700, 1600])
+    saved = []
+    result = refill_window(initial_elapsed_s=2539.3, deadline_epoch=15000, pending=pending,
+                           plan=plan, execute=execute, now=lambda: clock[0], persist=saved.append)
+    assert [r['stop_reason'] for r in saved] == [None, None, 'empty_queue']
+    assert result['stop_reason'] == 'empty_queue'
