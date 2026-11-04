@@ -58,10 +58,12 @@ def _locked(path):
 def _load(path, tables, window):
     if path.exists():
         state = json.loads(path.read_text())
+        known = state.get("tables")
         # Never turn malformed/incompatible state into a fresh nightly budget.
         if (
             state.get("version") not in (1, 2)
-            or state.get("tables") != tables
+            or not isinstance(known, list)
+            or len(set(known)) != len(known)
             or not isinstance(state.get("window"), str)
             or state["window"] > window
             or any(type(state.get(k)) is not int or state[k] < 0
@@ -70,14 +72,14 @@ def _load(path, tables, window):
             or state["input_bytes"] > compaction.MAX_INPUT_BYTES
             or not isinstance(state.get("queue"), list)
             or len(set(state["queue"])) != len(state["queue"])
-            or set(state["queue"]) - set(tables)
+            or set(state["queue"]) - set(known)
             or (state.get("version") == 1 and (
                 not isinstance(state.get("partition_offsets"), dict)
-                or any(k not in tables or type(v) is not int or v < 0
+                or any(k not in known or type(v) is not int or v < 0
                        for k, v in state["partition_offsets"].items())))
             or (state.get("version") == 2 and (
                 not isinstance(state.get("partition_cursors"), dict)
-                or set(state["partition_cursors"]) - set(tables)))
+                or set(state["partition_cursors"]) - set(known)))
         ):
             raise ValueError("Invalid direct compaction state")
         datetime.strptime(state["window"], "%Y-%m-%d")
@@ -90,6 +92,16 @@ def _load(path, tables, window):
         state.update(window=window, portions=0, input_bytes=0)
         if not state["queue"]:
             state["queue"] = tables[:]
+    if state["tables"] != tables:
+        # The allowlist moved under a saved night (night 04.11: two new WhoScored
+        # tables): keep the budget and the surviving positions, drop frozen
+        # tables and append newcomers to the rotation.
+        state["queue"] = ([t for t in state["queue"] if t in tables]
+                          + [t for t in tables if t not in state["tables"]
+                             and t not in state["queue"]])
+        state["partition_cursors"] = {
+            k: v for k, v in state["partition_cursors"].items() if k in tables}
+        state["tables"] = tables
     return state
 
 
