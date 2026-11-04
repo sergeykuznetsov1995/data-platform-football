@@ -654,7 +654,8 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
             budget_s=REFRESH_SCOPE_BUDGET.total_seconds(), now=time.time,
             persist=lambda value: _atomic_json(report_path, {**value, "run_id": run_id}),
         )
-    except Exception as exc:
+    # #2134: also Airflow's task timeout, which is not an Exception.
+    except BaseException as exc:
         previous = json.loads(report_path.read_text())
         _atomic_json(report_path, {**previous, "status": "failed", "errors": [str(exc)]})
         raise

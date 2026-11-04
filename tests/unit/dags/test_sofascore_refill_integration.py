@@ -153,6 +153,21 @@ def test_refill_deadline_is_capped_by_its_own_task_timeout(tmp_path, monkeypatch
     assert plans[0]['scope_budget_s'] == 4660
 
 
+def test_task_timeout_marks_the_refill_report_failed(tmp_path, monkeypatch):
+    # #2134: Airflow's task timeout is not an Exception; the report must not
+    # stay at its last intermediate point.
+    class _Timeout(BaseException):
+        pass
+    def execute(environment):
+        raise _Timeout('Timeout, PID: 1')
+    module, _, context = _refill_context(tmp_path, monkeypatch, execute=execute)
+    with pytest.raises(_Timeout):
+        module._refill_refresh_window(**context)
+    report = json.loads(module._refill_report_path('run').read_text())
+    assert report['status'] == 'failed'
+    assert report['errors'] == ['Timeout, PID: 1']
+
+
 def test_refill_child_timeout_terminates_process_group(monkeypatch):
     module = _module()
     class Child:
