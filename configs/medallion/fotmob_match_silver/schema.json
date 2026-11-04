@@ -1,0 +1,3972 @@
+{
+  "schema_version": "fotmob-match-v1",
+  "status": "first match release candidate; isolated validation required",
+  "match_context_key": {
+    "components": [
+      "competition_id",
+      "source_season_key",
+      "match_id"
+    ],
+    "encoding": "canonical JSON array, UTF-8, ensure_ascii=false,separators=(comma,colon); source_season_key preserved exactly",
+    "purpose": "C+S+M scope until global native-match uniqueness proven; Bronze target_type+entity_id unchanged"
+  },
+  "common_fields": {
+    "match_context_key": {
+      "type": "VARCHAR",
+      "nullable": false,
+      "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+    },
+    "competition_id": {
+      "type": "BIGINT",
+      "nullable": false,
+      "meaning": "Родительский турнир подтверждённого контекста Bronze"
+    },
+    "source_season_key": {
+      "type": "VARCHAR",
+      "nullable": false,
+      "meaning": "Точный ключ сезона FotMob"
+    },
+    "match_id": {
+      "type": "BIGINT",
+      "nullable": false,
+      "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+    },
+    "source_pointer": {
+      "type": "VARCHAR",
+      "nullable": false,
+      "meaning": "Конкретный JSON Pointer наблюдения"
+    },
+    "source_batch_id": {
+      "type": "VARCHAR",
+      "nullable": false,
+      "meaning": "Выбранная подтверждённая пачка Bronze"
+    },
+    "raw_value": {
+      "type": "JSON",
+      "nullable": true,
+      "meaning": "Исходное значение без потери JSON-типа"
+    },
+    "null_reason": {
+      "type": "MAP(VARCHAR,VARCHAR)",
+      "nullable": true,
+      "meaning": "Причина NULL отдельно для каждого поля"
+    },
+    "publication_id": {
+      "type": "VARCHAR",
+      "nullable": false,
+      "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+    },
+    "component_id": {
+      "type": "VARCHAR",
+      "nullable": false,
+      "meaning": "ID выбранного компонента match-card по общему publication-contract"
+    }
+  },
+  "tables": {
+    "matches": {
+      "entity_role": "matches",
+      "grain": "publication_id + match_context_key",
+      "foreign_keys": [],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "kickoff": {
+          "type": "TIMESTAMP(6) WITH TIME ZONE",
+          "nullable": true,
+          "meaning": "Плановое время UTC из ISO-поля"
+        },
+        "kickoff_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Человекочитаемый исходный текст времени"
+        },
+        "match_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название матча"
+        },
+        "country_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна/INT карточки"
+        },
+        "gender": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Опубликованная категория"
+        },
+        "coverage_level": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Объявленный уровень покрытия"
+        },
+        "stage_competition_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Локальный ID этапа/группы"
+        },
+        "competition_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное название турнира"
+        },
+        "parent_competition_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Родительский ID из карточки"
+        },
+        "round_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходный раунд"
+        },
+        "round_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное имя раунда"
+        },
+        "started": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Матч начался"
+        },
+        "finished": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Матч завершён"
+        },
+        "cancelled": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Матч отменён"
+        },
+        "awarded": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Технический результат"
+        },
+        "ongoing": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Матч идёт"
+        },
+        "has_pending_var": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Объявлена незавершённая VAR-проверка"
+        },
+        "status_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ статуса"
+        },
+        "status_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное описание статуса"
+        },
+        "status_short_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Короткий ключ статуса"
+        },
+        "status_short_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Короткое описание статуса"
+        },
+        "score_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Счёт матча без серии"
+        },
+        "shootout_score": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Счёт серии индекс0 home 1 away"
+        },
+        "lost_on_penalties_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное имя проигравшей серию команды"
+        },
+        "lost_on_aggregate_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное имя проигравшей по сумме команды"
+        },
+        "home_red_cards": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Число красных хозяев"
+        },
+        "away_red_cards": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Число красных гостей"
+        },
+        "attendance": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Опубликованная посещаемость"
+        },
+        "venue_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название стадиона"
+        },
+        "venue_city": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Город стадиона"
+        },
+        "venue_country": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна стадиона"
+        },
+        "venue_capacity": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Опубликованная вместимость"
+        },
+        "venue_latitude": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная широта стадиона"
+        },
+        "venue_longitude": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная долгота стадиона"
+        },
+        "venue_surface": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Покрытие"
+        },
+        "is_date_correct": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Флаг источника точности даты"
+        },
+        "lineup_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Вид заявки"
+        },
+        "lineup_source": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Поставщик заявки"
+        },
+        "has_playoff": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Объявлен playoff"
+        },
+        "leg_best_of_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Текст количества игр пары"
+        },
+        "leg_best_of_number": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Количество игр по исходному полю"
+        },
+        "other_leg_url": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ссылка на другую игру пары"
+        },
+        "half_clocks_raw": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Все исходные local clocks по точному имени; timezone не задан"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "aggregate_score_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "aggregate_score_text"
+        },
+        "tournament_link": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "tournament_link"
+        },
+        "leg_label_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "leg_label_key"
+        },
+        "leg_label_fallback": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "leg_label_fallback"
+        },
+        "has_referee_insight": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "has_referee_insight"
+        },
+        "has_betting_insight": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Explicit observed source field has_betting_insight"
+        },
+        "insight_languages": {
+          "type": "ARRAY(VARCHAR)",
+          "nullable": true,
+          "meaning": "Explicit observed source field insight_languages"
+        }
+      }
+    },
+    "match_teams": {
+      "entity_role": "match_teams",
+      "grain": "publication_id + match_context_key + side",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "side": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "home/away по general IDs"
+        },
+        "team_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID стороны"
+        },
+        "team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя стороны"
+        },
+        "score": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Счёт стороны в игре"
+        },
+        "fifa_rank": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Опубликованный рейтинг команды"
+        },
+        "formation": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Схема"
+        },
+        "rating": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Опубликованный рейтинг состава"
+        },
+        "average_starter_age": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Средний возраст стартового состава"
+        },
+        "total_starter_market_value": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходная суммарная стоимость; валюта неизвестна"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "match_players": {
+      "entity_role": "lineup starters/subs only; one source lineup record",
+      "grain": "publication_id + match_context_key + local_player_record_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "local_player_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Ключ наблюдаемой записи; не вечный ID человека"
+        },
+        "source_player_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Положительный родной ID игрока;0 преобразуется вNULL с raw"
+        },
+        "team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Команда участия при доказанной принадлежности"
+        },
+        "team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя команды участия"
+        },
+        "name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Полное имя в носителе"
+        },
+        "first_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное имя"
+        },
+        "last_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходная фамилия"
+        },
+        "short_name_raw": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Краткое имя; исходный0 сохраняется в raw"
+        },
+        "opta_id": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Дополнительный ID источника"
+        },
+        "shirt_number": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Номер футболки"
+        },
+        "is_captain": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Капитан"
+        },
+        "position_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Позиция заявки"
+        },
+        "usual_position_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Обычная позиция"
+        },
+        "position_label": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название/код позиции; носитель различён"
+        },
+        "is_goalkeeper": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Вратарь"
+        },
+        "is_player_of_match": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Отметка лучшего игрока"
+        },
+        "age_observed": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Возраст в карточке; не доказательство возраста на kickoff"
+        },
+        "country_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна игрока"
+        },
+        "country_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название страны"
+        },
+        "primary_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Основной клуб карточки отдельно от стороны матча"
+        },
+        "primary_team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Основной клуб по имени"
+        },
+        "market_value_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходная стоимость с неизвестной валютой"
+        },
+        "participation_event_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Сокращённый признак участия"
+        },
+        "substitution_minute": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Минута входа/выхода"
+        },
+        "substitution_reason": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Причина замены"
+        },
+        "minutes_played": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Минуты из POTM носителя"
+        },
+        "rating_exact": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Точная оценка при явном точном носителе"
+        },
+        "rating_display": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходная отображаемая оценка"
+        },
+        "rating_is_top": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Флаг максимальной оценки"
+        },
+        "rating_match_finished": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Завершённость матча в носителе оценки"
+        },
+        "is_home": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Сторона описанного игрока"
+        },
+        "horizontal_layout_x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы x"
+        },
+        "vertical_layout_x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы x"
+        },
+        "horizontal_layout_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы y"
+        },
+        "vertical_layout_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы y"
+        },
+        "horizontal_layout_width": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы width"
+        },
+        "vertical_layout_width": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы width"
+        },
+        "horizontal_layout_height": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы height"
+        },
+        "vertical_layout_height": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы height"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "carrier_kind": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "carrier_kind"
+        },
+        "position_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "position_code"
+        },
+        "national_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "national_team_id"
+        },
+        "potm_home_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "potm_home_team_id"
+        },
+        "potm_away_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "potm_away_team_id"
+        }
+      }
+    },
+    "match_unavailable_players": {
+      "entity_role": "match_unavailable_players",
+      "grain": "publication_id + match_context_key + team_id + local_unavailability_record_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_player_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Положительный ID игрока"
+        },
+        "name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя игрока"
+        },
+        "first_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя"
+        },
+        "last_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Фамилия"
+        },
+        "short_name_raw": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Краткое имя"
+        },
+        "age_observed": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Возраст карточки"
+        },
+        "country_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна"
+        },
+        "country_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название страны"
+        },
+        "market_value_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Стоимость без подтверждённой валюты"
+        },
+        "position_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Позиция"
+        },
+        "unavailable_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "injury/suspension/internationalDuty"
+        },
+        "injury_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Код травмы"
+        },
+        "expected_return_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Неточный текст срока"
+        },
+        "expected_return_date": {
+          "type": "TIMESTAMP(6) WITH TIME ZONE",
+          "nullable": true,
+          "meaning": "Явная исходная дата UTC"
+        },
+        "team_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа team_id; см. договор таблицы"
+        },
+        "local_unavailability_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа local_unavailability_record_key; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "national_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Explicit observed source field national_team_id"
+        }
+      }
+    },
+    "match_officials": {
+      "entity_role": "match_officials",
+      "grain": "publication_id + match_context_key + role + local_official_record_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_official_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Положительный ID судьи/тренера"
+        },
+        "name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя официального лица"
+        },
+        "first_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя"
+        },
+        "last_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Фамилия"
+        },
+        "country_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна"
+        },
+        "country_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название страны"
+        },
+        "age_observed": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Возраст карточки"
+        },
+        "source_league_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Лига судейского контекста"
+        },
+        "source_league_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название лиги судейского контекста"
+        },
+        "primary_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Основная команда карточки"
+        },
+        "primary_team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Основная команда карточки"
+        },
+        "is_coach": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Отметка тренера"
+        },
+        "usual_position_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходная позиция; обычноNULL"
+        },
+        "role": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа role; см. договор таблицы"
+        },
+        "local_official_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа local_official_record_key; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "national_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "national_team_id"
+        },
+        "opta_id": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Explicit observed source field opta_id"
+        }
+      }
+    },
+    "match_official_metrics": {
+      "entity_role": "match_official_metrics",
+      "grain": "publication_id + match_context_key + local_official_record_key + source_league_id + metric_key + value_type + role",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        },
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "role",
+            "local_official_record_key"
+          ],
+          "references": "match_officials(publication_id,match_context_key,role,local_official_record_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "metric_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Тип исходного показателя"
+        },
+        "value": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Значение"
+        },
+        "value_type": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "total/perMatch"
+        },
+        "source_total": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходное число событий"
+        },
+        "average": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Сравниваемое среднее источника"
+        },
+        "average_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "above/below/average"
+        },
+        "local_official_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа local_official_record_key; см. договор таблицы"
+        },
+        "source_league_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Явно объявленная часть логического ключа source_league_id; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "role": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Role of source official parent"
+        },
+        "average_percentage": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Explicit observed source field average_percentage"
+        }
+      }
+    },
+    "player_match_metrics": {
+      "entity_role": "player_match_metrics",
+      "grain": "publication_id + match_context_key + local_player_record_key + metric_key + metric_context",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "metric_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Исходный ключ показателя"
+        },
+        "metric_label": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное название"
+        },
+        "source_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Тип показателя источника"
+        },
+        "source_format": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Формат значения"
+        },
+        "source_presentation_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "text/graph/title; title исключение"
+        },
+        "value_number": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Типизированное число без округления; raw_value обязателен"
+        },
+        "value_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное текстовое значение"
+        },
+        "denominator": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный исходный знаменатель"
+        },
+        "bonus_value": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный бонус"
+        },
+        "percentage": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный/разобранный процент"
+        },
+        "published_rank": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Опубликованная позиция"
+        },
+        "matches_with_rating": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Число игр с оценкой"
+        },
+        "local_player_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа local_player_record_key; см. договор таблицы"
+        },
+        "metric_context": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа metric_context; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "player_record_table": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "player_record_table"
+        }
+      },
+      "tagged_player_reference": {
+        "table_field": "player_record_table",
+        "key_fields": [
+          "publication_id",
+          "match_context_key",
+          "local_player_record_key"
+        ],
+        "allowed_tables": [
+          "match_players",
+          "match_player_carriers"
+        ]
+      }
+    },
+    "player_context_metrics": {
+      "entity_role": "player_context_metrics",
+      "grain": "publication_id + match_context_key + local_player_record_key + source_context + metric_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "metric_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Исходный ключ показателя"
+        },
+        "metric_label": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное название"
+        },
+        "source_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Тип показателя источника"
+        },
+        "source_format": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Формат значения"
+        },
+        "source_presentation_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "text/graph/title; title исключение"
+        },
+        "value_number": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Типизированное число без округления; raw_value обязателен"
+        },
+        "value_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное текстовое значение"
+        },
+        "denominator": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный исходный знаменатель"
+        },
+        "bonus_value": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный бонус"
+        },
+        "percentage": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный/разобранный процент"
+        },
+        "published_rank": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Опубликованная позиция"
+        },
+        "matches_with_rating": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Число игр с оценкой"
+        },
+        "local_player_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа local_player_record_key; см. договор таблицы"
+        },
+        "source_context": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_context; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "player_record_table": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "player_record_table"
+        }
+      },
+      "tagged_player_reference": {
+        "table_field": "player_record_table",
+        "key_fields": [
+          "publication_id",
+          "match_context_key",
+          "local_player_record_key"
+        ],
+        "allowed_tables": [
+          "match_players",
+          "match_player_carriers",
+          "match_unavailable_players"
+        ],
+        "target_key_by_table": {
+          "match_players": "local_player_record_key",
+          "match_player_carriers": "local_player_record_key",
+          "match_unavailable_players": "local_unavailability_record_key"
+        }
+      }
+    },
+    "team_match_metrics": {
+      "entity_role": "team_match_metrics",
+      "grain": "publication_id + match_context_key + side + raw_period + metric_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        },
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "side"
+          ],
+          "references": "match_teams(publication_id,match_context_key,side)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "metric_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Исходный ключ показателя"
+        },
+        "metric_label": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное название"
+        },
+        "source_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Тип показателя источника"
+        },
+        "source_format": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Формат значения"
+        },
+        "source_presentation_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "text/graph/title; title исключение"
+        },
+        "value_number": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Типизированное число без округления; raw_value обязателен"
+        },
+        "value_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное текстовое значение"
+        },
+        "denominator": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный исходный знаменатель"
+        },
+        "bonus_value": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный бонус"
+        },
+        "percentage": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Явный/разобранный процент"
+        },
+        "published_rank": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Опубликованная позиция"
+        },
+        "matches_with_rating": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Число игр с оценкой"
+        },
+        "side": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа side; см. договор таблицы"
+        },
+        "raw_period": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа raw_period; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "source_pointers": {
+          "type": "ARRAY(VARCHAR)",
+          "nullable": true,
+          "meaning": "source_pointers"
+        }
+      }
+    },
+    "metric_definitions": {
+      "entity_role": "metric_definitions",
+      "grain": "publication_id + match_context_key + source_family + metric_key + source_type + context",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "group_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ группы представления"
+        },
+        "group_title": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название группы представления"
+        },
+        "source_family": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_family; см. договор таблицы"
+        },
+        "metric_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа metric_key; см. договор таблицы"
+        },
+        "source_type": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_type; см. договор таблицы"
+        },
+        "context": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа context; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "player_match_ranks": {
+      "entity_role": "player_match_ranks",
+      "grain": "publication_id + match_context_key + local_player_record_key + metric_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "rank": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Место"
+        },
+        "total_players": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Количество ранжированных игроков"
+        },
+        "local_player_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа local_player_record_key; см. договор таблицы"
+        },
+        "metric_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа metric_key; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "player_record_table": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "player_record_table"
+        }
+      },
+      "tagged_player_reference": {
+        "table_field": "player_record_table",
+        "key_fields": [
+          "publication_id",
+          "match_context_key",
+          "local_player_record_key"
+        ],
+        "allowed_tables": [
+          "match_players",
+          "match_player_carriers"
+        ]
+      }
+    },
+    "match_events": {
+      "entity_role": "match_events",
+      "grain": "publication_id + match_context_key + event_record_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_event_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Положительный исходный ID; nullable при0/absence"
+        },
+        "event_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Тип события"
+        },
+        "minute": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Минута источника"
+        },
+        "additional_minute": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Добавленная минута"
+        },
+        "beneficiary_is_home": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Сторона события; не обязательно команда игрока"
+        },
+        "home_score_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходный промежуточный счёт хозяев"
+        },
+        "away_score_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходный промежуточный счёт гостей"
+        },
+        "home_aggregate_score": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходный агрегат хозяев"
+        },
+        "away_aggregate_score": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходный агрегат гостей"
+        },
+        "new_score_raw": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Исходный счёт после события"
+        },
+        "shootout_score": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Исходный счёт серии"
+        },
+        "penalty_summary_score": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Итог серии из marker"
+        },
+        "is_shootout_attempt": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Попытка серии"
+        },
+        "card_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Карточка"
+        },
+        "card_description_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Описание карточки"
+        },
+        "card_description_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ описания"
+        },
+        "card_reason_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Причина карточки"
+        },
+        "card_reason_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ причины"
+        },
+        "is_own_goal": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Автогол"
+        },
+        "goal_description": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Описание гола"
+        },
+        "goal_description_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ описания"
+        },
+        "suffix_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ уточнения гола"
+        },
+        "minutes_added": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Объявленное добавленное время"
+        },
+        "half_marker_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ границы периода"
+        },
+        "is_penalty": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Исходный признак пенальти"
+        },
+        "injured_player_out": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Выход из-за повреждения"
+        },
+        "react_key_raw": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ интерфейса; не entity key"
+        },
+        "var_raw": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Непустая форма ещё не наблюдалась"
+        },
+        "added_time_raw": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "НеизученноеNULL поле"
+        },
+        "event_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа event_record_key; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "match_event_participants": {
+      "entity_role": "match_event_participants",
+      "grain": "publication_id + match_context_key + event_record_key + role + participant_ordinal",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        },
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "event_record_key"
+          ],
+          "references": "match_events(publication_id,match_context_key,event_record_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_player_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Положительный ID участника"
+        },
+        "name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя участника"
+        },
+        "first_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя"
+        },
+        "last_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Фамилия"
+        },
+        "short_name_raw": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Краткое имя"
+        },
+        "event_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа event_record_key; см. договор таблицы"
+        },
+        "role": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа role; см. договор таблицы"
+        },
+        "participant_ordinal": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа participant_ordinal; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "shots": {
+      "entity_role": "shots",
+      "grain": "publication_id + match_context_key + source_shot_id",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_shot_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "ID удара"
+        },
+        "team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Команда игрока/удара"
+        },
+        "source_player_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "ID бьющего"
+        },
+        "keeper_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "ID вратаря"
+        },
+        "player_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя бьющего"
+        },
+        "first_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя"
+        },
+        "last_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Фамилия"
+        },
+        "short_name_raw": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Краткое имя"
+        },
+        "event_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исход события"
+        },
+        "shot_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Тип удара"
+        },
+        "situation": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ситуация"
+        },
+        "raw_period": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Период источника"
+        },
+        "minute": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Минута"
+        },
+        "additional_minute": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Добавленная минута"
+        },
+        "expected_goals": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "xG"
+        },
+        "expected_goals_on_target": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "xGOT"
+        },
+        "is_blocked": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Блокировка"
+        },
+        "is_on_target": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "В створ"
+        },
+        "is_own_goal": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Автогол"
+        },
+        "is_saved_off_line": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "С линии"
+        },
+        "is_from_inside_box": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Из штрафной"
+        },
+        "canonical_coordinate_carrier_path": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Точный путь $.content.shotmap.shots[i] выбранной карточки"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "shot_coordinate_observations": {
+      "entity_role": "shot_coordinate_observations",
+      "grain": "publication_id + match_context_key + source_shot_id + carrier_path",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        },
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "source_shot_id"
+          ],
+          "references": "shots(publication_id,match_context_key,source_shot_id)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_shot_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "ID удара"
+        },
+        "carrier_path": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный pointer носителя удара"
+        },
+        "carrier_kind": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "canonical/event/playerStats/periods"
+        },
+        "is_canonical": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Носитель content.shotmap.shots"
+        },
+        "x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная x данного носителя"
+        },
+        "y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная y данного носителя"
+        },
+        "blocked_x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная blockedX"
+        },
+        "blocked_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная blockedY"
+        },
+        "goal_crossed_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная goalCrossedY"
+        },
+        "goal_crossed_z": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная goalCrossedZ"
+        },
+        "on_goal_x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная onGoalShot.x"
+        },
+        "on_goal_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная onGoalShot.y"
+        },
+        "on_goal_zoom_ratio": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходный zoomRatio"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "momentum_points": {
+      "entity_role": "momentum_points",
+      "grain": "publication_id + match_context_key + source_series + model_slot + minute_raw + disambiguating_ordinal",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "minute_raw": {
+          "type": "DOUBLE",
+          "nullable": false,
+          "meaning": "Дробная шкала времени исходного графика"
+        },
+        "value_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Значение графика"
+        },
+        "model_debug_title": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Описание модели"
+        },
+        "source_series": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_series; см. договор таблицы"
+        },
+        "model_slot": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа model_slot; см. договор таблицы"
+        },
+        "disambiguating_ordinal": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа disambiguating_ordinal; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "attacking_zones": {
+      "entity_role": "attacking_zones",
+      "grain": "publication_id + match_context_key + side + raw_period + zone",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        },
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "side"
+          ],
+          "references": "match_teams(publication_id,match_context_key,side)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "value_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходная доля зоны; unit пока неизвестна"
+        },
+        "side": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа side; см. договор таблицы"
+        },
+        "raw_period": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа raw_period; см. договор таблицы"
+        },
+        "zone": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа zone; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "match_weather": {
+      "entity_role": "match_weather",
+      "grain": "publication_id + match_context_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "api_used": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "historical/current"
+        },
+        "description": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Описание погоды"
+        },
+        "temperature_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Температура в неподтверждённой единице"
+        },
+        "wind_speed_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Скорость ветра в неподтверждённой единице"
+        },
+        "wind_direction_cardinal": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Направление ветра"
+        },
+        "relative_humidity_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Влажность источника"
+        },
+        "cloud_cover_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Облачность источника"
+        },
+        "precipitation_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Осадки источника"
+        },
+        "snow_raw": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Снег источника"
+        },
+        "last_updated": {
+          "type": "TIMESTAMP(6) WITH TIME ZONE",
+          "nullable": true,
+          "meaning": "Время обновления источника"
+        },
+        "valid_time_utc_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходное числовое время; единица epoch ещё не подтверждена"
+        },
+        "localized_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ описания погоды"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "default_title": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Explicit observed source field default_title"
+        },
+        "icon_code": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Explicit observed source field icon_code"
+        }
+      }
+    },
+    "match_related_matches": {
+      "entity_role": "match_related_matches",
+      "grain": "publication_id + match_context_key + relation_kind + anchor_team_id + source_ordinal",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "home_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "ID хозяев связанного матча"
+        },
+        "away_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "ID гостей связанного матча"
+        },
+        "home_team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя хозяев"
+        },
+        "away_team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя гостей"
+        },
+        "home_is_anchor_team": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Явный isOurTeam"
+        },
+        "away_is_anchor_team": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Явный isOurTeam"
+        },
+        "source_league_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Лига связанного матча"
+        },
+        "source_league_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя лиги"
+        },
+        "related_match_url": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ссылка на матч; ID изURL только с пометкой derived"
+        },
+        "outer_finished": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Противоречивый внешний флаг"
+        },
+        "status_finished": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Вложенный флаг"
+        },
+        "status_started": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Вложенный флаг"
+        },
+        "status_cancelled": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Вложенный флаг"
+        },
+        "status_awarded": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Вложенный флаг"
+        },
+        "kickoff": {
+          "type": "TIMESTAMP(6) WITH TIME ZONE",
+          "nullable": true,
+          "meaning": "Дата связанного матча"
+        },
+        "score_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходный счёт"
+        },
+        "home_score_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Текст счёта хозяев"
+        },
+        "away_score_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Текст счёта гостей"
+        },
+        "result_code": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходный код результата формы"
+        },
+        "result_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "W/D/L"
+        },
+        "status_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ статуса"
+        },
+        "status_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Текст статуса"
+        },
+        "status_short_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Короткий ключ"
+        },
+        "status_short_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Короткий текст"
+        },
+        "shootout_score": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Серия связанного матча"
+        },
+        "relation_kind": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа relation_kind; см. договор таблицы"
+        },
+        "anchor_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Явно объявленная часть логического ключа anchor_team_id; см. договор таблицы"
+        },
+        "source_ordinal": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_ordinal; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "match_h2h_summary": {
+      "entity_role": "match_h2h_summary",
+      "grain": "publication_id + match_context_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "summary_counts": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Индексы0/1/2=победы anchor home/ничьи/победы anchor away"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "match_source_statements": {
+      "entity_role": "match_source_statements",
+      "grain": "publication_id + match_context_key + statement_source + subject_key + source_ordinal",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "template_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ шаблона"
+        },
+        "text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходный текст"
+        },
+        "fallback_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Резервный шаблон/текст"
+        },
+        "source_player_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Субъект игрок"
+        },
+        "team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Субъект команда"
+        },
+        "subject_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Тип субъекта"
+        },
+        "priority": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Порядок приоритета"
+        },
+        "argument_names": {
+          "type": "ARRAY(VARCHAR)",
+          "nullable": true,
+          "meaning": "Имена аргументов в исходном порядке"
+        },
+        "argument_types": {
+          "type": "ARRAY(VARCHAR)",
+          "nullable": true,
+          "meaning": "Типы аргументов"
+        },
+        "argument_values": {
+          "type": "ARRAY(JSON)",
+          "nullable": true,
+          "meaning": "Исходные значения аргументов"
+        },
+        "value_number": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Число funFact"
+        },
+        "value_format": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Формат funFact"
+        },
+        "is_positive": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Оценка позитивности источника"
+        },
+        "has_live_variant": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Флаг живой формы"
+        },
+        "question_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Текст вопроса опроса"
+        },
+        "option_labels": {
+          "type": "ARRAY(VARCHAR)",
+          "nullable": true,
+          "meaning": "Варианты ответа"
+        },
+        "option_keys": {
+          "type": "ARRAY(VARCHAR)",
+          "nullable": true,
+          "meaning": "Ключи вариантов"
+        },
+        "question_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Ключ вопроса"
+        },
+        "odds_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Контекст опроса"
+        },
+        "statement_source": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа statement_source; см. договор таблицы"
+        },
+        "subject_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа subject_key; см. договор таблицы"
+        },
+        "source_ordinal": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_ordinal; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "default_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "default_text"
+        },
+        "stat_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "stat_key"
+        },
+        "live_translation_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "live_translation_key"
+        }
+      }
+    },
+    "match_resource_links": {
+      "entity_role": "match_resource_links",
+      "grain": "publication_id + match_context_key + resource_kind + owner_source_pointer + source_ordinal",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "url": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "URL или шаблонURL"
+        },
+        "resource_id": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "ID редакционного ресурса"
+        },
+        "resource_source": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Поставщик ресурса"
+        },
+        "resource_title": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название ресурса"
+        },
+        "resource_description": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Описание; не разобранный спортивный факт"
+        },
+        "language": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Язык"
+        },
+        "updated_at": {
+          "type": "TIMESTAMP(6) WITH TIME ZONE",
+          "nullable": true,
+          "meaning": "Дата обновления ресурса"
+        },
+        "source_league_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "ID локального турнира ссылки"
+        },
+        "parent_competition_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Родитель ссылки"
+        },
+        "country_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна ссылки"
+        },
+        "team_ids": {
+          "type": "ARRAY(BIGINT)",
+          "nullable": true,
+          "meaning": "Команды ресурса"
+        },
+        "resource_kind": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа resource_kind; см. договор таблицы"
+        },
+        "owner_source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа owner_source_pointer; см. договор таблицы"
+        },
+        "source_ordinal": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа source_ordinal; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        }
+      }
+    },
+    "data_coverage": {
+      "entity_role": "data_coverage",
+      "grain": "publication_id + match_context_key + selected_input_version + concrete_source_path + coverage_scope",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "source_state": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "missing/null/empty/false/filled/invalid"
+        },
+        "declared_filter": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Объявленный фильтр"
+        },
+        "declared_event_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Объявленный тип события"
+        },
+        "events_ongoing": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Статус секции событий"
+        },
+        "model_debug_title": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Описание модели"
+        },
+        "selected_input_version": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа selected_input_version; см. договор таблицы"
+        },
+        "concrete_source_path": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа concrete_source_path; см. договор таблицы"
+        },
+        "coverage_scope": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Явно объявленная часть логического ключа coverage_scope; см. договор таблицы"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "owner_record_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "owner_record_key"
+        },
+        "owner_table": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "owner_table"
+        },
+        "marker_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "marker_name"
+        },
+        "source_marker_value": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "source_marker_value"
+        },
+        "marker_available": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "marker_available"
+        },
+        "marker_label": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "marker_label"
+        },
+        "marker_stat_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "marker_stat_type"
+        },
+        "source_metric_key": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "source_metric_key"
+        },
+        "source_text": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Explicit observed source field source_text"
+        }
+      }
+    },
+    "match_player_carriers": {
+      "entity_role": "player representations outside lineup; not appearances",
+      "grain": "publication_id + match_context_key + local_player_record_key",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key"
+          ],
+          "references": "matches(publication_id,match_context_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "local_player_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Ключ наблюдаемой записи; не вечный ID человека"
+        },
+        "source_player_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Положительный родной ID игрока;0 преобразуется вNULL с raw"
+        },
+        "team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Команда участия при доказанной принадлежности"
+        },
+        "team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Имя команды участия"
+        },
+        "name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Полное имя в носителе"
+        },
+        "first_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходное имя"
+        },
+        "last_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходная фамилия"
+        },
+        "short_name_raw": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Краткое имя; исходный0 сохраняется в raw"
+        },
+        "opta_id": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Дополнительный ID источника"
+        },
+        "shirt_number": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Номер футболки"
+        },
+        "is_captain": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Капитан"
+        },
+        "position_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Позиция заявки"
+        },
+        "usual_position_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Обычная позиция"
+        },
+        "position_label": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название/код позиции; носитель различён"
+        },
+        "is_goalkeeper": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Вратарь"
+        },
+        "is_player_of_match": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Отметка лучшего игрока"
+        },
+        "age_observed": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Возраст в карточке; не доказательство возраста на kickoff"
+        },
+        "country_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Страна игрока"
+        },
+        "country_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Название страны"
+        },
+        "primary_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Основной клуб карточки отдельно от стороны матча"
+        },
+        "primary_team_name": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Основной клуб по имени"
+        },
+        "market_value_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Исходная стоимость с неизвестной валютой"
+        },
+        "participation_event_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Сокращённый признак участия"
+        },
+        "substitution_minute": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Минута входа/выхода"
+        },
+        "substitution_reason": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Причина замены"
+        },
+        "minutes_played": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "Минуты из POTM носителя"
+        },
+        "rating_exact": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Точная оценка при явном точном носителе"
+        },
+        "rating_display": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "Исходная отображаемая оценка"
+        },
+        "rating_is_top": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Флаг максимальной оценки"
+        },
+        "rating_match_finished": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Завершённость матча в носителе оценки"
+        },
+        "is_home": {
+          "type": "BOOLEAN",
+          "nullable": true,
+          "meaning": "Сторона описанного игрока"
+        },
+        "horizontal_layout_x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы x"
+        },
+        "vertical_layout_x": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы x"
+        },
+        "horizontal_layout_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы y"
+        },
+        "vertical_layout_y": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы y"
+        },
+        "horizontal_layout_width": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы width"
+        },
+        "vertical_layout_width": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы width"
+        },
+        "horizontal_layout_height": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная horizontal координата схемы height"
+        },
+        "vertical_layout_height": {
+          "type": "DOUBLE",
+          "nullable": true,
+          "meaning": "Исходная vertical координата схемы height"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "carrier_kind": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "carrier_kind"
+        },
+        "position_code": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "position_code"
+        },
+        "national_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "national_team_id"
+        },
+        "potm_home_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "potm_home_team_id"
+        },
+        "potm_away_team_id": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "potm_away_team_id"
+        }
+      }
+    },
+    "match_player_observations": {
+      "entity_role": "Repeated lineup observations, not timeline events",
+      "grain": "publication_id + match_context_key + local_player_record_key + observation_kind + source_ordinal",
+      "foreign_keys": [
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "local_player_record_key"
+          ],
+          "references": "match_players(publication_id,match_context_key,local_player_record_key)"
+        },
+        {
+          "fields": [
+            "publication_id",
+            "match_context_key",
+            "local_player_record_key"
+          ],
+          "references": "match_players(publication_id,match_context_key,local_player_record_key)"
+        }
+      ],
+      "fields": {
+        "match_context_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точное кодирование [competition_id,source_season_key,match_id]; JSON array canonical separators; season не изменять"
+        },
+        "competition_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родительский турнир подтверждённого контекста Bronze"
+        },
+        "source_season_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Точный ключ сезона FotMob"
+        },
+        "match_id": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "Родной ID матча FotMob; глобальная уникальность не утверждается"
+        },
+        "source_pointer": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Конкретный JSON Pointer наблюдения"
+        },
+        "source_batch_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "Выбранная подтверждённая пачка Bronze"
+        },
+        "raw_value": {
+          "type": "JSON",
+          "nullable": true,
+          "meaning": "Исходное значение без потери JSON-типа"
+        },
+        "null_reason": {
+          "type": "MAP(VARCHAR,VARCHAR)",
+          "nullable": true,
+          "meaning": "Причина NULL отдельно для каждого поля; отсутствие причины не доказывает присутствие исходного поля"
+        },
+        "publication_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID публикации по общему publication-contract; прежнее generation_id переименовано"
+        },
+        "component_id": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "ID выбранного компонента match-card по общему publication-contract"
+        },
+        "local_player_record_key": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "local_player_record_key"
+        },
+        "observation_kind": {
+          "type": "VARCHAR",
+          "nullable": false,
+          "meaning": "observation_kind"
+        },
+        "source_ordinal": {
+          "type": "BIGINT",
+          "nullable": false,
+          "meaning": "source_ordinal"
+        },
+        "event_type": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "event_type"
+        },
+        "minute_raw": {
+          "type": "BIGINT",
+          "nullable": true,
+          "meaning": "minute_raw"
+        },
+        "reason": {
+          "type": "VARCHAR",
+          "nullable": true,
+          "meaning": "reason"
+        }
+      }
+    }
+  },
+  "conditional_mappings": [
+    {
+      "source": "$.content.stats.Periods.*.stats[*].stats[*]",
+      "when": {
+        "type": "title"
+      },
+      "target": "metric_definitions",
+      "fields": {
+        "key": [
+          "metric_key",
+          "group_key"
+        ],
+        "title": "group_title",
+        "type": "source_type"
+      },
+      "stats": "data_coverage by exact slot; no numeric metric row"
+    }
+  ],
+  "supported_parser_versions": [
+    "fotmob-native-v2"
+  ]
+}
