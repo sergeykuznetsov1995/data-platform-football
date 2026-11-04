@@ -42,6 +42,6 @@
 # Хостовую копию дописать append-ом ДО первой доставки цели с этим файлом.
 ^dag_trigger_sofascore_daily_tail\.py$
 
-# v2.4 (04.11.2026, #2020): новый чужой для изолята даг — dag_transform_fotmob_silver_v2 (Silver
+# v2.6 (04.11.2026, #2020; хостовая копия /root/fotmob-runtime/airflowignore-fotmob.v2 уже на v2.5): новый чужой для изолята даг — dag_transform_fotmob_silver_v2 (Silver
 # FotMob нового образца, без расписания; живёт на общем scheduler, не в изоляте). Дописано append-ом.
 ^dag_transform_fotmob_silver_v2\.py$
