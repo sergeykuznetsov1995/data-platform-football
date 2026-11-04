@@ -120,7 +120,11 @@ IDLE, BUDGET, LIVE_DEBT, LANE_CLOSED, STOPPED, ERROR = (
 )
 HISTORY_YEARS = 10
 LIST_LIMIT = 100
-BATCH_MATCHES = 400
+# #2142: a batch is written after the fetch, even past the budget, so its write
+# must fit the gap between BUDGET (12 min) and the task timeout (18 min).  On
+# prod a write costs ~2.6 s per match: 380 matches took 900-1000 s and never
+# fit; 50 take ~2.5 min.  A smaller batch only adds commits, never lost work.
+BATCH_MATCHES = 50
 MAX_ATTEMPTS = 2
 CLOSED_AFTER = timedelta(days=7)
 DEFAULT_SCOPE_PATH = (
