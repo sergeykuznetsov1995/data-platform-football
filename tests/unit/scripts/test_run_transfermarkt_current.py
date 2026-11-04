@@ -2155,3 +2155,35 @@ def test_registry_only_competition_resolves_in_writer_helpers(offline, monkeypat
     assert report['scopes'] and all(item.get('error') is None for item in report['scopes'])
     assert seasons and set(seasons) == {'2627'}
     assert 'TM_COMPETITION_RECORDS_JSON' not in current.os.environ
+
+
+def test_due_signals_interleave_with_apply_change_under_deadline(offline):
+    """#2068: due signals no longer starve a pending apply_change of the portion."""
+    competitions = ('GB1', 'ES1', 'IT1')
+    offline.run_cold('cold', competitions=competitions)
+    assert all(data['cursor']['cold_complete'] for data in offline.state()['scopes'].values())
+    offline.clock.advance(21 * 3600)
+    offline.values['10'] = offline.squad_values['10'] = '€2.0m'
+    offline.player_values['110'] = 2000000
+    offline.run('detect', competitions=competitions)
+    assert all(data['cursor']['change_pending'] for data in offline.state()['scopes'].values())
+    offline.clock.advance(21 * 3600)  # every target is due for signals again
+    factory = offline.factory
+
+    def slow_factory(*args):
+        offline.clock.advance(1200)  # two items fit the 2400 s portion
+        return factory(*args)
+
+    offline.factory = slow_factory
+    report = offline.run('apply', competitions=competitions)
+    # Each slot takes one signal, the scope's own first, then its work.
+    first, applied = report['scopes']
+    assert (first['kind'], applied['kind']) == ('signals', 'apply_change')
+    assert first['scope_id'] == applied['scope_id']
+    offline.factory = factory
+    report = offline.run('rest', competitions=competitions)
+    # The deadline retained the first apply; it resumes after the others' pairs.
+    assert [(item['kind'], item['scope_id']) for item in report['scopes']] == [
+        ('signals', report['scopes'][1]['scope_id']), ('apply_change', report['scopes'][1]['scope_id']),
+        ('signals', report['scopes'][3]['scope_id']), ('apply_change', report['scopes'][3]['scope_id']),
+        ('apply_change', applied['scope_id'])]
