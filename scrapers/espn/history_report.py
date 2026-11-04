@@ -106,7 +106,8 @@ SELECT (SELECT count(*) FROM seasons) AS seasons,
          + (SELECT count_if(state = 'red') FROM iceberg.ops.espn_history_queue_v1
             WHERE slug <> '(run)' AND season_year = 0) AS red,
        (SELECT coalesce(sum(matches), 0) FROM runs) AS matches,
-       (SELECT count_if(state = 'live_debt') FROM runs) AS pauses"""
+       (SELECT count_if(state = 'live_debt') FROM runs) AS pauses,
+       (SELECT count_if(state = 'error') FROM runs) AS errors"""
 
 # Network requests only: a raw-store hit or a closed lane has no attempt.
 HISTORY_JOURNAL_SQL = """SELECT count(*) AS requests, coalesce(sum(direct_bytes), 0) AS bytes
@@ -189,7 +190,7 @@ def render_history_line(
     dd = f"{day[8:10]}.{day[5:7]}"
     if queue is None or (int(queue[0]) == 0 and int(queue[3]) == 0):
         return f"• ESPN история {dd}: очередь пуста"
-    seasons, finished_day, finished, red, matches, pauses = (int(value) for value in queue)
+    seasons, finished_day, finished, red, matches, pauses, errors = (int(value) for value in queue)
     requests, size = (int(value) for value in journal) if journal else (0, 0)
     per_match = (
         f" (≈ {requests / matches:.1f} запр. и {size / 1024 / matches:.0f} КБ на матч)"
@@ -200,11 +201,13 @@ def render_history_line(
         f"• ESPN история {dd}: сезонов готово за сутки {finished_day} "
         f"(всего готово {finished} из {seasons}), красных {red}, матчей {matches}, "
         f"запросов {requests}, {size / 1024:.0f} КБ{per_match}, "
-        f"пауз из-за актуалки {pauses}"
+        f"пауз из-за актуалки {pauses}, прогонов с ошибкой {errors}"
     )
     if defects is not None:
         line += f"; пустых частей в полных сезонах {defects}"
-    flag = "‼️" if red else "✅"
+    # #2142: a run killed by the task timeout writes nothing and colours no
+    # season red; only its run row (state 'error') shows the lane stands still.
+    flag = "‼️" if red or errors else "✅"
     return f"{line} {flag}"
 
 

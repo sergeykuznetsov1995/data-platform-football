@@ -149,7 +149,7 @@ def test_history_line_from_the_queue_and_the_journal(db) -> None:
         row("ger.2", 0, 1, history.RED, today, attempts=2, last_error="seasons: 503"),
     ])
     for state, matches, at in (("idle", 300, today), ("live_debt", 80, today),
-                               ("live_debt", 5, today), ("budget", 999, yesterday)):
+                               ("live_debt", 5, today), ("error", 0, today), ("budget", 999, yesterday)):
         history.append_run_row(db.con, history.QueueRow("(run)", 0, 0, state, matches=matches, updated_at=at))
     db.con.execute(
         "INSERT INTO iceberg.ops.espn_request_journal_v1 VALUES "
@@ -164,13 +164,16 @@ def test_history_line_from_the_queue_and_the_journal(db) -> None:
     # Seasons: eng.1 2015 (finished today), 2014 (finished yesterday), 2013
     # (red), UCL 2010 (a type still listed), UCL 2011 (types not read); the
     # failed season list of ger.2 is red too.
-    assert tuple(queue) == (5, 1, 2, 2, 385, 2)
+    assert tuple(queue) == (5, 1, 2, 2, 385, 2, 1)
     assert tuple(journal) == (2, 40960)
     line = render_history_line(DAY, queue, journal, defects=3)
     assert line == (
         "• ESPN история 28.09: сезонов готово за сутки 1 (всего готово 2 из 5), красных 2, "
-        "матчей 385, запросов 2, 40 КБ (≈ 0.0 запр. и 0 КБ на матч), пауз из-за актуалки 2; "
+        "матчей 385, запросов 2, 40 КБ (≈ 0.0 запр. и 0 КБ на матч), пауз из-за актуалки 2, прогонов с ошибкой 1; "
         "пустых частей в полных сезонах 3 ‼️"
     )
-    assert render_history_line(DAY, (0, 0, 0, 0, 0, 0), None) == "• ESPN история 28.09: очередь пуста"
-    assert "красных 1" in render_history_line(DAY, (0, 0, 0, 1, 0, 0), None)
+    assert render_history_line(DAY, (0, 0, 0, 0, 0, 0, 0), None) == "• ESPN история 28.09: очередь пуста"
+    assert "красных 1" in render_history_line(DAY, (0, 0, 0, 1, 0, 0, 0), None)
+    # #2142: runs that die on the timeout turn the line red with no red season.
+    assert render_history_line(DAY, (5, 0, 2, 0, 0, 0, 0), None).endswith("прогонов с ошибкой 0 ✅")
+    assert render_history_line(DAY, (5, 0, 2, 0, 0, 0, 48), None).endswith("прогонов с ошибкой 48 ‼️")
