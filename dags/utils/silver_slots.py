@@ -8,12 +8,19 @@ The model is two physical copies of each Silver table (``<table>_a`` and
 ``<table>_b``) plus one reader-state row per source:
 
 * a new build always targets :func:`inactive_slot`;
-* :func:`switch_reader` moves the reader with a compare-and-set on
-  ``revision`` and only then re-points ``CREATE OR REPLACE VIEW <table>`` at
-  the chosen slot, so a retry after a half-applied switch is a CAS no-op that
-  still rebuilds the views;
-* the state row is created by the caller's bootstrap
-  (:func:`state_table_ddl`), never inferred by a switch.
+* :func:`switch_reader` refuses a slot whose tables are not all built, moves
+  the reader with a compare-and-set on ``revision`` and only then re-points
+  ``CREATE OR REPLACE VIEW <table>`` at the chosen slot;
+* a retry with the same ``expected_revision`` after the CAS landed (state is
+  already at ``expected + 1``) skips the UPDATE and rebuilds the views on the
+  active slot, so a failed view step is completed, never reversed;
+* the state row is created by :func:`bootstrap`, never inferred by a switch.
+
+The reader state is the source of truth; views follow it.  The set is
+re-pointed sequentially, so while the ``CREATE OR REPLACE VIEW`` loop runs
+(seconds) a reader joining two views may see a mix of slots.  Slot tables are
+immutable during the switch, so no data is corrupted.  A concurrent switch
+detected after the loop raises :class:`RevisionConflict`.
 """
 from __future__ import annotations
 
@@ -28,6 +35,7 @@ DEFAULT_ACTOR = 'silver_slots'
 
 _NAME = re.compile(r'[a-z0-9_]+')
 _QUALIFIED = re.compile(r'[a-z0-9_.]+')
+_CATALOG_SCHEMA = re.compile(r'[a-z0-9_]+\.[a-z0-9_]+')
 _MUTATION = re.compile(r'\s*(CREATE|UPDATE|MERGE|INSERT|DELETE|ALTER)\b', re.I)
 
 
@@ -59,7 +67,10 @@ class SlotSpec:
 
     def __post_init__(self) -> None:
         _check_name(self.source, 'source')
-        _check_qualified(self.schema, 'schema')
+        if not isinstance(self.schema, str) or not _CATALOG_SCHEMA.fullmatch(self.schema):
+            raise ValueError(f'schema must be <catalog>.<schema>, got {self.schema!r}')
+        if isinstance(self.tables, str):
+            raise ValueError('tables must be a sequence of names, not a string')
         tables = tuple(self.tables)
         for table in tables:
             _check_name(table, 'table')
@@ -167,6 +178,12 @@ WHEN NOT MATCHED THEN INSERT (
     ]
 
 
+def bootstrap(cur, spec: SlotSpec) -> None:
+    """Create the state table and seed its singleton (idempotent)."""
+    for sql in state_table_ddl(spec):
+        _execute(cur, sql)
+
+
 def read_state_sql(spec: SlotSpec) -> str:
     return f"""
 SELECT active_slot, revision, updated_at
@@ -194,6 +211,19 @@ WHERE source = {_sql_literal(spec.source)}
   AND state_key = '{STATE_KEY}'
   AND revision = {_normalise_revision(expected_revision)}
   AND active_slot IS DISTINCT FROM {slot}
+""".strip()
+
+
+def slot_tables_exist_sql(spec: SlotSpec, slot: str) -> str:
+    catalog, schema = spec.schema.split('.')
+    names = ', '.join(
+        _sql_literal(slotted_relation(table, slot)) for table in spec.tables
+    )
+    return f"""
+SELECT table_name
+FROM {catalog}.information_schema.tables
+WHERE table_schema = {_sql_literal(schema)}
+  AND table_name IN ({names})
 """.strip()
 
 
@@ -248,13 +278,42 @@ def assert_reader_revision(cur, spec: SlotSpec, expected_revision: int) -> Reade
     return state
 
 
+def _read_for_switch(cur, spec: SlotSpec, expected_revision: int) -> tuple[ReaderState, bool]:
+    """Return the state and whether this caller's CAS has already landed."""
+    expected = _normalise_revision(expected_revision)
+    state = read_reader_state(cur, spec, allow_missing=(expected == 0))
+    if state.revision == expected + 1 and state.active_slot in SLOTS:
+        return state, True
+    if state.revision != expected:
+        raise RevisionConflict(
+            f'{spec.source} reader revision drift: expected={expected}, '
+            f'actual={state.revision}'
+        )
+    return state, False
+
+
+def _missing_slot_tables(cur, spec: SlotSpec, slot: str) -> list[str]:
+    if not spec.tables:
+        return []
+    _execute(cur, slot_tables_exist_sql(spec, slot))
+    built = {str(row[0]) for row in cur.fetchall()}
+    return [
+        name for name in (slotted_relation(table, slot) for table in spec.tables)
+        if name not in built
+    ]
+
+
 def _switch_from(
-    cur, spec: SlotSpec, state: ReaderState, to_slot: str, actor: str,
+    cur, spec: SlotSpec, state: ReaderState, slot: str, *, applied: bool, actor: str,
 ) -> dict[str, Any]:
-    slot = normalise_slot(to_slot)
-    switched = state.active_slot != slot
+    switched = not applied and state.active_slot != slot
     revision = state.revision
     if switched:
+        missing = _missing_slot_tables(cur, spec, slot)
+        if missing:
+            raise StateInvariantError(
+                f'slot {slot} is not built: missing {", ".join(missing)}'
+            )
         _execute(cur, switch_sql(
             spec, to_slot=slot, expected_revision=state.revision, actor=actor,
         ))
@@ -269,6 +328,12 @@ def _switch_from(
         revision = after.revision
     for sql in reader_view_sql_all(spec, slot):
         _execute(cur, sql)
+    final = read_reader_state(cur, spec)
+    if final.revision != revision:
+        raise RevisionConflict(
+            f'{spec.source} reader moved during the view rebuild: expected '
+            f'revision={revision}, actual={final.revision}; views may be stale'
+        )
     return {
         'switched': switched,
         'from_slot': state.active_slot,
@@ -287,23 +352,29 @@ def switch_reader(
 ) -> dict[str, Any]:
     """CAS the reader state onto ``to_slot``, then re-point every view.
 
-    Re-switching onto the active slot skips the UPDATE but still rebuilds
-    the views, which completes a switch whose view step failed midway.
+    Re-switching onto the active slot, or retrying after this CAS already
+    landed, skips the UPDATE but still rebuilds the views.
     """
-    normalise_slot(to_slot)
-    state = assert_reader_revision(cur, spec, expected_revision)
-    return _switch_from(cur, spec, state, to_slot, actor)
+    slot = normalise_slot(to_slot)
+    state, applied = _read_for_switch(cur, spec, expected_revision)
+    if applied and state.active_slot != slot:
+        raise RevisionConflict(
+            f'{spec.source} reader moved to slot {state.active_slot}, not {slot}'
+        )
+    return _switch_from(cur, spec, state, slot, applied=applied, actor=actor)
 
 
 def advance(cur, spec: SlotSpec, *, expected_revision: int) -> dict[str, Any]:
     """Promote a finished build in the inactive slot."""
-    state = assert_reader_revision(cur, spec, expected_revision)
-    return _switch_from(cur, spec, state, inactive_slot(state), DEFAULT_ACTOR)
+    state, applied = _read_for_switch(cur, spec, expected_revision)
+    slot = state.active_slot if applied else inactive_slot(state)
+    return _switch_from(cur, spec, state, slot, applied=applied, actor=DEFAULT_ACTOR)
 
 
 def rollback(cur, spec: SlotSpec, *, expected_revision: int) -> dict[str, Any]:
     """Return readers to the previously active slot."""
-    state = assert_reader_revision(cur, spec, expected_revision)
+    state, applied = _read_for_switch(cur, spec, expected_revision)
     if state.active_slot is None:
         raise StateInvariantError(f'{spec.source}: nothing to roll back')
-    return _switch_from(cur, spec, state, other_slot(state.active_slot), DEFAULT_ACTOR)
+    slot = state.active_slot if applied else other_slot(state.active_slot)
+    return _switch_from(cur, spec, state, slot, applied=applied, actor=DEFAULT_ACTOR)

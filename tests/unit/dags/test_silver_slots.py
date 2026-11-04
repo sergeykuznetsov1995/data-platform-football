@@ -13,21 +13,37 @@ SPEC = slots.SlotSpec(
 
 
 class FakeCursor:
-    """DB-API stand-in that emulates the reader-state row and the CAS UPDATE."""
+    """DB-API stand-in that emulates the reader-state row and the CAS UPDATE.
 
-    def __init__(self, rows=None, *, missing=False, cas_fails=False):
+    ``built`` lists existing slot tables (default: every name asked for);
+    ``hook(cur, sql)`` runs before each statement and may raise or mutate rows.
+    A mutation result must be fetched before the next statement.
+    """
+
+    def __init__(self, rows=None, *, missing=False, cas_fails=False, built=None, hook=None):
         self.rows = [list(row) for row in (rows or [])]
         self.missing = missing
         self.cas_fails = cas_fails
+        self.built = built
+        self.hook = hook
         self.sql: list[str] = []
         self._result: list[tuple] = []
+        self._unfetched = False
 
     def execute(self, sql):
+        assert not self._unfetched, 'mutation result was not fetched'
         self.sql.append(sql)
-        if self.missing:
-            raise RuntimeError('TABLE_NOT_FOUND: iceberg.ops.fotmob_reader_state does not exist')
+        if self.hook:
+            self.hook(self, sql)
         head = sql.split(None, 1)[0].upper()
-        if head == 'SELECT':
+        if sql.startswith('CREATE TABLE'):
+            self.missing = False
+        elif self.missing and 'VIEW' not in sql:
+            raise RuntimeError('TABLE_NOT_FOUND: iceberg.ops.fotmob_reader_state does not exist')
+        if 'information_schema' in sql:
+            names = re.findall(r"'([a-z0-9_]+)'", sql.split(' IN ', 1)[1])
+            self._result = [(n,) for n in names if self.built is None or n in self.built]
+        elif head == 'SELECT':
             self._result = [tuple(row) for row in self.rows]
         elif head == 'UPDATE':
             expected = int(re.search(r'AND revision = (\d+)', sql).group(1))
@@ -38,19 +54,41 @@ class FakeCursor:
                     row[0], row[1] = slot, row[1] + 1
                     matched += 1
             self._result = [(matched,)]
+        elif head == 'MERGE':
+            if not self.rows:
+                self.rows.append([None, 0, None])
+            self._result = [(len(self.rows),)]
         else:
             self._result = [(True,)]
+        self._unfetched = head in {'UPDATE', 'CREATE', 'MERGE'}
 
     def fetchall(self):
         result, self._result = self._result, []
+        self._unfetched = False
         return result
 
     def kinds(self):
-        return [sql.split(None, 1)[0].upper() for sql in self.sql]
+        return [
+            'EXISTS' if 'information_schema' in sql else sql.split(None, 1)[0].upper()
+            for sql in self.sql
+        ]
 
 
 def bootstrap_cursor(**kwargs):
     return FakeCursor([[None, 0, None]], **kwargs)
+
+
+def fail_once(fragment):
+    fired = []
+
+    def hook(cur, sql):
+        if fragment in sql and not fired:
+            fired.append(sql)
+            raise RuntimeError(f'boom: {fragment}')
+    return hook
+
+
+SWITCH = ['SELECT', 'EXISTS', 'UPDATE', 'SELECT', 'CREATE', 'CREATE', 'SELECT']
 
 
 def test_slotted_relation():
@@ -76,8 +114,9 @@ def test_first_switch_from_bootstrap_row():
     cur = bootstrap_cursor()
     result = slots.advance(cur, SPEC, expected_revision=0)
     assert result == {'switched': True, 'from_slot': None, 'to_slot': 'a', 'revision': 1}
-    assert cur.kinds() == ['SELECT', 'UPDATE', 'SELECT', 'CREATE', 'CREATE']
-    assert cur.sql[3:] == slots.reader_view_sql_all(SPEC, 'a')
+    assert cur.kinds() == SWITCH
+    assert cur.sql[1] == slots.slot_tables_exist_sql(SPEC, 'a')
+    assert cur.sql[4:6] == slots.reader_view_sql_all(SPEC, 'a')
     assert cur.rows == [['a', 1, None]]
 
 
@@ -96,6 +135,13 @@ def test_missing_or_empty_state_table():
     assert 'CREATE' not in cur.kinds()
 
 
+def test_bootstrap_then_first_switch():
+    cur = FakeCursor(missing=True)
+    slots.bootstrap(cur, SPEC)
+    assert cur.sql == slots.state_table_ddl(SPEC)
+    assert slots.advance(cur, SPEC, expected_revision=0)['revision'] == 1
+
+
 def test_advance_then_rollback():
     cur = bootstrap_cursor()
     assert slots.advance(cur, SPEC, expected_revision=0)['to_slot'] == 'a'
@@ -104,15 +150,54 @@ def test_advance_then_rollback():
     back = slots.rollback(cur, SPEC, expected_revision=2)
     assert back == {'switched': True, 'from_slot': 'b', 'to_slot': 'a', 'revision': 3}
     assert cur.rows == [['a', 3, None]]
-    assert cur.sql[-2:] == slots.reader_view_sql_all(SPEC, 'a')
+    assert cur.sql[-3:-1] == slots.reader_view_sql_all(SPEC, 'a')
 
 
 def test_retry_onto_active_slot_rebuilds_views_without_update():
     cur = FakeCursor([['a', 1, None]])
     result = slots.switch_reader(cur, SPEC, to_slot='a', expected_revision=1)
     assert result == {'switched': False, 'from_slot': 'a', 'to_slot': 'a', 'revision': 1}
-    assert cur.kinds() == ['SELECT', 'CREATE', 'CREATE']
+    assert cur.kinds() == ['SELECT', 'CREATE', 'CREATE', 'SELECT']
     assert cur.rows == [['a', 1, None]]
+
+
+def test_retry_after_failed_view_completes_the_switch():
+    cur = FakeCursor([['a', 1, None]], hook=fail_once('VIEW iceberg.silver.lineup'))
+    with pytest.raises(RuntimeError, match='boom'):
+        slots.advance(cur, SPEC, expected_revision=1)
+    assert cur.rows == [['b', 2, None]]
+    cur.sql.clear()
+    result = slots.advance(cur, SPEC, expected_revision=1)
+    assert result == {'switched': False, 'from_slot': 'b', 'to_slot': 'b', 'revision': 2}
+    assert cur.kinds() == ['SELECT', 'CREATE', 'CREATE', 'SELECT']
+    assert cur.sql[1:3] == slots.reader_view_sql_all(SPEC, 'b')
+
+
+def test_stale_advance_does_not_switch_back():
+    cur = FakeCursor([['b', 2, None]])
+    assert slots.advance(cur, SPEC, expected_revision=1)['to_slot'] == 'b'
+    assert slots.rollback(cur, SPEC, expected_revision=1)['to_slot'] == 'b'
+    assert 'UPDATE' not in cur.kinds() and cur.rows == [['b', 2, None]]
+    assert slots.switch_reader(cur, SPEC, to_slot='b', expected_revision=1)['switched'] is False
+    with pytest.raises(slots.RevisionConflict, match='not a'):
+        slots.switch_reader(cur, SPEC, to_slot='a', expected_revision=1)
+
+
+def test_unbuilt_slot_is_refused_before_update():
+    cur = FakeCursor([['a', 1, None]], built={'match_b'})
+    with pytest.raises(slots.StateInvariantError, match='slot b is not built: missing lineup_b'):
+        slots.rollback(cur, SPEC, expected_revision=1)
+    assert cur.kinds() == ['SELECT', 'EXISTS']
+    assert cur.rows == [['a', 1, None]]
+
+
+def test_concurrent_switch_during_views_is_detected():
+    def hook(cur, sql):
+        if 'VIEW iceberg.silver.lineup' in sql:
+            cur.rows[0] = ['a', cur.rows[0][1] + 1, None]
+    cur = FakeCursor([['a', 1, None]], hook=hook)
+    with pytest.raises(slots.RevisionConflict, match='moved during the view rebuild'):
+        slots.advance(cur, SPEC, expected_revision=1)
 
 
 def test_empty_table_list_switches_state_only():
@@ -120,7 +205,7 @@ def test_empty_table_list_switches_state_only():
     cur = bootstrap_cursor()
     result = slots.switch_reader(cur, spec, to_slot='b', expected_revision=0)
     assert result['switched'] and result['revision'] == 1
-    assert cur.kinds() == ['SELECT', 'UPDATE', 'SELECT']
+    assert cur.kinds() == ['SELECT', 'UPDATE', 'SELECT', 'SELECT']
 
 
 def test_revision_conflicts():
@@ -131,7 +216,7 @@ def test_revision_conflicts():
     cur = FakeCursor([['a', 1, None]], cas_fails=True)
     with pytest.raises(slots.RevisionConflict, match='CAS failed'):
         slots.advance(cur, SPEC, expected_revision=1)
-    assert cur.kinds() == ['SELECT', 'UPDATE', 'SELECT']
+    assert cur.kinds() == ['SELECT', 'EXISTS', 'UPDATE', 'SELECT']
 
 
 def test_exact_sql():
@@ -156,6 +241,12 @@ SELECT active_slot, revision, updated_at
 FROM iceberg.ops.fotmob_reader_state
 WHERE source = 'fotmob'
   AND state_key = 'canonical'
+""".strip()
+    assert slots.slot_tables_exist_sql(SPEC, 'b') == """
+SELECT table_name
+FROM iceberg.information_schema.tables
+WHERE table_schema = 'silver'
+  AND table_name IN ('match_b', 'lineup_b')
 """.strip()
     assert slots.state_table_ddl(SPEC) == [
         """
@@ -187,6 +278,9 @@ WHEN NOT MATCHED THEN INSERT (
     {'tables': ("match'",)},
     {'source': 'Fot-Mob'},
     {'schema': 'iceberg.silver;'},
+    {'schema': 'silver'},
+    {'schema': 'iceberg.silver.extra'},
+    {'tables': 'match'},
     {'state_table': "iceberg.ops.x'"},
 ])
 def test_spec_rejects_unsafe_names(kwargs):
