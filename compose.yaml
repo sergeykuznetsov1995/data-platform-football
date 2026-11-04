@@ -329,6 +329,14 @@ services:
     container_name: seaweedfs-s3
     hostname: seaweedfs-s3
     restart: unless-stopped
+    # Container logs had no rotation: lakekeeper (audit INFO per request) reached
+    # 18 GB and seaweedfs-s3 14 GB in /var/lib/docker (#1937, 04.11.2026). json-file
+    # keeps at most 5 x 200 MB per service; takes effect when the container is recreated.
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "5"
     stop_grace_period: 60s
     security_opt:
       - no-new-privileges:true
@@ -470,6 +478,14 @@ services:
     container_name: lakekeeper
     hostname: lakekeeper
     restart: unless-stopped
+    # Container logs had no rotation: lakekeeper (audit INFO per request) reached
+    # 18 GB and seaweedfs-s3 14 GB in /var/lib/docker (#1937, 04.11.2026). json-file
+    # keeps at most 5 x 200 MB per service; takes effect when the container is recreated.
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "5"
     security_opt:
       - no-new-privileges:true
     cap_drop:
