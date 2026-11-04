@@ -1921,8 +1921,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             closing.values(), key=lambda target: (
                 cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
                 target.cold_priority)))
-        # #2068: due signals are cheap and must cover every target daily; only
-        # the portion deadline bounds them. Slots apply to the other work.
+        # #2068: due signals must cover every target daily; only the portion
+        # deadline bounds them. Slots apply to the other work, which alternates
+        # with the signals so that they cannot starve apply_change.
         signals = tuple(item for item in ordinary if item.kind == 'signals')
         ordinary = tuple(item for item in ordinary if item.kind != 'signals')
         # A failed close cannot occupy every current slot on every portion.
@@ -1930,7 +1931,15 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         if max_scopes == 1 and ordinary and state['turn'] % 2 and not newly_detected_close:
             work = signals + ordinary[:1]
         else:
-            work = closing_work[:close_quota] + signals + ordinary[:max_scopes - min(close_quota, len(closing_work))]
+            work, rest = list(closing_work[:close_quota]), list(signals)
+            for item in ordinary[:max_scopes - min(close_quota, len(closing_work))]:
+                # One signal per slot, the scope's own first: its work follows its checks.
+                own = next((signal for signal in rest if signal.target.scope_id == item.target.scope_id), None)
+                if own or rest:
+                    work.append(own or rest[0])
+                    rest.remove(work[-1])
+                work.append(item)
+            work = tuple(work + rest)
 
         state['turn'] += 1
         save = store.save
