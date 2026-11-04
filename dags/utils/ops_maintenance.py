@@ -10,6 +10,11 @@ contract as ``maintain_sofascore_capture_manifest``).
 
 A commit conflict with a concurrent writer is retried; a table that stays
 busy is recorded as ``busy`` and the pass continues with the next table.
+
+``expire_snapshots`` runs in commits of at most ``EXPIRE_CHUNK`` snapshots:
+Iceberg sends one ``remove-snapshots`` update per expired snapshot and
+Lakekeeper 0.13 rejects request bodies above ~2 MB with a plain-text 413
+(night 04.11: ``ops.espn_http_attempt_v1``, 33.8k expirable snapshots).
 """
 
 from __future__ import annotations
@@ -27,7 +32,10 @@ from utils import maintenance_tasks as maintenance
 OPS_SCHEMA = "ops"
 OPS_RETENTION = "3d"
 COMMIT_ATTEMPTS = 4
+EXPIRE_CHUNK = 5000
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
+_DURATION_RE = re.compile(r"^([1-9][0-9]*)(ms|s|m|h|d)$")
+_DURATION_SECONDS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def _now():
@@ -55,6 +63,21 @@ def _scalar(conn, sql: str) -> int:
     finally:
         cur.close()
     return int(rows[0][0])
+
+
+def _first_value(conn, sql: str):
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+    return rows[0][0] if rows else None
+
+
+def _retention_seconds(retention: str) -> float:
+    amount, unit = _DURATION_RE.fullmatch(retention).groups()
+    return int(amount) * _DURATION_SECONDS[unit]
 
 
 def _metrics(conn, schema: str, table: str) -> dict[str, int]:
@@ -96,6 +119,40 @@ def _alter_with_retry(conn, sql: str, deadline: datetime, sleep) -> bool:
                 raise TimeoutError("ops maintenance deadline reached") from exc
             sleep(delay)
     return False
+
+
+def _expire_in_chunks(conn, schema, table, retention, deadline, sleep):
+    """Expire older snapshots first, at most EXPIRE_CHUNK per commit.
+
+    Each pass expires everything older than the EXPIRE_CHUNK-th oldest
+    expirable snapshot; the last pass uses ``retention`` itself.
+    Returns ``(expired, commits)``.
+    """
+    fq = f'iceberg."{schema}"."{table}"'
+    snapshots = f'iceberg."{schema}"."{table}$snapshots"'
+    commits = 0
+    previous = None
+    while True:
+        cutoff = _now().timestamp() - _retention_seconds(retention)
+        boundary = _first_value(conn, (
+            f"SELECT to_unixtime(committed_at) FROM {snapshots} "
+            f"WHERE to_unixtime(committed_at) < {cutoff:.3f} "
+            f"ORDER BY committed_at OFFSET {EXPIRE_CHUNK - 1} LIMIT 1"))
+        # No progress means the chunk was not removed: fall through and let the
+        # final pass report the real error instead of looping.
+        if boundary is None or (previous is not None and boundary <= previous):
+            break
+        previous = boundary
+        threshold = math.ceil(_now().timestamp() - float(boundary))
+        if not _alter_with_retry(conn, f"ALTER TABLE {fq} EXECUTE expire_snapshots("
+                                       f"retention_threshold => '{threshold}s')",
+                                 deadline, sleep):
+            return False, commits
+        commits += 1
+    expired = _alter_with_retry(conn, f"ALTER TABLE {fq} EXECUTE expire_snapshots("
+                                      f"retention_threshold => '{retention}')",
+                                deadline, sleep)
+    return expired, commits + 1
 
 
 def maintain_ops_tables(
@@ -164,11 +221,11 @@ def maintain_ops_tables(
                 try:
                     optimized = _alter_with_retry(
                         conn, f"ALTER TABLE {fq} EXECUTE optimize", deadline, sleep)
-                    expired = _alter_with_retry(
-                        conn, f"ALTER TABLE {fq} EXECUTE expire_snapshots("
-                              f"retention_threshold => '{retention}')", deadline, sleep)
+                    expired, commits = _expire_in_chunks(
+                        conn, schema, table, retention, deadline, sleep)
                     event["status"] = "ok" if optimized and expired else "busy"
                     event["optimized"], event["expired"] = optimized, expired
+                    event["expire_commits"] = commits
                     event["after"] = _metrics(conn, schema, table)
                 except TimeoutError:
                     event["status"] = "deadline"

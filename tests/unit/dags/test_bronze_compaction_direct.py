@@ -112,6 +112,30 @@ def test_dry_run_never_alters_or_changes_real_state(host):
     assert args.state_file.read_bytes() == before
 
 
+def test_allowlist_change_keeps_budget_and_positions(host):
+    args, deadline, _, alters, offsets = host
+    assert direct.run_direct(args, deadline) == 0
+    assert len(alters) == 2
+    # Night 04.11: two tables were added to the allowlist between nights and the
+    # saved state was refused. Growth keeps the charge and the positions and
+    # appends the newcomers to the rotation.
+    args.table, args.portions = ["fbref_schedule", "espn_match"], 4
+    assert direct.run_direct(args, deadline) == 0
+    assert len(alters) == 4 and summary(args)["stop_reason"] == "budget"
+    state = json.loads(args.state_file.read_text())
+    assert state["tables"] == ["espn_match", "fbref_schedule"]
+    assert state["queue"] == ["espn_match", "fbref_schedule"]
+    assert state["portions"] == 4
+    assert state["partition_cursors"] == {"espn_match": "96", "fbref_schedule": "32"}
+    # A frozen table leaves the rotation and its cursor; the budget stays.
+    args.table, args.portions = ["fbref_schedule"], 5
+    assert direct.run_direct(args, deadline) == 0
+    state = json.loads(args.state_file.read_text())
+    assert state["tables"] == ["fbref_schedule"] and state["queue"] == ["fbref_schedule"]
+    assert state["portions"] == 5 and state["partition_cursors"] == {"fbref_schedule": "64"}
+    assert offsets == [None, "32", "64", None, "32"]
+
+
 def test_corrupt_state_fails_closed(host):
     args, deadline, _, alters, _ = host
     args.state_file.write_text('{"version": 1}')

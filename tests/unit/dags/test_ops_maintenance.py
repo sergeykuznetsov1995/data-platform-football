@@ -17,9 +17,11 @@ class CommitConflict(Exception):
 
 
 class FakeTrino:
-    def __init__(self, files, failures=None):
+    def __init__(self, files, failures=None, boundaries=()):
         self.files = dict(files)
         self.failures = failures or {}
+        # Unix times answered to the chunk-boundary query, oldest first.
+        self.boundaries = list(boundaries)
         self.statements = []
         self.closed = False
 
@@ -42,6 +44,8 @@ class FakeCursor:
         elif '$files"' in sql:
             table = sql.split('"')[3].split("$")[0]
             self.rows = [(self.conn.files[table],)]
+        elif "OFFSET" in sql:
+            self.rows = [(self.conn.boundaries.pop(0),)] if self.conn.boundaries else []
         elif '$snapshots"' in sql:
             self.rows = [(7,)]
         elif sql.startswith("ALTER"):
@@ -94,6 +98,30 @@ def test_fattest_first_full_optimize_then_expire_without_orphans(tmp_path):
     assert events[0]["before"] == {"files": 44837, "snapshots": 7}
     assert events[0]["after"] == {"files": 1, "snapshots": 7}
     assert conn.closed
+
+
+def test_expire_runs_in_chunks_oldest_first(tmp_path):
+    day = 86400
+    conn = FakeTrino({"espn_http_attempt_v1": 44984},
+                     boundaries=[NOW.timestamp() - 10 * day, NOW.timestamp() - 6 * day])
+    result, events, _ = _run(conn, tmp_path, dry_run=False)
+    assert result["tables"] == {"espn_http_attempt_v1": "ok"}
+    expires = [a for a in _alters(conn) if "expire_snapshots" in a]
+    assert [a.split("'")[1] for a in expires] == [f"{10 * day}s", f"{6 * day}s", "3d"]
+    assert events[0]["expire_commits"] == 3
+    boundary_sql = [s for s in conn.statements if "OFFSET" in s][0]
+    assert boundary_sql.startswith('SELECT to_unixtime(committed_at) FROM '
+                                   'iceberg."ops"."espn_http_attempt_v1$snapshots" WHERE')
+    assert f"OFFSET {ops.EXPIRE_CHUNK - 1} LIMIT 1" in boundary_sql
+
+
+def test_chunk_without_progress_falls_through_to_final_pass(tmp_path):
+    same = NOW.timestamp() - 5 * 86400
+    conn = FakeTrino({"t": 3}, boundaries=[same, same, same])
+    result, events, _ = _run(conn, tmp_path, dry_run=False)
+    expires = [a for a in _alters(conn) if "expire_snapshots" in a]
+    assert len(expires) == 2 and expires[-1].endswith("'3d')")
+    assert result["tables"] == {"t": "ok"} and events[0]["expire_commits"] == 2
 
 
 def test_commit_conflict_retried_then_busy_is_not_fatal(tmp_path):
