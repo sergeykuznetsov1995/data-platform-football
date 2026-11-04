@@ -251,7 +251,8 @@ def test_league_with_one_type_over_four_pages_is_written_whole(conn) -> None:
     listed = _ids(*ENG_2015_PAGES)
     assert len(listed) == len(set(listed)) == 380
     assert run.reason == history.IDLE and run.matches == 380 and run.failed == 0
-    assert run.batches == 1  # 380 <= BATCH_MATCHES: one publication
+    # #2142: a season is published in batches that fit the task timeout.
+    assert run.batches == 8 and history.BATCH_MATCHES == 50
     rows = _matches(trino)
     assert set(rows) == set(listed)
     assert all(row["disposition"] == "captured" and row["season_year"] == 2015 for row in rows.values())
@@ -720,8 +721,10 @@ def test_real_history_parallel_workers_write_on_main_thread(conn, tmp_path):
     assert len({id(worker.network) for worker in workers}) == 4
     assert not _summaries(client)
     from scrapers.espn.pace_store import PaceStore
-    timing = PaceStore(tmp_path / 'pace.sqlite3').rows('write', 0, NOW.timestamp())[0]
-    assert timing['matches'] == 380 and timing['step'] == 2
+    timings = PaceStore(tmp_path / 'pace.sqlite3').rows('write', 0, NOW.timestamp())
+    assert [t['matches'] for t in timings] == [50] * 7 + [30]
+    timing = timings[0]
+    assert timing['step'] == 2
     assert 0 <= timing['write_seconds'] <= timing['batch_seconds']
 
 
