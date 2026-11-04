@@ -205,6 +205,24 @@ def test_a_blip_with_nothing_else_to_do_waits_for_its_retry():
     assert result['stop_reason'] == 'empty_queue'
 
 
+def test_a_blip_waits_for_its_retry_when_only_unplannable_rows_are_left():
+    # The census also carries partitions the planner never takes (esoccer,
+    # excluded seasons); they must not end the window before the retry.
+    kwargs, visited, sleeps, rounds, _ = _scopes_harness([['transient_failure', 'refreshed']])
+    plan = kwargs['plan']
+    esoccer = ('SS-9999', '2026', 5, None, 0, 999900)
+    kwargs['pending'] = lambda rows=kwargs['pending']: [*rows(), esoccer]
+    kwargs['plan'] = lambda current, budget, number: (
+        plan([row for row in current if row != esoccer], budget, number)
+        if any(row != esoccer for row in current) else None)
+    result = refill_window(**kwargs)
+    assert sleeps == [600]
+    assert visited == ['1', '1']
+    assert rounds == [1, 3]
+    assert result['stop_reason'] == 'insufficient_headroom'
+    assert result['blocked_scopes'] == []
+
+
 def test_a_second_transport_loss_blocks_the_scope_for_the_run():
     kwargs, visited, sleeps, _, _ = _scopes_harness([['transient_failure', 'transient_failure']])
     result = refill_window(**kwargs)

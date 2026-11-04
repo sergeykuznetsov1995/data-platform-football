@@ -145,6 +145,20 @@ def refill_window(
         return [row for row in rows if _partition(row) not in blocked
                 and retry_after.get(_partition(row), 0) <= current]
 
+    def wait_for_retry(rows: list[tuple]) -> bool:
+        """Sleep until the next scope due for a retry, if one still fits after it."""
+        current = now()
+        waiting = {key: retry_after[key] for key in map(_partition, rows)
+                   if key not in blocked and retry_after.get(key, 0) > current}
+        if not waiting:
+            return False
+        wait = min(waiting.values()) - current
+        if min(left()) - wait < min_scope_s:
+            blocked.update((key, retried[key]) for key in waiting)
+            return False
+        sleep(wait)
+        return True
+
     rows: list[tuple] | None = None
     for round_number in range(1, max_rounds + 1):
         if stop := spent():
@@ -152,16 +166,8 @@ def refill_window(
             break
         rows = pending() if rows is None else rows
         candidates = ready(rows)
-        if not candidates:
-            waiting = {key: retry_after[key] for key in map(_partition, rows)
-                       if key in retry_after and key not in blocked}
-            if waiting:
-                wait = max(min(waiting.values()) - now(), 0)
-                if min(left()) - wait >= min_scope_s:
-                    sleep(wait)
-                else:
-                    blocked.update((key, retried[key]) for key in waiting)
-                candidates = ready(rows)
+        if not candidates and wait_for_retry(rows):
+            candidates = ready(rows)
         if not candidates:
             reason = "no_progress" if rows else "empty_queue"
             status = "partial" if rows else "success"
@@ -173,6 +179,11 @@ def refill_window(
             break
         env = plan(candidates, min(left()), round_number)
         if env is None:
+            # #2160: only unplannable rows were ready while a scope waits for
+            # its retry. The plan of this round is already recorded, so the
+            # retry is planned in the next one.
+            if wait_for_retry(rows):
+                continue
             reason = "insufficient_headroom"
             break
         # Planning itself can take time (Trino): never grant it a fresh window.
