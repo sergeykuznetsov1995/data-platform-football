@@ -10480,6 +10480,36 @@ def test_live_waves_stop_at_the_deadline_with_a_partial_aggregate(tmp_path):
     assert result.frontier_closed is False
 
 
+@pytest.mark.parametrize("third_start,expected_batches", [
+    # 03.11: two 1.6 h batches, a 4.5 h deadline; the third would not fit.
+    (2 * 5760.0, 2),
+    # The rest still holds the slowest batch, so the third one starts.
+    (16200.0 - 5760.0, 3),
+])
+def test_live_waves_skip_a_batch_the_rest_of_the_deadline_cannot_hold(
+    tmp_path, third_start, expected_batches,
+):
+    """#2151: a batch begun before the deadline ran past the 6 h task."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    ticks = iter((0.0, 5760.0, third_start, 16200.0))
+    pipeline = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter(),
+        monotonic=lambda: next(ticks),
+    )
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(claimed=1, fetched=1)
+    pipeline.parse_wave = lambda *_a, **_k: WaveResult(cohort_size=1, parsed=1)
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()), worker_id="current-live", page_kinds=["match"],
+        settings=_settings(), max_batches=14, deadline_monotonic=16200.0,
+    )
+
+    assert result.batches == expected_batches
+    assert result.deadline_reached is True
+    assert result.frontier_closed is False
+
+
 def test_live_waves_without_a_deadline_are_unchanged(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)

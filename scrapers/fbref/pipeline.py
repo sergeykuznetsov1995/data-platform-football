@@ -4603,10 +4603,22 @@ class FBrefPipeline:
                 else nullcontext()
             )
             with reconcile_context as reconciliation:
+                batch_started = None
+                longest_batch = 0.0
                 for batch in range(1, normalized_batches + 1):
-                    if (
-                        deadline_monotonic is not None
-                        and self.monotonic() >= deadline_monotonic
+                    if deadline_monotonic is not None:
+                        now = self.monotonic()
+                        if batch_started is not None:
+                            longest_batch = max(
+                                longest_batch, now - batch_started
+                            )
+                        batch_started = now
+                    if deadline_monotonic is not None and (
+                        now >= deadline_monotonic
+                        # One batch can outlast the task timeout once begun:
+                        # start it only if the slowest so far still fits
+                        # (#2151).
+                        or deadline_monotonic - now < longest_batch
                     ):
                         # Stop between batches, before spending a paid lease on
                         # work the task timeout would kill mid-flight.  The run
