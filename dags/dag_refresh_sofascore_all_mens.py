@@ -89,19 +89,23 @@ METADATA_TIMEOUT = timedelta(minutes=25)
 REFRESH_SCOPE_BUDGET = timedelta(hours=2)
 # #1751: transport-only scope losses in one run before it is red.
 MAX_INITIAL_TRANSIENT_FAILURES = 3
-# 5 min short of 2 h: they pay for the sweep's retry delay (#2107).
-REFRESH_RETRY_RESERVE = timedelta(hours=1, minutes=55)
+# 15 min short of 2 h: they pay for the sweep's retry delay (#2107) and for
+# one scope retry delay after the window deadline (#2118: a scope that lost
+# its transport right at the deadline is retried 10 min later and its third
+# try ends at once past the deadline).
+REFRESH_RETRY_RESERVE = timedelta(hours=1, minutes=45)
 if (
     REFRESH_FETCH_TIMEOUT
     + REFRESH_FETCH_RETRY_DELAY
     + REFRESH_SCOPE_BUDGET
+    + REFRESH_SCOPE_RETRY_DELAY
     + REFRESH_RETRY_RESERVE
     + METADATA_TIMEOUT
     > REFRESH_DAGRUN_TIMEOUT
 ):
     raise AirflowException(
         "refresh window does not fit the DagRun: sweep + its retry delay + "
-        "scope budget + retry reserve + metadata > dagrun_timeout"
+        "scope budget + scope retry delay + retry reserve + metadata > dagrun_timeout"
     )
 # Pace of the match phase, re-measured 29-30.09 on the refresh lane (~12 s a
 # match, ``state.DEFAULT_REFRESH_SECONDS_PER_MATCH``); an env override retunes
@@ -843,11 +847,22 @@ set -euo pipefail
 cd /opt/airflow
 # #2118: the third try (REFRESH_SCOPE_RETRIES) is only for a scope whose
 # previous try lost only its transport; any other failure stays red at once.
-if [ "{{ ti.try_number }}" -gt 2 ] \
-    && ! /opt/legacy-scraper-venv/bin/python -c 'import sys; sys.path.insert(0, "dags"); from utils.sofascore_refresh_window import transient_scope_failure as t; sys.exit(0 if t(sys.argv[1], sys.argv[2]) else 1)' \
-        "${SOFASCORE_SCOPE_RESULT_PATH}" "${SOFASCORE_SCOPE_RUN_ID}"; then
-  echo "SofaScore scope did not fail on transport only; no third try (#2118)"
-  exit 1
+# It is the last try of the round (a clear keeps try_number and sets
+# max_tries = try_number + retries) and never try 2 (TIs planned before
+# #2118 keep max_tries=1).  Past the window deadline it would only overwrite
+# that transport result with a time-budget stop, so the scope waits for the
+# next run as on #1751.  Accepted residue: a killed second try leaves the
+# first try's result behind, which grants one extra try inside the window.
+if [ "{{ ti.try_number }}" -gt "{{ ti.max_tries }}" ] && [ "{{ ti.try_number }}" -gt 2 ]; then
+  if ! /opt/legacy-scraper-venv/bin/python -c 'import sys; sys.path.insert(0, "dags"); from utils.sofascore_refresh_window import transient_scope_failure as t; sys.exit(0 if t(sys.argv[1], sys.argv[2]) else 1)' \
+      "${SOFASCORE_SCOPE_RESULT_PATH}" "${SOFASCORE_SCOPE_RUN_ID}"; then
+    echo "SofaScore scope did not fail on transport only; no third try (#2118)"
+    exit 1
+  fi
+  if [ "$(date +%s)" -ge "${SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH}" ]; then
+    echo "SofaScore scope lost only its transport and the window is over; it waits for the next run (#1751, #2118)"
+    exit 0
+  fi
 fi
 code=0
 started=$(date +%s)

@@ -74,8 +74,8 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     assert datetime.fromisoformat(window["started_at"]) > context["dag_run"].start_date
     assert datetime.fromisoformat(window["deadline_at"]).timestamp() == int(
         selected[0]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
-    assert 14099 <= (datetime.fromisoformat(window["deadline_at"])
-                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 14100
+    assert 13499 <= (datetime.fromisoformat(window["deadline_at"])
+                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 13500
     # #2117: the plan declares the debt reserve it applied, not the ceiling.
     assert window["scope_budget_s"] == 7200 and window["debt_reserve_s"] == 90
 
@@ -213,13 +213,15 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     assert fetch._init_kwargs["execution_timeout"] == timedelta(minutes=150)
     # #1358: 7 h hold the sweep, the scopes' shared window, the reserve for
     # their retries and the metadata enrichment; #2107 adds the sweep's retry
-    # delay: 150 min + 10 min + 2 h + 1 h 55 min + 25 min.
+    # delay, #2118 one scope retry delay past the window deadline:
+    # 150 min + 10 min + 2 h + 10 min + 1 h 45 min + 25 min.
     assert module.REFRESH_SCOPE_BUDGET == timedelta(hours=2)
-    assert module.REFRESH_RETRY_RESERVE == timedelta(hours=1, minutes=55)
+    assert module.REFRESH_RETRY_RESERVE == timedelta(hours=1, minutes=45)
     assert (
         module.REFRESH_FETCH_TIMEOUT
         + module.REFRESH_FETCH_RETRY_DELAY
         + module.REFRESH_SCOPE_BUDGET
+        + module.REFRESH_SCOPE_RETRY_DELAY
         + module.REFRESH_RETRY_RESERVE
         + module.METADATA_TIMEOUT
         <= module.REFRESH_DAGRUN_TIMEOUT
@@ -937,12 +939,12 @@ def test_plan_task_maps_each_scope_with_its_own_timeout(clean_env, monkeypatch):
     )
 
     # Every scope, and every retry of it, stops by the batch's own deadline:
-    # plan time + the 2 h window + the 1 h 55 min retry reserve (#2107).
+    # plan time + the 2 h window + the 1 h 45 min retry reserve (#2107, #2118).
     assert items == [{
         "env": {
             "SOFASCORE_SCOPE_TIMEOUT_S": "1030",
             "X": "1",
-            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600 - 300),
+            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600 - 900),
         },
         "execution_timeout": timedelta(seconds=1030),
     }]
@@ -1025,13 +1027,21 @@ def test_propagate_is_red_only_on_a_streak_of_transport_losses(clean_env, monkey
         assert module._propagate_status(dag_run=dag_run, ti=ti)["initial_transient_failures"] == losses
 
 
+# The stub stamps a result's ``started_at`` when it runs, after the command
+# took its own start: a value taken by the test earlier can fall a second
+# before it and read as a stale result.
+_STUB_NOW = "__STUB_STARTED_AT__"
+
+
 def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1, max_tries=1,
-                       previous=None):
+                       previous=None, deadline=None):
     """Execute the real rendered scope command with a stub scope cycle.
 
     ``previous`` is the result an earlier try left behind; the stub touches
     ``ran`` so a test sees whether the scope cycle was started at all.
+    ``deadline`` is the window deadline epoch (default: an hour ahead).
     """
+    import time
     import subprocess
     from pathlib import Path
 
@@ -1049,10 +1059,13 @@ def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1, max
     result_path.unlink(missing_ok=True)
     if previous is not None:
         result_path.write_text(json.dumps(previous))
+    template = tmp_path / "result.template.json"
+    template.write_text(json.dumps(result))
     stub.write_text(
         f"#!/bin/sh\nif [ \"$1\" = dags/scripts/run_sofascore_scope_cycle.py ]; then\n"
         f"  touch {ran}\n"
-        f"  cat > {result_path} <<'JSON'\n{json.dumps(result)}\nJSON\n  exit {exit_code}\nfi\n"
+        f"  sed \"s/{_STUB_NOW}/$(date -u +%Y-%m-%dT%H:%M:%S+00:00)/\" {template} > {result_path}\n"
+        f"  exit {exit_code}\nfi\n"
         f"exec {sys.executable} \"$@\"\n")
     stub.chmod(0o755)
     command = jinja2.Template(module.RUN_SCOPE_COMMAND).render(
@@ -1060,7 +1073,9 @@ def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1, max
     command = command.replace("/opt/legacy-scraper-venv/bin/python", str(stub)).replace(
         "cd /opt/airflow", f"cd {root}")
     env = {"PATH": "/usr/bin:/bin", "SOFASCORE_SCOPE_RESULT_PATH": str(result_path),
-           "SOFASCORE_SCOPE_RUN_ID": "r:1"}
+           "SOFASCORE_SCOPE_RUN_ID": "r:1",
+           "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(
+               int(time.time() + 3600) if deadline is None else deadline)}
     for name in ("SOFASCORE_CAMPAIGN_SNAPSHOT", "SOFASCORE_TOURNAMENT_ID", "SOFASCORE_SOURCE_SEASON_ID",
                  "SOFASCORE_EXPECTED_SNAPSHOT_ID", "SOFASCORE_EXPECTED_CAMPAIGN_ID",
                  "SOFASCORE_SCOPE_OUTPUT_DIR", "SOFASCORE_WORKLOAD_ARTIFACT"):
@@ -1069,11 +1084,8 @@ def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1, max
 
 
 def test_scope_command_lets_a_transport_loss_through_only_on_the_last_try(clean_env, monkeypatch, tmp_path):
-    from datetime import datetime, timezone
-
     module = _load_dag_module(monkeypatch)
-    now = datetime.now(timezone.utc).isoformat()
-    blip = {"status": "failed", "run_id": "r:1", "started_at": now, "errors": [f"matches: {_BLIP}"],
+    blip = {"status": "failed", "run_id": "r:1", "started_at": _STUB_NOW, "errors": [f"matches: {_BLIP}"],
             "phases": [{"status": "failed", "errors": [_BLIP], "accounting_uncertain": 0,
                         "control_channel_failures": 0, "status_counts": {"retryable_failure": 1}}]}
     assert _run_scope_command(module, tmp_path, try_number=1, result=blip) == 1
@@ -1087,11 +1099,8 @@ def test_scope_command_lets_a_transport_loss_through_only_on_the_last_try(clean_
 
 def test_scope_command_gives_a_transport_loss_a_third_try_but_not_a_hard_failure(
         clean_env, monkeypatch, tmp_path):
-    from datetime import datetime, timezone
-
     module = _load_dag_module(monkeypatch)
-    now = datetime.now(timezone.utc).isoformat()
-    blip = {"status": "failed", "run_id": "r:1", "started_at": now, "errors": [f"matches: {_BLIP}"],
+    blip = {"status": "failed", "run_id": "r:1", "started_at": _STUB_NOW, "errors": [f"matches: {_BLIP}"],
             "phases": [{"status": "failed", "errors": [_BLIP], "accounting_uncertain": 0,
                         "control_channel_failures": 0, "status_counts": {"retryable_failure": 1}}]}
     hard = {**blip, "errors": ["matches: schema drift"],
@@ -1114,4 +1123,42 @@ def test_scope_command_gives_a_transport_loss_a_third_try_but_not_a_hard_failure
     # No previous result (killed try) is not a transport loss either.
     assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2,
                               result={"status": "success"}, exit_code=0) == 1
+    assert not ran.exists()
+    # A cleared TI keeps try_number and gets max_tries = try_number + retries:
+    # its round's first retry runs as usual, the round's third try is guarded.
+    assert _run_scope_command(module, tmp_path, try_number=4, max_tries=5,
+                              result={"status": "success"}, exit_code=0, previous=hard) == 0
+    assert ran.exists()
+    assert _run_scope_command(module, tmp_path, try_number=6, max_tries=5,
+                              result={"status": "success"}, exit_code=0, previous=hard) == 1
+    assert not ran.exists()
+
+
+def test_scope_command_skips_a_third_try_past_the_window_deadline(clean_env, monkeypatch, tmp_path):
+    import time
+
+    module = _load_dag_module(monkeypatch)
+    blip = {"status": "failed", "run_id": "r:1", "started_at": "2026-11-04T10:00:00+00:00",
+            "errors": [f"matches: {_BLIP}"],
+            "phases": [{"status": "failed", "errors": [_BLIP], "accounting_uncertain": 0,
+                        "control_channel_failures": 0, "status_counts": {"retryable_failure": 1}}]}
+    hard = {**blip, "errors": ["matches: schema drift"],
+            "phases": [{**blip["phases"][0], "errors": ["schema drift"]}]}
+    ran = tmp_path / "ran"
+    result_path = tmp_path / "out" / "result.json"
+    past = int(time.time()) - 1
+    # The window is over: the transport loss of try 2 stays the scope's result
+    # (validate reads it as transient_failure) and the scope waits (#1751).
+    assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2,
+                              result={"status": "success"}, exit_code=0, previous=blip,
+                              deadline=past) == 0
+    assert not ran.exists()
+    assert json.loads(result_path.read_text()) == blip
+    assert module._validate_refresh_scope(env={
+        "SOFASCORE_SCOPE_RESULT_PATH": str(result_path), "SOFASCORE_SCOPE_RUN_ID": "r:1",
+        "SOFASCORE_SCOPE_KEY": "c:25:97078"})["status"] == "transient_failure"
+    # A hard failure stays red past the deadline too.
+    assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2,
+                              result={"status": "success"}, exit_code=0, previous=hard,
+                              deadline=past) == 1
     assert not ran.exists()
