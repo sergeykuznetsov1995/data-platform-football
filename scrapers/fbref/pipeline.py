@@ -6273,6 +6273,12 @@ class FBrefPipeline:
         stale_typed_observations_skipped: int = 0,
     ) -> _ProcessedObservation:
         failures: list[str] = []
+        # A carryover from an earlier transient wave of this raw is stale the
+        # moment it fails again: only a new transient deferral below restores
+        # it, or the deadline hands the store an error it no longer has (#2150).
+        previous_carryover = self._parse_carryovers.pop(
+            record.logical_refresh_id, None
+        )
         if not isinstance(exc, TypedPromotionDeferred):
             try:
                 self._record_page_completion(
@@ -6476,10 +6482,9 @@ class FBrefPipeline:
                 "error_class": type(exc).__name__,
                 "error_message": str(exc)[:2000],
             }
-            previous = self._parse_carryovers.get(record.logical_refresh_id)
             deferred_errors = [
                 row
-                for row in (previous or {}).get("deferred_errors", [])
+                for row in (previous_carryover or {}).get("deferred_errors", [])
                 if row != error
             ][-MAX_PARSE_DEFERRALS_PER_TARGET:] + [error]
             self._parse_carryovers[record.logical_refresh_id] = {
