@@ -236,8 +236,12 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     assert "execution_timeout" not in run._init_kwargs
     assert run._init_kwargs["pool"] == "ingest_scraper_pool"
     assert run._init_kwargs["priority_weight"] == 5
-    assert run._init_kwargs["retries"] == 1
-    assert run._init_kwargs["retry_delay"] >= timedelta(seconds=60)
+    # #2118: two retries 10 min apart; the pool-wait meter knows the delay.
+    assert run._init_kwargs["retries"] == 2
+    assert run._init_kwargs["retry_delay"] == timedelta(minutes=10)
+    from dags.utils import sofascore_pool_wait
+    assert sofascore_pool_wait.RETRY_DELAY_S == run._init_kwargs["retry_delay"].total_seconds()
+    assert sofascore_pool_wait.RETRY_DELAY_S == fetch._init_kwargs["retry_delay"].total_seconds()
     assert run._init_kwargs["max_active_tis_per_dag"] == 1
     assert run._init_kwargs["do_xcom_push"] is False
     for flag in (
@@ -1021,8 +1025,13 @@ def test_propagate_is_red_only_on_a_streak_of_transport_losses(clean_env, monkey
         assert module._propagate_status(dag_run=dag_run, ti=ti)["initial_transient_failures"] == losses
 
 
-def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1):
-    """Execute the real rendered scope command with a stub scope cycle."""
+def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1, max_tries=1,
+                       previous=None):
+    """Execute the real rendered scope command with a stub scope cycle.
+
+    ``previous`` is the result an earlier try left behind; the stub touches
+    ``ran`` so a test sees whether the scope cycle was started at all.
+    """
     import subprocess
     from pathlib import Path
 
@@ -1035,13 +1044,19 @@ def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1):
     stub = tmp_path / "python"
     result_path = tmp_path / "out" / "result.json"
     result_path.parent.mkdir(exist_ok=True)
+    ran = tmp_path / "ran"
+    ran.unlink(missing_ok=True)
+    result_path.unlink(missing_ok=True)
+    if previous is not None:
+        result_path.write_text(json.dumps(previous))
     stub.write_text(
         f"#!/bin/sh\nif [ \"$1\" = dags/scripts/run_sofascore_scope_cycle.py ]; then\n"
+        f"  touch {ran}\n"
         f"  cat > {result_path} <<'JSON'\n{json.dumps(result)}\nJSON\n  exit {exit_code}\nfi\n"
         f"exec {sys.executable} \"$@\"\n")
     stub.chmod(0o755)
     command = jinja2.Template(module.RUN_SCOPE_COMMAND).render(
-        ti=SimpleNamespace(try_number=try_number, max_tries=1))
+        ti=SimpleNamespace(try_number=try_number, max_tries=max_tries))
     command = command.replace("/opt/legacy-scraper-venv/bin/python", str(stub)).replace(
         "cd /opt/airflow", f"cd {root}")
     env = {"PATH": "/usr/bin:/bin", "SOFASCORE_SCOPE_RESULT_PATH": str(result_path),
@@ -1068,3 +1083,35 @@ def test_scope_command_lets_a_transport_loss_through_only_on_the_last_try(clean_
     stale = {**blip, "started_at": "2026-01-01T00:00:00+00:00"}
     assert _run_scope_command(module, tmp_path, try_number=2, result=stale) == 1
     assert _run_scope_command(module, tmp_path, try_number=1, result={"status": "success"}, exit_code=0) == 0
+
+
+def test_scope_command_gives_a_transport_loss_a_third_try_but_not_a_hard_failure(
+        clean_env, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    module = _load_dag_module(monkeypatch)
+    now = datetime.now(timezone.utc).isoformat()
+    blip = {"status": "failed", "run_id": "r:1", "started_at": now, "errors": [f"matches: {_BLIP}"],
+            "phases": [{"status": "failed", "errors": [_BLIP], "accounting_uncertain": 0,
+                        "control_channel_failures": 0, "status_counts": {"retryable_failure": 1}}]}
+    hard = {**blip, "errors": ["matches: schema drift"],
+            "phases": [{**blip["phases"][0], "errors": ["schema drift"]}]}
+    ran = tmp_path / "ran"
+    # The second of three tries is not the last: a transport loss still fails it.
+    assert _run_scope_command(module, tmp_path, try_number=2, max_tries=2, result=blip) == 1
+    assert ran.exists()
+    # The third try after a transport loss runs; losing transport again waits.
+    assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2, result=blip,
+                              previous=blip) == 0
+    assert ran.exists()
+    assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2,
+                              result={"status": "success"}, exit_code=0, previous=blip) == 0
+    assert ran.exists()
+    # After a hard failure the third try fails at once without starting the scope.
+    assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2,
+                              result={"status": "success"}, exit_code=0, previous=hard) == 1
+    assert not ran.exists()
+    # No previous result (killed try) is not a transport loss either.
+    assert _run_scope_command(module, tmp_path, try_number=3, max_tries=2,
+                              result={"status": "success"}, exit_code=0) == 1
+    assert not ran.exists()

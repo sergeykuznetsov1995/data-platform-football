@@ -63,6 +63,12 @@ REFRESH_FETCH_TIMEOUT = timedelta(minutes=150)
 # try's window (counted from the DagRun start) instead of getting its own, so
 # the sweep phase costs at most REFRESH_FETCH_TIMEOUT + this delay.
 REFRESH_FETCH_RETRY_DELAY = timedelta(minutes=10)
+# #2118: a scope gets two retries, 10 min apart.  A proxy exit that is down
+# is usually still down 2 min later; 10 min later a new lease mostly lands on
+# another exit.  The third try is for a transport-only loss only
+# (RUN_SCOPE_COMMAND); a waiting scope does not hold the pool slot.
+REFRESH_SCOPE_RETRIES = 2
+REFRESH_SCOPE_RETRY_DELAY = timedelta(minutes=10)
 # Ceiling of one scope task; its real timeout is its own estimate x 1.5.
 REFRESH_SCOPE_TIMEOUT = timedelta(seconds=state.REFRESH_MAX_SCOPE_TIMEOUT_SECONDS)
 # Season metadata enrichment (#1354) runs after the scopes inside the same
@@ -79,7 +85,7 @@ METADATA_TIMEOUT = timedelta(minutes=25)
 # a timeout from its own estimate, and a scope that hits its time or byte
 # ceiling stops taking allocations and ends ``partial`` — the rest of it is
 # the next run's.  The other half of the old window is the reserve for the
-# retries (``retries=1`` below: the workload plan supports a resumed retry).
+# retries (REFRESH_SCOPE_RETRIES: the workload plan supports a resumed retry).
 REFRESH_SCOPE_BUDGET = timedelta(hours=2)
 # #1751: transport-only scope losses in one run before it is red.
 MAX_INITIAL_TRANSIENT_FAILURES = 3
@@ -835,6 +841,14 @@ ${run_limit} /opt/legacy-scraper-venv/bin/python \
 RUN_SCOPE_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
+# #2118: the third try (REFRESH_SCOPE_RETRIES) is only for a scope whose
+# previous try lost only its transport; any other failure stays red at once.
+if [ "{{ ti.try_number }}" -gt 2 ] \
+    && ! /opt/legacy-scraper-venv/bin/python -c 'import sys; sys.path.insert(0, "dags"); from utils.sofascore_refresh_window import transient_scope_failure as t; sys.exit(0 if t(sys.argv[1], sys.argv[2]) else 1)' \
+        "${SOFASCORE_SCOPE_RESULT_PATH}" "${SOFASCORE_SCOPE_RUN_ID}"; then
+  echo "SofaScore scope did not fail on transport only; no third try (#2118)"
+  exit 1
+fi
 code=0
 started=$(date +%s)
 /opt/legacy-scraper-venv/bin/python \
@@ -944,10 +958,11 @@ with DAG(
         priority_weight=5,
         do_xcom_push=False,
         max_active_tis_per_dag=REFRESH_MAX_ACTIVE_TASKS,
-        # One retry keeps the same run_id: the gateway reuses the signed
-        # plan and a latched lease is re-claimed after the reaper grace.
-        retries=1,
-        retry_delay=timedelta(minutes=2),
+        # Retries keep the same run_id: the gateway reuses the signed plan
+        # and a latched lease is re-claimed after the reaper grace.  The
+        # third try runs only after a transport-only loss (#2118).
+        retries=REFRESH_SCOPE_RETRIES,
+        retry_delay=REFRESH_SCOPE_RETRY_DELAY,
         # ``execution_timeout`` comes from each item of the plan (#1358):
         # the scope's own estimate x 1.5, at most REFRESH_SCOPE_TIMEOUT.
         # ``strict=False`` lets the mapped value replace the default_args one.
