@@ -118,7 +118,9 @@ class Offline:
                 elif parsed.path == '/players':
                     value = packet(parse_qs(parsed.query)['ids[]'], outer.player_values)
                     if outer.stop_after_first_packet:
-                        outer.clock.advance(2330)
+                        # Retain a completed packet near this item's deadline,
+                        # including when it owns only the signal phase.
+                        outer.clock.advance(max(0, deadline - outer.clock.elapsed - 45))
                         outer.stop_after_first_packet = False
                     for row in value['data']:
                         if row['id'] in outer.player_contracts:
@@ -854,7 +856,7 @@ def test_write_time_consumes_whole_deadline_and_preserves_pending_careers(offlin
     offline.stop_in_writer = True
     report = offline.run('write-tail')
     # #2068: a cold roster portion stops after the roster; careers stay queued.
-    assert [item['status'] for item in report['scopes']] == ['pending'] and report['status'] == 'pending'
+    assert [item['status'] for item in report['scopes']] == ['retained']
     assert offline.careers == []
     data = next(iter(offline.state()['scopes'].values()))
     assert data['snapshot']
@@ -1619,7 +1621,7 @@ def test_cli_absolute_alarm_interrupts_blocking_work_and_writes_report(tmp_path)
                               'registry_rows': [], 'preflight': {}}))
     program = '''from dags.scripts import run_transfermarkt_current as c
 import sys,time
-c.available_work_seconds=lambda *args: 2700
+c.available_work_seconds=lambda *args, **kwargs: 2700
 c.run_current_portion=lambda *args, **kwargs: time.sleep(10)
 raise SystemExit(c.main(['--job',sys.argv[1],'--report',sys.argv[2]]))
 '''
@@ -2182,8 +2184,53 @@ def test_due_signals_interleave_with_apply_change_under_deadline(offline):
     assert first['scope_id'] == applied['scope_id']
     offline.factory = factory
     report = offline.run('rest', competitions=competitions)
-    # The deadline retained the first apply; it resumes after the others' pairs.
-    assert [(item['kind'], item['scope_id']) for item in report['scopes']] == [
-        ('signals', report['scopes'][1]['scope_id']), ('apply_change', report['scopes'][1]['scope_id']),
-        ('signals', report['scopes'][3]['scope_id']), ('apply_change', report['scopes'][3]['scope_id']),
-        ('apply_change', applied['scope_id'])]
+    # The reserved check phase may check all scopes first when they are cheap.
+    # Every due own check still precedes its write, and retained work rotates.
+    applied_scopes = [item['scope_id'] for item in report['scopes'] if item['kind'] == 'apply_change']
+    assert len(applied_scopes) == 3
+    assert applied_scopes[-1] == applied['scope_id']
+    checked = set()
+    for item in report['scopes']:
+        if item['kind'] == 'signals':
+            assert item['scope_id'] not in checked
+            checked.add(item['scope_id'])
+        elif item['kind'] == 'apply_change':
+            assert item['scope_id'] in checked
+
+
+def test_oldest_healthy_signal_gets_time_before_pending_changes(offline):
+    """A healthy edition must not wait behind every changed edition's own check."""
+    competitions = ('GB1', 'ES1', 'IT1')
+    offline.run_cold('cold', competitions=competitions)
+    offline.clock.advance(21 * 3600)
+    offline.values['10'] = offline.squad_values['10'] = '€2.0m'
+    offline.player_values['110'] = 2000000
+    offline.run('detect', competitions=competitions)
+    state = offline.state()
+    old_scope = next(key for key, value in state['scopes'].items()
+                     if value['snapshot']['competition_id'] == 'IT1')
+    for scope_id, data in state['scopes'].items():
+        old = offline.clock.wall - timedelta(hours=96 if scope_id == old_scope else 21)
+        for name in ('listing', 'players', 'injury'):
+            data['cursor'][name + '_checked_at'] = old.isoformat()
+        data['cursor']['last_work_at'] = old.isoformat()
+        if scope_id == old_scope:
+            data['cursor']['change_pending'] = False
+            data['cursor']['resume_json'] = '{}'
+    offline.write_state(state)
+    factory = offline.factory
+    deadlines = []
+
+    def costly_factory(*args):
+        deadlines.append(args[3])
+        offline.clock.advance(400)
+        return factory(*args)
+
+    offline.factory = costly_factory
+    report = offline.run('mixed', competitions=competitions)
+    assert report['scopes'][0]['scope_id'] == old_scope
+    assert report['scopes'][0]['kind'] == 'signals'
+    assert any(item['kind'] == 'apply_change' for item in report['scopes'])
+    assert deadlines[0] < max(deadlines), 'oldest checks cannot consume the write phase'
+    signals = [item['scope_id'] for item in report['scopes'] if item['kind'] == 'signals']
+    assert len(signals) == len(set(signals))

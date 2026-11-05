@@ -18,6 +18,8 @@ import math
 import os
 from typing import Any
 
+from dags.utils.transfermarkt_discovery_continuation import reservations
+
 MAX_PORTION_SECONDS = 45 * 60
 IDLE_POLL_SECONDS = 5 * 60
 # Host: ${TRANSFERMARKT_RUNTIME_DIR}/gateway-state, bind-mounted read-only into Airflow.
@@ -59,29 +61,38 @@ def _quiet_window_admission(current: datetime) -> datetime:
     return resume if cutoff <= current < resume else current
 
 
-def next_admitted_time(now: datetime) -> datetime:
+def next_admitted_time(now: datetime, *, reserve_discovery: bool = False) -> datetime:
     """Return now, or when a portion may start (03:00 UTC, end of a delivery drain)."""
     admitted = _quiet_window_admission(_utc(now))
     drained = drain_until(admitted)
-    return admitted if drained is None else _quiet_window_admission(drained)
+    admitted = admitted if drained is None else _quiet_window_admission(drained)
+    if reserve_discovery:
+        for start, end in reservations(admitted):
+            if start <= admitted < end:
+                admitted = _quiet_window_admission(end)
+    return admitted
 
 
-def available_work_seconds(now: datetime, max_seconds: float = MAX_PORTION_SECONDS) -> float:
+def available_work_seconds(now: datetime, max_seconds: float = MAX_PORTION_SECONDS, *, reserve_discovery: bool = False) -> float:
     """Budget for a newly starting portion; do not wait through the quiet window."""
     current = _utc(now)
     budget = _budget(max_seconds)
-    if next_admitted_time(current) != current:
+    if next_admitted_time(current, reserve_discovery=reserve_discovery) != current:
         return 0.0
     delivery_start = current.replace(hour=1, minute=0, second=0, microsecond=0)
     if current >= delivery_start:
         delivery_start += timedelta(days=1)
+    if reserve_discovery:
+        starts = [start for start, _ in reservations(current) if start > current]
+        if starts:
+            delivery_start = min(delivery_start, min(starts))
     return min(budget, (delivery_start - current).total_seconds())
 
 
-def work_deadline(started_at: datetime, max_seconds: float = MAX_PORTION_SECONDS) -> datetime:
+def work_deadline(started_at: datetime, max_seconds: float = MAX_PORTION_SECONDS, *, reserve_discovery: bool = False) -> datetime:
     """Hard deadline including requests, retries, and committing the portion."""
     started = _utc(started_at)
-    return started + timedelta(seconds=available_work_seconds(started, max_seconds))
+    return started + timedelta(seconds=available_work_seconds(started, max_seconds, reserve_discovery=reserve_discovery))
 
 
 def remaining_work_seconds(deadline: datetime, now: datetime) -> float:
@@ -109,18 +120,22 @@ else:
         active_runs_limit = 1
         description = "Continuous Transfermarkt current; delivery quiet window 04:00–06:00 MSK"
 
+        def __init__(self, *, reserve_discovery: bool = False):
+            super().__init__()
+            self.reserve_discovery = reserve_discovery
+
         @property
         def summary(self) -> str:
             return "@continuous (TM: no new portions 00:15–03:00 UTC)"
 
         def serialize(self) -> dict[str, Any]:
-            return {}
+            return {'reserve_discovery': True} if self.reserve_discovery else {}
 
         @classmethod
         def deserialize(cls, data: dict[str, Any]) -> TransfermarktCurrentTimetable:
-            if data != {}:
+            if data != {} and not (set(data) == {'reserve_discovery'} and data['reserve_discovery'] is True):
                 raise ValueError("Invalid Transfermarkt current timetable configuration")
-            return cls()
+            return cls(reserve_discovery=bool(data.get('reserve_discovery')))
 
         def next_dagrun_info(
             self,
@@ -142,7 +157,7 @@ else:
                 # metadata reads. A full work portion already outlasts this
                 # interval and therefore continues immediately.
                 candidate = max(candidate, start + timedelta(seconds=IDLE_POLL_SECONDS))
-            admitted = pendulum.instance(next_admitted_time(candidate))
+            admitted = pendulum.instance(next_admitted_time(candidate, reserve_discovery=self.reserve_discovery))
             if restriction.latest is not None and admitted > restriction.latest:
                 return None
             return DagRunInfo.interval(start, admitted)

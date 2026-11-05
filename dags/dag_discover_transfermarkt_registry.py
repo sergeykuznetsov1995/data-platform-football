@@ -1,6 +1,6 @@
 """Daily, approval-gated Transfermarkt competition registry discovery.
 
-Every day at 18:00 UTC (21:00 MSK): ``daily`` mode reads the tmapi regulation
+A daily cohort advances in bounded calendar slots: ``daily`` mode reads the tmapi regulation
 of every competition of the canonical snapshot and uses a strict HTML season
 selector only for known competitions whose regulation is unusable. Once the
 last full crawl is a week old the same run is ``full`` — catalogue, country
@@ -28,16 +28,48 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from utils.config import DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
+from utils.transfermarkt_discovery_continuation import (
+    SCHEDULE as DISCOVERY_SCHEDULE, RUN_SECONDS, WORK_SECONDS,
+    cohort_day, identity_for, mark_published, read_job, select_job, write_job,
+    ensure_manual_delivery_admission,
+)
+
+
+class DiscoveryPortionOperator(BashOperator):
+    """A settled partial portion terminates this run; the next slot resumes it."""
+
+    def execute(self, context):
+        if isinstance(self.env, dict) and self.env.get('TM_DAG_ID') == MANUAL_DAG_ID:
+            ensure_manual_delivery_admission(datetime.now(timezone.utc))
+        if isinstance(self.env, dict) and self.env.get('TM_APPROVAL_MODE') == 'standing_policy':
+            if self.env.get('TM_COHORT_COMPLETE') == 'true':
+                raise AirflowSkipException('daily discovery cohort already published')
+            if self.env.get('TM_FINAL_MANIFEST_PATH'):
+                output = json.dumps({'status': 'success',
+                    'manifest_path': self.env['TM_FINAL_MANIFEST_PATH'],
+                    'manifest_hash': self.env['TM_FINAL_MANIFEST_HASH']})
+                _load_discovery_manifest(output, cycle_id=self.env['TM_CYCLE_ID'])
+                return output
+        output = super().execute(context)
+        result = json.loads(output)
+        if result.get('status') == 'paused':
+            if not isinstance(self.env, dict) or self.env.get('TM_APPROVAL_MODE') != 'standing_policy':
+                raise AirflowException('one-shot discovery cannot resume automatically')
+            raise AirflowSkipException('discovery cohort incomplete; next calendar slot resumes it')
+        if result.get('status') != 'success':
+            raise AirflowException('discovery returned no successful source result')
+        return output
 
 
 DAG_ID = "dag_discover_transfermarkt_registry"
+MANUAL_DAG_ID = "dag_discover_transfermarkt_registry_manual"
 DISCOVERY_TASK_ID = "discover_registry"
 DISCOVERY_SCRIPT = "/opt/airflow/dags/scripts/run_transfermarkt_discovery.py"
 STATE_ROOT = Path("/opt/airflow/logs/transfermarkt-registry")
@@ -91,14 +123,14 @@ def _path_under(path: Path, root: Path, *, field: str) -> Path:
     return path
 
 
-def _cycle_id(run_id: str) -> str:
+def _cycle_id(run_id: str, dag_id: str = DAG_ID) -> str:
     raw = str(run_id or "").strip()
     if not raw:
         raise AirflowException("Airflow run_id is required")
     return (
         "tm-registry-"
         + hashlib.sha256(
-            f"{DAG_ID}:{raw}".encode("utf-8"),
+            f"{dag_id}:{raw}".encode("utf-8"),
         ).hexdigest()[:24]
     )
 
@@ -242,6 +274,7 @@ def _proxy_control_url() -> str:
 
 def _discovery_argv(
     *,
+    dag_id: str = DAG_ID,
     cycle_id: str,
     run_id: str,
     proxy_control_url: str,
@@ -257,7 +290,7 @@ def _discovery_argv(
         "--cycle-id",
         cycle_id,
         "--dag-id",
-        DAG_ID,
+        dag_id,
         "--run-id",
         run_id,
         "--task-id",
@@ -313,6 +346,13 @@ def _validate_discovery_packet(
         raise AirflowException("discovery approval file assets drift")
 
 
+def _other_discovery_active(dag_id: str) -> bool:
+    from airflow.models.dagrun import DagRun
+    other = MANUAL_DAG_ID if dag_id == DAG_ID else DAG_ID
+    return bool(DagRun.find(dag_id=other, state='running')
+                or DagRun.find(dag_id=other, state='queued'))
+
+
 def _prepare_discovery(
     *,
     paid_proxy_packet_path: str,
@@ -321,6 +361,7 @@ def _prepare_discovery(
     bronze_write_packet_hash: str,
     promotion_write_packet_path: str,
     approval_journal: str,
+    lane_dag_id: str | None = None,
     **context,
 ) -> dict[str, str]:
     """Validate both discovery approvals without consuming either packet.
@@ -334,7 +375,22 @@ def _prepare_discovery(
     from utils.transfermarkt_approval import ApprovalJournal
 
     run_id = _run_id(context)
-    cycle_id = _cycle_id(run_id)
+    dag_id = lane_dag_id or DAG_ID
+    cycle_id = _cycle_id(run_id, dag_id)
+    if lane_dag_id is not None:
+        if dag_id not in {DAG_ID, MANUAL_DAG_ID}:
+            raise AirflowException('unknown discovery DAG identity')
+        if dag_id == DAG_ID and not _is_scheduled_run(context):
+            raise AirflowException(f'For a manual one-shot crawl trigger {MANUAL_DAG_ID} with new approval packets')
+        if dag_id == MANUAL_DAG_ID and _is_scheduled_run(context):
+            raise AirflowException('manual discovery DAG cannot run on standing policy')
+        if _other_discovery_active(dag_id):
+            raise AirflowSkipException('another discovery DAG is queued or running')
+        if dag_id == MANUAL_DAG_ID:
+            ensure_manual_delivery_admission(datetime.now(timezone.utc))
+            job_path = STATE_ROOT / 'cohorts' / 'active.json'
+            if job_path.exists() and read_job(job_path)['status'] != 'published':
+                raise AirflowException('manual discovery requires the scheduled cohort to be published first')
     if (
         not any(
             str(value or "").strip()
@@ -351,16 +407,64 @@ def _prepare_discovery(
         previous_snapshot_id, sizing = _discovery_sizing(
             datetime.now(timezone.utc)
         )
+        now = datetime.now(timezone.utc)
+        slot = context.get('data_interval_end') or getattr(context.get('dag_run'), 'start_date', None) or now
+        slot = datetime.fromisoformat(str(slot)) if not isinstance(slot, datetime) else slot
+        if slot.tzinfo is None:
+            raise AirflowException('discovery slot must include timezone')
+        deadline = slot + timedelta(seconds=RUN_SECONDS)
+        if deadline <= now:
+            raise AirflowSkipException('discovery calendar slot expired before preparation')
+        job_path = STATE_ROOT / 'cohorts' / 'active.json'
+        if job_path.exists():
+            prior_job = read_job(job_path)
+            if prior_job['status'] != 'published':
+                # A week boundary during a cohort cannot change its work or caps.
+                sizing = type(sizing)(mode=prior_job['identity']['mode'],
+                    previous_competitions=prior_job.get('sizing', {}).get('previous_competitions', sizing.previous_competitions),
+                    country_pages=prior_job.get('sizing', {}).get('country_pages', sizing.country_pages))
         policy, limits = _load_validated_standing_policy(sizing)
-        checkpoint = STATE_ROOT / "checkpoints" / f"{cycle_id}.json"
+        identity = identity_for(previous_snapshot_id=previous_snapshot_id, mode=sizing.mode,
+            policy_hash=policy.policy_hash, request_limit=limits.request_limit,
+            retry_limit=limits.retry_limit, byte_cap_bytes=limits.byte_cap_bytes,
+            day=cohort_day(now))
+        if job_path.exists():
+            previous_job = read_job(job_path)
+            final_ack = previous_job.get('final_manifest', {})
+            if (previous_job['status'] == 'source_complete'
+                    and final_ack.get('snapshot_id') == previous_snapshot_id):
+                # A crash after canonical CAS/readback but before the local
+                # completion marker must not refetch or publish a second time.
+                expected = {**identity,
+                    'previous_snapshot_id': previous_job['identity']['previous_snapshot_id'],
+                    'cohort_day': previous_job['identity']['cohort_day']}
+                if previous_job['identity'] != expected:
+                    raise AirflowException('completed cohort policy/parser/caps drift')
+                _load_discovery_manifest(json.dumps({'status': 'success',
+                    'manifest_path': final_ack['path'], 'manifest_hash': final_ack['hash']}),
+                    cycle_id=final_ack['cycle_id'])
+                mark_published(job_path, manifest_hash=final_ack['hash'],
+                    snapshot_id=previous_snapshot_id, now=now, write=_atomic_json)
+        job = select_job(job_path, identity, now=now, write=_atomic_json)
+        if 'sizing' not in job and job['status'] == 'ready':
+            job['sizing'] = {'previous_competitions': sizing.previous_competitions,
+                             'country_pages': sizing.country_pages}
+            write_job(job_path, job, _atomic_json)
+        final = job.get('final_manifest', {}) if job['status'] == 'source_complete' else {}
+        checkpoint = Path(job['checkpoint_path'])
         return {
+            'TM_DISCOVERY_JOB_PATH': str(job_path),
+            'TM_DISCOVERY_DEADLINE_AT': deadline.isoformat(),
+            'TM_COHORT_COMPLETE': 'true' if job['status'] == 'published' else 'false',
+            'TM_FINAL_MANIFEST_PATH': final.get('path', ''),
+            'TM_FINAL_MANIFEST_HASH': final.get('hash', ''),
             "TM_APPROVAL_MODE": "standing_policy",
             "PYTHONPATH": RUNNER_PYTHONPATH,
             "TM_MODE": sizing.mode,
             "TM_PREVIOUS_SNAPSHOT_ID": previous_snapshot_id or "",
             "TM_BYTE_CAP_BYTES": str(limits.byte_cap_bytes),
-            "TM_CYCLE_ID": cycle_id,
-            "TM_DAG_ID": DAG_ID,
+            "TM_CYCLE_ID": final.get("cycle_id", cycle_id),
+            "TM_DAG_ID": dag_id,
             "TM_RUN_ID": run_id,
             "TM_TASK_ID": DISCOVERY_TASK_ID,
             "TM_PROXY_CONTROL_URL": _proxy_control_url(),
@@ -412,6 +516,7 @@ def _prepare_discovery(
     checkpoint = STATE_ROOT / "checkpoints" / f"{cycle_id}.json"
     proxy_url = _proxy_control_url()
     argv = _discovery_argv(
+        dag_id=dag_id,
         cycle_id=cycle_id,
         run_id=run_id,
         proxy_control_url=proxy_url,
@@ -458,7 +563,7 @@ def _prepare_discovery(
         "TM_APPROVAL_MODE": "one_shot",
         "PYTHONPATH": RUNNER_PYTHONPATH,
         "TM_CYCLE_ID": cycle_id,
-        "TM_DAG_ID": DAG_ID,
+        "TM_DAG_ID": dag_id,
         "TM_RUN_ID": run_id,
         "TM_TASK_ID": DISCOVERY_TASK_ID,
         "TM_PROXY_CONTROL_URL": proxy_url,
@@ -534,6 +639,7 @@ def _load_discovery_manifest(
 
 def _promotion_argv(
     *,
+    dag_id: str = DAG_ID,
     run_id: str,
     cycle_id: str,
     expected_revision: int,
@@ -544,7 +650,7 @@ def _promotion_argv(
         "airflow",
         "tasks",
         "run",
-        DAG_ID,
+        dag_id,
         "publish_registry",
         run_id,
         "--cycle-id",
@@ -815,6 +921,10 @@ def _publish_registry_standing(
             publication_path,
             {"manifest_hash": publication_hash, "manifest": evidence},
         )
+        if prepared.get('TM_DISCOVERY_JOB_PATH'):
+            mark_published(Path(prepared['TM_DISCOVERY_JOB_PATH']),
+                manifest_hash=manifest_hash, snapshot_id=applied.plan.snapshot_id,
+                now=datetime.now(timezone.utc), write=_atomic_json)
         return {
             "status": "success",
             "registry_snapshot_id": applied.plan.snapshot_id,
@@ -836,6 +946,7 @@ def _publish_registry(
     approval_journal: str,
     connection_factory=None,
     publisher=None,
+    lane_dag_id: str | None = None,
     **context,
 ) -> dict[str, Any]:
     """Apply Silver registry transforms and CAS after the third approval."""
@@ -850,10 +961,18 @@ def _publish_registry(
         raise AirflowException("expected_revision must be a non-negative integer")
     revision = int(expected_revision)
     run_id = _run_id(context)
-    cycle_id = _cycle_id(run_id)
+    dag_id = lane_dag_id or DAG_ID
+    cycle_id = _cycle_id(run_id, dag_id)
     ti = context.get("ti")
     if ti is None:
         raise AirflowException("task instance context is required")
+    prepared = (ti.xcom_pull(task_ids='prepare_discovery')
+                if _is_scheduled_run(context) and _truthy_env(STANDING_POLICY_ENV_GATE) else None)
+    if (isinstance(prepared, Mapping) and prepared.get('TM_APPROVAL_MODE') == 'standing_policy'
+            and prepared.get('TM_DISCOVERY_JOB_PATH')):
+        if Path(prepared['TM_DISCOVERY_JOB_PATH']) != STATE_ROOT / 'cohorts' / 'active.json':
+            raise AirflowException('unexpected discovery cohort path')
+        cycle_id = str(prepared['TM_CYCLE_ID'])
     manifest_path, manifest_hash, manifest = _load_discovery_manifest(
         ti.xcom_pull(task_ids=DISCOVERY_TASK_ID),
         cycle_id=cycle_id,
@@ -937,6 +1056,7 @@ def _publish_registry(
         else packet.packet_hash
     )
     argv = _promotion_argv(
+        dag_id=dag_id,
         run_id=run_id,
         cycle_id=cycle_id,
         expected_revision=revision,
@@ -1058,150 +1178,162 @@ def _publish_registry(
             connection.close()
 
 
-with DAG(
-    dag_id=DAG_ID,
-    default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
-    description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
-    # Daily at 18:00 UTC (21:00 MSK): after the ingest day (≈15–18 MSK) and
-    # well before the nightly auto-delivery (≈04 MSK).  The run is "daily"
-    # (regulations only) unless the last full crawl is a week old (#1391).
-    schedule="0 18 * * *",
-    start_date=datetime(2024, 1, 1),
-    catchup=False,
-    render_template_as_native_obj=True,
-    tags=DAG_TAGS.get(
-        "transfermarkt",
-        ["scraping", "transfermarkt", "bronze", "football"],
-    )
-    + ["registry", "discovery"],
-    max_active_runs=1,
-    params={
-        "paid_proxy_packet_path": Param(default="", type="string"),
-        "paid_proxy_packet_hash": Param(default="", type="string"),
-        "bronze_write_packet_path": Param(default="", type="string"),
-        "bronze_write_packet_hash": Param(default="", type="string"),
-        "promotion_write_packet_path": Param(
-            default=str(APPROVAL_ROOT / "registry-promotion.json"),
-            type="string",
-        ),
-        "promotion_write_packet_hash": Param(default="", type="string"),
-        "approval_journal": Param(default=str(APPROVAL_JOURNAL), type="string"),
-        "expected_registry_revision": Param(
-            default=0,
-            type="integer",
-            minimum=0,
-        ),
-    },
-    doc_md="""
-    Daily central-registry refresh (#1391): "daily" mode refreshes every
-    competition's editions from tmapi regulation; "full" (catalogue, country
-    pages, regulations) runs when the last full crawl is a week old. A page
-    that cannot be read carries its competitions over from the canonical
-    snapshot; more than 10 % carried drops the snapshot. A manual trigger keeps the one-shot
-    ritual: the run fails closed until separate approved paid-proxy and
-    Bronze-write packets are supplied, and after discovery the third exact
-    packet must be created/approved before clearing `publish_registry`. Only
-    a run_type=scheduled run with every packet parameter empty and
-    TM_STANDING_POLICY_ENABLED=true is instead covered by the committed
-    standing policy (dags/configs/transfermarkt/standing_registry_policy.json),
-    whose floors must equal the pinned 15 MiB/1024/96 discovery limits (its
-    `scaling` block grows them with the run's work) and whose
-    sha256 is re-verified by the child before paid I/O and by publication.
-    The gate is deliberately the same key as dag_ingest_transfermarkt's: the
-    two paid contours activate together and per-DAG isolation comes from the
-    dag_id inside each policy file. Standing publication reads the live
-    canonical revision immediately before the swap; the CAS MERGE plus its
-    mandatory readback still fail on any concurrent revision change, and all
-    publication DQ gates (unknown_active_count = 0 included) are unchanged.
-    The proxy task is single-concurrency in `transfermarkt_proxy` and has a
-    hard 15 MiB provider ledger. No Silver table or CAS state is touched
-    before the promotion authorization (packet or standing policy) is proven.
-    Unknown or conflicting active classification blocks publication in both
-    modes.
-    """,
-) as dag:
-    prepare_discovery_task = PythonOperator(
-        task_id="prepare_discovery",
-        python_callable=_prepare_discovery,
-        op_kwargs={
-            "paid_proxy_packet_path": "{{ params.paid_proxy_packet_path }}",
-            "paid_proxy_packet_hash": "{{ params.paid_proxy_packet_hash }}",
-            "bronze_write_packet_path": "{{ params.bronze_write_packet_path }}",
-            "bronze_write_packet_hash": "{{ params.bronze_write_packet_hash }}",
-            "promotion_write_packet_path": ("{{ params.promotion_write_packet_path }}"),
-            "approval_journal": "{{ params.approval_journal }}",
+def _build_dag(dag_id: str, *, manual: bool = False):
+    with DAG(
+        dag_id=dag_id,
+        default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
+        description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
+        # Nine bounded slots retain three four-hour delivery gaps and 01–03 UTC quiet.
+        # One daily cohort resumes until complete; its paid caps never reset per slot.
+        schedule=None if manual else DISCOVERY_SCHEDULE,
+        dagrun_timeout=timedelta(hours=6) if manual else timedelta(seconds=RUN_SECONDS),
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        render_template_as_native_obj=True,
+        tags=DAG_TAGS.get(
+            "transfermarkt",
+            ["scraping", "transfermarkt", "bronze", "football"],
+        )
+        + ["registry", "discovery"],
+        max_active_runs=1,
+        is_paused_upon_creation=True if manual else None,
+        params={
+            "paid_proxy_packet_path": Param(default="", type="string"),
+            "paid_proxy_packet_hash": Param(default="", type="string"),
+            "bronze_write_packet_path": Param(default="", type="string"),
+            "bronze_write_packet_hash": Param(default="", type="string"),
+            "promotion_write_packet_path": Param(
+                default=str(APPROVAL_ROOT / "registry-promotion.json"),
+                type="string",
+            ),
+            "promotion_write_packet_hash": Param(default="", type="string"),
+            "approval_journal": Param(default=str(APPROVAL_JOURNAL), type="string"),
+            "expected_registry_revision": Param(
+                default=0,
+                type="integer",
+                minimum=0,
+            ),
         },
-        retries=0,
-    )
+        doc_md="""
+        Daily central-registry refresh (#1391): "daily" mode refreshes every
+        competition's editions from tmapi regulation; "full" (catalogue, country
+        pages, regulations) runs when the last full crawl is a week old. A page
+        that cannot be read carries its competitions over from the canonical
+        snapshot; more than 10 % carried drops the snapshot. A manual trigger keeps the one-shot
+        ritual: the run fails closed until separate approved paid-proxy and
+        Bronze-write packets are supplied, and after discovery the third exact
+        packet must be created/approved before clearing `publish_registry`. Only
+        a run_type=scheduled run with every packet parameter empty and
+        TM_STANDING_POLICY_ENABLED=true is instead covered by the committed
+        standing policy (dags/configs/transfermarkt/standing_registry_policy.json),
+        whose floors must equal the pinned 15 MiB/1024/96 discovery limits (its
+        `scaling` block grows them with the run's work) and whose
+        sha256 is re-verified by the child before paid I/O and by publication.
+        The gate is deliberately the same key as dag_ingest_transfermarkt's: the
+        two paid contours activate together and per-DAG isolation comes from the
+        dag_id inside each policy file. Standing publication reads the live
+        canonical revision immediately before the swap; the CAS MERGE plus its
+        mandatory readback still fail on any concurrent revision change, and all
+        publication DQ gates (unknown_active_count = 0 included) are unchanged.
+        The proxy task is single-concurrency in `transfermarkt_proxy` and has a
+        hard 15 MiB provider ledger. No Silver table or CAS state is touched
+        before the promotion authorization (packet or standing policy) is proven.
+        Unknown or conflicting active classification blocks publication in both
+        modes.
+        """,
+    ) as dag:
+        prepare_discovery_task = PythonOperator(
+            task_id="prepare_discovery",
+            python_callable=_prepare_discovery,
+            op_kwargs={
+                "lane_dag_id": dag_id,
+                "paid_proxy_packet_path": "{{ params.paid_proxy_packet_path }}",
+                "paid_proxy_packet_hash": "{{ params.paid_proxy_packet_hash }}",
+                "bronze_write_packet_path": "{{ params.bronze_write_packet_path }}",
+                "bronze_write_packet_hash": "{{ params.bronze_write_packet_hash }}",
+                "promotion_write_packet_path": ("{{ params.promotion_write_packet_path }}"),
+                "approval_journal": "{{ params.approval_journal }}",
+            },
+            retries=0,
+        )
 
-    discover_registry_task = BashOperator(
-        task_id=DISCOVERY_TASK_ID,
-        bash_command=r'''set -euo pipefail
-cd /opt/airflow
-case "$TM_APPROVAL_MODE" in
-  standing_policy)
-    approval_args=(
-      --standing-policy "$TM_STANDING_POLICY_PATH"
-      --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
-      --mode "$TM_MODE"
-      --byte-cap-bytes "$TM_BYTE_CAP_BYTES"
-    )
-    if [ -n "$TM_PREVIOUS_SNAPSHOT_ID" ]; then
-      approval_args+=(--previous-snapshot-id "$TM_PREVIOUS_SNAPSHOT_ID")
-    fi
-    ;;
-  one_shot)
-    approval_args=(
-      --paid-proxy-approval-packet "$TM_PAID_PACKET"
-      --production-write-approval-packet "$TM_BRONZE_PACKET"
-      --approval-journal "$TM_APPROVAL_JOURNAL"
-    )
-    ;;
-  *)
-    echo "unknown TM_APPROVAL_MODE: $TM_APPROVAL_MODE" >&2
-    exit 1
-    ;;
-esac
-exec python /opt/airflow/dags/scripts/run_transfermarkt_discovery.py \
-  --cycle-id "$TM_CYCLE_ID" \
-  --dag-id "$TM_DAG_ID" \
-  --run-id "$TM_RUN_ID" \
-  --task-id "$TM_TASK_ID" \
-  --proxy-control-url "$TM_PROXY_CONTROL_URL" \
-  --checkpoint "$TM_CHECKPOINT" \
-  --cache "$TM_CACHE" \
-  --output-root "$TM_OUTPUT_ROOT" \
-  --request-limit "$TM_REQUEST_LIMIT" \
-  --retry-limit "$TM_RETRY_LIMIT" \
-  --cache-ttl-seconds "$TM_CACHE_TTL_SECONDS" \
-  --lease-ttl-seconds "$TM_LEASE_TTL_SECONDS" \
-  "${approval_args[@]}"''',
-        env="{{ ti.xcom_pull(task_ids='prepare_discovery') }}",
-        append_env=True,
-        retries=0,
-        pool="transfermarkt_proxy",
-        pool_slots=1,
-        max_active_tis_per_dag=1,
-        # A full crawl reads ~2 000 pages at 10 requests a minute.
-        execution_timeout=timedelta(hours=6),
-        do_xcom_push=True,
-    )
+        discover_registry_task = DiscoveryPortionOperator(
+            task_id=DISCOVERY_TASK_ID,
+            bash_command=r'''set -euo pipefail
+    cd /opt/airflow
+    case "$TM_APPROVAL_MODE" in
+      standing_policy)
+        approval_args=(
+          --standing-policy "$TM_STANDING_POLICY_PATH"
+          --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
+          --mode "$TM_MODE"
+          --byte-cap-bytes "$TM_BYTE_CAP_BYTES"
+          --portion-seconds 2700
+          --job-path "$TM_DISCOVERY_JOB_PATH"
+          --deadline-at "$TM_DISCOVERY_DEADLINE_AT"
+        )
+        if [ -n "$TM_PREVIOUS_SNAPSHOT_ID" ]; then
+          approval_args+=(--previous-snapshot-id "$TM_PREVIOUS_SNAPSHOT_ID")
+        fi
+        ;;
+      one_shot)
+        approval_args=(
+          --paid-proxy-approval-packet "$TM_PAID_PACKET"
+          --production-write-approval-packet "$TM_BRONZE_PACKET"
+          --approval-journal "$TM_APPROVAL_JOURNAL"
+        )
+        ;;
+      *)
+        echo "unknown TM_APPROVAL_MODE: $TM_APPROVAL_MODE" >&2
+        exit 1
+        ;;
+    esac
+    exec python /opt/airflow/dags/scripts/run_transfermarkt_discovery.py \
+      --cycle-id "$TM_CYCLE_ID" \
+      --dag-id "$TM_DAG_ID" \
+      --run-id "$TM_RUN_ID" \
+      --task-id "$TM_TASK_ID" \
+      --proxy-control-url "$TM_PROXY_CONTROL_URL" \
+      --checkpoint "$TM_CHECKPOINT" \
+      --cache "$TM_CACHE" \
+      --output-root "$TM_OUTPUT_ROOT" \
+      --request-limit "$TM_REQUEST_LIMIT" \
+      --retry-limit "$TM_RETRY_LIMIT" \
+      --cache-ttl-seconds "$TM_CACHE_TTL_SECONDS" \
+      --lease-ttl-seconds "$TM_LEASE_TTL_SECONDS" \
+      "${approval_args[@]}"''',
+            env="{{ ti.xcom_pull(task_ids='prepare_discovery') }}",
+            append_env=True,
+            retries=0,
+            pool="transfermarkt_proxy",
+            pool_slots=1,
+            max_active_tis_per_dag=1,
+            # Calendar slots, not task retries: the shared proxy pool is free between them.
+            priority_weight=200,
+            execution_timeout=timedelta(hours=6) if manual else timedelta(minutes=50),
+            do_xcom_push=True,
+        )
 
-    publish_registry_task = PythonOperator(
-        task_id="publish_registry",
-        python_callable=_publish_registry,
-        op_kwargs={
-            "expected_revision": "{{ params.expected_registry_revision }}",
-            "promotion_write_packet_path": ("{{ params.promotion_write_packet_path }}"),
-            "promotion_write_packet_hash": ("{{ params.promotion_write_packet_hash }}"),
-            "approval_journal": "{{ params.approval_journal }}",
-        },
-        retries=0,
-        execution_timeout=timedelta(minutes=30),
-    )
+        publish_registry_task = PythonOperator(
+            task_id="publish_registry",
+            python_callable=_publish_registry,
+            op_kwargs={
+                "lane_dag_id": dag_id,
+                "expected_revision": "{{ params.expected_registry_revision }}",
+                "promotion_write_packet_path": ("{{ params.promotion_write_packet_path }}"),
+                "promotion_write_packet_hash": ("{{ params.promotion_write_packet_hash }}"),
+                "approval_journal": "{{ params.approval_journal }}",
+            },
+            retries=0,
+            execution_timeout=timedelta(minutes=30) if manual else timedelta(minutes=5),
+        )
 
-    prepare_discovery_task >> discover_registry_task >> publish_registry_task
+        prepare_discovery_task >> discover_registry_task >> publish_registry_task
+    return dag
 
+
+dag = _build_dag(DAG_ID)
+manual_dag = _build_dag(MANUAL_DAG_ID, manual=True)
 
 __all__ = [
     "DAG_ID",

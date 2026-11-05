@@ -560,3 +560,11 @@ def test_listing_bytes_meet_squad_memberships_ops():
     merged = traffic.merge_ops(ledger, rows, {}, ALL_OK)
     assert merged["reconciliation"]["unexplained"] == [] and merged["reconciliation"]["status"] == "ok"
     assert merged["entities"]["current"]["players"]["kib_per_request"] == 1000 / 1024 / 2
+
+
+def test_manual_discovery_bytes_remain_in_registry_lane(tmp_path):
+    write_ledger(tmp_path, [event(at='2026-10-29T15:00:10+00:00', size=180,
+        dag='dag_discover_transfermarkt_registry_manual', run='manual-registry')])
+    summary = ledger_summary(tmp_path)
+    assert summary['by_lane'] == {'registry': 180}
+    assert summary['run_ids']['registry'] == ['manual-registry']

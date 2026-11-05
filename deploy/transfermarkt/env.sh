@@ -118,3 +118,40 @@ transfermarkt_mounts_in() {  # transfermarkt_mounts_in <контейнер> <к�
     index($0,root)==1 { t++; if ($0!=new && index($0,new"/")!=1) b++ }
     END { print (t>=min && b==0) ? 1 : 0 }'
 }
+
+# Read the release contract without importing Airflow or executing release code.
+# Legacy releases expose four DAGs; the factory adds an explicitly declared manual DAG.
+transfermarkt_release_dags() {
+  python3 -I - "$1/dags/dag_discover_transfermarkt_registry.py" <<'PY'
+import ast
+from pathlib import Path
+import sys
+try:
+    tree = ast.parse(Path(sys.argv[1]).read_text())
+    assignments = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+                   for target in node.targets if isinstance(target, ast.Name)}
+    assert isinstance(assignments.get('DAG_ID'), ast.Constant) and assignments['DAG_ID'].value == 'dag_discover_transfermarkt_registry'
+    for name in ('DAG_ID', 'MANUAL_DAG_ID', 'manual_dag'):
+        bindings = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name]
+        assert len(bindings) == int(name in assignments)
+    marker = assignments.get('MANUAL_DAG_ID')
+    manual = assignments.get('manual_dag')
+    dags = ['dag_ingest_transfermarkt', 'dag_discover_transfermarkt_registry',
+            'dag_backfill_transfermarkt', 'dag_transform_transfermarkt_silver']
+    if marker is not None or manual is not None:
+        assert isinstance(marker, ast.Constant) and marker.value == 'dag_discover_transfermarkt_registry_manual'
+        assert isinstance(manual, ast.Call) and isinstance(manual.func, ast.Name) and manual.func.id == '_build_dag'
+        assert len(manual.args) == 1 and isinstance(manual.args[0], ast.Name) and manual.args[0].id == 'MANUAL_DAG_ID'
+        assert any(k.arg == 'manual' and isinstance(k.value, ast.Constant) and k.value.value is True for k in manual.keywords)
+        dags.append(marker.value)
+    print(' '.join(dags))
+except (OSError, UnicodeError, SyntaxError, AssertionError):
+    print('invalid Transfermarkt release DAG contract', file=sys.stderr)
+    sys.exit(2)
+PY
+}
+transfermarkt_dags_sql() {
+  local d result=""
+  for d in $1; do result="$result'$d',"; done
+  printf '%s' "${result%,}"
+}

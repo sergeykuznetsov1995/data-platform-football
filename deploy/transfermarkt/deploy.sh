@@ -2,7 +2,7 @@
 # Выкат замороженного дерева на контур Transfermarkt (проекты transfermarkt-airflow /
 # transfermarkt-gw, #1387). Образец — deploy/sofascore/deploy.sh, без drain: доставка идёт
 # только когда в своей метабазе нет running-прогона TM-DAG (иначе код 4, бой не тронут);
-# перед остановкой шлюза все четыре DAG встают на паузу и простой подтверждается ещё раз.
+# перед остановкой шлюза все зарегистрированные DAG контура встают на паузу и простой подтверждается ещё раз.
 # Использование: bash deploy/transfermarkt/deploy.sh <release-root> [old-release-root]
 #   Тот же скрипт из СТАРОГО дерева — это и есть откат (auto_deliver.sh).
 # Переменные — из $TRANSFERMARKT_ENV_FILE (по умолчанию /etc/data-platform/transfermarkt.env);
@@ -32,7 +32,12 @@ INGEST=dag_ingest_transfermarkt
 DISCOVER=dag_discover_transfermarkt_registry
 BACKFILL=dag_backfill_transfermarkt
 SILVER=dag_transform_transfermarkt_silver
-TM_DAGS_SQL="'$INGEST','$DISCOVER','$BACKFILL','$SILVER'"
+MANUAL=dag_discover_transfermarkt_registry_manual
+TM_DAGS=$(transfermarkt_release_dags "$RELEASE") || exit 2
+TM_DAGS_SQL=$(transfermarkt_dags_sql "$TM_DAGS")
+TM_DAG_COUNT=$(wc -w <<< "$TM_DAGS")
+GUARD_DAGS="$INGEST $DISCOVER $BACKFILL $SILVER $MANUAL"
+GUARD_DAGS_SQL=$(transfermarkt_dags_sql "$GUARD_DAGS")
 # Таймаут обязателен: зависший `docker exec` держал бы выкат (и автомат из cron) вечно.
 PSQL="timeout -k 5 ${TRANSFERMARKT_DEPLOY_METADB_TIMEOUT:-30} docker exec $METADB psql -U airflow -d airflow -At -c"
 # Леджер шлюза старше стольких дней уходит в gzip-архив на доставке (решение 9 #1387).
@@ -127,12 +132,12 @@ fi
 STEP="idle"
 # Драйна нет (решение 9 #1387): TM-DAG идут раз в сутки в 04:00 UTC, окно доставки
 # 01:00–03:00. Идущий прогон не обрываем — выходим с 4. Пустой ответ = «не знаю».
-running=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ($TM_DAGS_SQL) AND state='running';" || true)
+running=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ($GUARD_DAGS_SQL) AND (state='running' OR (dag_id='$MANUAL' AND state='queued'));" || true)
 [ -n "$running" ] || { log "метабаза $METADB не ответила про идущие прогоны — nothing deployed"; exit 4; }
 [ "$running" = 0 ] || { log "идёт прогон TM ($running running) — nothing deployed"; exit 4; }
-# Закрыть новые запуски: все четыре DAG на паузу (прогон паузного DAG планировщик не
+# Закрыть новые запуски: все зарегистрированные DAG контура на паузу (прогон паузного DAG планировщик не
 # двигает), затем подтвердить простой ещё раз — ран мог стартовать между проверкой и паузой.
-for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
+for d in $GUARD_DAGS; do
   WAS_PAUSED[$d]=$(is_paused "$d" || true)
   case "${WAS_PAUSED[$d]}" in
     t|f) ;;
@@ -144,9 +149,9 @@ for d in "${!WAS_PAUSED[@]}"; do
   timeout -k 5 60 docker exec "$SCHED" airflow dags pause "$d" >> "$LOG" 2>&1 8>&- || true
   [ "$(is_paused "$d")" = t ] || { log "$d не встал на паузу — nothing deployed"; exit 4; }
 done
-busy=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($TM_DAGS_SQL) AND state='running') + (SELECT count(*) FROM task_instance WHERE dag_id IN ($TM_DAGS_SQL) AND state IN ('queued','running','restarting'));" || true)
+busy=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($GUARD_DAGS_SQL) AND (state='running' OR (dag_id='$MANUAL' AND state='queued'))) + (SELECT count(*) FROM task_instance WHERE dag_id IN ($GUARD_DAGS_SQL) AND state IN ('queued','running','restarting'));" || true)
 [ "$busy" = 0 ] || { log "после паузы контур не пуст ('${busy:-нет ответа}') — nothing deployed"; exit 4; }
-log "idle: running-прогонов TM нет, четыре DAG на паузе; deploy $RELEASE (old: ${OLD_RELEASE:--})"
+log "idle: running-прогонов TM нет, DAG контура на паузе; deploy $RELEASE (old: ${OLD_RELEASE:--})"
 
 STEP="repin-env"
 transfermarkt_set_env_var "$ENV_FILE" TRANSFERMARKT_RELEASE_ROOT "$RELEASE"
@@ -232,12 +237,12 @@ present=""; errs=""
 for _ in $(seq 1 60); do
   errs=$($PSQL "SELECT count(*) FROM import_error;" || true)
   present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ($TM_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$STARTED';" || true)
-  [ "$present" = "4" ] && break
+  [ "$present" = "$TM_DAG_COUNT" ] && break
   sleep 10
 done
 log "dags parsed after start=$present import_errors=$errs"
 [ "$errs" = "0" ] || { log "import errors present — см. import_error"; exit 6; }
-[ "$present" = "4" ] || { log "expected 4 parsed TM DAGs, got '$present'"; exit 6; }
+[ "$present" = "$TM_DAG_COUNT" ] || { log "expected $TM_DAG_COUNT parsed TM DAGs, got '$present'"; exit 6; }
 # Живой SchedulerJob: healthcheck контейнера — `airflow jobs check` по heartbeat.
 for _ in $(seq 1 30); do
   [ "$(docker inspect -f '{{.State.Health.Status}}' "$SCHED" 2>/dev/null)" = "healthy" ] && break
@@ -260,11 +265,11 @@ log "mounts of $SCHED and $GW lead into $RELEASE"
 STEP="pauses"
 # Паузы — как были до выката: ручная пауза оператора выкат не снимает. DAG, которого до
 # выката в метабазе не было (первый подъём), получает дефолт решения 10 #1387:
-# ingest/discover работают, backfill/silver — на паузе. Откат возвращает паузы из
+# ingest/discover работают, backfill/silver/manual — на паузе. Откат возвращает паузы из
 # снимка — это делает автомат после этого скрипта.
-declare -A DEFAULT_PAUSED=(["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t)
+declare -A DEFAULT_PAUSED=(["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t ["$MANUAL"]=t)
 summary=""
-for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
+for d in $TM_DAGS; do
   want="${WAS_PAUSED[$d]:-${DEFAULT_PAUSED[$d]}}"
   set_pause "$d" "$want"
   summary="$summary $d=$want"

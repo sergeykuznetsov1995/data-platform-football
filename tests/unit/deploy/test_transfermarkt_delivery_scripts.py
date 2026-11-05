@@ -50,6 +50,10 @@ case "$cmd" in
     c=$1; shift
     if [ "$c" = transfermarkt-airflow-metadb ]; then
       sql=${@: -1}
+      echo "$sql" >> "$S/queries"
+      if [[ "$sql" == *dag_discover_transfermarkt_registry_manual* && "$sql" == *dag_run* ]] && [ -e "$S/manual_busy" ]; then
+        cat "$S/manual_busy"; exit 0
+      fi
       case "$sql" in
         *last_parsed_time*) cat "$S/dags" ;;
         *import_error*) cat "$S/import_errors" 2>/dev/null || echo 0 ;;
@@ -63,7 +67,9 @@ case "$cmd" in
         *"state IN ('queued','running')"*)
           case "$sql" in *dag_ingest_transfermarkt*) [ -e "$S/ingest_running" ] && { echo 1; exit 0; } ;; esac
           cat "$S/registry_busy" 2>/dev/null || echo 0 ;;
-        *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" ;;
+        *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}
+          if [[ "$sql" == *coalesce* ]] && [ ! -e "$S/paused_$dag" ]; then echo -
+          else cat "$S/paused_$dag"; fi ;;
         *slot_pool*) pool=${sql#*pool=\'}; pool=${pool%%\'*}
           [ ! -e "$S/pool_query_fails_$pool" ] || exit 1
           cat "$S/pool_$pool" ;;
@@ -125,6 +131,8 @@ class Stand:
         self.new = self.releases / "release-ne000000"
         for tree in (self.old, self.new):
             (tree / "deploy" / "transfermarkt").mkdir(parents=True)
+            (tree / "dags").mkdir()
+            (tree / "dags" / "dag_discover_transfermarkt_registry.py").write_text('DAG_ID = "dag_discover_transfermarkt_registry"\n')
         stub = OLD_DEPLOY_STUB.replace("__STATE__", str(self.state)).replace(
             "__SCHED__", SCHED).replace("__GW__", GW).replace("__POOLS__", " ".join(POOLS))
         old_deploy = self.old / "deploy" / "transfermarkt" / "deploy.sh"
@@ -436,7 +444,9 @@ case "$cmd" in
         printf '%s/dags\n%s/deploy/transfermarkt/.airflowignore\n%s/scrapers\n%s/scripts\n%s/configs\n' \
           "$r" "$r" "$r" "$r" "$r" > "$S/mounts_transfermarkt-airflow-scheduler"
         echo healthy > "$S/health_transfermarkt-airflow-scheduler"
-        echo 4 > "$S/registered" ;;
+        if grep -q '^MANUAL_DAG_ID' "$r/dags/dag_discover_transfermarkt_registry.py"; then
+          echo 5 > "$S/registered"
+        else echo 4 > "$S/registered"; fi ;;
     esac ;;
   inspect)
     fmt=""; [ "$1" = -f ] && { fmt=$2; shift 2; }
@@ -452,6 +462,9 @@ case "$cmd" in
     c=$1; shift
     if [ "$c" = transfermarkt-airflow-metadb ]; then
       sql=${@: -1}
+      if [[ "$sql" == *dag_discover_transfermarkt_registry_manual* && "$sql" == *dag_run* ]] && [ -e "$S/manual_busy" ]; then
+        cat "$S/manual_busy"; exit 0
+      fi
       case "$sql" in
         *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" 2>/dev/null || echo - ;;
         *last_parsed_time*) cat "$S/registered" 2>/dev/null || echo 0 ;;
@@ -492,6 +505,8 @@ def _deploy_stand(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     releases = tmp_path / "releases"
     release = releases / "release-f1r5t000"
     (release / "deploy" / "transfermarkt").mkdir(parents=True)
+    (release / "dags").mkdir()
+    (release / "dags" / "dag_discover_transfermarkt_registry.py").write_text('DAG_ID = "dag_discover_transfermarkt_registry"\n')
     for name in ("airflow.compose.yaml", "gateway.compose.yaml", ".airflowignore", "deploy.sh", "env.sh"):
         (release / "deploy" / "transfermarkt" / name).write_text(
             (DEPLOY / name).read_text(encoding="utf-8"), encoding="utf-8")
@@ -686,6 +701,8 @@ class Delivery(Stand):
         # Релиз несёт ровно установленную копию автомата: сверка по md5 (#1362).
         (d / "auto_deliver.sh").write_text(self.automat.read_text(encoding="utf-8"), encoding="utf-8")
         (d / "env.sh").write_text((DEPLOY / "env.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (self.source / "dags").mkdir()
+        (self.source / "dags" / "dag_discover_transfermarkt_registry.py").write_text('DAG_ID = "dag_discover_transfermarkt_registry"\n')
         (self.source / "marker.txt").write_text("one\n", encoding="utf-8")
         _git(self.source, "add", "-A")
         _git(self.source, "commit", "-q", "-m", "one")
@@ -1030,3 +1047,136 @@ def test_a_failed_pause_restore_within_the_drain_term_is_retried_not_escalated(d
     assert delivery.run().returncode == 0
     assert not delivery.drain().exists()
     _assert_pauses_as_before(delivery)
+
+MANUAL = "dag_discover_transfermarkt_registry_manual"
+
+
+def add_manual_contract(tree: Path) -> None:
+    (tree / "dags" / "dag_discover_transfermarkt_registry.py").write_text(
+        'DAG_ID = "dag_discover_transfermarkt_registry"\n'
+        f'MANUAL_DAG_ID = "{MANUAL}"\n'
+        'manual_dag = _build_dag(MANUAL_DAG_ID, manual=True)\n'
+    )
+
+
+@pytest.mark.unit
+def test_new_automatic_script_accepts_old_four_dag_snapshot(stand: Stand) -> None:
+    add_manual_contract(stand.new)
+    result = stand.probe('snapshot_ok && echo valid')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'valid'
+    stand.put('dags', '4')
+    assert stand.acceptance().stdout.strip() == '0'
+    stand.put('dags', '5')
+    for pool in POOLS:
+        stand.put(f'pool_{pool}', '0' if 'backfill' in pool else '1')
+    assert stand.acceptance().stdout.strip() == '1'
+
+
+@pytest.mark.unit
+def test_rollback_from_five_to_four_dags_pauses_removed_manual(stand: Stand) -> None:
+    add_manual_contract(stand.new)
+    stand.put(f'paused_{MANUAL}', 'f')
+    result = stand.probe(f'transfermarkt_deploy_lock_init\nrollback_to_old "{stand.old}" "before" && echo restored')
+    assert result.returncode == 0, (result.stderr, stand.log())
+    assert result.stdout.strip() == 'restored'
+    assert stand.env_root() == str(stand.old)
+    assert (stand.state / f'paused_{MANUAL}').read_text().strip() == 't'
+    queries = (stand.state / 'queries').read_text().splitlines()
+    parsed = [q for q in queries if 'last_parsed_time' in q]
+    assert parsed and MANUAL not in parsed[-1]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('previous', ['t', 'f'])
+def test_drain_preserves_existing_manual_pause(stand: Stand, previous: str) -> None:
+    add_manual_contract(stand.new)
+    stand.put(f'paused_{MANUAL}', previous)
+    (stand.runtime / 'gateway-state').mkdir()
+    result = stand.probe('LANE="dag_ingest_transfermarkt"\nWANT=target\ndrain_begin && drain_pause')
+    assert result.returncode == 0, (result.stderr, stand.log())
+    assert (stand.state / f'paused_{MANUAL}').read_text().strip() == 't'
+    result = stand.probe('drain_release')
+    assert result.returncode == 0, (result.stderr, stand.log())
+    assert (stand.state / f'paused_{MANUAL}').read_text().strip() == previous
+
+
+@pytest.mark.unit
+def test_manual_work_blocks_idle_outer_and_legacy_rollback(stand: Stand) -> None:
+    add_manual_contract(stand.new)
+    stand.put(f'paused_{MANUAL}', 'f')
+    stand.put('manual_busy', '1')
+    result = stand.probe('lane_refresh\nouter_busy\ncontour_busy')
+    assert result.stdout.strip() == '11'
+    result = stand.probe(f'transfermarkt_deploy_lock_init\nrollback_to_old "{stand.old}" "before"')
+    assert result.returncode != 0
+    assert not (stand.state / 'old_deploy_called').exists()
+    assert (stand.state / f'paused_{MANUAL}').read_text().strip() == 'f'
+
+
+@pytest.mark.unit
+def test_manual_never_enters_next_scheduled_run_query(stand: Stand) -> None:
+    add_manual_contract(stand.new)
+    result = stand.probe('lane_refresh\nset_deadline')
+    assert result.returncode == 0, result.stderr
+    queries = (stand.state / 'queries').read_text().splitlines()
+    scheduled = [q for q in queries if 'next_dagrun_create_after' in q]
+    assert scheduled and all(MANUAL not in q for q in scheduled)
+
+
+@pytest.mark.unit
+def test_invalid_manual_contract_fails_closed(stand: Stand) -> None:
+    add_manual_contract(stand.new)
+    source = stand.new / 'dags' / 'dag_discover_transfermarkt_registry.py'
+    source.write_text(source.read_text().replace('manual=True', 'manual=False'))
+    assert stand.acceptance().stdout.strip() == 'X'
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('manual_target', [False, True])
+def test_direct_deploy_migrates_dag_contract_and_preserves_pauses(tmp_path: Path, manual_target: bool) -> None:
+    state, runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    (state / 'registered').write_text('4' if manual_target else '5')
+    for dag in DAGS:
+        (state / f'paused_{dag}').write_text('t' if 'ingest' in dag else 'f')
+    if manual_target:
+        add_manual_contract(release)
+    else:
+        (state / f'paused_{MANUAL}').write_text('f')
+    result = _run_deploy(release, stubs, env_file)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (state / 'registered').read_text().strip() == ('5' if manual_target else '4')
+    for dag in DAGS:
+        assert (state / f'paused_{dag}').read_text().strip() == ('t' if 'ingest' in dag else 'f')
+    # New manual defaults paused; removed manual stays paused on rollback.
+    assert (state / f'paused_{MANUAL}').read_text().strip() == 't'
+
+
+@pytest.mark.unit
+def test_direct_deploy_refuses_queued_manual_without_touching_services(tmp_path: Path) -> None:
+    state, runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    (state / 'manual_busy').write_text('1')
+    result = _run_deploy(release, stubs, env_file)
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert not (state / 'compose_calls').exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('bad_source', [None, 'def (:', 'x = 1',
+    'DAG_ID = "dag_discover_transfermarkt_registry"\nMANUAL_DAG_ID = "x"',
+    'DAG_ID = "dag_discover_transfermarkt_registry"\nDAG_ID = "dag_discover_transfermarkt_registry"'])
+def test_release_contract_rejects_missing_malformed_ambiguous_source(stand: Stand, bad_source: str | None) -> None:
+    source = stand.new / 'dags' / 'dag_discover_transfermarkt_registry.py'
+    if bad_source is None:
+        source.unlink()
+    else:
+        source.write_text(bad_source)
+    assert stand.acceptance().stdout.strip() == 'X'
+
+
+@pytest.mark.unit
+def test_five_dag_old_release_requires_manual_pause_in_snapshot(stand: Stand) -> None:
+    add_manual_contract(stand.old)
+    result = stand.probe('snapshot_ok')
+    assert result.returncode != 0
+    assert MANUAL in stand.log()

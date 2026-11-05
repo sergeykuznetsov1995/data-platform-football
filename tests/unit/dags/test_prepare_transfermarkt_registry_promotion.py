@@ -14,7 +14,7 @@ from dags.utils import transfermarkt_registry_publish as registry_publish
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "prepare_transfermarkt_registry_promotion.py"
 RUN_ID = "manual__tm_registry_prod_20260711T180000Z"
-CYCLE_ID = "tm-registry-77baf81bfcf39e40e44de0ad"
+CYCLE_ID = "tm-registry-b60c785a48a63dfbc19a76b1"
 SNAPSHOT_ID = "tm-discovery-0123456789abcdef01234567"
 
 
@@ -88,6 +88,8 @@ def test_plan_binds_the_exact_manifest_and_authorizes_zero_proxy_io(tmp_path):
 
     assert first["promotion_packet_hash"] == second["promotion_packet_hash"]
     assert first["cycle_id"] == CYCLE_ID
+    assert "dag_discover_transfermarkt_registry_manual" in first["clear_argv"]
+    assert "dag_discover_transfermarkt_registry_manual" in first["packet"].argv
     assert not (tmp_path / "approvals").exists()
     assert packet.action == "production_write"
     assert packet.byte_cap_bytes == 0

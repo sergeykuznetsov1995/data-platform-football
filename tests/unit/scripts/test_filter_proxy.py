@@ -7363,6 +7363,29 @@ def test_transfermarkt_only_boots_without_budget_flags(
     )
 
 
+def test_manual_registry_uses_existing_current_stream_and_lease_cap(
+    shared_mod, monkeypatch, tmp_path
+):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    metadata = _tm_metadata("dag_discover_transfermarkt_registry_manual")
+    metadata["run_id"] = "manual__approved-registry"
+    lease = shared_mod._create_lease(
+        mgr, max_bytes=24 * 1024 * 1024, ttl_seconds=3600,
+        metadata=metadata, require_context=True,
+    )
+    assert lease.source == "transfermarkt"
+    assert lease.stream_id == "current-0"
+    assert lease.max_bytes == shared_mod.MAX_LEASE_BYTES == 24 * 1024 * 1024
+    assert lease.dag_id == metadata["dag_id"]
+    # A new DAG identity must not create another paid stream alongside current.
+    with pytest.raises(RuntimeError, match="reserved stream concurrency limit"):
+        shared_mod._create_lease(
+            mgr, max_bytes=4096, ttl_seconds=60,
+            metadata=_tm_metadata(), require_context=True,
+        )
+
+
 def test_transfermarkt_only_lease_is_bounded_by_the_lease_cap_alone(
     shared_mod, monkeypatch, tmp_path
 ):

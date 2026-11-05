@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import replace
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -1295,3 +1296,159 @@ def test_previous_snapshot_drift_fails_before_client_io(tmp_path):
             utcnow=lambda: NOW,
         )
     assert _FakeClient.instances == []
+
+
+
+def _portion_args(mod, tmp_path, raw):
+    from dags.utils.transfermarkt_discovery_continuation import select_job, identity_for, cohort_day
+    raw += ['--portion-seconds', '1200', '--deadline-at', (NOW + timedelta(minutes=55)).isoformat(),
+            '--job-path', str(tmp_path / 'cohorts' / 'active.json')]
+    args = mod._parser().parse_args(raw)
+    job = select_job(Path(args.job_path), identity_for(previous_snapshot_id=None, mode='full',
+        policy_hash=args.standing_policy_sha256, request_limit=args.request_limit,
+        retry_limit=args.retry_limit, byte_cap_bytes=args.byte_cap_bytes,
+        day=cohort_day(NOW), dry_run=args.dry_run), now=NOW, write=mod._atomic_json_write)
+    args.checkpoint = job['checkpoint_path']
+    return args
+
+def test_settled_portion_resumes_checkpoint_with_cumulative_budget(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, 'true')
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+    clients = []
+    class Client(_FakeClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.options = kwargs
+            clients.append(self)
+        def fetch(self, url, **kwargs):
+            return replace(super().fetch(url, **kwargs), raw_uri='s3://raw/original',
+                           raw_fetched_at=NOW.isoformat(), raw_capture_id='original-capture',
+                           raw_attempt_envelope_ids=('original-envelope',))
+    def first(**kw):
+        kw['fetch']('https://www.transfermarkt.com/wettbewerbe/europa')
+        kw['checkpoint']['finished-first-page'] = {'proof': 'fixture'}
+        clock[0] = 1140
+        kw['fetch']('https://www.transfermarkt.com/second')
+        pytest.fail('deadline must yield before second fetch')
+    common = dict(execution_argv=(str(SCRIPT), *raw), previous_reader=lambda _: None,
+                  lease_provider_factory=lambda _: object(), http_client_factory=Client,
+                  utcnow=lambda: NOW, monotonic=lambda: clock[0],
+                  writer_factory=lambda: pytest.fail('incomplete portion must not write'))
+    paused = mod.execute(args, discovery_fn=first, **common)
+    assert paused.manifest['status'] == 'paused'
+    assert paused.manifest['traffic']['requests'] == 1
+    assert paused.manifest['rows']['competitions'] is None
+    assert clients[0].closed
+    assert clients[0].options['request_deadline_monotonic'] == 1200
+    clock[0] = 4000
+    args.run_id = 'next-calendar-run'
+    args.cycle_id = 'next-calendar-cycle'
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    common['utcnow'] = lambda: NOW + timedelta(hours=4)
+    def second(**kw):
+        assert kw['checkpoint']['finished-first-page'] == {'proof': 'fixture'}
+        replay = kw['fetch']('https://www.transfermarkt.com/wettbewerbe/europa')
+        assert replay.status is FetchStatus.OK
+        assert replay.payload_hash == stable_payload_hash(replay.value)
+        assert clients[1].fetch_calls == []
+        assert replay.raw_uri == 's3://raw/original'
+        assert replay.raw_fetched_at == NOW.isoformat()
+        assert replay.raw_capture_id == 'original-capture'
+        assert replay.raw_attempt_envelope_ids == ('original-envelope',)
+        assert kw['traffic_ledger'].snapshot()['requests'] == 1
+        assert kw['traffic_ledger'].snapshot()['provider_metered_bytes'] == 100
+        return (_page(),)
+    complete = mod.execute(args, discovery_fn=second, **common)
+    assert complete.manifest['status'] == 'success'
+    assert complete.manifest['traffic']['requests'] == 1
+    assert clients[1].request_budget == args.request_limit - 1
+    assert complete.manifest['traffic']['provider_metered_bytes'] == 100
+    with pytest.raises(ValueError, match='not settled and resumable'):
+        mod.execute(args, discovery_fn=second, **common)
+
+
+def test_unsettled_portion_cannot_resume_or_publish(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, 'true')
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+    class Client(_FakeClient):
+        def close(self):
+            raise RuntimeError('unsettled provider counters')
+    def discovery(**kw):
+        clock[0] = 1140
+        kw['fetch']('https://www.transfermarkt.com/second')
+    common = dict(execution_argv=(str(SCRIPT), *raw), discovery_fn=discovery,
+                  previous_reader=lambda _: None, lease_provider_factory=lambda _: object(),
+                  http_client_factory=Client, utcnow=lambda: NOW, monotonic=lambda: clock[0],
+                  writer_factory=lambda: pytest.fail('unsettled portion must not write'))
+    with pytest.raises(RuntimeError, match='unsettled provider counters'):
+        mod.execute(args, **common)
+    with pytest.raises(ValueError, match='not settled and resumable'):
+        mod.execute(args, **common)
+
+
+def test_continuation_identity_drift_rejects_before_paid_client(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, 'true')
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+    def discovery(**kw):
+        clock[0] = 1140
+        kw['fetch']('https://www.transfermarkt.com/second')
+    common = dict(execution_argv=(str(SCRIPT), *raw), discovery_fn=discovery,
+                  previous_reader=lambda _: None, lease_provider_factory=lambda _: object(),
+                  http_client_factory=_FakeClient, utcnow=lambda: NOW, monotonic=lambda: clock[0])
+    mod.execute(args, **common)
+    from dags.utils.transfermarkt_discovery_continuation import read_job, write_job
+    saved = read_job(Path(args.job_path))
+    saved['identity']['policy_hash'] = '0' * 64
+    write_job(Path(args.job_path), saved, mod._atomic_json_write)
+    common['http_client_factory'] = lambda **kw: pytest.fail('identity drift must fail before client')
+    with pytest.raises(ValueError, match='identity differs'):
+        mod.execute(args, **common)
+
+
+def test_delayed_pool_start_cannot_create_fresh_work_budget(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, 'true')
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    with pytest.raises(mod.DiscoveryRunnerError, match='slot expired'):
+        mod.execute(args, execution_argv=(str(SCRIPT), *raw),
+            previous_reader=lambda _: None, utcnow=lambda: NOW + timedelta(minutes=50),
+            http_client_factory=lambda **kw: pytest.fail('expired slot must not acquire proxy'))
+
+
+def test_expired_cohort_refuses_before_paid_client_or_quota_reset(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, 'true')
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    original = Path(args.job_path).read_bytes()
+    args.deadline_at = (NOW + timedelta(days=1, minutes=55)).isoformat()
+    with pytest.raises(ValueError, match='cohort expired'):
+        mod.execute(args, execution_argv=(str(SCRIPT), *raw),
+            previous_reader=lambda _: None, utcnow=lambda: NOW + timedelta(days=1),
+            http_client_factory=lambda **kw: pytest.fail('expired cohort cannot buy requests'))
+    assert Path(args.job_path).read_bytes() == original
+
+
+def test_manual_runner_drain_refuses_before_paid_client(tmp_path, monkeypatch):
+    from dags.utils import transfermarkt_discovery_continuation as cohorts
+    mod = _load()
+    raw = _raw_args(tmp_path, dry_run=True, approval=False)
+    args = mod._parser().parse_args(raw)
+    args.dag_id = cohorts.MANUAL_DAG_ID
+    flag = tmp_path / 'drain'
+    flag.write_text(str(int((NOW + timedelta(minutes=10)).timestamp())))
+    monkeypatch.setattr(cohorts, 'DELIVERY_DRAIN_PATH', flag)
+    with pytest.raises(ValueError, match='delivery drain'):
+        mod.execute(args, execution_argv=(str(SCRIPT), *raw),
+            previous_reader=lambda _: None, utcnow=lambda: NOW,
+            http_client_factory=lambda **kw: pytest.fail('manual drain must refuse before client'))
