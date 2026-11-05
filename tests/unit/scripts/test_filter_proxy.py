@@ -8516,3 +8516,131 @@ def test_sofascore_admission_keeps_signed_run_budget(request, module_fixture):
     )
     assert lease.max_bytes == 1000
     assert lease.report()["dagrun_budget_bytes"] == 1000
+
+
+# #2167: durable parent retirement follows allocation retirement, not age alone.
+def _parent_retirement_fixture(module):
+    module.SOURCE_MODE = "sofascore-only"
+    module.SOFASCORE_DAGRUN_BUDGET_BYTES = 1000
+    context = _sofascore_context(run_id="scheduled__retirement::season", budget=1000)
+    plan, _ = module._signed_allocation_from_request(context, max_bytes=1000)
+    parent = module._parent_envelope_ledger()
+    parent.register(plan)
+    parent.consume(dag_id=plan.dag_id, base_run_id="scheduled__retirement",
+                   phase="season", phase_plan_digest=plan.plan_digest, provider_bytes=100)
+    parent.flush()
+    allocations = module._allocation_ledger()
+    allocations.snapshot(plan)
+    key = allocations._run_key(plan)
+    run = allocations._load()["runs"][key]
+    run.update(compacted=True, compacted_at=(datetime.now(timezone.utc) - timedelta(days=31)).isoformat())
+    allocations.flush(force=True)
+    assert key in json.loads(allocations.path.read_text())["retired_runs"]
+    return parent, allocations, plan
+
+
+def test_parent_retirement_rejects_old_and_new_phase_after_restart_and_legacy_read(shared_mod):
+    parent, allocations, plan = _parent_retirement_fixture(shared_mod)
+    shared_mod._flush_ledgers()
+    stored = json.loads(Path(parent.path).read_text())
+    (marker,) = stored["runs"].values()
+    assert marker["retired"] is True
+    assert marker["spent_provider_bytes"] == 100
+    assert "phases" not in marker
+    assert parent.retire(allocations.retired_run_keys()) == 0
+    legacy = _load_module()  # Frozen pre-retirement parent reader used by FBref.
+    for reader in (shared_mod, legacy):
+        restarted = reader.ParentRunEnvelopeLedger(parent.path)
+        for phase in ("season", "targets", "players"):
+            context = _sofascore_context(run_id=f"scheduled__retirement::{phase}", budget=1000)
+            retry, _ = shared_mod._signed_allocation_from_request(context, max_bytes=1000)
+            with pytest.raises(reader.ParentEnvelopeError):
+                restarted.register(retry)
+    restarted = shared_mod.ParentRunEnvelopeLedger(parent.path)
+    assert restarted.replay({(plan.dag_id, "scheduled__retirement"): {"season": 100}}) == 0
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    with pytest.raises(shared_mod.ParentEnvelopeError, match="retired"):
+        shared_mod._create_lease(manager, max_bytes=1000, ttl_seconds=30,
+                                metadata=_sofascore_context(run_id="scheduled__retirement::targets", budget=1000),
+                                require_context=True)
+    assert manager.calls == 0
+
+
+def test_parent_retirement_keeps_unregistered_or_live_allocation_phases(shared_mod):
+    parent, allocations, plan = _parent_retirement_fixture(shared_mod)
+    context = _sofascore_context(run_id="scheduled__retirement::targets", budget=1000)
+    target, _ = shared_mod._signed_allocation_from_request(context, max_bytes=1000)
+    parent.register(target)
+    before = Path(parent.path).read_bytes()
+    # No allocation record for targets: absence is not proof of retirement.
+    assert parent.retire(allocations.retired_run_keys()) == 0
+    assert Path(parent.path).read_bytes() == before
+    # Even an inconsistent retired marker cannot retire a still-present run.
+    allocations.snapshot(target)
+    payload = allocations._load()
+    target_key = allocations._run_key(target)
+    payload["retired_runs"][target_key] = datetime.now(timezone.utc).isoformat()
+    payload["runs"][target_key]["allocations"][target.allocations[0].allocation_id]["active_claim"] = {"lease_id": "active"}
+    allocations._write(payload)
+    assert target_key not in allocations.retired_run_keys()
+    assert parent.retire(allocations.retired_run_keys()) == 0
+    assert Path(parent.path).read_bytes() == before
+
+
+def test_parent_retirement_ignores_unpersisted_allocation_markers(shared_mod):
+    parent, allocations, plan = _parent_retirement_fixture(shared_mod)
+    # Remove the proof on disk while leaving the in-memory retired map intact.
+    disk = json.loads(allocations.path.read_text())
+    disk["retired_runs"] = {}
+    allocations._write(disk)
+    assert allocations._load()["retired_runs"]
+    assert allocations.retired_run_keys() == frozenset()
+    assert parent.retire(allocations.retired_run_keys()) == 0
+    assert parent.register(plan).parent_spent_provider_bytes == 100
+
+
+def test_parent_retirement_write_failure_keeps_full_budget(shared_mod, monkeypatch):
+    parent, allocations, plan = _parent_retirement_fixture(shared_mod)
+    before = Path(parent.path).read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(parent, "_write", lambda _: (_ for _ in ()).throw(OSError("disk")))
+        with pytest.raises(OSError, match="disk"):
+            parent.retire(allocations.retired_run_keys())
+    assert Path(parent.path).read_bytes() == before
+    with pytest.raises(shared_mod.ParentEnvelopeError, match="retired"):
+        parent.register(plan)
+    assert parent.dirty
+    assert parent.flush()
+    (marker,) = json.loads(Path(parent.path).read_text())["runs"].values()
+    assert marker["retired"] and marker["spent_provider_bytes"] == 100
+
+
+def test_parent_retirement_rejects_corrupt_allocation_retirement_map(shared_mod):
+    parent, allocations, _ = _parent_retirement_fixture(shared_mod)
+    before = Path(parent.path).read_bytes()
+    disk = json.loads(allocations.path.read_text())
+    disk["retired_runs"] = ["not a durable map"]
+    allocations._write(disk)
+    with pytest.raises(shared_mod.AllocationAccountingError, match="retired"):
+        allocations.retired_run_keys()
+    assert Path(parent.path).read_bytes() == before
+
+
+def test_parent_retirement_post_replace_failure_cannot_reopen_a_new_phase(shared_mod, monkeypatch):
+    parent, allocations, _ = _parent_retirement_fixture(shared_mod)
+    original_write = parent._write
+    def installed_then_failed(payload):
+        original_write(payload)
+        raise OSError("directory fsync after replace")
+    with monkeypatch.context() as patch:
+        patch.setattr(parent, "_write", installed_then_failed)
+        with pytest.raises(OSError, match="directory fsync"):
+            parent.retire(allocations.retired_run_keys())
+    context = _sofascore_context(run_id="scheduled__retirement::players", budget=1000)
+    plan, _ = shared_mod._signed_allocation_from_request(context, max_bytes=1000)
+    with pytest.raises(shared_mod.ParentEnvelopeError, match="retired"):
+        parent.register(plan)
+    assert parent.dirty
+    assert parent.flush()
+    (marker,) = json.loads(Path(parent.path).read_text())["runs"].values()
+    assert marker["retired"] and marker["spent_provider_bytes"] == 100

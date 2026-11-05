@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1769,6 +1770,24 @@ class AllocationLedger:
             self._write(payload)
             self._dirty = False
             return True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+    def retired_run_keys(self) -> frozenset[str]:
+        """Read durable retirement proof, never unflushed in-memory markers."""
+        handle = self._locked()
+        try:
+            payload = self._read()
+            retired = payload.get("retired_runs", {})
+            if not isinstance(retired, dict) or any(
+                not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key)
+                or not isinstance(value, str)
+                for key, value in retired.items()
+            ):
+                raise AllocationAccountingError("invalid retired allocation runs")
+            # An inconsistent marker must not retire a still-present run.
+            return frozenset(retired).difference(payload["runs"])
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
