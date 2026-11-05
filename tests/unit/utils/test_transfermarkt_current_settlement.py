@@ -196,3 +196,25 @@ def test_failed_save_replays_from_durable_state_without_double_charge(evidence):
     recover(durable, events, path)
     assert durable['traffic_used']['provider_metered_bytes'] == 10
     assert recover(durable, events, path) == []
+
+
+def test_rejected_connect_is_diagnostic_not_a_second_byte_charge(evidence):
+    data, events, path = evidence
+    events.insert(1, {**events[0], 'event_id': 'rejected', 'event_type': 'connect_rejected', 'reason': '502'})
+    recover(data, events, path)
+    assert data['traffic_used']['provider_metered_bytes'] == 10
+
+
+@pytest.mark.parametrize('case', ['before_created', 'after_closed', 'no_reason', 'no_close'])
+def test_rejected_connect_requires_open_lifecycle_and_terminal_proof(evidence, case):
+    data, events, path = evidence
+    rejected = {**events[0], 'event_id': 'rejected', 'event_type': 'connect_rejected', 'reason': '502'}
+    if case == 'no_reason':
+        rejected['reason'] = ''
+    events.insert(0 if case == 'before_created' else len(events) if case == 'after_closed' else 1, rejected)
+    if case == 'no_close':
+        events.pop()
+    original = deepcopy(data)
+    with pytest.raises(CurrentSettlementError):
+        recover(data, events, path)
+    assert data == original

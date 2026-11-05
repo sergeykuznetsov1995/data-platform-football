@@ -71,7 +71,7 @@ class CurrentSettlement:
                 continue
             if event.get('source') != 'transfermarkt' or event.get('event_version') != 'paid-proxy-v2':
                 raise CurrentSettlementError('unsupported gateway event schema or source')
-            if event.get('event_type') not in {'lease_created', 'bytes', 'lease_closed'}:
+            if event.get('event_type') not in {'lease_created', 'bytes', 'lease_closed', 'connect_rejected'}:
                 raise CurrentSettlementError('unsupported gateway event type')
             if event.get('scope') != scope_id or event.get('dag_id') != 'dag_ingest_transfermarkt':
                 raise CurrentSettlementError('gateway child scope identity differs')
@@ -113,6 +113,12 @@ class CurrentSettlement:
                 if not lease['created'] or lease['closed']:
                     raise CurrentSettlementError('duplicate/out-of-order lease close')
                 lease['closed'], lease['total'] = True, _integer(event.get('total_bytes'))
+            elif kind == 'connect_rejected':
+                # Gateway diagnostic only; CONNECT traffic has separate bytes
+                # events. A rejection never substitutes for a terminal receipt.
+                if (not lease['created'] or lease['closed'] or not isinstance(event.get('reason'), str)
+                        or not event['reason'].strip()):
+                    raise CurrentSettlementError('invalid connection rejection evidence')
         totals = {child: {'up': 0, 'down': 0, 'leases': [], 'uncertain_leases': []} for child in paid}
         for lease_id, lease in leases.items():
             if not lease['closed'] or lease['total'] != lease['up'] + lease['down']:
