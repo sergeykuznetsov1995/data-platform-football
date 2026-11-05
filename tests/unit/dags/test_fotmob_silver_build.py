@@ -1002,3 +1002,40 @@ def test_full_rebuild_rechecks_revision_after_reader_barrier(monkeypatch):
     with pytest.raises(RevisionConflict):
         build.prepare_run(cur, _cfg(full_rebuild=True))
     assert cur.writes() == []
+
+
+@pytest.mark.parametrize('stop_after_insert', [1, 2])
+def test_night_window_interruption_keeps_completed_batches_and_resumes(monkeypatch, stop_after_insert):
+    from datetime import datetime
+    from utils.fotmob_silver_admission import AdmittedCursor, AdmissionClosed, LOAD_SQL, MSK
+
+    raw = _match_cursor()
+    answer = raw._answer
+    monkeypatch.setattr(raw, '_answer', lambda sql: [(0,)] if sql == LOAD_SQL else
+                        [] if sql.startswith('SET SESSION') else answer(sql))
+    clock = [datetime(2026, 11, 6, 1, 0, tzinfo=MSK)]
+    inserts = []
+
+    def expire_after_insert(cur, sql):
+        if sql.startswith('INSERT INTO iceberg.silver.fotmob_matches_a'):
+            inserts.append(sql)
+            if len(inserts) == stop_after_insert:
+                clock[0] = datetime(2026, 11, 6, 2, 45, tzinfo=MSK)
+
+    raw.hook = expire_after_insert
+    cur = AdmittedCursor(raw, now=lambda: clock[0])
+    cfg = _cfg(max_partitions_per_batch=1)
+    build.prepare_run(cur, cfg)
+    with pytest.raises(AdmissionClosed):
+        build.build_family(cur, cfg, 'match', 'a', 'night-1', expected_revision=0)
+    # INSERT may have committed, but no state was recorded for its interrupted batch.
+    assert len(raw.state_keys('fotmob_matches')) == stop_after_insert - 1
+    assert raw.reader[:2] == [None, 0]
+    raw.hook = None
+    raw.sql.clear()
+    clock[0] = datetime(2026, 11, 7, 0, 30, tzinfo=MSK)
+    build.prepare_run(cur, cfg)
+    assert build.build_family(cur, cfg, 'match', 'a', 'night-2', expected_revision=0) == 3 - stop_after_insert
+    assert raw.state_keys('fotmob_matches') == [(47, '2025/2026'), (47, '2026/2027')]
+    assert len([s for s in raw.sql if s.startswith('INSERT INTO iceberg.silver.fotmob_matches_a')]) == 3 - stop_after_insert
+    assert raw.reader[:2] == [None, 0]

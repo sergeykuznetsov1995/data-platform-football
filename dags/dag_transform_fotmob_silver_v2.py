@@ -13,6 +13,7 @@ from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 
 from utils import fotmob_silver_build as build
+from utils.fotmob_silver_admission import AdmittedCursor
 from utils.default_args import SILVER_ARGS
 
 SQL_DIR = Path(__file__).resolve().parent / "sql" / "silver"
@@ -30,9 +31,12 @@ def _config(params: Dict[str, Any]) -> build.BuildConfig:
     Narrow builds (``competitions``/``tables``) are for host-side pilots via
     :class:`fotmob_silver_build.BuildConfig` only.
     """
+    batch_size = int(params.get("max_partitions_per_batch") or 10)
+    if not 1 <= batch_size <= 10:
+        raise ValueError("production FotMob Silver batches must contain 1–10 partitions")
     return build.BuildConfig(
         sql_dir=SQL_DIR,
-        max_partitions_per_batch=int(params.get("max_partitions_per_batch") or 10),
+        max_partitions_per_batch=batch_size,
         entity_buckets=dict(params.get("entity_buckets") or {}) or None,
         full_rebuild=bool(params.get("full_rebuild")) and params.get("mode") == "build",
     )
@@ -46,7 +50,7 @@ def _cursor():
         session_properties={**_PARTITION_STAGED_SESSION_PROPERTIES, **build.SESSION_PROPERTIES}
     )
     try:
-        yield conn.cursor()
+        yield AdmittedCursor(conn.cursor())
     finally:
         conn.close()
 
@@ -95,7 +99,7 @@ with DAG(
     max_active_tasks=1,
     tags=["transform", "fotmob", "silver", "football", "trino"],
     params={
-        "max_partitions_per_batch": Param(default=10, type="integer", minimum=1),
+        "max_partitions_per_batch": Param(default=10, type="integer", minimum=1, maximum=10),
         "entity_buckets": Param(
             default={}, type="object",
             description="Override mod(key, N) buckets per global table, e.g. {\"fotmob_players\": 8}",
@@ -127,7 +131,10 @@ with DAG(
       on that slot), the abandoned slot is then cleared and rebuilt in full by the next build.
     * Both physical schemas remain in place. Incompatible SQL schema changes fail before data writes
       and require an explicit migration.
-    * No schedule until #2021; not triggered by ingest.
+    * Every query is admitted only at 00:30–02:45 MSK with at most five foreign
+      RUNNING queries. Busy/closed admission fails the run; completed batches
+      remain available for the next nightly resume. No partial publication.
+    * No schedule until #2021 authorization; not triggered by ingest.
     """,
 ) as dag:
     bootstrap_reader = PythonOperator(task_id="bootstrap_reader", python_callable=_bootstrap_reader)

@@ -115,3 +115,10 @@ def test_rollback_mode_builds_nothing_and_rolls_back(monkeypatch):
     assert module._build("match", **_context(mode="rollback")) == 0
     module._switch_reader(**_context(mode="rollback"))
     assert calls == [("rollback", {"expected_revision": 3, "actor": "manual__1"})]
+
+
+@pytest.mark.parametrize('size', [-1, 11, 100])
+def test_production_batch_cap_cannot_be_overridden(size):
+    module = _reload()
+    with pytest.raises(ValueError, match='1–10'):
+        module._config({'max_partitions_per_batch': size})
