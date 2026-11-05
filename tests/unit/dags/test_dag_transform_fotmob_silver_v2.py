@@ -74,6 +74,7 @@ def test_config_always_builds_all_competitions_and_tables():
                           "full_rebuild": True, "mode": "rollback"})
     assert cfg.competitions == ()
     assert cfg.tables == module.build.ALL_TABLES
+    assert module.build.slot_spec(cfg).state_selected is True
     assert cfg.entity_buckets is None and cfg.full_rebuild is False
     assert cfg.sql_dir.is_dir()
 

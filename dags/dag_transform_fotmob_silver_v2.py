@@ -71,7 +71,7 @@ def _build(family: str, **context) -> int:
 
 
 def _switch_reader(**context) -> Dict[str, Any]:
-    """Move all 22 reader views at once; empty input switches onto an equal set."""
+    """Publish one state pointer for all 22 readers; empty input switches onto an equal set."""
     params = context["params"]
     ti = context["ti"]
     run = ti.xcom_pull(task_ids="bootstrap_reader")
@@ -102,7 +102,7 @@ with DAG(
         ),
         "full_rebuild": Param(
             default=False, type="boolean",
-            description="Emergency: drop the build slot's tables and state first (template changes are detected)",
+            description="Emergency: clear the build slot's data and state first (template changes are detected)",
         ),
         "mode": Param(default="build", enum=["build", "rollback"]),
     },
@@ -110,8 +110,10 @@ with DAG(
     ## FotMob Silver core (v2)
 
     Builds all 22 `silver.fotmob_*` core tables for all competitions into the slot readers do not see
-    (`<table>_a` / `<table>_b`, `utils.silver_slots`), then `switch_reader` re-points all
-    22 views at once (`advance`, actor = run_id). Readers see the old or the new set whole.
+    (`<table>_a` / `<table>_b`, `utils.silver_slots`), then `switch_reader` updates one
+    state pointer (`advance`, actor = run_id). Permanent views select that slot.
+    Separate SQL queries may select different versions. Reader barriers wait for older
+    transactions before slot reuse and publication; writers must be serialized.
 
     * Increment: a context partition `(competition_id, source_season_key)` or a global table
       is rebuilt only when the signal of its bronze `_current` views (max `_observed_at`,
@@ -122,7 +124,9 @@ with DAG(
     * Empty input (nothing rebuilt) -> `switch_reader` still advances onto the build slot,
       which then equals bronze (an equal set). `mode=rollback` -> readers go back to the
       other slot, nothing is built; run it before the next build (refused once a build started
-      on that slot), the abandoned slot is then dropped and rebuilt in full by the next build.
+      on that slot), the abandoned slot is then cleared and rebuilt in full by the next build.
+    * Both physical schemas remain in place. Incompatible SQL schema changes fail before data writes
+      and require an explicit migration.
     * No schedule until #2021; not triggered by ingest.
     """,
 ) as dag:

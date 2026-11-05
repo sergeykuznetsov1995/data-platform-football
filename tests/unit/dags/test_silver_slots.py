@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 
 import pytest
 
@@ -22,12 +23,15 @@ class FakeCursor:
     A mutation result must be fetched before the next statement.
     """
 
-    def __init__(self, rows=None, *, missing=False, cas_fails=False, built=None, hook=None):
+    def __init__(self, rows=None, *, missing=False, cas_fails=False, built=None, hook=None,
+                 views=None, columns=None):
         self.rows = [list(row) for row in (rows or [])]
         self.missing = missing
         self.cas_fails = cas_fails
         self.built = built
         self.hook = hook
+        self.views = dict(views or {})
+        self.columns = columns
         self.sql: list[str] = []
         self._result: list[tuple] = []
         self._unfetched = False
@@ -37,12 +41,33 @@ class FakeCursor:
         self.sql.append(sql)
         if self.hook:
             self.hook(self, sql)
+        if 'system.runtime.nodes' in sql:
+            self._result = [(1,)]
+            return
+        if sql == 'SELECT to_iso8601(current_timestamp)':
+            self._result = [('2026-11-05T13:00:00Z',)]
+            return
+        if 'system.runtime.transactions' in sql:
+            self._result = []
+            return
         head = sql.split(None, 1)[0].upper()
         if sql.startswith('CREATE TABLE'):
             self.missing = False
         elif self.missing and 'VIEW' not in sql:
             raise RuntimeError('TABLE_NOT_FOUND: iceberg.ops.fotmob_reader_state does not exist')
-        if 'information_schema' in sql:
+        if 'information_schema.views' in sql:
+            name = re.search(r"table_name = '([^']*)'", sql).group(1)
+            self._result = [(self.views[name],)] if name in self.views else []
+        elif 'information_schema.columns' in sql:
+            names = re.findall(r"'([a-z0-9_]+)'", sql.split(' IN ', 1)[1])
+            self._result = [
+                (name, col, dtype, pos) for name in names
+                for col, dtype, pos in (
+                    self.columns.get(name, []) if self.columns is not None
+                    else [('id', 'bigint', 1), ('label', 'varchar', 2)]
+                )
+            ]
+        elif 'information_schema' in sql:
             names = re.findall(r"'([a-z0-9_]+)'", sql.split(' IN ', 1)[1])
             self._result = [(n,) for n in names if self.built is None or n in self.built]
         elif head == 'SELECT':
@@ -61,6 +86,10 @@ class FakeCursor:
             if not self.rows:
                 self.rows.append([None, 0, 'bootstrap'])
             self._result = [(len(self.rows),)]
+        elif sql.startswith('CREATE OR REPLACE VIEW'):
+            view, query = sql.split(' AS\n', 1)
+            self.views[view.rsplit('.', 1)[1]] = query
+            self._result = [(True,)]
         else:
             self._result = [(True,)]
         self._unfetched = head in {'UPDATE', 'CREATE', 'MERGE'}
@@ -344,3 +373,192 @@ def test_transfermarkt_delegates_to_shared_module():
     for active in (None, 'a', 'b'):
         state = tm_v2.ReaderState(exists=True, active_slot=active)
         assert tm_v2.inactive_slot(state) == slots.inactive_slot(state)
+
+
+STATE_SPEC = slots.SlotSpec(
+    source='fotmob', schema='iceberg.silver', tables=('match', 'lineup'), state_selected=True,
+)
+
+
+def legacy_views(slot='a'):
+    return {name: f'SELECT * FROM iceberg.silver.{name}_{slot}' for name in STATE_SPEC.tables}
+
+
+def test_state_selected_sql_uses_singleton_selector_for_both_slots():
+    sql = slots.reader_view_sql(STATE_SPEC, 'match', 'a')
+    assert sql == slots.reader_view_sql(STATE_SPEC, 'match', 'b')
+    assert sql.count('CASE WHEN (count(*) = 1) THEN max(active_slot) END') == 2
+    assert sql.count("(source = 'fotmob') AND (state_key = 'canonical')") == 2
+    assert 'UNION ALL' in sql
+    assert 'FROM iceberg.silver.match_a' in sql and 'FROM iceberg.silver.match_b' in sql
+
+
+@pytest.mark.parametrize(('active_rows', 'expected'), [
+    ([], []), ([(None,)], []), ([('x',)], []),
+    ([('a',)], [('old',)]), ([('b',)], [('new',)]),
+    ([('a',), ('a',)], []), ([('a',), ('b',)], []),
+])
+def test_selector_returns_only_a_valid_singleton(active_rows, expected):
+    # SQLite executes this portable SELECT shape to verify predicate semantics;
+    # it does not establish Trino's cross-table snapshot/planning guarantees.
+    query = slots.reader_view_sql(STATE_SPEC, 'match', 'a').split(' AS\n', 1)[1]
+    query = query.replace('iceberg.silver.', '').replace('iceberg.ops.', '')
+    with sqlite3.connect(':memory:') as db:
+        db.execute('CREATE TABLE match_a (value TEXT)')
+        db.execute('CREATE TABLE match_b (value TEXT)')
+        db.execute("INSERT INTO match_a VALUES ('old')")
+        db.execute("INSERT INTO match_b VALUES ('new')")
+        db.execute('CREATE TABLE fotmob_reader_state (source TEXT, state_key TEXT, active_slot TEXT)')
+        db.executemany("INSERT INTO fotmob_reader_state VALUES ('fotmob', 'canonical', ?)", active_rows)
+        db.execute("INSERT INTO fotmob_reader_state VALUES ('other', 'canonical', 'a')")
+        db.execute("INSERT INTO fotmob_reader_state VALUES ('fotmob', 'other', 'a')")
+        assert db.execute(query).fetchall() == expected
+
+
+def test_state_selected_bootstrap_prepares_views_before_cas_and_retry_has_no_ddl():
+    cur = bootstrap_cursor()
+    result = slots.advance(cur, STATE_SPEC, expected_revision=0, actor='first')
+    assert result['to_slot'] == 'a' and result['revision'] == 1
+    update = cur.kinds().index('UPDATE')
+    assert cur.kinds()[:update].count('CREATE') == 2
+    assert 'CREATE' not in cur.kinds()[update:]
+    cur.sql.clear()
+    assert not slots.advance(cur, STATE_SPEC, expected_revision=0, actor='first')['switched']
+    assert 'CREATE' not in cur.kinds() and 'UPDATE' not in cur.kinds()
+    with pytest.raises(slots.RevisionConflict, match="not 'other'"):
+        slots.advance(cur, STATE_SPEC, expected_revision=0, actor='other')
+
+
+def test_state_selected_migrates_current_static_views_before_cas():
+    cur = FakeCursor([['a', 1, None]], views=legacy_views())
+    slots.advance(cur, STATE_SPEC, expected_revision=1, actor='next')
+    update = cur.kinds().index('UPDATE')
+    assert cur.kinds()[:update].count('CREATE') == 2
+    assert 'CREATE' not in cur.kinds()[update:]
+    assert cur.rows == [['b', 2, 'next']]
+
+
+def test_preparation_failure_keeps_old_state_and_partial_migration_is_retryable():
+    cur = FakeCursor([['a', 1, None]], views=legacy_views(),
+                     hook=fail_once('CREATE OR REPLACE VIEW iceberg.silver.lineup'))
+    with pytest.raises(RuntimeError, match='boom'):
+        slots.advance(cur, STATE_SPEC, expected_revision=1, actor='next')
+    assert cur.rows == [['a', 1, None]]
+    assert 'UPDATE' not in cur.kinds()
+    assert 'UNION ALL' in cur.views['match']
+    assert cur.views['lineup'].endswith('lineup_a')
+    cur.sql.clear()
+    slots.advance(cur, STATE_SPEC, expected_revision=1, actor='next')
+    assert cur.kinds().count('CREATE') == 1
+    assert cur.rows == [['b', 2, 'next']]
+
+
+def test_failed_response_after_state_selected_cas_is_retryable_without_ddl():
+    fired = []
+
+    def hook(cur, sql):
+        if sql == slots.read_state_sql(STATE_SPEC) and cur.rows[0][1] == 2 and not fired:
+            fired.append(True)
+            raise RuntimeError('lost confirmation')
+
+    cur = FakeCursor([['a', 1, None]], views=legacy_views(), hook=hook)
+    with pytest.raises(RuntimeError, match='lost confirmation'):
+        slots.advance(cur, STATE_SPEC, expected_revision=1, actor='next')
+    assert cur.rows == [['b', 2, 'next']]
+    cur.sql.clear()
+    slots.advance(cur, STATE_SPEC, expected_revision=1, actor='next')
+    assert 'CREATE' not in cur.kinds() and 'UPDATE' not in cur.kinds()
+
+
+@pytest.mark.parametrize('unsafe', [
+    None,
+    'SELECT * FROM iceberg.silver.lineup_b',
+    'SELECT * FROM iceberg.silver.lineup_a WHERE id > 0',
+    "SELECT * FROM iceberg.silver.lineup_a WHERE 'A' = 'a'",
+])
+def test_unsafe_or_missing_existing_view_fails_before_any_ddl(unsafe):
+    views = legacy_views()
+    if unsafe is None:
+        views.pop('lineup')
+    else:
+        views['lineup'] = unsafe
+    cur = FakeCursor([['a', 1, None]], views=views)
+    with pytest.raises(slots.StateInvariantError, match='unsafe reader view'):
+        slots.advance(cur, STATE_SPEC, expected_revision=1)
+    assert 'CREATE' not in cur.kinds() and 'UPDATE' not in cur.kinds()
+    assert cur.rows == [['a', 1, None]]
+
+
+@pytest.mark.parametrize('missing', ['match_a', 'lineup_b'])
+def test_state_selected_requires_both_physical_slots(missing):
+    built = {f'{name}_{slot}' for name in STATE_SPEC.tables for slot in slots.SLOTS} - {missing}
+    cur = FakeCursor([['a', 1, None]], views=legacy_views(), built=built)
+    with pytest.raises(slots.StateInvariantError, match='is not built'):
+        slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=1)
+    assert 'CREATE' not in cur.kinds() and 'UPDATE' not in cur.kinds()
+
+
+@pytest.mark.parametrize('bad_columns', [
+    [], [('other', 'bigint', 1)], [('id', 'varchar', 1)],
+    [('label', 'varchar', 1), ('id', 'bigint', 2)],
+])
+def test_state_selected_checks_column_names_types_and_order(bad_columns):
+    columns = {f'{name}_{slot}': [('id', 'bigint', 1), ('label', 'varchar', 2)]
+               for name in STATE_SPEC.tables for slot in slots.SLOTS}
+    columns['lineup_b'] = bad_columns
+    cur = FakeCursor([['a', 1, None]], views=legacy_views(), columns=columns)
+    with pytest.raises(slots.StateInvariantError, match='physical slot columns'):
+        slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=1)
+    assert 'CREATE' not in cur.kinds() and 'UPDATE' not in cur.kinds()
+
+
+def test_prepare_is_idempotent_and_revision_is_strict():
+    cur = bootstrap_cursor()
+    state = slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=0)
+    assert state.active_slot is None and cur.rows == [[None, 0, 'bootstrap']]
+    cur.sql.clear()
+    slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=0)
+    assert 'CREATE' not in cur.kinds() and 'UPDATE' not in cur.kinds()
+    with pytest.raises(slots.RevisionConflict):
+        slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=1)
+    with pytest.raises(ValueError, match='state_selected'):
+        slots.prepare_reader_views(cur, SPEC, expected_revision=0)
+    with pytest.raises(slots.StateInvariantError, match='singleton'):
+        slots.prepare_reader_views(FakeCursor(), STATE_SPEC, expected_revision=0)
+
+
+def test_view_normalization_preserves_literals_and_accepts_identifier_quotes():
+    assert slots._normalise_view_sql('select * from "iceberg"."silver"."match_a"') == (
+        slots._normalise_view_sql('SELECT * FROM iceberg.silver.match_a')
+    )
+    assert slots._normalise_view_sql("SELECT 'A'") != slots._normalise_view_sql("SELECT 'a'")
+
+
+def test_preparation_accepts_actual_trino_formatted_view_definition():
+    # Captured from Trino's information_schema.views in the isolated #2020
+    # probe on 2026-11-05; only schema/source/table names are replaced here.
+    template = """SELECT *
+FROM
+  iceberg.silver.{name}_a
+WHERE ((SELECT (CASE WHEN (count(*) = 1) THEN max(active_slot) END)
+FROM
+  iceberg.ops.fotmob_reader_state
+WHERE ((source = 'fotmob') AND (state_key = 'canonical'))
+) = 'a')
+UNION ALL SELECT *
+FROM
+  iceberg.silver.{name}_b
+WHERE ((SELECT (CASE WHEN (count(*) = 1) THEN max(active_slot) END)
+FROM
+  iceberg.ops.fotmob_reader_state
+WHERE ((source = 'fotmob') AND (state_key = 'canonical'))
+) = 'b')
+"""
+    views = {name: template.format(name=name) for name in STATE_SPEC.tables}
+    cur = FakeCursor([['a', 1, None]], views=views)
+    slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=1)
+    assert 'CREATE' not in cur.kinds()
+    # Do not erase structural parentheses or accept a changed selector.
+    cur.views['lineup'] = cur.views['lineup'].replace('count(*) = 1', 'count(*) >= 1')
+    with pytest.raises(slots.StateInvariantError, match='unsafe reader view'):
+        slots.prepare_reader_views(cur, STATE_SPEC, expected_revision=1)

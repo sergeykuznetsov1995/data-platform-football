@@ -20,17 +20,20 @@ The model is two physical copies of each Silver table (``<table>_a`` and
   someone else's switch;
 * the state row is created by :func:`bootstrap`, never inferred by a switch.
 
-The reader state is the source of truth; views follow it.  The set is
-re-pointed sequentially, so while the ``CREATE OR REPLACE VIEW`` loop runs
-(seconds) a reader joining two views may see a mix of slots.  Slot tables are
-immutable during the switch, so no data is corrupted.  A concurrent switch
-detected after the loop raises :class:`RevisionConflict`.
+By default views are re-pointed sequentially; a reader joining two views may
+see a mix of slots during that loop. With ``SlotSpec.state_selected=True``,
+permanent views select A/B through the state row. They are prepared before
+the CAS and never rebuilt after it. Both physical slots must keep compatible
+schemas. This alone does not synchronize snapshots of the physical tables:
+callers also need to serialize builds and publication against reader queries.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from typing import Any
+
+from .silver_reader_barrier import drain_readers
 
 
 SLOTS = ('a', 'b')
@@ -69,6 +72,7 @@ class SlotSpec:
     schema: str
     tables: tuple[str, ...]
     state_table: str = ''
+    state_selected: bool = False
 
     def __post_init__(self) -> None:
         _check_name(self.source, 'source')
@@ -234,8 +238,21 @@ WHERE table_schema = {_sql_literal(schema)}
 
 
 def reader_view_sql(spec: SlotSpec, table: str, slot: str) -> str:
-    """Pin the stable reader view to one physical slot."""
+    """Render a static view, or a permanent state-selected view when opted in."""
+    normalise_slot(slot)
     view = f'{spec.schema}.{_check_name(table, "table")}'
+    if spec.state_selected:
+        # Match Trino's persisted expression parentheses so validation needs
+        # only token/whitespace normalization, never expression rewriting.
+        selector = f"""SELECT (CASE WHEN (count(*) = 1) THEN max(active_slot) END)
+FROM {spec.state_table}
+WHERE ((source = {_sql_literal(spec.source)}) AND (state_key = '{STATE_KEY}'))"""
+        branches = [
+            f"SELECT * FROM {slotted_relation(view, candidate)}\n"
+            f"WHERE (({selector}) = '{candidate}')"
+            for candidate in SLOTS
+        ]
+        return f"CREATE OR REPLACE VIEW {view} AS\n" + '\nUNION ALL\n'.join(branches)
     return f"""
 CREATE OR REPLACE VIEW {view} AS
 SELECT * FROM {slotted_relation(view, slot)}
@@ -324,11 +341,88 @@ def _missing_slot_tables(cur, spec: SlotSpec, slot: str) -> list[str]:
     ]
 
 
+def _normalise_view_sql(sql: str) -> tuple[str, ...]:
+    """Compare SQL tokens, preserving literals and expression structure."""
+    tokens = re.findall(
+        r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[a-zA-Z_][a-zA-Z_0-9]*|[0-9]+|[^\s]", sql,
+    )
+    return tuple(
+        token if token.startswith("'") else token.removeprefix('"').removesuffix('"').lower()
+        for token in tokens
+    )
+
+
+def prepare_reader_views(cur, spec: SlotSpec, *, expected_revision: int) -> ReaderState:
+    """Validate all relations, then install state-selected views before a CAS.
+
+    A partially completed migration may be retried: each view must already be
+    state-selected or statically pinned to the current active slot. Missing
+    views are allowed only before the first publication. No reader state is
+    changed. Callers must serialize builds/switches for a source.
+    """
+    if not spec.state_selected:
+        raise ValueError('prepare_reader_views requires state_selected=True')
+    state = assert_reader_revision(cur, spec, expected_revision)
+    if not state.exists:
+        raise StateInvariantError(f'{spec.source} reader singleton is missing')
+    for slot in SLOTS:
+        missing = _missing_slot_tables(cur, spec, slot)
+        if missing:
+            raise StateInvariantError(f'slot {slot} is not built: missing {", ".join(missing)}')
+    catalog, schema = spec.schema.split('.')
+    pending = []
+    for table in spec.tables:
+        names = ', '.join(_sql_literal(slotted_relation(table, slot)) for slot in SLOTS)
+        _execute(cur, f"""
+SELECT table_name, column_name, data_type, ordinal_position
+FROM {catalog}.information_schema.columns
+WHERE table_schema = {_sql_literal(schema)} AND table_name IN ({names})
+ORDER BY table_name, ordinal_position
+""".strip())
+        columns = {slotted_relation(table, slot): [] for slot in SLOTS}
+        for name, column, data_type, ordinal in cur.fetchall():
+            columns[name].append((int(ordinal), column, data_type))
+        left, right = (sorted(columns[slotted_relation(table, slot)]) for slot in SLOTS)
+        if not left or left != right:
+            raise StateInvariantError(f'{table}: incompatible or missing physical slot columns')
+        _execute(cur, f"""
+SELECT view_definition
+FROM {catalog}.information_schema.views
+WHERE table_schema = {_sql_literal(schema)} AND table_name = {_sql_literal(table)}
+""".strip())
+        rows = cur.fetchall()
+        desired = reader_view_sql(spec, table, 'a')
+        desired_query = desired.split(' AS\n', 1)[1]
+        if len(rows) == 1 and _normalise_view_sql(rows[0][0]) == _normalise_view_sql(desired_query):
+            continue
+        if not rows and state.active_slot is None:
+            pending.append(desired)
+            continue
+        legacy = (
+            f'SELECT * FROM {spec.schema}.{slotted_relation(table, state.active_slot)}'
+            if state.active_slot else None
+        )
+        if (len(rows) != 1 or legacy is None
+                or _normalise_view_sql(rows[0][0]) != _normalise_view_sql(legacy)):
+            raise StateInvariantError(f'{table}: unsafe reader view for active slot {state.active_slot}')
+        pending.append(desired)
+    # All validation precedes DDL; drift also invalidates legacy migrations.
+    assert_reader_revision(cur, spec, state.revision)
+    for sql in pending:
+        _execute(cur, sql)
+    return assert_reader_revision(cur, spec, state.revision)
+
+
 def _switch_from(
     cur, spec: SlotSpec, state: ReaderState, slot: str, *, applied: bool, actor: str,
 ) -> dict[str, Any]:
     switched = not applied and state.active_slot != slot
     revision = state.revision
+    if spec.state_selected:
+        prepare_reader_views(cur, spec, expected_revision=state.revision)
+        if switched:
+            drain_readers(cur)
+            assert_reader_revision(cur, spec, state.revision)
     if switched:
         missing = _missing_slot_tables(cur, spec, slot)
         if missing:
@@ -347,8 +441,9 @@ def _switch_from(
                 f'{after.revision} slot={after.active_slot}'
             )
         revision = after.revision
-    for sql in reader_view_sql_all(spec, slot):
-        _execute(cur, sql)
+    if not spec.state_selected:
+        for sql in reader_view_sql_all(spec, slot):
+            _execute(cur, sql)
     final = read_reader_state(cur, spec)
     if final.revision != revision:
         raise RevisionConflict(
@@ -371,10 +466,11 @@ def switch_reader(
     expected_revision: int,
     actor: str = DEFAULT_ACTOR,
 ) -> dict[str, Any]:
-    """CAS the reader state onto ``to_slot``, then re-point every view.
+    """CAS the reader state onto ``to_slot``.
 
     Re-switching onto the active slot, or retrying after this CAS already
-    landed, skips the UPDATE but still rebuilds the views.
+    landed, skips the UPDATE. Static mode rebuilds views after the CAS;
+    state-selected mode validates/prepares permanent views before it.
     """
     slot = normalise_slot(to_slot)
     state, applied = _read_for_switch(cur, spec, expected_revision, actor)

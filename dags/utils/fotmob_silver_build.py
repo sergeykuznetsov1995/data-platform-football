@@ -7,9 +7,10 @@ one contract.
 
 * The 22 core tables (``dags/sql/silver/fotmob_*.sql.j2``) are built into
   ``<table>_<slot>`` of the slot readers do not see
-  (:func:`silver_slots.inactive_slot`); :func:`switch_reader` then moves every
-  reader view at once with :func:`silver_slots.advance` (also when nothing
-  changed: the build slot then equals bronze).
+  (:func:`silver_slots.inactive_slot`); :func:`switch_reader` publishes one
+  state pointer used by permanent views. Separate SQL queries may select
+  different versions. Reader barriers drain older transactions before slot
+  reuse and publication; writers must be serialized.
 * Context tables (13, partitioned by ``competition_id, source_season_key``) are
   rebuilt per partition with ``DELETE`` + ``INSERT``, in batches of one
   competition.  A partition is rebuilt when its change signal (max
@@ -23,8 +24,8 @@ one contract.
   ``mod(<key>, N)`` buckets (players do not fit the 2 GB query limit).
 * Build state is written after each batch, so a failed run resumes where it
   stopped.  Both slots start empty: the first two runs are full builds.  The
-  state carries the sha256 of the table's template: a changed template drops
-  the slot table and rebuilds it in full.
+  state carries the sha256 of the template: compatible changes clear and
+  rebuild the slot. Schema changes require a migration.
 """
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .silver_reader_barrier import drain_readers
 from .silver_slots import (
     SlotSpec,
     advance,
@@ -42,6 +44,7 @@ from .silver_slots import (
     bootstrap,
     inactive_slot,
     other_slot,
+    prepare_reader_views,
     read_reader_state,
     rollback,
     slotted_relation,
@@ -171,7 +174,7 @@ class BuildConfig:
 
 def slot_spec(cfg: BuildConfig) -> SlotSpec:
     return SlotSpec(
-        source='fotmob', schema=cfg.schema, tables=ALL_TABLES,
+        source='fotmob', schema=cfg.schema, tables=cfg.tables, state_selected=True,
         state_table=cfg.reader_state_table,
     )
 
@@ -419,11 +422,11 @@ WHERE slot = {_str(slot)}
 
 def _slot_state(cur, cfg: BuildConfig, table: str, slot: str,
                 log: Callable[[str], Any]) -> dict:
-    """Build state of a slot table; a changed template drops the table and its state."""
+    """Build state of a slot table; a changed template clears data and state."""
     state, shas = read_build_state(cur, cfg, slot, table)
     if shas - {template_sha(cfg, table)}:
         log(f'{table}: template changed since slot {slot} was built, rebuilding in full')
-        _run(cur, f'DROP TABLE IF EXISTS {_relation(cfg, table, slot)}')
+        _run(cur, f'DELETE FROM {_relation(cfg, table, slot)}')
         _delete_state(cur, cfg, slot, [table])
         return {}
     return state
@@ -470,8 +473,8 @@ def _relation(cfg: BuildConfig, table: str, slot: str) -> str:
     return f'{cfg.schema}.{slotted_relation(table, slot)}'
 
 
-def ensure_context_table(cur, cfg: BuildConfig, table: str, slot: str) -> bool:
-    """Create the empty partitioned slot table; state without its table is stale.
+def ensure_slot_table(cur, cfg: BuildConfig, table: str, slot: str) -> bool:
+    """Create an empty slot table; context tables alone are partitioned.
 
     Returns True when the table had to be created (its state was cleared).
     """
@@ -482,10 +485,13 @@ def ensure_context_table(cur, cfg: BuildConfig, table: str, slot: str) -> bool:
         table, cfg.sql_dir, calendar_scope='FALSE', payload_scope='FALSE',
         season_scope='FALSE', entity_scope='FALSE',
     )
-    partitioning = ', '.join(_str(c) for c in PARTITION_COLUMNS)
+    properties = "format = 'PARQUET'"
+    if table not in GLOBAL_TABLES:
+        partitioning = ', '.join(_str(c) for c in PARTITION_COLUMNS)
+        properties += f', partitioning = ARRAY[{partitioning}]'
     _run(cur, (
         f'CREATE TABLE IF NOT EXISTS {_relation(cfg, table, slot)}\n'
-        f"WITH (format = 'PARQUET', partitioning = ARRAY[{partitioning}])\n"
+        f'WITH ({properties})\n'
         f'AS\n{wrap_select(sql, "FALSE")}\nWITH NO DATA'
     ))
     return True
@@ -527,7 +533,7 @@ def build_context_table(cur, cfg: BuildConfig, table: str, slot: str, run_id: st
                         log: Callable[[str], Any] = _LOG.info, cache: dict | None = None) -> int:
     """Rebuild changed partitions of one context table; return partitions touched."""
     state = _slot_state(cur, cfg, table, slot, log)
-    if ensure_context_table(cur, cfg, table, slot):
+    if ensure_slot_table(cur, cfg, table, slot):
         state = {}
     targets = context_targets(cur, cfg, table, cache)
     in_scope = (lambda c: c in cfg.competitions) if cfg.competitions else (lambda c: True)
@@ -555,23 +561,22 @@ def build_global_table(cur, cfg: BuildConfig, table: str, slot: str, run_id: str
     """Rebuild one global table whole (in buckets) if its signal changed; return 0 or 1."""
     signal = read_signals(cur, table, cfg.competitions, cache)[(None, None)]
     state = _slot_state(cur, cfg, table, slot, log)
-    exists = _table_exists(cur, cfg.schema, slotted_relation(table, slot))
-    if exists and state.get((None, None)) == signal:
+    if ensure_slot_table(cur, cfg, table, slot):
+        state = {}
+    if state.get((None, None)) == signal:
         return 0
     season_scope = 'TRUE'
     if table in SEASON_GLOBAL_TABLES and cfg.competitions:
         season_scope = f'competition_id IN ({", ".join(_int(c) for c in cfg.competitions)})'
     relation = _relation(cfg, table, slot)
     buckets = cfg.buckets(table)
+    _run(cur, f'DELETE FROM {relation}')
     for bucket in range(buckets):
         entity_scope = f'mod({BUCKET_KEY[table]}, {buckets}) = {bucket}' if buckets > 1 else 'TRUE'
         select = wrap_select(render_scoped_sql(
             table, cfg.sql_dir, season_scope=season_scope, entity_scope=entity_scope,
         ))
-        if bucket == 0:
-            _run(cur, f"CREATE OR REPLACE TABLE {relation}\nWITH (format = 'PARQUET')\nAS\n{select}")
-        else:
-            _run(cur, f'INSERT INTO {relation}\n{select}')
+        _run(cur, f'INSERT INTO {relation}\n{select}')
         log(f'{table}: bucket {bucket + 1}/{buckets} written')
     write_build_state(cur, cfg, slot, table, None, {None: signal}, run_id)
     return 1
@@ -581,7 +586,7 @@ def mark_build(cur, cfg: BuildConfig, slot: str, run_id: str) -> None:
     """Stamp the slot as touched by ``run_id`` before its first write (once per run).
 
     A failed build may leave a hole (DELETE before INSERT, partial buckets, a
-    table dropped for a changed template) without any state row; the marker
+    table cleared for a changed template) without any state row; the marker
     is what the rollback guard sees.  Table state reads filter it out by name.
     """
     rows = _run(cur, f"""
@@ -592,10 +597,14 @@ WHERE slot = {_str(slot)}
 """.strip())
     if [row[0] for row in rows] == [run_id]:
         return
-    _delete_state(cur, cfg, slot, [BUILD_MARKER])
     _run(cur, (
-        f'INSERT INTO {cfg.build_state_table} (slot, table_name, built_at, run_id)\n'
-        f'VALUES ({_str(slot)}, {_str(BUILD_MARKER)}, CURRENT_TIMESTAMP, {_str(run_id)})'
+        f'MERGE INTO {cfg.build_state_table} target\n'
+        f'USING (VALUES ({_str(slot)}, {_str(BUILD_MARKER)}, {_str(run_id)})) '
+        'incoming (slot, table_name, run_id)\n'
+        'ON target.slot = incoming.slot AND target.table_name = incoming.table_name\n'
+        'WHEN MATCHED THEN UPDATE SET built_at = CURRENT_TIMESTAMP, run_id = incoming.run_id\n'
+        'WHEN NOT MATCHED THEN INSERT (slot, table_name, built_at, run_id)\n'
+        'VALUES (incoming.slot, incoming.table_name, CURRENT_TIMESTAMP, incoming.run_id)'
     ))
 
 
@@ -603,6 +612,9 @@ def build_family(cur, cfg: BuildConfig, family: str, slot: str, run_id: str, *,
                  expected_revision: int, log: Callable[[str], Any] = _LOG.info) -> int:
     """Build one family into ``slot``; stop if readers moved. Return units rebuilt."""
     spec = slot_spec(cfg)
+    prepare_reader_views(cur, spec, expected_revision=expected_revision)
+    validate_template_schemas(cur, cfg)
+    drain_readers(cur)
     cache: dict = {}
     rebuilt = 0
     for index, table in enumerate(t for t in FAMILIES[family] if t in cfg.tables):
@@ -620,22 +632,66 @@ def build_family(cur, cfg: BuildConfig, family: str, slot: str, run_id: str, *,
     return rebuilt
 
 
-def drop_slot(cur, cfg: BuildConfig, slot: str) -> None:
-    """Forget a slot (``full_rebuild``): drop its tables and its build state."""
+def validate_template_schemas(cur, cfg: BuildConfig) -> None:
+    """Analyze SELECT output without scanning Bronze; reject implicit migrations.
+
+    Names, types and order must match; positional INSERT alone misses renames.
+    """
+    def stored_type(value: str) -> str:
+        # Iceberg stores bounded VARCHAR as unbounded, including nested fields.
+        return re.sub(r'\bvarchar\(\d+\)', 'varchar', value)
+
+    catalog, schema = cfg.schema.split('.')
     for table in cfg.tables:
-        _run(cur, f'DROP TABLE IF EXISTS {_relation(cfg, table, slot)}')
-    _delete_state(cur, cfg, slot, (*cfg.tables, BUILD_MARKER))
+        sql = wrap_select(render_scoped_sql(
+            table, cfg.sql_dir, calendar_scope='FALSE', payload_scope='FALSE',
+            season_scope='FALSE', entity_scope='FALSE',
+        ), 'FALSE')
+        output = [(r[0], stored_type(r[4])) for r in _run(cur, f'DESCRIBE OUTPUT ({sql})')]
+        for slot in ('a', 'b'):
+            actual = _run(cur, (
+                f'SELECT column_name, data_type FROM {catalog}.information_schema.columns\n'
+                f'WHERE table_schema = {_str(schema)}\n'
+                f'  AND table_name = {_str(slotted_relation(table, slot))}\n'
+                'ORDER BY ordinal_position'
+            ))
+            if not output or [tuple(row) for row in actual] != output:
+                raise RuntimeError(f'{table}_{slot}: SQL output schema changed; explicit migration required')
+
+
+def clear_slot(cur, cfg: BuildConfig, slot: str) -> None:
+    """Clear an inactive slot while retaining schemas and the rollback guard."""
+    mark_build(cur, cfg, slot, '__full_rebuild__')
+    _delete_state(cur, cfg, slot, cfg.tables)
+    for table in cfg.tables:
+        _run(cur, f'DELETE FROM {_relation(cfg, table, slot)}')
 
 
 def prepare_run(cur, cfg: BuildConfig) -> dict:
-    """Bootstrap reader and build state; pick the build slot for this run."""
+    """Ensure both physical schemas and safe readers before any rebuild writes."""
     spec = slot_spec(cfg)
     bootstrap(cur, spec)
     _run(cur, build_state_ddl(cfg))
     state = read_reader_state(cur, spec, allow_missing=False)
     slot = inactive_slot(state)
+    # A missing active table is corruption, never publish emptiness silently.
+    if state.active_slot is not None:
+        for table in cfg.tables:
+            if not _table_exists(cur, cfg.schema, slotted_relation(table, state.active_slot)):
+                raise RuntimeError(f'active slot table missing: {table}_{state.active_slot}')
+    if state.active_slot is not None and any(
+        not _table_exists(cur, cfg.schema, slotted_relation(table, slot)) for table in cfg.tables
+    ):
+        mark_build(cur, cfg, slot, '__schema_recovery__')
+    for table in cfg.tables:
+        for physical_slot in ('a', 'b'):
+            ensure_slot_table(cur, cfg, table, physical_slot)
+    prepare_reader_views(cur, spec, expected_revision=state.revision)
+    validate_template_schemas(cur, cfg)
+    drain_readers(cur)
+    assert_reader_revision(cur, spec, state.revision)
     if cfg.full_rebuild:
-        drop_slot(cur, cfg, slot)
+        clear_slot(cur, cfg, slot)
     return {'active_slot': state.active_slot, 'revision': state.revision, 'build_slot': slot}
 
 
@@ -669,11 +725,20 @@ def switch_reader(cur, cfg: BuildConfig, *, mode: str, expected_revision: int,
     has started on the target slot after the last switch (its marker or state
     rows are newer than the switch; a failed build may have left a hole).
     After it the build state of the abandoned slot is invalidated (``sql_sha``
-    = ``rolled_back``), so the next build drops and rebuilds every table there.
+    = ``rolled_back``), so the next build clears and rebuilds every table there.
     """
+    if mode not in ('build', 'rollback'):
+        raise ValueError(f'mode must be build or rollback, got {mode!r}')
+    if set(cfg.tables) != set(ALL_TABLES):
+        raise ValueError(
+            'switch refused: a switch needs all 22 FotMob Silver tables, '
+            f'this run built {len(cfg.tables)}: {", ".join(cfg.tables)}'
+        )
     spec = slot_spec(cfg)
     if mode == 'rollback':
         state = read_reader_state(cur, spec, allow_missing=False)
+        if state.revision == 1 and state.revision == int(expected_revision):
+            raise RuntimeError('rollback refused: the other slot has not been published yet')
         if state.active_slot is not None and state.revision == int(expected_revision):
             target = other_slot(state.active_slot)
             (written,), = _run(cur, _written_since_switch_sql(cfg, target))
@@ -683,8 +748,8 @@ def switch_reader(cur, cfg: BuildConfig, *, mode: str, expected_revision: int,
                     f'switch ({written} state rows); finish a build and advance instead'
                 )
         result = rollback(cur, spec, expected_revision=expected_revision, actor=actor)
-        # Invalidate, not delete: the next build drops and rebuilds every table of the
-        # abandoned slot (vanished partitions go with the DROP); rolling back again
+        # Invalidate, not delete: the next build clears and rebuilds every table of the
+        # abandoned slot (including vanished partitions); rolling back again
         # before that build still finds its tables intact.
         _run(cur, (
             f'UPDATE {cfg.build_state_table}\n'
@@ -692,11 +757,4 @@ def switch_reader(cur, cfg: BuildConfig, *, mode: str, expected_revision: int,
             f'WHERE slot = {_str(other_slot(result["to_slot"]))}'
         ))
         return result
-    if mode != 'build':
-        raise ValueError(f'mode must be build or rollback, got {mode!r}')
-    if set(cfg.tables) != set(ALL_TABLES):
-        raise ValueError(
-            'switch refused: a build switch needs all 22 FotMob Silver tables, '
-            f'this run built {len(cfg.tables)}: {", ".join(cfg.tables)}'
-        )
     return advance(cur, spec, expected_revision=expected_revision, actor=actor)
