@@ -70,9 +70,10 @@ class SignalRefreshRequired(CurrentPortionError):
 def _deadline_retained(exc):
     """#2068: a portion tail, also when a writer wraps it, is not a scope failure."""
     from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+    from dags.utils.transfermarkt_current_settlement import CurrentSettlementDeadline
     while exc is not None:
         # The current writer refuses a new connection with this marker.
-        if isinstance(exc, (PortionDeadlineError, CurrentPortionDeadlineExceeded)) or 'deadline prohibits' in str(exc):
+        if isinstance(exc, (PortionDeadlineError, CurrentPortionDeadlineExceeded, CurrentSettlementDeadline)) or 'deadline prohibits' in str(exc):
             return True
         exc = exc.__cause__
     return False
@@ -264,6 +265,8 @@ class _CurrentStore:
             self.index['scopes'][self.active_scope_id] = {
                 'scope_file': relative, 'cursor': self.active_data.get('cursor'),
                 'denominator_hash': self.active_data.get('denominator_hash')}
+            if self.active_data.get('settlement_attempted_at'):
+                self.index['scopes'][self.active_scope_id]['settlement_attempted_at'] = self.active_data['settlement_attempted_at']
         _atomic(self.index_path, self.index)
 
     def save_player_packet(self, facts, raw_capture_id):
@@ -1885,6 +1888,44 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         store = _CurrentStore(directory, started, now)
         state, player_facts = store.index, store.player_facts
+        # Read-only gateway recovery gets a small early window, independently
+        # of paid work priority. Every attempted scope rotates behind its peers.
+        from dags.utils.transfermarkt_current_settlement import timeout_backoff_proven
+        recovery_end = min(work_deadline - 60, clock() + min(120.0, max(0.0, work_deadline - clock()) / 10))
+        recovery_blocked = set()
+        target_ids = {target.scope_id for target in targets.targets}
+        candidates = sorted((key for key in state['scopes'] if key in target_ids),
+                            key=lambda key: (state['scopes'][key].get('settlement_attempted_at') or '', key))
+        for scope_id in candidates:
+            if clock() >= recovery_end:
+                break
+            data = store.activate(scope_id)
+            if not data.get('in_flight'):
+                continue
+            cursor = ScopeCursor.from_mapping(data['cursor']) if data.get('cursor') else ScopeCursor(scope_id)
+            outcome = {'scope_id': scope_id, 'kind': 'settlement', 'status': 'reconciled'}
+            data['settlement_attempted_at'] = now().isoformat()
+            store.save()
+            try:
+                old_timeout = timeout_backoff_proven(directory, scope_id, cursor.last_error_at,
+                                                    deadline=recovery_end, clock=clock)
+                if clock() >= recovery_end:
+                    raise PortionDeadlineError('settlement admission deadline reached')
+                settlement.recover(data, scope_id=scope_id, directory=directory, now=now(),
+                                   save=store.save, deadline=recovery_end, clock=clock)
+                if old_timeout:
+                    data['cursor'] = replace(cursor, last_error_at=None).as_dict()
+                    store.save()
+            except Exception as exc:
+                recovery_blocked.add(scope_id)
+                message = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
+                if _deadline_retained(exc):
+                    outcome.update(status='retained', retained=message)
+                else:
+                    outcome.update(status='failed', error=message)
+                    data['cursor'] = replace(cursor, last_error_at=cursor.last_error_at or now()).as_dict()
+                    store.save()
+            report['scopes'].append(outcome)
         cursors = {key: ScopeCursor.from_mapping(data['cursor']) for key, data in state['scopes'].items() if data.get('cursor')}
         for scope_id, cursor in list(cursors.items()):
             if state['scopes'][scope_id].get('denominator_hash') != denominator_hash:
@@ -1958,11 +1999,14 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         rows = {(row['competition_id'], str(row['edition_id'])): row for row in registry_rows}
         for work_index, item in enumerate(work):
             priority_check = work_index < priority_count
+            if item.target.scope_id in recovery_blocked:
+                continue
             if item.kind == 'signals' and item.target.scope_id in attempted_signals:
                 continue
-            if priority_check and clock() + 60 >= priority_deadline:
-                continue
-            if clock() + 60 >= deadline:
+            item_deadline = min(work_deadline, priority_deadline) if priority_check else work_deadline
+            if clock() + 60 >= item_deadline:
+                if priority_check:
+                    continue
                 break
             if item.kind == 'signals':
                 attempted_signals.add(item.target.scope_id)
@@ -1980,9 +2024,10 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             previous_child_cycle = os.environ.get('TM_CHILD_CYCLE_ID')
             previous_records = os.environ.get('TM_COMPETITION_RECORDS_JSON')
             scraper, scope = None, None
-            item_deadline = min(work_deadline, priority_deadline) if priority_check else work_deadline
             try:
                 if data.get('in_flight'):
+                    if clock() >= item_deadline - 60:
+                        raise PortionDeadlineError('settlement admission deadline reached')
                     settlement.recover(data, scope_id=target.scope_id, directory=directory, now=now(), save=save,
                                        deadline=item_deadline - 60, clock=clock)
                     cache = data.setdefault('response_cache', {})

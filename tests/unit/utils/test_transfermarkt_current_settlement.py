@@ -218,3 +218,139 @@ def test_rejected_connect_requires_open_lifecycle_and_terminal_proof(evidence, c
     with pytest.raises(CurrentSettlementError):
         recover(data, events, path)
     assert data == original
+
+
+def _blocked_runner(offline, evidence):
+    from datetime import timedelta
+    offline.run('cold-setup')
+    state = offline.state()
+    sid, data = next(iter(state['scopes'].items()))
+    old, events, path = evidence
+    data.update(deepcopy(old))
+    for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at'):
+        data['cursor'][name] = (offline.clock.wall - timedelta(days=2)).isoformat()
+    previous = json.loads(path.read_text())
+    previous['scopes'][0]['scope_id'] = sid
+    (offline.root / 'state' / path.name).write_text(json.dumps(previous))
+    offline.write_state(state)
+    for event in events:
+        event['scope'] = sid
+    offline.calls.clear()
+    offline.clients.clear()
+    return sid, events
+
+
+def test_real_runner_timeout_retains_then_next_run_recovers_before_paid_work(offline, evidence, monkeypatch):
+    from dags.utils import transfermarkt_current_settlement as settlement
+    from dags.scripts import run_transfermarkt_current as current
+    sid, events = _blocked_runner(offline, evidence)
+    def slow_events(directory):
+        offline.clock.advance(121)
+        yield from events
+    monkeypatch.setattr(settlement, '_events', slow_events)
+    first = offline.run('recovery-timeout')
+    entry = next(item for item in first['scopes'] if item['kind'] == 'settlement')
+    assert entry['status'] == 'retained'
+    assert 'CurrentSettlementDeadline' in entry['retained']
+    data = offline.state()['scopes'][sid]
+    assert data['in_flight'] == 'old-parent'
+    assert data['cursor']['last_error_at'] is None
+    assert offline.clients == [] and offline.calls == []
+    assert current._deadline_retained(settlement.CurrentSettlementDeadline('expired'))
+    monkeypatch.setattr(settlement, '_events', lambda directory: iter(events))
+    offline.clock.advance(1)
+    second = offline.run('recovery-next-run')
+    assert second['scopes'][0]['status'] == 'reconciled'
+    assert any(item['kind'] == 'signals' for item in second['scopes'])
+    assert 'in_flight' not in offline.state()['scopes'][sid]
+    assert offline.calls
+
+
+@pytest.mark.parametrize('other_error', [False, True])
+def test_legacy_timeout_penalty_requires_exact_report_and_valid_receipts(offline, evidence, monkeypatch, other_error):
+    from datetime import timedelta
+    from dags.utils import transfermarkt_current_settlement as settlement
+    from dags.scripts import run_transfermarkt_current as current
+    sid, events = _blocked_runner(offline, evidence)
+    stamp = offline.clock.wall
+    state = offline.state()
+    state['scopes'][sid]['cursor']['last_error_at'] = stamp.isoformat()
+    offline.write_state(state)
+    cycle = 'legacy-timeout'
+    report = {'cycle_id': cycle, 'started_at': (stamp - timedelta(seconds=1)).isoformat(),
+              'finished_at': (stamp + timedelta(seconds=1)).isoformat(), 'scopes': [{
+                  'scope_id': sid, 'error': 'CurrentSettlementError: gateway reconciliation reached work deadline; retain in_flight'}]}
+    if other_error:
+        report['scopes'].append({'scope_id': sid, 'error': 'source_mismatch'})
+    path = offline.root / 'state' / ('portion-' + hashlib.sha256(cycle.encode()).hexdigest()[:24] + '.json')
+    path.write_text(json.dumps(report))
+    monkeypatch.setattr(settlement, '_events', lambda directory: iter(events))
+    def stop_paid(*args):
+        raise current.PortionDeadlineError('test paid work stopped after recovery')
+    offline.factory = stop_paid
+    result = offline.run('legacy-recovery')
+    assert result['scopes'][0]['status'] == 'reconciled'
+    data = offline.state()['scopes'][sid]
+    assert 'in_flight' not in data
+    assert data['cursor']['last_error_at'] == (stamp.isoformat() if other_error else None)
+    assert any(item['kind'] == 'signals' for item in result['scopes']) is not other_error
+
+
+def test_malformed_receipts_remain_failed_without_extending_existing_backoff(offline, evidence, monkeypatch):
+    from datetime import timedelta
+    from dags.utils import transfermarkt_current_settlement as settlement
+    sid, events = _blocked_runner(offline, evidence)
+    state = offline.state()
+    old_error = (offline.clock.wall - timedelta(minutes=30)).isoformat()
+    state['scopes'][sid]['cursor']['last_error_at'] = old_error
+    offline.write_state(state)
+    monkeypatch.setattr(settlement, '_events', lambda directory: iter(events[:-1]))
+    result = offline.run('bad-receipt')
+    assert result['scopes'][0]['status'] == 'failed'
+    assert 'final bytes differ' in result['scopes'][0]['error']
+    data = offline.state()['scopes'][sid]
+    assert data['in_flight'] == 'old-parent'
+    assert data['cursor']['last_error_at'] == old_error
+    assert not offline.calls and not offline.clients
+
+
+def test_early_budget_rotates_past_malformed_scope(offline, monkeypatch):
+    from dags.utils import transfermarkt_current_settlement as settlement
+    offline.run('setup-two', competitions=('GB1', 'FR1'))
+    state = offline.state()
+    for data in state['scopes'].values():
+        data['in_flight'] = 'missing-completed-report'
+    offline.write_state(state)
+    original = settlement.CurrentSettlement.recover
+    attempted = []
+    def costly_invalid(self, data, **kwargs):
+        attempted.append(kwargs['scope_id'])
+        try:
+            return original(self, data, **kwargs)
+        finally:
+            offline.clock.advance(121)
+    monkeypatch.setattr(settlement.CurrentSettlement, 'recover', costly_invalid)
+    offline.calls.clear()
+    offline.clients.clear()
+    first = offline.run('invalid-first', competitions=('GB1', 'FR1'))
+    first_attempt = attempted[0]
+    assert first['scopes'][0]['status'] == 'failed'
+    attempted.clear()
+    second = offline.run('invalid-next', competitions=('GB1', 'FR1'))
+    assert attempted[0] != first_attempt
+    assert second['scopes'][0]['status'] == 'failed'
+    assert not offline.calls and not offline.clients
+
+
+def test_runner_stops_admission_at_effective_work_tail(offline):
+    from dags.scripts import run_transfermarkt_current as current
+    attempted = []
+    def exhaust_work(target, row, cache, deadline, used):
+        attempted.append(target.scope_id)
+        offline.clock.advance(deadline - offline.clock.elapsed + 1)
+        raise current.PortionDeadlineError('work ended before the next item')
+    offline.factory = exhaust_work
+    report = offline.run('expired-admission', competitions=('GB1', 'FR1'))
+    assert len(attempted) == 1
+    assert len(report['scopes']) == 1
+    assert report['scopes'][0]['status'] == 'retained'
