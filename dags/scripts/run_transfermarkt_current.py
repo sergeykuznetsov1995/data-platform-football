@@ -1831,6 +1831,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
     if budget <= 0:
         return {**report, 'status': 'delivery_window'}
     deadline = min(clock() + budget, deadline_monotonic) if deadline_monotonic is not None else clock() + budget
+    work_deadline = deadline - 120
+    from dags.utils.transfermarkt_current_settlement import CurrentSettlement
+    settlement = CurrentSettlement('/opt/airflow/gateway-state')
     if denominator_rows is None:
         from scrapers.transfermarkt.denominator import load_denominator
         denominator_rows = list(load_denominator().rows.values())
@@ -1941,13 +1944,28 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 work.append(item)
             work = tuple(work + rest)
 
+        # Reserve the first half for oldest due checks, independently of the
+        # ordinary queue. Keep the own-check/write pairs in the second half:
+        # neither a backlog of changes nor a backlog of checks owns the portion.
+        priority_signals = signals if ordinary or closing_work else ()
+        priority_count = len(priority_signals)
+        priority_deadline = clock() + max(0.0, deadline - clock() - 120) / 2
+        work = tuple(priority_signals) + tuple(work)
+        attempted_signals = set()
         state['turn'] += 1
         save = store.save
         save()
         rows = {(row['competition_id'], str(row['edition_id'])): row for row in registry_rows}
         for work_index, item in enumerate(work):
+            priority_check = work_index < priority_count
+            if item.kind == 'signals' and item.target.scope_id in attempted_signals:
+                continue
+            if priority_check and clock() + 60 >= priority_deadline:
+                continue
             if clock() + 60 >= deadline:
                 break
+            if item.kind == 'signals':
+                attempted_signals.add(item.target.scope_id)
             target = item.target
             data = store.activate(target.scope_id)
             if data.get('denominator_hash') != denominator_hash and data.get('cursor'):
@@ -1962,9 +1980,12 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             previous_child_cycle = os.environ.get('TM_CHILD_CYCLE_ID')
             previous_records = os.environ.get('TM_COMPETITION_RECORDS_JSON')
             scraper, scope = None, None
+            item_deadline = min(work_deadline, priority_deadline) if priority_check else work_deadline
             try:
                 if data.get('in_flight'):
-                    raise CurrentPortionError('previous portion has unsettled traffic; reconcile immutable gateway evidence before paid retry')
+                    settlement.recover(data, scope_id=target.scope_id, directory=directory, now=now(), save=save,
+                                       deadline=item_deadline - 60, clock=clock)
+                    cache = data.setdefault('response_cache', {})
                 if data.get('grant_cycle_id') != cycle_id:
                     if data.get('grant_cycle_id'):
                         data.setdefault('closed_grants', []).append({
@@ -1979,19 +2000,22 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 save()
                 os.environ['TM_CHILD_CYCLE_ID'] = child_cycle_id
                 scraper = factory(target, rows[target.competition_id, target.edition_id], cache,
-                                  deadline - 60, data.get('traffic_used', {}))
+                                  item_deadline, data.get('traffic_used', {}))
+                provider = getattr(getattr(scraper, '_http_client', None), '_lease_provider', None)
+                if provider is not None:
+                    provider.settlement_deadline_monotonic = min(deadline - 30, priority_deadline + 60) if priority_check else deadline - 30
                 if scraper._competition_records is not None:
                     # #2067: writer helpers resolve the scope through this env, as
                     # in a scope-cycle child; give them the scraper's registry rows.
                     os.environ['TM_COMPETITION_RECORDS_JSON'] = json.dumps(
                         [record.as_dict() for record in scraper._competition_records], sort_keys=True)
-                scraper._current_deadline_monotonic = deadline
+                scraper._current_deadline_monotonic = item_deadline
                 scraper._current_child_cycle_id = child_cycle_id
                 scraper._current_monotonic_fn = clock
                 original_connection = scraper._bronze_connection
 
                 def bounded_connection():
-                    return _bound_connection(original_connection(), deadline, clock)
+                    return _bound_connection(original_connection(), item_deadline, clock)
 
                 scraper._bronze_connection = bounded_connection
                 _install_entity_limits(scraper, data)
@@ -2018,7 +2042,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         data['bronze_warm_activation'] = {'started_at': now().isoformat()}
                         save()
                 scope = _Scope(target, rows[target.competition_id, target.edition_id], data, scraper,
-                               cycle_id, denominator_hash, save, now, clock, deadline, preflight,
+                               cycle_id, denominator_hash, save, now, clock, item_deadline, preflight,
                                roster_writer, career_writer, coach_writer, player_facts, store.save_player_packet,
                                baseline_verifier, store.invalidate_player_fact)
                 if item.kind == 'signals':

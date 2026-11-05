@@ -327,6 +327,7 @@ class ProxyFilterLeaseProvider:
         sleep_fn: Callable[[float], None] = time.sleep,
         time_fn: Callable[[], float] = time.time,
         request_deadline_monotonic: Optional[float] = None,
+        settlement_deadline_monotonic: Optional[float] = None,
         monotonic_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         base = str(control_base_url).rstrip("/")
@@ -352,6 +353,9 @@ class ProxyFilterLeaseProvider:
         if request_deadline_monotonic is not None and not math.isfinite(float(request_deadline_monotonic)):
             raise ValueError("request_deadline_monotonic must be finite")
         self.request_deadline_monotonic = float(request_deadline_monotonic) if request_deadline_monotonic is not None else None
+        if settlement_deadline_monotonic is not None and not math.isfinite(float(settlement_deadline_monotonic)):
+            raise ValueError("settlement_deadline_monotonic must be finite")
+        self.settlement_deadline_monotonic = settlement_deadline_monotonic
         self._monotonic = monotonic_fn
         self._stream_lease = None
         self._last_permit_request = None
@@ -365,9 +369,12 @@ class ProxyFilterLeaseProvider:
         return min(self.timeout_seconds, remaining)
 
     def _settlement_timeout(self) -> float:
-        if self.request_deadline_monotonic is None:
+        deadline = self.settlement_deadline_monotonic
+        if deadline is None:
+            deadline = self.request_deadline_monotonic
+        if deadline is None:
             return self.timeout_seconds
-        remaining = self.request_deadline_monotonic - self._monotonic()
+        remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise TrafficMeterError("Transfermarkt portion deadline exhausted before lease settlement")
         return min(self.timeout_seconds, remaining)
@@ -671,7 +678,10 @@ class ProxyFilterLeaseProvider:
                     f"proxy lease API rejected DELETE {path} (HTTP 409): "
                     "lease close stayed pending after drain retries"
                 )
-            if self.request_deadline_monotonic is not None and delay >= self.request_deadline_monotonic - self._monotonic():
+            close_deadline = self.settlement_deadline_monotonic
+            if close_deadline is None:
+                close_deadline = self.request_deadline_monotonic
+            if close_deadline is not None and delay >= close_deadline - self._monotonic():
                 raise TrafficMeterError("Transfermarkt portion has no time for lease close retry")
             self._sleep(delay)
         try:
