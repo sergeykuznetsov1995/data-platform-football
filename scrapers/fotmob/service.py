@@ -55,6 +55,7 @@ from .planner import (
     BudgetExceeded,
     BudgetLedger,
     RunMode,
+    SOURCE_GAP_REVIEW_AFTER,
     TransportBudget,
     tombstones_after_two_absences,
     utc_run_id,
@@ -2839,6 +2840,48 @@ class FotMobIngestService:
             self._match_budget_stopped = True
         return fetch
 
+    def _match_source_gap_proof(
+        self, match: Mapping[str, Any], now: datetime,
+    ) -> Optional[dict[str, Any]]:
+        """Validate committed absence without treating it as a source success.
+
+        Prior-run evidence is reusable only for old matches within the same
+        review interval as explicit historical scope gaps. Keep its run identity
+        and observation time: a retry is not a new source observation.
+        """
+        key = str(match["match_id"])
+        target = canonicalize_target("matchDetails", {"matchId": key})
+        if self.repository.latest_match_source(target.target_key) is not None:
+            return None
+        manifest = self.repository.latest_entity_attempt("match", key)
+        if (
+            not manifest
+            or manifest.get("status") != ManifestStatus.NOT_AVAILABLE.value
+            or manifest.get("error_code") != "source_data_not_found"
+            or manifest.get("stale")
+            or manifest.get("target_key") != target.target_key
+            or not all(manifest.get(field) for field in ("run_id", "raw_uri", "content_hash"))
+        ):
+            return None
+        observed = source_observed_at(manifest)
+        if observed is None:
+            return None
+        if manifest["run_id"] != self.run_id:
+            kickoff = match_time(match.get("utc_time"))
+            completed = match_time(manifest.get("completed_at"))
+            if (
+                kickoff is None or kickoff + timedelta(hours=72) > now
+                or completed is None
+                or not timedelta(0) <= now - completed < SOURCE_GAP_REVIEW_AFTER
+            ):
+                return None
+        return {
+            "match_id": key, "target_key": target.target_key,
+            "raw_uri": manifest["raw_uri"], "content_hash": manifest["content_hash"],
+            "run_id": manifest["run_id"], "reason": "source_data_not_found",
+            "observed_at": observed.isoformat(),
+        }
+
     def sync_match_payloads(
         self,
         bundle: SeasonBundle,
@@ -2847,6 +2890,7 @@ class FotMobIngestService:
         limit: Optional[int] = None,
         phase: Optional[str] = None,
         force_refresh: bool = False,
+        reuse_history_source_gaps: bool = False,
     ) -> OperationResult:
         """Fetch each needed match with exactly one ``matchDetails`` request."""
 
@@ -2871,6 +2915,19 @@ class FotMobIngestService:
             recover = None
             if self.mode != RunMode.REPLAY and not force_refresh:
                 recover = self._recover_match_fetch(match)
+            if (
+                reuse_history_source_gaps and self.mode == RunMode.BACKFILL
+                and not force_refresh and recover is None and state.kind == "primary"
+                and phase in {None, "primary"}
+            ):
+                proof = self._match_source_gap_proof(match, now)
+                if proof is not None:
+                    result.not_available += 1
+                    result.metadata["intentional_not_available"] = (
+                        int(result.metadata.get("intentional_not_available", 0)) + 1
+                    )
+                    result.metadata.setdefault("source_gap_matches", []).append(proof)
+                    continue
             kind = state.kind
             if self.mode == RunMode.REPLAY or force_refresh:
                 kind = "primary"
@@ -2953,7 +3010,7 @@ class FotMobIngestService:
                     "content_hash": fetch.content_hash,
                     "run_id": self.run_id,
                     "reason": "source_data_not_found",
-                    "observed_at": fetch.source_observed_at or fetch.fetched_at,
+                    "observed_at": fetch.source_observed_at or fetch.validated_at or fetch.fetched_at,
                 })
                 continue
             try:
@@ -3663,7 +3720,7 @@ class FotMobIngestService:
         """Resolve an explicit scope without claiming unavailable rows exist.
 
         Every finished match must have a successful published card or an exact
-        raw-bearing absence committed by this run. Flush dependencies before
+        raw-bearing absence with a valid historical review age. Flush dependencies before
         buffering the marker, so even a partial final flush cannot publish a
         resolution ahead of its evidence.
         """
@@ -3683,18 +3740,14 @@ class FotMobIngestService:
                 available.add(match_id)
                 continue
             proof = proofs.get(match_id)
-            manifest = self.repository.latest_entity_attempt("match", match_id, run_id=self.run_id)
+            match = next(match for match in bundle.matches if str(match["match_id"]) == match_id)
+            committed = self._match_source_gap_proof(match, utc_now())
             if (
-                proof is None or manifest is None
-                or manifest.get("status") != ManifestStatus.NOT_AVAILABLE.value
-                or manifest.get("error_code") != "source_data_not_found"
-                or manifest.get("stale")
-                or proof.get("run_id") != self.run_id
-                or proof.get("reason") != "source_data_not_found"
-                or not proof.get("observed_at")
-                or any(not proof.get(key) or proof[key] != manifest.get(key)
-                       for key in ("target_key", "raw_uri", "content_hash"))
-                or proof.get("target_key") != target.target_key
+                proof is None or committed is None
+                or any(proof.get(key) != committed[key] for key in (
+                    "match_id", "target_key", "raw_uri", "content_hash", "run_id", "reason",
+                ))
+                or match_time(proof.get("observed_at")) != match_time(committed["observed_at"])
             ):
                 raise ValueError(f"match {match_id} has no committed source gap proof")
         evidence = {

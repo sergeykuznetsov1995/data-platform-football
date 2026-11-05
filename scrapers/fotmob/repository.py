@@ -2782,7 +2782,9 @@ class FotMobRepository:
             + normalized_run_id.replace("'", "''")
             + "'"
         )
-        columns = ", ".join(self._READ_COLUMNS)
+        # Attempt identity must survive flush just as it does in pending_view.
+        attempt_columns = (*self._READ_COLUMNS, "run_id")
+        columns = ", ".join(attempt_columns)
         rows = trino.execute_query(
             f"""
             SELECT {columns}
@@ -2797,7 +2799,7 @@ class FotMobRepository:
             """
         )
         durable_view = (
-            dict(zip(self._READ_COLUMNS, rows[0])) if rows else None
+            dict(zip(attempt_columns, rows[0])) if rows else None
         )
         if pending_view is None:
             return durable_view
