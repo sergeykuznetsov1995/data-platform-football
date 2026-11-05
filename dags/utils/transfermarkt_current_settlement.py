@@ -12,6 +12,42 @@ class CurrentSettlementError(ValueError):
     """A previous paid operation is not yet proven settled."""
 
 
+class CurrentSettlementDeadline(CurrentSettlementError):
+    """Time ended without changing the unsettled evidence or penalizing a scope."""
+
+
+def _check_deadline(deadline, clock):
+    if deadline is not None and clock() >= deadline:
+        raise CurrentSettlementDeadline('gateway reconciliation reached work deadline; retain in_flight')
+
+
+def timeout_backoff_proven(directory, scope_id, error_at, *, deadline, clock):
+    """Conservatively identify an old timeout penalty from its completed report."""
+    if error_at is None:
+        return False
+    legacy = 'CurrentSettlementError: gateway reconciliation reached work deadline; retain in_flight'
+    paths = sorted(Path(directory).glob('portion-*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths[:128]:
+        _check_deadline(deadline, clock)
+        try:
+            if path.stat().st_size > 4 * 1024 * 1024:
+                return False
+            report = json.loads(path.read_text())
+            cycle = report['cycle_id']
+            expected = 'portion-' + hashlib.sha256(cycle.encode()).hexdigest()[:24] + '.json'
+            start, end = (datetime.fromisoformat(report[key]) for key in ('started_at', 'finished_at'))
+            if path.name != expected or not start <= error_at <= end:
+                continue
+            entries = [entry for entry in report['scopes'] if entry.get('scope_id') == scope_id]
+            if entries:
+                errors = [entry['error'] for entry in entries if entry.get('error')]
+                return bool(errors) and all(error == legacy for error in errors)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            # Unknown report evidence must never erase a possible real error.
+            return False
+    return False
+
+
 def _integer(value):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise CurrentSettlementError('invalid gateway byte counter')
@@ -45,6 +81,7 @@ class CurrentSettlement:
         self.events = events
 
     def recover(self, data, *, scope_id, directory, now, save, deadline=None, clock=time.monotonic):
+        _check_deadline(deadline, clock)
         cycle = data.get('in_flight')
         if not cycle:
             return
@@ -65,8 +102,7 @@ class CurrentSettlement:
             raise CurrentSettlementError('previous paid children and receipts differ')
         leases, seen = {}, {}
         for event in self.events if self.events is not None else _events(self.directory):
-            if deadline is not None and clock() >= deadline:
-                raise CurrentSettlementError('gateway reconciliation reached work deadline; retain in_flight')
+            _check_deadline(deadline, clock)
             if event.get('run_id') not in paid:
                 continue
             if event.get('source') != 'transfermarkt' or event.get('event_version') != 'paid-proxy-v2':
@@ -127,6 +163,7 @@ class CurrentSettlement:
             target['up'] += lease['up']; target['down'] += lease['down']; target['leases'].append(lease_id)
             if lease['uncertain']:
                 target['uncertain_leases'].append(lease_id)
+        _check_deadline(deadline, clock)
         updated = deepcopy(data)
         delta_total = 0
         for receipt in [r for r in updated['traffic_receipts'] if r.get('cycle_id') == cycle]:
@@ -162,5 +199,6 @@ class CurrentSettlement:
         updated.setdefault('traffic_reconciliations', []).append({'cycle_id': cycle, 'at': now.isoformat(),
                                                                  'provider_delta_bytes': delta_total})
         updated.pop('in_flight')
+        _check_deadline(deadline, clock)
         data.clear(); data.update(updated)
         save()
