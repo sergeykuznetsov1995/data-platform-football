@@ -2084,6 +2084,61 @@ class ParentRunEnvelopeLedger:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
 
+    def retire(self, retired_phase_keys: frozenset[str]) -> int:
+        """Replace fully retired parents with durable, fail-closed markers.
+
+        The caller supplies only allocation retirements already on disk.
+        Missing or still-present phases are never proof of retirement.
+        Markers remain in ``runs`` without provenance/phase fields, so even
+        the previous reader rejects registration instead of resetting spend.
+        """
+        if not retired_phase_keys:
+            return 0
+        handle = self._locked()
+        try:
+            payload = self._load()
+            replacements = {}
+            for key, run in payload["runs"].items():
+                if not isinstance(run, dict) or run.get("retired") is True:
+                    continue
+                phases = run.get("phases")
+                if (not isinstance(phases, dict) or not phases
+                        or not set(phases).issubset(self.PHASE_ORDER)
+                        or not run.get("dag_id") or not run.get("base_run_id")):
+                    continue
+                phase_keys = {
+                    self._key(run["dag_id"], f"{run['base_run_id']}::{phase}")
+                    for phase in phases
+                }
+                if not phase_keys.issubset(retired_phase_keys):
+                    continue
+                spent = run.get("spent_provider_bytes")
+                if isinstance(spent, bool) or not isinstance(spent, int) or spent < 0:
+                    raise ParentEnvelopeError("invalid retired parent spend")
+                replacements[key] = {
+                    "retired": True,
+                    "spent_provider_bytes": spent,
+                    "retired_at": datetime.now(timezone.utc).isoformat(),
+                }
+            if not replacements:
+                return 0
+            candidate = {**payload, "runs": {**payload["runs"], **replacements}}
+            try:
+                self._write(candidate)
+            except OSError:
+                # replace may have succeeded before directory fsync failed.
+                # Never reopen that parent from the older in-memory copy;
+                # retain exact spend and retry durability on the next flush.
+                self._payload = candidate
+                self._dirty = True
+                raise
+            self._payload = candidate
+            self._dirty = False
+            return len(replacements)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
     def _locked(self):
         os.makedirs(os.path.dirname(self.lock_path) or ".", exist_ok=True)
         handle = open(self.lock_path, "a+")
@@ -2118,7 +2173,7 @@ class ParentRunEnvelopeLedger:
         )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, indent=2, sort_keys=True)
+                json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -2212,6 +2267,8 @@ class ParentRunEnvelopeLedger:
         try:
             payload = self._load()
             run = payload["runs"].get(key)
+            if isinstance(run, dict) and run.get("retired") is True:
+                raise ParentEnvelopeError("parent DagRun envelope was retired")
             if run is None:
                 run = {
                     "dag_id": plan.dag_id,
@@ -5942,7 +5999,10 @@ def _dump(out_path: str, quiet: bool = False) -> None:
 
     tmp = out_path + ".tmp"
     with open(tmp, "w") as fh:
-        json.dump(report, fh, indent=2)
+        if SOURCE_MODE == "sofascore-only":
+            json.dump(report, fh, separators=(",", ":"))
+        else:
+            json.dump(report, fh, indent=2)
     os.replace(tmp, out_path)
     if not quiet:
         log.info("=== allowed (total %.2f MB) ===", total / 1048576)
@@ -5955,9 +6015,14 @@ def _dump(out_path: str, quiet: bool = False) -> None:
 def _flush_ledgers() -> None:
     """Persist dirty SofaScore ledgers (#1350); synchronous, no threads."""
 
-    for ledger in (SOFASCORE_ALLOCATION_LEDGER, SOFASCORE_PARENT_ENVELOPE_LEDGER):
-        if ledger is not None:
-            ledger.flush()
+    allocations = SOFASCORE_ALLOCATION_LEDGER
+    parent = SOFASCORE_PARENT_ENVELOPE_LEDGER
+    if allocations is not None:
+        allocations.flush()
+    if parent is not None:
+        if SOURCE_MODE == "sofascore-only" and allocations is not None:
+            parent.retire(allocations.retired_run_keys())
+        parent.flush()
 
 
 def _compact_sofascore_registry(path: str, *, kind: str):
