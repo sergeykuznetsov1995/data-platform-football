@@ -4470,3 +4470,248 @@ def test_history_workers_own_disjoint_pool_lines_through_rotation(monkeypatch, t
     owned = [ports(f"{i}/3") for i in range(3)]
     assert owned[0][0] == [0, 3, 6][5 % 3]
     assert [sorted(lines) for lines in owned] == [[0, 3, 6], [1, 4], [2, 5]]
+
+
+MAINTENANCE_HTML = (
+    b"<html><head><title>WhoScored.com</title></head><body>"
+    b"<p>We are unable to respond to you at the moment but we will be back "
+    b"shortly.</p>"
+    b"<p>Please check us again soon and thanks for your patience.</p>"
+    b"</body></html>"
+)
+MATCHCENTRE_WITH_MAINTENANCE_TEXT_HTML = (
+    b"<html><head><title>WhoScored.com</title></head><body>"
+    b"<script>var matchCentreData = {}</script>"
+    b"<!-- We are unable to respond to you at the moment but we will be back "
+    b"shortly. -->"
+    b"<!-- Please check us again soon and thanks for your patience. -->"
+    b"</body></html>"
+)
+
+
+def _matchcentre_validator(response):
+    return True if b"matchCentreData" in response.content else False
+
+
+@pytest.mark.unit
+def test_maintenance_page_retries_direct_then_recovers_without_browser():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MAINTENANCE_HTML),
+        FakeHTTPResponse(content=OK_HTML),
+    )
+    fs = FakeFSClient()
+    cache = MemoryRawCache()
+    transport, _ = _transport(direct, direct_fs=fs, raw_cache=cache)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        cache_key="m1",
+        validator=_matchcentre_validator,
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert result.content == OK_HTML
+    assert len(direct.calls) == 2
+    assert fs.created == []
+    # The transient maintenance shell is never persisted to the raw cache.
+    assert [entry[1].content for entry in cache.stored] == [OK_HTML]
+
+
+@pytest.mark.unit
+def test_maintenance_page_bounded_exhaustion_is_retryable_http_status_200():
+    direct = FakeHTTPSession(*[FakeHTTPResponse(content=MAINTENANCE_HTML)] * 3)
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch(
+            "https://www.whoscored.com/Matches/1/Live",
+            validator=_matchcentre_validator,
+        )
+
+    assert exc.value.kind is FailureKind.HTTP_STATUS
+    assert exc.value.kind is not FailureKind.CONTENT
+    assert exc.value.status_code == 200
+    assert exc.value.retryable is True
+    assert "maintenance" in str(exc.value).lower()
+    assert len(direct.calls) == 3
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_maintenance_page_in_browser_retries_within_bounded_attempts():
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        {"html": MAINTENANCE_HTML.decode(), "status": 200},
+        {"html": OK_HTML.decode(), "status": 200},
+    )
+    transport, _ = _transport(direct, direct_fs=fs, attempts=2)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        validator=_matchcentre_validator,
+    )
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert result.content == OK_HTML
+    assert len(fs.get_calls) == 2
+
+
+@pytest.mark.unit
+def test_cached_maintenance_page_is_rejected_and_refetched_direct():
+    cache = MemoryRawCache(
+        CachedPayload(content=MAINTENANCE_HTML, status_code=200, headers={})
+    )
+    direct = FakeHTTPSession(FakeHTTPResponse(content=OK_HTML))
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs, raw_cache=cache)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        cache_key="m1",
+        validator=_matchcentre_validator,
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert result.content == OK_HTML
+    assert len(direct.calls) == 1
+    assert fs.created == []
+    assert transport.get_traffic_stats()["cache_invalid"] == 1
+    assert transport.get_traffic_stats()["cache_hits"] == 0
+
+
+@pytest.mark.unit
+def test_maintenance_signature_requires_both_sentences_and_exact_title():
+    drift_pages = [
+        # Single sentence only.
+        b"<html><head><title>WhoScored.com</title></head><body>"
+        b"We are unable to respond to you at the moment but we will be back "
+        b"shortly.</body></html>",
+        # Both sentences but a different title.
+        b"<html><head><title>WhoScored.com | Maintenance</title></head><body>"
+        b"We are unable to respond to you at the moment but we will be back "
+        b"shortly. Please check us again soon and thanks for your patience."
+        b"</body></html>",
+        # Exact title but a generic missing-payload shell.
+        b"<html><head><title>WhoScored.com</title></head><body>"
+        b"<div id=\"layout\"></div></body></html>",
+    ]
+    for content in drift_pages:
+        direct = FakeHTTPSession(FakeHTTPResponse(content=content))
+        fs = FakeFSClient()
+        transport, _ = _transport(direct, direct_fs=fs, http_attempts=2)
+
+        with pytest.raises(WhoScoredTransportError) as exc:
+            transport.fetch(
+                "https://www.whoscored.com/Matches/1/Live",
+                validator=_matchcentre_validator,
+            )
+
+        assert exc.value.kind is FailureKind.CONTENT
+        assert exc.value.retryable is False
+        # Non-maintenance drift never consumes a transport retry.
+        assert len(direct.calls) == 1
+        assert fs.created == []
+
+
+@pytest.mark.unit
+def test_matchcentre_page_embedding_maintenance_text_is_accepted():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MATCHCENTRE_WITH_MAINTENANCE_TEXT_HTML)
+    )
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        validator=_matchcentre_validator,
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert result.content == MATCHCENTRE_WITH_MAINTENANCE_TEXT_HTML
+    assert len(direct.calls) == 1
+    assert fs.created == []
+
+
+def _padded_matchcentre_with_maintenance_text(padding: int) -> bytes:
+    # Normal page: both maintenance sentences and the exact title sit near
+    # the top (embedded prose), while the real matchCentreData payload is
+    # pushed past ``padding`` filler bytes.
+    return (
+        b"<html><head><title>WhoScored.com</title></head><body>"
+        b"<!-- We are unable to respond to you at the moment but we will be "
+        b"back shortly. -->"
+        b"<!-- Please check us again soon and thanks for your patience. -->"
+        + b" " * padding
+        + b"<script>var matchCentreData = {}</script></body></html>"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("padding", [0, 16_384])
+def test_matchcentre_payload_after_padding_is_never_retried_as_maintenance(padding):
+    # Regression: the detector truncated the body to 16KiB before checking
+    # for matchCentreData, so a valid page whose payload began past that
+    # window was misclassified as maintenance and burned bounded retries.
+    page = _padded_matchcentre_with_maintenance_text(padding)
+    direct = FakeHTTPSession(FakeHTTPResponse(content=page))
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs, http_attempts=2)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        validator=_matchcentre_validator,
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert result.content == page
+    assert len(direct.calls) == 1
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_oversized_maintenance_like_shell_is_drift_not_maintenance():
+    # Observed maintenance shells are <1KiB; a body larger than the 16KiB
+    # bound is rejected by length alone and is ordinary content drift, never
+    # a retryable maintenance status.
+    shell = MAINTENANCE_HTML + b" " * 16_385
+    assert len(shell) > 16_384
+    direct = FakeHTTPSession(FakeHTTPResponse(content=shell))
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs, http_attempts=2)
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch(
+            "https://www.whoscored.com/Matches/1/Live",
+            validator=_matchcentre_validator,
+        )
+
+    assert exc.value.kind is FailureKind.CONTENT
+    assert exc.value.retryable is False
+    assert len(direct.calls) == 1
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_cloudflare_challenge_markup_takes_priority_over_maintenance_text():
+    hybrid = (
+        b"<html><head><title>WhoScored.com</title>"
+        b"<script src='/cdn-cgi/challenge-platform/x'></script></head><body>"
+        b"We are unable to respond to you at the moment but we will be back "
+        b"shortly. Please check us again soon and thanks for your patience."
+        b"</body></html>"
+    )
+    direct = FakeHTTPSession(FakeHTTPResponse(200, hybrid, {"cf-ray": "x"}))
+    fs = FakeFSClient({"html": OK_HTML.decode(), "status": 200})
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        validator=_matchcentre_validator,
+    )
+
+    # The Cloudflare guard routes to the direct browser; the maintenance
+    # detector must never swallow a challenge as an ordinary HTTP status.
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(direct.calls) == 1
+    assert len(fs.get_calls) == 1
