@@ -72,6 +72,32 @@ def page_h1(html: str) -> Tuple[date, str]:
     return _iso_date(match.group(1), "h1 date"), match.group(2)
 
 
+_REGIONAL_SECTIONS = frozenset({
+    "Africa", "Asia", "Europe", "North America", "South America", "Oceania", "World",
+})
+
+
+def _country_sections(doc):
+    """A linked regional header (e.g. Europe → UEFA) is not a country."""
+    return [
+        section for section in doc.xpath(
+            '//div[@class="stamm"]//div[@class="accordion-item"]'
+            '[div[@class="accordion-header"]/a/@href]'
+        )
+        if _text(section.xpath('./div[@class="accordion-header"]')[0])
+        not in _REGIONAL_SECTIONS
+    ]
+
+
+def _section_elements(section, xpath):
+    # lxml repairs malformed markup into nested accordion items. Descendant
+    # rows/links belong to their nearest section, not to a country ancestor.
+    return [
+        element for element in section.xpath(xpath)
+        if element.xpath('ancestor::div[@class="accordion-item"][1]')[0] == section
+    ]
+
+
 def parse_ranking_slugs(html: str) -> Tuple[date, List[str]]:
     """Rating date and the club slugs linked from the country tables.
 
@@ -84,16 +110,16 @@ def parse_ranking_slugs(html: str) -> Tuple[date, List[str]]:
     if page != "Ranking":
         raise LayoutChanged(f"h1 points to {page!r}, expected 'Ranking'")
     doc = lxml_html.fromstring(html)
-    sections = doc.xpath(
-        '//div[@class="stamm"]//div[@class="accordion-item"]'
-        '[div[@class="accordion-header"]/a/@href]'
-    )
+    sections = _country_sections(doc)
     if not sections:
         raise LayoutChanged("no country sections on /Ranking")
     slugs: List[str] = []
     seen = set()
     for section in sections:
-        for href in section.xpath('.//table[@class="ast"]//a[span[@class="NonAst"]]/@href'):
+        for link in _section_elements(
+            section, './/table[@class="ast"]//a[span[@class="NonAst"]][@href]'
+        ):
+            href = link.get("href")
             if not href.startswith("/") or "/" in href[1:] or len(href) < 2:
                 raise LayoutChanged(f"unexpected club link {href!r}")
             slug = href[1:]
@@ -417,10 +443,7 @@ def _vega_ranking(html: str) -> List[Dict[str, Any]]:
 def _country_tables(doc) -> List[Dict[str, Any]]:
     """Rows of the per-country accordion tables (sections with a flag link)."""
 
-    sections = doc.xpath(
-        '//div[@class="stamm"]//div[@class="accordion-item"]'
-        '[div[@class="accordion-header"]/a/@href]'
-    )
+    sections = _country_sections(doc)
     if not sections:
         raise LayoutChanged("C1 no country tables on /Ranking")
     rows = []
@@ -428,7 +451,9 @@ def _country_tables(doc) -> List[Dict[str, Any]]:
         section_name = _text(section.xpath('./div[@class="accordion-header"]')[0])
         group: Optional[str] = None
         level: Optional[int] = None
-        for tr in section.xpath('.//table[@class="ast"]//tr'):
+        for tr in _section_elements(section, './/table[@class="ast"]//tr'):
+            if tr.xpath('.//div[@class="accordion-item"]'):
+                raise LayoutChanged(f"C3 country table {section_name!r}: nested section in row")
             if tr.xpath('./td[@class="l"]/i'):
                 group = " ".join(_text(td) for td in tr.xpath("./td"))  # "Level 1 (18 teams) ⌀1751"
                 match = _LEVEL_GROUP.match(group)
