@@ -8358,7 +8358,7 @@ def test_history_pressure_reclaims_small_wal_and_archives_old_daily_sums(shared_
     assert wal.read_bytes() == pending_raw
     assert shared_mod._sofascore_registry_bytes() < shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES
     assert totals(registry.iter_events(path)) == totals(rows)
-    assert len([e for e in map(json.loads, path.read_text().splitlines()) if e["event_type"] == "bytes"]) == 1
+    assert len([e for e in map(json.loads, path.read_text().splitlines()) if e["event_type"] == "bytes"]) == 0
     assert any(e.get("request_id") == "week" for e in registry.iter_events(path))
     assert restore() == expected
     # A daily refresh/restart retains all archived lease/run/URL/phase counters.
@@ -8396,6 +8396,8 @@ def _close_discovery_control(mod, lease, manager):
 def test_discovery_connect_refusal_complete_closes_exactly(
     shared_mod, monkeypatch, code, framing, previous_tunnel
 ):
+    # Production compaction and checkpoint-aware replay are enabled together.
+    shared_mod.SOURCE_MODE = "sofascore-only"
     manager = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_discovery_lease(shared_mod, manager)
     _relax_provider_head_timeout(shared_mod, monkeypatch)

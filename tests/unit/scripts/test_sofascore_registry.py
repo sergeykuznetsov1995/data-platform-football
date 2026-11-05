@@ -68,7 +68,8 @@ def test_compacted_checkpoint_preserves_every_recovery_key_and_week_evidence(tmp
     events = [event() for _ in range(30)] + [event(direction="up"), event(occurred_at="2026-10-07T00:00:00Z"), event(lease_id="other"), event(event_type="lease_created"), event(event_type="accounting_uncertain", reason="disk_failed"), event(event_type="lease_closed"), event(event_type="lease_created", occurred_at="2026-09-01T00:00:00Z")]
     write(path, events)
     result = registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000)
-    assert totals(read(path)) == totals(events)
+    assert totals(registry.iter_events(path)) == totals(events)
+    assert totals(read(path)) == {}  # Recovery sums live in the snapshot, not the tail.
     assert result["after_bytes"] < 10000
     assert {e["event_type"] for e in registry.iter_events(path)} == {"bytes", "lease_created", "accounting_uncertain", "lease_closed"}
     assert sum(e["event_type"] == "lease_created" for e in registry.iter_events(path)) == 1
@@ -90,7 +91,10 @@ def test_concurrent_append_is_copied_exactly_once(tmp_path, monkeypatch):
             yield item
     monkeypatch.setattr(registry, "_events", scan)
     registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000)
-    assert totals(read(path)) == totals(events + [appended])
+    # The concurrent append is copied into the raw tail exactly once; the
+    # already committed prefix sums are archived, not duplicated in the tail.
+    assert totals(read(path)) == totals([appended])
+    assert totals(registry.iter_events(path)) == totals(events + [appended])
 
 
 @pytest.mark.parametrize("fault", ["fsync", "replace"])
@@ -128,9 +132,20 @@ def test_irreducible_state_is_preserved_instead_of_pruned(tmp_path):
     path = tmp_path / "paid.jsonl"
     write(path, [event(lease_id=str(i), padding="") for i in range(30)])
     original = path.read_bytes()
+    # A concurrently appended raw event must be copied verbatim into the
+    # journal tail. When that retained tail alone exceeds the trigger, the
+    # compaction must fail instead of pruning evidence to fit.
+    payload = json.dumps(event(lease_id="late", padding="y" * 5000)) + "\n"
+    def append_large():
+        with path.open("a") as out:
+            out.write(payload)
     with pytest.raises(RuntimeError, match="cannot compact"):
-        registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=1000)
-    assert path.read_bytes() == original
+        registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=1000, before_replace=append_large)
+    # The journal generation is never replaced; the committed append survives.
+    assert path.read_bytes() == original + payload.encode()
+    registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=1000)
+    expected = [event(lease_id=str(i)) for i in range(30)] + [event(lease_id="late")]
+    assert totals(registry.iter_events(path)) == totals(expected)
 
 
 def test_forced_same_day_rotation_below_trigger_preserves_recovery_and_evidence(tmp_path):
@@ -146,7 +161,8 @@ def test_forced_same_day_rotation_below_trigger_preserves_recovery_and_evidence(
     assert registry.compact(str(path), RLock(), kind="paid", now=NOW) is None
     result = registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
     assert result["after_bytes"] < before
-    assert totals(read(path)) == totals(original + appended)
+    assert totals(registry.iter_events(path)) == totals(original + appended)
+    assert totals(read(path)) == {}
     assert {e["event_type"] for e in registry.iter_events(path)} == {"bytes", "lease_created", "accounting_uncertain"}
 
 
@@ -191,7 +207,9 @@ def test_forced_below_trigger_copies_concurrent_append_once(tmp_path, monkeypatc
             yield item
     monkeypatch.setattr(registry, "_expanded_events", scan)
     registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
-    assert totals(read(path)) == totals([event(), event(), appended])
+    # Only the concurrent append remains raw; committed sums stay archived.
+    assert totals(read(path)) == totals([appended])
+    assert totals(registry.iter_events(path)) == totals([event(), event(), appended])
 
 
 def test_another_source_is_never_rotated(tmp_path):
@@ -224,7 +242,9 @@ def test_pending_tail_repair_runs_before_atomic_install(tmp_path, monkeypatch):
             out.write(payload)
     monkeypatch.setattr(registry, "_events", scan)
     registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000, before_replace=repair)
-    assert totals(read(path)) == totals(events + [appended])
+    # The repaired tail event is copied raw exactly once; prefix sums archive.
+    assert totals(read(path)) == totals([appended])
+    assert totals(registry.iter_events(path)) == totals(events + [appended])
 
 
 def test_large_week_of_forensics_is_archived_without_losing_events(tmp_path):
@@ -235,8 +255,8 @@ def test_large_week_of_forensics_is_archived_without_losing_events(tmp_path):
     assert path.stat().st_size < 10000
     physical = read(path)
     assert physical[0]["event_type"] == "forensic_checkpoint"
-    assert totals(physical) == totals([event() for _ in range(30)])
     expanded = list(registry.iter_events(path))
+    assert totals(expanded) == totals([event() for _ in range(30)])
     assert [e["request_id"] for e in expanded if e["event_type"] == "endpoint_finished"] == [str(i) for i in range(400)]
     assert len(list(tmp_path.glob("*.jsonl.gz"))) == 1
 
@@ -447,7 +467,8 @@ def test_old_daily_sums_move_to_archive_without_losing_any_recovery_key(tmp_path
     for field in registry.RECOVERY_FIELDS:
         value = "up" if field == "direction" else "sofascore_discovery" if field == "source" else "other"
         rows.append({**old, field: value})
-    # The cutoff is Oct 2 at noon: retain that entire day, archive Oct 1.
+    # The cutoff is Oct 2 at noon. Recovery sums are archived for every UTC
+    # day, fresh days included; only seven-day non-bytes evidence expires.
     rows += [event(occurred_at="2026-10-01T23:59:59+00:00", padding=""),
              event(occurred_at="2026-10-02T00:00:00+00:00", padding=""),
              event(event_type="endpoint_finished", request_id="recent", padding="")]
@@ -455,7 +476,7 @@ def test_old_daily_sums_move_to_archive_without_losing_any_recovery_key(tmp_path
     now = NOW + timedelta(hours=12)
     registry.compact(str(path), RLock(), kind="paid", now=now)
     assert read(path)[0]["schema_version"] == 2
-    assert {e["occurred_at"][:10] for e in read(path) if e["event_type"] == "bytes"} == {"2026-10-02"}
+    assert not [e for e in read(path) if e["event_type"] == "bytes"]
     assert totals(registry.iter_events(path)) == totals(rows)
     assert any(e.get("request_id") == "recent" for e in registry.iter_events(path))
     # Daily refresh must retain archived recovery even after evidence expires.

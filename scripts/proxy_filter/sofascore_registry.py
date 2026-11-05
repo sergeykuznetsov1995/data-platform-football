@@ -377,13 +377,13 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                     forensic_count += 1
                     forensic_length += len(raw)
             for event in groups.values():
+                # Every aggregated recovery group is committed to the snapshot,
+                # including the current UTC day: keys never expire and the raw
+                # tail must not duplicate sums the checkpoint already covers.
                 raw = _line(event)
-                # Keep the entire UTC day online until its end is outside the
-                # evidence window. Archived recovery keys never expire.
-                if event["occurred_at"][:10] < cutoff[:10]:
-                    packed.write(raw)
-                    forensic_count += 1
-                    forensic_length += len(raw)
+                packed.write(raw)
+                forensic_count += 1
+                forensic_length += len(raw)
             archive_name = None
             archive_bytes = 0
             if packed is not None:
@@ -399,10 +399,6 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                                  "archive": archive_name, "sha256": digest,
                                  "events_count": forensic_count, "uncompressed_bytes": forensic_length}))
                 kept += forensic_count
-            for event in groups.values():
-                if event["occurred_at"][:10] >= cutoff[:10]:
-                    out.write(_line(event))
-                    kept += 1
             out.flush()
             with lock:
                 if before_replace is not None:
