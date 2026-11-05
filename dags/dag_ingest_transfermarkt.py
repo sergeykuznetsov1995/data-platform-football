@@ -96,7 +96,7 @@ def _current_schedule():
 
     if TransfermarktCurrentTimetable is None:
         raise RuntimeError('real Airflow timetable support is required for TM current')
-    return TransfermarktCurrentTimetable()
+    return TransfermarktCurrentTimetable(reserve_discovery=True)
 
 
 def _plan_current_portion(context, registry_rows, preflight, qualification):
@@ -120,7 +120,7 @@ def _plan_current_portion(context, registry_rows, preflight, qualification):
         'registry_rows': [row for row in registry_rows if row.get('is_current') is True],
         'preflight': preflight,
         'cycle_id': cycle, 'qualification': qualification,
-        'deadline_at': work_deadline(started).isoformat(),
+        'deadline_at': work_deadline(started, reserve_discovery=True).isoformat(),
     })
     return [{
         'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
@@ -300,7 +300,7 @@ def _bounded_current_planning(function):
         started = context['dag_run'].start_date
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
-        remaining = remaining_work_seconds(work_deadline(started), _planning_now())
+        remaining = remaining_work_seconds(work_deadline(started, reserve_discovery=True), _planning_now())
         if remaining <= 0:
             raise AirflowFailException('qualified current planning reached the whole DagRun deadline')
         deadline = _planning_monotonic() + remaining

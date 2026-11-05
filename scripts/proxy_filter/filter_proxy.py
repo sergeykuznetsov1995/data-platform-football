@@ -138,6 +138,7 @@ TRANSFERMARKT_DAG_IDS = frozenset(
     {
         "dag_ingest_transfermarkt",
         "dag_discover_transfermarkt_registry",
+        "dag_discover_transfermarkt_registry_manual",
     }
 )
 TRANSFERMARKT_BACKFILL_DAG_ID = "dag_backfill_transfermarkt"

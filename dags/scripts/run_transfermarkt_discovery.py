@@ -28,7 +28,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
@@ -47,8 +47,14 @@ from dags.utils.transfermarkt_approval import (
     StandingPolicyScaling,
     load_standing_policy,
 )
+from dags.utils.transfermarkt_discovery_continuation import (
+    DiscoveryContinuation, DiscoveryPortionComplete, identity_for, read_job, WORK_SECONDS,
+    ensure_manual_delivery_admission, MANUAL_DAG_ID,
+)
+
 from scrapers.transfermarkt.client import (
     ProxyFilterLeaseProvider,
+    CurrentPortionDeadlineExceeded,
     TransfermarktHttpClient,
     redact_sensitive,
 )
@@ -1289,11 +1295,46 @@ def _execute_once(
         soft_provider_bytes=args.byte_cap_bytes - SOFT_STOP_MARGIN_BYTES,
         retry_limit=args.retry_limit,
     )
+    portion_seconds = getattr(args, 'portion_seconds', 0)
+    if portion_seconds and (standing_policy is None or not 60 <= portion_seconds <= WORK_SECONDS):
+        raise DiscoveryRunnerError('resumable portions require standing policy and 60..2700 seconds')
+    continuation = None
+    failures = None
+    started = monotonic()
+    deadline = started + portion_seconds if portion_seconds else None
+    if portion_seconds:
+        if not args.job_path or not args.deadline_at:
+            raise DiscoveryRunnerError('portion requires prepared cohort and absolute deadline')
+        hard_end = datetime.fromisoformat(args.deadline_at)
+        if hard_end.tzinfo is None:
+            raise DiscoveryRunnerError('discovery deadline must include timezone')
+        # Queue waiting consumes the same slot. Keep five minutes for writes,
+        # publication and final task completion, not a fresh budget on start.
+        deadline = min(deadline, started + (hard_end - utcnow()).total_seconds() - 300)
+        if deadline - started <= 60:
+            raise DiscoveryRunnerError('discovery slot expired before source admission')
+        job_path = Path(_absolute_path(args.job_path, field='job_path'))
+        saved = read_job(job_path)
+        identity = identity_for(previous_snapshot_id=previous.snapshot_id if previous else None,
+            mode=mode, policy_hash=standing_policy.policy_hash, request_limit=args.request_limit,
+            retry_limit=args.retry_limit, byte_cap_bytes=args.byte_cap_bytes,
+            day=saved['identity']['cohort_day'], dry_run=args.dry_run)
+        if Path(saved['checkpoint_path']) != Path(checkpoint_path):
+            raise DiscoveryRunnerError('cohort checkpoint path differs')
+        continuation = DiscoveryContinuation(job_path, identity, ledger, _atomic_json_write,
+                                             now=utcnow, run_id=str(args.run_id))
+        failures = AtomicJsonMapping(Path(checkpoint_path).with_suffix('.failures.json'))
+    remaining_requests = args.request_limit - ledger.snapshot()['requests']
+    remaining_retries = args.retry_limit - ledger.snapshot()['retries']
+    if remaining_requests <= 0 or remaining_retries < 0:
+        raise DiscoveryRunnerError('discovery cumulative request/retry budget exhausted')
+    if args.dag_id == MANUAL_DAG_ID:
+        ensure_manual_delivery_admission(utcnow())
     lease_provider = lease_provider_factory(args.proxy_control_url)
     client = http_client_factory(
         lease_provider=lease_provider,
         traffic_ledger=ledger,
-        retry_budget=args.retry_limit,
+        retry_budget=remaining_retries,
         lease_metadata={
             "dag_id": args.dag_id,
             "run_id": args.run_id,
@@ -1301,14 +1342,14 @@ def _execute_once(
             "entity": ENTITY,
             "scope": cycle_id,
         },
-        lease_ttl_seconds=args.lease_ttl_seconds,
+        lease_ttl_seconds=min(args.lease_ttl_seconds, portion_seconds) if portion_seconds else args.lease_ttl_seconds,
+        **({"request_deadline_monotonic": deadline, "monotonic_fn": monotonic} if deadline is not None else {}),
         cache=cache,
         rate_limiter=RateLimiter(
             max_requests=REQUESTS_PER_MINUTE, window_seconds=60,
         ),
     )
-    client.begin_request_scope(request_attempt_budget=args.request_limit)
-    started = monotonic()
+    client.begin_request_scope(request_attempt_budget=remaining_requests)
     source_started = False
     source_validated = False
     write_authorized = False
@@ -1318,9 +1359,19 @@ def _execute_once(
     edition_rows: list[dict[str, Any]] | None = None
     writes: tuple[dict[str, Any], ...] = ()
 
+    def check_portion() -> None:
+        if deadline is not None and monotonic() >= deadline - 60:
+            raise DiscoveryPortionComplete('discovery portion exhausted; checkpoint retained')
+
     def fetch(url: str) -> FetchOutcome[str]:
+        check_portion()
+        if failures is not None and url in failures:
+            saved = failures[url]
+            saved = {**saved, 'status': FetchStatus(saved['status']),
+                     'raw_attempt_envelope_ids': tuple(saved.get('raw_attempt_envelope_ids', ()))}
+            return _checked(FetchOutcome(**saved))
         paid_authorization.require()
-        retries_used = int(client.get_traffic_stats().get("retries", 0))
+        retries_used = int(ledger.snapshot()["retries"])
         remaining_retries = max(0, args.retry_limit - retries_used)
         outcome = client.fetch(
             url,
@@ -1333,11 +1384,23 @@ def _execute_once(
             cache_ttl_seconds=args.cache_ttl_seconds,
             max_405_attempts=MAX_405_ATTEMPTS,
         )
-        return _checked(outcome)
+        outcome = _checked(outcome)
+        if failures is not None:
+            # Preserve even schema-unusable HTTP 200 responses and the last
+            # response before a deadline; another slot must not buy them again.
+            failures[url] = {**asdict(outcome), 'status': outcome.status.value}
+        check_portion()
+        return outcome
 
     def fetch_json(url: str) -> FetchOutcome[Any]:
+        check_portion()
+        if failures is not None and url in failures:
+            saved = failures[url]
+            saved = {**saved, 'status': FetchStatus(saved['status']),
+                     'raw_attempt_envelope_ids': tuple(saved.get('raw_attempt_envelope_ids', ()))}
+            return _checked(FetchOutcome(**saved))
         paid_authorization.require()
-        retries_used = int(client.get_traffic_stats().get("retries", 0))
+        retries_used = int(ledger.snapshot()["retries"])
         remaining_retries = max(0, args.retry_limit - retries_used)
         outcome = client.fetch(
             url,
@@ -1351,7 +1414,13 @@ def _execute_once(
             ),
             max_405_attempts=MAX_405_ATTEMPTS,
         )
-        return _checked(outcome)
+        outcome = _checked(outcome)
+        if failures is not None:
+            # Preserve even schema-unusable HTTP 200 responses and the last
+            # response before a deadline; another slot must not buy them again.
+            failures[url] = {**asdict(outcome), 'status': outcome.status.value}
+        check_portion()
+        return outcome
 
     def _checked(outcome: FetchOutcome[Any]) -> FetchOutcome[Any]:
         if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
@@ -1369,6 +1438,7 @@ def _execute_once(
         wait for the next run instead of the snapshot failing on the cap.
         """
 
+        check_portion()
         used = ledger.snapshot()
         spare_retries = max(0, args.retry_limit - int(used["retries"]))
         return (
@@ -1415,6 +1485,8 @@ def _execute_once(
         if traffic["retries"] > args.retry_limit:
             raise DiscoveryRunnerError("retry limit exceeded")
         source_validated = True
+        if continuation is not None:
+            continuation.save('writing')
 
         if not args.dry_run:
             write_authorization.require()
@@ -1446,6 +1518,7 @@ def _execute_once(
             # Carried/unreadable competitions, title-only editions, HTML vs
             # regulation disagreements and new current editions (#1391).
             "discovery_report": dict(report),
+            "logical_cohort": ({"job_id": continuation.saved["job_id"], "started_at": continuation.saved["started_at"], "portion": continuation.portion} if continuation is not None else None),
             # The snapshot's own timezone-aware capture time: standing
             # publication compares it with the canonical state's promoted_at
             # so a cleared publish task of an old run cannot replay a stale
@@ -1521,16 +1594,34 @@ def _execute_once(
                 manifest_hash=manifest_hash,
                 policy=standing_policy,
             )
+        if continuation is not None:
+            continuation.save('source_complete', final_manifest={
+                'path': manifest_path, 'hash': manifest_hash,
+                'snapshot_id': snapshot.snapshot_id, 'cycle_id': cycle_id})
         return DiscoveryRunResult(
             manifest_path=manifest_path,
             manifest_hash=manifest_hash,
             manifest=manifest,
         )
     except BaseException as exc:
+        settled = False
         try:
             client.close()
-        except BaseException:
-            pass
+            settled = True
+        except BaseException as close_error:
+            if isinstance(exc, (DiscoveryPortionComplete, CurrentPortionDeadlineExceeded)):
+                exc = close_error
+        if settled and continuation is not None and isinstance(exc, (DiscoveryPortionComplete, CurrentPortionDeadlineExceeded)):
+            continuation.save('paused')
+            paused = {'status': 'paused', 'cycle_id': cycle_id, 'run_id': str(args.run_id),
+                      'rows': {'competitions': None, 'competition_editions': None},
+                      'traffic': _traffic_manifest(ledger), 'source_status': 'incomplete',
+                      'dq': {'source_complete': False}, 'writes': [],
+                      'portion': continuation.portion, 'error': str(exc)}
+            manifest_path, manifest_hash = _manifest_output(output_root, cycle_id, paused)
+            return DiscoveryRunResult(manifest_path=manifest_path, manifest_hash=manifest_hash, manifest=paused)
+        if continuation is not None:
+            continuation.save('failed' if settled else 'unsettled')
         for authorization in (paid_authorization, write_authorization):
             try:
                 authorization.fail(str(exc))
@@ -1569,7 +1660,7 @@ def _execute_once(
             setattr(exc, "manifest", failure)
         except BaseException:
             pass
-        raise
+        raise exc
 
 
 def execute(
@@ -1668,6 +1759,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-limit", type=int, default=12)
     parser.add_argument("--cache-ttl-seconds", type=int, default=86400)
     parser.add_argument("--lease-ttl-seconds", type=int, default=3600)
+    parser.add_argument("--portion-seconds", type=int, default=0)
+    parser.add_argument("--job-path")
+    parser.add_argument("--deadline-at")
     parser.add_argument("--paid-proxy-approval-packet")
     parser.add_argument("--production-write-approval-packet")
     parser.add_argument("--approval-journal")
@@ -1691,7 +1785,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "status": "success",
+                    "status": result.manifest["status"],
                     "manifest_path": result.manifest_path,
                     "manifest_hash": result.manifest_hash,
                     "rows": result.manifest["rows"],

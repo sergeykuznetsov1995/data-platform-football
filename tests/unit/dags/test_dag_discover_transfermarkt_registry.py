@@ -100,14 +100,16 @@ def _write_packet(path: Path, packet: ApprovalPacket) -> None:
     path.write_text(json.dumps(packet.payload()), encoding="utf-8")
 
 
-def _discovery_approvals(module, paths: dict[str, Path], run_id: str = RUN_ID):
-    cycle_id = module._cycle_id(run_id)
+def _discovery_approvals(module, paths: dict[str, Path], run_id: str = RUN_ID, *, dag_id=None):
+    dag_id = dag_id or module.DAG_ID
+    cycle_id = module._cycle_id(run_id, dag_id)
     checkpoint = paths["state_root"] / "checkpoints" / f"{cycle_id}.json"
     journal_path = paths["approval_root"] / "journal.json"
     paid_path = paths["approval_root"] / "paid.json"
     bronze_path = paths["approval_root"] / "bronze.json"
     promotion_path = paths["approval_root"] / "promotion.json"
     argv = module._discovery_argv(
+        dag_id=dag_id,
         cycle_id=cycle_id,
         run_id=run_id,
         proxy_control_url="http://proxy_filter:8899",
@@ -250,7 +252,8 @@ def test_dag_is_daily_single_run_and_proxy_task_is_serialized(dag_module):
 
     assert dag_module.dag.dag_id == "dag_discover_transfermarkt_registry"
     # 18:00 UTC = 21:00 MSK, every day (#1391).
-    assert dag_module.dag.schedule == "0 18 * * *"
+    assert dag_module.dag.schedule == "0 3,5,7,11,13,15,19,21,23 * * *"
+    assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=55)
     assert dag_module.dag._dag_kwargs["max_active_runs"] == 1
     assert dag_module.dag._dag_kwargs["catchup"] is False
 
@@ -650,6 +653,29 @@ class TestStandingRegistryDiscovery:
         assert int(env["TM_RETRY_LIMIT"]) == 96
         assert env["TM_REQUIRE_METERED_PROXY"] == "true"
         assert "TM_PAID_PACKET" not in env
+
+    def test_canonical_ack_recovers_marker_without_refetch_or_second_publish(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        paths, _, _ = self._arm(dag_module, monkeypatch, tmp_path)
+        kwargs = self._prepare_kwargs(dag_module, paths)
+        env = dag_module._prepare_discovery(**kwargs)
+        manifest, digest, manifest_path, _ = _persist_discovery(
+            dag_module, paths, run_id=SCHEDULED_RUN_ID)
+        path = Path(env['TM_DISCOVERY_JOB_PATH'])
+        job = dag_module.read_job(path)
+        job.update(status='source_complete', final_manifest={
+            'hash': digest, 'path': str(manifest_path),
+            'snapshot_id': SNAPSHOT_ID, 'cycle_id': env['TM_CYCLE_ID']})
+        dag_module.write_job(path, job, dag_module._atomic_json)
+        # CAS already committed and canonical population changed. The grant
+        # sizing remains pinned to the cohort that performed that publication.
+        monkeypatch.setattr(dag_module, '_read_registry_facts',
+            lambda: (SNAPSHOT_ID, 938, datetime.now(timezone.utc)))
+        recovered = dag_module._prepare_discovery(**kwargs)
+        assert recovered['TM_COHORT_COMPLETE'] == 'true'
+        assert recovered['TM_FINAL_MANIFEST_PATH'] == ''
+        assert dag_module.read_job(path)['status'] == 'published'
 
     def test_prepared_env_lets_the_runner_import_its_modules(
         self, dag_module, monkeypatch, tmp_path
@@ -1320,3 +1346,123 @@ class TestStandingRegistryPublication:
                 ti=_StandingTi(armed["discovery_result"], None),
             )
         assert opened is False
+
+
+def test_partial_operator_skips_publication_and_rejects_manual_resume(dag_module, monkeypatch):
+    operator = object.__new__(dag_module.DiscoveryPortionOperator)
+    operator.env = {'TM_APPROVAL_MODE': 'standing_policy'}
+    monkeypatch.setattr(dag_module.BashOperator, 'execute',
+                        lambda self, context: json.dumps({'status': 'paused'}), raising=False)
+    with pytest.raises(dag_module.AirflowSkipException, match='incomplete'):
+        operator.execute({})
+    operator.env = {}
+    with pytest.raises(dag_module.AirflowException, match='one-shot'):
+        operator.execute({})
+
+
+def test_completed_operator_does_not_start_subprocess(dag_module, monkeypatch):
+    operator = object.__new__(dag_module.DiscoveryPortionOperator)
+    operator.env = {'TM_APPROVAL_MODE': 'standing_policy', 'TM_COHORT_COMPLETE': 'true'}
+    monkeypatch.setattr(dag_module.BashOperator, 'execute',
+                        lambda *args: pytest.fail('completed daily cohort must not start worker'), raising=False)
+    with pytest.raises(dag_module.AirflowSkipException, match='already published'):
+        operator.execute({})
+
+
+def test_manual_factory_retains_long_timeouts_and_explicit_identity(dag_module):
+    from airflow.operators.bash import BashOperator
+    from airflow.operators.python import PythonOperator
+    assert dag_module.manual_dag.dag_id == dag_module.MANUAL_DAG_ID
+    assert dag_module.manual_dag.schedule is None
+    assert dag_module.manual_dag._dag_kwargs['dagrun_timeout'] == timedelta(hours=6)
+    workers = [task for task in BashOperator._instances if task.task_id == 'discover_registry']
+    assert [task._init_kwargs['execution_timeout'] for task in workers] == [timedelta(minutes=50), timedelta(hours=6)]
+    publishers = [task for task in PythonOperator._instances if task.task_id == 'publish_registry']
+    assert [task._init_kwargs['execution_timeout'] for task in publishers] == [timedelta(minutes=5), timedelta(minutes=30)]
+    assert publishers[1].op_kwargs['lane_dag_id'] == dag_module.MANUAL_DAG_ID
+
+
+def _prepare_manual_kwargs(module, paths, approvals):
+    return dict(paid_proxy_packet_path=str(approvals['paid_path']),
+        paid_proxy_packet_hash=approvals['paid'].packet_hash,
+        bronze_write_packet_path=str(approvals['bronze_path']),
+        bronze_write_packet_hash=approvals['bronze'].packet_hash,
+        promotion_write_packet_path=str(approvals['promotion_path']),
+        approval_journal=str(approvals['journal_path']),
+        lane_dag_id=module.MANUAL_DAG_ID,
+        dag_run=SimpleNamespace(run_id=RUN_ID, run_type='manual'))
+
+
+def test_manual_uses_new_approval_identity_and_no_standing_continuation(dag_module, monkeypatch, tmp_path):
+    paths = _configure_paths(dag_module, monkeypatch, tmp_path)
+    approvals = _discovery_approvals(dag_module, paths, dag_id=dag_module.MANUAL_DAG_ID)
+    monkeypatch.setattr(dag_module, '_other_discovery_active', lambda _: False)
+    monkeypatch.setenv(dag_module.STANDING_POLICY_ENV_GATE, 'true')
+    env = dag_module._prepare_discovery(**_prepare_manual_kwargs(dag_module, paths, approvals))
+    assert env['TM_APPROVAL_MODE'] == 'one_shot'
+    assert env['TM_DAG_ID'] == dag_module.MANUAL_DAG_ID
+    assert env['TM_CYCLE_ID'] != dag_module._cycle_id(RUN_ID)
+    assert 'TM_DISCOVERY_JOB_PATH' not in env
+    assert not (paths['state_root'] / 'cohorts').exists()
+
+
+def test_old_manual_trigger_rejected_before_reading_packets(dag_module):
+    with pytest.raises(dag_module.AirflowException, match='trigger dag_discover_transfermarkt_registry_manual'):
+        dag_module._prepare_discovery(paid_proxy_packet_path='', paid_proxy_packet_hash='',
+            bronze_write_packet_path='', bronze_write_packet_hash='', promotion_write_packet_path='',
+            approval_journal='', lane_dag_id=dag_module.DAG_ID,
+            dag_run=SimpleNamespace(run_id=RUN_ID, run_type='manual'))
+
+
+def test_manual_refuses_old_packets_and_overlap(dag_module, monkeypatch, tmp_path):
+    paths = _configure_paths(dag_module, monkeypatch, tmp_path)
+    approvals = _discovery_approvals(dag_module, paths)
+    kwargs = _prepare_manual_kwargs(dag_module, paths, approvals)
+    monkeypatch.setattr(dag_module, '_other_discovery_active', lambda _: False)
+    with pytest.raises(Exception, match='argv'):
+        dag_module._prepare_discovery(**kwargs)
+    monkeypatch.setattr(dag_module, '_other_discovery_active', lambda _: True)
+    with pytest.raises(dag_module.AirflowSkipException, match='another discovery'):
+        dag_module._prepare_discovery(**kwargs)
+
+
+def test_manual_cannot_replace_unfinished_scheduled_cohort(dag_module, monkeypatch, tmp_path):
+    paths = _configure_paths(dag_module, monkeypatch, tmp_path)
+    approvals = _discovery_approvals(dag_module, paths, dag_id=dag_module.MANUAL_DAG_ID)
+    monkeypatch.setattr(dag_module, '_other_discovery_active', lambda _: False)
+    now = datetime.now(timezone.utc)
+    job_path = paths['state_root'] / 'cohorts' / 'active.json'
+    identity = dag_module.identity_for(previous_snapshot_id=None, mode='full', policy_hash='a' * 64,
+        request_limit=1024, retry_limit=96, byte_cap_bytes=15728640, day=dag_module.cohort_day(now))
+    dag_module.select_job(job_path, identity, now=now, write=dag_module._atomic_json)
+    before = job_path.read_bytes()
+    with pytest.raises(dag_module.AirflowException, match='scheduled cohort to be published'):
+        dag_module._prepare_discovery(**_prepare_manual_kwargs(dag_module, paths, approvals))
+    assert job_path.read_bytes() == before
+
+
+def test_scheduled_run_yields_to_manual_before_cohort_or_approval_io(dag_module, monkeypatch):
+    monkeypatch.setattr(dag_module, '_other_discovery_active', lambda _: True)
+    with pytest.raises(dag_module.AirflowSkipException, match='another discovery'):
+        dag_module._prepare_discovery(paid_proxy_packet_path='', paid_proxy_packet_hash='',
+            bronze_write_packet_path='', bronze_write_packet_hash='', promotion_write_packet_path='',
+            approval_journal='', lane_dag_id=dag_module.DAG_ID,
+            dag_run=SimpleNamespace(run_id=SCHEDULED_RUN_ID, run_type='scheduled'))
+
+
+def test_manual_drain_blocks_prepare_and_delayed_operator_before_io(dag_module, monkeypatch):
+    def blocked(now):
+        raise ValueError('manual discovery cannot start during delivery drain')
+    monkeypatch.setattr(dag_module, '_other_discovery_active', lambda _: False)
+    monkeypatch.setattr(dag_module, 'ensure_manual_delivery_admission', blocked)
+    with pytest.raises(ValueError, match='delivery drain'):
+        dag_module._prepare_discovery(paid_proxy_packet_path='', paid_proxy_packet_hash='',
+            bronze_write_packet_path='', bronze_write_packet_hash='', promotion_write_packet_path='',
+            approval_journal='', lane_dag_id=dag_module.MANUAL_DAG_ID,
+            dag_run=SimpleNamespace(run_id=RUN_ID, run_type='manual'))
+    operator = object.__new__(dag_module.DiscoveryPortionOperator)
+    operator.env = {'TM_DAG_ID': dag_module.MANUAL_DAG_ID, 'TM_APPROVAL_MODE': 'one_shot'}
+    monkeypatch.setattr(dag_module.BashOperator, 'execute',
+                        lambda *args: pytest.fail('drained worker must not start subprocess'), raising=False)
+    with pytest.raises(ValueError, match='delivery drain'):
+        operator.execute({})

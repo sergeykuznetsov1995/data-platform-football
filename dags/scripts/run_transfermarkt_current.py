@@ -1824,7 +1824,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
     now = now_fn or (lambda: datetime.now(timezone.utc))
     clock = monotonic_fn or time.monotonic
     started = now()
-    budget = available_work_seconds(started, max_seconds)
+    budget = available_work_seconds(started, max_seconds, reserve_discovery=True)
     report = {'policy_version': CURRENT_POLICY_VERSION, 'cycle_id': cycle_id,
               'started_at': started.isoformat(), 'portion_budget_seconds': budget,
               'scopes': [], 'daily_complete_scope_ids': [], 'full_scope_completed': False}
@@ -2229,7 +2229,7 @@ def main(argv=None):
     now = datetime.now(timezone.utc)
     deadline_at = _utc(job['deadline_at'])
     remaining = (deadline_at - now).total_seconds()
-    if remaining <= 0 or available_work_seconds(now) <= 0:
+    if remaining <= 0 or available_work_seconds(now, reserve_discovery=True) <= 0:
         report = {'policy_version': CURRENT_POLICY_VERSION, 'cycle_id': job['cycle_id'],
                   'status': 'deadline' if remaining <= 0 else 'delivery_window', 'scopes': [],
                   'full_scope_completed': False, 'started_at': now.isoformat()}

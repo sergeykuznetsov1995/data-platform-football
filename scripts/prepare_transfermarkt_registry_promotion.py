@@ -26,6 +26,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from prepare_transfermarkt_registry_approval import (  # noqa: E402
+    DAG_ID,
     APPROVAL_JOURNAL,
     APPROVAL_ROOT,
     APPROVAL_TTL_SECONDS,
@@ -97,6 +98,7 @@ def build_plan(
         packet_id=f"tm-registry-promotion-{cycle_id}",
         action="production_write",
         argv=discovery_dag._promotion_argv(
+            dag_id=DAG_ID,
             run_id=run_id,
             cycle_id=cycle_id,
             expected_revision=expected_revision,
@@ -165,7 +167,7 @@ def build_plan(
             "airflow",
             "tasks",
             "clear",
-            discovery_dag.DAG_ID,
+            DAG_ID,
             "--task-regex",
             "^publish_registry$",
             "--yes",

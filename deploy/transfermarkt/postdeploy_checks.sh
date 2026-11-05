@@ -13,8 +13,9 @@ RUNTIME="${TRANSFERMARKT_RUNTIME_DIR:?}"
 SCHED=transfermarkt-airflow-scheduler
 GW=transfermarkt_gw
 PSQL="timeout -k 5 30 docker exec transfermarkt-airflow-metadb psql -U airflow -d airflow -At -c"
-TM_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
-TM_DAGS_SQL="'dag_ingest_transfermarkt','dag_discover_transfermarkt_registry','dag_backfill_transfermarkt','dag_transform_transfermarkt_silver'"
+TM_DAGS=$(transfermarkt_release_dags "$RELEASE") || exit 2
+TM_DAGS_SQL=$(transfermarkt_dags_sql "$TM_DAGS")
+TM_DAG_COUNT=$(wc -w <<< "$TM_DAGS")
 FAILS=0
 fail() { echo "  ✗ $*"; FAILS=$((FAILS + 1)); }
 ok() { echo "  ✓ $*"; }
@@ -79,11 +80,11 @@ else
   echo "  /health: $health"; fail "/health не в ожидаемом виде"
 fi
 
-echo "== 3. Метабаза: import_error, 4 DAG, паузы =="
+echo "== 3. Метабаза: import_error, $TM_DAG_COUNT DAG, паузы =="
 errs=$($PSQL "SELECT count(*) FROM import_error;")
 [ "$errs" = 0 ] && ok "import_error = 0" || fail "import_error = '$errs'"
 active=$($PSQL "SELECT count(*) FROM dag WHERE is_active;")
-[ "$active" = 4 ] && ok "активных DAG ровно 4" || fail "активных DAG '$active' (ожидалось 4)"
+[ "$active" = "$TM_DAG_COUNT" ] && ok "активных DAG $TM_DAG_COUNT" || fail "активных DAG '$active' (ожидалось $TM_DAG_COUNT)"
 $PSQL "SELECT dag_id, is_active, is_paused, has_import_errors, last_parsed_time FROM dag WHERE dag_id IN ($TM_DAGS_SQL) ORDER BY dag_id;"
 for d in $TM_DAGS; do
   p=$($PSQL "SELECT is_paused FROM dag WHERE dag_id='$d';")

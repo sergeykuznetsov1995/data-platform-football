@@ -1621,7 +1621,7 @@ def test_cli_absolute_alarm_interrupts_blocking_work_and_writes_report(tmp_path)
                               'registry_rows': [], 'preflight': {}}))
     program = '''from dags.scripts import run_transfermarkt_current as c
 import sys,time
-c.available_work_seconds=lambda *args: 2700
+c.available_work_seconds=lambda *args, **kwargs: 2700
 c.run_current_portion=lambda *args, **kwargs: time.sleep(10)
 raise SystemExit(c.main(['--job',sys.argv[1],'--report',sys.argv[2]]))
 '''

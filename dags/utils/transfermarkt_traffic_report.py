@@ -26,7 +26,8 @@ TRAFFIC_RECONCILIATION_TOLERANCE_PCT = 2.0
 TRAFFIC_RECONCILIATION_MIN_COVERAGE_PCT = 98.0
 # A run is unsettled while its last bytes are younger than the gateway lease TTL.
 LEASE_TTL = timedelta(seconds=3600)
-LANES = {'dag_discover_transfermarkt_registry': 'registry', 'dag_ingest_transfermarkt': 'current',
+LANES = {'dag_discover_transfermarkt_registry': 'registry',
+         'dag_discover_transfermarkt_registry_manual': 'registry', 'dag_ingest_transfermarkt': 'current',
          'dag_backfill_transfermarkt': 'history'}
 # The registry lane has no ops writer by design: outside the ±2 % reconciliation.
 NOT_COVERED_LANES = ('registry',)

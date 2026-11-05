@@ -26,7 +26,7 @@ except ModuleNotFoundError:  # Airflow has /opt/airflow/dags on PYTHONPATH.
     from utils.transfermarkt_approval import ApprovalJournal, ApprovalPacket
 
 
-DAG_ID = "dag_discover_transfermarkt_registry"
+DAG_ID = "dag_discover_transfermarkt_registry_manual"
 DISCOVERY_TASK_ID = "discover_registry"
 DISCOVERY_SCRIPT = "/opt/airflow/dags/scripts/run_transfermarkt_discovery.py"
 STATE_ROOT = Path("/opt/airflow/logs/transfermarkt-registry")

@@ -48,7 +48,10 @@ def test_plan_is_deterministic_and_side_effect_free(tmp_path):
 
     assert first["paid_packet_hash"] == second["paid_packet_hash"]
     assert first["bronze_packet_hash"] == second["bronze_packet_hash"]
-    assert first["cycle_id"] == "tm-registry-77baf81bfcf39e40e44de0ad"
+    assert first["cycle_id"] == "tm-registry-b60c785a48a63dfbc19a76b1"
+    assert module.DAG_ID == "dag_discover_transfermarkt_registry_manual"
+    assert module.DAG_ID in first["trigger_argv"]
+    assert module.DAG_ID in first["packets"]["paid"].argv
     assert not (tmp_path / "approvals").exists()
     assert first["packets"]["paid"].affected_tables == ()
     assert set(first["packets"]["bronze"].affected_tables) == {

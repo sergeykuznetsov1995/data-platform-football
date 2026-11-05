@@ -75,7 +75,7 @@ DRAIN=$STATE/transfermarkt-drain.env           # дренаж полосы ид�
 # Запись попытки: transfermarkt-window-<UTC-дата>T<ЧЧММ>.env (старые — <дата>); WIN — открытая.
 WIN=""
 POOLS="transfermarkt_control transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
-CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
+CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_discover_transfermarkt_registry_manual dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
 # Полоса — непрерывный сбор порциями (TransfermarktCurrentTimetable): у неё next_dagrun ≈ now,
 # дедлайну она не годится — её закрывает пауза дренажа.
 LANE_DAGS="dag_ingest_transfermarkt dag_backfill_transfermarkt"
@@ -273,7 +273,9 @@ restore_state(){
       log "MANUAL ACTION REQUIRED: пул $pool не вернулся к $want слотам"
     fi
   done
-  for dag in $CORE_DAGS; do
+  local restore_dags
+  restore_dags=$(transfermarkt_release_dags "$(snap_get "${release^^}_RELEASE_ROOT")") || return 1
+  for dag in $restore_dags; do
     restore_pause "$dag" "$(snap_get "$(paused_key "$dag")")" || true
   done
   [ -z "$RESTORE_NOTE" ]
@@ -301,11 +303,15 @@ acceptance_result(){
 }
 acceptance_seen(){  # acceptance_seen <дерево> <StartedAt scheduler'а>
   local new="$1" started="$2" dags errs gw got c want
-  dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
+  local expected expected_sql expected_count
+  expected=$(transfermarkt_release_dags "$new") || { acceptance_result X dag_parse invalid_release; return; }
+  expected_sql=$(transfermarkt_dags_sql "$expected")
+  expected_count=$(wc -w <<< "$expected")
+  dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($expected_sql) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
   errs=$(metadb "SELECT count(*) FROM import_error;")
   case "$dags:$errs" in *X*|*[!0-9:]*) acceptance_result X dag_parse read_failed; return ;; esac
   [ -n "$dags" ] && [ -n "$errs" ] || { acceptance_result X dag_parse missing_counts; return; }
-  [ "$dags" = 4 ] && [ "$errs" = 0 ] || { acceptance_result 0 dag_parse "parsed=$dags import_errors=$errs"; return; }
+  [ "$dags" = "$expected_count" ] && [ "$errs" = 0 ] || { acceptance_result 0 dag_parse "parsed=$dags import_errors=$errs"; return; }
   # Живой SchedulerJob: healthcheck контейнера — `airflow jobs check` по heartbeat.
   got=$(inspect -f '{{.State.Health.Status}}' "$SCHED") || { acceptance_result X scheduler_health inspect_failed; return; }
   [ "$got" = healthy ] || { acceptance_result 0 scheduler_health "observed=$got"; return; }
@@ -342,7 +348,9 @@ snapshot_ok(){
   for p in OLD_RELEASE_ROOT NEW_RELEASE_ROOT; do
     [ -n "$(snap_get "$p")" ] || { log "снимок отката неполон: нет $p"; return 1; }
   done
-  for d in $CORE_DAGS; do
+  local old_dags
+  old_dags=$(transfermarkt_release_dags "$(snap_get OLD_RELEASE_ROOT)") || return 1
+  for d in $old_dags; do
     case "$(snap_get "$(paused_key "$d")")" in
       t|f) ;;
       *) log "снимок отката неполон: пауза $d не прочитана"; return 1 ;;
@@ -361,7 +369,7 @@ snapshot_ok(){
 # Контур пуст — тот же предикат, что idle-проверка deploy.sh: running-прогонов TM нет и задач
 # в queued/running/restarting нет. Число; X — метабаза не ответила.
 contour_busy(){
-  metadb "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($CORE_DAGS_SQL) AND state='running') + (SELECT count(*) FROM task_instance WHERE dag_id IN ($CORE_DAGS_SQL) AND state IN ('queued','running','restarting'));"
+  metadb "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($CORE_DAGS_SQL) AND (state='running' OR (dag_id='dag_discover_transfermarkt_registry_manual' AND state='queued'))) + (SELECT count(*) FROM task_instance WHERE dag_id IN ($CORE_DAGS_SQL) AND state IN ('queued','running','restarting'));"
 }
 # Прогоны внешних DAG (registry, silver, полоса не на непрерывном расписании): дренаж их не
 # закрывает, выкат оборвал бы их.
@@ -397,7 +405,7 @@ lane_refresh(){
   got=$(metadb "SELECT 'L' || coalesce(string_agg(dag_id, ',' ORDER BY dag_id), '') FROM dag WHERE dag_id IN (${sql#,}) AND timetable_description LIKE 'Continuous Transfermarkt current%';")
   case "$got" in L*) ;; *) return 1 ;; esac
   LANE=${got#L}; LANE=${LANE//,/ }
-  OUTER_DAGS_SQL="'dag_discover_transfermarkt_registry','dag_transform_transfermarkt_silver'"
+  OUTER_DAGS_SQL="'dag_discover_transfermarkt_registry','dag_discover_transfermarkt_registry_manual','dag_transform_transfermarkt_silver'"
   NEXT_RUN_DAGS="'dag_discover_transfermarkt_registry'"; NEXT_RUN_COUNT=1
   for d in $LANE_DAGS; do
     case " $LANE " in *" $d "*) continue ;; esac
@@ -470,8 +478,13 @@ drain_begin(){
 # Пауза дренируемой полосы на границе порций: паузы ДО неё — в файл, затем пауза с проверкой по
 # метабазе. 1 — не встала (дренаж прерван, всё возвращено).
 drain_pause(){
-  local d v kv=()
-  for d in $(drain_get LANE); do
+  local d v kv=() pause_dags live_dags
+  pause_dags=$(drain_get LANE)
+  live_dags=$(transfermarkt_release_dags "$TRANSFERMARKT_RELEASE_ROOT") || return 1
+  case " $live_dags " in
+    *" dag_discover_transfermarkt_registry_manual "*) pause_dags="$pause_dags dag_discover_transfermarkt_registry_manual" ;;
+  esac
+  for d in $pause_dags; do
     v=$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")
     case "$v" in
       t|f) kv+=("$(paused_key "$d")=$v") ;;
@@ -480,7 +493,7 @@ drain_pause(){
          return 1 ;;
     esac
   done
-  drain_write "TARGET=$(drain_get TARGET)" "STARTED_AT=$(drain_get STARTED_AT)" "LANE=$(drain_get LANE)" \
+  drain_write "TARGET=$(drain_get TARGET)" "STARTED_AT=$(drain_get STARTED_AT)" "LANE=$pause_dags" \
     "PAUSED=1" "${kv[@]}" || { drain_abort "файл дренажа не записан"; return 1; }
   log "ДРЕНАЖ: ставлю на паузу $(drain_get LANE) (до дренажа: ${kv[*]})"
   for d in $(drain_get LANE); do
@@ -513,6 +526,18 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
     log "в старом дереве $old нет deploy/transfermarkt/deploy.sh — откатывать нечем"
     return 1
   fi
+  local manual_busy manual_pause
+  manual_pause=$(metadb "SELECT coalesce((SELECT CASE WHEN is_paused THEN 't' ELSE 'f' END FROM dag WHERE dag_id='dag_discover_transfermarkt_registry_manual'),'-');")
+  case "$manual_pause" in
+    t|f) restore_pause dag_discover_transfermarkt_registry_manual t || return 1 ;;
+    -) manual_pause="" ;;
+    *) return 1 ;;
+  esac
+  manual_busy=$(metadb "SELECT count(*) FROM dag_run WHERE dag_id='dag_discover_transfermarkt_registry_manual' AND state IN ('queued','running');")
+  [ "$manual_busy" = 0 ] || {
+    [ -z "${manual_pause:-}" ] || restore_pause dag_discover_transfermarkt_registry_manual "$manual_pause" || true
+    log "manual discovery занят/неизвестен — откат не начат"; return 1;
+  }
   setsid env TRANSFERMARKT_DEPLOY_LOCK="$TRANSFERMARKT_DEPLOY_LOCK" TRANSFERMARKT_DEPLOY_LOCK_FD=8 \
     timeout -k 30 "$DEPLOY_CEILING" "$old/deploy/transfermarkt/deploy.sh" "$old" >> "$LOG" 2>&1 9>&- &
   wait $!; rrc=$?
@@ -1241,7 +1266,7 @@ fi
   printf 'WINDOW_ID=%s\n' "$WIN"
   # Паузы полосы — из файла дренажа (значения ДО него), не текущие `t`: иначе выкат и откат
   # вернули бы полосу на паузу навсегда.
-  for d in $CORE_DAGS; do
+  for d in $(transfermarkt_release_dags "$OLD"); do
     if [ "$(drain_get PAUSED)" = 1 ] && case " $(drain_get LANE) " in *" $d "*) true ;; *) false ;; esac; then
       printf '%s=%s\n' "$(paused_key "$d")" "$(drain_get "$(paused_key "$d")")"
     else
