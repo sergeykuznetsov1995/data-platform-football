@@ -120,7 +120,7 @@ def test_explicit_old_source_gap_completes_first_attempt_and_survives_restart(
         assert item["content_hash"] == fetch.content_hash
         assert item["run_id"] == "explicit-history-1"
         assert item["reason"] == "source_data_not_found"
-        assert item["observed_at"] == (fetch.source_observed_at or fetch.fetched_at)
+        assert item["observed_at"] == (fetch.source_observed_at or fetch.validated_at or fetch.fetched_at)
     markers = [commit for commit in history.repo.commits if commit.target_type == "scope_source_gap"]
     assert len(markers) == 1 and markers[0].status == ManifestStatus.NOT_AVAILABLE
     assert markers[0].capabilities["source_gap_matches"] == evidence
@@ -203,7 +203,10 @@ def test_missing_raw_proof_cannot_complete_scope(monkeypatch, field):
     history = ExplicitHistory(monkeypatch)
     service, transport = history.service()
     url = history.url(history.missing_ids[0])
-    history.responses[url] = replace(transport.fetch_json(url), **{field: None})
+    missing = {field: None}
+    if field == "fetched_at":
+        missing.update(validated_at=None, source_observed_at=None)
+    history.responses[url] = replace(transport.fetch_json(url), **missing)
     transport.calls.clear()
     transport._results.clear()
     rc, report, _ = history.run(service=service)
@@ -371,3 +374,170 @@ def test_trino_and_buffered_gap_records_match_memory_and_filter_identity(monkeyp
     repository._pending_manifest.append(valid)
     assert repository.source_gap_scope_records(signature) == history.repo.source_gap_scope_records(signature)
     assert history.repo.completed_scope_keys(signature) == set()
+
+
+def test_partial_history_retry_spends_limit_on_unobserved_matches(monkeypatch):
+    history = ExplicitHistory(monkeypatch, total=204, missing=194)
+    service, _ = history.service(max_requests=400)
+    rc, first, _ = history.run(service=service, extra=("--match-limit", "199"))
+    _assert_pending(history, rc, first)
+    original = [commit for commit in history.repo.commits if commit.target_type == "match"
+                and commit.status == ManifestStatus.NOT_AVAILABLE]
+    assert len(original) == 194
+    rc, second, transport = history.run(extra=("--match-limit", "5"))
+    assert rc == 0, second["errors"]
+    assert second["complete"] is True
+    assert {url for url, _ in transport.calls if "/matchDetails?" in url} == {
+        history.url(match_id) for match_id in history.ids[-5:]
+    }
+    assert {proof["run_id"] for proof in _gap_evidence(second)} == {"explicit-history-1"}
+    assert len(history.repo.tables["fotmob_match_payloads"]) == 10
+    for match_id in history.missing_ids:
+        target = canonicalize_target(history.url(match_id))
+        assert history.repo.latest_match_source(target.target_key) is None
+
+
+@pytest.mark.parametrize("invalid", [
+    "expired", "future", "target_key", "raw_uri", "content_hash", "run_id",
+    "stale", "failure", "young", "unknown_kickoff",
+])
+def test_partial_history_rechecks_invalid_or_young_absence(monkeypatch, invalid):
+    history = ExplicitHistory(monkeypatch)
+    rc, first, _ = history.run(extra=("--match-limit", "1"))
+    _assert_pending(history, rc, first)
+    changes = {
+        "expired": {"completed_at": datetime.now(timezone.utc) - timedelta(days=31)},
+        "future": {"completed_at": datetime.now(timezone.utc) + timedelta(days=1)},
+        "target_key": {"target_key": "different-target"},
+        "raw_uri": {"raw_uri": None},
+        "content_hash": {"content_hash": None},
+        "run_id": {"run_id": ""},
+        "stale": {"stale": True},
+        "failure": {"status": ManifestStatus.RETRYABLE_FAILURE},
+    }
+    if invalid in changes:
+        history.repo.commits[:] = [
+            replace(commit, **changes[invalid]) if commit.target_type == "match" else commit
+            for commit in history.repo.commits
+        ]
+    else:
+        history.league["fixtures"]["allMatches"][0]["status"]["utcTime"] = (
+            (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            if invalid == "young" else None
+        )
+    if invalid == "unknown_kickoff":
+        service, _ = history.service()
+        assert service._match_source_gap_proof(
+            {"match_id": history.missing_ids[0], "finished": True, "utc_time": None},
+            datetime.now(timezone.utc).replace(tzinfo=None),
+        ) is None
+        return
+    rc, second, transport = history.run(extra=("--match-limit", "1"))
+    _assert_pending(history, rc, second)
+    assert history.url(history.missing_ids[0]) in {url for url, _ in transport.calls}
+
+
+@pytest.mark.parametrize("mode,reuse", [
+    (RunMode.BACKFILL, False), (RunMode.DAILY, False), (RunMode.DAILY, True),
+])
+def test_absence_reuse_is_opt_in_and_history_only(monkeypatch, mode, reuse):
+    history = ExplicitHistory(monkeypatch)
+    history.run(extra=("--match-limit", "1"))
+    service, transport = history.service()
+    service.mode = mode
+    _, bundle = service.sync_season(history.cid, history.season)
+    assert bundle is not None
+    result = service.sync_match_payloads(
+        bundle, limit=1, phase="primary", reuse_history_source_gaps=reuse,
+    )
+    assert result.not_available == 1
+    assert history.url(history.missing_ids[0]) in {url for url, _ in transport.calls}
+    assert {proof["run_id"] for proof in result.metadata["source_gap_matches"]} == {service.run_id}
+
+
+def test_recoverable_success_takes_precedence_over_prior_absence(monkeypatch):
+    history = ExplicitHistory(monkeypatch)
+    history.run(extra=("--match-limit", "1"))
+    service, transport = history.service()
+    match_id = history.missing_ids[0]
+    history.responses[history.url(match_id)] = history.details(match_id)
+    recovered = transport.replay_json("matchDetails", {"matchId": str(match_id)})
+    transport.calls.clear()
+    monkeypatch.setattr(service, "_recover_match_fetch", lambda match: (
+        recovered if str(match["match_id"]) == str(match_id) else None
+    ))
+    rc, report, _ = history.run(service=service)
+    assert rc == 0, report["errors"]
+    assert report["selection"]["source_gap_scopes"] == []
+    assert history.repo.latest_match_source(recovered.target_key) is not None
+    assert history.url(match_id) not in {url for url, _ in transport.calls}
+
+
+def test_gap_closure_rejects_changed_observation_time(monkeypatch):
+    history = ExplicitHistory(monkeypatch)
+    service, _ = history.service()
+    sync = service.sync_match_payloads
+
+    def tamper(bundle, **kwargs):
+        result = sync(bundle, **kwargs)
+        for proof in result.metadata.get("source_gap_matches", []):
+            proof["observed_at"] = "2000-01-01T00:00:00"
+        return result
+
+    monkeypatch.setattr(service, "sync_match_payloads", tamper)
+    rc, report, _ = history.run(service=service)
+    _assert_pending(history, rc, report)
+    assert any("no committed source gap proof" in error for error in report["errors"])
+
+
+def test_durable_gap_identity_survives_flush_selection_and_closure(monkeypatch):
+    from tests.unit.scrapers.test_fotmob_repository import RecordingWriter
+
+    history = ExplicitHistory(monkeypatch, total=2, missing=2)
+    history.run(extra=("--match-limit", "1"))
+    prior = next(commit for commit in history.repo.commits if commit.target_type == "match")
+    service, transport = history.service()
+    _, bundle = service.sync_season(history.cid, history.season)
+
+    class DurableWriter(RecordingWriter):
+        def _get_trino_manager(self):
+            return self
+
+        def table_exists(self, *args):
+            return False
+
+        def execute_query(self, query):
+            # Return exactly the requested SQL columns, like Trino. In
+            # particular, a fixture must not inject run_id when SELECT omits it.
+            if "WHERE target_type = 'match'" not in query or "LIMIT 1" not in query:
+                return []
+            rows = [row for frame, options in self.calls
+                    if options["table"] == "fotmob_ingest_manifest"
+                    for row in frame.to_dict("records")
+                    if row["target_type"] == "match"
+                    and f"entity_id = '{row['entity_id']}'" in query]
+            if not rows:
+                return []
+            columns = query.split("SELECT", 1)[1].split("FROM", 1)[0].strip().split(", ")
+            return [tuple(rows[-1].get(column) for column in columns)]
+
+    writer = DurableWriter()
+    repository = FotMobRepository(writer=writer, batch_size=100)
+    repository.commit(prior)
+    repository.flush()
+    assert not repository._pending_manifest
+    assert repository.latest_entity_attempt("match", prior.entity_id)["run_id"] == prior.run_id
+    service.repository = repository
+    transport.calls.clear()
+    result = service.sync_match_payloads(bundle, limit=1, phase="primary", reuse_history_source_gaps=True)
+    assert result.not_available == 2
+    assert {url for url, _ in transport.calls} == {history.url(history.ids[1])}
+    repository.flush()
+    assert not repository._pending_manifest
+    _, evidence = service.record_scope_source_gap(
+        bundle, plan_signature="durable-history", scope_entities=("season", "matches"),
+        source_gap_matches=result.metadata["source_gap_matches"],
+    )
+    assert {proof["run_id"] for proof in evidence["source_gap_matches"]} == {
+        prior.run_id, service.run_id,
+    }

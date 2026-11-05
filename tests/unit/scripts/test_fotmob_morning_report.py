@@ -513,3 +513,87 @@ def test_deleted_payload_without_own_input_invalidates_other_season(db, monkeypa
     assert report["_c1_classify"](db.execute_query(query), now)[1] == 0
     checkpoint = db.db.execute("SELECT checkpoint_json FROM fotmob_c1_inputs WHERE kind='checkpoint'").fetchone()[0]
     assert json.loads(checkpoint)["snapshots"][c1.PAYLOADS] == harness.version
+
+
+def test_large_checkpoint_bootstrap_incremental_and_shrink(db, monkeypatch):
+    harness = SnapshotHarness(db, monkeypatch)
+    harness.capture()
+    # One fingerprint inventory larger than the production staging row limit.
+    harness.inventory[c1.PAYLOADS] = {
+        (str(i), "2016/2017"): "ab" * 8 for i in range(7000)
+    }
+    c1.refresh(db, first_day="2026-10-20", last_day="2026-10-27")
+    before = db.db.execute("SELECT * FROM fotmob_c1_inputs ORDER BY ALL").fetchall()
+    c1.refresh(db)
+    parts = db.db.execute("SELECT count(*) FROM fotmob_c1_inputs WHERE kind='checkpoint_part'").fetchone()[0]
+    assert parts > 1
+    assert len(before) > 9
+    # Bootstrap with smaller source inventory must delete obsolete parts atomically.
+    harness.inventory[c1.PAYLOADS] = {}
+    c1.refresh(db, first_day="2026-10-20", last_day="2026-10-27")
+    assert db.db.execute("SELECT count(*) FROM fotmob_c1_inputs WHERE kind='checkpoint_part'").fetchone()[0] == 0
+    c1.refresh(db)
+
+
+@pytest.mark.parametrize('damage', ['missing', 'duplicate', 'generation', 'incomplete', 'content', 'index', 'header'])
+def test_chunked_checkpoint_rejects_corruption_before_source_reads(db, monkeypatch, damage):
+    harness = SnapshotHarness(db, monkeypatch)
+    harness.capture()
+    harness.inventory[c1.PAYLOADS] = {(str(i), '2016/2017'): 'ab' * 8 for i in range(2000)}
+    c1.refresh(db, first_day='2026-10-20', last_day='2026-10-27')
+    predicate = "kind='checkpoint_part' AND match_id='0'"
+    if damage == 'missing':
+        db.db.execute(f'DELETE FROM fotmob_c1_inputs WHERE {predicate}')
+    elif damage == 'duplicate':
+        db.db.execute(f'INSERT INTO fotmob_c1_inputs SELECT * FROM fotmob_c1_inputs WHERE {predicate}')
+    elif damage == 'generation':
+        db.db.execute(f"UPDATE fotmob_c1_inputs SET generation='other' WHERE {predicate}")
+    elif damage == 'incomplete':
+        db.db.execute(f'UPDATE fotmob_c1_inputs SET complete=false WHERE {predicate}')
+    elif damage == 'content':
+        db.db.execute(f"UPDATE fotmob_c1_inputs SET checkpoint_json=checkpoint_json || 'x' WHERE {predicate}")
+    elif damage == 'index':
+        db.db.execute(f"UPDATE fotmob_c1_inputs SET match_id='99' WHERE {predicate}")
+    else:
+        value = json.loads(db.db.execute("SELECT checkpoint_json FROM fotmob_c1_inputs WHERE kind='checkpoint'").fetchone()[0])
+        value['first_day'] = '2020-01-01'
+        db.db.execute("UPDATE fotmob_c1_inputs SET checkpoint_json=? WHERE kind='checkpoint'", [json.dumps(value)])
+    monkeypatch.setattr(c1, 'snapshots', lambda manager: pytest.fail('must reject before source reads'))
+    with pytest.raises(RuntimeError, match='C1 .*checkpoint'):
+        c1.refresh(db)
+
+
+@pytest.mark.parametrize('failure', ['stage', 'merge'])
+def test_chunked_checkpoint_failure_preserves_published_generation(db, monkeypatch, failure):
+    harness = SnapshotHarness(db, monkeypatch)
+    harness.capture()
+    harness.inventory[c1.PAYLOADS] = {(str(i), '2016/2017'): 'ab' * 8 for i in range(7000)}
+    c1.refresh(db, first_day='2026-10-20', last_day='2026-10-27')
+    before = db.db.execute('SELECT * FROM fotmob_c1_inputs ORDER BY ALL').fetchall()
+    execute = db.execute_query
+    insertions = 0
+    def fail(query):
+        nonlocal insertions
+        if query.startswith('INSERT INTO iceberg.bronze.fotmob_c1_inputs__stg_'):
+            insertions += 1
+            if failure == 'stage' and insertions == 2:
+                raise RuntimeError('injected second staging insert failure')
+        if failure == 'merge' and query.startswith('MERGE'):
+            raise RuntimeError('injected merge failure')
+        return execute(query)
+    db.execute_query = fail
+    with pytest.raises(RuntimeError, match='injected'):
+        c1.refresh(db)
+    assert db.db.execute('SELECT * FROM fotmob_c1_inputs ORDER BY ALL').fetchall() == before
+
+
+def test_checkpoint_parts_roundtrip_escaped_unicode_and_quotes():
+    import hashlib
+    checkpoint = {'files': {'test': ['русский ключ "quoted" it\'s' * 3000]}, 'snapshots': {}}
+    payload = json.dumps(checkpoint, sort_keys=True)
+    generation = hashlib.sha256(payload.encode()).hexdigest()
+    parts = c1._checkpoint_payloads(payload, generation)
+    assert len(parts) > 2
+    rows = [(None, None, mid, kind, generation, True, value) for mid, kind, value in parts]
+    assert c1._read_checkpoint(list(reversed(rows))) == checkpoint
+    assert max(len(c1.literal(value).encode()) for _, _, value in parts) < 200_000
