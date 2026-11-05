@@ -139,3 +139,224 @@ def test_manual_active_drain_blocks_delayed_worker_but_expired_flag_does_not(tmp
     with pytest.raises(ValueError, match='during delivery drain'):
         cohorts.ensure_manual_delivery_admission(NOW, path)
     cohorts.ensure_manual_delivery_admission(NOW + timedelta(minutes=6), path)
+
+
+def test_continuation_marks_running_only_on_explicit_claim(tmp_path):
+    from scrapers.transfermarkt.models import LeaseTrafficSnapshot, SharedTrafficLedger
+
+    def ledger_with_traffic():
+        ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                     soft_provider_bytes=9000, retry_limit=10)
+        ledger.observe_lease('lease-1', LeaseTrafficSnapshot(up_bytes=10, down_bytes=90))
+        ledger.record_attempt(entity='competition_registry', decoded_bytes=100,
+                              provider_up_bytes=10, provider_down_bytes=90,
+                              retry=True, duration_seconds=0.5)
+        return ledger
+
+    path, job = prepared(tmp_path)
+    job.update(status='paused', portion=1, traffic=ledger_with_traffic().snapshot())
+    cohorts.write_job(path, job, write)
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    continuation = cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                                 now=lambda: NOW, run_id='run-2')
+    # Construction validates and restores cumulative traffic but must not
+    # claim the slot: a later setup failure leaves the cohort resumable.
+    assert cohorts.read_job(path)['status'] == 'paused'
+    assert ledger.snapshot()['requests'] == 1
+    assert ledger.snapshot()['retries'] == 1
+    continuation.mark_running()
+    saved = cohorts.read_job(path)
+    assert saved['status'] == 'running'
+    assert saved['portion'] == 2
+    assert saved['traffic']['requests'] == 1
+    assert saved['traffic']['retries'] == 1
+    with pytest.raises(ValueError, match='already running'):
+        continuation.mark_running()
+
+
+@pytest.mark.parametrize('status', ['running', 'unsettled', 'failed', 'writing'])
+def test_continuation_still_rejects_unsettled_or_unknown_states(tmp_path, status):
+    from scrapers.transfermarkt.models import SharedTrafficLedger
+
+    path, job = prepared(tmp_path)
+    job.update(status=status)
+    cohorts.write_job(path, job, write)
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='not settled and resumable'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert cohorts.read_job(path)['status'] == status
+
+
+# --- One-time pinned recovery of the single audited legacy 'running' marker ---
+
+import hashlib
+from pathlib import Path
+
+from scrapers.transfermarkt.models import (LeaseTrafficSnapshot,
+                                           SharedTrafficLedger,
+                                           stable_payload_hash)
+
+
+def _traffic():
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    ledger.observe_lease('lease-1', LeaseTrafficSnapshot(up_bytes=10, down_bytes=90))
+    ledger.record_attempt(entity='competition_registry', decoded_bytes=100,
+                          provider_up_bytes=10, provider_down_bytes=90,
+                          retry=True, duration_seconds=0.5)
+    return ledger.snapshot()
+
+
+def _paused_manifest(traffic):
+    return {'status': 'paused', 'cycle_id': 'cycle-1', 'run_id': 'run-1',
+            'portion': 1, 'traffic': traffic, 'source_status': 'incomplete',
+            'writes': [], 'error': 'discovery portion exhausted; checkpoint retained'}
+
+
+def _failed_manifest():
+    return {'status': 'failed', 'cycle_id': 'cycle-2', 'run_id': 'run-2',
+            'error': {'type': 'ValueError',
+                      'message': 'retry_budget differs from the shared traffic ledger limit'},
+            'source_status': 'not_started', 'writes': [],
+            'write_status': {'status': 'not_started', 'authorized': False,
+                             'attempted': False, 'completed': False,
+                             'affected_tables': []}}
+
+
+def _write_manifest(root, name, manifest):
+    digest = stable_payload_hash(manifest)
+    path = root / 'runs' / f'{name}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'manifest_hash': digest, 'manifest': manifest}))
+    return {'path': str(path.relative_to(root)), 'hash': digest}
+
+
+def stranded(tmp_path, monkeypatch, *, paused=None, failed=None):
+    """Legacy marker: claimed 'running' at construction, then setup failed."""
+    path, job = prepared(tmp_path)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text(json.dumps({'https://example.test/a': {'hash': 'x'}}))
+    failures = checkpoint.with_suffix('.failures.json')
+    failures.write_text(json.dumps({'https://example.test/a': {'status': 'ok'}}))
+    traffic = _traffic()
+    job.update(status='running', portion=2, traffic=traffic, last_run_id='run-2',
+               artifacts={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                          for p in (checkpoint, failures)})
+    cohorts.write_job(path, job, write)
+    root = path.parent.parent
+    paused_pin = _write_manifest(root, 'paused', paused or _paused_manifest(traffic))
+    failed_pin = _write_manifest(root, 'failed', failed or _failed_manifest())
+    monkeypatch.setattr(cohorts, 'KNOWN_SETUP_FAILURE_RECOVERY', {
+        'marker_hash': stable_payload_hash(job),
+        'paused_manifest': paused_pin, 'failed_manifest': failed_pin})
+    return path, job
+
+
+def test_pinned_recovery_preserves_accounting_and_resumes(tmp_path, monkeypatch):
+    path, job = stranded(tmp_path, monkeypatch)
+    resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(hours=2), write=write)
+    assert resumed['status'] == 'paused'
+    for field in ('portion', 'started_at', 'identity', 'traffic', 'artifacts',
+                  'job_id', 'checkpoint_path', 'last_run_id'):
+        assert resumed[field] == job[field]
+    recovery = resumed['recovery']
+    assert 'setup failure' in recovery['reason']
+    assert recovery['marker_hash'] == stable_payload_hash(job)
+    assert len(recovery['paused_manifest_hash']) == 64
+    assert len(recovery['failed_manifest_hash']) == 64
+    # The re-settled cohort is genuinely resumable by the normal continuation.
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    continuation = cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                                 now=lambda: NOW + timedelta(hours=2),
+                                                 run_id='run-3')
+    assert continuation.portion == 3
+    assert ledger.snapshot()['requests'] == 1
+    # Repeat selection is a no-op: the marker is simply 'paused' now.
+    before = path.read_bytes()
+    again = cohorts.select_job(path, identity(), now=NOW + timedelta(hours=3), write=write)
+    assert again['status'] == 'paused'
+    assert path.read_bytes() == before
+
+
+def test_unrelated_running_marker_stays_rejected(tmp_path, monkeypatch):
+    path, job = prepared(tmp_path)
+    job.update(status='running', portion=1, last_run_id='run-x')
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='unresolved traffic or writes'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+def test_recovery_rejects_changed_artifact_without_writing(tmp_path, monkeypatch):
+    path, job = stranded(tmp_path, monkeypatch)
+    Path(job['checkpoint_path']).write_text(json.dumps({'tampered': True}))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='changed after settlement'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'running'
+
+
+def test_recovery_rejects_tampered_manifest_without_writing(tmp_path, monkeypatch):
+    path, job = stranded(tmp_path, monkeypatch)
+    pinned = cohorts.KNOWN_SETUP_FAILURE_RECOVERY['paused_manifest']
+    envelope_path = path.parent.parent / pinned['path']
+    envelope = json.loads(envelope_path.read_text())
+    envelope['manifest']['portion'] = 99
+    envelope_path.write_text(json.dumps(envelope))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='differs from the audited pin'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('kind,manifest', [
+    ('failed', {**_failed_manifest(),
+                'error': {'type': 'ValueError', 'message': 'some other setup error'}}),
+    ('failed', {**_failed_manifest(), 'error': {'type': 'RuntimeError',
+                'message': 'retry_budget differs from the shared traffic ledger limit'}}),
+    ('failed', {**_failed_manifest(), 'source_status': 'failed'}),
+    ('failed', {**_failed_manifest(), 'writes': [{'table': 'x', 'rows': 1}]}),
+    ('failed', {**_failed_manifest(),
+                'write_status': {'attempted': True}}),
+    ('failed', {**_failed_manifest(), 'run_id': 'run-1'}),
+    ('paused', {**_paused_manifest(_traffic()), 'status': 'failed'}),
+    ('paused', {**_paused_manifest(_traffic()), 'portion': 2}),
+    ('paused', {**_paused_manifest({**_traffic(), 'requests': 2})}),
+    ('paused', {**_paused_manifest({**_traffic(), 'provider_metered_bytes': 0})}),
+    ('paused', {**_paused_manifest({**_traffic(), 'cache_hits': 9})}),
+])
+def test_recovery_rejects_wrong_evidence_semantics(tmp_path, monkeypatch, kind, manifest):
+    kwargs = {'paused' if kind == 'paused' else 'failed': manifest}
+    path, _ = stranded(tmp_path, monkeypatch, **kwargs)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='recovery .* evidence does not match'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'running'
+
+
+def test_recovery_never_bypasses_age_or_identity(tmp_path, monkeypatch):
+    path, job = stranded(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='expired'):
+        cohorts.select_job(path, identity(), now=NOW + timedelta(days=1), write=write)
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'running'
+
+
+def test_recovery_fails_closed_on_missing_manifest(tmp_path, monkeypatch):
+    path, _ = stranded(tmp_path, monkeypatch)
+    (path.parent.parent / cohorts.KNOWN_SETUP_FAILURE_RECOVERY['failed_manifest']['path']).unlink()
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='missing or unreadable'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before

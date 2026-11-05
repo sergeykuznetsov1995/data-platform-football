@@ -1452,3 +1452,279 @@ def test_manual_runner_drain_refuses_before_paid_client(tmp_path, monkeypatch):
         mod.execute(args, execution_argv=(str(SCRIPT), *raw),
             previous_reader=lambda _: None, utcnow=lambda: NOW,
             http_client_factory=lambda **kw: pytest.fail('manual drain must refuse before client'))
+
+
+def test_resumed_portion_real_client_contract_gets_total_retry_limit(
+    tmp_path, monkeypatch
+):
+    """Resumed cohort passes the total shared retry limit, not the remainder.
+
+    Fake I/O sits on top of the real TransfermarktHttpClient constructor,
+    whose contract rejects a retry_budget that differs from the shared
+    ledger's limit (production total 314, consumed 1, remainder 313).
+    """
+    from scrapers.transfermarkt.client import TransfermarktHttpClient
+
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+    clients = []
+
+    class Client(TransfermarktHttpClient):
+        spend_retry = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.kwargs = kwargs
+            self.fetch_calls: list[dict] = []
+            self.request_budget = None
+            self.closed = False
+            clients.append(self)
+
+        def begin_request_scope(self, *, request_attempt_budget):
+            self.request_budget = request_attempt_budget
+
+        def fetch(self, url, **kwargs):
+            self.fetch_calls.append({"url": url, **kwargs})
+            body = "<html><body><main>catalog</main></body></html>"
+            ledger = self._traffic_ledger
+            ledger.observe_lease(
+                "fake-lease", LeaseTrafficSnapshot(up_bytes=10, down_bytes=90)
+            )
+            ledger.record_attempt(
+                entity="competition_registry",
+                decoded_bytes=len(body.encode()),
+                provider_up_bytes=10,
+                provider_down_bytes=90,
+                retry=False,
+                duration_seconds=0.25,
+            )
+            if Client.spend_retry:
+                # The first portion settles with one cumulative retry spent.
+                Client.spend_retry = False
+                ledger.record_attempt(
+                    entity="competition_registry",
+                    decoded_bytes=0,
+                    provider_up_bytes=0,
+                    provider_down_bytes=0,
+                    retry=True,
+                    duration_seconds=0.25,
+                )
+            return FetchOutcome(
+                status=FetchStatus.OK,
+                value=body,
+                status_code=200,
+                attempts=2,
+                label="competition_registry",
+                decoded_body_bytes=len(body.encode()),
+                provider_metered_bytes=100,
+                payload_hash=stable_payload_hash(body),
+            )
+
+        def close(self):
+            self.closed = True
+
+    def first(**kw):
+        kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        kw["checkpoint"]["finished-first-page"] = {"proof": "fixture"}
+        clock[0] = 1140
+        kw["fetch"]("https://www.transfermarkt.com/second")
+        pytest.fail("deadline must yield before second fetch")
+
+    common = dict(
+        execution_argv=(str(SCRIPT), *raw),
+        previous_reader=lambda _: None,
+        lease_provider_factory=lambda _: object(),
+        http_client_factory=Client,
+        utcnow=lambda: NOW,
+        monotonic=lambda: clock[0],
+        writer_factory=lambda: pytest.fail("dry run must not write"),
+    )
+    paused = mod.execute(args, discovery_fn=first, **common)
+    assert paused.manifest["status"] == "paused"
+    assert paused.manifest["traffic"]["requests"] == 2
+    assert paused.manifest["traffic"]["retries"] == 1
+    assert paused.manifest["traffic"]["provider_metered_bytes"] == 100
+
+    clock[0] = 4000
+    args.run_id = "next-calendar-run"
+    args.cycle_id = "next-calendar-cycle"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    common["utcnow"] = lambda: NOW + timedelta(hours=4)
+
+    def second(**kw):
+        assert kw["checkpoint"]["finished-first-page"] == {"proof": "fixture"}
+        replay = kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        assert replay.status is FetchStatus.OK
+        assert clients[1].fetch_calls == []
+        cumulative = kw["traffic_ledger"].snapshot()
+        assert cumulative["requests"] == 2
+        assert cumulative["retries"] == 1
+        return (_page(),)
+
+    complete = mod.execute(args, discovery_fn=second, **common)
+    assert complete.manifest["status"] == "success"
+    assert complete.manifest["traffic"]["requests"] == 2
+    assert complete.manifest["traffic"]["retries"] == 1
+    assert complete.manifest["traffic"]["provider_metered_bytes"] == 100
+    # One retry is already consumed, yet the client contract requires the
+    # total shared limit; per-fetch max_attempts enforces the remainder.
+    assert clients[1].kwargs["retry_budget"] == args.retry_limit
+    assert (
+        clients[1].kwargs["retry_budget"]
+        == clients[1]._traffic_ledger.retry_limit
+    )
+    assert clients[1].request_budget == args.request_limit - 2
+
+
+def test_resumed_portion_rejects_exhausted_cumulative_retries(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+
+    class Client(_FakeClient):
+        def fetch(self, url, **kwargs):
+            self.fetch_calls.append({"url": url, **kwargs})
+            body = "<html><body><main>catalog</main></body></html>"
+            self.ledger.observe_lease(
+                "fake-lease", LeaseTrafficSnapshot(up_bytes=10, down_bytes=90)
+            )
+            for attempt in range(4):
+                # Settled evidence over-spent the shared retry budget.
+                self.ledger.record_attempt(
+                    entity="competition_registry",
+                    decoded_bytes=len(body.encode()) if attempt == 0 else 0,
+                    provider_up_bytes=10 if attempt == 0 else 0,
+                    provider_down_bytes=90 if attempt == 0 else 0,
+                    retry=attempt > 0,
+                    duration_seconds=0.25,
+                )
+            return FetchOutcome(
+                status=FetchStatus.OK,
+                value=body,
+                status_code=200,
+                attempts=4,
+                label="competition_registry",
+                decoded_body_bytes=len(body.encode()),
+                provider_metered_bytes=100,
+                payload_hash=stable_payload_hash(body),
+            )
+
+    def first(**kw):
+        kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        clock[0] = 1140
+        kw["fetch"]("https://www.transfermarkt.com/second")
+        pytest.fail("deadline must yield before second fetch")
+
+    common = dict(
+        execution_argv=(str(SCRIPT), *raw),
+        previous_reader=lambda _: None,
+        lease_provider_factory=lambda _: object(),
+        utcnow=lambda: NOW,
+        monotonic=lambda: clock[0],
+        writer_factory=lambda: pytest.fail("dry run must not write"),
+    )
+    paused = mod.execute(args, discovery_fn=first, http_client_factory=Client, **common)
+    assert paused.manifest["status"] == "paused"
+    assert paused.manifest["traffic"]["retries"] == 3
+
+    clock[0] = 4000
+    args.run_id = "next-calendar-run"
+    args.cycle_id = "next-calendar-cycle"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    common["utcnow"] = lambda: NOW + timedelta(hours=4)
+    with pytest.raises(
+        mod.DiscoveryRunnerError,
+        match="cumulative request/retry budget exhausted",
+    ):
+        mod.execute(
+            args,
+            discovery_fn=first,
+            http_client_factory=lambda **kw: pytest.fail(
+                "exhausted retries must fail before client setup"
+            ),
+            **common,
+        )
+    # No claim and no cap renewal: the settled cohort stays paused.
+    from dags.utils.transfermarkt_discovery_continuation import read_job
+
+    assert read_job(Path(args.job_path))["status"] == "paused"
+
+
+def test_client_setup_failure_keeps_settled_cohort_resumable(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+    _FakeClient.instances.clear()
+
+    def first(**kw):
+        kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        kw["checkpoint"]["finished-first-page"] = {"proof": "fixture"}
+        clock[0] = 1140
+        kw["fetch"]("https://www.transfermarkt.com/second")
+        pytest.fail("deadline must yield before second fetch")
+
+    def second(**kw):
+        assert kw["checkpoint"]["finished-first-page"] == {"proof": "fixture"}
+        replay = kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        assert replay.status is FetchStatus.OK
+        return (_page(),)
+
+    common = dict(
+        execution_argv=(str(SCRIPT), *raw),
+        previous_reader=lambda _: None,
+        lease_provider_factory=lambda _: object(),
+        utcnow=lambda: NOW,
+        monotonic=lambda: clock[0],
+        writer_factory=lambda: pytest.fail("dry run must not write"),
+    )
+    paused = mod.execute(
+        args, discovery_fn=first, http_client_factory=_FakeClient, **common
+    )
+    assert paused.manifest["status"] == "paused"
+    assert paused.manifest["traffic"]["requests"] == 1
+
+    clock[0] = 4000
+    args.run_id = "next-calendar-run"
+    args.cycle_id = "next-calendar-cycle"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    common["utcnow"] = lambda: NOW + timedelta(hours=4)
+
+    def broken_factory(**kwargs):
+        raise RuntimeError("client setup boom")
+
+    with pytest.raises(RuntimeError, match="client setup boom") as caught:
+        mod.execute(
+            args, discovery_fn=second, http_client_factory=broken_factory, **common
+        )
+    from dags.utils.transfermarkt_discovery_continuation import read_job
+
+    # The setup failure happened before any paid work: the cohort keeps its
+    # settled state instead of being stranded in 'running'.
+    assert read_job(Path(args.job_path))["status"] == "paused"
+    # Restored cumulative traffic is consumed budget; terminal evidence must
+    # not read zeros.
+    failure = caught.value.manifest
+    assert failure["status"] == "failed"
+    assert failure["traffic"]["requests"] == 1
+    assert failure["traffic"]["provider_metered_bytes"] == 100
+
+    # Safe subsequent resumption of the same settled cohort and checkpoint.
+    args.run_id = "third-calendar-run"
+    args.cycle_id = "third-calendar-cycle"
+    complete = mod.execute(
+        args, discovery_fn=second, http_client_factory=_FakeClient, **common
+    )
+    assert complete.manifest["status"] == "success"
+    assert complete.manifest["traffic"]["requests"] == 1
+    assert complete.manifest["traffic"]["provider_metered_bytes"] == 100

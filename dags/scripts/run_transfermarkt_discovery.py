@@ -1331,24 +1331,44 @@ def _execute_once(
     if args.dag_id == MANUAL_DAG_ID:
         ensure_manual_delivery_admission(utcnow())
     lease_provider = lease_provider_factory(args.proxy_control_url)
-    client = http_client_factory(
-        lease_provider=lease_provider,
-        traffic_ledger=ledger,
-        retry_budget=remaining_retries,
-        lease_metadata={
-            "dag_id": args.dag_id,
-            "run_id": args.run_id,
-            "task_id": args.task_id,
-            "entity": ENTITY,
-            "scope": cycle_id,
-        },
-        lease_ttl_seconds=min(args.lease_ttl_seconds, portion_seconds) if portion_seconds else args.lease_ttl_seconds,
-        **({"request_deadline_monotonic": deadline, "monotonic_fn": monotonic} if deadline is not None else {}),
-        cache=cache,
-        rate_limiter=RateLimiter(
-            max_requests=REQUESTS_PER_MINUTE, window_seconds=60,
-        ),
-    )
+    try:
+        client = http_client_factory(
+            lease_provider=lease_provider,
+            traffic_ledger=ledger,
+            # Shared-ledger contract: the client requires the total retry
+            # limit, not the remainder.  A resumed cohort has already spent
+            # part of it; per-fetch max_attempts enforces the remainder, so
+            # the cumulative cap is preserved, never increased.
+            retry_budget=args.retry_limit,
+            lease_metadata={
+                "dag_id": args.dag_id,
+                "run_id": args.run_id,
+                "task_id": args.task_id,
+                "entity": ENTITY,
+                "scope": cycle_id,
+            },
+            lease_ttl_seconds=min(args.lease_ttl_seconds, portion_seconds) if portion_seconds else args.lease_ttl_seconds,
+            **({"request_deadline_monotonic": deadline, "monotonic_fn": monotonic} if deadline is not None else {}),
+            cache=cache,
+            rate_limiter=RateLimiter(
+                max_requests=REQUESTS_PER_MINUTE, window_seconds=60,
+            ),
+        )
+    except BaseException as exc:
+        if continuation is not None:
+            try:
+                # Restored cumulative traffic is already consumed budget; the
+                # terminal evidence written by execute() must not read zeros.
+                exc.restored_traffic_ledger = ledger
+            except BaseException:
+                pass
+        raise
+    if continuation is not None:
+        # The production client constructor is lazy, so reaching this line
+        # means setup succeeded without paid I/O.  Claim the slot only now,
+        # immediately before paid work: a setup failure leaves the settled
+        # cohort resumable instead of stranded in 'running'.
+        continuation.mark_running()
     client.begin_request_scope(request_attempt_budget=remaining_requests)
     source_started = False
     source_validated = False
@@ -1701,10 +1721,17 @@ def execute(
             cycle_id = _safe_component(args.cycle_id, field="cycle_id")
             output_root = _absolute_path(args.output_root, field="output_root")
             retry_limit = max(0, int(args.retry_limit))
-            ledger = SharedTrafficLedger(
-                hard_provider_bytes=HARD_PROVIDER_BYTE_BUDGET,
-                soft_provider_bytes=SOFT_PROVIDER_BYTE_STOP,
-                retry_limit=retry_limit,
+            # A resumed cohort may have restored its cumulative paid traffic
+            # before the setup failure; keep that evidence instead of zeros.
+            restored_ledger = getattr(exc, "restored_traffic_ledger", None)
+            ledger = (
+                restored_ledger
+                if isinstance(restored_ledger, SharedTrafficLedger)
+                else SharedTrafficLedger(
+                    hard_provider_bytes=HARD_PROVIDER_BYTE_BUDGET,
+                    soft_provider_bytes=SOFT_PROVIDER_BYTE_STOP,
+                    retry_limit=retry_limit,
+                )
             )
             failure = _failure_manifest(
                 args=args,
