@@ -3334,11 +3334,16 @@ def main(argv=None, *, manifest_store=None):
         default=None,
         help="Single league override (used for player_ratings)",
     )
-    parser.add_argument(
+    season_args = parser.add_mutually_exclusive_group()
+    season_args.add_argument(
         "--season",
         type=str,
         default="2024",
-        help="Canonical season or registry alias (2024, 2526, 2025/26, named)",
+        help="Start year or registry alias (2024, 2526, 2025/26, named)",
+    )
+    season_args.add_argument(
+        "--canonical-season",
+        help="Exact canonical season from the scope plan; never a start year.",
     )
     parser.add_argument(
         "--allow-inactive-season",
@@ -3404,8 +3409,14 @@ def main(argv=None, *, manifest_store=None):
         )
         return 1
 
-    season_token = args.season.strip()
-    if season_token.isdigit() and 1900 <= int(season_token) <= 2098:
+    season_token = (
+        args.canonical_season if args.canonical_season is not None else args.season
+    ).strip()
+    if (
+        args.canonical_season is None
+        and season_token.isdigit()
+        and 1900 <= int(season_token) <= 2098
+    ):
         # Preserve the established CLI meaning: 2021 is the 2021/22 start
         # year for split-year leagues, while registry aliases such as 2526
         # and named seasons remain exact strings.
@@ -3491,7 +3502,11 @@ def main(argv=None, *, manifest_store=None):
     )
 
     _is_tournament = is_single_year_competition(leagues[0])
-    if _is_tournament and not args.allow_inactive_season:
+    if (
+        _is_tournament
+        and not args.allow_inactive_season
+        and args.canonical_season is None
+    ):
         _t_league = leagues[0]
         _t_season = get_active_season(_t_league)
         if _t_season is None:
@@ -3537,6 +3552,14 @@ def main(argv=None, *, manifest_store=None):
     )
 
     try:
+        if args.canonical_season is not None:
+            from scrapers.sofascore.scraper import _season_label
+
+            normalized = _season_label(leagues[0], args.season)
+            if not args.season or normalized != args.season:
+                raise ValueError(
+                    f"canonical season {args.season!r} normalizes to {normalized!r}"
+                )
         workload_plan, workload_allocations = _load_runtime_workload_plan(
             args.workload_plan,
             entity=entity,

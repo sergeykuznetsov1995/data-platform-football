@@ -2820,6 +2820,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     bundle,
                     limit=min(per_run_limit, capacity),
                     phase=("primary" if mode != RunMode.REPLAY else None),
+                    # A stale scope marker starts a genuine review; partial
+                    # retries alone may reuse previously committed absences.
+                    reuse_history_source_gaps=(
+                        explicit_history and item.identity not in explicit_gap_records
+                    ),
                 )
                 operations.append(match_operation)
                 scope_operations.append(match_operation)

@@ -220,7 +220,7 @@ def run_phase(
     argv = [
         "--entity", entity,
         "--league", capture_key,
-        "--season", canonical,
+        "--canonical-season", canonical,
         "--allow-inactive-season",
         "--manifest-backend", str(scope.get("manifest_backend") or "trino"),
         "--workload-plan", str(plan),

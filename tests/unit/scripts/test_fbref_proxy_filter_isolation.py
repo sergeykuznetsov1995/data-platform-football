@@ -30,7 +30,8 @@ SHARED_FILTER_SHA256 = (
     # #1788: measured CONNECT 502 refusal for SofaScore discovery; FBref bytes unchanged.
     # #1788: any measured CONNECT refusal for SofaScore discovery.
     # #2145: manual TM registry uses the existing source/stream; FBref unchanged.
-    "1b2c49c87fc7c9b836932b21594c2f7105432a01e631e1df735bdded5a86b5cb"
+    # #2163: owned compaction scratch accounting; dedicated FBref bytes unchanged.
+    "6dc277fb93f16094ace3c2d12c969baa10d06223042eaa36fbe578417aaf6647"
 )
 
 

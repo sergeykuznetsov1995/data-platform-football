@@ -8098,6 +8098,63 @@ def test_sofascore_1365_registry_size_includes_archives_and_generations(shared_m
     assert shared_mod._sofascore_registry_bytes() == 72
 
 
+def test_active_compaction_cannot_trip_lease_pressure(shared_mod, tmp_path, monkeypatch):
+    from scripts.proxy_filter import sofascore_registry as registry
+
+    path = tmp_path / "paid.jsonl"
+    row = {"event_type": "bytes", "source": "sofascore", "occurred_at": "2026-11-04T00:00:00Z",
+           "lease_id": "l", "direction": "down", "bytes": 13, "padding": "x" * 1000}
+    path.write_text((json.dumps(row) + "\n") * 30)
+    shared_mod.LEDGER_PATH = str(path)
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1000
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    committed = shared_mod._sofascore_registry_bytes()
+    original = registry._expanded_events
+    observed = []
+
+    def inspect_during_scan(*args):
+        temporaries = [p for p in tmp_path.glob(".registry-*.tmp") if not p.name.startswith(".registry-forensics-")]
+        assert temporaries
+        # Mimic a large in-flight gzip snapshot without changing input data.
+        with temporaries[-1].open("ab") as stream:
+            stream.truncate(61_000_000)
+        observed.append(shared_mod._sofascore_registry_bytes())
+        lease = shared_mod._create_lease(manager, max_bytes=1000, ttl_seconds=30,
+            metadata=_sofascore_context(budget=1000), require_context=True)
+        assert lease.max_bytes == 1000
+        with temporaries[-1].open("r+b") as stream:
+            stream.truncate(0)
+        yield from original(*args)
+
+    monkeypatch.setattr(registry, "_expanded_events", inspect_during_scan)
+    registry.compact(str(path), shared_mod._REGISTRY_LOCK, kind="paid",
+                     now=datetime(2026, 11, 5, tzinfo=timezone.utc))
+    assert observed == [committed]
+    assert manager.calls == 1
+    monkeypatch.setattr(registry, "_expanded_events", original)
+    assert sum(e["bytes"] for e in registry.iter_events(path) if e["event_type"] == "bytes") == 13 * 30
+
+
+def test_registry_pressure_forcing_is_bounded_but_hard_limit_retries(shared_mod, monkeypatch):
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
+    size = [58_700_000]
+    clock = [1000.0]
+    monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", lambda: size[0])
+    monkeypatch.setattr(shared_mod.time, "monotonic", lambda: clock[0])
+    calls = []
+    monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: calls.append(k["force"]))
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    clock[0] += 5
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    clock[0] += 300
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    size[0] = 60_000_000
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    assert calls == [True, False, True, True]
+
+
 @pytest.mark.parametrize("size,expected_force", [(57_999_999, False), (58_000_000, True), (60_013_623, True)])
 @pytest.mark.parametrize("kind", ["paid", "wal"])
 def test_sofascore_paid_rotation_uses_aggregate_pressure(shared_mod, monkeypatch, size, expected_force, kind):
@@ -8281,9 +8338,9 @@ def test_history_pressure_reclaims_small_wal_and_archives_old_daily_sums(shared_
                 shared_mod._daily_up_bytes, shared_mod._daily_down_bytes]
 
     expected = restore()
-    ticks = iter([0, shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1,
-                  shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1])
-    monkeypatch.setattr(shared_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    ticks = iter([0, shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1])
+    monkeypatch.setattr(shared_mod, "time", SimpleNamespace(
+        monotonic=lambda: next(ticks, shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1)))
     sleeps = 0
     async def sleep(_interval):
         nonlocal sleeps

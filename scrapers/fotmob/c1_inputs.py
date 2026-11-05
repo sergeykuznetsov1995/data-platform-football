@@ -283,6 +283,62 @@ def _stage_rows(manager, stage, rows):
         manager.execute_query(f"INSERT INTO {stage} VALUES " + ",".join(chunk))
 
 
+def _checkpoint_payloads(checkpoint_json, generation):
+    """Keep legacy small checkpoints; bound SQL literals for larger inventories.
+
+    json.dumps uses ASCII escapes, so 32k characters remain below the staging
+    ceiling even after SQL quote escaping. Header and parts share one MERGE.
+    """
+    if len(checkpoint_json.encode()) <= 32_000:
+        return [(None, "checkpoint", checkpoint_json)]
+    parts = [checkpoint_json[i:i + 32_000]
+             for i in range(0, len(checkpoint_json), 32_000)]
+    header = json.loads(checkpoint_json)
+    del header["files"]
+    header["checkpoint_storage"] = {"version": 1, "parts": len(parts), "sha256": generation}
+    return [(None, "checkpoint", json.dumps(header, sort_keys=True)),
+            *[(str(i), "checkpoint_part", part) for i, part in enumerate(parts)]]
+
+
+def _read_checkpoint(rows):
+    """Validate one control-partition snapshot before consuming any inventory."""
+    headers = [row for row in rows if row[3] == "checkpoint"]
+    if len(headers) != 1:
+        raise RuntimeError("C1 requires an approved bootstrap")
+    cid, season, mid, _, generation, complete, payload = headers[0]
+    if (cid, season, mid) != (None, None, None) or complete is not True:
+        raise RuntimeError("C1 incomplete checkpoint")
+    header = json.loads(payload)
+    parts = [row for row in rows if row[3] == "checkpoint_part"]
+    storage = header.get("checkpoint_storage")
+    if storage is None:
+        if parts:
+            raise RuntimeError("C1 unexpected checkpoint parts")
+        return header
+    if (not isinstance(storage, dict) or storage.get("version") != 1
+            or type(storage.get("parts")) is not int or storage["parts"] < 1
+            or len(parts) != storage["parts"] or storage.get("sha256") != generation):
+        raise RuntimeError("C1 incomplete checkpoint parts")
+    indexed = {}
+    for cid, season, mid, _, part_generation, complete, payload in parts:
+        if (cid is not None or season is not None or mid in indexed
+                or part_generation != generation or complete is not True
+                or not isinstance(payload, str)):
+            raise RuntimeError("C1 invalid checkpoint part")
+        indexed[mid] = payload
+    if set(indexed) != {str(i) for i in range(len(parts))}:
+        raise RuntimeError("C1 invalid checkpoint part indexes")
+    payload = "".join(indexed[str(i)] for i in range(len(parts)))
+    if hashlib.sha256(payload.encode()).hexdigest() != generation:
+        raise RuntimeError("C1 checkpoint checksum mismatch")
+    checkpoint = json.loads(payload)
+    if {k: v for k, v in checkpoint.items() if k != "files"} != {
+        k: v for k, v in header.items() if k != "checkpoint_storage"
+    }:
+        raise RuntimeError("C1 checkpoint header mismatch")
+    return checkpoint
+
+
 def refresh(manager, *, first_day=None, last_day=None):
     """Call under the FotMob writer lease; first_day is explicit bootstrap only.
 
@@ -296,13 +352,12 @@ def refresh(manager, *, first_day=None, last_day=None):
         if first_day <= CONTROL_DAY or last_day < first_day:
             raise ValueError("invalid C1 bootstrap range")
         manager.execute_query(f"CREATE TABLE IF NOT EXISTS {TABLE} {DDL}")
-    checkpoints = manager.execute_query(
-        f"SELECT checkpoint_json FROM {TABLE} WHERE deadline_day=DATE '{CONTROL_DAY}' "
-        "AND kind='checkpoint' AND complete"
+    controls = manager.execute_query(
+        f"SELECT competition_id, source_season_key, match_id, kind, generation, complete, "
+        f"checkpoint_json FROM {TABLE} WHERE deadline_day=DATE '{CONTROL_DAY}' "
+        "AND kind IN ('checkpoint','checkpoint_part')"
     )
-    if not bootstrap and len(checkpoints) != 1:
-        raise RuntimeError("C1 requires an approved bootstrap")
-    previous = json.loads(checkpoints[0][0]) if checkpoints and not bootstrap else None
+    previous = None if bootstrap else _read_checkpoint(controls)
     if previous is not None and (
         previous.get("contract_version") != CONTRACT_VERSION
         or previous.get("parser_versions") != [PARSER_VERSION, LEGACY_PARSER_VERSION]
@@ -417,8 +472,15 @@ def refresh(manager, *, first_day=None, last_day=None):
         key = (day, None, None, None, "day")
         replacements[key] = (*key, *([None] * 7), generation, True, None)
         day += timedelta(days=1)
-    key = (CONTROL_DAY, None, None, None, "checkpoint")
-    replacements[key] = (*key, *([None] * 7), generation, True, checkpoint_json)
+    for mid, kind, payload in _checkpoint_payloads(checkpoint_json, generation):
+        key = (CONTROL_DAY, None, None, mid, kind)
+        replacements[key] = (*key, *([None] * 7), generation, True, payload)
+    # Shrinking inventories/rebootstrap must not leave previous parts behind.
+    # Tombstones are published atomically with the new header, inputs and parts.
+    for cid, season, mid, kind, *_ in controls:
+        key = (CONTROL_DAY, cid, season, mid, kind)
+        if key not in replacements:
+            replacements[key] = (*key, *([None] * 7), generation, False, None)
     stage = PREFIX + "fotmob_c1_inputs__stg_" + uuid4().hex
     manager.execute_query(f"CREATE TABLE {stage} {DDL}")
     try:

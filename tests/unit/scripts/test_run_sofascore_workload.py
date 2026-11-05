@@ -546,3 +546,105 @@ def test_signed_history_capture_replays_raw_before_planned_missing_endpoints(tmp
             allocation_id=allocation.allocation_id, transport_factory=no_source,
         )
     assert engine.metrics.snapshot()["source_request_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "token,single_year,from_cycle,expected",
+    [
+        ("1920", False, True, "1920"),
+        ("2021", False, True, "2021"),
+        ("2526", False, True, "2526"),
+        ("2026", True, True, "2026"),
+        ("2021", False, False, "2122"),
+        ("1920", False, False, "2021"),
+        ("2526", False, False, "2526"),
+        ("2026", True, False, "2026"),
+        ("2026", True, "canonical", "2026"),
+    ],
+)
+def test_cli_and_scope_cycle_select_exact_signed_season(
+    tmp_path, monkeypatch, token, single_year, from_cycle, expected
+):
+    from unittest.mock import MagicMock
+    from dags.scripts import run_sofascore_scraper as runner
+    from dags.scripts import run_sofascore_scope_cycle as cycle
+    from scrapers.sofascore import scraper
+    from scrapers.sofascore.manifest import InMemoryManifestStore
+
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_sofascore")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-1")
+    monkeypatch.delenv("SOFASCORE_RUN_ID", raising=False)
+    monkeypatch.setattr(scraper, "_is_single_year", lambda *_: single_year)
+    catalog = SimpleNamespace(competition=lambda _: SimpleNamespace(capture_allowed=True))
+    monkeypatch.setattr("scrapers.sofascore.catalog.SofaScoreCatalog.load", lambda: catalog)
+    policy = WorkloadBudgetPolicy("c" * 64, {MATCH_WORKLOAD_CLASS: _match_budget()})
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_ingest_sofascore",
+        run_id="scheduled-1::targets",
+        partitions=[PartitionWorkload("SS-17", expected, 17, pending_match_ids=("123",))],
+        control_token=TOKEN,
+    )
+    path = write_plan(tmp_path / "targets.json", plan)
+    runtime = MagicMock(side_effect=RuntimeError("stop after signed allocation selection"))
+    monkeypatch.setattr("scrapers.sofascore.pipeline.build_capture_runtime", runtime)
+    if from_cycle is True:
+        def prepare(**kwargs):
+            assert kwargs["competition_seasons"][0].season == token
+            return path
+        monkeypatch.setattr("dags.scripts.prepare_sofascore_workload.prepare_workload_plan", prepare)
+        monkeypatch.setattr("scrapers.sofascore.pipeline.build_manifest_store", lambda _: InMemoryManifestStore())
+        cycle.run_phase(
+            "matches",
+            {"capture_key": "SS-17", "canonical_season": token,
+             "run_id": "scheduled-1", "dag_id": "dag_ingest_sofascore"},
+            output_dir=tmp_path / "run", workload_artifact=tmp_path / "artifact.json",
+        )
+    else:
+        import importlib
+        medallion = importlib.import_module("utils.medallion_config")
+        monkeypatch.setattr(medallion, "is_single_year_competition", lambda _: single_year)
+        monkeypatch.setattr(medallion, "get_active_season", lambda _: 2030)
+        season_args = (["--canonical-season", token] if from_cycle == "canonical"
+                       else ["--season", token, "--allow-inactive-season"])
+        assert runner.main([
+            "--entity", "match_capture", "--league", "SS-17", *season_args,
+            "--workload-plan", str(path),
+            "--output", str(tmp_path / "result.json"),
+        ]) == 1
+    runtime.assert_called_once()
+    assert runtime.call_args.kwargs["workload_class"] == MATCH_WORKLOAD_CLASS
+
+
+@pytest.mark.parametrize("token", ["", "2025", "2026"])
+def test_explicit_canonical_season_rejects_renormalization_before_plan(
+    tmp_path, monkeypatch, token
+):
+    from unittest.mock import MagicMock
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import scraper
+
+    monkeypatch.setattr(scraper, "_is_single_year", lambda *_: False)
+    catalog = SimpleNamespace(competition=lambda _: SimpleNamespace(capture_allowed=True))
+    monkeypatch.setattr("scrapers.sofascore.catalog.SofaScoreCatalog.load", lambda: catalog)
+    load = MagicMock(side_effect=AssertionError("plan must not load"))
+    monkeypatch.setattr(runner, "_load_runtime_workload_plan", load)
+    output = tmp_path / "result.json"
+    assert runner.main([
+        "--entity", "match_capture", "--league", "SS-17", "--canonical-season", token,
+        "--output", str(output),
+    ]) == 1
+    load.assert_not_called()
+    import json
+    assert "canonical season" in json.loads(output.read_text())["errors"][0]
+
+
+def test_cli_rejects_conflicting_season_forms(monkeypatch):
+    from dags.scripts import run_sofascore_scraper as runner
+    from unittest.mock import MagicMock
+
+    load = MagicMock(side_effect=AssertionError("catalog must not load"))
+    monkeypatch.setattr("scrapers.sofascore.catalog.SofaScoreCatalog.load", load)
+    assert runner.main(["--season", "2021", "--canonical-season", "2021"]) == 1
+    load.assert_not_called()

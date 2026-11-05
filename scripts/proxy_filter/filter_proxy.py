@@ -68,6 +68,7 @@ from scripts.proxy_filter.budget import (  # noqa: E402 - standalone entry point
     load_verified_policy,
 )
 from scripts.proxy_filter.sofascore_registry import compact as _compact_registry
+from scripts.proxy_filter.sofascore_registry import registry_bytes as _registry_directory_bytes
 from scripts.proxy_filter.sofascore_registry import iter_events as _iter_registry_events
 from scripts.proxy_filter.sofascore_registry import validate_checkpoint as _validate_registry_checkpoint
 
@@ -2731,19 +2732,30 @@ def _signed_allocation_from_request(
 
 SOFASCORE_REGISTRY_LIMIT_BYTES = 60_000_000
 SOFASCORE_REGISTRY_COMPACT_BYTES = 58_000_000
+SOFASCORE_REGISTRY_FORCE_INTERVAL_SECONDS = 300
+_REGISTRY_FORCE_LAST: dict[str, float] = {}
 
 
 def _sofascore_registry_bytes() -> int:
-    total = 0
-    directory = os.path.dirname(LEDGER_PATH) or "."
-    try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.is_file(follow_symlinks=False) and entry.name.endswith((".json", ".jsonl", ".bak", ".tmp", ".gz")):
-                    total += entry.stat(follow_symlinks=False).st_size
-    except FileNotFoundError:
-        pass
-    return total
+    # Serialize with installation so the new archive plus the old committed
+    # generation cannot temporarily reject leases between the two renames.
+    with _REGISTRY_LOCK:
+        return _registry_directory_bytes(os.path.dirname(LEDGER_PATH) or ".")
+
+
+def _registry_force_due(path: str) -> bool:
+    if SOURCE_MODE != "sofascore-only":
+        return False
+    size = _sofascore_registry_bytes()
+    if size < SOFASCORE_REGISTRY_COMPACT_BYTES:
+        return False
+    now = time.monotonic()
+    key = os.path.abspath(path)
+    if (size < SOFASCORE_REGISTRY_LIMIT_BYTES
+            and now - _REGISTRY_FORCE_LAST.get(key, float("-inf")) < SOFASCORE_REGISTRY_FORCE_INTERVAL_SECONDS):
+        return False
+    _REGISTRY_FORCE_LAST[key] = now
+    return True
 
 
 def _repair_failed_claim_creations() -> None:
@@ -4619,7 +4631,10 @@ def _service_health_report(mgr) -> dict[str, Any]:
         "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
         "max_active_leases": MAX_ACTIVE_LEASES,
         "sofascore_max_active_leases": SOFASCORE_MAX_ACTIVE_LEASES,
-        **({"registry_bytes": _sofascore_registry_bytes(), "registry_limit_bytes": SOFASCORE_REGISTRY_LIMIT_BYTES} if SOURCE_MODE == "sofascore-only" else {}),
+        **({"registry_bytes": _sofascore_registry_bytes(),
+            "registry_physical_bytes": _registry_directory_bytes(
+                os.path.dirname(LEDGER_PATH) or ".", include_active_temporary=True),
+            "registry_limit_bytes": SOFASCORE_REGISTRY_LIMIT_BYTES} if SOURCE_MODE == "sofascore-only" else {}),
         "dagrun_budget_bytes": DAGRUN_BUDGET_BYTES,
         "url_budget_bytes": URL_BUDGET_BYTES,
         "lease_proxy_url": LEASE_PROXY_URL,
@@ -5952,13 +5967,11 @@ def _compact_sofascore_registry(path: str, *, kind: str):
         with _REGISTRY_LOCK:
             if _ALLOCATION_WAL_PENDING_ROLLBACK is not None:
                 return None
-            force = (SOURCE_MODE == "sofascore-only"
-                     and _sofascore_registry_bytes() >= SOFASCORE_REGISTRY_COMPACT_BYTES)
+            force = _registry_force_due(path)
             return _compact_registry(path, _REGISTRY_LOCK, kind=kind, force=force)
     with _REGISTRY_LOCK:
         _repair_paid_ledger_append()
-        force = (SOURCE_MODE == "sofascore-only"
-                 and _sofascore_registry_bytes() >= SOFASCORE_REGISTRY_COMPACT_BYTES)
+        force = _registry_force_due(path)
     return _compact_registry(path, _REGISTRY_LOCK, kind=kind,
                              before_replace=_repair_paid_ledger_append, force=force)
 
