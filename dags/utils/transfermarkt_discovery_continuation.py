@@ -19,6 +19,29 @@ DELIVERY_DRAIN_PATH = Path("/opt/airflow/gateway-state/delivery-drain-until")
 JOB_PATH = Path('/opt/airflow/logs/transfermarkt-registry/cohorts/active.json')
 ACTIVE_STAGES = {'ready', 'running', 'paused', 'source_complete'}
 
+# One-time, narrowly pinned migration of a single audited legacy cohort
+# stranded in 'running': its run claimed the slot under the old constructor,
+# then failed during client setup ('retry_budget differs from the shared
+# traffic ledger limit') before any paid I/O, leaving settled accounting
+# resumable but the marker rejected. Pins identify the 2026-11-05 failure;
+# gateway audit confirmed no failed-run requests and prior bytes match the
+# cumulative ledger. See TRANSFERMARKT-DISCOVERY-2145.md for the audit basis.
+# This is not configurable permission to recover arbitrary 'running' markers:
+# anything that does not match every pin exactly stays rejected, and cohort
+# age/identity checks still run first (no expiry bypass).
+KNOWN_SETUP_FAILURE_RECOVERY = {
+    'marker_hash': '0f04956acac89c73f86cdc6bd883c57cd581b1286577eafed7f85dde465d1afe',
+    'paused_manifest': {'path': 'manifests/tm-registry-2f1b84aa92adbce7406f1163/transfermarkt-discovery-93986bc6272bd0b64bf7a658f3df9a22e62ca1614db40acc1b0e2f0ded8702a8.json',
+                        'hash': '93986bc6272bd0b64bf7a658f3df9a22e62ca1614db40acc1b0e2f0ded8702a8'},
+    'failed_manifest': {'path': 'manifests/tm-registry-8d50231f49f18d786c69e87b/transfermarkt-discovery-2f286ffc967f238b2b0979fb0fb47dfbb507f8f0e65fcee82386281e4cb207bc.json',
+                        'hash': '2f286ffc967f238b2b0979fb0fb47dfbb507f8f0e65fcee82386281e4cb207bc'},
+}
+_RECOVERY_REASON = 'audited legacy setup failure before paid I/O'
+_RECOVERY_TRAFFIC_FIELDS = ('requests', 'retries', 'provider_up_bytes',
+                            'provider_down_bytes', 'provider_metered_bytes',
+                            'decoded_bytes', 'cache_hits')
+_RECOVERY_SETUP_ERROR = 'retry_budget differs from the shared traffic ledger limit'
+
 
 class DiscoveryPortionComplete(RuntimeError):
     """Source remains incomplete: release the slot without publication."""
@@ -104,6 +127,69 @@ def ensure_cohort_age(saved: dict[str, Any], now: datetime) -> None:
         raise ValueError('discovery cohort expired or has invalid start time; no budget renewal')
 
 
+def _read_recovery_manifest(root: Path, pinned: dict[str, str]) -> dict[str, Any]:
+    try:
+        envelope = json.loads((root / pinned['path']).read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError('recovery manifest is missing or unreadable') from exc
+    if not isinstance(envelope, dict) or not isinstance(envelope.get('manifest'), dict):
+        raise ValueError('recovery manifest differs from the audited pin')
+    manifest = envelope['manifest']
+    if (envelope.get('manifest_hash') != pinned['hash']
+            or stable_payload_hash(manifest) != pinned['hash']):
+        raise ValueError('recovery manifest differs from the audited pin')
+    return manifest
+
+
+def _recover_known_setup_failure(path: Path, saved: dict[str, Any], *,
+                                 now: datetime, write: Callable) -> None:
+    """Re-settle the one audited legacy 'running' marker as 'paused'.
+
+    Every fact is pinned: the marker payload hash binds the expected artifact
+    paths and digests, and both manifest envelopes are bound by exact hashes.
+    Any missing, corrupt or drifted evidence fails closed without writing.
+    """
+    descriptor = KNOWN_SETUP_FAILURE_RECOVERY
+    checkpoint = Path(saved['checkpoint_path'])
+    artifacts = saved.get('artifacts')
+    expected = {str(checkpoint), str(checkpoint.with_suffix('.failures.json'))}
+    if not isinstance(artifacts, dict) or set(artifacts) != expected:
+        raise ValueError('recovery marker artifacts do not match its checkpoint')
+    for filename, digest in artifacts.items():
+        try:
+            actual = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ValueError('recovery marker artifact is missing or unreadable') from exc
+        if actual != digest:
+            raise ValueError('recovery marker checkpoint changed after settlement')
+    root = path.parent.parent
+    paused = _read_recovery_manifest(root, descriptor['paused_manifest'])
+    failed = _read_recovery_manifest(root, descriptor['failed_manifest'])
+    traffic = saved.get('traffic') or {}
+    paused_traffic = paused.get('traffic') or {}
+    if (paused.get('status') != 'paused'
+            or paused.get('portion') != saved['portion'] - 1
+            or any(paused_traffic.get(field) != traffic.get(field)
+                   for field in _RECOVERY_TRAFFIC_FIELDS)):
+        raise ValueError('recovery paused evidence does not match the stranded cohort')
+    error = failed.get('error') or {}
+    if (error.get('type') != 'ValueError'
+            or error.get('message') != _RECOVERY_SETUP_ERROR
+            or failed.get('source_status') != 'not_started'
+            or failed.get('writes') != []
+            or (failed.get('write_status') or {}).get('attempted') is not False
+            or failed.get('run_id') != saved.get('last_run_id')):
+        raise ValueError('recovery failure evidence does not match the stranded cohort')
+    # Preserve portion, started_at, identity, traffic and artifacts exactly;
+    # only the status, update time and recovery provenance change.
+    saved.update(status='paused', updated_at=now.isoformat(),
+                 recovery={'reason': _RECOVERY_REASON,
+                           'marker_hash': descriptor['marker_hash'],
+                           'paused_manifest_hash': descriptor['paused_manifest']['hash'],
+                           'failed_manifest_hash': descriptor['failed_manifest']['hash']})
+    write_job(path, saved, write)
+
+
 def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Callable) -> dict[str, Any]:
     """Keep one grant across slots; a new calendar slot never renews its caps."""
     if path.exists():
@@ -120,6 +206,10 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
             expected = {**identity, 'cohort_day': saved['identity']['cohort_day']}
             if saved['identity'] != expected:
                 raise ValueError('active discovery cohort registry/policy/parser/caps drift')
+            if (saved['status'] == 'running'
+                    and stable_payload_hash(saved) == KNOWN_SETUP_FAILURE_RECOVERY['marker_hash']):
+                _recover_known_setup_failure(path, saved, now=now, write=write)
+                return saved
             if saved['status'] not in {'ready', 'paused', 'source_complete'}:
                 raise ValueError('active discovery cohort has unresolved traffic or writes')
             return saved
@@ -184,6 +274,21 @@ class DiscoveryContinuation:
                 if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
                     raise ValueError('discovery continuation checkpoint changed after settlement')
             self._restore(self.saved['traffic'])
+        self._claimed = False
+
+    def mark_running(self) -> None:
+        """Claim the cohort only immediately before paid work.
+
+        Construction validates the settled cohort and restores its cumulative
+        traffic, but the setup that follows (admission, lease/client
+        construction) may still fail before any paid I/O.  Claiming 'running'
+        at construction would strand the settled cohort and block its
+        continuation; an explicit claim keeps unknown/unsettled traffic
+        fail-closed while a setup failure leaves the cohort resumable.
+        """
+        if self._claimed:
+            raise ValueError('discovery continuation is already running')
+        self._claimed = True
         self.save('running')
 
     def _restore(self, traffic: dict[str, Any]) -> None:
