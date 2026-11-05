@@ -29,7 +29,8 @@ SHARED_FILTER_SHA256 = (
     # #1804: align the FBref history-controller DAG allowlist with the client.
     # #1788: measured CONNECT 502 refusal for SofaScore discovery; FBref bytes unchanged.
     # #1788: any measured CONNECT refusal for SofaScore discovery.
-    "ba80bd8d1ddc24c2c244c22318e3e9ee54e4fd98c420171d36d8c5925c6994c7"
+    # #2163: owned compaction scratch accounting; dedicated FBref bytes unchanged.
+    "ce0e0360cf9a24ed584c785925b38e4f4910d1ceeaa724adec458e0d88360501"
 )
 
 
