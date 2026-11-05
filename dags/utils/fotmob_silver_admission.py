@@ -78,4 +78,3 @@ class AdmittedCursor:
 
     def fetchall(self):
         return self._cursor.fetchall()
-
