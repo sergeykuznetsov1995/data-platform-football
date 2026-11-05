@@ -31,6 +31,38 @@ def totals(events):
     return values
 
 
+def test_only_owned_temporary_inode_is_exempt_and_ownership_expires(tmp_path):
+    from contextlib import ExitStack
+    import os
+
+    (tmp_path / ".registry-orphan.tmp").write_bytes(b"orphan")
+    with ExitStack() as stack:
+        fd, name = registry._temporary(tmp_path, ".registry-", stack)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(b"copy")
+        assert registry.registry_bytes(tmp_path) == 6
+        assert registry.registry_bytes(tmp_path, include_active_temporary=True) == 10
+        # Replacement at the owned path is not owned by this compactor.
+        other = tmp_path / "replacement"
+        other.write_bytes(b"unknown")
+        os.replace(other, name)
+        assert registry.registry_bytes(tmp_path) == 13
+    assert registry.registry_bytes(tmp_path) == 13
+    assert not registry._ACTIVE_TEMPORARIES
+
+
+def test_failed_compaction_does_not_leave_exempt_files(tmp_path, monkeypatch):
+    path = tmp_path / "paid.jsonl"
+    write(path, [event()])
+    def fail(*args):
+        raise OSError("injected scan failure")
+    monkeypatch.setattr(registry, "_expanded_events", fail)
+    with pytest.raises(OSError, match="injected scan failure"):
+        registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    assert not registry._ACTIVE_TEMPORARIES
+    assert registry.registry_bytes(tmp_path) == path.stat().st_size
+
+
 def test_compacted_checkpoint_preserves_every_recovery_key_and_week_evidence(tmp_path):
     path = tmp_path / "paid.jsonl"
     events = [event() for _ in range(30)] + [event(direction="up"), event(occurred_at="2026-10-07T00:00:00Z"), event(lease_id="other"), event(event_type="lease_created"), event(event_type="accounting_uncertain", reason="disk_failed"), event(event_type="lease_closed"), event(event_type="lease_created", occurred_at="2026-09-01T00:00:00Z")]
@@ -123,8 +155,7 @@ def test_forced_rotation_without_reduction_keeps_committed_files(tmp_path):
     write(path, [event(lease_id=str(i), padding="") for i in range(30)])
     registry.compact(str(path), RLock(), kind="paid", now=NOW)
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
-    with pytest.raises(RuntimeError, match="cannot compact safely"):
-        registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
+    assert registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True) is None
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
 
 

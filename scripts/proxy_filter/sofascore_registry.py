@@ -34,6 +34,51 @@ RECOVERY_FIELDS = (
     "base_run_id", "workload_phase", "direction",
 )
 SOURCES = {"sofascore", "sofascore_discovery"}
+_TEMPORARIES_LOCK = RLock()
+_ACTIVE_TEMPORARIES = {}
+
+
+def registry_bytes(directory, *, include_active_temporary=False):
+    """Count state, including orphans, but not this process's working copies.
+
+    Only a live compactor's exact path and inode are exempt. A crash loses the
+    ownership map, so leftover temporary files count again on restart.
+    """
+    total = 0
+    with _TEMPORARIES_LOCK:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.name.endswith((".json", ".jsonl", ".bak", ".tmp", ".gz")):
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue  # A concurrent atomic install removed this name.
+                    identity = _ACTIVE_TEMPORARIES.get(os.path.abspath(entry.path))
+                    if not include_active_temporary and identity == (stat.st_dev, stat.st_ino):
+                        continue
+                    total += stat.st_size
+        except FileNotFoundError:
+            pass
+    return total
+
+
+def _temporary(directory, prefix, stack):
+    def release(path):
+        with _TEMPORARIES_LOCK:
+            _ACTIVE_TEMPORARIES.pop(path, None)
+
+    # Size readers cannot see a created-but-not-yet-owned file.
+    with _TEMPORARIES_LOCK:
+        descriptor, path = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+        stat = os.fstat(descriptor)
+        key = os.path.abspath(path)
+        _ACTIVE_TEMPORARIES[key] = (stat.st_dev, stat.st_ino)
+        stack.callback(release, key)
+    return descriptor, path
 
 
 def _events(stream, end):
@@ -288,13 +333,13 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
         groups = {}
         finished = set()
         before = kept = forensic_count = forensic_length = 0
-        descriptor, temporary = tempfile.mkstemp(prefix=".registry-", suffix=".tmp", dir=directory)
+        descriptor, temporary = _temporary(directory, ".registry-", stack)
         archive_tmp = None
         try:
             out = stack.enter_context(os.fdopen(descriptor, "wb"))
             archive_out = packed = None
             if kind == "paid":
-                archive_fd, archive_tmp = tempfile.mkstemp(prefix=".registry-forensics-", suffix=".tmp", dir=directory)
+                archive_fd, archive_tmp = _temporary(directory, ".registry-forensics-", stack)
                 archive_out = stack.enter_context(os.fdopen(archive_fd, "w+b"))
                 packed = gzip.GzipFile(filename="", fileobj=archive_out, mode="wb", mtime=0)
                 stack.callback(packed.close)
@@ -376,10 +421,12 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                 after = out.tell()
                 previous_archive_bytes = os.fstat(snapshot.fileno()).st_size if snapshot else 0
                 projected = _projected_bytes(path, after, archive_bytes, (temporary, archive_tmp)) if kind == "paid" else after
-                if after >= limit or projected >= REGISTRY_LIMIT_BYTES or (
-                    (prefix >= limit or forced) and after + archive_bytes >= actual.st_size + previous_archive_bytes
-                ):
+                if after >= limit or projected >= REGISTRY_LIMIT_BYTES:
                     raise RuntimeError(f"SofaScore registry cannot compact safely: retained={after}, limit={limit}, projected={projected}")
+                if (prefix >= limit or forced) and after + archive_bytes >= actual.st_size + previous_archive_bytes:
+                    # Aggregate pressure can force a journal already in its
+                    # smallest safe form. Keep the committed generation intact.
+                    return None
                 if archive_name:
                     os.fsync(archive_out.fileno())
                     os.replace(archive_tmp, directory / archive_name)
