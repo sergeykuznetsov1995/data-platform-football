@@ -553,3 +553,284 @@ def test_v1_checkpoint_remains_readable_but_cannot_hide_recovery_bytes(tmp_path)
             assert read(path)[0]["schema_version"] == 2
             assert totals(registry.iter_events(path)) == totals([old])
             assert next(registry.iter_events(path)) == {k: row[k] for k in registry.FORENSIC_FIELDS if k in row}
+
+
+# --- Crash recovery and cross-process compaction locking -------------------
+
+import os
+import signal
+import subprocess
+import sys
+import time
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _wait_for(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _child_compaction_script(kind="paid", stage="replace"):
+    # The child compacts but blocks at a chosen stage with its working
+    # temporaries (partially) written. It signals readiness with a flag file
+    # and waits for a "go" file it may never get. A fixed NOW keeps forensic
+    # retention assertions independent of the actual wall-clock date.
+    return f"""
+import os, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+from datetime import datetime, timezone
+from scripts.proxy_filter import sofascore_registry as registry
+from threading import RLock
+
+path, flag, go = sys.argv[1], sys.argv[2], sys.argv[3]
+now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+def wait_for_go():
+    with open(flag, "w") as marker:
+        marker.write("ready")
+    deadline = time.monotonic() + 30
+    while not os.path.exists(go):
+        if time.monotonic() > deadline:
+            raise RuntimeError("child timed out waiting for go")
+        time.sleep(0.01)
+
+stage = {stage!r}
+if stage == "replace":
+    # After every temporary has been fully written and fsynced, before the
+    # final commit.
+    real_replace = os.replace
+    def blocking_replace(source, target):
+        if str(target) == str(path):
+            wait_for_go()
+        return real_replace(source, target)
+    registry.os.replace = blocking_replace
+else:
+    # Midstream in _expanded_events, after part of the forensic snapshot
+    # output has already been produced into the working temporaries.
+    original = registry._expanded_events
+    def scan(*args):
+        for index, item in enumerate(original(*args)):
+            if index == 3:
+                wait_for_go()
+            yield item
+    registry._expanded_events = scan
+result = registry.compact(path, RLock(), kind={kind!r}, trigger=10000, now=now)
+print("RESULT", result, flush=True)
+"""
+
+
+def _start_child(tmp_path, path, kind="paid", stage="replace", timeout=10.0):
+    flag = tmp_path / "child-ready"
+    go = tmp_path / "child-go"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _child_compaction_script(kind, stage), str(path), str(flag), str(go)],
+        cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        if not _wait_for(lambda: flag.exists(), timeout=timeout):
+            raise AssertionError("child never reached the commit point")
+    except BaseException:
+        # Never leak a live or zombie child if readiness cannot be confirmed.
+        child.kill()
+        child.wait(timeout=10)
+        raise
+    return child, go
+
+
+def _work_temps(directory):
+    return [p for p in directory.iterdir()
+            if p.name.startswith(".registry-work-") and not p.is_symlink()]
+
+
+@pytest.mark.parametrize("stage", ["replace", "midstream"])
+def test_sigkill_mid_compaction_orphan_reclaimed_and_replay_exact(tmp_path, stage):
+    path = tmp_path / "paid.jsonl"
+    # Incompressible forensic events first, so the midstream kill happens
+    # after part of the snapshot output is already flushed to its temporary.
+    # The error field is retained forensic evidence; incompressible payloads
+    # overflow the gzip buffer so part of the snapshot reaches its temporary.
+    forensic = [event(event_type="endpoint_finished", request_id=f"keep-{i}",
+                      error=os.urandom(20000).hex()) for i in range(8)]
+    events = forensic + [event() for _ in range(30)]
+    write(path, events)
+    original = path.read_bytes()
+    expected = totals(registry.iter_events(path))
+
+    child, _go = _start_child(tmp_path, path, stage=stage)
+    orphans = _work_temps(tmp_path)
+    assert orphans  # The child blocked with its working temporaries on disk.
+    if stage == "midstream":
+        assert any(p.stat().st_size > 0 for p in orphans)  # Partial output produced.
+    child.send_signal(signal.SIGKILL)
+    child.wait(timeout=10)
+
+    # The durable journal is untouched; the orphan temps now count toward caps.
+    assert path.read_bytes() == original
+    assert totals(registry.iter_events(path)) == expected
+    assert _work_temps(tmp_path) == orphans
+    assert registry.registry_bytes(tmp_path) >= path.stat().st_size + sum(p.stat().st_size for p in orphans)
+
+    # The next compaction reclaims only the new-namespace orphans and replays.
+    result = registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000)
+    assert result is not None
+    assert _work_temps(tmp_path) == []
+    assert totals(registry.iter_events(path)) == expected
+    assert {e.get("request_id") for e in registry.iter_events(path)} >= {f"keep-{i}" for i in range(8)}
+
+
+def test_concurrent_compactor_returns_none_and_preserves_active_temps(tmp_path):
+    path = tmp_path / "paid.jsonl"
+    events = [event() for _ in range(30)] + [event(event_type="endpoint_finished", request_id="keep")]
+    write(path, events)
+    expected = totals(registry.iter_events(path))
+    legacy = tmp_path / ".registry-legacy-orphan.tmp"
+    legacy.write_bytes(b"verified legacy orphan")
+    foreign = tmp_path / ".registry-work-foreign00.tmp"
+    foreign.symlink_to(path)  # A symlink in the new namespace is never unlinked.
+
+    child, go = _start_child(tmp_path, path)
+    active = _work_temps(tmp_path)
+    assert active
+    try:
+        started = time.monotonic()
+        assert registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000) is None
+        assert time.monotonic() - started < 5  # Contention returns promptly.
+        # The contending call never deletes the live compactor's working
+        # files, legacy temporaries, foreign symlinks, or the lock file.
+        assert _work_temps(tmp_path) == active
+        assert legacy.read_bytes() == b"verified legacy orphan"
+        assert foreign.is_symlink()
+        lock_file = tmp_path / registry.COMPACTION_LOCK_NAME
+        assert lock_file.is_file() and not lock_file.is_symlink()
+    finally:
+        go.write_text("go")
+    out, err = child.communicate(timeout=30)
+    assert child.returncode == 0, err
+    assert "RESULT {" in out
+
+    # The first compactor finished a valid committed generation.
+    assert totals(registry.iter_events(path)) == expected
+    assert _work_temps(tmp_path) == []
+    assert legacy.exists()  # Legacy orphans remain the operator's concern.
+    assert foreign.is_symlink()
+    assert (tmp_path / registry.COMPACTION_LOCK_NAME).exists()
+
+    # After the child exits, the directory is compactable again.
+    with path.open("a") as tail:
+        tail.write("".join(json.dumps(event()) + "\n" for _ in range(30)))
+    assert registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000) is not None
+    assert totals(registry.iter_events(path)) == totals(events + [event() for _ in range(30)])
+
+
+def test_contention_closes_lock_descriptor_exactly_once(tmp_path, monkeypatch):
+    from contextlib import ExitStack
+    closed = []
+    real_close = os.close
+    def tracking_close(descriptor):
+        closed.append(descriptor)
+        real_close(descriptor)
+    def contended(descriptor, how):
+        raise BlockingIOError("another compactor owns this directory")
+    monkeypatch.setattr(registry.os, "close", tracking_close)
+    monkeypatch.setattr(registry.fcntl, "flock", contended)
+    with ExitStack() as stack:
+        assert registry._acquire_compaction_lock(tmp_path, stack) is None
+    # A double close would raise OSError during unwind; exactly one close happened.
+    assert len(closed) == 1  # Closed exactly once, before returning None.
+
+
+def test_repeated_real_contention_does_not_leak_descriptors(tmp_path):
+    import fcntl
+    from contextlib import ExitStack
+    holder = os.open(tmp_path / registry.COMPACTION_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(25):
+            with ExitStack() as stack:
+                assert registry._acquire_compaction_lock(tmp_path, stack) is None
+            assert registry.compact(str(tmp_path / "paid.jsonl"), RLock(), kind="paid", now=NOW) is None
+        assert len(os.listdir("/proc/self/fd")) == before
+    finally:
+        os.close(holder)
+
+
+def test_flock_failure_propagates_and_closes_descriptor(tmp_path, monkeypatch):
+    from contextlib import ExitStack
+    closed = []
+    real_close = os.close
+    def tracking_close(descriptor):
+        closed.append(descriptor)
+        real_close(descriptor)
+    def broken(descriptor, how):
+        raise OSError("injected flock failure")
+    monkeypatch.setattr(registry.os, "close", tracking_close)
+    monkeypatch.setattr(registry.fcntl, "flock", broken)
+    with ExitStack() as stack:
+        with pytest.raises(OSError, match="injected flock failure"):
+            registry._acquire_compaction_lock(tmp_path, stack)
+    assert len(closed) == 1
+
+
+def test_symlink_lock_file_fails_closed(tmp_path):
+    lock = tmp_path / registry.COMPACTION_LOCK_NAME
+    target = tmp_path / "elsewhere.lock"
+    target.write_bytes(b"foreign")
+    lock.symlink_to(target)
+    with pytest.raises(OSError):  # O_NOFOLLOW refuses the symlink.
+        registry.compact(str(tmp_path / "paid.jsonl"), RLock(), kind="paid", now=NOW)
+    assert lock.is_symlink() and target.read_bytes() == b"foreign"
+
+
+def test_nonregular_lock_file_fails_closed_and_is_preserved(tmp_path):
+    lock = tmp_path / registry.COMPACTION_LOCK_NAME
+    os.mkfifo(lock)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        registry.compact(str(tmp_path / "paid.jsonl"), RLock(), kind="paid", now=NOW)
+    assert not lock.is_file() and lock.exists()  # Never unlinked or replaced.
+
+
+def test_foreign_entries_survive_cleanup_on_successful_acquisition(tmp_path):
+    path = tmp_path / "paid.jsonl"
+    events = [event() for _ in range(30)] + [event(event_type="endpoint_finished", request_id="keep")]
+    write(path, events)
+    foreign_file = tmp_path / ".registry-work-foreign.tmp"  # 7 chars: outside exact-8 rule.
+    foreign_file.write_bytes(b"foreign regular file")
+    matching_link = tmp_path / ".registry-work-zzzzzzzz.tmp"  # 8 chars but a symlink.
+    matching_link.symlink_to(path)
+    stale_owned = tmp_path / ".registry-work-abcdef12.tmp"  # 8-char regular: reclaimed.
+    stale_owned.write_bytes(b"crashed generation")
+    result = registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000)
+    assert result is not None
+    assert foreign_file.read_bytes() == b"foreign regular file"
+    assert matching_link.is_symlink()
+    assert not stale_owned.exists()  # The exact-8char rule only reclaimed this one.
+    assert totals(registry.iter_events(path)) == totals(events)
+
+
+def test_start_child_readiness_failure_kills_and_reaps_child(tmp_path, monkeypatch):
+    path = tmp_path / "wal.jsonl"
+    write(path, [event(event_type="claim_intent", padding="")])  # Below trigger: child exits without flag.
+    spawned = []
+    real_popen = subprocess.Popen
+    def tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+    monkeypatch.setattr(subprocess, "Popen", tracking_popen)
+    with pytest.raises(AssertionError, match="never reached"):
+        _start_child(tmp_path, path, kind="wal", timeout=0.5)
+    assert spawned and spawned[0].poll() is not None  # Killed/exited and reaped: no zombie.
+
+
+def test_missing_parent_returns_none_without_creating_directories(tmp_path):
+    missing = tmp_path / "absent" / "paid.jsonl"
+    assert registry.compact(str(missing), RLock(), kind="paid", now=NOW) is None
+    assert registry.compact(str(missing), RLock(), kind="wal", now=NOW) is None
+    assert not (tmp_path / "absent").exists()
+    assert not (tmp_path / registry.COMPACTION_LOCK_NAME).exists()
