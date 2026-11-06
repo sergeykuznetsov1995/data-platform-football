@@ -531,6 +531,18 @@ _CF_ORIGIN_ERROR_TITLE = re.compile(
     re.IGNORECASE,
 )
 
+# WhoScored occasionally serves a short HTTP 200 maintenance shell (observed
+# as temporary unavailability; the trigger is unknown).  Only the exact
+# observed document is recognised: the plain ``WhoScored.com`` title plus
+# both verbatim maintenance sentences.  Observed shells are <1KiB.
+_WHOSCORED_MAINTENANCE_TITLE = re.compile(
+    r"<title>\s*WhoScored\.com\s*</title>", re.IGNORECASE
+)
+_WHOSCORED_MAINTENANCE_SENTENCES = (
+    "we are unable to respond to you at the moment but we will be back shortly.",
+    "please check us again soon and thanks for your patience.",
+)
+
 _WHOSCORED_STRUCTURED_FEED_PATHS = (
     re.compile(r"\A/statisticsfeed/1/get(?:team|player)statistics\Z"),
     re.compile(r"\A/stagestatfeed/[1-9][0-9]*/stageteams/\Z"),
@@ -875,6 +887,36 @@ def _cloudflare_origin_error_status(content: bytes | str) -> Optional[int]:
     )
     match = _CF_ORIGIN_ERROR_TITLE.search(body[:16_384])
     return int(match.group(1)) if match is not None else None
+
+
+_WHOSCORED_MAINTENANCE_MAX_BYTES = 16_384
+
+
+def _is_whoscored_maintenance_page(content: bytes | str) -> bool:
+    """Match the exact HTTP 200 WhoScored maintenance shell.
+
+    The page carries the plain ``WhoScored.com`` title and both verbatim
+    maintenance sentences.  A real application payload (``matchCentreData``)
+    always wins over embedded maintenance prose, and a different title or a
+    single sentence is ordinary parser drift, not maintenance.
+    """
+
+    # Observed maintenance shells are <1KiB, so anything past the bound is a
+    # real page: reject by length alone instead of decoding and scanning a
+    # potentially multi-MB body.
+    if len(content) > _WHOSCORED_MAINTENANCE_MAX_BYTES:
+        return False
+    body = (
+        content.decode("utf-8", errors="ignore")
+        if isinstance(content, bytes)
+        else content
+    )
+    if "matchCentreData" in body:
+        return False
+    if _WHOSCORED_MAINTENANCE_TITLE.search(body) is None:
+        return False
+    lowered = body.lower()
+    return all(sentence in lowered for sentence in _WHOSCORED_MAINTENANCE_SENTENCES)
 
 
 Validator = Callable[[TransportResponse], Optional[bool]]
@@ -3262,6 +3304,19 @@ class WhoScoredTransport:
                     response.route is TransportRoute.DIRECT_FLARESOLVERR
                     and browser_challenge
                 ),
+            )
+        if response.status_code == 200 and _is_whoscored_maintenance_page(
+            response.content
+        ):
+            # A bounded retryable status failure that keeps the observed HTTP
+            # 200: no synthetic 503, no raw-cache poisoning, no browser route.
+            raise WhoScoredTransportError(
+                "WhoScored maintenance page served as HTTP 200",
+                kind=FailureKind.HTTP_STATUS,
+                url=response.url,
+                route=response.route,
+                status_code=response.status_code,
+                retryable=True,
             )
         if not 200 <= response.status_code < 300:
             redirect_location = None
