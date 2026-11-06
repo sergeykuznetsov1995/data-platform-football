@@ -13,7 +13,15 @@
 #   . "$(dirname "$0")/env.sh"; sofascore_load_env "$ENV_FILE" || exit 2
 
 sofascore_load_env() {
-  local file="$1" line key value
+  local file="$1" line key value evidence_configured=0
+  # #2182: унаследованный из окружения процесса SOFASCORE_EVIDENCE_CODE_REVISION не
+  # должен переживать загрузку — цикл ниже снимает только ключи, ЕСТЬ в файле, а
+  # compose отдал бы приоритет процессному env над --env-file, и отчётность
+  # evidence приписала бы код не того релиза (после выката и отката alike).
+  # Сброс — ДО проверки читаемости и парсинга: отказ по любой причине (нет файла,
+  # битая строка, невыводимая ревизия) обязан оставить ревизию неустановленной,
+  # а не унаследованной.
+  unset -v SOFASCORE_EVIDENCE_CODE_REVISION
   [ -r "$file" ] || { echo "нет env-файла контура: $file" >&2; return 2; }
   while IFS= read -r line || [ -n "$line" ]; do
     line=${line%$'\r'}
@@ -30,11 +38,58 @@ sofascore_load_env() {
       \'*\') value=${value#\'}; value=${value%\'} ;;
       \"*\") value=${value#\"}; value=${value%\"}; value=${value//\\\"/\"}; value=${value//\\\\/\\} ;;
     esac
+    # Решение «recorder настроен» принимается ТОЛЬКО по файлу: непустые
+    # SOFASCORE_REFRESH_EVIDENCE_DIR / SOFASCORE_EVIDENCE_CODE_REVISION из файла —
+    # конфигурация, унаследованные из окружения процесса — нет (#2182).
+    case "$key" in
+      SOFASCORE_REFRESH_EVIDENCE_DIR)
+        [ -n "$value" ] && evidence_configured=1 ;;
+      SOFASCORE_EVIDENCE_CODE_REVISION)
+        # #2182: пин из файла в процесс НЕ устанавливается — ревизию выводит только
+        # sofascore_derive_evidence_revision из дерева релиза. Пин лишь отмечает,
+        # что recorder сконфигурирован; иначе при сбое вывода (или отсутствии
+        # вывода) compose увидел бы устаревший файловый пин как боевую ревизию.
+        [ -n "$value" ] && evidence_configured=1
+        continue ;;
+    esac
     # Снять переменную целиком (в том числе атрибут export, унаследованный от окружения),
     # затем задать заново как обычную переменную оболочки.
     unset -v "$key"
     printf -v "$key" '%s' "$value"
   done < "$file"
+  # Выключенный recorder (ни каталога, ни пина в файле) не обязан иметь git-дерево:
+  # вывод ревизии — только когда recorder/пин сконфигурирован.
+  [ "$evidence_configured" = 1 ] || return 0
+  sofascore_derive_evidence_revision
+}
+
+# #2182: полный sha кода, который реально смонтирован в контур, выводится из САМОГО
+# дерева SOFASCORE_RELEASE_ROOT, а не доверяется пину из env-файла/окружения: перепин
+# корня релиза при выкате и откате иначе оставлял бы отчётность evidence на чужом коде.
+# Вывод — строгий (fail closed): корень обязан быть вершиной git-дерева (не подкаталогом
+# чужого репозитория), HEAD — полным 40-hex, отслеживаемый код — чистым. Подменяется
+# ТОЛЬКО SOFASCORE_EVIDENCE_CODE_REVISION и только в процессе (export для compose,
+# чьё процессное окружение сильнее --env-file); env-файл не правится. Дерево
+# переиспользуется из $SOFASCORE_RELEASE_ROOT, уже загруженного выше, — без новых
+# подпроцессов на каждый матч и без новых зависимостей (git и так нужен выкату).
+sofascore_derive_evidence_revision() {
+  local root top sha dirty
+  [ -n "${SOFASCORE_RELEASE_ROOT:-}" ] || { echo "recorder evidence настроен, а SOFASCORE_RELEASE_ROOT не задан" >&2; return 2; }
+  root=$SOFASCORE_RELEASE_ROOT
+  [ -d "$root" ] || { echo "SOFASCORE_RELEASE_ROOT не каталог: $root" >&2; return 2; }
+  root=$(cd "$root" && pwd -P) || { echo "не канонизируется SOFASCORE_RELEASE_ROOT: $SOFASCORE_RELEASE_ROOT" >&2; return 2; }
+  top=$(git -C "$root" --no-optional-locks rev-parse --show-toplevel 2>/dev/null)     || { echo "recorder evidence настроен, а $root не git-дерево — ревизию кода вывести нечем" >&2; return 2; }
+  top=$(cd "$top" && pwd -P) || { echo "не канонизируется вершина git-дерева: $top" >&2; return 2; }
+  [ "$top" = "$root" ] || { echo "SOFASCORE_RELEASE_ROOT $root не вершина git-дерева ($top) — ревизия была бы чужой" >&2; return 2; }
+  sha=$(git -C "$root" --no-optional-locks rev-parse HEAD 2>/dev/null)     || { echo "в дереве $root не читается HEAD — ревизию evidence вывести нечем" >&2; return 2; }
+  case "$sha" in
+    *[!0-9a-f]*) echo "HEAD дерева $root не 40-hex: $sha" >&2; return 2 ;;
+  esac
+  [ "${#sha}" = 40 ] || { echo "HEAD дерева $root не 40-hex: $sha" >&2; return 2; }
+  dirty=$(git -C "$root" --no-optional-locks status --porcelain --untracked-files=no 2>/dev/null)     || { echo "git status в дереве $root не отработал — чистоту кода не подтвердить, fail closed" >&2; return 2; }
+  [ -z "$dirty" ] || { echo "отслеживаемый код дерева $root грязный — ревизия evidence непредставительна" >&2; return 2; }
+  SOFASCORE_EVIDENCE_CODE_REVISION=$sha
+  export SOFASCORE_EVIDENCE_CODE_REVISION
 }
 
 # Замок выката (#1245): один протокол на автомат ночной доставки и на ручной deploy.sh.

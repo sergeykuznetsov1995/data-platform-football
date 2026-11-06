@@ -6,11 +6,13 @@ but cannot remove the evidence referenced by the durable journal.
 """
 from __future__ import annotations
 
+import fcntl
 import gzip
 import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
@@ -36,6 +38,69 @@ RECOVERY_FIELDS = (
 SOURCES = {"sofascore", "sofascore_discovery"}
 _TEMPORARIES_LOCK = RLock()
 _ACTIVE_TEMPORARIES = {}
+COMPACTION_LOCK_NAME = ".sofascore-compaction.lock"
+# Only this narrow generation namespace is ever reclaimed automatically.
+_STALE_TEMPORARY = re.compile(r"\.registry-work-(?:forensics-)?[0-9a-z_]{8}\.tmp\Z")
+
+
+def _acquire_compaction_lock(directory, stack):
+    """Directory-wide nonblocking flock serializing compactors, not appends.
+
+    The persistent lock file is a regular non-symlink opened O_NOFOLLOW and
+    close-on-exec; it is never unlinked. The descriptor is released only by
+    the caller's ExitStack, after all compaction temporaries are cleaned up.
+    Unsafe open errors fail closed (raise); only lock contention returns None.
+    """
+    try:
+        descriptor = os.open(
+            Path(directory) / COMPACTION_LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+        )
+    except FileNotFoundError:
+        return None  # Absent registry parent: nothing to compact, nothing to create.
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError("unsafe SofaScore compaction lock: not a regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            return None  # Another live compactor owns this directory.
+    except BaseException:
+        os.close(descriptor)
+        raise
+    stack.callback(os.close, descriptor)
+    return descriptor
+
+
+def _remove_stale_temporaries(directory):
+    """Reclaim crashed generations of this code's own temporary namespace.
+
+    Only regular non-symlink files matching the exact .registry-work-*.tmp
+    pattern are removed, under the directory flock, so a live compactor's
+    working files (in any process) are never touched. Legacy .registry-*
+    temporaries, symlinks and foreign files remain for the operator.
+    """
+    changed = False
+    with _TEMPORARIES_LOCK:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if _STALE_TEMPORARY.fullmatch(entry.name) is None:
+                        continue
+                    if os.path.abspath(entry.path) in _ACTIVE_TEMPORARIES:
+                        continue  # Owned by a live compactor in this process.
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        continue
+                    changed = True
+        except FileNotFoundError:
+            return
+    if changed:
+        _sync_directory(directory)
 
 
 def registry_bytes(directory, *, include_active_temporary=False):
@@ -298,14 +363,31 @@ def _projected_bytes(path, after, archive_bytes, temporary_paths):
 
 
 def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before_replace=None, force=False):
+    """Compact under a directory-wide cross-process compaction lock.
+
+    The nonblocking flock covers stale-temporary reclamation, temporary
+    creation and cleanup, and is released only after the ExitStack closes. A
+    concurrent compactor in the same directory makes this call return None
+    without touching the other process's working files.
+    """
+    if kind not in {"paid", "wal"}:
+        raise ValueError("unknown registry kind")
+    path = str(path)
+    directory = Path(path).parent
+    with ExitStack() as stack:
+        if _acquire_compaction_lock(directory, stack) is None:
+            return None
+        _remove_stale_temporaries(directory)
+        return _compact(path, lock, kind=kind, now=now, trigger=trigger,
+                        before_replace=before_replace, force=force)
+
+
+def _compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before_replace=None, force=False):
     """Compact without discarding recovery sums or seven-day evidence.
 
     Aggregate pressure can force either journal below its individual trigger.
     It never relaxes the retained-size caps or drops unfinished WAL claims.
     """
-    if kind not in {"paid", "wal"}:
-        raise ValueError("unknown registry kind")
-    path = str(path)
     forced = force
     limit = trigger if trigger is not None else (PAID_TRIGGER_BYTES if kind == "paid" else WAL_TRIGGER_BYTES)
     current = now or datetime.now(timezone.utc)
@@ -333,13 +415,13 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
         groups = {}
         finished = set()
         before = kept = forensic_count = forensic_length = 0
-        descriptor, temporary = _temporary(directory, ".registry-", stack)
+        descriptor, temporary = _temporary(directory, ".registry-work-", stack)
         archive_tmp = None
         try:
             out = stack.enter_context(os.fdopen(descriptor, "wb"))
             archive_out = packed = None
             if kind == "paid":
-                archive_fd, archive_tmp = _temporary(directory, ".registry-forensics-", stack)
+                archive_fd, archive_tmp = _temporary(directory, ".registry-work-forensics-", stack)
                 archive_out = stack.enter_context(os.fdopen(archive_fd, "w+b"))
                 packed = gzip.GzipFile(filename="", fileobj=archive_out, mode="wb", mtime=0)
                 stack.callback(packed.close)

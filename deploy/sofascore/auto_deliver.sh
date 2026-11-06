@@ -473,7 +473,10 @@ repin_env_to_old(){  # repin_env_to_old <старое дерево>
   sofascore_set_env_var "$ENV_FILE" SOFASCORE_RELEASE_ROOT "$old" || ok=0
   sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$(snap_get OLD_ARTIFACT_HOST)" || ok=0
   sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$(snap_get OLD_ARTIFACT_ID)" || ok=0
-  sofascore_load_env "$ENV_FILE"
+  # #2182: загрузка обязана быть проверена явно. Раньше её код возврата игнорировался,
+  # и при совпавших полях ФАЙЛА функция возвращала успех — откат шёл пересоздавать
+  # контейнеры на незагруженном/битом env (например, при невыводимой ревизии evidence).
+  sofascore_load_env "$ENV_FILE" || { log "env-файл после перепина НЕ ЗАГРУЖАЕТСЯ — контейнеры не трогаю"; return 1; }
   # Сверяемся с ФАЙЛОМ, а не с переменными оболочки: sofascore_load_env снимает только те
   # ключи, что есть в файле, поэтому ИСЧЕЗНУВШАЯ строка оставила бы в памяти прежнее
   # значение и проверка прошла бы на устаревших данных, ничего не заметив.

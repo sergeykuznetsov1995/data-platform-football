@@ -610,7 +610,9 @@ STEP="repin-env"
 sofascore_set_env_var "$ENV_FILE" SOFASCORE_RELEASE_ROOT "$RELEASE"
 sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$ARTIFACT_DEST"
 sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$ARTIFACT_ID"
-sofascore_load_env "$ENV_FILE"
+# #2182: проверка явная, а не надежда на errexit — compose ниже не должен стартовать
+# при незагруженном env (например, при невыводимой ревизии evidence нового дерева).
+sofascore_load_env "$ENV_FILE" || { log "env file $ENV_FILE failed to load after repin"; exit 2; }
 [ "$SOFASCORE_RELEASE_ROOT" = "$RELEASE" ] || { log "env file did not take the new release root"; exit 2; }
 log "env file $ENV_FILE repinned to $RELEASE"
 
