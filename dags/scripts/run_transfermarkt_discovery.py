@@ -34,6 +34,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+import orjson
 import pandas as pd
 from bs4 import BeautifulSoup
 
@@ -194,8 +195,81 @@ class DiscoveryRunnerError(RuntimeError):
     """A fail-closed runner invariant was violated."""
 
 
+_ORJSON_INT_MIN = -(2**63)
+_ORJSON_INT_MAX = 2**63 - 1
+# orjson refuses nesting far shallower than stdlib ``json``; keep the fast
+# path strictly inside both encoders' accepted depth.
+_MAX_FASTPATH_DEPTH = 128
+
+
+def _json_fastpath_safe(value: Any) -> bool:
+    """Return True when ``value`` is an exact-built-in JSON tree orjson encodes
+    with the same semantics as stdlib ``json``.
+
+    Conservative on purpose: only plain ``str``/``bool``/``None``, 64-bit
+    ``int``, finite ``float`` and ``dict``/``list``/``tuple`` containers with
+    string keys qualify.  Anything else (non-finite floats, huge ints,
+    datetime, dataclasses, custom objects, nonstring keys, cycles) falls back
+    to the stdlib encoder so prior acceptance and error behavior is unchanged.
+    Nesting is also bounded conservatively: orjson refuses deeper structures
+    than stdlib ``json``, so anything nested past ``_MAX_FASTPATH_DEPTH``
+    falls back to the stdlib encoder before deep recursion can diverge.
+    """
+
+    seen: set[int] = set()
+
+    def check(node: Any, depth: int = 0) -> bool:
+        if depth > _MAX_FASTPATH_DEPTH:
+            return False
+        node_type = type(node)
+        if node_type is str or node_type is bool or node is None:
+            return True
+        if node_type is int:
+            return _ORJSON_INT_MIN <= node <= _ORJSON_INT_MAX
+        if node_type is float:
+            return math.isfinite(node)
+        if node_type is dict:
+            if id(node) in seen:
+                return False
+            seen.add(id(node))
+            try:
+                return all(
+                    type(key) is str and check(item, depth + 1)
+                    for key, item in node.items()
+                )
+            finally:
+                seen.discard(id(node))
+        if node_type is list or node_type is tuple:
+            if id(node) in seen:
+                return False
+            seen.add(id(node))
+            try:
+                return all(check(item, depth + 1) for item in node)
+            finally:
+                seen.discard(id(node))
+        return False
+
+    return check(value)
+
+
+def _encode_json_entry(value: Any) -> bytes:
+    """Encode one already-validated JSON-tree entry (key or value) to bytes.
+
+    ``OPT_SORT_KEYS`` preserves nested key ordering. Finite float spelling
+    may differ from stdlib JSON; decoded numeric values remain unchanged.
+    """
+    try:
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
+    except orjson.JSONEncodeError:
+        # Unpaired surrogates raise TypeError from orjson where the previous
+        # stdlib UTF-8 writer raised UnicodeEncodeError; retain that contract.
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+
 class AtomicJsonMapping(MutableMapping[str, Any]):
-    """Small atomic JSON mapping used for durable resume and HTTP cache.
+    """Large atomic JSON mapping used for durable resume and HTTP cache.
 
     Discovery is intentionally single-concurrency.  The file lock still keeps
     a second accidental process from observing a partially replaced document.
@@ -241,16 +315,34 @@ class AtomicJsonMapping(MutableMapping[str, Any]):
             )
             try:
                 os.fchmod(descriptor, 0o600)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(
-                        self._data,
-                        handle,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                if _json_fastpath_safe(self._data):
+                    # Large mappings are rewritten in full on every response,
+                    # so stream each top-level entry with the fast encoder
+                    # instead of materializing one whole-map buffer.  This
+                    # mapping is written by a single process, so per-entry
+                    # streaming stays simple and ordered.
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(b"{")
+                        for index, key in enumerate(sorted(self._data)):
+                            if index:
+                                handle.write(b",")
+                            handle.write(_encode_json_entry(key))
+                            handle.write(b":")
+                            handle.write(_encode_json_entry(self._data[key]))
+                        handle.write(b"}")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                else:
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            self._data,
+                            handle,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        handle.flush()
+                        os.fsync(handle.fileno())
                 os.replace(temporary, self.path)
             except BaseException:
                 try:
