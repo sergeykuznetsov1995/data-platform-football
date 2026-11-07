@@ -2,6 +2,7 @@
 from datetime import date, datetime, timezone
 import multiprocessing
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -272,3 +273,51 @@ def test_squad_context_columns_keep_types_when_a_batch_is_all_null():
         'shirt_number': 'BIGINT', 'signed_from_fee_eur': 'BIGINT'}
     assert types['is_on_loan'] == types['is_captain'] == 'BOOLEAN'
     assert {types[column] for column in tm.SQUAD_DATE_COLUMNS} == {'DATE'}
+
+
+def _fake_trino(monkeypatch, calls):
+    monkeypatch.setattr(
+        writer.base_trino,
+        'trino',
+        SimpleNamespace(
+            dbapi=SimpleNamespace(connect=lambda **kwargs: calls.append(kwargs)),
+            auth=SimpleNamespace(BasicAuthentication=lambda *args: args),
+        ),
+        raising=False,
+    )
+
+
+@pytest.mark.parametrize('password', [None, 'secret'])
+def test_tm_connection_disables_dynamic_filtering(monkeypatch, password):
+    calls = []
+    _fake_trino(monkeypatch, calls)
+    if password:
+        monkeypatch.setenv('TRINO_PASSWORD', password)
+    else:
+        monkeypatch.delenv('TRINO_PASSWORD', raising=False)
+
+    manager = writer.TransfermarktTrinoManager(host='trino')
+    manager._create_connection()
+
+    assert calls[-1]['session_properties'] == {'enable_dynamic_filtering': 'false'}
+    assert calls[-1]['host'] == 'trino'
+    assert calls[-1]['port'] == manager.port
+    assert calls[-1]['user'] == manager.user
+    assert calls[-1]['catalog'] == manager.catalog
+    if password:
+        assert calls[-1]['http_scheme'] == 'https'
+        assert calls[-1]['auth'] == ('airflow', password)
+        assert calls[-1]['verify'] is False
+    else:
+        assert 'http_scheme' not in calls[-1]
+        assert 'auth' not in calls[-1]
+
+
+def test_base_trino_manager_still_receives_no_session_properties(monkeypatch):
+    calls = []
+    _fake_trino(monkeypatch, calls)
+    monkeypatch.delenv('TRINO_PASSWORD', raising=False)
+
+    writer.base_trino.TrinoTableManager(host='trino')._create_connection()
+
+    assert 'session_properties' not in calls[-1]
