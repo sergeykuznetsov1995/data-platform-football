@@ -1467,7 +1467,6 @@ def attest_fotmob_isolated_runtime(
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
-                "dag_refresh_fotmob_c1",
             }
         )
         and report_unpaused
@@ -1475,6 +1474,7 @@ def attest_fotmob_isolated_runtime(
             {
                 FOTMOB_AUTOMATIC_OWNER_DAG_ID,
                 "dag_ingest_fotmob",
+                "dag_refresh_fotmob_c1",
             }
         )
     )
@@ -1482,9 +1482,9 @@ def attest_fotmob_isolated_runtime(
         common_admission
         and report.get("activation_state") == "pending_consumer"
         and report.get("kept_paused") is False
-        and report_paused == sorted({FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"})
+        and report_paused == [FOTMOB_ISOLATED_DAILY_DAG_ID]
         and report_unpaused
-        == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS - {FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"})
+        == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS - {FOTMOB_ISOLATED_DAILY_DAG_ID})
     )
     kept_paused_admission = (
         common_admission
@@ -1708,13 +1708,13 @@ def attest_fotmob_shared_runtime(
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
             "dag_collect_fotmob_players",
-            "dag_refresh_fotmob_c1",
         }
         and isinstance(unpaused, list)
         and set(unpaused)
         == {
             FOTMOB_AUTOMATIC_OWNER_DAG_ID,
             "dag_ingest_fotmob",
+            "dag_refresh_fotmob_c1",
         }
     )
     pending_automatic_wait_admission = (
@@ -1730,11 +1730,10 @@ def attest_fotmob_shared_runtime(
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
             "dag_collect_fotmob_players",
-            "dag_refresh_fotmob_c1",
         }
         and isinstance(unpaused, list)
         and set(unpaused)
-        == {"dag_ingest_fotmob"}
+        == {"dag_ingest_fotmob", "dag_refresh_fotmob_c1"}
     )
     automatic_admission = None
     automatic_rollout = None

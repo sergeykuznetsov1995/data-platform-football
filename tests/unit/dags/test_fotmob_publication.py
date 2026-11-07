@@ -132,13 +132,13 @@ def _isolated_runtime_evidence(tmp_path: Path):
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
-                "dag_refresh_fotmob_c1",
             }
         ),
         "unpaused": sorted(
             {
                 publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
                 "dag_ingest_fotmob",
+                "dag_refresh_fotmob_c1",
             }
         ),
         "container_report_path": str(report_path),
@@ -303,10 +303,9 @@ def _pending_automatic_shared_wait_report(tmp_path: Path, report: dict) -> dict:
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
-                "dag_refresh_fotmob_c1",
             }
         ),
-        unpaused=["dag_ingest_fotmob"],
+        unpaused=["dag_ingest_fotmob", "dag_refresh_fotmob_c1"],
         evidence_dir=str(tmp_path.resolve()),
         generated_at="2026-08-08T13:36:00+00:00",
         scheduler_container_id=isolated_id,
@@ -332,10 +331,10 @@ def _pending_consumer_report(report: dict) -> dict[str, str]:
     report.update(
         activation_state="pending_consumer",
         kept_paused=False,
-        paused=sorted({publication.FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"}),
+        paused=[publication.FOTMOB_ISOLATED_DAILY_DAG_ID],
         unpaused=sorted(
             publication.FOTMOB_EXPECTED_ISOLATED_DAGS
-            - {publication.FOTMOB_ISOLATED_DAILY_DAG_ID, "dag_refresh_fotmob_c1"}
+            - {publication.FOTMOB_ISOLATED_DAILY_DAG_ID}
         ),
         schedule_boundary={
             "shared_dag_id": "dag_sofascore_pipeline",
@@ -1080,13 +1079,13 @@ def test_pending_automatic_sofa_sensor_waits_without_claim_then_active_claims(
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
                 "dag_collect_fotmob_players",
-                "dag_refresh_fotmob_c1",
             }
         ),
         unpaused=sorted(
             {
                 publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
                 "dag_ingest_fotmob",
+                "dag_refresh_fotmob_c1",
             }
         ),
         automatic_rollout=certificate["automatic_rollout"],

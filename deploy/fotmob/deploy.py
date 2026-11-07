@@ -74,11 +74,10 @@ LEGACY_OWNER_DAGS = frozenset(
         "dag_collect_fotmob_players",
     }
 )
-# C1 requires separate approval after bootstrap; ordinary admission keeps it paused.
-PAUSED_SERVICE_DAGS = frozenset({"dag_refresh_fotmob_c1"})
+PAUSED_SERVICE_DAGS = frozenset()
 AUTOMATIC_PAUSED_DAGS = LEGACY_OWNER_DAGS | PAUSED_SERVICE_DAGS
 AUTOMATIC_ACTIVE_DAGS = frozenset(
-    {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob"}
+    {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob", "dag_refresh_fotmob_c1"}
 )
 AUTOMATIC_CANARY_SCHEMA = "fotmob-automatic-canary-v1"
 AUTOMATIC_ROLLOUT_SCHEMA = "fotmob-automatic-rollout-v1"
