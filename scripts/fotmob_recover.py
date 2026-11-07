@@ -81,7 +81,7 @@ ISOLATED_DAGS = (
     "dag_collect_fotmob_players",
     "dag_refresh_fotmob_c1",
 )
-LEGACY_DAGS = frozenset(ISOLATED_DAGS[2:])
+LEGACY_DAGS = frozenset(ISOLATED_DAGS[2:]) - {"dag_refresh_fotmob_c1"}
 ACTIVE_PAUSE_STATES = {dag_id: dag_id in LEGACY_DAGS for dag_id in ISOLATED_DAGS}
 ALL_PAUSED_STATES = {dag_id: True for dag_id in ISOLATED_DAGS}
 SHARED_DOWNSTREAM_DAGS = (
