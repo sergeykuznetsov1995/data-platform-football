@@ -126,7 +126,7 @@ def test_proxy_file_has_no_default(monkeypatch, module_name):
     ("module_name", "task_ids"),
     [
         ("dag_ingest_whoscored", ("discover_catalog", "ingest_matches", "ingest_stages")),
-        ("dag_backfill_whoscored", ("run_backfill_chunk",)),
+        ("dag_backfill_whoscored", ("run_backfill_chunk", "run_replay_matches")),
     ],
 )
 def test_runtime_root_drives_cd_and_pythonpath(monkeypatch, module_name, task_ids):
@@ -573,3 +573,196 @@ def test_current_collection_wins_the_shared_slot_within_one_history_chunk(ingest
     chunk = _bash("run_backfill_chunk")._init_kwargs
     assert chunk["execution_timeout"] == timedelta(minutes=45)
     assert chunk.get("priority_weight", 1) < 100
+
+
+# ------------------- targeted replay recovery (2026-11-07) -----------------
+
+REPLAY_IDS = (1951316, 1951142)
+REPLAY_SCOPE = "WS-233-85=2025"
+
+
+def test_branch_selects_history_without_exact_replay_conf(backfill):
+    from types import SimpleNamespace
+    for conf in (None, {}, {"replay": "true"}, {"replay": 1}, {"replay": False},
+                 {"other": True}):
+        assert backfill._select_run_path(dag_run=SimpleNamespace(conf=conf)) == [
+            "run_backfill_chunk", "finalize_chunk"]
+
+
+def test_branch_selects_replay_with_exact_true_conf(backfill):
+    from types import SimpleNamespace
+    assert backfill._select_run_path(
+        dag_run=SimpleNamespace(conf={"replay": True})) == [
+        "run_replay_matches", "finalize_replay"]
+
+
+def test_replay_command_is_bounded_direct_and_pool_native(backfill):
+    from datetime import timedelta
+    from utils.default_args import INGEST_SCRAPER_POOL
+    replay = _bash("run_replay_matches")
+    chunk = _bash("run_backfill_chunk")
+    cmd = replay._init_kwargs["bash_command"]
+    assert "run_whoscored_scraper.py replay" in cmd
+    assert f"--scope {REPLAY_SCOPE}" in cmd
+    assert cmd.count("--game-id") == 2
+    assert "--game-id 1951316" in cmd
+    assert "--game-id 1951142" in cmd
+    assert "--transport-policy direct_only" in cmd
+    assert backfill.REPLAY_RESULT_PATH in cmd
+    for banned in ("--proxy-approval", "direct_then_paid", "gateway"):
+        assert banned not in cmd
+    assert replay._init_kwargs["retries"] == 0
+    assert replay._init_kwargs["execution_timeout"] == timedelta(minutes=45)
+    assert replay._init_kwargs["execution_timeout"] == chunk._init_kwargs["execution_timeout"]
+    assert replay._init_kwargs.get("pool") == chunk._init_kwargs.get("pool")
+    assert backfill.dag._dag_kwargs["default_args"]["pool"] == INGEST_SCRAPER_POOL
+    assert "WHOSCORED_PROXY_FILE" in replay._init_kwargs["env"]
+
+
+def test_branch_topology_keeps_history_and_adds_replay(backfill):
+    choose = _python("choose_backfill_or_replay")
+    assert choose.downstream_task_ids == {
+        "run_backfill_chunk", "finalize_chunk",
+        "run_replay_matches", "finalize_replay"}
+    chunk = _bash("run_backfill_chunk")
+    assert chunk.downstream_task_ids == {"finalize_chunk"}
+    finalize = _python("finalize_chunk")
+    assert finalize.downstream_task_ids == {"wait_before_next_continuous_run"}
+    assert _python("wait_before_next_continuous_run")._init_kwargs["mode"] == "reschedule"
+    replay = _bash("run_replay_matches")
+    assert replay.upstream_task_ids == {"choose_backfill_or_replay"}
+    assert replay.downstream_task_ids == {"finalize_replay"}
+    finalize_replay = _python("finalize_replay")
+    assert finalize_replay._init_kwargs["trigger_rule"] == "all_done"
+    assert finalize_replay.downstream_task_ids == set()
+
+
+def _replay_report(**extra):
+    from scrapers.whoscored.repository import entity_id_payload_sha256
+    report = {
+        "schema_version": 3,
+        "command": "replay",
+        "status": "success",
+        "errors": [],
+        "row_counts_complete": True,
+        "scopes": [{"scope": REPLAY_SCOPE, "status": "success"}],
+        "match_candidates": {"schema_version": 1, "count": 2,
+                             "attempted": 2, "remaining": 0},
+        "producer_attempts": {"schema_version": 1, "match": [{
+            "schema_version": 1, "scope": REPLAY_SCOPE, "count": 2,
+            "payload_sha256": entity_id_payload_sha256(REPLAY_IDS),
+        }], "preview": [], "profile": []},
+        "producer_commits": {"schema_version": 1, "scope": [],
+                             "match": ["ws2-v3-" + "a" * 64, "ws2-v3-" + "b" * 64],
+                             "match_not_available": [], "preview": [],
+                             "preview_not_available": [], "profile": [],
+                             "profile_not_available": []},
+    }
+    report.update(extra)
+    return report
+
+
+def _replay_context(tmp_path, report, task_state="success"):
+    from types import SimpleNamespace
+    context = _budget_context(tmp_path, report)
+    context["dag_run"] = SimpleNamespace(
+        get_task_instance=lambda task: SimpleNamespace(state=task_state))
+    return context
+
+
+def test_replay_finalize_accepts_two_recovered_matches(backfill, tmp_path):
+    backfill.finalize_replay(**_replay_context(tmp_path, _replay_report()))
+
+
+def test_replay_finalize_rejects_missing_or_malformed_report(backfill, tmp_path):
+    from airflow.exceptions import AirflowException
+    context = _replay_context(tmp_path, _replay_report())
+    from pathlib import Path
+    Path(context["templates_dict"]["result_path"]).unlink()
+    with pytest.raises(AirflowException, match="missing or invalid"):
+        backfill.finalize_replay(**context)
+    with pytest.raises(AirflowException, match="failed validation"):
+        backfill.finalize_replay(**_replay_context(tmp_path, {"status": "success"}))
+
+
+def test_replay_finalize_rejects_failed_producer(backfill, tmp_path):
+    from airflow.exceptions import AirflowException
+    with pytest.raises(AirflowException, match="process failed"):
+        backfill.finalize_replay(
+            **_replay_context(tmp_path, _replay_report(), task_state="failed"))
+
+
+def _replay_attempt(**extra):
+    from scrapers.whoscored.repository import entity_id_payload_sha256
+    record = {"schema_version": 1, "scope": REPLAY_SCOPE, "count": 2,
+              "payload_sha256": entity_id_payload_sha256(REPLAY_IDS)}
+    record.update(extra)
+    return record
+
+
+@pytest.mark.parametrize("attempt", [
+    _replay_attempt(count=3),
+    _replay_attempt(payload_sha256="0" * 64),
+    _replay_attempt(scope="WS-233-85=2024"),
+])
+def test_replay_finalize_rejects_wrong_attempted_identity(backfill, tmp_path, attempt):
+    from airflow.exceptions import AirflowException
+    report = _replay_report()
+    report["producer_attempts"]["match"] = [attempt]
+    with pytest.raises(AirflowException, match="attempted match identity"):
+        backfill.finalize_replay(**_replay_context(tmp_path, report))
+
+
+def test_replay_finalize_rejects_wrong_attempted_count(backfill, tmp_path):
+    from airflow.exceptions import AirflowException
+    report = _replay_report()
+    report["match_candidates"]["attempted"] = 1
+    with pytest.raises(AirflowException, match="attempted match count"):
+        backfill.finalize_replay(**_replay_context(tmp_path, report))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("count", 3),
+    ("count", 1),
+    ("remaining", 1),
+])
+def test_replay_finalize_rejects_incomplete_candidates(backfill, tmp_path,
+                                                       field, value):
+    from airflow.exceptions import AirflowException
+    report = _replay_report()
+    report["match_candidates"][field] = value
+    with pytest.raises(AirflowException, match="attempted match count"):
+        backfill.finalize_replay(**_replay_context(tmp_path, report))
+
+
+def test_replay_finalize_rejects_wrong_scope(backfill, tmp_path):
+    from airflow.exceptions import AirflowException
+    report = _replay_report(scopes=[{"scope": "WS-182-77=2627", "status": "success"}])
+    with pytest.raises(AirflowException, match="unexpected scope"):
+        backfill.finalize_replay(**_replay_context(tmp_path, report))
+
+
+@pytest.mark.parametrize("commits", [
+    {"match": []},
+    {"match": ["ws2-v3-" + "a" * 64]},
+    {"match": ["ws2-v3-" + "a" * 64, "ws2-v3-" + "b" * 64, "ws2-v3-" + "c" * 64]},
+    {"match": ["ws2-v3-" + "a" * 64, "ws2-v3-" + "a" * 64]},
+    {"match": ["ws2-v3-" + "a" * 64, "ws2-v3-" + "b" * 64],
+     "scope": ["wss2-" + "d" * 64]},
+])
+def test_replay_finalize_rejects_missing_or_extra_commits(backfill, tmp_path, commits):
+    from airflow.exceptions import AirflowException
+    report = _replay_report()
+    report["producer_commits"].update(commits)
+    with pytest.raises(AirflowException, match="did not commit both matches"):
+        backfill.finalize_replay(**_replay_context(tmp_path, report))
+
+
+def test_replay_finalize_rejects_not_available_only(backfill, tmp_path):
+    from airflow.exceptions import AirflowException
+    report = _replay_report()
+    report["producer_commits"]["match"] = []
+    report["producer_commits"]["match_not_available"] = [
+        "wsna2-v3-" + "e" * 64, "wsna2-v3-" + "f" * 64]
+    with pytest.raises(AirflowException, match="did not commit both matches"):
+        backfill.finalize_replay(**_replay_context(tmp_path, report))
