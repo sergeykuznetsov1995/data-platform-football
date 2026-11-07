@@ -37,8 +37,8 @@ from utils.config import DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
 from utils.transfermarkt_discovery_continuation import (
     SCHEDULE as DISCOVERY_SCHEDULE, RUN_SECONDS, WORK_SECONDS,
-    cohort_day, identity_for, mark_published, read_job, select_job, write_job,
-    ensure_manual_delivery_admission,
+    cohort_age, cohort_day, identity_for, mark_published, read_job,
+    select_job, write_job, ensure_manual_delivery_admission,
 )
 
 
@@ -418,8 +418,12 @@ def _prepare_discovery(
         job_path = STATE_ROOT / 'cohorts' / 'active.json'
         if job_path.exists():
             prior_job = read_job(job_path)
-            if prior_job['status'] != 'published':
+            prior_age = cohort_age(prior_job, now)
+            prior_active = prior_age is not None and timedelta(0) <= prior_age < timedelta(days=1)
+            if prior_job['status'] != 'published' and prior_active:
                 # A week boundary during a cohort cannot change its work or caps.
+                # An expired paused cohort is archived and replaced by select_job
+                # below; its mode must not pin the genuinely new cohort's sizing.
                 sizing = type(sizing)(mode=prior_job['identity']['mode'],
                     previous_competitions=prior_job.get('sizing', {}).get('previous_competitions', sizing.previous_competitions),
                     country_pages=prior_job.get('sizing', {}).get('country_pages', sizing.country_pages))
@@ -1183,7 +1187,7 @@ def _build_dag(dag_id: str, *, manual: bool = False):
         dag_id=dag_id,
         default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
         description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
-        # Nine bounded slots retain three four-hour delivery gaps and 01–03 UTC quiet.
+        # Thirteen bounded slots retain three four-hour delivery gaps and 01–03 UTC quiet.
         # One daily cohort resumes until complete; its paid caps never reset per slot.
         schedule=None if manual else DISCOVERY_SCHEDULE,
         dagrun_timeout=timedelta(hours=6) if manual else timedelta(seconds=RUN_SECONDS),

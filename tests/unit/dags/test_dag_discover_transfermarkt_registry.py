@@ -252,7 +252,7 @@ def test_dag_is_daily_single_run_and_proxy_task_is_serialized(dag_module):
 
     assert dag_module.dag.dag_id == "dag_discover_transfermarkt_registry"
     # 18:00 UTC = 21:00 MSK, every day (#1391).
-    assert dag_module.dag.schedule == "0 3,5,7,11,13,15,19,21,23 * * *"
+    assert dag_module.dag.schedule == "0 3,4,5,6,7,11,12,13,14,15,19,21,23 * * *"
     assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=55)
     assert dag_module.dag._dag_kwargs["max_active_runs"] == 1
     assert dag_module.dag._dag_kwargs["catchup"] is False
@@ -745,12 +745,82 @@ class TestStandingRegistryDiscovery:
 
         countries = len(load_countries())
         per_competition = 2 if mode == "full" else 1
-        expected = math.ceil(1.5 * (per_competition * 803 + countries + 6))
+        # Committed full-mode lower bounds (#2145): max(803, 2040) candidates
+        # and max(countries, 481) listing pages; daily sizing is unchanged.
+        competitions = max(803, 2040) if mode == "full" else 803
+        pages = max(countries, 481) if mode == "full" else countries
+        expected = math.ceil(1.5 * (per_competition * competitions + pages + 6))
         assert env["TM_MODE"] == mode
         assert env["TM_PREVIOUS_SNAPSHOT_ID"] == snapshot_id
         assert int(env["TM_REQUEST_LIMIT"]) == expected
         assert int(env["TM_RETRY_LIMIT"]) == math.ceil(0.1 * expected)
         assert int(env["TM_BYTE_CAP_BYTES"]) == expected * 32 * 1024
+
+    def test_expired_paused_cohort_is_archived_and_does_not_pin_the_new_mode(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        # #2145: an expired paused cohort (tm-discovery-job-3d9db936 blocked
+        # select_job) rolls over.  The old marker is preserved verbatim as
+        # <job_id>/expired.json and a genuinely new cohort sizes from the live
+        # registry facts; the old 'full' mode must not cross the week boundary.
+        import hashlib
+
+        paths, _, _ = self._arm(dag_module, monkeypatch, tmp_path)
+        kwargs = self._prepare_kwargs(dag_module, paths)
+        env = dag_module._prepare_discovery(**kwargs)
+        path = Path(env["TM_DISCOVERY_JOB_PATH"])
+        job = dag_module.read_job(path)
+        checkpoint = Path(job["checkpoint_path"])
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(json.dumps({"https://example.test/a": {"hash": "x"}}))
+        failures = checkpoint.with_suffix(".failures.json")
+        failures.write_text(json.dumps({"https://example.test/a": {"status": "ok"}}))
+        expired_at = datetime.now(timezone.utc) - timedelta(days=2)
+        from scrapers.transfermarkt.models import LeaseTrafficSnapshot, SharedTrafficLedger
+        ledger = SharedTrafficLedger(hard_provider_bytes=10000, soft_provider_bytes=9000, retry_limit=10)
+        ledger.observe_lease("lease-1", LeaseTrafficSnapshot(up_bytes=10, down_bytes=90))
+        ledger.record_attempt(entity="competition_registry", decoded_bytes=100,
+                              provider_up_bytes=10, provider_down_bytes=90,
+                              retry=True, duration_seconds=0.5)
+        job.update(
+            status="paused",
+            portion=3,
+            started_at=expired_at.isoformat(),
+            updated_at=expired_at.isoformat(),
+            traffic=ledger.snapshot(),
+            sizing={"previous_competitions": 938, "country_pages": 211},
+            artifacts={
+                str(candidate): hashlib.sha256(candidate.read_bytes()).hexdigest()
+                for candidate in (checkpoint, failures)
+            },
+        )
+        job["identity"]["mode"] = "full"
+        dag_module.write_job(path, job, dag_module._atomic_json)
+        # The live registry facts now say a daily crawl with 803 competitions.
+        monkeypatch.setattr(
+            dag_module,
+            "_read_registry_facts",
+            lambda: (SNAPSHOT_ID, 803, datetime.now(timezone.utc)),
+        )
+
+        env = dag_module._prepare_discovery(**kwargs)
+
+        assert env["TM_MODE"] == "daily"
+        assert env["TM_PREVIOUS_SNAPSHOT_ID"] == SNAPSHOT_ID
+        new_job = dag_module.read_job(path)
+        assert new_job["status"] == "ready"
+        assert new_job["job_id"] != job["job_id"]
+        assert new_job["identity"]["mode"] == "daily"
+        assert new_job["traffic"] is None
+        assert new_job["started_at"] != job["started_at"]
+        # The old marker is archived untouched, never renewed or reset.
+        archived = dag_module.read_job(
+            path.parent / job["job_id"] / "expired.json"
+        )
+        assert archived["status"] == "paused"
+        assert archived["portion"] == 3
+        assert archived["started_at"] == job["started_at"]
+        assert archived["identity"]["mode"] == "full"
 
     def test_gate_off_scheduled_prepare_fails_closed(
         self, dag_module, monkeypatch, tmp_path

@@ -567,6 +567,9 @@ def discovery_limits(
     ``request_limit = max(floor, ceil(multiplier * (k * competitions +
     country pages + seed pages)))`` with ``k`` baseline requests per
     competition of the mode (full: profile + regulation; daily: regulation).
+    Full sizing applies the policy's committed lower bounds
+    (``max(previous_competitions, full_min_competitions)`` and
+    ``max(country_pages, full_listing_pages)``); daily sizing does not.
     Daily HTML fallbacks spend only existing multiplier/floor headroom and stop
     through the same guard. Retries and provider bytes scale with the result.
     The policy's ``paid_proxy`` caps are the floors, and a policy without
@@ -583,14 +586,20 @@ def discovery_limits(
         raise DiscoveryRunnerError(f"unknown discovery mode: {sizing.mode!r}")
     if sizing.previous_competitions < 0 or sizing.country_pages < 0:
         raise DiscoveryRunnerError("discovery sizing must be non-negative")
-    per_competition = (
-        scaling.full_requests_per_competition
-        if sizing.mode == "full"
-        else scaling.daily_requests_per_competition
-    )
+    if sizing.mode == "full":
+        per_competition = scaling.full_requests_per_competition
+        # Committed full-mode lower bounds (#2145): the measured replay found
+        # 2040 candidates and 481 listing pages, so a full crawl never sizes
+        # below them.  Daily sizing is unchanged.
+        competitions = max(sizing.previous_competitions, scaling.full_min_competitions)
+        pages = max(sizing.country_pages, scaling.full_listing_pages)
+    else:
+        per_competition = scaling.daily_requests_per_competition
+        competitions = sizing.previous_competitions
+        pages = sizing.country_pages
     work = (
-        per_competition * sizing.previous_competitions
-        + sizing.country_pages
+        per_competition * competitions
+        + pages
         + scaling.seed_pages
     )
     request_limit = max(
