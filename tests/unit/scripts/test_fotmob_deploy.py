@@ -4379,7 +4379,7 @@ def test_live_canary_requires_exact_bronze_only_lineage():
         )
 
 
-def test_c1_updater_is_projected_fenced_and_kept_paused():
+def test_c1_updater_is_projected_fenced_and_active_after_approval():
     from scripts import fotmob_cleanup, fotmob_recover, fotmob_rollback, purge_fotmob_competitions
     from dags.utils import fotmob_publication
 
@@ -4394,14 +4394,14 @@ def test_c1_updater_is_projected_fenced_and_kept_paused():
     for module in (mod, fotmob_runtime):
         assert dag_path in module.ISOLATED_DAG_ROOT_PATHS
         assert dag_path in module.SHARED_REQUIRED_RUNTIME_PATHS
-        assert dag_id in module.PAUSED_SERVICE_DAGS
-        assert dag_id in module.AUTOMATIC_PAUSED_DAGS
-        assert dag_id not in module.AUTOMATIC_ACTIVE_DAGS
+        assert dag_id not in module.PAUSED_SERVICE_DAGS
+        assert dag_id not in module.AUTOMATIC_PAUSED_DAGS
+        assert dag_id in module.AUTOMATIC_ACTIVE_DAGS
     assert dag_id in fotmob_cleanup.PAUSED_DAGS
     assert dag_id in fotmob_rollback.DAGS
     assert dag_id in purge_fotmob_competitions.ISOLATED_WRITER_DAG_IDS
     assert mod.EXPECTED_DAGS == fotmob_publication.FOTMOB_EXPECTED_ISOLATED_DAGS
-    assert fotmob_recover.ACTIVE_PAUSE_STATES[dag_id] is True
+    assert fotmob_recover.ACTIVE_PAUSE_STATES[dag_id] is False
     assert fotmob_recover.ALL_PAUSED_STATES[dag_id] is True
     script = SCRIPT.with_name("b6_deliver.sh").read_text()
     parsed_query = next(line for line in script.splitlines() if "parsed=$(" in line)
