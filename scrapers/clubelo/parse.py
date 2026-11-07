@@ -29,6 +29,7 @@ MATCH_TABLE_HEADERS = (
 MATCH_ROW_CELLS = (6, 14)  # 6 = fixture without a result, 14 = played match
 
 _H1_HREF = re.compile(r'<h1><a href="/(\d{4}-\d{2}-\d{2})/([^"]+)">')
+_H1_HREF_EXACT = re.compile(r"/(\d{4}-\d{2}-\d{2})/([^\"]+)")
 _HEADER = re.compile(
     r"Elo:\s*(-?\d+)\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\)"
     r"(?:,\s*Golo:\s*(-?\d+(?:\.\d+)?))?"
@@ -45,7 +46,8 @@ class LayoutChanged(Exception):
 
 @dataclass
 class ClubPage:
-    captured_rating_date: date
+    # None when the page h1 is the valid dateless variant ``<h1>Club</h1>``.
+    captured_rating_date: Optional[date]
     club_name: str
     header: Dict[str, Any]
     points: List[Dict[str, Any]] = field(default_factory=list)
@@ -276,19 +278,50 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
 
 
 def parse_club_page(html: str, slug: str) -> ClubPage:
-    """Parse ``/{slug}``: h1 date, header, vega points, last-16 match table."""
+    """Parse ``/{slug}``: h1, header, vega points, last-16 match table.
 
-    captured, page = page_h1(html)
-    if page != slug:
-        raise LayoutChanged(f"h1 points to {page!r}, expected {slug!r}")
+    The h1 is either the linked ``<h1><a href="/<date>/<slug>">`` (its ISO date
+    becomes ``captured_rating_date``) or a single non-empty ``<h1>Club</h1>``
+    without a link and without a date (``captured_rating_date is None``); every
+    other h1 shape fails closed.
+    """
+
     doc = lxml_html.fromstring(html)
+    h1s = doc.xpath("//h1")
+    # Exactly one h1; the variant (linked/dateless) is decided by the DOM of
+    # that h1 alone. A regex over the raw document would let a decoy string in
+    # a comment/script/another element fake the linked h1.
+    if len(h1s) != 1:
+        raise LayoutChanged(f"expected exactly one h1, got {len(h1s)}")
+    h1 = h1s[0]
+    if not _text(h1):
+        raise LayoutChanged("empty h1")
+    anchors = h1.xpath(".//a")
+    if anchors:
+        # Linked variant: the h1 consists of exactly one direct anchor with the
+        # exact href "/<ISO-date>/<slug>"; anything else fails closed.
+        if len(anchors) != 1 or anchors[0].getparent() is not h1:
+            raise LayoutChanged("h1 link markup changed")
+        if (h1.text or "").strip() or (anchors[0].tail or "").strip():
+            raise LayoutChanged("h1 link markup changed")
+        match = _H1_HREF_EXACT.fullmatch(anchors[0].get("href") or "")
+        if not match:
+            raise LayoutChanged("h1 rating date not found")
+        captured: Optional[date] = _iso_date(match.group(1), "h1 date")
+        page = match.group(2)
+        if page != slug:
+            raise LayoutChanged(f"h1 points to {page!r}, expected {slug!r}")
+    else:
+        # Dateless variant: a single non-empty ``<h1>Club</h1>`` without any
+        # link, so no rating date can be captured from it.
+        captured = None
     header_match = _HEADER.search(_text(doc))
     if not header_match:
         raise LayoutChanged("header 'Elo: … (Best: …, reached on …)' not found")
     elo, best, reached, golo = header_match.groups()
     return ClubPage(
         captured_rating_date=captured,
-        club_name=_text(doc.xpath("//h1")[0]),
+        club_name=_text(h1s[0]),
         header={
             "elo": int(elo),
             "elo_best": int(best),
