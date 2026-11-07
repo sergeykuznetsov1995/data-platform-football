@@ -631,6 +631,12 @@ class StandingPolicyScaling:
     daily_requests_per_competition: int
     retry_share: float
     provider_bytes_per_request: int
+    # Committed full-mode lower bounds (#2145, owner authorization 2026-11-07):
+    # replay of the actual listings measured 2040 candidates and 481 listing
+    # pages, so a full crawl never sizes below them.  Daily sizing is
+    # unaffected.
+    full_min_competitions: int
+    full_listing_pages: int
 
     def __post_init__(self) -> None:
         for field in ('request_multiplier', 'retry_share'):
@@ -652,10 +658,18 @@ class StandingPolicyScaling:
                 raise ApprovalValidationError(
                     f'{field} must be a positive integer'
                 )
+        for field in ('full_min_competitions', 'full_listing_pages'):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ApprovalValidationError(
+                    f'{field} must be a non-negative integer'
+                )
 
     def payload(self) -> dict[str, Any]:
         return {
             'daily_requests_per_competition': self.daily_requests_per_competition,
+            'full_listing_pages': self.full_listing_pages,
+            'full_min_competitions': self.full_min_competitions,
             'full_requests_per_competition': self.full_requests_per_competition,
             'provider_bytes_per_request': self.provider_bytes_per_request,
             'request_multiplier': self.request_multiplier,

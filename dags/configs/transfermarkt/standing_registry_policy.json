@@ -2,8 +2,8 @@
   "policy_version": 3,
   "dag_id": "dag_discover_transfermarkt_registry",
   "approved_by": "sergeykuznetsov1995",
-  "approved_at": "2026-10-28T00:00:00Z",
-  "expires_at": "2027-10-28T00:00:00Z",
+  "approved_at": "2026-11-07T00:00:00Z",
+  "expires_at": "2027-11-07T00:00:00Z",
   "paid_proxy": {
     "byte_cap_bytes": 15728640,
     "request_limit": 1024,
@@ -29,6 +29,8 @@
     "full_requests_per_competition": 2,
     "daily_requests_per_competition": 1,
     "retry_share": 0.1,
-    "provider_bytes_per_request": 32768
+    "provider_bytes_per_request": 32768,
+    "full_min_competitions": 2040,
+    "full_listing_pages": 481
   }
 }

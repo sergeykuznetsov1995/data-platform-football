@@ -1132,15 +1132,81 @@ def test_scaled_limits_follow_the_formula_with_the_policy_floors():
         policy, mod.DiscoverySizing("daily", previous_competitions=10, country_pages=0)
     )
 
-    # ceil(1.5 * (803 + 211 + 6)) and ceil(1.5 * (2 * 803 + 211 + 6)).
+    # ceil(1.5 * (803 + 211 + 6)) and, with the committed full floors (#2145),
+    # ceil(1.5 * (2 * max(803, 2040) + max(211, 481) + 6)).
     assert daily.request_limit == 1530
-    assert full.request_limit == 2735
-    assert full.retry_limit == 274
-    assert full.byte_cap_bytes == 2735 * 32 * 1024
+    assert full.request_limit == 6851
+    assert full.retry_limit == 686
+    assert full.byte_cap_bytes == 224493568
     assert tiny == mod.DiscoveryLimits(1024, 103, 1024 * 32 * 1024)
     assert mod.discovery_limits(policy, None) == mod.DiscoveryLimits(
         1024, 96, mod.HARD_PROVIDER_BYTE_BUDGET
     )
+
+
+def test_full_mode_committed_floors_give_the_authorized_capacity():
+    # #2145: replay measured 2040 candidates and 481 listing pages.  Required
+    # estimated attempts are 2*2040+481+6 = 4567; the multiplier 1.5 yields
+    # the exact authorized caps 6851/686/224493568.
+    import math
+
+    mod = _load()
+    policy = load_standing_policy(
+        Path(__file__).resolve().parents[3]
+        / "dags" / "configs" / "transfermarkt" / "standing_registry_policy.json"
+    )
+
+    full = mod.discovery_limits(
+        policy, mod.DiscoverySizing("full", previous_competitions=938, country_pages=211)
+    )
+    assert (full.request_limit, full.retry_limit, full.byte_cap_bytes) == (
+        6851, 686, 224493568
+    )
+    # The floors are lower bounds, not fixed values: a larger registry grows.
+    grown = mod.discovery_limits(
+        policy, mod.DiscoverySizing("full", previous_competitions=3000, country_pages=600)
+    )
+    assert grown.request_limit == math.ceil(1.5 * (2 * 3000 + 600 + 6))
+    # Daily calculations remain unchanged.
+    daily = mod.discovery_limits(
+        policy, mod.DiscoverySizing("daily", previous_competitions=803, country_pages=211)
+    )
+    assert daily.request_limit == 1530
+    assert daily.retry_limit == 153
+    assert daily.byte_cap_bytes == 1530 * 32 * 1024
+
+
+def test_scaling_floors_are_validated_and_hashed(tmp_path):
+    from dags.utils.transfermarkt_approval import (
+        ApprovalValidationError,
+        StandingPolicyScaling,
+    )
+
+    base = dict(
+        request_multiplier=1.5, seed_pages=6, full_requests_per_competition=2,
+        daily_requests_per_competition=1, retry_share=0.1,
+        provider_bytes_per_request=32768,
+        full_min_competitions=2040, full_listing_pages=481,
+    )
+    scaling = StandingPolicyScaling(**base)
+    # Both bounds are part of the committed payload (and hence the hash).
+    assert scaling.payload()["full_min_competitions"] == 2040
+    assert scaling.payload()["full_listing_pages"] == 481
+    for field in ("full_min_competitions", "full_listing_pages"):
+        for bad in (-1, True, 1.5, "2040", None):
+            with pytest.raises(ApprovalValidationError):
+                StandingPolicyScaling(**{**base, field: bad})
+
+    committed_path = (
+        Path(__file__).resolve().parents[3]
+        / "dags" / "configs" / "transfermarkt" / "standing_registry_policy.json"
+    )
+    policy = load_standing_policy(committed_path)
+    drifted = json.loads(committed_path.read_text("utf-8"))
+    drifted["scaling"]["full_min_competitions"] = 2041
+    drifted_path = tmp_path / "standing_registry_policy.json"
+    drifted_path.write_text(json.dumps(drifted), encoding="utf-8")
+    assert load_standing_policy(drifted_path).policy_hash != policy.policy_hash
 
 
 def test_run_passes_previous_mode_and_budget_guard_and_reports(tmp_path):
