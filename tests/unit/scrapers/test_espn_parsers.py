@@ -596,7 +596,7 @@ def test_summary_is_parsed_once_and_joins_reordered_sections_by_native_team_id()
     assert result.matchsheet[0].is_home
     assert result.matchsheet[0].referee == "Ref Example"
     assert [row.score for row in result.matchsheet] == [2, 1]
-    assert result.parser_version == "espn-native-parser-v5"
+    assert result.parser_version == "espn-native-parser-v6"
 
 
 @pytest.mark.unit

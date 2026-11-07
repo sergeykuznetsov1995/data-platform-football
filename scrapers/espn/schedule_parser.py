@@ -521,6 +521,79 @@ def parse_all_scoreboard_day(
     )
 
 
+def _period_score(raw: Any) -> int | None:
+    """Non-negative whole number like ``summary_parser._count`` accepts."""
+
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() and raw >= 0 else None
+    if isinstance(raw, str):
+        digits = raw.strip()
+        return int(digits) if digits.isdigit() else None
+    return None
+
+
+def _linescore_total(side: Mapping[str, Any]) -> int | None:
+    """Sum of a side's period scores, or ``None`` when not fully numeric.
+
+    Each period is read from ``value`` or ``displayValue`` (real Summaries
+    carry only ``{"displayValue": "3"}``); a present pair that disagrees is
+    a contradiction and the total is ``None``.
+    """
+
+    linescores = side.get("linescores")
+    if not isinstance(linescores, list) or not linescores:
+        return None
+    total = 0
+    for period in linescores:
+        if not isinstance(period, Mapping):
+            return None
+        value = _period_score(period.get("value"))
+        display = _period_score(period.get("displayValue"))
+        if value is not None and display is not None and value != display:
+            return None
+        score = value if value is not None else display
+        if score is None:
+            return None
+        total += score
+    return total
+
+
+def _recovered_final_scores(
+    sides: Mapping[str, Mapping[str, Any]],
+) -> tuple[int, int] | None:
+    """Final score of a stale not-started Summary, from its own evidence only.
+
+    Recovery needs all of: both scores absent (checked by the caller), a
+    non-empty fully numeric ``linescores`` list on each side, exactly one
+    ``winner`` true, and the linescore sums agreeing with that winner.  Any
+    gap or contradiction returns ``None`` and the row stays what it is
+    (#2190: five esp.1/2022 Summaries kept ``STATUS_SCHEDULED`` with NULL
+    scores after the match was played).
+    """
+
+    if set(sides) != {"home", "away"}:
+        return None
+    home_winner = sides["home"].get("winner")
+    away_winner = sides["away"].get("winner")
+    if (
+        type(home_winner) is not bool
+        or type(away_winner) is not bool
+        or home_winner is away_winner
+    ):
+        return None
+    home_total = _linescore_total(sides["home"])
+    away_total = _linescore_total(sides["away"])
+    if home_total is None or away_total is None or home_total == away_total:
+        return None
+    if (home_total > away_total) is not home_winner:
+        return None
+    return home_total, away_total
+
+
 def schedule_row_from_header(
     raw: bytes, *, competition: Competition, edition: Edition
 ) -> ScheduleRow:
@@ -532,6 +605,12 @@ def schedule_row_from_header(
     through the same ``_event_row``, so the row equals the scoreboard row of
     the same match except ``extra_json``.  A header of another season or a
     kickoff outside the edition window is an error, never a skipped match.
+
+    A stale not-started header (``STATUS_SCHEDULED``/``STATUS_PRE_GAME`` with
+    both scores absent) is recovered as the played final only when its own
+    evidence is complete and consistent — non-empty numeric linescores on
+    both sides, exactly one ``winner`` true, sums agreeing with the winner
+    (#2190); anything weaker stays the scheduled row it is.
     """
 
     _validate_scope(competition, edition)
@@ -544,11 +623,14 @@ def schedule_row_from_header(
     game_info = payload.get("gameInfo")
     game_info = game_info if isinstance(game_info, Mapping) else {}
     sides = []
+    raw_sides: dict[str, Mapping[str, Any]] = {}
     for index, raw_side in enumerate(
         required_list(node.get("competitors"), "header.competitors")
     ):
         side = required_mapping(raw_side, f"header.competitors[{index}]")
         team = required_mapping(side.get("team"), f"header.competitors[{index}].team")
+        if isinstance(side.get("homeAway"), str):
+            raw_sides[side["homeAway"]] = side
         item: dict[str, Any] = {
             "homeAway": side.get("homeAway"),
             "team": {"id": team.get("id"), "displayName": team.get("displayName")},
@@ -588,6 +670,24 @@ def schedule_row_from_header(
             f"Summary header of event {header.get('id')} is outside "
             f"{competition.scope_id(edition)}"
         )
+    if (
+        row.status in _NOT_STARTED
+        and row.home_score is None
+        and row.away_score is None
+    ):
+        recovered = _recovered_final_scores(raw_sides)
+        if recovered is not None:
+            home_score, away_score = recovered
+            row = replace(
+                row,
+                home_score=home_score,
+                away_score=away_score,
+                home_goals=str(home_score),
+                away_goals=str(away_score),
+                terminal=True,
+                played_final=True,
+                summary_required=True,
+            )
     return row
 
 

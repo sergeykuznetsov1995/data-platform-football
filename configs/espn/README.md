@@ -162,14 +162,16 @@ edition already in `allow`; exclusions reduce both collection and denominator.
 The initial exclusions list is empty. Changing it requires recording the
 confirmation and owner's decision in the reason.
 
-The checked-in registry is a snapshot: it still says current=2025 for the
-three European club cups and current=2024 for Euro. Before delivery, verify
-current season years through the established registry procedure. No source
-requests were made for this implementation. The history lane retains its
-`year < current_season_year` guard: with this snapshot it will mark the three
-2025 cup pairs and Euro 2024 red, rather than collect them. Such exhausted
-queue rows need the established retry procedure after the registry is corrected;
-this change does not reset retries or silently advance registry years.
+The registry of the three European club cups was re-verified against ESPN on
+07.11.2026: their current edition is already 2026 (`2026-27`), so
+`current_season_year` is 2026 for `uefa.champions`, `uefa.europa` and
+`uefa.europa.conf` (#2190). ESPN still names Euro 2024 its current/latest
+season, so `uefa.euro` keeps 2024; its core season ended 2024-07-30 and the
+history lane admits an explicitly allowed current/latest season once that
+season is closed by the usual `_Season.closed` rule — an active current
+season is still never collected by history. Such exhausted queue rows need
+the established retry procedure after the registry is corrected; this change
+does not reset retries or silently advance registry years.
 
 `scrapers.espn.history_acceptance` provides read-only report builders, separate
 from the existing morning report and live-debt API:

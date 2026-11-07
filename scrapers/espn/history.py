@@ -7,7 +7,9 @@ gate (``TransportGate(lane="history")``):
 
 1. inventory — ``leagues/{slug}/seasons`` once per slug: an inventory row
    (``season_year = 0``) and one season row (``season_type = 0``) per past
-   season.  Past = ``year < current_season_year`` of the registry; the
+   season.  Past = ``year < current_season_year`` of the registry, plus an
+   explicitly allowed ``year == current_season_year`` whose core season is
+   already closed (#2190); an active current season stays with the live lane.
    seasons that started in the last ``HISTORY_YEARS`` years (ten seasons of a
    league, the editions of ten years of a national-team tournament).  The
    scope file ``configs/espn/history_scope.json`` narrows it: a non-empty
@@ -687,11 +689,32 @@ class _Runner:
                 listed.add(int(match.group(1)))
             rows = []
             if self.scope:
-                years = tuple(
-                    sorted((year for year in wanted if year in listed and year < current), reverse=True)
-                )
-                # An allowed season core does not list (or not a past one) is a
-                # red season row: visible, never tried again.
+                years = []
+                for year in sorted(wanted, reverse=True):
+                    if year not in listed or year > current:
+                        continue
+                    if year == current:
+                        # An explicitly allowed current/latest season joins the
+                        # history queue only when its core season is already
+                        # closed by the same rule every season gets (#2190:
+                        # Euro 2024 is still ESPN's latest, but its core season
+                        # ended 2024-07-30).  An active current season is never
+                        # collected by the history lane.
+                        try:
+                            closed = self._season(slug, year).closed
+                        except (AllOriginsBlocked, _Stop):
+                            raise
+                        except _STATUS_ERRORS:
+                            # No readable core season, no proof it is closed:
+                            # the allowed pair stays red.  Programming errors
+                            # propagate: a red row must never hide a bug.
+                            closed = False
+                        if not closed:
+                            continue
+                    years.append(year)
+                years = tuple(years)
+                # An allowed season core does not list (or a current one still
+                # open) is a red season row: visible, never tried again.
                 rows += [
                     self._row(
                         QueueRow(slug, year, SEASON, RED),

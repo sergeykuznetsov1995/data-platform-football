@@ -12,6 +12,7 @@ its raw store; the queue lives in DuckDB, bronze in the in-memory Trino.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 import json
@@ -20,7 +21,7 @@ import re
 import pytest
 
 from scrapers.espn import history, urls
-from scrapers.espn.denominator import load_denominator
+from scrapers.espn.denominator import Denominator, load_denominator
 from scrapers.espn.models import AgeClass, Competition, Edition, Gender
 from scrapers.espn.schedule_parser import parse_scoreboards, schedule_row_from_header
 from scrapers.espn.transport_contracts import HttpStatusError, LaneClosed
@@ -150,12 +151,22 @@ def _eng_2015(light: bool = True, **extra) -> Bodies:
     return Bodies({"eng.1": "summary_eng1_2015_422285.json"}, light=light, **bodies)
 
 
-def _run(client, trino, conn, *, scope=(("eng.1", 2015),), stop_file=None, now=NOW, budget=30):
+def _denominator_with(**current_years) -> Denominator:
+    """The checked-in registry with some ``current_season_year`` overridden."""
+
+    rows = dict(load_denominator().rows)
+    for slug, year in current_years.items():
+        rows[slug] = replace(rows[slug], current_season_year=year)
+    return Denominator(rows)
+
+
+def _run(client, trino, conn, *, scope=(("eng.1", 2015),), stop_file=None, now=NOW, budget=30,
+         denominator=None):
     return history.run_history(
         client=client,
         trino=trino,
         conn=conn,
-        denominator=load_denominator(),
+        denominator=denominator if denominator is not None else load_denominator(),
         scope=scope,
         run_id="r1",
         deadline=now + timedelta(minutes=budget),
@@ -571,11 +582,11 @@ def test_queue_follows_the_scope_file(conn) -> None:
 def test_allowed_season_core_does_not_list_is_a_red_season(conn) -> None:
     client, trino = HistoryClient(_eng_2015()), HistoryTrino()
 
-    run = _run(client, trino, conn, scope=(("eng.1", 1990), ("eng.1", 2026)))
+    run = _run(client, trino, conn, scope=(("eng.1", 1990), ("eng.1", 1991)))
 
     queue = _queue(conn)
     assert run.matches == 0 and queue[("eng.1", 0, 0)].state == history.DONE
-    for year in (1990, 2026):
+    for year in (1990, 1991):
         assert queue[("eng.1", year, 0)].state == history.RED
         assert queue[("eng.1", year, 0)].attempts == history.MAX_ATTEMPTS
     assert len(client.network) == 1  # the season list only
@@ -618,6 +629,118 @@ def test_open_season_downloads_even_a_stored_final(conn) -> None:
 
     assert run.matches == 380 and key in client.network
     assert len(client.network) == 1 + 1 + 4 + 380
+
+
+# ------------------------------------------------------ #2190 red seasons
+
+
+def _denominator_eng_current(year: int) -> Denominator:
+    return _denominator_with(**{"eng.1": year})
+
+
+def test_closed_current_allowed_season_is_collected(conn) -> None:
+    # The registry still says current=2015 while the season ended 01.06.2016:
+    # an explicitly allowed current season whose core is closed is history.
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+
+    run = _run(client, trino, conn, denominator=_denominator_eng_current(2015))
+
+    assert run.matches == 380 and run.failed == 0
+    assert _queue(conn)[("eng.1", 2015, 1)].state == history.DONE
+
+
+def test_bug_reading_current_core_season_propagates_without_a_red_row(conn) -> None:
+    # A programming error inside the closed-current admission check must reach
+    # the caller: a broad catch would hide it as a permanent red season.
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+
+    def hook(key: str) -> None:
+        if key == _req_key(urls.season("eng.1", 2015)):
+            raise RuntimeError("programming bug")
+
+    client.hook = hook
+    with pytest.raises(RuntimeError, match="programming bug"):
+        _run(client, trino, conn, denominator=_denominator_eng_current(2015))
+
+    assert all(row.state != history.RED for row in _queue(conn).values())
+
+
+def test_active_current_allowed_season_is_not_collected(conn) -> None:
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+
+    # 20.05.2016: the season ends 01.06.2016, the current season is still open.
+    run = _run(
+        client,
+        trino,
+        conn,
+        denominator=_denominator_eng_current(2015),
+        now=datetime(2016, 5, 20, 12, tzinfo=timezone.utc),
+    )
+
+    row = _queue(conn)[("eng.1", 2015, 0)]
+    assert run.matches == 0
+    assert (row.state, row.attempts) == (history.RED, history.MAX_ATTEMPTS)
+    assert "current 2015" in row.last_error
+
+
+def _stub_recovered(event_id: int, home_periods=(3, 1), away_periods=(0, 0)) -> bytes:
+    """STATUS_SCHEDULED with NULL scores but the full evidence of the final."""
+
+    body = json.loads(_summary_as("summary_eng1_2015_422285.json", event_id, light=True))
+    competition = body["header"]["competitions"][0]
+    competition["status"]["type"]["name"] = "STATUS_SCHEDULED"
+    periods = {"home": home_periods, "away": away_periods}
+    totals = {name: sum(values) for name, values in periods.items()}
+    for side in competition["competitors"]:
+        name = side["homeAway"]
+        side.pop("score", None)
+        side["linescores"] = [{"displayValue": str(value)} for value in periods[name]]
+        side["winner"] = totals[name] > totals["away" if name == "home" else "home"]
+    return json.dumps(body).encode()
+
+
+def test_stale_scheduled_summary_with_final_evidence_is_recovered(conn) -> None:
+    listed = _ids(*ENG_2015_PAGES)
+    key = _req_key(urls.summary("eng.1", listed[3]))
+    client = HistoryClient(_eng_2015(**{key: _stub_recovered(listed[3])}))
+    client.stored[key] = _stub_recovered(listed[3])
+    trino = HistoryTrino()
+
+    run = _run(client, trino, conn)
+
+    assert run.matches == 380 and run.failed == 0
+    row = _queue(conn)[("eng.1", 2015, 1)]
+    assert (row.state, row.done, row.failed) == (history.DONE, 380, 0)
+
+    edition = Edition(2015, "2015-16", date(2015, 7, 1), date(2016, 6, 30), True, _UNKNOWN)
+    competition = Competition(
+        700, "eng.1", "English Premier League", Gender.MALE, AgeClass.SENIOR, True, (edition,)
+    )
+    schedule = schedule_row_from_header(
+        _stub_recovered(listed[3]), competition=competition, edition=edition
+    )
+    assert schedule.status == "STATUS_SCHEDULED"
+    assert schedule.terminal and schedule.played_final
+    assert (schedule.home_score, schedule.away_score) == (4, 0)
+    assert (schedule.home_goals, schedule.away_goals) == ("4", "0")
+
+
+def test_scheduled_summary_without_enough_evidence_is_not_recovered(conn) -> None:
+    listed = _ids(*ENG_2015_PAGES)
+    body = json.loads(_stub_recovered(listed[3]))
+    for side in body["header"]["competitions"][0]["competitors"]:
+        side["winner"] = False  # no winner: contradicts the linescores
+    weak = json.dumps(body).encode()
+    edition = Edition(2015, "2015-16", date(2015, 7, 1), date(2016, 6, 30), True, _UNKNOWN)
+    competition = Competition(
+        700, "eng.1", "English Premier League", Gender.MALE, AgeClass.SENIOR, True, (edition,)
+    )
+
+    schedule = schedule_row_from_header(weak, competition=competition, edition=edition)
+
+    assert schedule.status == "STATUS_SCHEDULED"
+    assert not schedule.terminal and not schedule.played_final
+    assert schedule.home_score is None and schedule.away_score is None
 
 
 def test_parallel_pending_limit_shrinks_without_queued_batch():
