@@ -14,6 +14,7 @@ import re
 import threading
 import time
 
+from scrapers.base import trino_manager as base_trino
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager, _is_iceberg_commit_conflict
 
@@ -148,6 +149,26 @@ class CommittingConnection:
 
 
 class TransfermarktTrinoManager(TrinoTableManager):
+    def _create_connection(self):
+        if self._password:
+            return base_trino.trino.dbapi.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                catalog=self.catalog,
+                http_scheme='https',
+                auth=base_trino.trino.auth.BasicAuthentication(self.user, self._password),
+                verify=False,
+                session_properties={'enable_dynamic_filtering': 'false'},
+            )
+        return base_trino.trino.dbapi.connect(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            catalog=self.catalog,
+            session_properties={'enable_dynamic_filtering': 'false'},
+        )
+
     def arrow_schema_to_trino(self, arrow_schema):
         types = super().arrow_schema_to_trino(arrow_schema)
         if 'first_seen_at' in types:
