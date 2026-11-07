@@ -139,6 +139,7 @@ jobs:
             tests/unit/deploy/test_sofascore_pipeline_watchdog.py \
             tests/unit/deploy/test_sofascore_run_from_release.py \
             tests/unit/deploy/test_sofascore_veha1_measure.py \
+            tests/unit/deploy/test_sofascore_daily_parity.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
