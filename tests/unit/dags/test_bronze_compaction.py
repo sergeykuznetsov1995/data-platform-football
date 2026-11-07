@@ -755,3 +755,66 @@ def test_airflow_dry_run_does_not_write_checkpoint(runner, monkeypatch, shared_d
     assert visited == ["espn_match", "sofascore_schedule"]
     assert result["portions"] == 2 and result["stop_reason"] == "exhausted"
     assert not shared_db[0]
+
+
+def test_fbref_publication_lock_timeout_is_busy(monkeypatch):
+    from scrapers.fbref.control import ControlStore
+
+    now = datetime(2026, 10, 29, 2, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(compaction, "datetime", Clock)
+    monkeypatch.setattr(compaction.time, "time", lambda: now.timestamp())
+    monkeypatch.setattr(
+        compaction, "nightly_deadline", lambda: now + timedelta(hours=3)
+    )
+    monkeypatch.setattr(
+        maintenance, "_list_tables", lambda *_: ["fbref_dataset_availability"]
+    )
+    probes = []
+    monkeypatch.setattr(
+        maintenance,
+        "_compaction_candidates",
+        lambda *a, **kw: probes.append(kw["table"]),
+    )
+
+    class LockTimeout(Exception):
+        pgcode = "55P03"
+
+    events = []
+
+    class Control:
+        def create_run(self, *_a, **_kw):
+            return "maintenance"
+
+        def start_run(self, _run):
+            events.append("start")
+
+        def acquire_publication_lock(self, _run, **_kw):
+            raise LockTimeout("canceling statement due to lock timeout")
+
+        def release_publication_lock(self, _run):
+            events.append("release")
+
+        def finish_run(self, _run, *, succeeded):
+            events.append(succeeded)
+
+    monkeypatch.setattr(ControlStore, "from_env", lambda **kw: Control())
+
+    class Connection:
+        def close(self):
+            pass
+
+    result = compaction.run_compaction(
+        tables=("fbref_dataset_availability",),
+        deadline=now + timedelta(hours=1),
+        connection_factory=Connection,
+    )
+    assert result["stop_reason"] == "busy"
+    assert result["failures"] == []
+    assert probes == []
+    assert events == ["start", False]
