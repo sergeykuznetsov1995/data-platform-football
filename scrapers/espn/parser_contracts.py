@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-PARSER_VERSION = "espn-native-parser-v5"
-STATUS_MAP_VERSION = "espn-status-v2"
+PARSER_VERSION = "espn-native-parser-v6"  # v6: stale not-started Summary recovery (#2190)
+STATUS_MAP_VERSION = "espn-status-v3"  # v3: recovered stale finals (#2190)
 LINEUP_STAT_MAP_VERSION = "espn-lineup-stat-map-v1"
 MATCHSHEET_STAT_MAP_VERSION = "espn-matchsheet-stat-map-v2"
 

@@ -191,14 +191,14 @@ sui.1	3944	Swiss Super League	MALE	senior_official	rule:default	0	1	0	2025				к
 swe.1	3945	Swedish Allsvenskan	MALE	senior_official	rule:default	1	0	1	2026				
 swe.1.promotion.relegation	19968	Swedish Allsvenskan Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
 tur.1	3946	Turkish Super Lig	MALE	senior_official	rule:default	1	0	1	2026				
-uefa.champions	775	UEFA Champions League	MALE	senior_official	rule:default	1	0	1	2025				
+uefa.champions	775	UEFA Champions League	MALE	senior_official	rule:default	1	0	1	2026				
 uefa.champions_qual	19874	UEFA Champions League Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
 uefa.euro	781	UEFA European Championship	MALE	senior_official	rule:default	1	0	1	2024				
 uefa.euro.u19	5698	UEFA European Under-19 Championship	MALE	youth	rule:youth	0	0	1	2026				
 uefa.euro_u21	5693	UEFA European Under-21 Championship	MALE	youth	rule:youth	0	0	1	2025				
 uefa.euro_u21_qual	20114	UEFA European Under-21 Championship Qualifying	MALE	youth	rule:youth	0	0	1	2025				
-uefa.europa	776	UEFA Europa League	MALE	senior_official	rule:default	1	0	1	2025				
-uefa.europa.conf	20296	UEFA Conference League	MALE	senior_official	rule:default	1	0	1	2025				
+uefa.europa	776	UEFA Europa League	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.europa.conf	20296	UEFA Conference League	MALE	senior_official	rule:default	1	0	1	2026				
 uefa.europa.conf_qual	20221	UEFA Conference League Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
 uefa.europa_qual	19887	UEFA Europa League Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
 uefa.euroq	3947	UEFA European Championship Qualifying	MALE	senior_official	rule:default	1	0	1	2023				
