@@ -370,8 +370,9 @@ class _Run:
         self.result["pages_ok"] += 1
         self.result["points"] += len(club.points)
         self.result["matches"] += len(club.matches)
-        if club.captured_rating_date != self.rating_date:
-            # Pages are rebuilt one by one (M-09): count, do not fail.
+        if club.captured_rating_date is not None and club.captured_rating_date != self.rating_date:
+            # Pages are rebuilt one by one (M-09): count, do not fail. A
+            # dateless club h1 (captured None) is not a mismatch.
             self.result["date_mismatch"] += 1
 
 

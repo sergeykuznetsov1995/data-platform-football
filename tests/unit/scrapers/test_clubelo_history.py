@@ -222,6 +222,27 @@ def test_date_mismatch_is_counted_not_failed():
     assert history.exit_code(result) == 0
 
 
+def test_dateless_h1_club_is_done_without_mismatch():
+    original = fixture_html("club_Arsenal.html.gz")
+    html = original.replace(
+        '<h1><a href="/2026-09-22/Arsenal">', "<h1>").replace("</a></h1>", "</h1>")
+    assert html != original and "<h1>" in html and "</a></h1>" not in html
+    answers = _answers(**{"/Arsenal": FakeResponse(200, gzip.compress(html.encode()), {"content-encoding": "gzip"})})
+    result, store, _, _ = _run(answers, CLUBS)
+    assert result["pages_failed"] == 0 and result["date_mismatch"] == 0
+    assert history.exit_code(result) == 0
+
+    manifest = {r["slug"]: r for r in _manifest_new(store)}
+    assert manifest["Arsenal"]["status"] == "done"
+    assert manifest["Arsenal"]["captured_rating_date"] is None
+    raw = [r for r in store.rows(history.RAW_TABLE) if r["page"] == "/Arsenal"][0]
+    assert raw["rating_date"] is None
+    points = [p for p in store.rows(history.POINT_TABLE) if p["slug"] == "Arsenal"]
+    assert points and all(p["captured_rating_date"] is None for p in points)
+    matches = [m for m in store.rows(history.MATCH_TABLE) if m["slug"] == "Arsenal"]
+    assert matches and all(m["captured_rating_date"] is None for m in matches)
+
+
 def test_ranking_error_is_red():
     result, _, _, _ = _run({"/Ranking": [FakeResponse(500, b"x")] * 3}, CLUBS)
     assert "HTTP 500" in result["error"]

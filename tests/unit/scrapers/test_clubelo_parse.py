@@ -263,6 +263,82 @@ def test_h1_of_another_page_fails_closed(riverplate_html):
         parse_club_page(riverplate_html, "boca")
 
 
+def test_dateless_h1_parses_with_captured_date_none(riverplate_html):
+    baseline = parse_club_page(riverplate_html, "riverplate")
+    dateless = riverplate_html.replace(
+        '<h1><a href="/2026-09-22/riverplate">', "<h1>").replace("</a></h1>", "</h1>")
+    assert dateless != riverplate_html
+    page = parse_club_page(dateless, "riverplate")
+    assert page.captured_rating_date is None
+    assert page.club_name == baseline.club_name
+    assert page.header == baseline.header
+    assert page.points == baseline.points
+    assert page.matches == baseline.matches
+
+
+def _dateless_riverplate(riverplate_html):
+    dateless = riverplate_html.replace(
+        '<h1><a href="/2026-09-22/riverplate">', "<h1>").replace("</a></h1>", "</h1>")
+    assert dateless != riverplate_html  # the replacement really happened
+    return dateless
+
+
+@pytest.mark.parametrize("decoy", [
+    # linked-h1 string inside an HTML comment
+    "<!-- <h1><a href=\"/2026-09-22/riverplate\">Decoy</a></h1> -->",
+    # linked-h1 string inside a script
+    "<script>var s = '<h1><a href=\"/2026-09-22/riverplate\">Decoy</a></h1>';</script>",
+    # linked-h1 string as plain body text
+    "<p>&lt;h1&gt;&lt;a href=\"/2026-09-22/riverplate\"&gt;</p>",
+])
+def test_dateless_h1_with_linked_h1_decoy_stays_dateless(riverplate_html, decoy):
+    html = decoy + _dateless_riverplate(riverplate_html)
+    page = parse_club_page(html, "riverplate")
+    assert page.captured_rating_date is None
+    assert page.club_name == "River Plate"
+
+
+def test_dateless_h1_with_foreign_slug_decoy_stays_dateless(riverplate_html):
+    # the decoy points at another club; it must not fake a slug mismatch
+    decoy = "<!-- <h1><a href=\"/2026-09-22/boca\">Decoy</a></h1> -->"
+    html = decoy + _dateless_riverplate(riverplate_html)
+    page = parse_club_page(html, "riverplate")
+    assert page.captured_rating_date is None
+    assert page.club_name == "River Plate"
+
+
+def test_multiple_h1_fail_closed(riverplate_html):
+    extra = "<h1>Extra</h1>"
+    with pytest.raises(LayoutChanged, match="h1"):
+        parse_club_page(riverplate_html + extra, "riverplate")
+    dateless = _dateless_riverplate(riverplate_html) + extra
+    with pytest.raises(LayoutChanged, match="h1"):
+        parse_club_page(dateless, "riverplate")
+
+
+def test_nested_h1_anchor_fails_closed(riverplate_html):
+    broken = riverplate_html.replace(
+        '<h1><a href="/2026-09-22/riverplate">',
+        '<h1><span><a href="/2026-09-22/riverplate">').replace(
+        "</a></h1>", "</a></span></h1>")
+    assert broken != riverplate_html
+    with pytest.raises(LayoutChanged, match="h1"):
+        parse_club_page(broken, "riverplate")
+
+
+@pytest.mark.parametrize("old,new", [
+    # link without a date in the href
+    ('<h1><a href="/2026-09-22/riverplate">', '<h1><a href="/riverplate">'),
+    # invalid ISO date in the link
+    ('<h1><a href="/2026-09-22/riverplate">', '<h1><a href="/2026-13-01/riverplate">'),
+    # empty dateless h1
+    ('<h1><a href="/2026-09-22/riverplate">River Plate</a></h1>', "<h1></h1>"),
+])
+def test_damaged_h1_still_fails_closed(riverplate_html, old, new):
+    with pytest.raises(LayoutChanged):
+        parse_club_page(riverplate_html.replace(old, new), "riverplate")
+
+
 def test_non_numeric_cell_fails_closed(riverplate_html):
     broken = riverplate_html.replace('<td class="r">1732</td>', '<td class="r">n/a</td>', 1)
     with pytest.raises(LayoutChanged, match="New Elo"):
