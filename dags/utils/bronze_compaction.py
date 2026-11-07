@@ -246,11 +246,20 @@ def _publication_fence(enabled, deadline=None):
     control.start_run(run_id)
     acquired = succeeded = False
     try:
-        control.acquire_publication_lock(
-            run_id,
-            dag_id="dag_iceberg_maintenance_daily",
-            ttl_seconds=lease_seconds(),
-        )
+        try:
+            control.acquire_publication_lock(
+                run_id,
+                dag_id="dag_iceberg_maintenance_daily",
+                ttl_seconds=lease_seconds(),
+            )
+        except Exception as exc:
+            if getattr(exc, "pgcode", None) == "55P03":
+                from scrapers.fbref.control import StateConflict
+
+                raise StateConflict(
+                    "FBref publication is locked by another control run"
+                ) from exc
+            raise
         acquired = True
 
         def fence():
