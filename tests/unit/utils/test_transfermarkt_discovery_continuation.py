@@ -742,3 +742,309 @@ def test_corrupt_existing_archive_refuses_without_overwriting(tmp_path):
                            now=NOW + timedelta(days=1, hours=2), write=write)
     assert archive.read_text() == 'not json'
     assert path.read_bytes() == active_before
+
+
+# --- One-time pinned recovery of the single audited 'failed' paid-I/O marker ---
+
+def _paid_traffics():
+    """Portion-7 (paused) and portion-8 (active) cumulative snapshots.
+
+    One ledger grows between the snapshots: portion 8 really made paid
+    requests before the raw-store commit failed closed, so every counter
+    delta from paused to active is non-negative (requests strictly grow).
+    """
+    ledger = SharedTrafficLedger(hard_provider_bytes=1000000,
+                                 soft_provider_bytes=900000, retry_limit=10)
+    ledger.observe_lease('lease-1', LeaseTrafficSnapshot(up_bytes=10, down_bytes=90))
+    ledger.record_attempt(entity='competition_registry', decoded_bytes=100,
+                          provider_up_bytes=10, provider_down_bytes=90,
+                          retry=True, duration_seconds=0.5)
+    paused = ledger.snapshot()
+    ledger.observe_lease('lease-2', LeaseTrafficSnapshot(up_bytes=20, down_bytes=180))
+    ledger.record_attempt(entity='competition_registry', decoded_bytes=200,
+                          provider_up_bytes=20, provider_down_bytes=180,
+                          retry=False, duration_seconds=0.7)
+    return paused, ledger.snapshot()
+
+
+_PAID_PAUSED_TRAFFIC, _PAID_ACTIVE_TRAFFIC = _paid_traffics()
+
+
+def _failed_paid_manifest(traffic):
+    return {'status': 'failed', 'cycle_id': 'cycle-2', 'run_id': 'run-2',
+            'error': {'type': 'RawStoreError',
+                      'message': 'Transfermarkt raw response commit failed closed'},
+            'source_status': 'failed', 'writes': [],
+            'write_status': {'status': 'failed', 'authorized': True,
+                             'attempted': False, 'completed': False,
+                             'affected_tables': []},
+            'traffic': traffic}
+
+
+def _paused_portion_manifest(traffic):
+    return {'status': 'paused', 'cycle_id': 'cycle-1', 'run_id': 'run-1',
+            'portion': 7, 'traffic': traffic, 'source_status': 'incomplete',
+            'writes': [], 'error': 'discovery portion exhausted; checkpoint retained'}
+
+
+def _settled_traffic_by_entity(by_entity):
+    """A settled-consistent traffic dict built from per-entity specs."""
+    counters = ('requests', 'retries', 'provider_up_bytes',
+                'provider_down_bytes', 'decoded_bytes', 'cache_hits')
+    traffic = {field: 0 for field in counters}
+    traffic['provider_metered_bytes'] = 0
+    traffic['by_entity'] = {}
+    for name, item in by_entity.items():
+        entry = {field: 0 for field in counters}
+        entry.update(item)
+        entry.setdefault('duration_seconds', 0.0)
+        traffic['by_entity'][name] = entry
+        for field in counters:
+            traffic[field] += entry[field]
+    traffic['provider_metered_bytes'] = (traffic['provider_up_bytes']
+                                         + traffic['provider_down_bytes'])
+    return traffic
+
+
+def _bump(traffic, field, amount):
+    """Settled-consistent drift: the same delta on aggregate and entities."""
+    drifted = json.loads(json.dumps(traffic))
+    drifted[field] += amount
+    for item in drifted['by_entity'].values():
+        if field in item:
+            item[field] += amount
+    return drifted
+
+
+def failed_stranded(tmp_path, monkeypatch, *, marker_traffic=None, paused=None, failed=None):
+    """Audited marker: portion 8 paid I/O, then RawStoreError failed the run."""
+    path, job = prepared(tmp_path)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text(json.dumps({'https://example.test/a': {'hash': 'x'}}))
+    failures = checkpoint.with_suffix('.failures.json')
+    failures.write_text(json.dumps({'https://example.test/a': {'status': 'ok'}}))
+    active_traffic = _PAID_ACTIVE_TRAFFIC if marker_traffic is None else marker_traffic
+    job.update(status='failed', portion=8, traffic=active_traffic,
+               last_run_id='run-2',
+               artifacts={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                          for p in (checkpoint, failures)})
+    cohorts.write_job(path, job, write)
+    root = path.parent.parent
+    paused_pin = _write_manifest(root, 'paused-7',
+                                 paused if paused is not None else _paused_portion_manifest(_PAID_PAUSED_TRAFFIC))
+    failed_pin = _write_manifest(root, 'failed-8',
+                                 failed if failed is not None else _failed_paid_manifest(active_traffic))
+    monkeypatch.setattr(cohorts, 'KNOWN_PAID_IO_FAILURE_RECOVERY', {
+        'marker_hash': stable_payload_hash(job),
+        'cohort_job_id': job['job_id'],
+        'paused_manifest': paused_pin, 'failed_manifest': failed_pin})
+    return path, job
+
+
+def test_paid_io_recovery_preserves_accounting_and_resumes(tmp_path, monkeypatch):
+    # The delta between the paused baseline and the marker is real paid work.
+    assert (_PAID_ACTIVE_TRAFFIC['requests']
+            == _PAID_PAUSED_TRAFFIC['requests'] + 1)
+    path, job = failed_stranded(tmp_path, monkeypatch)
+    resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(hours=2), write=write)
+    assert resumed['status'] == 'paused'
+    for field in ('portion', 'started_at', 'identity', 'traffic', 'artifacts',
+                  'job_id', 'checkpoint_path', 'last_run_id'):
+        assert resumed[field] == job[field]
+    recovery = resumed['recovery']
+    assert 'paid' in recovery['reason']
+    assert recovery['marker_hash'] == stable_payload_hash(job)
+    assert len(recovery['paused_manifest_hash']) == 64
+    assert len(recovery['failed_manifest_hash']) == 64
+    # The re-settled cohort is genuinely resumable: the normal continuation
+    # restores the paid-inclusive cumulative traffic and proceeds to portion 9.
+    ledger = SharedTrafficLedger(hard_provider_bytes=1000000,
+                                 soft_provider_bytes=900000, retry_limit=10)
+    continuation = cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                                 now=lambda: NOW + timedelta(hours=2),
+                                                 run_id='run-3')
+    assert continuation.portion == 9
+    snapshot = ledger.snapshot()
+    assert snapshot['requests'] == 2
+    assert snapshot['provider_up_bytes'] == 30
+    assert snapshot['provider_down_bytes'] == 270
+    # Repeat selection is a no-op: the marker is simply 'paused' now.
+    before = path.read_bytes()
+    again = cohorts.select_job(path, identity(), now=NOW + timedelta(hours=3), write=write)
+    assert again['status'] == 'paused'
+    assert path.read_bytes() == before
+
+
+def test_unrelated_failed_marker_stays_rejected(tmp_path, monkeypatch):
+    path, job = prepared(tmp_path)
+    job.update(status='failed', portion=1, last_run_id='run-x')
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='unresolved traffic or writes'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_negative_aggregate_delta(tmp_path, monkeypatch):
+    inflated = _bump(_PAID_PAUSED_TRAFFIC, 'requests', 2)
+    path, _ = failed_stranded(tmp_path, monkeypatch, paused=_paused_portion_manifest(inflated))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='recovery traffic delta'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_negative_entity_delta(tmp_path, monkeypatch):
+    # Aggregate deltas all stay non-negative, but one entity loses counted
+    # work: compensation by another entity must not hide the regression.
+    marker = _settled_traffic_by_entity({
+        'competition_registry': {'requests': 1, 'retries': 0,
+                                 'provider_up_bytes': 20, 'provider_down_bytes': 180,
+                                 'decoded_bytes': 200},
+        'league_registry': {'requests': 3, 'retries': 1,
+                            'provider_up_bytes': 60, 'provider_down_bytes': 540,
+                            'decoded_bytes': 600}})
+    baseline = _settled_traffic_by_entity({
+        'competition_registry': {'requests': 2, 'retries': 1,
+                                 'provider_up_bytes': 30, 'provider_down_bytes': 270,
+                                 'decoded_bytes': 300},
+        'league_registry': {'requests': 2, 'retries': 0,
+                            'provider_up_bytes': 30, 'provider_down_bytes': 270,
+                            'decoded_bytes': 300}})
+    path, _ = failed_stranded(tmp_path, monkeypatch, marker_traffic=marker,
+                              paused=_paused_portion_manifest(baseline))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='per-entity'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_disappeared_entity(tmp_path, monkeypatch):
+    # Aggregate counters match exactly, but the paused entity set is not a
+    # subset of the active one: an entity must never vanish between portions.
+    marker = _settled_traffic_by_entity({
+        'competition_registry': {'requests': 2, 'retries': 1,
+                                 'provider_up_bytes': 30, 'provider_down_bytes': 270,
+                                 'decoded_bytes': 300}})
+    baseline = _settled_traffic_by_entity({
+        'other_registry': {'requests': 2, 'retries': 1,
+                           'provider_up_bytes': 30, 'provider_down_bytes': 270,
+                           'decoded_bytes': 300}})
+    path, _ = failed_stranded(tmp_path, monkeypatch, marker_traffic=marker,
+                              paused=_paused_portion_manifest(baseline))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='lost a paused entity'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_failed_traffic_mismatch(tmp_path, monkeypatch):
+    drifted = _bump(_PAID_ACTIVE_TRAFFIC, 'requests', 1)
+    path, _ = failed_stranded(tmp_path, monkeypatch, failed=_failed_paid_manifest(drifted))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='failed traffic differs from the marker'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_failed_entity_mismatch(tmp_path, monkeypatch):
+    # Same aggregates, renamed entity: the failed traffic must be the
+    # marker's exact per-entity ledger, not a look-alike.
+    renamed = _settled_traffic_by_entity({'other_registry': {
+        'requests': 2, 'retries': 1, 'provider_up_bytes': 30,
+        'provider_down_bytes': 270, 'decoded_bytes': 300}})
+    path, _ = failed_stranded(tmp_path, monkeypatch, failed=_failed_paid_manifest(renamed))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='entities differ from the marker'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'marker_traffic': {'requests': 12}},
+    {'failed': _failed_paid_manifest(None)},
+    {'paused': _paused_portion_manifest(None)},
+])
+def test_paid_io_recovery_requires_settled_traffic_snapshots(tmp_path, monkeypatch, kwargs):
+    path, _ = failed_stranded(tmp_path, monkeypatch, **kwargs)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='settled snapshot'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+@pytest.mark.parametrize('kind,manifest', [
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC),
+                'error': {'type': 'RawStoreError', 'message': 'some other storage error'}}),
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC),
+                'error': {'type': 'ValueError',
+                          'message': 'Transfermarkt raw response commit failed closed'}}),
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC), 'status': 'paused'}),
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC), 'source_status': 'not_started'}),
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC), 'writes': [{'table': 'x', 'rows': 1}]}),
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC), 'write_status': {'attempted': True}}),
+    ('failed', {**_failed_paid_manifest(_PAID_ACTIVE_TRAFFIC), 'run_id': 'run-1'}),
+    ('paused', {**_paused_portion_manifest(_PAID_PAUSED_TRAFFIC), 'status': 'failed'}),
+    ('paused', {**_paused_portion_manifest(_PAID_PAUSED_TRAFFIC), 'portion': 8}),
+])
+def test_paid_io_recovery_rejects_wrong_evidence_semantics(tmp_path, monkeypatch, kind, manifest):
+    kwargs = {'paused' if kind == 'paused' else 'failed': manifest}
+    path, _ = failed_stranded(tmp_path, monkeypatch, **kwargs)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='recovery .* evidence does not match'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_changed_artifact_without_writing(tmp_path, monkeypatch):
+    path, job = failed_stranded(tmp_path, monkeypatch)
+    Path(job['checkpoint_path']).write_text(json.dumps({'tampered': True}))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='changed after settlement'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_rejects_tampered_manifest_without_writing(tmp_path, monkeypatch):
+    path, job = failed_stranded(tmp_path, monkeypatch)
+    pinned = cohorts.KNOWN_PAID_IO_FAILURE_RECOVERY['paused_manifest']
+    envelope_path = path.parent.parent / pinned['path']
+    envelope = json.loads(envelope_path.read_text())
+    envelope['manifest']['portion'] = 99
+    envelope_path.write_text(json.dumps(envelope))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='differs from the audited pin'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_fails_closed_on_missing_manifest(tmp_path, monkeypatch):
+    path, _ = failed_stranded(tmp_path, monkeypatch)
+    (path.parent.parent / cohorts.KNOWN_PAID_IO_FAILURE_RECOVERY['failed_manifest']['path']).unlink()
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='missing or unreadable'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_paid_io_recovery_never_bypasses_age_or_identity(tmp_path, monkeypatch):
+    path, job = failed_stranded(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='expired'):
+        cohorts.select_job(path, identity(), now=NOW + timedelta(days=1), write=write)
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'failed'
