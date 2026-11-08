@@ -26,6 +26,7 @@ from scrapers.fbref.html_parser import (
 
 MATCH_PARSER_VERSION = "fbref-match-parser-v3"
 MATCH_COMPLETION_CONTRACT_VERSION = "match-v3-scored-page-marker-last"
+COMPETITION_SOURCE_DATASET_UNAVAILABLE = "competition_source_dataset_unavailable"
 
 
 class DatasetStatus(str, Enum):
@@ -293,6 +294,7 @@ def parse_match_html(
     enabled_datasets: Optional[Set[str]] = None,
     require_player_contract: bool = True,
     parser_overrides: Optional[Dict[str, Callable]] = None,
+    source_unavailable_datasets: Optional[Set[str]] = None,
 ) -> MatchParseResult:
     """Parse all current match datasets without transport or proxy objects."""
     soup = BeautifulSoup(html, "html.parser")
@@ -360,6 +362,22 @@ def parse_match_html(
             **kwargs,
         )
         if scored and name in {"match_events", "lineups"} and not result.row_count:
+            # Only a dataset the source left simply absent or empty may be
+            # re-read as a proven competition-level gap (#2057).  A container
+            # with rows the parser could not read stays a loud failure.
+            if (
+                name in (source_unavailable_datasets or ())
+                and result.error_type is None
+                and result.status in {
+                    DatasetStatus.EMPTY,
+                    DatasetStatus.NOT_APPLICABLE,
+                }
+            ):
+                return DatasetParseResult(
+                    dataset=name,
+                    status=DatasetStatus.NOT_APPLICABLE,
+                    reason=COMPETITION_SOURCE_DATASET_UNAVAILABLE,
+                )
             return DatasetParseResult(
                 dataset=name, status=DatasetStatus.ERROR,
                 reason="scored_match_incomplete",

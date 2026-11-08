@@ -537,6 +537,12 @@ class FakeControl:
     def settle_unscheduled_incomplete_match(self, *_args, **_kwargs):
         return None
 
+    def match_detail_coverage(self, *_args, **_kwargs):
+        return {
+            "match_events": {"populated_match_count": 1, "exhausted_match_count": 0},
+            "lineups": {"populated_match_count": 1, "exhausted_match_count": 0},
+        }
+
     def __init__(self, raw_store=None):
         self.raw_store = raw_store
         self.events = []
@@ -15688,6 +15694,47 @@ def test_acceptance_rejects_zero_rows_for_scored_match(dataset, availability, co
     assert any(f"{target_id}:{dataset}" in error for error in errors)
 
 
+def test_acceptance_allows_zero_rows_only_for_proven_competition_source_gap():
+    from scrapers.fbref.pipeline import _acceptance_coverage_errors
+    target_id = "fbref:match:13351335"
+    manifests = []
+    for name in ("__page__", "typed:__complete__", "typed:shot_events", "typed:match_events",
+                 "typed:lineups", "typed:match_team_stats", "typed:match_managers",
+                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_player_stats"):
+        manifests.append(dict(target_id=target_id, dataset=name, availability="available",
+                              row_count=1, parse_status="succeeded", persistence_status="succeeded",
+                              validation_status="succeeded",
+                              error_message="scored_match_requires_rows" if name == "typed:__complete__" else None))
+    for dataset in ("typed:match_events", "typed:lineups"):
+        row = next(m for m in manifests if m["dataset"] == dataset)
+        row.update(availability="not_applicable", row_count=0, parse_status="succeeded",
+                   persistence_status="skipped", validation_status="skipped",
+                   empty_reason="competition_source_dataset_unavailable")
+    evidence = {
+        "targets": [dict(target_id=target_id, page_kind="match", status="succeeded",
+                         http_status=200, raw_manifest_key="raw", content_hash="hash",
+                         evidence_class="full_match")],
+        "datasets": manifests,
+    }
+    anchor = {"target_ids": [target_id], "coverage_slots": {"match_full": target_id}}
+    assert _acceptance_coverage_errors(anchor, evidence) == []
+
+    for dataset in ("typed:match_events", "typed:lineups"):
+        row = next(m for m in manifests if m["dataset"] == dataset)
+        row["empty_reason"] = "source_container_not_published"
+    errors = _acceptance_coverage_errors(anchor, evidence)
+    assert any(f"{target_id}:typed:match_events" in error for error in errors)
+    assert any(f"{target_id}:typed:lineups" in error for error in errors)
+
+    for dataset in ("typed:match_events", "typed:lineups"):
+        row = next(m for m in manifests if m["dataset"] == dataset)
+        row["empty_reason"] = "competition_source_dataset_unavailable"
+        row["persistence_status"] = "failed"
+    errors = _acceptance_coverage_errors(anchor, evidence)
+    assert any(f"{target_id}:typed:match_events" in error for error in errors)
+    assert any(f"{target_id}:typed:lineups" in error for error in errors)
+
+
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("dag_id", ["dag_ingest_fbref", "dag_backfill_fbref"])
 def test_incomplete_match_recovery_drains_batches_before_fetch(tmp_path, monkeypatch, batched, dag_id):
@@ -16614,3 +16661,125 @@ def test_permanent_failure_drops_stale_transient_carryover(
     )
     assert result.incomplete_match_refetches == 1
     assert refresh not in pipeline._parse_carryovers
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_competition_source_gap_persists_scored_match_without_refetch(
+    tmp_path, monkeypatch, batched,
+):
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218",),
+    )
+    pipeline.batch_persist_enabled = batched
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    monkeypatch.setattr(match_parser, "parse_lineup_table", lambda *_a, **_k: None)
+    original_evidence = match_parser._match_source_evidence
+
+    def source_gap_evidence(soup, comment_tables):
+        evidence = original_evidence(soup, comment_tables)
+        evidence["match_events"] = (False, False)
+        evidence["lineups"] = (False, False)
+        return evidence
+
+    monkeypatch.setattr(match_parser, "_match_source_evidence", source_gap_evidence)
+    control.match_detail_coverage = lambda competition_id: {
+        "match_events": {"populated_match_count": 0, "exhausted_match_count": 2},
+        "lineups": {"populated_match_count": 0, "exhausted_match_count": 2},
+    }
+    control.schedule_incomplete_match_refetch = lambda *_a, **_k: pytest.fail(
+        "competition source gap must not request a refetch"
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+
+    assert result.parsed == 1
+    assert result.failures == []
+    assert result.incomplete_match_refetches == 0
+    assert result.incomplete_match_exhausted == 0
+    assert typed.calls
+    assert control.frontier[records[0].target_id]["state"] == "fetched"
+    manifests = [m for m in control.manifests if m["target_id"] == records[0].target_id]
+    assert any(m["dataset"] == "typed:__complete__" for m in manifests)
+    for dataset in ("typed:match_events", "typed:lineups"):
+        assert any(
+            m["dataset"] == dataset
+            and m["availability"] == "not_applicable"
+            and m["error_message"] == "competition_source_dataset_unavailable"
+            for m in manifests
+        )
+
+
+def test_missing_dataset_coverage_keeps_incomplete_match_refetch(tmp_path, monkeypatch):
+    from scrapers.fbref import match_parser
+
+    pipeline, control, _records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218",),
+    )
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    control.match_detail_coverage = lambda competition_id: {
+        "lineups": {"populated_match_count": 0, "exhausted_match_count": 2},
+    }
+    refetches = []
+
+    def refetch(target_id, **_kwargs):
+        refetches.append(target_id)
+        control.frontier[target_id]["state"] = "retry"
+        return True
+
+    control.schedule_incomplete_match_refetch = refetch
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings(),
+    )
+
+    assert result.parsed == 0
+    assert result.incomplete_match_refetches == 1
+    assert refetches == [_records[0].target_id]
+    assert typed.calls == []
+    assert not any(m["dataset"] == "typed:__complete__" for m in control.manifests)
+
+
+def test_match_coverage_is_refreshed_after_new_positive_evidence(tmp_path, monkeypatch):
+    from scrapers.fbref import match_parser
+
+    pipeline, control, records, _generic, _typed = _pipeline_with_saved_matches(
+        tmp_path, ("0701e218",),
+    )
+    monkeypatch.setattr(match_parser, "parse_events_from_scorebox", lambda *_: None)
+    monkeypatch.setattr(match_parser, "parse_lineup_table", lambda *_a, **_k: None)
+    original_evidence = match_parser._match_source_evidence
+
+    def source_gap_evidence(soup, comment_tables):
+        evidence = original_evidence(soup, comment_tables)
+        evidence["match_events"] = (False, False)
+        evidence["lineups"] = (False, False)
+        return evidence
+
+    monkeypatch.setattr(match_parser, "_match_source_evidence", source_gap_evidence)
+    coverage = {
+        "match_events": {"populated_match_count": 0, "exhausted_match_count": 2},
+        "lineups": {"populated_match_count": 0, "exhausted_match_count": 2},
+    }
+    control.match_detail_coverage = lambda competition_id: coverage
+    context = pipeline._typed_context(records[0])
+    html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode()
+
+    first = pipeline._parse_match_with_source_availability(
+        html, match_id=records[0].source_ids["match_id"], context=context,
+    )
+    assert not first.has_errors
+
+    coverage = {
+        "match_events": {"populated_match_count": 1, "exhausted_match_count": 2},
+        "lineups": {"populated_match_count": 1, "exhausted_match_count": 2},
+    }
+    second = pipeline._parse_match_with_source_availability(
+        html, match_id=records[0].source_ids["match_id"], context=context,
+    )
+    assert second.has_errors
+    assert second.datasets["match_events"].error_type == "IncompleteMatchPageError"
+    assert second.datasets["lineups"].error_type == "IncompleteMatchPageError"
