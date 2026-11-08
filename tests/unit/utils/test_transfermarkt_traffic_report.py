@@ -137,6 +137,67 @@ def test_unreadable_archive_makes_ledger_incomplete_and_missing_ledger_fails(tmp
         ledger_summary(tmp_path / "empty")
 
 
+def test_first_day_with_first_record_after_day_start_is_not_covered(tmp_path):
+    directory = write_ledger(tmp_path / "gw", [event(at="2026-10-29T10:00:00+00:00", size=100)])
+    summary = ledger_summary(directory)
+    assert (summary["complete"], summary["incomplete_reason"]) == (False, "day_not_covered")
+    assert summary["earliest_event_at"] == "2026-10-29T10:00:00+00:00"
+    report = {"report_day": DAY, "ledger": summary, **traffic.merge_ops(summary, [], {}, ALL_OK)}
+    assert "ТРЕВОГА: леджер не покрывает день" in traffic.format_traffic_summary(report).splitlines()
+    (directory / "paid_requests.jsonl").write_text(
+        json.dumps(event(at="2026-10-28T21:00:00+00:00", size=1)) + "\n", encoding="utf-8")
+    covered = ledger_summary(directory)
+    assert (covered["complete"], covered["incomplete_reason"]) == (True, None)
+
+
+def test_gap_after_archive_stamp_makes_ledger_incomplete(tmp_path):
+    directory = write_ledger(tmp_path / "gw", [event(at="2026-10-29T14:00:01+00:00", size=20)],
+                             archives={"20261029T120000Z": [event(at="2026-10-28T20:00:00+00:00", size=5),
+                                                            event(at="2026-10-29T11:00:00+00:00", size=10)]})
+    summary = ledger_summary(directory)
+    assert summary["files_read"] == ["paid_requests.20261029T120000Z.jsonl.gz", "paid_requests.jsonl"]
+    assert (summary["complete"], summary["incomplete_reason"]) == (False, "ledger_gap")
+    merged = traffic.merge_ops(summary, [], {}, ALL_OK)
+    assert merged["reconciliation"]["status"] == "not_measured"
+    report = {"report_day": DAY, "ledger": summary, **merged}
+    assert "ТРЕВОГА: леджер не покрывает день" in traffic.format_traffic_summary(report).splitlines()
+
+
+def test_gap_within_lease_ttl_and_continuous_files_stay_complete(tmp_path):
+    archive = [event(at="2026-10-28T20:00:00+00:00", size=5)]
+    exact_ttl = write_ledger(tmp_path / "gw", [event(at="2026-10-29T13:00:00+00:00", size=20)],
+                             archives={"20261029T120000Z": archive})
+    summary = ledger_summary(exact_ttl)
+    assert (summary["complete"], summary["incomplete_reason"]) == (True, None)
+    tight = write_ledger(tmp_path / "more", [event(at="2026-10-29T12:59:59+00:00", size=20)],
+                         archives={"20261029T120000Z": archive})
+    assert ledger_summary(tight)["complete"] is True
+
+
+def test_gap_between_consecutive_archives(tmp_path):
+    steady = write_ledger(tmp_path / "gw", [event(at="2026-10-29T13:30:20+00:00", size=20)],
+                          archives={"20261029T120000Z": [event(at="2026-10-28T20:00:00+00:00", size=5)],
+                                    "20261029T133000Z": [event(at="2026-10-29T12:00:30+00:00", size=10)]})
+    summary = ledger_summary(steady)
+    assert summary["files_read"] == ["paid_requests.20261029T120000Z.jsonl.gz",
+                                     "paid_requests.20261029T133000Z.jsonl.gz", "paid_requests.jsonl"]
+    assert (summary["complete"], summary["incomplete_reason"]) == (True, None)
+    gapped = write_ledger(tmp_path / "more", [event(at="2026-10-29T14:00:00+00:00", size=20)],
+                          archives={"20261029T120000Z": [event(at="2026-10-28T20:00:00+00:00", size=5)],
+                                    "20261029T133000Z": [event(at="2026-10-29T14:00:00+00:00", size=10)]})
+    summary = ledger_summary(gapped)
+    assert (summary["complete"], summary["incomplete_reason"]) == (False, "ledger_gap")
+
+
+def test_unreadable_archive_keeps_priority_over_gap(tmp_path):
+    directory = write_ledger(tmp_path / "gw", [event(at="2026-10-29T14:00:01+00:00", size=20)],
+                             archives={"20261029T120000Z": [event(at="2026-10-28T20:00:00+00:00", size=5)]})
+    (directory / "paid_requests.20261030T000000Z.jsonl.gz").write_bytes(b"not gzip")
+    summary = ledger_summary(directory)
+    assert summary["archives_unreadable"] == ["paid_requests.20261030T000000Z.jsonl.gz"]
+    assert (summary["complete"], summary["incomplete_reason"]) == (False, "archives_unreadable")
+
+
 def _duck(sql, params, setup):
     con = duckdb.connect()
     con.execute("CREATE SCHEMA ops")
@@ -515,7 +576,7 @@ def test_cli_reads_ops_sources_independently(tmp_path, capsys, monkeypatch):
             pass
 
     monkeypatch.setattr(native, "connect", Connection)
-    directory = write_ledger(tmp_path / "gw", [event(at="2026-10-29T10:00:00+00:00", size=100)])
+    directory = write_ledger(tmp_path / "gw", [event(at="2026-10-28T21:00:00+00:00", size=100)])
     assert cli.main(["--day", DAY, "--ledger-dir", str(directory), "--current-state-dir", str(tmp_path),
                      "--as-of", AS_OF.isoformat()]) == 0
     report = json.loads(capsys.readouterr().out)["report"]
@@ -537,6 +598,22 @@ def test_cli_day_outside_ledger_raises_an_alarm(tmp_path, capsys):
     assert cli.main(["--day", "2026-10-30", "--ledger-dir", str(directory), "--no-trino",
                      "--as-of", "2026-11-02T00:00:00+00:00"]) == 0
     assert json.loads(capsys.readouterr().out)["report"]["ledger"]["complete"] is True
+
+
+def test_cli_naive_as_of_is_argparse_error(capsys):
+    with pytest.raises(SystemExit) as exit_code:
+        cli.main(["--day", DAY, "--as-of", "2026-10-30T10:00:00"])
+    assert exit_code.value.code == 2
+    captured = capsys.readouterr()
+    assert "--as-of должен содержать часовой пояс" in captured.err and captured.out == ""
+
+
+def test_cli_malformed_as_of_is_iso_error(capsys):
+    with pytest.raises(SystemExit) as exit_code:
+        cli.main(["--day", DAY, "--as-of", "not-a-date"])
+    assert exit_code.value.code == 2
+    captured = capsys.readouterr()
+    assert "--as-of должен быть ISO8601 с часовым поясом" in captured.err and captured.out == ""
 
 
 def test_entity_groups_cover_every_label_and_output_name():
