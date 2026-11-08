@@ -38,8 +38,6 @@ SCRIPTS = (
     DEPLOY / "auto_deliver.sh",
 )
 MINI_DAGS = (
-    "dag_trigger_sofascore_daily.py",
-    "dag_trigger_sofascore_daily_tail.py",
     "dag_sofascore_manifest_maintenance.py",
     "dag_sofascore_schedule_maintenance.py",
 )
@@ -294,6 +292,24 @@ def test_mini_dags_are_repository_files_hidden_only_from_the_shared_scheduler() 
         assert any(re.match(pattern, foreign) for pattern in contour), foreign
     # RE2: no lookahead in either file.
     assert "(?!" not in "".join(shared + contour)
+
+
+@pytest.mark.unit
+def test_retired_daily_triggers_are_not_wired_anywhere() -> None:
+    """#1370: триггеры дейли и её хвоста выведены из контура — файлов в дереве
+    может и не быть, но и активных ссылок на них остаться не должно ни в рецепте
+    доставки, ни в CI, ни в runbook (повествование об их выводе — не ссылка)."""
+    for path in (
+        DEPLOY / "freeze_release.sh",
+        DEPLOY / "postdeploy_checks.sh",
+        DEPLOY / "auto_deliver.sh",
+        AIRFLOW_COMPOSE,
+        ROOT / ".github" / "workflows" / "sofascore-ci.yml",
+        ROOT / "docs" / "operations" / "sofascore-production.md",
+    ):
+        text = path.read_text(encoding="utf-8")
+        for name in ("dag_trigger_sofascore_daily.py", "dag_trigger_sofascore_daily_tail.py"):
+            assert name not in text, f"{path}: активная ссылка на выведенный {name}"
 
 
 @pytest.mark.unit

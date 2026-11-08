@@ -256,3 +256,16 @@ def test_matching_zero_receipt_remains_consistent_with_counter():
                                              location="iceberg.bronze.sofascore_player_ratings"))
     report["tables"].append("iceberg.bronze.sofascore_player_ratings")
     assert tail.assess_tail(data, "a" * 40)["status"] == "pass"
+
+
+def test_configured_tournaments_accepts_old_and_new_basis(tmp_path):
+    rows = [("ENG-Premier League", 17), ("ESP-La Liga", 8), ("ITA-Serie A", 23),
+            ("FRA-Ligue 1", 34), ("GER-Bundesliga", 35), ("RUS-Premier League", 203),
+            ("INT-World Cup", 16)]
+    expected = {key: tid for key, tid in rows}
+    for basis in (tail.DAILY_TAIL_BASIS, tail.ALL_MEN_TAIL_BASIS):
+        path = tmp_path / "denominator.tsv"
+        lines = ["capture_key\ttournament_id\tbasis"]
+        lines += [f"{key}\t{tid}\t{basis}" for key, tid in rows]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert tail.configured_tournaments(path) == expected

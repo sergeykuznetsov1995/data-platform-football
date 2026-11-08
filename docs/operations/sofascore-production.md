@@ -14,16 +14,16 @@
 | Планировщик + своя metadata-DB | `deploy/sofascore/airflow.compose.yaml` | `sofascore-airflow` (`sofascore-airflow-scheduler`, `sofascore-airflow-metadb`, `airflow-init`, `airflow-webserver` по профилю `ui`) | код — из `${SOFASCORE_RELEASE_ROOT}`; состояние кампании, опубликованная статическая политика бюджета, пул прокси, venv-шим — из runtime-каталога |
 | Платные шлюзы полос (3 шт.) | `deploy/sofascore/gateway.compose.yaml` | `sofascore-gw` (`sofascore_gw_951` с алиасом сервиса `sofascore_proxy_filter`, `sofascore_gw_history`, `sofascore_gw_players` в сети `sofascore-net`) | всё дерево релиза в `/opt/sofascore-repo:ro`; артефакт и fallback-файл общие, WAL/ledger — свой каталог у каждого |
 | Блок-лист DagBag | `deploy/sofascore/.airflowignore` | накрывает `dags/.airflowignore` внутри scheduler'а | — |
-| Мини-DAG контура | `dags/dag_trigger_sofascore_daily.py`, `dags/dag_trigger_sofascore_daily_tail.py`, `dags/dag_sofascore_manifest_maintenance.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
+| Мини-DAG контура | `dags/dag_sofascore_manifest_maintenance.py`, `dags/dag_sofascore_schedule_maintenance.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
 | Сторожа аренд (3 шт.) | `deploy/sofascore/gateway_lease_watchdog.py` + `systemd/sofascore-gw-lease-watchdog{,-history,-players}.service` | одноимённые unit'ы, все читают `/etc/data-platform/sofascore.env` | — |
 | Ротация | `freeze_release.sh` → `deploy.sh` → `postdeploy_checks.sh` | — | — |
 | Переменные | `deploy/sofascore/sofascore.env.example` → `/etc/data-platform/sofascore.env` | второй `--env-file` после общего `.env` платформы | — |
 
-Активны в контуре ровно семь DAG: `dag_ingest_sofascore`, `dag_backfill_sofascore_all_mens`,
-`dag_refresh_sofascore_all_mens`, `dag_trigger_sofascore_daily` (14:00 UTC, триггер
-ежедневника), `dag_trigger_sofascore_daily_tail` (00:20 UTC, хвост дейли: только матчи
-лиг реестра с basis `registry:tournaments.json (дейли до #1370)` в `denominator.tsv`,
-#1359; свой ключ свежести афиши, создаётся не на паузе; уходит вместе с дейли в #1370), `dag_sofascore_schedule_maintenance` (03:00 UTC) и `dag_sofascore_manifest_maintenance` (воскресенье 05:00 UTC). Остальные
+Активны в контуре ровно пять DAG: `dag_ingest_sofascore` (расписания не имеет, #1370:
+триггеры дейли и её хвоста выведены — прогон запускается вручную или полосой актуалки),
+`dag_backfill_sofascore_all_mens`, `dag_refresh_sofascore_all_mens`,
+`dag_sofascore_schedule_maintenance` (03:00 UTC) и `dag_sofascore_manifest_maintenance`
+(воскресенье 05:00 UTC). Остальные
 файлы `dags/` блок-лист не пускает в DagBag (движок RE2, lookahead не работает —
 поэтому блок-лист, а не allow-list).
 
@@ -36,7 +36,7 @@ reached` почти на каждом запуске истории (03.09 за 
 
 | Полоса | Шлюз (сервис / контейнер) | Пул Airflow | Дневной потолок |
 | --- | --- | --- | --- |
-| Дейли | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
+| Ручной ingest (бывший дейли) | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
 | Кампания истории | `sofascore_gw_history` / `sofascore_gw_history` | `sofascore_history_pool` | 2000 МБ |
 | Актуалка (#1360; бывшая полоса игроков) | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
 
@@ -321,7 +321,7 @@ install -d -m 0755 "$SOFASCORE_AUTO_STATE_DIR"     # автомат его НЕ 
 
 **Когда доставляет (#1980)** — в любой час, часов в коде нет. Дедлайн попытки — ближайший
 запуск сбора по расписанию Airflow (`dag.next_dagrun_create_after` DAG не на паузе: актуалка,
-триггер дейли и её хвоста, обслуживание расписаний и манифеста) минус запас на откат
+обслуживание расписаний и манифеста) минус запас на откат
 `ROLLBACK_RESERVE` (2700 с), но не дальше 2,5 ч вперёд (`DEADLINE_MAX`, длина бывшего окна
 03:30–06:00). История (`@continuous`) в дедлайн не входит — её осушает drain `deploy.sh`.
 Тик доставляет, только если контур свободен и хватает запаса:
@@ -359,7 +359,7 @@ install -d -m 0755 "$SOFASCORE_AUTO_STATE_DIR"     # автомат его НЕ 
   копии руками по блоку выше (под замком автомата).
 
 **Приёмка** — шесть признаков подряд, все привязаны к факту пересоздания контейнера
-(`.Created` изменился), а не к часам автомата: семь DAG контура активны, без ошибок
+(`.Created` изменился), а не к часам автомата: пять DAG контура активны, без ошибок
 импорта и перечитаны после `.State.StartedAt` нового scheduler'а; `import_error = 0`;
 три шлюза `healthy`, `HostConfig.Memory = 1 GiB` и метка `com.docker.compose.project =
 sofascore-gw`; монты scheduler'а И трёх шлюзов ведут в новое дерево; слоты трёх пулов
@@ -622,7 +622,7 @@ s.clear_failed(p, campaign_id=cid, scope_key=f'{cid}:<tournament_id>:<source_sea
 queue_priority basis`. В файле все 1 504 турнира снапшота кампании (sha256 их отсортированных
 id обязан совпасть с `candidate_ids_sha256` политики `all_mens_campaign.json` — это проверяет
 тест-контракт) плюс 7 турниров реестра дейли, которых в снапшоте нет (8, 16, 17, 23, 34, 35,
-203; `capture_key` = их `canonical_id`, в очередь кампании не входят — их собирает дейли).
+203; `capture_key` = их `canonical_id`, в очередь кампании не входят — их собирает полоса ingest, бывший дейли).
 Набор id снапшота файл не меняет: он фильтр и порядок поверх снапшота. Читает его
 `scrapers/sofascore/denominator.py` (`load_denominator`, путь — `SOFASCORE_DENOMINATOR_PATH`
 или `/opt/airflow/configs/sofascore/denominator.tsv` из релиза); ошибка формата —
