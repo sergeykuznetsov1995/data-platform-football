@@ -1106,3 +1106,41 @@ heap/RestartCount и вести 7 суток приёмки по #1879. Это �
 `scrapers/sofascore`; старое доказательство с другим digest несовместимо,
 исключений из fingerprint нет. Схема, parser version и batch identity
 расписаний не меняются.
+
+## Паритет daily/all-men: read-only отчёт Bronze (#1370)
+
+**Команда** (только чтение; Trino — через контракт `veha1_measure.trino_rows`:
+`trino-ro.sh`, sentinel `__sentinel__`; SQL-шаблон `sofascore_daily_parity.sql`
+лежит рядом в `deploy/sofascore/`):
+
+```bash
+python3 deploy/sofascore/daily_parity.py --start YYYY-MM-DD --days 7 --output /tmp/sofascore-daily-parity.json
+```
+
+JSON печатается в stdout; `--output` сохраняет тот же текст атомарно
+(tmp + rename) — это единственная запись на диске, других runtime-записей нет.
+Окно — epoch `[start, start+7)`, ровно 7 дней: другое значение `--days`/`days`
+отклоняется `ValueError`. Турниры — source IDs enabled-реестра
+(`SofaScoreCatalog.tournament_map(enabled_only=True)`); список ID нигде не
+дублируется.
+
+**Семантика union coverage.** Отчёт требует, чтобы каждый `finished` матч этих
+турниров имел `capture_complete` хотя бы под одним ключом — daily или SS. Во
+время параллельной работы обеих копий матч НЕ обязан быть закрыт каждой:
+capture пропускается глобально по match_id. `postponed`/`canceled` покрытия не
+требуют. `status="fail"` — если хотя бы один `finished` без `any_complete`;
+`missing_finished` — отсортированные ID таких матчей. `days` — все семь
+ISO-дат по порядку со счётчиками `finished`/`covered`; день без матчей
+остаётся в отчёте с нулями (zero-match day — норма, не пропуск строки).
+
+**Physical overlap — не логический дубль.** `physical_both_complete` —
+информационное число матчей, закрытых под обоими ключами сразу. Логических
+дублей нет (`logical_duplicates=0`): расписание дедуплицировано по
+`(day, match_id)` со статусом `max_by(status_type, _ingested_at)`, capture — по
+match_id.
+
+**Граница доказательства.** Каждый JSON несёт
+`acceptance="scheduler_and_dq_evidence_required"`: отчёт описывает только
+Bronze-паритет и не доказывает приёмку scheduler/DQ. Решение о выводе дейли
+(#1370) владелец принимает по этому отдельному доказательству; отчёт ничего не
+выключает и не утверждает, что дейли уже выключен.
