@@ -125,9 +125,10 @@ def parsed_parts(summary):
     }
 
 
-def _read_tables(trino, slug, year, event_id):
-    scope = delete_filter(slug, year, [event_id])
-    return {
+def _read_tables(trino, slug, year, event_ids):
+    event_ids = list(event_ids)
+    scope = delete_filter(slug, year, event_ids)
+    rows = {
         table: [
             dict(zip(schema.names, row))
             for row in trino.execute_query(
@@ -136,6 +137,12 @@ def _read_tables(trino, slug, year, event_id):
         ]
         for table, schema in TABLES.items()
     }
+    before = {}
+    for table, table_rows in rows.items():
+        for row in table_rows:
+            entry = before.setdefault(row["event_id"], {name: [] for name in TABLES})
+            entry[table].append(row)
+    return before
 
 
 def _loses_json(before, after):
@@ -195,11 +202,9 @@ def _loses_rows(before, after):
     return False
 
 
-def _prepare_write(payload, competition, edition, store, trino):
-    event = payload.schedule
-    before = _read_tables(
-        trino, event.competition_slug, event.source_season_year, event.event_id
-    )
+def _prepare_write(payload, competition, edition, store, before=None):
+    if before is None:
+        before = {table: [] for table in TABLES}
     matches = before[MATCH_TABLE]
     if len(matches) > 1:
         raise ValueError("duplicate Bronze match")
@@ -410,14 +415,39 @@ def run(
         if not pending:
             return
         slug, year = key
+        before_by_event = _read_tables(
+            trino, slug, year, [p.schedule.event_id for p, _, _, _ in pending]
+        )
+        ready = []
+        for chosen, record, comp, edition in pending:
+            try:
+                ready.append(
+                    (
+                        _prepare_write(
+                            chosen,
+                            comp,
+                            edition,
+                            store,
+                            before=before_by_event.get(chosen.schedule.event_id),
+                        ),
+                        record,
+                    )
+                )
+            except Exception as exc:
+                record.update(
+                    outcome="skipped", write_error=f"{type(exc).__name__}: {exc}"
+                )
+        if not ready:
+            pending.clear()
+            return
         owners, retake = duplicate_owners(
-            trino, slug, year, [p.schedule.event_id for p, _ in pending]
+            trino, slug, year, [p.schedule.event_id for p, _ in ready]
         )
         payloads = [
             replace(p, schedule=replace(p.schedule, duplicate_of=owners[eid]))
             if (eid := p.schedule.event_id) in owners
             else p
-            for p, _ in pending
+            for p, _ in ready
         ]
         receipt = write_tournament_batch(
             TournamentBatch(*key, payloads), trino=trino, state_dir=state_dir
@@ -427,7 +457,7 @@ def run(
         for (other_slug, other_year), ids in sorted(retake.items()):
             mark_duplicates(trino, f"{slug}:{year}", other_slug, other_year, ids)
         report["receipts"].append(asdict(receipt))
-        for _, record in pending:
+        for _, record in ready:
             record["outcome"] = "written"
         pending.clear()
 
@@ -499,15 +529,8 @@ def run(
         elif trino is None:
             record["outcome"] = "parsed"
         else:
-            try:
-                chosen = _prepare_write(chosen, comp, edition, store, trino)
-            except Exception as exc:
-                record.update(
-                    outcome="skipped", write_error=f"{type(exc).__name__}: {exc}"
-                )
-                continue
             key = (slug, year)
-            batches[key].append((chosen, record))
+            batches[key].append((chosen, record, comp, edition))
             if len(batches[key]) >= batch_size:
                 flush(key)
     for key in sorted(batches):
