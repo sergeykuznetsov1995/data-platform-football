@@ -539,7 +539,11 @@ def run_compaction(
 
                 if isinstance(exc, StateConflict):
                     if str(exc) == "FBref publication is locked by another control run":
+                        # A locked FBref publication must not stall the other
+                        # sources; stop only when nothing but FBref remains.
                         queue.append(table)
+                        if any(t not in FBREF_TABLES for t in queue):
+                            continue
                         result["stop_reason"] = "busy"
                         break
                     raise

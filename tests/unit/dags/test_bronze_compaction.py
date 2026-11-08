@@ -158,11 +158,11 @@ def test_bytes_dry_run_and_no_progress(runner, monkeypatch):
 
 
 def test_deadline_stop_and_window():
-    with pytest.raises(TimeoutError, match="03:00–05:00 MSK"):
+    with pytest.raises(TimeoutError, match="06:00–08:00 MSK"):
         compaction.nightly_deadline(datetime(2026, 10, 28, 2, tzinfo=timezone.utc))
     assert compaction.nightly_deadline(
-        datetime(2026, 10, 28, 0, 30, tzinfo=timezone.utc)
-    ) == datetime(2026, 10, 28, 2, tzinfo=timezone.utc)
+        datetime(2026, 10, 28, 3, 30, tzinfo=timezone.utc)
+    ) == datetime(2026, 10, 28, 5, tzinfo=timezone.utc)
     stop = Event()
     conn = compaction._DeadlineConnection(
         None, datetime.now(timezone.utc) - timedelta(seconds=1), stop, lambda: None
@@ -313,7 +313,7 @@ def test_catchup_cli_queues_instead_of_bypassing_pool(monkeypatch, tmp_path):
     class Clock:
         @staticmethod
         def now(_tz):
-            return datetime(2026, 10, 28, 0, tzinfo=timezone.utc)
+            return datetime(2026, 10, 28, 3, tzinfo=timezone.utc)
 
     monkeypatch.setattr(cli, "datetime", Clock)
     calls = []
@@ -345,7 +345,7 @@ def test_catchup_cli_queues_instead_of_bypassing_pool(monkeypatch, tmp_path):
     ]
     conf = json.loads(command[-1])
     assert conf["apply"] is False
-    assert conf["deadline"] == "2026-10-28T00:30:00+00:00"
+    assert conf["deadline"] == "2026-10-28T03:30:00+00:00"
     assert kwargs == {"check": True}
     assert cli.main(["--stop-file", str(stop), "--stop"]) == 0
     assert stop.exists()
@@ -818,3 +818,73 @@ def test_fbref_publication_lock_timeout_is_busy(monkeypatch):
     assert result["failures"] == []
     assert probes == []
     assert events == ["start", False]
+
+
+def test_fbref_busy_defers_to_other_source_then_fbref_only_rest_is_busy(
+    runner, monkeypatch
+):
+    from scrapers.fbref.control import StateConflict
+
+    attempts = []
+
+    @contextmanager
+    def locked(enabled, deadline=None):
+        attempts.append(enabled)
+        if enabled:
+            raise StateConflict("FBref publication is locked by another control run")
+        yield lambda: None
+
+    monkeypatch.setattr(compaction, "_publication_fence", locked)
+
+    def probe(_conn, *, table, **_kwargs):
+        return maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0)
+
+    monkeypatch.setattr(maintenance, "_compaction_candidates", probe)
+    result = compaction.run_compaction(
+        tables=("fbref_schedule", "matchhistory_results"),
+        deadline=runner, dry_run=True,
+    )
+    # One busy attempt per FBref visit: no tight loop while MatchHistory runs.
+    assert attempts == [True, False, True]
+    assert result["stop_reason"] == "busy"
+    assert result["portions"] == 1 and result["input_bytes"] == 20
+    assert result["targets"]["matchhistory_results"] == "dry_run"
+    assert result["targets"]["fbref_schedule"] == "pending"
+    assert result["queue"] == ["fbref_schedule"]
+    assert not result["failures"]
+
+
+def test_mixed_queue_keeps_budget_result_after_fbref_busy(runner, monkeypatch):
+    from scrapers.fbref.control import StateConflict
+
+    attempts = []
+
+    @contextmanager
+    def locked(enabled, deadline=None):
+        attempts.append(enabled)
+        if enabled:
+            raise StateConflict("FBref publication is locked by another control run")
+        yield lambda: None
+
+    monkeypatch.setattr(compaction, "_publication_fence", locked)
+    monkeypatch.setattr(
+        maintenance, "_compaction_candidates",
+        lambda *_a, **kw:
+            maintenance._CompactionProbeResult((("s3://a", 10), ("s3://b", 10)), 0),
+    )
+    compacted = []
+    monkeypatch.setattr(
+        maintenance, "_compact_exact_files",
+        lambda *_a, **kw: compacted.append(kw["table"]) or {},
+    )
+    result = compaction.run_compaction(
+        tables=("fbref_schedule", "matchhistory_results"),
+        deadline=runner, max_portions=3,
+    )
+    assert compacted == ["matchhistory_results"] * 3
+    assert attempts == [True, False] * 3
+    assert result["stop_reason"] == "budget"
+    assert result["portions"] == 3
+    assert not result["failures"]
+    assert "fbref_schedule" in result["queue"]
+    assert result["targets"]["fbref_schedule"] == "pending"

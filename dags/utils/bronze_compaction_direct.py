@@ -109,8 +109,9 @@ def _maintenance_ready(dsn, now):
     """No maintenance DAG may run, and tonight's in-window daily (if scheduled)
     must have finished; fail closed.
 
-    Until the 00:00 UTC schedule is delivered, the production daily still runs
-    at 02:00 UTC (after the window), so a missing in-window run admits.
+    The current snapshot schedules the daily at 03:00 UTC (inside the
+    window). While production still runs the old daily at 02:00 UTC, that
+    starts before the window; a running daily blocks direct regardless.
     """
     import psycopg2
 
@@ -210,6 +211,7 @@ def run_direct(args, deadline):
                             counts["files_before"] = event["files_before"]
                         counts["files_after"] = event["files_after"]
 
+                    busy = set()
                     while state["queue"]:
                         if (state["portions"] >= args.portions
                                 or state["input_bytes"] >= args.bytes):
@@ -238,8 +240,22 @@ def run_direct(args, deadline):
                             summary["stop_reason"] = "budget"
                             break
                         if result["stop_reason"] == "busy":
-                            time.sleep(min(5, max(0, (deadline - _now()).total_seconds())))
+                            # A busy FBref publication must not stall the other
+                            # sources: requeue durably at the end (no portion,
+                            # byte or cursor change) and move on. Pause only once
+                            # every remaining table returned busy, then retry.
+                            state["queue"].remove(table)
+                            state["queue"].append(table)
+                            if args.apply:
+                                _save(args.state_file, state)
+                            busy.add(table)
+                            if busy.issuperset(state["queue"]):
+                                time.sleep(
+                                    min(60, max(0, (deadline - _now()).total_seconds()))
+                                )
+                                busy.clear()
                             continue
+                        busy.discard(table)
                         if not args.apply or not result["queue"]:
                             state["queue"].remove(table)
                         if not args.apply:

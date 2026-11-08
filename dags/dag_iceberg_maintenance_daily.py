@@ -4,8 +4,8 @@ Iceberg Maintenance — Daily (high-churn bronze)
 
 Daily `expire_snapshots` and `remove_orphan_files` for a curated allow-list of
 high-churn Bronze tables (delete-then-insert pattern from daily ingest DAGs).
-A separate serial pass compacts physical Bronze tables at 00:00–02:00 UTC
-(03:00–05:00 MSK, owner decision 29.10), with at most 120 portions / 8 GiB. Other feeds retain 3d; WhoScored retains
+A separate serial pass compacts physical Bronze tables at 03:00–05:00 UTC
+(06:00–08:00 MSK, owner decision 08.11), with at most 120 portions / 8 GiB. Other feeds retain 3d; WhoScored retains
 14d for rollback. Compaction does not repeat retention. The `iceberg.ops` source journals get a
 full `optimize` + `expire_snapshots('3d')` (never orphan cleanup: live writers)
 via `maintain_ops`; a table that stays commit-busy is skipped, not failed.
@@ -16,7 +16,7 @@ The full bronze/silver/gold sweep stays weekly (`dag_iceberg_maintenance.py`,
 retention 30d) — this DAG is a tighter loop only for the worst offenders
 identified during the 2026-04-30 disk-fill incident.
 
-Schedule: 00:00 UTC (03:00 MSK) daily — well before the 14:00 UTC master pipeline.
+Schedule: 03:00 UTC (06:00 MSK) daily — well before the 14:00 UTC master pipeline.
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ with DAG(
     dag_id="dag_iceberg_maintenance_daily",
     default_args=SILVER_ARGS,
     description="Daily expire_snapshots+remove_orphan_files for high-churn bronze",
-    schedule="0 0 * * *",  # 03:00 MSK, owner window 03:00–05:00 MSK
+    schedule="0 3 * * *",  # 06:00 MSK, owner window 03:00–05:00 UTC
     start_date=datetime(2026, 5, 1),
     catchup=False,
     max_active_runs=1,
