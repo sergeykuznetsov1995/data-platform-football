@@ -5,6 +5,9 @@ and retried; neither cached RED nor incomplete evidence is ever reported green.
 The local deployment marker records the first actual invocation, not a guessed
 historical date. Iceberg reads are pinned to the invocation's cutoff, including
 ops evidence and promoted-registry inputs used by the existing full DQ suite.
+Current listing checks join those pinned inputs, so a fresher proven listing
+supersedes an older manifest outcome while missing or unusable checks leave
+the previous outcome in force (#2202).
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from utils import transfermarkt_bronze_dq as dq
+from utils.transfermarkt_current_state import CHECKS_TABLE
 
 VERSION = 'tm-daily-bronze-dq-v1'
 MOSCOW = ZoneInfo('Europe/Moscow')
@@ -30,7 +34,8 @@ FIRST_SEEN_REGISTRY = 'iceberg.ops.transfermarkt_first_seen_v1'
 AUDIT_TABLES = tuple(sorted({
     *dq.NATIVE_BRONZE_KEYS, *dq.LEGACY_BRONZE_KEYS,
     dq.COMPETITIONS_REGISTRY_TABLE, dq.EDITIONS_REGISTRY_TABLE,
-    dq.REGISTRY_STATE_TABLE, dq.SCOPE_MANIFEST_TABLE, FETCH_STATE, CAREER_REFS,
+    dq.REGISTRY_STATE_TABLE, dq.SCOPE_MANIFEST_TABLE, CHECKS_TABLE,
+    FETCH_STATE, CAREER_REFS,
 }))
 LINEAGE = ('source_url', 'source_body_hash', 'fetched_at', '_ingested_at',
            'parser_revision', 'schema_revision', 'cycle_id', 'scope_id', '_batch_id')
@@ -194,18 +199,62 @@ def build_placeholder_zero_sql() -> str:
      WHERE fee_eur = 0 AND {_placeholder('fee_text')}) AS transfer_fee_placeholder_zero"""
 
 
+# A current listing proves emptiness only with these exact runner results;
+# any other zero-coverage outcome stays unknown (#2202).
+CURRENT_AUTHORITATIVE_EMPTY_RESULTS = (
+    'tmapi+teilnehmer authoritative empty',
+    'authoritative empty source listing',
+)
+
+
 def build_empty_routes_sql(routes: Mapping[str, str]) -> str:
-    """Latest listing outcome per edition; missing status is unknown, not empty."""
+    """Latest listing outcome per edition from manifests and current checks.
+
+    A current check qualifies only when complete, fully covered and raw-backed,
+    and maps to its edition through the manifests' deterministic scope_id.
+    Both sources compete in one latest-outcome selection, so failed, uncertain
+    or partial current checks never mask the previous complete outcome (#2202).
+    """
     if not routes or any(route not in {'pokal', 'wettbewerb'} for route in routes.values()):
         raise ValueError('daily DQ routes require the denominator contract')
     values = ', '.join('(' + dq._sql_literal(key) + ', ' + dq._sql_literal(route) + ')'
                        for key, route in sorted(routes.items()))
-    return f"""WITH routes(competition_id, route) AS (VALUES {values}), latest AS (
+    empties = ', '.join(dq._sql_literal(result) for result in CURRENT_AUTHORITATIVE_EMPTY_RESULTS)
+    return f"""WITH routes(competition_id, route) AS (VALUES {values}), scopes AS (
+    SELECT scope_id, competition_id, edition_id,
+           ROW_NUMBER() OVER (PARTITION BY scope_id
+                              ORDER BY committed_at DESC, child_cycle_id DESC) rn
+    FROM {dq.SCOPE_MANIFEST_TABLE}
+    WHERE scope_id IS NOT NULL AND competition_id IS NOT NULL AND edition_id IS NOT NULL
+      AND status = 'complete'
+), manifest_outcomes AS (
     SELECT competition_id, edition_id,
            json_extract_scalar(entity_manifest_json, '$.dq_evidence.scope_capture.listing_status') listing_status,
+           committed_at decided_at, 'manifest' source, child_cycle_id cycle_id
+    FROM (
+        SELECT competition_id, edition_id, entity_manifest_json, committed_at, child_cycle_id,
+               ROW_NUMBER() OVER (PARTITION BY competition_id, edition_id
+                                  ORDER BY committed_at DESC, child_cycle_id DESC) rn
+        FROM {dq.SCOPE_MANIFEST_TABLE} WHERE status = 'complete'
+    ) WHERE rn = 1
+), current_outcomes AS (
+    SELECT s.competition_id, s.edition_id,
+           CASE WHEN c.expected_ids > 0 THEN 'ok'
+                WHEN c.expected_ids = 0 AND c.result IN ({empties}) THEN 'authoritative_empty'
+           END listing_status,
+           c.checked_at decided_at, 'current' source, c.cycle_id
+    FROM {CHECKS_TABLE} c
+    JOIN (SELECT scope_id, competition_id, edition_id FROM scopes WHERE rn = 1) s
+      ON s.scope_id = c.scope_id
+    WHERE c.check_kind = 'listing' AND c.status = 'complete'
+      AND c.expected_ids = c.observed_ids AND c.checked_at IS NOT NULL
+      AND c.raw_capture_ids_json IS NOT NULL
+      AND cardinality(CAST(json_parse(c.raw_capture_ids_json) AS array(varchar))) > 0
+), latest AS (
+    SELECT competition_id, edition_id, listing_status,
            ROW_NUMBER() OVER (PARTITION BY competition_id, edition_id
-                              ORDER BY committed_at DESC, child_cycle_id DESC) rn
-    FROM {dq.SCOPE_MANIFEST_TABLE} WHERE status = 'complete'
+                              ORDER BY decided_at DESC, source DESC, cycle_id DESC) rn
+    FROM (SELECT * FROM manifest_outcomes UNION ALL SELECT * FROM current_outcomes)
 ) SELECT COALESCE(r.route, 'unknown'), COUNT(*),
          COUNT_IF(listing_status = 'authoritative_empty'),
          COUNT_IF(listing_status IS NULL OR listing_status NOT IN ('ok', 'authoritative_empty'))

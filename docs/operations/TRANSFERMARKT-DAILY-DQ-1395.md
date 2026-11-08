@@ -33,6 +33,7 @@ run_id=..., now=...)` выполняет полный `run_bronze_dq(zone='full'
 Падение процесса до сохранения также не создаёт завершённого результата.
 
 Все native и legacy Bronze, входы опубликованного реестра и ops-доказательства
+(включая таблицу current-проверок `iceberg.ops.transfermarkt_current_checks_v1`)
 фиксируются Iceberg snapshot IDs, существовавшими к `cutoff_at`. Отсутствие
 снимка — неполная проверка, а не разрешение читать изменяемую таблицу.
 
@@ -60,10 +61,28 @@ run_id=..., now=...)` выполняет полный `run_bronze_dq(zone='full'
   срока. Если nullable колонка ещё не создана первым write или ops-реестра нет
   к cutoff, результат этой метрики UNKNOWN; полный аудит продолжается.
   NULL first_seen в новой когорте и несовпадение с реестром дают RED.
-- `metrics.empty_by_route`: последняя complete-проверка listing каждого
-  издания, сгруппированная по `route` файла-знаменателя #1390. У `pokal`
-  доля `authoritative_empty` строго выше 5% даёт `RED`; отсутствие исхода
-  остаётся unknown. Нулевой знаменатель даёт NULL отношения.
+- `metrics.empty_by_route`: последний исход listing каждого издания,
+  сгруппированный по `route` файла-знаменателя #1390. Источники исхода:
+  прежние complete-манифесты scope и current-проверки listing из
+  `iceberg.ops.transfermarkt_current_checks_v1`. Current-проверка принимается
+  только при `check_kind='listing'`, `status='complete'`, полном покрытии
+  (`expected_ids=observed_ids`) и непустом JSON-массиве raw capture IDs;
+  к изданию она привязывается через детерминированный `scope_id`
+  манифест-доказательств. Оба источника объединяются до выбора последнего
+  исхода: один исход на издание по убыванию времени (current `checked_at`
+  против manifest `committed_at`), при равенстве — детерминированный
+  tie-break по источнику и cycle/child id, поэтому издание попадает в итоговый
+  COUNT ровно один раз. Более свежая успешная current-проверка заменяет старый
+  манифест-исход. Current `expected_ids>0` даёт `ok`; ноль даёт
+  `authoritative_empty` только при результате ровно
+  `tmapi+teilnehmer authoritative empty` или `authoritative empty source
+  listing`; остальные случаи остаются unknown. Отсутствие current-проверки
+  не создаёт `ok` и не заменяет прежний исход; failed, uncertain или неполная
+  current-проверка не маскирует прежний complete-исход. Старые pokal-издания
+  без current-проверки сохраняют прежний манифест-исход `authoritative_empty`;
+  live-перезахват не входит в этот этап, и немедленный ноль по pokal не
+  обещается. У `pokal` доля `authoritative_empty` строго выше 5% даёт `RED`;
+  отсутствие исхода остаётся unknown. Нулевой знаменатель даёт NULL отношения.
 - `metrics.career_debt`: существующее доказательство долга career fetches и
   число manifests без него. Очередь и алгоритм #1394 не меняются.
 - Ноль считается подменой неизвестного только при исходном `mv_raw` или
