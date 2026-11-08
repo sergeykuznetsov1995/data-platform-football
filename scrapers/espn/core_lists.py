@@ -52,6 +52,10 @@ class CoreSeason:
     end: date
     type_id: int | None
     type_name: str | None
+    # Raw core ``type`` value (e.g. 13502) and slug of the embedded current
+    # stage; None without one (#2108).
+    source_type_id: int | None = None
+    stage_slug: str | None = None
 
 
 def raise_on_error_body(payload: Any, field: str) -> None:
@@ -152,6 +156,8 @@ def _season_type(item: Any, field: str) -> SeasonType:
             raise EspnParseError(f"{field}.$ref is not a season type: {ref!r}")
         type_id = native_id(match.group(1), f"{field}.$ref id")
     name = node.get("name")
+    raw_source_type = node.get("type")
+    slug = node.get("slug")
     return SeasonType(
         id=type_id,
         name=required_string(name, f"{field}.name") if name is not None else None,
@@ -161,6 +167,10 @@ def _season_type(item: Any, field: str) -> SeasonType:
         end_date=_day(node["endDate"], f"{field}.endDate")
         if node.get("endDate") is not None
         else None,
+        source_type_id=native_id(raw_source_type, f"{field}.type")
+        if raw_source_type is not None
+        else None,
+        slug=required_string(slug, f"{field}.slug") if slug is not None else None,
     )
 
 
@@ -187,10 +197,14 @@ def _core_season(season: Mapping[str, Any], field: str) -> CoreSeason:
     if start > end:
         raise EspnParseError(f"{field} starts after it ends")
     type_id = type_name = None
+    source_type_id = stage_slug = None
     if season.get("type") is not None:
         current_type = _season_type(season["type"], f"{field}.type")
         type_id, type_name = current_type.id, current_type.name
-    return CoreSeason(year, display_name, start, end, type_id, type_name)
+        source_type_id, stage_slug = current_type.source_type_id, current_type.slug
+    return CoreSeason(
+        year, display_name, start, end, type_id, type_name, source_type_id, stage_slug
+    )
 
 
 def parse_league_current_season(detail: Any) -> CoreSeason:

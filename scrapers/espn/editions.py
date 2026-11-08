@@ -45,6 +45,45 @@ class EditionPlan:
     keep: tuple[EditionState, ...]
 
 
+def _with_current_stage(state: EditionState, current: CoreSeason) -> EditionState:
+    """``state`` with the core's current stage in ``types`` (#2108).
+
+    The stage merges into the entry of the same id: name/source id/slug are
+    refreshed only where the core provides them, and the recorded dates are
+    kept — the core's current type never carries dates.  A stage the state
+    has not seen is appended.  Without a current type the state is unchanged.
+    """
+
+    if current.type_id is None:
+        return state
+    existing = next(
+        (item for item in state.types if item.id == current.type_id), None
+    )
+    if existing is None:
+        stage = SeasonType(
+            id=current.type_id,
+            name=current.type_name,
+            source_type_id=current.source_type_id,
+            slug=current.stage_slug,
+        )
+        types = (*state.types, stage)
+    else:
+        stage = replace(
+            existing,
+            name=current.type_name if current.type_name is not None else existing.name,
+            source_type_id=(
+                current.source_type_id
+                if current.source_type_id is not None
+                else existing.source_type_id
+            ),
+            slug=current.stage_slug if current.stage_slug is not None else existing.slug,
+        )
+        types = tuple(
+            stage if item.id == stage.id else item for item in state.types
+        )
+    return replace(state, types=types)
+
+
 def plan_editions(
     current: CoreSeason,
     known: Sequence[EditionState],
@@ -67,17 +106,20 @@ def plan_editions(
     same = next((state for state in known if state.year == current.year), None)
     if same is None:
         open_now.append(
-            EditionState(
-                competition_slug,
-                current.year,
-                current.display_name,
-                current.start,
-                current.end,
+            _with_current_stage(
+                EditionState(
+                    competition_slug,
+                    current.year,
+                    current.display_name,
+                    current.start,
+                    current.end,
+                ),
+                current,
             )
         )
     elif not same.open:
         # Core still calls it current: it is not finished after all.
-        open_now.append(replace(same, open=True))
+        open_now.append(_with_current_stage(replace(same, open=True), current))
     for state in known:
         if state is same and not state.open:
             continue
@@ -85,6 +127,9 @@ def plan_editions(
             state.year, False
         ):
             close_now.append(replace(state, open=False))
+        elif state is same:
+            # The current edition carries the current stage in its types.
+            keep.append(_with_current_stage(state, current))
         else:
             keep.append(state)
     return EditionPlan(tuple(open_now), tuple(close_now), tuple(keep))

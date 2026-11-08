@@ -154,6 +154,7 @@ def build_competition(
         edition_state.end,
         True,
         _UNKNOWN,
+        edition_state.types,
     )
     competition = Competition(
         row.espn_id,

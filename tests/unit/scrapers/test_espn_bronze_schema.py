@@ -121,6 +121,7 @@ def test_every_contract_field_has_a_home_or_a_reason() -> None:
 @pytest.mark.unit
 def test_ensure_bronze_tables_creates_each_table_with_partitions() -> None:
     writer = MagicMock()
+    writer.table_exists.return_value = False
 
     ensure_bronze_tables(writer)
 
@@ -132,6 +133,27 @@ def test_ensure_bronze_tables_creates_each_table_with_partitions() -> None:
     for call in calls:
         assert call.args[2] is schemas[call.args[1]]
         assert call.kwargs["partition_spec"] == PARTITION_SPEC
+
+
+@pytest.mark.unit
+def test_ensure_bronze_tables_evolves_existing_tables_additively() -> None:
+    writer = MagicMock()
+    writer.table_exists.return_value = True
+
+    ensure_bronze_tables(writer)
+
+    from scrapers.espn.deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
+
+    schemas = {**TABLES, PLAYS_TABLE: PLAYS_SCHEMA}
+    # An existing table keeps its rows: only the schema is evolved (#2108).
+    assert writer.create_table_if_not_exists.call_args_list == []
+    evolved = writer._evolve_schema.call_args_list
+    assert [call.args[2] for call in evolved] == list(schemas)
+    for call in evolved:
+        assert call.args[0] is writer._get_trino_manager.return_value
+        assert call.args[1] == "bronze"
+        assert call.args[3] is schemas[call.args[2]]
+    assert writer.table_exists.call_count == len(schemas)
 
 
 @pytest.mark.unit

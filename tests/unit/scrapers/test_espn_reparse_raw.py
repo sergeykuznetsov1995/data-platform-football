@@ -1,5 +1,7 @@
 """Offline replay: exact blobs, no source transport, safe repeated replacement."""
 
+from datetime import date
+
 import csv
 import gzip
 import hashlib
@@ -98,6 +100,10 @@ def corpus(tmp_path, competition=None):
     data.setdefault("gameInfo", {})["officials"] = [
         {"displayName": "Referee", "order": 1}
     ]
+    # #2108 context: season type, group note and one substitution pair.
+    header["season"]["type"] = {"id": "31234", "type": "group", "name": "Group stage"}
+    header["competitions"][0]["altGameNote"] = "Group A"
+    data["rosters"][0]["roster"][0]["subbedInFor"] = {"athlete": {"id": "98765"}}
     for side in header["competitions"][0]["competitors"]:
         side["linescores"] = [{"value": 0}, {"value": 1}]
     for roster in data["rosters"]:
@@ -174,6 +180,8 @@ def test_exact_replay_and_idempotent_write(tmp_path, monkeypatch):
     record = report["matches"][0]
     assert record["other_variants"] == 1
     assert record["disposition"] == "lineup_anomaly"
+    assert record["raw"]["season_context"] and record["raw"]["group"]
+    assert record["raw"]["officials"] and record["raw"]["substitution_pairs"]
     assert all(
         record["parsed"][p]
         for p in (
@@ -183,6 +191,10 @@ def test_exact_replay_and_idempotent_write(tmp_path, monkeypatch):
             "commentary",
             "referee",
             "linescores",
+            "season_context",
+            "group",
+            "officials",
+            "substitution_pairs",
         )
     )
     assert report["corpus"]["raw_lineup_event_ids"] == [int(data["header"]["id"])]
@@ -195,9 +207,26 @@ def test_exact_replay_and_idempotent_write(tmp_path, monkeypatch):
         assert len(keys) == len(set(keys))
     assert len(bronze.tables["espn_match_events"]) == 2
     assert bronze.tables[MATCH_TABLE][0]["raw_sha256"] == record["selected_sha256"]
+    # The new context reaches the Bronze cells verbatim (#2108).
+    match = bronze.tables[MATCH_TABLE][0]
+    assert match["season_type_id"] == 31234
+    assert match["season_type_name"] == "Group stage"
+    assert match["group_name"] == "Group A"
+    assert (match["season_start_date"], match["season_end_date"]) == (
+        date(2026, 1, 1),
+        date(2027, 12, 31),
+    )
+    assert json.loads(match["officials_json"]) == data["gameInfo"]["officials"]
+    assert any(
+        row["replaced_athlete_id"] == 98765
+        for row in bronze.tables["espn_match_lineup"]
+    )
 
 
-@pytest.mark.parametrize("loss", ["commentary", "referee", "formation", "linescores"])
+@pytest.mark.parametrize(
+    "loss",
+    ["commentary", "referee", "formation", "linescores", "substitution_pairs"],
+)
 def test_actual_bronze_loss_is_rejected(tmp_path, loss):
     data, manifest, editions, store, add = corpus(tmp_path)
     bronze = Bronze()
@@ -210,6 +239,11 @@ def test_actual_bronze_loss_is_rejected(tmp_path, loss):
     elif loss == "formation":
         for roster in data["rosters"]:
             roster.pop("formation")
+    elif loss == "substitution_pairs":
+        for roster in data["rosters"]:
+            for player in roster["roster"]:
+                player.pop("subbedInFor", None)
+                player.pop("subbedOutFor", None)
     else:
         for side in data["header"]["competitions"][0]["competitors"]:
             side.pop("linescores")

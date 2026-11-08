@@ -279,6 +279,35 @@ def test_league_with_one_type_over_four_pages_is_written_whole(conn) -> None:
     assert _run_rows(conn) == [("idle", 380, 0, None)]
 
 
+def test_type_run_builds_the_edition_from_the_season_types(conn, monkeypatch) -> None:
+    # #2108: the EditionState of a type run carries the season's stages, so
+    # every Summary of the batch is matched against them. No live IO: the
+    # recorded bodies answer the run, the spy watches the context build.
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+    states = []
+    real_build = history.build_competition
+
+    def spy(row, state):
+        states.append(state)
+        return real_build(row, state)
+
+    monkeypatch.setattr(history, "build_competition", spy)
+
+    run = _run(client, trino, conn)
+
+    assert run.matches == 380 and run.failed == 0
+    (state,) = states
+    core, types = history.parse_season(
+        json.loads((PROBES / "season_eng1_2015.json").read_bytes())
+    )
+    assert types
+    assert state.types == types
+    assert (state.competition_slug, state.year, state.display_name) == (
+        "eng.1", 2015, core.display_name,
+    )
+    assert (state.start, state.end) == (core.start, core.end)
+
+
 def test_repeat_of_a_closed_season_makes_no_network_request(conn) -> None:
     client, trino = HistoryClient(_eng_2015()), HistoryTrino()
     _run(client, trino, conn)

@@ -26,6 +26,7 @@ from . import urls
 from .core_lists import parse_league_current_season
 from .denominator import DenominatorRow
 from .editions import EditionState, plan_editions
+from .models import SeasonType
 from .parser_common import EspnParseError
 from .transport_contracts import (
     AllOriginsBlocked,
@@ -81,6 +82,30 @@ class EditionsSnapshot:
         return next((state for state in self.of(slug) if state.year == year), None)
 
 
+def _encode_type(item: SeasonType) -> dict:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "start_date": item.start_date.isoformat() if item.start_date else None,
+        "end_date": item.end_date.isoformat() if item.end_date else None,
+        "source_type_id": item.source_type_id,
+        "slug": item.slug,
+    }
+
+
+def _decode_type(raw: Mapping) -> SeasonType:
+    start, end = raw.get("start_date"), raw.get("end_date")
+    source_type_id = raw.get("source_type_id")
+    return SeasonType(
+        id=int(raw["id"]),
+        name=raw.get("name"),
+        start_date=date.fromisoformat(start) if start else None,
+        end_date=date.fromisoformat(end) if end else None,
+        source_type_id=int(source_type_id) if source_type_id is not None else None,
+        slug=raw.get("slug"),
+    )
+
+
 def _encode(snapshot: EditionsSnapshot) -> str:
     return json.dumps(
         {
@@ -94,6 +119,7 @@ def _encode(snapshot: EditionsSnapshot) -> str:
                     "start": state.start.isoformat(),
                     "end": state.end.isoformat(),
                     "open": state.open,
+                    "types": [_encode_type(item) for item in state.types],
                 }
                 for state in snapshot.editions
             ],
@@ -120,6 +146,10 @@ def _decode(text: str) -> EditionsSnapshot:
                 item["display_name"],
                 date.fromisoformat(item["start"]),
                 date.fromisoformat(item["end"]),
+                # A file written before the types were kept has no such key.
+                types=tuple(
+                    _decode_type(raw) for raw in item.get("types", ())
+                ),
                 open=bool(item["open"]),
             )
             for item in document["editions"]
