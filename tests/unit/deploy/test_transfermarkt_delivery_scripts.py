@@ -1180,3 +1180,22 @@ def test_five_dag_old_release_requires_manual_pause_in_snapshot(stand: Stand) ->
     result = stand.probe('snapshot_ok')
     assert result.returncode != 0
     assert MANUAL in stand.log()
+
+
+@pytest.mark.unit
+def test_automat_mismatch_preserves_outcome_and_alert_when_restore_fails(delivery: Delivery) -> None:
+    delivery.put_drain(started_ago=60)
+    delivery.put("pause_fails_dag_ingest_transfermarkt", "1")
+    marker = delivery.auto / f"transfermarkt-automat-installed-{delivery.new_sha[:8]}"
+    marker.write_text("", encoding="utf-8")
+    delivery.automat.write_text(delivery.automat.read_text(encoding="utf-8") + "\n# mismatch\n", encoding="utf-8")
+
+    result = delivery.run()
+
+    assert result.returncode == 0, result.stderr + delivery.log()
+    [rec] = delivery.records().values()
+    assert rec["OUTCOME"] == "failed", delivery.records()
+    pending = (delivery.auto / "transfermarkt-pending-alert").read_text(encoding="utf-8")
+    assert "не совпадает с релизом" in pending
+    assert delivery.drain().exists()
+    assert not (delivery.auto / "transfermarkt-auto-deliver.off").exists()
