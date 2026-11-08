@@ -526,6 +526,7 @@ def parse_match_html(
     context: TypedSourceContext,
     enabled_datasets: Optional[set[str]] = None,
     require_player_contract: bool = True,
+    source_unavailable_datasets: Optional[set[str]] = None,
 ) -> MatchParseResult:
     """Parse a stored match page and attach both source-native identifiers."""
 
@@ -538,6 +539,7 @@ def parse_match_html(
         season=context.season,
         enabled_datasets=enabled_datasets,
         require_player_contract=require_player_contract,
+        source_unavailable_datasets=source_unavailable_datasets,
     )
     for dataset in result.datasets.values():
         if dataset.frame is not None and not dataset.frame.empty:

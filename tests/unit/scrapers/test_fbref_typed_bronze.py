@@ -1801,3 +1801,34 @@ def test_unscored_match_still_allows_absent_events_and_lineups():
     assert not parsed.has_errors
     assert not parsed.has_score
     assert all(d.status == DatasetStatus.NOT_APPLICABLE for d in parsed.datasets.values())
+
+
+def test_competition_source_gap_is_not_an_incomplete_match_error():
+    parsed = match_parser.parse_match_html(
+        '<div class="scorebox"><div class="score">1</div>'
+        '<div class="score">0</div></div>',
+        match_id="13351335", league="test", season=2026,
+        enabled_datasets={"match_events", "lineups"},
+        require_player_contract=False,
+        source_unavailable_datasets={"match_events", "lineups"},
+    )
+
+    assert not parsed.has_errors
+    assert parsed.has_score
+    for name in ("match_events", "lineups"):
+        assert parsed.datasets[name].status == DatasetStatus.NOT_APPLICABLE
+        assert parsed.datasets[name].reason == match_parser.COMPETITION_SOURCE_DATASET_UNAVAILABLE
+
+
+def test_competition_coverage_does_not_hide_parser_schema_drift():
+    parsed = match_parser.parse_match_html(
+        SCORED_EVENT_MATCH_HTML,
+        match_id="scored-events", league="GER-Bundesliga", season=2017,
+        enabled_datasets={"match_events"}, require_player_contract=False,
+        source_unavailable_datasets={"match_events"},
+        parser_overrides={"match_events": lambda *_a, **_k: None},
+    )
+
+    assert parsed.has_errors
+    assert parsed.datasets["match_events"].error_type == "MatchPageSchemaDriftError"
+    assert parsed.datasets["match_events"].reason == "source_container_unparsed"

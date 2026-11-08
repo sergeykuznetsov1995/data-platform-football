@@ -3551,3 +3551,32 @@ def test_version_reparse_selector_orders_current_lane_and_newest_season_first():
             stateful_parser_version="disc-v6",
             limit=1001,
         )
+
+
+def test_match_detail_coverage_combines_positive_and_exhausted_evidence():
+    executions = []
+
+    def handler(sql, params):
+        if sql.startswith("WITH populated AS"):
+            executions.append((sql, params))
+            return ([
+                {"dataset": "typed:match_events", "populated_match_count": 0,
+                 "exhausted_match_count": 2},
+                {"dataset": "typed:lineups", "populated_match_count": 3,
+                 "exhausted_match_count": 2},
+            ], 2)
+        raise AssertionError(sql)
+
+    store, _ = make_store(handler)
+    coverage = store.match_detail_coverage("45")
+
+    assert coverage == {
+        "match_events": {"populated_match_count": 0, "exhausted_match_count": 2},
+        "lineups": {"populated_match_count": 3, "exhausted_match_count": 2},
+    }
+    assert executions[0][1] == ("45", "45")
+    assert "manifest.availability = 'available'" in executions[0][0]
+    assert "manifest.row_count > 0" in executions[0][0]
+    assert "retry.exhausted_at IS NOT NULL" in executions[0][0]
+    assert "frontier.last_error_class = 'IncompleteMatchExhausted'" in executions[0][0]
+    assert "frontier.source_ids ->> 'competition_id' = %s" in executions[0][0]

@@ -6510,6 +6510,70 @@ class ControlStore:
                 WHERE target_id = %s""", (refresh, target))
             return "exhausted"
 
+    def match_detail_coverage(
+        self, competition_id: object
+    ) -> dict[str, dict[str, int]]:
+        """Combine positive and exhausted evidence for one competition (#2057).
+
+        ``populated_match_count`` counts distinct matches whose typed detail
+        dataset committed rows; ``exhausted_match_count`` counts scored
+        matches whose refetch window is spent.  Zero populated matches beside
+        exhausted ones is competition-level evidence that the source never
+        publishes that dataset there, not evidence the next fetch will.
+        """
+        normalized = _text(competition_id, "competition_id")
+        with self._transaction() as cursor:
+            cursor.execute("""
+                WITH populated AS (
+                    SELECT manifest.dataset AS dataset,
+                           count(DISTINCT manifest.target_id)
+                               AS populated_match_count
+                    FROM fbref_control.dataset_manifest AS manifest
+                    JOIN fbref_control.page_frontier AS frontier
+                      ON frontier.target_id = manifest.target_id
+                    WHERE frontier.source = 'fbref'
+                      AND frontier.page_kind = 'match'
+                      AND frontier.source_ids ->> 'competition_id' = %s
+                      AND manifest.dataset IN (
+                          'typed:match_events', 'typed:lineups')
+                      AND manifest.availability = 'available'
+                      AND manifest.row_count > 0
+                      AND manifest.parse_status = 'succeeded'
+                      AND manifest.persistence_status = 'succeeded'
+                      AND manifest.validation_status = 'succeeded'
+                    GROUP BY manifest.dataset
+                ), exhausted AS (
+                    SELECT count(DISTINCT retry.target_id)
+                               AS exhausted_match_count
+                    FROM fbref_control.incomplete_match_refetch AS retry
+                    JOIN fbref_control.page_frontier AS frontier
+                      ON frontier.target_id = retry.target_id
+                    WHERE frontier.source = 'fbref'
+                      AND frontier.page_kind = 'match'
+                      AND frontier.source_ids ->> 'competition_id' = %s
+                      AND retry.exhausted_at IS NOT NULL
+                      AND frontier.last_error_class = 'IncompleteMatchExhausted'
+                )
+                SELECT datasets.dataset AS dataset,
+                       COALESCE(populated.populated_match_count, 0)
+                           AS populated_match_count,
+                       COALESCE(exhausted.exhausted_match_count, 0)
+                           AS exhausted_match_count
+                FROM (VALUES ('typed:match_events'), ('typed:lineups'))
+                         AS datasets (dataset)
+                CROSS JOIN exhausted
+                LEFT JOIN populated
+                  ON populated.dataset = datasets.dataset
+            """, (normalized, normalized))
+            rows = _fetchall(cursor)
+        return {
+            str(row["dataset"]).removeprefix("typed:"): {
+                "populated_match_count": int(row["populated_match_count"]),
+                "exhausted_match_count": int(row["exhausted_match_count"]),
+            }
+            for row in rows
+        }
+
     def quarantine_contract_rejected_target(
         self,
         target_id: object,

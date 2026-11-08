@@ -126,7 +126,11 @@ from scrapers.fbref.typed_bronze import (
     parse_season_stats_html as parse_typed_season_stats_html,
     typed_result_requires_persistence,
 )
-from scrapers.fbref.match_parser import IncompleteMatchPageError, MatchParseResult
+from scrapers.fbref.match_parser import (
+    COMPETITION_SOURCE_DATASET_UNAVAILABLE,
+    IncompleteMatchPageError,
+    MatchParseResult,
+)
 
 
 SENTINEL_COMPETITIONS = (
@@ -265,6 +269,10 @@ MAX_DEFERRED_TARGET_FAILURES_PER_RUN = 25
 # that keeps failing is down, not blinking, and the run must end red.
 MAX_PARSE_DEFERRALS_PER_TARGET = 2
 MAX_DEFERRED_PARSE_FAILURES_PER_RUN = 25
+# A scored match missing events/lineups is a competition-level source gap only
+# when this many of the competition's own shells have exhausted their refetch
+# window while zero matches in it ever published the dataset (#2057).
+MIN_EXHAUSTED_MATCHES_FOR_SOURCE_UNAVAILABLE = 2
 # Driver error names that describe the storage under Trino blinking, not the
 # statement or the table.  Only observed names belong here; any other named
 # driver error (a USER_ERROR is SQL or schema) stays loud.
@@ -1874,11 +1882,21 @@ def _acceptance_coverage_errors(
         for dataset_name in sorted(required_typed):
             requires_rows = scored_match and dataset_name in {"typed:match_events", "typed:lineups"}
             manifest = manifests_by_target.get(target_id, {}).get(dataset_name, {})
+            source_unavailable = requires_rows and (
+                str(manifest.get("availability") or "").casefold()
+                == "not_applicable"
+                and int(manifest.get("row_count") or 0) == 0
+                and str(manifest.get("empty_reason") or "").strip()
+                == COMPETITION_SOURCE_DATASET_UNAVAILABLE
+            )
             if not _manifest_ok(
                 target_id,
                 dataset_name,
-                allow_skipped=dataset_name != "typed:__complete__" and not requires_rows,
-            ) or (requires_rows and (
+                allow_skipped=(
+                    dataset_name != "typed:__complete__"
+                    and (not requires_rows or source_unavailable)
+                ),
+            ) or (requires_rows and not source_unavailable and (
                 manifest.get("availability") != "available"
                 or int(manifest.get("row_count") or 0) <= 0
             )):
@@ -5757,6 +5775,22 @@ class FBrefPipeline:
         match_id = str(record.source_ids.get("match_id") or "").strip()
         if not match_id:
             raise TypedBronzeError("Match target has no source match_id")
+        parsed = self._parse_match_with_source_availability(
+            html, match_id=match_id, context=context
+        )
+        return parsed, match_id, context
+
+    def _parse_match_with_source_availability(
+        self, html: str, *, match_id: str, context: TypedSourceContext
+    ) -> MatchParseResult:
+        """Re-read a scored page once coverage proves its dataset is a gap.
+
+        The first parse names the datasets a scored page is missing.  Only
+        datasets this competition provably never publishes -- zero populated
+        matches while its shells keep exhausting their refetch window
+        (#2057) -- are re-read as explicit source-unavailable results; every
+        other failure keeps its fresh-fetch request.
+        """
         parsed = parse_typed_match_html(
             html,
             match_id=match_id,
@@ -5765,7 +5799,36 @@ class FBrefPipeline:
         )
         if not isinstance(parsed, MatchParseResult):
             raise TypedBronzeError("Typed match parser returned invalid result")
-        return parsed, match_id, context
+        gapped = sorted(
+            name
+            for name, dataset in parsed.datasets.items()
+            if dataset.error_type == "IncompleteMatchPageError"
+        )
+        if not gapped:
+            return parsed
+        coverage = self._match_detail_coverage(context.source_competition_id)
+        allowed = frozenset(
+            name
+            for name in gapped
+            if name in coverage
+            and int(coverage[name].get("populated_match_count") or 0) == 0
+            and int(coverage[name].get("exhausted_match_count") or 0)
+            >= MIN_EXHAUSTED_MATCHES_FOR_SOURCE_UNAVAILABLE
+        )
+        if not allowed:
+            return parsed
+        return parse_typed_match_html(
+            html,
+            match_id=match_id,
+            context=context,
+            require_player_contract=False,
+            source_unavailable_datasets=allowed,
+        )
+
+    def _match_detail_coverage(
+        self, competition_id: str
+    ) -> Mapping[str, Mapping[str, int]]:
+        return self.control.match_detail_coverage(competition_id)
 
     def _persist_preparsed_typed_match(
         self,
@@ -5921,11 +5984,10 @@ class FBrefPipeline:
                 match_id = record.source_ids.get("match_id")
                 if not match_id:
                     raise TypedBronzeError("Match target has no source match_id")
-                match = parse_typed_match_html(
+                match = self._parse_match_with_source_availability(
                     html,
                     match_id=str(match_id),
                     context=context,
-                    require_player_contract=False,
                 )
                 parsed = match.datasets
                 if match.has_errors:
