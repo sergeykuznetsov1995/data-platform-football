@@ -42,6 +42,30 @@ _RECOVERY_TRAFFIC_FIELDS = ('requests', 'retries', 'provider_up_bytes',
                             'provider_down_bytes', 'provider_metered_bytes',
                             'decoded_bytes', 'cache_hits')
 _RECOVERY_SETUP_ERROR = 'retry_budget differs from the shared traffic ledger limit'
+# A second one-time, narrowly pinned recovery: the single audited cohort
+# stranded in 'failed' AFTER paid I/O.  Portion 8 committed provider
+# requests, then RawStoreError closed the raw response write ('commit
+# failed closed'), leaving settled cumulative accounting and checkpoint
+# artifacts behind a marker that select_job rejects.  Unlike the setup
+# failure above (which happened before any paid I/O), the paid delta is
+# proven, so the failed portion-8 manifest must carry the marker's exact
+# cumulative traffic and the paused portion-7 manifest only a non-negative
+# baseline.  This does NOT claim the underlying storage cause is fixed:
+# it only re-settles the already proven failed marker into the ordinary
+# resumable 'paused' state.  This is not configurable permission to
+# recover arbitrary 'failed' markers: anything that does not match every
+# pin exactly stays rejected, and cohort age/identity checks still run
+# first (no expiry bypass).
+KNOWN_PAID_IO_FAILURE_RECOVERY = {
+    'marker_hash': 'ae445516192db8e20abd1913f0b32aa87f94dde56a5dc872eb03e1906daba66a',
+    'cohort_job_id': 'tm-discovery-job-969093c1f5efc1b1c03e59c3',
+    'paused_manifest': {'path': 'manifests/tm-registry-1e35a81110b98e8c8c42cb05/transfermarkt-discovery-6f029aacf396a61004e06bb4430c88d4366de8020eb15ca72dc83e829e6f8290.json',
+                        'hash': '6f029aacf396a61004e06bb4430c88d4366de8020eb15ca72dc83e829e6f8290'},
+    'failed_manifest': {'path': 'manifests/tm-registry-fc4a721c09916d85a55eee6b/transfermarkt-discovery-3aad3e2a2b5536f1ec007300c89ec497f610970bb2dd0097e644efadafefb914.json',
+                        'hash': '3aad3e2a2b5536f1ec007300c89ec497f610970bb2dd0097e644efadafefb914'},
+}
+_PAID_IO_RECOVERY_REASON = 'audited raw-store failure after paid I/O; re-settled as resumable paused'
+_PAID_IO_RECOVERY_ERROR = 'Transfermarkt raw response commit failed closed'
 # Counters the aggregate snapshot must prove against by_entity exactly.
 _ENTITY_COUNTER_FIELDS = ('requests', 'retries', 'provider_up_bytes',
                           'provider_down_bytes', 'decoded_bytes', 'cache_hits')
@@ -327,6 +351,97 @@ def _recover_known_setup_failure(path: Path, saved: dict[str, Any], *,
     write_job(path, saved, write)
 
 
+def _recover_known_paid_io_failure(path: Path, saved: dict[str, Any], *,
+                                   now: datetime, write: Callable) -> None:
+    """Re-settle the one audited 'failed' cohort as 'paused'.
+
+    Unlike the setup-failure recovery above, this cohort failed AFTER paid
+    I/O: portion 8's provider requests are proven, so the failed portion-8
+    manifest must carry the marker's exact cumulative traffic, while the
+    paused portion-7 manifest proves a strictly non-negative baseline for
+    every cumulative counter, aggregate and per-entity, with no entity
+    disappearing or losing counted work between the portions.  This does
+    not claim the raw-store commit failure is fixed; it only re-settles
+    the already proven failed marker into the ordinary resumable 'paused'
+    state that DiscoveryContinuation accepts with the preserved cumulative
+    traffic.  Every fact is pinned: the marker payload hash and cohort
+    job_id bind the expected artifact paths and digests, both manifest
+    envelopes are bound by exact hashes, and all three traffic snapshots
+    (active marker, paused, failed) must be complete settled snapshots.
+    Any missing, corrupt or drifted evidence fails closed without writing.
+    """
+    descriptor = KNOWN_PAID_IO_FAILURE_RECOVERY
+    if saved['job_id'] != descriptor['cohort_job_id']:
+        raise ValueError('paid-io recovery marker job_id differs from the audited cohort')
+    checkpoint = Path(saved['checkpoint_path'])
+    artifacts = saved.get('artifacts')
+    expected = {str(checkpoint), str(checkpoint.with_suffix('.failures.json'))}
+    if not isinstance(artifacts, dict) or set(artifacts) != expected:
+        raise ValueError('recovery marker artifacts do not match its checkpoint')
+    for filename, digest in artifacts.items():
+        try:
+            actual = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ValueError('recovery marker artifact is missing or unreadable') from exc
+        if actual != digest:
+            raise ValueError('recovery marker checkpoint changed after settlement')
+    root = path.parent.parent
+    paused = _read_recovery_manifest(root, descriptor['paused_manifest'])
+    failed = _read_recovery_manifest(root, descriptor['failed_manifest'])
+    if not (_settled_traffic_snapshot(saved.get('traffic'))
+            and _settled_traffic_snapshot(paused.get('traffic'))
+            and _settled_traffic_snapshot(failed.get('traffic'))):
+        raise ValueError('paid-io recovery traffic is not a complete settled snapshot')
+    if (paused.get('status') != 'paused'
+            or paused.get('portion') != saved['portion'] - 1):
+        raise ValueError('recovery paused evidence does not match the failed cohort')
+    error = failed.get('error') or {}
+    if (failed.get('status') != 'failed'
+            or error.get('type') != 'RawStoreError'
+            or error.get('message') != _PAID_IO_RECOVERY_ERROR
+            or failed.get('source_status') != 'failed'
+            or failed.get('writes') != []
+            or (failed.get('write_status') or {}).get('attempted') is not False
+            or failed.get('run_id') != saved.get('last_run_id')):
+        raise ValueError('recovery failure evidence does not match the failed cohort')
+    # The failed portion did the paid I/O: its cumulative traffic must equal
+    # the marker's exactly, and the paused baseline must never exceed it —
+    # every cumulative counter grows non-negatively between portion 7 and 8,
+    # aggregate and per-entity, and no entity may disappear or shrink.
+    active_traffic = saved['traffic']
+    paused_traffic = paused['traffic']
+    failed_traffic = failed['traffic']
+    for field in _RECOVERY_TRAFFIC_FIELDS:
+        if failed_traffic[field] != active_traffic[field]:
+            raise ValueError('recovery failed traffic differs from the marker')
+        if active_traffic[field] < paused_traffic[field]:
+            raise ValueError('recovery traffic delta between paused and active is negative')
+    paused_entities = paused_traffic['by_entity']
+    active_entities = active_traffic['by_entity']
+    if set(failed_traffic['by_entity']) != set(active_entities):
+        raise ValueError('recovery failed traffic entities differ from the marker')
+    for entity, item in failed_traffic['by_entity'].items():
+        if any(item[field] != active_entities[entity][field]
+               for field in _ENTITY_COUNTER_FIELDS):
+            raise ValueError('recovery failed traffic differs from the marker')
+    if not set(paused_entities).issubset(active_entities):
+        raise ValueError('recovery traffic lost a paused entity between portions')
+    for entity, item in active_entities.items():
+        if entity in paused_entities and any(
+                item[field] < paused_entities[entity][field]
+                for field in _ENTITY_COUNTER_FIELDS):
+            raise ValueError('recovery per-entity traffic delta between paused and active is negative')
+    # Preserve portion, started_at, identity, traffic, artifacts, job_id,
+    # checkpoint_path and last_run_id exactly; only the status, update time
+    # and recovery provenance change.
+    saved.update(status='paused', updated_at=now.isoformat(),
+                 recovery={'reason': _PAID_IO_RECOVERY_REASON,
+                           'marker_hash': descriptor['marker_hash'],
+                           'paused_manifest_hash': descriptor['paused_manifest']['hash'],
+                           'failed_manifest_hash': descriptor['failed_manifest']['hash']})
+    write_job(path, saved, write)
+
+
 def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Callable) -> dict[str, Any]:
     """Keep one grant across slots; a new calendar slot never renews its caps."""
     # Compute the fresh cohort's job_id once, up front: it is both the
@@ -378,6 +493,12 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
                 if (saved['status'] == 'running'
                         and stable_payload_hash(saved) == KNOWN_SETUP_FAILURE_RECOVERY['marker_hash']):
                     _recover_known_setup_failure(path, saved, now=now, write=write)
+                    return saved
+                # Same one-time pattern, pinned to the single audited
+                # raw-store 'failed' marker (paid I/O already done).
+                if (saved['status'] == 'failed'
+                        and stable_payload_hash(saved) == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
+                    _recover_known_paid_io_failure(path, saved, now=now, write=write)
                     return saved
                 if saved['status'] not in {'ready', 'paused', 'source_complete'}:
                     raise ValueError('active discovery cohort has unresolved traffic or writes')
