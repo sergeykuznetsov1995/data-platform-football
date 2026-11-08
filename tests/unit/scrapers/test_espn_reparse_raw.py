@@ -130,7 +130,7 @@ def corpus(tmp_path, competition=None):
     store = EspnRawStore.from_uri((tmp_path / "raw").as_uri())
     manifest = tmp_path / "ledger.csv"
 
-    def add(payload, fetched="2026-08-02 00:00:00"):
+    def add(payload, fetched="2026-08-02 00:00:00", event_id=None):
         body = json.dumps(payload).encode()
         sha = hashlib.sha256(body).hexdigest()
         path = Path(store.root) / f"blobs/sha256/{sha[:2]}/{sha}.json.gz"
@@ -143,7 +143,7 @@ def corpus(tmp_path, competition=None):
                     f"{cid}:{year}",
                     cid,
                     year,
-                    header["id"],
+                    event_id if event_id is not None else header["id"],
                     path.as_uri(),
                     sha,
                     fetched,
@@ -601,3 +601,28 @@ def test_replay_after_deep_publication_preserves_cells(tmp_path):
     assert bronze.tables[MATCH_TABLE][0]["deep_state"] == "completed"
     assert bronze.tables[PLAYS_TABLE] == plays
     assert all(row["deep_stats_json"] is not None for row in bronze.tables["espn_team_stats"])
+
+
+def test_batch_readback_is_shared_by_two_matches(tmp_path, monkeypatch):
+    data, manifest, editions, store, add = corpus(tmp_path)
+    second = json.loads(json.dumps(data))
+    second["header"]["id"] = str(int(data["header"]["id"]) + 1)
+    add(second, "2026-08-02 00:00:01", event_id=second["header"]["id"])
+    bronze = Bronze()
+    readbacks = []
+    original = replay._read_tables
+
+    def spy(trino, slug, year, event_ids):
+        readbacks.append(list(event_ids))
+        return original(trino, slug, year, event_ids)
+
+    monkeypatch.setattr(replay, "_read_tables", spy)
+    report = replay.run(manifest, editions, store=store, trino=bronze, batch_size=2)
+    expected_ids = sorted(int(data["header"]["id"]) + offset for offset in (0, 1))
+    assert readbacks == [expected_ids]
+    assert [r["outcome"] for r in report["matches"]] == ["written", "written"]
+    assert len(report["receipts"]) == 1
+    assert sorted(r["event_id"] for r in bronze.tables[MATCH_TABLE]) == expected_ids
+    for table, rows in bronze.tables.items():
+        keys = [tuple(r[k] for k in NATURAL_KEYS[table]) for r in rows]
+        assert len(keys) == len(set(keys))
