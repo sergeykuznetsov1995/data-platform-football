@@ -18,9 +18,9 @@ from utils import bronze_compaction_direct as direct
 
 @pytest.fixture
 def host(tmp_path, monkeypatch):
-    now = datetime(2026, 10, 28, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 28, 3, tzinfo=timezone.utc)
     monkeypatch.setattr(direct, "_now", lambda: now)
-    monkeypatch.setattr(compaction, "nightly_deadline", lambda: now.replace(hour=2))
+    monkeypatch.setattr(compaction, "nightly_deadline", lambda: now.replace(hour=5))
     # The executor's watchdog uses wall time independently of the driver clock.
     monkeypatch.setattr(compaction.time, "time", lambda: now.timestamp())
     for key in ("TRINO_USER", "TRINO_PASSWORD", "FBREF_CONTROL_DB_URI"):
@@ -55,7 +55,7 @@ def host(tmp_path, monkeypatch):
     args = SimpleNamespace(table=["espn_match"], apply=True, portions=2, bytes=1000,
                            state_file=tmp_path / "state.json", journal=tmp_path / "journal",
                            stop_file=tmp_path / "stop")
-    return args, now.replace(hour=2), connections, alters, offsets
+    return args, now.replace(hour=5), connections, alters, offsets
 
 
 def summary(args):
@@ -223,12 +223,12 @@ def test_maintenance_query_requires_exact_daily_and_no_running(monkeypatch):
         return connection
 
     monkeypatch.setitem(sys.modules, "psycopg2", SimpleNamespace(connect=connect))
-    assert direct._maintenance_ready("dsn", datetime(2026, 10, 28, 1, tzinfo=timezone.utc))
+    assert direct._maintenance_ready("dsn", datetime(2026, 10, 28, 4, tzinfo=timezone.utc))
     sql, params = statements[0]
     assert sql.count("NOT EXISTS") == 2 and "AND EXISTS" not in sql
     assert "NOT IN ('success', 'failed')" in sql and "state = 'running'" in sql
     assert "dag_iceberg_maintenance'" in sql
-    assert params == (datetime(2026, 10, 27, 0, tzinfo=timezone.utc),)
+    assert params == (datetime(2026, 10, 27, 3, tzinfo=timezone.utc),)
     assert settings == [dict(readonly=True, autocommit=True)]
 
 
@@ -257,7 +257,7 @@ def test_cli_direct_uses_full_window_by_default(host, monkeypatch):
     class Clock:
         @staticmethod
         def now(_):
-            return deadline.replace(hour=0)
+            return deadline.replace(hour=3)
 
     monkeypatch.setattr(cli, "datetime", Clock)
     calls = []
@@ -293,7 +293,7 @@ c.nightly_deadline = lambda: end
 class Clock:
     @staticmethod
     def now(_):
-        return now.replace(hour=0)
+        return now.replace(hour=3)
 cli.datetime = Clock
 d._maintenance_ready = lambda *_: True
 c.maintenance._get_trino_connection = lambda **kw: SimpleNamespace(close=lambda: None)
@@ -359,6 +359,69 @@ def test_missing_daily_waits_until_deadline_without_work(host, monkeypatch):
     assert direct.run_direct(args, deadline) == 0
     assert not connections and not alters
     assert summary(args)["stop_reason"] == "deadline"
+
+
+def test_busy_fbref_defers_to_espn_without_wait_or_budget(host, monkeypatch):
+    from scrapers.fbref.control import StateConflict
+
+    args, deadline, _, alters, _ = host
+    args.table = ["espn_match", "fbref_schedule"]
+
+    @contextmanager
+    def busy_fbref(enabled, *_):
+        if enabled:
+            raise StateConflict("FBref publication is locked by another control run")
+        yield lambda: None
+
+    monkeypatch.setattr(compaction, "_publication_fence", busy_fbref)
+    sleeps = []
+    monkeypatch.setattr(direct.time, "sleep", lambda s: sleeps.append(s))
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters] == ["espn_match", "espn_match"]
+    state = json.loads(args.state_file.read_text())
+    assert state["queue"] == ["fbref_schedule", "espn_match"]
+    assert state["portions"] == 2 and state["input_bytes"] == 40
+    assert not sleeps
+    assert summary(args)["stop_reason"] == "budget"
+
+
+def test_fbref_only_busy_pauses_60s_until_deadline(host, monkeypatch):
+    from scrapers.fbref.control import StateConflict
+
+    args, deadline, _, alters, _ = host
+    args.table = ["fbref_schedule"]
+    attempts = []
+
+    @contextmanager
+    def busy(*_):
+        attempts.append(1)
+        raise StateConflict("FBref publication is locked by another control run")
+        yield
+
+    monkeypatch.setattr(compaction, "_publication_fence", busy)
+    current = [deadline.replace(hour=3)]
+
+    def advance(seconds):
+        current[0] += timedelta(seconds=seconds)
+
+    sleeps = []
+
+    def pause(seconds):
+        sleeps.append(seconds)
+        advance(seconds)
+
+    monkeypatch.setattr(direct, "_now", lambda: current[0])
+    monkeypatch.setattr(direct.time, "sleep", pause)
+    assert direct.run_direct(args, deadline) == 0
+    assert set(sleeps) == {60} and len(sleeps) == 120
+    assert len(attempts) == 120
+    assert not alters
+    result = summary(args)
+    assert result["stop_reason"] == "deadline" and result["exit_code"] == 0
+    assert result["portions"] == 0
+    state = json.loads(args.state_file.read_text())
+    assert state["queue"] == ["fbref_schedule"]
+    assert state["portions"] == 0 and state["input_bytes"] == 0
 
 
 @pytest.mark.parametrize("apply", [False, True])

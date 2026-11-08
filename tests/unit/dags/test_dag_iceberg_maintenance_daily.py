@@ -21,7 +21,7 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
 
     assert mod.dag._dag_kwargs["max_active_runs"] == 1
     assert mod.dag._dag_kwargs["max_active_tasks"] == 1
-    assert mod.dag._dag_kwargs["schedule"] == "0 0 * * *"
+    assert mod.dag._dag_kwargs["schedule"] == "0 3 * * *"
     assert tasks["janitor_fbref_generic_stages"]._init_kwargs[
         "execution_timeout"
     ] == timedelta(minutes=120)

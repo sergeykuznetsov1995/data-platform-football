@@ -207,7 +207,7 @@ def test_cli_refuses_outside_window(tmp_path, monkeypatch, hour):
 def test_cli_in_window_runs_dry_by_default(tmp_path, monkeypatch):
     from utils import bronze_compaction_direct as direct
 
-    _clock(monkeypatch, 0)
+    _clock(monkeypatch, 3)
     for key in ("TRINO_USER", "TRINO_PASSWORD", "FBREF_CONTROL_DB_URI"):
         monkeypatch.setenv(key, "secret")
     monkeypatch.setattr(direct, "_maintenance_ready", lambda *_: True)
@@ -216,7 +216,7 @@ def test_cli_in_window_runs_dry_by_default(tmp_path, monkeypatch):
                         lambda f, **kw: calls.append(kw) or {"exit_code": 0})
     assert cli.main(_cli_args(tmp_path, "--table", "a", "--seconds", "600")) == 0
     assert calls[0]["dry_run"] is True and calls[0]["only"] == ["a"]
-    assert calls[0]["deadline"] == datetime(2026, 11, 4, 0, 20, tzinfo=timezone.utc)
+    assert calls[0]["deadline"] == datetime(2026, 11, 4, 3, 20, tzinfo=timezone.utc)
 
     monkeypatch.setattr(direct, "_maintenance_ready", lambda *_: False)
     assert cli.main(_cli_args(tmp_path, "--apply")) == 1
@@ -224,7 +224,7 @@ def test_cli_in_window_runs_dry_by_default(tmp_path, monkeypatch):
 
 
 def test_cli_default_budget_leaves_room_for_bronze_compaction():
-    """Review of #2135: ops cleanup must not eat the whole 00:00-02:00 UTC window."""
+    """Review of #2135: ops cleanup must not eat the whole 03:00-05:00 UTC window."""
     import re
     from pathlib import Path
 
