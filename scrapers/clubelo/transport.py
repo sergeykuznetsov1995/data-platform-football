@@ -5,8 +5,10 @@ pages. This transport is the single, polite way to fetch them:
 
 - https only, ``Accept-Encoding: gzip`` (brotli is not needed, R-53);
 - a white list of paths: ``/Ranking``, ``/Results``, ``/login/`` and a single
-  path segment ``/{slug}``. Anything else (``/{slug}/Results`` answers 500,
-  M-14) raises ``ValueError`` before a request is made;
+  path segment ``/{slug}`` (a literal space in the slug is allowed and sent
+  as ``%20``: ``/Porto B`` → ``/Porto%20B``). Anything else
+  (``/{slug}/Results`` answers 500, M-14) raises ``ValueError`` before a
+  request is made;
 - one request per ``min_interval`` seconds in one thread (a parameter, not a
   ``rate_limiter.py`` preset);
 - redirects are NOT followed: a club without a page answers ``302 → /``, the
@@ -41,6 +43,7 @@ import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -50,7 +53,10 @@ BASE_URL = "https://clubelo.com"
 FIXED_PATHS = frozenset({"/Ranking", "/Results", "/login/"})
 # One path segment: no "/", "\\", query, fragment or percent-escape (an
 # escaped "%2F" or "%2e%2e" would smuggle a second segment or a dot-segment).
-_SLUG_PATH = re.compile(r"^/[^/\\?#%\s]+$")
+# A literal space is the only whitespace a slug may carry ("/Porto B"); every
+# other whitespace stays forbidden and control characters are rejected in
+# ``check_path`` — the space itself is quoted as "%20" on the wire.
+_SLUG_PATH = re.compile(r"^/(?:[^/\\?#%\s]| )+$")
 BLOCK_STATUSES = frozenset({403, 429})
 BOOTSTRAP_ATTEMPTS = 3
 BOOTSTRAP_RETRY_PAUSE = 10.0
@@ -78,13 +84,37 @@ def get_source(source: str = "html") -> str:
 
 
 def check_path(path: str) -> str:
-    """Return ``path`` if it is on the white list, else raise ``ValueError``."""
+    """Return ``path`` if it is on the white list, else raise ``ValueError``.
+
+    The logical path is validated exactly as given: percent-escapes stay
+    forbidden (no ``%2F``, ``%2e%2e`` or double-encoded input can slip
+    through), and a literal space is the only whitespace a slug may carry
+    (``/Porto B``); control characters fail closed.
+    """
 
     if path in FIXED_PATHS:
         return path
-    if _SLUG_PATH.match(path) and path.strip("/."):
+    if (
+        _SLUG_PATH.match(path)
+        and path.strip("/. ")
+        and all(ord(ch) > 0x1F and ord(ch) != 0x7F for ch in path)
+    ):
         return path
     raise ValueError(f"path is not on the ClubElo white list: {path!r}")
+
+
+def http_path(path: str) -> str:
+    """A white-listed logical path as it goes on the wire.
+
+    ``check_path`` forbids ``%``, so nothing here can decode or re-escape an
+    input escape: the literal space of ``/Porto B`` is quoted as ``%20`` and
+    any non-ASCII slug character as its standard UTF-8 quoting; fixed paths
+    and plain slugs pass through unchanged.
+    """
+
+    if path in FIXED_PATHS:
+        return path
+    return quote(path, safe="/")
 
 
 @dataclass(frozen=True)
@@ -256,7 +286,9 @@ class ClubEloTransport:
         check_path(path)
         if self._closed:
             raise ClubEloBlocked("ClubElo transport is closed")
-        url = self.base_url + path
+        # The wire URL quotes the slug ("/Porto B" → "/Porto%20B"); ``Page``
+        # and the raw store keep the logical path as identity.
+        url = self.base_url + http_path(path)
         last_error = ""
         for attempt in range(self.retries + 1):
             if attempt:

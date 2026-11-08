@@ -196,6 +196,45 @@ def test_500_after_retries_is_failed():
     assert history.exit_code(result) == 1
 
 
+def test_transport_value_error_fails_one_slug_and_the_next_still_runs():
+    session = FakeSession({"/riverplate": fixture_response("club_riverplate.html.gz")})
+    transport = ClubEloTransport(session, min_interval=0, retry_pause=0, sleep=no_sleep)
+    store = MemoryStore()
+    run = history._Run(transport, store, "test-batch")
+    run.club("%2e%2e")  # rejected by the white list before any request
+    run.club("riverplate")
+    run.flush()
+    manifest = {r["slug"]: r for r in _manifest_new(store)}
+    assert manifest["%2e%2e"]["status"] == "failed"
+    assert "white list" in manifest["%2e%2e"]["error"]
+    assert manifest["riverplate"]["status"] == "done"
+    # only the good slug reached the HTTP session, and no run-level error
+    assert [c["path"] for c in session.calls] == ["/riverplate"]
+    assert (run.result["pages_ok"], run.result["pages_failed"]) == (1, 1)
+    assert run.result["error"] is None and history.exit_code(run.result) == 1
+
+
+def test_space_slug_porto_b_runs_end_to_end_via_canonical_alias():
+    html = fixture_html("club_riverplate.html.gz").replace(
+        '<h1><a href="/2026-09-22/riverplate">', '<h1><a href="/2026-09-22/fc-porto-b">')
+    assert html != fixture_html("club_riverplate.html.gz")
+    session = FakeSession({"/Porto%20B": gzip_response(html)})
+    transport = ClubEloTransport(session, min_interval=0, retry_pause=0, sleep=no_sleep)
+    store = MemoryStore()
+    run = history._Run(transport, store, "test-batch")
+    run.club("Porto B")
+    run.flush()
+    # the wire URL is quoted; raw page and manifest keep the logical identity
+    assert [c["path"] for c in session.calls] == ["/Porto%20B"]
+    manifest = _manifest_new(store)[0]
+    assert (manifest["slug"], manifest["status"]) == ("Porto B", "done")
+    raw = [r for r in store.rows(history.RAW_TABLE) if r["page"] == "/Porto B"][0]
+    assert gzip.decompress(raw["body"]).decode("utf-8") == html
+    points = [p for p in store.rows(history.POINT_TABLE) if p["slug"] == "Porto B"]
+    assert points and all(p["captured_rating_date"] == date(2026, 9, 22) for p in points)
+    assert (run.result["pages_ok"], run.result["pages_failed"]) == (1, 0)
+
+
 def test_batches_commit_separately():
     result, store, _, _ = _run(_answers(), CLUBS, batch_size=3)
     assert result["batches"] == 2

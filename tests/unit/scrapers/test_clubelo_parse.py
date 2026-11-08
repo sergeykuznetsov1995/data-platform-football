@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from scrapers.clubelo.parse import LayoutChanged, parse_club_page, parse_ranking_slugs
+from scrapers.clubelo.parse import H1_SLUG_ALIASES, LayoutChanged, parse_club_page, parse_ranking_slugs
 from tests.unit.scrapers.clubelo_fakes import fixture_html
 
 RATING_DATE = date(2026, 9, 22)
@@ -261,6 +261,31 @@ def test_header_of_14_th_required(riverplate_html):
 def test_h1_of_another_page_fails_closed(riverplate_html):
     with pytest.raises(LayoutChanged, match="expected 'boca'"):
         parse_club_page(riverplate_html, "boca")
+
+
+def _h1_pointing_at(html: str, page_slug: str) -> str:
+    old = '<h1><a href="/2026-09-22/riverplate">'
+    assert old in html
+    return html.replace(old, f'<h1><a href="/2026-09-22/{page_slug}">')
+
+
+@pytest.mark.parametrize("slug, page_slug", sorted(H1_SLUG_ALIASES.items()))
+def test_confirmed_h1_aliases_are_accepted(riverplate_html, slug, page_slug):
+    page = parse_club_page(_h1_pointing_at(riverplate_html, page_slug), slug)
+    assert page.captured_rating_date == RATING_DATE
+    assert page.club_name == "River Plate"
+
+
+@pytest.mark.parametrize("slug, page_slug", [
+    ("Vicenza", "vicenza"),           # renamed again: not the confirmed pair
+    ("riverplate", "l-r-vicenza"),    # a canonical slug of someone else's pair
+    ("l-r-vicenza", "Vicenza"),       # the alias direction is not reversible
+    ("Juventude", "criciuma-sc"),     # canonical slug of a foreign pair
+    ("Porto B", "riverplate"),
+])
+def test_unconfirmed_h1_mismatch_still_fails_closed(riverplate_html, slug, page_slug):
+    with pytest.raises(LayoutChanged, match="h1 points"):
+        parse_club_page(_h1_pointing_at(riverplate_html, page_slug), slug)
 
 
 def test_dateless_h1_parses_with_captured_date_none(riverplate_html):

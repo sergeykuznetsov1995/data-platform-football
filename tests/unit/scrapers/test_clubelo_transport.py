@@ -42,7 +42,9 @@ def _transport(session, clock=None, **kw):
     return ClubEloTransport(session, sleep=clock.sleep, clock=clock.time, **kw)
 
 
-@pytest.mark.parametrize("path", ["/Ranking", "/Results", "/login/", "/riverplate", "/santos-fc_2"])
+@pytest.mark.parametrize(
+    "path", ["/Ranking", "/Results", "/login/", "/riverplate", "/santos-fc_2", "/Porto B"]
+)
 def test_white_list_accepts(path):
     assert check_path(path) == path
 
@@ -52,6 +54,41 @@ def test_white_list_accepts(path):
              "/.", "/...", "/Arsenal%2FResults", "/%2e%2e", "/a\\b", "/a#b"]
 )
 def test_white_list_rejects_before_any_request(path):
+    session = FakeSession({})
+    with pytest.raises(ValueError):
+        _transport(session).get(path)
+    assert session.calls == []
+
+
+def test_space_slug_is_sent_quoted_and_page_path_stays_logical():
+    session = FakeSession({"/Porto%20B": FakeResponse(200, b"<html>x</html>")})
+    transport = _transport(session)
+    page = transport.get("/Porto B")
+    assert check_path("/Porto B") == "/Porto B"
+    assert [call["path"] for call in session.calls] == ["/Porto%20B"]
+    assert page.path == "/Porto B" and page.body == b"<html>x</html>"
+
+
+def test_non_ascii_slug_is_utf8_quoted():
+    session = FakeSession({"/K%C3%B8benhavn": FakeResponse(200, b"<html>x</html>")})
+    page = _transport(session).get("/København")
+    assert [call["path"] for call in session.calls] == ["/K%C3%B8benhavn"]
+    assert page.path == "/København"
+
+
+@pytest.mark.parametrize("path", [
+    "/Porto%20B",        # input percent-escape: never decoded or accepted
+    "/Porto B/extra",    # a space does not re-open a second segment
+    "/Porto B?x=1",
+    "/Porto B#frag",
+    "/Porto B%x",
+    "/Porto B\\x",
+    "/Porto\tB", "/Porto\nB", "/Porto\rB", "/Porto\vB", "/Porto\fB",
+    "/Porto\xa0B",       # NBSP and other unicode whitespace stay forbidden
+    "/Porto\x00B", "/Porto\x7fB",  # control characters and DEL
+    "/ ",
+])
+def test_space_slug_rejects_forbidden_variants_before_any_request(path):
     session = FakeSession({})
     with pytest.raises(ValueError):
         _transport(session).get(path)

@@ -277,13 +277,35 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
     return rows
 
 
+# Ten saved club pages keep their legacy requested slug while the single h1
+# anchor already links the renamed canonical slug; "Porto B" → "fc-porto-b"
+# is confirmed by the current daily /Ranking (the page itself was not yet
+# requested in the failed run). Exact pairs only, no name normalization or
+# case aliasing: any other requested-slug → h1 mismatch stays LayoutChanged.
+H1_SLUG_ALIASES = {
+    "Vicenza": "l-r-vicenza",
+    "Juventude": "juventude-rs",
+    "Criciuma": "criciuma-sc",
+    "VilaNovaGO": "vila-nova-go",
+    "CRBrasil": "cr-brasil-al",
+    "Cuiaba": "cuiaba-mt",
+    "Nautico": "lsapi-3966",
+    "Londrina": "londrina-pr",
+    "SportingB": "sporting-cp-b",
+    "BenficaB": "sl-benfica-b",
+    "Porto B": "fc-porto-b",
+}
+
+
 def parse_club_page(html: str, slug: str) -> ClubPage:
     """Parse ``/{slug}``: h1, header, vega points, last-16 match table.
 
     The h1 is either the linked ``<h1><a href="/<date>/<slug>">`` (its ISO date
     becomes ``captured_rating_date``) or a single non-empty ``<h1>Club</h1>``
     without a link and without a date (``captured_rating_date is None``); every
-    other h1 shape fails closed.
+    other h1 shape fails closed. A linked h1 may point at the exact canonical
+    alias of the requested slug (``H1_SLUG_ALIASES``, confirmed pairs only);
+    any other mismatch fails closed.
     """
 
     doc = lxml_html.fromstring(html)
@@ -309,7 +331,9 @@ def parse_club_page(html: str, slug: str) -> ClubPage:
             raise LayoutChanged("h1 rating date not found")
         captured: Optional[date] = _iso_date(match.group(1), "h1 date")
         page = match.group(2)
-        if page != slug:
+        # Exact slug, or the exact confirmed alias pair; anything else
+        # (including a canonical slug of someone else's pair) fails closed.
+        if page != slug and H1_SLUG_ALIASES.get(slug) != page:
             raise LayoutChanged(f"h1 points to {page!r}, expected {slug!r}")
     else:
         # Dateless variant: a single non-empty ``<h1>Club</h1>`` without any
