@@ -50,8 +50,9 @@ DEFAULT_POOL = "default_pool"   # пул Airflow, не наш: в pools.json е�
 ARCHIVE_PATHS = ("deploy/espn", "scrapers", "configs/espn")
 # Пути контура сверх замыкания импортов DAG: код доставки и данные, которые читает код.
 STATIC_PATHS = ("deploy/espn", "configs/espn")
-# Точки входа вне DAG, которые исполняются из смонтированного кода (замер темпа #1510).
-ENTRY_MODULES = ("scrapers/espn/measure_pace.py",)
+# Точки входа вне DAG, которые исполняются из смонтированного кода (замер темпа #1510
+# и offline replay #2108).
+ENTRY_MODULES = ("scrapers/espn/measure_pace.py", "scrapers/espn/reparse_raw.py")
 # Байты в контейнере = корню релиза: путь в корне → путь в контейнере.
 BYTE_CHECK = {"deploy/espn/dags": "/opt/airflow/dags", "scrapers/espn": "/opt/airflow/scrapers/espn"}
 DAGS_TARGET = "/opt/airflow/dags"
