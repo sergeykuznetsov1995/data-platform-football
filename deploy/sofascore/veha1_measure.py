@@ -16,8 +16,9 @@
 
 Знаменатель — class == core в <SOFASCORE_RELEASE_ROOT>/configs/sofascore/denominator.tsv
 (из /etc/data-platform/sofascore.env читается только строка SOFASCORE_RELEASE_ROOT=).
-Матч → турнир: партиция SS-<id> (полоса SS) или tournament_unique_tournament_id расписания
-для партиций реестра дейли (ENG-… и т. п., полоса daily). Trino — только trino-ro.sh.
+Матч → турнир: партиция SS-<id> (полоса SS) важнее; при её отсутствии —
+tournament_unique_tournament_id расписания для партиций реестра дейли (ENG-… и т. п.,
+полоса daily). Trino — только trino-ro.sh.
 Вердикт позднего finished (#2094) — по ключу visits артефактов обхода афиши
 <SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR>/refresh-results/schedule-refresh-*.json.
 Пишет только в /root/watchdog/state/sofascore_veha1/.
@@ -126,11 +127,11 @@ def _int(value: str | None) -> int | None:
 
 
 def game_tournament(ss_league: str | None, reg_league: str | None, tut: str | None):
-    """(tournament_id, lane, league): партиция реестра дейли важнее SS."""
-    if reg_league:
-        return _int(tut), "daily", reg_league
+    """(tournament_id, lane, league): партиция SS (полоса актуалки) важнее дейли."""
     if ss_league and ss_league.startswith("SS-"):
         return int(ss_league[3:]), "SS", ss_league
+    if reg_league:
+        return _int(tut), "daily", reg_league
     return None, None, ss_league or reg_league
 
 

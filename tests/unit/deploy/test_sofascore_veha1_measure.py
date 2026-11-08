@@ -182,3 +182,9 @@ def test_sweep_verdict_source_late_vs_our_sweep_late(tmp_path, monkeypatch):
     assert verdict(None)["late_reason"] == "no_tournament"
     rec = {"start_ts": start + 10 * 86400, "prev_observe_at": start + 11 * 86400, "tournament_id": 7, "season": "2627"}
     assert measure.sweep_verdict(rec, visits, logs)["late_reason"] == "no_visit_log"
+
+
+def test_game_tournament_prefers_ss_partition_and_falls_back_to_daily():
+    # #1370: партиция SS-<id> (полоса актуалки) важнее дейли-реестра.
+    assert measure.game_tournament("SS-17", "ENG-Premier League", "17") == (17, "SS", "SS-17")
+    assert measure.game_tournament(None, "ENG-Premier League", "17") == (17, "daily", "ENG-Premier League")

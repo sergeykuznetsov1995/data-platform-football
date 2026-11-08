@@ -113,8 +113,8 @@ x-ss-airflow-common: &ss-airflow-common
   volumes:
     # Везде длинный синтаксис + create_host_path: false: отсутствующий источник —
     # ошибка запуска, а не молча созданный Docker'ом пустой каталог.
-    # DagBag = dags/ дерева релиза. Мини-DAG контура (dag_trigger_sofascore_daily,
-    # dag_sofascore_manifest_maintenance) лежат в dags/ репозитория; на общем
+    # DagBag = dags/ дерева релиза. Мини-DAG контура (dag_sofascore_manifest_maintenance,
+    # dag_sofascore_schedule_maintenance) лежат в dags/ репозитория; на общем
     # scheduler'е их прячет dags/.airflowignore, здесь его накрывает свой блок-лист.
     - type: bind
       source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/dags

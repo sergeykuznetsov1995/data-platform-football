@@ -14,6 +14,7 @@ from pathlib import Path
 from .refresh_evidence import _instant, _integer
 
 DAILY_TAIL_BASIS = "registry:tournaments.json (дейли до #1370)"
+ALL_MEN_TAIL_BASIS = "registry:tournaments.json + all-men refresh (#1370)"
 DENOMINATOR = Path(__file__).resolve().parents[2] / "configs/sofascore/denominator.tsv"
 PRIMARY = "ENG-Premier League"
 # Existing runner counters, paired with their actual Bronze MERGE targets.
@@ -29,7 +30,8 @@ COUNTERS = {
 
 def configured_tournaments(path=DENOMINATOR):
     with Path(path).open(newline="") as stream:
-        rows = [r for r in csv.DictReader(stream, delimiter="\t") if r["basis"] == DAILY_TAIL_BASIS]
+        rows = [r for r in csv.DictReader(stream, delimiter="\t")
+                if r["basis"] in (DAILY_TAIL_BASIS, ALL_MEN_TAIL_BASIS)]
     result = {r["capture_key"]: int(r["tournament_id"]) for r in rows}
     if len(rows) != 7 or len(result) != 7 or len(set(result.values())) != 7:
         raise ValueError("configured tail denominator must contain exactly seven tournaments")

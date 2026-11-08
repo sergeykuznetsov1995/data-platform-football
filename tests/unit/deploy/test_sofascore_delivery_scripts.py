@@ -272,7 +272,7 @@ exec /usr/bin/flock "$@"
         self.put("started", "2026-09-03T00:00:00.000000000Z")
         self.put("mounts_root", str(self.old_tree))
         self.put("mounts_sched_root", str(self.old_tree))
-        self.put("dags", "6")
+        self.put("dags", "4")
         self.put("import_error", "0")
         self.put("busy", "0")
         self._flock_stub()
@@ -1980,7 +1980,7 @@ def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
 
 @pytest.mark.unit
 @pytest.mark.parametrize("has_compaction,registered,expected", [
-    (True, 6, "0"), (True, 7, "1"), (False, 6, "1"),
+    (True, 6, "0"), (True, 5, "1"), (False, 4, "1"),
 ])
 def test_acceptance_requires_compaction_only_for_releases_containing_it(
     tmp_path: Path, has_compaction: bool, registered: int, expected: str,
@@ -2007,7 +2007,7 @@ metadb(){
       echo "$1" > "$SQL_LOG"
       case "$1" in
         *dag_sofascore_schedule_maintenance*) echo "$REGISTERED" ;;
-        *) echo 6 ;;
+        *) echo 4 ;;
       esac ;;
     *) echo 0 ;;
   esac
@@ -2082,19 +2082,22 @@ def test_three_failed_attempts_in_one_day_shut_the_automaton_off(stand: Stand) -
 
 @pytest.mark.unit
 def test_the_busy_check_and_the_deadline_ask_the_metadb_about_the_right_dags(stand: Stand) -> None:
-    """Занятость — с триггерами дейли и её хвоста (их прогон запускает dag_ingest_sofascore);
-    дедлайн — по расписаниям актуалки, триггеров и обслуживания, только DAG не на паузе;
-    история (@continuous) в дедлайн не входит — её осушает deploy.sh."""
+    """Занятость — актуалка, ручной ingest и обслуживание; дедлайн — по расписаниям
+    актуалки и обслуживания, только DAG не на паузе; история (@continuous) в дедлайн
+    не входит — её осушает deploy.sh; retired-триггеры #1370 нигде не спрашиваются."""
     stand.put("busy", "1")
     stand.run()
     sql = [c for c in stand.calls("docker") if "sofascore-airflow-metadb" in c]
     nxt = [c for c in sql if "next_dagrun_create_after" in c]
     busy = [c for c in sql if "FROM dag_run" in c]
     assert len(nxt) == 1 and len(busy) == 1, sql
-    for dag in (REFRESH, "dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail", COMPACT, MAINT):
+    for dag in (REFRESH, COMPACT, MAINT):
         assert f"'{dag}'" in nxt[0], nxt[0]
+    for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
+        assert f"'{retired}'" not in nxt[0], nxt[0]
     assert HIST not in nxt[0] and "'dag_ingest_sofascore'" not in nxt[0] and "NOT is_paused" in nxt[0]
-    for dag in ("dag_ingest_sofascore", REFRESH, MAINT, COMPACT,
-                "dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
+    for dag in ("dag_ingest_sofascore", REFRESH, MAINT, COMPACT):
         assert f"'{dag}'" in busy[0], busy[0]
+    for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
+        assert f"'{retired}'" not in busy[0], busy[0]
     assert HIST not in busy[0]

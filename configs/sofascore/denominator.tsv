@@ -1,26 +1,26 @@
 tournament_id	capture_key	name	class	queue_priority	basis
 1	SS-1	EURO	core	1	G1:CORE взрослые мужские
 7	SS-7	UEFA Champions League	core	1	G1:CORE взрослые мужские
-8	ESP-La Liga	LaLiga	core	1	registry:tournaments.json (дейли до #1370)
+8	ESP-La Liga	LaLiga	core	1	registry:tournaments.json + all-men refresh (#1370)
 9	SS-9	Challenger Pro League	core	1	G1:CORE взрослые мужские
 11	SS-11	World Cup Qual. UEFA	core	1	G1:CORE взрослые мужские
 13	SS-13	World Cup Qual. CAF	core	1	G1:CORE взрослые мужские
 14	SS-14	World Cup Qual. CONCACAF	core	1	G1:CORE взрослые мужские
-16	INT-World Cup	FIFA World Cup	core	1	registry:tournaments.json (дейли до #1370)
-17	ENG-Premier League	Premier League	core	1	registry:tournaments.json (дейли до #1370)
+16	INT-World Cup	FIFA World Cup	core	1	registry:tournaments.json + all-men refresh (#1370)
+17	ENG-Premier League	Premier League	core	1	registry:tournaments.json + all-men refresh (#1370)
 18	SS-18	Championship	core	1	G1:CORE взрослые мужские
 19	SS-19	FA Cup	core	1	G1:CORE взрослые мужские
 20	SS-20	Eliteserien	core	1	G1:CORE взрослые мужские
 21	SS-21	EFL Cup	core	1	G1:CORE взрослые мужские
 22	SS-22	Norwegian 1st Division	core	1	G1:CORE взрослые мужские
-23	ITA-Serie A	Serie A	core	1	registry:tournaments.json (дейли до #1370)
+23	ITA-Serie A	Serie A	core	1	registry:tournaments.json + all-men refresh (#1370)
 24	SS-24	League One	core	1	G1:CORE взрослые мужские
 25	SS-25	League Two	core	1	G1:CORE взрослые мужские
 27	SS-27	EURO, Qualification	core	1	G1:CORE взрослые мужские
 28	SS-28	AFC Asian Cup Qual.	core	1	G1:CORE взрослые мужские
 29	SS-29	NM Cup	core	1	G1:CORE взрослые мужские
-34	FRA-Ligue 1	Ligue 1	core	1	registry:tournaments.json (дейли до #1370)
-35	GER-Bundesliga	Bundesliga	core	1	registry:tournaments.json (дейли до #1370)
+34	FRA-Ligue 1	Ligue 1	core	1	registry:tournaments.json + all-men refresh (#1370)
+35	GER-Bundesliga	Bundesliga	core	1	registry:tournaments.json + all-men refresh (#1370)
 36	SS-36	Scottish Premiership	core	1	G1:CORE взрослые мужские
 37	SS-37	VriendenLoterij Eredivisie	core	1	G1:CORE взрослые мужские
 38	SS-38	Pro League	core	1	G1:CORE взрослые мужские
@@ -84,7 +84,7 @@ tournament_id	capture_key	name	class	queue_priority	basis
 199	SS-199	1. MFL	core	1	G1:CORE взрослые мужские
 200	SS-200	NIFL Premiership	core	1	G1:CORE взрослые мужские
 202	SS-202	Ekstraklasa	core	1	G1:CORE взрослые мужские
-203	RUS-Premier League	Russian Premier League	core	1	registry:tournaments.json (дейли до #1370)
+203	RUS-Premier League	Russian Premier League	core	1	registry:tournaments.json + all-men refresh (#1370)
 204	SS-204	First League	core	1	G1:CORE взрослые мужские
 205	SS-205	FNL	core	1	G1:CORE взрослые мужские
 206	SS-206	Scottish Championship	core	1	G1:CORE взрослые мужские

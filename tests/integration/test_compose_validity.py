@@ -383,7 +383,12 @@ class TestComposeFile:
         )
         assert not any(
             target.endswith(
-                ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
+                (
+                    "dag_trigger_sofascore_daily.py",
+                    "dag_trigger_sofascore_daily_tail.py",
+                    "dag_sofascore_manifest_maintenance.py",
+                    "dag_sofascore_schedule_maintenance.py",
+                )
             )
             for target in binds
         )
