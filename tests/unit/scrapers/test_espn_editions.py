@@ -74,9 +74,15 @@ def test_autumn_spring_league_rolls_over_and_closes_only_when_all_terminal() -> 
             "sui.1", 2025, recorded.display_name, recorded.start, recorded.end
         )
     ]
-    # Same season: nothing to do.
+    # Same season: nothing to open or close; the kept edition carries the
+    # current stage of the core detail (#2108).
     same = plan_editions(recorded, known, {}, competition_slug="sui.1")
-    assert (same.open_now, same.close_now, same.keep) == ((), (), tuple(known))
+    assert same.open_now == () and same.close_now == ()
+    (kept,) = same.keep
+    assert kept.key == "sui.1:2025" and kept.open
+    (stage,) = kept.types
+    assert (stage.id, stage.name) == (2, "Second Phase")
+    assert (stage.source_type_id, stage.slug) == (13502, "second-phase")
 
     # ESPN moves the detail to 2026 (only ``season`` changed in the body).
     detail["season"] = {
@@ -93,11 +99,85 @@ def test_autumn_spring_league_rolls_over_and_closes_only_when_all_terminal() -> 
     assert open_both.open_now[0].display_name == "2026-27 Swiss Super League"
     assert open_both.close_now == ()
     assert [state.key for state in open_both.keep] == ["sui.1:2025"]
+    # The new edition carries the current stage of its core detail too (#2108).
+    (new_stage,) = open_both.open_now[0].types
+    assert (new_stage.id, new_stage.name, new_stage.source_type_id, new_stage.slug) == (
+        2, "Second Phase", 13502, "second-phase"
+    )
 
     rolled = plan_editions(new, known, {2025: True}, competition_slug="sui.1")
     assert [state.key for state in rolled.close_now] == ["sui.1:2025"]
     # A year missing from the terminal map is not finished.
     assert plan_editions(new, known, {}, competition_slug="sui.1").close_now == ()
+
+
+@pytest.mark.unit
+def test_bare_ref_current_stage_keeps_existing_metadata_and_dates() -> None:
+    # League detail with the current type as a bare $ref: no name/type/slug.
+    detail = _json("league_detail_sui.1.json")
+    detail["season"]["type"] = {
+        "$ref": (
+            "http://sports.core.api.espn.com/v2/sports/soccer/leagues/sui.1"
+            "/seasons/2025/types/2?lang=en&region=us"
+        )
+    }
+    current = parse_league_current_season(detail)
+    assert (current.type_id, current.type_name) == (2, None)
+    assert (current.source_type_id, current.stage_slug) == (None, None)
+    recorded = SeasonType(
+        id=2,
+        name="Second Phase",
+        start_date=date(2026, 4, 19),
+        end_date=date(2026, 6, 1),
+        source_type_id=13502,
+        slug="second-phase",
+    )
+    known = _state("sui.1", 2025, types=(recorded,))
+
+    kept = plan_editions(current, [known], {}, competition_slug="sui.1").keep[0]
+
+    (stage,) = kept.types
+    assert (stage.id, stage.name) == (2, "Second Phase")
+    assert (stage.source_type_id, stage.slug) == (13502, "second-phase")
+    assert (stage.start_date, stage.end_date) == (date(2026, 4, 19), date(2026, 6, 1))
+
+    # A stage the state has not seen yet is appended without dates.
+    fresh = plan_editions(
+        current, [_state("sui.1", 2025)], {}, competition_slug="sui.1"
+    ).keep[0]
+    (appended,) = fresh.types
+    assert (appended.id, appended.name) == (2, None)
+    assert (appended.start_date, appended.end_date) == (None, None)
+
+
+@pytest.mark.unit
+def test_full_current_stage_refreshes_metadata_and_keeps_dates() -> None:
+    detail = _json("league_detail_sui.1.json")
+    detail["season"]["type"].update(
+        {"name": "Championship Round", "type": 13601, "slug": "championship-round"}
+    )
+    current = parse_league_current_season(detail)
+    known = _state(
+        "sui.1",
+        2025,
+        types=(
+            SeasonType(
+                id=2,
+                name="Second Phase",
+                start_date=date(2026, 4, 19),
+                end_date=date(2026, 6, 1),
+                source_type_id=13502,
+                slug="second-phase",
+            ),
+        ),
+    )
+
+    kept = plan_editions(current, [known], {}, competition_slug="sui.1").keep[0]
+
+    (stage,) = kept.types
+    assert (stage.id, stage.name) == (2, "Championship Round")
+    assert (stage.source_type_id, stage.slug) == (13601, "championship-round")
+    assert (stage.start_date, stage.end_date) == (date(2026, 4, 19), date(2026, 6, 1))
 
 
 @pytest.mark.unit

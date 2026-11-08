@@ -82,6 +82,7 @@ def test_edition_carries_its_season_types() -> None:
     assert edition.types == types
     assert edition.to_dict()["types"][0] == {
         "id": 1, "name": "League Phase", "start_date": None, "end_date": None,
+        "source_type_id": None, "slug": None,
     }
     with pytest.raises(ValueError, match="repeat a type id"):
         replace(_edition(), types=(SeasonType(1), SeasonType(1)))

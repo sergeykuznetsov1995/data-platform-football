@@ -18,6 +18,7 @@ from scrapers.espn.models import (
     EntityCapabilities,
     Gender,
     LegacyAliases,
+    SeasonType,
 )
 from scrapers.espn.denominator import DEFAULT_DENOMINATOR_PATH, load_denominator
 from scrapers.espn.parsers import (
@@ -59,6 +60,7 @@ def _scope(
     end: date = date(2021, 7, 31),
     lineup: CapabilityState = CapabilityState.PROVEN,
     matchsheet: CapabilityState = CapabilityState.PROVEN,
+    types: tuple[SeasonType, ...] = (),
 ) -> tuple[Competition, Edition]:
     edition = Edition(
         year,
@@ -67,6 +69,7 @@ def _scope(
         end,
         True,
         EntityCapabilities(CapabilityState.PROVEN, lineup, matchsheet),
+        types,
     )
     competition = Competition(
         espn_id,
@@ -596,7 +599,7 @@ def test_summary_is_parsed_once_and_joins_reordered_sections_by_native_team_id()
     assert result.matchsheet[0].is_home
     assert result.matchsheet[0].referee == "Ref Example"
     assert [row.score for row in result.matchsheet] == [2, 1]
-    assert result.parser_version == "espn-native-parser-v6"
+    assert result.parser_version == "espn-native-parser-v7"
 
 
 @pytest.mark.unit
@@ -755,6 +758,182 @@ def test_referee_falls_back_to_the_first_labelled_referee() -> None:
     result = _summary(payload)
 
     assert {row.referee for row in result.matchsheet} == {"Main Referee"}
+
+
+@pytest.mark.unit
+def test_officials_json_keeps_the_full_source_list() -> None:
+    # #2108: the complete gameInfo.officials list is stored verbatim next to
+    # the referee selection, which stays the first ordered official.
+    payload = _load("native_summary.json")
+    payload["gameInfo"]["officials"] = [
+        {
+            "id": "88",
+            "fullName": "Fourth Official",
+            "order": 4,
+        },
+        {
+            "id": "77",
+            "fullName": "Ref Example",
+            "position": {"name": "REFEREE"},
+            "order": 1,
+        },
+    ]
+
+    result = _summary(payload)
+
+    assert json.loads(result.officials_json) == payload["gameInfo"]["officials"]
+    assert {row.referee for row in result.matchsheet} == {"Ref Example"}
+
+
+@pytest.mark.unit
+def test_season_context_type_name_slug_group_and_edition_window() -> None:
+    payload = _load("native_summary.json")
+    payload["header"]["season"] = {
+        "year": 2020,
+        "slug": "premier-league-2020",
+        "type": {"id": "10351", "type": "total", "name": "Premier League"},
+    }
+    payload["header"]["competitions"][0]["altGameNote"] = "Matchday 3"
+
+    result = _summary(payload)
+
+    assert result.season_type_id == 10351
+    assert result.season_type_name == "Premier League"
+    assert result.stage_slug == "premier-league-2020"
+    assert result.group_name == "Matchday 3"
+    # The window is ALWAYS the edition window (#2108): a knockout stage keeps
+    # the shared season dates, never the SeasonType's own.
+    assert (result.season_start_date, result.season_end_date) == (
+        date(2020, 8, 1),
+        date(2021, 7, 31),
+    )
+    assert json.loads(result.officials_json) == payload["gameInfo"]["officials"]
+
+
+@pytest.mark.unit
+def test_season_type_native_id_falls_back_to_the_edition_type_name() -> None:
+    payload = _load("native_summary.json")
+    payload["header"]["season"] = {"year": 2020, "type": 10351}
+    competition, edition, schedule = _schedule(
+        types=(SeasonType(10351, "Premier League"), SeasonType(10352))
+    )
+
+    def parse():
+        return parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+    # A native integer id takes its name from the matching edition type.
+    result = parse()
+    assert result.season_type_id == 10351
+    assert result.season_type_name == "Premier League"
+    assert result.stage_slug is None and result.group_name is None
+
+    payload["header"]["season"]["type"] = 10352
+    unnamed = parse()
+    assert (unnamed.season_type_id, unnamed.season_type_name) == (10352, None)
+
+    payload["header"]["season"]["type"] = 99999
+    unknown = parse()
+    assert (unknown.season_type_id, unknown.season_type_name) == (99999, None)
+
+    # Any other shape is unreadable and fails closed.
+    payload["header"]["season"]["type"] = "regular"
+    broken = parse()
+    assert broken.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert "season.type" in broken.reason
+
+
+@pytest.mark.unit
+def test_season_context_embedded_type_reads_type_when_the_id_is_absent() -> None:
+    # #2108: the embedded header.season.type of a real body can carry the raw
+    # core ``type`` without the stage ``id`` (the sui.1 Second Phase shape);
+    # the raw value is the Bronze season_type_id and the name/slug come from
+    # the matching edition stage. With the id present the id is read instead.
+    payload = _load("native_summary.json")
+    payload["header"]["season"] = {"year": 2020, "type": {"type": "13502"}}
+    competition, edition, schedule = _schedule(
+        types=(SeasonType(2, "Second Phase", source_type_id=13502, slug="second-phase"),)
+    )
+
+    def parse():
+        return parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+    result = parse()
+
+    assert result.disposition is SummaryDisposition.CAPTURED
+    assert result.season_type_id == 13502
+    assert result.season_type_name == "Second Phase"
+    assert result.stage_slug == "second-phase"
+
+    payload["header"]["season"]["type"] = {"id": 2}
+    by_id = parse()
+
+    assert by_id.season_type_id == 2
+    assert by_id.season_type_name == "Second Phase"
+    assert by_id.stage_slug == "second-phase"
+
+    # A non-numeric raw type stays an unreadable shape.
+    payload["header"]["season"]["type"] = {"type": "second"}
+    broken = parse()
+
+    assert broken.disposition is SummaryDisposition.SOURCE_MALFORMED
+
+
+@pytest.mark.unit
+def test_missing_season_context_and_officials_stay_none() -> None:
+    payload = _load("native_summary.json")
+    payload["gameInfo"].pop("officials")
+
+    result = _summary(payload)
+
+    assert result.season_type_id is None
+    assert result.season_type_name is None
+    assert result.stage_slug is None
+    assert result.group_name is None
+    # The edition window is kept even without a season context (#2108).
+    assert (result.season_start_date, result.season_end_date) == (
+        date(2020, 8, 1),
+        date(2021, 7, 31),
+    )
+    assert result.officials_json is None
+    assert all(row.referee is None for row in result.matchsheet)
+
+    payload["gameInfo"]["officials"] = []
+    assert _summary(payload).officials_json is None
+
+
+@pytest.mark.unit
+def test_substitution_pair_prefers_subbed_in_for_and_is_consumed() -> None:
+    payload = _load("native_summary.json")
+    away = payload["rosters"][0]["roster"][0]
+    away["subbedOutFor"] = {"athlete": {"id": "300", "displayName": "Incoming"}}
+    home = payload["rosters"][1]["roster"][0]
+    home["subbedIn"] = True
+    home["subbedInFor"] = {"athlete": {"id": "301"}}
+    home["subbedOutFor"] = {"athlete": {"id": "999"}}
+
+    result = _summary(payload)
+
+    rows = {row.athlete_id: row for row in result.lineup}
+    # A leaving player names who came on for him (#2108).
+    assert rows[201].replaced_athlete_id == 300
+    # A player with both links keeps the subbedInFor one.
+    assert rows[101].replaced_athlete_id == 301
+    assert rows[101].subbed_in is True and rows[201].subbed_out is True
+    # Both keys are consumed: kept in the substitution facts, not re-reported.
+    assert '"subbedOutFor"' in rows[201].substitutions_json
+    assert '"subbedInFor"' in rows[101].substitutions_json
+    row_extra = json.loads(rows[101].extra_json)
+    assert "subbedInFor" not in row_extra and "subbedOutFor" not in row_extra
+
+    # A link without an athlete id is an unreadable shape.
+    home["subbedInFor"] = {"athlete": {"displayName": "No Id"}}
+    broken = _summary(payload)
+    assert broken.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert "subbedInFor" in broken.reason
 
 
 @pytest.mark.unit

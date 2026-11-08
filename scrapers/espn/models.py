@@ -156,13 +156,18 @@ class SeasonType(CanonicalModel):
     """One ESPN season stage (``seasons/{year}/types/{id}``).
 
     A bare ``$ref`` list carries only the id; name and dates come with the
-    embedded form (league detail, ``seasons/{year}``).
+    embedded form (league detail, ``seasons/{year}``).  ``source_type_id`` is
+    the raw core ``type`` value (e.g. 13502) ESPN also puts in a Summary
+    header; ``id`` stays the core list/stage id (e.g. 1).  ``slug`` is the
+    stage slug (e.g. ``second-phase``).
     """
 
     id: int
     name: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    source_type_id: Optional[int] = None
+    slug: Optional[str] = None
 
     def __post_init__(self) -> None:
         _positive_int(self.id, "season type id")
@@ -171,6 +176,10 @@ class SeasonType(CanonicalModel):
         for value in (self.start_date, self.end_date):
             if value is not None and type(value) is not date:
                 raise TypeError("season type dates must be date values")
+        if self.source_type_id is not None:
+            _positive_int(self.source_type_id, "season type source_type_id")
+        if self.slug is not None:
+            _required_string(self.slug, "season type slug")
 
 
 @dataclass(frozen=True, slots=True)

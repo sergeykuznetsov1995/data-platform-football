@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 
 import pytest
@@ -68,6 +68,14 @@ def test_captured_summary_gives_full_match_and_children() -> None:
     assert {match["home_formation"], match["away_formation"]} == {"4-2-3-1", "4-3-3"}
     # The 2020-21 body has no gameInfo.officials: referee comes from 2010.
     assert match["referee"] is None
+    assert match["officials_json"] is None
+    # The window always stays the edition window (#2108).
+    assert (match["season_start_date"], match["season_end_date"]) == (
+        date(2020, 1, 1),
+        date(2021, 12, 31),
+    )
+    # The recorded body names replacements: they reach the lineup cells.
+    assert any(row["replaced_athlete_id"] is not None for row in lineup)
     assert _rows("summary_eng1_2010.json")[2]["referee"] == "Peter Walton"
     assert match["attendance"] == 10000
     assert match["first_fetched_at"] == datetime(2026, 9, 25, 10)
@@ -84,6 +92,23 @@ def test_captured_summary_gives_full_match_and_children() -> None:
     keys = {(row["kind"], row["event_key"]) for row in events}
     assert len(keys) == len(events)
     assert None not in {row["event_key"] for row in events}
+
+
+@pytest.mark.unit
+def test_recorded_eng1_2020_substitution_pairs_are_exact() -> None:
+    # #2108: the recorded Arsenal 2-0 Brighton body links substitutions in
+    # both directions: entering players name who they replaced, and leaving
+    # players name their replacements.
+    _, _, _, lineup, _, _ = _rows("summary_eng1_2020.json")
+
+    replaced = {row["athlete_id"]: row["replaced_athlete_id"] for row in lineup}
+    subbed_in = {row["athlete_id"]: row["subbed_in"] for row in lineup}
+    subbed_out = {row["athlete_id"]: row["subbed_out"] for row in lineup}
+
+    assert replaced[269844] == 203669 and subbed_in[269844] is True
+    assert replaced[203669] == 269844 and subbed_out[203669] is True
+    assert replaced[131752] == 122260 and subbed_in[131752] is True
+    assert replaced[122260] == 131752 and subbed_out[122260] is True
 
 
 @pytest.mark.unit
@@ -179,6 +204,12 @@ def test_match_without_summary_is_pending_with_no_children() -> None:
     assert match["team_stats_state"] == match["events_state"] == "pending"
     assert match["first_fetched_at"] is None
     assert match["first_published_at"] is None
+    # Without a Summary the season/officials context is NULL too (#2108).
+    assert match["season_type_id"] is None
+    assert match["season_type_name"] is None
+    assert match["stage_slug"] is None
+    assert match["group_name"] is None
+    assert match["officials_json"] is None
     assert lineup_rows(event, None, **kwargs) == []
     assert team_stats_rows(event, None, **kwargs) == []
     assert event_rows(event, None, **kwargs) == []

@@ -41,6 +41,10 @@ PARTS = (
     "commentary",
     "referee",
     "linescores",
+    "season_context",
+    "group",
+    "officials",
+    "substitution_pairs",
 )
 
 
@@ -59,6 +63,7 @@ def raw_parts(body):
     rosters = objects(data.get("rosters"))
     competitions = objects(mapping(data.get("header")).get("competitions"))
     sides = objects(competitions[0].get("competitors")) if competitions else []
+    season = mapping(mapping(data.get("header")).get("season"))
     officials = objects(mapping(data.get("gameInfo")).get("officials"))
     referee = False
     for official in officials:
@@ -82,6 +87,14 @@ def raw_parts(body):
         "commentary": bool(objects(data.get("commentary"))),
         "referee": referee,
         "linescores": any(s.get("linescores") for s in sides),
+        "season_context": bool(season.get("type")),
+        "group": bool(competitions and competitions[0].get("altGameNote")),
+        "officials": bool(officials),
+        "substitution_pairs": any(
+            p.get("subbedInFor") or p.get("subbedOutFor")
+            for r in rosters
+            for p in objects(r.get("roster"))
+        ),
     }
 
 
@@ -96,6 +109,18 @@ def parsed_parts(summary):
         "linescores": any(
             any(getattr(r, c) is not None for c in ("score_h1", "score_h2", "score_et"))
             for r in summary.matchsheet
+        ),
+        # A context is only kept when the type id and both edition dates
+        # survived the parse (#2108).
+        "season_context": (
+            summary.season_type_id is not None
+            and summary.season_start_date is not None
+            and summary.season_end_date is not None
+        ),
+        "group": bool(summary.group_name),
+        "officials": summary.officials_json is not None,
+        "substitution_pairs": any(
+            r.replaced_athlete_id is not None for r in summary.lineup
         ),
     }
 

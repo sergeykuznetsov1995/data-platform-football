@@ -137,6 +137,31 @@ def test_league_detail_gives_the_current_season_and_stage() -> None:
 
 
 @pytest.mark.unit
+def test_sui_detail_current_stage_keeps_id_source_type_id_and_slug() -> None:
+    # #2108: the current stage of sui.1 2025/26 is the Second Phase; the raw
+    # core ``type`` (13502) and the slug ride next to the stage id (2) as
+    # three independent values, in the current season and in the types list.
+    detail = _json("league_detail_sui.1.json")
+
+    season = parse_league_current_season(detail)
+    assert (season.type_id, season.type_name) == (2, "Second Phase")
+    assert (season.source_type_id, season.stage_slug) == (13502, "second-phase")
+
+    core, types = parse_season(detail["season"])
+    assert (core.year, core.type_id, core.source_type_id, core.stage_slug) == (
+        2025, 2, 13502, "second-phase"
+    )
+    assert {item.id for item in types} == {1, 2}
+    second_phase = next(item for item in types if item.id == 2)
+    assert (second_phase.id, second_phase.name) == (2, "Second Phase")
+    assert (second_phase.source_type_id, second_phase.slug) == (13502, "second-phase")
+    regular_season = next(item for item in types if item.id == 1)
+    assert (regular_season.name, regular_season.source_type_id) == (
+        "Regular Season", 13503,
+    )
+
+
+@pytest.mark.unit
 def test_season_2010_embeds_nine_types_and_2026_lists_six() -> None:
     season, types = parse_season(_json("season_uefa.champions_2010.json"))
 

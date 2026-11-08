@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 
-PARSER_VERSION = "espn-native-parser-v6"  # v6: stale not-started Summary recovery (#2190)
+PARSER_VERSION = "espn-native-parser-v7"  # v7: season/stage/group context, officials list and substitution pairs (#2108)
 STATUS_MAP_VERSION = "espn-status-v3"  # v3: recovered stale finals (#2190)
 LINEUP_STAT_MAP_VERSION = "espn-lineup-stat-map-v1"
 MATCHSHEET_STAT_MAP_VERSION = "espn-matchsheet-stat-map-v2"
@@ -151,6 +151,10 @@ class LineupRow:
     game: str
     parser_version: str
     extra_json: str
+    # Athlete this roster entry replaced on the field (#2108): the
+    # ``subbedInFor.athlete.id`` of an entered player, else the
+    # ``subbedOutFor.athlete.id`` of the leaving one; None without a link.
+    replaced_athlete_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,3 +276,13 @@ class SummaryParseResult:
     anomalies: tuple[str, ...]
     events: tuple[MatchEventRow, ...]
     advance_team_id: int | None
+    # Season/stage/group context and the full officials list (#2108); None
+    # when the Summary does not carry the piece.  The window is always the
+    # edition window, never the SeasonType's own dates.
+    season_type_id: int | None = None
+    season_type_name: str | None = None
+    stage_slug: str | None = None
+    group_name: str | None = None
+    season_start_date: date | None = None
+    season_end_date: date | None = None
+    officials_json: str | None = None

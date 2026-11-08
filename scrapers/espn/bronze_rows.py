@@ -250,6 +250,19 @@ def match_row(
         "venue": venue,
         "attendance": attendance,
         "referee": referee,
+        # Season/stage/group context and the verbatim officials list (#2108);
+        # all NULL without a Summary.
+        "season_type_id": summary.season_type_id if summary is not None else None,
+        "season_type_name": (
+            summary.season_type_name if summary is not None else None
+        ),
+        "stage_slug": summary.stage_slug if summary is not None else None,
+        "group_name": summary.group_name if summary is not None else None,
+        "season_start_date": (
+            summary.season_start_date if summary is not None else None
+        ),
+        "season_end_date": summary.season_end_date if summary is not None else None,
+        "officials_json": summary.officials_json if summary is not None else None,
         "disposition": disposition,
         "anomalies": anomalies,
         "reason": reason,
@@ -332,6 +345,7 @@ def lineup_rows(
             "subbed_out": row.subbed_out,
             "sub_in": row.sub_in,
             "sub_out": row.sub_out,
+            "replaced_athlete_id": row.replaced_athlete_id,
             **{name: getattr(row, name) for name in LINEUP_STAT_COLUMNS},
             "substitutions_json": row.substitutions_json,
             "lineup_anomaly": row.team_id in flagged,

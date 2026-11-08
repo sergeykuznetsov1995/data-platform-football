@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import date
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -379,13 +380,33 @@ def _legacy_substitutions(
     return sub_in, sub_out
 
 
+def _replaced_athlete_id(player: Mapping[str, Any], field: str) -> int | None:
+    """Native id of the athlete a roster entry replaced on the field (#2108).
+
+    ``subbedInFor`` names the athlete an entered player came on for,
+    ``subbedOutFor`` the player who came on for a leaving one; when a row
+    carries both, the entering link wins.  Absent links give None.
+    """
+
+    for key in ("subbedInFor", "subbedOutFor"):
+        value = player.get(key)
+        if value is None:
+            continue
+        link = required_mapping(value, f"{field}.{key}")
+        athlete = required_mapping(link.get("athlete"), f"{field}.{key}.athlete")
+        return native_id(athlete.get("id"), f"{field}.{key}.athlete.id")
+    return None
+
+
 def _parse_game_info(
     payload: Mapping[str, Any],
-) -> tuple[int | None, str | None, int | None, str | None, dict[str, Any]]:
+) -> tuple[
+    int | None, str | None, int | None, str | None, str | None, dict[str, Any]
+]:
     """Venue, attendance and the referee; no gameInfo -> all NULL."""
 
     if "gameInfo" not in payload or payload["gameInfo"] is None:
-        return None, None, None, None, {}
+        return None, None, None, None, None, {}
     info = required_mapping(payload["gameInfo"], "summary.gameInfo")
     venue_id: int | None = None
     venue_name: str | None = None
@@ -404,12 +425,15 @@ def _parse_game_info(
         optional_nonnegative_int(info.get("attendance"), "summary.gameInfo.attendance")
         or None
     )
+    raw_officials = info.get("officials", [])
     officials = [
         required_mapping(raw, f"summary.gameInfo.officials[{index}]")
         for index, raw in enumerate(
-            required_list(info.get("officials", []), "summary.gameInfo.officials")
+            required_list(raw_officials, "summary.gameInfo.officials")
         )
     ]
+    # The complete source list, kept verbatim for the Bronze cell (#2108).
+    officials_json = canonical_json(raw_officials) if officials else None
     labelled: list[int] = []
     for index, official in enumerate(officials):
         if official.get("position") is None:
@@ -455,7 +479,78 @@ def _parse_game_info(
         extra["venue"] = venue_extra
     if any(official_extras):
         extra["officials"] = official_extras
-    return venue_id, venue_name, attendance, referee_name, extra
+    return venue_id, venue_name, attendance, referee_name, officials_json, extra
+
+
+def _season_context(
+    payload: Mapping[str, Any], edition: Edition
+) -> tuple[int | None, str | None, str | None, str | None, date, date]:
+    """Season type, stage slug and group of the match; nothing is guessed.
+
+    ``header.season.type`` is a native integer id or an embedded object with
+    an optional ``name`` whose value is read from its ``id`` or, when ESPN
+    omits it, from its raw ``type``; the raw value stays the Bronze
+    ``season_type_id`` even though it is the core ``type`` (e.g. 13502), not
+    the stage id (e.g. 1) (#2108).  A missing name or slug is matched in
+    ``edition.types`` first by ``source_type_id``, then — legacy — by the
+    stage id; raw values win over the core ones.  The window is always the
+    edition window (#2108): the per-SeasonType dates would shrink the shared
+    2025/26 window on a knockout stage.  Absent pieces stay None.
+    """
+
+    header = payload["header"]
+    season_id: int | None = None
+    season_name: str | None = None
+    stage_slug: str | None = None
+    season = header.get("season")
+    if season is not None:
+        season = required_mapping(season, "summary.header.season")
+        raw_type = season.get("type")
+        if isinstance(raw_type, Mapping):
+            raw_id = raw_type.get("id")
+            if raw_id is None:
+                raw_id = raw_type.get("type")
+            season_id = (
+                native_id(raw_id, "summary.header.season.type.id")
+                if raw_id is not None
+                else None
+            )
+            season_name = optional_string(
+                raw_type.get("name"), "summary.header.season.type.name"
+            )
+        elif type(raw_type) is int:
+            season_id = native_id(raw_type, "summary.header.season.type")
+        elif raw_type is not None:
+            raise _SourceMalformed(
+                "summary.header.season.type must be a native id or an object"
+            )
+        if season_id is not None:
+            matched = next(
+                (item for item in edition.types if item.source_type_id == season_id),
+                None,
+            )
+            if matched is None:
+                matched = next(
+                    (item for item in edition.types if item.id == season_id), None
+                )
+            if matched is not None:
+                if season_name is None:
+                    season_name = matched.name
+                if stage_slug is None:
+                    stage_slug = matched.slug
+        stage_slug = (
+            optional_string(season.get("slug"), "summary.header.season.slug")
+            or stage_slug
+        )
+    competition = required_mapping(
+        required_list(header.get("competitions"), "summary.header.competitions")[0],
+        "summary.header.competitions[0]",
+    )
+    group_name = optional_string(
+        competition.get("altGameNote"),
+        "summary.header.competitions[0].altGameNote",
+    )
+    return season_id, season_name, stage_slug, group_name, edition.start_date, edition.end_date
 
 
 def _lineup_stat_entries(statistics: Any, field: str) -> list[tuple[str, Any, str]]:
@@ -621,6 +716,7 @@ def _lineup(
             else:
                 statistics = []
             legacy_stats = _lineup_stat_values(stat_sources, f"{field}.statistics")
+            replaced_athlete_id = _replaced_athlete_id(player, field)
             substitution_fields = {
                 key: value
                 for key, value in player.items()
@@ -628,6 +724,8 @@ def _lineup(
                 in {
                     "subbedIn",
                     "subbedOut",
+                    "subbedInFor",
+                    "subbedOutFor",
                     "substitution",
                     "substitutions",
                     "plays",
@@ -641,6 +739,8 @@ def _lineup(
                     "starter",
                     "subbedIn",
                     "subbedOut",
+                    "subbedInFor",
+                    "subbedOutFor",
                     "substitution",
                     "substitutions",
                     "statistics",
@@ -674,6 +774,7 @@ def _lineup(
                 subbed_out=subbed_out,
                 sub_in=sub_in,
                 sub_out=sub_out,
+                replaced_athlete_id=replaced_athlete_id,
                 appearances=legacy_stats.get("appearances"),
                 fouls_committed=legacy_stats.get("fouls_committed"),
                 fouls_suffered=legacy_stats.get("fouls_suffered"),
@@ -773,7 +874,9 @@ def _matchsheet(
     rosters: Mapping[int, tuple[str, str, Mapping[str, Any]]],
     side_facts: Mapping[int, Mapping[str, Any]],
     leg: int | None,
-    game_info: tuple[int | None, str | None, int | None, str | None, dict[str, Any]],
+    game_info: tuple[
+        int | None, str | None, int | None, str | None, str | None, dict[str, Any]
+    ],
     anomalies: _Anomalies,
 ) -> tuple[tuple[MatchsheetRow, ...], EntityParseState]:
     boxscore = required_mapping(payload.get("boxscore", {}), "summary.boxscore")
@@ -802,7 +905,7 @@ def _matchsheet(
     ):
         anomalies.add("one_sided_statistics")
 
-    venue_id, venue_name, attendance, referee_name, _ = game_info
+    venue_id, venue_name, attendance, referee_name, _, _ = game_info
     rows: list[MatchsheetRow] = []
     for team_id, (side, team_name) in by_team.items():
         statistics = statistics_by_team.get(team_id) or []
@@ -1044,6 +1147,7 @@ def parse_summary(
             else {}
         )
         game_info = _parse_game_info(payload)
+        season_context = _season_context(payload, edition)
         lineup, lineup_state = _lineup(
             payload,
             competition=competition,
@@ -1134,4 +1238,11 @@ def parse_summary(
         anomalies=tuple(sorted(anomalies.classes)),
         events=events,
         advance_team_id=advancing[0] if len(advancing) == 1 else None,
+        season_type_id=season_context[0],
+        season_type_name=season_context[1],
+        stage_slug=season_context[2],
+        group_name=season_context[3],
+        season_start_date=season_context[4],
+        season_end_date=season_context[5],
+        officials_json=game_info[4],
     )

@@ -811,7 +811,14 @@ class _Runner:
         registry = self.denominator.row(slug)
         competition, edition = build_competition(
             registry,
-            EditionState(slug, year, season.core.display_name, season.core.start, season.core.end),
+            EditionState(
+                slug,
+                year,
+                season.core.display_name,
+                season.core.start,
+                season.core.end,
+                types=season.types,
+            ),
         )
         stored = bronze_matches(self.trino, slug, year, ids)
         todo = [event_id for event_id in ids if not _collected(stored.get(event_id))]

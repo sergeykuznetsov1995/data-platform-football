@@ -136,6 +136,15 @@ MATCH_SCHEMA = _schema(
     pa.field("venue", pa.string()),
     pa.field("attendance", pa.int64()),
     pa.field("referee", pa.string()),
+    # Season/stage/group context and the verbatim officials list (#2108);
+    # the window is always the edition window, never a SeasonType's own.
+    pa.field("season_type_id", pa.int32()),
+    pa.field("season_type_name", pa.string()),
+    pa.field("stage_slug", pa.string()),
+    pa.field("group_name", pa.string()),
+    pa.field("season_start_date", pa.date32()),
+    pa.field("season_end_date", pa.date32()),
+    pa.field("officials_json", pa.string()),
     # Summary outcome (#1502); NULL while the Summary is not fetched.
     pa.field("disposition", pa.string()),
     # JSON list of lineup anomaly classes.
@@ -177,6 +186,8 @@ LINEUP_SCHEMA = _schema(
     pa.field("subbed_out", pa.bool_()),
     pa.field("sub_in", pa.string()),
     pa.field("sub_out", pa.string()),
+    # Athlete this roster entry replaced (subbedInFor/subbedOutFor) (#2108).
+    pa.field("replaced_athlete_id", pa.int64()),
     *(pa.field(name, pa.float64()) for name in LINEUP_STAT_COLUMNS),
     pa.field("substitutions_json", pa.string()),
     pa.field("lineup_anomaly", pa.bool_()),
@@ -239,10 +250,20 @@ NATURAL_KEYS: dict[str, tuple[str, ...]] = {
 
 
 def ensure_bronze_tables(writer) -> None:
-    """Create the four tables when missing (``IcebergWriter``)."""
+    """Create the four tables when missing; additively evolve existing ones.
+
+    A table that already exists keeps its rows and partitions: only the
+    missing columns of the current schema are added (#2108).  The generic
+    ``IcebergWriter`` is not changed.
+    """
     from .deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
 
     for table, schema in {**TABLES, PLAYS_TABLE: PLAYS_SCHEMA}.items():
+        if writer.table_exists(BRONZE_DATABASE, table):
+            writer._evolve_schema(
+                writer._get_trino_manager(), BRONZE_DATABASE, table, schema
+            )
+            continue
         writer.create_table_if_not_exists(
             BRONZE_DATABASE,
             table,

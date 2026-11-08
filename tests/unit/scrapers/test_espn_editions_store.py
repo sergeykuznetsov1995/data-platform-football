@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import json
 
 import pytest
 
 from scrapers.espn import editions_store, urls
 from scrapers.espn.denominator import load_denominator
 from scrapers.espn.editions import EditionState
+from scrapers.espn.models import SeasonType
 from scrapers.espn.transport_contracts import HttpStatusError
 from tests.unit.scrapers.test_espn_probes import PROBES
 from tests.unit.scrapers.test_espn_wave import FakeClient, _req_key
@@ -115,6 +117,58 @@ def test_default_path_sits_next_to_the_gate_state(monkeypatch) -> None:
     assert str(editions_store.default_state_path()) == "/opt/airflow/state/espn/editions.json"
     monkeypatch.setenv(editions_store.EDITIONS_STATE_ENV, "/tmp/x.json")
     assert str(editions_store.default_state_path()) == "/tmp/x.json"
+
+
+@pytest.mark.unit
+def test_type_round_trip_keeps_id_name_dates_source_type_id_and_slug(tmp_path) -> None:
+    path = tmp_path / "editions.json"
+    types = (
+        SeasonType(1, "Regular Season", date(2026, 7, 1), date(2026, 12, 31), 21846, "regular-season"),
+        SeasonType(2, "Second Phase", None, None, 13502, "second-phase"),
+    )
+    state = EditionState(
+        UCL, 2026, "2026-27 UCL", date(2026, 7, 1), date(2027, 6, 30), types=types
+    )
+    editions_store.save(path, editions_store.EditionsSnapshot(NOW, (state,)))
+
+    snapshot = editions_store.load(path)
+
+    assert snapshot is not None and snapshot.editions == (state,)
+    assert snapshot.editions[0].types == types
+
+
+@pytest.mark.unit
+def test_state_file_without_types_key_reads_empty_types(tmp_path) -> None:
+    # A file written before the types were kept has no such key: the editions
+    # still load, their types stay empty until the next core refresh (#2108).
+    path = tmp_path / "editions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "refreshed_at": NOW.isoformat(),
+                "editions": [
+                    {
+                        "slug": UCL,
+                        "year": 2026,
+                        "display_name": "2026-27 UCL",
+                        "start": "2026-07-01",
+                        "end": "2027-06-30",
+                        "open": True,
+                    }
+                ],
+                "failed": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = editions_store.load(path)
+
+    assert snapshot is not None
+    (state,) = snapshot.editions
+    assert (state.competition_slug, state.year, state.open) == (UCL, 2026, True)
+    assert state.types == ()
 
 
 @pytest.mark.unit

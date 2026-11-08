@@ -26,6 +26,7 @@ import pytest
 from scrapers.espn import editions_store, urls, wave
 from scrapers.espn.denominator import load_denominator
 from scrapers.espn.editions import EditionState
+from scrapers.espn.models import SeasonType
 from scrapers.espn.parser_contracts import PARSER_VERSION
 from scrapers.espn.raw_store import RawTargetNotFound
 from scrapers.espn.transport_contracts import HttpStatusError
@@ -391,6 +392,21 @@ def _wave1(tmp_path, *, fail_slug=None, **extra):
 
 
 # ------------------------------------------------------------------- tests
+
+
+@pytest.mark.unit
+def test_build_competition_carries_the_edition_types_into_the_context() -> None:
+    # #2108: the parser context of a wave match knows the edition's stages,
+    # so a Summary header season can be matched against them.
+    types = (SeasonType(2, "Second Phase", None, None, 13502, "second-phase"),)
+    state = EditionState(
+        "eng.1", 2020, "2020-21", date(2020, 1, 1), date(2021, 12, 31), types=types
+    )
+
+    competition, edition = wave.build_competition(load_denominator().row("eng.1"), state)
+
+    assert edition.types == types
+    assert competition.editions == (edition,)
 
 
 @pytest.mark.unit
