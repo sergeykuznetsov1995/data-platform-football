@@ -14,6 +14,8 @@ One run:
    ``slug`` and ``_batch_id``).
 4. Every page is parsed from the stored gzip bytes (raw-first, R-54) and fails
    closed: a page that does not parse is ``failed``, nothing parsed is written.
+   A page the transport cannot send or fetch is ``failed`` the same way — the
+   queue moves on; only a block stops the whole run.
 
 All four tables are append-only (no replace/merge/optimize) and carry
 ``model_version='web-2026'`` — the new site recomputed the history, its values
@@ -315,7 +317,11 @@ class _Run:
     def club(self, slug: str) -> None:
         try:
             page = self.transport.get("/" + slug)
-        except ClubEloFetchError as exc:
+        except (ClubEloFetchError, ValueError) as exc:
+            # A per-slug transport ValueError (a /Ranking link the transport
+            # cannot send, e.g. off the white list) fails this page exactly
+            # like a network error and the next slug still runs. ClubEloBlocked
+            # is a RuntimeError, not a ValueError: it must stop the whole run.
             self._fail(slug, str(exc))
             return
         if 300 <= page.status < 400:
