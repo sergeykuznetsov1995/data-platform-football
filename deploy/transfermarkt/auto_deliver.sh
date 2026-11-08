@@ -455,15 +455,15 @@ drain_abort(){  # drain_abort <причина>
   if [ $(( $(date -u +%s) - started )) -lt "$DRAIN_MAX" ]; then
     log "дренаж прерван ($1), но паузы полосы не вернулись:$RESTORE_NOTE — повторю следующим тиком (срок дренажа до $(( started + DRAIN_MAX )))"
     window_note "паузы полосы не вернулись — повтор следующим тиком"
-    exit 0
+    return 0
   fi
   log "ДРЕНАЖ ПРЕРВАН ($1), НО ПАУЗЫ ПОЛОСЫ НЕ ВЕРНУЛИСЬ:$RESTORE_NOTE — глушу автомат"
   set_off
-  said_today "$m" && exit 1
+  said_today "$m" && return 1
   hands_close "" "дренаж прерван ($1), паузы полосы не вернулись:$RESTORE_NOTE" f
   tg_durable "Transfermarkt: дренаж полосы прерван ($1), но паузы ingest/backfill не вернулись к прежним —$RESTORE_NOTE Сбор стоит. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   mark_said "$m"
-  exit 1
+  return 1
 }
 # Начать дренаж: файл (цель, старт, дренируемые DAG), затем флаг для расписания.
 drain_begin(){
@@ -875,12 +875,13 @@ WIN=$(latest_open_window)
 if is_plain "$OFF"; then
   # Паузы полосы — ДО выхода: иначе выключатель оставил бы сбор на паузе навсегда.
   drain_abort "стоит выключатель $OFF"
+  drain_rc=$?
   [ "$DRILL" = 1 ] && echo "автомат заглушен ($OFF) — учения не начаты" >&2
   if is_plain "$INFLIGHT" && ! said_today "$STATE/transfermarkt-off-reminded-$TODAY"; then
     tg_durable "Transfermarkt: автомат заглушен ($OFF), а незакрытая доставка ещё висит ($INFLIGHT). Бой: $LIVE_ROOT. НУЖНЫ РУКИ."
     mark_said "$STATE/transfermarkt-off-reminded-$TODAY"
   fi
-  exit 0
+  exit "$drain_rc"
 fi
 if [ ! -r "$PLATFORM_ENV" ]; then
   log "НЕТ ОБЩЕГО .env ПЛАТФОРМЫ ($PLATFORM_ENV)"
