@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +25,19 @@ def _reload():
     return importlib.import_module("dag_backfill_transfermarkt")
 
 
+_ADMITTED_NOW = datetime(2026, 11, 8, 12, 0, 14, tzinfo=timezone.utc)
+
+
+def _pinned_datetime(moment):
+    class _PinnedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return moment.astimezone().replace(tzinfo=None)
+            return moment.astimezone(tz)
+    return _PinnedDatetime
+
+
 @pytest.fixture
 def module(monkeypatch):
     monkeypatch.setenv('TM_HISTORY_STREAMS', '1')
@@ -35,6 +50,7 @@ def module(monkeypatch):
     monkeypatch.setattr(transfermarkt_history_authority, "validate_batch_policy", lambda *_a, **_k: None)
     module = _reload()
     monkeypatch.setattr(module, "existing_batch_requires_paid_io", lambda *_a: True)
+    monkeypatch.setattr(module, "datetime", _pinned_datetime(_ADMITTED_NOW))
     return module
 
 
@@ -542,3 +558,35 @@ def test_history_uses_the_registered_timetable_class(monkeypatch):
     monkeypatch.setattr(registered, 'TransfermarktCurrentTimetable', RegisteredTimetable)
     module = _reload()
     assert isinstance(module.dag.schedule, RegisteredTimetable)
+
+
+def test_bounded_task_proceeds_under_pinned_admitted_clock(module):
+    observed = {}
+
+    @module._bounded_historical_task
+    def _probe(**context):
+        observed["now"] = module.datetime.now(timezone.utc)
+        observed["deadline_at"] = os.environ["TM_HISTORY_DEADLINE_AT"]
+        return "admitted"
+
+    assert module.datetime is not datetime
+    assert module.datetime.now(timezone.utc) == _ADMITTED_NOW
+    assert _probe() == "admitted"
+    assert observed["now"] == _ADMITTED_NOW
+    expected_deadline = _ADMITTED_NOW + timedelta(seconds=module.MAX_PORTION_SECONDS)
+    assert observed["deadline_at"] == expected_deadline.isoformat()
+
+
+def test_bounded_task_refuses_start_inside_quiet_window(module, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "datetime",
+        _pinned_datetime(datetime(2026, 11, 8, 0, 38, 14, tzinfo=timezone.utc)),
+    )
+
+    @module._bounded_historical_task
+    def _probe(**context):
+        raise AssertionError("decorated body must not run during the quiet window")
+
+    with pytest.raises(module.AirflowException, match="deadline or delivery window"):
+        _probe()
