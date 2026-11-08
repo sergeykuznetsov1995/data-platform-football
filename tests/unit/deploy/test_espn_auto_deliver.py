@@ -55,6 +55,7 @@ FILES = {
     "scrapers/espn/__init__.py": "",
     "scrapers/espn/wave.py": "from .helper import go\nfrom scrapers.base.trino_manager import T\n",
     "scrapers/espn/helper.py": "def go():\n    return 1\n",
+    "scrapers/espn/pace_store.py": "X = 1\n",
     "scrapers/base/__init__.py": "",
     "scrapers/base/trino_manager.py": "T = 1\n",
     "scrapers/other/x.py": "X = 1\n",
@@ -434,6 +435,18 @@ def test_measure_module_and_its_imports_are_contour(env):
     assert ad.main([], host=host) == 0
     assert state(paths, "accepted") == first
     sha = repo.commit({"scrapers/espn/pace_store.py": "X = 2\n"}, "pace store fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == sha
+
+
+def test_replay_module_and_its_imports_are_contour(env):
+    """Offline replay #2108 исполняется из смонтированного scrapers/espn вне замыкания DAG."""
+    repo, paths, world, host, base = env
+    seed(env)
+    first = repo.commit({"scrapers/espn/reparse_raw.py": "from . import pace_store\n"}, "replay")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == first
+    sha = repo.commit({"scrapers/espn/pace_store.py": "X = 2\n"}, "pace store replay fix")
     assert ad.main([], host=host) == 0
     assert state(paths, "accepted") == sha
 
