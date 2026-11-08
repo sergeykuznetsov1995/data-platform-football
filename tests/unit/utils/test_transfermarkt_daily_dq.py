@@ -7,6 +7,7 @@ import pytest
 
 from utils import transfermarkt_daily_dq as daily
 from utils import transfermarkt_bronze_dq as dq
+from utils import transfermarkt_current_state as current
 
 NOW = datetime(2026, 10, 12, 22, tzinfo=timezone.utc)  # 13 October Moscow
 
@@ -216,6 +217,53 @@ def test_fill_applicability_and_zero_semantics_bind_raw_evidence():
     assert 'fee_eur = 0' in sql and 'fee_text' in sql
     assert 'value_eur = 0' in sql and 'mv_raw' in sql
     assert 'IS NULL' not in sql  # A missing raw value is unknown, not proof of a placeholder.
+
+
+def test_current_checks_input_is_pinned_at_the_same_cutoff(tmp_path, full_runner):
+    assert current.CHECKS_TABLE in daily.AUDIT_TABLES
+    cur = Cursor()
+    report = run(cur, tmp_path)
+    assert report['input_snapshot_ids'][current.CHECKS_TABLE] == 123
+    empty_sql = next(sql for sql in cur.sql if 'WITH routes' in sql)
+    assert empty_sql.count(f'{dq.SCOPE_MANIFEST_TABLE} FOR VERSION AS OF 123') == 2
+    assert empty_sql.count(f'{current.CHECKS_TABLE} FOR VERSION AS OF 123') == 1
+
+
+def test_current_listing_checks_need_complete_covered_raw_scope_mapping():
+    sql = daily.build_empty_routes_sql({'GB1': 'wettbewerb', 'FAC': 'pokal'})
+    assert f'FROM {current.CHECKS_TABLE} c' in sql
+    assert "c.check_kind = 'listing'" in sql
+    assert "c.status = 'complete'" in sql
+    assert 'c.expected_ids = c.observed_ids' in sql
+    assert 'c.checked_at IS NOT NULL' in sql
+    assert 'c.raw_capture_ids_json IS NOT NULL' in sql
+    assert 'cardinality(CAST(json_parse(c.raw_capture_ids_json) AS array(varchar))) > 0' in sql
+    assert 'JOIN (SELECT scope_id, competition_id, edition_id FROM scopes WHERE rn = 1) s' in sql
+    assert 'ON s.scope_id = c.scope_id' in sql
+    assert "AND status = 'complete'\n), manifest_outcomes AS (" in sql
+    assert f"FROM {dq.SCOPE_MANIFEST_TABLE} WHERE status = 'complete'" in sql
+    assert ("json_extract_scalar(entity_manifest_json, "
+            "'$.dq_evidence.scope_capture.listing_status') listing_status") in sql
+
+
+def test_current_zero_needs_exact_authoritative_empty_and_nonempty_is_ok():
+    sql = daily.build_empty_routes_sql({'FAC': 'pokal'})
+    assert "CASE WHEN c.expected_ids > 0 THEN 'ok'" in sql
+    assert ("WHEN c.expected_ids = 0 AND c.result IN ('tmapi+teilnehmer authoritative empty', "
+            "'authoritative empty source listing') THEN 'authoritative_empty'") in sql
+    assert 'ELSE' not in sql
+    assert "COALESCE(r.route, 'unknown'), COUNT(*)" in sql
+    assert "COUNT_IF(listing_status = 'authoritative_empty')" in sql
+    assert "COUNT_IF(listing_status IS NULL OR listing_status NOT IN ('ok', 'authoritative_empty'))" in sql
+
+
+def test_outcomes_unite_before_one_latest_selection_per_edition():
+    sql = daily.build_empty_routes_sql({'FAC': 'pokal'})
+    assert 'SELECT * FROM manifest_outcomes UNION ALL SELECT * FROM current_outcomes' in sql
+    assert sql.count('ROW_NUMBER() OVER (PARTITION BY competition_id, edition_id') == 2
+    assert 'ORDER BY decided_at DESC, source DESC, cycle_id DESC) rn' in sql
+    assert 'FROM latest l LEFT JOIN routes r ON l.competition_id = r.competition_id' in sql
+    assert 'WHERE rn = 1 GROUP BY 1' in sql
 
 
 def test_read_summary_reports_missing_and_stale_unknown(tmp_path, full_runner):

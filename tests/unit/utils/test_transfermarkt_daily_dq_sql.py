@@ -17,6 +17,7 @@ from dags.scripts import run_transfermarkt_discovery as discovery
 from scrapers.transfermarkt import scraper
 from scrapers.transfermarkt.first_seen import KEYS, fact_key
 from utils import transfermarkt_bronze_dq as bronze
+from utils import transfermarkt_current_state as current
 from utils import transfermarkt_daily_dq as daily
 from utils import transfermarkt_registry_publish as publication
 
@@ -113,7 +114,12 @@ def warehouse():
     for entity, columns in SCHEMAS.items():
         conn.execute(f'CREATE TABLE {_table(entity)} (' + ', '.join(f'"{column}" {_type(column)}' for column in columns) + ')')
     conn.execute(f'CREATE TABLE {daily.FIRST_SEEN_REGISTRY} (table_name VARCHAR, key_hash VARCHAR, key_json VARCHAR, first_seen_at TIMESTAMP)')
-    conn.execute(f'CREATE TABLE {bronze.SCOPE_MANIFEST_TABLE} (competition_id VARCHAR, edition_id VARCHAR, child_cycle_id VARCHAR, status VARCHAR, committed_at TIMESTAMP, entity_manifest_json VARCHAR)')
+    conn.execute(f'CREATE TABLE {bronze.SCOPE_MANIFEST_TABLE} (competition_id VARCHAR, edition_id VARCHAR, child_cycle_id VARCHAR, status VARCHAR, committed_at TIMESTAMP, entity_manifest_json VARCHAR, scope_id VARCHAR)')
+    conn.execute(f'''CREATE TABLE {current.CHECKS_TABLE} (
+        scope_id VARCHAR, check_kind VARCHAR, cycle_id VARCHAR, registry_snapshot_id VARCHAR,
+        denominator_hash VARCHAR, checked_at TIMESTAMP, status VARCHAR, result VARCHAR,
+        raw_capture_ids_json VARCHAR, expected_ids BIGINT, observed_ids BIGINT,
+        edition_fingerprint VARCHAR, denominator_definition_hash VARCHAR)''')
     try:
         yield conn
     finally:
@@ -123,6 +129,7 @@ def warehouse():
 def _frozen(conn, *, registry=False):
     pins = {table: 123 for table in bronze.NATIVE_BRONZE_KEYS}
     pins[bronze.SCOPE_MANIFEST_TABLE] = 123
+    pins[current.CHECKS_TABLE] = 123
     if registry:
         pins[daily.FIRST_SEEN_REGISTRY] = 123
     return daily._PinnedCursor(SqlCursor(conn), pins), pins
@@ -195,11 +202,38 @@ def test_route_counts_use_latest_outcome_and_keep_unknown(warehouse):
                                        ('one', CLOCK, 'ok'), ('two', CLOCK, 'authoritative_empty'),
                                        ('three', CLOCK, None)]:
         payload = json.dumps({'dq_evidence': {'scope_capture': {'listing_status': status}}})
-        warehouse.execute(f'INSERT INTO {bronze.SCOPE_MANIFEST_TABLE} VALUES (?, ?, ?, ?, ?, ?)',
-                          ['FAC', edition, f'{edition}-{committed}', 'complete', committed, payload])
+        warehouse.execute(f'INSERT INTO {bronze.SCOPE_MANIFEST_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)',
+                          ['FAC', edition, f'{edition}-{committed}', 'complete', committed, payload,
+                           f'FAC:{edition}'])
     cur, _ = _frozen(warehouse)
     cur.execute(daily.build_empty_routes_sql({'FAC': 'pokal'}))
     assert cur.fetchall() == [('pokal', 3, 1, 1)]
+
+
+def _insert_current_check(conn, scope_id, cycle_id, checked_at, status, expected_ids,
+                          *, observed_ids=None, result='checked'):
+    conn.execute(f'INSERT INTO {current.CHECKS_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+        scope_id, 'listing', cycle_id, 'registry', 'd' * 64, checked_at, status, result,
+        '["raw"]', expected_ids, expected_ids if observed_ids is None else observed_ids, None, None,
+    ])
+
+
+def test_current_route_outcomes_execute_with_latest_complete_evidence(warehouse):
+    for edition in ('one', 'two', 'three', 'four'):
+        status = 'authoritative_empty' if edition in {'one', 'two'} else 'ok'
+        payload = json.dumps({'dq_evidence': {'scope_capture': {'listing_status': status}}})
+        warehouse.execute(f'INSERT INTO {bronze.SCOPE_MANIFEST_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)', [
+            'FAC', edition, f'manifest-{edition}', 'complete', CLOCK - timedelta(days=1), payload,
+            f'FAC:{edition}',
+        ])
+    _insert_current_check(warehouse, 'FAC:one', 'current-ok', CLOCK, 'complete', 2)
+    _insert_current_check(warehouse, 'FAC:two', 'current-failed', CLOCK, 'failed', 2)
+    _insert_current_check(warehouse, 'FAC:three', 'current-unknown', CLOCK, 'complete', 0)
+    _insert_current_check(warehouse, 'FAC:four', 'current-empty', CLOCK, 'complete', 0,
+                          result='tmapi+teilnehmer authoritative empty')
+    cur, _ = _frozen(warehouse)
+    cur.execute(daily.build_empty_routes_sql({'FAC': 'pokal'}))
+    assert cur.fetchall() == [('pokal', 4, 2, 1)]
 
 
 def test_first_seen_completeness_and_invariance_execute_with_nullable_key(warehouse):
@@ -274,8 +308,8 @@ def test_full_daily_metrics_execute_for_all_nine_and_real_pokal_threshold(wareho
     for index in range(20):
         status = 'authoritative_empty' if index < empty_count else 'ok'
         payload = json.dumps({'dq_evidence': {'scope_capture': {'listing_status': status}}})
-        warehouse.execute(f'INSERT INTO {bronze.SCOPE_MANIFEST_TABLE} VALUES (?, ?, ?, ?, ?, ?)',
-                          ['FAC', str(index), str(index), 'complete', CLOCK, payload])
+        warehouse.execute(f'INSERT INTO {bronze.SCOPE_MANIFEST_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)',
+                          ['FAC', str(index), str(index), 'complete', CLOCK, payload, f'FAC:{index}'])
     cur, _ = _frozen(warehouse)
     metrics, checks = daily.collect_daily_metrics(cur, NOW, {'FAC': 'pokal'})
     assert set(metrics['fields']) == set(SCHEMAS)
