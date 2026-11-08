@@ -70,7 +70,7 @@ def execute_trino(run_ids, campaign):
 
 def main(argv=None) -> int:
     from dags.utils import transfermarkt_traffic_report as traffic
-    from dags.utils.transfermarkt_daily_measure import day_bounds, utc
+    from dags.utils.transfermarkt_daily_measure import MeasurementError, day_bounds, utc
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--day', required=True, help='YYYY-MM-DD, Moscow calendar day')
@@ -84,7 +84,15 @@ def main(argv=None) -> int:
     parser.add_argument('--json', type=Path, help='also write the full report to this file')
     args = parser.parse_args(argv)
     start, end = day_bounds(args.day)
-    as_of = utc(args.as_of) if args.as_of else datetime.now(timezone.utc)
+    if args.as_of:
+        try:
+            as_of = utc(args.as_of)
+        except MeasurementError as exc:
+            message = ('--as-of должен содержать часовой пояс' if str(exc) == 'timestamp must include timezone'
+                       else '--as-of должен быть ISO8601 с часовым поясом')
+            parser.error(message)
+    else:
+        as_of = datetime.now(timezone.utc)
     try:
         ledger = traffic.read_ledger(args.ledger_dir, start, end, as_of)
     except (OSError, traffic.TrafficReportError):

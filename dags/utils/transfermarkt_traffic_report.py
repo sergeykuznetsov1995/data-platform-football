@@ -85,7 +85,9 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
     An archive stamped before ``day_start`` holds only earlier events and is
     skipped; later archives and the current file are read whole, so runs of the
     day are seen beyond the day too. An unreadable archive is listed in
-    ``stats``; the current file is mandatory. Malformed lines are counted.
+    ``stats``; the current file is mandatory. Malformed lines are counted. A
+    first valid event of a readable file more than ``LEASE_TTL`` after the
+    previous readable archive's stamp sets ``stats['ledger_gap']``.
     """
     stats = {} if stats is None else stats
     stats.update(malformed_lines=0, files_read=[], archives_unreadable=[], older_archive=False, earliest_at=None)
@@ -104,7 +106,11 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
     current = directory / LEDGER_FILE
     if not current.is_file() and not archives:
         raise TrafficReportError('ledger file is missing')
+    previous_stamp = None
     for path in archives + ([current] if current.is_file() else []):
+        stamp = None if path is current else datetime.strptime(
+            _ARCHIVE.match(path.name).group(1), '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+        first_valid = False
         try:
             handle = (gzip.open(path, 'rt', encoding='utf-8', errors='replace') if path is not current
                       else path.open(encoding='utf-8', errors='replace'))
@@ -119,6 +125,10 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
                     except (ValueError, TypeError, KeyError, MeasurementError):
                         stats['malformed_lines'] += 1
                         continue
+                    if not first_valid:
+                        first_valid = True
+                        if previous_stamp is not None and event['_at'] - previous_stamp > LEASE_TTL:
+                            stats['ledger_gap'] = True
                     if stats['earliest_at'] is None or event['_at'] < stats['earliest_at']:
                         stats['earliest_at'] = event['_at']
                     yield event
@@ -126,6 +136,9 @@ def iter_ledger_events(ledger_dir: Path | str, day_start: datetime,
             if path is current:
                 raise TrafficReportError('ledger file is unreadable') from exc
             stats['archives_unreadable'].append(path.name)
+        else:
+            if stamp is not None:
+                previous_stamp = stamp
 
 
 def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
@@ -203,18 +216,22 @@ def summarize_ledger(events: Iterable[Mapping[str, Any]], day_start: datetime,
 def read_ledger(ledger_dir: Path | str, day_start: datetime, day_end: datetime,
                 as_of: datetime) -> dict[str, Any]:
     """Ledger summary with file stats; ``complete`` is False on an unreadable
-    archive or when the files do not reach back to the day."""
+    archive, when the files do not reach back to the day, or when the gap after
+    an archive stamp exceeds the lease TTL."""
     stats: dict[str, Any] = {}
     summary = summarize_ledger(iter_ledger_events(ledger_dir, day_start, stats), day_start, day_end, as_of)
     earliest = stats.pop('earliest_at')
     older = stats.pop('older_archive')
+    gap = stats.pop('ledger_gap', False)
     summary.update(stats)
     summary['earliest_event_at'] = earliest.isoformat() if earliest else None
     reason = None
     if stats['archives_unreadable']:
         reason = 'archives_unreadable'
-    elif not summary['events_in_day'] and (earliest is None or (not older and earliest > day_start)):
+    elif earliest is None or (not older and earliest > day_start):
         reason = 'day_not_covered'
+    elif gap:
+        reason = 'ledger_gap'
     summary['complete'], summary['incomplete_reason'] = reason is None, reason
     return summary
 
@@ -555,7 +572,7 @@ def format_traffic_summary(report: Mapping[str, Any]) -> str:
     lines = [f'Transfermarkt трафик {report["report_day"]} МСК: оплачено {_mib(ledger["provider_bytes"]["total"])} МиБ '
              f'({split}), запросов {requests}, КиБ/запрос: {per_request}, туннелей {ledger["tunnels"]} '
              f'(CONNECT-отказы {rejected or "нет"}), {coverage}']
-    if ledger.get('incomplete_reason') == 'day_not_covered':
+    if ledger.get('incomplete_reason') in ('day_not_covered', 'ledger_gap'):
         lines.append('ТРЕВОГА: леджер не покрывает день')
     if ledger.get('archives_unreadable'):
         lines.append('ТРЕВОГА: леджер: нечитаемые архивы: ' + ', '.join(ledger['archives_unreadable']))
