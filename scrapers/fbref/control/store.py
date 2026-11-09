@@ -8873,6 +8873,11 @@ class ControlStore:
                 WHERE attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
+                  -- Only the newest successful raw of a target is still debt
+                  -- (#1332): older raw is superseded content and must not
+                  -- inflate the run gate, lane/global counts, oldest raw
+                  -- timestamps, SLA overdue counts, or version lag here.
+                  AND {_LATEST_RAW_ATTEMPT_SQL}
                   -- Raw behind a retired target is out of scope by the same
                   -- decision that retired it, exactly as in the recovery
                   -- cohort.  Without this the run would clear recovery and
@@ -9748,6 +9753,11 @@ class ControlStore:
         drained first so repeated bounded calls cannot starve earlier
         observations.
 
+        Only the newest successful raw of a target is still recovery work
+        (#1332): once a newer successful raw exists, older raw is superseded
+        content and is neither selected nor counted, however its own parse
+        ended.
+
         A scored match shell is excluded only while a fresh request owns it
         (the same rule as the run gate, #2051); a shell nobody owns is
         selected again so its re-parse schedules a refetch or parks it.
@@ -9795,6 +9805,7 @@ class ControlStore:
                   AND attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
+                  AND """ + _LATEST_RAW_ATTEMPT_SQL + """
                   AND (%s::text[] IS NULL OR frontier.page_kind = ANY(%s))
                   AND (%s::uuid IS NULL OR EXISTS (
                     SELECT 1 FROM fbref_control.crawl_run campaign_run
