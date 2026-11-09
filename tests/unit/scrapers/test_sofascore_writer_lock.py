@@ -157,6 +157,66 @@ def test_busy_lock_times_out_and_closes_the_connection(monkeypatch):
 
 
 @pytest.mark.unit
+def test_scope_deadline_stops_busy_wait_before_task_timeout(monkeypatch):
+    connections = _fake_psycopg2(monkeypatch, answers=[False])
+    clock = _FakeClock()
+    environ = {
+        writer_lock.WRITER_LOCK_DSN_ENV: DSN,
+        writer_lock.SCOPE_DEADLINE_ENV: "12",
+    }
+
+    with pytest.raises(writer_lock.WriterLockTimeout) as excinfo:
+        with writer_lock.bronze_writer_lock(
+            environ,
+            sleep=clock.sleep,
+            clock=clock,
+            wall_clock=clock,
+        ):
+            pytest.fail("the body must not run without the lock")
+
+    assert "0s" in str(excinfo.value)
+    assert clock.now == 0
+    assert clock.sleeps == []
+    assert connections[0][1].closed is True
+
+
+@pytest.mark.unit
+def test_scope_deadline_caps_configured_wait_with_completion_reserve(monkeypatch):
+    connections = _fake_psycopg2(monkeypatch, answers=[False] * 4)
+    clock = _FakeClock()
+    environ = {
+        writer_lock.WRITER_LOCK_DSN_ENV: DSN,
+        writer_lock.SCOPE_DEADLINE_ENV: "42",
+    }
+
+    with pytest.raises(writer_lock.WriterLockTimeout) as excinfo:
+        with writer_lock.bronze_writer_lock(
+            environ, sleep=clock.sleep, clock=clock, wall_clock=clock
+        ):
+            pytest.fail("the body must not run without the lock")
+
+    assert "12s" in str(excinfo.value)
+    assert clock.now == 15
+    assert len(connections[0][1].executed) == 4
+    assert connections[0][1].closed is True
+
+
+@pytest.mark.unit
+def test_malformed_scope_deadline_fails_closed(monkeypatch):
+    connections = _fake_psycopg2(monkeypatch, answers=[True])
+    environ = {
+        writer_lock.WRITER_LOCK_DSN_ENV: DSN,
+        writer_lock.SCOPE_DEADLINE_ENV: "not-an-epoch",
+    }
+
+    with pytest.raises(ValueError):
+        with writer_lock.bronze_writer_lock(environ):
+            pytest.fail("the body must not run without the lock")
+
+    assert connections == []
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("value", ["0", "false", "No"])
 def test_lock_is_disabled_only_by_an_explicit_switch(monkeypatch, value):
     _refusing_psycopg2(monkeypatch)

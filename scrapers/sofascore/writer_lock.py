@@ -14,10 +14,14 @@ cost is seconds of waiting per commit block.
 Unlike the FotMob lock (``run_fotmob_scraper._writer_lock``) this one waits:
 a busy lock is polled with ``pg_try_advisory_lock`` until
 ``SOFASCORE_WRITER_LOCK_TIMEOUT_SECONDS`` elapse, because the second lane is
-legitimate work that should queue, not fail.  The session-level advisory lock
-is released when the connection closes, so a killed process leaves no stale
-lock behind.  The DSN is the Airflow metadata DB the scraper process already
-carries in ``AIRFLOW__DATABASE__SQL_ALCHEMY_CONN``.
+legitimate work that should queue, not fail.  Inside an active refresh scope
+(``SOFASCORE_SCOPE_DEADLINE_EPOCH``, #2133) the wait is additionally capped
+to that absolute deadline minus a 30-second completion reserve, so repeated
+reacquisition cannot starve the scope past the task timeout Airflow would
+kill it at.  The session-level advisory lock is released when the connection
+closes, so a killed process leaves no stale lock behind.  The DSN is the
+Airflow metadata DB the scraper process already carries in
+``AIRFLOW__DATABASE__SQL_ALCHEMY_CONN``.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ WRITER_LOCK_ENV = "SOFASCORE_WRITER_LOCK"
 WRITER_LOCK_TIMEOUT_ENV = "SOFASCORE_WRITER_LOCK_TIMEOUT_SECONDS"
 WRITER_LOCK_DSN_ENV = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"
 DEFAULT_WRITER_LOCK_TIMEOUT_SECONDS = 1800
+SCOPE_DEADLINE_ENV = "SOFASCORE_SCOPE_DEADLINE_EPOCH"
+SCOPE_DEADLINE_RESERVE_SECONDS = 30.0
 # #2062: the longest a process may hold the global Bronze key. Below the
 # waiters' own timeout, so a stuck holder is dumped and killed before it fails
 # every other SofaScore writer (measured legit holds: p99 306s, max 1316s).
@@ -93,6 +99,7 @@ def bronze_writer_lock(
     *,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
     _lock_key: int = WRITER_LOCK_KEY,
     _abort: Callable[[str], None] = _abort_stuck_holder,
     _timer: Optional[Callable[..., threading.Timer]] = None,
@@ -118,6 +125,12 @@ def bronze_writer_lock(
     timeout = int(
         env.get(WRITER_LOCK_TIMEOUT_ENV, DEFAULT_WRITER_LOCK_TIMEOUT_SECONDS)
     )
+    scope_deadline = str(env.get(SCOPE_DEADLINE_ENV, "")).strip()
+    if scope_deadline:
+        remaining = (
+            float(scope_deadline) - wall_clock() - SCOPE_DEADLINE_RESERVE_SECONDS
+        )
+        timeout = min(timeout, max(0, int(remaining)))
 
     # Only the global key is bounded: a season key legitimately spans capture.
     max_hold = (
