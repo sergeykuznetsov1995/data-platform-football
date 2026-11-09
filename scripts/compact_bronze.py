@@ -20,6 +20,7 @@ from utils.maintenance_window import nightly_deadline  # noqa: E402
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--table", action="append")
+    parser.add_argument("--priority-table", action="append")
     parser.add_argument("--apply", action="store_true", help="default: dry-run")
     parser.add_argument("--direct", action="store_true")
     parser.add_argument("--state-file", type=Path)
@@ -39,6 +40,13 @@ def main(argv=None):
         parser.error("--table and absolute --journal are required")
     if args.direct and (not args.state_file or not args.state_file.is_absolute()):
         parser.error("--direct requires absolute --state-file")
+    if args.priority_table and not args.direct:
+        parser.error("--priority-table requires --direct")
+    if args.priority_table:
+        if len(set(args.priority_table)) != len(args.priority_table):
+            parser.error("--priority-table values must be unique")
+        if set(args.priority_table) - set(args.table):
+            parser.error("--priority-table values must be listed in --table")
     if args.seconds is None:
         args.seconds = 10800 if args.direct else 1800
     if (

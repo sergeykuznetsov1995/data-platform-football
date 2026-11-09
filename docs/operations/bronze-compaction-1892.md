@@ -180,6 +180,31 @@ FBref использует прежний publication lock с renew/assert и о
 оставшаяся очередь вернула busy, после чего набор busy сбрасывается и попытка
 повторяется до deadline. Свободный FBref не гарантируется.
 
+### Приоритет direct-очереди
+
+Repeatable `--priority-table` работает только с `--direct`: приоритетные таблицы
+идут раньше остальных, а round-robin внутри приоритетной и обычной групп сохраняется.
+Все значения должны быть уникальными и входить в полный набор `--table`. Busy-таблица
+временно остаётся в конце текущего прохода и не останавливает остальные.
+
+```bash
+/root/.venvs/dpf-test/bin/python scripts/compact_bronze.py --direct \
+  --table fbref_schedule --table fbref_match_managers \
+  --table fotmob_competition_scope_observations \
+  --priority-table fbref_schedule \
+  --priority-table fotmob_competition_scope_observations \
+  --state-file /shared/maintenance/1892-direct-state.json \
+  --journal /shared/maintenance/1892-direct.jsonl \
+  --stop-file /shared/maintenance/1892-direct.stop
+```
+
+Приоритет сохраняется в общем state и используется при продолжении без повторной
+передачи параметра, в том числе на следующую ночь. Новый explicit набор заменяет
+сохранённый; выпавшие из allowlist таблицы удаляются из приоритета. Бюджет и
+partition cursors не сбрасываются. Старый state без приоритета сохраняет прежний
+round-robin. Не сокращайте `--table` до подмножества и не создавайте второй
+state-file. Окно, лимиты и остальные guards не меняются.
+
 Все прямые apply-запуски используют **один state-file и одинаковый набор таблиц**.
 Не удалять state и стабильный соседний `.lock`: lock держится весь процесс,
 JSON заменяется атомарно с fsync. Перед ALTER сохраняются расход ночного бюджета,

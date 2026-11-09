@@ -178,7 +178,8 @@ def test_direct_legacy_state_migrates_without_refunding_budget(tmp_path):
     path.write_text(json.dumps(old))
     state = direct._load(path, ['espn_match'], '2026-10-29')
     assert state == dict(version=2, tables=['espn_match'], window='2026-10-29',
-                         portions=7, input_bytes=1234, queue=['espn_match'], partition_cursors={})
+                         portions=7, input_bytes=1234, queue=['espn_match'],
+                         partition_cursors={}, priority_tables=[])
     assert json.loads(path.read_text()) == old
     state['partition_cursors'] = {'espn_match': 'p031'}
     direct._save(path, state)

@@ -55,7 +55,16 @@ def _locked(path):
         yield
 
 
-def _load(path, tables, window):
+def _ordered(queue, priority, busy=()):
+    """Priority tables first, then the rest, busy tables last; within a rank
+    the current round-robin order is kept."""
+    if not priority:
+        return queue
+    return sorted(
+        queue, key=lambda t: 2 if t in busy else (0 if t in priority else 1))
+
+
+def _load(path, tables, window, priority=()):
     if path.exists():
         state = json.loads(path.read_text())
         known = state.get("tables")
@@ -80,14 +89,21 @@ def _load(path, tables, window):
             or (state.get("version") == 2 and (
                 not isinstance(state.get("partition_cursors"), dict)
                 or set(state["partition_cursors"]) - set(known)))
+            or (state.get("priority_tables") is not None and (
+                not isinstance(state["priority_tables"], list)
+                or any(not isinstance(t, str) for t in state["priority_tables"])
+                or len(set(state["priority_tables"])) != len(state["priority_tables"])
+                or set(state["priority_tables"]) - set(known)))
         ):
             raise ValueError("Invalid direct compaction state")
         datetime.strptime(state["window"], "%Y-%m-%d")
         compaction._migrate_partition_cursors(state)
         state["version"] = 2
+        state["priority_tables"] = sorted(priority or state.get("priority_tables") or [])
     else:
         state = dict(version=2, tables=tables, window=window, portions=0,
-                     input_bytes=0, queue=tables[:], partition_cursors={})
+                     input_bytes=0, queue=tables[:], partition_cursors={},
+                     priority_tables=sorted(priority))
     if state["window"] != window:
         state.update(window=window, portions=0, input_bytes=0)
         if not state["queue"]:
@@ -101,7 +117,10 @@ def _load(path, tables, window):
                              and t not in state["queue"]])
         state["partition_cursors"] = {
             k: v for k, v in state["partition_cursors"].items() if k in tables}
+        state["priority_tables"] = [
+            t for t in state["priority_tables"] if t in tables]
         state["tables"] = tables
+    state["queue"] = _ordered(state["queue"], state["priority_tables"])
     return state
 
 
@@ -174,17 +193,21 @@ def run_direct(args, deadline):
                 if (len(set(tables)) != len(tables) or not tables
                         or set(tables) - set(compaction.BRONZE_COMPACTION_TABLES)):
                     raise ValueError("Invalid physical table allowlist")
+                priority = sorted(set(getattr(args, "priority_table", None) or ()))
+                if set(priority) - set(tables):
+                    raise ValueError("Invalid priority tables")
                 for key in ("TRINO_USER", "TRINO_PASSWORD", "FBREF_CONTROL_DB_URI"):
                     if not os.environ.get(key):
                         raise ValueError("Missing required environment")
                 dsn = os.environ["FBREF_CONTROL_DB_URI"]
                 stop = StopFile(args.stop_file)
                 with _locked(args.state_file):
-                    state = _load(args.state_file, tables, _now().date().isoformat())
+                    state = _load(args.state_file, tables,
+                                  _now().date().isoformat(), priority)
                     if not args.apply:
                         # _load creates an independent in-memory copy; never save it.
                         state["portions"] = state["input_bytes"] = 0
-                        state["queue"] = tables[:]
+                        state["queue"] = _ordered(tables[:], state["priority_tables"])
 
                     def reserve(table, size, next_cursor):
                         if (state["portions"] >= args.portions
@@ -196,6 +219,8 @@ def run_direct(args, deadline):
                         state["partition_cursors"][table] = next_cursor
                         state["queue"].remove(table)
                         state["queue"].append(table)
+                        state["queue"] = _ordered(
+                            state["queue"], state["priority_tables"], busy)
                         _save(args.state_file, state)
                         summary["portions"] += 1
                         summary["input_bytes"] += size
@@ -246,9 +271,11 @@ def run_direct(args, deadline):
                             # every remaining table returned busy, then retry.
                             state["queue"].remove(table)
                             state["queue"].append(table)
+                            busy.add(table)
+                            state["queue"] = _ordered(
+                                state["queue"], state["priority_tables"], busy)
                             if args.apply:
                                 _save(args.state_file, state)
-                            busy.add(table)
                             if busy.issuperset(state["queue"]):
                                 time.sleep(
                                     min(60, max(0, (deadline - _now()).total_seconds()))
