@@ -134,6 +134,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     assert dag._dag_kwargs["max_active_runs"] == 1
     assert dag._dag_kwargs["catchup"] is False
     assert dag._dag_kwargs["dagrun_timeout"] == timedelta(hours=7)
+    assert module.REFILL_SCOPE_RETRIES == 1
     assert dag._dag_kwargs["is_paused_upon_creation"] is True
     assert dag._dag_kwargs["default_args"] is module.DEFAULT_ARGS
     assert set(operators) == {

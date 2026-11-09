@@ -69,6 +69,10 @@ REFRESH_FETCH_RETRY_DELAY = timedelta(minutes=10)
 # (RUN_SCOPE_COMMAND); a waiting scope does not hold the pool slot.
 REFRESH_SCOPE_RETRIES = 2
 REFRESH_SCOPE_RETRY_DELAY = timedelta(minutes=10)
+# #2160: a refill scope that lost only its transport is planned once more
+# after REFRESH_SCOPE_RETRY_DELAY, under a new round (new plan identity and
+# lease); a second loss leaves it for the next run.
+REFILL_SCOPE_RETRIES = 1
 # Ceiling of one scope task; its real timeout is its own estimate x 1.5.
 REFRESH_SCOPE_TIMEOUT = timedelta(seconds=state.REFRESH_MAX_SCOPE_TIMEOUT_SECONDS)
 # Season metadata enrichment (#1354) runs after the scopes inside the same
@@ -652,6 +656,8 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
             else _pending_refresh_partitions,
             plan=plan, execute=_execute_refill_scope,
             budget_s=REFRESH_SCOPE_BUDGET.total_seconds(), now=time.time,
+            max_scope_retries=REFILL_SCOPE_RETRIES,
+            retry_pause_s=REFRESH_SCOPE_RETRY_DELAY.total_seconds(), sleep=time.sleep,
             persist=lambda value: _atomic_json(report_path, {**value, "run_id": run_id}),
         )
     # #2134: also Airflow's task timeout, which is not an Exception.
