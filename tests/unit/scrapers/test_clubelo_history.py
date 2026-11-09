@@ -69,6 +69,7 @@ def test_four_fixture_clubs_complete_run():
     result, store, session, sent = _run(_answers(), CLUBS)
     assert result["rating_date"] == "2026-09-22"
     assert (result["queue"], result["pending_before"], result["pending_after"]) == (498, 4, 0)
+    assert result["queue_slugs"] == QUEUE
     assert (result["pages_ok"], result["pages_failed"], result["no_page"]) == (4, 0, 0)
     assert result["redirects"] == 0 and result["date_mismatch"] == 0
     assert result["requests"] == 5
@@ -157,6 +158,7 @@ def test_403_stops_the_run_alerts_and_exits_non_zero():
     answers = _answers(**{"/riverplate": FakeResponse(403, b"forbidden")})
     result, store, session, sent = _run(answers, CLUBS)
     assert result["blocked"] and "403" in result["blocked"]
+    assert result["queue_slugs"] == QUEUE
     assert len(sent) == 1 and "блокирует" in sent[0]
     # pages before the block are committed; nothing after riverplate is requested
     assert [c["path"] for c in session.calls] == ["/Ranking", "/Arsenal", "/santos-fc_2", "/riverplate"]
@@ -285,6 +287,7 @@ def test_dateless_h1_club_is_done_without_mismatch():
 def test_ranking_error_is_red():
     result, _, _, _ = _run({"/Ranking": [FakeResponse(500, b"x")] * 3}, CLUBS)
     assert "HTTP 500" in result["error"]
+    assert result["queue_slugs"] == []
     assert history.exit_code(result) == 1
 
 

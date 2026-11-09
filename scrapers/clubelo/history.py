@@ -240,6 +240,7 @@ class _Run:
             "rating_date": None,
             "batch_id": batch_id,
             "queue": 0,
+            "queue_slugs": [],
             "pending_before": 0,
             "pending_after": 0,
             "batches": 0,
@@ -407,6 +408,7 @@ def run_history(
     try:
         store.ensure_tables()
         queue = run.ranking()
+        result["queue_slugs"] = queue
         closed = store.closed_slugs()
         pending = [slug for slug in queue if slug not in closed]
         result["queue"] = len(queue)
