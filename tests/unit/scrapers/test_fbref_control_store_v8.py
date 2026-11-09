@@ -999,6 +999,77 @@ def test_unprocessed_list_and_summary_use_the_same_superseded_rule():
     assert "newer_attempt.finished_at > attempt.finished_at" not in cohort
     assert "newer_attempt.content_hash <> attempt.content_hash" not in cohort
     assert "failed_observed.status <> 'succeeded'" not in cohort
+    # #1332: only the newest successful raw of a target is recovery work.
+    assert cohort.count("_LATEST_RAW_ATTEMPT_SQL") == 1
+    assert summary.count("_LATEST_RAW_ATTEMPT_SQL") == 1
+
+
+def test_unprocessed_list_and_summary_render_the_exact_latest_raw_predicate():
+    """#1332: one shared newest-raw predicate guards selection and accounting."""
+    from scrapers.fbref.control.store import _LATEST_RAW_ATTEMPT_SQL
+
+    run_id = str(uuid.uuid4())
+    expected = " ".join(_LATEST_RAW_ATTEMPT_SQL.split())
+    queries = []
+
+    def handler(sql, params):
+        assert sql.count("%s") == len(params or ())
+        queries.append((" ".join(sql.split()), params))
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if ") AS missing" in sql:
+            return [{"count": 0}], 1
+        if "AS global_sla_overdue_count" in sql:
+            return [{
+                "page_kind": "match", "run_count": 0, "lane_count": 0,
+                "lane_sla_overdue_count": 0, "global_count": 0,
+                "global_sla_overdue_count": 0, "run_oldest_raw_at": None,
+                "lane_oldest_raw_at": None, "global_oldest_raw_at": None,
+                "lane_version_lag_count": 0, "global_version_lag_count": 0,
+            }], 1
+        return [], 0
+
+    store, _ = make_store(handler)
+    assert store.list_unprocessed_fetches(
+        run_type="current",
+        parser_version="page-v2",
+        typed_parser_version="typed-v3",
+        stateful_parser_version="stateful-v4",
+        limit=10,
+    ) == []
+    assert len(queries) == 1
+    store.get_run_summary(run_id)
+
+    list_sql, list_params = queries[0]
+    summary_sql, summary_params = next(
+        (sql, params) for sql, params in queries
+        if "AS global_sla_overdue_count" in sql
+    )
+    # The exact shared predicate, in the outer WHERE of both queries.
+    assert expected in list_sql
+    assert expected in summary_sql
+    for sql in (list_sql, summary_sql):
+        assert sql.index(expected) > sql.index(
+            "attempt.content_hash IS NOT NULL"
+        )
+        assert sql.index(expected) < sql.index(
+            "newer_attempt.status = 'succeeded'"
+        )
+    # The predicate takes no parameters: recovery signatures are unchanged.
+    assert list_params[:2] == ("fbref", "current")
+    assert list_params[-1] == 10
+    assert len(list_params) == 19
+    assert summary_params[:9] == (
+        run_id,
+        "[]",
+        "current",
+        "current",
+        86_400,
+        86_400,
+        run_id,
+        "[]",
+        "current",
+    )
 
 
 def _faithful_recovery_visibility(
@@ -1027,6 +1098,7 @@ def _faithful_recovery_visibility(
 def _newer_recovery_observation(**overrides):
     item = {
         "lease_epoch": 2,
+        "attempt_number": 1,
         "attempt_status": "succeeded",
         "versions": ("page-v2", "typed-v3", "stateful-v4"),
         "status": "succeeded",
@@ -1035,6 +1107,7 @@ def _newer_recovery_observation(**overrides):
         "stateful_status": "succeeded",
         "validation_status": "succeeded",
         "content_hash": "b" * 64,
+        "raw_manifest_key": "raw/fbref/newer.json.zst",
     }
     item.update(overrides)
     return item
@@ -1088,6 +1161,87 @@ def test_recovery_supersession_behavior_with_faithful_fake(
     # The final fixture is A -> B -> A. Repeating the old hash does not make
     # chronology ambiguous because the decision uses lease_epoch only.
     assert _faithful_recovery_visibility(
+        old_status=old_status,
+        newer=newer,
+    ) is visible
+
+
+def _faithful_latest_raw_visibility(*, old_status, newer):
+    """The failed-observation rule plus the newest-successful-raw rule."""
+
+    if not _faithful_recovery_visibility(old_status=old_status, newer=newer):
+        return False
+    for item in newer:
+        later = item["lease_epoch"] > 1 or (
+            item["lease_epoch"] == 1 and item["attempt_number"] > 1
+        )
+        committed = (
+            item["attempt_status"] == "succeeded"
+            and item["raw_manifest_key"]
+            and item["content_hash"]
+        )
+        if later and committed:
+            return False
+    return True
+
+
+@pytest.mark.parametrize(
+    ("old_status", "newer", "visible"),
+    [
+        # Without a newer raw the existing rule alone decides.
+        ("failed", [], True),
+        # A newer committed raw supersedes the old raw however its own
+        # observation ended (#1332): failed, pending, or not started yet.
+        ("failed", [_newer_recovery_observation(status="failed")], False),
+        ("failed", [_newer_recovery_observation(status="processing")], False),
+        ("failed", [_newer_recovery_observation(status="skipped")], False),
+        # A failed or in-flight later attempt commits no raw: not superseding.
+        (
+            "failed",
+            [_newer_recovery_observation(
+                attempt_status="failed",
+                raw_manifest_key=None,
+                content_hash=None,
+            )],
+            True,
+        ),
+        (
+            "failed",
+            [_newer_recovery_observation(
+                attempt_status="claimed",
+                raw_manifest_key=None,
+                content_hash=None,
+            )],
+            True,
+        ),
+        # Equal lease_epoch: the later attempt_number wins.
+        (
+            "failed",
+            [_newer_recovery_observation(lease_epoch=1, attempt_number=2)],
+            False,
+        ),
+        (
+            "processing",
+            [_newer_recovery_observation(lease_epoch=1, attempt_number=3)],
+            False,
+        ),
+        # A -> B -> A: repeated content hashes never decide recency.
+        (
+            "failed",
+            [
+                _newer_recovery_observation(
+                    content_hash="c" * 64, status="failed"
+                ),
+                _newer_recovery_observation(content_hash="a" * 64),
+            ],
+            False,
+        ),
+    ],
+)
+def test_recovery_supersession_with_latest_raw_rule_faithful_fake(
+    old_status, newer, visible
+):
+    assert _faithful_latest_raw_visibility(
         old_status=old_status,
         newer=newer,
     ) is visible
