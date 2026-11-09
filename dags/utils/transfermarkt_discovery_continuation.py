@@ -55,7 +55,12 @@ _RECOVERY_SETUP_ERROR = 'retry_budget differs from the shared traffic ledger lim
 # resumable 'paused' state.  This is not configurable permission to
 # recover arbitrary 'failed' markers: anything that does not match every
 # pin exactly stays rejected, and cohort age/identity checks still run
-# first (no expiry bypass).
+# first (no expiry bypass).  The one owner-authorized exception
+# (#2145, 2026-11-09): when this exact marker has also genuinely aged out,
+# select_job re-settles it with this same pinned recovery and then rolls it
+# over into a fresh cohort through the ordinary expired-paused archive path
+# — an owner-authorized rollover, not an age bypass and not a renewal of
+# the old cohort's started_at.
 KNOWN_PAID_IO_FAILURE_RECOVERY = {
     'marker_hash': 'ae445516192db8e20abd1913f0b32aa87f94dde56a5dc872eb03e1906daba66a',
     'cohort_job_id': 'tm-discovery-job-969093c1f5efc1b1c03e59c3',
@@ -461,6 +466,33 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
             try:
                 ensure_cohort_age(saved, now)
             except ValueError:
+                # Owner-authorized one-time rollover (#2145, 2026-11-09): a
+                # saved 'failed' marker matching the exact audited paid-I/O
+                # pin that has ALSO genuinely aged out (>= 24h; an invalid or
+                # future start time never qualifies) is first re-settled as
+                # 'paused' by its existing pinned recovery — the job_id,
+                # artifact and manifest guards inside it still run — and the
+                # re-settled marker then continues through the ordinary
+                # expired-paused rollover below, with its identity/collision
+                # guards and readback intact.  This is an owner-authorized
+                # rollover into a fresh cohort, not an age bypass and not a
+                # renewal of the old cohort: its started_at, portion,
+                # identity, traffic, artifacts and recovery provenance are
+                # preserved verbatim in <job_id>/expired.json, and the fresh
+                # cohort starts at portion 0 with traffic=None (the old
+                # traffic is never carried over as new spend).  No other
+                # expired status and no off-pin marker is recovered here.
+                if (saved['status'] == 'failed' and cohort_expired(saved, now)
+                        and stable_payload_hash(saved)
+                        == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
+                    # Crash-safe order: this failed→paused active write lands
+                    # first, then the <job_id>/expired.json archive below,
+                    # then the fresh active 'ready' marker at the end.  A
+                    # retry after a crash on any step finds a paused expired
+                    # marker and follows the ordinary archive path; an
+                    # existing archive must read back identically or the
+                    # rollover refuses.
+                    _recover_known_paid_io_failure(path, saved, now=now, write=write)
                 # An expired 'paused' cohort (only that status, only genuinely
                 # aged out) rolls over: its marker is archived verbatim under
                 # <job_id>/expired.json after artifact verification, and a

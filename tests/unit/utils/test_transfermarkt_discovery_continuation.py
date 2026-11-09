@@ -1042,9 +1042,53 @@ def test_paid_io_recovery_fails_closed_on_missing_manifest(tmp_path, monkeypatch
 def test_paid_io_recovery_never_bypasses_age_or_identity(tmp_path, monkeypatch):
     path, job = failed_stranded(tmp_path, monkeypatch)
     before = path.read_bytes()
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(), now=NOW + timedelta(days=1), write=write)
+    # Identity drift is still rejected first: a drifted caller never reaches
+    # the pinned recovery, whether the marker is fresh or expired.
     with pytest.raises(ValueError, match='drift'):
         cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
     assert path.read_bytes() == before
     assert cohorts.read_job(path)['status'] == 'failed'
+    # Owner-authorized rollover (#2145, 2026-11-09): the exact pinned failed
+    # marker that has ALSO genuinely aged out is re-settled by its pinned
+    # recovery, archived verbatim and replaced by a fresh cohort.  This is an
+    # owner-authorized rollover, not an age bypass and not a renewal of the
+    # old cohort's started_at.
+    later = NOW + timedelta(days=1, hours=2)
+    # Collision guard: the unchanged identity hashes to the marker's own
+    # job_id.  Per the crash-safe order the failed→paused re-settlement lands
+    # first, then the rollover refuses before any archive write or fresh
+    # cohort in the same job_id/checkpoint namespace.
+    with pytest.raises(ValueError, match='collides with the expired paused cohort'):
+        cohorts.select_job(path, identity(), now=later, write=write)
+    assert cohorts.read_job(path)['status'] == 'paused'
+    assert not (path.parent / job['job_id'] / 'expired.json').exists()
+    # The retry with a genuinely new identity finds the paused expired marker
+    # and follows the ordinary archive path into a fresh cohort.
+    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
+                             now=later, write=write)
+    assert new['status'] == 'ready'
+    assert new['portion'] == 0
+    assert new['traffic'] is None
+    assert new['job_id'] != job['job_id']
+    assert new['started_at'] == later.isoformat()
+    assert new['checkpoint_path'] != job['checkpoint_path']
+    assert cohorts.read_job(path)['job_id'] == new['job_id']
+    # Archive accounting: the re-settled marker is preserved verbatim —
+    # started_at, portion, identity, traffic, artifacts and recovery
+    # provenance — and the old spend is not carried into the fresh cohort.
+    archive = path.parent / job['job_id'] / 'expired.json'
+    archived = cohorts.read_job(archive)
+    assert archived['status'] == 'paused'
+    for field in ('portion', 'started_at', 'identity', 'traffic', 'artifacts',
+                  'job_id', 'checkpoint_path', 'last_run_id'):
+        assert archived[field] == job[field]
+    assert archived['updated_at'] == later.isoformat()
+    assert 'paid' in archived['recovery']['reason']
+    assert archived['recovery']['marker_hash'] == stable_payload_hash(job)
+    # Retry idempotency: repeat selection resumes the fresh cohort and never
+    # rewrites the existing archive.
+    archive_bytes = archive.read_bytes()
+    again = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
+                               now=later + timedelta(minutes=30), write=write)
+    assert again['job_id'] == new['job_id']
+    assert archive.read_bytes() == archive_bytes
