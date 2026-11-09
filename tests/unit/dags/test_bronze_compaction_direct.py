@@ -442,3 +442,138 @@ def test_remaining_byte_limit_is_passed_to_each_portion(host, monkeypatch, apply
     assert summary(args)["input_bytes"] == 20
     assert budgets[0] == 25 and set(budgets[1:]) == {5}
     assert len(alters) == (1 if apply else 0)
+
+
+def test_priority_tables_lead_queue_and_persist(host, monkeypatch):
+    args, deadline, _, alters, offsets = host
+    args.table = ["espn_match", "fbref_schedule"]
+    args.priority_table = ["fbref_schedule"]
+    args.portions = 3
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters] == ["fbref_schedule"] * 3
+    state = json.loads(args.state_file.read_text())
+    assert state["priority_tables"] == ["fbref_schedule"]
+    assert state["queue"] == ["fbref_schedule", "espn_match"]
+    # A later call without --priority-table reuses the saved priority.
+    args.priority_table = None
+    args.portions = 4
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters[3:]] == ["fbref_schedule"]
+    tomorrow = deadline + timedelta(days=1)
+    monkeypatch.setattr(direct, "_now", lambda: tomorrow.replace(hour=0))
+    monkeypatch.setattr(compaction, "nightly_deadline", lambda: tomorrow)
+    monkeypatch.setattr(compaction.time, "time",
+                        lambda: tomorrow.replace(hour=0).timestamp())
+    args.portions = 5
+    assert direct.run_direct(args, tomorrow) == 0
+    assert [a["table"] for a in alters[4:]] == ["fbref_schedule"] * 5
+    state = json.loads(args.state_file.read_text())
+    assert state["priority_tables"] == ["fbref_schedule"]
+    assert state["portions"] == 5
+    assert state["queue"] == ["fbref_schedule", "espn_match"]
+    assert offsets[-5:] == ["128", "160", "192", "224", "256"]
+
+
+def test_priority_rotation_keeps_round_robin(host):
+    args, deadline, _, alters, _ = host
+    args.table = ["espn_match", "fbref_schedule"]
+    args.priority_table = ["fbref_schedule", "espn_match"]
+    args.portions = 4
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters] == ["espn_match", "fbref_schedule",
+                                            "espn_match", "fbref_schedule"]
+    state = json.loads(args.state_file.read_text())
+    assert state["priority_tables"] == ["espn_match", "fbref_schedule"]
+    assert state["queue"] == ["espn_match", "fbref_schedule"]
+
+
+def test_priority_busy_table_defers_without_stalling(host, monkeypatch):
+    from scrapers.fbref.control import StateConflict
+
+    args, deadline, _, alters, _ = host
+    args.table = ["espn_match", "fbref_schedule"]
+    args.priority_table = ["fbref_schedule"]
+    args.portions = 2
+
+    @contextmanager
+    def busy_fbref(enabled, *_):
+        if enabled:
+            raise StateConflict("FBref publication is locked by another control run")
+        yield lambda: None
+
+    monkeypatch.setattr(compaction, "_publication_fence", busy_fbref)
+    sleeps = []
+    monkeypatch.setattr(direct.time, "sleep", lambda s: sleeps.append(s))
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters] == ["espn_match", "espn_match"]
+    assert not sleeps
+    state = json.loads(args.state_file.read_text())
+    assert state["queue"] == ["espn_match", "fbref_schedule"]
+    assert state["portions"] == 2
+
+
+def test_priority_follows_allowlist_change(host):
+    args, deadline, _, alters, _ = host
+    args.table = ["espn_match", "fbref_schedule"]
+    args.priority_table = ["fbref_schedule"]
+    args.portions = 2
+    assert direct.run_direct(args, deadline) == 0
+    args.table = ["espn_match"]
+    args.priority_table = None
+    args.portions = 3
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters] == ["fbref_schedule", "fbref_schedule",
+                                            "espn_match"]
+    state = json.loads(args.state_file.read_text())
+    assert state["tables"] == ["espn_match"]
+    assert state["priority_tables"] == []
+    assert state["queue"] == ["espn_match"]
+    assert state["portions"] == 3
+    assert "fbref_schedule" not in json.dumps(state)
+
+
+def test_old_state_without_priority_stays_compatible(host):
+    args, deadline, _, alters, _ = host
+    args.table = ["espn_match", "fbref_schedule"]
+    args.state_file.write_text(json.dumps(dict(
+        version=2, tables=["espn_match", "fbref_schedule"],
+        window=direct._now().date().isoformat(), portions=1, input_bytes=10,
+        queue=["fbref_schedule", "espn_match"],
+        partition_cursors={"espn_match": "32"})))
+    assert direct.run_direct(args, deadline) == 0
+    assert [a["table"] for a in alters] == ["fbref_schedule"]
+    state = json.loads(args.state_file.read_text())
+    assert state["version"] == 2 and state["portions"] == 2
+    assert state["priority_tables"] == []
+    assert state["queue"] == ["espn_match", "fbref_schedule"]
+    assert state["partition_cursors"] == {"espn_match": "32",
+                                          "fbref_schedule": "32"}
+
+
+def test_cli_validates_priority_tables(host, monkeypatch, capsys):
+    args, deadline, *_ = host
+
+    class Clock:
+        @staticmethod
+        def now(_):
+            return deadline.replace(hour=3)
+
+    monkeypatch.setattr(cli, "datetime", Clock)
+    base = ["--direct", "--table", "espn_match", "--state-file", str(args.state_file),
+            "--journal", str(args.journal), "--stop-file", str(args.stop_file)]
+    with pytest.raises(SystemExit):
+        cli.main(base + ["--priority-table", "fbref_schedule"])
+    assert "--priority-table" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(base + ["--priority-table", "espn_match",
+                         "--priority-table", "espn_match"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        cli.main(["--table", "espn_match", "--journal", str(args.journal),
+                  "--stop-file", str(args.stop_file),
+                  "--priority-table", "espn_match"])
+    capsys.readouterr()
+    calls = []
+    monkeypatch.setattr(direct, "run_direct", lambda a, d: calls.append(a) or 0)
+    assert cli.main(base + ["--priority-table", "espn_match"]) == 0
+    assert calls[0].priority_table == ["espn_match"]
