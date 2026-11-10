@@ -2823,6 +2823,10 @@ def _fbref_reparse_must_yield(night_slot: bool) -> bool:
     """Between groups: give the lock back to a queued current run, or when
     the night slot this run was planned on is no longer handed over."""
 
+    from airflow.models import DagRun
+
+    if DagRun.find(dag_id="dag_ingest_fbref", state="running"):
+        return True
     if _control_store().current_publication_waiter_pending():
         return True
     return night_slot and not fbref_reparse_night_slot_enabled()
