@@ -565,11 +565,12 @@ def discovery_limits(
     """The exact caps a standing policy grants one run.
 
     ``request_limit = max(floor, ceil(multiplier * (k * competitions +
-    country pages + seed pages)))`` with ``k`` baseline requests per
-    competition of the mode (full: profile + regulation; daily: regulation).
-    Full sizing applies the policy's committed lower bounds
-    (``max(previous_competitions, full_min_competitions)`` and
-    ``max(country_pages, full_listing_pages)``); daily sizing does not.
+    country pages + seed pages + full canonical second-profile requests)))``
+    with ``k`` baseline requests per competition of the mode (full: profile
+    + regulation; daily: regulation); only full sizing adds the committed
+    canonical second-profile requests.  Full sizing applies the policy's
+    committed lower bounds (``max(previous_competitions, full_min_competitions)``
+    and ``max(country_pages, full_listing_pages)``); daily sizing does not.
     Daily HTML fallbacks spend only existing multiplier/floor headroom and stop
     through the same guard. Retries and provider bytes scale with the result.
     The policy's ``paid_proxy`` caps are the floors, and a policy without
@@ -588,9 +589,11 @@ def discovery_limits(
         raise DiscoveryRunnerError("discovery sizing must be non-negative")
     if sizing.mode == "full":
         per_competition = scaling.full_requests_per_competition
-        # Committed full-mode lower bounds (#2145): the measured replay found
-        # 2040 candidates and 481 listing pages, so a full crawl never sizes
-        # below them.  Daily sizing is unchanged.
+        # Committed full-mode lower bounds (#2145): the measured portion 13
+        # found 2041 candidates and 486 valid listing documents + 26 listing
+        # errors = 512 outcomes, plus 609 canonical second-profile requests,
+        # so a full crawl never sizes below that work.  Daily sizing is
+        # unchanged.
         competitions = max(sizing.previous_competitions, scaling.full_min_competitions)
         pages = max(sizing.country_pages, scaling.full_listing_pages)
     else:
@@ -601,6 +604,7 @@ def discovery_limits(
         per_competition * competitions
         + pages
         + scaling.seed_pages
+        + (scaling.full_canonical_profile_requests if sizing.mode == "full" else 0)
     )
     request_limit = max(
         paid.request_limit, math.ceil(scaling.request_multiplier * work),
@@ -1398,7 +1402,7 @@ def _execute_once(
     )
     portion_seconds = getattr(args, 'portion_seconds', 0)
     if portion_seconds and (standing_policy is None or not 60 <= portion_seconds <= WORK_SECONDS):
-        raise DiscoveryRunnerError('resumable portions require standing policy and 60..2700 seconds')
+        raise DiscoveryRunnerError('resumable portions require standing policy and 60..3120 seconds')
     continuation = None
     failures = None
     started = monotonic()

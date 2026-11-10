@@ -30,7 +30,8 @@
     "daily_requests_per_competition": 1,
     "retry_share": 0.1,
     "provider_bytes_per_request": 32768,
-    "full_min_competitions": 2040,
-    "full_listing_pages": 481
+    "full_min_competitions": 2041,
+    "full_listing_pages": 512,
+    "full_canonical_profile_requests": 609
   }
 }

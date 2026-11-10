@@ -94,3 +94,28 @@ def test_committed_policy_renewal_has_twelve_calendar_months():
     assert policy.policy_version == 3
     assert policy.approved_at == datetime(2026, 11, 7, tzinfo=timezone.utc)
     assert policy.expires_at >= policy.approved_at.replace(year=policy.approved_at.year + 1)
+
+
+def test_committed_scaling_bounds_carry_the_measured_portion13_work():
+    # #2145 (authorization extended 2026-11-10): settled portion 13 measured
+    # 2041 candidates, 486 valid listing documents + 26 listing errors = 512
+    # outcomes and 609 canonical second-profile requests.
+    policy = load_standing_policy(POLICY_PATH)
+
+    scaling = policy.scaling
+    assert scaling is not None
+    assert scaling.full_min_competitions == 2041
+    assert scaling.full_listing_pages == 512
+    assert scaling.full_canonical_profile_requests == 609
+    # The bounds are part of the committed payload (and hence the hash).
+    assert scaling.payload() == {
+        "daily_requests_per_competition": 1,
+        "full_canonical_profile_requests": 609,
+        "full_listing_pages": 512,
+        "full_min_competitions": 2041,
+        "full_requests_per_competition": 2,
+        "provider_bytes_per_request": 32768,
+        "request_multiplier": 1.5,
+        "retry_share": 0.1,
+        "seed_pages": 6,
+    }

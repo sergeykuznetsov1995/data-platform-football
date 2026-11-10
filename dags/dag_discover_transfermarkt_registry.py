@@ -1187,8 +1187,9 @@ def _build_dag(dag_id: str, *, manual: bool = False):
         dag_id=dag_id,
         default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
         description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
-        # Thirteen bounded slots retain three four-hour delivery gaps and 01–03 UTC quiet.
-        # One daily cohort resumes until complete; its paid caps never reset per slot.
+        # Thirteen bounded slots retain three four-hour delivery gaps and
+        # 01–03 UTC quiet. One daily cohort resumes until complete; its paid
+        # caps never reset per slot.
         schedule=None if manual else DISCOVERY_SCHEDULE,
         dagrun_timeout=timedelta(hours=6) if manual else timedelta(seconds=RUN_SECONDS),
         start_date=datetime(2024, 1, 1),
@@ -1272,7 +1273,7 @@ def _build_dag(dag_id: str, *, manual: bool = False):
           --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
           --mode "$TM_MODE"
           --byte-cap-bytes "$TM_BYTE_CAP_BYTES"
-          --portion-seconds 2700
+          --portion-seconds 3120
           --job-path "$TM_DISCOVERY_JOB_PATH"
           --deadline-at "$TM_DISCOVERY_DEADLINE_AT"
         )
@@ -1314,7 +1315,7 @@ def _build_dag(dag_id: str, *, manual: bool = False):
             max_active_tis_per_dag=1,
             # Calendar slots, not task retries: the shared proxy pool is free between them.
             priority_weight=200,
-            execution_timeout=timedelta(hours=6) if manual else timedelta(minutes=50),
+            execution_timeout=timedelta(hours=6) if manual else timedelta(minutes=57),
             do_xcom_push=True,
         )
 
