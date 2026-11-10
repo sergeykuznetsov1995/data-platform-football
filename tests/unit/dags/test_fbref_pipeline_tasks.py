@@ -4761,6 +4761,11 @@ def test_reparse_yields_between_groups_to_current_or_a_withdrawn_slot(
     store = MagicMock()
     store.current_publication_waiter_pending.return_value = waiter
     monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", lambda: store)
+    dag_run = MagicMock()
+    dag_run.find.return_value = []
+    monkeypatch.setattr(
+        sys.modules["airflow.models"], "DagRun", dag_run, raising=False
+    )
     answers = iter([night_at_start] + [night_now] * 10)
     monkeypatch.setattr(
         fbref_pipeline_tasks,
@@ -4773,6 +4778,34 @@ def test_reparse_yields_between_groups_to_current_or_a_withdrawn_slot(
     assert pipeline.reparse_version_lag_wave.call_count == groups
     if groups == 1:
         assert result["status"] == "yielded"
+
+
+@pytest.mark.unit
+def test_reparse_yields_to_running_current_waiting_for_pool(monkeypatch):
+    """A running current can wait for the pool before it queues for the lock."""
+
+    must_yield = fbref_pipeline_tasks._fbref_reparse_must_yield
+    pipeline = _timed_groups(monkeypatch, [10] * 5, window_minutes=110)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_fbref_reparse_must_yield", must_yield
+    )
+    store = MagicMock()
+    store.current_publication_waiter_pending.return_value = False
+    monkeypatch.setattr(fbref_pipeline_tasks, "_control_store", lambda: store)
+    dag_run = MagicMock()
+    dag_run.find.return_value = [MagicMock()]
+    monkeypatch.setattr(
+        sys.modules["airflow.models"], "DagRun", dag_run, raising=False
+    )
+
+    result = _drain_reparse()
+
+    assert result["status"] == "yielded"
+    assert pipeline.reparse_version_lag_wave.call_count == 1
+    dag_run.find.assert_called_once_with(
+        dag_id="dag_ingest_fbref", state="running"
+    )
+    store.current_publication_waiter_pending.assert_not_called()
 
 
 @pytest.mark.unit
