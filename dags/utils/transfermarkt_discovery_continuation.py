@@ -11,10 +11,13 @@ from typing import Any, Callable
 from scrapers.transfermarkt.models import LeaseTrafficSnapshot, SharedTrafficLedger, stable_payload_hash
 from scrapers.transfermarkt.discovery import PARSER_REVISION, SCHEMA_REVISION
 
+# Thirteen bounded slots (#2145, owner authorization 2026-11-10) keep the
+# 07→11, 15→19 and 23→03 four-hour delivery gaps and the 01–03 UTC quiet
+# window; one daily cohort resumes across slots without renewing its paid caps.
 SLOT_HOURS = (3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 19, 21, 23)
 SCHEDULE = '0 3,4,5,6,7,11,12,13,14,15,19,21,23 * * *'
-RUN_SECONDS = 55 * 60
-WORK_SECONDS = 45 * 60
+RUN_SECONDS = 57 * 60
+WORK_SECONDS = 52 * 60
 MANUAL_DAG_ID = "dag_discover_transfermarkt_registry_manual"
 DELIVERY_DRAIN_PATH = Path("/opt/airflow/gateway-state/delivery-drain-until")
 JOB_PATH = Path('/opt/airflow/logs/transfermarkt-registry/cohorts/active.json')

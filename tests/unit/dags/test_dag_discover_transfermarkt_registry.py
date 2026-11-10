@@ -251,9 +251,9 @@ def test_dag_is_daily_single_run_and_proxy_task_is_serialized(dag_module):
     from airflow.operators.python import PythonOperator
 
     assert dag_module.dag.dag_id == "dag_discover_transfermarkt_registry"
-    # 18:00 UTC = 21:00 MSK, every day (#1391).
+    # Thirteen bounded slots per day (#2145, owner authorization 2026-11-10).
     assert dag_module.dag.schedule == "0 3,4,5,6,7,11,12,13,14,15,19,21,23 * * *"
-    assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=55)
+    assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=57)
     assert dag_module.dag._dag_kwargs["max_active_runs"] == 1
     assert dag_module.dag._dag_kwargs["catchup"] is False
 
@@ -745,11 +745,26 @@ class TestStandingRegistryDiscovery:
 
         countries = len(load_countries())
         per_competition = 2 if mode == "full" else 1
-        # Committed full-mode lower bounds (#2145): max(803, 2040) candidates
-        # and max(countries, 481) listing pages; daily sizing is unchanged.
-        competitions = max(803, 2040) if mode == "full" else 803
-        pages = max(countries, 481) if mode == "full" else countries
-        expected = math.ceil(1.5 * (per_competition * competitions + pages + 6))
+        # Committed full-mode lower bounds (#2145): max(803, 2041) candidates,
+        # max(countries, 512) listing outcomes and the 609 canonical
+        # second-profile requests; daily sizing is unchanged.
+        scaling = committed["scaling"]
+        competitions = (
+            max(803, scaling["full_min_competitions"]) if mode == "full" else 803
+        )
+        pages = (
+            max(countries, scaling["full_listing_pages"])
+            if mode == "full"
+            else countries
+        )
+        canonical_extra = (
+            scaling["full_canonical_profile_requests"] if mode == "full" else 0
+        )
+        expected = math.ceil(
+            scaling["request_multiplier"]
+            * (per_competition * competitions + pages
+               + scaling["seed_pages"] + canonical_extra)
+        )
         assert env["TM_MODE"] == mode
         assert env["TM_PREVIOUS_SNAPSHOT_ID"] == snapshot_id
         assert int(env["TM_REQUEST_LIMIT"]) == expected
@@ -1446,7 +1461,7 @@ def test_manual_factory_retains_long_timeouts_and_explicit_identity(dag_module):
     assert dag_module.manual_dag.schedule is None
     assert dag_module.manual_dag._dag_kwargs['dagrun_timeout'] == timedelta(hours=6)
     workers = [task for task in BashOperator._instances if task.task_id == 'discover_registry']
-    assert [task._init_kwargs['execution_timeout'] for task in workers] == [timedelta(minutes=50), timedelta(hours=6)]
+    assert [task._init_kwargs['execution_timeout'] for task in workers] == [timedelta(minutes=57), timedelta(hours=6)]
     publishers = [task for task in PythonOperator._instances if task.task_id == 'publish_registry']
     assert [task._init_kwargs['execution_timeout'] for task in publishers] == [timedelta(minutes=5), timedelta(minutes=30)]
     assert publishers[1].op_kwargs['lane_dag_id'] == dag_module.MANUAL_DAG_ID

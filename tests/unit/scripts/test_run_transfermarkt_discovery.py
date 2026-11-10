@@ -1132,12 +1132,12 @@ def test_scaled_limits_follow_the_formula_with_the_policy_floors():
         policy, mod.DiscoverySizing("daily", previous_competitions=10, country_pages=0)
     )
 
-    # ceil(1.5 * (803 + 211 + 6)) and, with the committed full floors (#2145),
-    # ceil(1.5 * (2 * max(803, 2040) + max(211, 481) + 6)).
+    # ceil(1.5 * (803 + 211 + 6)) and, with the committed full floors
+    # (#2145), ceil(1.5 * (2 * max(803, 2041) + max(211, 512) + 6 + 609)).
     assert daily.request_limit == 1530
-    assert full.request_limit == 6851
-    assert full.retry_limit == 686
-    assert full.byte_cap_bytes == 224493568
+    assert full.request_limit == 7814
+    assert full.retry_limit == 782
+    assert full.byte_cap_bytes == 256049152
     assert tiny == mod.DiscoveryLimits(1024, 103, 1024 * 32 * 1024)
     assert mod.discovery_limits(policy, None) == mod.DiscoveryLimits(
         1024, 96, mod.HARD_PROVIDER_BYTE_BUDGET
@@ -1145,9 +1145,11 @@ def test_scaled_limits_follow_the_formula_with_the_policy_floors():
 
 
 def test_full_mode_committed_floors_give_the_authorized_capacity():
-    # #2145: replay measured 2040 candidates and 481 listing pages.  Required
-    # estimated attempts are 2*2040+481+6 = 4567; the multiplier 1.5 yields
-    # the exact authorized caps 6851/686/224493568.
+    # #2145: settled portion 13 measured 2041 candidates, 486 valid listing
+    # documents + 26 listing errors = 512 outcomes and 609 canonical
+    # second-profile requests.  Required estimated attempts are
+    # 2*2041+512+6+609 = 5209; the multiplier 1.5 yields the exact authorized
+    # caps 7814/782/256049152.
     import math
 
     mod = _load()
@@ -1160,13 +1162,13 @@ def test_full_mode_committed_floors_give_the_authorized_capacity():
         policy, mod.DiscoverySizing("full", previous_competitions=938, country_pages=211)
     )
     assert (full.request_limit, full.retry_limit, full.byte_cap_bytes) == (
-        6851, 686, 224493568
+        7814, 782, 256049152
     )
     # The floors are lower bounds, not fixed values: a larger registry grows.
     grown = mod.discovery_limits(
         policy, mod.DiscoverySizing("full", previous_competitions=3000, country_pages=600)
     )
-    assert grown.request_limit == math.ceil(1.5 * (2 * 3000 + 600 + 6))
+    assert grown.request_limit == math.ceil(1.5 * (2 * 3000 + 600 + 6 + 609))
     # Daily calculations remain unchanged.
     daily = mod.discovery_limits(
         policy, mod.DiscoverySizing("daily", previous_competitions=803, country_pages=211)
@@ -1174,6 +1176,67 @@ def test_full_mode_committed_floors_give_the_authorized_capacity():
     assert daily.request_limit == 1530
     assert daily.retry_limit == 153
     assert daily.byte_cap_bytes == 1530 * 32 * 1024
+
+
+def test_full_work_fits_the_thirteen_slot_timetable():
+    """Production-shaped capacity contract (#2145, authorization 2026-11-10).
+
+    The committed policy's canonical extra and the continuation timetable are
+    tied together: the full work derived from the policy (including the 609
+    canonical second-profile requests) must fit the thirteen slots at the
+    measured conditional rate, and the timetable must keep all three
+    four-hour delivery gaps strictly above the mandatory drain, delivery and
+    rollback budget.
+    """
+    from dags.utils.transfermarkt_discovery_continuation import (
+        RUN_SECONDS,
+        SLOT_HOURS,
+        WORK_SECONDS,
+    )
+
+    mod = _load()
+    policy = load_standing_policy(
+        Path(__file__).resolve().parents[3]
+        / "dags" / "configs" / "transfermarkt" / "standing_registry_policy.json"
+    )
+    scaling = policy.scaling
+    work = (
+        scaling.full_requests_per_competition * scaling.full_min_competitions
+        + scaling.full_listing_pages
+        + scaling.seed_pages
+        + scaling.full_canonical_profile_requests
+    )
+    assert work == 5209  # 2*2041 + 512 + 6 + 609
+    full = mod.discovery_limits(
+        policy, mod.DiscoverySizing("full", previous_competitions=0, country_pages=0)
+    )
+    assert (full.request_limit, full.retry_limit, full.byte_cap_bytes) == (
+        7814, 782, 256049152
+    )
+    assert RUN_SECONDS == 57 * 60
+    assert WORK_SECONDS == 52 * 60
+    # A worker keeps min(WORK_SECONDS, RUN_SECONDS - 300) minus the one-minute
+    # portion guard: 51 effective minutes per slot; thirteen slots cover the
+    # scenario.
+    assert len(SLOT_HOURS) == 13
+    capacity_minutes = len(SLOT_HOURS) * (
+        min(WORK_SECONDS, RUN_SECONDS - 300) // 60 - 1
+    )
+    assert capacity_minutes == 663
+    rate_attempts_per_minute = 8.0648875609956
+    scenario_minutes = work / rate_attempts_per_minute
+    assert scenario_minutes == pytest.approx(645.886, abs=0.01)
+    assert capacity_minutes - scenario_minutes == pytest.approx(17.114, abs=0.01)
+    assert capacity_minutes > scenario_minutes
+    # Strict delivery contract: all three four-hour gaps (07→11, 15→19 and
+    # 23→03) keep more than the mandatory 9460 s after discovery — drain
+    # 3600 s, delivery budget 5260 s and rollback 600 s combined.
+    starts = [datetime(2026, 11, 10, hour, tzinfo=timezone.utc) for hour in SLOT_HOURS]
+    ends = [start + timedelta(seconds=RUN_SECONDS) for start in starts]
+    next_starts = starts[1:] + [starts[0].replace(day=11)]
+    gaps = [(nxt - end).total_seconds() for end, nxt in zip(ends, next_starts)]
+    delivery_gaps = [gap for gap in gaps if gap >= 3600 + 5260 + 600]
+    assert delivery_gaps == [10980, 10980, 10980]
 
 
 def test_scaling_floors_are_validated_and_hashed(tmp_path):
@@ -1186,14 +1249,17 @@ def test_scaling_floors_are_validated_and_hashed(tmp_path):
         request_multiplier=1.5, seed_pages=6, full_requests_per_competition=2,
         daily_requests_per_competition=1, retry_share=0.1,
         provider_bytes_per_request=32768,
-        full_min_competitions=2040, full_listing_pages=481,
+        full_min_competitions=2041, full_listing_pages=512,
+        full_canonical_profile_requests=609,
     )
     scaling = StandingPolicyScaling(**base)
-    # Both bounds are part of the committed payload (and hence the hash).
-    assert scaling.payload()["full_min_competitions"] == 2040
-    assert scaling.payload()["full_listing_pages"] == 481
-    for field in ("full_min_competitions", "full_listing_pages"):
-        for bad in (-1, True, 1.5, "2040", None):
+    # All three bounds are part of the committed payload (and hence the hash).
+    assert scaling.payload()["full_min_competitions"] == 2041
+    assert scaling.payload()["full_listing_pages"] == 512
+    assert scaling.payload()["full_canonical_profile_requests"] == 609
+    for field in ("full_min_competitions", "full_listing_pages",
+                  "full_canonical_profile_requests"):
+        for bad in (-1, True, 1.5, "2041", None):
             with pytest.raises(ApprovalValidationError):
                 StandingPolicyScaling(**{**base, field: bad})
 
@@ -1203,8 +1269,11 @@ def test_scaling_floors_are_validated_and_hashed(tmp_path):
     )
     policy = load_standing_policy(committed_path)
     drifted = json.loads(committed_path.read_text("utf-8"))
-    drifted["scaling"]["full_min_competitions"] = 2041
+    drifted["scaling"]["full_min_competitions"] = 2042
     drifted_path = tmp_path / "standing_registry_policy.json"
+    drifted_path.write_text(json.dumps(drifted), encoding="utf-8")
+    assert load_standing_policy(drifted_path).policy_hash != policy.policy_hash
+    drifted["scaling"]["full_canonical_profile_requests"] = 610
     drifted_path.write_text(json.dumps(drifted), encoding="utf-8")
     assert load_standing_policy(drifted_path).policy_hash != policy.policy_hash
 

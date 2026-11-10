@@ -54,7 +54,7 @@ def test_publication_ack_releases_slots_without_skipping_tomorrow(tmp_path):
         cohorts.mark_published(path, manifest_hash='wrong', snapshot_id='new', now=NOW, write=write)
     cohorts.mark_published(path, manifest_hash='manifest', snapshot_id='new', now=NOW, write=write)
     slots = cohorts.reservations(NOW, path)
-    assert slots == ((NOW + timedelta(days=1), NOW + timedelta(days=1, minutes=55)),)
+    assert slots == ((NOW + timedelta(days=1), NOW + timedelta(days=1, minutes=57)),)
     done = cohorts.select_job(path, identity(previous_snapshot_id='new'), now=NOW, write=write)
     assert done['status'] == 'published'
     next_day = cohorts.select_job(path, identity(previous_snapshot_id='new', cohort_day='2026-11-06'),
@@ -74,22 +74,28 @@ def test_corrupt_marker_only_reserves_bootstrap_and_discovery_fails_closed(tmp_p
 def test_current_stops_before_slot_and_backfill_unchanged(tmp_path, monkeypatch):
     path, _ = prepared(tmp_path)
     monkeypatch.setattr(cohorts, 'JOB_PATH', path)
-    # 10:45 sits in the 07:55→11:00 delivery gap of the 13-slot timetable (#2145).
+    # 10:45 sits in the 07:57→11:00 delivery gap of the 13-slot timetable (#2145).
     before = NOW.replace(hour=10, minute=45)
     assert timetable.available_work_seconds(before, reserve_discovery=True) == 900
     assert timetable.available_work_seconds(before) == 2700
-    assert timetable.next_admitted_time(NOW.replace(hour=5), reserve_discovery=True) == NOW.replace(hour=5, minute=55)
-    assert timetable.next_admitted_time(NOW.replace(hour=2), reserve_discovery=True) == NOW.replace(hour=3, minute=55)
+    assert timetable.next_admitted_time(NOW.replace(hour=5), reserve_discovery=True) == NOW.replace(hour=5, minute=57)
+    assert timetable.next_admitted_time(NOW.replace(hour=2), reserve_discovery=True) == NOW.replace(hour=3, minute=57)
 
 
 def test_three_delivery_gaps_keep_drain_and_rollback_headroom(tmp_path):
     path, _ = prepared(tmp_path)
     windows = cohorts.reservations(NOW, path)
     # Thirteen slots: 03,04,05,06,07,11,12,13,14,15,19,21,23 UTC (#2145,
-    # owner authorization 2026-11-07), preserving 07→11, 15→19 and 23→03.
+    # owner authorization 2026-11-10), preserving the four-hour delivery
+    # gaps 07→11, 15→19 and 23→03.
     assert [start.hour for start, _ in windows[:13]] == [3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 19, 21, 23]
     gaps = [(b[0] - a[1]).total_seconds() for a, b in zip(windows, windows[1:])]
-    assert sum(gap >= 5260 + 3600 + 600 for gap in gaps[:13]) == 3
+    # Strict delivery contract: every four-hour gap leaves 183 minutes
+    # (4h minus the 57-minute run) after discovery — above the mandatory
+    # 9460 s of drain 3600 s, delivery budget 5260 s and rollback 600 s
+    # combined. Two days are reserved, so five of the six daily gaps appear.
+    delivery_gaps = [gap for gap in gaps if gap >= 3600 + 5260 + 600]
+    assert delivery_gaps == [10980] * 5
     assert all(start.hour not in (1, 2) for start, _ in windows)
 
 

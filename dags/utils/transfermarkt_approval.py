@@ -621,8 +621,9 @@ class StandingPolicyScaling:
 
     The ``paid_proxy`` caps stay the floors.  A DAG whose work is known only
     at run time (the registry discovery: competitions of the last canonical
-    snapshot, configured country pages) derives its exact caps from these
-    committed factors instead of one fixed number.
+    snapshot, configured country pages, canonical second-profile requests)
+    derives its exact caps from these committed factors instead of one fixed
+    number.
     """
 
     request_multiplier: float
@@ -631,12 +632,14 @@ class StandingPolicyScaling:
     daily_requests_per_competition: int
     retry_share: float
     provider_bytes_per_request: int
-    # Committed full-mode lower bounds (#2145, owner authorization 2026-11-07):
-    # replay of the actual listings measured 2040 candidates and 481 listing
-    # pages, so a full crawl never sizes below them.  Daily sizing is
-    # unaffected.
+    # Committed full-mode lower bounds (#2145, owner authorization
+    # 2026-11-07, extended 2026-11-10): replay of the actual listings
+    # measured 2041 candidates, 486 valid listing documents + 26 listing
+    # errors = 512 outcomes and 609 canonical second-profile requests, so a
+    # full crawl never sizes below that work.  Daily sizing is unaffected.
     full_min_competitions: int
     full_listing_pages: int
+    full_canonical_profile_requests: int
 
     def __post_init__(self) -> None:
         for field in ('request_multiplier', 'retry_share'):
@@ -658,7 +661,8 @@ class StandingPolicyScaling:
                 raise ApprovalValidationError(
                     f'{field} must be a positive integer'
                 )
-        for field in ('full_min_competitions', 'full_listing_pages'):
+        for field in ('full_min_competitions', 'full_listing_pages',
+                      'full_canonical_profile_requests'):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ApprovalValidationError(
@@ -668,6 +672,7 @@ class StandingPolicyScaling:
     def payload(self) -> dict[str, Any]:
         return {
             'daily_requests_per_competition': self.daily_requests_per_competition,
+            'full_canonical_profile_requests': self.full_canonical_profile_requests,
             'full_listing_pages': self.full_listing_pages,
             'full_min_competitions': self.full_min_competitions,
             'full_requests_per_competition': self.full_requests_per_competition,
