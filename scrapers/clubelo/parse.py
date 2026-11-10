@@ -233,7 +233,7 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
         opp_href = _first(opp.xpath('.//a[span[@class="max640"]]/@href'))
         opp_rank = _first(opp.xpath(".//small/text()"))
         elo_pct = "".join(tds[5].xpath('./span[@class="min1081"]/text()')).strip()
-        if not elo_pct:
+        if not elo_pct and (_text(tds[5]) or cells[3] or cells[4]):
             raise LayoutChanged(f"match row {seq}: Elo % (span.min1081) is empty")
         # NEW marks a club without a prior rating, as on /Results.
         prior, prior_sigma = (None, None) if cells[3] == "NEW" else _value_sigma(cells[3], "Prior Δ")
@@ -277,11 +277,11 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
     return rows
 
 
-# Ten saved club pages keep their legacy requested slug while the single h1
-# anchor already links the renamed canonical slug; "Porto B" → "fc-porto-b"
-# is confirmed by the current daily /Ranking (the page itself was not yet
-# requested in the failed run). Exact pairs only, no name normalization or
-# case aliasing: any other requested-slug → h1 mismatch stays LayoutChanged.
+# Exact confirmed pairs (requested → canonical) from the saved club pages:
+# the requested slug is the legacy one while the single h1 anchor already
+# links the renamed canonical slug. Exact pairs only, no name normalization
+# or case aliasing: any other requested-slug → h1 mismatch stays
+# LayoutChanged.
 H1_SLUG_ALIASES = {
     "Vicenza": "l-r-vicenza",
     "Juventude": "juventude-rs",
@@ -294,6 +294,67 @@ H1_SLUG_ALIASES = {
     "SportingB": "sporting-cp-b",
     "BenficaB": "sl-benfica-b",
     "Porto B": "fc-porto-b",
+    "AcademiaPuertoCabello": "academia-puerto-cabello",
+    "AlianzaPetrolera": "alianza-fc",
+    "AmericadeCali": "america-de-cali",
+    "Atlas": "atlas-guadalajara",
+    "AtleticoNacional": "atletico-nacional",
+    "AustinFC": "austin-fc",
+    "AvispaFukuoka": "avispa-fukuoka",
+    "Blooming": "blooming",
+    "BrisbaneRoar": "brisbane-roar",
+    "Caracas": "caracas-fc",
+    "Cienciano": "cienciano",
+    "ColoradoRapids": "colorado-rapids",
+    "CruzAzul": "cruz-azul",
+    "DeportivoCali": "deportivo-cali",
+    "FCDallas": "fc-dallas",
+    "FCTokyo": "fc-tokyo",
+    "FagianoOkayama": "fagiano-okayama",
+    "Guabira": "cd-guabira",
+    "Gwangju": "gwangju-fc",
+    "HoustonDynamo": "houston-dynamo",
+    "JejuSK": "jeju-sk-fc",
+    "JuanPablo2College": "lsapi-8022",
+    "Kairat": "fk-kairat",
+    "KashimaAntlers": "kashima-antlers",
+    "KashiwaReysol": "kashiwa-reysol",
+    "KawasakiFrontale": "kawasaki-frontale",
+    "KyotoSanga": "kyoto-sanga-fc",
+    "LAFC": "lafc",
+    "LAGalaxy": "los-angeles-galaxy",
+    "Llaneros": "llaneros-fc",
+    "Macarthur": "macarthur-fc",
+    "Melgar": "fbc-melgar",
+    "MinnesotaUtd": "minnesota-united-fc",
+    "Monagas": "monagas",
+    "Monterrey": "monterrey",
+    "NagoyaGrampus": "nagoya-grampus",
+    "NewcastleJets": "newcastle-united-jets",
+    "OrientePetrolero": "oriente-petrolero",
+    "Pachuca": "pachuca",
+    "Pereira": "deportivo-pereira",
+    "PerthGlory": "perth-glory",
+    "PortlandTimbers": "portland-timbers",
+    "Puebla": "puebla-fc",
+    "Queretaro": "gallos-blancos",
+    "RealSaltLake": "real-salt-lake",
+    "SKAKhabarovsk": "ska-khabarovsk",
+    "SanAntonioBuloBulo": "san-antonio-bulo-bulo",
+    "SanDiegoFC": "san-diego-fc",
+    "SanJose": "san-jose-earthquakes",
+    "SeattleSounders": "seattlesounders",
+    "ShonanBellmare": "shonan-bellmare",
+    "SportHuancayo": "sport-huancayo",
+    "SportingKC": "sporting-kansas-city",
+    "StLouisCity": "st-louis-city-sc",
+    "SuwonBluewings": "suwon-bluewings",
+    "Tachira": "deportivo-tachira",
+    "Toluca": "deportivo-toluca",
+    "UANL": "uanl-tigres",
+    "UNAM": "pumas-unam",
+    "VVarenNagasaki": "v-varen-nagasaki",
+    "YokohamaMarinos": "yokohama-f-marinos",
 }
 
 

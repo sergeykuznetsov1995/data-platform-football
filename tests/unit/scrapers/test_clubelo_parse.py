@@ -393,6 +393,29 @@ def test_missing_elo_pct_span_fails_closed(riverplate_html):
         parse_club_page(broken, "riverplate")
 
 
+def _empty_first_row_cells(html: str, empty: list[int]) -> str:
+    """Rewrite the first match row with the indexed cells emptied entirely."""
+    start = html.index("<tr><td>", html.index("<h3>Calculation</h3>"))
+    end = html.index("</tr>", start)
+    chunks = html[start:end].split("</td>")
+    for i in empty:
+        chunks[i] = chunks[i][:chunks[i].index(">") + 1]
+    return html[:start] + "</td>".join(chunks) + "</tr>" + html[end:]
+
+
+def test_blank_prior_hfa_and_elo_pct_cell_parse_as_none(riverplate_html):
+    html = _empty_first_row_cells(riverplate_html, empty=[3, 4, 5])
+    first = parse_club_page(html, "riverplate").matches[0]
+    assert (first["prior_delta"], first["prior_delta_sigma"]) == (None, None)
+    assert first["hfa"] is None and first["elo_pct"] is None
+
+
+def test_blank_elo_pct_with_filled_prior_or_hfa_fails_closed(riverplate_html):
+    html = _empty_first_row_cells(riverplate_html, empty=[5])
+    with pytest.raises(LayoutChanged, match="Elo %"):
+        parse_club_page(html, "riverplate")
+
+
 @pytest.mark.parametrize("old, new, what", [
     ('"Elo": 1784.0233989796975', '"Elo": NaN', "Elo"),
     ('"Golo": 1.3348056', '"Golo": Infinity', "Golo"),
