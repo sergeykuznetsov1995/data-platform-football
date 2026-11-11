@@ -1098,3 +1098,197 @@ def test_paid_io_recovery_never_bypasses_age_or_identity(tmp_path, monkeypatch):
                                now=later + timedelta(minutes=30), write=write)
     assert again['job_id'] == new['job_id']
     assert archive.read_bytes() == archive_bytes
+
+
+# --- One-time pinned rollover of the owner-authorized unused 'ready' marker ---
+# (#2145, owner authorization 2026-11-11): production marker job_id
+# tm-discovery-job-e8e97a7722721d97cb20d271, payload hash 761daa37…; tests
+# monkeypatch the pin to a tmp-path-bound variant via the unused_ready helper.
+
+def unused_ready(tmp_path, monkeypatch):
+    """The pinned unused 'ready' marker: portion 0, traffic None, no
+    evidence on the marker and no checkpoint files on disk."""
+    path, job = prepared(tmp_path)
+    monkeypatch.setattr(cohorts, 'KNOWN_UNUSED_READY_ROLLOVER', {
+        'marker_hash': stable_payload_hash(job), 'cohort_job_id': job['job_id']})
+    return path, job
+
+
+def test_unused_ready_rollover_before_24h_new_caps_fresh_identity(tmp_path, monkeypatch):
+    path, old = unused_ready(tmp_path, monkeypatch)
+    # New caps before 24h previously rejected as identity drift; the exact
+    # unused pin rolls the marker over instead.
+    early = NOW + timedelta(hours=2)
+    new = cohorts.select_job(path, identity(request_limit=200), now=early, write=write)
+    assert new['status'] == 'ready'
+    assert new['portion'] == 0
+    assert new['traffic'] is None
+    assert new['job_id'] != old['job_id']
+    assert new['started_at'] == early.isoformat()
+    assert new['checkpoint_path'] != old['checkpoint_path']
+    assert new['identity']['request_limit'] == 200
+    # The exact old marker is archived untouched as <job_id>/unused.json.
+    assert cohorts.read_job(path.parent / old['job_id'] / 'unused.json') == old
+    assert cohorts.read_job(path)['job_id'] == new['job_id']
+    # A repeat call resumes the fresh cohort; the archive stays exact.
+    again = cohorts.select_job(path, identity(request_limit=200),
+                               now=early + timedelta(minutes=30), write=write)
+    assert again['job_id'] == new['job_id']
+    assert cohorts.read_job(path.parent / old['job_id'] / 'unused.json') == old
+
+
+def test_unused_ready_rollover_after_24h_expired_ready_fresh_identity(tmp_path, monkeypatch):
+    path, old = unused_ready(tmp_path, monkeypatch)
+    # Expired 'ready' after 24h previously rejected outright; the pin rolls
+    # the marker over into a genuinely fresh cohort.
+    later = NOW + timedelta(days=1, hours=2)
+    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
+                             now=later, write=write)
+    assert new['status'] == 'ready'
+    assert new['portion'] == 0
+    assert new['traffic'] is None
+    assert new['job_id'] != old['job_id']
+    assert new['started_at'] == later.isoformat()
+    assert new['checkpoint_path'] != old['checkpoint_path']
+    assert cohorts.read_job(path.parent / old['job_id'] / 'unused.json') == old
+    assert cohorts.read_job(path)['job_id'] == new['job_id']
+
+
+def test_unused_ready_retry_idempotent_and_never_rewrites_archive(tmp_path, monkeypatch):
+    path, old = unused_ready(tmp_path, monkeypatch)
+    archive = path.parent / old['job_id'] / 'unused.json'
+    caller = identity(request_limit=200)
+    calls, crashed = [], []
+
+    def flaky_write(target, payload):
+        calls.append(str(target))
+        if target == path and archive.exists() and not crashed:
+            crashed.append(True)
+            raise OSError('simulated crash before active-marker write')
+        write(target, payload)
+
+    with pytest.raises(OSError, match='simulated crash'):
+        cohorts.select_job(path, caller, now=NOW + timedelta(hours=2), write=flaky_write)
+    # Archive→active ordering: the archive landed first, the old marker is
+    # still active untouched.
+    assert cohorts.read_job(archive) == old
+    assert cohorts.read_job(path)['job_id'] == old['job_id']
+    # The retry finds the equal archive, treats it as idempotent success
+    # (no rewrite) and writes the fresh active cohort.
+    calls.clear()
+    new = cohorts.select_job(path, caller, now=NOW + timedelta(hours=2), write=flaky_write)
+    assert new['job_id'] != old['job_id']
+    assert str(archive) not in calls
+    assert cohorts.read_job(archive) == old
+    assert cohorts.read_job(path)['job_id'] == new['job_id']
+
+
+def test_unused_ready_conflicting_archive_refuses_without_overwriting(tmp_path, monkeypatch):
+    path, old = unused_ready(tmp_path, monkeypatch)
+    archive = path.parent / old['job_id'] / 'unused.json'
+    conflicting = {**old, 'portion': 1}
+    cohorts.write_job(archive, conflicting, write)
+    archive_before = archive.read_bytes()
+    active_before = path.read_bytes()
+    with pytest.raises(ValueError, match='conflicts'):
+        cohorts.select_job(path, identity(request_limit=200),
+                           now=NOW + timedelta(hours=2), write=write)
+    assert archive.read_bytes() == archive_before
+    assert path.read_bytes() == active_before
+
+
+def test_unused_ready_job_id_collision_refuses_before_writes(tmp_path, monkeypatch):
+    path, job = unused_ready(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    # The unchanged identity hashes to the pinned job_id: rollover would
+    # archive and recreate a cohort in the same job_id/checkpoint namespace,
+    # so select_job refuses before any write at all.
+    with pytest.raises(ValueError, match='collides with the unused ready cohort'):
+        cohorts.select_job(path, identity(), now=NOW + timedelta(hours=2), write=write)
+    assert path.read_bytes() == before
+    assert not (path.parent / job['job_id'] / 'unused.json').exists()
+
+
+@pytest.mark.parametrize('name', ['checkpoint.json', 'checkpoint.failures.json'])
+def test_unused_ready_with_checkpoint_file_present_stays_rejected(tmp_path, monkeypatch, name):
+    path, job = unused_ready(tmp_path, monkeypatch)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    target = checkpoint if name == 'checkpoint.json' else checkpoint.with_suffix('.failures.json')
+    target.write_text(json.dumps({'https://example.test/a': {'hash': 'x'}}))
+    before = path.read_bytes()
+    # Any progress evidence on disk keeps the old fail-closed behavior in
+    # both windows, and nothing is archived.
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=200),
+                           now=NOW + timedelta(hours=2), write=write)
+    assert path.read_bytes() == before
+    later = NOW + timedelta(days=1, hours=2)
+    with pytest.raises(ValueError, match='expired'):
+        cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
+                           now=later, write=write)
+    assert path.read_bytes() == before
+    assert not (path.parent / job['job_id'] / 'unused.json').exists()
+
+
+def test_unused_ready_off_pin_marker_stays_rejected(tmp_path, monkeypatch):
+    path, job = prepared(tmp_path)
+    # The pin names a different payload hash: this ready marker is off-pin.
+    monkeypatch.setattr(cohorts, 'KNOWN_UNUSED_READY_ROLLOVER', {
+        'marker_hash': '0' * 64, 'cohort_job_id': job['job_id']})
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='expired'):
+        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
+                           now=NOW + timedelta(days=1), write=write)
+    assert path.read_bytes() == before
+    assert not (path.parent / job['job_id'] / 'unused.json').exists()
+
+
+def test_unused_ready_literal_production_pin():
+    assert cohorts.KNOWN_UNUSED_READY_ROLLOVER == {
+        'marker_hash': '761daa3756cd37f6e30fbf98d5a84b209f073fec16790c52156dbed95fb7fac7',
+        'cohort_job_id': 'tm-discovery-job-e8e97a7722721d97cb20d271',
+    }
+
+
+@pytest.mark.parametrize('changes', [
+    {'portion': 1},
+    {'traffic': _traffic()},
+    {'last_run_id': 'run-1'},
+    {'artifacts': {'checkpoint.json': 'x'}},
+    {'final_manifest': {'path': 'x'}},
+    {'recovery': {'reason': 'x'}},
+    {'writes': [{'table': 'x'}]},
+    {'write_status': {'attempted': True}},
+])
+def test_unused_ready_progress_evidence_stays_rejected_even_if_pinned(tmp_path, monkeypatch, changes):
+    path, job = prepared(tmp_path)
+    job.update(**changes)
+    cohorts.write_job(path, job, write)
+    # Even a pin naming this drifted payload is refused: the unused
+    # invariants (portion 0, traffic None, no write evidence) are enforced
+    # beyond the hash, so any progress keeps the old rejection.
+    monkeypatch.setattr(cohorts, 'KNOWN_UNUSED_READY_ROLLOVER', {
+        'marker_hash': stable_payload_hash(job), 'cohort_job_id': job['job_id']})
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=200),
+                           now=NOW + timedelta(hours=2), write=write)
+    assert path.read_bytes() == before
+    assert not (path.parent / job['job_id'] / 'unused.json').exists()
+
+
+def test_unused_ready_relative_checkpoint_refused_even_with_matching_pin(tmp_path, monkeypatch):
+    path, job = prepared(tmp_path)
+    job['checkpoint_path'] = str(Path(job['job_id']) / 'checkpoint.json')
+    monkeypatch.setattr(cohorts, 'KNOWN_UNUSED_READY_ROLLOVER', {
+        'marker_hash': stable_payload_hash(job), 'cohort_job_id': job['job_id']})
+    monkeypatch.chdir(tmp_path)
+    relative_path = Path('active.json')
+    cohorts.write_job(relative_path, job, write)
+    before = relative_path.read_bytes()
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(relative_path, identity(request_limit=200),
+                           now=NOW + timedelta(hours=2), write=write)
+    assert relative_path.read_bytes() == before
+    assert not (tmp_path / job['job_id'] / 'unused.json').exists()
