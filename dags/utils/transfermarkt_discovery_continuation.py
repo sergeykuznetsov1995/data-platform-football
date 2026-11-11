@@ -77,6 +77,24 @@ _PAID_IO_RECOVERY_ERROR = 'Transfermarkt raw response commit failed closed'
 # Counters the aggregate snapshot must prove against by_entity exactly.
 _ENTITY_COUNTER_FIELDS = ('requests', 'retries', 'provider_up_bytes',
                           'provider_down_bytes', 'decoded_bytes', 'cache_hits')
+# A third one-time, narrowly pinned rollover (#2145, owner authorization
+# 2026-11-11): exactly one audited cohort stranded UNUSED in 'ready' —
+# portion 0, traffic None, no artifacts/final/recovery/write evidence, and
+# both checkpoint files absent — under caps that can never resume it: the
+# normal code rejects new caps before 24h (identity drift) and rejects
+# expired 'ready' after 24h outright.  The pins identify this exact marker
+# by payload hash and job_id; the unused invariants are re-checked on every
+# call.  The exact marker is archived verbatim as <job_id>/unused.json and
+# then replaced by the ordinary fresh cohort creation (fresh
+# identity/job_id/checkpoint/started_at, traffic=None).  This is not
+# configurable permission to roll over arbitrary 'ready' markers: anything
+# that does not match every pin exactly, or that shows any progress
+# evidence, follows the old fail-closed behavior.  No age or identity
+# bypass for any other marker.
+KNOWN_UNUSED_READY_ROLLOVER = {
+    'marker_hash': '761daa3756cd37f6e30fbf98d5a84b209f073fec16790c52156dbed95fb7fac7',
+    'cohort_job_id': 'tm-discovery-job-e8e97a7722721d97cb20d271',
+}
 
 
 class DiscoveryPortionComplete(RuntimeError):
@@ -296,6 +314,68 @@ def _archive_expired_paused_cohort(path: Path, saved: dict[str, Any], write: Cal
     write_job(archive, saved, write)
 
 
+def _match_unused_ready_pin(path: Path, saved: dict[str, Any]) -> bool:
+    """True only for the exact owner-authorized unused 'ready' marker.
+
+    Pins (#2145, 2026-11-11): the marker payload hash and the cohort job_id
+    must equal KNOWN_UNUSED_READY_ROLLOVER exactly, and the unused
+    invariants must hold — status 'ready', portion 0, traffic None, no
+    artifacts/final/recovery/write evidence, the checkpoint bound exactly
+    to <active-parent>/<job_id>/checkpoint.json, and both checkpoint files
+    absent on disk (no work ever touched them).  Anything else — a drifted
+    payload, a different job_id or any progress evidence — is off-pin and
+    follows the old fail-closed behavior.
+    """
+    descriptor = KNOWN_UNUSED_READY_ROLLOVER
+    if (saved.get('status') != 'ready' or saved.get('portion') != 0
+            or saved.get('traffic') is not None):
+        return False
+    if stable_payload_hash(saved) != descriptor['marker_hash']:
+        return False
+    if saved['job_id'] != descriptor['cohort_job_id']:
+        return False
+    if saved['job_id'] != ('tm-discovery-job-'
+                           + stable_payload_hash(saved.get('identity'))[:24]):
+        return False
+    checkpoint = Path(saved['checkpoint_path'])
+    if (not checkpoint.is_absolute()
+            or checkpoint != path.parent / saved['job_id'] / 'checkpoint.json'):
+        return False
+    for field in ('artifacts', 'final_manifest', 'recovery', 'writes', 'write_status'):
+        if saved.get(field):
+            return False
+    if saved.get('last_run_id'):
+        return False
+    if checkpoint.exists() or checkpoint.with_suffix('.failures.json').exists():
+        return False
+    return True
+
+
+def _archive_unused_ready_cohort(path: Path, saved: dict[str, Any], write: Callable) -> None:
+    """Preserve the exact unused 'ready' marker before its one-shot rollover.
+
+    The marker payload is written verbatim (checkpoint binding, started_at
+    and traffic=None untouched) as <active-parent>/<job_id>/unused.json via
+    write_job; nothing is renewed or reset.  Idempotent replay: a retry
+    after a crash between the archive write and the fresh active-marker
+    write must not rewrite the archive.  An existing archive must parse
+    under the same strict read_job and equal the marker being archived
+    exactly; a match simply continues (the caller writes the fresh active
+    marker), while a corrupt or conflicting archive fails closed and is
+    never overwritten.
+    """
+    archive = path.parent / saved['job_id'] / 'unused.json'
+    if archive.exists():
+        try:
+            existing = read_job(archive)
+        except (OSError, ValueError) as exc:
+            raise ValueError('unused cohort archive is corrupt; refusing to overwrite') from exc
+        if existing != saved:
+            raise ValueError('unused cohort archive conflicts with the active marker')
+        return
+    write_job(archive, saved, write)
+
+
 def _read_recovery_manifest(root: Path, pinned: dict[str, str]) -> dict[str, Any]:
     try:
         envelope = json.loads((root / pinned['path']).read_text())
@@ -466,78 +546,102 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
             # Preserve the completed accounting evidence before starting a new day.
             write_job(path.parent / saved['job_id'] / 'completed.json', saved, write)
         else:
-            try:
-                ensure_cohort_age(saved, now)
-            except ValueError:
-                # Owner-authorized one-time rollover (#2145, 2026-11-09): a
-                # saved 'failed' marker matching the exact audited paid-I/O
-                # pin that has ALSO genuinely aged out (>= 24h; an invalid or
-                # future start time never qualifies) is first re-settled as
-                # 'paused' by its existing pinned recovery — the job_id,
-                # artifact and manifest guards inside it still run — and the
-                # re-settled marker then continues through the ordinary
-                # expired-paused rollover below, with its identity/collision
-                # guards and readback intact.  This is an owner-authorized
-                # rollover into a fresh cohort, not an age bypass and not a
-                # renewal of the old cohort: its started_at, portion,
-                # identity, traffic, artifacts and recovery provenance are
-                # preserved verbatim in <job_id>/expired.json, and the fresh
-                # cohort starts at portion 0 with traffic=None (the old
-                # traffic is never carried over as new spend).  No other
-                # expired status and no off-pin marker is recovered here.
-                if (saved['status'] == 'failed' and cohort_expired(saved, now)
-                        and stable_payload_hash(saved)
-                        == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
-                    # Crash-safe order: this failed→paused active write lands
-                    # first, then the <job_id>/expired.json archive below,
-                    # then the fresh active 'ready' marker at the end.  A
-                    # retry after a crash on any step finds a paused expired
-                    # marker and follows the ordinary archive path; an
-                    # existing archive must read back identically or the
-                    # rollover refuses.
-                    _recover_known_paid_io_failure(path, saved, now=now, write=write)
-                # An expired 'paused' cohort (only that status, only genuinely
-                # aged out) rolls over: its marker is archived verbatim under
-                # <job_id>/expired.json after artifact verification, and a
-                # fresh cohort is created below.  Every other expired status
-                # and invalid/future timestamps fail closed as before.
-                if saved['status'] != 'paused' or not cohort_expired(saved, now):
-                    raise
-                # Structural guard: the expired marker's identity must be a
-                # dict with exactly the current identity key set before any
-                # artifact read or archive write.  Keys are compared, not
-                # values: the expired marker is historical, and the genuinely
-                # new cohort intentionally uses current policy/parser/caps.
-                if (not isinstance(saved.get('identity'), dict)
-                        or set(saved['identity']) != set(identity)):
-                    raise ValueError(
-                        'expired paused cohort identity has an incomplete key set')
-                # Collision guard: if the caller identity hashes to the same
-                # job_id as the expired paused cohort, a rollover would archive
-                # and then recreate a cohort in the same job_id/checkpoint
-                # namespace.  Refuse before any artifact read or archive
-                # write, leaving active.json untouched and no expired.json.
+            # Owner-authorized one-shot unused-ready rollover (#2145,
+            # 2026-11-11): exactly one audited marker stranded unused in
+            # 'ready' (portion 0, traffic None, no progress evidence,
+            # checkpoint files absent) is pinned by exact payload hash and
+            # job_id, and is matched BEFORE the normal age/identity
+            # rejections it would otherwise hit both before and after 24h
+            # (new caps before 24h reject as drift; expired 'ready' after
+            # 24h rejects outright).  Off-pin markers and any progress
+            # evidence keep the old fail-closed behavior below.  A caller
+            # identity hashing to the pinned job_id is refused before any
+            # write; otherwise the exact marker is archived as
+            # <job_id>/unused.json first (archive→active ordering;
+            # idempotent: an existing equal archive simply continues, a
+            # corrupt or conflicting one refuses without overwrite), and the
+            # ordinary fresh cohort creation at the end starts a genuinely
+            # new cohort (fresh identity/job_id/checkpoint/started_at,
+            # traffic=None).  No other recovery, age, identity, paused,
+            # publication or schedule behavior is altered.
+            if _match_unused_ready_pin(path, saved):
                 if job_id == saved['job_id']:
                     raise ValueError(
-                        'fresh discovery cohort job_id collides with the expired paused cohort')
-                _archive_expired_paused_cohort(path, saved, write)
+                        'fresh discovery cohort job_id collides with the unused ready cohort')
+                _archive_unused_ready_cohort(path, saved, write)
             else:
-                expected = {**identity, 'cohort_day': saved['identity']['cohort_day']}
-                if saved['identity'] != expected:
-                    raise ValueError('active discovery cohort registry/policy/parser/caps drift')
-                if (saved['status'] == 'running'
-                        and stable_payload_hash(saved) == KNOWN_SETUP_FAILURE_RECOVERY['marker_hash']):
-                    _recover_known_setup_failure(path, saved, now=now, write=write)
+                try:
+                    ensure_cohort_age(saved, now)
+                except ValueError:
+                    # Owner-authorized one-time rollover (#2145, 2026-11-09): a
+                    # saved 'failed' marker matching the exact audited paid-I/O
+                    # pin that has ALSO genuinely aged out (>= 24h; an invalid or
+                    # future start time never qualifies) is first re-settled as
+                    # 'paused' by its existing pinned recovery — the job_id,
+                    # artifact and manifest guards inside it still run — and the
+                    # re-settled marker then continues through the ordinary
+                    # expired-paused rollover below, with its identity/collision
+                    # guards and readback intact.  This is an owner-authorized
+                    # rollover into a fresh cohort, not an age bypass and not a
+                    # renewal of the old cohort: its started_at, portion,
+                    # identity, traffic, artifacts and recovery provenance are
+                    # preserved verbatim in <job_id>/expired.json, and the fresh
+                    # cohort starts at portion 0 with traffic=None (the old
+                    # traffic is never carried over as new spend).  No other
+                    # expired status and no off-pin marker is recovered here.
+                    if (saved['status'] == 'failed' and cohort_expired(saved, now)
+                            and stable_payload_hash(saved)
+                            == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
+                        # Crash-safe order: this failed→paused active write lands
+                        # first, then the <job_id>/expired.json archive below,
+                        # then the fresh active 'ready' marker at the end.  A
+                        # retry after a crash on any step finds a paused expired
+                        # marker and follows the ordinary archive path; an
+                        # existing archive must read back identically or the
+                        # rollover refuses.
+                        _recover_known_paid_io_failure(path, saved, now=now, write=write)
+                    # An expired 'paused' cohort (only that status, only genuinely
+                    # aged out) rolls over: its marker is archived verbatim under
+                    # <job_id>/expired.json after artifact verification, and a
+                    # fresh cohort is created below.  Every other expired status
+                    # and invalid/future timestamps fail closed as before.
+                    if saved['status'] != 'paused' or not cohort_expired(saved, now):
+                        raise
+                    # Structural guard: the expired marker's identity must be a
+                    # dict with exactly the current identity key set before any
+                    # artifact read or archive write.  Keys are compared, not
+                    # values: the expired marker is historical, and the genuinely
+                    # new cohort intentionally uses current policy/parser/caps.
+                    if (not isinstance(saved.get('identity'), dict)
+                            or set(saved['identity']) != set(identity)):
+                        raise ValueError(
+                            'expired paused cohort identity has an incomplete key set')
+                    # Collision guard: if the caller identity hashes to the same
+                    # job_id as the expired paused cohort, a rollover would archive
+                    # and then recreate a cohort in the same job_id/checkpoint
+                    # namespace.  Refuse before any artifact read or archive
+                    # write, leaving active.json untouched and no expired.json.
+                    if job_id == saved['job_id']:
+                        raise ValueError(
+                            'fresh discovery cohort job_id collides with the expired paused cohort')
+                    _archive_expired_paused_cohort(path, saved, write)
+                else:
+                    expected = {**identity, 'cohort_day': saved['identity']['cohort_day']}
+                    if saved['identity'] != expected:
+                        raise ValueError('active discovery cohort registry/policy/parser/caps drift')
+                    if (saved['status'] == 'running'
+                            and stable_payload_hash(saved) == KNOWN_SETUP_FAILURE_RECOVERY['marker_hash']):
+                        _recover_known_setup_failure(path, saved, now=now, write=write)
+                        return saved
+                    # Same one-time pattern, pinned to the single audited
+                    # raw-store 'failed' marker (paid I/O already done).
+                    if (saved['status'] == 'failed'
+                            and stable_payload_hash(saved) == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
+                        _recover_known_paid_io_failure(path, saved, now=now, write=write)
+                        return saved
+                    if saved['status'] not in {'ready', 'paused', 'source_complete'}:
+                        raise ValueError('active discovery cohort has unresolved traffic or writes')
                     return saved
-                # Same one-time pattern, pinned to the single audited
-                # raw-store 'failed' marker (paid I/O already done).
-                if (saved['status'] == 'failed'
-                        and stable_payload_hash(saved) == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
-                    _recover_known_paid_io_failure(path, saved, now=now, write=write)
-                    return saved
-                if saved['status'] not in {'ready', 'paused', 'source_complete'}:
-                    raise ValueError('active discovery cohort has unresolved traffic or writes')
-                return saved
     saved = {'version': 1, 'job_id': job_id, 'identity': identity,
              'status': 'ready', 'portion': 0, 'traffic': None,
              'started_at': now.isoformat(), 'updated_at': now.isoformat(),
