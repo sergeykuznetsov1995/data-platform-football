@@ -137,6 +137,7 @@ CURRENT_VIEW_KEYS: Mapping[str, tuple[str, ...]] = {
         "source_season_key",
         "participant_type",
         "source_order",
+        "name",
     ),
     "fotmob_leaderboards": (
         "competition_id",

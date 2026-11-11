@@ -904,8 +904,11 @@ wave_guard(){ # $1 = путь маркера фазы
 # JSON-строка отчёта доходит до 650 КБ: разбираем на стороне контейнера.
 # INFRA (#1978) — только когда в КАЖДОЙ попытке итоговый отчёт раннера (`errors[]`,
 # верхнее исключение) целиком состоит из отказа HTTP-транспорта к Trino: таймаут
-# чтения, таймаут или отказ соединения. Traceback не разбираем — его формат зависит
-# от библиотек. Нет отчёта или любая другая ошибка — прежний путь (откат).
+# чтения, таймаут или отказ соединения, — либо из диагностированной точной формы
+# REMOTE_TASK_MISMATCH. Форма сверяется ЦЕЛИКОМ (fullmatch): иное имя, иное
+# сообщение, другой хост или битый query_id — прежний путь (откат). Traceback не
+# разбираем — его формат зависит от библиотек. Нет отчёта или любая другая ошибка —
+# прежний путь (откат).
 runner_error(){ # $1 = run_id
   local out logs
   case "$1" in
@@ -917,6 +920,7 @@ runner_error(){ # $1 = run_id
   if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc "ls $logs >/dev/null 2>&1 || exit 3; python3 -c '
 import json, re, sys
 infra = re.compile(r\"TrinoError: SQL execution failed: failed to fetch: HTTPSConnectionPool\(host=.trino., port=\d+\): (Read timed out\..*|Max retries exceeded with url: .*\(Caused by (ConnectTimeoutError|NewConnectionError)\(.*)\")
+mismatch = re.compile(r\"TrinoError: SQL execution failed: TrinoQueryError\(type=INTERNAL_ERROR, name=REMOTE_TASK_MISMATCH, message=\\\"Could not communicate with the remote task\. The node may have crashed or be under too much load\. This is probably a transient issue, so please retry your query in a few minutes\. \(trino:8443\)\\\", query_id=\d{8}_\d{6}_\d{5}_[0-9a-z]+\)\")
 first, all_infra = \"\", True
 for path in sys.argv[1:]:
     errors = None
@@ -932,7 +936,7 @@ for path in sys.argv[1:]:
                     continue
                 if isinstance(report, dict) and isinstance(report.get(\"errors\"), list):
                     errors = report[\"errors\"]
-    all_infra = all_infra and bool(errors) and all(isinstance(e, str) and infra.fullmatch(e) for e in errors)
+    all_infra = all_infra and bool(errors) and all(isinstance(e, str) and (infra.fullmatch(e) or mismatch.fullmatch(e)) for e in errors)
 print(\"INFRA\" if all_infra else first[:300])
 ' $logs" 2>/dev/null); then
     echo X; return

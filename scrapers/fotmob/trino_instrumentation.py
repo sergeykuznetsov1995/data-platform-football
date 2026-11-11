@@ -49,13 +49,24 @@ _HISTORY_RUN_PREFIX = "fotmob-hist-"
 # остаётся 3 с, ``max_attempts=1`` — тоже: повтор POST клиентом запрещён (#1289).
 FOTMOB_TRINO_READ_TIMEOUT_S = 30
 
-# Читающий SQL повторяем при сетевых сбоях и таймаутах (#2014); изменяющий —
-# никогда: ответ мог потеряться после фиксации (#1289). Паузы перед 2-й и 3-й
-# попытками.
+# Читающий SQL повторяем при сетевых сбоях и таймаутах (#2014), а также при
+# точной диагностированной форме REMOTE_TASK_MISMATCH. Изменяющий SQL не
+# повторяем никогда: ответ мог потеряться после фиксации (#1289). Паузы перед
+# 2-й и 3-й попытками.
 _RETRYABLE_READ_ERRORS = TrinoTableManager._CONNECTION_ERRORS + (
     "Read timed out", "failed to fetch")
 _READ_RETRY_BACKOFF = (5, 15)
 _sleep = time.sleep
+
+# Допускается только INTERNAL_ERROR с полным диагностированным сообщением и
+# синтаксически корректным переменным query_id. Любая другая форма не повторяется.
+_REMOTE_TASK_MISMATCH_RE = re.compile(
+    r"TrinoQueryError\(type=INTERNAL_ERROR, name=REMOTE_TASK_MISMATCH, "
+    r"message=\"Could not communicate with the remote task\. The node may "
+    r"have crashed or be under too much load\. This is probably a transient "
+    r"issue, so please retry your query in a few minutes\. \(trino:8443\)\", "
+    r"query_id=\d{8}_\d{6}_\d{5}_[0-9a-z]+\)"
+)
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _IN_LIST_RE = re.compile(r"\bIN\s*\(([^()]*)\)", re.IGNORECASE)
@@ -73,6 +84,22 @@ def _is_read_only(sql: str) -> bool:
     statement = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", sql, flags=re.S)
     return bool(re.match(r"(?:SELECT|SHOW|DESCRIBE|DESC|WITH)\b", statement, re.I)
                 or re.match(r"EXPLAIN\b(?!\s+ANALYZE\b)", statement, re.I))
+
+
+def _is_retryable_read_error(exc: Exception) -> bool:
+    """Сетевой сбой/таймаут или точная форма REMOTE_TASK_MISMATCH.
+
+    Guarded-путь оборачивает ошибку в ``SQL execution failed:``. Срезается
+    только этот префикс в самом начале строки, а не произвольный текст перед ним.
+    """
+
+    text = str(exc)
+    if "REMOTE_TASK_MISMATCH" not in text:
+        return any(msg in text for msg in _RETRYABLE_READ_ERRORS)
+    prefix = "SQL execution failed: "
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    return bool(_REMOTE_TASK_MISMATCH_RE.fullmatch(text))
 
 
 def fotmob_query_source(run_id: str) -> str:
@@ -247,7 +274,8 @@ class FotMobTrinoTableManager(TrinoTableManager):
         raise base.TrinoError(f"Failed to connect to Trino: {last_error}")
 
     def _run_with_read_retries(self, sql, attempt_fn):
-        """Одна попытка для записи; до трёх для чтения при сетевом сбое/таймауте."""
+        """Одна попытка для записи; до трёх для чтения при сбое сети/таймауте
+        или REMOTE_TASK_MISMATCH."""
 
         retryable = _is_read_only(sql)
         with self._conn_lock:
@@ -260,7 +288,7 @@ class FotMobTrinoTableManager(TrinoTableManager):
                     raise
                 except Exception as exc:
                     if (not retryable or attempt == len(_READ_RETRY_BACKOFF)
-                            or not any(msg in str(exc) for msg in _RETRYABLE_READ_ERRORS)):
+                            or not _is_retryable_read_error(exc)):
                         raise
                     pause = _READ_RETRY_BACKOFF[attempt]
                     logger.warning("FotMob read SQL retry: attempt=%d pause=%ds sql=%s",
