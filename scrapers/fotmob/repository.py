@@ -843,6 +843,10 @@ CURRENT_VIEW_SPECS: dict[str, tuple[str, tuple[str, ...]]] = {
             "source_season_key",
             "participant_type",
             "source_order",
+            # The source advertises team and player boards under the same
+            # source_order, so the category name is part of row identity
+            # (#2096); without it one board silently replaced the other.
+            "name",
         ),
     ),
     "fotmob_leaderboards": (

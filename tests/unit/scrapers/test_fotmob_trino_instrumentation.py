@@ -546,6 +546,94 @@ def test_read_query_gives_up_after_three_read_timeouts(monkeypatch, guarded):
     assert sleeps == [5, 15]
 
 
+_REMOTE_TASK_MISMATCH_ERROR = (
+    'TrinoQueryError(type=INTERNAL_ERROR, name=REMOTE_TASK_MISMATCH, '
+    'message="Could not communicate with the remote task. The node may have '
+    'crashed or be under too much load. This is probably a transient issue, '
+    'so please retry your query in a few minutes. (trino:8443)", '
+    'query_id=20261111_010203_00000_synthetic)'
+)
+
+
+def test_remote_task_mismatch_wrapper_is_anchored():
+    from scrapers.fotmob.trino_instrumentation import _is_retryable_read_error
+
+    assert _is_retryable_read_error(Exception(_REMOTE_TASK_MISMATCH_ERROR))
+    assert _is_retryable_read_error(
+        Exception("SQL execution failed: " + _REMOTE_TASK_MISMATCH_ERROR)
+    )
+    assert not _is_retryable_read_error(
+        Exception("SomeOtherError: prefix SQL execution failed: " + _REMOTE_TASK_MISMATCH_ERROR)
+    )
+    assert not _is_retryable_read_error(
+        Exception(
+            "SomeOtherError: Read timed out; prefix SQL execution failed: "
+            + _REMOTE_TASK_MISMATCH_ERROR
+        )
+    )
+
+
+def _mismatching_manager(monkeypatch, mismatches, guarded=True, text=None):
+    """Курсор бросает точную форму REMOTE_TASK_MISMATCH на первых попытках."""
+    from scrapers.fotmob import trino_instrumentation as mod
+    sleeps = []
+    monkeypatch.setattr(mod, "_sleep", sleeps.append)
+    left = [mismatches]
+    raised = text or _REMOTE_TASK_MISMATCH_ERROR
+    def failure(sql):
+        if sql != "SELECT 1" and left[0] > 0:
+            left[0] -= 1
+            raise OSError(raised)
+    manager, lease, calls = _guarded_manager(monkeypatch, failure)
+    if not guarded:
+        manager.set_write_authority(None)
+        manager._authority_required = False
+    return manager, lease, calls, sleeps
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_read_query_is_retried_on_exact_remote_task_mismatch(monkeypatch, guarded):
+    sql = "SELECT id FROM iceberg.bronze.fotmob_t"
+    manager, _, calls, sleeps = _mismatching_manager(monkeypatch, 2, guarded)
+    assert manager._execute(sql, fetch=True) == [[1]]
+    assert calls.count(sql) == 3
+    assert sleeps == [5, 15]
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_mutation_is_not_retried_on_remote_task_mismatch(monkeypatch, guarded):
+    from scrapers.base.trino_manager import TrinoError
+    sql = "INSERT INTO iceberg.bronze.fotmob_t VALUES (1)"
+    manager, _, calls, sleeps = _mismatching_manager(monkeypatch, 1, guarded)
+    with pytest.raises(TrinoError, match="REMOTE_TASK_MISMATCH"):
+        manager._execute(sql)
+    assert calls == [sql]
+    assert sleeps == []
+
+
+@pytest.mark.parametrize('text', [
+    _REMOTE_TASK_MISMATCH_ERROR.replace(
+        "name=REMOTE_TASK_MISMATCH", "name=REMOTE_TASK_ERROR"),
+    _REMOTE_TASK_MISMATCH_ERROR.replace(
+        "The node may have crashed or be under too much load.",
+        "The node may have crashed."),
+    _REMOTE_TASK_MISMATCH_ERROR.replace("(trino:8443)", "(trino:8444)"),
+    _REMOTE_TASK_MISMATCH_ERROR.replace(
+        "query_id=20261111_010203_00000_synthetic", "query_id=oops"),
+])
+@pytest.mark.parametrize("guarded", [True, False])
+def test_read_query_is_not_retried_on_a_near_miss_mismatch(
+    monkeypatch, text, guarded
+):
+    from scrapers.base.trino_manager import TrinoError
+    sql = "SELECT id FROM iceberg.bronze.fotmob_t"
+    manager, _, calls, sleeps = _mismatching_manager(monkeypatch, 1, guarded, text)
+    with pytest.raises(TrinoError):
+        manager._execute(sql, fetch=True)
+    assert calls == [sql]
+    assert sleeps == []
+
+
 @pytest.mark.parametrize('failure_check', [1, 2])
 def test_repository_boundary_loss_irrevocably_revokes_manager(monkeypatch, failure_check):
     from contextlib import nullcontext

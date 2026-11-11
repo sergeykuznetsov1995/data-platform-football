@@ -168,6 +168,40 @@ class ViewWriter(RecordingWriter):
         return self.trino
 
 
+class LeaderboardCategoriesTrino(ViewTrino):
+    """Trino, у которого есть только таблица категорий лидербордов (#2096)."""
+
+    def table_exists(self, schema, table):
+        return table == "fotmob_leaderboard_categories"
+
+    def get_table_columns(self, schema, table):
+        return [
+            "competition_id",
+            "source_season_key",
+            "participant_type",
+            "source_order",
+            "name",
+            "_target_batch_id",
+            "_observed_at",
+            "_ingested_at",
+        ]
+
+
+class LeaderboardCategoriesViewWriter(ViewWriter):
+    def __init__(self):
+        super().__init__()
+        self.trino = LeaderboardCategoriesTrino()
+
+
+def _category_current_key(row):
+    """Ключ текущего вида строки категорий — тот же порядок, что в spec."""
+
+    return tuple(
+        str(row[column])
+        for column in CURRENT_VIEW_SPECS["fotmob_leaderboard_categories"][1]
+    )
+
+
 class CatalogSnapshotTrino:
     def __init__(self):
         self.sql = []
@@ -865,6 +899,55 @@ def test_current_view_rolls_from_last_good_v1_to_v2_replacement_or_tombstone():
         "THEN 1 ELSE 0 END DESC, COALESCE("
     ) in sql
     assert "WHERE target_rn = 1 AND status IN ('success', 'not_modified')" in sql
+
+
+def test_2096_leaderboard_categories_current_key_keeps_same_order_different_name():
+    """Имя категории — часть ключа текущего вида (#2096).
+
+    Источник рекламирует командную и игроковую доски под одним source_order:
+    старый ключ оставлял в current только одну из них и молча терял вторую.
+    Манифест имён не знает, поэтому идентичность снимка не меняется.
+    """
+
+    assert CURRENT_VIEW_SPECS["fotmob_leaderboard_categories"] == (
+        "league_season",
+        (
+            "competition_id",
+            "source_season_key",
+            "participant_type",
+            "source_order",
+            "name",
+        ),
+    )
+    assert REPLACE_TARGET_MANIFEST_IDENTITIES["fotmob_leaderboard_categories"] == (
+        "target_type",
+        "competition_id",
+        "source_season_key",
+    )
+
+    shared = {
+        "competition_id": "289",
+        "source_season_key": "2025/2026",
+        "participant_type": "team",
+        "source_order": "5",
+    }
+    clean_sheet = {**shared, "name": "clean_sheet_team"}
+    squad_value = {**shared, "name": "squad_value_team"}
+    assert _category_current_key(clean_sheet) != _category_current_key(squad_value)
+    assert _category_current_key(clean_sheet) == _category_current_key(
+        {**clean_sheet, "_observed_at": "later"}
+    )
+
+    writer = LeaderboardCategoriesViewWriter()
+    created = FotMobRepository(writer=writer).ensure_current_views()
+
+    assert created == ["iceberg.bronze.fotmob_leaderboard_categories_current"]
+    sql = " ".join(writer.trino.sql[0].split())
+    assert (
+        'PARTITION BY r."competition_id", r."source_season_key", '
+        'r."participant_type", r."source_order", r."name"'
+    ) in sql
+    assert "PARTITION BY target_type, competition_id, source_season_key" in sql
 
 
 def test_entity_tombstone_supersedes_previous_success_for_skip_state():
