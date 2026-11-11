@@ -1655,6 +1655,19 @@ def _infra_traceback(kind: str = "read_timeout") -> str:
     return _runner_log(_INFRA_ERRORS[kind].format(host="trino"))
 
 
+# Диагностированная точная форма REMOTE_TASK_MISMATCH в errors[] отчёта раннера
+# (верхнее исключение с обёрткой TrinoError). query_id переменный — по этому полю
+# классификатор сверяет только синтаксис, а не конкретное значение.
+_REMOTE_TASK_MISMATCH_ERROR = (
+    "TrinoError: SQL execution failed: "
+    'TrinoQueryError(type=INTERNAL_ERROR, name=REMOTE_TASK_MISMATCH, '
+    'message="Could not communicate with the remote task. The node may have '
+    'crashed or be under too much load. This is probably a transient issue, '
+    'so please retry your query in a few minutes. (trino:8443)", '
+    "query_id=20261111_010203_00000_synthetic)"
+)
+
+
 def _attempt_path(tmp_path: Path, run: str, attempt: int = 1) -> Path:
     return tmp_path / (
         f"airflow-logs/dag_id=dag_ingest_fotmob/run_id={run}/"
@@ -1692,9 +1705,47 @@ def test_phase2_defers_infrastructure_failure_then_accepts_green(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("first_error", [
+    _REMOTE_TASK_MISMATCH_ERROR,
+    _INFRA_ERRORS["read_timeout"].format(host="trino"),
+])
+def test_phase2_defers_remote_task_mismatch_then_accepts_green(
+    tmp_path: Path, first_error: str,
+) -> None:
+    run = "fotmob_orchestrated__mismatch"
+    rows = f"{run}|failed|2026-09-08T00:00:10|refresh\n"
+    # Попытки различаются query_id: классификатор сверяет форму, а не значение.
+    second = _REMOTE_TASK_MISMATCH_ERROR.replace(
+        "query_id=20261111_010203_00000_synthetic",
+        "query_id=20261111_023045_00007_worker9",
+    )
+    w = _phase2_world(tmp_path, rows, runner_err=_runner_log(first_error))
+    # Каждая попытка должна сама подтвердить допустимый инфраструктурный сбой.
+    _attempt_path(tmp_path, run, 2).write_text(_runner_log(second), encoding="utf-8")
+    for _ in range(2):
+        proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+        assert proc.returncode == 0, proc.stderr + proc.stdout
+        assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+        assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+        assert not list(w["state"].glob("fotmob-wave-rollback-pending-*"))
+        assert not list(w["state"].glob("fotmob-wave-verdict-*"))
+    assert w["sent"].read_text(encoding="utf-8").count("отказ соединения/таймаут") == 1
+    (tmp_path / "waves.txt").write_text(
+        rows + "fotmob_orchestrated__green|success|2026-09-08T04:00:00|daily\n", encoding="utf-8",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "fotmob_orchestrated__green accepted" in verdict.read_text(encoding="utf-8")
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("case", [
     "source_host", "mixed_errors", "previous_attempt", "no_report", "empty_errors",
     "sql_error", "code_error",
+    "mismatch_wrong_name", "mismatch_wrong_message", "mismatch_wrong_host",
+    "mismatch_generic_remote", "mismatch_bad_query_id", "mixed_mismatch_code",
 ])
 def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, case: str) -> None:
     run = "fotmob_orchestrated__bad"
@@ -1707,6 +1758,19 @@ def test_phase2_does_not_excuse_unconfirmed_or_mixed_failures(tmp_path: Path, ca
         "empty_errors": _runner_log(),
         "sql_error": _runner_log("TrinoError: SQL execution failed: TrinoUserError(type=USER_ERROR, name=COLUMN_NOT_FOUND)"),
         "code_error": _runner_log("KeyError: 'matchId'"),
+        "mismatch_wrong_name": _runner_log(_REMOTE_TASK_MISMATCH_ERROR.replace(
+            "name=REMOTE_TASK_MISMATCH", "name=REMOTE_TASK_ERROR")),
+        "mismatch_wrong_message": _runner_log(_REMOTE_TASK_MISMATCH_ERROR.replace(
+            "The node may have crashed or be under too much load.",
+            "The node may have crashed.")),
+        "mismatch_wrong_host": _runner_log(_REMOTE_TASK_MISMATCH_ERROR.replace(
+            "(trino:8443)", "(trino:8444)")),
+        "mismatch_generic_remote": _runner_log(
+            "TrinoError: SQL execution failed: REMOTE_TASK_MISMATCH"),
+        "mismatch_bad_query_id": _runner_log(_REMOTE_TASK_MISMATCH_ERROR.replace(
+            "query_id=20261111_010203_00000_synthetic", "query_id=oops")),
+        "mixed_mismatch_code": _runner_log(
+            _REMOTE_TASK_MISMATCH_ERROR, "ValueError: broken contract"),
     }[case]
     w = _phase2_world(
         tmp_path, f"{run}|failed|2026-09-08T00:00:10|refresh\n"
