@@ -1292,3 +1292,285 @@ def test_unused_ready_relative_checkpoint_refused_even_with_matching_pin(tmp_pat
                            now=NOW + timedelta(hours=2), write=write)
     assert relative_path.read_bytes() == before
     assert not (tmp_path / job['job_id'] / 'unused.json').exists()
+
+
+# --- One-time pinned recovery of the audited AWS WAF failed cohort ---
+_WAF_URL = 'https://www.transfermarkt.com/navigation/wettbewerbe'
+_WAF_ENVELOPES = [
+    '3ec6700925ae3eaaf8a2002ad87f4c537f42dc9c9d67e37a612593bc49a63048',
+    '195ee3f40365eff0531b1a1ff8a007f9285cbb1aa098da0ba1d6cd586c0f6238',
+]
+
+
+def _waf_failure_document():
+    return {_WAF_URL: {
+        'status': 'blocked', 'status_code': 405, 'attempts': 2, 'error': 'HTTP 405',
+        'raw_capture_id': '7bacc8a74379e55f903a9e029348d6b6ca6d745421e0d513f2da60aac6be1185',
+        'raw_body_hash': '807f282e72f4a318018f98f6bb39a8166b996fe2817c94974c6b6bdff11a364b',
+        'raw_attempt_envelope_ids': _WAF_ENVELOPES,
+        'value': None,
+    }}
+
+
+def _failed_waf_manifest(traffic):
+    manifest_traffic = json.loads(json.dumps(traffic))
+    for field in ('remaining_hard_bytes', 'remaining_retries', 'retry_limit'):
+        manifest_traffic.pop(field, None)
+    return {
+        'status': 'failed', 'run_id': 'scheduled__2026-11-11T11:00:00+00:00',
+        'error': {'type': 'DiscoveryPageUnavailable',
+                  'message': 'required discovery page failed: url=https://www.transfermarkt.com/navigation/wettbewerbe, status=blocked, http=405'},
+        'source_status': 'failed', 'writes': [],
+        'write_status': {'attempted': False, 'authorized': False, 'completed': False},
+        'traffic': manifest_traffic,
+    }
+
+
+def waf_failed(tmp_path, monkeypatch, *, failures=None, manifest=None, traffic=None):
+    path, job = prepared(tmp_path)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    failure_document = _waf_failure_document() if failures is None else failures
+    failure_path = checkpoint.with_suffix('.failures.json')
+    failure_path.write_text(json.dumps(failure_document))
+    active_traffic = _PAID_ACTIVE_TRAFFIC if traffic is None else traffic
+    job.update(status='failed', portion=1,
+               last_run_id='scheduled__2026-11-11T11:00:00+00:00',
+               traffic=active_traffic,
+               artifacts={str(failure_path): hashlib.sha256(failure_path.read_bytes()).hexdigest()})
+    cohorts.write_job(path, job, write)
+    failed_pin = _write_manifest(path.parent.parent, 'waf-failed',
+        manifest if manifest is not None else _failed_waf_manifest(active_traffic))
+    monkeypatch.setattr(cohorts, 'KNOWN_WAF_FAILURE_RECOVERY', {
+        'marker_hash': stable_payload_hash(job),
+        'cohort_job_id': job['job_id'],
+        'failure_sha256': hashlib.sha256(failure_path.read_bytes()).hexdigest(),
+        'failed_manifest': failed_pin,
+        'url': _WAF_URL,
+        'raw_capture_id': '7bacc8a74379e55f903a9e029348d6b6ca6d745421e0d513f2da60aac6be1185',
+        'raw_body_hash': '807f282e72f4a318018f98f6bb39a8166b996fe2817c94974c6b6bdff11a364b',
+        'raw_attempt_envelope_ids': _WAF_ENVELOPES,
+    })
+    return path, job, failure_document
+
+
+def test_waf_recovery_quarantines_failure_and_resumes_with_traffic(tmp_path, monkeypatch):
+    path, job, original_failures = waf_failed(tmp_path, monkeypatch)
+    resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(hours=2), write=write)
+    assert resumed['status'] == 'paused'
+    for field in ('portion', 'started_at', 'identity', 'traffic',
+                  'job_id', 'checkpoint_path', 'last_run_id'):
+        assert resumed[field] == job[field]
+    checkpoint = Path(job['checkpoint_path'])
+    failures = checkpoint.with_suffix('.failures.json')
+    quarantine = checkpoint.with_suffix('.failures.blocked.json')
+    assert json.loads(failures.read_text()) == {}
+    assert resumed['artifacts'] == {str(failures): hashlib.sha256(failures.read_bytes()).hexdigest()}
+    retained = json.loads(quarantine.read_text())
+    assert retained['failed_marker'] == job
+    assert retained['failures'] == original_failures
+    assert retained['original_marker_hash'] == stable_payload_hash(job)
+    assert retained['original_failures_sha256'] == job['artifacts'][str(failures)]
+    recovery = resumed['recovery']
+    assert recovery['quarantine_path'] == str(quarantine)
+    assert recovery['quarantine_hash'] == hashlib.sha256(quarantine.read_bytes()).hexdigest()
+    assert recovery['raw_attempt_envelope_ids'] == _WAF_ENVELOPES
+    ledger = SharedTrafficLedger(hard_provider_bytes=1000000,
+                                 soft_provider_bytes=900000, retry_limit=10)
+    continuation = cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                                 now=lambda: NOW + timedelta(hours=2),
+                                                 run_id='next-run')
+    assert continuation.portion == 2
+    assert ledger.snapshot()['requests'] == 2
+    assert ledger.snapshot()['retries'] == 1
+    before = path.read_bytes()
+    again = cohorts.select_job(path, identity(), now=NOW + timedelta(hours=3), write=write)
+    assert again['status'] == 'paused'
+    assert path.read_bytes() == before
+
+
+def test_waf_recovery_completes_after_quarantine_only_crash(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    checkpoint = Path(job['checkpoint_path'])
+    quarantine = checkpoint.with_suffix('.failures.blocked.json')
+    failures = checkpoint.with_suffix('.failures.json')
+    original = failures.read_bytes()
+    def interrupted(target, payload):
+        if target == failures:
+            raise RuntimeError('crash after quarantine')
+        write(target, payload)
+    with pytest.raises(RuntimeError, match='after quarantine'):
+        cohorts.select_job(path, identity(), now=NOW, write=interrupted)
+    assert quarantine.exists() and failures.read_bytes() == original
+    resumed = cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert resumed['status'] == 'paused'
+    assert json.loads(failures.read_text()) == {}
+
+
+def test_waf_recovery_completes_after_empty_failures_crash(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    failures = Path(job['checkpoint_path']).with_suffix('.failures.json')
+    def interrupted(target, payload):
+        if target == path:
+            raise RuntimeError('crash before marker')
+        write(target, payload)
+    with pytest.raises(RuntimeError, match='before marker'):
+        cohorts.select_job(path, identity(), now=NOW, write=interrupted)
+    assert cohorts.read_job(path)['status'] == 'failed'
+    assert json.loads(failures.read_text()) == {}
+    resumed = cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert resumed['status'] == 'paused'
+
+
+@pytest.mark.parametrize('contents', ['{broken', '{"conflict": true}'])
+def test_waf_recovery_refuses_invalid_quarantine_without_overwrite(tmp_path, monkeypatch, contents):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    quarantine = Path(job['checkpoint_path']).with_suffix('.failures.blocked.json')
+    quarantine.write_text(contents)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='quarantine'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert quarantine.read_text() == contents
+    assert cohorts.read_job(path)['status'] == 'failed'
+
+
+def test_waf_recovery_refuses_empty_failures_without_quarantine(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    failures = Path(job['checkpoint_path']).with_suffix('.failures.json')
+    failures.write_text('{}')
+    quarantine = failures.with_suffix('.blocked.json')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='quarantine'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert not quarantine.exists()
+
+
+def test_waf_recovery_rejects_checkpoint_and_changed_artifact(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.write_text('{}')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='checkpoint'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert not checkpoint.with_suffix('.failures.blocked.json').exists()
+
+
+def test_waf_recovery_rejects_manifest_traffic_mismatch(tmp_path, monkeypatch):
+    drifted = _bump(_PAID_ACTIVE_TRAFFIC, 'requests', 1)
+    path, _, _ = waf_failed(tmp_path, monkeypatch, manifest=_failed_waf_manifest(drifted))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='traffic'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('changes', [
+    {'status': 'paused'},
+    {'source_status': 'not_started'},
+    {'writes': [{'table': 'x', 'rows': 1}]},
+    {'write_status': {'attempted': True, 'authorized': False, 'completed': False}},
+    {'error': {'type': 'RawStoreError', 'message': 'other'}},
+])
+def test_waf_recovery_rejects_wrong_manifest_semantics(tmp_path, monkeypatch, changes):
+    manifest = {**_failed_waf_manifest(_PAID_ACTIVE_TRAFFIC), **changes}
+    path, _, _ = waf_failed(tmp_path, monkeypatch, manifest=manifest)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='evidence'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+def test_waf_recovery_rejects_changed_failure_evidence(tmp_path, monkeypatch):
+    changed = _waf_failure_document()
+    changed[_WAF_URL]['raw_capture_id'] = '0' * 64
+    path, _, _ = waf_failed(tmp_path, monkeypatch, failures=changed)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='failure evidence'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+def test_waf_recovery_never_bypasses_age_identity_or_off_pin(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
+    assert path.read_bytes() == before
+    with pytest.raises(ValueError, match='expired'):
+        cohorts.select_job(path, identity(), now=NOW + timedelta(days=1), write=write)
+    assert path.read_bytes() == before
+    job['portion'] = 2
+    cohorts.write_job(path, job, write)
+    off_pin = path.read_bytes()
+    with pytest.raises(ValueError, match='unresolved traffic or writes'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == off_pin
+
+
+def test_waf_recovery_literal_production_pin():
+    pin = cohorts.KNOWN_WAF_FAILURE_RECOVERY
+    assert pin['cohort_job_id'] == 'tm-discovery-job-75915fb274a0ddc406940e83'
+    assert pin['marker_hash'] == 'a716819d35272452911d20c2ad10c11b8999e0da53bdabff33346ddac74797f1'
+    assert pin['failure_sha256'] == '5853ce0dfa67b0f0666af232de6731442654a8c7c10c83ebdafc6b3d1ad41d4a'
+    assert pin['failed_manifest']['hash'] == 'f32dcea613f131574f3191853d3a23ffcc601185e5ec93254decba5e15bab763'
+    assert pin['url'] == _WAF_URL
+    assert pin['raw_attempt_envelope_ids'] == _WAF_ENVELOPES
+
+
+
+def test_waf_recovery_rejects_changed_artifact_without_writing(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    failures = Path(job['checkpoint_path']).with_suffix('.failures.json')
+    failures.write_text('{"changed": true}')
+    quarantine = failures.with_suffix('.blocked.json')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='active failures'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert not quarantine.exists()
+
+
+def test_waf_recovery_rejects_tampered_manifest_without_writing(tmp_path, monkeypatch):
+    path, job, _ = waf_failed(tmp_path, monkeypatch)
+    pinned = cohorts.KNOWN_WAF_FAILURE_RECOVERY['failed_manifest']
+    manifest_path = path.parent.parent / pinned['path']
+    envelope = json.loads(manifest_path.read_text())
+    envelope['manifest']['run_id'] = 'different-run'
+    manifest_path.write_text(json.dumps(envelope))
+    quarantine = Path(job['checkpoint_path']).with_suffix('.failures.blocked.json')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='differs from the audited pin'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+    assert not quarantine.exists()
+
+
+@pytest.mark.parametrize('scope', ['aggregate', 'entity'])
+def test_waf_recovery_rejects_duration_drift(tmp_path, monkeypatch, scope):
+    manifest = _failed_waf_manifest(_PAID_ACTIVE_TRAFFIC)
+    if scope == 'aggregate':
+        manifest['traffic']['duration_seconds'] += 1
+    else:
+        manifest['traffic']['by_entity']['competition_registry']['duration_seconds'] += 1
+    path, _, _ = waf_failed(tmp_path, monkeypatch, manifest=manifest)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='traffic differs'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('location', ['active', 'failed'])
+@pytest.mark.parametrize('value', [None, -1, float('inf'), float('nan')])
+def test_waf_recovery_rejects_invalid_aggregate_duration(tmp_path, monkeypatch, location, value):
+    traffic = json.loads(json.dumps(_PAID_ACTIVE_TRAFFIC))
+    traffic['duration_seconds'] = value
+    kwargs = {'traffic': traffic} if location == 'active' else {
+        'manifest': _failed_waf_manifest(traffic)}
+    path, _, _ = waf_failed(tmp_path, monkeypatch, **kwargs)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='aggregate duration is invalid'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before

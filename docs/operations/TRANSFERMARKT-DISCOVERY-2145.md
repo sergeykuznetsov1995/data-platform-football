@@ -246,3 +246,30 @@ Evidence: `.local/tasks/2145/discovery-resume-20261105/evidence/recovery-proof.j
 24 часов, и миграция должна отказать; дата начала и квоты не обновляются.
 Эти факты разрешают только точечную миграцию закреплённого состояния,
 а не автоматическое восстановление любого `running` с похожей ошибкой.
+
+
+## Точечный recovery AWS WAF failed-когорты 11 ноября 2026
+
+Для cohort `tm-discovery-job-75915fb274a0ddc406940e83` с marker hash
+`a716819d35272452911d20c2ad10c11b8999e0da53bdabff33346ddac74797f1`
+добавлен отдельный fail-closed recovery после прежних age/identity checks.
+Оба immutable ответа HTTP 405 на required seed подтверждены как AWS WAF Human
+Verification/CAPTCHA. Обычный перевод `failed → paused` недостаточен: runner
+сначала читает terminal outcome из `checkpoint.failures.json` и не выполняет
+новый upstream request.
+
+Recovery применим только к точному marker, manifest, artifact, traffic и raw
+IDs. Порядок crash-safe: сначала детерминированный
+`checkpoint.failures.blocked.json` сохраняет исходный failed marker и полный
+failure document, затем active failures заменяется пустым объектом с readback,
+последним `write_job` записывает `paused` с прежними identity, portion,
+started_at, last_run_id и cumulative traffic. Recovery provenance связывает
+исходные hashes, quarantine path/hash и raw IDs. Повтор после записи
+quarantine или пустого failures завершает marker update; конфликтующее или
+неподтверждённое промежуточное состояние не перезаписывается. Expired cohort
+не восстанавливается и не превращается в fresh rollover.
+
+Код и offline replay не являются production recovery. Merge, автоматическая
+доставка, изменение production marker/artifacts и последующий paid scheduled
+retry требуют отдельного разрешения владельца. Полный реестр, публикация и
+зелёные дни этим изменением не подтверждаются.

@@ -95,6 +95,30 @@ KNOWN_UNUSED_READY_ROLLOVER = {
     'marker_hash': '761daa3756cd37f6e30fbf98d5a84b209f073fec16790c52156dbed95fb7fac7',
     'cohort_job_id': 'tm-discovery-job-e8e97a7722721d97cb20d271',
 }
+# One owner-authorized recovery of the exact failed cohort whose required seed
+# received AWS WAF CAPTCHA on two upstream exits.  The cached terminal failure
+# must be quarantined before the cohort can resume; a status-only transition
+# would replay it without a new request.  Age and identity checks still run.
+KNOWN_WAF_FAILURE_RECOVERY = {
+    'marker_hash': 'a716819d35272452911d20c2ad10c11b8999e0da53bdabff33346ddac74797f1',
+    'cohort_job_id': 'tm-discovery-job-75915fb274a0ddc406940e83',
+    'failure_sha256': '5853ce0dfa67b0f0666af232de6731442654a8c7c10c83ebdafc6b3d1ad41d4a',
+    'failed_manifest': {
+        'path': 'manifests/tm-registry-c15b355527dffaaa3b75bc70/transfermarkt-discovery-f32dcea613f131574f3191853d3a23ffcc601185e5ec93254decba5e15bab763.json',
+        'hash': 'f32dcea613f131574f3191853d3a23ffcc601185e5ec93254decba5e15bab763',
+    },
+    'url': 'https://www.transfermarkt.com/navigation/wettbewerbe',
+    'raw_capture_id': '7bacc8a74379e55f903a9e029348d6b6ca6d745421e0d513f2da60aac6be1185',
+    'raw_body_hash': '807f282e72f4a318018f98f6bb39a8166b996fe2817c94974c6b6bdff11a364b',
+    'raw_attempt_envelope_ids': [
+        '3ec6700925ae3eaaf8a2002ad87f4c537f42dc9c9d67e37a612593bc49a63048',
+        '195ee3f40365eff0531b1a1ff8a007f9285cbb1aa098da0ba1d6cd586c0f6238',
+    ],
+}
+_WAF_RECOVERY_REASON = 'audited AWS WAF failure; cached blocked seed quarantined for scheduled retry'
+_WAF_RECOVERY_ERROR = ('required discovery page failed: '
+                       'url=https://www.transfermarkt.com/navigation/wettbewerbe, '
+                       'status=blocked, http=405')
 
 
 class DiscoveryPortionComplete(RuntimeError):
@@ -530,6 +554,162 @@ def _recover_known_paid_io_failure(path: Path, saved: dict[str, Any], *,
     write_job(path, saved, write)
 
 
+def _write_recovery_json(path: Path, payload: dict[str, Any], write: Callable) -> str:
+    write(path, payload)
+    try:
+        actual = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError('WAF recovery write readback failed') from exc
+    if actual != payload:
+        raise ValueError('WAF recovery write readback differs')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _recover_known_waf_failure(path: Path, saved: dict[str, Any], *,
+                               now: datetime, write: Callable) -> None:
+    """Quarantine the exact WAF-blocked seed and resume with preserved spend."""
+    descriptor = KNOWN_WAF_FAILURE_RECOVERY
+    if (stable_payload_hash(saved) != descriptor['marker_hash']
+            or saved.get('job_id') != descriptor['cohort_job_id']
+            or saved.get('status') != 'failed'
+            or saved.get('portion') != 1
+            or saved.get('last_run_id') != 'scheduled__2026-11-11T11:00:00+00:00'):
+        raise ValueError('WAF recovery marker differs from the audited pin')
+    if saved['job_id'] != ('tm-discovery-job-'
+                           + stable_payload_hash(saved.get('identity'))[:24]):
+        raise ValueError('WAF recovery job_id is not bound to its identity')
+    checkpoint = Path(saved['checkpoint_path'])
+    if (not checkpoint.is_absolute()
+            or checkpoint != path.parent / saved['job_id'] / 'checkpoint.json'):
+        raise ValueError('WAF recovery checkpoint is not bound to its cohort')
+    if checkpoint.exists():
+        raise ValueError('WAF recovery checkpoint must be absent')
+    failures = checkpoint.with_suffix('.failures.json')
+    quarantine = checkpoint.with_suffix('.failures.blocked.json')
+    artifacts = saved.get('artifacts')
+    if artifacts != {str(failures): descriptor['failure_sha256']}:
+        raise ValueError('WAF recovery marker artifacts do not match its checkpoint')
+
+    failed = _read_recovery_manifest(path.parent.parent, descriptor['failed_manifest'])
+    write_status = failed.get('write_status') or {}
+    error = failed.get('error') or {}
+    if (failed.get('status') != 'failed'
+            or failed.get('source_status') != 'failed'
+            or failed.get('run_id') != saved['last_run_id']
+            or error.get('type') != 'DiscoveryPageUnavailable'
+            or error.get('message') != _WAF_RECOVERY_ERROR
+            or failed.get('writes') != []
+            or any(write_status.get(field) is not False
+                   for field in ('attempted', 'authorized', 'completed'))):
+        raise ValueError('WAF recovery failed evidence does not match')
+    if not _settled_traffic_snapshot(saved.get('traffic')):
+        raise ValueError('WAF recovery traffic is not a complete settled snapshot')
+    active_traffic = saved['traffic']
+    failed_traffic = failed.get('traffic') or {}
+    if not _settled_traffic_snapshot(failed_traffic):
+        raise ValueError('WAF recovery failed traffic is not a complete settled snapshot')
+    for traffic in (active_traffic, failed_traffic):
+        duration = traffic.get('duration_seconds')
+        if (not isinstance(duration, (int, float)) or isinstance(duration, bool)
+                or not math.isfinite(duration) or duration < 0):
+            raise ValueError('WAF recovery aggregate duration is invalid')
+    if any(failed_traffic.get(field) != active_traffic[field]
+           for field in (*_RECOVERY_TRAFFIC_FIELDS, 'duration_seconds')):
+        raise ValueError('WAF recovery traffic differs from the marker')
+    active_entities = active_traffic['by_entity']
+    failed_entities = failed_traffic.get('by_entity') or {}
+    if set(failed_entities) != set(active_entities):
+        raise ValueError('WAF recovery traffic entities differ from the marker')
+    for entity, item in failed_entities.items():
+        if any(item.get(field) != active_entities[entity][field]
+               for field in (*_ENTITY_COUNTER_FIELDS, 'duration_seconds')):
+            raise ValueError('WAF recovery traffic differs from the marker')
+
+    try:
+        failure_bytes = failures.read_bytes()
+        failure_digest = hashlib.sha256(failure_bytes).hexdigest()
+        current_failures = json.loads(failure_bytes)
+    except (OSError, ValueError) as exc:
+        raise ValueError('WAF recovery failure evidence is unreadable') from exc
+    if not isinstance(current_failures, dict):
+        raise ValueError('WAF recovery failure evidence is not an object')
+    if failure_digest == descriptor['failure_sha256']:
+        original_failures = current_failures
+    elif current_failures == {} and quarantine.exists():
+        original_failures = None
+    elif current_failures == {}:
+        raise ValueError('WAF recovery empty failures has no quarantine')
+    else:
+        raise ValueError('WAF recovery active failures differ from the pinned state')
+
+    existing_quarantine = None
+    if quarantine.exists():
+        try:
+            existing_quarantine = json.loads(quarantine.read_text())
+        except (OSError, ValueError) as exc:
+            raise ValueError('WAF recovery quarantine is unreadable') from exc
+        if not isinstance(existing_quarantine, dict):
+            raise ValueError('WAF recovery quarantine is not an object')
+    if original_failures is None:
+        original_failures = existing_quarantine.get('failures')
+    if not isinstance(original_failures, dict) or set(original_failures) != {descriptor['url']}:
+        raise ValueError('WAF recovery failure evidence does not match')
+    entry = original_failures[descriptor['url']]
+    if not isinstance(entry, dict):
+        raise ValueError('WAF recovery failure evidence does not match')
+    if (entry.get('status') != 'blocked'
+            or entry.get('status_code') != 405
+            or entry.get('attempts') != 2
+            or entry.get('error') != 'HTTP 405'
+            or entry.get('raw_capture_id') != descriptor['raw_capture_id']
+            or entry.get('raw_body_hash') != descriptor['raw_body_hash']
+            or entry.get('raw_attempt_envelope_ids') != descriptor['raw_attempt_envelope_ids']):
+        raise ValueError('WAF recovery failure evidence does not match')
+
+    retained = {
+        'schema': 'transfermarkt-waf-failure-quarantine-v1',
+        'job_id': saved['job_id'],
+        'original_marker_hash': descriptor['marker_hash'],
+        'original_failures_sha256': descriptor['failure_sha256'],
+        'failed_manifest': descriptor['failed_manifest'],
+        'url': descriptor['url'],
+        'raw_capture_id': descriptor['raw_capture_id'],
+        'raw_body_hash': descriptor['raw_body_hash'],
+        'raw_attempt_envelope_ids': descriptor['raw_attempt_envelope_ids'],
+        'failed_marker': saved,
+        'failures': original_failures,
+    }
+    if existing_quarantine is not None and existing_quarantine != retained:
+        raise ValueError('WAF recovery quarantine conflicts with the audited evidence')
+    if existing_quarantine is None:
+        quarantine_hash = _write_recovery_json(quarantine, retained, write)
+    else:
+        quarantine_hash = hashlib.sha256(quarantine.read_bytes()).hexdigest()
+    if current_failures == {}:
+        empty_hash = hashlib.sha256(failures.read_bytes()).hexdigest()
+    else:
+        empty_hash = _write_recovery_json(failures, {}, write)
+
+    saved.update(
+        status='paused',
+        updated_at=now.isoformat(),
+        artifacts={str(failures): empty_hash},
+        recovery={
+            'reason': _WAF_RECOVERY_REASON,
+            'marker_hash': descriptor['marker_hash'],
+            'failures_hash': descriptor['failure_sha256'],
+            'failed_manifest_hash': descriptor['failed_manifest']['hash'],
+            'quarantine_path': str(quarantine),
+            'quarantine_hash': quarantine_hash,
+            'url': descriptor['url'],
+            'raw_capture_id': descriptor['raw_capture_id'],
+            'raw_body_hash': descriptor['raw_body_hash'],
+            'raw_attempt_envelope_ids': descriptor['raw_attempt_envelope_ids'],
+        },
+    )
+    write_job(path, saved, write)
+
+
 def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Callable) -> dict[str, Any]:
     """Keep one grant across slots; a new calendar slot never renews its caps."""
     # Compute the fresh cohort's job_id once, up front: it is both the
@@ -632,6 +812,10 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
                     if (saved['status'] == 'running'
                             and stable_payload_hash(saved) == KNOWN_SETUP_FAILURE_RECOVERY['marker_hash']):
                         _recover_known_setup_failure(path, saved, now=now, write=write)
+                        return saved
+                    if (saved['status'] == 'failed'
+                            and stable_payload_hash(saved) == KNOWN_WAF_FAILURE_RECOVERY['marker_hash']):
+                        _recover_known_waf_failure(path, saved, now=now, write=write)
                         return saved
                     # Same one-time pattern, pinned to the single audited
                     # raw-store 'failed' marker (paid I/O already done).
