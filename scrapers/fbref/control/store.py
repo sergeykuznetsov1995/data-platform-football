@@ -2595,6 +2595,83 @@ class ControlStore:
         result["safe"] = True
         return result
 
+    @staticmethod
+    def _terminal_airflow_owner_evidence(
+        cursor: Any,
+        *,
+        owner_run_id: str,
+        owner_dag_id: Any,
+    ) -> Optional[dict[str, str]]:
+        """Prove a lock owner's Airflow DagRun is terminal, or return None.
+
+        #2022: an Airflow DagRun marked ``success`` or ``failed`` can never
+        release its publication lock, which previously stayed active until the
+        TTL.  The takeover is allowed only on exact evidence: the owner
+        crawl_run metadata carries ``airflow_run_id``, ``public.dag_run``
+        shows that run terminal for the lock row's ``owner_dag_id``, and no
+        ``public.task_instance`` of the DagRun is active: ``running``,
+        ``queued``, ``restarting``, ``scheduled``, ``up_for_retry``,
+        ``up_for_reschedule`` or ``deferred``. Anything missing or
+        nonterminal returns ``None`` so callers keep the TTL-only behaviour;
+        a takeover is never guessed.
+        Plain reads only, issued while the caller already holds the
+        publication row lock, so no crawl_run/Airflow FOR UPDATE lock-order
+        inversion can arise.
+        """
+        dag_id = None if owner_dag_id is None else str(owner_dag_id).strip()
+        if not dag_id:
+            return None
+        cursor.execute(
+            """
+            SELECT metadata ->> 'airflow_run_id' AS airflow_run_id
+            FROM fbref_control.crawl_run
+            WHERE run_id = %s
+            """,
+            (owner_run_id,),
+        )
+        row = _fetchone(cursor)
+        airflow_run_id = (
+            str(row.get("airflow_run_id") or "").strip() if row else ""
+        )
+        if not airflow_run_id:
+            return None
+        cursor.execute(
+            """
+            SELECT state
+            FROM public.dag_run
+            WHERE dag_id = %s AND run_id = %s
+            """,
+            (dag_id, airflow_run_id),
+        )
+        dag_run = _fetchone(cursor)
+        if dag_run is None:
+            return None
+        dag_state = str(dag_run.get("state") or "").strip().casefold()
+        if dag_state not in {"success", "failed"}:
+            return None
+        cursor.execute(
+            """
+            SELECT 1
+            FROM public.task_instance
+            WHERE dag_id = %s AND run_id = %s
+              AND state IN (
+                  'running', 'queued', 'restarting', 'scheduled',
+                  'up_for_retry', 'up_for_reschedule', 'deferred'
+              )
+            LIMIT 1
+            """,
+            (dag_id, airflow_run_id),
+        )
+        if _fetchone(cursor) is not None:
+            return None
+        return {
+            "reason": "airflow_owner_terminal",
+            "previous_owner_run_id": str(owner_run_id),
+            "previous_owner_dag_id": dag_id,
+            "previous_airflow_run_id": airflow_run_id,
+            "previous_airflow_state": dag_state,
+        }
+
     def acquire_publication_lock(
         self,
         run_id: object,
@@ -2604,7 +2681,15 @@ class ControlStore:
         ttl_seconds: int = 18 * 60 * 60,
         queue: bool = False,
     ) -> dict:
-        """Acquire the source lock spanning Bronze through master Gold."""
+        """Acquire the source lock spanning Bronze through master Gold.
+
+        An active different-owner lock is taken over immediately, without
+        waiting for its TTL, when ``_terminal_airflow_owner_evidence`` proves
+        the owner's Airflow DagRun terminal with no active task; the
+        new lock row's metadata then records the takeover.  Ordinary expired
+        takeovers keep ``metadata='{}'``.  Priority, queue ordering, exact-
+        owner idempotency, and release/expiry semantics are unchanged.
+        """
 
         normalized_run_id = _uuid(run_id, "run_id")
         normalized_dag_id = _text(dag_id, "dag_id")
@@ -2716,12 +2801,19 @@ class ControlStore:
                     "acquired": inserted,
                     "idempotent": not inserted,
                 }
+            stale_takeover = None
             if bool(lock["active"]):
-                if queue:
-                    return {"acquired": False, "queued": True, "owner_run_id": current_owner}
-                raise StateConflict(
-                    "FBref publication is locked by another control run"
+                stale_takeover = self._terminal_airflow_owner_evidence(
+                    cursor,
+                    owner_run_id=current_owner,
+                    owner_dag_id=lock.get("owner_dag_id"),
                 )
+                if stale_takeover is None:
+                    if queue:
+                        return {"acquired": False, "queued": True, "owner_run_id": current_owner}
+                    raise StateConflict(
+                        "FBref publication is locked by another control run"
+                    )
             cursor.execute(
                 """
                 UPDATE fbref_control.publication_lock
@@ -2731,7 +2823,7 @@ class ControlStore:
                     expires_at = clock_timestamp()
                         + (%s * interval '1 second'),
                     released_at = NULL,
-                    metadata = '{}'::jsonb
+                    metadata = %s::jsonb
                 WHERE source = %s
                 RETURNING source, owner_run_id, owner_dag_id, acquired_at,
                           expires_at, released_at
@@ -2740,6 +2832,9 @@ class ControlStore:
                     normalized_run_id,
                     normalized_dag_id,
                     normalized_ttl,
+                    "{}"
+                    if stale_takeover is None
+                    else _json({"takeover": stale_takeover}),
                     normalized_source,
                 ),
             )
@@ -2940,6 +3035,10 @@ class ControlStore:
         The row lock is deliberately held across the caller's Trino/Iceberg
         writes.  A release, expiry takeover, or reassignment therefore cannot
         commit between the ownership check and the external publication.
+
+        #2022: the owner is also rejected once its Airflow DagRun is exactly
+        provable terminal, so stale fences cannot block the next acquire; the
+        transaction rolls back and the lock row stays in place for takeover.
         """
 
         normalized_run_id = _uuid(run_id, "run_id")
@@ -2966,6 +3065,17 @@ class ControlStore:
             ):
                 raise StateConflict(
                     "Active publication lock is not owned by this control run"
+                )
+            stale_takeover = self._terminal_airflow_owner_evidence(
+                cursor,
+                owner_run_id=str(lock["owner_run_id"]),
+                owner_dag_id=lock.get("owner_dag_id"),
+            )
+            if stale_takeover is not None:
+                raise StateConflict(
+                    "Publication lock owner has a terminal "
+                    f"{stale_takeover['previous_airflow_state']} Airflow "
+                    f"DagRun {stale_takeover['previous_airflow_run_id']}"
                 )
             lock["owner_run_id"] = str(lock["owner_run_id"])
             lock["active"] = True

@@ -857,6 +857,336 @@ def test_publication_guard_blocks_release_or_takeover_until_write_finishes(
         setup.close()
 
 
+def _seed_airflow_owner_publication_lock(
+    store,
+    *,
+    owner,
+    contender,
+    source,
+    airflow_run_id,
+    dag_state,
+    task_states=(),
+    owner_dag_id="dag_ingest_fbref",
+):
+    """Install exact Airflow DagRun evidence and an active owner lock."""
+
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE public.dag_run (
+                dag_id text NOT NULL,
+                run_id text NOT NULL,
+                state text NOT NULL,
+                PRIMARY KEY (dag_id, run_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.task_instance (
+                dag_id text NOT NULL,
+                run_id text NOT NULL,
+                task_id text NOT NULL,
+                state text,
+                PRIMARY KEY (dag_id, run_id, task_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO fbref_control.crawl_run (
+                run_id, run_type, status, request_limit, byte_limit, metadata
+            ) VALUES
+                (%s, 'current', 'running', 100, 1000, %s::jsonb),
+                (%s, 'current', 'running', 100, 1000, '{}'::jsonb)
+            """,
+            (
+                owner,
+                json.dumps({"airflow_run_id": airflow_run_id}),
+                contender,
+            ),
+        )
+        if dag_state is not None:
+            cursor.execute(
+                "INSERT INTO public.dag_run VALUES (%s, %s, %s)",
+                (owner_dag_id, airflow_run_id, dag_state),
+            )
+        for ordinal, task_state in enumerate(task_states):
+            cursor.execute(
+                "INSERT INTO public.task_instance VALUES (%s, %s, %s, %s)",
+                (owner_dag_id, airflow_run_id, f"task_{ordinal}", task_state),
+            )
+    store.acquire_publication_lock(
+        owner,
+        dag_id=owner_dag_id,
+        source=source,
+        ttl_seconds=18 * 60 * 60,
+    )
+
+
+def test_terminal_airflow_owner_lock_is_taken_over_without_waiting_for_ttl(
+    isolated_postgres_uri,
+):
+    store = ControlStore(isolated_postgres_uri)
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "manual__2026-11-12T00:00:00+00:00"
+    source = f"fbref-test-{uuid.uuid4().hex}"
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE public.dag_run (
+                dag_id text NOT NULL,
+                run_id text NOT NULL,
+                state text NOT NULL,
+                PRIMARY KEY (dag_id, run_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.task_instance (
+                dag_id text NOT NULL,
+                run_id text NOT NULL,
+                task_id text NOT NULL,
+                state text,
+                PRIMARY KEY (dag_id, run_id, task_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO fbref_control.crawl_run (
+                run_id, run_type, status, request_limit, byte_limit, metadata
+            ) VALUES
+                (%s, 'current', 'running', 100, 1000, %s::jsonb),
+                (%s, 'current', 'running', 100, 1000, '{}'::jsonb)
+            """,
+            (
+                owner,
+                json.dumps({"airflow_run_id": airflow_run_id}),
+                contender,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO public.dag_run VALUES ('dag_ingest_fbref', %s, 'failed')",
+            (airflow_run_id,),
+        )
+    store.acquire_publication_lock(
+        owner,
+        dag_id="dag_ingest_fbref",
+        source=source,
+        ttl_seconds=18 * 60 * 60,
+    )
+
+    result = store.acquire_publication_lock(
+        contender,
+        dag_id="dag_ingest_fbref",
+        source=source,
+        ttl_seconds=18 * 60 * 60,
+    )
+
+    assert result["acquired"] is True
+    assert str(result["owner_run_id"]) == contender
+    with store._transaction() as cursor:
+        cursor.execute(
+            "SELECT owner_run_id, metadata FROM fbref_control.publication_lock WHERE source = %s",
+            (source,),
+        )
+        lock = cursor.fetchone()
+    assert str(lock["owner_run_id"]) == contender
+    assert lock["metadata"]["takeover"] == {
+        "reason": "airflow_owner_terminal",
+        "previous_owner_run_id": owner,
+        "previous_owner_dag_id": "dag_ingest_fbref",
+        "previous_airflow_run_id": airflow_run_id,
+        "previous_airflow_state": "failed",
+    }
+
+
+def test_terminal_success_airflow_owner_lock_is_taken_over_immediately(
+    isolated_postgres_uri,
+):
+    store = ControlStore(isolated_postgres_uri)
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "scheduled__2026-11-11T21:07:00+00:00"
+    source = f"fbref-test-{uuid.uuid4().hex}"
+    _seed_airflow_owner_publication_lock(
+        store,
+        owner=owner,
+        contender=contender,
+        source=source,
+        airflow_run_id=airflow_run_id,
+        dag_state="success",
+    )
+
+    result = store.acquire_publication_lock(
+        contender,
+        dag_id="dag_ingest_fbref",
+        source=source,
+        ttl_seconds=18 * 60 * 60,
+    )
+
+    assert result["acquired"] is True
+    assert result["idempotent"] is False
+    assert str(result["owner_run_id"]) == contender
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            SELECT owner_run_id, released_at,
+                   expires_at > clock_timestamp() AS active, metadata
+            FROM fbref_control.publication_lock WHERE source = %s
+            """,
+            (source,),
+        )
+        lock = cursor.fetchone()
+    assert str(lock["owner_run_id"]) == contender
+    assert lock["released_at"] is None
+    assert lock["active"] is True
+    assert lock["metadata"]["takeover"] == {
+        "reason": "airflow_owner_terminal",
+        "previous_owner_run_id": owner,
+        "previous_owner_dag_id": "dag_ingest_fbref",
+        "previous_airflow_run_id": airflow_run_id,
+        "previous_airflow_state": "success",
+    }
+
+
+@pytest.mark.parametrize("dag_state", ["running", None])
+def test_nonterminal_or_missing_airflow_run_blocks_takeover(
+    isolated_postgres_uri,
+    dag_state,
+):
+    store = ControlStore(isolated_postgres_uri)
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "manual__2026-11-12T00:00:00+00:00"
+    source = f"fbref-test-{uuid.uuid4().hex}"
+    _seed_airflow_owner_publication_lock(
+        store,
+        owner=owner,
+        contender=contender,
+        source=source,
+        airflow_run_id=airflow_run_id,
+        dag_state=dag_state,
+    )
+
+    with pytest.raises(StateConflict, match="locked by another"):
+        store.acquire_publication_lock(
+            contender,
+            dag_id="dag_ingest_fbref",
+            source=source,
+            ttl_seconds=18 * 60 * 60,
+        )
+
+    with store._transaction() as cursor:
+        cursor.execute(
+            "SELECT owner_run_id, metadata FROM fbref_control.publication_lock WHERE source = %s",
+            (source,),
+        )
+        lock = cursor.fetchone()
+    assert str(lock["owner_run_id"]) == owner
+    assert lock["metadata"] == {}
+
+
+@pytest.mark.parametrize(
+    "task_state",
+    [
+        "running",
+        "queued",
+        "restarting",
+        "scheduled",
+        "up_for_retry",
+        "up_for_reschedule",
+        "deferred",
+    ],
+)
+def test_active_airflow_task_blocks_takeover_of_failed_owner(
+    isolated_postgres_uri,
+    task_state,
+):
+    store = ControlStore(isolated_postgres_uri)
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "manual__2026-11-12T00:00:00+00:00"
+    source = f"fbref-test-{uuid.uuid4().hex}"
+    _seed_airflow_owner_publication_lock(
+        store,
+        owner=owner,
+        contender=contender,
+        source=source,
+        airflow_run_id=airflow_run_id,
+        dag_state="failed",
+        task_states=[task_state],
+    )
+
+    with pytest.raises(StateConflict, match="locked by another"):
+        store.acquire_publication_lock(
+            contender,
+            dag_id="dag_ingest_fbref",
+            source=source,
+            ttl_seconds=18 * 60 * 60,
+        )
+
+    with store._transaction() as cursor:
+        cursor.execute(
+            "SELECT owner_run_id, metadata FROM fbref_control.publication_lock WHERE source = %s",
+            (source,),
+        )
+        lock = cursor.fetchone()
+    assert str(lock["owner_run_id"]) == owner
+    assert lock["metadata"] == {}
+
+
+def test_publication_guard_rejects_terminal_owner_but_retains_nonterminal(
+    isolated_postgres_uri,
+):
+    store = ControlStore(isolated_postgres_uri)
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "manual__2026-11-12T00:00:00+00:00"
+    source = f"fbref-test-{uuid.uuid4().hex}"
+    _seed_airflow_owner_publication_lock(
+        store,
+        owner=owner,
+        contender=contender,
+        source=source,
+        airflow_run_id=airflow_run_id,
+        dag_state="failed",
+    )
+
+    with pytest.raises(StateConflict, match="terminal"):
+        with store.guard_publication_lock(owner, source=source):
+            raise AssertionError("a terminal owner must not receive a fence")
+
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            UPDATE public.dag_run
+            SET state = 'running'
+            WHERE dag_id = %s AND run_id = %s
+            """,
+            ("dag_ingest_fbref", airflow_run_id),
+        )
+    with store.guard_publication_lock(owner, source=source) as guard:
+        assert str(guard["owner_run_id"]) == owner
+        assert guard["active"] is True
+
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            SELECT owner_run_id, released_at, metadata
+            FROM fbref_control.publication_lock WHERE source = %s
+            """,
+            (source,),
+        )
+        lock = cursor.fetchone()
+    assert str(lock["owner_run_id"]) == owner
+    assert lock["released_at"] is None
+    assert lock["metadata"] == {}
+
+
 def test_raw_baseline_and_attempt_set_are_durably_anchored(
     isolated_postgres_uri,
 ):
