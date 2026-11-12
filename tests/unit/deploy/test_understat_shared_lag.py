@@ -36,7 +36,8 @@ LAG = {
 # Берём весь класс (включая self-вызовы), ошибки и их зависимости, без вырезания merge.
 TRINO_ENTRIES = ("TrinoTableManager", "TrinoError", "_is_iceberg_invalid_metadata")
 TRINO_PINNED = "8046cb66e8361ebb4aebbb50727010c9f1f7cc3864971db89be02b06e3e5acd2"
-TRINO_MASTER = "efcccea2dabcf351c24a0820da6215ca8a7865927ca0ef970729a9ae7881d73c"
+# 2235 opt-in ESPN strict replay; default Understat SQL/retries unchanged, existing behavioral checks retained.
+TRINO_MASTER = "20abf47bfffe32646034dde0e634760b026b87eb985f1540038c4aba154b46c4"
 # Хеш замыкания telegram_on_failure в alerts.py blob 30c4988a (0caf6bca^, до #1477).
 ALERTS_PINNED = "fe0c8ab93ff3897e5dd10a7e9860bff2cb9e93094eb3cd4759b7931cc6b1d7b1"
 # То, что Understat берёт из config.py blob 221a1271 (до #1590).

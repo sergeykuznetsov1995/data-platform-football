@@ -284,7 +284,8 @@ class TrinoTableManager:
     _COMMIT_CAP = 8.0
 
     def _execute(self, sql: str, fetch: bool = False,
-                 params: Optional[tuple] = None) -> Optional[List[Any]]:
+                 params: Optional[tuple] = None, *,
+                 replay_safe: bool = True) -> Optional[List[Any]]:
         """Execute SQL statement.
 
         Always consumes query results to prevent USER_CANCELED errors.
@@ -295,7 +296,15 @@ class TrinoTableManager:
         while polling results — i.e. inside fetchall() — so they propagate
         as TrinoError even for DDL/DML, never a silent success (#456).
 
-        On connection errors, resets connection and retries once.
+        On connection errors, resets connection and retries once. With
+        ``replay_safe=False`` a classified connection error is instead a
+        possibly-committed write: reset the connection (best effort — a
+        reset failure must not mask the ambiguity) and raise
+        TrinoAmbiguousWriteError without retrying. In that strict mode the
+        cursor cleanup is likewise best effort — a ``cursor.close()``
+        failure must not replace the pending ambiguity (nor blur a
+        classified commit conflict into the broad retry) with an unrelated
+        connection error.
 
         ``params`` binds ``?`` placeholders in ``sql`` (Trino prepared
         statement) — prefer it over interpolating values into the string.
@@ -323,6 +332,24 @@ class TrinoTableManager:
                     error_str = str(e)
                     is_conn_error = any(msg in error_str for msg in self._CONNECTION_ERRORS)
 
+                    if is_conn_error and not replay_safe:
+                        # The server may have committed this statement before
+                        # the connection dropped; replaying it could duplicate
+                        # the write. Best-effort reset — a failure here must
+                        # not mask the ambiguity with a different error.
+                        try:
+                            self._reset_connection()
+                        except Exception:
+                            logger.warning(
+                                "Connection reset failed after ambiguous "
+                                "write failure",
+                                exc_info=True,
+                            )
+                        raise TrinoAmbiguousWriteError(
+                            f"Connection lost while executing SQL; the write "
+                            f"may have committed and must not be replayed: {e}"
+                        ) from e
+
                     if is_conn_error and attempt == 0:
                         logger.warning(
                             f"Connection error during SQL execution: {e}. "
@@ -335,25 +362,69 @@ class TrinoTableManager:
                     raise TrinoError(f"SQL execution failed: {e}") from e
 
                 finally:
-                    cursor.close()
+                    if replay_safe:
+                        cursor.close()
+                    else:
+                        # Strict mode: the connection is broken and was
+                        # likely just reset, so close() can fail; that
+                        # failure must not replace a pending
+                        # TrinoAmbiguousWriteError or a classified commit
+                        # conflict. Best effort, log only.
+                        try:
+                            cursor.close()
+                        except Exception:
+                            logger.warning(
+                                "Trino cursor close failed after "
+                                "non-replay-safe execution",
+                                exc_info=True,
+                            )
 
-    def _execute_committing(self, sql: str) -> None:
+    def _execute_committing(self, sql: str, *,
+                            replay_safe: bool = True) -> None:
         """Execute an idempotent MERGE, retrying Iceberg commit conflicts.
 
         Only safe for statements whose re-execution converges to the same
-        final state (natural-key MERGE upsert, tombstone replace-MERGE): Trino
-        re-plans against the latest committed snapshot on each run. The
-        legacy DELETE+INSERT path must NOT go through here — after the DELETE
-        commits it is no longer idempotent as a unit.
+        final state (natural-key MERGE upsert): Trino re-plans against the
+        latest committed snapshot on each run.
+
+        ``replay_safe=False`` protects statements that must not be replayed
+        after an ambiguous COMMIT outcome: the statement itself is atomic,
+        but the client cannot tell whether the server committed it before
+        the connection dropped, and re-executing could duplicate the write —
+        a classified connection error then raises
+        TrinoAmbiguousWriteError instead of replaying. The tombstone
+        replace-MERGE is NOT universally idempotent, so this protection is
+        opt-in per source: only ESPN (via ``_execute_replacement``) runs it
+        strict; every other caller keeps the default replay-safe semantics.
+        In strict mode the conflict retry below is likewise narrowed: only
+        a definite rejected commit — a cause carrying the structured
+        ICEBERG_COMMIT_ERROR name whose own message says "Found conflicting
+        files" — may be re-executed. A generic ICEBERG_COMMIT_ERROR or a
+        bare "Failed to commit the transaction" message is not proof the
+        commit was rejected, so it propagates without retry.
+        The legacy DELETE+INSERT path must NOT go through here — after the
+        DELETE commits it is no longer idempotent as a unit.
         """
         for attempt in range(self._COMMIT_RETRIES):
             try:
                 with _COMMIT_LOCK:
-                    self._execute(sql)
+                    if replay_safe:
+                        self._execute(sql)
+                    else:
+                        self._execute(sql, replay_safe=False)
                 return
+            except TrinoAmbiguousWriteError:
+                # The statement may already have committed; replaying it is
+                # exactly the hazard, so surface the ambiguity before the
+                # conflict-retry logic below can blur it.
+                raise
             except TrinoError as e:
-                if (attempt < self._COMMIT_RETRIES - 1
-                        and _is_iceberg_commit_conflict(e)):
+                retryable = (
+                    _is_iceberg_commit_conflict(e)
+                    if replay_safe
+                    else _is_definite_iceberg_commit_conflict(e)
+                )
+                if attempt < self._COMMIT_RETRIES - 1 and retryable:
                     delay = min(self._COMMIT_CAP, self._COMMIT_BASE * (2 ** attempt))
                     delay += random.uniform(0, self._COMMIT_BASE)
                     logger.warning(
@@ -363,6 +434,19 @@ class TrinoTableManager:
                     time.sleep(delay)
                     continue
                 raise
+
+    def _execute_replacement(self, sql: str) -> None:
+        """Execute the final tombstone replace-MERGE of an atomic swap.
+
+        The default delegates to ``_execute_committing`` unchanged
+        (replay-safe retry semantics), so subclass overrides of
+        ``_execute``/``_execute_committing`` keep their behavior and
+        instrumentation. The tombstone MERGE is not universally idempotent,
+        so strict ``replay_safe=False`` protection is opt-in per source:
+        only subclasses that can tolerate no-replay (ESPN) override this
+        hook to pass it.
+        """
+        return self._execute_committing(sql)
 
     def create_schema(self, schema: str) -> None:
         """
@@ -1213,7 +1297,12 @@ WITH (
                 values = ", ".join(
                     f's.\"{column}\"' for column in df.columns
                 )
-                self._execute_committing(
+                # The tombstone MERGE is not universally idempotent, so the
+                # strict replay protection is opt-in per source:
+                # ``_execute_replacement`` defaults to the replay-safe
+                # commit path; only opted-in subclasses (ESPN) run this
+                # with replay_safe=False.
+                self._execute_replacement(
                     f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
                     f"ON s.\"{replace_op}\" = 'delete' AND ({equality}) "
                     f"WHEN MATCHED THEN DELETE "
@@ -1231,9 +1320,11 @@ WITH (
                     f"SELECT {cols} FROM {qualified_stage}"
                 )
         except Exception:
-            # The stage remains the recovery source. For a single-statement
-            # replacement the live target is unchanged; for the legacy path a
-            # preceding DELETE may already have committed.
+            # The stage is retained for inspection/recovery. For the legacy
+            # path a preceding DELETE may already have committed; for a
+            # single-statement replacement a failed final MERGE can likewise
+            # mean the target already changed (ambiguous write), not only
+            # that it is untouched.
             logger.error(
                 f"Atomic swap failed for {qualified_target}; stage {qualified_stage} "
                 f"retained for recovery (holds {inserted} insert rows)"
@@ -1564,6 +1655,16 @@ class TrinoError(Exception):
     pass
 
 
+class TrinoAmbiguousWriteError(TrinoError):
+    """A non-replay-safe write may have committed before the connection failed.
+
+    Raised when a statement executed with ``replay_safe=False`` hits a
+    classified connection error: the client cannot tell whether the server
+    committed it, so the statement must not be blindly re-executed.
+    """
+    pass
+
+
 _ICEBERG_METADATA_ERRORS = frozenset({
     'ICEBERG_INVALID_METADATA',
     'ICEBERG_MISSING_METADATA',
@@ -1609,6 +1710,27 @@ def _is_iceberg_commit_conflict(error: Exception) -> bool:
         message = str(cause)
         if ('conflicting files' in message
                 or 'Failed to commit the transaction' in message):
+            return True
+        cause = getattr(cause, '__cause__', None)
+    return False
+
+
+def _is_definite_iceberg_commit_conflict(error: Exception) -> bool:
+    """
+    Strict-mode retry gate: True only for a definite rejected commit.
+
+    The SAME cause must carry the structured ICEBERG_COMMIT_ERROR name and
+    the optimistic-concurrency message "Found conflicting files"
+    (case-insensitive). A generic ICEBERG_COMMIT_ERROR, or the bare
+    "Failed to commit the transaction" message the replay-safe classifier
+    above also accepts, may stand for an ambiguous commit outcome — in
+    replay_safe=False mode that is not proof the commit was rejected, so
+    it must propagate without retry.
+    """
+    cause: Optional[BaseException] = error
+    while cause is not None:
+        if (getattr(cause, 'error_name', None) == 'ICEBERG_COMMIT_ERROR'
+                and 'found conflicting files' in str(cause).lower()):
             return True
         cause = getattr(cause, '__cause__', None)
     return False
