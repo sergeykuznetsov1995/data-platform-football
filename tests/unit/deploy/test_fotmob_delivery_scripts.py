@@ -51,11 +51,15 @@ REQUIRED = {
 RUNTIME_MODULES = (DEPLOY / "release-1292.env").read_text().split("FOTMOB_RUNTIME_HASHES=")[1].splitlines()[0].split("|")
 
 
+EMERGENCY_PACKAGE_KEYS = {
+    "FOTMOB_EMERGENCY_WINDOW_START_EPOCH", "FOTMOB_EMERGENCY_WINDOW_END_EPOCH",
+    "FOTMOB_EMERGENCY_WINDOW_TARGET",
+}
 PACKAGE_KEYS = {
     "FOTMOB_TARGET", "FOTMOB_ROLLBACK_REF", "FOTMOB_ROLLBACK_SHA",
     "FOTMOB_NEW_CODE_FILE", "FOTMOB_NEW_CODE_MD5", "FOTMOB_REPOSITORY_MD5",
     "FOTMOB_RUNTIME_HASHES", "FOTMOB_REQUIRED_MODULES",
-}
+} | EMERGENCY_PACKAGE_KEYS
 
 
 def _write_env(path: Path, **values: str) -> Path:
@@ -324,7 +328,10 @@ def test_b6_refuses_a_production_apply_outside_the_automaton(tmp_path: Path) -> 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("mutate_validation", [False, True])
-def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_path: Path, mutate_validation: bool) -> None:
+@pytest.mark.parametrize("emergency_window", [False, True], ids=["standard-window", "emergency-window"])
+def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(
+    tmp_path: Path, mutate_validation: bool, emergency_window: bool,
+) -> None:
     """Настоящий автомат против заглушек: окно — из date, живые раннеры — из pgrep, метабаза
     и контейнер — из docker. Автомат берёт замок в каталоге состояния из env-файла (по
     СЫРОМУ пути, с хвостовым `/`), выписывает одноразовый пропуск и зовёт СОСЕДНИЙ
@@ -347,6 +354,13 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
         FOTMOB_TARGET=two_short, FOTMOB_ROLLBACK_REF=one_short, FOTMOB_ROLLBACK_SHA=one_short,
         FOTMOB_NEW_CODE_MD5=md5,
     )
+    now = 1767268800
+    if emergency_window:
+        values.update(
+            FOTMOB_EMERGENCY_WINDOW_START_EPOCH=str(now - 60),
+            FOTMOB_EMERGENCY_WINDOW_END_EPOCH=str(now + 3600),
+            FOTMOB_EMERGENCY_WINDOW_TARGET=two_short,
+        )
     validation = Path(values["FOTMOB_VALIDATION_ROOT"])
     _git(tmp_path, "clone", "-q", str(repo), str(validation))
     _git(validation, "checkout", "-q", "--detach", two)
@@ -354,7 +368,7 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
     stubs.mkdir()
-    _date_stub(stubs, "2000")
+    _date_stub(stubs, "1200" if emergency_window else "2000", epoch=now if emergency_window else None)
     # `sleep 5` — ожидание старта драйвера кампании: заглушке драйвера нужно мгновение,
     # чтобы оставить след; остальные ожидания (приёмка, 90 с) — мгновенны.
     _stub(stubs, "sleep", '[ "$1" = 5 ] && exec /bin/sleep 1\nexit 0\n')
@@ -416,17 +430,117 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     assert "FotMob B6 доставлен" in (state / "fotmob-pending-alert").read_text(encoding="utf-8")
     assert not (state / "fotmob-auto-deliver.off").exists()
 
-def _date_stub(stubs: Path, hhmm: str) -> None:
+def _date_stub(stubs: Path, hhmm: str, epoch: int | None = None) -> None:
+    epoch_line = f'  *"+%s") echo {epoch} ;;\n' if epoch is not None else ""
     _stub(
         stubs, "date",
         'case "$*" in\n'
-        f'  *"+%H%M") echo {hhmm} ;;\n'
+        + epoch_line
+        + f'  *"+%H%M") echo {hhmm} ;;\n'
         f'  *"+%H%M%S") echo {hhmm}00 ;;\n'
         '  *"+%F") echo 2026-01-01 ;;\n'
         '  *"+%H:%M") echo 20:00 ;;\n'
         '  *) exec /bin/date "$@" ;;\n'
         'esac\n',
     )
+
+
+def _window_probe(tmp_path: Path, values: dict[str, str], hhmm: str, epoch: int | None = None) -> subprocess.CompletedProcess:
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, hhmm, epoch=epoch)
+    probe = (
+        f'. "{ENV_SH}"; . "{DEPLOY / "delivery_barrier.sh"}"; '
+        'fotmob_load_package "$1" || exit 9; TARGET=$FOTMOB_TARGET; '
+        'if fotmob_delivery_window_open; then printf "open|"; else printf "closed|"; fi; '
+        'fotmob_delivery_safe_left'
+    )
+    return subprocess.run(
+        ["bash", "-c", probe, "bash", str(env_file.with_suffix(".release"))],
+        env={"PATH": f"{stubs}:{os.environ['PATH']}", "LANG": "C.UTF-8"},
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+@pytest.mark.unit
+def test_standard_delivery_window_keeps_its_clock_and_safe_left(tmp_path: Path) -> None:
+    proc = _window_probe(tmp_path, _layout(tmp_path), "2000")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "open|12600\n"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "case",
+    ["valid", "wrong-target", "missing-target", "missing-start", "missing-end", "nonnumeric-start",
+     "nonnumeric-end", "reversed", "too-long", "future", "expired"],
+)
+def test_emergency_delivery_window_is_bounded_and_fail_closed(tmp_path: Path, case: str) -> None:
+    values = _layout(tmp_path)
+    now = 1767268800
+    values.update(
+        FOTMOB_EMERGENCY_WINDOW_START_EPOCH=str(now - 60),
+        FOTMOB_EMERGENCY_WINDOW_END_EPOCH=str(now + 3600),
+        FOTMOB_EMERGENCY_WINDOW_TARGET=values["FOTMOB_TARGET"],
+    )
+    if case == "wrong-target":
+        values["FOTMOB_EMERGENCY_WINDOW_TARGET"] = "22222222"
+    elif case == "missing-target":
+        del values["FOTMOB_EMERGENCY_WINDOW_TARGET"]
+    elif case == "missing-start":
+        del values["FOTMOB_EMERGENCY_WINDOW_START_EPOCH"]
+    elif case == "missing-end":
+        del values["FOTMOB_EMERGENCY_WINDOW_END_EPOCH"]
+    elif case == "nonnumeric-start":
+        values["FOTMOB_EMERGENCY_WINDOW_START_EPOCH"] = "not-a-time"
+    elif case == "nonnumeric-end":
+        values["FOTMOB_EMERGENCY_WINDOW_END_EPOCH"] = "12x"
+    elif case == "reversed":
+        values["FOTMOB_EMERGENCY_WINDOW_START_EPOCH"] = str(now + 3600)
+        values["FOTMOB_EMERGENCY_WINDOW_END_EPOCH"] = str(now - 60)
+    elif case == "too-long":
+        values["FOTMOB_EMERGENCY_WINDOW_END_EPOCH"] = str(now + 14461)
+    elif case == "future":
+        values["FOTMOB_EMERGENCY_WINDOW_START_EPOCH"] = str(now + 60)
+    elif case == "expired":
+        values["FOTMOB_EMERGENCY_WINDOW_START_EPOCH"] = str(now - 7200)
+        values["FOTMOB_EMERGENCY_WINDOW_END_EPOCH"] = str(now - 3600)
+    proc = _window_probe(tmp_path, values, "1200", epoch=now)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ("open|4200\n" if case == "valid" else "closed|-1\n")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case", ["wrong-target", "expired"])
+def test_auto_deliver_refuses_invalid_emergency_before_attempt(tmp_path: Path, case: str) -> None:
+    values = _layout(tmp_path)
+    repo = Path(values["FOTMOB_RELEASE_ROOT"])
+    one, two = _two_commits(repo)
+    one_short = _git(repo, "rev-parse", "--short", one)
+    two_short = _git(repo, "rev-parse", "--short", two)
+    now = 1767268800
+    values.update(
+        FOTMOB_TARGET=two_short, FOTMOB_ROLLBACK_REF=one_short, FOTMOB_ROLLBACK_SHA=one_short,
+        FOTMOB_EMERGENCY_WINDOW_START_EPOCH=str(now - 60),
+        FOTMOB_EMERGENCY_WINDOW_END_EPOCH=str(now + 3600),
+        FOTMOB_EMERGENCY_WINDOW_TARGET=two_short,
+    )
+    if case == "wrong-target":
+        values["FOTMOB_EMERGENCY_WINDOW_TARGET"] = one_short
+    else:
+        values["FOTMOB_EMERGENCY_WINDOW_START_EPOCH"] = str(now - 7200)
+        values["FOTMOB_EMERGENCY_WINDOW_END_EPOCH"] = str(now - 3600)
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "1200", epoch=now)
+    auto = _install(tmp_path, stubs)
+    proc = _run(auto, env_file=env_file, stubs=stubs)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    state = Path(values["FOTMOB_STATE_DIR"])
+    assert not list(state.glob("fotmob-auto-deliver-attempted-*"))
+    assert _git(repo, "rev-parse", "HEAD") == one
 
 
 def _tg_env(values: dict[str, str]) -> None:
@@ -1020,7 +1134,7 @@ def test_one_package_pointer_switches_both_scripts_and_pins_the_handoff(tmp_path
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("key", sorted(PACKAGE_KEYS))
+@pytest.mark.parametrize("key", sorted(PACKAGE_KEYS - EMERGENCY_PACKAGE_KEYS))
 def test_incomplete_package_refuses_both_scripts_before_any_action(tmp_path: Path, key: str) -> None:
     values = _layout(tmp_path)
     del values[key]
