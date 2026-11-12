@@ -33,7 +33,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .silver_reader_barrier import drain_readers
+if __package__:
+    from .silver_reader_barrier import drain_readers
+else:
+    from utils.silver_reader_barrier import drain_readers
 
 
 SLOTS = ('a', 'b')
