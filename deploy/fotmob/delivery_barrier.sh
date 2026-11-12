@@ -1,6 +1,47 @@
 # Общий барьер checkout. Вызывается только под flock автомата (B6 наследует fd 9).
 # Журнал намерения пишется ДО UPDATE: SIGKILL не теряет владение паузами.
 # При неподтверждённом checkout паузы остаются до восстановления/ручного разбора.
+fotmob_standard_delivery_window_open() {
+  local hm
+  hm=$(date -u +%H%M)
+  [ "$hm" -ge 1945 ] && [ "$hm" -le 2320 ]
+}
+
+fotmob_emergency_delivery_window_open() {
+  local start end now
+  start=${FOTMOB_EMERGENCY_WINDOW_START_EPOCH:-}
+  end=${FOTMOB_EMERGENCY_WINDOW_END_EPOCH:-}
+  [ -n "${TARGET:-}" ] && [ "${FOTMOB_EMERGENCY_WINDOW_TARGET:-}" = "$TARGET" ] || return 1
+  case "$start" in ''|*[!0-9]*) return 1 ;; esac
+  case "$end" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$start" -lt "$end" ] && [ $((end - start)) -le 14400 ] || return 1
+  now=$(date -u +%s)
+  [ "$now" -ge "$start" ] && [ "$now" -le "$end" ] || return 1
+  [ $((end + 2400 - now - 1800)) -gt 0 ]
+}
+
+fotmob_delivery_window_open() {
+  if fotmob_standard_delivery_window_open; then
+    return 0
+  fi
+  fotmob_emergency_delivery_window_open
+}
+
+fotmob_delivery_safe_left() {
+  local hms now
+  hms=$(date -u +%H%M%S)
+  if fotmob_standard_delivery_window_open; then
+    echo $((86400 - 10#${hms:0:2} * 3600 - 10#${hms:2:2} * 60 - 10#${hms:4:2} - 1800))
+    return 0
+  fi
+  if fotmob_emergency_delivery_window_open; then
+    now=$(date -u +%s)
+    echo $((FOTMOB_EMERGENCY_WINDOW_END_EPOCH + 2400 - now - 1800))
+    return 0
+  fi
+  echo -1
+}
+
 barrier_sql() {
   timeout -k 5 "${METADB_TIMEOUT:-30}" docker exec "$FOTMOB_METADB_CONTAINER" \
     psql -X -q -v ON_ERROR_STOP=1 -U airflow -d airflow -tA -c "$1"
@@ -125,7 +166,7 @@ barrier_rebind_ignore() {
   echo "BARRIER: блок-лист отвязан $1 — рестарт scheduler, эталон восстановлен ($BARRIER_MD5)"
 }
 barrier_checkout() {
-  local before after hm hms safe_left
+  local before after safe_left
   if [ "$(realpath -m "$TREE")" != "$(realpath -m "$FOTMOB_RELEASE_ROOT")" ]; then
     git -C "$TREE" checkout "$@"
     return $?
@@ -133,10 +174,8 @@ barrier_checkout() {
   barrier_acquire || { echo 'BARRIER: отказ, checkout запрещён' >&2; return 1; }
   if [ "$1" = -B ]; then
     # Drain расходует окно: повторная сверка непосредственно перед apply.
-    hm=$(date -u +%H%M)
-    hms=$(date -u +%H%M%S)
-    safe_left=$((86400 - 10#${hms:0:2} * 3600 - 10#${hms:2:2} * 60 - 10#${hms:4:2} - 1800))
-    [ "$hm" -ge 1945 ] && [ "$hm" -le 2320 ] && [ "$safe_left" -gt 0 ] || return 1
+    safe_left=$(fotmob_delivery_safe_left)
+    [ "$safe_left" -gt 0 ] || return 1
   fi
   # До checkout bind мог остаться отвязанным оборванной прошлой попыткой.
   barrier_rebind_ignore 'до checkout' || return 1

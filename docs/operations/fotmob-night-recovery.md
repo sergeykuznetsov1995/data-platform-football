@@ -59,7 +59,12 @@ REPLAY сохраняет строгий отказ. Повреждённый я
    OFF. Под общим flock, вне окна, сверить исходные SHA перед атомарной заменой;
    сохранить backup и fsync файлов/каталогов. Hold и STOP сохранить. Доставляет
    существующий cron в19:45–23:20UTC (22:45–02:20МСК). Ручной checkout/apply/ingest
-   запрещён. Общий стек, cron и#1185 не меняются.
+   запрещён. Исключение — только отдельно одобренный владельцем immutable package с
+   `FOTMOB_EMERGENCY_WINDOW_START_EPOCH`, `FOTMOB_EMERGENCY_WINDOW_END_EPOCH` и
+   `FOTMOB_EMERGENCY_WINDOW_TARGET`: интервал не больше четырёх часов, target совпадает
+   с пакетом, время и запас на откат проверяются автоматом, B6 и checkout barrier.
+   Общего override нет; lock, nonce, OFF, суточная защёлка, suite и rollback сохраняются.
+   Общий стек, cron и#1185 не меняются.
 
 ## Первая штатная волна и Bronze
 
