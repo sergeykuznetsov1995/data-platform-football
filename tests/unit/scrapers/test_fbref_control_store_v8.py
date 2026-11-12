@@ -306,6 +306,8 @@ def test_publication_lock_rejects_an_active_different_owner():
                 ],
                 1,
             )
+        if "metadata ->> 'airflow_run_id'" in sql:
+            return ([{"airflow_run_id": None}], 1)
         raise AssertionError(sql)
 
     store, _ = make_store(handler)
@@ -313,6 +315,325 @@ def test_publication_lock_rejects_an_active_different_owner():
         store.acquire_publication_lock(
             contender, dag_id="dag_backfill_fbref"
         )
+
+
+def test_publication_lock_takes_over_terminal_airflow_owner_and_records_evidence():
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "manual__2026-11-12T00:00:00+00:00"
+    now = datetime.now(timezone.utc)
+
+    def handler(sql, params):
+        if sql.startswith("SELECT waiter.run_id AS priority_owner"):
+            return [], 0
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
+        if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
+            return ([{"status": "running"}], 1)
+        if sql.startswith("INSERT INTO fbref_control.publication_lock"):
+            return ([], 0)
+        if "FROM fbref_control.publication_lock" in sql and "FOR UPDATE" in sql:
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": owner,
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                        "active": True,
+                    }
+                ],
+                1,
+            )
+        if "metadata ->> 'airflow_run_id'" in sql:
+            return ([{"airflow_run_id": airflow_run_id}], 1)
+        if "FROM public.dag_run" in sql:
+            assert params == ("dag_ingest_fbref", airflow_run_id)
+            return ([{"state": "failed"}], 1)
+        if "FROM public.task_instance" in sql:
+            return ([], 0)
+        if sql.startswith("UPDATE fbref_control.publication_lock"):
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": contender,
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                    }
+                ],
+                1,
+            )
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    result = store.acquire_publication_lock(
+        contender, dag_id="dag_ingest_fbref"
+    )
+
+    executions = factory.connections[0].fake_cursor.executions
+    kinds = [sql for sql, _params in executions]
+    fence_index = kinds.index(
+        next(
+            sql
+            for sql in kinds
+            if sql.startswith("SELECT pg_advisory_xact_lock")
+        )
+    )
+    metadata_index = kinds.index(
+        next(sql for sql in kinds if "metadata ->> 'airflow_run_id'" in sql)
+    )
+    dag_run_index = kinds.index(
+        next(sql for sql in kinds if "FROM public.dag_run" in sql)
+    )
+    task_index = kinds.index(
+        next(sql for sql in kinds if "FROM public.task_instance" in sql)
+    )
+    update_index = kinds.index(
+        next(
+            sql
+            for sql in kinds
+            if sql.startswith("UPDATE fbref_control.publication_lock")
+        )
+    )
+    assert fence_index < metadata_index < dag_run_index < task_index < update_index
+
+    takeover = {
+        "reason": "airflow_owner_terminal",
+        "previous_owner_run_id": owner,
+        "previous_owner_dag_id": "dag_ingest_fbref",
+        "previous_airflow_run_id": airflow_run_id,
+        "previous_airflow_state": "failed",
+    }
+    update_params = next(
+        params
+        for sql, params in executions
+        if sql.startswith("UPDATE fbref_control.publication_lock")
+    )
+    assert update_params == (
+        contender,
+        "dag_ingest_fbref",
+        18 * 60 * 60,
+        json.dumps({"takeover": takeover}, sort_keys=True, separators=(",", ":")),
+        "fbref",
+    )
+    assert json.loads(update_params[3])["takeover"] == takeover
+    assert result["acquired"] is True
+    assert result["idempotent"] is False
+    assert str(result["owner_run_id"]) == contender
+    assert factory.connections[0].committed is True
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "missing_airflow_run_id",
+        "missing_dag_run",
+        "dag_run_still_running",
+        "task_instance_still_running",
+    ],
+)
+def test_publication_lock_takeover_fails_closed_without_exact_airflow_evidence(
+    evidence,
+):
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    def handler(sql, params):
+        if sql.startswith("SELECT waiter.run_id AS priority_owner"):
+            return [], 0
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
+        if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
+            return ([{"status": "running"}], 1)
+        if sql.startswith("INSERT INTO fbref_control.publication_lock"):
+            return ([], 0)
+        if "FROM fbref_control.publication_lock" in sql and "FOR UPDATE" in sql:
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": owner,
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                        "active": True,
+                    }
+                ],
+                1,
+            )
+        if "metadata ->> 'airflow_run_id'" in sql:
+            if evidence == "missing_airflow_run_id":
+                return ([{"airflow_run_id": None}], 1)
+            return ([{"airflow_run_id": "manual__2026-11-12"}], 1)
+        if "FROM public.dag_run" in sql:
+            if evidence == "missing_dag_run":
+                return ([], 0)
+            if evidence == "dag_run_still_running":
+                return ([{"state": "running"}], 1)
+            return ([{"state": "failed"}], 1)
+        if "FROM public.task_instance" in sql:
+            if evidence == "task_instance_still_running":
+                return ([{"run_id": owner}], 1)
+            return ([], 0)
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    with pytest.raises(StateConflict, match="locked by another"):
+        store.acquire_publication_lock(
+            contender, dag_id="dag_ingest_fbref"
+        )
+
+    assert factory.connections[0].rolled_back is True
+    executions = factory.connections[0].fake_cursor.executions
+    assert not any(
+        sql.startswith("UPDATE fbref_control.publication_lock")
+        for sql, _params in executions
+    )
+    if evidence == "missing_airflow_run_id":
+        assert not any("FROM public." in sql for sql, _params in executions)
+
+
+def test_publication_lock_queued_contender_waits_behind_the_head_despite_terminal_owner():
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    other_waiter = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    def handler(sql, params):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
+        if sql.startswith(
+            "SELECT status, run_type FROM fbref_control.crawl_run"
+        ):
+            return ([{"status": "running", "run_type": "current"}], 1)
+        if "FROM fbref_control.publication_lock" in sql and "FOR UPDATE" in sql:
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": owner,
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                        "active": True,
+                    }
+                ],
+                1,
+            )
+        if sql.startswith("INSERT INTO fbref_control.publication_waiter"):
+            return ([], 1)
+        if sql.startswith("SELECT waiter.run_id FROM fbref_control.publication_waiter"):
+            return ([{"run_id": other_waiter}], 1)
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    result = store.acquire_publication_lock(
+        contender, dag_id="dag_ingest_fbref", queue=True
+    )
+
+    assert result == {"acquired": False, "queued": True}
+    executions = factory.connections[0].fake_cursor.executions
+    assert not any(
+        "metadata ->> 'airflow_run_id'" in sql or "FROM public." in sql
+        for sql, _params in executions
+    )
+    assert not any(
+        sql.startswith("UPDATE fbref_control.publication_lock")
+        for sql, _params in executions
+    )
+
+
+def test_publication_lock_queue_head_takes_over_terminal_airflow_owner():
+    owner = str(uuid.uuid4())
+    contender = str(uuid.uuid4())
+    airflow_run_id = "manual__2026-11-12T00:00:00+00:00"
+    now = datetime.now(timezone.utc)
+
+    def handler(sql, params):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
+        if sql.startswith(
+            "SELECT status, run_type FROM fbref_control.crawl_run"
+        ):
+            return ([{"status": "running", "run_type": "current"}], 1)
+        if "FROM fbref_control.publication_lock" in sql and "FOR UPDATE" in sql:
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": owner,
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                        "active": True,
+                    }
+                ],
+                1,
+            )
+        if sql.startswith("INSERT INTO fbref_control.publication_waiter"):
+            return ([], 1)
+        if sql.startswith("SELECT waiter.run_id FROM fbref_control.publication_waiter"):
+            return ([{"run_id": contender}], 1)
+        if sql.startswith("INSERT INTO fbref_control.publication_lock"):
+            return ([], 0)
+        if "metadata ->> 'airflow_run_id'" in sql:
+            return ([{"airflow_run_id": airflow_run_id}], 1)
+        if "FROM public.dag_run" in sql:
+            return ([{"state": "failed"}], 1)
+        if "FROM public.task_instance" in sql:
+            return ([], 0)
+        if sql.startswith("UPDATE fbref_control.publication_lock"):
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": contender,
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                    }
+                ],
+                1,
+            )
+        if sql.startswith("DELETE FROM fbref_control.publication_waiter"):
+            return ([], 1)
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    result = store.acquire_publication_lock(
+        contender, dag_id="dag_ingest_fbref", queue=True
+    )
+
+    assert result["acquired"] is True
+    assert result["idempotent"] is False
+    assert str(result["owner_run_id"]) == contender
+    executions = factory.connections[0].fake_cursor.executions
+    update_params = next(
+        params
+        for sql, params in executions
+        if sql.startswith("UPDATE fbref_control.publication_lock")
+    )
+    assert json.loads(update_params[3])["takeover"] == {
+        "reason": "airflow_owner_terminal",
+        "previous_owner_run_id": owner,
+        "previous_owner_dag_id": "dag_ingest_fbref",
+        "previous_airflow_run_id": airflow_run_id,
+        "previous_airflow_state": "failed",
+    }
+    assert (
+        "DELETE FROM fbref_control.publication_waiter WHERE source=%s AND run_id=%s"
+        in [sql for sql, _params in executions]
+    )
 
 
 def test_publication_lock_release_is_exact_owner_only():
@@ -408,11 +729,10 @@ def test_publication_writer_assertion_requires_active_exact_owner():
 def test_publication_guard_holds_row_fence_through_external_write():
     owner = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
-    captured = {}
+    executions = []
 
     def handler(sql, params):
-        captured["sql"] = sql
-        captured["params"] = params
+        executions.append((sql, params))
         return (
             [
                 {
@@ -437,9 +757,60 @@ def test_publication_guard_holds_row_fence_through_external_write():
 
     assert external_write_completed is True
     assert factory.connections[0].committed is True
-    assert captured["params"] == ("fbref",)
-    assert "FOR UPDATE" in captured["sql"]
-    assert "expires_at > clock_timestamp()" in captured["sql"]
+    fences = [(sql, params) for sql, params in executions if "FOR UPDATE" in sql]
+    assert len(fences) == 1
+    fence_sql, fence_params = fences[0]
+    assert fence_params == ("fbref",)
+    assert "expires_at > clock_timestamp()" in fence_sql
+    assert "released_at IS NULL" in fence_sql
+    assert executions[-1][0].startswith(
+        "SELECT metadata ->> 'airflow_run_id' AS airflow_run_id"
+    )
+    assert executions[-1][1] == (owner,)
+
+
+def test_publication_guard_rejects_owner_once_airflow_evidence_is_terminal():
+    owner = str(uuid.uuid4())
+    airflow_run_id = "scheduled__2026-11-11T21:07:00+00:00"
+    now = datetime.now(timezone.utc)
+
+    def handler(sql, params):
+        if "FROM fbref_control.publication_lock" in sql and "FOR UPDATE" in sql:
+            return (
+                [
+                    {
+                        "source": "fbref",
+                        "owner_run_id": uuid.UUID(owner),
+                        "owner_dag_id": "dag_ingest_fbref",
+                        "acquired_at": now,
+                        "expires_at": now,
+                        "released_at": None,
+                        "active": True,
+                    }
+                ],
+                1,
+            )
+        if "metadata ->> 'airflow_run_id'" in sql:
+            return ([{"airflow_run_id": airflow_run_id}], 1)
+        if "FROM public.dag_run" in sql:
+            assert params == ("dag_ingest_fbref", airflow_run_id)
+            return ([{"state": "failed"}], 1)
+        if "FROM public.task_instance" in sql:
+            return ([], 0)
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    with pytest.raises(StateConflict, match="terminal"):
+        with store.guard_publication_lock(owner):
+            raise AssertionError("a terminal owner must not receive a fence")
+
+    assert factory.connections[0].rolled_back is True
+    executions = factory.connections[0].fake_cursor.executions
+    assert not any(
+        sql.startswith("UPDATE fbref_control.publication_lock")
+        or sql.startswith("DELETE FROM fbref_control.publication_waiter")
+        for sql, _params in executions
+    )
 
 
 @pytest.mark.parametrize(
