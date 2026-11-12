@@ -36,19 +36,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .silver_reader_barrier import drain_readers
-from .silver_slots import (
-    SlotSpec,
-    advance,
-    assert_reader_revision,
-    bootstrap,
-    inactive_slot,
-    other_slot,
-    prepare_reader_views,
-    read_reader_state,
-    rollback,
-    slotted_relation,
-)
+if __package__:
+    from .silver_reader_barrier import drain_readers
+    from .silver_slots import (
+        SlotSpec,
+        advance,
+        assert_reader_revision,
+        bootstrap,
+        inactive_slot,
+        other_slot,
+        prepare_reader_views,
+        read_reader_state,
+        rollback,
+        slotted_relation,
+    )
+else:
+    from utils.silver_reader_barrier import drain_readers
+    from utils.silver_slots import (
+        SlotSpec,
+        advance,
+        assert_reader_revision,
+        bootstrap,
+        inactive_slot,
+        other_slot,
+        prepare_reader_views,
+        read_reader_state,
+        rollback,
+        slotted_relation,
+    )
 
 _LOG = logging.getLogger(__name__)
 
@@ -213,7 +228,10 @@ def render_scoped_sql(
     entity_scope: str = 'TRUE',
 ) -> str:
     """Render one core template; every scope placeholder is always passed."""
-    from .medallion_config import render_sql_template
+    if __package__:
+        from .medallion_config import render_sql_template
+    else:
+        from utils.medallion_config import render_sql_template
 
     sql = render_sql_template(
         Path(sql_dir) / f'{table}.sql.j2',

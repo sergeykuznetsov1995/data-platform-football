@@ -1,7 +1,9 @@
 """FotMob Silver core build (#2020) on a scripted DB-API cursor: slots, increment, batches."""
 from __future__ import annotations
 
+import importlib.util
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -1039,3 +1041,31 @@ def test_night_window_interruption_keeps_completed_batches_and_resumes(monkeypat
     assert raw.state_keys('fotmob_matches') == [(47, '2025/2026'), (47, '2026/2027')]
     assert len([s for s in raw.sql if s.startswith('INSERT INTO iceberg.silver.fotmob_matches_a')]) == 3 - stop_after_insert
     assert raw.reader[:2] == [None, 0]
+
+
+# standalone path import (shared scheduler) ------------------------------------------
+
+STANDALONE_PATHS = {
+    'fotmob_silver_build': ROOT / 'dags' / 'utils' / 'fotmob_silver_build.py',
+    'silver_slots': ROOT / 'dags' / 'utils' / 'silver_slots.py',
+}
+STANDALONE_EXPORTS = {
+    'fotmob_silver_build': ('BuildConfig', 'switch_reader'),
+    'silver_slots': ('SlotSpec', 'switch_reader'),
+}
+
+
+@pytest.mark.parametrize('name', sorted(STANDALONE_PATHS))
+def test_util_module_imports_standalone_from_file_path(monkeypatch, name):
+    """The shared scheduler reads utility files as standalone DAG files
+    (``.airflowignore`` contains only ``^$``): loading by path without a
+    parent package must not raise a relative-import ``ImportError``."""
+    path = STANDALONE_PATHS[name]
+    assert path.exists()
+    spec = importlib.util.spec_from_file_location(f'standalone_{name}', path)
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses consult sys.modules[cls.__module__]; monkeypatch restores sys.modules.
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    for attr in STANDALONE_EXPORTS[name]:
+        assert hasattr(module, attr)
