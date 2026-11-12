@@ -18,9 +18,21 @@ SESSION_PROPERTIES = {"enable_dynamic_filtering": "false"}
 
 
 class EspnTrinoTableManager(base.TrinoTableManager):
-    """``TrinoTableManager`` whose connections disable dynamic filtering."""
+    """``TrinoTableManager`` whose connections disable dynamic filtering.
+
+    Tombstone replace-MERGEs also run non-replay-safe here
+    (``_execute_replacement``): an ambiguous connection loss raises
+    ``TrinoAmbiguousWriteError`` instead of replaying the insert rows.
+    """
 
     def _create_connection(self):
+        # max_attempts=1 disables the trino client's internal HTTP retry
+        # loop: after a network exception it silently re-POSTs the same
+        # statement, which would replay a possibly-committed write and
+        # defeat the strict no-replay protection of _execute_replacement.
+        # Resilience stays where replay is safe: _connect_with_retry keeps
+        # re-trying connections (its probe is a read-only SELECT 1), and
+        # commit retries remain explicit in _execute_committing.
         if self._password:
             return base.trino.dbapi.connect(
                 host=self.host,
@@ -31,6 +43,7 @@ class EspnTrinoTableManager(base.TrinoTableManager):
                 auth=base.trino.auth.BasicAuthentication(self.user, self._password),
                 verify=False,  # self-signed certificate
                 session_properties=dict(SESSION_PROPERTIES),
+                max_attempts=1,
             )
         return base.trino.dbapi.connect(
             host=self.host,
@@ -38,4 +51,16 @@ class EspnTrinoTableManager(base.TrinoTableManager):
             user=self.user,
             catalog=self.catalog,
             session_properties=dict(SESSION_PROPERTIES),
+            max_attempts=1,
         )
+
+    def _execute_replacement(self, sql: str) -> None:
+        """Run the tombstone replace-MERGE with strict replay protection.
+
+        The MERGE ON clause never matches insert rows, so re-executing it
+        after an ambiguous COMMIT outcome would re-apply already-committed
+        inserts as duplicates; ``replay_safe=False`` makes a classified
+        connection error raise ``TrinoAmbiguousWriteError`` instead of
+        replaying.
+        """
+        return self._execute_committing(sql, replay_safe=False)
