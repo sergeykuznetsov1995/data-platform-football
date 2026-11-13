@@ -1,6 +1,6 @@
 """Daily, approval-gated Transfermarkt competition registry discovery.
 
-A daily cohort advances in bounded calendar slots: ``daily`` mode reads the tmapi regulation
+One persistent cohort advances in bounded calendar slots: ``daily`` mode reads the tmapi regulation
 of every competition of the canonical snapshot and uses a strict HTML season
 selector only for known competitions whose regulation is unusable. Once the
 last full crawl is a week old the same run is ``full`` — catalogue, country
@@ -37,7 +37,7 @@ from utils.config import DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
 from utils.transfermarkt_discovery_continuation import (
     SCHEDULE as DISCOVERY_SCHEDULE, RUN_SECONDS, WORK_SECONDS,
-    cohort_age, cohort_day, identity_for, mark_published, read_job,
+    cohort_day, identity_for, mark_published, read_job,
     select_job, write_job, ensure_manual_delivery_admission,
 )
 
@@ -418,12 +418,11 @@ def _prepare_discovery(
         job_path = STATE_ROOT / 'cohorts' / 'active.json'
         if job_path.exists():
             prior_job = read_job(job_path)
-            prior_age = cohort_age(prior_job, now)
-            prior_active = prior_age is not None and timedelta(0) <= prior_age < timedelta(days=1)
-            if prior_job['status'] != 'published' and prior_active:
+            if prior_job['status'] != 'published':
                 # A week boundary during a cohort cannot change its work or caps.
-                # An expired paused cohort is archived and replaced by select_job
-                # below; its mode must not pin the genuinely new cohort's sizing.
+                # The cohort persists across days until complete (or terminally
+                # exhausted); its mode keeps pinning the cohort's sizing at any
+                # age, and only a published cohort sizes a genuinely new one.
                 sizing = type(sizing)(mode=prior_job['identity']['mode'],
                     previous_competitions=prior_job.get('sizing', {}).get('previous_competitions', sizing.previous_competitions),
                     country_pages=prior_job.get('sizing', {}).get('country_pages', sizing.country_pages))
@@ -1188,8 +1187,8 @@ def _build_dag(dag_id: str, *, manual: bool = False):
         default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
         description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
         # Thirteen bounded slots retain three four-hour delivery gaps and
-        # 01–03 UTC quiet. One daily cohort resumes until complete; its paid
-        # caps never reset per slot.
+        # 01–03 UTC quiet. One cohort resumes across slots and days until
+        # complete; its paid caps never reset per slot.
         schedule=None if manual else DISCOVERY_SCHEDULE,
         dagrun_timeout=timedelta(hours=6) if manual else timedelta(seconds=RUN_SECONDS),
         start_date=datetime(2024, 1, 1),

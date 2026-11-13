@@ -1431,8 +1431,25 @@ def _execute_once(
         failures = AtomicJsonMapping(Path(checkpoint_path).with_suffix('.failures.json'))
     remaining_requests = args.request_limit - ledger.snapshot()['requests']
     remaining_retries = args.retry_limit - ledger.snapshot()['retries']
-    if remaining_requests <= 0 or remaining_retries < 0:
-        raise DiscoveryRunnerError('discovery cumulative request/retry budget exhausted')
+    metered = ledger.snapshot()['provider_metered_bytes']
+    if remaining_requests <= 0 or remaining_retries < 0 or metered > args.byte_cap_bytes:
+        if continuation is not None:
+            try:
+                # The cohort spent its cumulative caps: settle it terminal
+                # 'exhausted'.  There is no budget renewal, and the marker
+                # keeps its portion/traffic/artifacts verbatim.
+                continuation.save('exhausted')
+            except BaseException:
+                pass
+        error = DiscoveryRunnerError(
+            'discovery cumulative request/retry/byte budget exhausted before source_complete; no renewal')
+        try:
+            # Restored cumulative traffic is already consumed budget; the
+            # terminal evidence written by execute() must not read zeros.
+            error.restored_traffic_ledger = ledger
+        except BaseException:
+            pass
+        raise error
     if args.dag_id == MANUAL_DAG_ID:
         ensure_manual_delivery_admission(utcnow())
     lease_provider = lease_provider_factory(args.proxy_control_url)
@@ -1468,13 +1485,14 @@ def _execute_once(
             except BaseException:
                 pass
         raise
-    if continuation is not None:
-        # The production client constructor is lazy, so reaching this line
-        # means setup succeeded without paid I/O.  Claim the slot only now,
-        # immediately before paid work: a setup failure leaves the settled
-        # cohort resumable instead of stranded in 'running'.
-        continuation.mark_running()
     client.begin_request_scope(request_attempt_budget=remaining_requests)
+    if continuation is not None:
+        # The scope admission above is the last setup step: a failure there
+        # leaves the settled cohort resumable.  Claim the slot only now,
+        # immediately before paid work — after this write only a kill -9
+        # window remains where the marker can stay 'running', and that
+        # stays fail-closed in select_job.
+        continuation.mark_running()
     source_started = False
     source_validated = False
     write_authorized = False
@@ -1746,7 +1764,13 @@ def _execute_once(
             manifest_path, manifest_hash = _manifest_output(output_root, cycle_id, paused)
             return DiscoveryRunResult(manifest_path=manifest_path, manifest_hash=manifest_hash, manifest=paused)
         if continuation is not None:
-            continuation.save('failed' if settled else 'unsettled')
+            if settled and not write_started:
+                # A settled client failure before any production write is a
+                # pausable source outcome: the next slot resumes the cohort
+                # (cached failures replay without buying them again).
+                continuation.save('paused')
+            else:
+                continuation.save('failed' if settled else 'unsettled')
         for authorization in (paid_authorization, write_authorization):
             try:
                 authorization.fail(str(exc))

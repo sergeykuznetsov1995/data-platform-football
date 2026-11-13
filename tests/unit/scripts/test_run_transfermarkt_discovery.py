@@ -1560,18 +1560,34 @@ def test_delayed_pool_start_cannot_create_fresh_work_budget(tmp_path, monkeypatc
             http_client_factory=lambda **kw: pytest.fail('expired slot must not acquire proxy'))
 
 
-def test_expired_cohort_refuses_before_paid_client_or_quota_reset(tmp_path, monkeypatch):
+def test_aged_cohort_resumes_next_day_without_renewal(tmp_path, monkeypatch):
     mod = _load()
     monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, 'true')
     raw, _ = _standing_args(mod, tmp_path, dry_run=True)
     args = _portion_args(mod, tmp_path, raw)
     original = Path(args.job_path).read_bytes()
     args.deadline_at = (NOW + timedelta(days=1, minutes=55)).isoformat()
-    with pytest.raises(ValueError, match='cohort expired'):
+
+    def broken_factory(**kwargs):
+        raise RuntimeError('client setup boom')
+
+    with pytest.raises(RuntimeError, match='client setup boom'):
         mod.execute(args, execution_argv=(str(SCRIPT), *raw),
             previous_reader=lambda _: None, utcnow=lambda: NOW + timedelta(days=1),
-            http_client_factory=lambda **kw: pytest.fail('expired cohort cannot buy requests'))
+            lease_provider_factory=lambda _: object(),
+            http_client_factory=broken_factory)
+    from dags.utils.transfermarkt_discovery_continuation import read_job
+    saved = read_job(Path(args.job_path))
+    # Age never blocks the resume and never renews the cohort: the aged
+    # marker is taken up untouched, no fresh grant or budget reset happened,
+    # and the setup failure left it resumable.
+    assert saved['status'] == 'ready'
+    assert saved['portion'] == 0
+    assert saved['traffic'] is None
     assert Path(args.job_path).read_bytes() == original
+    # No rollover side evidence: an aged cohort is never archived.
+    assert not (Path(args.job_path).parent / saved['job_id'] / 'expired.json').exists()
+    assert not (Path(args.job_path).parent / saved['job_id'] / 'unused.json').exists()
 
 
 def test_manual_runner_drain_refuses_before_paid_client(tmp_path, monkeypatch):
@@ -1776,8 +1792,8 @@ def test_resumed_portion_rejects_exhausted_cumulative_retries(
     common["utcnow"] = lambda: NOW + timedelta(hours=4)
     with pytest.raises(
         mod.DiscoveryRunnerError,
-        match="cumulative request/retry budget exhausted",
-    ):
+        match="budget exhausted",
+    ) as caught:
         mod.execute(
             args,
             discovery_fn=first,
@@ -1786,10 +1802,18 @@ def test_resumed_portion_rejects_exhausted_cumulative_retries(
             ),
             **common,
         )
-    # No claim and no cap renewal: the settled cohort stays paused.
+    # No budget renewal: the cohort settles terminal 'exhausted' instead of
+    # resetting its caps, and the terminal evidence carries the restored
+    # cumulative traffic rather than zeros.
     from dags.utils.transfermarkt_discovery_continuation import read_job
 
-    assert read_job(Path(args.job_path))["status"] == "paused"
+    saved = read_job(Path(args.job_path))
+    assert saved["status"] == "exhausted"
+    assert saved["traffic"]["retries"] == 3
+    assert "no renewal" in str(caught.value)
+    failure = caught.value.manifest
+    assert failure["status"] == "failed"
+    assert failure["traffic"]["retries"] == 3
 
 
 def test_client_setup_failure_keeps_settled_cohort_resumable(
@@ -1863,3 +1887,69 @@ def test_client_setup_failure_keeps_settled_cohort_resumable(
     assert complete.manifest["status"] == "success"
     assert complete.manifest["traffic"]["requests"] == 1
     assert complete.manifest["traffic"]["provider_metered_bytes"] == 100
+
+
+def test_request_scope_failure_keeps_settled_cohort_resumable(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path, dry_run=True)
+    args = _portion_args(mod, tmp_path, raw)
+    clock = [0.0]
+
+    class Client(_FakeClient):
+        refuse_scope = False
+
+        def begin_request_scope(self, *, request_attempt_budget):
+            if Client.refuse_scope:
+                raise RuntimeError("request scope admission refused")
+            super().begin_request_scope(
+                request_attempt_budget=request_attempt_budget
+            )
+
+    def first(**kw):
+        kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        kw["checkpoint"]["finished-first-page"] = {"proof": "fixture"}
+        clock[0] = 1140
+        kw["fetch"]("https://www.transfermarkt.com/second")
+        pytest.fail("deadline must yield before second fetch")
+
+    def second(**kw):
+        assert kw["checkpoint"]["finished-first-page"] == {"proof": "fixture"}
+        replay = kw["fetch"]("https://www.transfermarkt.com/wettbewerbe/europa")
+        assert replay.status is FetchStatus.OK
+        return (_page(),)
+
+    common = dict(
+        execution_argv=(str(SCRIPT), *raw),
+        previous_reader=lambda _: None,
+        lease_provider_factory=lambda _: object(),
+        http_client_factory=Client,
+        utcnow=lambda: NOW,
+        monotonic=lambda: clock[0],
+        writer_factory=lambda: pytest.fail("dry run must not write"),
+    )
+    paused = mod.execute(args, discovery_fn=first, **common)
+    assert paused.manifest["status"] == "paused"
+
+    clock[0] = 4000
+    args.run_id = "next-calendar-run"
+    args.cycle_id = "next-calendar-cycle"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    common["utcnow"] = lambda: NOW + timedelta(hours=4)
+    # Scope admission is the last setup step: failing there must not claim
+    # the slot, so the settled cohort stays resumable instead of being
+    # stranded in 'running'.
+    Client.refuse_scope = True
+    with pytest.raises(RuntimeError, match="request scope admission refused"):
+        mod.execute(args, discovery_fn=second, **common)
+    from dags.utils.transfermarkt_discovery_continuation import read_job
+
+    assert read_job(Path(args.job_path))["status"] == "paused"
+
+    args.run_id = "third-calendar-run"
+    args.cycle_id = "third-calendar-cycle"
+    Client.refuse_scope = False
+    complete = mod.execute(args, discovery_fn=second, **common)
+    assert complete.manifest["status"] == "success"
