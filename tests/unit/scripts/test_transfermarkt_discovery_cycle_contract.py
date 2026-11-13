@@ -41,6 +41,7 @@ from dags.utils.transfermarkt_discovery_continuation import (
     mark_published,
     read_job,
     select_job,
+    write_job,
 )
 from scrapers.transfermarkt.client import TransfermarktHttpClient
 from scrapers.transfermarkt.discovery import BASE_URL, PreviousRegistry
@@ -93,6 +94,7 @@ class _FixtureRegulationClient(TransfermarktHttpClient):
     instances: list["_FixtureRegulationClient"] = []
     spend_retry = False
     advance_clock = None
+    raise_once_on_url = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -109,6 +111,10 @@ class _FixtureRegulationClient(TransfermarktHttpClient):
         self.fetch_calls.append({"url": url, **kwargs})
         if url not in REGULATION_PAYLOADS:
             raise AssertionError(f"chain must only buy fixture URLs: {url}")
+        failing = type(self).raise_once_on_url
+        if failing is not None and url == failing:
+            type(self).raise_once_on_url = None
+            raise RuntimeError("fixture transport failed mid-portion")
         payload = REGULATION_PAYLOADS[url]
         body = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -525,7 +531,293 @@ def test_pause_setup_failure_resume_completes_real_daily_cycle(
     assert read_job(job_path)["status"] == "source_complete"
 
 
-def test_expired_paused_cohort_is_rejected_without_io(tmp_path, monkeypatch):
+def test_paused_cohort_resumes_across_day_boundary_without_rebuy(
+    tmp_path, monkeypatch
+):
+    helpers = _helpers()
+    mod = helpers._load()
+    args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
+    clock = [0.0]
+    job_path = Path(args.job_path)
+    paused = _first_portion(mod, helpers, args, raw, clock)
+    assert paused.manifest["status"] == "paused"
+    saved = read_job(job_path)
+    job_id = saved["job_id"]
+    started_at = saved["started_at"]
+    failures_path = Path(args.checkpoint).with_suffix(".failures.json")
+    fac_entry = json.loads(failures_path.read_text(encoding="utf-8"))[FAC_URL]
+
+    # More than a calendar day passes.  Nothing about the cohort is renewed:
+    # the next slot takes up the same grant, job and identity, replays the
+    # settled FAC answer for free and buys only RSK1.
+    next_day = NOW + timedelta(days=1, hours=2)
+    args.run_id = "next-day-attempt"
+    args.cycle_id = "tm-registry-next-day"
+    args.deadline_at = (next_day + timedelta(minutes=55)).isoformat()
+    clock[0] = 0
+    writer = _RecordingWriter()
+    complete = _execute(
+        mod, helpers, args, raw, clock, next_day,
+        http_client_factory=_FixtureRegulationClient,
+        writer_factory=lambda: writer,
+    )
+    assert complete.manifest["status"] == "success"
+    assert complete.manifest["dq"]["source_complete"] is True
+    assert complete.manifest["logical_cohort"]["job_id"] == job_id
+    assert complete.manifest["logical_cohort"]["portion"] == 2
+    # Cumulative accounting across the day boundary: nothing rebought, the
+    # spent retry carried, only RSK1 added.
+    assert complete.manifest["traffic"]["requests"] == 3
+    assert complete.manifest["traffic"]["retries"] == 1
+    assert complete.manifest["traffic"]["provider_metered_bytes"] == 200
+    resumed_client = _FixtureRegulationClient.instances[-1]
+    assert [call["url"] for call in resumed_client.fetch_calls] == [RSK1_URL]
+    # The cohort identity is pinned to its own cohort day, not the calendar
+    # day the resume happens to run on.
+    saved = read_job(job_path)
+    assert saved["status"] == "source_complete"
+    assert saved["job_id"] == job_id
+    assert saved["started_at"] == started_at
+    assert saved["portion"] == 2
+    assert saved["identity"]["cohort_day"] == cohort_day(NOW)
+    # The paid FAC answer was never rebought or rewritten across the gap.
+    assert (
+        json.loads(failures_path.read_text(encoding="utf-8"))[FAC_URL]
+        == fac_entry
+    )
+
+
+# --- Persistent cohort: mid-portion failures, terminal states -------------
+
+_TRAFFIC_COUNTERS = (
+    "requests",
+    "retries",
+    "provider_up_bytes",
+    "provider_down_bytes",
+    "decoded_bytes",
+    "cache_hits",
+)
+
+
+def _settled_traffic(by_entity):
+    """A complete settled ledger snapshot, consistent by construction."""
+    traffic = {field: 0 for field in _TRAFFIC_COUNTERS}
+    traffic["by_entity"] = {}
+    for name, item in by_entity.items():
+        entry = {field: 0 for field in _TRAFFIC_COUNTERS}
+        entry.update(item)
+        entry["duration_seconds"] = 0.0
+        traffic["by_entity"][name] = entry
+        for field in _TRAFFIC_COUNTERS:
+            traffic[field] += entry[field]
+    traffic["provider_metered_bytes"] = (
+        traffic["provider_up_bytes"] + traffic["provider_down_bytes"]
+    )
+    return traffic
+
+
+def test_mid_portion_failure_settles_paused_and_resume_never_rebuys(
+    tmp_path, monkeypatch
+):
+    helpers = _helpers()
+    mod = helpers._load()
+    args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
+    clock = [0.0]
+    job_path = Path(args.job_path)
+
+    # Portion 1: FAC is bought (one retry spent), then the transport fails
+    # on RSK1 mid-portion.  The client settles and nothing was written, so
+    # the cohort pauses instead of failing — the next slot continues it.
+    _FixtureRegulationClient.instances.clear()
+    _FixtureRegulationClient.spend_retry = True
+    _FixtureRegulationClient.raise_once_on_url = RSK1_URL
+    with pytest.raises(Exception) as caught:
+        _execute(
+            mod, helpers, args, raw, clock, NOW,
+            http_client_factory=_FixtureRegulationClient,
+            writer_factory=lambda: pytest.fail(
+                "a mid-portion failure must not write Bronze"
+            ),
+        )
+    assert _FixtureRegulationClient.raise_once_on_url is None
+    saved = read_job(job_path)
+    assert saved["status"] == "paused"
+    assert saved["portion"] == 1
+    assert saved["traffic"]["requests"] == 2
+    assert saved["traffic"]["retries"] == 1
+    failure = caught.value.manifest
+    assert failure["status"] == "failed"
+    assert failure["write_status"]["attempted"] is False
+    failures_path = Path(args.checkpoint).with_suffix(".failures.json")
+    stored = json.loads(failures_path.read_text(encoding="utf-8"))
+    assert stored.keys() == {FAC_URL}
+    fac_entry = stored[FAC_URL]
+
+    # Portion 2 (a later slot): the settled FAC answer replays for free,
+    # only RSK1 is bought, and the real parser completes the snapshot.
+    args.run_id = "mid-portion-resume"
+    args.cycle_id = "tm-registry-mid-portion-resume"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    clock[0] = 0
+    writer = _RecordingWriter()
+    complete = _execute(
+        mod, helpers, args, raw, clock, NOW + timedelta(hours=4),
+        http_client_factory=_FixtureRegulationClient,
+        writer_factory=lambda: writer,
+    )
+    assert complete.manifest["status"] == "success"
+    assert complete.manifest["dq"]["source_complete"] is True
+    assert complete.manifest["traffic"]["requests"] == 3
+    assert complete.manifest["traffic"]["retries"] == 1
+    assert complete.manifest["traffic"]["provider_metered_bytes"] == 200
+    resumed_client = _FixtureRegulationClient.instances[-1]
+    assert [call["url"] for call in resumed_client.fetch_calls] == [RSK1_URL]
+    saved = read_job(job_path)
+    assert saved["status"] == "source_complete"
+    assert saved["portion"] == 2
+    assert (
+        json.loads(failures_path.read_text(encoding="utf-8"))[FAC_URL]
+        == fac_entry
+    )
+
+
+def test_blocked_seed_replays_free_and_grows_the_portion(tmp_path, monkeypatch):
+    helpers = _helpers()
+    mod = helpers._load()
+    args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
+    clock = [0.0]
+    job_path = Path(args.job_path)
+    seed_url = "https://www.transfermarkt.com/navigation/wettbewerbe"
+
+    class BlockedSeedClient(_FixtureRegulationClient):
+        def fetch(self, url, **kwargs):
+            self.fetch_calls.append({"url": url, **kwargs})
+            return FetchOutcome(
+                status=FetchStatus("blocked"),
+                value=None,
+                status_code=405,
+                attempts=2,
+                label="competition_registry",
+                error="HTTP 405",
+                provider_metered_bytes=100,
+            )
+
+    def required_seed_discovery(fetch, **_kwargs):
+        outcome = fetch(seed_url)
+        assert outcome.status is FetchStatus("blocked")
+        raise RuntimeError("required discovery seed failed: blocked")
+
+    _FixtureRegulationClient.instances.clear()
+    with pytest.raises(RuntimeError, match="required discovery seed failed"):
+        _execute(
+            mod, helpers, args, raw, clock, NOW,
+            http_client_factory=BlockedSeedClient,
+            discovery_fn=required_seed_discovery,
+            writer_factory=lambda: pytest.fail(
+                "a blocked seed must not write Bronze"
+            ),
+        )
+    saved = read_job(job_path)
+    assert saved["status"] == "paused"
+    assert saved["portion"] == 1
+    failures_path = Path(args.checkpoint).with_suffix(".failures.json")
+    stored = json.loads(failures_path.read_text(encoding="utf-8"))
+    assert stored.keys() == {seed_url}
+    assert stored[seed_url]["status"] == "blocked"
+
+    # Portion 2: the cached terminal failure replays without a new request
+    # or renewal — the portion simply grows.
+    class NoBuyClient(_FixtureRegulationClient):
+        def fetch(self, url, **kwargs):
+            self.fetch_calls.append({"url": url, **kwargs})
+            pytest.fail("the cached blocked seed must replay without a rebuy")
+
+    args.run_id = "blocked-replay"
+    args.cycle_id = "tm-registry-blocked-replay"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    clock[0] = 0
+    with pytest.raises(RuntimeError, match="required discovery seed failed"):
+        _execute(
+            mod, helpers, args, raw, clock, NOW + timedelta(hours=4),
+            http_client_factory=NoBuyClient,
+            discovery_fn=required_seed_discovery,
+            writer_factory=lambda: pytest.fail(
+                "a blocked seed must not write Bronze"
+            ),
+        )
+    saved = read_job(job_path)
+    assert saved["status"] == "paused"
+    assert saved["portion"] == 2
+    assert NoBuyClient.instances[-1].fetch_calls == []
+    assert (
+        json.loads(failures_path.read_text(encoding="utf-8"))[seed_url]
+        == stored[seed_url]
+    )
+
+
+def test_write_failure_keeps_cohort_failed_and_fail_closed(
+    tmp_path, monkeypatch
+):
+    helpers = _helpers()
+    mod = helpers._load()
+    args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
+    clock = [0.0]
+    job_path = Path(args.job_path)
+
+    class FailingWriter:
+        def write_dataframe(self, frame, **kwargs):
+            raise RuntimeError("Iceberg append failed")
+
+    _FixtureRegulationClient.instances.clear()
+    with pytest.raises(RuntimeError, match="Iceberg append failed") as caught:
+        _execute(
+            mod, helpers, args, raw, clock, NOW,
+            http_client_factory=_FixtureRegulationClient,
+            writer_factory=FailingWriter,
+        )
+    saved = read_job(job_path)
+    assert saved["status"] == "failed"
+    assert saved["portion"] == 1
+    failure = caught.value.manifest
+    assert failure["status"] == "failed"
+    assert failure["write_status"]["attempted"] is True
+    assert failure["write_status"]["status"] == "failed_or_partial"
+
+    # 'failed' stays fail-closed: a later slot refuses before any paid I/O.
+    args.run_id = "after-write-failure"
+    args.cycle_id = "tm-registry-after-write-failure"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    clock[0] = 0
+    with pytest.raises(ValueError, match="not settled and resumable"):
+        _execute(
+            mod, helpers, args, raw, clock, NOW + timedelta(hours=4),
+            lease_provider_factory=lambda _url: pytest.fail(
+                "a failed cohort must not acquire a proxy lease"
+            ),
+            http_client_factory=lambda **_kw: pytest.fail(
+                "a failed cohort must not construct a client"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "member,entry,expected",
+    [
+        (
+            "requests",
+            {"requests": 10, "retries": 0},
+            {"requests": 10, "retries": 0, "provider_metered_bytes": 0},
+        ),
+        (
+            "retries",
+            {"requests": 3, "retries": 3},
+            {"requests": 3, "retries": 3, "provider_metered_bytes": 0},
+        ),
+    ],
+)
+def test_budget_exhaustion_settles_terminal_exhausted_without_renewal(
+    tmp_path, monkeypatch, member, entry, expected
+):
     helpers = _helpers()
     mod = helpers._load()
     args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
@@ -534,29 +826,155 @@ def test_expired_paused_cohort_is_rejected_without_io(tmp_path, monkeypatch):
     assert paused.manifest["status"] == "paused"
 
     job_path = Path(args.job_path)
-    tracked = [job_path, Path(args.checkpoint)]
-    failures = Path(args.checkpoint).with_suffix(".failures.json")
-    tracked.append(failures)
-    before = {path: path.read_bytes() for path in tracked if path.exists()}
+    saved = read_job(job_path)
+    # The daily standing limits (10 requests / 2 retries / 15 MiB bytes);
+    # the restored cumulative snapshot for this member has already spent it.
+    assert (args.request_limit, args.retry_limit) == (10, 2)
+    spent = _settled_traffic({"competition_registry": entry})
+    saved["traffic"] = spent
+    write_job(job_path, saved, write=mod._atomic_json_write)
 
-    # A cohort at least a day old never renews budget: the refusal happens
-    # before the lease provider, client or writer are even constructed.
-    args.run_id = "expired-attempt"
-    args.cycle_id = "tm-registry-expired"
-    args.deadline_at = (NOW + timedelta(days=1, minutes=55)).isoformat()
-    with pytest.raises(ValueError, match="expired"):
+    args.run_id = "exhausted-" + member
+    args.cycle_id = "tm-registry-exhausted-" + member
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    clock[0] = 0
+    with pytest.raises(
+        mod.DiscoveryRunnerError, match="budget exhausted"
+    ) as caught:
         _execute(
-            mod, helpers, args, raw, clock, NOW + timedelta(days=1),
+            mod, helpers, args, raw, clock, NOW + timedelta(hours=4),
             lease_provider_factory=lambda _url: pytest.fail(
-                "an expired cohort must not acquire a proxy lease"
+                "an exhausted cohort must not acquire a proxy lease"
             ),
             http_client_factory=lambda **_kw: pytest.fail(
-                "an expired cohort must not construct a client"
+                "an exhausted cohort must not construct a client"
             ),
             writer_factory=lambda: pytest.fail(
-                "an expired cohort must not write"
+                "an exhausted cohort must not write"
             ),
         )
-    for path, content in before.items():
-        assert path.read_bytes() == content
-    assert read_job(job_path)["status"] == "paused"
+    marker = read_job(job_path)
+    assert marker["status"] == "exhausted"
+    assert marker["portion"] == 2
+    # No renewal: the terminal marker keeps the spent cumulative accounting.
+    assert marker["traffic"]["requests"] == expected["requests"]
+    assert marker["traffic"]["retries"] == expected["retries"]
+    assert (
+        marker["traffic"]["provider_metered_bytes"]
+        == expected["provider_metered_bytes"]
+    )
+    # The failure evidence carries the restored traffic, never zeros.
+    failure = caught.value.manifest
+    assert failure["traffic"]["requests"] == expected["requests"]
+    assert failure["traffic"]["retries"] == expected["retries"]
+    assert (
+        failure["traffic"]["provider_metered_bytes"]
+        == expected["provider_metered_bytes"]
+    )
+    # Terminal: the next slot's selection refuses without any renewal.
+    with pytest.raises(ValueError, match="no budget renewal"):
+        select_job(
+            job_path,
+            identity_for(
+                previous_snapshot_id=PREVIOUS_SNAPSHOT_ID,
+                mode="daily",
+                policy_hash=args.standing_policy_sha256,
+                request_limit=args.request_limit,
+                retry_limit=args.retry_limit,
+                byte_cap_bytes=args.byte_cap_bytes,
+                day=saved["identity"]["cohort_day"],
+                dry_run=args.dry_run,
+            ),
+            now=NOW + timedelta(hours=5),
+            write=mod._atomic_json_write,
+        )
+
+
+def test_byte_budget_exhaustion_settles_terminal_exhausted_without_renewal(
+    tmp_path, monkeypatch
+):
+    helpers = _helpers()
+    mod = helpers._load()
+    args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
+    clock = [0.0]
+    paused = _first_portion(mod, helpers, args, raw, clock)
+    assert paused.manifest["status"] == "paused"
+
+    job_path = Path(args.job_path)
+    saved = read_job(job_path)
+    # The daily standing byte cap (15 MiB); the restored cumulative snapshot
+    # has already spent one metered byte beyond it, so the ledger itself
+    # refuses the restore and the cohort settles terminally 'exhausted'.
+    assert args.byte_cap_bytes == 15 * 1024 * 1024
+    spent = _settled_traffic(
+        {"competition_registry": {"requests": 1, "provider_down_bytes": 15_728_641}}
+    )
+    saved["traffic"] = spent
+    write_job(job_path, saved, write=mod._atomic_json_write)
+
+    args.run_id = "exhausted-bytes"
+    args.cycle_id = "tm-registry-exhausted-bytes"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    clock[0] = 0
+    with pytest.raises(ValueError, match="byte budget exhausted"):
+        _execute(
+            mod, helpers, args, raw, clock, NOW + timedelta(hours=4),
+            lease_provider_factory=lambda _url: pytest.fail(
+                "an exhausted cohort must not acquire a proxy lease"
+            ),
+            http_client_factory=lambda **_kw: pytest.fail(
+                "an exhausted cohort must not construct a client"
+            ),
+            writer_factory=lambda: pytest.fail(
+                "an exhausted cohort must not write"
+            ),
+        )
+    marker = read_job(job_path)
+    assert marker["status"] == "exhausted"
+    # Verbatim terminal settle: portion and accounting never restart.
+    assert marker["portion"] == saved["portion"]
+    assert marker["traffic"]["provider_metered_bytes"] == 15_728_641
+    # Terminal: the next slot's selection refuses without any renewal.
+    with pytest.raises(ValueError, match="no budget renewal"):
+        select_job(
+            job_path,
+            identity_for(
+                previous_snapshot_id=PREVIOUS_SNAPSHOT_ID,
+                mode="daily",
+                policy_hash=args.standing_policy_sha256,
+                request_limit=args.request_limit,
+                retry_limit=args.retry_limit,
+                byte_cap_bytes=args.byte_cap_bytes,
+                day=saved["identity"]["cohort_day"],
+                dry_run=args.dry_run,
+            ),
+            now=NOW + timedelta(hours=5),
+            write=mod._atomic_json_write,
+        )
+
+
+def test_running_marker_never_resumes_fail_closed(tmp_path, monkeypatch):
+    helpers = _helpers()
+    mod = helpers._load()
+    args, raw = _cycle_args(mod, helpers, tmp_path, monkeypatch)
+    job_path = Path(args.job_path)
+
+    # A kill -9 between mark_running and the settled save strands 'running';
+    # only select_job's pinned recoveries may re-settle such a marker.
+    saved = read_job(job_path)
+    saved.update(status="running", last_run_id="scheduled__killed-mid-portion")
+    write_job(job_path, saved, write=mod._atomic_json_write)
+
+    args.run_id = "after-kill"
+    args.cycle_id = "tm-registry-after-kill"
+    args.deadline_at = (NOW + timedelta(hours=4, minutes=55)).isoformat()
+    with pytest.raises(ValueError, match="not settled and resumable"):
+        _execute(
+            mod, helpers, args, raw, [0.0], NOW + timedelta(hours=4),
+            lease_provider_factory=lambda _url: pytest.fail(
+                "a stranded running cohort must not acquire a lease"
+            ),
+            http_client_factory=lambda **_kw: pytest.fail(
+                "a stranded running cohort must not construct a client"
+            ),
+        )

@@ -27,14 +27,20 @@ def prepared(tmp_path):
     return path, job
 
 
-def test_resume_later_slot_retains_grant_and_checkpoint(tmp_path):
+@pytest.mark.parametrize('delay', [
+    timedelta(hours=20),
+    timedelta(days=1, minutes=1),
+    timedelta(days=7),
+])
+def test_resume_later_slot_retains_grant_and_checkpoint(tmp_path, delay):
     path, job = prepared(tmp_path)
     job.update(status='paused', portion=2, traffic={'requests': 12})
     cohorts.write_job(path, job, write)
-    resumed = cohorts.select_job(path, identity(),
-                                now=NOW + timedelta(hours=20), write=write)
+    before = path.read_bytes()
+    resumed = cohorts.select_job(path, identity(), now=NOW + delay, write=write)
     assert resumed == job
     assert resumed['identity']['request_limit'] == 100
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize('change', [dict(policy_hash='changed'), dict(request_limit=101),
@@ -43,6 +49,15 @@ def test_resume_rejects_identity_drift(tmp_path, change):
     path, _ = prepared(tmp_path)
     with pytest.raises(ValueError, match='drift'):
         cohorts.select_job(path, identity(**change), now=NOW, write=write)
+
+
+@pytest.mark.parametrize('delay', [timedelta(0), timedelta(days=2)])
+def test_identity_drift_rejected_at_any_age(tmp_path, delay):
+    path, _ = prepared(tmp_path)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=101), now=NOW + delay, write=write)
+    assert path.read_bytes() == before
 
 
 def test_publication_ack_releases_slots_without_skipping_tomorrow(tmp_path):
@@ -99,14 +114,17 @@ def test_three_delivery_gaps_keep_drain_and_rollback_headroom(tmp_path):
     assert all(start.hour not in (1, 2) for start, _ in windows)
 
 
-def test_expired_cohort_never_renews_its_paid_grant(tmp_path):
+def test_aged_cohort_never_renews_its_paid_grant_but_persists(tmp_path):
     path, job = prepared(tmp_path)
     before = path.read_bytes()
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
+    later = NOW + timedelta(days=2)
+    # An aged cohort is never renewed, rolled over or reset: the same grant,
+    # started_at and caps persist byte-for-byte at any age.
+    resumed = cohorts.select_job(path, identity(), now=later, write=write)
+    assert resumed == job
     assert path.read_bytes() == before
-    assert [start.hour for start, _ in cohorts.reservations(NOW + timedelta(days=1), path)] == [3, 3]
+    assert resumed['identity']['request_limit'] == 100
+    assert [start.hour for start, _ in cohorts.reservations(NOW, path)] != [3, 3]
 
 
 @pytest.mark.parametrize('payload', [None, 12, 'broken', [], True])
@@ -198,6 +216,21 @@ def test_continuation_still_rejects_unsettled_or_unknown_states(tmp_path, status
         cohorts.DiscoveryContinuation(path, identity(), ledger, write,
                                       now=lambda: NOW, run_id='run-2')
     assert cohorts.read_job(path)['status'] == status
+
+
+def test_continuation_rejects_exhausted_state_without_renewal(tmp_path):
+    from scrapers.transfermarkt.models import SharedTrafficLedger
+
+    path, job = prepared(tmp_path)
+    job.update(status='exhausted')
+    cohorts.write_job(path, job, write)
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    # The explicit exhausted branch precedes the generic resumable gate.
+    with pytest.raises(ValueError, match='budget exhausted'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert cohorts.read_job(path)['status'] == 'exhausted'
 
 
 # --- One-time pinned recovery of the single audited legacy 'running' marker ---
@@ -352,15 +385,21 @@ def test_recovery_rejects_wrong_evidence_semantics(tmp_path, monkeypatch, kind, 
     assert cohorts.read_job(path)['status'] == 'running'
 
 
-def test_recovery_never_bypasses_age_or_identity(tmp_path, monkeypatch):
+def test_recovery_never_bypasses_identity_but_ignores_age(tmp_path, monkeypatch):
     path, job = stranded(tmp_path, monkeypatch)
     before = path.read_bytes()
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(), now=NOW + timedelta(days=1), write=write)
     with pytest.raises(ValueError, match='drift'):
         cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
     assert path.read_bytes() == before
     assert cohorts.read_job(path)['status'] == 'running'
+    # Age never blocks the pinned recovery: an aged-out marker re-settles as
+    # 'paused' with its accounting preserved; nothing is rolled over.
+    aged = NOW + timedelta(days=3)
+    resumed = cohorts.select_job(path, identity(), now=aged, write=write)
+    assert resumed['status'] == 'paused'
+    assert resumed['traffic'] == job['traffic']
+    assert resumed['started_at'] == job['started_at']
+    assert not (path.parent / job['job_id'] / 'expired.json').exists()
 
 
 def test_recovery_fails_closed_on_missing_manifest(tmp_path, monkeypatch):
@@ -372,7 +411,7 @@ def test_recovery_fails_closed_on_missing_manifest(tmp_path, monkeypatch):
     assert path.read_bytes() == before
 
 
-# --- Expired paused cohort rollover (#2145, owner authorization 2026-11-07) ---
+# --- Settled paused markers used by resume/portion-limit tests ---
 
 def _settled_paused(tmp_path, **changes):
     """A settled 'paused' marker with real checkpoint evidence on disk."""
@@ -382,143 +421,12 @@ def _settled_paused(tmp_path, **changes):
     checkpoint.write_text(json.dumps({'https://example.test/a': {'hash': 'x'}}))
     failures = checkpoint.with_suffix('.failures.json')
     failures.write_text(json.dumps({'https://example.test/a': {'status': 'ok'}}))
-    job.update(status='paused', portion=1, traffic=_traffic(), last_run_id='run-1',
+    changes.setdefault('portion', 1)
+    job.update(status='paused', traffic=_traffic(), last_run_id='run-1',
                artifacts={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in (checkpoint, failures)}, **changes)
     cohorts.write_job(path, job, write)
     return path, job
-
-
-def test_expired_paused_cohort_rolls_over_with_evidence_preserved(tmp_path):
-    path, old = _settled_paused(tmp_path)
-    later = NOW + timedelta(days=1, hours=2)
-
-    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                             now=later, write=write)
-
-    # A genuinely new cohort: fresh started_at/job_id/checkpoint, no traffic.
-    assert new['status'] == 'ready'
-    assert new['portion'] == 0
-    assert new['traffic'] is None
-    assert new['job_id'] != old['job_id']
-    assert new['started_at'] == later.isoformat()
-    assert new['checkpoint_path'] != old['checkpoint_path']
-    # The exact old marker is preserved as <job_id>/expired.json: checkpoint,
-    # started_at and cumulative traffic untouched, nothing renewed or reset.
-    archived = cohorts.read_job(path.parent / old['job_id'] / 'expired.json')
-    assert archived == old
-    assert archived['started_at'] == old['started_at']
-    assert archived['traffic'] == old['traffic']
-    assert archived['portion'] == old['portion']
-    # The active marker is the fresh cohort, not a renewed old one.
-    active = cohorts.read_job(path)
-    assert active['job_id'] == new['job_id']
-    assert active['started_at'] == later.isoformat()
-    # A same-day call resumes the fresh cohort without touching the archive.
-    again = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                               now=later + timedelta(minutes=30), write=write)
-    assert again['job_id'] == new['job_id']
-
-
-def test_expired_paused_same_identity_collision_refuses_without_archiving(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    later = NOW + timedelta(days=1, hours=2)
-    # The caller supplies the identity unchanged: it hashes to the same
-    # job_id as the expired paused cohort.  Rollover would archive and then
-    # recreate a cohort in the same job_id/checkpoint namespace, so select_job
-    # must refuse before any artifact read or archive write.
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='collides with the expired paused cohort'):
-        cohorts.select_job(path, identity(), now=later, write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-    # A genuinely changed identity (new cohort_day and/or policy) still rolls over.
-    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                             now=later, write=write)
-    assert new['job_id'] != job['job_id']
-    assert (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-@pytest.mark.parametrize('status', ['ready', 'running', 'source_complete', 'failed', 'unsettled', 'writing'])
-def test_expired_non_paused_cohort_never_rolls_over(tmp_path, status):
-    path, job = _settled_paused(tmp_path)
-    job.update(status=status)
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_with_incomplete_identity_refuses_without_archiving(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    # Structural gap: a required identity key is missing from the expired
-    # marker.  Fail closed before any artifact read or archive write; the
-    # active marker stays byte-identical and no archive is created.
-    del job['identity']['parser_revision']
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='incomplete key set'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_artifact_drift_refuses_without_archiving(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    Path(job['checkpoint_path']).write_text(json.dumps({'tampered': True}))
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='changed after settlement'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_missing_artifact_refuses_without_archiving(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    Path(job['checkpoint_path']).with_suffix('.failures.json').unlink()
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='missing or unreadable'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_without_settled_evidence_refuses(tmp_path):
-    path, job = prepared(tmp_path)
-    job.update(status='paused', portion=1, traffic=_traffic())
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='no settled artifact evidence'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_paused_marker_with_future_start_time_fails_closed(tmp_path):
-    path, job = _settled_paused(tmp_path, started_at=(NOW + timedelta(hours=1)).isoformat())
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(), now=NOW, write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_paused_marker_just_under_24h_still_resumes_without_rollover(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    before = path.read_bytes()
-    resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(days=1, microseconds=-1),
-                                 write=write)
-    assert resumed['job_id'] == job['job_id']
-    assert resumed['started_at'] == job['started_at']
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
 
 
 def _malformed_traffic_variants():
@@ -561,193 +469,6 @@ def _malformed_traffic_variants():
         nan_duration,
         empty_entity_key,
     ]
-
-
-def test_expired_paused_with_zeroed_empty_ledger_still_rolls_over(tmp_path):
-    """An empty by_entity ledger is valid when every aggregate counter is zero."""
-    zeroed = {'requests': 0, 'retries': 0, 'provider_up_bytes': 0,
-              'provider_down_bytes': 0, 'provider_metered_bytes': 0,
-              'decoded_bytes': 0, 'cache_hits': 0, 'by_entity': {}}
-    path, old = _settled_paused(tmp_path)
-    old['traffic'] = zeroed
-    cohorts.write_job(path, old, write)
-    later = NOW + timedelta(days=1, hours=2)
-
-    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                             now=later, write=write)
-    assert new['status'] == 'ready'
-    assert new['job_id'] != old['job_id']
-    archived = cohorts.read_job(path.parent / old['job_id'] / 'expired.json')
-    assert archived == old
-    assert archived['traffic'] == zeroed
-
-
-@pytest.mark.parametrize('job_id', [
-    '../escape',
-    'tm-discovery-job-../escape',
-    'tm-discovery-job-' + '0' * 24,
-])
-def test_expired_paused_changed_or_traversal_job_id_refuses_first(tmp_path, job_id):
-    """job_id must equal tm-discovery-job- + stable_payload_hash(identity)[:24]
-    before any artifact is read or any archive path is touched."""
-    path, job = _settled_paused(tmp_path)
-    original_job_id = job['job_id']
-    job['job_id'] = job_id
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='not bound to its identity'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    # No archive was written anywhere: neither under the traversal target nor
-    # under the original cohort directory.
-    assert not (tmp_path / 'escape' / 'expired.json').exists()
-    assert not (path.parent / original_job_id / 'expired.json').exists()
-
-
-@pytest.mark.parametrize('traffic', _malformed_traffic_variants())
-def test_expired_paused_without_complete_traffic_refuses(tmp_path, traffic):
-    """Valid artifact files on disk do not prove the accounting was settled."""
-    path, job = _settled_paused(tmp_path)
-    job['traffic'] = traffic
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='complete settled traffic'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_with_missing_traffic_key_refuses(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    del job['traffic']
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='complete settled traffic'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_artifact_outside_cohort_refuses(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    outside = tmp_path / 'elsewhere' / 'checkpoint.json'
-    outside.parent.mkdir(parents=True)
-    outside.write_text(json.dumps({'planted': True}))
-    job['artifacts'] = {**job['artifacts'],
-                        str(outside): hashlib.sha256(outside.read_bytes()).hexdigest()}
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='do not match its checkpoint'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_relative_artifact_refuses(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    checkpoint = Path(job['checkpoint_path'])
-    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    # Relative artifact entries survive read_job (they are strings) but are
-    # not bound to the cohort and must never be read or archived.
-    job['artifacts'] = {'checkpoint.json': digest,
-                        'checkpoint.failures.json': digest}
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='do not match its checkpoint'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_checkpoint_outside_cohort_refuses(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    job['checkpoint_path'] = str(tmp_path / 'other-job' / 'checkpoint.json')
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='not bound to its cohort'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_expired_paused_missing_failures_artifact_entry_refuses(tmp_path):
-    path, job = _settled_paused(tmp_path)
-    checkpoint = Path(job['checkpoint_path'])
-    # Only the checkpoint is listed: the .failures.json sibling is dropped.
-    job['artifacts'] = {str(checkpoint): job['artifacts'][str(checkpoint)]}
-    cohorts.write_job(path, job, write)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='do not match its checkpoint'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-
-
-def test_rollover_retry_after_active_write_crash_does_not_rewrite_archive(tmp_path):
-    path, old = _settled_paused(tmp_path)
-    archive = path.parent / old['job_id'] / 'expired.json'
-    later = NOW + timedelta(days=1, hours=2)
-    calls = []
-
-    crashed = []
-
-    def flaky_write(target, payload):
-        calls.append(str(target))
-        if target == path and archive.exists() and not crashed:
-            crashed.append(True)
-            raise OSError('simulated crash before active-marker write')
-        write(target, payload)
-
-    with pytest.raises(OSError, match='simulated crash'):
-        cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                           now=later, write=flaky_write)
-    # The archive was written but the old active marker remains untouched.
-    assert cohorts.read_job(archive) == old
-    assert cohorts.read_job(path)['job_id'] == old['job_id']
-
-    calls.clear()
-    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                             now=later, write=flaky_write)
-    assert new['job_id'] != old['job_id']
-    assert cohorts.read_job(path)['job_id'] == new['job_id']
-    # The retry never rewrote the archive: no write call touched it.
-    assert str(archive) not in calls
-    assert cohorts.read_job(archive) == old
-
-
-def test_conflicting_existing_archive_refuses_without_overwriting(tmp_path):
-    path, old = _settled_paused(tmp_path)
-    archive = path.parent / old['job_id'] / 'expired.json'
-    conflicting = {**old, 'portion': old['portion'] + 1}
-    cohorts.write_job(archive, conflicting, write)
-    archive_before = archive.read_bytes()
-    active_before = path.read_bytes()
-
-    with pytest.raises(ValueError, match='conflicts'):
-        cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(NOW + timedelta(days=1))),
-                           now=NOW + timedelta(days=1, hours=2), write=write)
-    assert archive.read_bytes() == archive_before
-    assert path.read_bytes() == active_before
-
-
-def test_corrupt_existing_archive_refuses_without_overwriting(tmp_path):
-    path, old = _settled_paused(tmp_path)
-    archive = path.parent / old['job_id'] / 'expired.json'
-    archive.write_text('not json')
-    active_before = path.read_bytes()
-
-    with pytest.raises(ValueError, match='corrupt'):
-        cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(NOW + timedelta(days=1))),
-                           now=NOW + timedelta(days=1, hours=2), write=write)
-    assert archive.read_text() == 'not json'
-    assert path.read_bytes() == active_before
 
 
 # --- One-time pinned recovery of the single audited 'failed' paid-I/O marker ---
@@ -1045,59 +766,31 @@ def test_paid_io_recovery_fails_closed_on_missing_manifest(tmp_path, monkeypatch
     assert cohorts.read_job(path)['status'] == 'failed'
 
 
-def test_paid_io_recovery_never_bypasses_age_or_identity(tmp_path, monkeypatch):
+def test_paid_io_recovery_never_bypasses_identity_but_ignores_age(tmp_path, monkeypatch):
     path, job = failed_stranded(tmp_path, monkeypatch)
     before = path.read_bytes()
     # Identity drift is still rejected first: a drifted caller never reaches
-    # the pinned recovery, whether the marker is fresh or expired.
+    # the pinned recovery, whatever the marker's age.
     with pytest.raises(ValueError, match='drift'):
         cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
     assert path.read_bytes() == before
     assert cohorts.read_job(path)['status'] == 'failed'
-    # Owner-authorized rollover (#2145, 2026-11-09): the exact pinned failed
-    # marker that has ALSO genuinely aged out is re-settled by its pinned
-    # recovery, archived verbatim and replaced by a fresh cohort.  This is an
-    # owner-authorized rollover, not an age bypass and not a renewal of the
-    # old cohort's started_at.
-    later = NOW + timedelta(days=1, hours=2)
-    # Collision guard: the unchanged identity hashes to the marker's own
-    # job_id.  Per the crash-safe order the failed→paused re-settlement lands
-    # first, then the rollover refuses before any archive write or fresh
-    # cohort in the same job_id/checkpoint namespace.
-    with pytest.raises(ValueError, match='collides with the expired paused cohort'):
-        cohorts.select_job(path, identity(), now=later, write=write)
-    assert cohorts.read_job(path)['status'] == 'paused'
-    assert not (path.parent / job['job_id'] / 'expired.json').exists()
-    # The retry with a genuinely new identity finds the paused expired marker
-    # and follows the ordinary archive path into a fresh cohort.
-    new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                             now=later, write=write)
-    assert new['status'] == 'ready'
-    assert new['portion'] == 0
-    assert new['traffic'] is None
-    assert new['job_id'] != job['job_id']
-    assert new['started_at'] == later.isoformat()
-    assert new['checkpoint_path'] != job['checkpoint_path']
-    assert cohorts.read_job(path)['job_id'] == new['job_id']
-    # Archive accounting: the re-settled marker is preserved verbatim —
-    # started_at, portion, identity, traffic, artifacts and recovery
-    # provenance — and the old spend is not carried into the fresh cohort.
-    archive = path.parent / job['job_id'] / 'expired.json'
-    archived = cohorts.read_job(archive)
-    assert archived['status'] == 'paused'
+    # Age never blocks the pinned recovery and never rolls the cohort over:
+    # the aged failed marker re-settles as 'paused' with its accounting,
+    # started_at and job_id preserved verbatim; no expired.json exists.
+    aged = NOW + timedelta(days=3)
+    resumed = cohorts.select_job(path, identity(), now=aged, write=write)
+    assert resumed['status'] == 'paused'
     for field in ('portion', 'started_at', 'identity', 'traffic', 'artifacts',
                   'job_id', 'checkpoint_path', 'last_run_id'):
-        assert archived[field] == job[field]
-    assert archived['updated_at'] == later.isoformat()
-    assert 'paid' in archived['recovery']['reason']
-    assert archived['recovery']['marker_hash'] == stable_payload_hash(job)
-    # Retry idempotency: repeat selection resumes the fresh cohort and never
-    # rewrites the existing archive.
-    archive_bytes = archive.read_bytes()
-    again = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
-                               now=later + timedelta(minutes=30), write=write)
-    assert again['job_id'] == new['job_id']
-    assert archive.read_bytes() == archive_bytes
+        assert resumed[field] == job[field]
+    assert resumed['updated_at'] == aged.isoformat()
+    assert not (path.parent / job['job_id'] / 'expired.json').exists()
+    # Retry idempotency: repeat selection is a no-op on the paused marker.
+    paused_bytes = path.read_bytes()
+    again = cohorts.select_job(path, identity(), now=aged + timedelta(minutes=30), write=write)
+    assert again['status'] == 'paused'
+    assert path.read_bytes() == paused_bytes
 
 
 # --- One-time pinned rollover of the owner-authorized unused 'ready' marker ---
@@ -1137,10 +830,10 @@ def test_unused_ready_rollover_before_24h_new_caps_fresh_identity(tmp_path, monk
     assert cohorts.read_job(path.parent / old['job_id'] / 'unused.json') == old
 
 
-def test_unused_ready_rollover_after_24h_expired_ready_fresh_identity(tmp_path, monkeypatch):
+def test_unused_ready_rollover_aged_ready_fresh_identity(tmp_path, monkeypatch):
     path, old = unused_ready(tmp_path, monkeypatch)
-    # Expired 'ready' after 24h previously rejected outright; the pin rolls
-    # the marker over into a genuinely fresh cohort.
+    # The unused pin rolls the marker over into a genuinely fresh cohort at
+    # any age; only the pin (never age) authorizes this rollover.
     later = NOW + timedelta(days=1, hours=2)
     new = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
                              now=later, write=write)
@@ -1217,29 +910,32 @@ def test_unused_ready_with_checkpoint_file_present_stays_rejected(tmp_path, monk
     target = checkpoint if name == 'checkpoint.json' else checkpoint.with_suffix('.failures.json')
     target.write_text(json.dumps({'https://example.test/a': {'hash': 'x'}}))
     before = path.read_bytes()
-    # Any progress evidence on disk keeps the old fail-closed behavior in
+    # Any progress evidence on disk keeps the fail-closed behavior in
     # both windows, and nothing is archived.
     with pytest.raises(ValueError, match='drift'):
         cohorts.select_job(path, identity(request_limit=200),
                            now=NOW + timedelta(hours=2), write=write)
     assert path.read_bytes() == before
     later = NOW + timedelta(days=1, hours=2)
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
+    with pytest.raises(ValueError, match='drift'):
+        cohorts.select_job(path, identity(request_limit=200),
                            now=later, write=write)
     assert path.read_bytes() == before
     assert not (path.parent / job['job_id'] / 'unused.json').exists()
 
 
-def test_unused_ready_off_pin_marker_stays_rejected(tmp_path, monkeypatch):
+def test_unused_ready_off_pin_marker_continues_at_any_age(tmp_path, monkeypatch):
     path, job = prepared(tmp_path)
     # The pin names a different payload hash: this ready marker is off-pin.
     monkeypatch.setattr(cohorts, 'KNOWN_UNUSED_READY_ROLLOVER', {
         'marker_hash': '0' * 64, 'cohort_job_id': job['job_id']})
     before = path.read_bytes()
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(cohort_day='2026-11-06'),
-                           now=NOW + timedelta(days=1), write=write)
+    later = NOW + timedelta(days=1, hours=2)
+    resumed = cohorts.select_job(path, identity(cohort_day=cohorts.cohort_day(later)),
+                                 now=later, write=write)
+    # Off-pin simply continues: the cohort persists at any age and nothing
+    # is archived or renewed.
+    assert resumed == job
     assert path.read_bytes() == before
     assert not (path.parent / job['job_id'] / 'unused.json').exists()
 
@@ -1493,15 +1189,18 @@ def test_waf_recovery_rejects_changed_failure_evidence(tmp_path, monkeypatch):
     assert path.read_bytes() == before
 
 
-def test_waf_recovery_never_bypasses_age_identity_or_off_pin(tmp_path, monkeypatch):
+def test_waf_recovery_never_bypasses_identity_or_pin_but_ignores_age(tmp_path, monkeypatch):
     path, job, _ = waf_failed(tmp_path, monkeypatch)
     before = path.read_bytes()
     with pytest.raises(ValueError, match='drift'):
         cohorts.select_job(path, identity(request_limit=101), now=NOW, write=write)
     assert path.read_bytes() == before
-    with pytest.raises(ValueError, match='expired'):
-        cohorts.select_job(path, identity(), now=NOW + timedelta(days=1), write=write)
-    assert path.read_bytes() == before
+    # Age never blocks the pinned WAF recovery: the aged failed marker still
+    # quarantines its cached blocked seed and re-settles as 'paused'.
+    resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(days=2), write=write)
+    assert resumed['status'] == 'paused'
+    assert resumed['started_at'] == job['started_at']
+    assert resumed['traffic'] == job['traffic']
     job['portion'] = 2
     cohorts.write_job(path, job, write)
     off_pin = path.read_bytes()
@@ -1574,3 +1273,232 @@ def test_waf_recovery_rejects_invalid_aggregate_duration(tmp_path, monkeypatch, 
     with pytest.raises(ValueError, match='aggregate duration is invalid'):
         cohorts.select_job(path, identity(), now=NOW, write=write)
     assert path.read_bytes() == before
+
+
+# --- Persistent cohort: started-time sanity, portion limit, resume guards ---
+
+def test_max_cohort_portions_pin():
+    # 104 saved portions of progress bound the persistent cohort; the count
+    # promises nothing about any calendar duration.
+    assert cohorts.MAX_COHORT_PORTIONS == 104 == 13 * 8
+
+
+@pytest.mark.parametrize('status', ['ready', 'paused', 'source_complete', 'failed'])
+def test_future_start_time_fails_closed_on_any_status(tmp_path, status):
+    path, job = _settled_paused(tmp_path)
+    job.update(status=status, started_at=(NOW + timedelta(hours=2)).isoformat())
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='invalid or future start time'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before
+
+
+def test_start_time_within_clock_skew_is_accepted(tmp_path):
+    path, job = _settled_paused(tmp_path, started_at=(NOW + timedelta(minutes=30)).isoformat())
+    before = path.read_bytes()
+    resumed = cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert resumed == job
+    assert path.read_bytes() == before
+
+
+def test_aged_marker_is_never_migrated_or_rewritten(tmp_path):
+    path, job = _settled_paused(tmp_path)
+    before = path.read_bytes()
+    later = NOW + timedelta(days=2)
+    resumed = cohorts.select_job(path, identity(), now=later, write=write)
+    assert resumed == job
+    assert path.read_bytes() == before
+    assert set(resumed) == set(job)
+
+
+def test_stale_expired_json_archive_is_inert(tmp_path):
+    path, job = _settled_paused(tmp_path)
+    stale = path.parent / job['job_id'] / 'expired.json'
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    cohorts.write_job(stale, job, write)
+    before = path.read_bytes()
+    later = NOW + timedelta(days=2)
+    resumed = cohorts.select_job(path, identity(), now=later, write=write)
+    assert resumed == job
+    assert path.read_bytes() == before
+
+
+def test_reservations_follow_updated_freshness_not_started_age(tmp_path):
+    path, job = prepared(tmp_path)
+    job.update(status='paused', portion=1, traffic=_traffic(),
+               started_at=(NOW - timedelta(days=5)).isoformat())
+    cohorts.write_job(path, job, write)
+    # A five-day-old cohort that a slot just refreshed still reserves both
+    # days: every bounded portion refreshes updated_at, age never releases.
+    assert len(cohorts.reservations(NOW, path)) == 26
+
+
+def test_reservations_stale_marker_keeps_only_daily_bootstrap(tmp_path):
+    path, job = prepared(tmp_path)
+    job.update(status='paused', portion=1,
+               updated_at=(NOW - timedelta(hours=25)).isoformat())
+    cohorts.write_job(path, job, write)
+    # A marker no slot refreshed for over a day releases everything except
+    # the guaranteed daily bootstrap slot, which can resume it.
+    assert [start.hour for start, _ in cohorts.reservations(NOW, path)] == [3, 3]
+
+
+@pytest.mark.parametrize('traffic', _malformed_traffic_variants())
+def test_continuation_resume_without_complete_traffic_refuses(tmp_path, traffic):
+    """Valid artifact files on disk do not prove the accounting was settled."""
+    path, job = _settled_paused(tmp_path)
+    job['traffic'] = traffic
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='not a complete settled snapshot'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'paused'
+
+
+def test_continuation_resume_with_missing_traffic_key_refuses(tmp_path):
+    path, job = _settled_paused(tmp_path)
+    del job['traffic']
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='not a complete settled snapshot'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert path.read_bytes() == before
+
+
+def test_continuation_construction_is_idempotent_noop(tmp_path):
+    path, job = _settled_paused(tmp_path)
+    before = path.read_bytes()
+    for _ in range(2):
+        ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                     soft_provider_bytes=9000, retry_limit=10)
+        continuation = cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                                     now=lambda: NOW, run_id='run-2')
+        assert continuation.portion == 2
+        assert ledger.snapshot()['requests'] == 1
+    assert path.read_bytes() == before
+
+
+def test_exhausted_marker_is_terminal_everywhere(tmp_path):
+    path, job = _settled_paused(tmp_path)
+    job.update(status='exhausted')
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='no budget renewal'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='no budget renewal'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    with pytest.raises(ValueError, match='publication'):
+        cohorts.mark_published(path, manifest_hash='x', snapshot_id='new',
+                               now=NOW, write=write)
+    assert path.read_bytes() == before
+    # Terminal exhausted releases every reservation except the daily bootstrap.
+    assert [start.hour for start, _ in cohorts.reservations(NOW, path)] == [3, 3]
+
+
+def test_continuation_portion_overflow_settles_terminal_exhausted(tmp_path):
+    path, job = _settled_paused(tmp_path, portion=cohorts.MAX_COHORT_PORTIONS)
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='portion limit exhausted'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    settled = cohorts.read_job(path)
+    # Terminal settle with no renewal: portion, traffic, artifacts and
+    # started_at verbatim; only the status and update time changed.
+    assert settled['status'] == 'exhausted'
+    assert settled['portion'] == cohorts.MAX_COHORT_PORTIONS
+    assert settled['traffic'] == job['traffic']
+    assert settled['artifacts'] == job['artifacts']
+    assert settled['started_at'] == job['started_at']
+    with pytest.raises(ValueError, match='no budget renewal'):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+
+
+def test_continuation_portion_overflow_with_damaged_evidence_stays_paused(tmp_path):
+    path, job = _settled_paused(tmp_path, portion=cohorts.MAX_COHORT_PORTIONS)
+    Path(job['checkpoint_path']).write_text(json.dumps({'tampered': True}))
+    before = path.read_bytes()
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    # No terminal settle on damaged evidence: the marker stays paused,
+    # byte-identical, for operator forensics.
+    with pytest.raises(ValueError, match='changed after settlement'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'paused'
+
+
+def test_continuation_portion_overflow_without_settled_traffic_stays_paused(tmp_path):
+    path, job = _settled_paused(tmp_path, portion=cohorts.MAX_COHORT_PORTIONS)
+    job['traffic'] = {'requests': 12}
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='not a complete settled snapshot'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert path.read_bytes() == before
+    assert cohorts.read_job(path)['status'] == 'paused'
+
+
+@pytest.mark.parametrize('job_id', [
+    '../escape',
+    'tm-discovery-job-../escape',
+    'tm-discovery-job-' + '0' * 24,
+])
+def test_continuation_resume_changed_or_traversal_job_id_refuses(tmp_path, job_id):
+    """job_id must equal tm-discovery-job- + stable_payload_hash(identity)[:24]
+    before any artifact is read."""
+    path, job = _settled_paused(tmp_path)
+    job['job_id'] = job_id
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='not bound to its identity'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert path.read_bytes() == before
+
+
+def test_continuation_resume_checkpoint_outside_cohort_refuses(tmp_path):
+    path, job = _settled_paused(tmp_path)
+    job['checkpoint_path'] = str(tmp_path / 'other-job' / 'checkpoint.json')
+    cohorts.write_job(path, job, write)
+    before = path.read_bytes()
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    with pytest.raises(ValueError, match='not bound to its cohort'):
+        cohorts.DiscoveryContinuation(path, identity(), ledger, write,
+                                      now=lambda: NOW, run_id='run-2')
+    assert path.read_bytes() == before
+
+
+def test_published_cohort_starts_fresh_cohort_next_operational_day(tmp_path):
+    path, job = prepared(tmp_path)
+    job.update(status='published', final_manifest={'hash': 'manifest', 'snapshot_id': 'new'},
+               published_at=NOW.isoformat())
+    cohorts.write_job(path, job, write)
+    later = NOW + timedelta(days=2)
+    fresh = cohorts.select_job(path, identity(previous_snapshot_id='new',
+                                              cohort_day=cohorts.cohort_day(later)),
+                               now=later, write=write)
+    assert fresh['status'] == 'ready'
+    assert fresh['portion'] == 0
+    assert fresh['traffic'] is None
+    assert fresh['job_id'] != job['job_id']
+    assert fresh['started_at'] == later.isoformat()
+    assert cohorts.read_job(path.parent / job['job_id'] / 'completed.json') == job

@@ -771,18 +771,30 @@ class TestStandingRegistryDiscovery:
         assert int(env["TM_RETRY_LIMIT"]) == math.ceil(0.1 * expected)
         assert int(env["TM_BYTE_CAP_BYTES"]) == expected * 32 * 1024
 
-    def test_expired_paused_cohort_is_archived_and_does_not_pin_the_new_mode(
+    def test_aged_paused_cohort_pins_its_mode_and_continues(
         self, dag_module, monkeypatch, tmp_path
     ):
-        # #2145: an expired paused cohort (tm-discovery-job-3d9db936 blocked
-        # select_job) rolls over.  The old marker is preserved verbatim as
-        # <job_id>/expired.json and a genuinely new cohort sizes from the live
-        # registry facts; the old 'full' mode must not cross the week boundary.
+        # #2145: a paused cohort persists at any age.  A week boundary or a
+        # changed live registry mid-cohort must not roll it over: its mode
+        # and sizing stay pinned, the marker is never archived or renewed,
+        # and the next slot simply resumes the same cohort.
         import hashlib
 
         paths, _, _ = self._arm(dag_module, monkeypatch, tmp_path)
         kwargs = self._prepare_kwargs(dag_module, paths)
+        # The first prepare sees a week-old full crawl and starts a 'full'
+        # cohort over the canonical snapshot.
+        monkeypatch.setattr(
+            dag_module,
+            "_read_registry_facts",
+            lambda: (
+                SNAPSHOT_ID,
+                938,
+                datetime.now(timezone.utc) - timedelta(days=8),
+            ),
+        )
         env = dag_module._prepare_discovery(**kwargs)
+        assert env["TM_MODE"] == "full"
         path = Path(env["TM_DISCOVERY_JOB_PATH"])
         job = dag_module.read_job(path)
         checkpoint = Path(job["checkpoint_path"])
@@ -790,7 +802,7 @@ class TestStandingRegistryDiscovery:
         checkpoint.write_text(json.dumps({"https://example.test/a": {"hash": "x"}}))
         failures = checkpoint.with_suffix(".failures.json")
         failures.write_text(json.dumps({"https://example.test/a": {"status": "ok"}}))
-        expired_at = datetime.now(timezone.utc) - timedelta(days=2)
+        paused_at = datetime.now(timezone.utc) - timedelta(days=2)
         from scrapers.transfermarkt.models import LeaseTrafficSnapshot, SharedTrafficLedger
         ledger = SharedTrafficLedger(hard_provider_bytes=10000, soft_provider_bytes=9000, retry_limit=10)
         ledger.observe_lease("lease-1", LeaseTrafficSnapshot(up_bytes=10, down_bytes=90))
@@ -800,8 +812,8 @@ class TestStandingRegistryDiscovery:
         job.update(
             status="paused",
             portion=3,
-            started_at=expired_at.isoformat(),
-            updated_at=expired_at.isoformat(),
+            started_at=paused_at.isoformat(),
+            updated_at=paused_at.isoformat(),
             traffic=ledger.snapshot(),
             sizing={"previous_competitions": 938, "country_pages": 211},
             artifacts={
@@ -809,33 +821,36 @@ class TestStandingRegistryDiscovery:
                 for candidate in (checkpoint, failures)
             },
         )
-        job["identity"]["mode"] = "full"
         dag_module.write_job(path, job, dag_module._atomic_json)
-        # The live registry facts now say a daily crawl with 803 competitions.
+        # Two days later the live registry facts would pick a 'daily' crawl
+        # of 803 competitions — but the aged paused cohort keeps its grant.
         monkeypatch.setattr(
             dag_module,
             "_read_registry_facts",
             lambda: (SNAPSHOT_ID, 803, datetime.now(timezone.utc)),
         )
 
-        env = dag_module._prepare_discovery(**kwargs)
+        resumed = dag_module._prepare_discovery(**kwargs)
 
-        assert env["TM_MODE"] == "daily"
-        assert env["TM_PREVIOUS_SNAPSHOT_ID"] == SNAPSHOT_ID
-        new_job = dag_module.read_job(path)
-        assert new_job["status"] == "ready"
-        assert new_job["job_id"] != job["job_id"]
-        assert new_job["identity"]["mode"] == "daily"
-        assert new_job["traffic"] is None
-        assert new_job["started_at"] != job["started_at"]
-        # The old marker is archived untouched, never renewed or reset.
-        archived = dag_module.read_job(
-            path.parent / job["job_id"] / "expired.json"
-        )
-        assert archived["status"] == "paused"
-        assert archived["portion"] == 3
-        assert archived["started_at"] == job["started_at"]
-        assert archived["identity"]["mode"] == "full"
+        assert resumed["TM_MODE"] == "full"
+        assert resumed["TM_PREVIOUS_SNAPSHOT_ID"] == SNAPSHOT_ID
+        assert resumed["TM_COHORT_COMPLETE"] == "false"
+        assert int(resumed["TM_REQUEST_LIMIT"]) == int(env["TM_REQUEST_LIMIT"])
+        assert int(resumed["TM_RETRY_LIMIT"]) == int(env["TM_RETRY_LIMIT"])
+        assert int(resumed["TM_BYTE_CAP_BYTES"]) == int(env["TM_BYTE_CAP_BYTES"])
+        # The same cohort continues: nothing is archived, renewed or reset.
+        pinned = dag_module.read_job(path)
+        assert pinned["status"] == "paused"
+        assert pinned["job_id"] == job["job_id"]
+        assert pinned["portion"] == 3
+        assert pinned["started_at"] == job["started_at"]
+        assert pinned["identity"]["mode"] == "full"
+        assert pinned["sizing"] == {
+            "previous_competitions": 938,
+            "country_pages": 211,
+        }
+        assert not (path.parent / job["job_id"] / "expired.json").exists()
+        assert not (path.parent / job["job_id"] / "completed.json").exists()
 
     def test_gate_off_scheduled_prepare_fails_closed(
         self, dag_module, monkeypatch, tmp_path
