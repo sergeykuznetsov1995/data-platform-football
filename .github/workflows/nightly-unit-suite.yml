@@ -1,0 +1,114 @@
+name: Nightly unit suite
+
+# Сигнал, не гейт (#2244): ночной полный unit suite на master ловит кросс-регрессию,
+# накопленную за день (PR-CI гоняет полный suite на merge-ref каждого PR, но быстрые
+# последовательные merge могут пройти без пересечения), и flakes на зелёном master.
+# Workflow НЕ входит в required checks (branch protection = unit-suite) и ничего
+# не блокирует; при падении открывает/комментирует одну issue с label
+# nightly-unit-suite. Push-триггер не нужен: ci.yml уже гоняет полный suite на
+# каждый push в master. Расписание работает только с default-ветки.
+
+on:
+  schedule:
+    # 02:23 UTC: вне top-of-hour пика GitHub cron, в стороне от
+    # sofascore-discovery (04:17 UTC).
+    - cron: "23 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-unit-suite
+  # Каждая ночь завершается полностью: красный прогон не должен быть отменён.
+  cancel-in-progress: false
+
+jobs:
+  unit:
+    name: nightly-unit-suite # отличается от required check "unit-suite"
+    if: github.ref == 'refs/heads/master' # schedule всегда master; dispatch из
+    # другой ветки не должен порождать ложный master-сигнал
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 # ci.yml: 45; ночной запас на пиковые 33 мин + задержки
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          # Как ci.yml: пин зафиксирован в requirements-ci.txt.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install test runtime
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-ci.txt
+
+      - name: Full unit suite
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        # Те же шесть WhoScored host-seal --ignore, что в ci.yml (job
+        # unit-suite): они истинны только на production-хосте и красные на
+        # любом hosted runner; локальный полный suite их по-прежнему гоняет.
+        run: |
+          pytest -q tests/unit \
+            --ignore=tests/unit/scripts/test_bench_whoscored_capacity.py \
+            --ignore=tests/unit/scripts/test_whoscored_production_admission.py \
+            --ignore=tests/unit/scripts/test_whoscored_go_decision.py \
+            --ignore=tests/unit/scripts/test_whoscored_capacity_container_runtime.py \
+            --ignore=tests/unit/scripts/test_generate_whoscored_deployment_attestation.py \
+            --ignore=tests/unit/scripts/test_validate_whoscored_build_provenance.py
+
+      - name: Offline BI and catalog scripts
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        # Явный выбор файла: в каталоге integration есть и live-тесты.
+        run: pytest -q tests/integration/test_bi_catalog_scripts.py -m unit
+
+  notify:
+    name: nightly-suite-notify
+    needs: unit
+    # Только реальное падение тестового job'а на master; skipped (dispatch из
+    # ветки) и cancelled не открывают issue.
+    if: failure() && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write # только для создания label/issue; код репозитория не чекаутится
+    steps:
+      - name: Ensure tracking label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh label create nightly-unit-suite --force --color d73a4a \
+            --description "Nightly full unit suite failure signal" || true
+
+      - name: Open or update tracking issue on failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body="Nightly full unit suite failed on master (${{ github.sha }}).
+          Run: $run_url
+
+          ## Приёмка
+
+          - **Тип:** одна проверка
+          - **Как проверить:** причина падения устранена; повторный запуск nightly-unit-suite (workflow_dispatch или очередное расписание) зелёный.
+          - **Шаг на проде:** нет
+          - **Разрешение владельца на шаг на проде:** не требуется"
+          number="$(gh issue list --state open --label nightly-unit-suite \
+            --limit 1 --json number --jq '.[0].number // empty')"
+          if [[ -z "$number" ]]; then
+            gh issue create --label nightly-unit-suite \
+              --title "Nightly unit suite failing on master" --body "$body"
+          else
+            gh issue comment "$number" --body "$body"
+          fi

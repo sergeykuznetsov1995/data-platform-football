@@ -37,10 +37,26 @@ env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS \
 
 ## Полный unit suite и обязательные CI
 
-Для кода, SQL, DAG, зависимостей или конфигурации приложения полный локальный suite
-обязателен перед PR. Между итерациями достаточно затронутых тестов. Для изменения
-только документации — содержимое, ссылки и загрузка; инструкции дополнительно
-проверяются в новой сессии. CI-гейты и защита ветки от этого не отключаются.
+Для кода, SQL, DAG, зависимостей или конфигурации приложения между итерациями и перед PR
+достаточно затронутых тестов, детерминированно выбранных `scripts/select_tests_by_diff.py`
+по diff ветки (вердикт FULL = полный локальный suite по команде ниже). Полный suite на каждый
+PR гарантирует обязательный CI `unit-suite`; локально полный прогон повторяй после влияющих
+изменений, при сбоях и неясном результате и на эпик-мерже. Ночной workflow
+`.github/workflows/nightly-unit-suite.yml` прогоняет полный suite на master по расписанию
+и открывает issue при падении — это сигнал, не гейт. Для изменения только документации —
+содержимое, ссылки и загрузка; инструкции дополнительно проверяются в новой сессии.
+CI-гейты и защита ветки от этого не отключаются.
+
+```bash
+# focused-набор по diff ветки (staged+unstaged; новые файлы: сначала git add -N .)
+mapfile -t targets < <(python3 scripts/select_tests_by_diff.py --worktree --pytest-args) || exit 1
+if ((${#targets[@]})); then
+  env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+    python -m pytest -q "${targets[@]}"
+else
+  echo "затронутых unit-тестов нет"
+fi
+```
 
 Полный профиль использует Python 3.12 и [requirements-ci.txt](requirements-ci.txt).
 Airflow намеренно отсутствует: unit DAG-тесты используют stubs. Минимальный smoke-venv
