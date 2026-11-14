@@ -9,6 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import re
 import subprocess
+import zlib
 
 import duckdb
 import pytest
@@ -56,6 +57,9 @@ def reports(tmp_path):
 class Database:
     def __init__(self):
         self.db = duckdb.connect()
+        # sqlglot preserves Trino CRC32; provide its unsigned BIGINT semantics
+        # for the offline engine after to_utf8 is translated to ENCODE.
+        self.db.create_function("crc32", lambda value: zlib.crc32(value), ["BLOB"], "BIGINT")
         self.queries = []
         self.db.execute("CREATE MACRO from_iso8601_timestamp(x) AS CAST(x AS TIMESTAMPTZ)")
         self.db.execute("CREATE MACRO to_iso8601(x) AS strftime(x, '%Y-%m-%dT%H:%M:%S')")
@@ -83,15 +87,16 @@ def db():
                            f"{columns}, _target_batch_id VARCHAR, _observed_at TIMESTAMP, _ingested_at TIMESTAMP)")
     manager.db.execute(f"CREATE TABLE {c1.MANIFEST} (competition_id VARCHAR, source_season_key VARCHAR, "
                        "target_type VARCHAR, entity_id VARCHAR, batch_id VARCHAR, parser_version VARCHAR, "
-                       "status VARCHAR, completed_at TIMESTAMP, run_id VARCHAR, error_code VARCHAR)")
+                       "status VARCHAR, completed_at TIMESTAMP, run_id VARCHAR, error_code VARCHAR, target_key VARCHAR)")
     return manager
 
 
 def manifest(db, batch, *, kind="league_season", cid="1", sk="2026", mid=None,
              version=c1.PARSER_VERSION, status="success", when="2026-10-20 12:00:00",
              run="r1", error=None):
-    db.db.execute(f"INSERT INTO {c1.MANIFEST} VALUES (?,?,?,?,?,?,?,?,?,?)",
-                  [cid, sk, kind, mid, batch, version, status, when, run, error])
+    db.db.execute(f"INSERT INTO {c1.MANIFEST} VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  [cid, sk, kind, mid, batch, version, status, when, run, error,
+                   f"{kind}:{cid}:{sk}:{mid}"])
 
 
 def calendar(db, mid=10, batch="cal", *, cid="1", sk="2026", utc="2026-10-19T22:00:00Z",

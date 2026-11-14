@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import date, datetime
 import json
 import re
+import zlib
 
 import pytest
 
@@ -25,12 +26,15 @@ IDENTITY = ("competition_id", "source_season_key", "target_type", "entity_id")
 OLD, NEW = 902, 7  # A current snapshot need not have a larger ID.
 DAY = date(2026, 11, 13)
 SQL_VALUE = r"(?:NULL|'(?:''|[^'])*')"
+# Independent spelling pins the Trino 484 type/function contract: VARCHAR ->
+# UTF-8 VARBINARY -> unsigned BIGINT CRC32 -> BIGINT modulus and comparison.
+# Do not import the production expression: SQL mutations must fail this parser.
+ROUTE_SQL = "mod(crc32(to_utf8(coalesce(target_key, ''))), BIGINT '64')"
 SOURCE = re.compile(
     r"\(SELECT \* FROM iceberg\.bronze\.fotmob_ingest_manifest "
     r"FOR VERSION AS OF (\d+) WHERE "
     r"(target_type=" + SQL_VALUE
-    + r"(?: AND competition_id IS NOT DISTINCT FROM " + SQL_VALUE
-    + r" AND source_season_key IS NOT DISTINCT FROM " + SQL_VALUE + r")?)\)"
+    + r"(?: AND " + re.escape(ROUTE_SQL) + r"=BIGINT '\d+')?)\)"
 )
 
 
@@ -57,9 +61,20 @@ def identity(record):
 
 def reference(before, after):
     """Unscoped full-row multiset oracle, with projection only AFTER subtraction."""
+    return set(reference_bag(before, after))
+
+
+def reference_bag(before, after):
+    """No routing/hash logic participates in the expected equality relation."""
     before = Counter(r for r in before if r[FIELDS.index("target_type")] in TYPES)
     after = Counter(r for r in after if r[FIELDS.index("target_type")] in TYPES)
-    return {identity(r) for r in (before - after) | (after - before)}
+    return Counter(identity(r) for r in ((before - after) + (after - before)).elements())
+
+
+def route(record):
+    key = record[FIELDS.index("target_key")]
+    assert key is None or isinstance(key, str)
+    return zlib.crc32((key or "").encode("utf-8")) % 64
 
 
 def decode(value):
@@ -69,15 +84,16 @@ def decode(value):
 class ManifestManager:
     """Tiny evaluator for the supported SQL grammar, using exact bag semantics.
 
-    Rejects unscoped heavy queries, missing time travel, key/hash-only comparison
-    and all-scope UNION. The oracle above independently compares whole snapshots.
+    Rejects unbucketed heavy queries, missing time travel, key/hash-only comparison
+    and all-bucket UNION. The oracle above independently compares whole snapshots.
     Result iteration must finish before the caller submits another statement.
     """
 
-    def __init__(self, before, after, *, fail_batch=None, expired=None):
+    def __init__(self, before, after, *, fail_batch=None, expired=None, fail_consuming=None):
         self.data = {OLD: before, NEW: after}
         self.fail_batch = fail_batch
         self.expired = expired
+        self.fail_consuming = fail_consuming
         self.queries = []
         self.discoveries = []
         self.batches = []
@@ -91,16 +107,17 @@ class ManifestManager:
             raise RuntimeError("synthetic expired snapshot")
         pattern = r"target_type=(" + SQL_VALUE + ")"
         if scoped:
-            pattern += (
-                r" AND competition_id IS NOT DISTINCT FROM (" + SQL_VALUE + ")"
-                r" AND source_season_key IS NOT DISTINCT FROM (" + SQL_VALUE + ")"
-            )
+            pattern += r" AND " + re.escape(ROUTE_SQL) + r"=BIGINT '(\d+)'"
         match = re.fullmatch(pattern, predicate)
-        assert match, "comparison must have one typed, NULL-safe scope"
-        values = tuple(decode(value) for value in match.groups())
-        fields = ("target_type", "competition_id", "source_season_key") if scoped else ("target_type",)
+        assert match, "comparison must have one typed, NULL-safe bucket"
+        values = (decode(match[1]),)
+        if scoped:
+            bucket = int(match[2])
+            assert 0 <= bucket < 64
+            values += (bucket,)
         selected = [r for r in self.data[version]
-                    if tuple(r[FIELDS.index(field)] for field in fields) == values]
+                    if r[FIELDS.index("target_type")] == values[0]
+                    and (not scoped or route(r) == values[1])]
         return version, values, selected
 
     def execute_query(self, sql):
@@ -114,7 +131,7 @@ class ManifestManager:
                 r"SELECT competition_id, source_season_key, target_type, entity_id "
                 r"FROM \(\s*SELECT \* FROM <source> EXCEPT ALL SELECT \* FROM <source>\)",
                 structure,
-            ), "full-row EXCEPT ALL must run separately for each scope and direction"
+            ), "full-row EXCEPT ALL must run separately for each bucket and direction"
             assert len(selections) == 2
             left_version, scope, left = self.select(selections[0], scoped=True)
             right_version, right_scope, right = self.select(selections[1], scoped=True)
@@ -129,13 +146,15 @@ class ManifestManager:
 
             def consume():
                 yield from result
+                if len(self.batches) == self.fail_consuming:
+                    raise RuntimeError("synthetic result consumption failure")
                 self.completed.append(batch)
                 self.pending = False
 
             return consume()
         if structure == (
-            "SELECT competition_id, source_season_key FROM <source> "
-            "UNION SELECT competition_id, source_season_key FROM <source>"
+            f"SELECT {ROUTE_SQL} FROM <source> "
+            f"UNION SELECT {ROUTE_SQL} FROM <source>"
         ):
             assert len(selections) == 2
             left_version, scope, left = self.select(selections[0], scoped=False)
@@ -143,7 +162,7 @@ class ManifestManager:
             assert scope == right_scope
             assert {left_version, right_version} == {OLD, NEW}
             self.discoveries.append(scope[0])
-            return list(dict.fromkeys((identity(r)[0], identity(r)[1]) for r in left + right))
+            return sorted({(route(r),) for r in left + right})
         return self.other_query(sql)
 
     def other_query(self, sql):
@@ -151,14 +170,14 @@ class ManifestManager:
 
 
 def expected_batches(before, after):
-    scopes = {(r[FIELDS.index("target_type")], *identity(r)[:2])
+    scopes = {(r[FIELDS.index("target_type")], route(r))
               for r in before + after if r[FIELDS.index("target_type")] in TYPES}
     return {(scope, left, right) for scope in scopes for left, right in ((OLD, NEW), (NEW, OLD))}
 
 
 @pytest.mark.parametrize("target_type", TYPES)
 @pytest.mark.parametrize("scenario", ["rewrite", "insert", "delete", "rollback", "duplicate", "null"])
-def test_scoped_comparison_matches_whole_snapshot_multiset(target_type, scenario):
+def test_bucket_comparison_matches_whole_snapshot_multiset(target_type, scenario):
     base = row(target_type)
     extra = row(target_type, cid="20", season="2025/26", mid="200")
     if scenario == "rewrite":
@@ -181,15 +200,15 @@ def test_scoped_comparison_matches_whole_snapshot_multiset(target_type, scenario
     before.append(ignored)
     manager = ManifestManager(before, after)
 
-    actual = set(c1.manifest_changes(manager, OLD, NEW))
+    actual = Counter(c1.manifest_changes(manager, OLD, NEW))
 
-    assert actual == reference(before, after)
+    assert actual == reference_bag(before, after)
     assert set(manager.batches) == expected_batches(before, after)
     assert len(manager.batches) == len(set(manager.batches))
     assert manager.completed == manager.batches
     assert manager.discoveries == list(TYPES)
     if scenario == "rewrite":
-        assert actual == set()
+        assert not actual
     else:
         assert actual
 
@@ -210,11 +229,11 @@ def test_changes_only_in_nonidentity_fields_remain_visible(field):
     after = [row(target_type, **{field: replacement}) for target_type in TYPES]
     manager = ManifestManager(before, after)
 
-    assert set(c1.manifest_changes(manager, OLD, NEW)) == reference(before, after)
+    assert Counter(c1.manifest_changes(manager, OLD, NEW)) == reference_bag(before, after)
     assert reference(before, after) == {identity(r) for r in before}
 
 
-def test_equal_rewrite_uses_observed_scopes_without_fixed_bucket_fanout():
+def test_equal_rewrite_uses_only_occupied_buckets():
     before = [row(target_type, cid=str(cid), season=season)
               for target_type in TYPES for cid in (10, 20)
               for season in (None, "2026/27", "synthetic ' season")]
@@ -222,12 +241,13 @@ def test_equal_rewrite_uses_observed_scopes_without_fixed_bucket_fanout():
 
     assert list(c1.manifest_changes(manager, OLD, NEW)) == []
     assert len(manager.discoveries) == 4
-    assert len(manager.batches) == 2 * len(before)
-    assert len(manager.queries) == 4 + 2 * len(before)
+    # Every synthetic row shares target_key, despite different pair identities.
+    assert len(manager.batches) == 8
+    assert len(manager.queries) == 12
     assert manager.completed == manager.batches
 
 
-def test_empty_snapshots_only_discover_scopes():
+def test_empty_snapshots_only_discover_buckets():
     manager = ManifestManager([], [])
     assert list(c1.manifest_changes(manager, OLD, NEW)) == []
     assert len(manager.queries) == 4
@@ -235,7 +255,7 @@ def test_empty_snapshots_only_discover_scopes():
 
 
 @pytest.mark.parametrize("deletion", [False, True])
-def test_scopes_existing_in_only_one_snapshot_are_compared(deletion):
+def test_buckets_existing_in_only_one_snapshot_are_compared(deletion):
     records = [row(target_type, cid=None, season=None, mid=None) for target_type in TYPES]
     before, after = (records, []) if deletion else ([], records)
     manager = ManifestManager(before, after)
@@ -259,6 +279,65 @@ def test_comparison_iterator_does_not_prefetch_batches():
     assert manager.pending
     assert {first, *changes} == reference(before, after)
     assert manager.completed == manager.batches
+
+
+@pytest.mark.parametrize("target_type", TYPES)
+def test_null_empty_unicode_delimiters_and_unsigned_crc_routing(target_type):
+    keys = (None, "", "123456789", "é|雪/'", "e\u0301", "a|b:c", "a:b|c")
+    before = [row(target_type, cid=None, season="", mid=None, target_key=key)
+              for key in keys]
+    after = [row(target_type, cid=None, season="", mid=None, target_key=key,
+                 actual_counts_json='{"synthetic":"changed"}') for key in keys]
+    assert zlib.crc32(b"123456789") == 3421780262  # Above signed int32 max.
+    assert route(before[2]) == 38
+    assert route(before[0]) == route(before[1]) == 0
+    manager = ManifestManager(before, after)
+
+    assert Counter(c1.manifest_changes(manager, OLD, NEW)) == reference_bag(before, after)
+    assert set(manager.completed) == expected_batches(before, after)
+
+
+@pytest.mark.parametrize("target_type", TYPES)
+def test_forced_crc_collision_does_not_hide_nonkey_change(target_type):
+    # NULL and empty both encode b'', forcing the SAME full CRC32, not just
+    # the same modulus. They remain distinct physical rows in EXCEPT ALL.
+    null = row(target_type, target_key=None)
+    empty = row(target_type, target_key="")
+    changed = row(target_type, target_key="", error="changed wide evidence")
+    before, after = [null, empty, empty], [null, empty, changed]
+    assert route(null) == route(empty) == route(changed)
+    manager = ManifestManager(before, after)
+
+    assert Counter(c1.manifest_changes(manager, OLD, NEW)) == reference_bag(before, after)
+    assert reference_bag(before, after) == Counter({identity(empty): 2})
+    assert len(manager.completed) == 2
+
+
+@pytest.mark.parametrize("target_type", TYPES)
+def test_routing_key_change_visits_old_and_new_snapshot_only_buckets(target_type):
+    old = row(target_type, target_key="", cid=None, season=None, mid="old")
+    new = row(target_type, target_key="123456789", cid="", season="雪|/'", mid="new")
+    assert route(old) != route(new)
+    manager = ManifestManager([old, old], [new])
+
+    assert Counter(c1.manifest_changes(manager, OLD, NEW)) == Counter({
+        identity(old): 2, identity(new): 1,
+    })
+    assert set(manager.completed) == expected_batches([old], [new])
+    assert len(manager.completed) == 4
+
+
+@pytest.mark.parametrize("bad", [
+    "mod(crc32(coalesce(target_key, '')), BIGINT '64')",
+    "mod(crc32(to_utf8(target_key)), BIGINT '64')",
+    "mod(crc32(to_utf8(coalesce(target_key, ''))), '64')",
+    "mod(CAST(crc32(to_utf8(coalesce(target_key, ''))) AS integer), 64)",
+])
+def test_sql_evaluator_rejects_invalid_or_nullable_routing(bad):
+    sql = c1.manifest_changes_sql(OLD, NEW, "match", 0)
+    assert ROUTE_SQL in sql
+    with pytest.raises(AssertionError):
+        ManifestManager([], []).execute_query(sql.replace(ROUTE_SQL, bad))
 
 
 class FrozenDatetime(datetime):
@@ -311,7 +390,7 @@ def setup_refresh(monkeypatch, manager):
 
 
 @pytest.mark.parametrize("rewrite", [False, True])
-def test_refresh_consumes_sequential_scopes_before_publishing(monkeypatch, rewrite):
+def test_refresh_consumes_sequential_buckets_before_publishing(monkeypatch, rewrite):
     before = [row(target_type, cid=str(cid)) for target_type, cid in zip(TYPES, (10, 20, 30, 40))]
     after = list(reversed(before)) if rewrite else [
         row(target_type, cid=str(cid), error="changed wide evidence " * 1024)
@@ -341,7 +420,7 @@ def test_refresh_consumes_sequential_scopes_before_publishing(monkeypatch, rewri
     assert json.loads(checkpoint_rows[0][-1])["snapshots"][c1.MANIFEST] == NEW
 
 
-@pytest.mark.parametrize("fail_batch", [1, 2, 5, 8])
+@pytest.mark.parametrize("fail_batch", range(1, 9))
 def test_refresh_batch_failure_aborts_before_any_publication(monkeypatch, fail_batch):
     before = [row(target_type, cid=str(cid)) for target_type, cid in zip(TYPES, (10, 20, 30, 40))]
     after = [row(target_type, cid=str(cid), error="changed")
@@ -354,6 +433,22 @@ def test_refresh_batch_failure_aborts_before_any_publication(monkeypatch, fail_b
 
     assert len(manager.batches) == fail_batch
     assert len(manager.completed) == fail_batch - 1
+    assert manager.writes == []
+    assert manager.checkpoint["snapshots"][c1.MANIFEST] == OLD
+
+
+@pytest.mark.parametrize("fail_consuming", range(1, 9))
+def test_refresh_result_consumption_failure_aborts_before_writes(monkeypatch, fail_consuming):
+    before = [row(target_type) for target_type in TYPES]
+    after = [row(target_type, error="changed") for target_type in TYPES]
+    manager = RefreshManager(before, after, fail_consuming=fail_consuming)
+    setup_refresh(monkeypatch, manager)
+
+    with pytest.raises(RuntimeError, match="synthetic result consumption failure"):
+        c1.refresh(manager)
+
+    assert len(manager.batches) == fail_consuming
+    assert len(manager.completed) == fail_consuming - 1
     assert manager.writes == []
     assert manager.checkpoint["snapshots"][c1.MANIFEST] == OLD
 
