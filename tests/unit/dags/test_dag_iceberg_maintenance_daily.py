@@ -22,20 +22,16 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert mod.dag._dag_kwargs["max_active_runs"] == 1
     assert mod.dag._dag_kwargs["max_active_tasks"] == 1
     assert mod.dag._dag_kwargs["schedule"] == "0 3 * * *"
-    assert tasks["janitor_fbref_generic_stages"]._init_kwargs[
-        "execution_timeout"
-    ] == timedelta(minutes=120)
     assert mod.dag._dag_kwargs["default_args"]["execution_timeout"] == timedelta(
         minutes=30
     )
     assert all(
         "execution_timeout" not in task._init_kwargs
         for task_id, task in tasks.items()
-        if task_id not in {"janitor_fbref_generic_stages", "compact_bronze", "maintain_ops"}
+        if task_id not in {"compact_bronze", "maintain_ops"}
     )
     assert set(tasks) == {
         "compact_bronze",
-        "janitor_fbref_generic_stages",
         "cleanup_whoscored_dq_stage_partitions",
         "maintain_whoscored_bronze",
         "maintain_other_high_churn_bronze",
@@ -48,17 +44,12 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert tasks["maintain_whoscored_bronze"].upstream_task_ids == {
         "cleanup_whoscored_dq_stage_partitions"
     }
-    assert tasks["janitor_fbref_generic_stages"].downstream_task_ids == {
-        "cleanup_whoscored_dq_stage_partitions",
-        "maintain_other_high_churn_bronze",
-        "check_maintenance_run",
+    assert tasks["cleanup_whoscored_dq_stage_partitions"].upstream_task_ids == {
+        "compact_bronze"
     }
-    assert tasks["cleanup_whoscored_dq_stage_partitions"]._init_kwargs[
-        "trigger_rule"
-    ] == "all_done"
-    assert tasks["maintain_other_high_churn_bronze"]._init_kwargs[
-        "trigger_rule"
-    ] == "all_done"
+    assert tasks["maintain_other_high_churn_bronze"].upstream_task_ids == {
+        "compact_bronze"
+    }
 
     with pytest.raises(Exception, match="WhoScored had 1 table failure"):
         mod._fail_on_partial_maintenance(
@@ -108,17 +99,6 @@ def test_daily_maintenance_runs_logical_dq_retention(monkeypatch) -> None:
     assert mod._cleanup_whoscored_dq_stage() is expected
 
 
-def test_daily_fbref_callable_uses_bounded_wait(monkeypatch) -> None:
-    import utils.fbref_maintenance as maintenance
-
-    mod = _load_module()
-    expected = {"mode": "audit", "control_run_id": "maintenance"}
-    monkeypatch.setattr(
-        maintenance, "maintain_fbref_stages_with_lock_wait", lambda: expected
-    )
-    assert mod._maintain_fbref_stages() is expected
-
-
 def test_nightly_compaction_is_first_and_uses_fbref_pool():
     from airflow.operators.python import PythonOperator
     PythonOperator._instances.clear()
@@ -127,7 +107,11 @@ def test_nightly_compaction_is_first_and_uses_fbref_pool():
     task = tasks["compact_bronze"]
     assert task._init_kwargs["pool"] == "fbref_scraper_pool"
     assert task._init_kwargs["mode"] == "reschedule"
-    assert task.downstream_task_ids == {"janitor_fbref_generic_stages", "check_maintenance_run"}
+    assert task.downstream_task_ids == {
+        "cleanup_whoscored_dq_stage_partitions",
+        "maintain_other_high_churn_bronze",
+        "check_maintenance_run",
+    }
     assert task._init_kwargs["execution_timeout"] == timedelta(hours=3)
 
 
@@ -142,14 +126,11 @@ def test_compaction_failure_cannot_be_hidden_by_successful_cleanup():
     assert final._init_kwargs["trigger_rule"] == "all_done"
     assert final.upstream_task_ids == set(tasks) - {final.task_id}
     assert not final.downstream_task_ids
-    assert tasks["cleanup_whoscored_dq_stage_partitions"]._init_kwargs[
-        "trigger_rule"
-    ] == "all_done"
     instances = [
-        SimpleNamespace(task_id=task_id, state=(
-            "failed" if task_id == "compact_bronze" else
-            "upstream_failed" if task_id == "janitor_fbref_generic_stages" else "success"
-        ))
+        SimpleNamespace(
+            task_id=task_id,
+            state="failed" if task_id == "compact_bronze" else "success",
+        )
         for task_id in tasks if task_id != final.task_id
     ]
     context = dict(task=final, dag_run=SimpleNamespace(get_task_instances=lambda: instances))

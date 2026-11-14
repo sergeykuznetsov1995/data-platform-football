@@ -16,6 +16,11 @@ The full bronze/silver/gold sweep stays weekly (`dag_iceberg_maintenance.py`,
 retention 30d) — this DAG is a tighter loop only for the worst offenders
 identified during the 2026-04-30 disk-fill incident.
 
+The fail-closed FBref stage janitor no longer runs here: its retries burned
+02:00–07:08 UTC on 11–14.11 and blocked the 03:00–05:00 UTC direct compaction
+window. It moved to its own DAG (`dag_fbref_stage_janitor`) scheduled after
+the window (owner decision 14.11.2026, TRINO-GRILL 14.11).
+
 Schedule: 03:00 UTC (06:00 MSK) daily — well before the 14:00 UTC master pipeline.
 """
 
@@ -129,18 +134,6 @@ def _maintain_ops(**_ctx) -> Dict[str, Any]:
     return result
 
 
-def _maintain_fbref_stages(*, reschedule_on_busy=False, **_ctx):
-    from utils.fbref_maintenance import maintain_fbref_stages_with_lock_wait
-
-    result = maintain_fbref_stages_with_lock_wait(
-        **({"reschedule_on_busy": True} if reschedule_on_busy else {})
-    )
-    if reschedule_on_busy and result is not False:
-        from airflow.sensors.base import PokeReturnValue
-        return PokeReturnValue(is_done=True, xcom_value=result)
-    return result
-
-
 with DAG(
     dag_id="dag_iceberg_maintenance_daily",
     default_args=SILVER_ARGS,
@@ -169,9 +162,6 @@ with DAG(
     cleanup_whoscored_dq_stage = PythonOperator(
         task_id="cleanup_whoscored_dq_stage_partitions",
         python_callable=_cleanup_whoscored_dq_stage,
-        # Retained FBref stages need attention, but must not suppress this
-        # unrelated cleanup wave.
-        trigger_rule="all_done",
     )
 
     maintain_whoscored = PythonOperator(
@@ -182,9 +172,6 @@ with DAG(
     maintain_other_high_churn = PythonOperator(
         task_id="maintain_other_high_churn_bronze",
         python_callable=_maintain_other_high_churn,
-        # A retained FBref stage needs attention, but must not suppress
-        # unrelated snapshot/orphan maintenance.
-        trigger_rule="all_done",
     )
 
     maintain_ops = PythonOperator(
@@ -195,27 +182,11 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    fbref_stage_janitor = PythonSensor(
-        task_id="janitor_fbref_generic_stages",
-        python_callable=_maintain_fbref_stages,
-        op_kwargs={"reschedule_on_busy": True},
-        mode="reschedule",
-        poke_interval=30,
-        timeout=90 * 60,
-        # Waiting pokes release the single FBref pool so ingest's tail can
-        # release publication ownership. Actual cleanup retains its time limit.
-        execution_timeout=timedelta(minutes=120),
-        pool="fbref_scraper_pool",
-        priority_weight=10,
-        weight_rule="absolute",
-    )
-
-    fbref_stage_janitor >> cleanup_whoscored_dq_stage
-    fbref_stage_janitor >> maintain_other_high_churn
     cleanup_whoscored_dq_stage >> maintain_whoscored
     maintain_other_high_churn >> maintain_ops
 
-    compact_bronze >> fbref_stage_janitor
+    compact_bronze >> cleanup_whoscored_dq_stage
+    compact_bronze >> maintain_other_high_churn
 
     check_maintenance_run = PythonOperator(
         task_id="check_maintenance_run",
@@ -224,7 +195,6 @@ with DAG(
     )
     for task in (
         compact_bronze,
-        fbref_stage_janitor,
         cleanup_whoscored_dq_stage,
         maintain_whoscored,
         maintain_other_high_churn,
