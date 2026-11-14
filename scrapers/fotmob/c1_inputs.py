@@ -403,7 +403,7 @@ def refresh(manager, *, first_day=None, last_day=None):
                 for table in (MATCHES, PAYLOADS):
                     for version in (previous["snapshots"], before):
                         ids |= {str(row[0]) for row in manager.execute_query(
-                            f"SELECT DISTINCT match_id FROM {source_sql(table, version, pairs_sql(affected, physical=True))}"
+                            f"SELECT DISTINCT match_id FROM {source_sql(table, version, pairs_sql(affected, physical=table == MATCHES))}"
                         )}
                 ids |= {str(row[0]) for row in manager.execute_query(
                     f"SELECT DISTINCT match_id FROM {TABLE} WHERE kind='input' "
