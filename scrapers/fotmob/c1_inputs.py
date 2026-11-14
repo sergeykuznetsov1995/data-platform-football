@@ -244,15 +244,47 @@ def _decoded_pairs(values):
     return {(cid, sk): value for cid, sk, value in values}
 
 
-def manifest_changes_sql(old, new):
-    # EXCEPT in both directions handles rollback/deletion as well as append;
-    # checkpoints never depend on wall-clock timestamps or completed_at order.
-    predicate = "target_type IN ('match','league_season','competition_profile','competition_seasons')"
+def manifest_changes_sql(old, new, target_type, competition_id, source_season_key):
+    """One direction of an exact multiset difference in one disjoint scope."""
+    predicate = (
+        f"target_type={literal(target_type)} "
+        f"AND competition_id IS NOT DISTINCT FROM {literal(competition_id)} "
+        f"AND source_season_key IS NOT DISTINCT FROM {literal(source_season_key)}"
+    )
     before = source_sql(MANIFEST, {MANIFEST: old}, predicate)
     after = source_sql(MANIFEST, {MANIFEST: new}, predicate)
     return f"""SELECT competition_id, source_season_key, target_type, entity_id FROM (
-        (SELECT * FROM {after} EXCEPT ALL SELECT * FROM {before})
-        UNION ALL (SELECT * FROM {before} EXCEPT ALL SELECT * FROM {after}))"""
+        SELECT * FROM {after} EXCEPT ALL SELECT * FROM {before})"""
+
+
+def manifest_changes(manager, old, new):
+    """Consume full-row differences sequentially, never across all scopes at once.
+
+    Discover only narrow keys from BOTH pinned snapshots, including deleted and
+    NULL scopes. UNION deduplicates scopes, not manifest rows. Each full-row
+    EXCEPT ALL retains physical multiplicity and runs separately per direction.
+    target_type prunes physical partitions; competition/season filters limit
+    comparison state even where they cannot prune files. No digest decides row
+    equality, and no checkpoint is published until this iterator is exhausted.
+
+    This trades scans (two comparisons per observed scope) for smaller per-query
+    state. Equal rewrites still require exact comparisons, but there is no fixed
+    bucket fan-out. A skewed scope or even key discovery can still exceed query
+    limits: propagate that failure without retry, repartitioning or publication.
+    """
+    for target_type in ("match", "league_season", "competition_profile", "competition_seasons"):
+        predicate = f"target_type={literal(target_type)}"
+        before = source_sql(MANIFEST, {MANIFEST: old}, predicate)
+        after = source_sql(MANIFEST, {MANIFEST: new}, predicate)
+        scopes = manager.execute_query(
+            f"SELECT competition_id, source_season_key FROM {before} "
+            f"UNION SELECT competition_id, source_season_key FROM {after}"
+        )
+        for cid, sk in scopes:
+            for left, right in ((old, new), (new, old)):
+                yield from manager.execute_query(
+                    manifest_changes_sql(left, right, target_type, cid, sk)
+                )
 
 
 def merge_sql(stage):
@@ -378,9 +410,9 @@ def refresh(manager, *, first_day=None, last_day=None):
         changed_competitions = set()
         ids = set()
         if before[MANIFEST] != previous["snapshots"][MANIFEST]:
-            for cid, sk, target_type, mid in manager.execute_query(manifest_changes_sql(
-                previous["snapshots"][MANIFEST], before[MANIFEST]
-            )):
+            for cid, sk, target_type, mid in manifest_changes(
+                manager, previous["snapshots"][MANIFEST], before[MANIFEST]
+            ):
                 if target_type in ("competition_profile", "competition_seasons"):
                     changed_competitions.add(str(cid))
                 elif target_type == "match":
