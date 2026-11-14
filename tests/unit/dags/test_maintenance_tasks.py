@@ -1317,6 +1317,79 @@ class TestFBrefGenericStageJanitor:
 
 
 @pytest.mark.unit
+class TestFBrefStageJanitorQueryCap:
+    """TRINO-GRILL 14.11: the janitor bounds its own Trino session so a
+    heavy stage-vs-live probe classifies as inspection_failed in minutes
+    instead of burning the nightly compaction window."""
+
+    NOW = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
+
+    def _run_janitor(self, monkeypatch):
+        import utils.maintenance_tasks as maintenance
+
+        conn = _MetadataConnection()
+        monkeypatch.setattr(maintenance, "_connect", lambda: conn)
+        monkeypatch.setattr(maintenance, "_list_tables", lambda *_args: [])
+        result = maintenance.janitor_fbref_generic_stages(
+            owner_lookup=lambda _refresh: None,
+            run_lookup=lambda _run_id: None,
+            now=self.NOW,
+        )
+        return conn, result
+
+    def test_own_session_issues_default_query_cap(self, monkeypatch):
+        monkeypatch.delenv("FBREF_STAGE_JANITOR_QUERY_CAP", raising=False)
+        conn, result = self._run_janitor(monkeypatch)
+
+        assert conn.statements == [
+            "SET SESSION query_max_execution_time = '120s'"
+        ]
+        assert result["stage_count"] == 0
+        assert conn.closed is True
+
+    def test_own_session_respects_env_cap_override(self, monkeypatch):
+        monkeypatch.setenv("FBREF_STAGE_JANITOR_QUERY_CAP", "90s")
+        conn, _result = self._run_janitor(monkeypatch)
+
+        assert conn.statements == [
+            "SET SESSION query_max_execution_time = '90s'"
+        ]
+
+    @pytest.mark.parametrize("cap", ["0", "off", " OFF "])
+    def test_own_session_skips_cap_on_explicit_opt_out(self, monkeypatch, cap):
+        monkeypatch.setenv("FBREF_STAGE_JANITOR_QUERY_CAP", cap)
+        conn, _result = self._run_janitor(monkeypatch)
+
+        assert conn.statements == []
+        assert conn.closed is True
+
+    @pytest.mark.parametrize(
+        "cap",
+        [
+            "120s' OR 1=1 --",
+            "120s; DROP TABLE x",
+            "${jndi:ldap://evil}",
+            " seconds",
+        ],
+    )
+    def test_own_session_rejects_non_duration_cap_fail_closed(
+        self, monkeypatch, cap
+    ):
+        monkeypatch.setenv("FBREF_STAGE_JANITOR_QUERY_CAP", cap)
+        with pytest.raises(ValueError, match="FBREF_STAGE_JANITOR_QUERY_CAP"):
+            self._run_janitor(monkeypatch)
+
+    @pytest.mark.parametrize("cap", ["250ms", "2min", "1.5s"])
+    def test_own_session_accepts_valid_duration_units(self, monkeypatch, cap):
+        monkeypatch.setenv("FBREF_STAGE_JANITOR_QUERY_CAP", cap)
+        conn, _result = self._run_janitor(monkeypatch)
+
+        assert conn.statements == [
+            f"SET SESSION query_max_execution_time = '{cap}'"
+        ]
+
+
+@pytest.mark.unit
 def test_maintenance_wrapper_defaults_to_audit_and_wires_per_drop_fence(
     monkeypatch,
 ):

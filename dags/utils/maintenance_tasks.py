@@ -474,7 +474,34 @@ def janitor_fbref_generic_stages(
     if apply and before_drop is None:
         raise ValueError("apply mode requires a destructive before_drop fence")
     own_connection = conn is None
+    # Bounded per-query cap for this janitor session only — never in the
+    # shared _connect, which every other maintenance call site uses, and
+    # never on a caller-supplied connection (no cap leak). The connection
+    # is closed in the finally below, so the session setting dies with it.
+    # The heavy stage-vs-live semantic probes on fbref_table_cells exceed
+    # the 100GB spill limit after ~50 minutes; the cap makes them classify
+    # as inspection_failed in ~2 minutes so an attempt finishes bounded
+    # (9 such stages on 14.11). Validate BEFORE connecting so a bad config
+    # fails without holding a connection.
+    cap = os.environ.get("FBREF_STAGE_JANITOR_QUERY_CAP", "120s")
+    cap_enabled = cap.strip().casefold() not in {"0", "off", ""}
+    if own_connection and cap_enabled and re.fullmatch(
+        r"\d+(?:\.\d+)?(?:s|ms|min)", cap.strip()
+    ) is None:
+        raise ValueError(
+            "FBREF_STAGE_JANITOR_QUERY_CAP must be a Trino duration like "
+            f"'120s', got {cap!r}"
+        )
     connection = conn or _connect()
+    if own_connection and cap_enabled:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SET SESSION query_max_execution_time = '%s'" % cap.strip()
+            )
+            cursor.fetchall()
+        finally:
+            cursor.close()
     observed_at = now or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         raise ValueError("janitor now must be timezone-aware")
