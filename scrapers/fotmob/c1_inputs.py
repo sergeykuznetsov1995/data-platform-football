@@ -502,9 +502,15 @@ def run_refresh(**context):
     conf = (context.get("dag_run").conf or {}) if context.get("dag_run") else {}
     if conf:
         raise ValueError("C1 bootstrap is manual and requires an approved window")
+    # Day/checkpoint rows have nullable MERGE keys matched with IS NOT DISTINCT
+    # FROM; disable dynamic filtering for these C1 joins.
     manager = FotMobTrinoTableManager(
         source="fotmob:c1-inputs",
-        session_properties={"query_max_run_time": "300s", "query_max_execution_time": "300s"},
+        session_properties={
+            "query_max_run_time": "300s",
+            "query_max_execution_time": "300s",
+            "enable_dynamic_filtering": "false",
+        },
     )
     with writer_lock() as authority:
         manager.set_write_authority(authority)
