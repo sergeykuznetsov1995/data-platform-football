@@ -65,6 +65,46 @@ def pairs_sql(pairs, *, physical=False):
     ) + ")"
 
 
+CLOSURE_PREDICATE_BYTES = 200_000
+
+
+def _pair_predicates(pairs, *, physical=False):
+    predicates, chunk, size = [], [], 0
+    for pair in sorted(pairs):
+        pair_size = len(pairs_sql([pair], physical=physical).encode("utf-8"))
+        if pair_size > CLOSURE_PREDICATE_BYTES:
+            raise RuntimeError("C1 closure pair exceeds predicate limit")
+        # Separate season terms need two more bytes than standalone predicates.
+        # Grouping competitions within a season can only reduce this bound.
+        if chunk and size + 2 + pair_size > CLOSURE_PREDICATE_BYTES:
+            predicates.append(pairs_sql(chunk, physical=physical))
+            chunk, size = [], 0
+        size += pair_size + (2 if chunk else 0)
+        chunk.append(pair)
+    if chunk:
+        predicates.append(pairs_sql(chunk, physical=physical))
+    return predicates
+
+
+def _id_predicates(ids):
+    prefix = "CAST(match_id AS varchar) IN ("
+    overhead = len(prefix.encode("utf-8")) + 1
+    predicates, chunk, size = [], [], overhead
+    for mid in sorted(ids):
+        value = literal(mid)
+        value_size = len(value.encode("utf-8"))
+        if overhead + value_size > CLOSURE_PREDICATE_BYTES:
+            raise RuntimeError("C1 closure match ID exceeds predicate limit")
+        if chunk and size + 1 + value_size > CLOSURE_PREDICATE_BYTES:
+            predicates.append(prefix + ",".join(chunk) + ")")
+            chunk, size = [], overhead
+        size += value_size + (1 if chunk else 0)
+        chunk.append(value)
+    if chunk:
+        predicates.append(prefix + ",".join(chunk) + ")")
+    return predicates
+
+
 def source_sql(table, snapshots, predicate="true"):
     return (f"(SELECT * FROM {PREFIX}{table} FOR VERSION AS OF "
             f"{int(snapshots[table])} WHERE {predicate})")
@@ -445,26 +485,32 @@ def refresh(manager, *, first_day=None, last_day=None):
             known = set(affected)
             if affected:
                 for table in (MATCHES, PAYLOADS):
+                    predicates = _pair_predicates(affected, physical=table == MATCHES)
                     for version in (previous["snapshots"], before):
-                        ids |= {str(row[0]) for row in manager.execute_query(
-                            f"SELECT DISTINCT match_id FROM {source_sql(table, version, pairs_sql(affected, physical=table == MATCHES))}"
-                        )}
-                ids |= {str(row[0]) for row in manager.execute_query(
-                    f"SELECT DISTINCT match_id FROM {TABLE} WHERE kind='input' "
-                    f"AND deadline_day >= DATE '{first_day}' "
-                    f"AND {pairs_sql(affected)}"
-                )}
+                        for predicate in predicates:
+                            ids |= {str(row[0]) for row in manager.execute_query(
+                                f"SELECT DISTINCT match_id FROM {source_sql(table, version, predicate)}"
+                            )}
+                for predicate in _pair_predicates(affected):
+                    ids |= {str(row[0]) for row in manager.execute_query(
+                        f"SELECT DISTINCT match_id FROM {TABLE} WHERE kind='input' "
+                        f"AND deadline_day >= DATE '{first_day}' "
+                        f"AND {predicate}"
+                    )}
             if ids:
-                id_predicate = "CAST(match_id AS varchar) IN (" + ",".join(map(literal, sorted(ids))) + ")"
-                affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
-                    "SELECT DISTINCT competition_id, source_season_key FROM "
-                    + source_sql(MATCHES, before, pairs_sql(all_pairs, physical=True) + " AND " + id_predicate)
-                )}
-                affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
-                    f"SELECT DISTINCT competition_id, source_season_key FROM {TABLE} "
-                    f"WHERE kind='input' AND deadline_day >= DATE '{first_day}' "
-                    f"AND {id_predicate}"
-                )}
+                id_predicates = _id_predicates(ids)
+                for predicate in _pair_predicates(all_pairs, physical=True):
+                    for id_predicate in id_predicates:
+                        affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
+                            "SELECT DISTINCT competition_id, source_season_key FROM "
+                            + source_sql(MATCHES, before, predicate + " AND " + id_predicate)
+                        )}
+                for id_predicate in id_predicates:
+                    affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
+                        f"SELECT DISTINCT competition_id, source_season_key FROM {TABLE} "
+                        f"WHERE kind='input' AND deadline_day >= DATE '{first_day}' "
+                        f"AND {id_predicate}"
+                    )}
             if affected == known:
                 break
     else:
