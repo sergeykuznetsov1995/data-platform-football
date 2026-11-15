@@ -137,16 +137,29 @@ _WAF_RECOVERY_ERROR = ('required discovery page failed: '
 # failure cache: two AWS WAF 405 pages (NIS3, RPLW) and one transport lease
 # rejection (SC14).  The quarantine removes exactly those three pinned
 # entries from the cache — every cached success stays, so nothing is rebought
-# — and the next slot may buy the three pages again.  This is not
-# configurable permission to purge arbitrary cache entries: anything that
-# does not match every pin exactly (marker hash, cohort identity, status,
-# portion, whole-cache digest and each entry's audited evidence) stays
+# — and the next slot may buy the three pages again.  The gate is NOT the
+# marker's whole-payload hash and NOT its portion: the live marker keeps
+# advancing (portion, updated_at, last_run_id and the free replay counters
+# grow with every failed slot), so an exact marker-hash pin can never match
+# by the time the quarantine deploys.  Instead the owner audited and froze
+# the marker's CONTENT: everything except those authorized mutable fields
+# must stay equal, pinned by content_sha256 over the v1 pinpoint
+# normalization (root portion/updated_at/last_run_id, traffic
+# cache_hits/cache_hit_rate aggregate and per-entity, and the failures
+# artifact binding whose state the whole-file digests below pin separately).
+# marker_stable_hash and portion are retained only as audited historical
+# evidence of the original portion-17 marker; neither is ever a gate.  This
+# is not configurable permission to purge arbitrary cache entries: anything
+# that does not match every pin exactly (cohort identity, status, content
+# pin, whole-cache digest and each entry's audited evidence) stays
 # fail-closed, and the identity/started-time checks above still run first.
 KNOWN_QUARANTINE_20261115 = {
     'marker_stable_hash': '9dca5a1568148b33e422cac10f55586eaff7380e3b8e165a1fd8d829a6d2a843',
     'cohort_job_id': 'tm-discovery-job-f0ce199ada11c30894e08432',
     'cohort_status': 'paused',
     'portion': 17,
+    'content_sha256': '751d86a5ba7a0d4f77e4c6101410e2f77bac72d7fc9cd12ddc79383e5157ca9f',
+    'normalization_version': 1,
     'failures_file_sha256': '32f228961bba5aaee736d64c52d4030f30b8e2fd17ab7329361e8c54397a857f',
     'reduced_failures_sha256': '77c61da69c45509ab4b019611593b841574aff5e508a56210cde61bf8419d14a',
     'urls': {
@@ -182,6 +195,18 @@ KNOWN_QUARANTINE_20261115 = {
         },
     },
 }
+_QUARANTINE_20261115_REASON = ('audited #2266 terminal failure cache entries '
+                               'quarantined; cohort resumed for scheduled rebuy')
+# Schema of the quarantine evidence document.  v2 (content-gate follow-up):
+# the document never existed on live, so the schema is upgraded in place to
+# record the audited original marker hash and the actual triggering marker
+# snapshot as distinct, honestly named fields.
+_QUARANTINE_20261115_SCHEMA = 'transfermarkt-discovery-quarantine-20261115-v2'
+_QUARANTINE_20261115_DOCUMENT_FIELDS = frozenset({
+    'schema', 'job_id', 'audited_original_marker_hash', 'triggering_marker_hash',
+    'triggering_marker', 'content_sha256', 'normalization_version',
+    'original_failures_sha256', 'reduced_failures_sha256', 'urls',
+    'removed_entries'})
 
 
 class DiscoveryPortionComplete(RuntimeError):
@@ -715,86 +740,80 @@ def _recover_known_waf_failure(path: Path, saved: dict[str, Any], *,
     write_job(path, saved, write)
 
 
-def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
-                                  now: datetime, write: Callable) -> None:
-    """Remove exactly the pinned terminal cache entries of the live cohort (#2266).
+def _pop_free_cache_counters(structure: dict[str, Any]) -> dict[str, Any]:
+    """Remove one structure's free replay counters after proving them well-formed.
 
-    The 2026-11-15 owner-authorized quarantine targets the single audited
-    paused cohort whose catalogue read-out completed but whose validator can
-    never finish while three pinned terminal entries sit unrebuyable in the
-    failure cache.  The quarantine keeps every cached success (nothing is
-    rebought), archives the exact original evidence, and rewrites only the
-    failures artifact hash on the marker.  Anything off-pin fails closed
-    without a single write.
+    cache_hits must be a non-negative int and cache_hit_rate a finite
+    number in [0, 1], and both must be present: the removal must never hide
+    a corrupted or missing counter.
     """
-    descriptor = KNOWN_QUARANTINE_20261115
-    if (stable_payload_hash(saved) != descriptor['marker_stable_hash']
-            or saved.get('job_id') != descriptor['cohort_job_id']
-            or saved.get('status') != descriptor['cohort_status']
-            or saved.get('portion') != descriptor['portion']):
-        raise ValueError('quarantine marker differs from the audited pin')
-    if saved['job_id'] != ('tm-discovery-job-'
-                           + stable_payload_hash(saved.get('identity'))[:24]):
-        raise ValueError('quarantine job_id is not bound to its identity')
-    checkpoint = Path(saved['checkpoint_path'])
-    if (not checkpoint.is_absolute()
-            or checkpoint != path.parent / saved['job_id'] / 'checkpoint.json'):
-        raise ValueError('quarantine checkpoint is not bound to its cohort')
-    if not _settled_traffic_snapshot(saved.get('traffic')):
-        raise ValueError('quarantine traffic is not a complete settled snapshot')
-    failures = checkpoint.with_suffix('.failures.json')
-    quarantine = checkpoint.with_suffix('.failures.blocked.json')
+    for field in ('cache_hits', 'cache_hit_rate'):
+        if field not in structure:
+            raise ValueError('quarantine marker cache counters are missing')
+        value = structure[field]
+        if field == 'cache_hits':
+            if type(value) is not int or value < 0:
+                raise ValueError('quarantine marker cache counters are invalid')
+        elif (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not 0 <= value <= 1):
+            raise ValueError('quarantine marker cache counters are invalid')
+        structure.pop(field)
+    return structure
 
+
+def _normalized_quarantine_content(saved: dict[str, Any]) -> dict[str, Any]:
+    """The #2266 content view of a marker: owner-frozen fields, pinpoint view.
+
+    Exactly the owner-authorized mutable fields leave the content view —
+    root portion/updated_at/last_run_id (and the protective hash, if one is
+    passed), the free replay counters (traffic cache_hits/cache_hit_rate,
+    aggregate and per-entity), and the failures artifact binding (whose
+    state the whole-file digests pin separately).  Everything else —
+    status, identity, started_at, checkpoint path and artifact, sizing,
+    paid counters and any unknown field — stays, so any drift there
+    changes the content hash.  The normalizable structures are type- and
+    presence-checked first: deleting a field must never hide corruption.
+    """
+    if (not isinstance(saved.get('last_run_id'), str)
+            or not saved['last_run_id']):
+        raise ValueError('quarantine marker run id is invalid')
+    normalized = dict(saved)
+    normalized.pop('hash', None)
+    for field in ('portion', 'updated_at', 'last_run_id'):
+        normalized.pop(field, None)
+    traffic = normalized.get('traffic')
+    if not isinstance(traffic, dict):
+        raise ValueError('quarantine marker traffic must be an object')
+    entities = traffic.get('by_entity')
+    if not isinstance(entities, dict) or any(
+            not isinstance(item, dict) for item in entities.values()):
+        raise ValueError('quarantine marker traffic entities must be objects')
+    traffic = dict(traffic)
+    traffic['by_entity'] = {entity: _pop_free_cache_counters(dict(item))
+                            for entity, item in entities.items()}
+    normalized['traffic'] = _pop_free_cache_counters(traffic)
+    artifacts = normalized.get('artifacts')
+    if not isinstance(artifacts, dict):
+        raise ValueError('quarantine marker artifacts must be an object')
+    failures_key = str(Path(saved['checkpoint_path']).with_suffix('.failures.json'))
+    if failures_key not in artifacts:
+        raise ValueError('quarantine marker must bind its failures artifact')
+    normalized['artifacts'] = {key: value for key, value in artifacts.items()
+                               if key != failures_key}
+    return normalized
+
+
+def _quarantine_content_hash(saved: dict[str, Any]) -> str:
+    """stable_payload_hash over the #2266 normalized content view."""
+    return stable_payload_hash(_normalized_quarantine_content(saved))
+
+
+def _check_quarantine_entries(removed_entries: Any, descriptor: dict[str, Any]) -> None:
+    """Every removed cache entry must match its audited per-URL pin exactly."""
     pinned_urls = descriptor['urls']
-    try:
-        failures_bytes = failures.read_bytes()
-        failures_digest = hashlib.sha256(failures_bytes).hexdigest()
-        current_failures = json.loads(failures_bytes)
-    except (OSError, ValueError) as exc:
-        raise ValueError('quarantine failure cache is unreadable') from exc
-    if not isinstance(current_failures, dict):
-        raise ValueError('quarantine failure cache is not an object')
-    if failures_digest == descriptor['failures_file_sha256']:
-        original_failures = True
-    elif (failures_digest == descriptor['reduced_failures_sha256']
-            and quarantine.exists()):
-        original_failures = False
-    else:
-        raise ValueError('quarantine failure cache differs from the pinned state')
-
-    removed_entries = None
-    if original_failures:
-        removed_entries = {url: current_failures[url] for url in pinned_urls}
-        retained_failures = {k: v for k, v in current_failures.items()
-                             if k not in pinned_urls}
-        reduced_bytes = json.dumps(retained_failures, ensure_ascii=False,
-                                   sort_keys=True,
-                                   separators=(',', ':')).encode()
-        if hashlib.sha256(reduced_bytes).hexdigest() != descriptor['reduced_failures_sha256']:
-            raise ValueError('quarantine reduced failure cache does not match the pin')
-    else:
-        # Crash-safe replay between the quarantine write and the cache/marker
-        # writes: the cache is already the retained remainder pinned by its
-        # own whole-file digest, so only the pinned URLs must be absent.
-        if any(url in current_failures for url in pinned_urls):
-            raise ValueError('quarantine failure cache differs from the replay state')
-        retained_failures = current_failures
-
-    quarantine_bytes = None
-    if quarantine.exists():
-        try:
-            quarantine_bytes = quarantine.read_bytes()
-            quarantine_document = json.loads(quarantine_bytes)
-        except (OSError, ValueError) as exc:
-            raise ValueError('quarantine file is unreadable') from exc
-        if not isinstance(quarantine_document, dict):
-            raise ValueError('quarantine file is not an object')
-        if not original_failures:
-            removed_entries = quarantine_document.get('removed_entries')
     if (not isinstance(removed_entries, dict)
             or set(removed_entries) != set(pinned_urls)):
         raise ValueError('quarantine evidence does not match the audited pin')
-
     for url, pin in pinned_urls.items():
         entry = removed_entries.get(url)
         if not isinstance(entry, dict) or any(
@@ -806,48 +825,220 @@ def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
         digest = hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
         if digest != pin['entry_sha256']:
             raise ValueError('quarantine entry evidence does not match the pin')
-    terminal = {url: entry.get('status')
-                for url, entry in current_failures.items()
-                if isinstance(entry, dict) and entry.get('status') not in (None, 'ok')}
-    if original_failures and terminal != {
-            url: pin['status'] for url, pin in pinned_urls.items()}:
-        raise ValueError('quarantine terminal entries do not match the pinned set')
 
-    retained = {
-        'schema': 'transfermarkt-discovery-quarantine-20261115-v1',
-        'job_id': saved['job_id'],
-        'original_marker_hash': descriptor['marker_stable_hash'],
-        'original_failures_sha256': descriptor['failures_file_sha256'],
-        'urls': pinned_urls,
-        'original_marker': saved,
-        'removed_entries': removed_entries,
-    }
-    expected_quarantine_bytes = json.dumps(retained, ensure_ascii=False,
-                                           sort_keys=True,
-                                           separators=(',', ':')).encode()
+
+def _read_quarantine_document(quarantine: Path, failures_key: str,
+                              descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Parse and strictly validate a saved #2266 quarantine evidence document.
+
+    The file's own bytes must be its canonical compact serialization, every
+    pinned field must equal the descriptor, and the SAVED triggering
+    snapshot must be a self-consistent pre-recovery marker of the same
+    cohort content.  Replay never rebuilds this document from the current
+    (possibly later) marker: the saved snapshot is the audited evidence of
+    what actually triggered the quarantine.
+    """
+    try:
+        raw = quarantine.read_bytes()
+        document = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise ValueError('quarantine file is unreadable') from exc
+    if not isinstance(document, dict):
+        raise ValueError('quarantine file is not an object')
+    if (set(document) != set(_QUARANTINE_20261115_DOCUMENT_FIELDS)
+            or json.dumps(document, ensure_ascii=False, sort_keys=True,
+                          separators=(',', ':')).encode() != raw):
+        raise ValueError('quarantine file conflicts with the audited evidence')
+    if (document['schema'] != _QUARANTINE_20261115_SCHEMA
+            or document['job_id'] != descriptor['cohort_job_id']
+            or document['audited_original_marker_hash'] != descriptor['marker_stable_hash']
+            or document['content_sha256'] != descriptor['content_sha256']
+            or document['normalization_version'] != descriptor['normalization_version']
+            or document['original_failures_sha256'] != descriptor['failures_file_sha256']
+            or document['reduced_failures_sha256'] != descriptor['reduced_failures_sha256']
+            or document['urls'] != descriptor['urls']):
+        raise ValueError('quarantine file conflicts with the audited evidence')
+    triggering = document['triggering_marker']
+    if (not isinstance(document['triggering_marker_hash'], str)
+            or not isinstance(triggering, dict)
+            or stable_payload_hash(triggering) != document['triggering_marker_hash']
+            or triggering.get('job_id') != descriptor['cohort_job_id']
+            or triggering.get('status') != descriptor['cohort_status']
+            or not isinstance(triggering.get('artifacts'), dict)
+            or triggering['artifacts'].get(failures_key)
+            != descriptor['failures_file_sha256']
+            or _quarantine_content_hash(triggering) != descriptor['content_sha256']):
+        raise ValueError('quarantine file conflicts with the audited evidence')
+    _check_quarantine_entries(document['removed_entries'], descriptor)
+    return document
+
+
+def _quarantine_20261115_completed(saved: dict[str, Any]) -> bool:
+    """True only when the #2266 quarantine already fully landed on the marker.
+
+    Completed recovery is proven by the marker's quarantine provenance —
+    written only by the quarantine helper at completion and integrity-hash
+    protected by write_job — plus the quarantine evidence file still
+    hashing to the recorded digest: marker and quarantine state together,
+    never a loose bypass flag.  After completion the cohort lives its
+    ordinary life (paid progress, new failures, publication); those states
+    never re-enter the quarantine gate below.
+    """
+    recovery = saved.get('recovery')
+    if not isinstance(recovery, dict):
+        return False
+    descriptor = KNOWN_QUARANTINE_20261115
+    if (recovery.get('reason') != _QUARANTINE_20261115_REASON
+            or recovery.get('audited_original_marker_hash') != descriptor['marker_stable_hash']
+            or recovery.get('content_sha256') != descriptor['content_sha256']
+            or recovery.get('normalization_version') != descriptor['normalization_version']
+            or recovery.get('failures_hash') != descriptor['reduced_failures_sha256']
+            or not isinstance(recovery.get('quarantine_hash'), str)):
+        return False
+    try:
+        quarantine = Path(saved['checkpoint_path']).with_suffix('.failures.blocked.json')
+        digest = hashlib.sha256(quarantine.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return False
+    return digest == recovery['quarantine_hash']
+
+
+def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
+                                  now: datetime, write: Callable) -> None:
+    """Remove exactly the pinned terminal cache entries of the live cohort (#2266).
+
+    The 2026-11-15 owner-authorized quarantine targets the single audited
+    paused cohort whose catalogue read-out completed but whose validator can
+    never finish while three pinned terminal entries sit unrebuyable in the
+    failure cache.  The quarantine keeps every cached success (nothing is
+    rebought), archives the exact original evidence — the audited
+    portion-17 marker hash plus the actual triggering marker snapshot as
+    distinct, honestly named fields — and rewrites only the failures
+    artifact hash and the quarantine provenance on the marker.  The gate
+    is the owner-frozen content pin, never the marker's whole-payload hash
+    or portion; anything off-pin fails closed without a single write.
+    """
+    descriptor = KNOWN_QUARANTINE_20261115
+    pinned_urls = descriptor['urls']
+    if (saved.get('job_id') != descriptor['cohort_job_id']
+            or saved.get('status') != descriptor['cohort_status']):
+        raise ValueError('quarantine marker differs from the audited pin')
+    if saved['job_id'] != ('tm-discovery-job-'
+                           + stable_payload_hash(saved.get('identity'))[:24]):
+        raise ValueError('quarantine job_id is not bound to its identity')
+    checkpoint = Path(saved['checkpoint_path'])
+    if (not checkpoint.is_absolute()
+            or checkpoint != path.parent / saved['job_id'] / 'checkpoint.json'):
+        raise ValueError('quarantine checkpoint is not bound to its cohort')
+    if not _settled_traffic_snapshot(saved.get('traffic')):
+        raise ValueError('quarantine traffic is not a complete settled snapshot')
+    if _quarantine_content_hash(saved) != descriptor['content_sha256']:
+        raise ValueError('quarantine marker content differs from the audited pin')
+    failures = checkpoint.with_suffix('.failures.json')
+    quarantine = checkpoint.with_suffix('.failures.blocked.json')
+    failures_key = str(failures)
+    artifacts = saved.get('artifacts')
+    if (not isinstance(artifacts, dict)
+            or not isinstance(artifacts.get(failures_key), str)):
+        raise ValueError('quarantine marker does not bind its failures artifact')
+    marker_failures_hash = artifacts[failures_key]
+
+    try:
+        failures_bytes = failures.read_bytes()
+        failures_digest = hashlib.sha256(failures_bytes).hexdigest()
+        current_failures = json.loads(failures_bytes)
+    except (OSError, ValueError) as exc:
+        raise ValueError('quarantine failure cache is unreadable') from exc
+    if not isinstance(current_failures, dict):
+        raise ValueError('quarantine failure cache is not an object')
+    # Strict crash-state matrix.  Marker original + cache original is the
+    # first application (or a crash right after the quarantine-only write);
+    # marker original + cache reduced is only legal with a valid saved
+    # quarantine (crash between the cache and marker writes); marker
+    # reduced + cache reduced is the completed recovery, handled read-only
+    # by the select_job gate before this helper.  A reduced marker over an
+    # original cache, any other hashes, and a reduced cache without the
+    # saved quarantine all fail closed.
+    if marker_failures_hash not in (descriptor['failures_file_sha256'],
+                                    descriptor['reduced_failures_sha256']):
+        raise ValueError('quarantine failure cache differs from the pinned state')
+    if failures_digest not in (descriptor['failures_file_sha256'],
+                               descriptor['reduced_failures_sha256']):
+        raise ValueError('quarantine failure cache differs from the pinned state')
+    if marker_failures_hash == descriptor['reduced_failures_sha256']:
+        raise ValueError('quarantine failure cache differs from the pinned state')
+    if (failures_digest == descriptor['reduced_failures_sha256']
+            and not quarantine.exists()):
+        raise ValueError('quarantine failure cache differs from the pinned state')
+
+    document = None
     if quarantine.exists():
-        if quarantine_bytes != expected_quarantine_bytes:
-            raise ValueError('quarantine file conflicts with the audited evidence')
-    else:
-        _write_recovery_json(quarantine, retained, write)
-
-    if original_failures:
+        document = _read_quarantine_document(quarantine, failures_key, descriptor)
+    if failures_digest == descriptor['failures_file_sha256']:
+        if any(url not in current_failures for url in pinned_urls):
+            raise ValueError('quarantine failure cache differs from the pinned state')
+        cache_removed = {url: current_failures[url] for url in pinned_urls}
+        retained_failures = {k: v for k, v in current_failures.items()
+                             if k not in pinned_urls}
+        reduced_bytes = json.dumps(retained_failures, ensure_ascii=False,
+                                   sort_keys=True,
+                                   separators=(',', ':')).encode()
+        if hashlib.sha256(reduced_bytes).hexdigest() != descriptor['reduced_failures_sha256']:
+            raise ValueError('quarantine reduced failure cache does not match the pin')
+        if document is not None:
+            # Byte-exact replay: the saved triggering snapshot is the
+            # evidence; the document is never rebuilt from the current
+            # (possibly later) marker with newer free counters.
+            if document['removed_entries'] != cache_removed:
+                raise ValueError('quarantine evidence does not match the audited pin')
+        else:
+            _check_quarantine_entries(cache_removed, descriptor)
+            terminal = {url: entry.get('status')
+                        for url, entry in current_failures.items()
+                        if isinstance(entry, dict) and entry.get('status') not in (None, 'ok')}
+            if terminal != {url: pin['status'] for url, pin in pinned_urls.items()}:
+                raise ValueError('quarantine terminal entries do not match the pinned set')
+            document = {
+                'schema': _QUARANTINE_20261115_SCHEMA,
+                'job_id': saved['job_id'],
+                'audited_original_marker_hash': descriptor['marker_stable_hash'],
+                'triggering_marker_hash': stable_payload_hash(saved),
+                'triggering_marker': saved,
+                'content_sha256': descriptor['content_sha256'],
+                'normalization_version': descriptor['normalization_version'],
+                'original_failures_sha256': descriptor['failures_file_sha256'],
+                'reduced_failures_sha256': descriptor['reduced_failures_sha256'],
+                'urls': pinned_urls,
+                'removed_entries': cache_removed,
+            }
+            _write_recovery_json(quarantine, document, write)
         write(failures, retained_failures)
     try:
         readback_bytes = failures.read_bytes()
         readback_cache = json.loads(readback_bytes)
     except (OSError, ValueError) as exc:
         raise ValueError('quarantine failure cache write differs') from exc
-    if readback_cache != retained_failures:
-        raise ValueError('quarantine failure cache write differs')
     readback = hashlib.sha256(readback_bytes).hexdigest()
-    if readback != descriptor['reduced_failures_sha256']:
+    if readback != descriptor['reduced_failures_sha256'] or (
+            failures_digest == descriptor['failures_file_sha256']
+            and readback_cache != retained_failures):
         raise ValueError('quarantine failure cache write differs')
 
+    quarantine_hash = hashlib.sha256(quarantine.read_bytes()).hexdigest()
     updated = dict(saved)
-    updated['artifacts'] = {**saved.get('artifacts', {})}
-    updated['artifacts'][str(failures)] = readback
+    updated['artifacts'] = {**saved['artifacts']}
+    updated['artifacts'][failures_key] = descriptor['reduced_failures_sha256']
     updated['updated_at'] = now.isoformat()
+    updated['recovery'] = {
+        'reason': _QUARANTINE_20261115_REASON,
+        'audited_original_marker_hash': descriptor['marker_stable_hash'],
+        'triggering_marker_hash': document['triggering_marker_hash'],
+        'content_sha256': descriptor['content_sha256'],
+        'normalization_version': descriptor['normalization_version'],
+        'failures_hash': descriptor['reduced_failures_sha256'],
+        'quarantine_path': str(quarantine),
+        'quarantine_hash': quarantine_hash,
+    }
     write_job(path, updated, write)
     if read_job(path) != updated:
         raise ValueError('quarantine marker write differs')
@@ -915,13 +1106,24 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
                         and stable_payload_hash(saved) == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
                     _recover_known_paid_io_failure(path, saved, now=now, write=write)
                     return saved
-                # Owner-authorized 2026-11-15 quarantine (#2266): the pinned
-                # paused marker's three terminal cache entries are removed
+                # Owner-authorized 2026-11-15 quarantine (#2266): the audited
+                # paused cohort's three terminal cache entries are removed
                 # (cached successes stay) so the next slot may rebuy only
-                # those pages; off-pin markers never reach this branch.
-                if (saved['status'] == 'paused'
-                        and stable_payload_hash(saved)
-                        == KNOWN_QUARANTINE_20261115['marker_stable_hash']):
+                # those pages.  The gate is the cohort's immutable job_id
+                # plus the owner-frozen content pin: the live marker's
+                # portion, timestamps and free replay counters keep advancing
+                # without invalidating it.  Until the quarantine completes,
+                # any other drift of this exact cohort fails closed here;
+                # after completion the marker's quarantine provenance
+                # releases it back to ordinary cohort life (paid progress,
+                # new failures, publication) with no repeated recovery.
+                if (saved['job_id'] == KNOWN_QUARANTINE_20261115['cohort_job_id']
+                        and not _quarantine_20261115_completed(saved)):
+                    if (saved['status'] != KNOWN_QUARANTINE_20261115['cohort_status']
+                            or _quarantine_content_hash(saved)
+                            != KNOWN_QUARANTINE_20261115['content_sha256']):
+                        raise ValueError(
+                            'quarantine cohort marker drifted from the audited pin')
                     _quarantine_known_waf_entries(path, saved, now=now, write=write)
                     saved = read_job(path)
                 if saved['status'] not in {'ready', 'paused', 'source_complete'}:
