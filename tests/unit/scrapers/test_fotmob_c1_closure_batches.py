@@ -119,9 +119,13 @@ class ClosureManager:
             else:
                 pair_predicate, tail = predicate.rsplit(" AND " + ID_PREFIX, 1)
                 id_predicate = ID_PREFIX + tail
-            for part in (pair_predicate, id_predicate):
-                if part is not None:
-                    assert len(part.encode("utf-8")) <= self.budget
+            if pair_predicate is not None:
+                assert len(pair_predicate.encode("utf-8")) <= self.budget
+            if id_predicate is not None:
+                if table == c1.MATCHES:
+                    assert len(sql.encode("utf-8")) <= getattr(c1, "REVERSE_QUERY_BYTES", 900_000)
+                else:
+                    assert len(id_predicate.encode("utf-8")) <= self.budget
             pairs = (parse_pairs(pair_predicate, physical=table == c1.MATCHES)
                      if pair_predicate is not None else None)
             ids = parse_ids(id_predicate) if id_predicate is not None else None
@@ -196,6 +200,11 @@ def test_refresh_large_id_inventory_stays_below_query_limit(monkeypatch):
         + ",".join(map(c1.literal, ids)) + ")",
     )
     assert len(unbatched.encode("utf-8")) > 1_000_000
+    legacy_ids = c1._id_predicates(ids)
+    pair_chunks = c1._pair_predicates(pairs, physical=True)
+    assert len(legacy_ids) == 6
+    assert [len(parse_pairs(sql, physical=True)) for sql in pair_chunks] == [3225, 515]
+    assert len(pair_chunks) * len(legacy_ids) == 12
 
     result = c1.refresh(manager)
 
@@ -203,9 +212,19 @@ def test_refresh_large_id_inventory_stays_below_query_limit(monkeypatch):
     assert manager.existing_pairs == {seed}
     assert max(len(sql.encode("utf-8")) for sql in manager.closure) < 1_000_000
     reverse = [scan for scan in manager.scans if not scan[0] and scan[1] == c1.MATCHES]
-    assert len(reverse) > 1
+    assert len(reverse) == 4
+    assert [len(scan[3]) for scan in reverse] == [3225, 3225, 515, 515]
     assert set().union(*(scan[4] for scan in reverse)) == set(ids)
     assert set().union(*(scan[3] for scan in reverse)) == pairs
+    for offset, predicate in zip((0, 2), pair_chunks):
+        scans = reverse[offset:offset + 2]
+        assert all(scan[3] == parse_pairs(predicate, physical=True) for scan in scans)
+        assert set().union(*(scan[4] for scan in scans)) == set(ids)
+    reverse_sql = [sql for sql in manager.closure
+                   if sql.startswith(REVERSE + "(SELECT * FROM " + c1.PREFIX + c1.MATCHES)]
+    assert len(reverse_sql) == 4
+    assert max(len(sql.encode("utf-8")) for sql in reverse_sql) <= c1.REVERSE_QUERY_BYTES
+    assert len([scan for scan in manager.scans if not scan[0] and scan[1] == c1.TABLE]) == 6
     assert c1._read_checkpoint(manager.controls)["snapshots"] == manager.current
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
 
@@ -317,6 +336,48 @@ def test_id_batch_boundaries_determinism_and_escaped_bytes(monkeypatch):
     assert c1._id_predicates([]) == []
 
 
+def test_reverse_query_byte_boundary_and_determinism(monkeypatch):
+    pairs = [("10", "a'雪"), ("20", "a'雪")]
+    ids = ["a'雪", "bé"]
+    manager = ClosureManager(pairs)
+    combined = REVERSE + c1.source_sql(
+        c1.MATCHES, manager.current,
+        c1.pairs_sql(pairs, physical=True) + " AND " + ID_PREFIX
+        + ",".join(map(c1.literal, ids)) + ")",
+    )
+    boundary = len(combined.encode("utf-8"))
+    assert boundary > len(combined)
+    monkeypatch.setattr(c1, "REVERSE_QUERY_BYTES", boundary)
+    plan = c1._reverse_matches_plan(pairs, ids, manager.current)
+    assert plan == [combined]
+    assert c1._reverse_matches_plan(
+        list(reversed(pairs)), list(reversed(ids)), manager.current
+    ) == plan
+    for sql in plan:
+        manager.execute_query(sql)
+    assert len(manager.closure) == 1
+    assert len(manager.closure[0].encode("utf-8")) == c1.REVERSE_QUERY_BYTES
+
+    monkeypatch.setattr(c1, "REVERSE_QUERY_BYTES", boundary - 1)
+    manager = ClosureManager(pairs)
+    plan = c1._reverse_matches_plan(pairs, ids, manager.current)
+    assert plan == [REVERSE + c1.source_sql(
+        c1.MATCHES, manager.current,
+        c1.pairs_sql(pairs, physical=True) + " AND " + ID_PREFIX + c1.literal(mid) + ")",
+    ) for mid in ids]
+    assert c1._reverse_matches_plan(
+        list(reversed(pairs)), list(reversed(ids)), manager.current
+    ) == plan
+    for sql in plan:
+        manager.execute_query(sql)
+    assert len(manager.closure) == 2
+    assert all(len(sql.encode("utf-8")) <= c1.REVERSE_QUERY_BYTES for sql in plan)
+    assert set().union(*(scan[4] for scan in manager.scans)) == set(ids)
+    assert all(scan[3] == set(pairs) for scan in manager.scans)
+    assert c1._reverse_matches_plan([], ids, manager.current) == []
+    assert c1._reverse_matches_plan(pairs, [], manager.current) == []
+
+
 @pytest.mark.parametrize("kind", ["pair", "physical_pair", "id"])
 def test_oversized_literal_fails_before_any_batch_is_executed(monkeypatch, kind):
     manager = ClosureManager()
@@ -356,6 +417,53 @@ def test_refresh_oversized_literal_stops_before_closure_queries(monkeypatch, kin
     monkeypatch.setattr(c1, "CLOSURE_PREDICATE_BYTES", manager.budget)
 
     with pytest.raises(RuntimeError, match="C1 closure .* exceeds predicate limit"):
+        c1.refresh(manager)
+
+    assert manager.closure == []
+    assert manager.writes == []
+    assert manager.staged == []
+    assert manager.controls == controls
+
+
+@pytest.mark.parametrize("kind", ["pair", "id"])
+def test_refresh_reverse_plan_oversized_literal_prevents_execution(monkeypatch, kind):
+    pair = ("10", "a")
+    pairs = [pair, ("20", "z'雪" * 5)] if kind == "pair" else [pair]
+    ids = ["a'雪"] if kind == "pair" else ["a", "z'雪" * 5]
+    manager = ClosureManager(pairs, seed_ids=ids, budget=90)
+    controls = list(manager.controls)
+    setup_refresh(monkeypatch, manager)
+    monkeypatch.setattr(c1, "CLOSURE_PREDICATE_BYTES", manager.budget)
+    assert len(c1._pair_predicates(pairs, physical=True)) == len(pairs)
+    assert c1._id_predicates(ids)
+    first_sql = REVERSE + c1.source_sql(
+        c1.MATCHES, manager.current,
+        c1.pairs_sql([pair], physical=True) + " AND " + ID_PREFIX + c1.literal(ids[0]) + ")",
+    )
+    monkeypatch.setattr(c1, "REVERSE_QUERY_BYTES", len(first_sql.encode("utf-8")))
+    assert c1._reverse_matches_plan([pair], ids[:1], manager.current) == [first_sql]
+
+    with pytest.raises(RuntimeError, match="C1 closure match ID exceeds predicate limit"):
+        c1.refresh(manager)
+
+    assert manager.closure == []
+    assert manager.writes == []
+    assert manager.staged == []
+    assert manager.controls == controls
+
+
+def test_refresh_reverse_plan_checks_actual_full_query_bytes(monkeypatch):
+    pair = ("10", "a'雪")
+    ids = ["a'雪"]
+    manager = ClosureManager([pair], seed_ids=ids)
+    controls = list(manager.controls)
+    setup_refresh(monkeypatch, manager)
+    sql, = c1._reverse_matches_plan([pair], ids, manager.current)
+    monkeypatch.setattr(c1, "REVERSE_QUERY_BYTES", len(sql.encode("utf-8")) - 1)
+    real_id_predicates = c1._id_predicates
+    monkeypatch.setattr(c1, "_id_predicates", lambda values, ceiling=None: real_id_predicates(values))
+
+    with pytest.raises(RuntimeError, match="C1 closure reverse MATCHES query exceeds query limit"):
         c1.refresh(manager)
 
     assert manager.closure == []

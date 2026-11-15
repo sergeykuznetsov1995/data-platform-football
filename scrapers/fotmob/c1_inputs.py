@@ -66,6 +66,7 @@ def pairs_sql(pairs, *, physical=False):
 
 
 CLOSURE_PREDICATE_BYTES = 200_000
+REVERSE_QUERY_BYTES = 900_000
 
 
 def _pair_predicates(pairs, *, physical=False):
@@ -86,16 +87,18 @@ def _pair_predicates(pairs, *, physical=False):
     return predicates
 
 
-def _id_predicates(ids):
+def _id_predicates(ids, ceiling=None):
+    if ceiling is None:
+        ceiling = CLOSURE_PREDICATE_BYTES
     prefix = "CAST(match_id AS varchar) IN ("
     overhead = len(prefix.encode("utf-8")) + 1
     predicates, chunk, size = [], [], overhead
     for mid in sorted(ids):
         value = literal(mid)
         value_size = len(value.encode("utf-8"))
-        if overhead + value_size > CLOSURE_PREDICATE_BYTES:
+        if overhead + value_size > ceiling:
             raise RuntimeError("C1 closure match ID exceeds predicate limit")
-        if chunk and size + 1 + value_size > CLOSURE_PREDICATE_BYTES:
+        if chunk and size + 1 + value_size > ceiling:
             predicates.append(prefix + ",".join(chunk) + ")")
             chunk, size = [], overhead
         size += value_size + (1 if chunk else 0)
@@ -108,6 +111,21 @@ def _id_predicates(ids):
 def source_sql(table, snapshots, predicate="true"):
     return (f"(SELECT * FROM {PREFIX}{table} FOR VERSION AS OF "
             f"{int(snapshots[table])} WHERE {predicate})")
+
+
+def _reverse_matches_plan(pairs, ids, snapshots):
+    queries = []
+    prefix = "SELECT DISTINCT competition_id, source_season_key FROM "
+    for predicate in _pair_predicates(pairs, physical=True):
+        overhead = len((prefix + source_sql(
+            MATCHES, snapshots, predicate + " AND "
+        )).encode("utf-8"))
+        for id_predicate in _id_predicates(ids, ceiling=REVERSE_QUERY_BYTES - overhead):
+            sql = prefix + source_sql(MATCHES, snapshots, predicate + " AND " + id_predicate)
+            if len(sql.encode("utf-8")) > REVERSE_QUERY_BYTES:
+                raise RuntimeError("C1 closure reverse MATCHES query exceeds query limit")
+            queries.append(sql)
+    return queries
 
 
 def current_sql(table, snapshots, predicate="true"):
@@ -499,12 +517,9 @@ def refresh(manager, *, first_day=None, last_day=None):
                     )}
             if ids:
                 id_predicates = _id_predicates(ids)
-                for predicate in _pair_predicates(all_pairs, physical=True):
-                    for id_predicate in id_predicates:
-                        affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
-                            "SELECT DISTINCT competition_id, source_season_key FROM "
-                            + source_sql(MATCHES, before, predicate + " AND " + id_predicate)
-                        )}
+                reverse_matches = _reverse_matches_plan(all_pairs, ids, before)
+                for sql in reverse_matches:
+                    affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(sql)}
                 for id_predicate in id_predicates:
                     affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
                         f"SELECT DISTINCT competition_id, source_season_key FROM {TABLE} "
