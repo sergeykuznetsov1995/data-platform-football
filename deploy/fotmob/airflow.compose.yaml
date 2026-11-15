@@ -29,8 +29,8 @@ x-airflow-common: &airflow-common
     TRINO_PORT: ${TRINO_PORT:-8443}
     TRINO_HTTP_SCHEME: ${TRINO_HTTP_SCHEME:-https}
     TRINO_TLS_VERIFY: ${TRINO_TLS_VERIFY:-false}
-    TRINO_USER: ${TRINO_USER:-airflow}
-    TRINO_PASSWORD: ${TRINO_PASSWORD:?set Trino password}
+    TRINO_USER: src_fotmob
+    TRINO_PASSWORD: ${TRINO_SRC_FOTMOB_PASSWORD:?set FotMob source Trino password}
     S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
     S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
     FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE:?set warehouse bucket}/raw/fotmob

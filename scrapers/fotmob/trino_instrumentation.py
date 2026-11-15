@@ -20,6 +20,7 @@ lease PostgreSQL: потеря замка отменяет активный за
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import threading
@@ -137,7 +138,13 @@ class FotMobTrinoTableManager(TrinoTableManager):
         session_properties: Optional[Mapping[str, str]] = None,
         **kwargs: Any,
     ) -> None:
+        kwargs["user"] = "src_fotmob"
         super().__init__(**kwargs)
+        source_password = os.environ.get("TRINO_SRC_FOTMOB_PASSWORD")
+        if source_password:
+            self._password = source_password
+            if kwargs.get("port") is None:
+                self.port = int(os.environ.get("TRINO_PORT", "8443"))
         self._source = source
         self._session_properties = (
             dict(session_properties) if session_properties else None

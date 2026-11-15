@@ -44,9 +44,23 @@ def _config(params: Dict[str, Any]) -> build.BuildConfig:
 
 @contextmanager
 def _cursor():
-    from utils.silver_tasks import _PARTITION_STAGED_SESSION_PROPERTIES, _get_trino_connection
+    import os
+    import trino
 
-    conn = _get_trino_connection(
+    from utils.silver_tasks import _PARTITION_STAGED_SESSION_PROPERTIES
+
+    password = os.environ.get("TRINO_SRC_FOTMOB_PASSWORD")
+    if not password:
+        raise RuntimeError("FotMob Silver requires TRINO_SRC_FOTMOB_PASSWORD")
+    conn = trino.dbapi.connect(
+        host=os.environ.get("TRINO_HOST", "trino"),
+        port=int(os.environ.get("TRINO_PORT", "8443")),
+        user="src_fotmob",
+        catalog="iceberg",
+        http_scheme="https",
+        auth=trino.auth.BasicAuthentication("src_fotmob", password),
+        verify=False,
+        source="fotmob:silver",
         session_properties={**_PARTITION_STAGED_SESSION_PROPERTIES, **build.SESSION_PROPERTIES}
     )
     try:

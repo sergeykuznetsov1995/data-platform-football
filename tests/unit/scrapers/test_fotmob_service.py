@@ -1843,7 +1843,7 @@ def test_match_payload_unfamiliar_error_body_stays_schema_drift():
     assert commit.status == ManifestStatus.SCHEMA_DRIFT
 
 
-def test_team_snapshots_are_global_observations_not_historical_season_rows():
+def test_team_snapshots_are_global_observations_not_historical_season_rows(monkeypatch):
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     team1 = canonicalize_target("teams", {"id": "1"}).canonical_url
     team2 = canonicalize_target("teams", {"id": "2"}).canonical_url
@@ -1862,8 +1862,19 @@ def test_team_snapshots_are_global_observations_not_historical_season_rows():
     second = copy.deepcopy(payload)
     second["details"]["id"] = 2
     service, _, repository = _service({team1: payload, team2: second})
+    batch_calls = []
+    original_batch = repository.current_squad_player_ids_for_teams
+
+    def record_batch(team_ids):
+        batch_calls.append(list(team_ids))
+        return original_batch(team_ids)
+
+    monkeypatch.setattr(
+        repository, "current_squad_player_ids_for_teams", record_batch
+    )
 
     result, player_ids = service.sync_team_snapshots(bundle)
+    assert batch_calls == []
 
     assert result.ok and player_ids == {10}
     team_rows = repository.tables["fotmob_team_snapshots"]
@@ -1872,6 +1883,7 @@ def test_team_snapshots_are_global_observations_not_historical_season_rows():
     assert all("snapshot_date" in row and "observed_at" in row for row in team_rows)
 
     second, cached_player_ids = service.sync_team_snapshots(bundle)
+    assert batch_calls == [[1, 2]]
     assert second.ok and second.skipped == 2
     assert cached_player_ids == {10}
 
