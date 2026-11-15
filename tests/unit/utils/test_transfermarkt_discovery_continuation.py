@@ -1230,6 +1230,12 @@ _QUARANTINE_URLS = (
 )
 
 
+def quarantine_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                               separators=(',', ':')))
+
+
 def _quarantine_entry(status='blocked', error='HTTP 405', attempts=2):
     return {'status': status, 'error': error, 'attempts': attempts,
             'raw_capture_id': 'capture-1' if status == 'blocked' else None,
@@ -1273,20 +1279,23 @@ def _quarantine_pins(urls):
 
 
 def quarantine_paused(tmp_path, monkeypatch, *, cache=None, extra_terminal=None,
-                      portion=17):
+                      portion=17, job_changes=None):
     """The audited paused marker plus its pinned terminal cache entries."""
     path, job = prepared(tmp_path)
     checkpoint = Path(job['checkpoint_path'])
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     failures = checkpoint.with_suffix('.failures.json')
     document = (_quarantine_cache_document(extra_terminal)
                 if cache is None else cache)
-    failures.write_text(json.dumps(document))
+    quarantine_write(failures, document)
+    quarantine_write(checkpoint, {'page': {'hash': 'x'}})
     job.update(status='paused', portion=portion, traffic=_traffic(),
-               artifacts={str(checkpoint): '0' * 64,
+               artifacts={str(checkpoint): hashlib.sha256(
+                              checkpoint.read_bytes()).hexdigest(),
                           str(failures): hashlib.sha256(
                               failures.read_bytes()).hexdigest()})
-    cohorts.write_job(path, job, write)
+    if job_changes:
+        job.update(job_changes)
+    cohorts.write_job(path, job, quarantine_write)
     monkeypatch.setattr(cohorts, 'KNOWN_QUARANTINE_20261115', {
         'marker_stable_hash': stable_payload_hash(job),
         'cohort_job_id': job['job_id'],
@@ -1294,6 +1303,11 @@ def quarantine_paused(tmp_path, monkeypatch, *, cache=None, extra_terminal=None,
         'portion': 17,
         'failures_file_sha256': hashlib.sha256(
             failures.read_bytes()).hexdigest(),
+        'reduced_failures_sha256': hashlib.sha256(json.dumps(
+            {k: v for k, v in document.items()
+             if k not in _QUARANTINE_URLS},
+            ensure_ascii=False, sort_keys=True,
+            separators=(',', ':')).encode()).hexdigest(),
         'urls': _quarantine_pins(_QUARANTINE_URLS),
     })
     return path, job, failures
@@ -1302,8 +1316,10 @@ def quarantine_paused(tmp_path, monkeypatch, *, cache=None, extra_terminal=None,
 def test_quarantine_removes_pinned_entries_and_keeps_cached_successes(
         tmp_path, monkeypatch):
     path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint_before = checkpoint.read_bytes()
     resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(days=2),
-                                 write=write)
+                                 write=quarantine_write)
     # The three pinned pages leave the cache; every success stays.
     cache = json.loads(failures.read_text())
     assert set(cache) == {_QUARANTINE_OK_A, _QUARANTINE_OK_B}
@@ -1312,6 +1328,20 @@ def test_quarantine_removes_pinned_entries_and_keeps_cached_successes(
     assert resumed['traffic'] == job['traffic']
     assert resumed['artifacts'][str(failures)] == hashlib.sha256(
         failures.read_bytes()).hexdigest()
+    # The unrelated checkpoint artifact survives untouched and the marker
+    # change is confined to the failures hash and updated_at.
+    assert checkpoint.read_bytes() == checkpoint_before
+    assert (resumed['artifacts'][str(checkpoint)]
+            == job['artifacts'][str(checkpoint)])
+    differs = {key for key in set(job) | set(resumed)
+               if job.get(key) != resumed.get(key)}
+    assert differs == {'updated_at', 'artifacts'}
+    assert resumed['updated_at'] == (NOW + timedelta(days=2)).isoformat()
+    artifact_differs = {key for key in set(job['artifacts'])
+                        | set(resumed['artifacts'])
+                        if job['artifacts'].get(key)
+                        != resumed['artifacts'].get(key)}
+    assert artifact_differs == {str(failures)}
     quarantine = failures.with_suffix('.blocked.json')
     evidence = json.loads(quarantine.read_text())
     assert evidence['schema'] == 'transfermarkt-discovery-quarantine-20261115-v1'
@@ -1319,13 +1349,25 @@ def test_quarantine_removes_pinned_entries_and_keeps_cached_successes(
     assert set(evidence['removed_entries']) == set(_QUARANTINE_URLS)
     assert evidence['removed_entries'][_QUARANTINE_URLS[2]][
         'status'] == 'retry_exhausted'
+    assert quarantine.read_bytes() == json.dumps(
+        evidence, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode()
     # The rewritten marker no longer matches the quarantine pin: a repeat
-    # selection is the ordinary paused resume, never a second quarantine.
+    # selection is the ordinary paused resume, never a second quarantine,
+    # and it must not rewrite any of the three files.
+    marker_bytes = path.read_bytes()
+    failures_bytes = failures.read_bytes()
+    quarantine_bytes = quarantine.read_bytes()
+
+    def forbidden(target, payload):
+        raise AssertionError('settled quarantine must not write again')
+
     again = cohorts.select_job(path, identity(), now=NOW + timedelta(days=2),
-                               write=write)
+                               write=forbidden)
     assert again['artifacts'][str(failures)] == resumed['artifacts'][str(failures)]
-    assert json.loads(failures.read_text()) == cache
-    assert json.loads(quarantine.read_text()) == evidence
+    assert path.read_bytes() == marker_bytes
+    assert failures.read_bytes() == failures_bytes
+    assert quarantine.read_bytes() == quarantine_bytes
 
 
 def test_quarantine_completes_after_crash_between_steps(tmp_path, monkeypatch):
@@ -1335,7 +1377,7 @@ def test_quarantine_completes_after_crash_between_steps(tmp_path, monkeypatch):
     quarantine = failures.with_suffix('.blocked.json')
     pins = cohorts.KNOWN_QUARANTINE_20261115
     document = json.loads(failures.read_text())
-    quarantine.write_text(json.dumps({
+    quarantine_write(quarantine, {
         'schema': 'transfermarkt-discovery-quarantine-20261115-v1',
         'job_id': job['job_id'],
         'original_marker_hash': pins['marker_stable_hash'],
@@ -1343,8 +1385,8 @@ def test_quarantine_completes_after_crash_between_steps(tmp_path, monkeypatch):
         'urls': pins['urls'],
         'original_marker': job,
         'removed_entries': {url: document[url] for url in _QUARANTINE_URLS},
-    }))
-    cohorts.select_job(path, identity(), now=NOW, write=write)
+    })
+    cohorts.select_job(path, identity(), now=NOW, write=quarantine_write)
     cache = json.loads(failures.read_text())
     assert set(cache) == {_QUARANTINE_OK_A, _QUARANTINE_OK_B}
     marker = cohorts.read_job(path)
@@ -1352,14 +1394,102 @@ def test_quarantine_completes_after_crash_between_steps(tmp_path, monkeypatch):
         failures.read_bytes()).hexdigest()
 
 
+def test_quarantine_completes_after_quarantine_only_crash(tmp_path, monkeypatch):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    quarantine = failures.with_suffix('.blocked.json')
+    original = failures.read_bytes()
+
+    def interrupted(target, payload):
+        if target == failures:
+            raise RuntimeError('crash after quarantine')
+        quarantine_write(target, payload)
+
+    with pytest.raises(RuntimeError, match='crash after quarantine'):
+        cohorts.select_job(path, identity(), now=NOW, write=interrupted)
+    # The crash landed between the quarantine file and the reduced cache.
+    assert failures.read_bytes() == original
+    assert quarantine.exists()
+    resumed = cohorts.select_job(path, identity(), now=NOW,
+                                 write=quarantine_write)
+    assert resumed['status'] == 'paused'
+    assert set(json.loads(failures.read_text())) == {_QUARANTINE_OK_A,
+                                                     _QUARANTINE_OK_B}
+    assert resumed['artifacts'][str(failures)] == hashlib.sha256(
+        failures.read_bytes()).hexdigest()
+
+
+def test_quarantine_completes_after_reduced_before_marker_crash(
+        tmp_path, monkeypatch):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    quarantine = failures.with_suffix('.blocked.json')
+    pins = cohorts.KNOWN_QUARANTINE_20261115
+    original_marker = path.read_bytes()
+
+    def interrupted(target, payload):
+        if target == path:
+            raise RuntimeError('crash before marker')
+        quarantine_write(target, payload)
+
+    with pytest.raises(RuntimeError, match='crash before marker'):
+        cohorts.select_job(path, identity(), now=NOW, write=interrupted)
+    # The crash landed between the reduced cache and the marker rewrite.
+    assert path.read_bytes() == original_marker
+    assert hashlib.sha256(
+        failures.read_bytes()).hexdigest() == pins['reduced_failures_sha256']
+    assert quarantine.exists()
+    failures_bytes = failures.read_bytes()
+    quarantine_bytes = quarantine.read_bytes()
+    later = NOW + timedelta(days=2)
+    resumed = cohorts.select_job(path, identity(), now=later,
+                                 write=quarantine_write)
+    assert resumed['status'] == 'paused'
+    expected_artifacts = dict(job['artifacts'])
+    expected_artifacts[str(failures)] = hashlib.sha256(
+        failures.read_bytes()).hexdigest()
+    assert resumed == dict(job, updated_at=later.isoformat(),
+                           artifacts=expected_artifacts)
+    assert cohorts.read_job(path) == resumed
+    assert failures.read_bytes() == failures_bytes
+    assert quarantine.read_bytes() == quarantine_bytes
+
+
+def test_quarantine_retry_after_marker_crash_is_read_only(
+        tmp_path, monkeypatch):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    quarantine = failures.with_suffix('.blocked.json')
+
+    def interrupted(target, payload):
+        quarantine_write(target, payload)
+        if target == path:
+            raise RuntimeError('crash after marker')
+
+    with pytest.raises(RuntimeError, match='crash after marker'):
+        cohorts.select_job(path, identity(), now=NOW, write=interrupted)
+    # The marker rewrite already completed: the retry is a plain paused
+    # resume and must not touch any of the three files.
+    marker_bytes = path.read_bytes()
+    failures_bytes = failures.read_bytes()
+    quarantine_bytes = quarantine.read_bytes()
+
+    def forbidden(target, payload):
+        raise AssertionError('settled quarantine must not write again')
+
+    resumed = cohorts.select_job(path, identity(), now=NOW, write=forbidden)
+    assert resumed['status'] == 'paused'
+    assert path.read_bytes() == marker_bytes
+    assert failures.read_bytes() == failures_bytes
+    assert quarantine.read_bytes() == quarantine_bytes
+
+
 def test_quarantine_off_pin_marker_resumes_without_touching_cache(
         tmp_path, monkeypatch):
     path, job, failures = quarantine_paused(tmp_path, monkeypatch, portion=17)
     # A different portion keeps the marker off-pin: ordinary paused resume.
     job.update(portion=18)
-    cohorts.write_job(path, job, write)
+    cohorts.write_job(path, job, quarantine_write)
     before = failures.read_bytes()
-    resumed = cohorts.select_job(path, identity(), now=NOW, write=write)
+    resumed = cohorts.select_job(path, identity(), now=NOW,
+                                 write=quarantine_write)
     assert resumed['portion'] == 18
     assert failures.read_bytes() == before
     assert not failures.with_suffix('.blocked.json').exists()
@@ -1388,26 +1518,149 @@ def test_quarantine_fails_closed_on_evidence_drift(tmp_path, monkeypatch,
     before_marker = path.read_bytes()
     before_cache = failures.read_bytes()
     with pytest.raises(ValueError, match=message):
-        cohorts.select_job(path, identity(), now=NOW, write=write)
+        cohorts.select_job(path, identity(), now=NOW, write=quarantine_write)
     assert path.read_bytes() == before_marker
     assert failures.read_bytes() == before_cache
     assert not failures.with_suffix('.blocked.json').exists()
 
 
+@pytest.mark.parametrize('mutation', [
+    'change_ok',
+    'delete_ok',
+    'add_ok',
+    'add_extra_terminal',
+])
+def test_quarantine_replay_drift_fails_closed_without_writes(
+        tmp_path, monkeypatch, mutation):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    pins = cohorts.KNOWN_QUARANTINE_20261115
+    quarantine = failures.with_suffix('.blocked.json')
+
+    def interrupted(target, payload):
+        if target == path:
+            raise RuntimeError('crash before marker')
+        quarantine_write(target, payload)
+
+    with pytest.raises(RuntimeError, match='crash before marker'):
+        cohorts.select_job(path, identity(), now=NOW, write=interrupted)
+    assert hashlib.sha256(
+        failures.read_bytes()).hexdigest() == pins['reduced_failures_sha256']
+    # Mutate the already-reduced cache after the crash: the reduced digest
+    # pins the whole remainder, not only the absence of the three URLs.
+    drifted = json.loads(failures.read_text())
+    if mutation == 'change_ok':
+        drifted[_QUARANTINE_OK_A] = {'status': 'ok', 'changed': True}
+    elif mutation == 'delete_ok':
+        del drifted[_QUARANTINE_OK_B]
+    elif mutation == 'add_ok':
+        drifted['https://www.transfermarkt.com/ok-c'] = {'status': 'ok'}
+    else:
+        drifted['https://www.transfermarkt.com/extra'] = _quarantine_entry()
+    failures.write_text(json.dumps(drifted))
+    before = (path.read_bytes(), failures.read_bytes(),
+              quarantine.read_bytes())
+
+    def forbidden(target, payload):
+        raise AssertionError('drifted replay must not write')
+
+    with pytest.raises(ValueError, match='pinned state'):
+        cohorts.select_job(path, identity(), now=NOW, write=forbidden)
+    assert (path.read_bytes(), failures.read_bytes(),
+            quarantine.read_bytes()) == before
+
+
+def _quarantine_evidence(job, failures, removed_entries=None):
+    """The exact evidence document this fixture must quarantine under."""
+    pins = cohorts.KNOWN_QUARANTINE_20261115
+    document = json.loads(failures.read_text())
+    return {
+        'schema': 'transfermarkt-discovery-quarantine-20261115-v1',
+        'job_id': job['job_id'],
+        'original_marker_hash': pins['marker_stable_hash'],
+        'original_failures_sha256': pins['failures_file_sha256'],
+        'urls': pins['urls'],
+        'original_marker': job,
+        'removed_entries': ({url: document[url] for url in _QUARANTINE_URLS}
+                            if removed_entries is None else removed_entries),
+    }
+
+
+@pytest.mark.parametrize('change, message', [
+    ('job_id', 'identity'),
+    ('relative_checkpoint', 'cohort'),
+    ('outside_cohort', 'cohort'),
+])
+def test_quarantine_refuses_unbound_marker_despite_matching_pin(
+        tmp_path, monkeypatch, change, message):
+    job_changes = {
+        'job_id': {'job_id': 'tm-discovery-job-' + '0' * 24},
+        'relative_checkpoint': {'checkpoint_path': 'relative/checkpoint.json'},
+        'outside_cohort': {'checkpoint_path': str(
+            tmp_path / 'other' / 'checkpoint.json')},
+    }[change]
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch,
+                                            job_changes=job_changes)
+    marker_before = path.read_bytes()
+    failures_before = failures.read_bytes()
+
+    def forbidden(target, payload):
+        raise AssertionError('unbound marker must not reach any write')
+
+    with pytest.raises(ValueError, match=message):
+        cohorts.select_job(path, identity(), now=NOW, write=forbidden)
+    assert path.read_bytes() == marker_before
+    assert failures.read_bytes() == failures_before
+    assert not failures.with_suffix('.blocked.json').exists()
+
+
+@pytest.mark.parametrize('conflict', [
+    'noncompact_bytes',
+    'literal_null',
+    'extra_removed_entry',
+    'changed_removed_entry',
+])
+def test_quarantine_refuses_conflicting_evidence_without_any_write(
+        tmp_path, monkeypatch, conflict):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    quarantine = failures.with_suffix('.blocked.json')
+    evidence = _quarantine_evidence(job, failures)
+    if conflict == 'noncompact_bytes':
+        quarantine.write_text(json.dumps(evidence))
+    elif conflict == 'literal_null':
+        quarantine.write_text('null')
+    elif conflict == 'extra_removed_entry':
+        evidence['removed_entries']['https://www.transfermarkt.com/extra'] = \
+            _quarantine_entry()
+        quarantine_write(quarantine, evidence)
+    else:
+        pinned = evidence['removed_entries'][_QUARANTINE_URLS[0]]
+        evidence['removed_entries'][_QUARANTINE_URLS[0]] = dict(
+            pinned, attempts=pinned['attempts'] + 1)
+        quarantine_write(quarantine, evidence)
+    before = (path.read_bytes(), failures.read_bytes(),
+              quarantine.read_bytes())
+
+    def forbidden(target, payload):
+        raise AssertionError('conflicting quarantine evidence must not write')
+
+    with pytest.raises(ValueError, match='quarantine'):
+        cohorts.select_job(path, identity(), now=NOW, write=forbidden)
+    assert (path.read_bytes(), failures.read_bytes(),
+            quarantine.read_bytes()) == before
+
+
 def test_quarantine_resumes_the_cohort_on_the_next_portion(tmp_path, monkeypatch):
     from scrapers.transfermarkt.models import SharedTrafficLedger
     path, job, failures = quarantine_paused(tmp_path, monkeypatch)
-    checkpoint = Path(job['checkpoint_path'])
-    checkpoint.write_text(json.dumps({'page': {'hash': 'x'}}))
-    marker = cohorts.read_job(path)
-    marker['artifacts'][str(checkpoint)] = hashlib.sha256(
-        checkpoint.read_bytes()).hexdigest()
-    cohorts.write_job(path, marker, write)
-    cohorts.select_job(path, identity(), now=NOW, write=write)
+    cohorts.select_job(path, identity(), now=NOW, write=quarantine_write)
+    # The quarantine has fully landed before the continuation is built.
+    assert set(_QUARANTINE_URLS).isdisjoint(json.loads(failures.read_text()))
+    assert failures.with_suffix('.blocked.json').exists()
     ledger = SharedTrafficLedger(hard_provider_bytes=10000,
                                  soft_provider_bytes=9000, retry_limit=10)
     continuation = cohorts.DiscoveryContinuation(
-        path, identity(), ledger, write, now=lambda: NOW, run_id='run-18')
+        path, identity(), ledger, quarantine_write, now=lambda: NOW,
+        run_id='run-18')
     assert continuation.portion == 18
     assert continuation.saved['status'] == 'paused'
 
@@ -1418,6 +1671,7 @@ def test_quarantine_literal_production_pin():
     assert pin['marker_stable_hash'] == '9dca5a1568148b33e422cac10f55586eaff7380e3b8e165a1fd8d829a6d2a843'
     assert pin['portion'] == 17
     assert pin['failures_file_sha256'] == '32f228961bba5aaee736d64c52d4030f30b8e2fd17ab7329361e8c54397a857f'
+    assert pin['reduced_failures_sha256'] == '77c61da69c45509ab4b019611593b841574aff5e508a56210cde61bf8419d14a'
     assert set(pin['urls']) == {
         'https://www.transfermarkt.com/nisa/startseite/wettbewerb/NIS3',
         'https://www.transfermarkt.com/second-league-division-b-gruppe-2-2023-/startseite/wettbewerb/RPLW',
