@@ -84,7 +84,10 @@ class SyntheticManager:
     def records(self, table, version):
         rows = []
         if table == c1.MATCHES:
-            rows = [(*OLD_RELATED, "101"), (*NEW_RELATED, "102")]
+            # Shared IDs can return rows outside the fingerprint pair domain;
+            # production closure, rather than this fake engine, must filter them.
+            rows = [(*OLD_RELATED, "101"), (*NEW_RELATED, "102"),
+                    ("40", PAIR[1], "101"), (None, PAIR[1], "102")]
         if table == self.changed:
             rows.append((*PAIR, "101" if version == self.old[table] else "102"))
         else:
@@ -122,10 +125,16 @@ class SyntheticManager:
             assert len(selections) == 1
             table, version, pairs, predicate = selections[0]
             assert table == c1.MATCHES
-            ids = re.search(r"CAST\(match_id AS varchar\) IN \(([^)]*)\)", predicate).group(1)
-            ids = set(re.findall(STRING, ids))
+            assert version == self.current[c1.MATCHES]
+            assert not pairs
+            values = re.fullmatch(
+                r"CAST\(match_id AS varchar\) IN \((" + STRING + r"(?:," + STRING + r")*)\)",
+                predicate,
+            )
+            assert values
+            ids = set(re.findall(STRING, values.group(1)))
             return [(cid, season) for cid, season, mid in self.records(table, version)
-                    if (cid, season) in pairs and c1.literal(mid) in ids]
+                    if c1.literal(mid) in ids]
         if sql.startswith(("SELECT DISTINCT match_id FROM " + c1.TABLE,
                            "SELECT DISTINCT competition_id, source_season_key FROM " + c1.TABLE,
                            "SELECT deadline_day, competition_id, source_season_key, match_id, kind")):
@@ -160,6 +169,11 @@ def test_refresh_changed_physical_pairs_use_table_types_and_both_snapshots(monke
                        for t, v, pairs, _ in manager.scans)
     assert {PAIR} in manager.target_pairs
     assert expected_pairs in manager.target_pairs
+    reverse = [(table, version, pairs) for table, version, pairs, predicate in manager.scans
+               if predicate.startswith("CAST(match_id AS varchar) IN (")]
+    assert reverse
+    assert all(table == c1.MATCHES and version == manager.current[c1.MATCHES] and not pairs
+               for table, version, pairs in reverse)
     # The checker also visits MATCHES predicates inside candidates/current_sql
     # (including the nonempty batch test) and inputs_sql, not just closure SQL.
     assert any(sql.startswith("CREATE TABLE ") and " AS WITH inc AS" in sql

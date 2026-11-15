@@ -113,18 +113,17 @@ def source_sql(table, snapshots, predicate="true"):
             f"{int(snapshots[table])} WHERE {predicate})")
 
 
-def _reverse_matches_plan(pairs, ids, snapshots):
+def _reverse_matches_plan(all_pairs, ids, snapshots):
     queries = []
+    if not all_pairs or not ids:
+        return queries
     prefix = "SELECT DISTINCT competition_id, source_season_key FROM "
-    for predicate in _pair_predicates(pairs, physical=True):
-        overhead = len((prefix + source_sql(
-            MATCHES, snapshots, predicate + " AND "
-        )).encode("utf-8"))
-        for id_predicate in _id_predicates(ids, ceiling=REVERSE_QUERY_BYTES - overhead):
-            sql = prefix + source_sql(MATCHES, snapshots, predicate + " AND " + id_predicate)
-            if len(sql.encode("utf-8")) > REVERSE_QUERY_BYTES:
-                raise RuntimeError("C1 closure reverse MATCHES query exceeds query limit")
-            queries.append(sql)
+    overhead = len((prefix + source_sql(MATCHES, snapshots, "")).encode("utf-8"))
+    for id_predicate in _id_predicates(ids, ceiling=REVERSE_QUERY_BYTES - overhead):
+        sql = prefix + source_sql(MATCHES, snapshots, id_predicate)
+        if len(sql.encode("utf-8")) > REVERSE_QUERY_BYTES:
+            raise RuntimeError("C1 closure reverse MATCHES query exceeds query limit")
+        queries.append(sql)
     return queries
 
 
@@ -499,6 +498,9 @@ def refresh(manager, *, first_day=None, last_day=None):
         # Pool legacy evidence across natural keys. Find IDs in changed physical
         # seasons in both snapshots, then every season containing them. Deleted
         # evidence may have no published input in its own physical season.
+        # The pinned current ID-to-pair relation is fixed; each newly found ID
+        # needs only one reverse source search as the closure grows.
+        reverse_searched_ids = set()
         while True:
             known = set(affected)
             if affected:
@@ -517,9 +519,14 @@ def refresh(manager, *, first_day=None, last_day=None):
                     )}
             if ids:
                 id_predicates = _id_predicates(ids)
-                reverse_matches = _reverse_matches_plan(all_pairs, ids, before)
+                new_ids = ids - reverse_searched_ids
+                reverse_matches = _reverse_matches_plan(all_pairs, new_ids, before)
                 for sql in reverse_matches:
-                    affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(sql)}
+                    for row in manager.execute_query(sql):
+                        pair = (str(row[0]), str(row[1]))
+                        if pair in all_pairs:
+                            affected.add(pair)
+                reverse_searched_ids.update(new_ids)
                 for id_predicate in id_predicates:
                     affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
                         f"SELECT DISTINCT competition_id, source_season_key FROM {TABLE} "
