@@ -148,6 +148,7 @@ KNOWN_QUARANTINE_20261115 = {
     'cohort_status': 'paused',
     'portion': 17,
     'failures_file_sha256': '32f228961bba5aaee736d64c52d4030f30b8e2fd17ab7329361e8c54397a857f',
+    'reduced_failures_sha256': '77c61da69c45509ab4b019611593b841574aff5e508a56210cde61bf8419d14a',
     'urls': {
         'https://www.transfermarkt.com/nisa/startseite/wettbewerb/NIS3': {
             'status': 'blocked', 'error': 'HTTP 405',
@@ -754,29 +755,45 @@ def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
     if not isinstance(current_failures, dict):
         raise ValueError('quarantine failure cache is not an object')
     if failures_digest == descriptor['failures_file_sha256']:
+        original_failures = True
+    elif (failures_digest == descriptor['reduced_failures_sha256']
+            and quarantine.exists()):
+        original_failures = False
+    else:
+        raise ValueError('quarantine failure cache differs from the pinned state')
+
+    removed_entries = None
+    if original_failures:
         removed_entries = {url: current_failures[url] for url in pinned_urls}
         retained_failures = {k: v for k, v in current_failures.items()
                              if k not in pinned_urls}
-    elif quarantine.exists():
+        reduced_bytes = json.dumps(retained_failures, ensure_ascii=False,
+                                   sort_keys=True,
+                                   separators=(',', ':')).encode()
+        if hashlib.sha256(reduced_bytes).hexdigest() != descriptor['reduced_failures_sha256']:
+            raise ValueError('quarantine reduced failure cache does not match the pin')
+    else:
         # Crash-safe replay between the quarantine write and the cache/marker
-        # writes: the cache is either still the pinned original or already
-        # the retained remainder (both writes are atomic single files).
-        try:
-            existing = json.loads(quarantine.read_text())
-        except (OSError, ValueError) as exc:
-            raise ValueError('quarantine evidence is unreadable') from exc
-        if (not isinstance(existing, dict)
-                or existing.get('schema') != 'transfermarkt-discovery-quarantine-20261115-v1'
-                or existing.get('original_failures_sha256')
-                != descriptor['failures_file_sha256']
-                or not isinstance(existing.get('removed_entries'), dict)):
-            raise ValueError('quarantine evidence does not match the audited pin')
-        removed_entries = existing['removed_entries']
+        # writes: the cache is already the retained remainder pinned by its
+        # own whole-file digest, so only the pinned URLs must be absent.
         if any(url in current_failures for url in pinned_urls):
             raise ValueError('quarantine failure cache differs from the replay state')
         retained_failures = current_failures
-    else:
-        raise ValueError('quarantine failure cache differs from the pinned state')
+
+    quarantine_bytes = None
+    if quarantine.exists():
+        try:
+            quarantine_bytes = quarantine.read_bytes()
+            quarantine_document = json.loads(quarantine_bytes)
+        except (OSError, ValueError) as exc:
+            raise ValueError('quarantine file is unreadable') from exc
+        if not isinstance(quarantine_document, dict):
+            raise ValueError('quarantine file is not an object')
+        if not original_failures:
+            removed_entries = quarantine_document.get('removed_entries')
+    if (not isinstance(removed_entries, dict)
+            or set(removed_entries) != set(pinned_urls)):
+        raise ValueError('quarantine evidence does not match the audited pin')
 
     for url, pin in pinned_urls.items():
         entry = removed_entries.get(url)
@@ -792,7 +809,7 @@ def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
     terminal = {url: entry.get('status')
                 for url, entry in current_failures.items()
                 if isinstance(entry, dict) and entry.get('status') not in (None, 'ok')}
-    if failures_digest == descriptor['failures_file_sha256'] and terminal != {
+    if original_failures and terminal != {
             url: pin['status'] for url, pin in pinned_urls.items()}:
         raise ValueError('quarantine terminal entries do not match the pinned set')
 
@@ -805,18 +822,16 @@ def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
         'original_marker': saved,
         'removed_entries': removed_entries,
     }
-    existing_quarantine = None
+    expected_quarantine_bytes = json.dumps(retained, ensure_ascii=False,
+                                           sort_keys=True,
+                                           separators=(',', ':')).encode()
     if quarantine.exists():
-        try:
-            existing_quarantine = json.loads(quarantine.read_text())
-        except (OSError, ValueError) as exc:
-            raise ValueError('quarantine file is unreadable') from exc
-    if existing_quarantine is not None and existing_quarantine != retained:
-        raise ValueError('quarantine file conflicts with the audited evidence')
-    if existing_quarantine is None:
+        if quarantine_bytes != expected_quarantine_bytes:
+            raise ValueError('quarantine file conflicts with the audited evidence')
+    else:
         _write_recovery_json(quarantine, retained, write)
 
-    if current_failures != retained_failures or failures_digest == descriptor['failures_file_sha256']:
+    if original_failures:
         write(failures, retained_failures)
     try:
         readback_bytes = failures.read_bytes()
@@ -826,18 +841,15 @@ def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
     if readback_cache != retained_failures:
         raise ValueError('quarantine failure cache write differs')
     readback = hashlib.sha256(readback_bytes).hexdigest()
+    if readback != descriptor['reduced_failures_sha256']:
+        raise ValueError('quarantine failure cache write differs')
 
     updated = dict(saved)
     updated['artifacts'] = {**saved.get('artifacts', {})}
     updated['artifacts'][str(failures)] = readback
     updated['updated_at'] = now.isoformat()
     write_job(path, updated, write)
-    readback_marker = read_job(path)
-    expected_marker = dict(updated)
-    expected_marker.pop('updated_at', None)
-    actual_marker = dict(readback_marker)
-    actual_marker.pop('updated_at', None)
-    if actual_marker != expected_marker:
+    if read_job(path) != updated:
         raise ValueError('quarantine marker write differs')
 
 
