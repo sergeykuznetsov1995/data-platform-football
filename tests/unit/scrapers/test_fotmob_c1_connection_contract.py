@@ -16,9 +16,13 @@ from scrapers.fotmob import maintenance, trino_instrumentation
 def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
     # Isolate both authentication branches from any real environment credentials.
     if password is None:
+        monkeypatch.delenv("TRINO_SRC_FOTMOB_PASSWORD", raising=False)
         monkeypatch.delenv("TRINO_PASSWORD", raising=False)
+        monkeypatch.delenv("TRINO_USER", raising=False)
     else:
-        monkeypatch.setenv("TRINO_PASSWORD", password)
+        monkeypatch.setenv("TRINO_SRC_FOTMOB_PASSWORD", password)
+        monkeypatch.delenv("TRINO_PASSWORD", raising=False)
+        monkeypatch.delenv("TRINO_USER", raising=False)
     monkeypatch.setenv("TRINO_PORT", "8443" if password else "8080")
     monkeypatch.setattr(base, "TRINO_AVAILABLE", True)
 
@@ -98,12 +102,12 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
     assert kwargs["max_attempts"] == 1
     assert kwargs["request_timeout"] == (3, 30)
     assert kwargs["host"] == "trino"
-    assert kwargs["user"] == "airflow"
+    assert kwargs["user"] == "src_fotmob"
     assert kwargs["catalog"] == "iceberg"
     if password:
         assert kwargs["port"] == 8443
         assert kwargs["http_scheme"] == "https"
-        assert kwargs["auth"] == ("basic", "airflow", password)
+        assert kwargs["auth"] == ("basic", "src_fotmob", password)
         assert kwargs["verify"] is False
     else:
         assert kwargs["port"] == 8080

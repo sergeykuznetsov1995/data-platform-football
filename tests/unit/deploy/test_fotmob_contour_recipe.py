@@ -20,6 +20,35 @@ import pytest
 import yaml
 
 
+def test_fotmob_recipes_use_source_trino_credentials():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    password_mapping = "${TRINO_SRC_FOTMOB_PASSWORD:?set FotMob source Trino password}"
+    for name in ("isolated.compose.yaml", "airflow.compose.yaml"):
+        text = (root / "deploy" / "fotmob" / name).read_text()
+        recipe = yaml.safe_load(text)
+        anchor = "x-fm-airflow-common" if name == "isolated.compose.yaml" else "x-airflow-common"
+        environment = recipe[anchor]["environment"]
+        assert environment["TRINO_USER"] == "src_fotmob"
+        assert environment["TRINO_PASSWORD"] == password_mapping
+        assert "    TRINO_USER: src_fotmob" in text.splitlines()
+        assert f"    TRINO_PASSWORD: {password_mapping}" in text.splitlines()
+
+
+def test_shared_compose_preserves_generic_credentials_and_maps_source_password():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    recipe = yaml.safe_load((root / "compose.yaml").read_text())
+    environment = recipe["x-airflow-common"]["environment"]
+    assert environment["TRINO_SRC_FOTMOB_PASSWORD"] == (
+        "${TRINO_SRC_FOTMOB_PASSWORD:?set FotMob source Trino password}"
+    )
+    assert environment["TRINO_PASSWORD"] == "${TRINO_PASSWORD}"
+    assert "TRINO_USER" not in environment
+
+
 ROOT = Path(__file__).resolve().parents[3]
 DEPLOY = ROOT / "deploy" / "fotmob"
 COMPOSE = DEPLOY / "isolated.compose.yaml"

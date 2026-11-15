@@ -3212,6 +3212,7 @@ class FotMobIngestService:
         now = utc_now()
         due = []
         player_ids: set[int] = set()
+        skipped_team_ids = []
         for team in teams:
             team_id = team.get("team_id")
             previous = self.repository.latest_entity_success("team", team_id)
@@ -3223,9 +3224,13 @@ class FotMobIngestService:
                 and self.mode != RunMode.REPLAY
             ):
                 result.skipped += 1
-                player_ids.update(self.repository.current_squad_player_ids(team_id))
+                skipped_team_ids.append(team_id)
             else:
                 due.append(team)
+        if skipped_team_ids:
+            player_ids.update(
+                self.repository.current_squad_player_ids_for_teams(skipped_team_ids)
+            )
         teams = due
         if limit is not None:
             teams = teams[: max(0, int(limit))]

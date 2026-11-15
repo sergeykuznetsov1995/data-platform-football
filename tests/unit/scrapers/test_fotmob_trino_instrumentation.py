@@ -21,6 +21,56 @@ from scrapers.fotmob.trino_instrumentation import (
 )
 
 
+def test_source_password_overrides_generic_connection_credentials(monkeypatch):
+    from scrapers.fotmob.trino_instrumentation import FotMobTrinoTableManager
+
+    monkeypatch.setenv("TRINO_PASSWORD", "generic-synthetic")
+    monkeypatch.setenv("TRINO_SRC_FOTMOB_PASSWORD", "source-synthetic")
+    monkeypatch.setenv("TRINO_USER", "generic-user")
+    calls = []
+    _fake_trino(monkeypatch, calls)
+    manager = FotMobTrinoTableManager(
+        source="fotmob:test", host="trino", port=8443, user="generic-user"
+    )
+    manager._create_connection()
+    kwargs = calls[-1]
+    assert kwargs["user"] == "src_fotmob"
+    assert kwargs["auth"] == ("basic", "src_fotmob", "source-synthetic")
+    assert kwargs["http_scheme"] == "https"
+    assert kwargs["verify"] is False
+    assert kwargs["source"] == "fotmob:test"
+
+
+def test_source_only_password_defaults_to_tls_port(monkeypatch):
+    from scrapers.fotmob.trino_instrumentation import FotMobTrinoTableManager
+
+    for key in ("TRINO_PASSWORD", "TRINO_USER", "TRINO_PORT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TRINO_SRC_FOTMOB_PASSWORD", "source-synthetic")
+    calls = []
+    _fake_trino(monkeypatch, calls)
+    manager = FotMobTrinoTableManager(source="fotmob:test", host="trino")
+    assert manager.port == 8443
+    manager._create_connection()
+    kwargs = calls[-1]
+    assert kwargs["user"] == "src_fotmob"
+    assert kwargs["auth"] == ("basic", "src_fotmob", "source-synthetic")
+    assert kwargs["http_scheme"] == "https"
+    assert kwargs["verify"] is False
+
+
+def test_default_connection_user_is_source_without_password_env(monkeypatch):
+    from scrapers.fotmob.trino_instrumentation import FotMobTrinoTableManager
+
+    for key in ("TRINO_PASSWORD", "TRINO_SRC_FOTMOB_PASSWORD", "TRINO_USER"):
+        monkeypatch.delenv(key, raising=False)
+    calls = []
+    _fake_trino(monkeypatch, calls)
+    manager = FotMobTrinoTableManager(source="fotmob:test", host="trino", port=8080)
+    manager._create_connection()
+    assert calls[-1]["user"] == "src_fotmob"
+
+
 def _fake_trino(monkeypatch, calls):
     """Подменить клиент Trino в базовом модуле и собирать kwargs connect()."""
 
@@ -42,6 +92,12 @@ def _fake_trino(monkeypatch, calls):
         raising=False,
     )
     return calls
+
+
+@pytest.fixture(autouse=True)
+def _isolate_trino_credentials(monkeypatch):
+    for key in ("TRINO_PASSWORD", "TRINO_SRC_FOTMOB_PASSWORD", "TRINO_USER"):
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.mark.unit
@@ -94,7 +150,7 @@ class TestSource:
         manager._create_connection()
 
         assert calls[-1]["http_scheme"] == "https"
-        assert calls[-1]["auth"] == ("basic", "airflow", "secret")
+        assert calls[-1]["auth"] == ("basic", "src_fotmob", "secret")
         assert calls[-1]["verify"] is False
         assert calls[-1]["source"] == "fotmob:current:x"
 

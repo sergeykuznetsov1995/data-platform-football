@@ -7,6 +7,8 @@ import sys
 from contextlib import contextmanager
 from datetime import timedelta
 
+from types import SimpleNamespace
+
 import pytest
 
 pytestmark = pytest.mark.unit
@@ -122,3 +124,62 @@ def test_production_batch_cap_cannot_be_overridden(size):
     module = _reload()
     with pytest.raises(ValueError, match='1–10'):
         module._config({'max_partitions_per_batch': size})
+
+
+def test_cursor_uses_fotmob_source_connection(monkeypatch):
+    module = _reload()
+    import trino
+    from utils.silver_tasks import _PARTITION_STAGED_SESSION_PROPERTIES
+
+    calls = []
+    cursor = object()
+    closed = []
+    connection = SimpleNamespace(
+        cursor=lambda: cursor, close=lambda: closed.append(True)
+    )
+    monkeypatch.setenv("TRINO_SRC_FOTMOB_PASSWORD", "synthetic-source")
+    monkeypatch.setenv("TRINO_HOST", "trino.example")
+    monkeypatch.setenv("TRINO_PORT", "9443")
+    monkeypatch.setattr(
+        trino.auth, "BasicAuthentication",
+        lambda user, password: ("basic", user, password),
+    )
+    monkeypatch.setattr(
+        trino.dbapi, "connect", lambda **kwargs: calls.append(kwargs) or connection
+    )
+    import utils.silver_tasks as shared
+    monkeypatch.setattr(
+        shared, "_get_trino_connection",
+        lambda **kwargs: pytest.fail("shared Trino helper must not be used"),
+    )
+
+    with module._cursor() as admitted:
+        assert admitted._cursor is cursor
+
+    assert closed == [True]
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["user"] == "src_fotmob"
+    assert kwargs["source"] == "fotmob:silver"
+    assert kwargs["host"] == "trino.example"
+    assert kwargs["port"] == 9443
+    assert kwargs["catalog"] == "iceberg"
+    assert kwargs["http_scheme"] == "https"
+    assert kwargs["auth"] == ("basic", "src_fotmob", "synthetic-source")
+    assert kwargs["verify"] is False
+    assert kwargs["session_properties"] == {
+        **_PARTITION_STAGED_SESSION_PROPERTIES, **module.build.SESSION_PROPERTIES
+    }
+
+
+def test_cursor_requires_fotmob_source_password(monkeypatch):
+    module = _reload()
+    import trino
+    monkeypatch.delenv("TRINO_SRC_FOTMOB_PASSWORD", raising=False)
+    monkeypatch.setattr(
+        trino.dbapi, "connect",
+        lambda **kwargs: pytest.fail("connect must not be called without source password"),
+    )
+    with pytest.raises(RuntimeError, match="TRINO_SRC_FOTMOB_PASSWORD"):
+        with module._cursor():
+            pass

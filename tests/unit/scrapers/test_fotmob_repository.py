@@ -3460,3 +3460,85 @@ def test_missing_players_cooldown_and_attempt_order_survive_build_change(monkeyp
     attempt(4, ManifestStatus.RETRYABLE_FAILURE, now + timedelta(seconds=1))
     assert select(2) == [3, 5]  # priority order is 5, 3; output must be sorted
     db.close()
+
+
+class SquadTrino:
+    def __init__(self, rows=(), exists=True):
+        self.rows = rows
+        self.exists = exists
+        self.queries = []
+
+    def table_exists(self, schema, table):
+        return self.exists and table == "fotmob_squad_snapshots_current"
+
+    def execute_query(self, sql):
+        self.queries.append(sql)
+        return self.rows
+
+
+class SquadWriter(RecordingWriter):
+    def __init__(self, rows=(), exists=True):
+        super().__init__()
+        self.trino = SquadTrino(rows=rows, exists=exists)
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
+def test_batch_squad_ids_use_one_query_and_preserve_buffered_rows():
+    writer = SquadWriter(rows=[(30,), ("bad",), 40])
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        _commit(target_type="team", entity_id="1"),
+        [TableRows("fotmob_squad_snapshots", [
+            {"team_id": "1", "member_type": "player", "member_id": "20"},
+            {"team_id": "1", "member_type": "coach", "member_id": "99"},
+        ], "squad_snapshots")],
+    )
+
+    assert repository.current_squad_player_ids_for_teams(["1", "2", "1"]) == {20, 30, 40}
+    assert len(writer.trino.queries) == 1
+    sql = writer.trino.queries[0]
+    assert "team_id IN ('1', '2')" in sql
+    assert "member_type = 'player'" in sql
+    assert "member_id IS NOT NULL" in sql
+
+
+def test_batch_squad_ids_empty_input_does_not_query():
+    writer = SquadWriter()
+    repository = FotMobRepository(writer=writer)
+    assert repository.current_squad_player_ids_for_teams([]) == set()
+    assert writer.trino.queries == []
+
+
+def test_batch_squad_ids_missing_view_returns_latest_buffered_batch():
+    writer = SquadWriter(exists=False)
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        _commit(target_type="team", entity_id="1", target_key="team-old",
+                content_hash="1" * 64, fetched_at=datetime(2026, 7, 11, 8, 30)),
+        [TableRows("fotmob_squad_snapshots", [
+            {"team_id": "1", "member_type": "player", "member_id": "10"},
+        ], "squad_snapshots")],
+    )
+    repository.commit(
+        _commit(target_type="team", entity_id="1", target_key="team-new",
+                content_hash="2" * 64, fetched_at=datetime(2026, 7, 11, 9, 30)),
+        [TableRows("fotmob_squad_snapshots", [
+            {"team_id": "1", "member_type": "player", "member_id": "20"},
+        ], "squad_snapshots")],
+    )
+
+    assert repository.current_squad_player_ids_for_teams(["1"]) == {20}
+    assert writer.trino.queries == []
+
+
+def test_single_squad_lookup_delegates_to_batch(monkeypatch):
+    repository = FotMobRepository(writer=RecordingWriter())
+    calls = []
+    monkeypatch.setattr(
+        repository, "current_squad_player_ids_for_teams",
+        lambda team_ids: calls.append(list(team_ids)) or {99},
+    )
+    assert repository.current_squad_player_ids(7) == {99}
+    assert calls == [[7]]

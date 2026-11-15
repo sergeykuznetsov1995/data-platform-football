@@ -47,6 +47,7 @@ x-airflow-common: &airflow-common
     # mount so task code cannot rewrite its own trust proof.
     FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH: ${FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH:?set exact report path under /opt/airflow/fotmob-admission}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
+    TRINO_SRC_FOTMOB_PASSWORD: ${TRINO_SRC_FOTMOB_PASSWORD:?set FotMob source Trino password}
     TRINO_PORT: ${TRINO_PORT}
     TRINO_HOST: ${TRINO_HOST:-trino}
     # Raw-first FBref pages share the existing SeaweedFS bucket but live

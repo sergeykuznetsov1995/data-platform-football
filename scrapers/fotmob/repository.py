@@ -3273,12 +3273,16 @@ class FotMobRepository:
         """Player IDs of a squad this run committed but has not flushed yet."""
 
         wanted = str(team_id)
+        pending_team = self._pending_entities.get(("team", wanted))
+        batch_id = pending_team.get("batch_id") if pending_team is not None else None
         output: set[int] = set()
         for (table, _, _), rows in self._pending.items():
             if table != "fotmob_squad_snapshots":
                 continue
             for row in rows:
                 if str(row.get("team_id")) != wanted:
+                    continue
+                if pending_team is not None and row.get("_target_batch_id") != batch_id:
                     continue
                 if row.get("member_type") != "player":
                     continue
@@ -3291,7 +3295,16 @@ class FotMobRepository:
     def current_squad_player_ids(self, team_id: str | int) -> set[int]:
         """Load player IDs from the latest committed snapshot of one team."""
 
-        buffered = self._buffered_squad_player_ids(team_id)
+        return self.current_squad_player_ids_for_teams([team_id])
+
+    def current_squad_player_ids_for_teams(self, team_ids) -> set[int]:
+        """Load current squad player IDs for teams with one durable query."""
+        wanted = list(dict.fromkeys(str(team_id) for team_id in team_ids))
+        if not wanted:
+            return set()
+        buffered: set[int] = set()
+        for team_id in wanted:
+            buffered.update(self._buffered_squad_player_ids(team_id))
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
             return buffered
@@ -3299,12 +3312,12 @@ class FotMobRepository:
         table = "fotmob_squad_snapshots_current"
         if not trino.table_exists(self.schema, table):
             return buffered
-        safe_id = str(team_id).replace("'", "''")
+        safe_ids = ", ".join("'" + team_id.replace("'", "''") + "'" for team_id in wanted)
         rows = trino.execute_query(
             f"""
             SELECT DISTINCT member_id
             FROM {self.catalog}.{self.schema}.{table}
-            WHERE team_id = '{safe_id}'
+            WHERE team_id IN ({safe_ids})
               AND member_type = 'player'
               AND member_id IS NOT NULL
             """
@@ -3884,6 +3897,13 @@ class MemoryFotMobRepository:
                 output.add(int(row["member_id"]))
             except (KeyError, TypeError, ValueError):
                 continue
+        return output
+
+    def current_squad_player_ids_for_teams(self, team_ids) -> set[int]:
+        """Union the latest committed squad for each distinct team."""
+        output: set[int] = set()
+        for team_id in dict.fromkeys(str(team_id) for team_id in team_ids):
+            output.update(self.current_squad_player_ids(team_id))
         return output
 
     def missing_current_squad_player_ids(self, limit: int) -> list[int]:
