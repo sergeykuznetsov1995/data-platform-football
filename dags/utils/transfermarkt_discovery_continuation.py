@@ -130,6 +130,57 @@ _WAF_RECOVERY_REASON = 'audited AWS WAF failure; cached blocked seed quarantined
 _WAF_RECOVERY_ERROR = ('required discovery page failed: '
                        'url=https://www.transfermarkt.com/navigation/wettbewerbe, '
                        'status=blocked, http=405')
+# One owner-authorized quarantine (#2266, 2026-11-15): the live paused cohort
+# tm-discovery-job-f0ce199ada11c30894e08432 finished reading the catalogue, but
+# the 'every discovered competition must have at least one edition' validator
+# can never complete while three terminal entries sit unrebuyable in the
+# failure cache: two AWS WAF 405 pages (NIS3, RPLW) and one transport lease
+# rejection (SC14).  The quarantine removes exactly those three pinned
+# entries from the cache — every cached success stays, so nothing is rebought
+# — and the next slot may buy the three pages again.  This is not
+# configurable permission to purge arbitrary cache entries: anything that
+# does not match every pin exactly (marker hash, cohort identity, status,
+# portion, whole-cache digest and each entry's audited evidence) stays
+# fail-closed, and the identity/started-time checks above still run first.
+KNOWN_QUARANTINE_20261115 = {
+    'marker_stable_hash': '9dca5a1568148b33e422cac10f55586eaff7380e3b8e165a1fd8d829a6d2a843',
+    'cohort_job_id': 'tm-discovery-job-f0ce199ada11c30894e08432',
+    'cohort_status': 'paused',
+    'portion': 17,
+    'failures_file_sha256': '32f228961bba5aaee736d64c52d4030f30b8e2fd17ab7329361e8c54397a857f',
+    'urls': {
+        'https://www.transfermarkt.com/nisa/startseite/wettbewerb/NIS3': {
+            'status': 'blocked', 'error': 'HTTP 405',
+            'raw_capture_id': 'd6d401a330ba0a3cf62f16624c473b7c02fb76873232b4482cb0c6d96e405181',
+            'raw_body_hash': '2df37731bc0327f0af7a7619d81b5bacd916f93c59b6fbda482aed686ea737e1',
+            'raw_attempt_envelope_ids': [
+                '5813f6d8793449a333ba569cf8a7755cd64631f3efe36ab87288b738b748e6e2',
+                '5693fb502819a45cb46e4ed25dff94048203d83776f8570d1e28c2fa55113199'],
+            'attempts': 2,
+            'entry_sha256': '0da1c8eaa87d92f07858497cea3417d716b18c36fa80a0f267c6df496b63be5c',
+        },
+        'https://www.transfermarkt.com/second-league-division-b-gruppe-2-2023-/startseite/wettbewerb/RPLW': {
+            'status': 'blocked', 'error': 'HTTP 405',
+            'raw_capture_id': 'f9d50690b45570b0f6f6b23fa9300ad0ef3ad33409e2f13b1515a31d58527491',
+            'raw_body_hash': 'c925d9e5175d3e877018cbed5528e621ab9ff9f00b9a450320c6902a227ead09',
+            'raw_attempt_envelope_ids': [
+                'a987fbd31d57073fdfb36fbd0c95ad1049a27a6491322609052f8cbe66118a6c',
+                'c3acdefff74e20f48618e9311db084414f68a73563c462b700fac2d8499b1daa'],
+            'attempts': 2,
+            'entry_sha256': 'd1a87bf01d02facf79f6127bd34fdc35939e4f8ab2304bb4ec32de5842ccab16',
+        },
+        'https://www.transfermarkt.com/supercopa-mx/startseite/wettbewerb/SC14': {
+            'status': 'retry_exhausted', 'error': 'transport:proxy:LeaseConcurrencyLimited',
+            'raw_capture_id': None,
+            'raw_body_hash': None,
+            'raw_attempt_envelope_ids': [
+                '2a0f1bdfcc67bd35a92aac8d1fa52d318c621d823405be6fea6b9db7d043cc6e',
+                'efa0424bc7aef70463d75e6009c2a56e20c5d5af5948c3c4f842bc46dfef2925'],
+            'attempts': 1,
+            'entry_sha256': '9f22e06d672c188430547c62281ed5789c606bce86961028cd60edbd2d0069fc',
+        },
+    },
+}
 
 
 class DiscoveryPortionComplete(RuntimeError):
@@ -663,6 +714,133 @@ def _recover_known_waf_failure(path: Path, saved: dict[str, Any], *,
     write_job(path, saved, write)
 
 
+def _quarantine_known_waf_entries(path: Path, saved: dict[str, Any], *,
+                                  now: datetime, write: Callable) -> None:
+    """Remove exactly the pinned terminal cache entries of the live cohort (#2266).
+
+    The 2026-11-15 owner-authorized quarantine targets the single audited
+    paused cohort whose catalogue read-out completed but whose validator can
+    never finish while three pinned terminal entries sit unrebuyable in the
+    failure cache.  The quarantine keeps every cached success (nothing is
+    rebought), archives the exact original evidence, and rewrites only the
+    failures artifact hash on the marker.  Anything off-pin fails closed
+    without a single write.
+    """
+    descriptor = KNOWN_QUARANTINE_20261115
+    if (stable_payload_hash(saved) != descriptor['marker_stable_hash']
+            or saved.get('job_id') != descriptor['cohort_job_id']
+            or saved.get('status') != descriptor['cohort_status']
+            or saved.get('portion') != descriptor['portion']):
+        raise ValueError('quarantine marker differs from the audited pin')
+    if saved['job_id'] != ('tm-discovery-job-'
+                           + stable_payload_hash(saved.get('identity'))[:24]):
+        raise ValueError('quarantine job_id is not bound to its identity')
+    checkpoint = Path(saved['checkpoint_path'])
+    if (not checkpoint.is_absolute()
+            or checkpoint != path.parent / saved['job_id'] / 'checkpoint.json'):
+        raise ValueError('quarantine checkpoint is not bound to its cohort')
+    if not _settled_traffic_snapshot(saved.get('traffic')):
+        raise ValueError('quarantine traffic is not a complete settled snapshot')
+    failures = checkpoint.with_suffix('.failures.json')
+    quarantine = checkpoint.with_suffix('.failures.blocked.json')
+
+    pinned_urls = descriptor['urls']
+    try:
+        failures_bytes = failures.read_bytes()
+        failures_digest = hashlib.sha256(failures_bytes).hexdigest()
+        current_failures = json.loads(failures_bytes)
+    except (OSError, ValueError) as exc:
+        raise ValueError('quarantine failure cache is unreadable') from exc
+    if not isinstance(current_failures, dict):
+        raise ValueError('quarantine failure cache is not an object')
+    if failures_digest == descriptor['failures_file_sha256']:
+        removed_entries = {url: current_failures[url] for url in pinned_urls}
+        retained_failures = {k: v for k, v in current_failures.items()
+                             if k not in pinned_urls}
+    elif quarantine.exists():
+        # Crash-safe replay between the quarantine write and the cache/marker
+        # writes: the cache is either still the pinned original or already
+        # the retained remainder (both writes are atomic single files).
+        try:
+            existing = json.loads(quarantine.read_text())
+        except (OSError, ValueError) as exc:
+            raise ValueError('quarantine evidence is unreadable') from exc
+        if (not isinstance(existing, dict)
+                or existing.get('schema') != 'transfermarkt-discovery-quarantine-20261115-v1'
+                or existing.get('original_failures_sha256')
+                != descriptor['failures_file_sha256']
+                or not isinstance(existing.get('removed_entries'), dict)):
+            raise ValueError('quarantine evidence does not match the audited pin')
+        removed_entries = existing['removed_entries']
+        if any(url in current_failures for url in pinned_urls):
+            raise ValueError('quarantine failure cache differs from the replay state')
+        retained_failures = current_failures
+    else:
+        raise ValueError('quarantine failure cache differs from the pinned state')
+
+    for url, pin in pinned_urls.items():
+        entry = removed_entries.get(url)
+        if not isinstance(entry, dict) or any(
+                entry.get(field) != pin[field]
+                for field in ('status', 'error', 'raw_capture_id',
+                              'raw_body_hash', 'raw_attempt_envelope_ids',
+                              'attempts')):
+            raise ValueError('quarantine entry evidence does not match the pin')
+        digest = hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
+        if digest != pin['entry_sha256']:
+            raise ValueError('quarantine entry evidence does not match the pin')
+    terminal = {url: entry.get('status')
+                for url, entry in current_failures.items()
+                if isinstance(entry, dict) and entry.get('status') not in (None, 'ok')}
+    if failures_digest == descriptor['failures_file_sha256'] and terminal != {
+            url: pin['status'] for url, pin in pinned_urls.items()}:
+        raise ValueError('quarantine terminal entries do not match the pinned set')
+
+    retained = {
+        'schema': 'transfermarkt-discovery-quarantine-20261115-v1',
+        'job_id': saved['job_id'],
+        'original_marker_hash': descriptor['marker_stable_hash'],
+        'original_failures_sha256': descriptor['failures_file_sha256'],
+        'urls': pinned_urls,
+        'original_marker': saved,
+        'removed_entries': removed_entries,
+    }
+    existing_quarantine = None
+    if quarantine.exists():
+        try:
+            existing_quarantine = json.loads(quarantine.read_text())
+        except (OSError, ValueError) as exc:
+            raise ValueError('quarantine file is unreadable') from exc
+    if existing_quarantine is not None and existing_quarantine != retained:
+        raise ValueError('quarantine file conflicts with the audited evidence')
+    if existing_quarantine is None:
+        _write_recovery_json(quarantine, retained, write)
+
+    if current_failures != retained_failures or failures_digest == descriptor['failures_file_sha256']:
+        write(failures, retained_failures)
+    try:
+        readback_bytes = failures.read_bytes()
+        readback_cache = json.loads(readback_bytes)
+    except (OSError, ValueError) as exc:
+        raise ValueError('quarantine failure cache write differs') from exc
+    if readback_cache != retained_failures:
+        raise ValueError('quarantine failure cache write differs')
+    readback = hashlib.sha256(readback_bytes).hexdigest()
+
+    updated = dict(saved)
+    updated['artifacts'] = {**saved.get('artifacts', {})}
+    updated['artifacts'][str(failures)] = readback
+    updated['updated_at'] = now.isoformat()
+    write_job(path, updated, write)
+    readback_marker = read_job(path)
+    expected_marker = dict(updated)
+    expected_marker.pop('updated_at', None)
+    actual_marker = dict(readback_marker)
+    actual_marker.pop('updated_at', None)
+    if actual_marker != expected_marker:
+        raise ValueError('quarantine marker write differs')
+
+
 def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Callable) -> dict[str, Any]:
     """Keep one grant across slots and days; nothing renews its caps."""
     # Compute the fresh cohort's job_id once, up front: it is both the
@@ -725,6 +903,15 @@ def select_job(path: Path, identity: dict[str, Any], *, now: datetime, write: Ca
                         and stable_payload_hash(saved) == KNOWN_PAID_IO_FAILURE_RECOVERY['marker_hash']):
                     _recover_known_paid_io_failure(path, saved, now=now, write=write)
                     return saved
+                # Owner-authorized 2026-11-15 quarantine (#2266): the pinned
+                # paused marker's three terminal cache entries are removed
+                # (cached successes stay) so the next slot may rebuy only
+                # those pages; off-pin markers never reach this branch.
+                if (saved['status'] == 'paused'
+                        and stable_payload_hash(saved)
+                        == KNOWN_QUARANTINE_20261115['marker_stable_hash']):
+                    _quarantine_known_waf_entries(path, saved, now=now, write=write)
+                    saved = read_job(path)
                 if saved['status'] not in {'ready', 'paused', 'source_complete'}:
                     raise ValueError('active discovery cohort has unresolved traffic or writes')
                 return saved

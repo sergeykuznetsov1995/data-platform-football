@@ -1219,6 +1219,215 @@ def test_waf_recovery_literal_production_pin():
     assert pin['raw_attempt_envelope_ids'] == _WAF_ENVELOPES
 
 
+# --- Owner-authorized 2026-11-15 quarantine of three terminal cache entries ---
+
+_QUARANTINE_OK_A = 'https://www.transfermarkt.com/ok-a'
+_QUARANTINE_OK_B = 'https://www.transfermarkt.com/ok-b'
+_QUARANTINE_URLS = (
+    'https://www.transfermarkt.com/nisa/startseite/wettbewerb/NIS3',
+    'https://www.transfermarkt.com/second-league-division-b-gruppe-2-2023-/startseite/wettbewerb/RPLW',
+    'https://www.transfermarkt.com/supercopa-mx/startseite/wettbewerb/SC14',
+)
+
+
+def _quarantine_entry(status='blocked', error='HTTP 405', attempts=2):
+    return {'status': status, 'error': error, 'attempts': attempts,
+            'raw_capture_id': 'capture-1' if status == 'blocked' else None,
+            'raw_body_hash': 'body-1' if status == 'blocked' else None,
+            'raw_attempt_envelope_ids': ['env-1', 'env-2']}
+
+
+def _quarantine_cache_document(extra_terminal=None):
+    document = {
+        _QUARANTINE_OK_A: {'status': 'ok'},
+        _QUARANTINE_OK_B: {'status': 'ok'},
+        _QUARANTINE_URLS[0]: _quarantine_entry(),
+        _QUARANTINE_URLS[1]: _quarantine_entry(),
+        _QUARANTINE_URLS[2]: _quarantine_entry(
+            status='retry_exhausted',
+            error='transport:proxy:LeaseConcurrencyLimited', attempts=1),
+    }
+    if extra_terminal is not None:
+        document['https://www.transfermarkt.com/extra'] = extra_terminal
+    return document
+
+
+def _quarantine_pins(urls):
+    pins = {}
+    for url in _QUARANTINE_URLS:
+        entry = _quarantine_entry()
+        if url.endswith('SC14'):
+            entry = _quarantine_entry(
+                status='retry_exhausted',
+                error='transport:proxy:LeaseConcurrencyLimited', attempts=1)
+        pins[url] = {
+            'status': entry['status'], 'error': entry['error'],
+            'raw_capture_id': entry['raw_capture_id'],
+            'raw_body_hash': entry['raw_body_hash'],
+            'raw_attempt_envelope_ids': entry['raw_attempt_envelope_ids'],
+            'attempts': entry['attempts'],
+            'entry_sha256': hashlib.sha256(
+                json.dumps(entry, sort_keys=True).encode()).hexdigest(),
+        }
+    return pins
+
+
+def quarantine_paused(tmp_path, monkeypatch, *, cache=None, extra_terminal=None,
+                      portion=17):
+    """The audited paused marker plus its pinned terminal cache entries."""
+    path, job = prepared(tmp_path)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    failures = checkpoint.with_suffix('.failures.json')
+    document = (_quarantine_cache_document(extra_terminal)
+                if cache is None else cache)
+    failures.write_text(json.dumps(document))
+    job.update(status='paused', portion=portion, traffic=_traffic(),
+               artifacts={str(checkpoint): '0' * 64,
+                          str(failures): hashlib.sha256(
+                              failures.read_bytes()).hexdigest()})
+    cohorts.write_job(path, job, write)
+    monkeypatch.setattr(cohorts, 'KNOWN_QUARANTINE_20261115', {
+        'marker_stable_hash': stable_payload_hash(job),
+        'cohort_job_id': job['job_id'],
+        'cohort_status': 'paused',
+        'portion': 17,
+        'failures_file_sha256': hashlib.sha256(
+            failures.read_bytes()).hexdigest(),
+        'urls': _quarantine_pins(_QUARANTINE_URLS),
+    })
+    return path, job, failures
+
+
+def test_quarantine_removes_pinned_entries_and_keeps_cached_successes(
+        tmp_path, monkeypatch):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    resumed = cohorts.select_job(path, identity(), now=NOW + timedelta(days=2),
+                                 write=write)
+    # The three pinned pages leave the cache; every success stays.
+    cache = json.loads(failures.read_text())
+    assert set(cache) == {_QUARANTINE_OK_A, _QUARANTINE_OK_B}
+    assert resumed['status'] == 'paused'
+    assert resumed['portion'] == 17
+    assert resumed['traffic'] == job['traffic']
+    assert resumed['artifacts'][str(failures)] == hashlib.sha256(
+        failures.read_bytes()).hexdigest()
+    quarantine = failures.with_suffix('.blocked.json')
+    evidence = json.loads(quarantine.read_text())
+    assert evidence['schema'] == 'transfermarkt-discovery-quarantine-20261115-v1'
+    assert evidence['original_marker_hash'] == stable_payload_hash(job)
+    assert set(evidence['removed_entries']) == set(_QUARANTINE_URLS)
+    assert evidence['removed_entries'][_QUARANTINE_URLS[2]][
+        'status'] == 'retry_exhausted'
+    # The rewritten marker no longer matches the quarantine pin: a repeat
+    # selection is the ordinary paused resume, never a second quarantine.
+    again = cohorts.select_job(path, identity(), now=NOW + timedelta(days=2),
+                               write=write)
+    assert again['artifacts'][str(failures)] == resumed['artifacts'][str(failures)]
+    assert json.loads(failures.read_text()) == cache
+    assert json.loads(quarantine.read_text()) == evidence
+
+
+def test_quarantine_completes_after_crash_between_steps(tmp_path, monkeypatch):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    # A crash right after the quarantine file leaves the cache untouched;
+    # the next selection must finish the remaining writes, not refuse.
+    quarantine = failures.with_suffix('.blocked.json')
+    pins = cohorts.KNOWN_QUARANTINE_20261115
+    document = json.loads(failures.read_text())
+    quarantine.write_text(json.dumps({
+        'schema': 'transfermarkt-discovery-quarantine-20261115-v1',
+        'job_id': job['job_id'],
+        'original_marker_hash': pins['marker_stable_hash'],
+        'original_failures_sha256': pins['failures_file_sha256'],
+        'urls': pins['urls'],
+        'original_marker': job,
+        'removed_entries': {url: document[url] for url in _QUARANTINE_URLS},
+    }))
+    cohorts.select_job(path, identity(), now=NOW, write=write)
+    cache = json.loads(failures.read_text())
+    assert set(cache) == {_QUARANTINE_OK_A, _QUARANTINE_OK_B}
+    marker = cohorts.read_job(path)
+    assert marker['artifacts'][str(failures)] == hashlib.sha256(
+        failures.read_bytes()).hexdigest()
+
+
+def test_quarantine_off_pin_marker_resumes_without_touching_cache(
+        tmp_path, monkeypatch):
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch, portion=17)
+    # A different portion keeps the marker off-pin: ordinary paused resume.
+    job.update(portion=18)
+    cohorts.write_job(path, job, write)
+    before = failures.read_bytes()
+    resumed = cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert resumed['portion'] == 18
+    assert failures.read_bytes() == before
+    assert not failures.with_suffix('.blocked.json').exists()
+
+
+@pytest.mark.parametrize('mutation, message', [
+    ('extra_terminal', 'terminal entries do not match'),
+    ('cache_drift', 'differs from the pinned state'),
+    ('entry_drift', 'differs from the pinned state'),
+])
+def test_quarantine_fails_closed_on_evidence_drift(tmp_path, monkeypatch,
+                                                    mutation, message):
+    cache = _quarantine_cache_document()
+    if mutation == 'extra_terminal':
+        cache = _quarantine_cache_document(
+            extra_terminal=_quarantine_entry())
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch, cache=cache)
+    # Mutate the cache AFTER the pin froze its original digest.
+    if mutation in ('cache_drift', 'entry_drift'):
+        drifted = json.loads(failures.read_text())
+        if mutation == 'cache_drift':
+            drifted[_QUARANTINE_OK_B] = {'status': 'ok', 'changed': True}
+        else:
+            drifted[_QUARANTINE_URLS[0]] = _quarantine_entry(attempts=3)
+        failures.write_text(json.dumps(drifted))
+    before_marker = path.read_bytes()
+    before_cache = failures.read_bytes()
+    with pytest.raises(ValueError, match=message):
+        cohorts.select_job(path, identity(), now=NOW, write=write)
+    assert path.read_bytes() == before_marker
+    assert failures.read_bytes() == before_cache
+    assert not failures.with_suffix('.blocked.json').exists()
+
+
+def test_quarantine_resumes_the_cohort_on_the_next_portion(tmp_path, monkeypatch):
+    from scrapers.transfermarkt.models import SharedTrafficLedger
+    path, job, failures = quarantine_paused(tmp_path, monkeypatch)
+    checkpoint = Path(job['checkpoint_path'])
+    checkpoint.write_text(json.dumps({'page': {'hash': 'x'}}))
+    marker = cohorts.read_job(path)
+    marker['artifacts'][str(checkpoint)] = hashlib.sha256(
+        checkpoint.read_bytes()).hexdigest()
+    cohorts.write_job(path, marker, write)
+    cohorts.select_job(path, identity(), now=NOW, write=write)
+    ledger = SharedTrafficLedger(hard_provider_bytes=10000,
+                                 soft_provider_bytes=9000, retry_limit=10)
+    continuation = cohorts.DiscoveryContinuation(
+        path, identity(), ledger, write, now=lambda: NOW, run_id='run-18')
+    assert continuation.portion == 18
+    assert continuation.saved['status'] == 'paused'
+
+
+def test_quarantine_literal_production_pin():
+    pin = cohorts.KNOWN_QUARANTINE_20261115
+    assert pin['cohort_job_id'] == 'tm-discovery-job-f0ce199ada11c30894e08432'
+    assert pin['marker_stable_hash'] == '9dca5a1568148b33e422cac10f55586eaff7380e3b8e165a1fd8d829a6d2a843'
+    assert pin['portion'] == 17
+    assert pin['failures_file_sha256'] == '32f228961bba5aaee736d64c52d4030f30b8e2fd17ab7329361e8c54397a857f'
+    assert set(pin['urls']) == {
+        'https://www.transfermarkt.com/nisa/startseite/wettbewerb/NIS3',
+        'https://www.transfermarkt.com/second-league-division-b-gruppe-2-2023-/startseite/wettbewerb/RPLW',
+        'https://www.transfermarkt.com/supercopa-mx/startseite/wettbewerb/SC14',
+    }
+    for url, entry in pin['urls'].items():
+        assert entry['status'] in ('blocked', 'retry_exhausted')
+        assert entry['entry_sha256'] != ''
+
+
 
 def test_waf_recovery_rejects_changed_artifact_without_writing(tmp_path, monkeypatch):
     path, job, _ = waf_failed(tmp_path, monkeypatch)
