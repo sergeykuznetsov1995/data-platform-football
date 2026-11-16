@@ -1,10 +1,13 @@
 """Small, single-attempt client for the dedicated ClubElo gateway."""
 
 import os
+import re
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 import requests
+
+_UPSTREAM_FINGERPRINT_RE = re.compile(r"\A[0-9a-f]{16}\Z", re.ASCII)
 
 
 class ClubEloLease:
@@ -17,6 +20,7 @@ class ClubEloLease:
         self.lease_id = None
         self.token = None
         self.proxy_url = None
+        self.upstream_fingerprint = None
 
     def acquire(self):
         control_token = os.environ.get("CLUBELO_PROXY_CONTROL_TOKEN", "").strip()
@@ -62,6 +66,14 @@ class ClubEloLease:
                 or proxy.query or proxy.fragment):
             raise ValueError("ClubElo gateway returned an invalid proxy URL")
         self.proxy_url = f"http://lease:{quote(self.token, safe='')}@{proxy.netloc}"
+        fingerprint = data.get("upstream_fingerprint")
+        if fingerprint is not None and (
+                not isinstance(fingerprint, str)
+                or not _UPSTREAM_FINGERPRINT_RE.match(fingerprint)):
+            raise ValueError(
+                "ClubElo gateway returned an invalid upstream fingerprint"
+            )
+        self.upstream_fingerprint = fingerprint
         return self
 
     def close(self):

@@ -1,14 +1,23 @@
-"""ClubElo transport (#1462): white list, pace, retries, block stop, wire bytes."""
+"""ClubElo transport (#1462): white list, pace, retries, block stop, wire bytes.
+
+#2246 adds bootstrap observability: every Cloudflare bootstrap attempt —
+success, solver failure or lease refusal — emits exactly one JSON record on
+the ``clubelo_bootstrap_attempt`` prefix. These tests parse the records as
+JSON (never substring-grepping for structure) and prove the bounded allowlist
+and the redaction of cookies, userAgent, proxy credentials and secrets.
+"""
 
 from __future__ import annotations
 
 import builtins
 import gzip
+import json
 
 import pytest
 import requests
 
 from scrapers.clubelo.transport import (
+    BOOTSTRAP_LOG_PREFIX,
     ClubEloBlocked,
     ClubEloFetchError,
     ClubEloTransport,
@@ -269,6 +278,38 @@ def _challenge():
     return FakeResponse(403, b"challenge", {"cf-mitigated": "challenge"})
 
 
+_ATTEMPT_KEYS = frozenset({
+    "schema", "event", "attempt", "outcome", "retry", "lease_id",
+    "upstream_fingerprint", "latency_ms", "failed_validation_predicate",
+})
+
+
+def _attempt_records(caplog):
+    """Parse every #2246 JSON attempt record; each record is the whole allowlist."""
+    records = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if not message.startswith(BOOTSTRAP_LOG_PREFIX + " "):
+            continue
+        data = json.loads(message[len(BOOTSTRAP_LOG_PREFIX) + 1:])
+        assert set(data) == _ATTEMPT_KEYS
+        assert data["schema"] == 1 and data["event"] == BOOTSTRAP_LOG_PREFIX
+        assert isinstance(data["attempt"], int) and data["attempt"] >= 1
+        assert isinstance(data["retry"], bool)
+        assert isinstance(data["latency_ms"], int) and data["latency_ms"] >= 0
+        records.append(data)
+    return records
+
+
+@pytest.fixture
+def identified_lease(bootstrap):
+    """The bootstrap lease double carrying a lease id and a stage-1 fingerprint."""
+    _events, Lease, _Solver = bootstrap
+    Lease.lease_id = "lease-7741"
+    Lease.upstream_fingerprint = "0123456789abcdef"
+    return bootstrap
+
+
 def test_challenge_solver_then_http_raw_same_lease(bootstrap):
     events, Lease, _ = bootstrap
     session = _challenge_session({"/Results": [_challenge(), FakeResponse(200, b"HTTP RAW")],
@@ -432,3 +473,232 @@ def test_solver_failure_reason_is_named(bootstrap, monkeypatch, error, reason):
             transport.get("/Ranking")
     assert "secret" not in str(caught.value)
     assert events.count("acquire") == events.count("release") == 3
+
+
+def test_success_emits_exactly_one_clearance_accepted_record(identified_lease, caplog):
+    _events, _Lease, _Solver = identified_lease
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session) as transport:
+        transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert set(record) == set(_ATTEMPT_KEYS)  # bounded allowlist, no extra keys
+    assert record["schema"] == 1 and record["event"] == BOOTSTRAP_LOG_PREFIX
+    assert record["attempt"] == 1
+    assert record["outcome"] == "clearance_accepted"
+    assert record["retry"] is False
+    assert record["lease_id"] == "lease-7741"
+    assert record["upstream_fingerprint"] == "0123456789abcdef"
+    assert record["latency_ms"] >= 0
+    assert record["failed_validation_predicate"] is None
+
+
+def test_tunnel_then_success_records_one_record_per_attempt(identified_lease, caplog):
+    from scrapers.base.flaresolverr_client import FlareSolverrError
+
+    _events, _Lease, Solver = identified_lease
+    original_get = Solver.get
+    seen = []
+
+    def get(self, url, session_id):
+        seen.append(url)
+        if len(seen) == 1:
+            raise FlareSolverrError(
+                "HTTP 500: net::ERR_TUNNEL_CONNECTION_FAILED lease:secret-lease")
+        return original_get(self, url, session_id)
+
+    Solver.get = get
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session) as transport:
+        assert transport.get("/Ranking").body == b"RAW"
+    records = _attempt_records(caplog)
+    assert [(r["attempt"], r["outcome"], r["retry"]) for r in records] == [
+        (1, "tunnel", True), (2, "clearance_accepted", False)]
+    assert all(r["lease_id"] == "lease-7741" for r in records)
+    assert all(r["upstream_fingerprint"] == "0123456789abcdef" for r in records)
+    assert all(r["latency_ms"] >= 0 for r in records)
+    assert all(r["failed_validation_predicate"] is None for r in records)
+    assert "ERR_TUNNEL_CONNECTION_FAILED" not in caplog.text
+    assert "secret-lease" not in caplog.text
+
+
+@pytest.mark.parametrize("error, outcome", [
+    ("FlareSolverrTimeout", "solver_timeout"),
+    ("FlareSolverrCFChallengeFailed", "challenge_not_solved"),
+    ("FlareSolverrError", "solver_error"),
+    ("RuntimeError", "solver_error"),
+    ("ValueError", "solver_error"),
+])
+def test_three_solver_failures_emit_exactly_three_records(
+        bootstrap, monkeypatch, caplog, error, outcome):
+    from scrapers.base import flaresolverr_client
+
+    _events, _Lease, Solver = bootstrap
+    exc_type = getattr(flaresolverr_client, error, None) or getattr(builtins, error)
+
+    def fail(self, url, session_id):
+        raise exc_type("SENTINEL-SOLVER-SECRET")
+
+    monkeypatch.setattr(Solver, "get", fail)
+    session = _challenge_session({"/Ranking": _challenge()})
+    with pytest.raises(ClubEloBlocked), _transport(session) as transport:
+        transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert len(records) == 3  # exactly one per attempt: never zero, never six
+    assert [(r["attempt"], r["outcome"], r["retry"]) for r in records] == [
+        (1, outcome, True), (2, outcome, True), (3, outcome, True)]
+    assert all(r["lease_id"] is None for r in records)
+    assert all(r["upstream_fingerprint"] is None for r in records)
+    assert all(r["latency_ms"] >= 0 for r in records)
+    assert all(r["failed_validation_predicate"] is None for r in records)
+    assert "SENTINEL-SOLVER-SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("solution, predicate", [
+    (None, "solution_not_dict"),
+    ({}, "status_not_200"),
+    ({"status": 403}, "status_not_200"),
+    ({"status": 200}, "user_agent_not_string"),
+    ({"status": 200, "userAgent": "  "}, "user_agent_blank"),
+    ({"status": 200, "userAgent": "SENTINEL-UA\r\ninjected"}, "user_agent_not_printable_ascii"),
+    ({"status": 200, "userAgent": "SENTINEL-UA"}, "cookies_not_list"),
+    ({"status": 200, "userAgent": "SENTINEL-UA", "cookies": ("cf_clearance",)},
+     "cookies_not_list"),
+    ({"status": 200, "userAgent": "SENTINEL-UA", "cookies": []}, "cookies_empty"),
+    ({"status": 200, "userAgent": "SENTINEL-UA", "cookies": ["SENTINEL-COOKIE"]},
+     "cookie_not_mapping"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": 42, "value": "SENTINEL-VALUE"}]}, "cookie_name_not_string"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": "", "value": "SENTINEL-VALUE"}]}, "cookie_name_empty"),
+    ({"status": 200, "userAgent": "SENTINEL-UA", "cookies": [{"name": "cf_clearance"}]},
+     "cookie_value_not_string"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": "cf_clearance", "value": ""}]}, "cookie_value_empty"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": "cf_clearance", "value": "SENTINEL-VALUE",
+                   "domain": "SENTINEL-evil.com"}]}, "cookie_domain_not_clubelo"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": "cf_clearance", "value": "SENTINEL-VALUE",
+                   "path": "/Ranking"}]}, "cookie_path_not_root"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": "cf_clearance", "value": "SENTINEL-VALUE,COMMA"}]},
+     "cookie_characters_forbidden"),
+    ({"status": 200, "userAgent": "SENTINEL-UA",
+      "cookies": [{"name": "__cf_bm", "value": "SENTINEL-VALUE"}]},
+     "missing_cf_clearance"),
+])
+def test_invalid_clearance_records_the_exact_failed_predicate(
+        bootstrap, caplog, solution, predicate):
+    _events, _Lease, Solver = bootstrap
+    Solver.solution = solution
+    session = _challenge_session({"/Ranking": _challenge()})
+    with pytest.raises(ClubEloBlocked, match=r"challenge not solved"), \
+            _transport(session) as transport:
+        transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert len(records) == 3
+    assert all(r["outcome"] == "invalid_clearance" for r in records)
+    assert all(r["retry"] is True for r in records)
+    assert [r["failed_validation_predicate"] for r in records] == [predicate] * 3
+    for sentinel in ("SENTINEL-UA", "SENTINEL-VALUE", "SENTINEL-evil", "SENTINEL-COOKIE"):
+        assert sentinel not in caplog.text
+
+
+def test_lease_refusal_emits_one_non_retryable_record(bootstrap, monkeypatch, caplog):
+    _events, Lease, _Solver = bootstrap
+
+    def refused(self):
+        raise ValueError("ClubElo gateway refused the lease")
+
+    monkeypatch.setattr(Lease, "acquire", refused)
+    session = _challenge_session({"/Ranking": _challenge()})
+    with pytest.raises(ClubEloBlocked,
+                       match=r"lease: ClubElo gateway refused the lease \(attempt 1/3\)"):
+        with _transport(session) as transport:
+            transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert (record["attempt"], record["outcome"], record["retry"]) == \
+        (1, "lease_refusal", False)
+    assert record["lease_id"] is None
+    assert record["upstream_fingerprint"] is None
+    assert record["latency_ms"] >= 0
+    assert record["failed_validation_predicate"] is None
+
+
+def test_gateway_lease_error_is_one_lease_error_record(bootstrap, monkeypatch, caplog):
+    _events, Lease, _Solver = bootstrap
+
+    def broken(self):
+        raise requests.ConnectionError("SENTINEL-CONTROL-TOKEN")
+
+    monkeypatch.setattr(Lease, "acquire", broken)
+    session = _challenge_session({"/Ranking": _challenge()})
+    with pytest.raises(ClubEloBlocked) as caught:
+        with _transport(session) as transport:
+            transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert len(records) == 1
+    assert records[0]["outcome"] == "lease_error"
+    assert records[0]["retry"] is False
+    assert "SENTINEL-CONTROL-TOKEN" not in str(caught.value) + caplog.text
+
+
+def test_attempt_records_redact_solution_and_proxy_secrets(identified_lease, caplog):
+    _events, _Lease, Solver = identified_lease
+    Solver.solution = {
+        "status": 200, "html": "SENTINEL-HTML-BODY",
+        "userAgent": "SENTINEL-UA/9.9",
+        "cookies": [{"name": "cf_clearance", "value": "SENTINEL-CLEARANCE-VALUE"},
+                    {"name": "__cf_bm", "value": "SENTINEL-BM-VALUE",
+                     "domain": ".clubelo.com"}],
+    }
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session) as transport:
+        transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert [r["outcome"] for r in records] == ["clearance_accepted"]
+    raw = caplog.text + json.dumps(records)
+    for sentinel in ("SENTINEL-HTML-BODY", "SENTINEL-UA/9.9", "SENTINEL-CLEARANCE-VALUE",
+                     "SENTINEL-BM-VALUE", "secret-lease", "clubelo_proxy_filter:8900"):
+        assert sentinel not in raw
+    for forbidden in ("html", "cookies", "userAgent", "user_agent", "proxy_url", "token",
+                      "exception", "error", "message"):
+        assert forbidden not in _ATTEMPT_KEYS
+
+
+def test_attempt_latency_uses_the_injected_monotonic_clock(identified_lease, caplog):
+    _events, _Lease, Solver = identified_lease
+    clock = Clock()
+    original_get = Solver.get
+
+    def get(self, url, session_id):
+        clock.now += 0.25
+        return original_get(self, url, session_id)
+
+    Solver.get = get
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session, clock=clock) as transport:
+        transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert records[0]["latency_ms"] == 250
+
+
+@pytest.mark.parametrize("fingerprint", [
+    "NOT-A-FINGERPRINT", "ABCDEF0123456789", "0123456789abcde", "0123456789abcdef0",
+    42, None,
+])
+def test_attempt_record_sanitizes_non_fingerprint_values(bootstrap, caplog, fingerprint):
+    _events, Lease, _Solver = bootstrap
+    Lease.lease_id = "lease-7741"
+    Lease.upstream_fingerprint = fingerprint
+    session = _challenge_session({"/Ranking": [_challenge(), FakeResponse(200, b"RAW")]})
+    with _transport(session) as transport:
+        transport.get("/Ranking")
+    records = _attempt_records(caplog)
+    assert len(records) == 1
+    assert records[0]["upstream_fingerprint"] is None
+    assert records[0]["lease_id"] == "lease-7741"

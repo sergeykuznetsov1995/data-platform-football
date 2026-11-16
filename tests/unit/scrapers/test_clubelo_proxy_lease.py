@@ -13,7 +13,8 @@ def control(monkeypatch):
     class Response:
         status_code = 201
         data = {"id": "lease-id", "token": "lease-token",
-                "proxy_url": "http://clubelo_proxy_filter:8900"}
+                "proxy_url": "http://clubelo_proxy_filter:8900",
+                "upstream_fingerprint": "0123456789abcdef"}
 
         def __enter__(self):
             return self
@@ -57,6 +58,7 @@ def test_acquire_and_release_contract(control):
     lease = ClubEloLease().acquire()
     assert lease.session.trust_env is False
     assert lease.proxy_url == "http://lease:lease-token@clubelo_proxy_filter:8900"
+    assert lease.upstream_fingerprint == "0123456789abcdef"
     lease.close()
     assert calls[0][0:2] == ("post", "http://clubelo_proxy_filter:8899/v1/leases")
     assert calls[0][2]["json"] == {
@@ -123,5 +125,35 @@ def test_bad_proxy_response_retains_identity_for_cleanup(control):
     lease = ClubEloLease()
     with pytest.raises(ValueError, match="invalid proxy"):
         lease.acquire()
+    lease.close()
+    assert calls[1][0] == "delete"
+
+
+def test_missing_fingerprint_is_none_for_rollout(control):
+    calls, Response = control
+    Response.data = {key: value for key, value in Response.data.items()
+                     if key != "upstream_fingerprint"}
+    lease = ClubEloLease().acquire()
+    assert lease.upstream_fingerprint is None
+    lease.close()
+    assert calls[0][0] == "post"
+
+
+@pytest.mark.parametrize("fingerprint", [
+    "0123456789ABCDEF",
+    "0123456789abc",
+    "0123456789abcdef0",
+    "g" * 16,
+    16,
+])
+def test_invalid_fingerprint_fails_closed_and_keeps_cleanup(control, fingerprint):
+    calls, Response = control
+    Response.data = {**Response.data, "upstream_fingerprint": fingerprint}
+    lease = ClubEloLease()
+    with pytest.raises(ValueError, match="invalid upstream fingerprint") as error:
+        lease.acquire()
+    assert str(error.value) == (
+        "ClubElo gateway returned an invalid upstream fingerprint"
+    )
     lease.close()
     assert calls[1][0] == "delete"

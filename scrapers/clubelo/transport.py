@@ -19,7 +19,14 @@ pages. This transport is the single, polite way to fetch them:
   dedicated lease and FlareSolverr; raw bytes still come only from requests.
   A failed solver attempt (dead proxy tunnel, solver timeout, unsolved
   challenge) is retried with a fresh lease — a new exit — up to
-  ``BOOTSTRAP_ATTEMPTS`` times (#1955); a lease failure stops at once;
+  ``BOOTSTRAP_ATTEMPTS`` times (#1955); a lease failure stops at once.
+  Every bootstrap attempt — success, solver failure or lease refusal — also
+  emits exactly one parseable JSON record on the ``BOOTSTRAP_LOG_PREFIX``
+  prefix (#2246): a fixed allowlist of schema/event, attempt, outcome class,
+  retry flag, lease id, upstream fingerprint, non-negative latency and the
+  failed validation predicate. The record never carries exception strings,
+  solution html, cookies, userAgent, proxy URLs or tokens, and
+  ``clearance_accepted`` states only that the solution predicates passed;
 - other 403 / 429 / a ``cf-mitigated`` header mean the site blocks us:
   ``ClubEloBlocked`` stops the whole run, no retry;
 - ``wire_bytes`` counts the compressed bytes read from the socket, the body is
@@ -34,6 +41,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import json
 import logging
 import os
 import re
@@ -60,6 +68,11 @@ _SLUG_PATH = re.compile(r"^/(?:[^/\\?#%\s]| )+$")
 BLOCK_STATUSES = frozenset({403, 429})
 BOOTSTRAP_ATTEMPTS = 3
 BOOTSTRAP_RETRY_PAUSE = 10.0
+# #2246: one parseable, credential-free JSON record per bootstrap attempt,
+# logged as ``BOOTSTRAP_LOG_PREFIX + " " + json.dumps(record)``.
+BOOTSTRAP_LOG_PREFIX = "clubelo_bootstrap_attempt"
+_BOOTSTRAP_LOG_SCHEMA = 1
+_FINGERPRINT_RE = re.compile(r"\A[0-9a-f]{16}\Z", re.ASCII)
 
 
 class ClubEloBlocked(RuntimeError):
@@ -214,15 +227,24 @@ class ClubEloTransport:
         for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
             if attempt > 1:
                 self._sleep(BOOTSTRAP_RETRY_PAUSE)
+            started = self._clock()
             try:
-                return self._bootstrap_once()
+                self._bootstrap_once()
             except _BootstrapFailure as failure:
                 reason, retry = failure.reason, failure.retry
-            logger.warning("ClubElo Cloudflare bootstrap attempt %d/%d failed: %s",
-                           attempt, BOOTSTRAP_ATTEMPTS, reason)
-            self._release_bootstrap()
-            if not retry:
-                break
+                # #2246: the structured record precedes the human warning and
+                # the cleanup/release, and is the only record for this attempt.
+                self._log_bootstrap_attempt(
+                    attempt, failure.outcome, retry, failure.predicate, started)
+                logger.warning("ClubElo Cloudflare bootstrap attempt %d/%d failed: %s",
+                               attempt, BOOTSTRAP_ATTEMPTS, reason)
+                self._release_bootstrap()
+                if not retry:
+                    break
+            else:
+                self._log_bootstrap_attempt(
+                    attempt, "clearance_accepted", False, None, started)
+                return
         self.close()
         raise ClubEloBlocked(f"Cloudflare bootstrap: {reason} "
                              f"(attempt {attempt}/{BOOTSTRAP_ATTEMPTS})")
@@ -232,12 +254,18 @@ class ClubEloTransport:
         from scrapers.clubelo.proxy_lease import ClubEloLease
 
         if self.base_url != BASE_URL:
-            raise _BootstrapFailure("invalid ClubElo origin", retry=False)
+            raise _BootstrapFailure("invalid ClubElo origin", retry=False,
+                                    outcome="invalid_origin")
         try:
             self._lease = ClubEloLease()
             self._lease.acquire()
         except Exception as exc:
-            raise _BootstrapFailure(_lease_reason(exc), retry=False) from None
+            # Only the gateway's fixed refusal text is an explicit refusal;
+            # any other acquisition error (e.g. a transport failure) is a
+            # distinct, non-retryable ``lease_error`` (#2246).
+            raise _BootstrapFailure(_lease_reason(exc), retry=False,
+                                    outcome="lease_refusal" if _is_lease_refusal(exc)
+                                    else "lease_error") from None
         try:
             self._solver = FlareSolverrClient(
                 url=os.environ.get("CLUBELO_FLARESOLVERR_URL", "http://flaresolverr:8191"),
@@ -247,31 +275,68 @@ class ClubEloTransport:
             self._solver.create_session(self._solver_session, proxy_url=self._lease.proxy_url)
             solution = self._solver.get(BASE_URL + "/Ranking", self._solver_session)
             if not isinstance(solution, dict):
-                raise ValueError("invalid clearance")
+                raise _InvalidClearance("solution_not_dict")
             cookies, ua = solution.get("cookies"), solution.get("userAgent")
-            if (solution.get("status") != 200 or not isinstance(ua, str) or not ua.strip()
-                    or any(ord(c) < 32 or ord(c) > 126 for c in ua)
-                    or not isinstance(cookies, list) or not cookies):
-                raise ValueError("invalid clearance")
+            if solution.get("status") != 200:
+                raise _InvalidClearance("status_not_200")
+            if not isinstance(ua, str):
+                raise _InvalidClearance("user_agent_not_string")
+            if not ua.strip():
+                raise _InvalidClearance("user_agent_blank")
+            if any(ord(c) < 32 or ord(c) > 126 for c in ua):
+                raise _InvalidClearance("user_agent_not_printable_ascii")
+            if not isinstance(cookies, list):
+                raise _InvalidClearance("cookies_not_list")
+            if not cookies:
+                raise _InvalidClearance("cookies_empty")
             for cookie in cookies:
-                if (not isinstance(cookie, dict)
-                        or not isinstance(cookie.get("name"), str) or not cookie["name"]
-                        or not isinstance(cookie.get("value"), str) or not cookie["value"]
-                        or cookie.get("domain", "clubelo.com") not in {"clubelo.com", ".clubelo.com"}
-                        or cookie.get("path", "/") != "/"
-                        or any(ord(c) < 33 or ord(c) > 126 or c in ';,'
-                               for c in cookie["name"] + cookie["value"])):
-                    raise ValueError("invalid clearance cookie")
+                if not isinstance(cookie, dict):
+                    raise _InvalidClearance("cookie_not_mapping")
+                if not isinstance(cookie.get("name"), str):
+                    raise _InvalidClearance("cookie_name_not_string")
+                if not cookie["name"]:
+                    raise _InvalidClearance("cookie_name_empty")
+                if not isinstance(cookie.get("value"), str):
+                    raise _InvalidClearance("cookie_value_not_string")
+                if not cookie["value"]:
+                    raise _InvalidClearance("cookie_value_empty")
+                if cookie.get("domain", "clubelo.com") not in {"clubelo.com", ".clubelo.com"}:
+                    raise _InvalidClearance("cookie_domain_not_clubelo")
+                if cookie.get("path", "/") != "/":
+                    raise _InvalidClearance("cookie_path_not_root")
+                if any(ord(c) < 33 or ord(c) > 126 or c in ';,'
+                       for c in cookie["name"] + cookie["value"]):
+                    raise _InvalidClearance("cookie_characters_forbidden")
             if not any(c["name"] == "cf_clearance" for c in cookies):
-                raise ValueError("missing clearance cookie")
+                raise _InvalidClearance("missing_cf_clearance")
         except Exception as exc:
-            raise _BootstrapFailure(_solver_reason(exc), retry=True) from None
+            reason, outcome, predicate = _classify_solver(exc)
+            raise _BootstrapFailure(reason, retry=True, outcome=outcome,
+                                    predicate=predicate) from None
         self.session.cookies.clear()
         for cookie in cookies:
             self.session.cookies.set(cookie["name"], cookie["value"],
                                      domain="clubelo.com", path="/", secure=True)
         self.session.headers["User-Agent"] = ua
         self.session.proxies = {"https": self._lease.proxy_url}
+
+    def _log_bootstrap_attempt(self, attempt: int, outcome: str, retry: bool,
+                               predicate: Optional[str], started: float) -> None:
+        """One #2246 JSON attempt record: fixed field allowlist, no credentials."""
+        lease_id = getattr(self._lease, "lease_id", None)
+        record = {
+            "schema": _BOOTSTRAP_LOG_SCHEMA,
+            "event": BOOTSTRAP_LOG_PREFIX,
+            "attempt": attempt,
+            "outcome": outcome,
+            "retry": retry,
+            "lease_id": lease_id if isinstance(lease_id, str) and lease_id else None,
+            "upstream_fingerprint": _sanitize_fingerprint(
+                getattr(self._lease, "upstream_fingerprint", None)),
+            "latency_ms": max(0, int(round((self._clock() - started) * 1000.0))),
+            "failed_validation_predicate": predicate,
+        }
+        logger.warning("%s %s", BOOTSTRAP_LOG_PREFIX, json.dumps(record, sort_keys=True))
 
     def _pace(self) -> None:
         if self._last_request is not None:
@@ -344,10 +409,22 @@ class ClubEloTransport:
 class _BootstrapFailure(Exception):
     """One failed bootstrap attempt: a fixed, credential-free reason."""
 
-    def __init__(self, reason: str, *, retry: bool) -> None:
+    def __init__(self, reason: str, *, retry: bool, outcome: str,
+                 predicate: Optional[str] = None) -> None:
         super().__init__(reason)
         self.reason = reason
         self.retry = retry
+        self.outcome = outcome
+        self.predicate = predicate
+
+
+# The gateway's one fixed, explicit refusal text; everything else raised
+# while constructing/acquiring the lease is a gateway/transport error.
+_LEASE_REFUSAL_TEXT = "ClubElo gateway refused the lease"
+
+
+def _is_lease_refusal(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and str(exc) == _LEASE_REFUSAL_TEXT
 
 
 # Gateway/solver error texts can contain credentials: callers get only these
@@ -359,28 +436,79 @@ def _lease_reason(exc: Exception) -> str:
 
 
 _CLEARANCE_ERRORS = frozenset({"invalid clearance", "invalid clearance cookie",
-                               "missing clearance cookie"})
+                                "missing clearance cookie"})
+
+# #2246: stable predicate codes for a rejected clearance; the value is the
+# exact legacy ``ValueError`` text each keeps producing, so the externally
+# visible ``ClubEloBlocked`` messages stay byte-for-byte unchanged.
+_CLEARANCE_PREDICATES = {
+    "solution_not_dict": "invalid clearance",
+    "status_not_200": "invalid clearance",
+    "user_agent_not_string": "invalid clearance",
+    "user_agent_blank": "invalid clearance",
+    "user_agent_not_printable_ascii": "invalid clearance",
+    "cookies_not_list": "invalid clearance",
+    "cookies_empty": "invalid clearance",
+    "cookie_not_mapping": "invalid clearance cookie",
+    "cookie_name_not_string": "invalid clearance cookie",
+    "cookie_name_empty": "invalid clearance cookie",
+    "cookie_value_not_string": "invalid clearance cookie",
+    "cookie_value_empty": "invalid clearance cookie",
+    "cookie_domain_not_clubelo": "invalid clearance cookie",
+    "cookie_path_not_root": "invalid clearance cookie",
+    "cookie_characters_forbidden": "invalid clearance cookie",
+    "missing_cf_clearance": "missing clearance cookie",
+}
 
 
-def _solver_reason(exc: Exception) -> str:
+class _InvalidClearance(ValueError):
+    """Clearance validation failure: fixed legacy text plus a predicate code."""
+
+    def __init__(self, predicate: str) -> None:
+        super().__init__(_CLEARANCE_PREDICATES[predicate])
+        self.predicate = predicate
+
+
+def _classify_solver(exc: Exception) -> "tuple[str, str, Optional[str]]":
+    """(fixed human reason, outcome class, failed predicate) for a solver error."""
     from scrapers.base.flaresolverr_client import (
         FlareSolverrCFChallengeFailed,
         FlareSolverrError,
         FlareSolverrTimeout,
     )
 
+    if isinstance(exc, _InvalidClearance):
+        return "challenge not solved: " + str(exc), "invalid_clearance", exc.predicate
     if isinstance(exc, ValueError) and str(exc) in _CLEARANCE_ERRORS:
-        return "challenge not solved: " + str(exc)
+        return "challenge not solved: " + str(exc), "invalid_clearance", None
     if isinstance(exc, FlareSolverrCFChallengeFailed):
-        return "challenge not solved: solver gave up"
+        return "challenge not solved: solver gave up", "challenge_not_solved", None
     if isinstance(exc, FlareSolverrTimeout):
-        return "solver timeout or unreachable"
+        return "solver timeout or unreachable", "solver_timeout", None
     if isinstance(exc, FlareSolverrError):
         text = str(exc).upper()
         if "ERR_TUNNEL" in text or "ERR_PROXY" in text:
-            return "proxy tunnel failed"
-        return "solver error"
-    return f"solver error ({type(exc).__name__})"
+            return "proxy tunnel failed", "tunnel", None
+        return "solver error", "solver_error", None
+    return f"solver error ({type(exc).__name__})", "solver_error", None
+
+
+def _solver_reason(exc: Exception) -> str:
+    """The fixed human label only (kept for reason-only callers)."""
+
+    return _classify_solver(exc)[0]
+
+
+def _sanitize_fingerprint(value: object) -> Optional[str]:
+    """A stage-1 upstream fingerprint (16 lowercase hex chars) or ``None``.
+
+    Stage 1 validates the gateway's fingerprints; anything a test double or a
+    malformed payload carries is dropped, never hashed or substituted.
+    """
+
+    if isinstance(value, str) and _FINGERPRINT_RE.match(value):
+        return value
+    return None
 
 
 def _page(path: str, status: int, headers, wire: bytes) -> Page:
