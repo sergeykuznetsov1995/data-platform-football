@@ -178,6 +178,23 @@ def test_shared_maintenance_skips_tm_without_real_shared_host_lock(monkeypatch):
     conn.cursor.assert_not_called()
 
 
+def test_shared_maintenance_skips_tm_when_writer_module_absent(monkeypatch):
+    """Trees without the TM scraper stack (shared scheduler, P0 15.11) skip
+    TM-protected maintenance instead of failing the weekly sweep."""
+    import sys
+
+    from utils import maintenance_tasks as maintenance
+
+    # Importing a module mapped to None raises ImportError in `from ... import`.
+    monkeypatch.setitem(sys.modules, 'scrapers.transfermarkt.writer', None)
+    conn = MagicMock()
+    result = maintenance._maintain_one(conn, 'iceberg.bronze.transfermarkt_transfer_events', '30d')
+    assert result['retention_skipped'] and result['reason'] == 'shared_tm_writer_lock_required'
+    result = maintenance._exec_alter(conn, 'ALTER TABLE iceberg.bronze.transfermarkt_transfer_events EXECUTE optimize')
+    assert result['maintenance_skipped']
+    conn.cursor.assert_not_called()
+
+
 def test_shared_lock_contract_checks_file_identity_and_rejects_other_volume(monkeypatch, tmp_path):
     path = tmp_path / 'shared.lock'
     path.touch()
