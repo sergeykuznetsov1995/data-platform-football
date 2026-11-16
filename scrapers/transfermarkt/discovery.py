@@ -1420,6 +1420,7 @@ class TransfermarktCompetitionDiscovery:
                     self._previous.snapshot_id if self._previous else None
                 ),
                 "regulation_unavailable": {},
+                "discovery_quarantined": {},
             }
         )
         if self._mode == "daily":
@@ -1550,6 +1551,9 @@ class TransfermarktCompetitionDiscovery:
         # published with season_format=unknown and no editions, so the
         # registry reports it (quarantined_competition_ids) and nothing
         # plans it, while the rest of the snapshot still publishes (#1390).
+        # The reason also travels on the owning page (#2274): reconciliation
+        # removes the row whatever its classification turns out to be, so an
+        # EXCLUDED competition can never survive with zero editions.
         quarantined: dict[str, str] = {}
         # Known competitions first: a spent budget then defers new ones.
         order = sorted(
@@ -1799,6 +1803,7 @@ class TransfermarktCompetitionDiscovery:
                 "unavailable_new": dict(sorted(unavailable_new.items())),
                 "title_only_competition_ids": sorted(title_only),
                 "current_mismatches": mismatches,
+                "discovery_quarantined": dict(sorted(quarantined.items())),
             }
         )
         return self._pages(
@@ -1809,6 +1814,7 @@ class TransfermarktCompetitionDiscovery:
             regulation_competition_ids=set(regulations),
             carried=carried,
             carried_records=carried_records,
+            quarantined=quarantined,
         )
 
     # ----------------------------------------------------------------- daily
@@ -1997,6 +2003,9 @@ class TransfermarktCompetitionDiscovery:
             regulation_competition_ids=set(regulations),
             carried=carried,
             carried_records=carried_records,
+            # Daily mode never publishes a local quarantine: an unreadable
+            # competition is carried whole or the run aborts.
+            quarantined={},
         )
 
     # ---------------------------------------------------------------- shared
@@ -2115,6 +2124,7 @@ class TransfermarktCompetitionDiscovery:
         carried_records: Mapping[
             str, tuple[CompetitionRecord, tuple[EditionRecord, ...]]
         ],
+        quarantined: Mapping[str, str],
     ) -> tuple[RegistryPage, ...]:
         groups = list(groups)
         if carried_records:
@@ -2147,6 +2157,13 @@ class TransfermarktCompetitionDiscovery:
                     source_body_hash=body_hash,
                     competitions=tuple(competitions),
                     editions=tuple(editions),
+                    # Only this page's owned IDs carry their local
+                    # quarantine reasons (#2274).
+                    quarantined_competitions=tuple(
+                        (competition_id, quarantined[competition_id])
+                        for competition_id in sorted(owned_ids)
+                        if competition_id in quarantined
+                    ),
                 )
             )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from scrapers.transfermarkt.registry import (
     EvidenceOrigin,
     Gender,
     IncompleteSnapshotError,
+    RegistryConflictError,
+    RegistryError,
     RegistryPage,
     SeasonFormat,
     TeamType,
@@ -256,6 +259,127 @@ def test_conflicting_duplicate_source_identity_quarantines_only_it(
     assert "GB1" not in ids
     assert "GB1" not in {item.competition_id for item in snapshot.editions}
     assert {"CL", "FIWC"} <= ids
+
+
+def test_registry_page_reads_quarantine_metadata_with_old_payloads_intact(
+    raw_registry: dict, pages: tuple[RegistryPage, ...]
+) -> None:
+    base = raw_registry["pages"][0]
+
+    mapping_form = RegistryPage.from_mapping(
+        {**base, "quarantined_competitions": {"MYSTERY": " selector failed "}}
+    )
+    assert mapping_form.quarantined_competitions == (
+        ("MYSTERY", "selector failed"),
+    )
+
+    pair_form = RegistryPage.from_mapping(
+        {
+            **base,
+            "quarantined_competitions": [
+                ["MYSTERY", "selector failed"],
+                ["MYSTERY", "selector failed"],
+            ],
+        }
+    )
+    assert pair_form.quarantined_competitions == (
+        ("MYSTERY", "selector failed"),
+    )
+
+    # Default-empty compatibility: an old payload and the positional
+    # constructor stay valid and equal.
+    assert RegistryPage.from_mapping(base).quarantined_competitions == ()
+    page = pages[0]
+    assert RegistryPage(
+        page.snapshot_id,
+        page.page_number,
+        page.page_count,
+        page.source_url,
+        page.source_body_hash,
+        page.competitions,
+        page.editions,
+    ) == page
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "MYSTERY",
+        42,
+        [["MYSTERY"]],
+        [["MYSTERY", "selector failed", "extra"]],
+        [["MYSTERY", ""]],
+        [["", "selector failed"]],
+    ],
+)
+def test_registry_page_rejects_malformed_quarantine_metadata(
+    raw_registry: dict, malformed
+) -> None:
+    base = raw_registry["pages"][0]
+    with pytest.raises(RegistryError, match="quarantined"):
+        RegistryPage.from_mapping({**base, "quarantined_competitions": malformed})
+
+
+def test_registry_page_rejects_conflicting_duplicate_quarantine_reasons(
+    raw_registry: dict,
+) -> None:
+    base = raw_registry["pages"][0]
+    with pytest.raises(RegistryConflictError, match="conflicting quarantined"):
+        RegistryPage.from_mapping(
+            {
+                **base,
+                "quarantined_competitions": [
+                    ["MYSTERY", "first reason"],
+                    ["MYSTERY", "second reason"],
+                ],
+            }
+        )
+
+
+def test_explicit_local_quarantine_removes_an_excluded_record(
+    pages: tuple[RegistryPage, ...],
+) -> None:
+    owning = next(
+        page
+        for page in pages
+        if any(item.competition_id == "GB1W" for item in page.competitions)
+    )
+    explicit = replace(
+        owning,
+        quarantined_competitions=(
+            ("GB1W", "edition selector must mark exactly one current edition"),
+        ),
+    )
+    snapshot = reconcile_registry_pages(
+        (explicit, *(page for page in pages if page is not owning))
+    )
+
+    assert "GB1W" in snapshot.quarantined_competition_ids
+    assert "GB1W" not in {item.competition_id for item in snapshot.competitions}
+    assert "GB1W" not in {item.competition_id for item in snapshot.editions}
+    # The rest of the snapshot still publishes.
+    assert {"GB1", "CL"} <= {item.competition_id for item in snapshot.competitions}
+
+
+def test_explicit_local_quarantine_reason_wins_over_classification(
+    pages: tuple[RegistryPage, ...], caplog
+) -> None:
+    owning = next(
+        page
+        for page in pages
+        if any(item.competition_id == "MYSTERY" for item in page.competitions)
+    )
+    reason = "edition selector must mark exactly one current edition: MYSTERY"
+    explicit = replace(owning, quarantined_competitions=(("MYSTERY", reason),))
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.transfermarkt.registry"):
+        snapshot = reconcile_registry_pages(
+            (explicit, *(page for page in pages if page is not owning))
+        )
+
+    assert "MYSTERY" in snapshot.quarantined_competition_ids
+    assert reason in caplog.text
+    assert "classification unknown" not in caplog.text
 
 
 def test_all_required_positive_fixtures_have_safe_scopes(snapshot) -> None:

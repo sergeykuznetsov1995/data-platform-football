@@ -381,6 +381,80 @@ def test_one_unreadable_profile_is_quarantined_and_reported(body) -> None:
     assert {"GB1", "CL"} <= {item.competition_id for item in snapshot.competitions}
 
 
+def test_discovery_quarantine_is_authoritative_for_excluded_competition() -> None:
+    profile_url = BASE_URL + "/womens-super-league/startseite/wettbewerb/GB1W"
+    no_current = (
+        '<!doctype html><html lang="en"><head>'
+        "<title>Women Super League | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="GB1W">Women Super League</h1>'
+        '<a href="/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2025">'
+        "25/26</a>"
+        '<a href="/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2024">'
+        "24/25</a></body></html>"
+    )
+
+    snapshot, report = _run(
+        fetch=FixtureFetch({profile_url: no_current}),
+        fetch_json=RegulationFetch(
+            {competition_regulation_url("GB1W"): _failed(504)}
+        ),
+    )
+
+    reason = f"edition selector must mark exactly one current edition: {profile_url}"
+    assert report["discovery_quarantined"] == {"GB1W": reason}
+    assert "GB1W" in snapshot.quarantined_competition_ids
+    assert "GB1W" not in {item.competition_id for item in snapshot.competitions}
+    assert "GB1W" not in {item.competition_id for item in snapshot.editions}
+
+
+def test_local_quarantine_travels_only_on_the_owning_page() -> None:
+    profile_url = BASE_URL + "/womens-super-league/startseite/wettbewerb/GB1W"
+    no_current = (
+        '<!doctype html><html lang="en"><head>'
+        "<title>Women Super League | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="GB1W">Women Super League</h1>'
+        '<a href="/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2025">'
+        "25/26</a>"
+        '<a href="/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2024">'
+        "24/25</a></body></html>"
+    )
+    report: dict = {}
+    pages = discover_competition_registry(
+        fetch=FixtureFetch({profile_url: no_current}),
+        checkpoint={},
+        traffic_ledger=LedgerSpy(),
+        clock=lambda: NOW,
+        report=report,
+        fetch_json=RegulationFetch(
+            {competition_regulation_url("GB1W"): _failed(504)}
+        ),
+    )
+    reason = f"edition selector must mark exactly one current edition: {profile_url}"
+
+    carrying = [page for page in pages if page.quarantined_competitions]
+
+    assert [page.quarantined_competitions for page in carrying] == [
+        (("GB1W", reason),)
+    ]
+    assert any(
+        item.competition_id == "GB1W" for item in carrying[0].competitions
+    )
+    assert report["discovery_quarantined"] == {"GB1W": reason}
+
+
+def test_intact_catalogue_reports_no_local_quarantine_and_keeps_excluded_rows() -> None:
+    snapshot, report = _run(fetch_json=RegulationFetch())
+
+    assert report["discovery_quarantined"] == {}
+    women = next(
+        item for item in snapshot.competitions if item.competition_id == "GB1W"
+    )
+    assert women.classification_status is ClassificationStatus.EXCLUDED
+    assert any(item.competition_id == "GB1W" for item in snapshot.editions)
+    # Reconcile-level quarantine of an unknown classification is unchanged.
+    assert snapshot.quarantined_competition_ids == ("MYSTERY",)
+
+
 def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
     listing = (
         '<!doctype html><html lang="en"><head>'
