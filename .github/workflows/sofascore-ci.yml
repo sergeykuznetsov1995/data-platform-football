@@ -86,6 +86,7 @@ jobs:
             dags/utils/maintenance_tasks.py \
             dags/utils/sofascore_dq.py \
             scripts/migrate_sofascore_production.py \
+            scripts/migrate_sofascore_partition_keys.py \
             scripts/backfill_sofascore.py \
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
@@ -94,6 +95,7 @@ jobs:
             deploy/sofascore/pipeline_watchdog.py \
             deploy/sofascore/pipeline_metrics.py \
             deploy/sofascore/pipeline_issues.py \
+            deploy/sofascore/endpoint_journal.py \
             deploy/sofascore/veha1_measure.py \
             scripts/research/replay_sofascore_watchdog.py \
             scripts/proxy_filter
@@ -103,13 +105,15 @@ jobs:
             dags/dag_sofascore_pipeline.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
-            scripts/migrate_sofascore_production.py
+            scripts/migrate_sofascore_production.py \
+            scripts/migrate_sofascore_partition_keys.py
           python -m py_compile \
             dags/dag_iceberg_maintenance.py \
             dags/utils/maintenance_tasks.py \
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
-            scripts/sofascore_runtime_preflight.py
+            scripts/sofascore_runtime_preflight.py \
+            deploy/sofascore/endpoint_journal.py
 
       - name: SofaScore unit and topology tests
         env:
@@ -133,6 +137,7 @@ jobs:
             tests/unit/deploy/test_sofascore_gateway_probe_load.py \
             tests/unit/deploy/test_sofascore_pipeline_watchdog.py \
             tests/unit/deploy/test_sofascore_run_from_release.py \
+            tests/unit/deploy/test_sofascore_endpoint_journal.py \
             tests/unit/deploy/test_sofascore_veha1_measure.py \
             tests/unit/deploy/test_sofascore_daily_parity.py \
             tests/unit/dq/test_sofascore_dq.py \
@@ -150,10 +155,12 @@ jobs:
             tests/unit/scrapers/test_sofascore_capture_engine.py \
             tests/unit/scrapers/test_sofascore_discovery.py \
             tests/unit/scrapers/test_sofascore_endpoint_manifest.py \
+            tests/unit/scrapers/test_sofascore_iceberg_writer.py \
             tests/unit/scrapers/test_sofascore_lease_client.py \
             tests/unit/scrapers/test_sofascore_live_capture.py \
             tests/unit/scrapers/test_sofascore_manifest_batching.py \
             tests/unit/scrapers/test_sofascore_manifest_scope_index.py \
+            tests/unit/scrapers/test_sofascore_partition_keys.py \
             tests/unit/scrapers/test_sofascore_pipeline.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \
             tests/unit/scrapers/test_sofascore_workload_runtime.py \
@@ -174,6 +181,7 @@ jobs:
             tests/unit/scripts/test_fbref_proxy_filter_isolation.py \
             tests/unit/scripts/test_filter_proxy.py \
             tests/unit/scripts/test_migrate_sofascore_production.py \
+            tests/unit/scripts/test_migrate_sofascore_partition_keys.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
             tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
             tests/unit/scripts/test_run_sofascore_schedule_refresh.py \

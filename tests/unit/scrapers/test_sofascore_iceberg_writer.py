@@ -14,7 +14,7 @@ from scrapers.sofascore.iceberg_writer import (
 @pytest.mark.parametrize("table", sorted(PARTITION_SCOPED_TABLES))
 def test_scopes_each_bronze_merge(table):
     manager = SofaScoreIcebergWriter()._get_trino_manager()
-    frame = pd.DataFrame({"league": ["A"], "season": ["2526"], "id": [1]})
+    frame = pd.DataFrame({"league": ["SS-17"], "season": ["2526"], "id": [1]})
     keys = ["league", "season", "id"]
     with patch.object(TrinoTableManager, "insert_dataframe_atomic", return_value=1) as insert:
         assert manager.insert_dataframe_atomic("bronze", table, frame, merge_keys=keys) == 1
@@ -23,6 +23,22 @@ def test_scopes_each_bronze_merge(table):
         "merge_keys": keys,
         "merge_partition_cols": ["league", "season"],
     }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("table", sorted(PARTITION_SCOPED_TABLES))
+@pytest.mark.parametrize("league", ["ENG", None])
+def test_refuses_invalid_leagues_before_bronze_merge(table, league):
+    manager = SofaScoreIcebergWriter()._get_trino_manager()
+    frame = pd.DataFrame({"league": [league], "season": ["2526"], "id": [1]})
+    original = frame.copy(deep=True)
+    with patch.object(TrinoTableManager, "insert_dataframe_atomic") as insert:
+        with pytest.raises(ValueError):
+            manager.insert_dataframe_atomic(
+                "bronze", table, frame, merge_keys=["league", "season", "id"]
+            )
+        insert.assert_not_called()
+    pd.testing.assert_frame_equal(frame, original)
 
 
 @pytest.mark.unit

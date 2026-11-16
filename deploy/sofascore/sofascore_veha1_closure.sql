@@ -1,12 +1,11 @@
-SELECT match_id,
-       CAST(to_unixtime(min(CASE WHEN event_status IN ({terminal}) AND lineups_status IN ({terminal})
-                                  AND statistics_status IN ({terminal}) AND shotmap_status IN ({terminal})
-                                  AND incidents_status IN ({terminal}) THEN _ingested_at END)) AS varchar),
-       CAST(to_unixtime(min(_ingested_at)) AS varchar),
-       max_by(event_status, _ingested_at), max_by(lineups_status, _ingested_at),
-       max_by(statistics_status, _ingested_at), max_by(shotmap_status, _ingested_at),
-       max_by(incidents_status, _ingested_at)
-FROM bronze.sofascore_match_capture_status
-WHERE match_id IN ({ids})
-GROUP BY match_id
-UNION ALL SELECT '__sentinel__', '', '', '', '', '', '', ''
+-- Thin compatibility stub: замер вехи 1 больше не исполняет собственного запроса закрытия.
+-- Каноническая семантика — журнал эндпоинтов: шаблон sofascore_endpoint_journal.sql,
+-- который рендерит и валидирует endpoint_journal.render_journal_sql(match_ids)
+-- (вызов — veha1_measure.closures, CHUNK = 2000 id на запрос), а свёртка строк —
+-- endpoint_journal.summarize_journal. Матч закрыт (capture_complete, closed_at =
+-- max(status_updated_at) терминальных эндпоинтов), только когда все пять эндпоинтов
+-- event/lineups/statistics/shotmap/incidents терминальны (collected или source_404);
+-- quarantine и not_collected матч не закрывают.
+-- Старый запрос закрытия по compatibility-таблице удалён — второй семантики здесь нет.
+-- Файл оставлен как указатель для хостовых раскладок, ждавших sofascore_veha1_*.sql
+-- рядом с измерителем; плейсхолдеров нет, через veha1_measure._sql не рендерится.

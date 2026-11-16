@@ -1630,7 +1630,7 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
 
     with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
         rc = runner._run_legacy(
-            leagues=["ENG-Premier League"],
+            leagues=["SS-17"],
             season=2025,
             output_path=str(output),
             capture_runtime=runtime,
@@ -1648,7 +1648,7 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     schedule_merge = next(sql for sql in merges
                           if sql.startswith("MERGE INTO iceberg.bronze.sofascore_schedule "))
     on_clause = schedule_merge.split(" ON ", 1)[1].split(" WHEN MATCHED", 1)[0]
-    assert '(t."league" = \'ENG-Premier League\' AND t."season" = \'2526\')' in on_clause
+    assert '(t."league" = \'SS-17\' AND t."season" = \'2526\')' in on_clause
     for key in ("league", "season", "game_id"):
         assert f't."{key}" = s."{key}"' in on_clause
     assert not any(sql.startswith("DELETE FROM") for sql in statements)
@@ -1688,7 +1688,7 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     browser = MagicMock(side_effect=AssertionError("no-op opened a scraper"))
     with patch("scrapers.sofascore.SofaScoreScraper", browser):
         rc = runner._run_legacy(
-            leagues=["ENG-Premier League"],
+            leagues=["SS-17"],
             season=2025,
             output_path=str(no_op_output),
             capture_runtime=no_op_runtime,

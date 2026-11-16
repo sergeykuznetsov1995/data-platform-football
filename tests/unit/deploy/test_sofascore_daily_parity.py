@@ -1,10 +1,12 @@
 """Offline checks for the read-only seven-day Bronze parity report (#1370)."""
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from deploy.sofascore import daily_parity as parity
+from deploy.sofascore import endpoint_journal
 from deploy.sofascore import veha1_measure as measure
 
 START = date(2026, 10, 20)
@@ -85,23 +87,70 @@ def test_duplicate_match_id_out_of_window_and_other_days_rejected():
         parity.build_report([], start=START, days=8)
 
 
-def test_sql_template_read_only_deduplicated_with_sentinel_and_placeholders():
+STATUS_WHEN = re.compile(
+    r"WHEN\s+(.+?)\s+THEN\s+'(collected|source_404|quarantine|not_collected)'"
+)
+
+
+def _status_mapping(sql_text):
+    # Mapping-ветки без табличных алиасов — как в endpoint_journal semantics.
+    return {
+        condition.replace("lm.", ""): status
+        for condition, status in STATUS_WHEN.findall(sql_text)
+        if "status" in condition
+    }
+
+
+def test_sql_template_read_only_canonical_journal_with_sentinel_and_placeholders():
     sql = (parity.TOOLS / "sofascore_daily_parity.sql").read_text(encoding="utf-8")
     for placeholder in ("{tournament_ids}", "{since}", "{until}"):
         assert placeholder in sql
     assert "__sentinel__" in sql
-    # Trino: позиционные GROUP BY (schedule — 1, 2; capture — ровно 1).
+    # Trino: позиционный GROUP BY (schedule — 1, 2; агрегаты — ровно 1).
     assert "GROUP BY 1, 2" in sql
     assert "GROUP BY 1\n" in sql
-    # Ключи таблиц: schedule — game_id, capture — match_id (не путать).
+    # Ключ таблицы schedule — game_id; sentinel UNION требует строковый day.
     assert "CAST(game_id AS varchar) AS match_id" in sql
-    assert "CAST(match_id AS varchar) AS match_id" in sql
-    assert "capture_rows" in sql
-    # Sentinel UNION требует строковый day.
     assert "CAST(s.day AS varchar) AS day" in sql
     assert "max_by(" in sql
     assert "bronze.sofascore_schedule" in sql
-    assert "bronze.sofascore_match_capture_status" in sql
+
+    # any_complete (#1366): canonical match×endpoint journal из ops manifest.
+    canonical, informational = sql.partition("compat_both AS")[0::2]
+    assert canonical and informational
+    assert "iceberg.ops.sofascore_capture_manifest" in canonical
+    assert "m.target_type = 'event'" in canonical
+    assert "m.endpoint IN ({})".format(
+        ", ".join(f"'{name}'" for name in endpoint_journal.CORE_ENDPOINTS)
+    ) in canonical
+    assert "PARTITION BY mc.match_id, mc.endpoint" in canonical
+    assert "ORDER BY mc.updated_at DESC, mc.run_id DESC, mc.freshness_key DESC" in canonical
+    assert "ELSE 'invalid'" in canonical
+    # Complete ⇔ ровно 5 core endpoints и все в collected/source_404:
+    # partial/missing → 0, quarantine → 0, retryable → 0.
+    assert "count(*) = 5" in canonical
+    assert "bool_and(journal_status IN ('collected', 'source_404'))" in canonical
+    assert "WHEN status = 'not_supported' AND http_status = 404 THEN 'source_404'" in canonical
+    assert "WHEN status = 'schema_error' THEN 'quarantine'" in canonical
+    assert (
+        "WHEN status IN ('not_supported', 'retryable_failure') THEN 'not_collected'"
+        in canonical
+    )
+    # Матч без manifest-наблюдений — incomplete через LEFT JOIN + coalesce.
+    assert "LEFT JOIN capture c ON c.match_id = s.match_id" in sql
+    assert "LEFT JOIN schedule_identity i ON i.match_id = s.match_id" in sql
+    assert "CASE WHEN i.ss_id_count > 1 THEN 0" in sql
+    assert "ELSE coalesce(c.any_complete, 0) END AS any_complete" in sql
+
+    # Compatibility-таблица — только informational physical overlap (#1366):
+    # единственный потребитель — both_complete, не any_complete/covered/missing.
+    assert "bronze.sofascore_match_capture_status" not in canonical
+    assert "bronze.sofascore_match_capture_status" in informational
+    assert "CAST(match_id AS varchar) AS match_id" in informational
+    assert (
+        "coalesce(cb.ss_complete, 0) * coalesce(cb.other_complete, 0) AS both_complete"
+        in sql
+    )
 
     import sqlglot
 
@@ -122,6 +171,131 @@ def test_sql_template_read_only_deduplicated_with_sentinel_and_placeholders():
             if len(s.expressions) == len(parity.REPORT_COLUMNS) and s.args.get("joins")]
     assert len(main) == 1
     assert [e.alias_or_name for e in main[0].expressions] == list(parity.REPORT_COLUMNS)
+
+
+def test_sql_status_mapping_is_identical_to_endpoint_journal_template():
+    expected = {
+        "status IN ('success', 'legitimate_empty')": "collected",
+        "status = 'not_supported' AND http_status = 404": "source_404",
+        "status = 'schema_error'": "quarantine",
+        "status IN ('not_supported', 'retryable_failure')": "not_collected",
+    }
+    parity_sql = (parity.TOOLS / "sofascore_daily_parity.sql").read_text(encoding="utf-8")
+    journal_sql = (parity.TOOLS / "sofascore_endpoint_journal.sql").read_text(encoding="utf-8")
+    assert _status_mapping(parity_sql) == expected
+    assert _status_mapping(journal_sql) == expected
+
+
+def test_parity_sql_executes_canonical_statuses_without_row_loss():
+    import sqlite3
+
+    import sqlglot
+
+    class ArgMax:
+        def __init__(self):
+            self.key = None
+            self.value = None
+
+        def step(self, value, key):
+            if self.key is None or key >= self.key:
+                self.key, self.value = key, value
+
+        def finalize(self):
+            return self.value
+
+    start = int(datetime(2026, 10, 20, tzinfo=timezone.utc).timestamp())
+    sql = parity.parity_sql([7], start, start + 7 * 86400)
+    for qualified, local in (
+        ("bronze.sofascore_schedule", "schedule_source"),
+        ("iceberg.ops.sofascore_capture_manifest", "manifest_source"),
+        ("bronze.sofascore_match_capture_status", "compat_source"),
+    ):
+        sql = sql.replace(qualified, local)
+    sql = sqlglot.transpile(sql, read="trino", write="sqlite")[0]
+
+    db = sqlite3.connect(":memory:")
+    db.create_aggregate("ARG_MAX", 2, ArgMax)
+    db.create_function(
+        "UNIX_TO_TIME", 1,
+        lambda value: datetime.fromtimestamp(int(value), timezone.utc).isoformat(),
+    )
+
+    def regexp_extract(value, pattern, group):
+        found = re.search(pattern, value)
+        return found.group(int(group)) if found else ""
+
+    db.create_function("REGEXP_EXTRACT", 3, regexp_extract)
+    db.execute(
+        "CREATE TABLE schedule_source (game_id, league, start_timestamp, "
+        "status_type, _ingested_at, tournament_unique_tournament_id)"
+    )
+    db.execute(
+        "CREATE TABLE manifest_source (target_id, target_type, endpoint, status, "
+        "http_status, updated_at, run_id, freshness_key)"
+    )
+    db.execute(
+        "CREATE TABLE compat_source (match_id, league, event_status, lineups_status, "
+        "statistics_status, shotmap_status, incidents_status)"
+    )
+    for match_id in map(str, range(1, 11)):
+        leagues = {
+            "6": ["ENG-PL", "SS-7"],
+            "10": ["SS-7", "SS-8"],
+        }.get(match_id, ["SS-7"])
+        for league in leagues:
+            db.execute(
+                "INSERT INTO schedule_source VALUES (?, ?, ?, ?, ?, ?)",
+                (match_id, league, start, "finished", 1, 7),
+            )
+
+    manifest = {
+        "1": ["success"] * 5,
+        "2": ["not_supported"] * 5,
+        "3": ["success"] * 4 + ["retryable_failure"],
+        "4": ["success"] * 4 + ["schema_error"],
+        "6": ["success"] * 5,
+        "7": ["success"] * 4 + ["not_supported"],
+        "8": ["legitimate_empty"] + ["success"] * 4,
+        "9": ["success"] * 5,
+        "10": ["success"] * 5,
+    }
+    for match_id, statuses in manifest.items():
+        for endpoint, status in zip(endpoint_journal.CORE_ENDPOINTS, statuses):
+            http_status = 200
+            if match_id == "2":
+                http_status = 404
+            elif status == "retryable_failure":
+                http_status = 503
+            db.execute(
+                "INSERT INTO manifest_source VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (match_id, "event", endpoint, status, http_status,
+                 "2026-10-21T00:00:00Z", "run", "fk"),
+            )
+    db.execute(
+        "INSERT INTO manifest_source VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("9", "event", "incidents", "retryable_failure", 503,
+         "2026-10-20T00:00:00Z", "old", "old"),
+    )
+    for match_id in ("5", "6"):
+        for league in ("ENG-PL", "SS-7"):
+            db.execute(
+                "INSERT INTO compat_source VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (match_id, league, *["success"] * 5),
+            )
+
+    raw = [row for row in db.execute(sql) if row[0] != "__sentinel__"]
+    db.close()
+    report = parity.build_report(rows(*raw), start=START)
+    assert len(raw) == 10
+    assert {row[1] for row in raw} == {str(value) for value in range(1, 11)}
+    assert {row[1]: row[3] for row in raw} == {
+        "1": 1, "2": 1, "3": 0, "4": 0, "5": 0,
+        "6": 1, "7": 0, "8": 1, "9": 1, "10": 0,
+    }
+    assert report["missing_finished"] == ["10", "3", "4", "5", "7"]
+    assert report["covered_total"] == 5
+    assert report["physical_both_complete"] == 2
+    assert report["logical_duplicates"] == 0
 
 
 class _FakeCatalog:
