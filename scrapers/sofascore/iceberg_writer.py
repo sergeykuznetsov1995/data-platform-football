@@ -2,6 +2,7 @@
 
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
+from scrapers.sofascore.partition_keys import assert_canonical_leagues
 
 
 # These tables use identity partitions (league, season) and include both
@@ -29,6 +30,7 @@ PARTITION_SCOPED_TABLES = frozenset({
 class SofaScoreTrinoTableManager(TrinoTableManager):
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         if schema == "bronze" and table in PARTITION_SCOPED_TABLES and kwargs.get("merge_keys"):
+            assert_canonical_leagues(df)
             kwargs["merge_partition_cols"] = ["league", "season"]
         return super().insert_dataframe_atomic(schema, table, df, **kwargs)
 
