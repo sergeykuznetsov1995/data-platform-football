@@ -7,10 +7,12 @@
 -- на any_complete/covered/missing не влияет.
 -- Placeholders: {tournament_ids} — source IDs enabled-реестра; {since}/{until} — epoch-секунды окна [start, start+7).
 -- Ровно 5 колонок: day, match_id, status_type, any_complete, both_complete; последняя строка — __sentinel__.
-WITH schedule AS (
+WITH schedule_rows AS (
     SELECT CAST(from_unixtime(CAST(start_timestamp AS bigint)) AS date) AS day,
            CAST(game_id AS varchar) AS match_id,
-           max_by(coalesce(status_type, 'unknown'), _ingested_at) AS status_type
+           coalesce(status_type, 'unknown') AS status_type,
+           _ingested_at AS _ingested_at,
+           league AS league
     FROM bronze.sofascore_schedule
     WHERE start_timestamp >= {since}
       AND start_timestamp < {until}
@@ -18,7 +20,20 @@ WITH schedule AS (
               CAST(tournament_unique_tournament_id AS bigint),
               CAST(nullif(regexp_extract(league, '^SS-([0-9]+)', 1), '') AS bigint)
           ) IN ({tournament_ids})
+),
+schedule AS (
+    SELECT day,
+           match_id,
+           max_by(status_type, _ingested_at) AS status_type
+    FROM schedule_rows
     GROUP BY 1, 2
+),
+schedule_identity AS (
+    -- Как endpoint_journal: ENG/SS объединяются, два разных SS ID fail closed.
+    SELECT match_id,
+           count(DISTINCT CASE WHEN league LIKE 'SS-%' THEN league END) AS ss_id_count
+    FROM schedule_rows
+    GROUP BY 1
 ),
 manifest_core AS (
     -- Тот же срез manifest, что в sofascore_endpoint_journal.sql: event-targets,
@@ -95,9 +110,11 @@ compat_both AS (
 SELECT CAST(s.day AS varchar) AS day,
        s.match_id,
        s.status_type,
-       coalesce(c.any_complete, 0) AS any_complete,
+       CASE WHEN i.ss_id_count > 1 THEN 0
+            ELSE coalesce(c.any_complete, 0) END AS any_complete,
        coalesce(cb.ss_complete, 0) * coalesce(cb.other_complete, 0) AS both_complete
 FROM schedule s
+LEFT JOIN schedule_identity i ON i.match_id = s.match_id
 LEFT JOIN capture c ON c.match_id = s.match_id
 LEFT JOIN compat_both cb ON cb.match_id = s.match_id
 UNION ALL SELECT '__sentinel__', NULL, NULL, NULL, NULL
