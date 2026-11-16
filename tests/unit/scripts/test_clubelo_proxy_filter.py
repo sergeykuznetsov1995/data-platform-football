@@ -153,6 +153,14 @@ def test_clubelo_control_plane_uses_dedicated_token(mod, token, status):
     ))
     assert int(writer.payload.split()[1]) == status
     assert len(mod.LEASES) == (1 if status == 201 else 0)
+    if status == 201:
+        response = json.loads(writer.payload.partition(b"\r\n\r\n")[2])
+        lease = next(iter(mod.LEASES.values()))
+        assert response["upstream_fingerprint"] == mod._upstream_fingerprint(
+            lease.upstream
+        )
+        for marker in (b"u:p", b"pool.invalid"):
+            assert marker not in writer.payload
 
 
 @pytest.mark.parametrize("token,daily,history,message", [

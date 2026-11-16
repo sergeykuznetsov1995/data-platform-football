@@ -4208,6 +4208,7 @@ async def _handle_control(
                 "max_bytes": lease.max_bytes,
                 "expires_at": lease.expires_at,
                 "proxy_url": LEASE_PROXY_URL,
+                "upstream_fingerprint": _upstream_fingerprint(lease.upstream),
                 "plan_digest": (
                     lease.workload_plan.plan_digest if lease.workload_plan else ""
                 ),
