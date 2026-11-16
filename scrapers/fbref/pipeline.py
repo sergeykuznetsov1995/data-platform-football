@@ -456,6 +456,12 @@ class PipelineError(RuntimeError):
 class FetchWaveError(PipelineError):
     """At least one target in a bounded fetch wave did not complete."""
 
+    def __init__(
+        self, message: str, *, result: Optional[WaveResult] = None
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+
 
 class ParseWaveError(PipelineError):
     """At least one raw page did not parse, persist, and validate."""
@@ -870,6 +876,8 @@ class WaveResult:
     postgres_ms: int = 0
     trino_generic_ms: int = 0
     trino_typed_ms: int = 0
+    failure_matrix: list[dict] = field(default_factory=list)
+    streak_transitions: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -882,6 +890,49 @@ _STAGE_FIELDS = (
     "trino_generic_ms",
     "trino_typed_ms",
 )
+
+_FAILURE_MATRIX_SLOTS = ("initial", "re_solve_1", "re_solve_2")
+
+
+def _not_attempted_cell() -> dict:
+    return {
+        "status": "not_attempted",
+        "diagnostic_class": None,
+        "attempt_id": None,
+    }
+
+
+def _new_failure_matrix_row(lease) -> dict:
+    return {
+        "target_id": lease.target_id,
+        "logical_refresh_id": lease.logical_refresh_id,
+        "initial": _not_attempted_cell(),
+        "re_solve_1": _not_attempted_cell(),
+        "re_solve_2": _not_attempted_cell(),
+    }
+
+
+def _diagnostic_failure_class(exc: Exception) -> str:
+    diagnostic_class = getattr(exc, "diagnostic_class", None)
+    if diagnostic_class == "geo-ip-transport":
+        return diagnostic_class
+    if (
+        getattr(exc, "session_failure_reason", None)
+        == "unrouted_websocket_upgrade"
+    ):
+        return "unrouted-websocket-101"
+    if int(getattr(exc, "http_status", 0) or 0) == 403:
+        return "http-403"
+    error_class = str(getattr(exc, "error_class", "") or "")
+    if error_class.startswith("warm_session_"):
+        return "warm-session"
+    if error_class in {
+        "clearance_failed",
+        "clearance_export_failed",
+        "raw_contract_cloudflare_challenge",
+    }:
+        return "clearance-failed"
+    return "other"
 
 
 class _TimedCalls:
@@ -3566,6 +3617,45 @@ class FBrefPipeline:
             )
         if not leases:
             return result
+        failure_rows = {
+            (lease.target_id, lease.logical_refresh_id): (
+                _new_failure_matrix_row(lease)
+            )
+            for lease in leases
+        }
+        result.failure_matrix = list(failure_rows.values())
+
+        def _record_attempt_outcome(lease, status: str, diagnostic_class=None):
+            row = failure_rows.get(
+                (lease.target_id, lease.logical_refresh_id)
+            )
+            if row is None:
+                return
+            for slot in _FAILURE_MATRIX_SLOTS:
+                if row[slot]["status"] == "not_attempted":
+                    row[slot] = {
+                        "status": status,
+                        "diagnostic_class": diagnostic_class,
+                        "attempt_id": lease.attempt_id,
+                    }
+                    return
+
+        def _record_streak_transition(lease, event: str, before, after):
+            result.streak_transitions.append({
+                "event": event,
+                "target_id": lease.target_id,
+                "logical_refresh_id": lease.logical_refresh_id,
+                "attempt_id": lease.attempt_id,
+                "before": {
+                    "consecutive_clearance_refreshes": before[0],
+                    "clearance_exhausted_targets": before[1],
+                },
+                "after": {
+                    "consecutive_clearance_refreshes": after[0],
+                    "clearance_exhausted_targets": after[1],
+                },
+            })
+
         owns_session = _live_session is None
         live_session = _live_session or _LiveFetchSession(
             persistent_enabled=settings.persistent_http_session,
@@ -3588,6 +3678,7 @@ class FBrefPipeline:
                 response = None
                 record = None
                 budget_settled = False
+                attempt_started = False
                 try:
                     if live_session.rollover_if_due(self.control):
                         logger.info(
@@ -3733,6 +3824,7 @@ class FBrefPipeline:
                                 ),
                             )
                             self._wait_for_slot(target_slot.scheduled_at)
+                    attempt_started = True
                     response = live_session.fetcher.fetch(
                         lease.canonical_url,
                         page_kind=lease.page_kind,
@@ -3774,8 +3866,17 @@ class FBrefPipeline:
                     self._complete_from_record(
                         lease, record, historical=historical
                     )
+                    _streak_before = (
+                        live_session.consecutive_clearance_refreshes,
+                        live_session.clearance_exhausted_targets,
+                    )
                     live_session.consecutive_clearance_refreshes = 0
                     live_session.clearance_exhausted_targets = 0
+                    if _streak_before != (0, 0):
+                        _record_streak_transition(
+                            lease, "success", _streak_before, (0, 0)
+                        )
+                    _record_attempt_outcome(lease, "success")
                     result.fetched += 1
                     result.requests += (
                         response.http_requests + response.browser_requests
@@ -3815,6 +3916,9 @@ class FBrefPipeline:
                     break
                 except FetchError as exc:
                     page_settlement = None
+                    _record_attempt_outcome(
+                        lease, "failed", _diagnostic_failure_class(exc)
+                    )
                     if (
                         reservation is not None
                         and not budget_settled
@@ -3951,7 +4055,20 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
+                        _streak_before = (
+                            live_session.consecutive_clearance_refreshes,
+                            live_session.clearance_exhausted_targets,
+                        )
                         live_session.consecutive_clearance_refreshes += 1
+                        _record_streak_transition(
+                            lease,
+                            "session_failure",
+                            _streak_before,
+                            (
+                                live_session.consecutive_clearance_refreshes,
+                                live_session.clearance_exhausted_targets,
+                            ),
+                        )
                         clearance_streak_exhausted = (
                             exc.session_failure_reason is not None
                             or (not historical and lease.page_kind in CURRENT_ENRICHMENT)
@@ -4133,8 +4250,21 @@ class FBrefPipeline:
                             # goes on depends on what the streak is evidence
                             # of: one exhausted page, or a source that rejects
                             # every fresh clearance it is handed.
+                            _streak_before = (
+                                live_session.consecutive_clearance_refreshes,
+                                live_session.clearance_exhausted_targets,
+                            )
                             live_session.clearance_exhausted_targets += 1
                             live_session.consecutive_clearance_refreshes = 0
+                            _record_streak_transition(
+                                lease,
+                                "target_exhausted",
+                                _streak_before,
+                                (
+                                    live_session.consecutive_clearance_refreshes,
+                                    live_session.clearance_exhausted_targets,
+                                ),
+                            )
                             if _session_failure(exc):
                                 result.deferred_dead_clearance += 1
                             result.deferred_session_failures += 1
@@ -4402,6 +4532,8 @@ class FBrefPipeline:
                                 )
                                 break
                 except Exception as exc:
+                    if attempt_started:
+                        _record_attempt_outcome(lease, "failed", "other")
                     if reservation is not None and not budget_settled:
                         if (
                             response is not None
@@ -4547,7 +4679,9 @@ class FBrefPipeline:
                 if settings.persistent_http_session and not result.failures:
                     self.control.assert_persistent_metering_reconciled(run_id)
         if result.failures:
-            raise FetchWaveError("; ".join(result.failures))
+            raise FetchWaveError(
+                "; ".join(result.failures), result=result
+            )
         return result
 
     @staticmethod
@@ -4558,6 +4692,8 @@ class FBrefPipeline:
                 "failures",
                 "deferred_target_failures",
                 "deferred_parse_failures",
+                "failure_matrix",
+                "streak_transitions",
             }:
                 getattr(target, name).extend(value)
             elif isinstance(value, bool):
@@ -4644,15 +4780,34 @@ class FBrefPipeline:
                         # its aggregate.
                         aggregate.deadline_reached = True
                         break
+                    fetch_failure = None
                     with self._profiled_wave() as fetch_ms:
-                        fetched = self.fetch_wave(
-                            run_id,
-                            worker_id=f"{worker_id}:batch-{batch:02d}",
-                            page_kinds=page_kinds,
-                            settings=settings,
-                            _live_session=live_session,
-                        )
+                        try:
+                            fetched = self.fetch_wave(
+                                run_id,
+                                worker_id=f"{worker_id}:batch-{batch:02d}",
+                                page_kinds=page_kinds,
+                                settings=settings,
+                                _live_session=live_session,
+                            )
+                        except FetchWaveError as wave_error:
+                            if wave_error.result is None:
+                                raise
+                            fetch_failure = wave_error
+                            fetched = wave_error.result
                     self._apply_stage_ms(fetched, fetch_ms)
+                    if fetch_failure is not None:
+                        aggregate.batches = batch
+                        self._merge_wave_result(aggregate.fetch, fetched)
+                        if on_batch is not None:
+                            try:
+                                on_batch(aggregate.as_dict())
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "FBref live waves batch callback failed",
+                                    exc_info=True,
+                                )
+                        raise fetch_failure
                     live_session.rollover_if_due(
                         self.control,
                         within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,

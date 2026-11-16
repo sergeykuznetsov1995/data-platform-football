@@ -1628,3 +1628,50 @@ def test_websocket_deferral_does_not_override_other_policy_failures(guard):
         stats["network_policy_failure"] = "unrouted_http_response"
     reason = fetcher._hard_transport_policy_reason(stats)
     assert fetcher._local_session_failure_reason(stats, reason) is None
+
+
+def test_unreachable_geoip_exit_carries_the_transport_diagnostic_marker():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+        "geoip_transport_failure": True,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "clearance_failed"
+    assert raised.value.diagnostic_class == "geo-ip-transport"
+
+
+def test_answered_geoip_failure_has_no_transport_diagnostic_marker():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert raised.value.diagnostic_class is None
+
+
+def test_fetch_error_diagnostic_class_defaults_to_none():
+    error = FetchError("x", error_class="http_status")
+
+    assert error.diagnostic_class is None

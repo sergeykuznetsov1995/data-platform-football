@@ -215,10 +215,12 @@ class FetchError(RuntimeError):
         latency_ms: int = 0,
         redirect_location: Optional[str] = None,
         session_failure_reason: Optional[str] = None,
+        diagnostic_class: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
         self.session_failure_reason = session_failure_reason
+        self.diagnostic_class = diagnostic_class
         # Where a 3xx pointed, when the source bothered to say.  A redirect
         # without it is not a usable "the page moved" statement.
         self.redirect_location = redirect_location
@@ -1315,6 +1317,11 @@ class FBrefFetcher:
                     else "clearance_failed"
                 ),
                 session_failure_reason=session_failure_reason,
+                diagnostic_class=(
+                    "geo-ip-transport"
+                    if self._exit_never_answered(bootstrap_stats)
+                    else None
+                ),
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],
                 browser_requests=breakdown[2],
