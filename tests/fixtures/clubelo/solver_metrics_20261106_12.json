@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "mode": "daily_aggregates",
+  "population": {
+    "source": "clubelo",
+    "population_id": "clubelo-challenge-events-2026-11-06_2026-11-12",
+    "counting_unit": "challenge_events",
+    "date_basis": "utc_solver_event_day",
+    "provenance": "Sanitized ClubElo aggregate; no attempt/session join and no full raw log. Correction fact: the old coarse grep solved=3 on 12 Nov became exact solved=2 because the extra matched line was 'Challenge not detected'. Separate fact: the two invalid-clearance attempts in the successful run are recorded as excluded_successful_run_invalid_clearance=2 and are excluded from the failed-run-attempt census; that exclusion is not the cause of the solved correction.",
+    "revision": "2026-11-12-final-corrected",
+    "coverage": "2026-11-06..2026-11-12 detected and solved challenge events only; no attempt/session join"
+  },
+  "days": [
+    {"day_utc": "2026-11-06", "detected": 6, "solved": 6, "attempts": null, "tunnel_failed": null, "validated": null},
+    {"day_utc": "2026-11-07", "detected": 5, "solved": 4, "attempts": null, "tunnel_failed": null, "validated": null},
+    {"day_utc": "2026-11-08", "detected": 6, "solved": 6, "attempts": null, "tunnel_failed": null, "validated": null},
+    {"day_utc": "2026-11-09", "detected": 7, "solved": 7, "attempts": null, "tunnel_failed": null, "validated": null},
+    {"day_utc": "2026-11-10", "detected": 8, "solved": 8, "attempts": null, "tunnel_failed": null, "validated": null},
+    {"day_utc": "2026-11-11", "detected": 6, "solved": 4, "attempts": null, "tunnel_failed": null, "validated": null},
+    {"day_utc": "2026-11-12", "detected": 4, "solved": 2, "attempts": null, "tunnel_failed": null, "validated": null}
+  ],
+  "failed_run_census_11_12": {
+    "solver_timeout": 10,
+    "tunnel": 8,
+    "unknown": 3,
+    "excluded_successful_run_invalid_clearance": 2
+  }
+}
