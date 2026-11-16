@@ -745,6 +745,37 @@ class CrawlScope:
         }
 
 
+def _quarantine_pairs(value: Any) -> tuple[tuple[Any, Any], ...]:
+    """Shape-check a page's explicit local quarantine metadata (#2274).
+
+    Accepts the natural serialized mapping (``id -> reason``) or an iterable
+    of ``(id, reason)`` pairs; text validation, duplicate rejection and
+    ordering happen in ``RegistryPage.__post_init__``.
+    """
+
+    if isinstance(value, Mapping):
+        entries: list[Any] = list(value.items())
+    elif isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise RegistryError(
+            "quarantined_competitions must be a mapping or (id, reason) pairs"
+        )
+    else:
+        entries = list(value)
+    pairs: list[tuple[Any, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Sequence) or isinstance(entry, (str, bytes)):
+            raise RegistryError(
+                f"invalid quarantined_competitions entry: {entry!r}"
+            )
+        pair = tuple(entry)
+        if len(pair) != 2:
+            raise RegistryError(
+                f"invalid quarantined_competitions entry: {entry!r}"
+            )
+        pairs.append(pair)
+    return tuple(pairs)
+
+
 @dataclass(frozen=True)
 class RegistryPage:
     snapshot_id: str
@@ -754,6 +785,10 @@ class RegistryPage:
     source_body_hash: str
     competitions: tuple[CompetitionRecord, ...]
     editions: tuple[EditionRecord, ...]
+    # Competitions this page's own discovery quarantined locally, whatever
+    # their classification: an EXCLUDED competition whose editions could not
+    # be read must not survive reconciliation with zero edition rows (#2274).
+    quarantined_competitions: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshot_id", _required_text("snapshot_id", self.snapshot_id))
@@ -765,6 +800,21 @@ class RegistryPage:
         )
         if self.page_count < 1 or not 1 <= self.page_number <= self.page_count:
             raise RegistryError("invalid registry pagination")
+        quarantined: dict[str, str] = {}
+        for raw_id, raw_reason in _quarantine_pairs(self.quarantined_competitions):
+            competition_id = _required_text("quarantined competition_id", raw_id)
+            reason = _required_text("quarantined reason", raw_reason)
+            previous = quarantined.get(competition_id)
+            if previous is not None and previous != reason:
+                raise RegistryConflictError(
+                    f"conflicting quarantined reason: {competition_id!r}"
+                )
+            quarantined[competition_id] = reason
+        object.__setattr__(
+            self,
+            "quarantined_competitions",
+            tuple(sorted(quarantined.items())),
+        )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RegistryPage":
@@ -794,6 +844,9 @@ class RegistryPage:
                 )
                 for item in value.get("editions", ())
             ),
+            quarantined_competitions=_quarantine_pairs(
+                value.get("quarantined_competitions", ())
+            ),
         )
 
 
@@ -805,8 +858,9 @@ class RegistrySnapshot:
     competitions: tuple[CompetitionRecord, ...]
     editions: tuple[EditionRecord, ...]
     snapshot_hash: str
-    # Competitions left out of this snapshot because their rows conflict or
-    # their class is unknown; the rest of the snapshot publishes (#1390).
+    # Competitions left out of this snapshot because their rows conflict,
+    # their class is unknown, or the owning page quarantined them during
+    # discovery; the rest of the snapshot publishes (#1390, #2274).
     quarantined_competition_ids: tuple[str, ...] = ()
 
     @property
@@ -894,6 +948,11 @@ def reconcile_registry_pages(
     quarantined: dict[str, str] = {}
     for page_number in sorted(by_page):
         page = by_page[page_number]
+        # A page's explicit local discovery quarantine is authoritative
+        # whatever the classification says (#2274): an EXCLUDED competition
+        # with no editions is removed here, not left to fail publication.
+        for competition_id, reason in page.quarantined_competitions:
+            quarantined.setdefault(competition_id, reason)
         for record in page.competitions:
             try:
                 _insert_unique(

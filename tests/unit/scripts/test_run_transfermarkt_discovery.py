@@ -709,6 +709,87 @@ def test_post_validation_write_failure_keeps_exact_row_hashes(
     assert len(writer.calls) == 1
 
 
+def _excluded_record() -> CompetitionRecord:
+    # Declared gender=women with no men's signal: EXCLUDED by the audience
+    # dimension even though its editions could not be read (#2274).
+    return CompetitionRecord(
+        competition_id="GB1W",
+        slug="womens-super-league",
+        name="Women's Super League",
+        country="England",
+        confederation="UEFA",
+        competition_type=CompetitionType.DOMESTIC_LEAGUE,
+        gender=Gender.WOMEN,
+        team_type=TeamType.CLUB,
+        age_category=AgeCategory.SENIOR,
+        season_format=SeasonFormat.SPLIT_YEAR,
+        active=True,
+        source_url=(
+            "https://www.transfermarkt.com/womens-super-league/"
+            "startseite/wettbewerb/GB1W"
+        ),
+        discovered_at=NOW,
+        evidence=(
+            ClassificationEvidence(
+                source_field="competition_audience",
+                source_value="women:senior",
+                source_url="https://www.transfermarkt.com/wettbewerbe/europa",
+                origin=EvidenceOrigin.STRUCTURED,
+                gender=Gender.WOMEN,
+                age_category=AgeCategory.SENIOR,
+            ),
+        ),
+        registry_snapshot_id=SNAPSHOT_ID,
+        source_body_hash="6" * 64,
+    )
+
+
+def _page_with_editionless_excluded(*, quarantined: bool) -> RegistryPage:
+    page = _page()
+    return replace(
+        page,
+        competitions=page.competitions + (_excluded_record(),),
+        quarantined_competitions=(
+            (("GB1W", "edition selector must mark exactly one current edition"),)
+            if quarantined
+            else ()
+        ),
+    )
+
+
+def test_flatten_still_rejects_an_editionless_excluded_competition_without_quarantine():
+    mod = _load()
+    snapshot = mod.reconcile_registry_pages(
+        (_page_with_editionless_excluded(quarantined=False),)
+    )
+
+    # The defect itself: the EXCLUDED row survives reconciliation.
+    assert "GB1W" in {item.competition_id for item in snapshot.competitions}
+    with pytest.raises(mod.DiscoveryRunnerError, match="at least one edition"):
+        mod._flatten_snapshot(
+            snapshot,
+            cycle_id="tm-registry-20260711",
+            fetched_at=NOW,
+        )
+
+
+def test_flatten_publishes_when_the_page_quarantined_the_editionless_record():
+    mod = _load()
+    snapshot = mod.reconcile_registry_pages(
+        (_page_with_editionless_excluded(quarantined=True),)
+    )
+    assert "GB1W" in snapshot.quarantined_competition_ids
+
+    competition_rows, edition_rows, scopes = mod._flatten_snapshot(
+        snapshot,
+        cycle_id="tm-registry-20260711",
+        fetched_at=NOW,
+    )
+    assert {row["competition_id"] for row in competition_rows} == {"GB1"}
+    assert {row["competition_id"] for row in edition_rows} == {"GB1"}
+    assert scopes
+
+
 def test_approval_asset_drift_fails_before_proxy_and_state_mutation(
     tmp_path, monkeypatch
 ):
