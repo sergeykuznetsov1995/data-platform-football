@@ -1,0 +1,72 @@
+{
+  "checks": [
+    "557 unique live catalog IDs and all mandatory IDs present",
+    "452 included and 105 excluded with matching live fingerprints and policy/probe counts",
+    "friendlies included; women/youth/reserve/show excluded",
+    "all included have exact available/required season keys",
+    "required = recent ten union start>=2010, unique and subset of available",
+    "EURO and World Cup golden pre-2010 sets match exactly",
+    "38 pre-2010 available pairs, 28 not required",
+    "three profile transitions explained; no unexplained review rows",
+    "56 differing scope/season hashes documented as separate evidence generations",
+    "all 23 required capability families present with complete contracts",
+    "heatmaps current raw_only versus target typed is explicit",
+    "future advertised_not_started outcome present",
+    "README provenance, limitations, links and denominator notes present"
+  ],
+  "decision_counts": {
+    "excluded": 105,
+    "included": 452
+  },
+  "included_available_season_rows": 5568,
+  "included_required_season_pairs": 5540,
+  "included_since_2010_pairs": 5530,
+  "live_catalog_fingerprint_matches": 557,
+  "matrix_families": [
+    "attackingZones",
+    "competitions",
+    "h2h",
+    "heatmaps",
+    "leaderboard_categories",
+    "leaderboards",
+    "lineup",
+    "matchFacts",
+    "matches",
+    "momentum",
+    "playerStats",
+    "players",
+    "playoffs",
+    "season_teams",
+    "seasons",
+    "shotmap",
+    "squads",
+    "stages",
+    "standings",
+    "stats",
+    "teams",
+    "transfers",
+    "weather"
+  ],
+  "matrix_rows": 23,
+  "policy_rule_counts": {
+    "exclude_dead_profile": 9,
+    "exclude_female": 76,
+    "exclude_reserve": 1,
+    "exclude_show": 3,
+    "exclude_youth": 16,
+    "include_structural_male_adult": 452
+  },
+  "pre_2010_available_not_required_pairs": 28,
+  "pre_2010_available_pairs": 38,
+  "probe_status_counts": {
+    "dead": 9,
+    "success": 548
+  },
+  "profile_transition_rows": 3,
+  "registry_rows": 557,
+  "schema_version": "fotmob.scope-deliverable-validation.v1",
+  "scope_profile_hash_absent_from_season_evidence": 56,
+  "status": "PASS",
+  "unexplained_review_rows": 0,
+  "unknown_representation_rows": 0
+}
