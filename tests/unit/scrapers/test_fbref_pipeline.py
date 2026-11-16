@@ -16783,3 +16783,480 @@ def test_match_coverage_is_refreshed_after_new_positive_evidence(tmp_path, monke
     assert second.has_errors
     assert second.datasets["match_events"].error_type == "IncompleteMatchPageError"
     assert second.datasets["lineups"].error_type == "IncompleteMatchPageError"
+
+
+def _failure_matrix_cell(status, diagnostic_class=None, attempt_id=None):
+    return {
+        "status": status,
+        "diagnostic_class": diagnostic_class,
+        "attempt_id": attempt_id,
+    }
+
+
+def _failure_matrix_row(
+    lease,
+    *,
+    initial=None,
+    re_solve_1=None,
+    re_solve_2=None,
+):
+    return {
+        "target_id": lease.target_id,
+        "logical_refresh_id": lease.logical_refresh_id,
+        "initial": initial or _failure_matrix_cell("not_attempted"),
+        "re_solve_1": re_solve_1 or _failure_matrix_cell("not_attempted"),
+        "re_solve_2": re_solve_2 or _failure_matrix_cell("not_attempted"),
+    }
+
+
+def _failure_matrix_streak(event, lease, before, after):
+    return {
+        "event": event,
+        "target_id": lease.target_id,
+        "logical_refresh_id": lease.logical_refresh_id,
+        "attempt_id": lease.attempt_id,
+        "before": {
+            "consecutive_clearance_refreshes": before[0],
+            "clearance_exhausted_targets": before[1],
+        },
+        "after": {
+            "consecutive_clearance_refreshes": after[0],
+            "clearance_exhausted_targets": after[1],
+        },
+    }
+
+
+class _FailureMatrixScriptedFetcher:
+    """Serves one shared queue of scripted outcomes across re-solved sessions."""
+
+    def __init__(self, events, actions):
+        self.events = events
+        self.actions = actions
+
+    def __enter__(self):
+        self.events.append("fetcher_enter")
+        return self
+
+    def __exit__(self, *args):
+        self.events.append("fetcher_exit")
+
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        action = next(self.actions)
+        if action is None:
+            body = b"<html>ok</html>"
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=1,
+                http_status_history=(200,),
+                browser_document_bytes=0,
+                browser_asset_bytes=0,
+                browser_requests=0,
+                browser_bootstrap_attempts=0,
+            )
+        raise FetchError("scripted failure", **action)
+
+
+def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
+    tmp_path,
+):
+    """A red wave must publish what every claimed lease did, not just a count.
+
+    The failure matrix pins each attempt to its slot (initial, re_solve_1,
+    re_solve_2) with a diagnostic class, and the streak transitions replay the
+    guard counters that ended the wave, so a red run can be triaged from its
+    published result JSON alone (#2247).
+    """
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=400,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(number, epoch=1):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=7000 + number * 10 + epoch)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=8000 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=9000 + number * 10 + epoch)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    initial = [make_lease(number) for number in (5, 9, 12, 13, 14)]
+    five, nine, twelve, thirteen, fourteen = initial
+    nine_e2, nine_e3 = make_lease(9, 2), make_lease(9, 3)
+    twelve_e2, twelve_e3 = make_lease(12, 2), make_lease(12, 3)
+    thirteen_e2, thirteen_e3 = make_lease(13, 2), make_lease(13, 3)
+    claims = iter(
+        (
+            initial,
+            [nine_e2],
+            [nine_e3],
+            [twelve_e2],
+            [twelve_e3],
+            [thirteen_e2],
+            [thirteen_e3],
+        )
+    )
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+    actions = iter(
+        [
+            {
+                "error_class": "http_status",
+                "http_status": 500,
+                "wire_bytes": 200,
+                "browser_document_bytes": 500,
+                "browser_asset_bytes": 100,
+                "browser_requests": 20,
+                "browser_bootstrap_attempts": 1,
+                "target_requests": 1,
+                "http_status_history": (500,),
+                "latency_ms": 100,
+            },
+            *(
+                [
+                    {
+                        "error_class": "clearance_failed",
+                        "diagnostic_class": "geo-ip-transport",
+                    }
+                ]
+                * 3
+            ),
+            *(
+                [
+                    {
+                        "error_class": "http_status",
+                        "http_status": 403,
+                        "wire_bytes": 200,
+                        "target_requests": 1,
+                        "http_status_history": (403,),
+                        "latency_ms": 100,
+                    }
+                ]
+                * 2
+            ),
+            {
+                "error_class": "hard_transport_policy",
+                "session_failure_reason": "unrouted_websocket_upgrade",
+            },
+            *([{"error_class": "warm_session_connection"}] * 2),
+            {"error_class": "clearance_failed"},
+        ]
+    )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: _FailureMatrixScriptedFetcher(
+            control.events, actions
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(
+        FetchWaveError,
+        match="clearance_session_refreshes_exhausted=2",
+    ) as excinfo:
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=PipelineSettings(
+                run_type="current",
+                request_limit=400,
+                byte_limit=100 * 1024 * 1024,
+                shard_size=5,
+                request_reservation_bytes=4 * 1024 * 1024,
+                domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+            ),
+        )
+
+    wave = excinfo.value.result
+    assert wave is not None
+    assert wave.fetched == 0
+    assert wave.requeued_dead_clearance == 9
+    assert wave.deferred_session_failures == 3
+    assert wave.deferred_target_failures == ["fbref:competition:5:http_status"]
+    assert wave.failures == ["clearance_session_refreshes_exhausted=2"]
+    assert len(control.failed) == 10
+    assert wave.failure_matrix == [
+        _failure_matrix_row(
+            five,
+            initial=_failure_matrix_cell("failed", "other", five.attempt_id),
+        ),
+        _failure_matrix_row(
+            nine,
+            initial=_failure_matrix_cell(
+                "failed", "geo-ip-transport", nine.attempt_id
+            ),
+            re_solve_1=_failure_matrix_cell(
+                "failed", "geo-ip-transport", nine_e2.attempt_id
+            ),
+            re_solve_2=_failure_matrix_cell(
+                "failed", "geo-ip-transport", nine_e3.attempt_id
+            ),
+        ),
+        _failure_matrix_row(
+            twelve,
+            initial=_failure_matrix_cell(
+                "failed", "http-403", twelve.attempt_id
+            ),
+            re_solve_1=_failure_matrix_cell(
+                "failed", "http-403", twelve_e2.attempt_id
+            ),
+            re_solve_2=_failure_matrix_cell(
+                "failed", "unrouted-websocket-101", twelve_e3.attempt_id
+            ),
+        ),
+        _failure_matrix_row(
+            thirteen,
+            initial=_failure_matrix_cell(
+                "failed", "warm-session", thirteen.attempt_id
+            ),
+            re_solve_1=_failure_matrix_cell(
+                "failed", "warm-session", thirteen_e2.attempt_id
+            ),
+            re_solve_2=_failure_matrix_cell(
+                "failed", "clearance-failed", thirteen_e3.attempt_id
+            ),
+        ),
+        _failure_matrix_row(fourteen),
+    ]
+    assert wave.streak_transitions == [
+        _failure_matrix_streak("session_failure", nine, (0, 0), (1, 0)),
+        _failure_matrix_streak("session_failure", nine_e2, (1, 0), (2, 0)),
+        _failure_matrix_streak("session_failure", nine_e3, (2, 0), (3, 0)),
+        _failure_matrix_streak("target_exhausted", nine_e3, (3, 0), (0, 1)),
+        _failure_matrix_streak("session_failure", twelve, (0, 1), (1, 1)),
+        _failure_matrix_streak("session_failure", twelve_e2, (1, 1), (2, 1)),
+        _failure_matrix_streak("session_failure", twelve_e3, (2, 1), (3, 1)),
+        _failure_matrix_streak("target_exhausted", twelve_e3, (3, 1), (0, 2)),
+        _failure_matrix_streak("session_failure", thirteen, (0, 2), (1, 2)),
+        _failure_matrix_streak(
+            "session_failure", thirteen_e2, (1, 2), (2, 2)
+        ),
+        _failure_matrix_streak(
+            "session_failure", thirteen_e3, (2, 2), (3, 2)
+        ),
+        _failure_matrix_streak(
+            "target_exhausted", thirteen_e3, (3, 2), (0, 3)
+        ),
+    ]
+    document = wave.as_dict()
+    assert json.loads(json.dumps(document)) == document
+
+
+def test_failure_matrix_records_success_after_re_solve_and_streak_reset(
+    tmp_path,
+):
+    """A target that recovers on its first re-solve shows both cells and the
+    streak reset, so a mixed wave is readable as what actually happened."""
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=400,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(epoch=1):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=7300 + epoch)),
+            run_id=run_id,
+            target_id="fbref:competition:9",
+            logical_refresh_id=str(uuid.UUID(int=8300)),
+            canonical_url="https://fbref.com/en/comps/9/history/x-Seasons",
+            page_kind="competition",
+            source_ids={"competition_id": "9"},
+            claim_token=str(uuid.UUID(int=9300 + epoch)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    first, retry = make_lease(1), make_lease(2)
+    claims = iter(([first], [retry]))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+    actions = iter(
+        [
+            {
+                "error_class": "http_status",
+                "http_status": 403,
+                "wire_bytes": 200,
+                "target_requests": 1,
+                "http_status_history": (403,),
+                "latency_ms": 100,
+            },
+            None,
+        ]
+    )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: _FailureMatrixScriptedFetcher(
+            control.events, actions
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=400,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=1,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
+    )
+
+    assert result.fetched == 1
+    assert result.failures == []
+    assert result.failure_matrix == [
+        _failure_matrix_row(
+            first,
+            initial=_failure_matrix_cell(
+                "failed", "http-403", first.attempt_id
+            ),
+            re_solve_1=_failure_matrix_cell("success", None, retry.attempt_id),
+        )
+    ]
+    assert result.streak_transitions == [
+        _failure_matrix_streak("session_failure", first, (0, 0), (1, 0)),
+        _failure_matrix_streak("success", retry, (1, 0), (0, 0)),
+    ]
+    document = result.as_dict()
+    assert json.loads(json.dumps(document)) == document
+
+
+def test_run_live_waves_red_wave_publishes_partial_result_once(tmp_path):
+    """A red batch publishes the progress it already has, exactly once, and
+    still raises the wave's own error (#2247)."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    documents = []
+
+    def on_batch(document):
+        documents.append(document)
+        if len(documents) == 2:
+            raise RuntimeError("progress sink unavailable")
+
+    parse_calls = []
+
+    def fake_parse(*_args, **_kwargs):
+        parse_calls.append(True)
+        return WaveResult()
+
+    pipeline.parse_wave = fake_parse
+
+    first_row = {
+        "target_id": "fbref:competition:9",
+        "logical_refresh_id": str(uuid.UUID(int=8009)),
+        "initial": _failure_matrix_cell(
+            "success", None, str(uuid.UUID(int=7091))
+        ),
+        "re_solve_1": _failure_matrix_cell("not_attempted"),
+        "re_solve_2": _failure_matrix_cell("not_attempted"),
+    }
+    partial_row = {
+        "target_id": "fbref:competition:5",
+        "logical_refresh_id": str(uuid.UUID(int=8005)),
+        "initial": _failure_matrix_cell(
+            "failed", "http-403", str(uuid.UUID(int=7051))
+        ),
+        "re_solve_1": _failure_matrix_cell("not_attempted"),
+        "re_solve_2": _failure_matrix_cell("not_attempted"),
+    }
+    partial_transition = _failure_matrix_streak(
+        "session_failure",
+        SimpleNamespace(
+            target_id="fbref:competition:5",
+            logical_refresh_id=str(uuid.UUID(int=8005)),
+            attempt_id=str(uuid.UUID(int=7051)),
+        ),
+        (0, 0),
+        (1, 0),
+    )
+    partial = WaveResult(
+        cohort_size=1,
+        claimed=1,
+        fetched=0,
+        failures=["fbref:competition:5:http_status"],
+        failure_matrix=[partial_row],
+        streak_transitions=[partial_transition],
+    )
+    failure = FetchWaveError("red wave: 5:http_status", result=partial)
+    fetch_calls = []
+
+    def fake_fetch(*_args, **_kwargs):
+        fetch_calls.append(True)
+        if len(fetch_calls) == 1:
+            return WaveResult(
+                cohort_size=2,
+                claimed=2,
+                fetched=2,
+                failure_matrix=[first_row],
+            )
+        raise failure
+
+    pipeline.fetch_wave = fake_fetch
+
+    with pytest.raises(FetchWaveError, match="red wave") as excinfo:
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=2,
+            on_batch=on_batch,
+        )
+
+    assert excinfo.value is failure
+    assert excinfo.value.result is partial
+    assert len(fetch_calls) == 2
+    assert len(parse_calls) == 1
+    assert [document["batches"] for document in documents] == [1, 2]
+    assert documents[1]["fetch"]["fetched"] == 2
+    assert documents[1]["fetch"]["claimed"] == 3
+    assert documents[1]["fetch"]["failures"] == [
+        "fbref:competition:5:http_status"
+    ]
+    assert documents[1]["fetch"]["failure_matrix"] == [
+        first_row,
+        partial_row,
+    ]
+    assert documents[1]["fetch"]["streak_transitions"] == [partial_transition]
