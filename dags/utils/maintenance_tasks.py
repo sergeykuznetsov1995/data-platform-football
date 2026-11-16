@@ -955,7 +955,14 @@ def _exec_alter(conn, sql: str) -> dict:
             cur.close()
     match = re.match(r'ALTER TABLE (\S+) ', sql)
     if match and _tm_career_table(match.group(1)):
-        from scrapers.transfermarkt.writer import _execute_committing, shared_writer_lock_ready
+        try:
+            from scrapers.transfermarkt.writer import _execute_committing, shared_writer_lock_ready
+        except ImportError:
+            # Shared scheduler trees without the TM scraper stack (P0 delivery
+            # 15.11: /root/dpf-whoscored-merge has no scrapers/transfermarkt
+            # writer) must skip TM-protected maintenance, not fail the sweep.
+            logger.warning('TM maintenance skipped: transfermarkt writer not present in this tree')
+            return {'maintenance_skipped': True, 'reason': 'shared_tm_writer_lock_required'}
         if not shared_writer_lock_ready():
             logger.warning('TM maintenance skipped: shared host writer lock is not configured')
             return {'maintenance_skipped': True, 'reason': 'shared_tm_writer_lock_required'}
@@ -1516,7 +1523,14 @@ def _maintain_one(conn, fq: str, retention_threshold: str) -> dict:
     """Keep TM immutable capture snapshots while applying normal other retention."""
     table = _tm_career_table(fq)
     if table:
-        from scrapers.transfermarkt.writer import writer_lock, shared_writer_lock_ready
+        try:
+            from scrapers.transfermarkt.writer import writer_lock, shared_writer_lock_ready
+        except ImportError:
+            # See _exec_alter: trees without the TM scraper stack skip instead
+            # of failing the weekly sweep.
+            logger.warning('TM retention skipped: transfermarkt writer not present in this tree')
+            return {'retention_skipped': True, 'reason': 'shared_tm_writer_lock_required',
+                'deleted_files_count': 0, 'scanned_files_count': 0}
         if not shared_writer_lock_ready():
             logger.warning('TM retention skipped: shared host writer lock is not configured')
             return {'retention_skipped': True, 'reason': 'shared_tm_writer_lock_required',
