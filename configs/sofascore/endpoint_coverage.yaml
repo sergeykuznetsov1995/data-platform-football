@@ -65,6 +65,31 @@ manifest:
     - player_profile
     - player_season_statistics
 
+# Canonical match-level completeness read model (#1366): the same match×endpoint
+# journal semantics as deploy/sofascore/sofascore_endpoint_journal.sql. This
+# block is a contract only: it claims no physical table and adds no writer;
+# the `tables:` inventory below is unchanged.
+completeness_journal:
+  version: schedule_core_x_ops_manifest_v1
+  sources:
+    schedule: bronze.sofascore_schedule
+    manifest: iceberg.ops.sofascore_capture_manifest
+  core_endpoints: [event, lineups, statistics, shotmap, incidents]
+  statuses: [not_collected, collected, source_404, quarantine]
+  complete_statuses: [collected, source_404]
+  manifest_status_mapping:
+    success: [collected]
+    legitimate_empty: [collected]
+    # source_404 only with http_status 404; otherwise the endpoint stays
+    # not_collected.
+    not_supported: [source_404, not_collected]
+    retryable_failure: [not_collected]
+    schema_error: [quarantine]
+  missing_endpoint_status: not_collected
+  match_identity: game_id across ENG/SS
+  partition_key: "SS-<id>"
+  read_model: sql_projection
+
 quality_gates:
   duplicate_natural_keys: 0
   season_mismatches: 0

@@ -406,3 +406,66 @@ def test_fresh_bootstrap_declares_both_sides_of_every_coalesce(coverage):
     assert ["stat_key", "key", "statistics_type"] in compat[
         "sofascore_match_stats"
     ]
+
+
+def test_completeness_journal_is_a_table_free_read_model_contract(coverage):
+    journal = coverage["completeness_journal"]
+    assert journal["version"] == "schedule_core_x_ops_manifest_v1"
+    assert journal["sources"] == {
+        "schedule": "bronze.sofascore_schedule",
+        "manifest": "iceberg.ops.sofascore_capture_manifest",
+    }
+    assert journal["read_model"] == "sql_projection"
+    assert journal["match_identity"] == "game_id across ENG/SS"
+    assert journal["partition_key"] == "SS-<id>"
+    # Contract only: никакая materialized таблица не заявлена.
+    assert "table" not in journal
+    assert "completeness_journal" not in coverage["tables"]
+
+
+def test_completeness_journal_core_endpoints_equal_endpoint_journal(coverage):
+    from deploy.sofascore.endpoint_journal import CORE_ENDPOINTS
+
+    journal = coverage["completeness_journal"]
+    assert journal["core_endpoints"] == list(CORE_ENDPOINTS)
+    assert journal["core_endpoints"] == coverage["committed_state_dq"][
+        "required_event_endpoints"
+    ]
+
+
+def test_completeness_journal_statuses_match_endpoint_journal_semantics(coverage):
+    from deploy.sofascore.endpoint_journal import (
+        JOURNAL_STATUSES,
+        TERMINAL_STATUSES,
+    )
+
+    journal = coverage["completeness_journal"]
+    assert journal["statuses"] == ["not_collected", "collected", "source_404", "quarantine"]
+    assert set(journal["statuses"]) == set(JOURNAL_STATUSES)
+    assert journal["complete_statuses"] == ["collected", "source_404"]
+    assert set(journal["complete_statuses"]) == set(TERMINAL_STATUSES)
+    assert set(journal["complete_statuses"]) <= set(journal["statuses"])
+    assert journal["missing_endpoint_status"] == "not_collected"
+
+
+def test_completeness_journal_manifest_status_mapping_is_consistent(coverage):
+    journal = coverage["completeness_journal"]
+    mapping = journal["manifest_status_mapping"]
+    assert set(mapping) == set(coverage["manifest"]["states"])
+    assert mapping == {
+        "success": ["collected"],
+        "legitimate_empty": ["collected"],
+        "not_supported": ["source_404", "not_collected"],
+        "retryable_failure": ["not_collected"],
+        "schema_error": ["quarantine"],
+    }
+    for targets in mapping.values():
+        assert set(targets) <= set(journal["statuses"])
+    reached = {status for targets in mapping.values() for status in targets}
+    assert set(journal["complete_statuses"]) <= reached
+    assert journal["missing_endpoint_status"] not in journal["complete_statuses"]
+
+
+def test_completeness_journal_extra_root_key_keeps_validator_green(coverage):
+    # Root validator допускает дополнительный key: контракт остаётся валидным.
+    validate_coverage_contract(coverage)

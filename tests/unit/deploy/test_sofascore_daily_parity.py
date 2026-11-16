@@ -1,10 +1,12 @@
 """Offline checks for the read-only seven-day Bronze parity report (#1370)."""
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from deploy.sofascore import daily_parity as parity
+from deploy.sofascore import endpoint_journal
 from deploy.sofascore import veha1_measure as measure
 
 START = date(2026, 10, 20)
@@ -85,23 +87,68 @@ def test_duplicate_match_id_out_of_window_and_other_days_rejected():
         parity.build_report([], start=START, days=8)
 
 
-def test_sql_template_read_only_deduplicated_with_sentinel_and_placeholders():
+STATUS_WHEN = re.compile(
+    r"WHEN\s+(.+?)\s+THEN\s+'(collected|source_404|quarantine|not_collected)'"
+)
+
+
+def _status_mapping(sql_text):
+    # Mapping-ветки без табличных алиасов — как в endpoint_journal semantics.
+    return {
+        condition.replace("lm.", ""): status
+        for condition, status in STATUS_WHEN.findall(sql_text)
+        if "status" in condition
+    }
+
+
+def test_sql_template_read_only_canonical_journal_with_sentinel_and_placeholders():
     sql = (parity.TOOLS / "sofascore_daily_parity.sql").read_text(encoding="utf-8")
     for placeholder in ("{tournament_ids}", "{since}", "{until}"):
         assert placeholder in sql
     assert "__sentinel__" in sql
-    # Trino: позиционные GROUP BY (schedule — 1, 2; capture — ровно 1).
+    # Trino: позиционный GROUP BY (schedule — 1, 2; агрегаты — ровно 1).
     assert "GROUP BY 1, 2" in sql
     assert "GROUP BY 1\n" in sql
-    # Ключи таблиц: schedule — game_id, capture — match_id (не путать).
+    # Ключ таблицы schedule — game_id; sentinel UNION требует строковый day.
     assert "CAST(game_id AS varchar) AS match_id" in sql
-    assert "CAST(match_id AS varchar) AS match_id" in sql
-    assert "capture_rows" in sql
-    # Sentinel UNION требует строковый day.
     assert "CAST(s.day AS varchar) AS day" in sql
     assert "max_by(" in sql
     assert "bronze.sofascore_schedule" in sql
-    assert "bronze.sofascore_match_capture_status" in sql
+
+    # any_complete (#1366): canonical match×endpoint journal из ops manifest.
+    canonical, informational = sql.partition("compat_both AS")[0::2]
+    assert canonical and informational
+    assert "iceberg.ops.sofascore_capture_manifest" in canonical
+    assert "m.target_type = 'event'" in canonical
+    assert "m.endpoint IN ({})".format(
+        ", ".join(f"'{name}'" for name in endpoint_journal.CORE_ENDPOINTS)
+    ) in canonical
+    assert "PARTITION BY mc.match_id, mc.endpoint" in canonical
+    assert "ORDER BY mc.updated_at DESC, mc.run_id DESC, mc.freshness_key DESC" in canonical
+    assert "ELSE 'invalid'" in canonical
+    # Complete ⇔ ровно 5 core endpoints и все в collected/source_404:
+    # partial/missing → 0, quarantine → 0, retryable → 0.
+    assert "count(*) = 5" in canonical
+    assert "bool_and(journal_status IN ('collected', 'source_404'))" in canonical
+    assert "WHEN status = 'not_supported' AND http_status = 404 THEN 'source_404'" in canonical
+    assert "WHEN status = 'schema_error' THEN 'quarantine'" in canonical
+    assert (
+        "WHEN status IN ('not_supported', 'retryable_failure') THEN 'not_collected'"
+        in canonical
+    )
+    # Матч без manifest-наблюдений — incomplete через LEFT JOIN + coalesce.
+    assert "LEFT JOIN capture c ON c.match_id = s.match_id" in sql
+    assert "coalesce(c.any_complete, 0) AS any_complete" in sql
+
+    # Compatibility-таблица — только informational physical overlap (#1366):
+    # единственный потребитель — both_complete, не any_complete/covered/missing.
+    assert "bronze.sofascore_match_capture_status" not in canonical
+    assert "bronze.sofascore_match_capture_status" in informational
+    assert "CAST(match_id AS varchar) AS match_id" in informational
+    assert (
+        "coalesce(cb.ss_complete, 0) * coalesce(cb.other_complete, 0) AS both_complete"
+        in sql
+    )
 
     import sqlglot
 
@@ -122,6 +169,19 @@ def test_sql_template_read_only_deduplicated_with_sentinel_and_placeholders():
             if len(s.expressions) == len(parity.REPORT_COLUMNS) and s.args.get("joins")]
     assert len(main) == 1
     assert [e.alias_or_name for e in main[0].expressions] == list(parity.REPORT_COLUMNS)
+
+
+def test_sql_status_mapping_is_identical_to_endpoint_journal_template():
+    expected = {
+        "status IN ('success', 'legitimate_empty')": "collected",
+        "status = 'not_supported' AND http_status = 404": "source_404",
+        "status = 'schema_error'": "quarantine",
+        "status IN ('not_supported', 'retryable_failure')": "not_collected",
+    }
+    parity_sql = (parity.TOOLS / "sofascore_daily_parity.sql").read_text(encoding="utf-8")
+    journal_sql = (parity.TOOLS / "sofascore_endpoint_journal.sql").read_text(encoding="utf-8")
+    assert _status_mapping(parity_sql) == expected
+    assert _status_mapping(journal_sql) == expected
 
 
 class _FakeCatalog:
