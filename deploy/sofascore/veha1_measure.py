@@ -11,18 +11,23 @@
       только дополнить журнал.
   --c1 START END [--denominator PATH]
       воспроизведение замера C1 (окно старта [START, END), даты YYYY-MM-DD) без журнала:
-      окончание = старт + 7200, закрытие = любая строка capture_status; ядро по старому
-      правилу (211 ключей sofascore_veha1_c1_noncore.txt) и по файлу знаменателя.
+      окончание = старт + 7200, закрытие = capture_complete журнала эндпоинтов (все 5
+      терминальны: collected/source_404); ядро по старому правилу (211 ключей
+      sofascore_veha1_c1_noncore.txt) и по файлу знаменателя.
 
 Знаменатель — class == core в <SOFASCORE_RELEASE_ROOT>/configs/sofascore/denominator.tsv
 (из /etc/data-platform/sofascore.env читается только строка SOFASCORE_RELEASE_ROOT=).
 Матч → турнир: партиция SS-<id> (полоса SS) важнее; при её отсутствии —
 tournament_unique_tournament_id расписания для партиций реестра дейли (ENG-… и т. п.,
 полоса daily). Trino — только trino-ro.sh.
+Закрытие матча и статусы пяти эндпоинтов — канонический журнал endpoint_journal.py
+(шаблон sofascore_endpoint_journal.sql; источник сводки — journal_source в daily.jsonl):
+матч закрыт, только когда все 5 эндпоинтов терминальны (collected/source_404).
 Вердикт позднего finished (#2094) — по ключу visits артефактов обхода афиши
 <SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR>/refresh-results/schedule-refresh-*.json.
 Пишет только в /root/watchdog/state/sofascore_veha1/.
-SQL-шаблоны sofascore_veha1_*.sql и sofascore_veha1_c1_noncore.txt лежат рядом в deploy/sofascore/.
+SQL-шаблоны sofascore_veha1_*.sql (closure — указатель на канонический журнал, без второй
+семантики) и sofascore_veha1_c1_noncore.txt лежат рядом в deploy/sofascore/.
 """
 from __future__ import annotations
 
@@ -38,6 +43,21 @@ from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
+try:
+    from .endpoint_journal import (
+        CORE_ENDPOINTS,
+        JOURNAL_COLUMNS,
+        render_journal_sql,
+        summarize_journal,
+    )
+except ImportError:  # прямой запуск скриптом: deploy/sofascore уже в sys.path
+    from endpoint_journal import (
+        CORE_ENDPOINTS,
+        JOURNAL_COLUMNS,
+        render_journal_sql,
+        summarize_journal,
+    )
+
 TRINO = "/root/.claude/bin/trino-ro.sh"
 SS_ENV = "/etc/data-platform/sofascore.env"
 TOOLS = Path(__file__).resolve().parent
@@ -50,10 +70,13 @@ CLOSURE_DAYS = 9
 THRESHOLD = 99.0
 OBSERVE_DAYS = 7
 CHUNK = 2000
-# scrapers/sofascore/adapters.py _legacy_state: success; LEGITIMATE_EMPTY/NOT_SUPPORTED → not_available
-# (404 источника терминально). schema_error/blocked/rate_limited/server_error/transport_error — не закрыт.
-TERMINAL = ("success", "not_available")
-ENDPOINTS = ("event", "lineups", "statistics", "shotmap", "incidents")
+# Журнал эндпоинтов (endpoint_journal.py): терминальны collected (success/legitimate_empty)
+# и source_404 (not_supported с HTTP 404); quarantine (schema_error) и not_collected
+# (retryable_failure и т. п.) матч не закрывают. Порядок статусов — CORE_ENDPOINTS журнала.
+TERMINAL = ("collected", "source_404")
+ENDPOINTS = CORE_ENDPOINTS
+JOURNAL_STATUS_KEYS = ("collected", "source_404", "quarantine", "not_collected")
+JOURNAL_SOURCE = "schedule_core_x_ops_manifest_v1"
 UNMARKED = ("notstarted", "inprogress", "postponed", "canceled", "interrupted", "suspended")
 DENOM_COLUMNS = ["tournament_id", "capture_key", "name", "class", "queue_priority", "basis"]
 
@@ -295,9 +318,10 @@ UNION ALL SELECT '__sentinel__', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 
 def observe(journal: dict[str, dict], now: datetime, *, debt_rows=None) -> tuple[int, dict[str, list]]:
     """В памяти: (1) дописать finished-матчи со стартом за 7 суток, которых нет в журнале, с отметкой
-    прошлого observe; (2) запомнить в записи первое увиденное закрытие (closed_at) — capture_status
-    хранит одну строку на матч и MERGE перезаписывает _ingested_at, поэтому min() в Trino со временем
-    уезжает вперёд. Возвращает (добавлено, последние статусы незакрытых)."""
+    прошлого observe; (2) запомнить в записи первое увиденное закрытие (closed_at) — MERGE журнала
+    эндпоинтов перезаписывает updated_at терминальных строк, поэтому закрытие, посчитанное в Trino
+    повторно, со временем уезжает вперёд; уже зафиксированное закрытие не перезаписывается.
+    Возвращает (добавлено, последние состояния незакрытых)."""
     prev_observe = read_last_observe()
     until = int(now.timestamp())
     since = until - OBSERVE_DAYS * 86400
@@ -387,12 +411,21 @@ def seen_late(rec: dict) -> bool:
 
 # ---------------------------------------------------------------- report
 def closures(game_ids: list[str]) -> dict[str, list]:
-    terminal = ", ".join(f"'{s}'" for s in TERMINAL)
+    """Состояния матчей по каноническому журналу эндпоинтов (render_journal_sql +
+    summarize_journal), а не по compatibility-таблице capture_status: {gid: [closed_at,
+    observed_at, статусы 5 эндпоинтов в порядке CORE_ENDPOINTS]}. Закрытие (closed_at) —
+    только capture_complete: все 5 эндпоинтов collected/source_404; сентинел отбрасывает
+    trino_rows. Пустой список — {} без похода в Trino."""
     out: dict[str, list] = {}
     for i in range(0, len(game_ids), CHUNK):
-        ids = ", ".join(f"'{g}'" for g in game_ids[i:i + CHUNK])
-        for row in trino_rows(_sql("closure", terminal=terminal, ids=ids), 8):
-            out[row[0]] = row[1:]
+        try:
+            rows = trino_rows(render_journal_sql(game_ids[i:i + CHUNK]), len(JOURNAL_COLUMNS))
+            summary = summarize_journal(dict(zip(JOURNAL_COLUMNS, row)) for row in rows)
+        except ValueError as exc:
+            raise MeasureError(f"журнал эндпоинтов: {exc}") from None
+        for gid, match in summary.items():
+            out[gid] = [match.closed_at, match.observed_at,
+                        *(match.statuses.get(endpoint) for endpoint in CORE_ENDPOINTS)]
     return out
 
 
@@ -467,6 +500,11 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
            and (not rec.get("reported_day") or rec["reported_day"] not in done_days)]
     core = [rec for rec in due if classes.get(rec["tournament_id"]) == "core"]
     late = [rec for rec in core if seen_late(rec)]
+    # endpoint_status_counts нужен каждому due-матчу, а observe прочитал только незакрытые
+    # за 9 суток — дочитываем остальных, чтобы counts не были молча неполными.
+    pending = [rec["game_id"] for rec in due if rec["game_id"] not in latest]
+    if pending:
+        latest.update(closures(pending))
     # Записи до #2094 вердикта не имеют — считаются «неизвестно», задним числом не пересчитываются.
     verdicts = Counter(rec.get("late_verdict", "unknown") for rec in late)
     verdicts_by_league: dict[str, Counter] = {}
@@ -494,7 +532,7 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         elif closed_at is not None:
             missing = "terminal after deadline"
         elif info is None:
-            missing = "no capture row"
+            missing = "no journal rows"
         else:
             missing = ",".join(
                 name for name, st in zip(ENDPOINTS, info[2:]) if st not in TERMINAL
@@ -505,6 +543,12 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
                           rec.get("late_verdict", "-") if seen_late(rec) else "-",
                           rec.get("last_sweep_without_at") or "-"])
     debt = Counter(rec["status_first_seen"] for rec in core if rec.get("status_debt"))
+    endpoint_status: Counter = Counter()
+    for rec in population:
+        info = latest.get(rec["game_id"])
+        if info is not None:
+            endpoint_status.update(st for st in info[2:] if st is not None)
+    endpoint_counts = {st: endpoint_status.get(st, 0) for st in JOURNAL_STATUS_KEYS}
     n = len(population)
     share = 100.0 * ok / n if n else 0.0
     mark = "✅" if n > 0 and share >= THRESHOLD else "⛔"
@@ -515,6 +559,9 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         f"• веха 1 SofaScore за {day:%d.%m} (UTC): ядро ≤ 24 ч {ok}/{n} = "
         f"{share_txt} % {mark} (порог ≥ 99 %; "
         f"SS {lanes['SS'][0]}/{lanes['SS'][1]}, дейли {lanes['daily'][0]}/{lanes['daily'][1]}); "
+        f"журнал ({JOURNAL_SOURCE}): collected {endpoint_counts['collected']}, "
+        f"source_404 {endpoint_counts['source_404']}, quarantine {endpoint_counts['quarantine']}, "
+        f"not_collected {endpoint_counts['not_collected']}; "
         f"finished увиден позже 24 ч после старта {len(late)} (в знаменателе; источник опоздал {verdicts['source_late']}, "
         f"наш обход {verdicts['our_sweep_late']}, неизвестно {verdicts['unknown']}); не размечено: notstarted {un['notstarted']}, "
         f"inprogress {un['inprogress']}, postponed {un['postponed']}, "
@@ -539,6 +586,8 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
         "share": round(share, 2), "pass": mark == "✅", "threshold": THRESHOLD,
         "lanes": {k: {"in24": v[0], "total": v[1]} for k, v in lanes.items()},
         "seen_finished_late_in_denominator": len(late), "unmarked": dict(un),
+        "endpoint_status_counts": endpoint_counts,
+        "journal_source": JOURNAL_SOURCE,
         "late_verdicts": {k: verdicts[k] for k in ("source_late", "our_sweep_late", "unknown")},
         "late_verdicts_by_league": {k: dict(v) for k, v in sorted(verdicts_by_league.items())},
         "top_misses": [[tid, cnt] for tid, cnt in misses.most_common(10)],
@@ -568,15 +617,17 @@ def c1(classes: dict[int, str], start: date, end: date) -> str:
     since = int(datetime.combine(start, time(0), timezone.utc).timestamp())
     until = int(datetime.combine(end, time(0), timezone.utc).timestamp())
     noncore_old = set((TOOLS / "sofascore_veha1_c1_noncore.txt").read_text().split())
-    rows = trino_rows(_sql("c1", since=str(since), until=str(until)), 6)
+    rows = trino_rows(_sql("c1", since=str(since), until=str(until)), 5)
+    closed = closures([row[0] for row in rows])  # только capture_complete/closed_at журнала
     old = {"core": [0, 0, 0], "noncore": [0, 0, 0]}  # fin, closed_ever, in24
     new = {"core": [0, 0, 0], "noncore": [0, 0, 0]}
-    for _gid, st, ss_league, reg_league, tut, closed in rows:
+    for gid, st, ss_league, reg_league, tut in rows:
         start_ts = int(st)
         is_old_core = not (ss_league in noncore_old and not reg_league)
         tid, _lane, _league = game_tournament(ss_league, reg_league, tut)
         is_new_core = tid is not None and classes.get(tid) == "core"
-        closed_ts = float(closed) if closed else None
+        info = closed.get(gid)
+        closed_ts = info[0] if info is not None else None
         in24 = closed_ts is not None and closed_ts <= start_ts + 7200 + 86400
         for bucket, flag in ((old, is_old_core), (new, is_new_core)):
             cell = bucket["core" if flag else "noncore"]

@@ -1,3 +1,7 @@
+-- Расписание-only: окно finished + identity-колонки, без join к capture-status.
+-- Закрытие считает veha1_measure.closures по каноническому журналу эндпоинтов
+-- (sofascore_endpoint_journal.sql, capture_complete/closed_at), а не любая строка
+-- bronze-таблицы статуса захвата.
 WITH s AS (
   SELECT CAST(game_id AS varchar) AS gid,
          min(start_timestamp) AS st,
@@ -7,10 +11,8 @@ WITH s AS (
   FROM bronze.sofascore_schedule
   WHERE status_type = 'finished' AND start_timestamp >= {since} AND start_timestamp < {until}
   GROUP BY 1
-),
-c AS (SELECT CAST(match_id AS varchar) AS gid, min(_ingested_at) AS closed_at
-      FROM bronze.sofascore_match_capture_status GROUP BY 1)
+)
 SELECT s.gid, CAST(CAST(s.st AS bigint) AS varchar), s.ss_league, s.reg_league,
-       CAST(CAST(s.tut AS bigint) AS varchar), CAST(to_unixtime(c.closed_at) AS varchar)
-FROM s LEFT JOIN c ON c.gid = s.gid
-UNION ALL SELECT '__sentinel__', '', '', '', '', ''
+       CAST(CAST(s.tut AS bigint) AS varchar)
+FROM s
+UNION ALL SELECT '__sentinel__', '', '', '', ''

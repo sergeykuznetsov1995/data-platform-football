@@ -2,7 +2,7 @@
 import json
 import os
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -30,7 +30,9 @@ def test_status_debt_counts_once_then_finished_keeps_identity(
     monkeypatch.setattr(measure, "_sql", lambda name, **_: name)
     monkeypatch.setattr(measure, "SS_ENV", str(tmp_path / "absent.env"))  # вердикт #2094 — без хоста
     monkeypatch.setattr(measure, "trino_rows", lambda *_: finished)
-    monkeypatch.setattr(measure, "closures", lambda _: {"1": [start + 8000]})
+    # Actual closures layout: closed_at, observed_at, five statuses in CORE_ENDPOINTS order.
+    closure_state = {"1": [float(start + 8000), float(start + 8600), *["collected"] * 5]}
+    monkeypatch.setattr(measure, "closures", lambda gids: dict(closure_state))
     monkeypatch.setattr(measure, "unmarked", lambda *_: Counter({status: 1}))
     debt_rows = [["2", str(start), "SS-7", "2627", None, None, None, status, "2026-10-25"]]
     monkeypatch.setattr(measure, "status_debt", lambda _, **kwargs: debt_rows + (
@@ -51,6 +53,11 @@ def test_status_debt_counts_once_then_finished_keeps_identity(
     summary = measure.read_daily()[0]
     assert summary["seen_finished_late_in_denominator"] == expected_late
     assert summary["status_debt_in_denominator"] == {status: 1}
+    assert summary["journal_source"] == "schedule_core_x_ops_manifest_v1"
+    assert summary["endpoint_status_counts"] == {
+        "collected": 5, "source_404": 0, "quarantine": 0, "not_collected": 0}
+    assert ("журнал (schedule_core_x_ops_manifest_v1): collected 5, "
+            "source_404 0, quarantine 0, not_collected 0") in summary["line"]
     tomorrow = now + timedelta(days=1)
     measure._report_locked({7: "core"}, Path("denominator.tsv"), tomorrow,
                            day + timedelta(days=1), cutoff + 86400, False)
@@ -63,11 +70,13 @@ def test_status_debt_counts_once_then_finished_keeps_identity(
     # the capture deadline may change, the measured status deadline may not.
     finished.append(["2", str(start), str(start + 7200), "SS-7", "2627", None, None, None])
     debt_rows.clear()
+    closure_state["1"][0] = float(start + 50000)  # replay: поздний closed_at не перезаписывает
     measure._report_locked({7: "core"}, Path("denominator.tsv"), now + timedelta(days=2),
                            day + timedelta(days=2), cutoff + 2 * 86400, False)
     assert measure.read_daily()[2]["status_debt_current"] == {}
     journal = measure.read_journal()
     assert len(journal) == 2
+    assert journal["1"]["closed_at"] == start + 8000  # первое закрытие переживает replay
     assert journal["2"]["latest_status"] == "finished"
     assert journal["2"]["deadline_ts"] == start + 7200 + 86400
     assert journal["2"]["measurement_deadline_ts"] == start + 86400
@@ -131,12 +140,113 @@ def test_status_debt_parses_double_start_timestamp(monkeypatch):
     db.close()
 
 
-@pytest.mark.parametrize("name", ["observe", "closure", "unmarked", "c1"])
+@pytest.mark.parametrize("name", ["observe", "unmarked", "c1"])
 def test_sql_templates_ship_with_the_measurer(name):
     # Шаблоны жили только в /root/watchdog/tools/ — из релиза измеритель падал FileNotFoundError.
-    sql = measure._sql(name, since="1", until="2", terminal="'success'", ids="'1'", statuses="'notstarted'")
+    # closure больше не рендерится _sql: это указатель на канонический журнал (тест ниже).
+    sql = measure._sql(name, since="1", until="2", statuses="'notstarted'")
     assert "__sentinel__" in sql and "{" not in sql
     assert len((measure.TOOLS / "sofascore_veha1_c1_noncore.txt").read_text().split()) == 211
+
+
+def test_closure_sql_is_a_pointer_to_the_canonical_journal():
+    # Старый SELECT по compatibility-таблице удалён — второй семантики закрытия нет.
+    text = (measure.TOOLS / "sofascore_veha1_closure.sql").read_text(encoding="utf-8")
+    assert "sofascore_endpoint_journal.sql" in text
+    assert "sofascore_match_capture_status" not in text
+    assert "{" not in text  # плейсхолдеров нет — файл не рендерится
+
+
+def test_c1_sql_is_schedule_only():
+    # Закрытие считает closures() по каноническому журналу, а не любая строка capture_status.
+    sql = measure._sql("c1", since="1", until="2")
+    assert "sofascore_match_capture_status" not in sql
+    assert "__sentinel__" in sql and "{" not in sql
+    assert sql.count("'__sentinel__'") == 1
+
+
+def test_closures_reads_the_canonical_endpoint_journal(monkeypatch):
+    # Compatibility-таблица не используется: closed_at только при capture_complete;
+    # partial и quarantine не закрыты, точный 404 терминален, отсутствающий матч не входит.
+    from deploy.sofascore import endpoint_journal
+
+    ts = "2026-10-26T12:00:00Z"
+    later = "2026-10-26T13:30:00Z"
+    manifest = {"collected": "success", "source_404": "not_supported",
+                "quarantine": "schema_error", "not_collected": "retryable_failure"}
+    http = {"collected": "200", "source_404": "404", "quarantine": "200", "not_collected": None}
+    rows = []
+    for gid, statuses in (
+        ("1", ("collected",) * 5),
+        ("2", ("source_404",) * 5),
+        ("3", ("collected", "collected", "not_collected", "collected", "collected")),
+        ("4", ("collected", "quarantine", "collected", "collected", "collected")),
+    ):
+        for endpoint, status in zip(endpoint_journal.CORE_ENDPOINTS, statuses):
+            rows.append([gid, "SS-7", "2627", "7", endpoint, status, manifest[status],
+                         http[status], later if status in measure.TERMINAL else None,
+                         ts, None])
+
+    seen = {}
+
+    def query(sql, ncols):
+        seen["sql"], seen["ncols"] = sql, ncols
+        return [list(row) for row in rows]
+
+    monkeypatch.setattr(measure, "trino_rows", query)
+    ids = ["1", "2", "3", "4", "404missing"]
+    out = measure.closures(ids)
+    assert seen["ncols"] == len(endpoint_journal.JOURNAL_COLUMNS)
+    assert seen["sql"] == endpoint_journal.render_journal_sql(ids)
+    assert "sofascore_match_capture_status" not in seen["sql"]
+    closed = datetime(2026, 10, 26, 13, 30, tzinfo=timezone.utc).timestamp()
+    observed = datetime(2026, 10, 26, 12, tzinfo=timezone.utc).timestamp()
+    assert out["1"] == [closed, observed, *["collected"] * 5]
+    assert out["2"] == [closed, observed, *["source_404"] * 5]
+    assert out["3"][0] is None and out["3"][2:] == [
+        "collected", "collected", "not_collected", "collected", "collected"]
+    assert out["4"][0] is None and "quarantine" in out["4"]
+    assert "404missing" not in out
+
+
+def test_closures_empty_ids_return_nothing_without_trino(monkeypatch):
+    def boom(*_args):
+        raise AssertionError("trino_rows не должен вызываться для пустого списка")
+    monkeypatch.setattr(measure, "trino_rows", boom)
+    assert measure.closures([]) == {}
+
+
+def test_c1_closes_only_on_canonical_capture_complete(tmp_path, monkeypatch):
+    start = int(datetime(2026, 10, 20, 18, tzinfo=timezone.utc).timestamp())
+    fin_rows = [["1", str(start), "SS-7", None, "7"],
+                ["2", str(start), "SS-7", None, "7"],
+                ["3", str(start), "SS-7", None, "7"]]
+    monkeypatch.setattr(measure, "TOOLS", tmp_path)  # noncore-список не зависит от релиза
+    (tmp_path / "sofascore_veha1_c1_noncore.txt").write_text("SS-1000 SS-1001\n", encoding="utf-8")
+    monkeypatch.setattr(measure, "_sql", lambda name, **_: name)
+    calls = {}
+
+    def rows(sql, ncols):
+        calls["ncols"] = ncols
+        return [list(row) for row in fin_rows]
+
+    monkeypatch.setattr(measure, "trino_rows", rows)
+    closure_state = {
+        "1": [float(start + 8000), None, *["collected"] * 5],                # в 24 ч
+        "2": [float(start + 7200 + 86400 + 500), None, *["collected"] * 5],  # закрыт позже 24 ч
+    }
+    requested = []
+
+    def closures(gids):
+        requested.append(list(gids))
+        return {gid: closure_state[gid] for gid in gids if gid in closure_state}
+
+    monkeypatch.setattr(measure, "closures", closures)
+    out = measure.c1({7: "core"}, date(2026, 10, 20), date(2026, 10, 22))
+    assert calls["ncols"] == 5  # c1.sql schedule-only: без колонки закрытия
+    assert requested == [["1", "2", "3"]]  # canonical closures, не compatibility-строки
+    assert "finished 3" in out
+    assert "ядро 1/3 (закрыто когда-либо 2)" in out  # 3 не закрыт: нет строк журнала
 
 
 def test_sweep_verdict_source_late_vs_our_sweep_late(tmp_path, monkeypatch):
