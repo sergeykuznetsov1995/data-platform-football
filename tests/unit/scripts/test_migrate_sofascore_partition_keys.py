@@ -273,9 +273,25 @@ def test_identifier_and_literal_quoting_and_archive_identity():
     assert migration.quote_literal("O'Brien") == "'O''Brien'"
     with pytest.raises(ValueError):
         migration.quote_literal("ENG\x00")
-    with pytest.raises(ValueError):
-        migration.quote_identifier("league;SELECT")
+    for identifier in ("league;SELECT", 'league" OR 1=1 --', "two words", "two.parts", "x" * 129):
+        with pytest.raises(ValueError):
+            migration.quote_identifier(identifier)
     assert migration.archive_name(SPEC, "a-b", "archives") != migration.archive_name(SPEC, "a_b", "archives")
+
+
+@pytest.mark.parametrize("identifier", [
+    "tournament_field_translations_name_translation_es-la",
+    "tournament_unique_tournament_field_translations_name_translation_pt-pt",
+    "team_primary_unique_tournament_field_translations_name_translation_es-la",
+    "team_tournament_field_translations_name_translation_es-la",
+])
+def test_locale_columns_survive_winner_projection(identifier):
+    assert migration.quote_identifier(identifier) == f'"{identifier}"'
+    select = migration.winner_select(
+        SPEC, "archive.synthetic", {**COLUMNS, identifier: "varchar"}, {"ENG": "SS-17"},
+    )
+    assert f'"{identifier}"' in select
+    sqlglot.parse_one(select, read="trino")
 
 
 def test_registry_conflict_fails_before_connection():

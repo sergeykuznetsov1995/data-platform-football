@@ -22,7 +22,7 @@ from scrapers.sofascore.partition_keys import canonical_league
 
 
 DEFAULT_CONTRACT = Path(__file__).resolve().parents[1] / "configs/sofascore/endpoint_coverage.yaml"
-IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,127}\Z")
 MIGRATION_ID = re.compile(r"[A-Za-z0-9_-]{1,48}\Z")
 SS_KEY = re.compile(r"SS-[1-9][0-9]*\Z")
 SCALAR_TYPE = re.compile(
