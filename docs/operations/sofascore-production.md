@@ -718,16 +718,23 @@ python3 -c "import json,collections as c;d=json.load(open('/root/sofascore-runti
 - Ядро — `class == core` в `<SOFASCORE_RELEASE_ROOT>/configs/sofascore/denominator.tsv` (#1353; путь берётся из
   строки `SOFASCORE_RELEASE_ROOT=` в `/etc/data-platform/sofascore.env`, `--denominator PATH` — подмена).
   Матч → турнир: партиция `SS-<id>` (полоса `SS`) или `tournament_unique_tournament_id` расписания для партиций
-  реестра дейли (`ENG-…` и т. п., полоса `daily`; при обеих партициях — `daily`).
+  реестра дейли (`ENG-…` и т. п., полоса `daily`; при обеих партициях приоритет у `SS`).
 - Журнал первого наблюдения `/root/watchdog/state/sofascore_veha1/journal.jsonl`: матч попадает в него, когда
   измеритель впервые видит его `finished` (старт за последние 7 суток). Колонки первого наблюдения в bronze нет:
   расписание пишется MERGE, `_ingested_at` перезаписывается.
 - Окончание — `changes_change_timestamp` источника, если он в `[старт + 45 мин, старт + 4 ч]`, иначе `старт + 7200`
   (поле `end_source`). Срок — окончание + 86 400 с.
-- Закрыт — строка `bronze.sofascore_match_capture_status`, где все пять `*_status` ∈ {`success`,
-  `not_available`} (`not_available` = 404/пусто у источника, терминально; `adapters._legacy_state`). В таблице
-  одна строка на матч (MERGE перезаписывает `_ingested_at`), поэтому время закрытия — первое увиденное
-  измерителем: каждый прогон записывает `closed_at` в журнал незакрытым матчам за 9 суток и больше его не трогает.
+- Канонический журнал полноты (#1366) — read model `deploy/sofascore/endpoint_journal.py` +
+  `sofascore_endpoint_journal.sql` поверх расписания и `iceberg.ops.sofascore_capture_manifest`, версия
+  `schedule_core_x_ops_manifest_v1`. Для каждого `game_id` проецируются ровно пять core-эндпоинтов; строки
+  `ENG-…`/`SS-…` сводятся по `game_id`, конфликт двух разных SS ID отклоняется fail-closed.
+  `success`/`legitimate_empty` → `collected`; только `not_supported` с HTTP 404 → `source_404`;
+  `schema_error` → `quarantine`; отсутствующий, retryable или не-404 `not_supported` → `not_collected`.
+- `capture_complete` истинно только при терминальном результате всех пяти: `collected` или `source_404`.
+  Partial capture и `quarantine` матч не закрывают. Compatibility-таблица `bronze.sofascore_match_capture_status`
+  больше не является источником закрытия. SQL возвращает `max(status_updated_at)` терминальных эндпоинтов;
+  измеритель сохраняет первое увиденное `closed_at` в журнале незакрытых матчей за 9 суток и при replay
+  не перезаписывает его более поздним MERGE-временем.
 - «finished увиден позже 24 ч после старта» — прошлый observe (`prev_observe_at`, `state/sofascore_veha1/observe.json`)
   был позже старт + 24 ч и матча `finished` не видел. Число справочное: матч **остаётся в знаменателе**. Это не
   доказывает позднюю разметку источником (мог отстать наш сбор афиши, а `changes_change_timestamp` — время последней
@@ -743,19 +750,23 @@ observe (дописать журнал), потом итог суток D = вч
 ещё не отчитанные (плюс записи с `reported_day` дня, итога которого нет в `daily.jsonl`, — след оборванного
 прогона любого дня). Итог — одна строка сводки
 `• веха 1 SofaScore за <дд.мм> (UTC): ядро ≤ 24 ч M/N = x,x % ✅|⛔ (порог ≥ 99 %; SS a/b, дейли c/d); …`
-(`✅` только при ≥ 99 % и N > 0; вместо «поздно размечено k» строка печатает «finished увиден позже 24 ч после старта k (в знаменателе; источник опоздал a, наш обход b, неизвестно c)»), запись в `daily.jsonl` (разрезы, топ-10 турниров по пропускам) и нарушители
+(`✅` только при ≥ 99 % и N > 0; вместо «поздно размечено k» строка печатает «finished увиден позже 24 ч после старта k (в знаменателе; источник опоздал a, наш обход b, неизвестно c)»). Строка также печатает счётчики
+`collected/source_404/quarantine/not_collected` по пяти эндпоинтам всех due-матчей ядра; в `daily.jsonl`
+они сохраняются как `endpoint_status_counts` вместе с `journal_source=schedule_core_x_ops_manifest_v1`.
+Там же сохраняются разрезы и топ-10 турниров по пропускам. Нарушители записываются в
 `state/sofascore_veha1/<D>.tsv` (`game_id, league, season, start, deadline, closed_at, missing_endpoints, late_verdict, last_sweep_without`).
 Запись: нарушители → журнал → `daily.jsonl` (точка фиксации, атомарная перезапись; битые строки пропускаются). Повторный запуск за тот же D печатает
 сохранённую строку; `--dry-run` ничего не создаёт и замок не берёт. Сбой — строка
 `⚠️ измеритель вехи 1: <причина>`, сводка не падает.
 
 **Ограничения.** Первое наблюдение — раз в сутки (observe только из сводки, по плану без отдельного cron). Закрытие, перезаписанное MERGE до первого запроса измерителя (в т. ч. весь хвост первого прогона),
-видно только по новому времени (в `capture_status` и `ops.sofascore_capture_manifest` одна строка на матч /
-эндпоинт, истории нет); сузить окно можно только более частым observe — отдельное решение. Окончание (`end_ts`) фиксируется при первом наблюдении. До доставки релиза с
-`denominator.tsv` строка — `⚠️ … файла знаменателя нет`.
+видно только по новому времени: canonical read model выбирает последний manifest-результат на матч/эндпоинт,
+а истории изменений результата нет. Сузить окно можно только более частым observe — отдельное решение.
+Окончание (`end_ts`) фиксируется при первом наблюдении. До доставки релиза с `denominator.tsv` строка —
+`⚠️ … файла знаменателя нет`.
 
 **Текущий долг (#1867).** Новый запрос текущего долга находится в Python и выбирает последнюю natural-key строку,
-затем предпочитает daily-партицию матча перед SS. Текущие сезоны — календарный год,
+затем предпочитает SS-партицию матча перед daily. Текущие сезоны — календарный год,
 прошлый/текущий и текущий/следующий год (`2026`, `2526`, `2627` для 2026).
 
 Незавершённый матч старше 24 ч (кроме canceled/postponed) входит в журнал по тому же
@@ -773,10 +784,19 @@ observe (дописать журнал), потом итог суток D = вч
 а не превращается в нулевой долг. Схема `core_in24/core_total` для watchdog сохранена.
 
 **Воспроизведение C1.** `/usr/local/libexec/sofascore/run_from_release.sh veha1_measure.py --c1 2026-09-14 2026-09-21
---denominator <tsv>` — окно старта без журнала, окончание = старт + 7200, закрытие = любая строка capture_status;
-ядро по старому правилу (211 ключей `sofascore_veha1_c1_noncore.txt`) и по файлу. Замер 23.09: finished 3 082
-(C1 22.09 — 3 074), ≤ 24 ч 186, ядро 136/2 755 по обоим правилам. Сухой `report` 23.09 (файл из #1418):
+--denominator <tsv>` — окно старта без журнала, окончание = старт + 7200, закрытие = `capture_complete`
+canonical endpoint journal, а не наличие compatibility-строки; ядро по старому правилу
+(211 ключей `sofascore_veha1_c1_noncore.txt`) и по файлу. Ниже — архивный замер 23.09,
+полученный прежней семантикой «любая строка capture_status»: finished 3 082
+(C1 22.09 — 3 074), ≤ 24 ч 186, ядро 136/2 755 по обоим правилам. Он не является результатом
+текущего canonical C1 и не доказывает приёмку. Архивный сухой `report` 23.09 (файл из #1418):
 ядро 116/2 431 = 4,8 % (SS 12/2 297, дейли 104/134).
+
+Переход исторических Bronze-партиций на `SS-<id>`, совмещение ENG/SS, полный архив,
+разовая дедупликация и независимые запросы «дублей = 0» описаны в
+[runbook миграции](sofascore-partition-migration.md). В code PR выполнен только disconnected
+dry-run: production preflight/apply, удаление или перезапись данных не выполнялись; фактический
+ноль дублей и оба критерия #1366 на Bronze ещё требуют отдельного разрешения и доказательств.
 
 ### Сторожа из текущего релиза (#1376)
 
@@ -1133,20 +1153,23 @@ JSON печатается в stdout; `--output` сохраняет тот же �
 (`SofaScoreCatalog.tournament_map(enabled_only=True)`); список ID нигде не
 дублируется.
 
-**Семантика union coverage.** Отчёт требует, чтобы каждый `finished` матч этих
-турниров имел `capture_complete` хотя бы под одним ключом — daily или SS. Во
-время параллельной работы обеих копий матч НЕ обязан быть закрыт каждой:
-capture пропускается глобально по match_id. `postponed`/`canceled` покрытия не
-требуют. `status="fail"` — если хотя бы один `finished` без `any_complete`;
-`missing_finished` — отсортированные ID таких матчей. `days` — все семь
-ISO-дат по порядку со счётчиками `finished`/`covered`; день без матчей
-остаётся в отчёте с нулями (zero-match day — норма, не пропуск строки).
+**Семантика union coverage.** `any_complete` (#1366) вычисляется по canonical
+match×endpoint journal поверх ops manifest: все пять core-эндпоинтов логического
+`game_id` должны быть `collected` или `source_404`; partial, missing, retryable и
+`quarantine` не закрывают матч. Строки daily/SS сведены по `match_id`, поэтому
+матч не обязан быть независимо закрыт под каждым физическим ключом.
+`postponed`/`canceled` покрытия не требуют. `status="fail"` — если хотя бы один
+`finished` без `any_complete`; `missing_finished` — отсортированные ID таких матчей.
+`days` — все семь ISO-дат по порядку со счётчиками `finished`/`covered`; день без
+матчей остаётся в отчёте с нулями (zero-match day — норма, не пропуск строки).
 
-**Physical overlap — не логический дубль.** `physical_both_complete` —
-информационное число матчей, закрытых под обоими ключами сразу. Логических
-дублей нет (`logical_duplicates=0`): расписание дедуплицировано по
-`(day, match_id)` со статусом `max_by(status_type, _ingested_at)`, capture — по
-match_id.
+**Physical overlap — не логический дубль.** `physical_both_complete`/`both_complete`
+остаются информационной сводкой старой compatibility-проекции о закрытии под обоими
+ключами и не участвуют в `any_complete`, `covered` или `missing_finished`. Расписание
+дедуплицировано по `(day, match_id)` со статусом `max_by(status_type, _ingested_at)`.
+Поле `logical_duplicates=0` описывает только этот агрегированный выходной grain:
+оно не является запросом уникальности production Bronze и не заменяет проверки
+«дублей = 0» из [runbook миграции](sofascore-partition-migration.md).
 
 **Граница доказательства.** Каждый JSON несёт
 `acceptance="scheduler_and_dq_evidence_required"`: отчёт описывает только
