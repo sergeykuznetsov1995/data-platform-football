@@ -149,13 +149,15 @@ canonical mapping, число distinct canonical keys и конфликты по
    `archive_rows == before_rows`. Проверить схему и профиль архива. Сравнить
    полные мультимножества source/archive через двусторонний `EXCEPT ALL`;
    различие означает остановку перед rewrite. Эта проверка не заменяет lock.
-3. Атомарно выполнить `CREATE OR REPLACE TABLE <source>` с
-   `format='PARQUET', partitioning=ARRAY['league','season']`. Источник SELECT —
+3. Атомарно выполнить `CREATE OR REPLACE TABLE <source>` с исходным comment и
+   полным исходным `WITH` block, включая format, partitioning и остальные
+   properties; код не подставляет усечённый список свойств. Источник SELECT —
    уже проверенный полный архив. Проекция сохраняет каждую колонку и её порядок,
    заменяя только league; `ROW_NUMBER` группирует по declared natural key уже
    после canonical mapping. Победитель должен быть доказан preflight.
-4. Снова фактически прочитать source и архив. Проверить partition declaration,
-   порядок/типы колонок, counts, двустороннее покрытие ключей и полное сравнение
+4. Снова фактически прочитать source и архив. Проверить исходный comment и все
+   properties, partition declaration, порядок/типы колонок, counts,
+   двустороннее покрытие ключей и полное сравнение
    ожидаемых canonical winner rows с результатом. Вызвать общий
    `validate_reconciliation` с фактическими результатами; ожидаемые числа
    не подставлять вместо запросов.

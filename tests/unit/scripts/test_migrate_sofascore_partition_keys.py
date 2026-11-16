@@ -79,7 +79,7 @@ class FakeManager:
     syntax/AST checks below complement this fake; this is not a Trino emulator.
     """
 
-    def __init__(self, rows=None, *, columns=None, damage=None, damage_archive=False):
+    def __init__(self, rows=None, *, columns=None, damage=None, damage_archive=False, ddl_text=None, drop_ddl_properties=False):
         self.columns = dict(COLUMNS if columns is None else columns)
         self.tables = {SPEC.name: deepcopy(sample_rows() if rows is None else rows)}
         self.statements = []
@@ -87,6 +87,8 @@ class FakeManager:
         self.damage = damage
         self.damage_archive = damage_archive
         self.ddl_partition = "ARRAY['league','season']"
+        self.ddl_text = ddl_text
+        self.drop_ddl_properties = drop_ddl_properties
         self.archive = None
 
     def table_exists(self, schema, table):
@@ -109,7 +111,8 @@ class FakeManager:
         self.statements.append(sql)
         if sql.startswith("SHOW CREATE TABLE"):
             assert fetch
-            return [("CREATE TABLE t (league varchar) WITH (format='PARQUET', partitioning=" + self.ddl_partition + ")",)]
+            ddl = self.ddl_text or "CREATE TABLE t (league varchar) WITH (format='PARQUET', partitioning=" + self.ddl_partition + ")"
+            return [(ddl,)]
         if sql.startswith("CREATE TABLE"):
             assert not fetch
             match = re.match(r'CREATE TABLE "([^"]+)"\."([^"]+)" AS SELECT \* FROM', sql)
@@ -125,6 +128,8 @@ class FakeManager:
             assert not fetch and self.archive is not None
             assert migration.qualified_name(self.archive) in sql
             self.tables[SPEC.name] = winners(self.tables[self.archive])
+            if self.drop_ddl_properties:
+                self.ddl_text = None
             if self.damage:
                 self.damage(self.tables[SPEC.name])
             return None
@@ -402,6 +407,33 @@ def test_archive_verify_rewrite_postcheck_order_and_sql_parse():
     assert isinstance(archive_ast, exp.Create) and not archive_ast.args.get("replace")
     assert isinstance(rewrite_ast, exp.Create) and rewrite_ast.args.get("replace")
     assert len(mutations(manager)) == 2
+
+
+def test_rewrite_preserves_original_properties_and_comment():
+    ddl = (
+        "CREATE TABLE t (league varchar) COMMENT 'grain' "
+        "WITH (format='PARQUET', partitioning=ARRAY['league','season'], compression='ZSTD')"
+    )
+    manager = FakeManager(ddl_text=ddl)
+    result = execute(manager)
+    assert result["success"]
+    rewrite = result["tables"][0]["plan"]["rewrite_sql"]
+    assert "COMMENT 'grain'" in rewrite
+    assert "compression='ZSTD'" in rewrite
+    assert migration.ddl_properties(ddl) in rewrite
+    sqlglot.parse_one(rewrite, read="trino")
+
+
+def test_postcheck_rejects_lost_properties_and_comment():
+    ddl = (
+        "CREATE TABLE t (league varchar) COMMENT 'grain' "
+        "WITH (format='PARQUET', partitioning=ARRAY['league','season'], compression='ZSTD')"
+    )
+    manager = FakeManager(ddl_text=ddl, drop_ddl_properties=True)
+    result = execute(manager)
+    assert not result["success"]
+    assert result["tables"][0]["phase"] == "postcheck"
+    assert "properties or comment changed" in result["error"]
 
 
 @pytest.mark.parametrize("damage, expected", [

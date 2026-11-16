@@ -213,17 +213,64 @@ def archive_sql(spec: TableSpec, archive: str) -> str:
     return f"CREATE TABLE {qualified_name(archive)} AS SELECT * FROM {qualified_name(spec.name)}"
 
 
-def rewrite_sql(spec: TableSpec, archive: str, columns: Mapping[str, str], mapping: Mapping[str, str]) -> str:
+def ddl_properties(ddl: str) -> str:
+    """Return the original WITH body, respecting strings and nested parentheses."""
+    matches = list(re.finditer(r"\bWITH\s*\(", ddl, flags=re.I))
+    if len(matches) != 1:
+        raise ValueError("source DDL must contain exactly one WITH properties block")
+    start = matches[0].end()
+    depth, quoted, index = 1, False, start
+    while index < len(ddl):
+        char = ddl[index]
+        if char == "'":
+            if quoted and index + 1 < len(ddl) and ddl[index + 1] == "'":
+                index += 2
+                continue
+            quoted = not quoted
+        elif not quoted:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    if ddl[index + 1:].strip():
+                        raise ValueError("unexpected SQL after WITH properties")
+                    return ddl[start:index]
+        index += 1
+    raise ValueError("unterminated WITH properties block")
+
+
+def ddl_comment(ddl: str) -> str | None:
+    match = re.search(r"\bCOMMENT\s+('(?:''|[^'])*')", ddl, flags=re.I)
+    return match.group(1) if match else None
+
+
+def rewrite_sql(
+    spec: TableSpec,
+    archive: str,
+    columns: Mapping[str, str],
+    mapping: Mapping[str, str],
+    source_ddl: str | None = None,
+) -> str:
+    properties = ddl_properties(source_ddl) if source_ddl is not None else "format='PARQUET', partitioning=ARRAY['league','season']"
+    comment = ddl_comment(source_ddl) if source_ddl is not None else None
     return (
         f"CREATE OR REPLACE TABLE {qualified_name(spec.name)} "
-        "WITH (format='PARQUET', partitioning=ARRAY['league','season']) AS "
+        + (f"COMMENT {comment} " if comment else "")
+        + f"WITH ({properties}) AS "
         + winner_select(spec, archive, columns, mapping)
     )
 
 
-def preview(spec: TableSpec, archive: str, mapping: Mapping[str, str], columns: Mapping[str, str] | None = None) -> dict:
+def preview(
+    spec: TableSpec,
+    archive: str,
+    mapping: Mapping[str, str],
+    columns: Mapping[str, str] | None = None,
+    source_ddl: str | None = None,
+) -> dict:
     if columns is not None:
-        rewrite = rewrite_sql(spec, archive, columns, mapping)
+        rewrite = rewrite_sql(spec, archive, columns, mapping, source_ddl)
     else:
         # A disconnected run cannot invent the current ordered source schema.
         keys = ", ".join(map(quote_identifier, spec.natural_key))
@@ -350,10 +397,19 @@ def rowset_difference(manager: Any, left: str, right: str, label: str) -> int:
     )
 
 
-def postcheck(manager: Any, spec: TableSpec, archive: str, archived: dict, mapping: Mapping[str, str]) -> tuple[dict, dict]:
+def postcheck(
+    manager: Any,
+    spec: TableSpec,
+    archive: str,
+    archived: dict,
+    mapping: Mapping[str, str],
+    original_ddl: str,
+) -> tuple[dict, dict]:
     after = profile_table(manager, spec, mapping)
     if after["columns"] != archived["columns"] or list(after["columns"]) != list(archived["columns"]):
         raise ValueError("ordered source schema changed")
+    if ddl_properties(after["ddl"]) != ddl_properties(original_ddl) or ddl_comment(after["ddl"]) != ddl_comment(original_ddl):
+        raise ValueError("table properties or comment changed during rewrite")
     keys = ", ".join(map(quote_identifier, spec.natural_key))
     canonical_keys = ", ".join(
         league_expression(mapping) + ' AS "league"' if key == "league" else quote_identifier(key)
@@ -440,7 +496,13 @@ def run_migration(
             item["phase"] = "preflight"
             before = profile_table(manager, spec, mapping)
             item["before"] = before
-            item["plan"] = preview(spec, item["plan"]["archive"], mapping, before["columns"])
+            item["plan"] = preview(
+                spec,
+                item["plan"]["archive"],
+                mapping,
+                before["columns"],
+                before["ddl"],
+            )
             item["status"] = "ready" if before["ready"] else "blocked"
             if not before["ready"]:
                 report["error"] = "preflight blocked: " + ", ".join(before["blockers"])
@@ -482,7 +544,14 @@ def run_migration(
             # An existing archive is never overwritten and never authorizes a
             # second rewrite. Only a verified canonical result is a valid repeat.
             item["phase"] = "postcheck"
-            after, reconciliation = postcheck(manager, spec, archive, archived, mapping)
+            after, reconciliation = postcheck(
+                manager,
+                spec,
+                archive,
+                archived,
+                mapping,
+                item["before"]["ddl"],
+            )
             item["after"] = after
             item["reconciliation"] = reconciliation
             validate_reconciliation(**reconciliation)
