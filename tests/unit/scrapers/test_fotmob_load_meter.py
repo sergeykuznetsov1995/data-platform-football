@@ -550,6 +550,38 @@ def fake_trino(monkeypatch, responder):
     return statements
 
 
+def test_connect_matches_platform_self_signed_contract(monkeypatch):
+    captured = {}
+
+    class Connection:
+        def close(self):
+            pass
+
+    def connect(**kwargs):
+        captured.update(kwargs)
+        return Connection()
+
+    module = types.ModuleType("trino")
+    module.__path__ = []
+    module.auth = types.ModuleType("trino.auth")
+    module.auth.BasicAuthentication = lambda user, password: object()
+    module.dbapi = types.ModuleType("trino.dbapi")
+    module.dbapi.connect = connect
+    monkeypatch.setitem(sys.modules, "trino", module)
+    monkeypatch.setitem(sys.modules, "trino.auth", module.auth)
+    monkeypatch.setitem(sys.modules, "trino.dbapi", module.dbapi)
+    monkeypatch.setenv("TRINO_HTTP_SCHEME", "https")
+    monkeypatch.setenv(meter.PASSWORD_ENV, "synthetic-test-value")
+    meter._connect(module, "synthetic-test-value").close()
+    # The shared coordinator serves a self-signed certificate; every platform
+    # client (scrapers/base/trino_manager.py, scrapers/fotmob/trino_instrumentation.py)
+    # disables verification, and the meter must match or every poll fails.
+    assert captured["verify"] is False
+    assert captured["http_scheme"] == "https"
+    assert captured["user"] == meter.SOURCE_USER
+    assert captured["request_timeout"] == 10 and captured["max_attempts"] == 1
+
+
 def test_qualify_only_k0_k3_and_no_writes(monkeypatch):
     now = [meter.utc_datetime("2026-11-02T00:00:00Z")]
 
