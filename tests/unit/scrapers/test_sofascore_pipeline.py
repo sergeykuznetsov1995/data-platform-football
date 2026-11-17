@@ -3913,6 +3913,8 @@ def test_runner_scopes_all_partitioned_merges_except_rejected_rows():
         if "natural_keys" not in kwargs or "table_name" not in kwargs:
             continue
         table_node = kwargs["table_name"]
+        if isinstance(table_node, ast.Name) and table_node.id == "table_name":
+            continue
         table = (getattr(runner, table_node.id) if isinstance(table_node, ast.Name)
                  else ast.literal_eval(table_node))
         if table == "sofascore_rejected_rows":
@@ -3922,7 +3924,11 @@ def test_runner_scopes_all_partitioned_merges_except_rejected_rows():
         assert table in PARTITION_SCOPED_TABLES
         assert {"league", "season"} <= set(ast.literal_eval(kwargs["natural_keys"]))
         tables.append(table)
+    for _counter, table, _entity, key_columns in runner._SEASON_FIELD_TABLES:
+        assert table in PARTITION_SCOPED_TABLES
+        assert key_columns
+        tables.append(table)
     assert set(tables) == PARTITION_SCOPED_TABLES
-    assert len(set(tables)) == 15
+    assert len(set(tables)) == 19
     # Legacy and long-manifest commits, plus the lost-status repair (#1957).
     assert tables.count("sofascore_match_capture_status") == 3
