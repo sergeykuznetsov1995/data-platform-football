@@ -505,15 +505,20 @@ def test_source_default_registry_and_rollback(monkeypatch):
 
 
 def test_real_pinned_registry_matches_independent_oracle():
+    import os
     from pathlib import Path
 
-    root = Path("/root/data-platform-football/.local/tasks/tm-1390-denominator-offline")
-    if not root.is_dir():
-        pytest.skip("task-local pinned evidence is not installed")
-    rows = json.loads((root / "inputs/promoted-current.json").read_text())
-    manifest = json.loads((root / "inputs/discovery-manifest.json").read_text())[
-        "manifest"
-    ]
+    evidence_dir = os.environ.get("TRANSFERMARKT_REGISTRY_EVIDENCE_DIR")
+    if not evidence_dir:
+        pytest.skip("set TRANSFERMARKT_REGISTRY_EVIDENCE_DIR to run the pinned oracle")
+    root = Path(evidence_dir)
+    try:
+        rows = json.loads((root / "inputs/promoted-current.json").read_text())
+        manifest = json.loads((root / "inputs/discovery-manifest.json").read_text())[
+            "manifest"
+        ]
+    except OSError as exc:
+        pytest.skip(f"pinned oracle is unavailable: {exc}")
     report = manifest["discovery_report"]
     quarantined = {
         cid: report["discovery_quarantined"].get(
