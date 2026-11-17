@@ -29,13 +29,28 @@ RECEIVED_AT = "2026-11-01T00:00:05Z"
 
 
 def event(query_id="synthetic_query", query=READ, *, user="src_fotmob", **overrides):
+    """Nested Trino 484 QueryCompletedEvent: metadata/context/ioMetadata/failureInfo."""
     payload = {
-        "queryId": query_id, "query": query, "state": "FINISHED", "user": user,
-        "source": "trino_ui", "catalog": "iceberg", "schema": "bronze",
+        "metadata": {"queryId": query_id, "query": query, "queryState": "FINISHED", "updateType": None, "uri": "http://example.invalid"},
+        "context": {"user": user, "source": "trino_ui", "catalog": "iceberg", "schema": "bronze",
+                    "environment": "production", "remoteClientAddress": "127.0.0.1"},
+        "ioMetadata": {"inputs": [], "output": None},
+        "failureInfo": None,
+        "warnings": [],
         "createTime": "2026-11-01T00:00:00Z", "executionStartTime": "2026-11-01T00:00:01Z",
-        "endTime": "2026-11-01T00:00:02Z", "errorType": None, "errorCode": None,
+        "endTime": "2026-11-01T00:00:02Z",
     }
-    payload.update(overrides)
+    metadata_keys = {"queryId", "query", "queryState", "updateType", "uri"}
+    context_keys = {"user", "source", "catalog", "schema"}
+    for key, value in overrides.items():
+        if key in metadata_keys:
+            payload["metadata"][key] = value
+        elif key in context_keys:
+            payload["context"][key] = value
+        elif key == "errorCode":
+            payload["failureInfo"] = {"errorCode": value, "message": "synthetic"} if value is not None else None
+        else:
+            payload[key] = value
     return payload
 
 
@@ -68,7 +83,7 @@ def test_event_to_snapshot_full_mapping():
         "user": "src_fotmob", "source": "trino_ui", "query": READ, "state": "FINISHED",
         "created": "2026-11-01T00:00:00Z", "started": "2026-11-01T00:00:01Z",
         "ended": "2026-11-01T00:00:02Z", "stmt_type": "read", "error_code": None,
-        "observed_at": RECEIVED_AT, "received_via": "http_event_listener",
+        "io_tables": [], "observed_at": RECEIVED_AT, "received_via": "http_event_listener",
     }
     written = receiver.event_to_snapshot(event(query=INSERT, errorCode="SYNTAX_ERROR"), tables=TABLES, received_at=RECEIVED_AT)
     assert written["stmt_type"] == "insert" and written["error_code"] == "SYNTAX_ERROR"
@@ -101,6 +116,18 @@ def test_event_to_snapshot_rejects_impossible_events():
 ])
 def test_keep_event(query, expected):
     assert receiver.keep_event(event(query=query)) is expected
+
+
+def test_keep_event_and_io_tables_from_io_metadata():
+    io = {"inputs": [{"catalogName": "iceberg", "schema": "bronze", "tableName": "fotmob_matches"}],
+          "output": {"catalogName": "iceberg", "schema": "bronze", "tableName": "other_summary"}}
+    # SQL text without the fotmob_ substring still kept via ioMetadata table names.
+    assert receiver.keep_event(event(query="SELECT * FROM other_summary", ioMetadata=io)) is True
+    assert receiver.keep_event(event(query="SELECT * FROM other_summary")) is False
+    record = receiver.event_to_snapshot(event(query=INSERT, ioMetadata=io), tables=TABLES, received_at=RECEIVED_AT)
+    assert record["io_tables"] == ["iceberg.bronze.fotmob_matches", "iceberg.bronze.other_summary"]
+    # Missing/partial ioMetadata never breaks mapping.
+    assert receiver.event_to_snapshot(event(ioMetadata=None), tables=TABLES, received_at=RECEIVED_AT)["io_tables"] == []
 
 
 def test_handle_post_body_outcomes():

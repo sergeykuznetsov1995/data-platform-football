@@ -44,16 +44,48 @@ def _event_time(value: Any) -> str | None:
         return None
 
 
+def _io_tables(event: Mapping[str, Any]) -> list[str]:
+    """Full catalog.schema.table names from ioMetadata inputs/output, deduplicated."""
+    names: list[str] = []
+    io = event.get("ioMetadata")
+    if isinstance(io, dict):
+        for key in ("inputs", "output"):
+            entry = io.get(key)
+            entries = entry if isinstance(entry, list) else [entry] if isinstance(entry, dict) else []
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                parts = [item.get(name) for name in ("catalogName", "schema", "tableName")]
+                if all(isinstance(part, str) and part for part in parts):
+                    names.append(".".join(parts))
+    return sorted(set(names))
+
+
 def keep_event(event: Mapping[str, Any]) -> bool:
     """Deliberately coarse filter; the aggregator re-parses SQL anyway."""
-    return "fotmob_" in str(event.get("query", "")).lower()
+    metadata = event.get("metadata")
+    query = metadata.get("query") if isinstance(metadata, dict) else event.get("query")
+    if "fotmob_" in str(query or "").lower():
+        return True
+    return any("fotmob_" in name.lower() for name in _io_tables(event))
 
 
 def event_to_snapshot(event: Mapping[str, Any], *, tables: Sequence[str], received_at: str) -> dict[str, Any] | None:
-    """Map a QueryCompletedEvent to a grain=snapshot load_meter record."""
-    query_id = event.get("queryId")
-    query = event.get("query")
-    user = event.get("user")
+    """Map a QueryCompletedEvent to a grain=snapshot load_meter record.
+
+    Trino 484 posts a nested event: metadata{queryId, query, queryState},
+    context{user, source}, ioMetadata{inputs, output}, failureInfo, and the
+    three top-level timestamps (createTime, executionStartTime, endTime).
+    """
+    metadata = event.get("metadata")
+    context = event.get("context")
+    query_id = metadata.get("queryId") if isinstance(metadata, dict) else None
+    query = metadata.get("query") if isinstance(metadata, dict) else None
+    state = metadata.get("queryState") if isinstance(metadata, dict) else None
+    user = context.get("user") if isinstance(context, dict) else None
+    source = context.get("source") if isinstance(context, dict) else None
+    failure = event.get("failureInfo")
+    error_code = failure.get("errorCode") if isinstance(failure, dict) else None
     if not isinstance(query_id, str) or not query_id or not meter.QUERY_ID_RE.fullmatch(query_id):
         return None
     if not isinstance(query, str) or not query:
@@ -67,11 +99,11 @@ def event_to_snapshot(event: Mapping[str, Any], *, tables: Sequence[str], receiv
         return None
     return {
         "grain": "snapshot", "poll_id": "recv", "query_id": query_id,
-        "user": user, "source": event.get("source") or None, "query": query,
-        "state": event.get("state"), "created": created, "started": started,
+        "user": user, "source": source or None, "query": query,
+        "state": state, "created": created, "started": started,
         "ended": ended, "stmt_type": meter.parse_sql(query, tables).stmt_type,
-        "error_code": event.get("errorCode"), "observed_at": received_at,
-        "received_via": RECEIVED_VIA,
+        "error_code": error_code, "observed_at": received_at,
+        "io_tables": _io_tables(event), "received_via": RECEIVED_VIA,
     }
 
 
