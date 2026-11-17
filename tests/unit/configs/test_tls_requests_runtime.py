@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ RUNNER_REQUIREMENTS = (
 )
 CORE_REQUIREMENTS = REPO_ROOT / "docker/images/airflow/requirements.txt"
 CI_REQUIREMENTS = REPO_ROOT / ".github/workflows/whoscored-test.lock"
+UNIT_SUITE_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
 COMPOSE_FILE = REPO_ROOT / "compose.yaml"
 
 EXPECTED_VERSION = "1.13.1"
@@ -289,3 +291,43 @@ def test_missing_explicit_library_fails_closed_without_download(monkeypatch):
 
     assert libraries.TLSLibrary.load() is None
     assert download_calls == []
+
+
+@pytest.mark.unit
+def test_hosted_ci_preflights_the_same_pinned_tls_library():
+    workflow = UNIT_SUITE_WORKFLOW.read_text(encoding="utf-8")
+
+    install_step = "- name: Install test runtime"
+    preflight_step = "- name: Preflight pinned TLS library"
+    full_suite_step = "- name: Full unit suite"
+    assert install_step in workflow
+    assert preflight_step in workflow
+    assert full_suite_step in workflow
+    assert (
+        workflow.index(install_step)
+        < workflow.index(preflight_step)
+        < workflow.index(full_suite_step)
+    )
+
+    preflight = workflow.split(preflight_step, 1)[1].split(full_suite_step, 1)[0]
+
+    official_url = (
+        "https://github.com/bogdanfinn/tls-client/releases/download/"
+        f"v{EXPECTED_VERSION}/"
+        f"tls-client-linux-ubuntu-amd64-{EXPECTED_VERSION}.so"
+    )
+    assert official_url in preflight
+    assert EXPECTED_SHA256 in preflight
+
+    assert 'test "$(stat -c %s "$tls_lib")" -eq 15236872' in preflight
+    env_exports = [
+        line for line in preflight.splitlines() if "TLS_LIBRARY_PATH=$tls_lib" in line
+    ]
+    assert env_exports
+    assert any("$GITHUB_ENV" in line for line in env_exports)
+
+    unwrapped = re.sub(r"\\\s*\n\s*", " ", preflight)
+    assert "curl --proto '=https' --tlsv1.2 --proto-redir '=https'" in unwrapped
+
+    assert "import tls_requests" in preflight
+    assert "tls_requests.Client()" in preflight
