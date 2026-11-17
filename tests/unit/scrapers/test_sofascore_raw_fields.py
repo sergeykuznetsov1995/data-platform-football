@@ -7,12 +7,27 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.sofascore.manifest import ManifestStatus
 from scrapers.sofascore.season_fields import (
     assert_natural_keys,
     parse_cup_trees,
     parse_participants,
     parse_referee_profile,
     parse_rounds,
+)
+from scrapers.sofascore.season_pipeline import (
+    REFEREE_PROFILE_ENDPOINT,
+    SeasonMaterializationError,
+    SeasonPartitionMaterialization,
+    SeasonPartitionPlan,
+    build_cup_trees_spec,
+    build_participants_spec,
+    build_referee_profile_spec,
+    build_rounds_spec,
+    build_schedule_page_spec,
+    build_squad_spec,
+    build_standings_total_spec,
+    materialize_season_partition,
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parents[2] / "fixtures"
@@ -318,3 +333,435 @@ class TestAssertNaturalKeys:
     def test_duplicate_key_raises(self):
         with pytest.raises(ValueError, match=r"rows\[1\].*duplicate natural key"):
             assert_natural_keys([{"a": "1"}, {"a": "1"}], ("a",))
+
+
+FRESHNESS_KEY = "2026-11-17"
+CANONICAL_LEAGUE = "england-premier-league"
+CANONICAL_SEASON = "2025-2026"
+
+_PARTITION_BASE = {
+    "source_tournament_id": TOURNAMENT_ID_STR,
+    "source_season_id": SEASON_ID_STR,
+}
+
+
+class _FakeRaw:
+    def __init__(self, target, content_hash, blob_key, http_status):
+        self.target = target
+        self.content_hash = content_hash
+        self.blob_key = blob_key
+        self.http_status = http_status
+
+
+class _FakeDataset:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+
+    @property
+    def row_count(self):
+        return len(self.rows)
+
+
+class _FakeManifest:
+    def __init__(
+        self,
+        key,
+        status,
+        *,
+        row_count=0,
+        raw_content_hash="",
+        raw_blob_key="",
+        request_url="",
+        fetched_at="",
+        http_status=None,
+        error_type=None,
+        is_terminal=True,
+    ):
+        self.key = key
+        self.status = status
+        self.row_count = row_count
+        self.raw_content_hash = raw_content_hash
+        self.raw_blob_key = raw_blob_key
+        self.request_url = request_url
+        self.fetched_at = fetched_at
+        self.http_status = http_status
+        self.error_type = error_type
+        self.is_terminal = is_terminal
+
+
+class _FakeCaptureResult:
+    def __init__(self, manifest, datasets=(), raw=None):
+        self.manifest = manifest
+        self.datasets = dict(datasets)
+        self.raw = raw
+
+
+def _common_kwargs():
+    return {
+        "source_tournament_id": TOURNAMENT_ID,
+        "source_season_id": SEASON_ID,
+        "freshness_key": FRESHNESS_KEY,
+        "paid_proxy": False,
+    }
+
+
+def _result(
+    spec,
+    *,
+    status,
+    dataset_name=None,
+    rows=(),
+    error_type=None,
+    http_status=200,
+    is_terminal=True,
+):
+    datasets = {}
+    if dataset_name is not None:
+        datasets[dataset_name] = _FakeDataset(rows)
+    content_hash = f"hash:{spec.key.endpoint}:{spec.key.target_id}"
+    blob_key = f"blob:{spec.key.endpoint}:{spec.key.target_id}"
+    manifest = _FakeManifest(
+        spec.key,
+        status,
+        row_count=len(rows),
+        raw_content_hash=content_hash,
+        raw_blob_key=blob_key,
+        request_url=spec.url,
+        fetched_at="2026-11-17T00:00:00+00:00",
+        http_status=http_status,
+        error_type=error_type,
+        is_terminal=is_terminal,
+    )
+    raw = _FakeRaw(spec.raw_target, content_hash, blob_key, http_status)
+    return _FakeCaptureResult(manifest, datasets, raw)
+
+
+def _parsed_result(spec, payload, **kwargs):
+    rows = [row for parser in spec.parsers.values() for row in parser(payload)]
+    assert rows
+    dataset_name = next(iter(spec.parsers))
+    return _result(spec, status=ManifestStatus.SUCCESS, dataset_name=dataset_name, rows=rows, **kwargs)
+
+
+def _empty_result(spec, *, http_status=200):
+    return _result(spec, status=ManifestStatus.LEGITIMATE_EMPTY, http_status=http_status)
+
+
+def _partition_specs(referee_ids=("900",)):
+    common = _common_kwargs()
+    return [
+        build_schedule_page_spec(direction="last", page=0, **common),
+        build_schedule_page_spec(direction="next", page=0, **common),
+        build_standings_total_spec(**common),
+        build_rounds_spec(**common),
+        build_cup_trees_spec(**common),
+        build_participants_spec(**common),
+        *(
+            build_referee_profile_spec(referee_id=referee_id, **common)
+            for referee_id in referee_ids
+        ),
+    ]
+
+
+def _season_plan(specs):
+    return SeasonPartitionPlan(
+        source_tournament_id=TOURNAMENT_ID_STR,
+        source_season_id=SEASON_ID_STR,
+        freshness_key=FRESHNESS_KEY,
+        event_freshness_key=FRESHNESS_KEY,
+        specs=tuple(specs),
+        pending_keys=(),
+        missing_raw_keys=(),
+        schedule_event_ids=(),
+        team_ids=(),
+        referee_ids=(),
+    )
+
+
+def _materialize(specs, results):
+    return materialize_season_partition(
+        _season_plan(specs),
+        results,
+        canonical_league=CANONICAL_LEAGUE,
+        canonical_season=CANONICAL_SEASON,
+    )
+
+
+def _partition_results(specs, *, referee_result=None):
+    fixture_by_endpoint = {
+        "rounds": ROUNDS_FIXTURE,
+        "cup_trees": CUP_TREES_FIXTURE,
+        "participants": PARTICIPANTS_FIXTURE,
+    }
+    results = []
+    for spec in specs:
+        endpoint = spec.key.endpoint
+        if endpoint.startswith("schedule_"):
+            results.append(_empty_result(spec, http_status=404))
+        elif endpoint == "standings_total":
+            results.append(_empty_result(spec))
+        elif endpoint == REFEREE_PROFILE_ENDPOINT:
+            results.append(
+                referee_result
+                or _parsed_result(spec, _load_fixture(REFEREE_FIXTURE))
+            )
+        else:
+            results.append(_parsed_result(spec, _load_fixture(fixture_by_endpoint[endpoint])))
+    return results
+
+
+class TestSeasonFieldSpecsNormalized:
+    @pytest.mark.parametrize(
+        ("builder", "endpoint", "collection", "fixture_name"),
+        [
+            (build_rounds_spec, "rounds", "rounds", ROUNDS_FIXTURE),
+            (build_cup_trees_spec, "cup_trees", "cupTrees", CUP_TREES_FIXTURE),
+            (build_participants_spec, "participants", "teams", PARTICIPANTS_FIXTURE),
+        ],
+    )
+    def test_season_specs_are_parser_backed(
+        self, builder, endpoint, collection, fixture_name
+    ):
+        path_by_endpoint = {
+            "rounds": "rounds",
+            "cup_trees": "cuptrees",
+            "participants": "teams",
+        }
+        spec = builder(**_common_kwargs())
+        assert spec.raw_only is False
+        assert set(spec.parsers) == {endpoint}
+        assert spec.paid_proxy is False
+        assert spec.key.endpoint == endpoint
+        assert spec.key.target_type == "season"
+        assert spec.key.target_id == SEASON_ID_STR
+        assert (
+            spec.url
+            == f"https://www.sofascore.com/api/v1/unique-tournament/{TOURNAMENT_ID_STR}"
+            f"/season/{SEASON_ID_STR}/{path_by_endpoint[endpoint]}"
+        )
+
+        payload = _load_fixture(fixture_name)
+        assert spec.schema_validator(payload) is True
+        assert spec.schema_validator({}) is False
+        assert spec.empty_predicate({collection: []}) is True
+
+        rows = spec.parsers[endpoint](payload)
+        assert rows
+        for row in rows:
+            assert row["source_tournament_id"] == TOURNAMENT_ID_STR
+            assert row["source_season_id"] == SEASON_ID_STR
+
+    def test_referee_spec_is_parser_backed_with_requested_id(self):
+        spec = build_referee_profile_spec(referee_id=900, **_common_kwargs())
+        assert spec.raw_only is False
+        assert set(spec.parsers) == {REFEREE_PROFILE_ENDPOINT}
+        assert spec.paid_proxy is False
+        assert spec.key.endpoint == REFEREE_PROFILE_ENDPOINT
+        assert spec.key.target_type == "referee"
+        assert spec.key.target_id == "900"
+        assert spec.url == "https://www.sofascore.com/api/v1/referee/900"
+
+        payload = _load_fixture(REFEREE_FIXTURE)
+        assert spec.schema_validator(payload) is True
+        assert spec.schema_validator({"referee": {"id": 999, "slug": "other"}}) is False
+        assert spec.empty_predicate({"referee": None}) is True
+
+        rows = spec.parsers[REFEREE_PROFILE_ENDPOINT](payload)
+        assert [row["requested_referee_id"] for row in rows] == ["900"]
+        assert rows[0]["source_tournament_id"] == TOURNAMENT_ID_STR
+        assert rows[0]["source_season_id"] == SEASON_ID_STR
+
+    def test_squads_spec_stays_raw_only(self):
+        spec = build_squad_spec(team_id=42, **_common_kwargs())
+        assert spec.raw_only is True
+        assert spec.parsers == {}
+        assert spec.key.endpoint == "squads"
+
+    def test_default_materialization_fields_are_empty_tuples(self):
+        materialization = SeasonPartitionMaterialization(
+            canonical_league=CANONICAL_LEAGUE,
+            canonical_season=CANONICAL_SEASON,
+            schedule_rows=(),
+            standings_rows=(),
+            raw_lineage={},
+            endpoint_statuses={},
+            deferred_keys=(),
+        )
+        assert materialization.rounds_rows == ()
+        assert materialization.cup_trees_rows == ()
+        assert materialization.participants_rows == ()
+        assert materialization.referee_profile_rows == ()
+
+
+class TestSeasonPartitionMaterializationFields:
+    def test_all_four_datasets_materialized_with_lineage(self):
+        specs = _partition_specs()
+        results = _partition_results(specs)
+        materialization = _materialize(specs, results)
+
+        assert [row["round_id"] for row in materialization.rounds_rows] == ["1", "2", "3"]
+        assert [row["is_current"] for row in materialization.rounds_rows] == [False, False, True]
+        assert [(row["cup_tree_id"], row["node_id"]) for row in materialization.cup_trees_rows] == [
+            ("9001", "1"),
+            ("9001", "2"),
+        ]
+        assert [row["team_id"] for row in materialization.participants_rows] == ["42", "44"]
+        assert len(materialization.referee_profile_rows) == 1
+        referee_row = materialization.referee_profile_rows[0]
+        assert referee_row["requested_referee_id"] == "900"
+        assert referee_row["referee_id"] == "900"
+
+        datasets = {
+            "rounds": materialization.rounds_rows,
+            "cup_trees": materialization.cup_trees_rows,
+            "participants": materialization.participants_rows,
+            REFEREE_PROFILE_ENDPOINT: materialization.referee_profile_rows,
+        }
+        for endpoint, rows in datasets.items():
+            assert rows
+            for row in rows:
+                assert row["league"] == CANONICAL_LEAGUE
+                assert row["season"] == CANONICAL_SEASON
+                assert row["source_tournament_id"] == TOURNAMENT_ID_STR
+                assert row["source_season_id"] == SEASON_ID_STR
+                assert row["raw_endpoint"] == endpoint
+                assert row["raw_content_hash"]
+                assert row["raw_blob_key"]
+                assert row["raw_request_url"]
+                assert row["raw_fetched_at"]
+        assert {row["raw_target_id"] for row in materialization.rounds_rows} == {SEASON_ID_STR}
+        assert {row["raw_target_id"] for row in materialization.referee_profile_rows} == {"900"}
+        assert set(materialization.raw_lineage) == {spec.key for spec in specs}
+        assert materialization.schedule_rows == ()
+        assert materialization.deferred_keys == ()
+
+    def test_empty_datasets_materialize_without_schedule_rows(self):
+        specs = _partition_specs()
+        results = [_empty_result(spec, http_status=404 if spec.key.endpoint.startswith("schedule_") else 200) for spec in specs]
+        materialization = _materialize(specs, results)
+
+        assert materialization.schedule_rows == ()
+        assert materialization.standings_rows == ()
+        assert materialization.rounds_rows == ()
+        assert materialization.cup_trees_rows == ()
+        assert materialization.participants_rows == ()
+        assert materialization.referee_profile_rows == ()
+        assert materialization.deferred_keys == ()
+        assert materialization.endpoint_completeness == 1.0
+
+    def test_deferred_normalized_referee_profile_is_allowed(self):
+        specs = _partition_specs()
+        referee_spec = specs[-1]
+        referee_rows = referee_spec.parsers[REFEREE_PROFILE_ENDPOINT](
+            _load_fixture(REFEREE_FIXTURE)
+        )
+        deferred_result = _result(
+            referee_spec,
+            status=ManifestStatus.RETRYABLE_FAILURE,
+            dataset_name=REFEREE_PROFILE_ENDPOINT,
+            rows=referee_rows,
+            error_type="DeferredMaterialization",
+            http_status=200,
+            is_terminal=False,
+        )
+        materialization = _materialize(
+            specs, _partition_results(specs, referee_result=deferred_result)
+        )
+
+        assert materialization.deferred_keys == (referee_spec.key,)
+        assert [row["requested_referee_id"] for row in materialization.referee_profile_rows] == ["900"]
+        assert materialization.referee_profile_rows[0]["raw_content_hash"]
+        assert materialization.referee_profile_rows[0]["raw_blob_key"]
+        assert materialization.endpoint_statuses[referee_spec.key] == ManifestStatus.RETRYABLE_FAILURE
+        assert materialization.endpoint_completeness == 1.0
+        assert materialization.match_phase_ready is True
+        assert [row["round_id"] for row in materialization.rounds_rows] == ["1", "2", "3"]
+
+    def test_rejected_referee_schema_error_stays_optional(self):
+        specs = _partition_specs()
+        referee_spec = specs[-1]
+        rejected_result = _result(
+            referee_spec,
+            status=ManifestStatus.SCHEMA_ERROR,
+            error_type="SchemaValidationError",
+            http_status=200,
+        )
+        materialization = _materialize(
+            specs, _partition_results(specs, referee_result=rejected_result)
+        )
+
+        assert materialization.referee_profile_rows == ()
+        assert materialization.endpoint_statuses[referee_spec.key] == ManifestStatus.SCHEMA_ERROR
+        assert materialization.match_phase_ready is True
+        assert set(materialization.raw_lineage) == {spec.key for spec in specs}
+
+    def test_non_referee_schema_error_blocks_publication(self):
+        common = _common_kwargs()
+        specs = [
+            build_schedule_page_spec(direction="last", page=0, **common),
+            build_schedule_page_spec(direction="next", page=0, **common),
+            build_rounds_spec(**common),
+        ]
+        results = [
+            _empty_result(specs[0], http_status=404),
+            _empty_result(specs[1], http_status=404),
+            _result(
+                specs[2],
+                status=ManifestStatus.SCHEMA_ERROR,
+                error_type="SchemaValidationError",
+                http_status=200,
+            ),
+        ]
+        with pytest.raises(SeasonMaterializationError):
+            _materialize(specs, results)
+
+
+class TestSeasonFieldDuplicateGuards:
+    @pytest.mark.parametrize(
+        ("build_spec", "endpoint", "key_row"),
+        [
+            (
+                lambda common: build_rounds_spec(**common),
+                "rounds",
+                {"round_id": "1"},
+            ),
+            (
+                lambda common: build_cup_trees_spec(**common),
+                "cup_trees",
+                {"cup_tree_id": "9001", "node_id": "1"},
+            ),
+            (
+                lambda common: build_participants_spec(**common),
+                "participants",
+                {"team_id": "42"},
+            ),
+            (
+                lambda common: build_referee_profile_spec(referee_id=900, **common),
+                REFEREE_PROFILE_ENDPOINT,
+                {"requested_referee_id": "900", "referee_id": "900"},
+            ),
+        ],
+    )
+    def test_duplicate_natural_keys_fail_publication(self, build_spec, endpoint, key_row):
+        common = _common_kwargs()
+        specs = [
+            build_schedule_page_spec(direction="last", page=0, **common),
+            build_schedule_page_spec(direction="next", page=0, **common),
+            build_spec(common),
+        ]
+        duplicate_rows = [
+            {**_PARTITION_BASE, **key_row},
+            {**_PARTITION_BASE, **key_row},
+        ]
+        results = [
+            _empty_result(specs[0], http_status=404),
+            _empty_result(specs[1], http_status=404),
+            _result(
+                specs[2],
+                status=ManifestStatus.SUCCESS,
+                dataset_name=endpoint,
+                rows=duplicate_rows,
+            ),
+        ]
+        with pytest.raises(SeasonMaterializationError, match="natural key check failed"):
+            _materialize(specs, results)

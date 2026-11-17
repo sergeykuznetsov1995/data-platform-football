@@ -17,8 +17,8 @@ coverage_statuses:
   - intentionally-excluded
 
 coverage_summary:
-  normalized: 14
-  raw-only: 4
+  normalized: 18
+  raw-only: 0
   unsupported: 2
   intentionally-excluded: 8
 
@@ -123,6 +123,10 @@ committed_state_dq:
     - bronze.sofascore_player_universe
     - bronze.sofascore_player_profile
     - bronze.sofascore_player_season_stats
+    - bronze.sofascore_rounds
+    - bronze.sofascore_cup_trees
+    - bronze.sofascore_participants
+    - bronze.sofascore_referee_profile
     - silver.sofascore_league_table
     - silver.sofascore_player_match_aggregate
     - silver.sofascore_team_match
@@ -191,11 +195,89 @@ tables:
   bronze.sofascore_league_table:
     grain: one team in one total standings block
     natural_key: [league, season, group, team]
-    required_columns: [team, mp, w, d, l, gf, ga, gd, pts, group, league, season, _ingested_at]
+    required_columns: [team, position, mp, w, d, l, gf, ga, gd, pts, promotion, promotion_json, group, league, season, _ingested_at]
     partition_columns: [league, season]
     materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
     production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
     downstream: [silver.sofascore_league_table]
+
+  bronze.sofascore_rounds:
+    grain: one round in one competition season partition
+    natural_key: [league, season, round_id]
+    required_columns:
+      - round_id
+      # is_current is projected from the payload's currentRound marker.
+      - is_current
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [season structure replay verification, fixture round sequencing]
+
+  bronze.sofascore_cup_trees:
+    grain: one cup-tree bracket node in one competition season partition
+    natural_key: [league, season, cup_tree_id, node_id]
+    required_columns:
+      - cup_tree_id
+      - node_id
+      - parent_node_id
+      # children_json keeps the nested node objects lossless for replay.
+      - children_json
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [bracket parent/children traversal, lossless children_json replay]
+
+  bronze.sofascore_participants:
+    grain: one tournament participant team in one competition season partition
+    natural_key: [league, season, team_id]
+    required_columns:
+      - team_id
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [team universe cross-check against event participants]
+
+  bronze.sofascore_referee_profile:
+    grain: one requested referee profile response in one competition season partition
+    natural_key: [league, season, requested_referee_id]
+    required_columns:
+      # The request identity keys the row; the payload's actual referee_id
+      # and slug are retained as observed columns.
+      - requested_referee_id
+      - referee_id
+      - slug
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [referee analysis alongside event referee scalars in bronze.sofascore_events]
 
   bronze.sofascore_events:
     grain: one full-event scalar projection
@@ -259,6 +341,10 @@ tables:
       - is_bench
       - is_unused_substitute
       - participation_status
+      - player_name
+      - formation
+      - missing_players_json
+      - support_staff_json
       - source_tournament_id
       - source_season_id
       - raw_content_hash
@@ -773,17 +859,17 @@ endpoints:
   rounds:
     path: /unique-tournament/{tournament_id}/season/{season_id}/rounds
     target_type: season
-    status: raw-only
+    status: normalized
     required: false
     raw_collection: rounds
     preserved_arrays: [/rounds]
+    normalized_cardinality_paths: [/rounds]
     required_json_paths: [/rounds]
-    destination: []
-    grain: one round
+    destination: [bronze.sofascore_rounds]
+    grain: one round in one competition season partition
     natural_key: [source_season_id, round_id]
     empty_semantics: a schema-valid empty rounds array is legitimate
-    reason: exact arrays are retained for replay; no stable cross-format normalized grain is published yet
-    dq: [schema-valid array, exact raw lineage]
+    dq: [unique round key, is_current projected from currentRound, exact raw lineage]
 
   stages:
     path: /unique-tournament/{tournament_id}/season/{season_id}/stages
@@ -802,31 +888,30 @@ endpoints:
   cup_trees:
     path: /unique-tournament/{tournament_id}/season/{season_id}/cuptrees
     target_type: season
-    status: raw-only
+    status: normalized
     required: false
     raw_collection: cupTrees
     preserved_arrays: [/cupTrees]
     required_json_paths: [/cupTrees]
-    destination: []
-    grain: one cup-tree node
+    destination: [bronze.sofascore_cup_trees]
+    grain: one cup-tree bracket node in one competition season partition
     natural_key: [source_season_id, cup_tree_id, node_id]
     empty_semantics: a schema-valid empty cupTrees array is legitimate for leagues
-    reason: nested bracket nodes are retained exactly pending a versioned node/edge model
-    dq: [schema-valid array, exact raw lineage]
+    dq: [parent and children links resolved, lossless children_json, exact raw lineage]
 
   participants:
     path: /unique-tournament/{tournament_id}/season/{season_id}/teams
     target_type: season
-    status: raw-only
+    status: normalized
     required: false
     raw_collection: teams
     preserved_arrays: [/teams]
+    normalized_cardinality_paths: [/teams]
     required_json_paths: [/teams]
-    destination: []
-    grain: one tournament participant team
+    destination: [bronze.sofascore_participants]
+    grain: one tournament participant team in one competition season partition
     natural_key: [source_season_id, team_id]
     empty_semantics: a schema-valid empty teams array is terminal but cannot expand squads
-    reason: exact participant objects drive squad expansion; event participants remain the normalized team spine
     dq: [unique source team ids for expansion, exact raw lineage]
 
   squads:
@@ -917,17 +1002,16 @@ endpoints:
   referee_profile:
     path: /referee/{referee_id}
     target_type: referee
-    status: raw-only
+    status: normalized
     required: false
     raw_collection: referee
     preserved_arrays: []
     required_json_paths: [/referee]
-    destination: []
-    grain: one referee
-    natural_key: [referee_id]
+    destination: [bronze.sofascore_referee_profile]
+    grain: one requested referee profile in one competition season partition
+    natural_key: [source_season_id, requested_referee_id]
     empty_semantics: a schema-valid null referee is legitimate
-    reason: exact referee objects are retained for future dimension design; event referee scalars remain in bronze.sofascore_events
-    dq: [referee target identity, exact raw lineage]
+    dq: [requested referee identity, actual referee_id and slug retained, exact raw lineage]
 
   h2h_events:
     path: /event/{event_id}/h2h/{scope}

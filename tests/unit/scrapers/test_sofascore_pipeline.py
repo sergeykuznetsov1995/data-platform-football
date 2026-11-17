@@ -3781,7 +3781,7 @@ def test_signed_match_runner_hands_the_tolerance_to_capture_live_specs(
         runtime.raw_store,
     )
 
-    token = "signed-match-control-token-at-least-32-bytes"
+    token = "x" * 32
     workload_class = match_workload_class()
     policy = WorkloadBudgetPolicy("c" * 64, {workload_class: WorkloadClassBudget(
         workload_class, "match", 25, 10_000_000, ("event",),

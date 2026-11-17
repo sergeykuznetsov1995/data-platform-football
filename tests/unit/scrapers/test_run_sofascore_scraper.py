@@ -309,6 +309,9 @@ def test_season_runner_receipts_are_after_merges_and_noop_does_not_claim_publica
     assert report["publication_receipts"] == [
         dict(table="sofascore_schedule", rows=2, location="iceberg.bronze.sofascore_schedule"),
         dict(table="sofascore_league_table", rows=4, location="iceberg.bronze.sofascore_league_table"),
+        dict(table="sofascore_rounds", rows=3, location="iceberg.bronze.sofascore_rounds"),
+        dict(table="sofascore_cup_trees", rows=2, location="iceberg.bronze.sofascore_cup_trees"),
+        dict(table="sofascore_participants", rows=4, location="iceberg.bronze.sofascore_participants"),
     ]
     noop = json.loads((tmp_path / "season-noop.json").read_text())
     assert not noop.get("publication_receipts")

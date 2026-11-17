@@ -24,6 +24,10 @@ PARTITION_SCOPED_TABLES = frozenset({
     "sofascore_player_universe",
     "sofascore_player_profile",
     "sofascore_player_season_stats",
+    "sofascore_rounds",
+    "sofascore_cup_trees",
+    "sofascore_participants",
+    "sofascore_referee_profile",
 })
 
 

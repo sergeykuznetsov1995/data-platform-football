@@ -65,13 +65,12 @@ def test_exact_endpoint_outcomes_match_current_capture_wiring(coverage):
         "incidents",
         "player_profile",
         "player_season_statistics",
-    }
-    raw_only = {
         "rounds",
         "cup_trees",
         "participants",
         "referee_profile",
     }
+    raw_only: set[str] = set()
     unsupported = {"stages", "squads"}
     excluded = {
         "player_event_statistics",
@@ -98,8 +97,8 @@ def test_exact_endpoint_outcomes_match_current_capture_wiring(coverage):
         "intentionally-excluded": excluded,
     }
     assert coverage["coverage_summary"] == {
-        "normalized": 14,
-        "raw-only": 4,
+        "normalized": 18,
+        "raw-only": 0,
         "unsupported": 2,
         "intentionally-excluded": 8,
     }
@@ -127,6 +126,10 @@ def test_new_bronze_tables_require_raw_replay_lineage(coverage):
         "bronze.sofascore_event_participants",
         "bronze.sofascore_lineups",
         "bronze.sofascore_incidents",
+        "bronze.sofascore_rounds",
+        "bronze.sofascore_cup_trees",
+        "bronze.sofascore_participants",
+        "bronze.sofascore_referee_profile",
     ):
         required = set(coverage["tables"][table_name]["required_columns"])
         assert {
@@ -217,8 +220,9 @@ def test_every_claimed_table_has_a_real_materializer_file_and_status(coverage):
         assert table["production_write_status"]
 
 
-def test_raw_only_and_excluded_payloads_have_reason(coverage):
+def test_excluded_and_unsupported_payloads_have_reason(coverage):
     expected = {
+        "player_event_statistics": "intentionally-excluded",
         "event_graph": "intentionally-excluded",
         "average_positions": "intentionally-excluded",
         "player_heatmap": "intentionally-excluded",
@@ -233,27 +237,108 @@ def test_raw_only_and_excluded_payloads_have_reason(coverage):
         assert spec["reason"]
         assert spec["destination"] == []
         assert spec["preserved_arrays"] == []
-    for endpoint in ("rounds", "cup_trees", "participants"):
-        spec = coverage["endpoints"][endpoint]
-        assert spec["status"] == "raw-only"
-        assert spec["reason"]
-        assert spec["destination"] == []
-        assert spec["preserved_arrays"]
     squads = coverage["endpoints"]["squads"]
     assert squads["status"] == "unsupported"
     assert squads["reason"]
     assert squads["destination"] == []
     assert squads["preserved_arrays"] == []
-    referee = coverage["endpoints"]["referee_profile"]
-    assert referee["status"] == "raw-only"
-    assert referee["reason"]
-    assert referee["required_json_paths"] == ["/referee"]
+    # The runner now publishes every retained season payload: no endpoint
+    # may stay raw-only against the real writer.
+    assert not {
+        name
+        for name, spec in coverage["endpoints"].items()
+        if spec["status"] == "raw-only"
+    }
+
+
+def test_season_capture_bronze_publications_match_the_real_writer(coverage):
+    committed = set(coverage["committed_state_dq"]["duplicate_tables"])
+    silver_gold_tables = {
+        name
+        for name in coverage["tables"]
+        if name.startswith(("silver.", "gold."))
+    }
+    for endpoint_name, table_name, key in (
+        ("rounds", "bronze.sofascore_rounds", ["league", "season", "round_id"]),
+        (
+            "cup_trees",
+            "bronze.sofascore_cup_trees",
+            ["league", "season", "cup_tree_id", "node_id"],
+        ),
+        (
+            "participants",
+            "bronze.sofascore_participants",
+            ["league", "season", "team_id"],
+        ),
+        (
+            "referee_profile",
+            "bronze.sofascore_referee_profile",
+            ["league", "season", "requested_referee_id"],
+        ),
+    ):
+        endpoint = coverage["endpoints"][endpoint_name]
+        assert endpoint["status"] == "normalized", endpoint_name
+        assert endpoint["destination"] == [table_name], endpoint_name
+        table = coverage["tables"][table_name]
+        assert table["grain"]
+        assert table["natural_key"] == key
+        assert set(key) <= set(table["required_columns"])
+        assert table["partition_columns"] == ["league", "season"]
+        assert table["materialized_by"] == (
+            "dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine"
+        )
+        assert "replay/no-op wired" in table["production_write_status"]
+        assert {
+            "source_tournament_id",
+            "source_season_id",
+            "raw_content_hash",
+            "raw_blob_key",
+            "league",
+            "season",
+            "_ingested_at",
+        } <= set(table["required_columns"])
+        assert table_name in committed
+        assert not set(table["downstream"]) & silver_gold_tables
+    rounds = coverage["tables"]["bronze.sofascore_rounds"]
+    assert "is_current" in rounds["required_columns"]
+    cup_trees = coverage["tables"]["bronze.sofascore_cup_trees"]
+    assert {"parent_node_id", "children_json"} <= set(cup_trees["required_columns"])
+    referee = coverage["tables"]["bronze.sofascore_referee_profile"]
+    assert {"requested_referee_id", "referee_id", "slug"} <= set(
+        referee["required_columns"]
+    )
+    assert coverage["endpoints"]["referee_profile"]["required_json_paths"] == [
+        "/referee"
+    ]
+
+
+def test_season_capture_columns_match_parser_anchors(coverage):
+    from scrapers.sofascore.season_fields import (
+        parse_cup_trees,
+        parse_referee_profile,
+    )
+
+    cup_row = parse_cup_trees(
+        {"cupTrees": [{"id": 1, "nodes": [{"id": 2}]}]},
+        source_tournament_id=17,
+        source_season_id=76986,
+    )[0]
+    referee_row = parse_referee_profile(
+        {"referee": {"id": 9, "slug": "canonical-referee"}},
+        source_tournament_id=17,
+        source_season_id=76986,
+        requested_referee_id=8,
+    )[0]
+    assert "children_json" in cup_row
+    assert "children_node_ids" not in cup_row
+    assert "slug" in referee_row
+    assert "referee_slug" not in referee_row
 
 
 def test_missing_group_playoff_round_and_bracket_tables_are_not_claimed(coverage):
     assert coverage["endpoints"]["standings_total"]["status"] == "normalized"
-    assert coverage["endpoints"]["rounds"]["status"] == "raw-only"
-    assert coverage["endpoints"]["cup_trees"]["status"] == "raw-only"
+    assert coverage["endpoints"]["rounds"]["status"] == "normalized"
+    assert coverage["endpoints"]["cup_trees"]["status"] == "normalized"
     assert coverage["endpoints"]["stages"]["status"] == "unsupported"
     assert {
         "silver.sofascore_standings",
@@ -309,6 +394,10 @@ def test_claimed_physical_tables_are_the_exact_current_sofascore_set(coverage):
         "bronze.sofascore_player_universe",
         "bronze.sofascore_player_profile",
         "bronze.sofascore_player_season_stats",
+        "bronze.sofascore_rounds",
+        "bronze.sofascore_cup_trees",
+        "bronze.sofascore_participants",
+        "bronze.sofascore_referee_profile",
     }
     assert {name for name in claimed if name.startswith("silver.")} == {
         "silver.sofascore_league_table",
