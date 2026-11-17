@@ -1,0 +1,80 @@
+{
+  "grain": "day_report",
+  "day_utc": "2026-11-01",
+  "generated_at": "2026-11-02T00:05:00Z",
+  "producer_variant": "query_history_poll",
+  "poll_interval_s": 60,
+  "coverage_minutes_total": 1440,
+  "gap_intervals_total": [],
+  "completeness": "full",
+  "discovered_tables": [
+    "iceberg.bronze.fotmob_ingest_manifest",
+    "iceberg.bronze.fotmob_matches"
+  ],
+  "unparsed_queries": 0,
+  "unparsed_fotmob": false,
+  "duplicate_queries": 0,
+  "conflicting_query_ids": [],
+  "n5_measurable": true,
+  "platform_ops_total": 0,
+  "unknown_ops_total": 0,
+  "foreign_load": false,
+  "tables": [
+    {
+      "grain": "day_table",
+      "day_utc": "2026-11-01",
+      "table": "iceberg.bronze.fotmob_ingest_manifest",
+      "user_attr": "src_fotmob",
+      "commits": 0,
+      "scan_reads": 720,
+      "scan_writes": 0,
+      "scans_total": 720,
+      "peak_commits_per_min": 0,
+      "peak_polls_per_min": 1,
+      "coverage_minutes": 1440,
+      "gap_intervals": [],
+      "completeness": "full"
+    },
+    {
+      "grain": "day_table",
+      "day_utc": "2026-11-01",
+      "table": "iceberg.bronze.fotmob_matches",
+      "user_attr": "src_fotmob",
+      "commits": 720,
+      "scan_reads": 300,
+      "scan_writes": 720,
+      "scans_total": 1020,
+      "peak_commits_per_min": 1,
+      "peak_polls_per_min": 0,
+      "coverage_minutes": 1440,
+      "gap_intervals": [],
+      "completeness": "full"
+    }
+  ],
+  "platform_activity": [],
+  "unknown_activity": [],
+  "peak_evidence": {
+    "N1": "iceberg.bronze.fotmob_matches@2026-11-01T14:03:00Z",
+    "N2": "iceberg.bronze.fotmob_ingest_manifest@2026-11-01T00:00:00Z"
+  },
+  "commit_checks": [
+    {
+      "table": "iceberg.bronze.fotmob_matches",
+      "sql_commits": 720,
+      "snapshot_commits": 720,
+      "difference": 0,
+      "match": true
+    }
+  ],
+  "commit_check_complete": true,
+  "commit_mismatch": false,
+  "verdicts": {
+    "N1": {"pass": true, "value": 1, "threshold": "<=1/min", "evidence": "iceberg.bronze.fotmob_matches@2026-11-01T14:03:00Z"},
+    "N2": {"pass": true, "value": 1, "threshold": "<=1/min", "evidence": "iceberg.bronze.fotmob_ingest_manifest@2026-11-01T00:00:00Z"},
+    "N3": {"pass": true, "value": 720, "threshold": "<=1440/day", "evidence": "iceberg.bronze.fotmob_matches"},
+    "N4": {"pass": true, "value": 1020, "threshold": "<=1440/day", "evidence": "iceberg.bronze.fotmob_matches"},
+    "N5": {"pass": true, "value": 0, "threshold": "foreign_ops==0", "evidence": null}
+  },
+  "pass": true,
+  "pass_reasons": []
+}
