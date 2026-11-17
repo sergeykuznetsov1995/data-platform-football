@@ -142,6 +142,8 @@ class Store:
         require(spec.get('source') in SOURCES, 'unknown source')
         reference_kind = spec.get('reference_kind', 'issue')
         require(reference_kind in {'issue', 'pull'}, 'unknown reference kind')
+        require('auto_close_issue' not in spec or type(spec.get('auto_close_issue')) is bool,
+                'auto_close_issue must be boolean')
         if reference_kind == 'issue':
             require(number(spec.get('issue'), 1), 'issue must be a positive integer')
             require(spec.get('id') == f"{spec['source']}-{spec['issue']}", 'id must be source-issue')
@@ -496,9 +498,14 @@ class Store:
                                 'saved evidence is missing or changed')
             if record.get('close_plan'):
                 return record['close_plan']
-            plan = {'token': uuid.uuid4().hex, 'id': key, 'issue': record['definition']['issue'],
+            definition = record['definition']
+            auto_close_issue = definition.get(
+                'auto_close_issue',
+                definition.get('reference_kind', 'issue') == 'issue',
+            )
+            plan = {'token': uuid.uuid4().hex, 'id': key, 'issue': definition['issue'],
                     'issue_url': self._view(record, now)['issue_url'],
-                    'auto_close_issue': record['definition'].get('reference_kind', 'issue') == 'issue',
+                    'auto_close_issue': auto_close_issue,
                     'acceptance_revision': record['revision'], 'series': record['series'],
                     'body_sha256': body_sha256, 'prepared_at': now.isoformat(),
                     'criteria': self._view(record, now)['criteria']}

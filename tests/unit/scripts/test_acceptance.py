@@ -175,9 +175,22 @@ def test_definition_is_immutable_and_unconfirmed_never_ready(registry):
     assert progress(store)['status'] == 'draft'
 
 
-def test_close_requires_matching_issue_and_all_criteria(registry):
+@pytest.mark.parametrize('value', [None, 'false', 0, 1])
+def test_auto_close_issue_must_be_boolean_when_present(registry, value):
+    store, _ = registry
+    definition = spec(required=1, kind='check')
+    definition['auto_close_issue'] = value
+    with pytest.raises(AcceptanceError, match='auto_close_issue must be boolean'):
+        store.register(definition, now=stamp())
+    assert store.snapshot(now=stamp())['acceptances'] == []
+
+
+@pytest.mark.parametrize('override', [{}, {'auto_close_issue': True}])
+def test_close_requires_matching_issue_and_all_criteria(registry, override):
     store, proof = registry
-    store.register(spec(required=1), now=stamp())
+    definition = spec(required=1)
+    definition.update(override)
+    store.register(definition, now=stamp())
     for criterion in ['data', 'cleanup']:
         store.observe('fotmob-1288', observation(proof, criterion=criterion), now=stamp(1))
     ready = progress(store, now=stamp(1))
@@ -186,9 +199,67 @@ def test_close_requires_matching_issue_and_all_criteria(registry):
     plan = store.prepare_close('fotmob-1288', 'a' * 64, now=stamp(1))
     assert plan['issue'] == 1288
     assert plan['acceptance_revision'] == ready['revision']
+    assert plan['auto_close_issue'] is True
+    with pytest.raises(AcceptanceError, match='GitHub readback does not match plan'):
+        store.confirm_closed('fotmob-1288', plan['token'],
+            {'state': 'ACCEPTED', 'body_sha256': 'a' * 64, 'evidence': [proof]}, now=stamp(1))
+    assert store.show('fotmob-1288')['closed'] is False
     store.confirm_closed('fotmob-1288', plan['token'],
         {'issue': 1288, 'state': 'CLOSED', 'body_sha256': 'a' * 64,
          'report_url': 'https://github.com/sergeykuznetsov1995/data-platform-football/issues/1288#issuecomment-1'}, now=stamp(1))
+    assert progress(store, now=stamp(1))['status'] == 'closed'
+
+
+def test_issue_acceptance_honors_local_only_definition(registry):
+    store, proof = registry
+    definition = spec(required=1, kind='check')
+    definition['auto_close_issue'] = False
+    store.register(definition, now=stamp())
+    for criterion in ['data', 'cleanup']:
+        store.observe('fotmob-1288', observation(proof, criterion=criterion), now=stamp(1))
+    plan = store.prepare_close('fotmob-1288', 'a' * 64, now=stamp(1))
+    assert plan['auto_close_issue'] is False
+    assert plan['issue'] == 1288
+    with pytest.raises(AcceptanceError, match='local final acceptance report required'):
+        store.confirm_closed('fotmob-1288', plan['token'],
+            {'state': 'ACCEPTED', 'body_sha256': 'a' * 64, 'evidence': []}, now=stamp(1))
+    assert store.show('fotmob-1288')['closed'] is False
+    receipt = {'state': 'ACCEPTED', 'body_sha256': 'a' * 64, 'evidence': [proof]}
+    closed = store.confirm_closed('fotmob-1288', plan['token'], receipt, now=stamp(1))
+    assert closed['closed'] is True
+    assert closed['closure_receipt'] == receipt
+    assert progress(store, now=stamp(1))['status'] == 'closed'
+
+
+def test_unaffected_change_reissues_local_only_close_plan(registry):
+    store, proof = registry
+    definition = spec(required=1, kind='check')
+    definition['auto_close_issue'] = False
+    store.register(definition, now=stamp())
+    for criterion in ['data', 'cleanup']:
+        store.observe('fotmob-1288', observation(proof, criterion=criterion), now=stamp(1))
+    plan = store.prepare_close('fotmob-1288', 'a' * 64, now=stamp(1))
+    record = store.show('fotmob-1288')
+    changed = store.change('fotmob-1288', {'expected_series': record['series'],
+        'expected_revision': record['revision'], 'impact': 'unaffected',
+        'deployed_revision': record['deployed_revision'],
+        'reason': 'Ремонт только среды выполнения', 'evidence': [proof]}, now=stamp(1))
+    assert changed['series'] == record['series']
+    assert changed['observations'] == record['observations']
+    assert 'close_plan' not in changed
+    assert changed['revision'] > record['revision']
+    assert progress(store, now=stamp(1))['status'] == 'ready'
+    assert any(e['kind'] == 'change' for e in store.history('fotmob-1288'))
+    with pytest.raises(AcceptanceError, match='missing or stale close plan'):
+        store.confirm_closed('fotmob-1288', plan['token'],
+            {'state': 'ACCEPTED', 'body_sha256': 'a' * 64, 'evidence': [proof]}, now=stamp(1))
+    new_plan = store.prepare_close('fotmob-1288', 'a' * 64, now=stamp(1))
+    assert new_plan['token'] != plan['token']
+    assert new_plan['acceptance_revision'] == changed['revision']
+    assert new_plan['auto_close_issue'] is False
+    closed = store.confirm_closed('fotmob-1288', new_plan['token'],
+        {'state': 'ACCEPTED', 'body_sha256': 'a' * 64, 'evidence': [proof]}, now=stamp(1))
+    assert closed['closed'] is True
     assert progress(store, now=stamp(1))['status'] == 'closed'
 
 

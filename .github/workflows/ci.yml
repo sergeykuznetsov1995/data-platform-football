@@ -47,6 +47,25 @@ jobs:
           # selenium/...), so the full frozen set is the contract.
           python -m pip install --disable-pip-version-check -r requirements-ci.txt
 
+      - name: Preflight pinned TLS library
+        shell: bash
+        run: |
+          set -euo pipefail
+          tls_dir="$RUNNER_TEMP/tls-client"
+          tls_lib="$tls_dir/tls-client.so"
+          install -d -m 0755 "$tls_dir"
+          curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
+            --connect-timeout 20 --max-time 300 -fsSL \
+            https://github.com/bogdanfinn/tls-client/releases/download/v1.13.1/tls-client-linux-ubuntu-amd64-1.13.1.so \
+            -o "$tls_lib"
+          echo "e4a4a5d771d1bd1558186a5ee46af1dfa1318bd31950d68ccd81ed30bad078fc  $tls_lib" \
+            | sha256sum -c -
+          test "$(stat -c %s "$tls_lib")" -eq 15236872
+          chmod 0444 "$tls_lib"
+          export TLS_LIBRARY_PATH="$tls_lib"
+          echo "TLS_LIBRARY_PATH=$tls_lib" >> "$GITHUB_ENV"
+          python -c "import tls_requests; client = tls_requests.Client(); client.close()"
+
       - name: Full unit suite
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
