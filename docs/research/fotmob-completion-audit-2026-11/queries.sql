@@ -1,0 +1,188 @@
+-- FotMob #2256 — SQL-сводка замороженного read-only аудита.
+-- Источники: evidence-report-build.md, evidence-snapshots.json,
+-- evidence-validation.json, evidence-marker-summary.json,
+-- evidence-historical-1294-results.csv; ограничения типов — постановка задачи.
+--
+-- Исполняемая процедура и исходный SQL:
+-- scripts/research/fotmob_completion_audit/README.md.
+-- Query IDs, SQL SHA256 и outcomes находятся в сохранённых query ledgers.
+-- Их строки, физические имена таблиц, полный schema и SQL не встроены в пакет.
+-- Ниже — документирующие шаблоны, а не копии выполненных statements.
+-- Они намеренно закомментированы: <...> требует точного значения из процедуры.
+-- Не запускать весь файл как замену сохранённому runner.
+--
+-- Общие предикаты и правила:
+--   * Только SELECT к физическим Iceberg-таблицам с FOR VERSION AS OF.
+--   * manifest.competition_id — VARCHAR: литерал '199', не число 199.
+--   * В физических matches/payloads competition_id numeric: 199, не '199'.
+--   * source_season_key сохраняет исходный VARCHAR slug, включая пробелы,
+--     '/', Apertura/Clausura; не приводить его к году.
+--   * Scope = competition + season. Match ID без scope не заменяет scoped ID.
+--   * Сначала frozen plan, затем ограниченные scopes/chunks/ID-наборы.
+--   * Не делать слепой full join matches_current × match_payloads_current.
+--   * Не заменять frozen снимки latest/current views при повторе.
+--   * Не использовать LIMIT для обрезания результатов ради бюджета:
+--     завершённость каждого запланированного chunk проверяется отдельно.
+--
+-- Подтверждённый общий бюджет (evidence-report-build.md):
+--   2121 запрос; max statement wall time 20.867489 s; лимит statement 25 s;
+--   HTTP read deadline 30 s; local process timeout 35 s.
+--   Все statements успешны по all_queries_successful; statement_budget=true.
+--   Индивидуальные строки/байты/секунды групп в final build не приведены.
+--   Приведённые ниже размеры evidence НЕ являются scan bytes или размером
+--   одного SQL-ответа. Нельзя назначить каждой группе время общего максимума.
+--   «Pass wall time» 9668.73838 s при фактическом лимите прогона 10800 s/pass
+--   (см. report.md, «Разбор отмеченных противоречий — ведущий»); validation
+--   pass_budget=true. Текст «3600» в build README — устаревший шаблон рендера.
+--   Полные ledgers: run-pass-c/passes/pass{1,2}/query-ledger.csv (SHA256 в report.md).
+
+-- Группа: идентичности снимков.
+-- Назначение: закрепить версии всех входов и времена made_current_at.
+-- Источник: evidence-snapshots.json. Frozen входы:
+--   c1       2953056259902045724 — 2026-11-15 20:09:50.847000+00:00
+--   manifest 3196714190286422442 — 2026-11-14 14:31:55.609000+00:00
+--   matches  3224980456284593238 — 2026-11-14 20:32:55.991000+00:00
+--   payloads  153801965908223392 — 2026-11-14 13:29:02.835000+00:00
+-- SQL-форма чтения данных каждой версии (точные колонки — из процедуры):
+-- SELECT <projection> FROM <physical_c1>
+-- FOR VERSION AS OF 2953056259902045724 WHERE <frozen_c1_input_predicate>;
+-- SELECT <projection> FROM <physical_manifest>
+-- FOR VERSION AS OF 3196714190286422442 WHERE <frozen_manifest_predicate>;
+-- SELECT <projection> FROM <physical_matches>
+-- FOR VERSION AS OF 3224980456284593238 WHERE <planned_scope_chunk>;
+-- SELECT <projection> FROM <physical_payloads>
+-- FOR VERSION AS OF 153801965908223392 WHERE <planned_payload_id_chunk>;
+-- Бюджет: черновик содержит 4 строки / <2 s для snapshot discovery.
+-- Это ориентир черновика; final build не содержит отдельного замера discovery.
+-- Байты не предоставлены. Не путать made_current_at с captured_at аудита.
+
+-- Группа: последние scope_completion v2 markers.
+-- Назначение: получить каждый latest target, его identity/status и scopes,
+-- включая interrupted latest rows. Success не является фильтром полноты.
+-- В исходном SQL latest выбирается по точному ключу/порядку процедуры;
+-- здесь нельзя изобретать timestamp, row_number tie-breaker или entity filter.
+-- SELECT <marker_identity_status_and_scope_projection>
+-- FROM <physical_manifest> FOR VERSION AS OF 3196714190286422442
+-- WHERE <scope_completion_and_v2_predicates>
+--   AND <planned_marker_target_chunk>
+--   AND competition_id = '199';
+-- Последняя строка иллюстрирует тип competition_id для одного scope,
+-- не ограничивает полный audit одним турниром. Затем — latest по процедуре.
+-- Бюджет: 7803 итоговых targets (build/marker summary).
+-- ~2.5 s — ориентир постановки и черновика, не замер из final build.
+-- На уровне markers результат локально соединяется с ID/section evidence;
+-- worst-of: unknown, writer_failed, parse_failed, fetch_failed,
+-- source_unavailable, not_applicable, confirmed_by_content.
+-- Внутренний confirmed_content отображается в confirmed_by_content
+-- при публикации marker-verdicts.csv ведущим. Этот SQL CSV не генерирует.
+
+-- Группа: C1 inputs и reconciliation.
+-- Назначение: ограниченный служебный вход и сопоставление ever-ingested
+-- с frozen current по тем же scoped IDs, без распространения на всю историю.
+-- SELECT <input_identity_scope_observation_projection>
+-- FROM <physical_c1> FOR VERSION AS OF 2953056259902045724
+-- WHERE kind = 'input' AND <planned_c1_chunk>;
+-- Control/checkpoint rows учитываются отдельно по исходной процедуре.
+-- Бюджет/результат build: 28053 cached input rows, 28053 resolved rows,
+-- 28053 distinct scoped input IDs; 38 control rows; unresolved 0.
+-- Сопоставление: ever-ingested no-payload 22211; current no-payload 22286;
+-- ever-ingested but not current 75; current added since observation 0.
+-- first_ft: known finished 5830, без ever-ingested payload 3,
+-- достигших source-unavailable threshold 0.
+-- Время/байты этой группы отдельно не предоставлены; каждый её statement
+-- входит в общий успешный набор с max 20.867489 s, лимит 25 s.
+-- Сохранять обе snapshot identities и наборы из c1-reconciliation.json.
+
+-- Группа: календарь и current-equivalent matches.
+-- Назначение: known IDs и finished-флаги по planned scopes/chunks;
+-- required cohort и supplementary union учитываются раздельно.
+-- SELECT <match_identity_finished_applicability_and_batch_projection>
+-- FROM <physical_matches> FOR VERSION AS OF 3224980456284593238
+-- WHERE competition_id = 199
+--   AND source_season_key = '2026 - Clausura'
+--   AND <planned_match_chunk>;
+-- Пример scope взят из historical CSV; полный список — из frozen plan.
+-- Дедупликация/current selection выполняются по исходному контракту,
+-- нельзя изобретать предикат finished или выбирать latest без batch identity.
+-- Бюджет/итог: required known 603039 / finished 563878;
+-- supplementary known 606056 / finished 565058 scoped IDs (build).
+-- Это итоги множества chunks, не один неограниченный запрос.
+-- Время/байты по группе не предоставлены; statement <=25 s по общему замеру.
+
+-- Группа: current payload ID sets и finished_without_details.
+-- Назначение: сначала ограниченная проекция идентичностей payload,
+-- затем локальная scoped set difference с finished IDs, без полного join views.
+-- SELECT <payload_identity_scope_batch_projection>
+-- FROM <physical_payloads> FOR VERSION AS OF 153801965908223392
+-- WHERE competition_id = 199
+--   AND source_season_key = '2026 - Clausura'
+--   AND <planned_payload_id_chunk>;
+-- Используются только замороженные payload query modes исходного runner.
+-- Literal gap = finished scoped IDs без current payload в том же scope;
+-- applicable/actionable классифицируется отдельно, не меняя literal definition.
+-- Бюджет/итог build: required finished with payload 555006,
+-- supplementary finished with payload 556186; literal gap 8872,
+-- actionable gap 8825 в обеих когортах. Все calendar scoped payload rows 556188.
+-- Время/байты каждого ID chunk берутся из ledger, в пакете их нет.
+-- Выход: current-id-evidence.csv, mismatched-ids.csv, scope-summary.csv;
+-- хеши полного evidence и наборов приведены в report.md.
+
+-- Группа: шесть секций карточек.
+-- Назначение: сопоставить raw, typed и mask выбранных current payload
+-- в marker/historical scopes: matchFacts, stats, playerStats, lineup,
+-- shotmap, momentum. Payload identity должна совпасть с предыдущей группой.
+-- SELECT <payload_identity_and_raw_typed_mask_projection>
+-- FROM <physical_payloads> FOR VERSION AS OF 153801965908223392
+-- WHERE <planned_present_payload_identity_chunk>;
+-- Предикат включает точные scope/ID/batch ограничения процедуры;
+-- нельзя читать весь raw payload архив или незаметно менять query mode.
+-- Применимость future: utc_time + 3 hours против frozen captured_at
+-- 2026-11-16T18:24:44.943480+00:00, не current_timestamp.
+-- Бюджет/итог build: matchFacts и shotmap по 538026 согласований;
+-- momentum 101808 согласований, 436210 unknown и 8 writer_failed.
+-- Это scoped section observations локальной классификации, не SQL row counts.
+-- Все шесть сравнений сохраняются в section-evidence.csv, а non-confirmed
+-- подмножество — в section-mismatches.csv. Время/байты группы не приведены.
+-- malformed_or_unresolved_json -> unknown; не превращать в parse_failed,
+-- source_unavailable или confirmed_by_content без дополнительных доказательств.
+
+-- Группа: source gaps, история попыток, поздние ошибки и потери current.
+-- Назначение: разделить stored_source_omission, явный scope source gap,
+-- повторные data_not_found, fetch/parse failures и expected current missing.
+-- SELECT <attempt_identity_status_reason_time_projection>
+-- FROM <physical_manifest> FOR VERSION AS OF 3196714190286422442
+-- WHERE competition_id = '199'
+--   AND source_season_key = '2026 - Clausura'
+--   AND <planned_history_id_chunk>;
+-- Не ограничивать историю только success: это уничтожило бы причины ошибок.
+-- Source-unavailable threshold: нет success и либо три runs,
+-- либо два runs с разносом 7200 s (build); сохранять observation times.
+-- Поздняя ошибка не удаляет last-good: build содержит 3 таких current rows.
+-- Бюджет/результат классификации build: explicit_scope_source_gap 1242,
+-- repeated_source_data_not_found 4149, insufficient_absence_evidence 547,
+-- expected_current_payload_missing 2887 scoped rows.
+-- Не складывать эти причины как альтернативный finished-gap знаменатель:
+-- применимость и cohort проверяются в построчном evidence.
+-- Время/байты и число SQL-строк этой группы отдельно не предоставлены.
+
+-- Группа: исторические пары #1294.
+-- Назначение: переиспользовать те же frozen выборки для точных 18 пар,
+-- сохраняя baseline_date, old_gap и parser/plan signatures отдельно.
+-- Ограничения: пары из evidence-historical-1294-results.csv, а не диапазон лет
+-- и не только competition_id. Для manifest ID строковый, для физических
+-- matches/payloads числовой; каждый запрос использует свой FOR VERSION AS OF.
+-- Пример одного проверяемого scope — в шаблонах выше.
+-- Исторический baseline 2026-10-21: всего 5305 без деталей,
+-- из них 1762 в 18 парах. Это не текущий общий знаменатель.
+-- Результат: historical-1294-results.csv, 18 строк и отдельные mismatch hashes;
+-- причины и все текущие числа по парам перенесены в report.md.
+-- Число итоговых строк CSV не является числом прочитанных SQL-строк.
+-- Отдельное время/байты для исторической группы в build не указаны.
+
+-- Проверка воспроизводимости (локальная процедура, не дополнительный SQL):
+-- повторить frozen plan на тех же snapshots/captured_at, сравнить ID sets,
+-- хеши, scope/marker/payload identities, reason_counts и coverage chunks.
+-- Build сообщает Coverage PASS и Replay PASS; validation status=PASS.
+-- unknown_excluded_from_confirmed=true: coverage не доказывает сбор unknown.
+-- Пропуск запроса/timeout/неполный проход не допускаются как валидный результат.
+-- Эта документирующая фаза запросы не исполняла и новые замеры не заявляет.
