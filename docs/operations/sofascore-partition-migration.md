@@ -30,8 +30,11 @@ legacy key, противоречие реестра, NULL/пустая част�
 
 Внутри каждой canonical natural-key группы приоритет задают `_ingested_at
 DESC NULLS LAST`, затем `_batch_id DESC NULLS LAST`, если эти колонки есть.
-Далее SQL использует `raw_content_hash`, если он есть, и остальные скалярные
-колонки в порядке исходной схемы для воспроизводимого результата. Хеш и
+В базовом full rewrite далее SQL использует `raw_content_hash`, если он есть,
+и остальные скалярные колонки в порядке исходной схемы для воспроизводимого
+результата. Batched helper использует только доступные `_ingested_at`/`_batch_id`
+(`metadata_only=True`) после обязательного source/archive preflight с
+`unsafe_winner_groups=0`; scalar/hash tie-break базового пути не меняется. Хеш и
 лексикографический порядок **не доказывают**, какая версия верна. Preflight
 отдельно находит разные полные canonical строки среди лидеров с одинаковыми
 доступными `_ingested_at`/`_batch_id`. Такой конфликт запрещает apply, даже
@@ -73,7 +76,7 @@ DESC NULLS LAST`, затем `_batch_id DESC NULLS LAST`, если эти кол
 Raw store остаётся неизменным. Скрипт не управляет retention, snapshot expiry,
 доставкой, Airflow или возобновлением источника.
 
-## Команды
+## Команды базового full rewrite
 
 Запускать из корня проверенной рабочей копии релиза. Во всех режимах обязателен
 один воспроизводимый `--migration-id`: 1–48 ASCII букв, цифр, `_` или `-`.
@@ -140,7 +143,8 @@ NULL/blank keys, non-SS keys, unmapped rows, число duplicate groups до/п
 canonical mapping, число distinct canonical keys и конфликты победителя.
 Известные legacy ключи и безопасно разрешимые дубли сами по себе не блокеры.
 
-Затем таблицы обрабатываются по имени. Для каждой:
+В базовом full rewrite (`run_migration`) затем таблицы обрабатываются по имени.
+Для каждой:
 
 1. Сохранить preflight JSON и исходный DDL/snapshot evidence. Полный архив:
    `CREATE TABLE <archive> AS SELECT * FROM <source>`. Не фильтровать,
@@ -177,7 +181,7 @@ canonical mapping, число distinct canonical keys и конфликты по
 - `archive_rows = before_rows`.
 
 При повторе того же migration ID существующий архив никогда не заменяется.
-Скрипт проверяет его схему, профиль, counts, canonical ключи и ожидаемые полные
+Базовый full rewrite проверяет его схему, профиль, counts, canonical ключи и ожидаемые полные
 winner rows против текущей таблицы. Только чистый совпадающий результат даёт
 `noop_verified`, без нового archive/rewrite. Архив после прерванного apply при
 ещё legacy/неполном source не разрешает автоматический повтор rewrite: будет
@@ -197,6 +201,79 @@ SHOW CREATE TABLE bronze_migration_archive.<archive_from_json>;
 Это шаблоны: `<table>`/`<archive_from_json>` заменяются проверенными именами.
 Сам скрипт сохраняет DDL evidence; он не выдаёт его за snapshot ID и не
 обещает доступность snapshot metadata конкретной установки.
+
+## Partition-batched staging + metadata swap
+
+Отдельный helper `scripts/migrate_sofascore_partition_keys_batched.py` использует
+путь **полный archive → stage группами → полная проверка → два metadata renames
+→ postcheck**. Это отдельный путь, а не изменение истории базового full rewrite.
+Все допуски выше сохраняются: разрешение владельца на точный reviewed SHA и окно,
+pause/OFF, внешний writer lock, source/archive preflight, natural-key dedup и
+completeness guard. Обрабатывать только одну таблицу за раз. Наличие helper
+не разрешает deploy, production-запросы или возобновление источника.
+
+1. Создать либо проверить существующий полный архив: исходные колонки и строки,
+   counts и двусторонний `EXCEPT ALL` source/archive. До staging обязателен
+   source/archive preflight с `unsafe_winner_groups=0`.
+2. `populate_stage(..., partition_group_size=8, should_stop=None)` группирует
+   до **8 canonical `(league, season)` pairs** в count/INSERT/verification
+   statements вместо отдельных statements для тысяч пар. Проекция сохраняет
+   все исходные колонки и declared natural key; winner ORDER BY использует
+   только доступные `_ingested_at`/`_batch_id` после указанного preflight.
+   Existing и missing pairs внутри группы разделяются: existing/noop subgroup
+   проверяется, INSERT выполняется только для missing subgroup. Existing
+   payload/count mismatch и unknown extra stage identity блокируют работу;
+   INSERT поверх существующих partitions запрещён. `should_stop` проверяется
+   перед каждой из этих отдельных work groups, в том числе перед INSERT после
+   долгой проверки existing subgroup. Функция возвращает batches и complete.
+3. После завершения всех групп выполнить полный `verify_stage`: проверить
+   схему, counts, полные ожидаемые winner rows и все перечисленные выше
+   инварианты reconciliation. Полнота групп сама по себе проверки не заменяет.
+4. Только после полной проверки выполнить два metadata renames:
+   `source → legacy`, затем `stage → source`. Выполнить полный postcheck
+   результата по тем же инвариантам. Полный archive и legacy не удалять.
+
+Approved low-memory adapter использует `iceberg.max_partitions_per_writer=1`.
+Прежние archive-only full rewrite probes завершились
+`ICEBERG_TOO_MANY_OPEN_PARTITIONS` при 10 open partition writers. Поэтому default
+group size — **8, не 16**: до восьми разных target partitions на INSERT, без
+изменения global/session memory controls. Увеличивать group size или менять
+session property без нового отдельного proof/approval запрещено. Cooperative
+deadline не доказывает достаточность памяти. При повторном
+`ICEBERG_TOO_MANY_OPEN_PARTITIONS` или 6GB OOM остановиться и разбирать отказ,
+не подбирать параметры автоматически.
+
+`run_batched_rewrite(..., max_duration_seconds=6000,
+verification_reserve_seconds=1200, clock=time.monotonic)` прекращает начинать
+новые work groups при достижении границы резервного времени для проверки.
+Это cooperative bound: уже выполняющийся SQL не отменяется, внешний writer-lock
+watchdog не заменяется. Внешний **7200s max-hold** допустим только как отдельно
+разрешённый process-local параметр конкретного окна, не новый global/default.
+
+При нормальной ранней остановке обязательно сохранить result JSON и дать lock
+выйти штатно по согласованному плану. Отчёт содержит `success=false`,
+`status=stage_incomplete`, `ready=false`, `resume_required=true`, фактический
+`stage_complete` и список завершённых batches. Если группы закончились, но
+резерв для полной проверки истёк, сохраняется тот же `stage_incomplete` с
+`stage_complete=true`. При неполном
+stage не выполнять полный verify/swap/ALTER; при непроверенном stage swap/ALTER
+также запрещены. Caller может вернуть exit 2: это само по себе ни повреждение,
+ни успешная миграция. Разобрать report/status, source/archive counts и
+двусторонний `EXCEPT ALL`, активные queries и факт release lock.
+
+Частичный stage совместим с ручным continuation только после read-only разбора
+и отдельного разрешённого продолжения с **тем же reviewed SHA и migration ID**.
+Существующие полные archive/stage не пересоздаются; существующие batches
+проверяются, missing обрабатываются, полный `verify_stage` обязателен до обоих
+renames. Уже canonical source с legacy backup проходит full noop verification.
+Автоматические retry/loops и новый migration ID для обхода блокера запрещены.
+
+Короткий incident-пример объясняет необходимость группировки: на reviewed SHA
+`1036e795` старый per-partition apply `event_participants` обработал 1,112 из
+4,793 partitions за 7,200s; watchdog завершил процесс до verify/swap. При разборе
+source=archive=1,209,122, `EXCEPT ALL=0`, stage=302,372, legacy absent,
+active INSERT=0, lock released. Это исторический пример, не evidence текущего
+состояния и не подтверждение production applied/verified/accepted нового кода.
 
 ## Независимые read-only проверки дублей
 
@@ -249,9 +326,24 @@ match IDs и логические duplicate groups. Падение row count и�
 При любом отказе сохранить фазу/JSON, исходный DDL, архив и доступные snapshots;
 оставить источник pause/OFF и lock согласно согласованному плану. Не продолжать
 со следующей таблицей и не подбирать новый migration ID для обхода ошибки.
-Не удалять архив и не применять DELETE/DROP/TRUNCATE или изменения raw store.
+Не удалять архив или legacy и не применять DELETE/DROP/TRUNCATE или изменения raw store.
 
-Rollback — отдельное разрешённое действие оператора. Из сохранённого **исходного
+Incomplete/unverified stage без swap не требует восстановления source, но его
+сохранность нужно доказать read-only: counts и двусторонний `EXCEPT ALL`
+source/archive, состояние имён и активных queries. Orphan query или process exit
+сами по себе не доказывают, что сервер прекратил либо завершил INSERT. До
+readback состояния не повторять DDL; проверить завершение queries и release lock
+по согласованному плану. Сохранить incomplete result JSON, не запускать retry.
+
+Batched helper при отказе второго rename или postcheck пытается откатить имена
+в обратном порядке и возвращает `rollback_error`. Это только ограниченный
+автоматический rollback метаданных; он не распространяется на базовый
+`run_migration`. Любой `rollback_error` требует остановки и разбора, его нельзя
+игнорировать. Даже после попытки rollback сохранность подтверждается readback
+имён, DDL, counts и полных мультимножеств, а не предположением. Archive и legacy
+сохраняются.
+
+Восстановление данных — отдельное разрешённое действие оператора. Из сохранённого **исходного
 DDL** подготовить атомарное восстановление source с исходными свойствами,
 типами и порядком колонок, читая **весь** полный архив без canonical CASE и
 без дедупликации. Перед выполнением проверить поддержку операции, schema
@@ -259,7 +351,9 @@ compatibility, права и отсутствие writers. После восст
 counts и полные мультимножества source/archive в обе стороны через
 `EXCEPT ALL`, затем повторно снять DDL/snapshot evidence. Архив сохраняется.
 Универсальная команда rollback здесь не дана: CTAS с текущими свойствами
-не гарантирует восстановление исходного DDL. Автоматического rollback нет.
+не гарантирует восстановление исходного DDL. У базового full rewrite
+`run_migration` автоматического rollback нет; ограниченный rollback имён batched
+helper описан выше.
 
 ## Фиксация результата
 
@@ -273,6 +367,6 @@ DDL; `verified` — пройдены фактические reconciliation и п
 и журнале приёмок по действующей процедуре проверенной установки, с readback
 и ответственным за следующий шаг. В этом PR журнал production-приёмки не
 обновляется как успешная миграция, issue не закрывается и источник не запускается.
-Тесты в пакете написаны для запуска ведущим после publication; здесь они
-не выполнялись. Ни dry-run, ни offline-тесты не подтверждают production apply,
+Исполнители пакетов не запускают тесты; проверки ведущего и обязательный CI
+выполняются отдельно. Ни dry-run, ни offline-тесты не подтверждают production apply,
 верификацию или приёмку.
