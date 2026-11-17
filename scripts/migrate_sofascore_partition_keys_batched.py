@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -71,7 +73,7 @@ def filtered_winner_select(
         f"WITH canonical AS (SELECT {migration.projection(columns, mapping)} "
         f"FROM {migration.qualified_name(archive)}{where}) "
         f"SELECT {names} FROM (SELECT {names}, ROW_NUMBER() OVER "
-        f"(PARTITION BY {keys} ORDER BY {migration.ordering(columns)}) AS "
+        f"(PARTITION BY {keys} ORDER BY {migration.ordering(columns, metadata_only=True)}) AS "
         f"{migration.quote_identifier(migration.RANK_COLUMN)} FROM canonical) AS ranked "
         f"WHERE {migration.quote_identifier(migration.RANK_COLUMN)} = 1"
     )
@@ -122,6 +124,94 @@ def _batch_count(manager: Any, query: str) -> int:
     return migration.count_query(manager, "batch_rows", "SELECT count(*) FROM (" + query + ") counted")
 
 
+def _expected_group_predicate(mapping: Mapping[str, str], pairs) -> str:
+    return " OR ".join(f"({_batch_predicate(mapping, league, season)})" for league, season in pairs)
+
+
+def _actual_group_predicate(pairs) -> str:
+    return " OR ".join(
+        f"(\"league\" = {migration.quote_literal(league)} AND \"season\" = {migration.quote_literal(season)})"
+        for league, season in pairs
+    )
+
+
+def _stage_inventory(manager: Any, stage: str, known: set[tuple[str, str]]) -> dict[tuple[str, str], int]:
+    rows = manager_call(
+        manager,
+        "_execute",
+        f"SELECT \"league\", \"season\", count(*) FROM {migration.qualified_name(stage)} "
+        f"GROUP BY \"league\", \"season\" ORDER BY \"league\", \"season\"",
+        fetch=True,
+    )
+    inventory: dict[tuple[str, str], int] = {}
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise ValueError("invalid stage inventory row")
+        league, season, count = row
+        if not isinstance(league, str) or not migration.SS_KEY.fullmatch(league):
+            raise ValueError("invalid league in stage inventory")
+        if not isinstance(season, str) or not season.strip():
+            raise ValueError("invalid season in stage inventory")
+        if type(count) is not int or count <= 0:
+            raise ValueError("invalid row count in stage inventory")
+        pair = (league, season)
+        if pair in inventory:
+            raise ValueError("duplicate partition in stage inventory")
+        if pair not in known:
+            raise ValueError("stage contains partitions outside the archive")
+        inventory[pair] = count
+    return inventory
+
+
+def _populate_group(
+    manager: Any,
+    spec,
+    stage: str,
+    archive: str,
+    columns: Mapping[str, str],
+    mapping: Mapping[str, str],
+    chunk: list[tuple[str, str]],
+    inventory: Mapping[tuple[str, str], int],
+) -> list[dict]:
+    reports = []
+    existing = [pair for pair in chunk if pair in inventory]
+    missing = [pair for pair in chunk if pair not in inventory]
+    if existing:
+        predicate = _expected_group_predicate(mapping, existing)
+        expected = filtered_winner_select(spec, archive, columns, mapping, predicate)
+        expected_count = _batch_count(manager, expected)
+        actual_count = sum(inventory[pair] for pair in existing)
+        if actual_count != expected_count:
+            raise ValueError("unexpected rows in existing partition")
+        actual = f"SELECT * FROM {migration.qualified_name(stage)} WHERE {_actual_group_predicate(existing)}"
+        if migration.rowset_difference(manager, expected, actual, "batch_payload_difference"):
+            raise ValueError("existing partition payload mismatch")
+        reports.append({
+            "partitions": [list(pair) for pair in existing],
+            "expected_rows": expected_count,
+            "before_rows": actual_count,
+            "after_rows": actual_count,
+            "noop_rows": actual_count,
+        })
+    if missing:
+        predicate = _expected_group_predicate(mapping, missing)
+        expected = filtered_winner_select(spec, archive, columns, mapping, predicate)
+        expected_count = _batch_count(manager, expected)
+        manager_call(manager, "_execute", f"INSERT INTO {migration.qualified_name(stage)} {expected}")
+        after = f"SELECT * FROM {migration.qualified_name(stage)} WHERE {_actual_group_predicate(missing)}"
+        after_count = _batch_count(manager, after)
+        if after_count != expected_count:
+            raise ValueError("inserted partition row count mismatch")
+        reports.append({
+            "partitions": [list(pair) for pair in missing],
+            "expected_rows": expected_count,
+            "before_rows": 0,
+            "after_rows": after_count,
+            "inserted_rows": expected_count,
+        })
+    return reports
+
+
 def populate_stage(
     manager: Any,
     spec,
@@ -129,32 +219,33 @@ def populate_stage(
     archive: str,
     columns: Mapping[str, str],
     mapping: Mapping[str, str],
-) -> list[dict]:
+    *,
+    partition_group_size: int = 8,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict:
+    if type(partition_group_size) is not int or partition_group_size <= 0:
+        raise ValueError("partition_group_size must be a positive integer")
+    pairs = partition_batches(manager, archive, mapping)
+    inventory = _stage_inventory(manager, stage, set(pairs))
+    work_groups = []
+    for index in range(0, len(pairs), partition_group_size):
+        chunk = pairs[index:index + partition_group_size]
+        existing = [pair for pair in chunk if pair in inventory]
+        missing = [pair for pair in chunk if pair not in inventory]
+        if existing:
+            work_groups.append(existing)
+        if missing:
+            work_groups.append(missing)
     batches = []
-    for league, season in partition_batches(manager, archive, mapping):
-        predicate = _batch_predicate(mapping, league, season)
-        expected = filtered_winner_select(spec, archive, columns, mapping, predicate)
-        expected_count = _batch_count(manager, expected)
-        actual_filter = f"\"league\" = {migration.quote_literal(league)} AND \"season\" = {migration.quote_literal(season)}"
-        actual = f"SELECT * FROM {migration.qualified_name(stage)} WHERE {actual_filter}"
-        actual_count = _batch_count(manager, actual)
-        item = {"league": league, "season": season, "expected_rows": expected_count, "before_rows": actual_count}
-        if actual_count == 0:
-            manager_call(manager, "_execute", f"INSERT INTO {migration.qualified_name(stage)} {expected}")
-            after_count = _batch_count(manager, actual)
-            if after_count != expected_count:
-                raise ValueError("inserted partition row count mismatch")
-            item["inserted_rows"] = expected_count
-        elif actual_count == expected_count:
-            difference = migration.rowset_difference(manager, expected, actual, "batch_payload_difference")
-            if difference:
-                raise ValueError("existing partition payload mismatch")
-            item["noop_rows"] = actual_count
-        else:
-            raise ValueError("unexpected rows in existing partition")
-        item["after_rows"] = _batch_count(manager, actual)
-        batches.append(item)
-    return batches
+    complete = True
+    for group in work_groups:
+        if should_stop is not None and should_stop():
+            complete = False
+            break
+        batches.extend(_populate_group(
+            manager, spec, stage, archive, columns, mapping, group, inventory,
+        ))
+    return {"batches": batches, "complete": complete}
 
 
 def _verify_payload(
@@ -243,6 +334,17 @@ def swap_stage(manager: Any, spec, stage: str, legacy: str, archive: str, archiv
         return {"success": False, "status": "failed", "error": error, "rollback_error": rollback_error}
 
 
+def _validate_time_budget(max_duration_seconds, verification_reserve_seconds) -> None:
+    for label, value in (
+        ("max_duration_seconds", max_duration_seconds),
+        ("verification_reserve_seconds", verification_reserve_seconds),
+    ):
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{label} must be a finite non-negative int or float")
+    if verification_reserve_seconds > max_duration_seconds:
+        raise ValueError("verification_reserve_seconds exceeds max_duration_seconds")
+
+
 def run_batched_rewrite(
     manager: Any,
     spec,
@@ -250,7 +352,13 @@ def run_batched_rewrite(
     mapping: Mapping[str, str],
     migration_id: str,
     archive_schema: str,
+    *,
+    max_duration_seconds: int | float = 6000,
+    verification_reserve_seconds: int | float = 1200,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict:
+    _validate_time_budget(max_duration_seconds, verification_reserve_seconds)
+    deadline = clock() + max_duration_seconds
     migration.validate_migration_id(migration_id)
     stage = stage_name(spec, migration_id, archive_schema)
     legacy = legacy_name(spec, migration_id, archive_schema)
@@ -289,7 +397,22 @@ def run_batched_rewrite(
                 mapping,
                 before["ddl"],
             ))
-        report["batches"] = populate_stage(manager, spec, stage, archive, before["columns"], mapping)
+        progress = populate_stage(
+            manager, spec, stage, archive, before["columns"], mapping,
+            should_stop=lambda: clock() >= deadline - verification_reserve_seconds,
+        )
+        report["batches"] = progress["batches"]
+        if any("inserted_rows" in item for item in progress["batches"]):
+            report["mutates"] = True
+        if not progress["complete"] or clock() >= deadline - verification_reserve_seconds:
+            report.update(
+                stage_complete=progress["complete"],
+                success=False,
+                ready=False,
+                status="stage_incomplete",
+                resume_required=True,
+            )
+            return report
         verified = verify_stage(manager, spec, stage, archive, archived, mapping, before["ddl"])
         report["stage_verification"] = verified
         swapped = swap_stage(manager, spec, stage, legacy, archive, archived, mapping, before["ddl"])
