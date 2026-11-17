@@ -1221,6 +1221,10 @@ def _signed_history_match_ids(
     explicit_ids = _history_match_ids()
     if explicit_ids is None:
         return None
+    if offline_replay and workload_plan is None and not force_replace:
+        # #1367: the offline replay lane has no signed plan by design; the
+        # scope cycle already validated and normalized this exact universe.
+        return explicit_ids
     if workload_plan is None or force_replace or offline_replay:
         raise RuntimeError("history match IDs require a signed plan without force/offline overrides")
     workload_plan.verify()
@@ -2342,6 +2346,20 @@ def _run_player_capture(
                 registered_ids | observed_ids,
                 key=int,
             )
+            offline_player_env = os.environ.get("SOFASCORE_OFFLINE_PLAYER_IDS_JSON")
+            if offline_player_env is not None:
+                if not offline_replay:
+                    raise RuntimeError(
+                        "SOFASCORE_OFFLINE_PLAYER_IDS_JSON is only valid with "
+                        "--offline-replay"
+                    )
+                from dags.scripts.prepare_sofascore_workload import (
+                    normalize_explicit_match_ids,
+                )
+
+                full_player_ids = list(
+                    normalize_explicit_match_ids(json.loads(offline_player_env))
+                )
             if workload_plan is not None:
                 from scrapers.sofascore.workload_plan import (
                     parse_qualified_work_unit,

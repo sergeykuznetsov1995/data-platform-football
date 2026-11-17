@@ -327,3 +327,195 @@ def test_season_runner_receipts_are_after_merges_and_noop_does_not_claim_publica
             physical["entity"] = report["entity"]
     result = assess_tail(data, "a" * 40)
     assert result["status"] == "pass", result
+
+
+def _history_match_ids_env(monkeypatch, ids):
+    monkeypatch.setenv("SOFASCORE_HISTORY_MATCH_IDS_JSON", json.dumps(ids))
+    monkeypatch.setenv("SOFASCORE_HISTORY_PHASE", "matches")
+    monkeypatch.setenv("SOFASCORE_HISTORY_SEASON_EVIDENCE", "bronze")
+
+
+@pytest.mark.unit
+def test_offline_history_match_ids_without_workload_plan_are_returned(monkeypatch):
+    runner = _runner_module()
+    _history_match_ids_env(monkeypatch, ["11352394", "11352395"])
+
+    explicit_ids = runner._signed_history_match_ids(
+        None, (), force_replace=False, offline_replay=True
+    )
+
+    assert tuple(explicit_ids) == ("11352394", "11352395")
+
+
+@pytest.mark.unit
+def test_history_match_ids_keep_the_live_signed_plan_contract(monkeypatch):
+    runner = _runner_module()
+    _history_match_ids_env(monkeypatch, ["11352394", "11352395"])
+
+    with pytest.raises(RuntimeError, match="history match IDs require a signed plan"):
+        runner._signed_history_match_ids(
+            None, (), force_replace=False, offline_replay=False
+        )
+
+    workload_runtime = importlib.import_module("scrapers.sofascore.workload_runtime")
+
+    class HashableAllocation(SimpleNamespace):
+        def __hash__(self):
+            return 1
+
+    allocation = HashableAllocation(allocation_id="alloc-1", scope="match")
+    plan = SimpleNamespace(
+        verify=MagicMock(),
+        allocations={allocation},
+        freshness_key=lambda scope: "final",
+    )
+    monkeypatch.setattr(
+        workload_runtime, "target_ids", lambda _allocation: ["11352394", "11352395"]
+    )
+
+    signed_ids = runner._signed_history_match_ids(
+        plan, (allocation,), force_replace=False, offline_replay=False
+    )
+
+    assert tuple(signed_ids) == ("11352394", "11352395")
+    plan.verify.assert_called_once()
+    with pytest.raises(RuntimeError, match="history match IDs require a signed plan"):
+        runner._signed_history_match_ids(
+            plan, (allocation,), force_replace=False, offline_replay=True
+        )
+    with pytest.raises(RuntimeError, match="history match IDs require a signed plan"):
+        runner._signed_history_match_ids(
+            None, (), force_replace=True, offline_replay=True
+        )
+
+
+def _player_capture_fakes(monkeypatch, *, registered, observed):
+    from contextlib import nullcontext
+
+    runner = _runner_module()
+    catalog = SimpleNamespace(
+        competition=lambda _league: SimpleNamespace(
+            capture_allowed=True,
+            unique_tournament_id=17,
+            slug="premier-league",
+        ),
+        resolve_source_season=lambda _tid, _token: SimpleNamespace(season_id=76986),
+    )
+    monkeypatch.setattr(
+        "scrapers.sofascore.catalog.SofaScoreCatalog.load", lambda: catalog
+    )
+    season_pipeline = importlib.import_module("scrapers.sofascore.season_pipeline")
+    monkeypatch.setattr(
+        season_pipeline,
+        "plan_season_partition",
+        lambda *args, **kwargs: SimpleNamespace(player_universe_ready=True),
+    )
+    monkeypatch.setattr(
+        season_pipeline,
+        "squad_player_ids",
+        lambda _raw_store, _plan: list(registered),
+    )
+    saved = []
+
+    class _FakePlayerScraper:
+        def __init__(self, *, leagues, seasons):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def _resolve_player_ids_from_bronze(self, league, season_short, limit=None):
+            return list(observed)
+
+        def _add_metadata(self, frame, _entity):
+            return frame
+
+        def save_to_iceberg(self, **kwargs):
+            saved.append(kwargs)
+            return "iceberg.bronze." + kwargs["table_name"]
+
+    monkeypatch.setattr("scrapers.sofascore.SofaScoreScraper", _FakePlayerScraper)
+    pipeline = importlib.import_module("scrapers.sofascore.pipeline")
+    monkeypatch.setattr(pipeline, "endpoint_resume_plan", lambda _store, _specs: {})
+    monkeypatch.setattr(
+        pipeline,
+        "replay_player_specs",
+        MagicMock(side_effect=RuntimeError("stop-after-universe")),
+    )
+    dq = importlib.import_module("dags.utils.sofascore_dq")
+    monkeypatch.setattr(dq, "validate_season_alignment", MagicMock())
+    monkeypatch.setattr(dq, "validate_minimum_coverage", MagicMock())
+    writer_lock = importlib.import_module("scrapers.sofascore.writer_lock")
+    monkeypatch.setattr(writer_lock, "bronze_writer_lock", nullcontext)
+    telemetry = importlib.import_module("utils.proxy_traffic")
+    monkeypatch.setattr(telemetry, "record_traffic_run", lambda *a, **kw: True)
+    monkeypatch.setattr(telemetry, "log_traffic_summary", lambda *a, **kw: None)
+    return runner, saved
+
+
+@pytest.mark.unit
+def test_offline_player_ids_env_replaces_the_discovered_universe(tmp_path, monkeypatch):
+    runner, saved = _player_capture_fakes(
+        monkeypatch, registered=["100", "200"], observed=["300"]
+    )
+    monkeypatch.setenv(
+        "SOFASCORE_OFFLINE_PLAYER_IDS_JSON", json.dumps(["900001", "900002"])
+    )
+    output = tmp_path / "player.json"
+
+    rc = runner._run_player_capture(
+        ["ENG-Premier League"],
+        2025,
+        None,
+        str(output),
+        capture_runtime=MagicMock(),
+        workload_plan=None,
+        offline_replay=True,
+    )
+
+    assert rc == 1
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["errors"] == ["capture_engine: stop-after-universe"]
+    assert [call["table_name"] for call in saved] == ["sofascore_player_universe"]
+    assert saved[0]["df"]["player_id"].tolist() == ["900001", "900002"]
+    assert report["universe_players"] == 2
+    assert report["players_total"] == 2
+
+
+@pytest.mark.unit
+def test_player_ids_env_is_offline_only_and_fails_before_source_access(
+    tmp_path, monkeypatch
+):
+    runner, saved = _player_capture_fakes(
+        monkeypatch, registered=["100"], observed=["200"]
+    )
+    live = MagicMock(side_effect=AssertionError("live capture must not be invoked"))
+    monkeypatch.setattr(
+        importlib.import_module("scrapers.sofascore.live_capture"),
+        "capture_live_specs",
+        live,
+    )
+    monkeypatch.setenv("SOFASCORE_OFFLINE_PLAYER_IDS_JSON", json.dumps(["900001"]))
+    output = tmp_path / "player.json"
+
+    rc = runner._run_player_capture(
+        ["ENG-Premier League"],
+        2025,
+        None,
+        str(output),
+        capture_runtime=MagicMock(),
+        workload_plan=None,
+        offline_replay=False,
+    )
+
+    assert rc == 1
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["errors"] == [
+        "capture_engine: SOFASCORE_OFFLINE_PLAYER_IDS_JSON is only valid with "
+        "--offline-replay"
+    ]
+    assert saved == []
+    live.assert_not_called()
