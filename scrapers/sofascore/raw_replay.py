@@ -1,8 +1,10 @@
 """Pure selection of SofaScore raw-replay scope plans (#1367).
 
-This module deliberately contains no SQL, catalog or worker wiring: it only
-turns already-captured endpoint manifest records into deterministic replay
-plans for committed raw blobs.
+Pure selection turns already-captured endpoint manifest records into
+deterministic replay plans for committed raw blobs.  The adapter functions at
+the bottom of this module additionally read scope keys and records from the
+fixed ``iceberg.ops.sofascore_capture_manifest`` table and resolve a scope
+through the tournament catalog.  Worker/DAG wiring deliberately stays out.
 
 A record is *replayable* when its raw payload is readable: ``http_status`` is
 a 2xx other than 204 and both ``raw_content_hash`` and ``raw_blob_key`` are
@@ -30,19 +32,35 @@ set of one target.
 
 from __future__ import annotations
 
-from typing import Iterable, NamedTuple, Optional, Sequence
+from typing import (
+    Callable,
+    Iterable,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 from .manifest import EndpointManifest, ManifestStatus
+from .partition_keys import canonical_league
 
 __all__ = [
     "FIELDS_ENDPOINTS",
     "MODES",
     "MODE_DRAIN",
     "MODE_FIELDS",
+    "REPLAY_MANIFEST_TABLE",
+    "ReplayCatalogProtocol",
+    "ReplayManagerProtocol",
     "ReplayPlanningError",
     "ReplayScopeKey",
     "ReplayScopePlan",
     "ReplaySelection",
+    "ResolvedReplayScope",
+    "list_replay_scope_keys",
+    "load_replay_scope_records",
+    "resolve_replay_scope",
     "select_replay_scope_plans",
 ]
 
@@ -242,3 +260,248 @@ def select_replay_scope_plans(
             )
         )
     return ReplaySelection(plans, skipped)
+
+
+REPLAY_MANIFEST_TABLE = "iceberg.ops.sofascore_capture_manifest"
+
+_HTTP_REPLAYABLE_SQL = (
+    '"http_status" >= 200',
+    '"http_status" < 300',
+    '"http_status" <> 204',
+)
+_RAW_LINEAGE_SQL = (
+    "COALESCE(TRIM(\"raw_content_hash\"), '') <> ''",
+    "COALESCE(TRIM(\"raw_blob_key\"), '') <> ''",
+)
+_SCOPE_ORDER_SQL = (
+    'ORDER BY "source_tournament_id", "source_season_id", "freshness_key"'
+)
+_RECORD_ORDER_SQL = (
+    'ORDER BY "target_type", "target_id", "endpoint", '
+    '"run_id", "task_id", "updated_at"'
+)
+_FIELDS_ENDPOINTS_SQL = '"endpoint" IN ({})'.format(
+    ", ".join(f"'{endpoint}'" for endpoint in sorted(FIELDS_ENDPOINTS))
+)
+_DRAIN_STATUS_SQL = "\"status\" = 'retryable_failure'"
+
+
+class ReplayManagerProtocol(Protocol):
+    def _execute(
+        self,
+        sql: str,
+        fetch: bool = False,
+        params: Optional[tuple] = None,
+    ): ...
+
+
+class ReplayCatalogProtocol(Protocol):
+    def tournament(self, unique_tournament_id: int) -> object: ...
+
+    def tournament_map(self) -> Mapping[str, int]: ...
+
+
+ResolvedReplayScope = NamedTuple(
+    "ResolvedReplayScope",
+    source_tournament_id=str,
+    source_season_id=str,
+    freshness_key=str,
+    league=str,
+    canonical_season=str,
+)
+
+
+def _mode_filter_sql(mode: str) -> str:
+    if mode == MODE_FIELDS:
+        return _FIELDS_ENDPOINTS_SQL
+    return _DRAIN_STATUS_SQL
+
+
+def _normalize_scope_key(scope: object) -> ReplayScopeKey:
+    if isinstance(scope, ReplayScopeKey):
+        values: Sequence[object] = tuple(scope)
+    elif isinstance(scope, (str, bytes)) or not isinstance(scope, Sequence):
+        raise ReplayPlanningError(
+            "scope must be a (source_tournament_id, source_season_id, "
+            "freshness_key) triple"
+        )
+    else:
+        values = tuple(scope)
+    if len(values) != 3:
+        raise ReplayPlanningError(
+            "scope must contain exactly (source_tournament_id, "
+            f"source_season_id, freshness_key), got {len(values)} values"
+        )
+    normalized = []
+    for value in values:
+        if not isinstance(value, (str, int)):
+            raise ReplayPlanningError(
+                f"scope ids must be str or int, got {value!r}"
+            )
+        text = str(value).strip()
+        if not text:
+            raise ReplayPlanningError("scope ids must not be empty")
+        normalized.append(text)
+    return ReplayScopeKey(*normalized)
+
+
+def _manifest_row_codec() -> tuple[
+    tuple[str, ...], Callable[[Sequence[object]], EndpointManifest]
+]:
+    from .adapters import MANIFEST_COLUMNS, manifest_from_row
+
+    return MANIFEST_COLUMNS, manifest_from_row
+
+
+def _scope_int_id(value: str, name: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise ReplayPlanningError(
+            f"{name} must be a numeric source identifier, got {value!r}"
+        ) from exc
+
+
+def list_replay_scope_keys(
+    manager: ReplayManagerProtocol,
+    *,
+    mode: str,
+    exact_scope: Optional[Sequence[object]] = None,
+    limit: int = 1,
+) -> tuple[ReplayScopeKey, ...]:
+    """List replayable scope keys from the fixed manifest table.
+
+    ``fields`` selects scopes with at least one paid field endpoint whose raw
+    payload is replayable (2xx other than 204 with committed raw lineage,
+    any manifest status); ``drain`` selects scopes with any endpoint whose
+    last observation is ``retryable_failure`` under the same raw conditions.
+    Keys come back ordered by ``(source_tournament_id, source_season_id,
+    freshness_key)`` capped by the SQL ``LIMIT``.  ``exact_scope`` values are
+    bound as SQL parameters; the table identifier is the fixed module
+    constant and never caller input.
+    """
+    if mode not in MODES:
+        raise ReplayPlanningError(f"mode must be one of {MODES}, got {mode!r}")
+    limit = _validate_positive_int(limit, "limit")
+    wanted_scope = _normalize_exact_scope(exact_scope)
+    clauses = [*_HTTP_REPLAYABLE_SQL, *_RAW_LINEAGE_SQL, _mode_filter_sql(mode)]
+    params: list[str] = []
+    if wanted_scope is not None:
+        clauses.extend(
+            ['"source_tournament_id" = ?', '"source_season_id" = ?']
+        )
+        params.extend(wanted_scope)
+    sql = (
+        'SELECT DISTINCT "source_tournament_id", "source_season_id", '
+        '"freshness_key" '
+        f"FROM {REPLAY_MANIFEST_TABLE} "
+        f"WHERE {' AND '.join(clauses)} "
+        f"{_SCOPE_ORDER_SQL} "
+        f"LIMIT {limit}"
+    )
+    rows = manager._execute(sql, fetch=True, params=tuple(params))
+    return tuple(
+        ReplayScopeKey(*(str(value) for value in row)) for row in (rows or [])
+    )
+
+
+def load_replay_scope_records(
+    manager: ReplayManagerProtocol,
+    scope: Sequence[object],
+    *,
+    mode: str,
+) -> tuple[EndpointManifest, ...]:
+    """Load one exact scope key's replayable manifest records.
+
+    Filters by the exact ``(source_tournament_id, source_season_id,
+    freshness_key)`` triple plus the same replayability/status conditions per
+    ``mode`` as :func:`list_replay_scope_keys`, orders rows deterministically
+    by target and endpoint, and converts each row through
+    ``manifest_from_row``.  The adapter never trims a scope's target set:
+    capping stays the responsibility of ``select_replay_scope_plans``.
+    """
+    if mode not in MODES:
+        raise ReplayPlanningError(f"mode must be one of {MODES}, got {mode!r}")
+    scope_key = _normalize_scope_key(scope)
+    columns, manifest_from_row = _manifest_row_codec()
+    select_columns = ", ".join(f'"{column}"' for column in columns)
+    clauses = [
+        '"source_tournament_id" = ?',
+        '"source_season_id" = ?',
+        '"freshness_key" = ?',
+        *_HTTP_REPLAYABLE_SQL,
+        *_RAW_LINEAGE_SQL,
+        _mode_filter_sql(mode),
+    ]
+    sql = (
+        f"SELECT {select_columns} "
+        f"FROM {REPLAY_MANIFEST_TABLE} "
+        f"WHERE {' AND '.join(clauses)} "
+        f"{_RECORD_ORDER_SQL}"
+    )
+    rows = manager._execute(sql, fetch=True, params=tuple(scope_key))
+    return tuple(manifest_from_row(row) for row in (rows or []))
+
+
+def resolve_replay_scope(
+    key: Sequence[object], catalog: ReplayCatalogProtocol
+) -> ResolvedReplayScope:
+    """Resolve a scope key to canonical league/season via the catalog.
+
+    The tournament is looked up by ``int(source_tournament_id)`` and the
+    season by exact ``season_id`` membership in ``tournament.seasons`` —
+    never by date and never by the first alias.  Unknown tournaments, unknown
+    or ambiguous seasons, missing ``canonical_id``/``canonical_season`` and
+    unknown legacy league keys all raise :class:`ReplayPlanningError`.
+    """
+    scope = _normalize_scope_key(key)
+    tournament_id = _scope_int_id(
+        scope.source_tournament_id, "source_tournament_id"
+    )
+    season_id = _scope_int_id(scope.source_season_id, "source_season_id")
+    try:
+        tournament = catalog.tournament(tournament_id)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ReplayPlanningError(
+            f"unknown source tournament {scope.source_tournament_id!r}: {exc}"
+        ) from exc
+    matches = [
+        season for season in tournament.seasons if season.season_id == season_id
+    ]
+    if not matches:
+        raise ReplayPlanningError(
+            f"season {scope.source_season_id!r} is unknown for source "
+            f"tournament {scope.source_tournament_id!r}"
+        )
+    if len(matches) > 1:
+        raise ReplayPlanningError(
+            f"season {scope.source_season_id!r} is ambiguous for source "
+            f"tournament {scope.source_tournament_id!r}"
+        )
+    canonical_season = getattr(matches[0], "canonical_season", None)
+    if not isinstance(canonical_season, str) or not canonical_season.strip():
+        raise ReplayPlanningError(
+            f"season {scope.source_season_id!r} has no canonical season"
+        )
+    canonical_id = getattr(tournament, "canonical_id", None)
+    if not isinstance(canonical_id, str) or not canonical_id.strip():
+        raise ReplayPlanningError(
+            f"source tournament {scope.source_tournament_id!r} has no "
+            "canonical id"
+        )
+    try:
+        league = canonical_league(
+            canonical_id.strip(), catalog.tournament_map()
+        )
+    except ValueError as exc:
+        raise ReplayPlanningError(
+            f"cannot map source tournament {scope.source_tournament_id!r} "
+            f"to a canonical league: {exc}"
+        ) from exc
+    return ResolvedReplayScope(
+        source_tournament_id=scope.source_tournament_id,
+        source_season_id=scope.source_season_id,
+        freshness_key=scope.freshness_key,
+        league=league,
+        canonical_season=canonical_season.strip(),
+    )
