@@ -1,16 +1,19 @@
-"""Offline SofaScore raw-replay worker core (#1367).
+"""Offline SofaScore raw-replay worker (#1367).
 
 These helpers normalize one exact replay scope, resolve it through the
 tournament catalog, select the planner's deterministic raw-replay plan and
 rebuild exact season endpoint specs from already-captured manifest records —
-all network-free.  Transport, phases, CLI and DAG wiring deliberately stay
-out of this module.
+all network-free.  The match, player and season phases republish captured
+raw into Bronze with zero source traffic and the strict CLI below drives one
+exact scope end to end.  DAG wiring deliberately stays out of this module.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
@@ -26,7 +29,12 @@ from typing import (
 )
 
 from scrapers.sofascore.catalog import SofaScoreCatalog
-from scrapers.sofascore.manifest import EndpointManifest, ManifestKey
+from scrapers.sofascore.manifest import (
+    EndpointManifest,
+    JsonFileManifestStore,
+    ManifestKey,
+    ManifestStatus,
+)
 from scrapers.sofascore.raw_replay import (
     MODES,
     ReplayManagerProtocol,
@@ -46,11 +54,37 @@ if TYPE_CHECKING:
 
 _SCOPE_FIELDS = ("source_tournament_id", "source_season_id", "freshness_key")
 
+_SEASON_SPEC_ENDPOINTS = frozenset(
+    {
+        "standings_total",
+        "rounds",
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+    }
+)
+
+_REPLAY_ENTITY = "sofascore_raw_replay"
+
+_DEFAULT_REPLAY_OUTPUT = "/tmp/sofascore_replay_result.json"
+
 _REPLAY_HISTORY_IDS_ENV = "SOFASCORE_HISTORY_MATCH_IDS_JSON"
 _REPLAY_PHASE_ENV = "SOFASCORE_HISTORY_PHASE"
 _REPLAY_EVIDENCE_ENV = "SOFASCORE_HISTORY_SEASON_EVIDENCE"
 _REPLAY_PLAYER_IDS_ENV = "SOFASCORE_OFFLINE_PLAYER_IDS_JSON"
 _REPLAY_PLAYER_FRESHNESS_ENV = "SOFASCORE_PLAYER_FRESHNESS_KEY"
+_REPLAY_SEASON_FRESHNESS_ENV = "SOFASCORE_SEASON_FRESHNESS_KEY"
+
+_MATCH_ENDPOINTS = (
+    "event",
+    "lineups",
+    "statistics",
+    "shotmap",
+    "incidents",
+)
 
 
 class ReplayScopeError(ValueError):
@@ -128,6 +162,7 @@ def _load_scope(
     mode: str,
     capture_runtime: object,
     records: Optional[Sequence[EndpointManifest]] = None,
+    target_cap: int = 25,
 ) -> tuple[ResolvedReplayScope, Optional[ReplayScopePlan]]:
     """Resolve one exact replay scope and select its raw-replay plan.
 
@@ -135,8 +170,9 @@ def _load_scope(
     ``SofaScoreCatalog.load``.  Records already in memory are prefiltered to
     the exact scope triple; when absent they are loaded through the manifest
     store's trino manager with the planner's mode filters.  Returns the
-    catalog-resolved scope and the single selected plan, or ``None`` when
-    nothing is replayable.
+    catalog-resolved scope and the single selected plan — selected with the
+    caller's ``target_cap`` (default 25) — or ``None`` when nothing is
+    replayable.
     """
     if mode not in MODES:
         raise ReplayScopeError(f"mode must be one of {MODES}, got {mode!r}")
@@ -172,7 +208,7 @@ def _load_scope(
         exact_records,
         mode=mode,
         scope_cap=1,
-        target_cap=25,
+        target_cap=target_cap,
         exact_scope=(
             scope.source_tournament_id,
             scope.source_season_id,
@@ -350,14 +386,29 @@ def _matches_phase(
 ) -> dict[str, Any]:
     """Run the offline match phase for one exact replay scope.
 
-    Fields mode replays ``lineups`` targets, drain mode ``event`` targets.
-    The phase refuses to run without targets or when the scope freshness
-    key is not ``final``.  The runner writes its JSON report inside a
-    temporary directory and the report is read back defensively.
+    Fields mode replays ``lineups`` targets; drain mode replays the union
+    of target ids across the five canonical event endpoints, so a match
+    whose only pending record is a non-``event`` endpoint still replays
+    from its already-captured raw.  The phase refuses to run without
+    targets or when the scope freshness key is not ``final``.  The runner
+    writes its JSON report inside a temporary directory and the report is
+    read back defensively.
     """
     if mode is None:
         mode = "fields" if _target_ids(records, "lineups") else "drain"
-    ids = _target_ids(records, "lineups" if mode == "fields" else "event")
+    if mode == "fields":
+        ids = _target_ids(records, "lineups")
+    else:
+        ids = tuple(
+            sorted(
+                {
+                    target_id
+                    for endpoint in _MATCH_ENDPOINTS
+                    for target_id in _target_ids(records, endpoint)
+                },
+                key=int,
+            )
+        )
     if not ids:
         return {
             "ran": False,
@@ -445,8 +496,11 @@ def _players_phase(
 
     Fields mode skips players entirely.  Drain mode collects the distinct
     player ids behind ``player_profile``/``player_season_statistics``
-    records, publishes them plus the scope freshness key through env
-    overrides and reads the runner's JSON report back defensively.
+    records and publishes them together with the scope's exact freshness
+    key through env overrides — both as the player freshness and as
+    ``SOFASCORE_SEASON_FRESHNESS_KEY``, so the canonical
+    ``plan_season_partition`` inside the player runner resolves the same
+    season raw — and reads the runner's JSON report back defensively.
     """
     if mode == "fields":
         return {
@@ -486,6 +540,7 @@ def _players_phase(
                     list(ids), ensure_ascii=False
                 ),
                 _REPLAY_PLAYER_FRESHNESS_ENV: freshness,
+                _REPLAY_SEASON_FRESHNESS_ENV: freshness,
             }
         ):
             exit_code = runner._run_player_capture(
@@ -530,6 +585,124 @@ def _players_phase(
     }
 
 
+def _season_phase(
+    resolved: ResolvedReplayScope,
+    records: Sequence[EndpointManifest],
+    scope: object,
+    capture_runtime: object,
+) -> dict[str, Any]:
+    """Run the offline season phase for one exact replay scope.
+
+    Rebuilds the exact season endpoint specs through :func:`_season_plan`,
+    replays them with ``replay_season_specs`` and materializes the partition.
+    Schedule and standings plus the normalized season fields republish inside
+    one ``SofaScoreScraper``/``bronze_writer_lock`` span;
+    ``finalize_materialized_results`` runs only after the lock released and
+    the manifest store is flushed right after it.  There is no
+    ``promote_repaired_results`` and no manual success upsert, a schedule
+    chain or ``match_phase_ready`` is never required, and true raw-only
+    squads replay without producing a table.  A phase error is reported, not
+    hidden: without the finalize the records stay deferred/schema_error.
+    """
+    import pandas as pd
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.pipeline import finalize_materialized_results
+    from scrapers.sofascore.season_pipeline import (
+        materialize_season_partition,
+        replay_season_specs,
+    )
+    from scrapers.sofascore.writer_lock import bronze_writer_lock
+
+    from dags.scripts import run_sofascore_scraper as runner
+
+    season_records = [
+        record
+        for record in records
+        if record.key.endpoint in _SEASON_SPEC_ENDPOINTS
+    ]
+    if not season_records:
+        return {
+            "ran": False,
+            "reason": "no_targets",
+            "targets": [],
+            "report": {},
+            "errors": [],
+        }
+    targets = sorted({record.key.target_id for record in season_records})
+    report: dict[str, Any] = {
+        "entity": "sofascore_season_replay",
+        "tables": [],
+        "publication_receipts": [],
+        "rows": 0,
+        "schedule_rows": 0,
+        "league_table_rows": 0,
+        "planned_endpoints": 0,
+        "errors": [],
+    }
+    try:
+        plan = _season_plan(season_records, scope)
+        report["planned_endpoints"] = len(plan.specs)
+        replayed = replay_season_specs(capture_runtime.engine, plan.specs)
+        materialized = materialize_season_partition(
+            plan,
+            replayed,
+            canonical_league=resolved.league,
+            canonical_season=resolved.canonical_season,
+        )
+        with SofaScoreScraper(
+            leagues=[resolved.league],
+            seasons=[resolved.canonical_season],
+        ) as scraper, bronze_writer_lock():
+            if materialized.schedule_rows:
+                schedule_df = scraper._add_metadata(
+                    pd.DataFrame(materialized.schedule_rows), "schedule"
+                )
+                path = runner._save_publication(
+                    scraper,
+                    report,
+                    df=schedule_df,
+                    table_name="sofascore_schedule",
+                    partition_cols=["league", "season"],
+                    natural_keys=["league", "season", "game_id"],
+                )
+                report["tables"].append(path)
+                report["schedule_rows"] = len(schedule_df)
+            if materialized.standings_rows:
+                standings_df = scraper._add_metadata(
+                    pd.DataFrame(materialized.standings_rows), "league_table"
+                )
+                path = runner._save_publication(
+                    scraper,
+                    report,
+                    df=standings_df,
+                    table_name="sofascore_league_table",
+                    partition_cols=["league", "season"],
+                    natural_keys=["league", "season", "group", "team"],
+                )
+                report["tables"].append(path)
+                report["league_table_rows"] = len(standings_df)
+            runner._publish_normalized_season_fields(
+                scraper, report, materialized
+            )
+        finalize_materialized_results(capture_runtime, replayed)
+        runner._flush_manifest_store(capture_runtime.manifest_store)
+    except Exception as exc:
+        report["errors"].append(f"season_phase: {exc}")
+        return {
+            "ran": False,
+            "reason": "season_phase_error",
+            "targets": targets,
+            "report": report,
+            "errors": list(report["errors"]),
+        }
+    return {
+        "ran": True,
+        "targets": targets,
+        "report": report,
+        "errors": [],
+    }
+
+
 def _merge_phase_report(
     results: MutableMapping[str, Any],
     phase: str,
@@ -539,7 +712,10 @@ def _merge_phase_report(
 
     Records the phase result, appends its report's tables, publication
     receipts and errors without duplicates and recomputes ``rows`` as the
-    sum of receipt rows.
+    sum of receipt rows.  A phase that ran, exited non-zero and reported
+    no errors of its own contributes exactly one
+    ``<phase>: runner exited <code>`` error, so a failed runner can never
+    hide behind an empty report.
     """
     phases: MutableMapping[str, Any] = results["phases"]
     phases[phase] = dict(phase_result)
@@ -558,6 +734,17 @@ def _merge_phase_report(
     for error in phase_result.get("errors") or []:
         if error not in errors:
             errors.append(error)
+    exit_code = phase_result.get("exit_code")
+    if (
+        phase_result.get("ran")
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+        and not (phase_result.get("errors") or [])
+    ):
+        runner_error = f"{phase}: runner exited {exit_code}"
+        if runner_error not in errors:
+            errors.append(runner_error)
     rows = 0
     for receipt in receipts:
         if isinstance(receipt, Mapping):
@@ -569,6 +756,46 @@ def _merge_phase_report(
     return results
 
 
+def _selected_status_counts(
+    capture_runtime: object, records: Sequence[EndpointManifest]
+) -> dict[str, int]:
+    """Classify the selected manifest keys once every phase has run.
+
+    ``success``, ``legitimate_empty``, ``not_supported`` and
+    ``schema_error`` mirror the committed manifest status of each selected
+    record; ``deferred`` counts only replay work that remains — retryable
+    failures, records the store cannot serve and unknown statuses.  A
+    ``schema_error`` is never a success, and capped or unselected records
+    do not appear in these counters at all.
+    """
+    counts = {
+        "success": 0,
+        "legitimate_empty": 0,
+        "not_supported": 0,
+        "schema_error": 0,
+        "deferred": 0,
+    }
+    store = getattr(capture_runtime, "manifest_store", None)
+    for record in records:
+        status = None
+        if store is not None:
+            try:
+                status = getattr(store.get(record.key), "status", None)
+            except Exception:
+                status = None
+        if status == ManifestStatus.SUCCESS:
+            counts["success"] += 1
+        elif status == ManifestStatus.LEGITIMATE_EMPTY:
+            counts["legitimate_empty"] += 1
+        elif status == ManifestStatus.NOT_SUPPORTED:
+            counts["not_supported"] += 1
+        elif status == ManifestStatus.SCHEMA_ERROR:
+            counts["schema_error"] += 1
+        else:
+            counts["deferred"] += 1
+    return counts
+
+
 def run_replay_scope(
     scope: object,
     *,
@@ -577,36 +804,29 @@ def run_replay_scope(
     capture_runtime: object,
     records: Optional[Sequence[EndpointManifest]] = None,
 ) -> dict[str, Any]:
-    """Run the match and player offline replay phases for one exact scope.
+    """Run the season, match and player offline replay phases for one scope.
 
-    The plan selection inside :func:`_load_scope` temporarily runs with the
-    caller's ``target_cap`` instead of its built-in default.  Both phases
-    merge through :func:`_merge_phase_report` and traffic comes from a
-    single final engine metrics snapshot.
+    Season finalize runs first and prepares the season manifest and player
+    universe, the match phase then publishes the captured event evidence
+    and the player phase runs last on top of that universe.  Plan
+    selection inside :func:`_load_scope` runs with the caller's
+    ``target_cap`` directly, without touching module globals.  Every phase
+    merges through :func:`_merge_phase_report`, a phase error never stops
+    the phases after it, the selected manifest keys are classified into
+    success/legitimate_empty/not_supported/schema_error/deferred counters
+    and traffic comes from a single final engine metrics snapshot.
     """
     scope_key = _normalize_scope(scope)
-    original_select = select_replay_scope_plans
-
-    def _select_with_cap(
-        candidate_records: object, **kwargs: object
-    ) -> object:
-        kwargs["target_cap"] = target_cap
-        return original_select(candidate_records, **kwargs)
-
-    module_globals = globals()
-    module_globals["select_replay_scope_plans"] = _select_with_cap
-    try:
-        resolved, plan = _load_scope(
-            scope_key,
-            mode=mode,
-            capture_runtime=capture_runtime,
-            records=records,
-        )
-    finally:
-        module_globals["select_replay_scope_plans"] = original_select
+    resolved, plan = _load_scope(
+        scope_key,
+        mode=mode,
+        capture_runtime=capture_runtime,
+        records=records,
+        target_cap=target_cap,
+    )
 
     results: dict[str, Any] = {
-        "entity": "sofascore_raw_replay",
+        "entity": _REPLAY_ENTITY,
         "mode": mode,
         "scope": (
             scope_key.source_tournament_id,
@@ -624,9 +844,10 @@ def run_replay_scope(
         "errors": [],
     }
     provided = len(records) if records is not None else 0
+    selected_records: tuple[EndpointManifest, ...] = ()
     if plan is None:
         results["skipped"] = provided
-        for phase in ("matches", "players"):
+        for phase in ("season", "matches", "players"):
             _merge_phase_report(
                 results,
                 phase,
@@ -639,6 +860,7 @@ def run_replay_scope(
             )
     else:
         plan_records = tuple(plan.records)
+        selected_records = plan_records
         results["skipped"] = max(0, provided - len(plan_records))
         targets: set[str] = set()
         for record in plan_records:
@@ -652,17 +874,282 @@ def run_replay_scope(
             ),
             "targets": sorted(targets),
         }
-        _merge_phase_report(
-            results,
-            "matches",
-            _matches_phase(resolved, plan_records, capture_runtime, mode=mode),
+        phases = (
+            (
+                "season",
+                lambda: _season_phase(
+                    resolved, plan_records, scope_key, capture_runtime
+                ),
+            ),
+            (
+                "matches",
+                lambda: _matches_phase(
+                    resolved, plan_records, capture_runtime, mode=mode
+                ),
+            ),
+            (
+                "players",
+                lambda: _players_phase(
+                    resolved, plan_records, capture_runtime, mode=mode
+                ),
+            ),
         )
-        _merge_phase_report(
-            results,
-            "players",
-            _players_phase(resolved, plan_records, capture_runtime, mode=mode),
-        )
+        for phase, run_phase in phases:
+            try:
+                phase_result = run_phase()
+            except Exception as exc:
+                phase_result = {
+                    "ran": False,
+                    "reason": "phase_error",
+                    "targets": [],
+                    "report": {},
+                    "errors": [f"{phase}: {exc}"],
+                }
+            _merge_phase_report(results, phase, phase_result)
+    results["status_counts"] = _selected_status_counts(
+        capture_runtime, selected_records
+    )
     traffic = capture_runtime.engine.metrics.snapshot()
     results["traffic"] = traffic
-    results["source_request_count"] = traffic["source_request_count"]
+    results["source_request_count"] = traffic.get("source_request_count", 0)
     return results
+
+
+def _build_cli_parser(parser_class: type) -> argparse.ArgumentParser:
+    """Build the strict #1367 offline replay CLI parser."""
+    parser = parser_class(
+        description="Offline SofaScore raw replay of one exact scope (#1367)."
+    )
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=tuple(MODES),
+        help="Replay mode: 'fields' or 'drain'.",
+    )
+    parser.add_argument(
+        "--scope-json",
+        required=True,
+        help=(
+            "JSON object with exactly the three string fields "
+            "(source_tournament_id, source_season_id, freshness_key)."
+        ),
+    )
+    parser.add_argument(
+        "--target-cap",
+        type=int,
+        default=25,
+        help="Maximum replayed targets per plan; must be positive.",
+    )
+    parser.add_argument(
+        "--output",
+        default=_DEFAULT_REPLAY_OUTPUT,
+        help="Output file for the replay result payload.",
+    )
+    parser.add_argument(
+        "--raw-store-uri",
+        default=None,
+        help="Override SOFASCORE_RAW_STORE_URI for capture/replay.",
+    )
+    parser.add_argument(
+        "--manifest-backend",
+        choices=("trino", "json"),
+        default="trino",
+        help="Endpoint manifest backend for the replay runtime.",
+    )
+    parser.add_argument(
+        "--manifest-path",
+        default=None,
+        help="JSON manifest file; only valid with --manifest-backend json.",
+    )
+    return parser
+
+
+def _cli_error_payload(
+    mode: Optional[str], errors: Sequence[str]
+) -> dict[str, Any]:
+    """The early-failure payload: errors plus a provably zero-traffic block."""
+    payload: dict[str, Any] = {
+        "entity": _REPLAY_ENTITY,
+        "tables": [],
+        "errors": list(errors),
+        "traffic": {
+            "paid_proxy_bytes": 0,
+            "browser_sessions": 0,
+            "browser_navigations": 0,
+            "requests": 0,
+            "source_request_count": 0,
+        },
+    }
+    if mode is not None:
+        payload["mode"] = mode
+    return payload
+
+
+def _parse_cli_scope(value: str) -> ReplayScopeKey:
+    """Parse ``--scope-json`` into an exact replay scope key.
+
+    The payload must be a JSON object with exactly
+    ``source_tournament_id``/``source_season_id``/``freshness_key`` and a
+    string value for each; anything else raises
+    :class:`ReplayScopeError` before a capture runtime exists.
+    """
+    try:
+        loaded = json.loads(value)
+    except ValueError as exc:
+        raise ReplayScopeError(
+            f"--scope-json is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise ReplayScopeError("--scope-json must be a JSON object")
+    fields = set(loaded)
+    expected = set(_SCOPE_FIELDS)
+    if fields != expected:
+        raise ReplayScopeError(
+            "--scope-json must contain exactly (source_tournament_id, "
+            "source_season_id, freshness_key); "
+            f"missing={sorted(expected - fields)}, "
+            f"extra={sorted(fields - expected)}"
+        )
+    values: dict[str, str] = {}
+    for name in _SCOPE_FIELDS:
+        item = loaded[name]
+        if isinstance(item, bool) or not isinstance(item, str):
+            raise ReplayScopeError(
+                f"--scope-json field {name} must be a string"
+            )
+        values[name] = item
+    return _normalize_scope(values)
+
+
+def _json_manifest_path(explicit: Optional[str]) -> str:
+    """Resolve the json manifest path like canonical ``build_manifest_store``.
+
+    An explicit ``--manifest-path`` wins; otherwise the path comes from
+    ``SOFASCORE_MANIFEST_PATH`` with the same
+    ``/tmp/sofascore-endpoint-manifest.json`` default the canonical
+    builder uses.
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get(
+        "SOFASCORE_MANIFEST_PATH",
+        "/tmp/sofascore-endpoint-manifest.json",
+    )
+
+
+def _json_manifest_store(path: str) -> JsonFileManifestStore:
+    """Build the canonical JSON file manifest store for offline replay."""
+    return JsonFileManifestStore(path)
+
+
+def _manifest_store_scope_records(
+    store: object, scope: ReplayScopeKey
+) -> Optional[Sequence[EndpointManifest]]:
+    """Read one scope's records from a manifest store that can list them."""
+    list_scope = getattr(store, "list_for_scope", None)
+    if not callable(list_scope):
+        return None
+    return list_scope(scope.source_tournament_id, scope.source_season_id)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Strict #1367 CLI: replay one exact offline SofaScore scope.
+
+    Invalid input fails with exit 1 and an errors payload before any capture
+    runtime is built; ``--manifest-path`` is only valid with the json
+    manifest backend.  For backend=json the store is always built from the
+    explicit flag or from ``SOFASCORE_MANIFEST_PATH`` (with canonical
+    ``build_manifest_store``'s default) and its records load through
+    ``list_for_scope``, so no trino manager is ever required.  A replay
+    that completes writes its results through
+    ``run_sofascore_scraper._write_results`` and returns 0 only when the
+    replay reported no errors.
+    """
+    from dags.scripts import run_sofascore_scraper as runner
+
+    parser = _build_cli_parser(runner._StrictArgumentParser)
+    try:
+        args = parser.parse_args(argv)
+    except runner._ArgparseError as exc:
+        runner._write_results(
+            _DEFAULT_REPLAY_OUTPUT,
+            _cli_error_payload(None, [f"cli: {exc}"]),
+        )
+        return 1
+
+    errors: list[str] = []
+    scope_key: Optional[ReplayScopeKey] = None
+    try:
+        scope_key = _parse_cli_scope(args.scope_json)
+    except ReplayScopeError as exc:
+        errors.append(f"scope_json: {exc}")
+    if args.target_cap < 1:
+        errors.append(
+            f"target_cap must be a positive integer, got {args.target_cap}"
+        )
+    if args.manifest_path is not None and args.manifest_backend != "json":
+        errors.append(
+            "--manifest-path is only valid with --manifest-backend json"
+        )
+    if errors:
+        runner._write_results(
+            args.output,
+            _cli_error_payload(args.mode, errors),
+        )
+        return 1
+
+    capture_runtime = None
+    records: Optional[Sequence[EndpointManifest]] = None
+    try:
+        from scrapers.sofascore.pipeline import build_capture_runtime
+
+        manifest_store = (
+            _json_manifest_store(_json_manifest_path(args.manifest_path))
+            if args.manifest_backend == "json"
+            else None
+        )
+        capture_runtime = build_capture_runtime(
+            run_id=(
+                os.environ.get("SOFASCORE_RUN_ID")
+                or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
+                or f"manual-{os.getpid()}"
+            ),
+            task_id=(
+                os.environ.get("AIRFLOW_CTX_TASK_ID")
+                or "cli-sofascore-raw-replay"
+            ),
+            raw_store_uri=args.raw_store_uri,
+            manifest_backend=args.manifest_backend,
+            **(
+                {"manifest_store": manifest_store}
+                if manifest_store is not None
+                else {}
+            ),
+        )
+        if manifest_store is not None:
+            records = _manifest_store_scope_records(
+                manifest_store, scope_key
+            )
+    except Exception as exc:
+        runner._write_results(
+            args.output,
+            _cli_error_payload(args.mode, [f"capture_runtime: {exc}"]),
+        )
+        return 1
+
+    try:
+        results = run_replay_scope(
+            scope_key,
+            mode=args.mode,
+            target_cap=args.target_cap,
+            capture_runtime=capture_runtime,
+            records=records,
+        )
+    except Exception as exc:
+        results = _cli_error_payload(args.mode, [f"replay: {exc}"])
+    runner._write_results(args.output, results)
+    return 0 if not results.get("errors") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

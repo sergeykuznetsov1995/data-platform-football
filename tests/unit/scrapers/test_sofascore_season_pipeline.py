@@ -1901,7 +1901,7 @@ def test_runner_main_with_a_real_signed_season_plan_publishes_despite_universe_g
         write_plan,
     )
 
-    token = "x" * 32
+    token = "season-gap-control-token-with-at-least-32-bytes"
     shape = production_season_shape(
         season_format="split_year",
         team_count_band="16_20",
