@@ -1,0 +1,29 @@
+{
+  "attempt": 1000008,
+  "blob_key": "blobs/sha256/33/33c41c1a75e78f12d8f1232b94b5c012b5df08a94aceb0b7e963188514b2b5f9.body.gz",
+  "capture_id": "76efd2a512b9aa2639f5f7c56eea7c190842bad6a7379238dce8b3dc7d508033",
+  "compression": "gzip",
+  "content_hash": "33c41c1a75e78f12d8f1232b94b5c012b5df08a94aceb0b7e963188514b2b5f9",
+  "content_type": "application/json",
+  "cycle_id": "tm-current-cfd30caeca8901779a498b13f8b85a5a",
+  "decoded_bytes": 117182,
+  "endpoint": "current_players",
+  "fetched_at": "2026-11-08T20:48:07.626251+00:00",
+  "hash_algorithm": "sha256",
+  "headers": {
+    "cache-control": "max-age=60, must-revalidate, public",
+    "content-encoding": "gzip",
+    "content-type": "application/json",
+    "date": "Sun, 08 Nov 2026 20:48:07 GMT",
+    "etag": "\"b3e9246f9136a88049f700de21d81f83d3afde83-gzip\"",
+    "last-modified": "Sun, 08 Nov 2026 20:48:07 GMT",
+    "vary": "Origin,Accept-Language,Accept-Encoding"
+  },
+  "manifest_version": "transfermarkt-raw-v1",
+  "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/33/33c41c1a75e78f12d8f1232b94b5c012b5df08a94aceb0b7e963188514b2b5f9.body.gz",
+  "scope_id": "tm-129798751f4cf25e29fe0c19",
+  "source": "transfermarkt",
+  "status_code": 200,
+  "stored_bytes": 13177,
+  "url": "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1007383&ids%5B%5D=1009658&ids%5B%5D=1011131&ids%5B%5D=1011738&ids%5B%5D=1011936&ids%5B%5D=1012534&ids%5B%5D=1012564&ids%5B%5D=1023191&ids%5B%5D=1034853&ids%5B%5D=1035765&ids%5B%5D=1045123&ids%5B%5D=1049020&ids%5B%5D=1049911&ids%5B%5D=1056993&ids%5B%5D=1060087&ids%5B%5D=1067904&ids%5B%5D=1069512&ids%5B%5D=1071138&ids%5B%5D=1077175&ids%5B%5D=1078163&ids%5B%5D=1079078&ids%5B%5D=1082631&ids%5B%5D=1086375&ids%5B%5D=1086619&ids%5B%5D=1097139&ids%5B%5D=1107733&ids%5B%5D=1108466&ids%5B%5D=1110406&ids%5B%5D=1111063&ids%5B%5D=1111589&ids%5B%5D=1122712&ids%5B%5D=1131161&ids%5B%5D=1138758&ids%5B%5D=1145504&ids%5B%5D=1178758&ids%5B%5D=1185888&ids%5B%5D=1187629&ids%5B%5D=1187640&ids%5B%5D=1191444&ids%5B%5D=1226357&ids%5B%5D=1240763&ids%5B%5D=1279984&ids%5B%5D=1282860&ids%5B%5D=1322090&ids%5B%5D=1353008&ids%5B%5D=1401779&ids%5B%5D=1421433"
+}
