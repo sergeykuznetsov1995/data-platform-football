@@ -91,6 +91,10 @@ REFRESH_ALLOCATION_OVERRUN_FACTOR = 2
 # window in six plans running, and no missed deadline was re-collected.
 REFRESH_FRESH_DEBT_SECONDS = 48 * 3600
 REFRESH_DEBT_RESERVE_SECONDS = 1800
+# #1374: the players lane replays the history lane's closed scopes for player
+# profiles; it never runs inside the history lane's own batch.
+DEFAULT_PLAYERS_BATCH_SIZE = 3
+DEFAULT_PLAYERS_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/players-results"
 
 
 def refresh_timeout_headroom(seconds_per_match: int) -> int:
@@ -1104,6 +1108,177 @@ def plan_refresh_batch(
     return planned
 
 
+def plan_players_batch(
+    snapshot: Mapping[str, Any],
+    *,
+    completed: Iterable[str],
+    batch_size: int = DEFAULT_PLAYERS_BATCH_SIZE,
+    snapshot_path: str = "/opt/airflow/runtime/sofascore/all-men/snapshot.json",
+    policy_path: str = "/opt/airflow/configs/sofascore/all_mens_campaign.json",
+    result_dir: str = DEFAULT_PLAYERS_RESULT_DIR,
+    workload_artifact: str = (
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    ),
+    dag_run_id: str = "manual",
+    task_env: Mapping[str, str] | None = None,
+    players_completed: Iterable[str] = (),
+    failures: Mapping[str, Mapping[str, Any]] | None = None,
+    max_scope_attempts: int = DEFAULT_MAX_SCOPE_ATTEMPTS,
+    park_cooldown_hours: int = DEFAULT_PARK_COOLDOWN_HOURS,
+    moment: datetime | None = None,
+    release: str | None = None,
+    denominator: Denominator | None = None,
+) -> list[dict[str, str]]:
+    """Plan player profiles for the history lane's closed scopes (#1374).
+
+    Candidates are the campaign's ``completed`` history keys — a scope whose
+    matches never closed never gets profiles — minus ``players_completed``,
+    the profiles this lane already captured.  A key the snapshot no longer
+    knows (rotated-out tournament, foreign campaign, malformed) is logged and
+    skipped, never fatal to the phase.
+
+    ``failures`` is this lane's own memory (see ``read_failures``), separate
+    from the history lane's: a scope parked for capture must not park its
+    profiles.  Quarantine, its release/season-identity grants and the park
+    cooldown behave exactly like in ``plan_historical_batch``.
+
+    The denominator (#1353) is the ranking tier, not a tie-breaker: every
+    core scope of every year comes before any disputed one, and a
+    ``queue_priority 0`` tournament (esoccer, student) is never planned.
+    Inside a tier scopes are ranked newest season first, and a season
+    without a ``start_year`` runs behind every dated one.  There is
+    deliberately no ``exclude_tournament_ids``: the registry leagues are
+    excluded by the denominator, not by a knob.
+    """
+
+    moment = moment or datetime.now(timezone.utc)
+    release = current_release() if release is None else str(release)
+    lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise CampaignPlanningError("batch_size must be a positive integer")
+    if (
+        isinstance(max_scope_attempts, bool)
+        or not isinstance(max_scope_attempts, int)
+        or max_scope_attempts < 1
+    ):
+        raise CampaignPlanningError("max_scope_attempts must be a positive integer")
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
+    if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
+        raise CampaignPlanningError("campaign snapshot digest mismatch")
+    campaign_id = str(snapshot.get("campaign_id") or "")
+    if not campaign_id:
+        raise CampaignPlanningError("campaign_id is missing")
+    tournaments = snapshot.get("tournaments")
+    if not isinstance(tournaments, list):
+        raise CampaignPlanningError("campaign tournaments must be a list")
+    denominator = load_denominator() if denominator is None else denominator
+    captured_keys = {str(value) for value in players_completed}
+    # The index reuses the refresh lane's snapshot validators (#1374
+    # hardening): a malformed season — missing canonical label, invalid
+    # source ID — a non-ready tournament or an excluded entry is logged and
+    # skipped exactly as there, so one malformed record can never abort the
+    # whole batch with a ``KeyError`` out of ``_scope_task_env``.
+    snapshot_scopes: dict[tuple[int, int], tuple[int, Mapping[str, Any]]] = {}
+    for tournament_id, _capture_key, seasons in _refresh_snapshot_tournaments(
+        snapshot
+    ):
+        for season, season_id, _start_year, _canonical in _refresh_snapshot_seasons(
+            tournament_id, seasons, require_start_year=False
+        ):
+            snapshot_scopes[(tournament_id, season_id)] = (tournament_id, season)
+    candidates: list[
+        tuple[tuple[int, bool, int, int, int], int, Mapping[str, Any]]
+    ] = []
+    for scope_key in sorted({str(value) for value in completed}):
+        if scope_key in captured_keys:
+            continue
+        parts = scope_key.split(":")
+        if (
+            len(parts) != 3
+            or parts[0] != campaign_id
+            or not parts[1].isdigit()
+            or not parts[2].isdigit()
+        ):
+            logger.warning(
+                "players scope key %r is not a scope key of this campaign; skipped",
+                scope_key,
+            )
+            continue
+        entry = snapshot_scopes.get((int(parts[1]), int(parts[2])))
+        if entry is None:
+            logger.warning(
+                "players scope key %r is not a ready snapshot season; skipped",
+                scope_key,
+            )
+            continue
+        tournament_id, season = entry
+        priority = denominator.queue_priority(tournament_id)
+        if priority == 0:
+            continue
+        attempts = (failures or {}).get(scope_key) or {}
+        quarantine_record = is_quarantined_record(attempts, max_scope_attempts)
+        if quarantine_record and _quarantine_applies(
+            attempts, release,
+            season_alignment_identity(tournament_id, season),
+        ):
+            logger.warning(
+                "players scope %s quarantined after %s free identical "
+                "failures on release %s: %s",
+                scope_key, attempts.get("streak_no_traffic"), release,
+                attempts.get("last_reason"),
+            )
+            continue
+        if (
+            # Changed relevant inputs (or release for other errors) grant
+            # ONE attempt past the park; the same free outcome quarantines
+            # it again.
+            not quarantine_record
+            and int(attempts.get("count", 0)) >= max_scope_attempts
+            and not park_has_cooled(attempts, moment, park_cooldown_hours)
+        ):
+            logger.warning(
+                "players scope %s parked after %s failed attempts (last run %s)",
+                scope_key, attempts.get("count"), attempts.get("last_run_id"),
+            )
+            continue
+        start_year = season.get("start_year")
+        start_year = (
+            start_year
+            if isinstance(start_year, int) and not isinstance(start_year, bool)
+            else None
+        )
+        candidates.append((
+            (
+                priority,
+                start_year is None,
+                -(start_year or 0),
+                tournament_id,
+                int(parts[2]),
+            ),
+            tournament_id,
+            season,
+        ))
+    candidates.sort(key=lambda item: item[0])
+    planned: list[dict[str, str]] = []
+    for _rank, tournament_id, season in candidates:
+        planned.append(_scope_task_env(
+            "players",
+            snapshot_id=snapshot_id,
+            campaign_id=campaign_id,
+            tournament_id=tournament_id,
+            season=season,
+            lane_env=lane_env,
+            snapshot_path=snapshot_path,
+            policy_path=policy_path,
+            result_dir=result_dir,
+            workload_artifact=workload_artifact,
+            dag_run_id=dag_run_id,
+        ))
+        if len(planned) == batch_size:
+            break
+    return planned
+
+
 def read_snapshot(
     path: str | Path, *, policy_path: str | Path | None = None
 ) -> Mapping[str, Any]:
@@ -1248,6 +1423,7 @@ def mark_failed(
     source_requests: int | None = None,
     release: str = UNKNOWN_RELEASE,
     season_identity: str | None = None,
+    quarantine_on_no_traffic: bool = True,
 ) -> None:
     """Count one failed attempt and its no-progress streak.
 
@@ -1256,6 +1432,11 @@ def mark_failed(
     is how many requests reached the source (``None`` = unknown, which never
     extends the streak).  ``streak_no_traffic`` grows only while attempts stay
     at 0 source requests with the same reason; anything else restarts it.
+    ``quarantine_on_no_traffic=False`` (the players DAG's deferred branch,
+    #1374) still records the free attempt, its reason and its release but
+    never grows the streak: an everyday evidence wait rides the
+    attempts/park-cooldown cycle instead of being quarantined until a new
+    release.
     """
 
     reason_text = str(reason or "")[:QUARANTINE_REASON_CHARS]
@@ -1267,7 +1448,7 @@ def mark_failed(
         if previous.get("last_run_id") == str(run_id):
             return
         streak = 0
-        if free:
+        if free and quarantine_on_no_traffic:
             streak = 1
             if previous.get("last_reason") == reason_text:
                 streak += int(previous.get("streak_no_traffic", 0) or 0)
@@ -1345,6 +1526,7 @@ __all__ = [
     "mark_completed_rejects",
     "mark_failed",
     "plan_historical_batch",
+    "plan_players_batch",
     "plan_refresh_batch",
     "read_completed",
     "read_failures",

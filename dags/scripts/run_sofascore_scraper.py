@@ -3246,6 +3246,9 @@ def _load_runtime_workload_plan(
         # so a broken plan hand-off would have fallen back to an unplanned
         # capture instead of failing closed (Sol round 12, finding 3).
         "dag_refresh_sofascore_all_mens",
+        # The players lane buys player profiles under its own dag and must
+        # fail closed the same way (#1374).
+        "dag_players_sofascore_all_mens",
     }
     if not path:
         if production:

@@ -996,3 +996,186 @@ def test_optional_referee_reject_keeps_diagnostics_and_does_not_block_matches(tm
     result = json.loads((tmp_path / 'result.json').read_text())
     assert result['status'] == 'success'
     assert result['phases'][0]['full_complete'] is False
+
+
+# --- #1374: the players phase buys profiles once the matches closed ---------
+
+
+@pytest.mark.unit
+def test_run_phase_signs_the_players_plan_and_captures_profiles(tmp_path):
+    scope = {**_scope(), "run_id": "players-1"}
+    plan = tmp_path / "players-plan.json"
+    captured = {}
+
+    def capture(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            return_value=plan,
+        ) as planner,
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=capture),
+    ):
+        result = cycle.run_phase(
+            "players",
+            scope,
+            output_dir=tmp_path / "run",
+            workload_artifact=tmp_path / "artifact.json",
+        )
+
+    assert result == {
+        "phase": "players",
+        "status": "success",
+        "exit_code": 0,
+        "plan": str(plan),
+        "errors": [],
+        # #1357: planner and runner are doubles here -> no Trino round-trip.
+        "trino_queries": {"select": 0, "merge": 0, "other": 0},
+    }
+    assert planner.call_args.kwargs["phase"] == "players"
+    # The lane's queue is its rotation, and the campaign's season manifests are
+    # written under the "final" key: the dated default would call every scope
+    # "season not ready".
+    assert planner.call_args.kwargs["players_force"] is True
+    assert planner.call_args.kwargs["season_freshness_key"] == "final"
+    argv = captured["argv"]
+    assert argv[argv.index("--entity") + 1] == "player_capture"
+    assert argv[argv.index("--league") + 1] == "SS-17"
+    assert argv[argv.index("--canonical-season") + 1] == "2526"
+    assert argv[argv.index("--workload-plan") + 1] == str(plan)
+    # No slicing: a partial universe would let endpoint-completeness DQ pass on
+    # a subset of the season's players.
+    assert "--limit" not in argv
+
+
+@pytest.mark.unit
+def test_the_players_phase_runs_alone_and_never_inside_all(tmp_path, monkeypatch):
+    calls = []
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setattr(
+        cycle,
+        "run_phase",
+        lambda phase, *a, **k: (
+            calls.append(phase) or {"phase": phase, "status": "success"}
+        ),
+    )
+
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 0
+    assert calls == ["players"]
+
+    calls.clear()
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 0
+    assert calls == ["season", "matches"]
+
+
+@pytest.mark.unit
+def test_the_players_phase_refuses_a_pending_season(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cycle,
+        "load_exact_scope",
+        lambda *a, **k: pytest.fail("argument validation must come first"),
+    )
+
+    with pytest.raises(SystemExit):
+        cycle.main(_cycle_argv(
+            tmp_path, "--phase", "players", "--allow-pending-season"
+        ))
+
+    # The refusal must be the combination check, not argparse not knowing the
+    # phase at all — otherwise this test would stay green after a rename.
+    assert "cannot use --allow-pending-season" in capsys.readouterr().err
+
+
+def _raiser(exc):
+    def run_phase(phase, *_args, **_kwargs):
+        raise exc
+
+    return run_phase
+
+
+@pytest.mark.unit
+def test_a_scope_that_is_only_too_early_defers_green(tmp_path, monkeypatch):
+    from dags.scripts.prepare_sofascore_workload import PlayerEvidenceNotReady
+
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setattr(
+        cycle,
+        "run_phase",
+        _raiser(PlayerEvidenceNotReady("SS-17 match raw/manifest is incomplete")),
+    )
+    # No paid traffic happened, so this is not an incident: exit 0.
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 0
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "deferred"
+    assert "PlayerEvidenceNotReady" in result["deferral_reason"]
+
+
+@pytest.mark.unit
+def test_a_lost_player_universe_still_fails_the_scope(tmp_path, monkeypatch):
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setattr(
+        cycle,
+        "run_phase",
+        _raiser(RuntimeError("SS-17 player universe is empty")),
+    )
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 1
+    assert json.loads(
+        (tmp_path / "result.json").read_text()
+    )["status"] == "failed"
+
+
+@pytest.mark.unit
+def test_pending_match_evidence_defers_the_phase_without_touching_the_runner(
+    tmp_path, monkeypatch
+):
+    """The seam between the planner's wait and the cycle's green deferral.
+
+    Drives the REAL run_phase with a planner double that reports the everyday
+    "matches not closed yet" wait: the deferred scope must stay green, and the
+    capture runner must not be invoked at all (zero paid traffic)."""
+
+    from dags.scripts.prepare_sofascore_workload import PlayerEvidenceNotReady
+
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    runner_calls = []
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=PlayerEvidenceNotReady(
+                "SS-17 match raw/manifest is incomplete; players cannot be planned"
+            ),
+        ),
+        patch(
+            "dags.scripts.run_sofascore_scraper.main",
+            side_effect=lambda *a, **k: runner_calls.append(a) or 0,
+        ),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 0
+
+    assert runner_calls == []
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "deferred"
+    assert "players cannot be planned" in result["deferral_reason"]

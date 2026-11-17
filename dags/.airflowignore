@@ -2,6 +2,8 @@
 # (deploy/sofascore/airflow.compose.yaml) здесь не регистрируем:
 # dag_sofascore_manifest_maintenance дублирует обслуживание из dag_iceberg_maintenance;
 # двойной запуск = двойной прогон. Триггеры дейли и её хвоста ушли с #1370.
+# Полоса игроков (#1374) — как и вся кампания all-mens: живёт только в контуре.
 # Изолированный контур накрывает этот файл своим deploy/sofascore/.airflowignore.
 ^dag_sofascore_manifest_maintenance\.py$
 ^dag_sofascore_schedule_maintenance\.py$
+^dag_players_sofascore_all_mens\.py$

@@ -42,3 +42,9 @@
 # v2.6 (04.11.2026, #2020; хостовая копия /root/fotmob-runtime/airflowignore-fotmob.v2 уже на v2.5): новый чужой для изолята даг — dag_transform_fotmob_silver_v2 (Silver
 # FotMob нового образца, без расписания; живёт на общем scheduler, не в изоляте). Дописано append-ом.
 ^dag_transform_fotmob_silver_v2\.py$
+
+# v2.7 (17.11.2026, #1374): новый чужой даг на master — dag_players_sofascore_all_mens
+# (полоса профилей игроков кампании SofaScore all-mens, живёт в изолированном контуре
+# SofaScore). Общий dags/.airflowignore его тоже прячет, но здесь его подменяет
+# file-bind этого файла. Дописано append-ом: file-bind живёт на иноде.
+^dag_players_sofascore_all_mens\.py$

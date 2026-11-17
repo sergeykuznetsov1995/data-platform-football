@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 
@@ -46,6 +47,12 @@ SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
 MAINT = "dag_sofascore_manifest_maintenance"
 COMPACT = "dag_sofascore_schedule_maintenance"
+PLAYERS = "dag_players_sofascore_all_mens"
+# Список ядра контура — единственный источник счётчика приёмки стенда (#1374): число
+# выводится из списка, иначе тест знал бы литерал и рассинхрон увидел бы прод, а не тест.
+CORE_DAGS = tuple(
+    re.search(r'^CORE_DAGS="([^"]+)"$', AUTO.read_text(encoding="utf-8"), re.M).group(1).split()
+)
 # Четверг 03:30 UTC — середина окна доставки; воскресенье того же формата — для сдвига.
 THU_0330 = "2026-09-03 03:30:00"
 SUN_0330 = "2026-09-06 03:30:00"
@@ -197,6 +204,11 @@ exit "$rc"
         )
         for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
             (self.source / "deploy" / "sofascore" / name).write_text("services: {}\n", encoding="utf-8")
+        # Релиз везёт файлы DAG компакции и полосы игроков (#1374): приёмка спрашивает ровно
+        # те DAG, что несёт дерево, а дедлайн — те, что уже в живом дереве.
+        (self.source / "dags").mkdir()
+        for dag in (COMPACT, PLAYERS):
+            (self.source / "dags" / f"{dag}.py").write_text("# stand probe\n", encoding="utf-8")
         for src in (AUTO, ENV_SH):
             copy = self.source / "deploy" / "sofascore" / src.name
             copy.write_text(_installed_text(src, self.stubs), encoding="utf-8")
@@ -272,7 +284,7 @@ exec /usr/bin/flock "$@"
         self.put("started", "2026-09-03T00:00:00.000000000Z")
         self.put("mounts_root", str(self.old_tree))
         self.put("mounts_sched_root", str(self.old_tree))
-        self.put("dags", "4")
+        self.put("dags", str(len(CORE_DAGS)))
         self.put("import_error", "0")
         self.put("busy", "0")
         self._flock_stub()
@@ -1979,25 +1991,30 @@ def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("has_compaction,registered,expected", [
-    (True, 6, "0"), (True, 5, "1"), (False, 4, "1"),
+@pytest.mark.parametrize("has_compaction,has_players,registered,expected", [
+    (True, True, 6, "1"), (True, True, 5, "0"), (True, False, 6, "0"),
+    (True, False, 5, "1"), (False, False, 4, "1"), (False, True, 5, "1"),
 ])
-def test_acceptance_requires_compaction_only_for_releases_containing_it(
-    tmp_path: Path, has_compaction: bool, registered: int, expected: str,
+def test_acceptance_requires_only_the_dags_the_release_carries(
+    tmp_path: Path, has_compaction: bool, has_players: bool, registered: int, expected: str,
 ) -> None:
-    """Execute the real acceptance function offline, including old-release rollback."""
+    """Приёмка спрашивает ровно те DAG, что везёт релиз (#1374): компакция — со времён
+    деревьев до неё, полоса игроков — так же. Иначе откат на дерево до полосы не сошёлся
+    бы никогда, а зелёная доставка становилась бы красной при каждом откате. Выполняется
+    настоящая acceptance_seen офлайн, включая откат на старый релиз."""
     tree = tmp_path / "release"
     (tree / "dags").mkdir(parents=True)
     if has_compaction:
         (tree / "dags" / f"{COMPACT}.py").touch()
-    text = AUTO.read_text()
+    if has_players:
+        (tree / "dags" / f"{PLAYERS}.py").touch()
+    text = AUTO.read_text(encoding="utf-8")
     core = next(line for line in text.splitlines() if line.startswith("CORE_DAGS="))
     acceptance = text.split("acceptance_seen(){", 1)[1].split("\n}", 1)[0]
     sql_log = tmp_path / "sql"
     script = core + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
-CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done)
-CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
 COMPACT=dag_sofascore_schedule_maintenance
+PLAYERS=dag_players_sofascore_all_mens
 GATEWAY_CONTAINERS="gw1 gw2 gw3"
 WATCHDOG_UNITS=watchdog
 POOLS=""
@@ -2006,7 +2023,7 @@ metadb(){
     *last_parsed_time*)
       echo "$1" > "$SQL_LOG"
       case "$1" in
-        *dag_sofascore_schedule_maintenance*) echo "$REGISTERED" ;;
+        *dag_sofascore_schedule_maintenance*|*dag_players_sofascore_all_mens*) echo "$REGISTERED" ;;
         *) echo 4 ;;
       esac ;;
     *) echo 0 ;;
@@ -2026,7 +2043,9 @@ acceptance_seen "$2" "2026-10-28T03:00:00Z"
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == expected, proc.stderr
-    assert (COMPACT in sql_log.read_text()) == has_compaction
+    sql = sql_log.read_text(encoding="utf-8")
+    assert (COMPACT in sql) == has_compaction
+    assert (PLAYERS in sql) == has_players
 
 
 # ---- #1980: доставка в любой час, защёлка на sha, запись на попытку ---------------------------
@@ -2082,22 +2101,136 @@ def test_three_failed_attempts_in_one_day_shut_the_automaton_off(stand: Stand) -
 
 @pytest.mark.unit
 def test_the_busy_check_and_the_deadline_ask_the_metadb_about_the_right_dags(stand: Stand) -> None:
-    """Занятость — актуалка, ручной ingest и обслуживание; дедлайн — по расписаниям
-    актуалки и обслуживания, только DAG не на паузе; история (@continuous) в дедлайн
-    не входит — её осушает deploy.sh; retired-триггеры #1370 нигде не спрашиваются."""
+    """Занятость — актуалка, ручной ingest, обслуживание и полоса игроков (#1374:
+    динамическая доставка не должна обрывать её активный DagRun); дедлайн — по
+    расписаниям актуалки, обслуживания и полосы (дерево боя её уже несёт), только DAG
+    не на паузе; история (@continuous) в дедлайн не входит — её осушает deploy.sh;
+    retired-триггеры #1370 нигде не спрашиваются."""
     stand.put("busy", "1")
     stand.run()
     sql = [c for c in stand.calls("docker") if "sofascore-airflow-metadb" in c]
     nxt = [c for c in sql if "next_dagrun_create_after" in c]
     busy = [c for c in sql if "FROM dag_run" in c]
     assert len(nxt) == 1 and len(busy) == 1, sql
-    for dag in (REFRESH, COMPACT, MAINT):
+    for dag in (REFRESH, COMPACT, MAINT, PLAYERS):
         assert f"'{dag}'" in nxt[0], nxt[0]
     for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
         assert f"'{retired}'" not in nxt[0], nxt[0]
     assert HIST not in nxt[0] and "'dag_ingest_sofascore'" not in nxt[0] and "NOT is_paused" in nxt[0]
-    for dag in ("dag_ingest_sofascore", REFRESH, MAINT, COMPACT):
+    for dag in ("dag_ingest_sofascore", REFRESH, MAINT, COMPACT, PLAYERS):
         assert f"'{dag}'" in busy[0], busy[0]
     for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
         assert f"'{retired}'" not in busy[0], busy[0]
     assert HIST not in busy[0]
+
+
+@pytest.mark.unit
+def test_the_acceptance_dag_count_is_derived_from_the_core_dag_list() -> None:
+    """#1374: полоса игроков — в списке ядра контура. Число приёмки выводится из списка
+    (CORE_DAGS), а не литералом рядом: рассинхрон списка и числа принял бы неполный
+    контур за полный каждую ночь."""
+    assert set(CORE_DAGS) == {
+        "dag_ingest_sofascore",
+        HIST,
+        REFRESH,
+        PLAYERS,
+        MAINT,
+        COMPACT,
+    }, CORE_DAGS
+    assert len(CORE_DAGS) == 6, CORE_DAGS
+
+
+@pytest.mark.unit
+def test_a_running_players_run_postpones_the_delivery_tick() -> None:
+    """#1374: ручной прогон полосы игроков держит контур занятым — пересоздание
+    scheduler'а оборвало бы его, а запись отката обязана об этом сказать. Истории в
+    этой проверке по-прежнему нет: её осушает шаг drain deploy.sh."""
+    text = AUTO.read_text(encoding="utf-8")
+    busy = text.split("contour_busy(){", 1)[1].split("\n}", 1)[0]
+    assert "'$PLAYERS'" in busy, busy
+    assert "'$HIST'" not in busy, busy
+    assert "дейли/актуалки/полосы игроков/обслуживания оборван" in text
+
+
+@pytest.mark.unit
+def test_the_deadline_gate_asks_the_players_lane_only_when_the_live_tree_has_it(
+    tmp_path: Path,
+) -> None:
+    """#1374: полоса игроков попадает в дедлайн, только когда её файл уже в ЖИВОМ дереве:
+    бой на релизе до полосы этого DAG не знает, и требование «активен» закрывало бы тик
+    навсегда. Дальше — как у всех: нет в метабазе, значит fail-closed."""
+    tree = tmp_path / "live"
+    (tree / "dags").mkdir(parents=True)
+    (tree / "dags" / f"{PLAYERS}.py").touch()
+    text = AUTO.read_text(encoding="utf-8")
+    nxt_line = next(line for line in text.splitlines() if line.startswith("NEXT_RUN_DAGS="))
+    set_deadline = text.split("set_deadline(){", 1)[1].split("\n}", 1)[0]
+    sql_log = tmp_path / "sql"
+    script = (
+        nxt_line + "\n"
+        "PLAYERS=dag_players_sofascore_all_mens\n"
+        f"LIVE_ROOT={tree}\n"
+        "DEADLINE_MAX=9000\n"
+        "ROLLBACK_RESERVE=2700\n"
+        'metadb(){ printf \'%s\' "$1" > "$SQL_LOG"; echo 0; }\n'
+        "set_deadline(){"
+        + set_deadline +
+        "\n}\n"
+        "set_deadline\n"
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script], env={**os.environ, "SQL_LOG": str(sql_log)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    sql = sql_log.read_text(encoding="utf-8")
+    assert f"'{PLAYERS}'" in sql, sql
+    assert "count(*) FILTER (WHERE is_active) < 4" in sql, sql
+
+    (tree / "dags" / f"{PLAYERS}.py").unlink()
+    sql_log.unlink()
+    proc = subprocess.run(
+        ["bash", "-c", script], env={**os.environ, "SQL_LOG": str(sql_log)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    sql = sql_log.read_text(encoding="utf-8")
+    assert f"'{PLAYERS}'" not in sql, sql
+    assert "count(*) FILTER (WHERE is_active) < 3" in sql, sql
+
+
+@pytest.mark.unit
+def test_a_rollback_to_a_pre_players_tree_does_not_require_the_players_dag(stand: Stand) -> None:
+    """#1374: цель отката — дерево до полосы игроков. Приёмка отката спрашивает только DAG
+    этого дерева (пять из шести), откат подтверждается — иначе первый релиз с полосой
+    прожил бы одну ночь и умирал при первом же откате."""
+    _git(stand.old_tree, "rm", "-q", f"dags/{PLAYERS}.py")
+    _git(stand.old_tree, "commit", "-q", "-m", "drop players lane")
+    stand.put("dags", "5")
+    stand.put("deploy_rc", "5")
+    stand.put("deploy_half")
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    stand.watchdog_pids()
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr + stand.log_text()
+    assert "ОТКАТ ПОДТВЕРЖДЁН" in stand.log_text(), stand.log_text()
+    assert not (stand.state / "sofascore-inflight").exists()
+    assert "⛔" in stand.pending()
+
+
+@pytest.mark.unit
+def test_the_next_run_gate_ignores_the_players_lane_on_a_pre_players_fight(stand: Stand) -> None:
+    """#1374: бой на дереве до полосы — дедлайн про players DAG не спрашивает (иначе тик
+    не состоялся бы никогда), а ручной прогон полосы в занятости всё равно виден."""
+    _git(stand.old_tree, "rm", "-q", f"dags/{PLAYERS}.py")
+    _git(stand.old_tree, "commit", "-q", "-m", "drop players lane")
+    stand.put("busy", "1")
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stderr
+    sql = [c for c in stand.calls("docker") if "sofascore-airflow-metadb" in c]
+    nxt = [c for c in sql if "next_dagrun_create_after" in c]
+    busy = [c for c in sql if "FROM dag_run" in c]
+    assert len(nxt) == 1 and len(busy) == 1, sql
+    assert f"'{PLAYERS}'" not in nxt[0], nxt[0]
+    assert f"'{PLAYERS}'" in busy[0], busy[0]

@@ -12,8 +12,10 @@ from dags.utils.sofascore_all_mens_state import (
     clear_failed,
     current_season_targets,
     env_int,
+    is_quarantined_record,
     mark_failed,
     plan_historical_batch,
+    plan_players_batch,
     plan_refresh_batch,
     read_failures,
 )
@@ -1693,3 +1695,418 @@ def test_native_alias_ties_do_not_depend_on_pending_query_order(deadline, open_c
                queue_mode='deadline',scope_budget_s=7200)[0]['SOFASCORE_SOURCE_SEASON_ID']
                for pending in (rows,list(reversed(rows)))]
     assert choices == ['1726','1726']
+
+
+# --- #1374: the players lane plans closed history scopes for profiles -------
+
+
+def _closed_history_keys():
+    """Every scope of the fixture snapshot, as the history lane records them."""
+
+    return {
+        campaign_scope_key("campaign-test", tournament_id, season_id)
+        for tournament_id, season_id in (
+            (17, 1725), (17, 1724), (8, 825), (8, 824)
+        )
+    }
+
+
+def _players_keys(snapshot, **kwargs):
+    kwargs.setdefault("completed", _closed_history_keys())
+    kwargs.setdefault("batch_size", 10)
+    kwargs.setdefault("denominator", _denominator(t17="core", t8="core"))
+    kwargs.setdefault("release", "aaaaaaaa")
+    return [
+        item["SOFASCORE_SCOPE_KEY"] for item in plan_players_batch(snapshot, **kwargs)
+    ]
+
+
+def _reidentified(snapshot):
+    snapshot.pop("snapshot_id", None)
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    return snapshot
+
+
+@pytest.mark.unit
+def test_players_planner_walks_closed_scopes_newest_season_first():
+    snapshot = _snapshot()
+    task_env = {"SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-players:8080"}
+
+    planned = plan_players_batch(
+        snapshot,
+        completed=_closed_history_keys(),
+        batch_size=10,
+        denominator=_denominator(t17="core", t8="core"),
+        task_env=task_env,
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825",
+        "campaign-test:17:1725",
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+    ]
+    assert planned[0]["SOFASCORE_CAMPAIGN_ACTION"] == "players"
+    assert planned[0]["SOFASCORE_TOURNAMENT_ID"] == "8"
+    assert planned[0]["SOFASCORE_SOURCE_SEASON_ID"] == "825"
+    assert planned[0]["SOFASCORE_CANONICAL_SEASON"] == "2526"
+    assert planned[0]["SOFASCORE_SCOPE_RUN_ID"] == "manual--8-825"
+    assert planned[0]["SOFASCORE_PROXY_CONTROL_URL"] == (
+        "http://sofascore-gw-players:8080"
+    )
+    assert planned[0]["SOFASCORE_SCOPE_RESULT_PATH"].startswith(
+        "/opt/airflow/runtime/sofascore/all-men/players-results/"
+    )
+    # One immutable plan per run_id on the gateway ledger.
+    assert len({item["SOFASCORE_SCOPE_RUN_ID"] for item in planned}) == 4
+    # Deterministic: the same frozen state plans the same batch twice.
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in plan_players_batch(
+        snapshot,
+        completed=_closed_history_keys(),
+        batch_size=10,
+        denominator=_denominator(t17="core", t8="core"),
+    )] == [item["SOFASCORE_SCOPE_KEY"] for item in planned]
+
+
+@pytest.mark.unit
+def test_players_planner_ranks_core_before_disputed_and_skips_priority_zero():
+    # Tournament 8 is DISPUTED and has the NEWER season: core still goes first,
+    # because the queue_priority (#1353) is not a tie-breaker, it is the tier.
+    snapshot = _snapshot(second_years=(2025,))
+    snapshot["tournaments"][0]["seasons"] = [_season(17, 2024, "ready")]
+    _reidentified(snapshot)
+    completed = {
+        campaign_scope_key("campaign-test", 17, 1724),
+        campaign_scope_key("campaign-test", 8, 825),
+    }
+
+    planned = _players_keys(
+        snapshot,
+        completed=completed,
+        denominator=_denominator(t17="core", t8="amateur"),
+    )
+    assert planned == ["campaign-test:17:1724", "campaign-test:8:825"]
+
+    # A priority-0 tournament (esoccer, student) is never planned at all.
+    planned = _players_keys(
+        snapshot,
+        completed=completed,
+        denominator=_denominator(t17="core", t8="esoccer"),
+    )
+    assert planned == ["campaign-test:17:1724"]
+
+
+@pytest.mark.unit
+def test_players_planner_puts_an_undated_season_behind_every_dated_one():
+    snapshot = _snapshot()
+    del snapshot["tournaments"][1]["seasons"][0]["start_year"]
+    _reidentified(snapshot)
+
+    assert _players_keys(snapshot) == [
+        "campaign-test:17:1725",
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+        "campaign-test:8:825",
+    ]
+
+
+@pytest.mark.unit
+def test_players_planner_never_replans_a_scope_it_already_captured():
+    assert _players_keys(
+        _snapshot(),
+        players_completed={"campaign-test:8:825", "campaign-test:17:1725"},
+    ) == [
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+    ]
+
+
+@pytest.mark.unit
+def test_players_planner_has_no_tournament_exclusion_knob():
+    """The registry leagues are excluded by the DENOMINATOR, not by a knob.
+
+    ``plan_historical_batch`` never had ``exclude_tournament_ids``; after the
+    daily retirement such a knob would silently drop required core coverage.
+    """
+
+    with pytest.raises(TypeError):
+        plan_players_batch(
+            _snapshot(),
+            completed=_closed_history_keys(),
+            batch_size=10,
+            exclude_tournament_ids=(17,),
+        )
+
+
+@pytest.mark.unit
+def test_players_planner_parks_a_repeatedly_failing_scope_until_it_cools():
+    from datetime import datetime, timedelta, timezone
+
+    moment = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+    failures = {
+        "campaign-test:8:825": {
+            "count": 3,
+            "last_run_id": "manual-1",
+            "last_at": (moment - timedelta(hours=2)).isoformat(),
+        }
+    }
+
+    parked = _players_keys(
+        _snapshot(), failures=failures, max_scope_attempts=3, moment=moment
+    )
+    assert "campaign-test:8:825" not in parked
+
+    cooled = _players_keys(
+        _snapshot(),
+        failures=failures,
+        max_scope_attempts=3,
+        moment=moment + timedelta(hours=23),
+    )
+    assert cooled[0] == "campaign-test:8:825"
+
+
+@pytest.mark.unit
+def test_players_planner_quarantines_a_deterministically_dead_scope(tmp_path):
+    """3 free identical failures quarantine like in the history lane (#1351):
+    no cooldown on the same release, one attempt on a new one, and the
+    tournament's other seasons are planned past the dead one."""
+
+    from datetime import datetime, timedelta, timezone
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+    for run_id in ("run-1", "run-2", "run-3"):
+        _fail(failures_path, campaign_id, head, run_id,
+              reason=SCHEMA_REASON, source_requests=0)
+
+    assert _players_keys(
+        snapshot,
+        failures=read_failures(failures_path, campaign_id=campaign_id),
+        max_scope_attempts=3,
+    ) == [
+        "campaign-test:17:1725",
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+    ]
+    # Terminal, unlike a park: waiting does not buy the scope a retry.
+    later = datetime.now(timezone.utc) + timedelta(hours=72)
+    assert head not in _players_keys(
+        snapshot,
+        failures=read_failures(failures_path, campaign_id=campaign_id),
+        max_scope_attempts=3,
+        moment=later,
+    )
+    # A new release may carry the parser fix: one free attempt.
+    assert _players_keys(
+        snapshot,
+        failures=read_failures(failures_path, campaign_id=campaign_id),
+        max_scope_attempts=3,
+        release="bbbbbbbb",
+    )[0] == head
+
+
+@pytest.mark.unit
+def test_players_planner_quarantine_follows_the_season_identity_for_mismatches(
+    tmp_path,
+):
+    from dags.utils.sofascore_all_mens_state import season_alignment_identity
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+    identity = season_alignment_identity(8, snapshot["tournaments"][1]["seasons"][0])
+    for run_id in ("run-1", "run-2", "run-3"):
+        mark_failed(
+            failures_path,
+            campaign_id=campaign_id,
+            scope_key=head,
+            run_id=run_id,
+            reason="players: season_mismatch: 4 rows",
+            source_requests=0,
+            release="aaaaaaaa",
+            season_identity=identity,
+        )
+    failures = read_failures(failures_path, campaign_id=campaign_id)
+
+    # Same mapping/contract inputs: quarantined, on ANY release.
+    assert head not in _players_keys(
+        snapshot, failures=failures, max_scope_attempts=3, release="bbbbbbbb"
+    )
+    # Repaired inputs grant exactly one attempt past the quarantine.
+    failures[head]["season_alignment_identity"] = "f" * 64
+    assert _players_keys(
+        snapshot, failures=failures, max_scope_attempts=3, release="bbbbbbbb"
+    )[0] == head
+
+
+@pytest.mark.unit
+def test_players_planner_keeps_its_own_failure_memory(tmp_path):
+    """A scope the HISTORY lane parked must not park the players lane: each
+    lane rotates on its own failures.json, or one bad season would freeze
+    both queues forever."""
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    head = campaign_scope_key(campaign_id, 8, 825)
+    history_failures = tmp_path / "history-failures.json"
+    for run_id in ("run-1", "run-2", "run-3"):
+        _fail(history_failures, campaign_id, head, run_id,
+              reason=SCHEMA_REASON, source_requests=0)
+
+    players_failures = read_failures(
+        tmp_path / "players-failures.json", campaign_id=campaign_id
+    )
+    assert players_failures == {}
+    assert _players_keys(
+        snapshot, failures=players_failures, max_scope_attempts=3
+    )[0] == head
+
+
+@pytest.mark.unit
+def test_players_planner_skips_a_key_the_snapshot_no_longer_knows(caplog):
+    """A rotated-out tournament must not take the whole phase down with it."""
+
+    completed = _closed_history_keys() | {
+        "campaign-test:999:99925", "campaign-other:8:825", "nonsense"
+    }
+
+    with caplog.at_level("WARNING"):
+        planned = _players_keys(_snapshot(), completed=completed)
+
+    assert len(planned) == 4
+    assert "campaign-test:999:99925" in caplog.text
+    assert "nonsense" in caplog.text
+
+
+@pytest.mark.unit
+def test_players_planner_skips_a_malformed_season_not_its_valid_siblings(caplog):
+    """Regression (#1374 hardening): a snapshot season whose canonical label
+    went missing used to reach ``_scope_task_env`` and raise ``KeyError``,
+    aborting every otherwise valid scope of the batch; the refresh lane's
+    validators skip it with a warning instead."""
+
+    snapshot = _snapshot()
+    del snapshot["tournaments"][1]["seasons"][0]["canonical_season"]
+    _reidentified(snapshot)
+
+    with caplog.at_level("WARNING"):
+        planned = _players_keys(snapshot)
+
+    assert planned == [
+        "campaign-test:17:1725",
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+    ]
+    assert "invalid refresh snapshot season for tournament 8" in caplog.text
+
+
+@pytest.mark.unit
+def test_players_planner_bounds_the_batch_and_refuses_a_bad_one():
+    assert len(_players_keys(_snapshot(), batch_size=2)) == 2
+
+    with pytest.raises(CampaignPlanningError):
+        _players_keys(_snapshot(), batch_size=0)
+
+
+# --- #1374 hardening: deferred evidence waits, it is not an incident --------
+
+
+DEFERRED_REASON = "PlayerEvidenceNotReady: matches pending"
+
+
+@pytest.mark.unit
+def test_mark_failed_by_default_still_grows_the_no_traffic_streak(tmp_path):
+    """The default is unchanged for every existing caller: free identical
+    outcomes keep building the streak that quarantines a deterministic dead
+    end (#1351)."""
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    for run_id in ("run-1", "run-2", "run-3"):
+        _fail(failures_path, campaign_id, head, run_id,
+              reason=DEFERRED_REASON, source_requests=0)
+
+    record = read_failures(failures_path, campaign_id=campaign_id)[head]
+    assert record["count"] == 3
+    assert record["streak_no_traffic"] == 3
+    assert is_quarantined_record(record, 3)
+
+
+@pytest.mark.unit
+def test_three_deferred_outcomes_with_the_opt_out_are_never_quarantined(tmp_path):
+    """Three deferred outcomes at zero source requests are an everyday
+    evidence wait: the opt-out keeps the accurate zero-source report, the
+    reason and the release, but no streak, so the scope is not suppressed
+    until a new release."""
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    for run_id in ("run-1", "run-2", "run-3"):
+        mark_failed(
+            failures_path,
+            campaign_id=campaign_id,
+            scope_key=head,
+            run_id=run_id,
+            reason=DEFERRED_REASON,
+            source_requests=0,
+            release="aaaaaaaa",
+            quarantine_on_no_traffic=False,
+        )
+
+    record = read_failures(failures_path, campaign_id=campaign_id)[head]
+    assert record["count"] == 3
+    assert record["streak_no_traffic"] == 0
+    assert record["last_reason"] == DEFERRED_REASON
+    assert record["last_release"] == "aaaaaaaa"
+    assert not is_quarantined_record(record, 3)
+
+
+@pytest.mark.unit
+def test_deferred_evidence_still_parks_and_returns_after_the_cooldown(tmp_path):
+    """The opt-out changes the lane, not the cycle: a scope that deferred
+    ``max_scope_attempts`` times is parked for the cooldown window — on the
+    SAME release, unlike a quarantine — and comes back on its own after it."""
+
+    from datetime import datetime, timedelta, timezone
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    for run_id in ("run-1", "run-2", "run-3"):
+        mark_failed(
+            failures_path,
+            campaign_id=campaign_id,
+            scope_key=head,
+            run_id=run_id,
+            reason=DEFERRED_REASON,
+            source_requests=0,
+            release="aaaaaaaa",
+            quarantine_on_no_traffic=False,
+        )
+    failures = read_failures(failures_path, campaign_id=campaign_id)
+    moment = datetime.now(timezone.utc)
+
+    assert head not in _players_keys(
+        snapshot, failures=failures, max_scope_attempts=3, moment=moment
+    )
+    cooled = _players_keys(
+        snapshot,
+        failures=failures,
+        max_scope_attempts=3,
+        moment=moment + timedelta(hours=25),
+        release="aaaaaaaa",
+    )
+    assert cooled[0] == head

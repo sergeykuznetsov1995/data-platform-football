@@ -178,8 +178,9 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     assert env["SOFASCORE_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
     assert env["SOFASCORE_ALL_MENS_STATE"] == "/opt/airflow/runtime/sofascore/all-men/state.json"
     assert env["SOFASCORE_REFRESH_BATCH_SIZE"] == "${SOFASCORE_REFRESH_BATCH_SIZE:-128}"
-    # Полосы (#1244, #1360): история и актуалка ходят к своим шлюзам и держат свои
-    # пулы; дейли остаётся на дефолтах (sofascore_proxy_filter/ingest_scraper_pool).
+    # Полосы (#1244, #1374): история и игроки ходят к своим шлюзам и держат
+    # свои пулы; актуалка после #1374 снова с дейли на дефолтах
+    # (sofascore_proxy_filter/ingest_scraper_pool).
     assert env["SOFASCORE_HISTORY_POOL"] == "sofascore_history_pool"
     assert env["SOFASCORE_HISTORY_PROXY_CONTROL_URL"] == "http://sofascore_gw_history:8899"
     # Ручки кампании (#1248 ступень 1): DAG читает их ТОЛЬКО из окружения планировщика,
@@ -190,12 +191,15 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
         env["SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE"]
         == "${SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE:-60}"
     )
-    # #1360: актуалке отдан третий шлюз и пул (бывшая полоса игроков #1244, имена
-    # сохранены); ключей PLAYERS никто не читает — в рецепте их нет.
-    assert env["SOFASCORE_REFRESH_POOL"] == "sofascore_players_pool"
-    assert env["SOFASCORE_REFRESH_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
-    assert "SOFASCORE_PLAYERS_POOL" not in env
-    assert "SOFASCORE_PLAYERS_PROXY_CONTROL_URL" not in env
+    assert env["SOFASCORE_REFRESH_POOL"] == "ingest_scraper_pool"
+    assert env["SOFASCORE_REFRESH_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
+    # #1374: полоса игроков вернулась (третий шлюз и пул, имена с #1244
+    # сохранены); состояние и результаты — в том же runtime-каталоге all-men.
+    assert env["SOFASCORE_PLAYERS_POOL"] == "sofascore_players_pool"
+    assert env["SOFASCORE_PLAYERS_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
+    assert env["SOFASCORE_PLAYERS_STATE"] == "/opt/airflow/runtime/sofascore/all-men/players-state.json"
+    assert env["SOFASCORE_PLAYERS_RESULT_DIR"] == "/opt/airflow/runtime/sofascore/all-men/players-results"
+    assert env["SOFASCORE_PLAYERS_BATCH_SIZE"] == "${SOFASCORE_PLAYERS_BATCH_SIZE:-3}"
     # deploy.sh не пересоздаёт airflow-init, поэтому пулы ставятся и здесь (первый
     # подъём контура), и шагом pools самого deploy.sh (ротация).
     init = "\n".join(cfg["services"]["airflow-init"]["command"])
@@ -286,7 +290,7 @@ def test_mini_dags_are_repository_files_hidden_only_from_the_shared_scheduler() 
     for name in MINI_DAGS:
         assert any(re.match(pattern, name) for pattern in shared), f"shared scheduler must ignore {name}"
         assert not any(re.match(pattern, name) for pattern in contour), f"contour must load {name}"
-    for name in ("dag_ingest_sofascore.py", "dag_backfill_sofascore_all_mens.py", "dag_refresh_sofascore_all_mens.py"):
+    for name in ("dag_ingest_sofascore.py", "dag_backfill_sofascore_all_mens.py", "dag_refresh_sofascore_all_mens.py", "dag_players_sofascore_all_mens.py"):
         assert not any(re.match(pattern, name) for pattern in contour), name
     for foreign in ("dag_backup_whoscored_storage.py", "dag_ingest_fbref.py", "dag_fbref_history_controller.py", "dag_sofascore_pipeline.py", "dag_iceberg_maintenance.py"):
         assert any(re.match(pattern, foreign) for pattern in contour), foreign
