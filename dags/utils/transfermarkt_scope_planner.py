@@ -831,6 +831,12 @@ def plan_transfermarkt_scopes(
     current_time = _as_utc(now or datetime.now(timezone.utc))
     assert current_time is not None
 
+    registry_denominator = False
+    if denominator is None and selection_mode == 'current_only':
+        from dags.utils.transfermarkt_denominator_registry import denominator_source
+        registry_denominator = denominator_source() == 'registry'
+        if registry_denominator:
+            registry_rows = tuple(registry_rows or ())
     competition_map, edition_map, last_success, career_pending, quarantined = (
         _load_registry(
             competitions=competitions,
@@ -839,7 +845,11 @@ def plan_transfermarkt_scopes(
         )
     )
     if denominator is None and selection_mode == 'current_only':
-        denominator = load_denominator()
+        if registry_denominator:
+            from dags.utils.transfermarkt_denominator_registry import build_registry_denominator
+            denominator = build_registry_denominator(registry_rows or ()).denominator
+        else:
+            denominator = load_denominator()
     selected = _select_candidates(
         params or {},
         competitions=competition_map,
