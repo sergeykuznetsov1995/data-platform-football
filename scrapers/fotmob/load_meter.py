@@ -920,10 +920,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command in {"poll", "discover"}:
+            # Env contract first: no filesystem access before it. Path.exists()
+            # raises PermissionError on unreadable parents (EACCES) on Python
+            # <=3.11, which would mask the missing-password diagnostics.
+            _password()
             qualification = None
             if args.command == "poll":
                 path = args.qualification or args.root / "qualification.json"
-                qualification = _load_json(path) if path.exists() else None
+                try:
+                    qualification = _load_json(path) if path.exists() else None
+                except OSError:
+                    qualification = None
             result = poll(args.root, discover_only=args.command == "discover", qualification=qualification, poll_interval_s=getattr(args, "poll_interval_s", 60))
             print(json_text(result), end="")
             return 1 if result.get("status") == "error" else 0

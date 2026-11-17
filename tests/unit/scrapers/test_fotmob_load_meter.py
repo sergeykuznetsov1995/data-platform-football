@@ -468,6 +468,23 @@ def test_poll_and_discover_require_password_name_only(command, monkeypatch, caps
     assert not output.out
 
 
+def test_poll_password_contract_survives_unreadable_paths(monkeypatch, capsys):
+    # CI reproduces this without stubs: Path.exists() raises PermissionError
+    # (EACCES) on unreadable parents on Python <=3.11; the env diagnostics must
+    # still win over any filesystem failure.
+    from pathlib import Path as _Path
+
+    def raising_exists(self):
+        raise PermissionError("EACCES: unreadable parent")
+
+    monkeypatch.delenv(meter.PASSWORD_ENV, raising=False)
+    monkeypatch.setattr(_Path, "exists", raising_exists)
+    assert meter.main(["poll"]) == 1
+    output = capsys.readouterr()
+    assert meter.PASSWORD_ENV in output.err
+    assert not output.out
+
+
 def test_qualify_reports_all_read_checks_when_environment_is_missing(monkeypatch, capsys):
     monkeypatch.delenv(meter.PASSWORD_ENV, raising=False)
     assert meter.main(["qualify"]) == 2
