@@ -15,6 +15,10 @@ pytestmark = pytest.mark.unit
 NOW = datetime(2026, 10, 8, tzinfo=timezone.utc)
 
 
+def _successful_bronze_dq():
+    return {"status": "success", "checks": 1, "violations": [], "errors": []}
+
+
 def snapshot(years=(2026, 2025, 2024, 2023), ids=(8, 17)):
     value = {"campaign_id": "history-test", "tournaments": [
         {"unique_tournament_id": tid, "capture_key": f"SS-{tid}", "metadata_status": "ready",
@@ -511,6 +515,7 @@ def test_slots_fill_next_scope_while_sibling_remains_busy(tmp_path):
         destination = __import__('pathlib').Path(env['SOFASCORE_SCOPE_RESULT_PATH'])
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps({'status':'success', 'campaign_id':snap['campaign_id'],
+            'bronze_dq':_successful_bronze_dq(),
             'tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
             'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),
             'run_id':env['SOFASCORE_SCOPE_RUN_ID']}))
@@ -601,6 +606,7 @@ def test_failed_scope_retries_same_identity_and_does_not_poison_next(tmp_path):
         destination.parent.mkdir(parents=True,exist_ok=True)
         failed=env['SOFASCORE_TOURNAMENT_ID']=='8'
         destination.write_text(json.dumps({'status':'failed' if failed else 'success',
+            'bronze_dq':_successful_bronze_dq(),
             'campaign_id':'history-test','tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
             'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),
             'run_id':env['SOFASCORE_SCOPE_RUN_ID'],'phases':[{'errors':['schema_error'], 'source_request_count':0}]}))
@@ -719,6 +725,7 @@ def test_restarted_slot_accounts_saved_success_after_last_attempt_without_source
         controller.record_scope(path,campaign_id='history-test',run_id='run1',slot=0,index=index,started_attempt=True)
     dest=Path(env['SOFASCORE_SCOPE_RESULT_PATH']);dest.parent.mkdir(parents=True,exist_ok=True)
     dest.write_text(json.dumps({'status':'success','campaign_id':'history-test',
+        'bronze_dq':_successful_bronze_dq(),
         'tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
         'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),'run_id':env['SOFASCORE_SCOPE_RUN_ID']}))
     assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
@@ -738,6 +745,7 @@ def test_history_waiting_is_accounted_once_without_retry_failure_or_completion(t
                      'canonical_season': env['SOFASCORE_CANONICAL_SEASON'],
                      'finished_matches': 0, 'schedule_events': 153}
         result = {'status': 'waiting', 'waiting_reason': 'season_has_no_finished_matches',
+                  'bronze_dq': _successful_bronze_dq(),
                   'campaign_id': snap['campaign_id'], 'tournament_id': inventory['tournament_id'],
                   'source_season_id': inventory['source_season_id'],
                   'canonical_season': inventory['canonical_season'], 'run_id': env['SOFASCORE_SCOPE_RUN_ID'],
@@ -792,6 +800,7 @@ def continuation_report(tid=8, sid=826, campaign='history-test', run_id='scope')
                    raw_manifest_committed=True, chunk_unit=unit,
                    continuation={'last': 49, 'next': None})
     return dict(status='partial', campaign_id=campaign, tournament_id=tid, source_season_id=sid,
+                bronze_dq=_successful_bronze_dq(),
                 scope_digest=hashlib.sha256(f'{tid}:{sid}'.encode()).hexdigest(),
                 run_id=run_id, errors=[], phases=[dict(phase='season', status='partial',
                 exit_code=0, errors=[], source_request_count=49, partial=partial)])

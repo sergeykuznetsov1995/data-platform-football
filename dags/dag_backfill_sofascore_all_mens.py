@@ -17,9 +17,11 @@ from airflow.sensors.python import PythonSensor
 
 from scrapers.sofascore.workload_plan import load_static_workload_policy
 from scrapers.sofascore import history_controller, history_inventory
+from scrapers.sofascore.history_worker import bronze_dq_failure_reason
 
 from utils.default_args import DEFAULT_ARGS
 from utils import sofascore_all_mens_state as state
+from utils.sofascore_dq import summarize_bronze_dq_reports
 
 
 DAG_ID = "dag_backfill_sofascore_all_mens"
@@ -155,6 +157,22 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     return planned
 
 
+def _summarize_bronze_dq(reports):
+    return summarize_bronze_dq_reports(reports)
+
+
+def _read_scope_dq_report(environment):
+    path = environment.get("SOFASCORE_SCOPE_RESULT_PATH")
+    if not path:
+        return None
+    try:
+        result = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    report = result.get("bronze_dq") if isinstance(result, dict) else None
+    return report if isinstance(report, dict) else None
+
+
 def _validate_historical_scope(**environment: str) -> dict[str, Any]:
     if "SOFASCORE_HISTORY_SLOT" in environment:
         run = history_controller.read_summary(
@@ -213,6 +231,11 @@ def _validate_historical_scope(**environment: str) -> dict[str, Any]:
                 or not waiting_for_finished_matches(result, scope)):
             raise AirflowException("unverified history waiting outcome")
         return {"status": "waiting", "scope_key": environment["SOFASCORE_SCOPE_KEY"]}
+    dq_reason = bronze_dq_failure_reason(result.get("bronze_dq"))
+    if dq_reason is not None:
+        raise AirflowException(
+            "scope result carries no successful Bronze DQ report: " + dq_reason
+        )
     if environment.get("SOFASCORE_HISTORY_GROUP") != "july":
         state.mark_completed(
             STATE_PATH, campaign_id=campaign_id,
@@ -297,8 +320,14 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
     target = datetime.now(timezone.utc) + (
         ACTIVE_COOLDOWN if did_work else IDLE_COOLDOWN
     )
+    bronze_dq = _summarize_bronze_dq(
+        [report for report in map(_read_scope_dq_report, planned) if report is not None]
+    )
     context["ti"].xcom_push(key="next_poll_at", value=target.isoformat())
-    return {"did_work": did_work, "next_poll_at": target.isoformat()}
+    context["ti"].xcom_push(key="bronze_dq", value=bronze_dq)
+    return {
+        "did_work": did_work, "next_poll_at": target.isoformat(), "bronze_dq": bronze_dq,
+    }
 
 
 def _finalize_slots(reservation, snapshot, context, release):
@@ -330,11 +359,21 @@ def _finalize_slots(reservation, snapshot, context, release):
         history_controller.record_scope(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id,
                                         slot=item["slot"], index=int(index), accounted=True)
     reservation = history_controller.read_summary(CONTROLLER_PATH, campaign)["run"]
+    reports = []
+    for item in reservation["items"].values():
+        outcome = item.get("outcome")
+        report = outcome.get("bronze_dq") if isinstance(outcome, dict) else None
+        if not isinstance(report, dict):
+            report = _read_scope_dq_report(reservation["plan"][item["plan_index"]])
+        if isinstance(report, dict):
+            reports.append(report)
+    bronze_dq = _summarize_bronze_dq(reports)
     receipt = {"history_slots_receipt": True, "dag_run_id": run_id, "campaign_id": campaign,
                "finalized": True, "claimed_count": reservation["cursor"],
                "plan_digest": reservation["plan_digest"], "plan_length": len(reservation["plan"]),
                "items": [dict(item, index=int(index), environment=reservation["plan"][item["plan_index"]])
-                                              for index, item in reservation["items"].items()]}
+                                              for index, item in reservation["items"].items()],
+               "bronze_dq": bronze_dq}
     destination = Path(RESULT_DIR) / ("history-slots-" + hashlib.sha256(run_id.encode()).hexdigest()[:20] + ".json")
     receipt["receipt_digest"] = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
     state._write_document_atomically(destination, receipt)
@@ -346,7 +385,9 @@ def _finalize_slots(reservation, snapshot, context, release):
     history_controller.finalize(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id)
     target = datetime.now(timezone.utc) + (ACTIVE_COOLDOWN if reservation["items"] else IDLE_COOLDOWN)
     context["ti"].xcom_push(key="next_poll_at", value=target.isoformat())
-    return {"did_work": bool(reservation["items"]), "next_poll_at": target.isoformat(), "receipt": str(destination)}
+    context["ti"].xcom_push(key="bronze_dq", value=bronze_dq)
+    return {"did_work": bool(reservation["items"]), "next_poll_at": target.isoformat(),
+            "receipt": str(destination), "bronze_dq": bronze_dq}
 
 
 def _poll_ready(**context: Any) -> bool:
@@ -366,17 +407,30 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
     dag_run = context.get("dag_run")
     if dag_run is None:
         raise AirflowException("campaign watcher has no DagRun")
+    summary = None
+    ti = context.get("ti")
+    if ti is not None:
+        summary = ti.xcom_pull(task_ids="finalize_historical_run", key="bronze_dq")
+        if summary is None:
+            finalized = ti.xcom_pull(task_ids="finalize_historical_run")
+            if isinstance(finalized, dict):
+                summary = finalized.get("bronze_dq")
     failures = []
     for task_instance in dag_run.get_task_instances():
         if task_instance.task_id not in HISTORY_TASK_IDS:
             continue
         if _task_state(task_instance) in {"failed", "upstream_failed"}:
             failures.append(task_instance.task_id)
+    if summary is not None:
+        print("bronze_dq " + json.dumps(summary, sort_keys=True, default=str))
     if failures:
         raise AirflowException(
             "SofaScore history attempt failed: " + ", ".join(sorted(failures))
         )
-    return {"status": "success"}
+    outcome: dict[str, Any] = {"status": "success"}
+    if summary is not None:
+        outcome["bronze_dq"] = summary
+    return outcome
 
 
 RUN_SCOPE_COMMAND = """

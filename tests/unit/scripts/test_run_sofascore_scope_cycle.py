@@ -16,6 +16,23 @@ def _offline_phase_manifest(monkeypatch):
                         lambda _backend: InMemoryManifestStore())
 
 
+@pytest.fixture(autouse=True)
+def _offline_bronze_dq(monkeypatch):
+    def run_dq(scope, phases, *, require_complete, **kwargs):
+        return {
+            "status": "success",
+            "league": scope["capture_key"],
+            "season": scope["canonical_season"],
+            "source_tournament_id": scope.get("tournament_id"),
+            "source_season_id": scope.get("source_season_id"),
+            "checks": 1,
+            "violations": [],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(cycle, "run_scope_bronze_dq", run_dq, raising=False)
+
+
 @pytest.mark.unit
 def test_cycle_sets_exact_overlays_before_running_phases(tmp_path, monkeypatch):
     scope = {
@@ -748,7 +765,8 @@ def test_cycle_retains_season_continuation_and_never_starts_matches(tmp_path, mo
     entities = []
     def run_capture(argv, **kwargs):
         entities.append(argv[argv.index('--entity') + 1])
-        dest = Path(argv[argv.index('--output') + 1]); dest.parent.mkdir(parents=True, exist_ok=True)
+        dest = Path(argv[argv.index('--output') + 1])
+        dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps(dict(errors=[], partial=partial, traffic={'paid_proxy_bytes': 4321})))
         return 0
     with (patch('dags.scripts.prepare_sofascore_workload.prepare_workload_plan', side_effect=_plan_double),

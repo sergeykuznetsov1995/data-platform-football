@@ -33,6 +33,7 @@ from airflow.operators.python import PythonOperator
 
 from scrapers.sofascore.match_deadline import match_deadline_sql
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.sofascore_dq import summarize_bronze_dq_reports
 from utils import sofascore_all_mens_state as state
 
 
@@ -417,8 +418,23 @@ def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _bronze_dq_report_passed(report: Any) -> bool:
+    """#1371: a finished scope must ship a structurally clean Bronze DQ report."""
+
+    checks = report.get("checks") if isinstance(report, dict) else None
+    return (
+        isinstance(report, dict)
+        and report.get("status") == "success"
+        and isinstance(checks, int)
+        and not isinstance(checks, bool)
+        and checks > 0
+        and not report.get("violations")
+        and not report.get("errors")
+    )
+
+
 def _validate_refresh_scope(
-    env: dict[str, str], execution_timeout: Any = None
+    env: dict[str, str], execution_timeout: Any = None, ti: Any = None
 ) -> dict[str, Any]:
     environment = env
     result_path = Path(environment["SOFASCORE_SCOPE_RESULT_PATH"])
@@ -427,6 +443,14 @@ def _validate_refresh_scope(
     except (OSError, json.JSONDecodeError) as exc:
         raise AirflowException(f"scope result is unreadable: {exc}") from exc
     status = result.get("status")
+    dq_report = result.get("bronze_dq")
+
+    def _retain_bronze_dq() -> None:
+        # #1371: a red validation still leaves its DQ evidence behind for the
+        # window summary instead of dying with the task.
+        if ti is not None and isinstance(dq_report, dict):
+            ti.xcom_push(key="bronze_dq", value=dq_report)
+
     # #1751: the scope command lets a transport-only loss through on its last
     # try; it is not refreshed, the next run re-plans it.
     if status == "failed" and _transient_scope_failure(environment):
@@ -435,8 +459,10 @@ def _validate_refresh_scope(
     # #1358: ``partial`` is a scope that stopped at its own time/byte/match
     # ceiling with the rest left for the next run — a finished task, not red.
     if status not in {"success", "partial"}:
+        _retain_bronze_dq()
         raise AirflowException("scope cycle did not finish successfully")
     if environment.get("SOFASCORE_CAMPAIGN_ACTION") != "refresh":
+        _retain_bronze_dq()
         raise AirflowException("unknown SofaScore campaign action")
     campaign_id, tournament_id, season_id = environment[
         "SOFASCORE_SCOPE_KEY"
@@ -449,7 +475,19 @@ def _validate_refresh_scope(
         or int(result.get("tournament_id", 0)) != int(tournament_id)
         or int(result.get("source_season_id", 0)) != int(season_id)
     ):
+        _retain_bronze_dq()
         raise AirflowException("scope result provenance mismatch")
+    # #1371: a finished capture must prove its Bronze DQ — a failed or
+    # malformed report is red here, and the mapped validator, which always
+    # holds the task context, also refuses a result that ships no report at
+    # all. A transport-only loss above never reaches this gate (#1751).
+    if (isinstance(dq_report, dict) or ti is not None) and not _bronze_dq_report_passed(
+        dq_report
+    ):
+        _retain_bronze_dq()
+        raise AirflowException(
+            "scope bronze data-quality report is failed, missing or malformed"
+        )
     # A refreshed scope is never "completed": the next DagRun re-plans it
     # from Bronze evidence as new games finish.
     outcome: dict[str, Any] = {
@@ -457,9 +495,13 @@ def _validate_refresh_scope(
         "scope_key": environment["SOFASCORE_SCOPE_KEY"],
         "elapsed_s": result.get("elapsed_s"),
     }
+    if isinstance(dq_report, dict):
+        outcome["bronze_dq"] = dq_report
     if status == "partial":
+        nested = result.get("partial")
+        nested = nested if isinstance(nested, dict) else {}
         for field in ("remaining_matches", "stop_reason", "bytes"):
-            outcome[field] = result.get(field)
+            outcome[field] = result.get(field, nested.get(field))
     return outcome
 
 
@@ -752,10 +794,17 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
     return {"status": "success", **summary}
 
 
-def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
+def _window_summary(
+    context: dict[str, Any] | None = None, **keywords: Any
+) -> dict[str, Any]:
     """#1358: how many scopes ended partial and how much of the window went."""
 
+    if context is None:
+        context = keywords
+    elif keywords:
+        context = {**context, **keywords}
     outcomes: list[Any] = []
+    dq_reports: list[Any] = []
     refill_reason = None
     refill = None
     ti = context.get("ti")
@@ -766,9 +815,36 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
             print(f"refresh window summary unavailable: {exc}")
             pulled = None
         if isinstance(pulled, dict):
-            outcomes = [pulled]
-        elif pulled is not None:
-            outcomes = [item for item in pulled if isinstance(item, dict)]
+            pulled = [pulled]
+        elif not isinstance(pulled, list):
+            pulled = []
+        outcomes = [item for item in pulled if isinstance(item, dict)]
+        try:
+            # #1371: failed validators push their DQ report instead of
+            # returning it; read it alongside the return values.
+            explicit_dq = ti.xcom_pull(
+                task_ids="validate_refresh_scope", key="bronze_dq"
+            )
+        except Exception as exc:
+            print(f"refresh bronze DQ summary unavailable: {exc}")
+            explicit_dq = None
+        if isinstance(explicit_dq, dict):
+            explicit_dq = [explicit_dq]
+        elif not isinstance(explicit_dq, list):
+            explicit_dq = []
+        # Align the two forms by mapped index so one scope's report is never
+        # counted twice, while a report that exists in only one of them —
+        # typically a failed validator's — still reaches the summary.
+        for index, item in enumerate(pulled):
+            report = item.get("bronze_dq") if isinstance(item, dict) else None
+            if not isinstance(report, dict) and index < len(explicit_dq):
+                report = explicit_dq[index]
+            if isinstance(report, dict):
+                dq_reports.append(report)
+        dq_reports.extend(
+            report for report in explicit_dq[len(pulled):]
+            if isinstance(report, dict)
+        )
         try:
             refill = ti.xcom_pull(task_ids="refill_refresh_window")
         except Exception as exc:
@@ -791,9 +867,19 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
         if "initial_outcomes" in refill:
             # A failed mapped validation may yield no XCom at all. Physical
             # attempt receipts retain retries and replace, rather than double
-            # count, the successful mapped-task XComs.
+            # count, the successful mapped-task XComs; their DQ reports ride
+            # the same replacement (#1371).
             outcomes = list(refill["initial_outcomes"])
-        outcomes.extend(refill.get("outcomes") or [])
+            dq_reports = [
+                item["bronze_dq"] for item in outcomes
+                if isinstance(item, dict) and isinstance(item.get("bronze_dq"), dict)
+            ]
+        refill_outcomes = refill.get("outcomes") or []
+        outcomes.extend(refill_outcomes)
+        dq_reports.extend(
+            item["bronze_dq"] for item in refill_outcomes
+            if isinstance(item, dict) and isinstance(item.get("bronze_dq"), dict)
+        )
         refill_reason = refill.get("stop_reason")
     used = sum(
         float(item.get("elapsed_s") or 0)
@@ -816,6 +902,9 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
         "window_use": round(used / budget, 3),
         "refill_stop_reason": refill_reason,
         "initial_transient_failures": initial_transient,
+        # #1371: the run's merged Bronze DQ verdict. No reports at all is
+        # "empty" (zero checks), never a data-quality PASS.
+        "bronze_dq": summarize_bronze_dq_reports(dq_reports),
     }
 
 
