@@ -87,6 +87,7 @@ jobs:
             dags/utils/sofascore_dq.py \
             scripts/migrate_sofascore_production.py \
             scripts/migrate_sofascore_partition_keys.py \
+            scripts/migrate_sofascore_partition_keys_batched.py \
             scripts/backfill_sofascore.py \
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
@@ -106,7 +107,8 @@ jobs:
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
             scripts/migrate_sofascore_production.py \
-            scripts/migrate_sofascore_partition_keys.py
+            scripts/migrate_sofascore_partition_keys.py \
+            scripts/migrate_sofascore_partition_keys_batched.py
           python -m py_compile \
             dags/dag_iceberg_maintenance.py \
             dags/utils/maintenance_tasks.py \
@@ -182,6 +184,7 @@ jobs:
             tests/unit/scripts/test_filter_proxy.py \
             tests/unit/scripts/test_migrate_sofascore_production.py \
             tests/unit/scripts/test_migrate_sofascore_partition_keys.py \
+            tests/unit/scripts/test_migrate_sofascore_partition_keys_batched.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
             tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
             tests/unit/scripts/test_run_sofascore_schedule_refresh.py \
