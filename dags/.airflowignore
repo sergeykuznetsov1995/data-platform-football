@@ -1,7 +1,10 @@
-# Общий scheduler (проект data-platform). Мини-DAG изолированного контура SofaScore
+# Общий scheduler (проект data-platform). DAG изолированного контура SofaScore
 # (deploy/sofascore/airflow.compose.yaml) здесь не регистрируем:
 # dag_sofascore_manifest_maintenance дублирует обслуживание из dag_iceberg_maintenance;
-# двойной запуск = двойной прогон. Триггеры дейли и её хвоста ушли с #1370.
+# двойной запуск = двойной прогон; dag_replay_sofascore_raw — ручной оффлайн-реплей
+# контура (paused-on-create, #1367), общему scheduler'у не нужен. Триггеры дейли
+# и её хвоста ушли с #1370.
 # Изолированный контур накрывает этот файл своим deploy/sofascore/.airflowignore.
 ^dag_sofascore_manifest_maintenance\.py$
 ^dag_sofascore_schedule_maintenance\.py$
+^dag_replay_sofascore_raw\.py$
