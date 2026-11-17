@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 
+def _successful_bronze_dq():
+    return {"status": "success", "checks": 1, "violations": [], "errors": []}
+
+
 def _load_dag_module():
     from airflow.operators.bash import BashOperator
     from airflow.operators.python import PythonOperator
@@ -432,10 +436,12 @@ def test_finalize_counts_paid_phases_as_traffic(monkeypatch, tmp_path):
 def test_validated_scope_clears_its_failure_memory(monkeypatch, tmp_path):
     module = _load_dag_module()
     result = tmp_path / "result.json"
-    result.write_text(
+    document = json.loads(
         '{"status": "success", "snapshot_id": "s", "campaign_id": "c",'
         ' "tournament_id": 8, "source_season_id": 825}'
     )
+    document["bronze_dq"] = _successful_bronze_dq()
+    result.write_text(json.dumps(document))
     calls = []
     monkeypatch.setattr(
         module.state, "mark_completed",
@@ -458,7 +464,9 @@ def test_validated_scope_clears_its_failure_memory(monkeypatch, tmp_path):
 
 def _validate_capture(module, monkeypatch, tmp_path, document):
     result = tmp_path / "result.json"
-    result.write_text(document)
+    payload = json.loads(document)
+    payload.setdefault("bronze_dq", _successful_bronze_dq())
+    result.write_text(json.dumps(payload))
     calls = []
     monkeypatch.setattr(
         module.state, "mark_completed",
@@ -654,7 +662,8 @@ def test_july_portion_does_not_mark_whole_legacy_season_completed(monkeypatch, t
     module = _load_dag_module()
     env = _capture_env("campaign-test:17:1725")
     path = tmp_path / "july-result.json"
-    path.write_text(json.dumps({"status": "success", "campaign_id": "campaign-test", "tournament_id": 17, "source_season_id": 1725}))
+    path.write_text(json.dumps({"status": "success", "campaign_id": "campaign-test", "tournament_id": 17, "source_season_id": 1725,
+                                "bronze_dq": _successful_bronze_dq()}))
     env.update(SOFASCORE_SCOPE_RESULT_PATH=str(path), SOFASCORE_HISTORY_GROUP="july")
     completed, cleared = [], []
     monkeypatch.setattr(module.state, "mark_completed", lambda *args, **kwargs: completed.append(kwargs))
