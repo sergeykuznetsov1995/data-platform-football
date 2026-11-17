@@ -74,6 +74,8 @@ from .match_refresh import (
     LATE_MATCH_CUTOFF, MATCH_SETTLE_MARGIN,
     MatchRefresh, match_refresh, match_time, source_observed_at,
 )
+from .heatmaps import aggregate_heatmap_report
+from .heatmap_service import sync_match_heatmap as _sync_match_heatmap
 from .transport import FetchOutcome, FetchResult, FotMobTransport, canonicalize_target
 
 
@@ -637,6 +639,8 @@ class FotMobIngestService:
         self.ledger = BudgetLedger(budget or TransportBudget())
         self.max_workers = min(int(max_workers), 16)
         self._late_match_requests = 0
+        self._late_heatmap_requests = 0
+        self._heatmap_budget_error = None
         self._budget_lock = threading.Lock()
         self._cancelled = threading.Event()
         self._next_build_id: Optional[str] = None
@@ -2805,8 +2809,9 @@ class FotMobIngestService:
         max_attempts = 1 if single_attempt else max(1, int(getattr(self.transport, "max_attempts", 1)))
         if self.ledger.remaining_requests < max_attempts:
             raise BudgetExceeded("remaining request budget cannot cover match retries")
-        if late and 9 * (self._late_match_requests + max_attempts) > (
-            self.ledger.requests - self._late_match_requests
+        late_requests = self._late_match_requests + self._late_heatmap_requests
+        if late and 9 * (late_requests + max_attempts) > (
+            self.ledger.requests - late_requests
         ):
             raise BudgetExceeded("late match quota deferred target")
         before = self.transport.snapshot_stats()
@@ -2907,6 +2912,8 @@ class FotMobIngestService:
                 "source_season_key": bundle.scope.source_season_key,
             },
         )
+        heatmap_observations = []
+        heatmap_deferred = []
         candidates = []
         now = utc_now()
         for match in matches:
@@ -3089,6 +3096,21 @@ class FotMobIngestService:
                 if not missing and not unknown:
                     result.succeeded += 1
                     result.counts["rows"] = result.counts.get("rows", 0) + 1
+                    result.tables.extend(_sync_match_heatmap(
+                        self,
+                        match,
+                        fetch,
+                        result,
+                        late=kind == "late",
+                        single_attempt=force_refresh,
+                        cutoff_at=(
+                            match_time(match.get("utc_time"))
+                            + MATCH_SETTLE_MARGIN + LATE_MATCH_CUTOFF
+                            if kind == "late" else None
+                        ),
+                        observations=heatmap_observations,
+                        deferred=heatmap_deferred,
+                    ))
             except Exception as exc:
                 result.record_exception(f"match {key} parse: {type(exc).__name__}: {exc}", exc)
                 self._commit_for_fetch(
@@ -3101,6 +3123,9 @@ class FotMobIngestService:
                     error_code=type(exc).__name__,
                     error=str(exc),
                 )
+        result.metadata["heatmap_report"] = aggregate_heatmap_report(heatmap_observations)
+        if heatmap_deferred:
+            result.metadata["heatmap_deferred"] = list(dict.fromkeys(heatmap_deferred))
         return result
 
     @staticmethod

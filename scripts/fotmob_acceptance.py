@@ -154,6 +154,8 @@ CURRENT_VIEW_KEYS: Mapping[str, tuple[str, ...]] = {
         "source_season_key",
         "match_id",
     ),
+    "fotmob_heatmap_assets": ("match_id",),
+    "fotmob_heatmap_points": ("match_id", "player_id", "point_index"),
     "fotmob_team_snapshots": ("team_id",),
     "fotmob_squad_snapshots": ("team_id", "member_type", "member_id"),
     "fotmob_player_snapshots": ("player_id",),
