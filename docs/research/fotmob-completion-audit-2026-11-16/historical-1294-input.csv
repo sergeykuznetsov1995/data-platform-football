@@ -1,0 +1,19 @@
+competition_id,competition_name,source_season_key,historical_finished_without_details,historical_parser_and_plan_signatures,historical_snapshot_date
+199,Division Profesional,2026 - Clausura,90,fotmob-native-v2:fmplan1-7996c3016a02e2488f6c10f22be617288e830952d58c83881ca52fa697075a48,2026-10-21
+199,Division Profesional,2026 - Apertura,132,fotmob-native-v2:fmplan1-7996c3016a02e2488f6c10f22be617288e830952d58c83881ca52fa697075a48,2026-10-21
+199,Division Profesional,2025 - Clausura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2025 - Apertura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2024 - Clausura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2024 - Apertura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2023 - Clausura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2023 - Apertura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2022 - Clausura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2022 - Apertura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2021 - Clausura,90,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2021 - Apertura,90,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2020 - Clausura,73,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+199,Division Profesional,2020 - Apertura,132,fotmob-native-v2:fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,2026-10-21
+490,Super Cup,2024/2025,1,fotmob-native-v1:fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385;fotmob-native-v2:fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385,2026-10-21
+10626,FA Cup Qualification,2026/2027,51,fotmob-native-v2:fmplan1-474b498e8e1b3bcfa4a6a5e7e9ce7676f16c9b43f48aab7ce773e2efb504d6e1,2026-10-21
+10626,FA Cup Qualification,2025/2026,45,fotmob-native-v2:fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385,2026-10-21
+11840,Throne Cup,2024/2025,2,fotmob-native-v1:fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385;fotmob-native-v2:fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385,2026-10-21

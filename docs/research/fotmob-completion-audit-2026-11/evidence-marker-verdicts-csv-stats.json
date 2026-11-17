@@ -1,0 +1,21 @@
+{
+ "rows_data": 7803,
+ "header": [
+  "competition_id",
+  "source_season_key",
+  "plan_signature",
+  "entity_id",
+  "marker_status",
+  "verdict",
+  "reason_counts",
+  "tournaments_breakdown"
+ ],
+ "first_5_rows": [
+  "268,2021,000f8b38b9db0a8b47a80c5729d56a769f9afc255f3f26aa3b2366f1527e0fe2,fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,success,unknown,\"{\"\"confirmed_content:current_payload_present\"\":380,\"\"confirmed_content:lineup:raw_typed_mask_agree\"\":380,\"\"confirmed_content:matchFacts:raw_typed_mask_agree\"\":380,\"\"confirmed_content:momentum:raw_typed_mask_agree\"\":3,\"\"confirmed_content:playerStats:raw_typed_mask_agree\"\":380,\"\"confirmed_content:shotmap:raw_typed_mask_agree\"\":380,\"\"confirmed_content:stats:raw_typed_mask_agree\"\":380,\"\"unknown:momentum:malformed_or_unresolved_json\"\":377}\",\"[\"\"required\"\"]\"",
+  "10270,2024/2025,0021b65b623fe7225643053e9e79922c2b008db0f0cdceb8297a3fbc286aaf8c,fmplan1-a24ecb8cd41771095c7d94ed090fb9727dda954850e43cc97fb686402eb11a73,success,unknown,\"{\"\"confirmed_content:current_payload_present\"\":46,\"\"confirmed_content:lineup:raw_typed_mask_agree\"\":24,\"\"confirmed_content:matchFacts:raw_typed_mask_agree\"\":46,\"\"confirmed_content:shotmap:raw_typed_mask_agree\"\":46,\"\"source_unavailable:lineup:stored_source_omission\"\":22,\"\"source_unavailable:playerStats:stored_source_omission\"\":46,\"\"source_unavailable:stats:stored_source_omission\"\":46,\"\"unknown:momentum:malformed_or_unresolved_json\"\":46}\",\"[\"\"required\"\"]\"",
+  "197,2025/2026,003e1d8fc12f0079d91c9e78495fdc41f26f86372132c502c59242c6e583a903,fmplan1-15baa7dff09f3aae879da775d8684bc4c4b4d6803e821f40c79f36a7cae7054b,success,unknown,\"{\"\"confirmed_content:current_payload_present\"\":309,\"\"confirmed_content:lineup:raw_typed_mask_agree\"\":6,\"\"confirmed_content:matchFacts:raw_typed_mask_agree\"\":309,\"\"confirmed_content:shotmap:raw_typed_mask_agree\"\":309,\"\"source_unavailable:lineup:stored_source_omission\"\":303,\"\"source_unavailable:playerStats:stored_source_omission\"\":309,\"\"source_unavailable:stats:stored_source_omission\"\":309,\"\"unknown:momentum:malformed_or_unresolved_json\"\":309}\",\"[\"\"required\"\"]\"",
+  "10705,2026/2027,004616a9cead2bb26aab51fb912f27391adfe8bf1e68d29065b7e9724e2b6aad,fmplan1-474b498e8e1b3bcfa4a6a5e7e9ce7676f16c9b43f48aab7ce773e2efb504d6e1,success,unknown,\"{\"\"confirmed_content:current_payload_present\"\":64,\"\"confirmed_content:lineup:raw_typed_mask_agree\"\":64,\"\"confirmed_content:matchFacts:raw_typed_mask_agree\"\":64,\"\"confirmed_content:momentum:raw_typed_mask_agree\"\":28,\"\"confirmed_content:playerStats:raw_typed_mask_agree\"\":4,\"\"confirmed_content:shotmap:raw_typed_mask_agree\"\":64,\"\"confirmed_content:stats:raw_typed_mask_agree\"\":35,\"\"source_unavailable:playerStats:stored_source_omission\"\":60,\"\"source_unavailable:stats:stored_source_omission\"\":29,\"\"unknown:momentum:malformed_or_unresolved_json\"\":36}\",\"[\"\"required\"\"]\"",
+  "8983,2026/2027,00478284959ea878544357fb4bcd0b10b94491149c38837f3518bb811b65457a,fmplan1-7996c3016a02e2488f6c10f22be617288e830952d58c83881ca52fa697075a48,success,unknown,\"{\"\"confirmed_content:current_payload_present\"\":80,\"\"confirmed_content:lineup:raw_typed_mask_agree\"\":80,\"\"confirmed_content:matchFacts:raw_typed_mask_agree\"\":80,\"\"confirmed_content:momentum:raw_typed_mask_agree\"\":43,\"\"confirmed_content:shotmap:raw_typed_mask_agree\"\":80,\"\"source_unavailable:playerStats:stored_source_omission\"\":80,\"\"source_unavailable:stats:stored_source_omission\"\":80,\"\"unknown:momentum:malformed_or_unresolved_json\"\":37}\",\"[\"\"required\"\"]\""
+ ],
+ "sha256": "7dc097796a85cd231969f55b2d2a2f1173607383d2869c5d452913dae302eeed"
+}
