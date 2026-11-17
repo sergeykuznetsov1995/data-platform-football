@@ -156,6 +156,8 @@ FOTMOB_NATIVE_HIGH_CHURN: Tuple[str, ...] = (
     "fotmob_leaderboard_categories",
     "fotmob_leaderboards",
     "fotmob_match_payloads",
+    "fotmob_heatmap_assets",
+    "fotmob_heatmap_points",
     "fotmob_team_snapshots",
     "fotmob_squad_snapshots",
     "fotmob_player_snapshots",
