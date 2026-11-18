@@ -26,6 +26,14 @@ def _selector_for(user):
     return None
 
 
+def _table_rule_for(rules, user, table):
+    for rule in rules["tables"]:
+        fields = {"user": user, "catalog": "iceberg", "schema": "bronze", "table": table}
+        if all(re.fullmatch(rule.get(key, ".*"), value) for key, value in fields.items()):
+            return rule
+    raise AssertionError(f"no table rule for {user} on {table}")
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("source", SOURCES)
 def test_source_user_routed_to_own_resource_group(source):
@@ -46,14 +54,33 @@ def test_source_user_may_write_like_airflow(source):
     user = f"src_{source}"
     rules = json.loads((TRINO / "rules.json").read_text())
     for section in ("catalogs", "schemas", "tables", "procedures"):
-        first = next(r for r in rules[section] if "user" in r)
+        first = (
+            _table_rule_for(rules, user, "fotmob_ingest_manifest")
+            if section == "tables" else next(r for r in rules[section] if "user" in r)
+        )
         assert re.fullmatch(first["user"], user), f"{user} not in rules.{section}"
         assert re.fullmatch(first["user"], "airflow")
     # humans and unapproved src_* names must not match the machine regex
+    machine = next(r for r in rules["tables"] if r.get("user", "").startswith("airflow|"))
     for stranger in ("sergey", "src_alice", "src_fbref2", "xsrc_fbref"):
-        assert not re.fullmatch(rules["tables"][0]["user"], stranger), stranger
+        assert not re.fullmatch(machine["user"], stranger), stranger
         sel = _selector_for(stranger)
         assert sel is None or sel["group"] == "humans", stranger
+
+
+@pytest.mark.unit
+def test_airflow_can_share_only_fotmob_definer_views():
+    rules = json.loads((TRINO / "rules.json").read_text())
+    rule = _table_rule_for(rules, "airflow", "fotmob_ingest_manifest")
+    assert {key: rule.get(key) for key in ("user", "catalog", "schema", "table")} == {
+        "user": "airflow", "catalog": "iceberg", "schema": "bronze", "table": "fotmob_.*",
+    }
+    assert rule["privileges"] == [
+        "SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT",
+    ]
+    for user in ("src_fotmob", "superset", "sergey"):
+        assert "GRANT_SELECT" not in _table_rule_for(rules, user, "fotmob_ingest_manifest")["privileges"]
+    assert "GRANT_SELECT" not in _table_rule_for(rules, "airflow", "fbref_matches")["privileges"]
 
 
 SCRIPT = ROOT / "scripts" / "trino" / "sync_source_users.sh"

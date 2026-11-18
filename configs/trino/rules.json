@@ -12,6 +12,13 @@
   ],
   "tables": [
     {
+      "user": "airflow",
+      "catalog": "iceberg",
+      "schema": "bronze",
+      "table": "fotmob_.*",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
+    },
+    {
       "user": "airflow|superset|openmetadata|src_(fbref|fotmob|sofascore|whoscored|transfermarkt|espn|understat|clubelo)",
       "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
     },
