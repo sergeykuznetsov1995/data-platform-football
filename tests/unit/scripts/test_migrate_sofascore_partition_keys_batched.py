@@ -531,6 +531,103 @@ def test_stop_callback_limits_groups_and_resume_verifies_before_swap(monkeypatch
     assert not any(re.search(r"\b(?:DELETE|DROP|TRUNCATE)\b", sql, re.I) for sql in manager.statements)
 
 
+def test_resume_result_skips_verified_prefix_and_preserves_full_verify():
+    original = many_seasons(24)
+    manager = BatchedFakeManager(original)
+    create_stage(manager)
+    pairs = sorted({(row["league"], row["season"]) for row in winners(original)})
+    existing = set(pairs[:8])
+    manager.tables[manager.stage] = deepcopy(selected_rows(winners(original), existing))
+    manager.statements.clear()
+    answers = iter([False, True])
+    first = populate(manager, partition_group_size=8, should_stop=lambda: next(answers))
+    assert first["complete"] is False
+    assert len(first["batches"]) == 1
+    assert first["batches"][0]["noop_rows"] == len(selected_rows(winners(original), existing))
+    previous = {
+        "migration_id": "r2-synthetic",
+        "table": SPEC.name,
+        "archive": manager.archive,
+        "stage": manager.stage,
+        "legacy": manager.legacy,
+        "status": "stage_incomplete",
+        "success": False,
+        "ready": False,
+        "resume_required": True,
+        "stage_complete": False,
+        "mutates": False,
+        "batches": first["batches"],
+    }
+    manager.statements.clear()
+
+    resumed = execute(manager, previous_result=previous)
+
+    assert resumed["success"] is True and resumed["status"] == "applied_verified"
+    assert resumed["resumed_groups"] == 1
+    assert resumed["batches"][0] == first["batches"][0]
+    assert len(resumed["batches"]) == 3
+    assert len(inserts(manager)) == 2
+    assert all(not sql_pairs(sql) & existing for sql in inserts(manager))
+    assert not any(sql.startswith("/* pk:batch_payload_difference */") for sql in manager.statements)
+    assert resumed["reconciliation"]["payload_mismatches"] == 0
+    assert multiset(manager.tables[SPEC.name], COLUMNS) == multiset(winners(original), COLUMNS)
+    assert manager.tables[manager.archive] == manager.tables[manager.legacy] == original
+
+
+def test_resume_result_must_match_current_work_group_prefix():
+    original = many_seasons(8)
+    manager = BatchedFakeManager(original)
+    create_stage(manager)
+    previous = {
+        "migration_id": "r2-synthetic",
+        "table": SPEC.name,
+        "archive": manager.archive,
+        "stage": manager.stage,
+        "legacy": manager.legacy,
+        "status": "stage_incomplete",
+        "success": False,
+        "ready": False,
+        "resume_required": True,
+        "stage_complete": False,
+        "mutates": False,
+        "batches": [{
+            "partitions": [["SS-999", "unknown"]],
+            "expected_rows": 1,
+            "before_rows": 1,
+            "after_rows": 1,
+            "noop_rows": 1,
+        }],
+    }
+    manager.statements.clear()
+
+    result = execute(manager, previous_result=previous)
+
+    assert result["success"] is False and result["mutates"] is False
+    assert "work-group prefix" in result["error"]
+    assert not inserts(manager)
+    assert_preserved(manager, original)
+
+
+def test_resume_checkpoint_row_count_change_fails_before_writes():
+    original = many_seasons(24)
+    manager = BatchedFakeManager(original)
+    create_stage(manager)
+    pairs = sorted({(row["league"], row["season"]) for row in winners(original)})
+    manager.tables[manager.stage] = deepcopy(selected_rows(winners(original), set(pairs[:8])))
+    answers = iter([False, True])
+    first = populate(manager, partition_group_size=8, should_stop=lambda: next(answers))
+    manager.tables[manager.stage].pop()
+    saved = deepcopy(manager.tables[manager.stage])
+    manager.statements.clear()
+
+    with pytest.raises(ValueError, match="checkpoint row count"):
+        populate(manager, partition_group_size=8, resume_batches=first["batches"])
+
+    assert manager.tables[manager.stage] == saved
+    assert not inserts(manager)
+    assert_preserved(manager, original)
+
+
 def assert_incomplete(result):
     assert result["success"] is False
     assert result["status"] == "stage_incomplete"

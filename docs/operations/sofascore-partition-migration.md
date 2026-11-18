@@ -262,11 +262,24 @@ stage не выполнять полный verify/swap/ALTER; при непро�
 двусторонний `EXCEPT ALL`, активные queries и факт release lock.
 
 Частичный stage совместим с ручным continuation только после read-only разбора
-и отдельного разрешённого продолжения с **тем же reviewed SHA и migration ID**.
-Существующие полные archive/stage не пересоздаются; существующие batches
-проверяются, missing обрабатываются, полный `verify_stage` обязателен до обоих
-renames. Уже canonical source с legacy backup проходит full noop verification.
-Автоматические retry/loops и новый migration ID для обхода блокера запрещены.
+и отдельного разрешённого продолжения с **migration ID и exact reviewed SHA,
+одобренным для данного окна**. Существующие полные archive/stage не
+пересоздаются. Чтобы не повторять дорогую проверку уже завершённых groups при
+каждом continuation, caller передаёт предыдущий terminal result как
+`previous_result`. Он обязан иметь `stage_incomplete`, `resume_required=true`,
+отсутствие error/rollback_error и совпадающие migration/table/archive/stage/
+legacy identity. Его batches должны образовывать точный prefix текущих work
+groups; каждая checkpoint partition обязана остаться в stage с прежним group
+row count. Иначе продолжение останавливается до INSERT/ALTER. Новый результат
+сохраняет cumulative `batches` и число пропущенных `resumed_groups`, поэтому
+следующее окно может использовать его как следующий checkpoint.
+
+Только не обработанные ранее existing groups проверяются повторно; missing
+обрабатываются, INSERT поверх existing запрещён. Полный `verify_stage` со всеми
+counts, natural keys и полным payload comparison обязателен до обоих renames,
+включая checkpoint-skipped groups. Уже canonical source с legacy backup
+проходит full noop verification. Автоматические retry/loops и новый migration
+ID для обхода блокера запрещены.
 
 Короткий incident-пример объясняет необходимость группировки: на reviewed SHA
 `1036e795` старый per-partition apply `event_participants` обработал 1,112 из
