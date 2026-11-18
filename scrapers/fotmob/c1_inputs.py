@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -440,13 +441,33 @@ def _read_checkpoint(rows):
     return checkpoint
 
 
-def refresh(manager, *, first_day=None, last_day=None):
-    """Call under the FotMob writer lease; first_day is explicit bootstrap only.
+@contextmanager
+def _write_lease(manager, writer_lock):
+    if writer_lock is None:
+        yield
+        return
+    with writer_lock() as authority:
+        manager.set_write_authority(authority)
+        try:
+            yield
+        finally:
+            manager.set_write_authority(None)
+
+
+def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
+    """Pin reads first and lease only shared writes; first_day is bootstrap only.
 
     A missing/expired previous snapshot fails closed. Rebootstrap in an approved
-    window rather than guessing which commits/partitions were lost.
+    window rather than guessing which commits/partitions were lost. Bootstrap
+    keeps one lease for the whole operation; the normal refresh leases only the
+    final publication after all reads and candidate staging have completed.
     """
     bootstrap = first_day is not None
+    if bootstrap and writer_lock is not None:
+        with _write_lease(manager, writer_lock):
+            return refresh(
+                manager, first_day=first_day, last_day=last_day,
+            )
     if bootstrap:
         first_day = date.fromisoformat(str(first_day))
         last_day = date.fromisoformat(str(last_day))
@@ -594,16 +615,17 @@ def refresh(manager, *, first_day=None, last_day=None):
         if key not in replacements:
             replacements[key] = (*key, *([None] * 7), generation, False, None)
     stage = PREFIX + "fotmob_c1_inputs__stg_" + uuid4().hex
-    manager.execute_query(f"CREATE TABLE {stage} {DDL}")
-    try:
-        _stage_rows(manager, stage, replacements.values())
-        # Metadata was read outside time travel; reject a mixed file inventory.
-        # Source commits during a lost lease can never advance our checkpoint.
-        if snapshots(manager) != before:
-            raise RuntimeError("C1 source snapshots changed during refresh")
-        manager.execute_query(merge_sql(stage))
-    finally:
-        manager.execute_query(f"DROP TABLE IF EXISTS {stage}")
+    with _write_lease(manager, writer_lock):
+        manager.execute_query(f"CREATE TABLE {stage} {DDL}")
+        try:
+            _stage_rows(manager, stage, replacements.values())
+            # Metadata was read outside time travel; reject a mixed file inventory.
+            # Source commits during a lost lease can never advance our checkpoint.
+            if snapshots(manager) != before:
+                raise RuntimeError("C1 source snapshots changed during refresh")
+            manager.execute_query(merge_sql(stage))
+        finally:
+            manager.execute_query(f"DROP TABLE IF EXISTS {stage}")
     return {"generation": generation, "seasons": len(affected), "rows": len(replacements)}
 
 
@@ -624,6 +646,4 @@ def run_refresh(**context):
             "enable_dynamic_filtering": "false",
         },
     )
-    with writer_lock() as authority:
-        manager.set_write_authority(authority)
-        return refresh(manager)
+    return refresh(manager, writer_lock=writer_lock)

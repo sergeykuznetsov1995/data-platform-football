@@ -537,3 +537,77 @@ def test_refresh_mid_loop_batch_failure_prevents_publication(monkeypatch, fail_b
     assert manager.staged == []
     assert manager.controls == controls
     assert manager.existing_pairs is None
+
+
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_refresh_locks_only_shared_writes_and_unbinds_released_lease(monkeypatch, bootstrap):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    pair = ("10", "2026/27")
+    manager = ClosureManager([pair], changed={pair})
+    setup_refresh(monkeypatch, manager)
+    authority = SimpleNamespace(held=False)
+    authority.check = lambda: pytest.fail("unexpected direct authority check") if not authority.held else None
+    events = []
+    manager.authority = None
+
+    def set_write_authority(value):
+        manager.authority = value
+
+    manager.set_write_authority = set_write_authority
+
+    @contextmanager
+    def write_lease():
+        assert not authority.held
+        authority.held = True
+        events.append(("acquire", True))
+        try:
+            yield authority
+        finally:
+            authority.held = False
+            events.append(("release", False))
+
+    real_execute = manager.execute_query
+
+    def execute_query(sql):
+        if sql == (
+            f"SELECT DISTINCT competition_id, source_season_key FROM {c1.TABLE} "
+            f"WHERE kind='input' AND deadline_day >= DATE '{DAY}'"
+        ):
+            return []
+        if sql.startswith(("CREATE TABLE ", "INSERT INTO ", "MERGE INTO ", "DROP TABLE ")):
+            kind = (
+                "candidate" if "fotmob_c1_candidates" in sql
+                else "bootstrap" if sql.startswith(f"CREATE TABLE IF NOT EXISTS {c1.TABLE} ")
+                else "publication"
+            )
+            events.append((kind, authority.held, manager.authority is authority))
+        return real_execute(sql)
+
+    manager.execute_query = execute_query
+
+    def snapshots(manager_arg):
+        events.append(("snapshots", authority.held))
+        return dict(manager_arg.current)
+
+    monkeypatch.setattr(c1, "snapshots", snapshots)
+    kwargs = {"first_day": DAY, "last_day": DAY} if bootstrap else {}
+    result = c1.refresh(manager, writer_lock=write_lease, **kwargs)
+
+    assert result["rows"] > 0
+    assert not authority.held
+    assert manager.authority is None
+    assert sum(event[0] == "acquire" for event in events) == 1
+    assert [event[1] for event in events if event[0] == "candidate"] == (
+        [True, True] if bootstrap else [False, False]
+    )
+    publication = [event for event in events if event[0] == "publication"]
+    assert publication and all(event[1] and event[2] for event in publication)
+    assert [event[1] for event in events if event[0] == "snapshots"] == (
+        [True, True] if bootstrap else [False, True]
+    )
+    if bootstrap:
+        assert any(
+            event[0] == "bootstrap" and event[1] and event[2] for event in events
+        )
