@@ -301,8 +301,9 @@ GATEWAY_HEALTH = """import json,sys,urllib.request
 with urllib.request.urlopen('http://127.0.0.1:8899'+sys.argv[1], timeout=5) as r:
  if r.status != 200: raise SystemExit(2)
  d=json.load(r)
-print(json.dumps({k:d.get(k) for k in ('healthy','daily_budget_bytes','daily_total_bytes',
-                                     'max_lease_bytes','max_active_leases','source_mode')}, allow_nan=False))
+print(json.dumps({'healthy':d.get('status') == 'ok',
+                  **{k:d.get(k) for k in ('daily_budget_bytes','daily_total_bytes',
+                                        'max_lease_bytes','max_active_leases','source_mode')}}, allow_nan=False))
 """
 
 
@@ -646,7 +647,14 @@ class Controller:
             row = harness.decode(self.execute(["docker", "image", "inspect", "--format", IMAGE_FORMAT,
                                               reference], env=self.env))
             need(set(row) == {"id", "digests"} and image_id(row["id"]))
-            need(type(row["digests"]) is list and reference in row["digests"])
+            repository, separator, digest = reference.rpartition("@")
+            need(separator == "@" and image_id(digest))
+            # Docker RepoDigests omit tags, but registry ports remain part of the repository.
+            if ":" in repository.rsplit("/", 1)[-1]:
+                repository = repository.rsplit(":", 1)[0]
+            equivalent = repository + "@" + digest
+            need(type(row["digests"]) is list and
+                 (reference in row["digests"] or equivalent in row["digests"]))
             images[name] = {"requested": reference, "resolved": row["id"]}
         return images
 

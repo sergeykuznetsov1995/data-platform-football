@@ -65,6 +65,8 @@ class FakeDocker:
         self.networks = {}
         self.resolved = {name: "sha256:" + digit * 64
                          for name, digit in zip(("control", "candidate", "gateway", "runner"), "abcd")}
+        self.repo_digests = {name: [reference] for name, reference in plan["images"].items()}
+        self.repo_digests["runner"] = ["apache/airflow@" + plan["images"]["runner"].split("@", 1)[1]]
         self.rows = {}
         for name, identity in plan["shared"].items():
             self.rows[identity] = self.row(identity, name, project="production", image="sha256:" + "1" * 64)
@@ -90,7 +92,7 @@ class FakeDocker:
         if argv[:3] == ["docker", "image", "inspect"]:
             assert argv[3:5] == ["--format", c.IMAGE_FORMAT] and len(argv) == 6
             name = next(name for name, ref in self.p["images"].items() if ref == argv[5])
-            return json.dumps(dict(id=self.resolved[name], digests=[argv[5]]))
+            return json.dumps(dict(id=self.resolved[name], digests=self.repo_digests[name]))
         if argv[:2] == ["docker", "inspect"]:
             assert argv[2:6] == ["--type", "container", "--format", c.CONTAINER_FORMAT] and len(argv) == 7
             return json.dumps(self.rows[argv[6]])
@@ -120,8 +122,16 @@ class FakeDocker:
                 return '{"solver":"3.4.6","chrome":"142.0.7444.175"}'
             assert argv[5:] == [c.GATEWAY_HEALTH, self.p["gateway_health_path"]]
             assert row["service"] == "clubelo-canary-gateway"
-            self.gateway_readbacks.append(copy.deepcopy(self.gateway_health))
-            return json.dumps(self.gateway_health)
+            raw = copy.deepcopy(self.gateway_health)
+            if "healthy" in raw:
+                health = raw.pop("healthy")
+                raw["status"] = "ok" if health is True else health
+            normalized = dict(healthy=raw.get("status") == "ok",
+                              **{key: raw.get(key) for key in (
+                                  "daily_budget_bytes", "daily_total_bytes", "max_lease_bytes",
+                                  "max_active_leases", "source_mode")})
+            self.gateway_readbacks.append(copy.deepcopy(normalized))
+            return json.dumps(normalized)
         if argv[:2] == ["docker", "stop"]:
             assert argv[2:4] == ["--time", "30"] and len(argv) == 5
             assert self.rows[argv[4]]["project"] == self.p["project"]
@@ -343,6 +353,57 @@ def test_rolling_two_starts_not_calendar_buckets():
         c.rate_delay([11], 10)
 
 
+@pytest.mark.parametrize("repository,reported_repository", [
+    ("apache/airflow:2.11.2-python3.11", "apache/airflow:2.11.2-python3.11"),
+    ("apache/airflow:2.11.2-python3.11", "apache/airflow"),
+    ("registry.example:5000/team/runner:tag", "registry.example:5000/team/runner"),
+    ("registry.example:5000/team/runner", "registry.example:5000/team/runner"),
+    ("runner:tag", "runner"),
+])
+def test_image_repo_digests_allow_exact_or_tagless_reference(repository, reported_repository):
+    digest = "sha256:" + "a" * 64
+    reference = repository + "@" + digest
+    resolved = "sha256:" + "b" * 64
+
+    def execute(argv, *, env):
+        assert argv == ["docker", "image", "inspect", "--format", c.IMAGE_FORMAT, reference]
+        return json.dumps(dict(id=resolved, digests=[reported_repository + "@" + digest]))
+
+    controller = SimpleNamespace(plan={"images": {"runner": reference}}, execute=execute, env={})
+    assert c.Controller._images(controller) == {"runner": {"requested": reference, "resolved": resolved}}
+
+
+@pytest.mark.parametrize("digests", [
+    [],
+    ["another/airflow@" + c.RUNNER_IMAGE.split("@", 1)[1]],
+    ["apache/airflow@sha256:" + "0" * 64],
+    [c.RUNNER_IMAGE.split("@", 1)[0]],
+    ["apache/airflow"],
+    ["sha256:" + "d" * 64],
+    ["apache/airflow@"],
+])
+def test_wrong_or_missing_image_repo_digests_prevent_solve(rig, digests):
+    _, docker, _, factory = rig
+    docker.repo_digests["runner"] = digests
+    controller = factory()
+    assert controller.run()["status"] == "INCONCLUSIVE"
+    assert controller.state["stop_reason"] == "invalid_evidence"
+    assert controller.state["preflight"] is None
+    assert not docker.runs
+
+
+@pytest.mark.parametrize("reported_repository", ["registry.example/team/runner", "registry.example"])
+def test_image_repo_digests_must_preserve_registry_port(reported_repository):
+    digest = "sha256:" + "a" * 64
+    reference = "registry.example:5000/team/runner@" + digest
+    controller = SimpleNamespace(
+        plan={"images": {"runner": reference}}, env={},
+        execute=lambda argv, **kwargs: json.dumps(dict(
+            id="sha256:" + "b" * 64, digests=[reported_repository + "@" + digest])))
+    with pytest.raises(c.Refusal):
+        c.Controller._images(controller)
+
+
 def test_full_block_fake_execution_and_exact_command_allowlist(rig):
     plan, docker, clock, factory = rig
     controller = factory()
@@ -374,18 +435,23 @@ def test_full_block_fake_execution_and_exact_command_allowlist(rig):
     assert len(docker.calls) == commands  # status/report are strictly read-only.
 
 
-def test_gateway_health_probe_projects_only_existing_safe_fields(monkeypatch, capsys):
+@pytest.mark.parametrize("status", ["ok", "missing", None, "unknown", False, 1])
+def test_gateway_health_probe_projects_only_existing_safe_fields(monkeypatch, capsys, status):
     import io
     import sys
     import urllib.request
 
-    expected = dict(healthy=True, daily_budget_bytes=2147483648, daily_total_bytes=123,
+    expected = dict(healthy=status == "ok", daily_budget_bytes=2147483648, daily_total_bytes=123,
                     max_lease_bytes=33554432, max_active_leases=1,
                     source_mode="shared-no-whoscored")
+    raw = {key: value for key, value in expected.items() if key != "healthy"}
+    raw.update(unrelated="MUST_NOT_APPEAR", healthy=False if status == "ok" else True)
+    if status != "missing":
+        raw["status"] = status
 
     def health_response(url, timeout):
         assert url == "http://127.0.0.1:8899/health" and timeout == 5
-        response = io.StringIO(json.dumps(dict(expected, unrelated="MUST_NOT_APPEAR")))
+        response = io.StringIO(json.dumps(raw))
         response.status = 200
         return response
 
