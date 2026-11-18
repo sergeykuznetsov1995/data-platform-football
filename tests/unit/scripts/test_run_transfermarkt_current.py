@@ -28,13 +28,15 @@ def listing(clubs=('10', '20'), values=None):
             + '</tbody></table></html>')
 
 
-def squad(club, players=None, value='€1.0m'):
+def squad(club, players=None, value='€1.0m', joined=None):
     players = players or [str(int(club) + 100)]
+    joined_header = '<th>Joined</th>' if joined is not None else ''
+    joined_cell = f'<td>{joined}</td>' if joined is not None else ''
     return ('<html><table class="items"><thead><tr><th>Player</th><th>Date of birth/age</th><th>Nat.</th>'
-            '<th>Height</th><th>Foot</th><th>Contract</th><th>Value</th></tr></thead><tbody>'
+            '<th>Height</th><th>Foot</th><th>Contract</th>' + joined_header + '<th>Value</th></tr></thead><tbody>'
             + ''.join(f'<tr><td class="hauptlink"><a href="/p-{player}/profil/spieler/{player}">P {player}</a></td>'
                       '<td>Jan 1, 2000 (26)</td><td><img title="France"></td><td>1,80 m</td><td>right</td>'
-                      f'<td>Jun 30, 2028</td><td class="rechts hauptlink">{value}</td></tr>' for player in players)
+                      f'<td>Jun 30, 2028</td>' + joined_cell + f'<td class="rechts hauptlink">{value}</td></tr>' for player in players)
             + '</tbody></table></html>')
 
 
@@ -71,6 +73,7 @@ class Offline:
         monkeypatch.setattr('scrapers.transfermarkt.raw_store.utc_now_iso', lambda: self.clock.wall.isoformat())
         self.club_ids = ('10', '20')
         self.values, self.player_values, self.squad_values = {}, {}, {}
+        self.squad_joined = {}
         self.player_dates = {}
         self.fail_scope, self.fail_club = None, None
         self.stop_after_club = None
@@ -156,7 +159,8 @@ class Offline:
                     if club in getattr(outer, 'squad_retry_once', set()):
                         outer.squad_retry_once.remove(club)
                         return _FakeResp(b'offline temporary unavailable', status=503)
-                    value = squad(club, players=outer.squad_players.get(club), value=outer.squad_values.get(club, '€1.0m'))
+                    value = squad(club, players=outer.squad_players.get(club), value=outer.squad_values.get(club, '€1.0m'),
+                                  joined=outer.squad_joined.get(club))
                     if outer.squad_padding.get(club):
                         value = value.replace('<html>', '<html><!--' + 'x' * outer.squad_padding[club] + '-->')
                     if outer.stop_after_club == club:
@@ -1262,6 +1266,117 @@ def test_shirt_number_change_does_not_select_transfer_or_value_career(offline):
     offline.run('shirt')
     offline.run('shirt-continue')
     assert offline.careers == []
+
+
+def test_later_current_assignments_preserve_all_twelve_seasonal_club_rosters(offline):
+    offline.club_ids = tuple(str(club) for club in range(10, 22))
+    offline.squad_joined = {club: 'Jul 1, 2025' for club in offline.club_ids}
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    writes = len(offline.writes)
+    for club in offline.club_ids:
+        player = str(int(club) + 100)
+        offline.assignment_override[player] = [{'clubId': str(90000 + int(club)), 'type': 'current',
+                                                'shirtNumber': None, 'isCaptain': False, 'start': '2026-07-01'}]
+    offline.clock.advance(21 * 3600)
+    offline.calls.clear()
+    first = offline.run('later-seasonal')
+    second = offline.run('later-seasonal-continue')
+    assert not any('source_mismatch' in item.get('error', '') for item in first['scopes'] + second['scopes'])
+    assert len(offline.writes) == writes + 1
+    assert sum('/kader/' in url for _, url in offline.calls) == 12
+    data = next(iter(offline.state()['scopes'].values()))
+    for club in offline.club_ids:
+        assert [row['player_id'] for row in data['snapshot']['clubs'][club]['rows']] == [str(int(club) + 100)]
+        assert any(f'/verein/{club}/' in url and '/kader/' in url for url in data['response_cache'])
+    assert not any(value.startswith('source-mismatch-')
+                   for value in json.loads(data['cursor']['resume_json']).get('squad_generations', {}).values())
+
+
+def test_without_club_start_after_seasonal_join_preserves_zakho_membership(offline):
+    offline.club_ids = ('39637',)
+    offline.squad_players = {'39637': ['952341']}
+    offline.squad_joined = {'39637': 'Jul 11, 2026'}
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    writes = len(offline.writes)
+    offline.assignment_override['952341'] = [{'clubId': '515', 'type': 'current', 'shirtNumber': None,
+                                              'isCaptain': False, 'start': '2026-11-05'}]
+    offline.clock.wall = datetime(2026, 11, 18, 18, tzinfo=timezone.utc)
+    first = offline.run('zakho')
+    second = offline.run('zakho-continue')
+    assert not any('source_mismatch' in item.get('error', '') for item in first['scopes'] + second['scopes'])
+    assert len(offline.writes) == writes + 1
+    data = next(iter(offline.state()['scopes'].values()))
+    rows = data['snapshot']['clubs']['39637']['rows']
+    assert [(row['player_id'], row['joined_at']) for row in rows] == [('952341', '2026-07-11')]
+    assert data['signals']['player:952341']['status'] == 'applied'
+
+
+@pytest.mark.parametrize(('joined', 'start'), [(None, '2026-01-01'), ('Jul 1, 2026', None)])
+def test_incomplete_club_dates_do_not_invalidate_seasonal_membership(offline, joined, start):
+    offline.club_ids = ('10',)
+    if joined is not None:
+        offline.squad_joined = {'10': joined}
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    writes = len(offline.writes)
+    offline.assignment_override['110'] = [{'clubId': '999', 'type': 'current', 'shirtNumber': None,
+                                           'isCaptain': False, 'start': start}]
+    offline.clock.advance(21 * 3600)
+    first = offline.run('unknown-club-date')
+    second = offline.run('unknown-club-date-continue')
+    assert not any('source_mismatch' in item.get('error', '') for item in first['scopes'] + second['scopes'])
+    assert len(offline.writes) == writes + 1
+    data = next(iter(offline.state()['scopes'].values()))
+    assert [row['player_id'] for row in data['snapshot']['clubs']['10']['rows']] == ['110']
+
+
+@pytest.mark.parametrize('start', ['2026-06-30', '2026-07-01'])
+def test_current_assignment_already_effective_on_seasonal_join_still_fails(offline, start):
+    offline.club_ids = ('10',)
+    offline.squad_joined = {'10': 'Jul 1, 2026'}
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    writes = len(offline.writes)
+    offline.assignment_override['110'] = [{'clubId': '999', 'type': 'current', 'shirtNumber': None,
+                                           'isCaptain': False, 'start': start}]
+    offline.clock.advance(21 * 3600)
+    offline.run('dated-club-conflict')
+    report = offline.run('dated-club-conflict-continue')
+    assert len(offline.writes) == writes
+    assert any('source_mismatch' in item.get('error', '') for item in report['scopes'])
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['signals']['player:110']['status'] == 'failed'
+    assert not any('/kader/verein/10/' in url for url in data['response_cache'])
+
+
+def test_later_current_assignment_does_not_hide_market_value_mismatch(offline):
+    offline.club_ids = ('10',)
+    offline.squad_joined = {'10': 'Jul 1, 2025'}
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-continue')
+    writes = len(offline.writes)
+    offline.assignment_override['110'] = [{'clubId': '999', 'type': 'current', 'shirtNumber': None,
+                                           'isCaptain': False, 'start': '2026-07-01'}]
+    offline.player_values['110'] = 2000000
+    offline.clock.advance(21 * 3600)
+    offline.run('later-value-conflict')
+    report = offline.run('later-value-conflict-continue')
+    assert len(offline.writes) == writes
+    assert any('source_mismatch' in item.get('error', '') for item in report['scopes'])
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['signals']['player:110']['status'] == 'failed'
 
 
 def test_lagging_squad_cannot_ack_player_change_and_only_bad_club_is_refetched(offline):

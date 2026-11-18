@@ -16,7 +16,7 @@ import logging
 import math
 import os
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import time
@@ -101,6 +101,23 @@ def _professional_assignment_changed(previous, signal):
         return sorted((str(item[0]), item[1], item[2] or '') for item in assignments
                       if item[1] in {'current', 'additional'})
     return projection(previous['assignments']) != projection(signal.assignments)
+
+
+def _seasonal_club_contradiction(values, rows):
+    """A different current assignment must already be effective on the seasonal join date."""
+    assignments = [item for item in values.get('assignments', ())
+                   if item[1] in {'current', 'additional'}]
+    current_clubs = {item[0] for item in assignments}
+    for row in rows:
+        if row['club_id'] in current_clubs or row.get('joined_at') is None:
+            continue
+        joined_value = row['joined_at']
+        joined = joined_value if isinstance(joined_value, date) else date.fromisoformat(joined_value)
+        for assignment in assignments:
+            start = assignment[2]
+            if start is not None and date.fromisoformat(start) <= joined:
+                return True
+    return False
 
 
 def _install_entity_limits(scraper, data):
@@ -1116,7 +1133,7 @@ class _Scope:
         return enriched
 
     def validate_player_business(self, snapshot):
-        """Do not acknowledge a detector while a CDN serves old squad fields."""
+        """Reject dated contradictions without rewriting seasonal memberships."""
         if self.row.get('is_current') is False:
             # Live player assignments describe the new edition. Closed-edition
             # squads retain their historical membership, with normal raw/DQ guards.
@@ -1137,7 +1154,9 @@ class _Scope:
             expected = set(values['club_ids']) & set(snapshot.expected_team_ids)
             changed = memberships if national else memberships | expected
             # Contract is the squad page's field (supplement_contracts); tmapi does not prove it (#2068).
-            inconsistent = (not national and memberships != expected) or any(
+            club_contradiction = (not national and memberships != expected
+                                  and _seasonal_club_contradiction(values, rows))
+            inconsistent = club_contradiction or any(
                 tmapi.normalize_market_value(row['market_value_eur']) != tmapi.normalize_market_value(values['market_value_eur'])
                 for row in rows)
             if inconsistent:
