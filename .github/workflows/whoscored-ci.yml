@@ -518,6 +518,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
           sentinel="$(mktemp -d)"
+          chmod 0777 "$sentinel"
           trap 'rm -rf "$sentinel"' EXIT
           assert_exit_78_before_sentinel() {
             label="$1"
