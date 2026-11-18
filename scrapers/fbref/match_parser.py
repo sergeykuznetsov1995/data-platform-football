@@ -22,9 +22,11 @@ from scrapers.fbref.html_parser import (
     parse_shots_table,
     parse_team_match_stats_table,
 )
+from scrapers.fbref.parsers.table_parser import _comment_table_values
 
 
-MATCH_PARSER_VERSION = "fbref-match-parser-v3"
+# v4 (#1331): all tables from each HTML comment reach the typed match path.
+MATCH_PARSER_VERSION = "fbref-match-parser-v4"
 MATCH_COMPLETION_CONTRACT_VERSION = "match-v3-scored-page-marker-last"
 COMPETITION_SOURCE_DATASET_UNAVAILABLE = "competition_source_dataset_unavailable"
 
@@ -196,7 +198,7 @@ def _match_source_evidence(soup, comment_tables) -> Dict[str, tuple[bool, bool]]
     an empty/restricted source section.
     """
 
-    tables = list(soup.find_all("table")) + list(comment_tables.values())
+    tables = list(soup.find_all("table")) + _comment_table_values(comment_tables)
     table_pairs = [
         (str(table.get("id") or ""), table)
         for table in tables

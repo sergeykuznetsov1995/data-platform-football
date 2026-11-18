@@ -3194,6 +3194,20 @@ def test_history_recovery_replays_real_atlas_raw_with_repeated_table_ids(tmp_pat
         and table.source_location == "dom"
     ]
     assert [table.row_count for table in repeated] == [5, 6]
+    rows = [row for table in page.tables for row in table.rows]
+    total_rows = [row for row in rows if getattr(row, "is_total", False)]
+    body_rows = [row for row in rows if not getattr(row, "is_total", False)]
+    assert len(total_rows) == 10
+    assert len(body_rows) == 188
+    assert len({row.row_id for row in rows}) == len(rows)
+    cells = page.cell_records()
+    assert {
+        cell["row_id"] for cell in cells if cell.get("is_total")
+    } == {row.row_id for row in total_rows}
+    assert len({
+        (cell["table_instance_id"], cell["row_id"], cell["cell_id"])
+        for cell in cells
+    }) == len(cells)
     # The failed production attempt already persisted this exact prefix.
     pipeline._record_generic_table_results(
         record, replace(page, tables=page.tables[:6])
@@ -3460,7 +3474,8 @@ def test_page_v3_recovers_verified_tableless_player_from_v2_raw_offline(
         settings=_settings("current"),
     )
 
-    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v4"
+    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v5"
+    assert TYPED_BRONZE_PARSER_VERSION == "fbref-typed-bronze-v7"
     assert result.parsed == 1
     assert writer.pages[0][0].tables == ()
     assert writer.pages[0][0].errors == ()

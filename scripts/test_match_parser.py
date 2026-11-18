@@ -447,7 +447,8 @@ def process_match(match_id: str, html: str, save_html: bool = False) -> dict:
     # Extract page title
     title = soup.title.string if soup.title else 'No title'
     print(INFO(f"Page title: {title}"))
-    print(INFO(f"Comment tables: {len(comment_tables)} ({list(comment_tables.keys())[:10]})"))
+    comment_table_ids = [table.get('id') or '<no-id>' for table in comment_tables]
+    print(INFO(f"Comment tables: {len(comment_tables)} ({comment_table_ids[:10]})"))
 
     report = {}
 

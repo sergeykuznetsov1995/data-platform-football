@@ -1832,3 +1832,47 @@ def test_competition_coverage_does_not_hide_parser_schema_drift():
     assert parsed.has_errors
     assert parsed.datasets["match_events"].error_type == "MatchPageSchemaDriftError"
     assert parsed.datasets["match_events"].reason == "source_container_unparsed"
+
+
+TWO_TABLE_COMMENT_MATCH_HTML = """
+<html><body>
+<div class="scorebox">
+  <div><strong><a href="/en/squads/11111111/Alpha">Alpha</a></strong></div>
+  <div><strong><a href="/en/squads/22222222/Beta">Beta</a></strong></div>
+</div>
+<!--
+<table id="stats_11111111_summary">
+  <thead><tr><th>Player</th><th>Min</th></tr></thead>
+  <tbody><tr>
+    <td data-stat="player"><a href="/en/players/aaaaaaaa/Alpha-Player">Alpha Player</a></td>
+    <td data-stat="minutes">90</td>
+  </tr></tbody>
+</table>
+<table id="stats_22222222_summary">
+  <thead><tr><th>Player</th><th>Min</th></tr></thead>
+  <tbody><tr>
+    <td data-stat="player"><a href="/en/players/bbbbbbbb/Beta-Player">Beta Player</a></td>
+    <td data-stat="minutes">88</td>
+  </tr></tbody>
+</table>
+-->
+</body></html>
+"""
+
+
+def test_both_summary_tables_from_one_comment_reach_typed_match_parser():
+    parsed = typed.parse_match_html(
+        TWO_TABLE_COMMENT_MATCH_HTML,
+        match_id="12345678",
+        context=typed.TypedSourceContext("9", "2025-2026"),
+        enabled_datasets={"match_player_stats"},
+        require_player_contract=True,
+    )
+
+    dataset = parsed.datasets["match_player_stats"]
+    assert dataset.status == DatasetStatus.AVAILABLE
+    assert dataset.frame is not None
+    assert dataset.frame["Player"].tolist() == ["Alpha Player", "Beta Player"]
+    assert dataset.frame["Min"].tolist() == [90, 88]
+    assert set(dataset.frame["team_side"]) == {"home", "away"}
+    assert parsed.parser_version == "fbref-match-parser-v4"

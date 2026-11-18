@@ -11,7 +11,7 @@ import gc
 import logging
 import re
 from io import StringIO
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import pandas as pd
 from bs4 import BeautifulSoup, Comment
@@ -23,6 +23,11 @@ from scrapers.fbref.parsers.id_extractors import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+CommentTables = Union[
+    Sequence[BeautifulSoup], Mapping[str, BeautifulSoup]
+]
 
 
 # Prefixes added by FBref MultiIndex headers that should be normalized
@@ -190,22 +195,55 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def extract_tables_from_comments(soup: BeautifulSoup) -> Dict[str, BeautifulSoup]:
+def _comment_table_values(
+    comment_tables: Optional[CommentTables],
+) -> List[BeautifulSoup]:
+    if not comment_tables:
+        return []
+    if isinstance(comment_tables, Mapping):
+        return list(comment_tables.values())
+    return list(comment_tables)
+
+
+def _comment_table_ids(comment_tables: Optional[CommentTables]) -> List[str]:
+    return [
+        str(table.get("id") or "")
+        for table in _comment_table_values(comment_tables)
+    ]
+
+
+def _find_table_by_id(
+    soup: BeautifulSoup,
+    table_id: str,
+    comment_tables: Optional[CommentTables],
+):
+    candidates = list(soup.find_all("table", id=table_id))
+    candidates.extend(
+        table
+        for table in _comment_table_values(comment_tables)
+        if str(table.get("id") or "") == table_id
+    )
+    distinct = {}
+    for table in candidates:
+        markup = re.sub(r"\s+", " ", str(table)).strip()
+        distinct.setdefault(markup, table)
+    if len(distinct) > 1:
+        raise ValueError(
+            f"Ambiguous table ID {table_id!r}: "
+            f"{len(distinct)} distinct tables in DOM/comments"
+        )
+    return next(iter(distinct.values()), None)
+
+
+def extract_tables_from_comments(soup: BeautifulSoup) -> List[BeautifulSoup]:
+    """Return every table from every HTML comment in source order.
+
+    Missing and repeated source IDs are retained as separate elements. Callers
+    that select one table by ID use content deduplication and fail closed on
+    conflicting duplicates instead of silently overwriting an earlier table.
     """
-    Extract tables hidden in HTML comments.
+    tables = []
 
-    FBref hides some tables in HTML comments for lazy loading.
-    This method finds and parses those hidden tables.
-
-    Args:
-        soup: BeautifulSoup object of the page
-
-    Returns:
-        Dictionary mapping table ID to table soup
-    """
-    tables = {}
-
-    # Find all comments
     comments = soup.find_all(string=lambda text: isinstance(text, Comment))
     logger.debug(f"Found {len(comments)} HTML comments to check for tables")
 
@@ -214,32 +252,29 @@ def extract_tables_from_comments(soup: BeautifulSoup) -> Dict[str, BeautifulSoup
     for comment in comments:
         comment_text = str(comment)
 
-        # Check if comment contains a table
         if '<table' in comment_text:
-            # Parse the comment as HTML
             comment_soup = BeautifulSoup(comment_text, 'html.parser')
-            table = comment_soup.find('table')
+            for table in comment_soup.find_all('table'):
+                tables.append(table.extract())
+                tables_found_count += 1
+                logger.debug(
+                    "Extracted table from comment: %s",
+                    table.get("id") or "<no-id>",
+                )
 
-            if table:
-                table_id = table.get('id', '')
-                if table_id:
-                    # Extract table before decomposing comment_soup
-                    tables[table_id] = table.extract()
-                    tables_found_count += 1
-                    logger.debug(f"Extracted table from comment: {table_id}")
-
-            # Clean up comment soup to free memory
             comment_soup.decompose()
 
         comments_processed += 1
-        # Periodic garbage collection for large pages
         if comments_processed % 50 == 0:
             gc.collect()
 
     if tables_found_count > 0:
-        logger.info(f"Extracted {tables_found_count} tables from HTML comments: {list(tables.keys())}")
+        table_ids = [table.get("id") or "<no-id>" for table in tables]
+        logger.info(
+            f"Extracted {tables_found_count} tables from HTML comments: "
+            f"{table_ids}"
+        )
     else:
-        # Check if DOM already has tables (e.g. uncommented by pre_content_js)
         dom_tables = soup.find_all('table')
         if len(dom_tables) > 0:
             logger.debug(
@@ -331,7 +366,7 @@ def drop_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
 def parse_table(
     soup: BeautifulSoup,
     table_id: str,
-    comment_tables: Optional[Dict[str, BeautifulSoup]] = None,
+    comment_tables: Optional[CommentTables] = None,
     extract_player_ids: bool = False,
     extract_team_ids: bool = False,
     extract_match_urls: bool = False,
@@ -353,12 +388,7 @@ def parse_table(
     Returns:
         DataFrame or None
     """
-    # First try to find table in regular HTML
-    table = soup.find('table', id=table_id)
-
-    # If not found, check comment tables
-    if table is None and comment_tables:
-        table = comment_tables.get(table_id)
+    table = _find_table_by_id(soup, table_id, comment_tables)
 
     if table is None:
         logger.debug(f"Table not found: {table_id}")

@@ -65,6 +65,7 @@ GENERIC_TABLE_SCHEMAS: Dict[str, Dict[str, str]] = {
         "table_id": "VARCHAR",
         "row_id": "VARCHAR",
         "source_row_index": "BIGINT",
+        "is_total": "BOOLEAN",
         "cell_id": "VARCHAR",
         "cell_index": "BIGINT",
         "data_stat": "VARCHAR",
@@ -162,6 +163,13 @@ class FBrefGenericBronzeWriter:
                 table,
                 columns,
                 partition_columns=["page_kind"] if "page_kind" in columns else None,
+            )
+        cell_columns = self.manager.get_table_columns(
+            self.schema, TABLE_CELLS_TABLE
+        )
+        if "is_total" not in {name.casefold() for name in cell_columns}:
+            self.manager.add_column(
+                self.schema, TABLE_CELLS_TABLE, "is_total", "BOOLEAN"
             )
         # Cache only a fully successful preflight.  A partial DDL failure must
         # retry every idempotent CREATE on the next page rather than turning a

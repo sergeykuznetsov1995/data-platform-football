@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup, Comment, Tag
 
 
+# v5 (#1331): tfoot rows are preserved as totals with an explicit is_total flag.
 # v4 (#949): the v3 label was reused across c75879b, which began emitting an
 # absence reason on empty/restricted/not_applicable page tables and on the
 # __page__ manifest.  Bumping the version lets a re-parse lay down fresh
@@ -27,7 +28,8 @@ from bs4 import BeautifulSoup, Comment, Tag
 # written by the pre-c75879b production parser (whose evidence stands under the
 # same v3 label and cannot be overwritten).
 from scrapers.fbref.policy import PAGE_DOCUMENT_VERSION  # canonical definition
-BRONZE_TABLE_CONTRACT_VERSION = "fbref-bronze-contract-v1"
+# v2 (#1331): generic cells carry an explicit is_total flag for tfoot rows.
+BRONZE_TABLE_CONTRACT_VERSION = "fbref-bronze-contract-v2"
 
 # High-confidence source containers only. Page kinds whose table inventory is
 # legitimately heterogeneous still use the universal material-table gate
@@ -338,6 +340,7 @@ class PageRow:
     source_row_index: int
     entity_ids: Mapping[str, str]
     cells: Tuple[PageCell, ...]
+    is_total: bool = False
 
 
 @dataclass(frozen=True)
@@ -407,6 +410,7 @@ class PageDocument:
                         "table_id": table.table_id,
                         "row_id": row.row_id,
                         "source_row_index": row.source_row_index,
+                        "is_total": row.is_total,
                         **cell.to_record(),
                     })
         return records
@@ -423,13 +427,15 @@ def _documents(html: str) -> Iterable[Tuple[str, BeautifulSoup]]:
             yield f"comment:{index}", BeautifulSoup(markup, "html.parser")
 
 
-def _table_rows(table: Tag) -> Tuple[List[List[str]], List[Tag]]:
+def _table_rows(table: Tag) -> Tuple[List[List[str]], List[Tuple[Tag, bool]]]:
     thead = table.find("thead")
     if thead is not None:
         header_rows = thead.find_all("tr")
     else:
         header_rows = []
         for row in table.find_all("tr"):
+            if row.find_parent("tfoot") is not None:
+                continue
             direct = row.find_all(["th", "td"], recursive=False)
             if direct and not any(cell.name == "td" for cell in direct):
                 header_rows.append(row)
@@ -437,10 +443,31 @@ def _table_rows(table: Tag) -> Tuple[List[List[str]], List[Tag]]:
                 break
     grid = _expand_header_grid(header_rows)
     body = table.find("tbody")
-    candidates = (body or table).find_all("tr", recursive=False)
+    candidates: List[Tuple[Tag, bool]] = []
+    if body is not None:
+        sections = [
+            section
+            for section in table.find_all(["tbody", "tfoot"])
+            if section is body or section.name == "tfoot"
+        ]
+        for section in sections:
+            candidates.extend(
+                (row, section.name == "tfoot")
+                for row in section.find_all("tr", recursive=False)
+            )
+    else:
+        for element in table.find_all(["tr", "tfoot"], recursive=False):
+            if element.name == "tfoot":
+                candidates.extend(
+                    (row, True)
+                    for row in element.find_all("tr", recursive=False)
+                )
+            else:
+                candidates.append((element, False))
     header_identity = {id(row) for row in header_rows}
     data_rows = [
-        row for row in candidates
+        (row, is_total)
+        for row, is_total in candidates
         if id(row) not in header_identity
         and "thead" not in set(row.get("class") or [])
     ]
@@ -461,7 +488,7 @@ def _parse_table(
     ordinal: int,
     seen_content: Mapping[str, str],
 ) -> PageTable:
-    header_grid, body_rows = _table_rows(table)
+    header_grid, row_candidates = _table_rows(table)
     width = max((len(row) for row in header_grid), default=0)
     header_paths = tuple(_header_path(header_grid, column) for column in range(width))
     # Repeated body rows carry the same ``data-stat`` values.  Keeping only
@@ -484,7 +511,7 @@ def _parse_table(
 
     rows: List[PageRow] = []
     identity_counts: Counter = Counter()
-    for row_index, row in enumerate(body_rows):
+    for row_index, (row, is_total) in enumerate(row_candidates):
         direct_cells = row.find_all(["th", "td"], recursive=False)
         values = [_text(cell) for cell in direct_cells]
         if not direct_cells or not any(values):
@@ -494,6 +521,9 @@ def _parse_table(
             "values": "\x1f".join(values),
             "ordinal": str(row_index),
         }
+        # Body IDs stay independent of totals even when tfoot precedes tbody.
+        if is_total:
+            stable_identity = {**stable_identity, "source_section": "tfoot"}
         identity = json.dumps(stable_identity, sort_keys=True)
         # FBref repeats the same entities across rows of one table: a player's
         # standard stats carry two rows for the same club, his wages table one
@@ -525,6 +555,7 @@ def _parse_table(
             source_row_index=row_index,
             entity_ids=row_entities,
             cells=tuple(cells),
+            is_total=is_total,
         ))
 
     duplicate_of = seen_content.get(content_signature)

@@ -40,6 +40,7 @@ from scrapers.fbref.html_parser import (
     find_team_stats_table,
     team_stats_table_ids,
 )
+from scrapers.fbref.parsers.table_parser import _comment_table_values
 from scrapers.fbref.match_parser import (
     DatasetParseResult,
     DatasetStatus,
@@ -50,6 +51,7 @@ from scrapers.fbref.match_parser import (
 from scrapers.fbref.page_document import response_owns_target_page
 
 
+# v7 (#1331): all tables from a shared HTML comment reach the typed datasets.
 # v4 (#949): paired with PAGE_DOCUMENT_VERSION v4.  c75879b started propagating
 # the dataset absence reason into manifest.error_message without bumping the
 # version, so reason-less v3 typed manifests (restricted shot_events, empty
@@ -393,7 +395,7 @@ def _table_has_materialized_rows(table) -> bool:
 
 
 def _matching_tables(soup, comment_tables, predicate):
-    tables = list(soup.find_all("table")) + list(comment_tables.values())
+    tables = list(soup.find_all("table")) + _comment_table_values(comment_tables)
     return [
         table
         for table in tables

@@ -14,7 +14,12 @@ from typing import Dict, Optional
 import pandas as pd
 from bs4 import BeautifulSoup
 
-from scrapers.fbref.parsers.table_parser import parse_table
+from scrapers.fbref.parsers.table_parser import (
+    CommentTables,
+    _comment_table_ids,
+    _comment_table_values,
+    parse_table,
+)
 from scrapers.fbref.parsers.id_extractors import (
     MANAGER_ID_PATTERN,
     PLAYER_ID_PATTERN,
@@ -26,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 def find_schedule_table(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup],
+    comment_tables: CommentTables,
     season_str: str,
     comp_id: str
 ) -> Optional[pd.DataFrame]:
@@ -48,9 +53,9 @@ def find_schedule_table(
     ):
         discovered_ids.append(str(table.get('id')))
     discovered_ids.extend(
-        str(table_id)
-        for table_id in comment_tables
-        if 'sched' in str(table_id).lower()
+        table_id
+        for table_id in _comment_table_ids(comment_tables)
+        if 'sched' in table_id.lower()
     )
 
     # ``sched_all`` is FBref's aggregate table.  When it is absent (common on
@@ -127,7 +132,7 @@ def team_stats_table_ids(stat_type: str) -> list:
 
 def find_team_stats_table(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup],
+    comment_tables: CommentTables,
     stat_type: str
 ) -> Optional[pd.DataFrame]:
     """
@@ -156,7 +161,7 @@ def find_team_stats_table(
 
 def find_player_stats_table(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup],
+    comment_tables: CommentTables,
     stat_type: str,
     extract_player_ids: bool = True,
 ) -> Optional[pd.DataFrame]:
@@ -208,14 +213,14 @@ def find_player_stats_table(
     logger.error(
         f"No player stats table found for stat_type={stat_type!r}. "
         f"DOM table IDs: {[t.get('id', '<no-id>') for t in all_tables]}, "
-        f"comment table IDs: {list(comment_tables.keys())}"
+        f"comment table IDs: {_comment_table_ids(comment_tables)}"
     )
     return None
 
 
 def parse_shots_table(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup]
+    comment_tables: CommentTables
 ) -> Optional[pd.DataFrame]:
     """
     Parse shots table from match page.
@@ -267,7 +272,7 @@ def parse_shots_table(
                 return df
 
     # Check comment tables
-    for key in comment_tables.keys():
+    for key in _comment_table_ids(comment_tables):
         if 'shot' in key.lower():
             df = parse_table(soup, key, comment_tables)
             if df is not None:
@@ -282,7 +287,7 @@ def parse_shots_table(
     all_table_ids = [
         t.get('id', '<no-id>') for t in soup.find_all('table')
     ]
-    comment_keys = list(comment_tables.keys())
+    comment_keys = _comment_table_ids(comment_tables)
     logger.debug(
         f"No shots table found. "
         f"DOM table IDs: {all_table_ids}, "
@@ -295,7 +300,7 @@ def parse_shots_table(
 def parse_lineup_table(
     soup: BeautifulSoup,
     team_id: Optional[str] = None,
-    comment_tables: Optional[Dict[str, BeautifulSoup]] = None,
+    comment_tables: Optional[CommentTables] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Parse lineup information from match page.
@@ -414,7 +419,7 @@ def parse_lineup_table(
 
 def _enrich_lineup_positions(
     soup: BeautifulSoup,
-    comment_tables: Optional[Dict[str, BeautifulSoup]],
+    comment_tables: Optional[CommentTables],
     lineup_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """Enrich lineup DataFrame with positions from stats summary tables.
@@ -439,8 +444,9 @@ def _enrich_lineup_positions(
 
     # Comment tables
     if comment_tables:
-        for key, table in comment_tables.items():
-            if 'summary' in key.lower() and 'stats' in key.lower():
+        for table in _comment_table_values(comment_tables):
+            table_id = str(table.get('id') or '')
+            if 'summary' in table_id.lower() and 'stats' in table_id.lower():
                 tables_to_check.append(table)
 
     for table in tables_to_check:
@@ -900,7 +906,7 @@ def _parse_team_stats_extra(extra_div, result: dict) -> None:
 
 def parse_team_match_stats_table(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup],
+    comment_tables: CommentTables,
     team_id: Optional[str] = None
 ) -> Optional[pd.DataFrame]:
     """
@@ -954,7 +960,7 @@ def parse_team_match_stats_table(
 
 def parse_player_match_stats_tables(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup],
+    comment_tables: CommentTables,
 ) -> Optional[pd.DataFrame]:
     """
     Parse player match stats from ``stats_*_summary`` tables.
@@ -984,7 +990,7 @@ def parse_player_match_stats_tables(
             summary_by_team.setdefault(match.group(1).lower(), table_id)
 
     if comment_tables:
-        for table_id in comment_tables:
+        for table_id in _comment_table_ids(comment_tables):
             match = summary_id_re.fullmatch(table_id or '')
             if match:
                 summary_by_team.setdefault(
@@ -1076,7 +1082,7 @@ def parse_player_match_stats_tables(
 
 def parse_keeper_match_stats_tables(
     soup: BeautifulSoup,
-    comment_tables: Dict[str, BeautifulSoup],
+    comment_tables: CommentTables,
 ) -> Optional[pd.DataFrame]:
     """
     Parse goalkeeper match stats from ``keeper_stats_{team_id}`` tables.
@@ -1103,7 +1109,7 @@ def parse_keeper_match_stats_tables(
             keeper_by_team.setdefault(match.group(1).lower(), table_id)
 
     if comment_tables:
-        for table_id in comment_tables:
+        for table_id in _comment_table_ids(comment_tables):
             match = keeper_id_re.fullmatch(table_id or '')
             if match:
                 keeper_by_team.setdefault(

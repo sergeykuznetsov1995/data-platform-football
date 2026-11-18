@@ -258,6 +258,160 @@ def test_generic_records_keep_raw_header_value_and_entity_json():
     assert cells[0]["entity_ids"] == '{"player_id": "1234abcd"}'
 
 
+def test_tfoot_is_preserved_as_total_without_changing_body_identity():
+    table = """
+    <table id="stats_standard">
+      <thead><tr><th data-stat="squad">Squad</th></tr></thead>
+      <tbody><tr><td data-stat="squad">Alpha</td></tr></tbody>
+      %s
+    </table>
+    """
+    body_only = parse_page_document(
+        table % "", target_id="t", page_kind="squad", content_hash="fixed"
+    )
+    with_total = parse_page_document(
+        table % """
+        <tfoot><tr><th data-stat="squad">Squad Total</th></tr></tfoot>
+        """,
+        target_id="t",
+        page_kind="squad",
+        content_hash="fixed",
+    )
+
+    body_table = body_only.tables[0]
+    total_table = with_total.tables[0]
+    assert total_table.table_instance_id == body_table.table_instance_id
+    assert total_table.rows[0].row_id == body_table.rows[0].row_id
+    assert [row.cells[0].raw_value for row in total_table.rows] == [
+        "Alpha", "Squad Total"
+    ]
+    assert [getattr(row, "is_total", None) for row in total_table.rows] == [
+        False, True
+    ]
+    assert [cell.get("is_total") for cell in with_total.cell_records()] == [
+        False, True
+    ]
+
+
+def test_tfoot_before_body_has_distinct_identity_without_moving_body_id():
+    row = (
+        '<th data-stat="squad">'
+        '<a href="/en/squads/11111111/Alpha">Alpha</a></th>'
+    )
+    table = (
+        '<table id="stats_standard"><thead><tr><th>Squad</th></tr></thead>'
+        '{}</table>'
+    )
+    body_only = parse_page_document(
+        table.format(f"<tbody><tr>{row}</tr></tbody>"),
+        target_id="t",
+        page_kind="squad",
+        content_hash="fixed",
+    )
+    with_total = parse_page_document(
+        table.format(
+            f"<tfoot><tr>{row}</tr></tfoot><tbody><tr>{row}</tr></tbody>"
+        ),
+        target_id="t",
+        page_kind="squad",
+        content_hash="fixed",
+    )
+
+    total_row, body_row = with_total.tables[0].rows
+    assert total_row.is_total is True
+    assert body_row.is_total is False
+    assert body_row.row_id == body_only.tables[0].rows[0].row_id
+    assert total_row.row_id != body_row.row_id
+
+
+def test_table_without_tbody_reads_direct_and_tfoot_rows_once():
+    page = parse_page_document(
+        """
+        <table id="stats_standard">
+          <tr><th data-stat="squad">Squad</th></tr>
+          <tr><td data-stat="squad">Alpha</td></tr>
+          <tfoot><tr><th data-stat="squad">Squad Total</th></tr></tfoot>
+        </table>
+        """,
+        target_id="t",
+        page_kind="squad",
+    )
+
+    rows = page.tables[0].rows
+    assert [row.cells[0].raw_value for row in rows] == [
+        "Alpha", "Squad Total"
+    ]
+    assert [getattr(row, "is_total", None) for row in rows] == [False, True]
+    assert rows[0].cells[0].raw_header_path == ("Squad",)
+
+
+def test_tfoot_th_row_is_not_promoted_to_fallback_header():
+    page = parse_page_document(
+        """
+        <table id="stats_standard">
+          <tfoot><tr><th data-stat="squad">Squad Total</th></tr></tfoot>
+          <tr><th data-stat="squad">Squad</th></tr>
+          <tr><td data-stat="squad">Alpha</td></tr>
+        </table>
+        """,
+        target_id="t",
+        page_kind="squad",
+    )
+
+    rows = page.tables[0].rows
+    assert [row.cells[0].raw_value for row in rows] == [
+        "Squad Total", "Alpha"
+    ]
+    assert [row.is_total for row in rows] == [True, False]
+    assert all(row.cells[0].raw_header_path == ("Squad",) for row in rows)
+
+
+def test_empty_tbody_does_not_trigger_table_fallback():
+    page = parse_page_document(
+        """
+        <table id="stats_standard">
+          <thead><tr><th data-stat="squad">Squad</th></tr></thead>
+          <tr><td data-stat="squad">Outside body</td></tr>
+          <tbody></tbody>
+          <tfoot><tr><th data-stat="squad">Squad Total</th></tr></tfoot>
+        </table>
+        """,
+        target_id="t",
+        page_kind="squad",
+    )
+
+    rows = page.tables[0].rows
+    assert [row.cells[0].raw_value for row in rows] == ["Squad Total"]
+    assert [getattr(row, "is_total", None) for row in rows] == [True]
+
+
+def test_incomplete_and_nested_rows_are_not_duplicated_across_sections():
+    page = parse_page_document(
+        """
+        <table id="stats_standard">
+          <thead><tr><th data-stat="squad">Squad</th></tr></thead>
+          <tbody>
+            <tr><td></td></tr>
+            <tr class="thead"><th>Squad</th></tr>
+            <tr><td data-stat="squad"><span>Alpha</span></td></tr>
+          </tbody>
+          <tfoot>
+            <tr><td></td></tr>
+            <tr><th data-stat="squad">Squad Total</th></tr>
+          </tfoot>
+        </table>
+        """,
+        target_id="t",
+        page_kind="squad",
+    )
+
+    rows = page.tables[0].rows
+    assert [row.cells[0].raw_value for row in rows] == [
+        "Alpha", "Squad Total"
+    ]
+    assert [getattr(row, "is_total", None) for row in rows] == [False, True]
+
+
 def test_a_broken_colspan_must_not_discard_the_whole_page():
     """FBref's player pages ship colspan="" on every wages row header, and one
     cell per page reaches the parser as colspan='class="' (an unquoted attribute
