@@ -46,6 +46,18 @@ jobs:
           # selenium/...), so the full frozen set is the contract.
           python -m pip install --disable-pip-version-check -r requirements-ci.txt
 
+      - name: Pin TLS client artifact
+        shell: bash
+        run: |
+          artifact=/tmp/tls-client-linux-ubuntu-amd64-1.13.1.so
+          curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
+            --connect-timeout 20 --max-time 300 -fsSL \
+            https://github.com/bogdanfinn/tls-client/releases/download/v1.13.1/tls-client-linux-ubuntu-amd64-1.13.1.so \
+            -o "$artifact"
+          echo "e4a4a5d771d1bd1558186a5ee46af1dfa1318bd31950d68ccd81ed30bad078fc  $artifact" | sha256sum -c -
+          test "$(stat -c %s "$artifact")" -eq 15236872
+          echo "TLS_LIBRARY_PATH=$artifact" >> "$GITHUB_ENV"
+
       - name: Full unit suite
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
