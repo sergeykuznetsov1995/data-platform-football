@@ -14,18 +14,20 @@
 | Планировщик + своя metadata-DB | `deploy/sofascore/airflow.compose.yaml` | `sofascore-airflow` (`sofascore-airflow-scheduler`, `sofascore-airflow-metadb`, `airflow-init`, `airflow-webserver` по профилю `ui`) | код — из `${SOFASCORE_RELEASE_ROOT}`; состояние кампании, опубликованная статическая политика бюджета, пул прокси, venv-шим — из runtime-каталога |
 | Платные шлюзы полос (3 шт.) | `deploy/sofascore/gateway.compose.yaml` | `sofascore-gw` (`sofascore_gw_951` с алиасом сервиса `sofascore_proxy_filter`, `sofascore_gw_history`, `sofascore_gw_players` в сети `sofascore-net`) | всё дерево релиза в `/opt/sofascore-repo:ro`; артефакт и fallback-файл общие, WAL/ledger — свой каталог у каждого |
 | Блок-лист DagBag | `deploy/sofascore/.airflowignore` | накрывает `dags/.airflowignore` внутри scheduler'а | — |
-| Мини-DAG контура | `dags/dag_sofascore_manifest_maintenance.py`, `dags/dag_sofascore_schedule_maintenance.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
+| Мини-DAG контура | `dags/dag_sofascore_manifest_maintenance.py`, `dags/dag_sofascore_schedule_maintenance.py`, `dags/dag_replay_sofascore_raw.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
 | Сторожа аренд (3 шт.) | `deploy/sofascore/gateway_lease_watchdog.py` + `systemd/sofascore-gw-lease-watchdog{,-history,-players}.service` | одноимённые unit'ы, все читают `/etc/data-platform/sofascore.env` | — |
 | Ротация | `freeze_release.sh` → `deploy.sh` → `postdeploy_checks.sh` | — | — |
 | Переменные | `deploy/sofascore/sofascore.env.example` → `/etc/data-platform/sofascore.env` | второй `--env-file` после общего `.env` платформы | — |
 
-Активны в контуре ровно пять DAG: `dag_ingest_sofascore` (расписания не имеет, #1370:
+В release-контуре шесть DAG: `dag_ingest_sofascore` (расписания не имеет, #1370:
 триггеры дейли и её хвоста выведены — прогон запускается вручную или полосой актуалки),
 `dag_backfill_sofascore_all_mens`, `dag_refresh_sofascore_all_mens`,
-`dag_sofascore_schedule_maintenance` (03:00 UTC) и `dag_sofascore_manifest_maintenance`
-(воскресенье 05:00 UTC). Остальные
+`dag_sofascore_schedule_maintenance` (03:00 UTC), `dag_sofascore_manifest_maintenance`
+(воскресенье 05:00 UTC) и ручной `dag_replay_sofascore_raw` (`schedule=None`,
+создаётся на паузе; [offline raw replay](sofascore-raw-replay.md)). Остальные
 файлы `dags/` блок-лист не пускает в DagBag (движок RE2, lookahead не работает —
-поэтому блок-лист, а не allow-list).
+поэтому блок-лист, а не allow-list). Фактический production roster до отдельной
+доставки этим release-документом не утверждается.
 
 ## Три полосы источника (#1244)
 
