@@ -1168,6 +1168,7 @@ jobs:
           else
             test_venv="$WHOSCORED_CI_TEST_VENV"
           fi
+          test -n "$test_venv" || { echo "WhoScored test venv is missing" >&2; exit 1; }
           test -x "$test_venv/bin/python"
           test -d "$test_venv/lib/python3.11/site-packages/pytest"
           WHOSCORED_REAL_DOCKER_TEST=1 \
