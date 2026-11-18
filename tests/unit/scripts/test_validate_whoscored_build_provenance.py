@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -301,6 +302,7 @@ def test_current_repository_evidence_matches_its_declared_state() -> None:
             ROOT,
             attestation_path=attestation_path,
             manifest_path=manifest_path,
+            release_revision=os.environ.get("WHOSCORED_CI_HEAD_SHA"),
         )
         assert discovery.report["status"] == "ready-v1"
         assert discovery.issues == []
@@ -327,7 +329,16 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
     }
     assert len(payload_ids) == 14
 
-    revision = provenance.source_revision(ROOT)
+    attestation = json.loads(
+        (ROOT / provenance.ATTESTATION_RELATIVE).read_text(encoding="utf-8")
+    )
+    if attestation.get("status") == "ready-v1":
+        manifest = json.loads(
+            (ROOT / provenance.MANIFEST_RELATIVE).read_text(encoding="utf-8")
+        )
+        revision = manifest["source_revision"]
+    else:
+        revision = provenance.source_revision(ROOT)
     provenance._validate_payload_blocked_evidence(ROOT, revision)
     discovery = provenance.discover_repository(
         ROOT,
@@ -360,7 +371,11 @@ def test_declared_repository_mode_emits_report_but_default_rejects_without_deplo
         if attestation.get("status") == "blocked-v1"
         else "--expect-ready-build"
     )
-    assert provenance.main(["--root", str(ROOT), mode]) == 0
+    args = ["--root", str(ROOT), mode]
+    release_revision = os.environ.get("WHOSCORED_CI_HEAD_SHA")
+    if attestation.get("status") == "ready-v1" and release_revision is not None:
+        args.extend(["--release-revision", release_revision])
+    assert provenance.main(args) == 0
     output = capsys.readouterr()
     assert json.loads(output.out)["status"] == attestation["status"]
 

@@ -701,6 +701,7 @@ jobs:
       - name: WhoScored unit, DAG and storage contract
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          WHOSCORED_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
@@ -935,6 +936,7 @@ jobs:
           set +e
           docker exec \
             --env GITHUB_WORKSPACE=/root/data-platform-football \
+            --env WHOSCORED_CI_HEAD_SHA="$WHOSCORED_CI_HEAD_SHA" \
             --env GIT_CONFIG_GLOBAL=/dev/null \
             --env GIT_CONFIG_NOSYSTEM=1 \
             --env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
