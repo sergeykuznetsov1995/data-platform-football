@@ -157,7 +157,8 @@ def _without_reference(entry: Mapping, as_of: datetime) -> bool:
 
 
 def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
-                   as_of: datetime, *, registered_seasons: frozenset = frozenset()) -> tuple[dict, list]:
+                   as_of: datetime, *, registered_seasons: frozenset = frozenset(),
+                   unavailable_sources: frozenset = frozenset()) -> tuple[dict, list]:
     counts = Counter()
     problems = []
     seasons = snapshot.get("fotmob_seasons", [])
@@ -202,7 +203,9 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                                  "fotmob_id": str(fid), "reason": "unknown_fotmob_season_phase",
                                  "season_keys": unknown_phases})
                 valid = False
-            if aliases:
+            if aliases and "fotmob_phase_catalog" in unavailable_sources:
+                valid = False
+            elif aliases:
                 # Loaded seasons are not a complete phase catalogue. Require
                 # a fresh full discovery, then load/confirm ALL its phases.
                 catalog = [r for r in snapshot.get("fotmob_phase_catalog", [])
@@ -220,36 +223,42 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                                      "reason": "missing_or_incomplete_fotmob_phase_catalog",
                                      "season_keys": sorted(edition_keys)})
                     valid = False
-            # Every explicit phase must have its own fresh confirmation.
-            required = [{key} for key in sorted(aliases)] if aliases else [
-                {key for key in known_keys if matches_season(key)}]
-            for keys in required:
-                available = [s for s in seasons if str(s["competition_id"]) == str(fid)
-                             and s.get("season_key") in keys]
-                confirmations = [_confirmation(s, as_of) for s in available]
-                confirmations = [t for t in confirmations if t is not None]
-                latest = max(confirmations, default=None)
-                if latest is None or as_of - latest > timedelta(hours=24):
-                    problems.append({"competition_id": cid, "fotmob_id": str(fid), "season_id": sid,
-                                     "season_keys": sorted(keys),
-                                     "reason": "stale_fotmob_season" if latest else "missing_fotmob_season",
-                                     "last_confirmed_at": latest.isoformat() if latest else None,
-                                     "age_hours": (as_of-latest).total_seconds()/3600 if latest else None})
-                    valid = False
-            for row in fixtures:
-                if str(row["competition_id"]) != str(fid) or not matches_season(row.get("season_key")):
-                    continue
-                if row.get("finished") is not True or any(row.get(k) is True for k in ("cancelled", "awarded")) or str(row.get("postponed") or "").lower() not in {"", "false"}:
-                    continue
-                try:
-                    kickoff = instant(row.get("utc_time"))
-                except (ValueError, TypeError):
-                    kickoff = None
-                if kickoff is None:
-                    valid = False
-                    problems.append({"competition_id": cid, "reason": "fotmob_fixture_time_unknown"})
-                elif kickoff <= as_of and kickoff.date() == day:
-                    seen.add((str(fid), str(row["match_id"])))
+            if "fotmob_season_manifest" in unavailable_sources:
+                valid = False
+            else:
+                # Every explicit phase must have its own fresh confirmation.
+                required = [{key} for key in sorted(aliases)] if aliases else [
+                    {key for key in known_keys if matches_season(key)}]
+                for keys in required:
+                    available = [s for s in seasons if str(s["competition_id"]) == str(fid)
+                                 and s.get("season_key") in keys]
+                    confirmations = [_confirmation(s, as_of) for s in available]
+                    confirmations = [t for t in confirmations if t is not None]
+                    latest = max(confirmations, default=None)
+                    if latest is None or as_of - latest > timedelta(hours=24):
+                        problems.append({"competition_id": cid, "fotmob_id": str(fid), "season_id": sid,
+                                         "season_keys": sorted(keys),
+                                         "reason": "stale_fotmob_season" if latest else "missing_fotmob_season",
+                                         "last_confirmed_at": latest.isoformat() if latest else None,
+                                         "age_hours": (as_of-latest).total_seconds()/3600 if latest else None})
+                        valid = False
+            if "fotmob_matches" in unavailable_sources:
+                valid = False
+            else:
+                for row in fixtures:
+                    if str(row["competition_id"]) != str(fid) or not matches_season(row.get("season_key")):
+                        continue
+                    if row.get("finished") is not True or any(row.get(k) is True for k in ("cancelled", "awarded")) or str(row.get("postponed") or "").lower() not in {"", "false"}:
+                        continue
+                    try:
+                        kickoff = instant(row.get("utc_time"))
+                    except (ValueError, TypeError):
+                        kickoff = None
+                    if kickoff is None:
+                        valid = False
+                        problems.append({"competition_id": cid, "reason": "fotmob_fixture_time_unknown"})
+                    elif kickoff <= as_of and kickoff.date() == day:
+                        seen.add((str(fid), str(row["match_id"])))
         counts[cid] = len(seen) if valid else None
     return dict(counts), problems
 
@@ -427,8 +436,15 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
     comparator_pairs, day_scope_exclusions = _day_comparator_scope(snapshot, pairs, day)
     without_reference = sorted({cid for cid, _ in comparator_pairs
                                 if _without_reference(mapping.get(cid, {}), as_of)})
-    fm_counts, fm_problems = _fotmob_counts(snapshot, mapping, comparator_pairs, day, as_of)
     errors = list(snapshot.get("errors", []))
+    unavailable_sources = frozenset(
+        str(error.get("source")) for error in errors
+        if isinstance(error, Mapping) and error.get("reason") == "read_failed"
+    )
+    fm_counts, fm_problems = _fotmob_counts(
+        snapshot, mapping, comparator_pairs, day, as_of,
+        unavailable_sources=unavailable_sources,
+    )
     population_complete = not gaps and not errors and bool(pairs) and all(r["date_confirmed"] for r in entries)
     completed = population_complete and bool(entries) and not totals["unknown"] and all(
         instant(row["deadline"]) <= as_of for row in entries
@@ -493,18 +509,31 @@ def summary_line(report: Mapping) -> str:
     percentage = f"{pct:.2f} %" if pct is not None else "н/д"
     k = report["fotmob"] if report["fotmob"] is not None else "н/д"
     state = "окончательный" if report["final"] else "предварительный"
+    milestone = "да" if report["milestone_day_pass"] else "нет"
     reasons = Counter(p["reason"] for p in report["fotmob_problems"])
+    scope_reasons = Counter(p["reason"] for p in report["scope_gaps"])
+    snapshot_errors = Counter(
+        f"{p.get('source', 'unknown')}:{p.get('reason', 'unknown')}"
+        if isinstance(p, Mapping) else str(p)
+        for p in report["errors"]
+    )
     unconfirmed = sum(not r["date_confirmed"] for r in report["matches"])
     deadlines = sum(instant(r["deadline"]) > instant(report["as_of"])
                     for r in report["matches"] if r["deadline"])
     differences = sum(r["difference"] not in (None, 0) for r in report["competitions"])
+    difference_text = "н/д" if report["fotmob"] is None else str(differences)
+    if report["fotmob"] is None and differences:
+        difference_text += f"; в известной части {differences}"
+    on_time = report["on_time"] if report["played"] else "н/д"
+    statuses = (f"ожидают {report['pending']}, неизвестно {report['unknown']}"
+                if report["played"] else "ожидают/неизвестно н/д")
     blockers = (f"UTC не подтверждено {unconfirmed}; дедлайн не истёк {deadlines}; "
                 f"FotMob причины {dict(reasons)}; известно частично {report['fotmob_known_count']}; "
-                f"расхождений {differences}; без эталона: {len(report.get('without_reference', []))}")
-    return (f"FBref: матчей {report['date']} UTC {report['played']}, ≤24 ч {report['on_time']} "
-            f"({percentage}), у FotMob {k}; {state}; ожидают {report['pending']}, "
-            f"неизвестно {report['unknown']}; "
-            f"пробелов данных {len(report['scope_gaps']) + len(report['errors'])}; {blockers}")
+                f"расхождения counts {difference_text}; без эталона: {len(report.get('without_reference', []))}")
+    return (f"FBref: матчей {report['date']} UTC {report['played']}, ≤24 ч {on_time} "
+            f"({percentage}), у FotMob {k}; {state}; зачёт вехи {milestone}; {statuses}; "
+            f"пробелов данных {len(report['scope_gaps']) + len(report['errors'])}; "
+            f"причины scope {dict(scope_reasons)}; ошибки среза {dict(snapshot_errors)}; {blockers}")
 
 
 def render_markdown(report: Mapping) -> str:
