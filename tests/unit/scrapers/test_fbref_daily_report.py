@@ -771,3 +771,135 @@ def test_1805_inventory_failure_is_isolated_and_aggregate_still_read():
     assert report(collected)["page_ages"]["errors"] == [
         {"source": "fbref_standings_inventory", "reason": "read_failed"}]
     assert "private" not in json.dumps(collected)
+
+
+@pytest.mark.parametrize("attribute", [
+    'data-venue-epoch="1791392400"',
+    'data-venue-time="2026-10-07T20:00:00+03:00"',
+])
+def test_1792_observation_to_report_preserves_utc_day(attribute):
+    html = ('<table id="sched_all"><tr><td><span ' + attribute + '></span>'
+            '<a href="/en/matches/12345678/Test">Report</a></td></tr></table>')
+    rows = [{"match_url": "/en/matches/12345678/Test", "score": "2–1"}]
+    observed = schedule_observations(html, rows)[0]
+    assert observed["kickoff_at"].astimezone(timezone.utc).isoformat() == "2026-10-07T17:00:00+00:00"
+    data = snapshot()
+    data["schedules"][0]["date"] = "2026-10-08"
+    data["observations"][0]["kickoff_at"] = observed["kickoff_at"].isoformat()
+    result = report(data)
+    assert result["played"] == 1 and result["matches"][0]["date_confirmed"]
+    assert result["final"] and result["milestone_day_pass"]
+
+
+@pytest.mark.parametrize("attribute", [
+    'data-venue-time="17:00"',
+    'data-venue-epoch="1791392400" data-venue-time="2026-10-08T17:00:00Z"',
+])
+def test_1792_observation_to_report_keeps_unconfirmed_time_fail_closed(attribute):
+    html = ('<table id="sched_all"><tr><td><span ' + attribute + '></span>'
+            '<a href="/en/matches/12345678/Test">Report</a></td></tr></table>')
+    rows = [{"match_url": "/en/matches/12345678/Test", "score": "2–1"}]
+    observed = schedule_observations(html, rows)[0]
+    assert observed["kickoff_at"] is None
+    data = snapshot()
+    data["observations"][0]["kickoff_at"] = observed["kickoff_at"]
+    result = report(data)
+    assert result["played"] == 1 and not result["matches"][0]["date_confirmed"]
+    assert not result["population_complete"]
+    assert not result["final"] and not result["milestone_day_pass"]
+
+
+@pytest.mark.parametrize("cid,fid", [("21", "112"), ("61", "199")])
+def test_1792_scope_aliases_deduplicate_generic_and_phase_matches(cid, fid):
+    data = snapshot()
+    sid = "2026"
+    data["competitions"][0]["competition_id"] = cid
+    for kind in ("seasons", "schedule_health", "observations", "readiness"):
+        data[kind][0].update(competition_id=cid, season_id=sid)
+    data["schedules"][0].update(source_competition_id=cid, source_season_id=sid)
+    keys = ["2026", "2026 - Apertura", "2026 - Clausura"]
+    data["fotmob_seasons"] = [
+        dict(data["fotmob_seasons"][0], competition_id=fid, season_key=key)
+        for key in keys
+    ]
+    data["fotmob_phase_catalog"] = deepcopy(data["fotmob_seasons"])
+    data["fotmob_matches"] = [
+        dict(data["fotmob_matches"][0], competition_id=fid, season_key="2026"),
+        dict(data["fotmob_matches"][0], competition_id=fid, season_key="2026 - Clausura"),
+    ]
+    mapping = json.loads((Path(__file__).resolve().parents[3] /
+                          "configs/fbref/fotmob-report-map.json").read_text())["competitions"]
+    result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result["played"] == 1
+    assert result["fotmob"] == 1
+    assert result["competitions"][0]["difference"] == 0
+    assert result["milestone_day_pass"]
+
+
+@pytest.mark.parametrize("source,forbidden_reason", [
+    ("fotmob_season_manifest", "missing_fotmob_season"),
+    ("fotmob_phase_catalog", "missing_or_incomplete_fotmob_phase_catalog"),
+    ("fotmob_matches", "missing_fotmob_season"),
+])
+def test_1792_read_failure_is_not_missing_reference_or_count_divergence(source, forbidden_reason):
+    from scrapers.fbref.daily_report import summary_line
+    data = snapshot()
+    mapping = MAP
+    if source == "fotmob_season_manifest":
+        data["fotmob_seasons"] = []
+    elif source == "fotmob_matches":
+        data["fotmob_matches"] = []
+    else:
+        data["fotmob_seasons"][0]["season_key"] = "2026/2027 - Apertura"
+        data["fotmob_matches"][0]["season_key"] = "2026/2027 - Apertura"
+        mapping = {"9": {"fotmob_ids": ["47"], "season_keys": {
+            "2026-2027": {"47": ["2026/2027 - Apertura"]}}}}
+    data["errors"] = [{"source": source, "reason": "read_failed"}]
+    result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result["fotmob"] is None
+    assert result["competitions"][0]["fotmob"] is None
+    assert result["competitions"][0]["difference"] is None
+    assert not result["final"] and not result["milestone_day_pass"]
+    assert forbidden_reason not in {p["reason"] for p in result["fotmob_problems"]}
+    assert source + ":read_failed" in summary_line(result)
+
+
+def test_1792_summary_distinguishes_missing_stale_and_actual_count_divergence():
+    from scrapers.fbref.daily_report import summary_line
+    data = snapshot()
+    data["fotmob_seasons"] = []
+    missing = summary_line(report(data))
+    assert "missing_fotmob_season" in missing
+    assert "stale_fotmob_season" not in missing
+    data = snapshot()
+    data["fotmob_seasons"][0]["fetched_at"] = (AS_OF - timedelta(hours=25)).isoformat()
+    stale = summary_line(report(data))
+    assert "stale_fotmob_season" in stale
+    assert "missing_fotmob_season" not in stale
+    data = snapshot()
+    data["fotmob_matches"].append({**data["fotmob_matches"][0], "match_id": "extra"})
+    result = report(data)
+    divergent = summary_line(result)
+    assert result["fotmob"] == 2 and not result["milestone_day_pass"]
+    assert "расхождения counts 1" in divergent
+    assert "расхождения counts н/д" not in divergent
+
+
+def test_1792_summary_exposes_scope_and_read_failures_without_false_zeros():
+    from scrapers.fbref.daily_report import summary_line
+    data = snapshot()
+    data["schedules"] = data["observations"] = data["readiness"] = []
+    data["schedule_health"][0]["fetched"] = False
+    data["fotmob_seasons"] = []
+    data["errors"] = [{"source": "fotmob_season_manifest", "reason": "read_failed"}]
+    result = report(data)
+    line = summary_line(result)
+    assert result["played"] == 0
+    assert not result["final"] and not result["milestone_day_pass"]
+    assert "missing_or_unfetched_schedule" in line
+    assert "fotmob_season_manifest:read_failed" in line
+    assert "расхождения counts н/д" in line
+    assert "зачёт вехи нет" in line
+    assert "≤24 ч н/д" in line
+    assert "ожидают 0" not in line and "неизвестно 0" not in line
+    assert line in render_markdown(result)
