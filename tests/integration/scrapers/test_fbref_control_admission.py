@@ -12,7 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
-from scrapers.fbref.control import ControlStore, StateConflict
+from scrapers.fbref.control import CompetitionRegistryEntry, ControlStore, StateConflict
 from scrapers.fbref.control.replay_effects import (
     normalize_replay_control_effects,
 )
@@ -146,6 +146,117 @@ def test_postponed_kickoff_uses_latest_source_read_and_old_replay_cannot_undo_it
         row = cursor.fetchone()
         assert row["kickoff_at"] is None
         assert row["kickoff_observed_at"] == first + timedelta(days=3)
+
+
+def test_reconcile_restores_assigned_incomplete_refetch_postgres(isolated_postgres_uri):
+    store = ControlStore(isolated_postgres_uri)
+    target_id = "fbref:match:1953-refetch-reconcile"
+    refresh_id = str(uuid.uuid4())
+    scheduled_at = datetime(2026, 10, 30, 1, 2, 3, tzinfo=timezone.utc)
+    retry_after = datetime(2026, 10, 30, 4, 5, 6, tzinfo=timezone.utc)
+    fetched_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    with store._transaction() as cursor:
+        cursor.execute(
+            """INSERT INTO fbref_control.page_frontier (
+                target_id, source, page_kind, canonical_url, source_ids,
+                refresh_policy, state, next_fetch_at, retry_after,
+                last_error_class, last_error_message, last_content_hash,
+                last_fetched_at
+            ) VALUES (
+                %s, 'fbref', 'match', %s, %s::jsonb, 'historical_once', 'retry',
+                %s, %s, 'IncompleteMatchPageError', 'scored_match_incomplete',
+                'incomplete-hash', %s
+            )""",
+            (
+                target_id, f"https://fbref.com/en/matches/{target_id}",
+                json.dumps({"competition_id": "68", "season_id": "2010"}),
+                scheduled_at, retry_after, fetched_at,
+            ),
+        )
+        cursor.execute(
+            """INSERT INTO fbref_control.incomplete_match_refetch (
+                target_id, attempts, logical_refresh_id, window_started_at
+            ) VALUES (%s, 1, %s, %s)""",
+            (target_id, refresh_id, datetime(2026, 10, 20, tzinfo=timezone.utc)),
+        )
+
+    def reconcile(at, metadata):
+        snapshot = store.create_registry_snapshot(fetched_at=at, successful=True)
+        return store.reconcile_competitions(
+            snapshot,
+            [CompetitionRegistryEntry(
+                competition_id="68",
+                canonical_url="https://fbref.com/en/comps/68/history/Seasons",
+                name="Discontinued League", gender="male",
+                classification="domestic_league", crawl_state="skipped",
+                metadata=metadata,
+            )],
+        )
+
+    first = reconcile(datetime(2026, 10, 29, 12, tzinfo=timezone.utc), {})
+    assert first["frontier_scope_reopened"] == 0
+    assert first["frontier_scope_closed"] == 1
+    with store._transaction() as cursor:
+        cursor.execute(
+            "SELECT state FROM fbref_control.page_frontier WHERE target_id = %s",
+            (target_id,),
+        )
+        assert cursor.fetchone()["state"] == "skipped"
+        cursor.execute(
+            "SELECT attempts, exhausted_at FROM fbref_control.incomplete_match_refetch "
+            "WHERE target_id = %s",
+            (target_id,),
+        )
+        refetch = cursor.fetchone()
+        assert refetch["attempts"] == 1
+        assert refetch["exhausted_at"] is None
+
+    discontinued = {
+        "current_scope_lifecycle": "discontinued",
+        "current_scope_reason": "last_source_season_2010",
+    }
+    repaired = reconcile(
+        datetime(2026, 10, 29, 12, 1, tzinfo=timezone.utc), discontinued,
+    )
+    assert repaired["frontier_scope_reopened"] == 1
+    assert repaired["frontier_scope_closed"] == 0
+    with store._transaction() as cursor:
+        cursor.execute(
+            "SELECT * FROM fbref_control.page_frontier WHERE target_id = %s",
+            (target_id,),
+        )
+        before_frontier = dict(cursor.fetchone())
+        cursor.execute(
+            "SELECT * FROM fbref_control.incomplete_match_refetch WHERE target_id = %s",
+            (target_id,),
+        )
+        before_refetch = dict(cursor.fetchone())
+    assert before_frontier["state"] == "retry"
+    assert before_frontier["next_fetch_at"] == scheduled_at
+    assert before_frontier["retry_after"] == retry_after
+    assert before_frontier["last_error_class"] == "IncompleteMatchPageError"
+    assert before_frontier["last_error_message"] == "scored_match_incomplete"
+    assert before_frontier["last_content_hash"] == "incomplete-hash"
+    assert before_frontier["last_fetched_at"] == fetched_at
+    assert before_refetch["attempts"] == 1
+    assert before_refetch["exhausted_at"] is None
+
+    again = reconcile(
+        datetime(2026, 10, 29, 12, 2, tzinfo=timezone.utc), discontinued,
+    )
+    assert again["frontier_scope_reopened"] == 0
+    assert again["frontier_scope_closed"] == 0
+    with store._transaction() as cursor:
+        cursor.execute(
+            "SELECT * FROM fbref_control.page_frontier WHERE target_id = %s",
+            (target_id,),
+        )
+        assert dict(cursor.fetchone()) == before_frontier
+        cursor.execute(
+            "SELECT * FROM fbref_control.incomplete_match_refetch WHERE target_id = %s",
+            (target_id,),
+        )
+        assert dict(cursor.fetchone()) == before_refetch
 
 
 def _postgres_uri() -> str:
