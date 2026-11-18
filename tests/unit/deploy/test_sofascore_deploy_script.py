@@ -1516,7 +1516,12 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
-            *is_active=true*) echo 5 ;;
+            *is_active=true*)
+              n=0
+              for dag in {' '.join(ACTIVE_DAG_ROSTER)}; do
+                case "${{@: -1}}" in *"$dag"*) n=$((n+1)) ;; esac
+              done
+              echo "$n" ;;
             *"pool='sofascore_history_pool'"*) echo 3 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;
@@ -1553,6 +1558,14 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
 
 
 GATEWAY_CONTAINERS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
+ACTIVE_DAG_ROSTER = (
+    "dag_backfill_sofascore_all_mens",
+    "dag_refresh_sofascore_all_mens",
+    "dag_ingest_sofascore",
+    "dag_replay_sofascore_raw",
+    "dag_sofascore_manifest_maintenance",
+    "dag_sofascore_schedule_maintenance",
+)
 
 
 def _run_postdeploy(
@@ -1673,6 +1686,7 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
     proc = _run_postdeploy(tmp_path, scheduler, gateways)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ПРИЁМКА: ок" in proc.stdout
+    assert "✓ 6 DAG контура активны" in proc.stdout, proc.stdout
     # Три полосы проверяются целиком: health, пулы, сторожа.
     for container in GATEWAY_CONTAINERS:
         assert f"✓ {container} healthy" in proc.stdout, proc.stdout
