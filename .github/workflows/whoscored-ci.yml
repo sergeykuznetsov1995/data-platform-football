@@ -681,7 +681,7 @@ jobs:
 
       - name: Install test runtime
         run: |
-          test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"
+          test_venv="/tmp/whoscored-ci-test-venv.evidence"
           setup_python_prefix="$("$WHOSCORED_CI_SETUP_PYTHON" -I -S -c \
             'import sys; print(sys.base_prefix)')"
           "$WHOSCORED_CI_SETUP_PYTHON" -I -S -m venv --copies "$test_venv"
@@ -1163,16 +1163,7 @@ jobs:
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
-          if test -z "${WHOSCORED_CI_TEST_VENV:-}"; then
-            test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"
-            python -I -m venv --copies "$test_venv"
-            "$test_venv/bin/python" -I -m pip install \
-              --disable-pip-version-check --no-deps \
-              --require-hashes --only-binary=:all: \
-              -r .github/workflows/whoscored-test.lock
-          else
-            test_venv="$WHOSCORED_CI_TEST_VENV"
-          fi
+          test_venv="${WHOSCORED_CI_TEST_VENV:-/tmp/whoscored-ci-test-venv.evidence}"
           test -x "$test_venv/bin/python"
           test -d "$test_venv/lib/python3.11/site-packages/pytest"
           WHOSCORED_REAL_DOCKER_TEST=1 \
