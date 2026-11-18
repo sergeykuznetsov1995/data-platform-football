@@ -69,16 +69,17 @@ def test_source_user_may_write_like_airflow(source):
 
 
 @pytest.mark.unit
-def test_airflow_can_share_only_fotmob_definer_views():
+def test_fotmob_definer_owners_can_share_views():
     rules = json.loads((TRINO / "rules.json").read_text())
-    rule = _table_rule_for(rules, "airflow", "fotmob_ingest_manifest")
-    assert {key: rule.get(key) for key in ("user", "catalog", "schema", "table")} == {
-        "user": "airflow", "catalog": "iceberg", "schema": "bronze", "table": "fotmob_.*",
-    }
-    assert rule["privileges"] == [
-        "SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT",
-    ]
-    for user in ("src_fotmob", "superset", "sergey"):
+    for user in ("airflow", "src_fotmob"):
+        rule = _table_rule_for(rules, user, "fotmob_ingest_manifest")
+        assert {key: rule.get(key) for key in ("user", "catalog", "schema", "table")} == {
+            "user": "airflow|src_fotmob", "catalog": "iceberg", "schema": "bronze", "table": "fotmob_.*",
+        }
+        assert rule["privileges"] == [
+            "SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT",
+        ]
+    for user in ("superset", "sergey", "src_fbref"):
         assert "GRANT_SELECT" not in _table_rule_for(rules, user, "fotmob_ingest_manifest")["privileges"]
     assert "GRANT_SELECT" not in _table_rule_for(rules, "airflow", "fbref_matches")["privileges"]
 

@@ -12,7 +12,7 @@
   ],
   "tables": [
     {
-      "user": "airflow",
+      "user": "airflow|src_fotmob",
       "catalog": "iceberg",
       "schema": "bronze",
       "table": "fotmob_.*",
