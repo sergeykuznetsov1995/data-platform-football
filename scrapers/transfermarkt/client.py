@@ -1732,6 +1732,11 @@ class TransfermarktHttpClient:
         return any(marker in lower for marker in _CHALLENGE_MARKERS)
 
     @staticmethod
+    def _looks_like_aws_waf_challenge(text: str) -> bool:
+        lower = text.lower()
+        return "awswaf.com" in lower and "challenge.js" in lower
+
+    @staticmethod
     def _looks_like_json_challenge(payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
@@ -2405,6 +2410,17 @@ class TransfermarktHttpClient:
                     error_type = (
                         ErrorType.CLOUDFLARE.value
                         if is_challenge else ErrorType.UNKNOWN.value
+                    )
+                elif status_code == 202 and self._looks_like_aws_waf_challenge(
+                    body.decode("utf-8", errors="replace")
+                ):
+                    terminal_status = FetchStatus.BLOCKED
+                    last_error = "HTTP 202 AWS WAF challenge"
+                    error_type = ErrorType.CLOUDFLARE.value
+                    self._report_site_block(status_code, challenge=True)
+                    retry_allowed = (
+                        self._has_alternate_proxy(proxy_obj)
+                        and attempt < min(attempts_cap, 2)
                     )
                 elif status_code == 404:
                     # A missing route/player is not proof that an existing
