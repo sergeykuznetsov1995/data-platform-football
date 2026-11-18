@@ -12,6 +12,7 @@ on:
       - "dags/dag_refresh_sofascore_all_mens.py"
       - "dags/dag_sofascore_manifest_maintenance.py"
       - "dags/dag_sofascore_schedule_maintenance.py"
+      - "dags/dag_replay_sofascore_raw.py"
       - "dags/.airflowignore"
       - "dags/utils/sofascore_all_mens_state.py"
       - "dags/dag_iceberg_maintenance.py"
@@ -75,9 +76,11 @@ jobs:
             dags/dag_refresh_sofascore_all_mens.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
+            dags/dag_replay_sofascore_raw.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
+            dags/scripts/replay_sofascore_raw.py \
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
             dags/scripts/run_sofascore_scope_cycle.py \
@@ -106,6 +109,7 @@ jobs:
             dags/dag_sofascore_pipeline.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
+            dags/dag_replay_sofascore_raw.py \
             scripts/migrate_sofascore_production.py \
             scripts/migrate_sofascore_partition_keys.py \
             scripts/migrate_sofascore_partition_keys_batched.py
@@ -127,6 +131,7 @@ jobs:
             tests/unit/dags/test_dag_backfill_sofascore_all_mens.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \
+            tests/unit/dags/test_dag_replay_sofascore_raw.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
@@ -166,6 +171,8 @@ jobs:
             tests/unit/scrapers/test_sofascore_pipeline.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \
             tests/unit/scrapers/test_sofascore_workload_runtime.py \
+            tests/unit/scrapers/test_sofascore_raw_fields.py \
+            tests/unit/scrapers/test_sofascore_raw_replay.py \
             tests/unit/scrapers/test_sofascore_raw_store.py \
             tests/unit/scrapers/test_sofascore_registry_v2.py \
             tests/unit/scrapers/test_scrapers_lazy_import.py \
@@ -187,6 +194,7 @@ jobs:
             tests/unit/scripts/test_migrate_sofascore_partition_keys_batched.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
             tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
+            tests/unit/scripts/test_replay_sofascore_raw.py \
             tests/unit/scripts/test_run_sofascore_schedule_refresh.py \
             tests/unit/scripts/test_run_sofascore_scope_cycle.py \
             tests/unit/scripts/test_run_sofascore_workload.py \
@@ -238,8 +246,11 @@ jobs:
           mkdir -p "${dag_dir}"
           for dag in \
             dag_ingest_sofascore.py \
+            dag_backfill_sofascore_all_mens.py \
             dag_refresh_sofascore_all_mens.py \
-            dag_backfill_sofascore_all_mens.py
+            dag_sofascore_manifest_maintenance.py \
+            dag_sofascore_schedule_maintenance.py \
+            dag_replay_sofascore_raw.py
           do
             cp "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
           done
@@ -264,17 +275,29 @@ jobs:
               raise SystemExit(f"real Airflow DAG import errors:\n{details}")
 
           expected = {
-              "dag_ingest_sofascore",
-              "dag_refresh_sofascore_all_mens",
-              "dag_backfill_sofascore_all_mens",
+              "dag_ingest_sofascore": 70,
+              "dag_backfill_sofascore_all_mens": 6,
+              "dag_refresh_sofascore_all_mens": 7,
+              "dag_sofascore_manifest_maintenance": 1,
+              "dag_sofascore_schedule_maintenance": 1,
+              "dag_replay_sofascore_raw": 3,
           }
           actual = set(dag_bag.dag_ids)
-          if actual != expected:
+          if actual != set(expected):
               raise SystemExit(
                   "real Airflow loaded the wrong SofaScore DAG set: "
-                  f"missing={sorted(expected - actual)}, "
-                  f"unexpected={sorted(actual - expected)}"
+                  f"missing={sorted(set(expected) - actual)}, "
+                  f"unexpected={sorted(actual - set(expected))}"
               )
+          for dag_id, expected_tasks in sorted(expected.items()):
+              dag = dag_bag.get_dag(dag_id)
+              task_count = len(dag.tasks) if dag is not None else -1
+              print(f"{dag_id}: tasks={task_count}")
+              if dag is None or task_count != expected_tasks:
+                  raise SystemExit(
+                      f"real Airflow DAG {dag_id} must expose exactly "
+                      f"{expected_tasks} tasks, got {task_count}"
+                  )
           PY
 
       - name: Check real Airflow DAG imports

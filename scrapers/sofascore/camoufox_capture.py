@@ -357,9 +357,25 @@ def normalize_standing(row: dict) -> dict:
     """Flatten a SofaScore standings row to a ``bronze.sofascore_league_table``
     row (business columns only; the caller adds ``league`` / ``season`` /
     metadata and casts the counts to nullable bigint). ``gd`` is derived — the
-    API row has no goal-difference field. Mirrors :func:`normalize_event`."""
+    API row has no goal-difference field. ``position`` passes through.
+    ``promotion`` splits by shape: a scalar lands in ``promotion``, a dict/list
+    is kept as canonical JSON in ``promotion_json`` (scalar column then NULL);
+    an absent ``promotion`` leaves both NULL. Mirrors
+    :func:`normalize_event`."""
     gf = row.get("scoresFor")
     ga = row.get("scoresAgainst")
+    promotion = row.get("promotion")
+    if isinstance(promotion, (dict, list, tuple)):
+        promotion_json = json.dumps(
+            promotion,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        promotion_value = None
+    else:
+        promotion_json = None
+        promotion_value = promotion
     return {
         "team": (row.get("team") or {}).get("name"),
         "mp": row.get("matches"),
@@ -370,6 +386,9 @@ def normalize_standing(row: dict) -> dict:
         "ga": ga,
         "gd": (gf - ga) if gf is not None and ga is not None else None,
         "pts": row.get("points"),
+        "position": row.get("position"),
+        "promotion": promotion_value,
+        "promotion_json": promotion_json,
         # group support for WC (Фаза 4 #913). Try to pull from row if the
         # standings response includes per-group info (e.g. for INT-World Cup).
         # Natural-key scope: a team may appear in more than one stage/block.

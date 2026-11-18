@@ -107,12 +107,13 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance dag_replay_sofascore_raw"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
 MAINT=dag_sofascore_manifest_maintenance
 COMPACT=dag_sofascore_schedule_maintenance
+REPLAY=dag_replay_sofascore_raw
 
 # Дедлайн попытки и потолки. Переопределяются из окружения только для стенда.
 # Дедлайн — ближайший запуск сбора по расписанию Airflow (dag.next_dagrun_create_after DAG не на
@@ -379,8 +380,10 @@ mounts_all_in(){  # mounts_all_in <дерево>
 acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt scheduler'а>
   local new="$1" started="$2" dags errs gw n c line want got dag_sql="" dag_count=0
   for c in $CORE_DAGS; do
-    # Rollback may target a release predating schedule compaction.
-    [ "$c" != "$COMPACT" ] || [ -f "$new/dags/$COMPACT.py" ] || continue
+    # Необязательные для дерева DAG ($COMPACT — компакция расписаний, $REPLAY — перегрузка
+    # raw): цель отката может быть старее их появления. Нет файла dags/<dag>.py в дереве —
+    # приёмка этот DAG от дерева не требует; на новом дереве требует всех.
+    case "$c" in "$COMPACT"|"$REPLAY") [ -f "$new/dags/$c.py" ] || continue ;; esac
     dag_sql="$dag_sql'$c',"
     dag_count=$(( dag_count + 1 ))
   done
@@ -1131,7 +1134,7 @@ if [ "$LIVE" = "$WANT" ]; then
       log "БОЙ НА MASTER, НО КОНТРАКТ ПРИЁМКИ НЕ СОШЁЛСЯ — маркер приёмки не выдаю"
       window_touch '?' "бой на master, контракт приёмки не сошёлся"
       if ! said_today "$STATE/sofascore-contract-failed-$TODAY"; then
-        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (пять DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
+        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (шесть DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
         mark_said "$STATE/sofascore-contract-failed-$TODAY"
       fi
       exit 0
@@ -1457,7 +1460,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8}), артефакт ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}"
   # Маркер снимаем ПОСЛЕ гарантированной отправки: смерть между снятием и сообщением
   # оставила бы исход немым, а защёлка sha — следующие тики молчаливыми.
-  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (пять DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s. Учёт оплаченного скоупа истории: $accounted.${extra}"
+  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (шесть DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s. Учёт оплаченного скоупа истории: $accounted.${extra}"
   # delivered пишется ПОСЛЕДНИМ (план 1245 §3.3): фаза finishing → снятие INFLIGHT → исход.
   # Обрыв до снятия маркера — следующий тик разберёт INFLIGHT (откат, failed); обрыв между
   # снятием и записью — просроченное закрытие даст unknown по DELIVERY_PHASE=finishing.

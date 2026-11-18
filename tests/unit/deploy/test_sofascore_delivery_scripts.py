@@ -46,6 +46,7 @@ SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
 MAINT = "dag_sofascore_manifest_maintenance"
 COMPACT = "dag_sofascore_schedule_maintenance"
+REPLAY = "dag_replay_sofascore_raw"
 # Четверг 03:30 UTC — середина окна доставки; воскресенье того же формата — для сдвига.
 THU_0330 = "2026-09-03 03:30:00"
 SUN_0330 = "2026-09-06 03:30:00"
@@ -1979,25 +1980,37 @@ def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("has_compaction,registered,expected", [
-    (True, 6, "0"), (True, 5, "1"), (False, 4, "1"),
+@pytest.mark.parametrize("has_compaction,has_replay,registered,expected", [
+    # Новое дерево несёт оба необязательных DAG — спрашиваются все шесть; меньший ответ
+    # метабазы приёмку не проходит.
+    (True, True, 6, "1"), (True, True, 5, "0"),
+    # Rollback на дерево эпохи компакции без replay-файла: replay пропущен по absent-файлу,
+    # ростер и счётчик — пять; потребовать от такого дерева шесть — провал, не «авансом».
+    (True, False, 5, "1"), (True, False, 6, "0"),
+    # Rollback на дерево до компакции: пропущены оба необязательных DAG.
+    (False, False, 4, "1"),
 ])
-def test_acceptance_requires_compaction_only_for_releases_containing_it(
-    tmp_path: Path, has_compaction: bool, registered: int, expected: str,
+def test_acceptance_demands_optional_dags_only_from_releases_carrying_them(
+    tmp_path: Path, has_compaction: bool, has_replay: bool, registered: int, expected: str,
 ) -> None:
-    """Execute the real acceptance function offline, including old-release rollback."""
+    """Execute the real acceptance function offline, including old-release rollback:
+    ростер и счётчик собираются по фактическим файлам dags/ дерева, необязательные DAG
+    (компакция расписаний, перегрузка raw) требуются только от релизов с их файлом."""
     tree = tmp_path / "release"
     (tree / "dags").mkdir(parents=True)
     if has_compaction:
         (tree / "dags" / f"{COMPACT}.py").touch()
+    if has_replay:
+        (tree / "dags" / f"{REPLAY}.py").touch()
     text = AUTO.read_text()
     core = next(line for line in text.splitlines() if line.startswith("CORE_DAGS="))
+    compact = next(line for line in text.splitlines() if line.startswith("COMPACT="))
+    replay = next(line for line in text.splitlines() if line.startswith("REPLAY="))
     acceptance = text.split("acceptance_seen(){", 1)[1].split("\n}", 1)[0]
     sql_log = tmp_path / "sql"
-    script = core + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
+    script = core + '\n' + compact + '\n' + replay + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done)
 CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
-COMPACT=dag_sofascore_schedule_maintenance
 GATEWAY_CONTAINERS="gw1 gw2 gw3"
 WATCHDOG_UNITS=watchdog
 POOLS=""
@@ -2006,7 +2019,7 @@ metadb(){
     *last_parsed_time*)
       echo "$1" > "$SQL_LOG"
       case "$1" in
-        *dag_sofascore_schedule_maintenance*) echo "$REGISTERED" ;;
+        *dag_sofascore_schedule_maintenance*|*dag_replay_sofascore_raw*) echo "$REGISTERED" ;;
         *) echo 4 ;;
       esac ;;
     *) echo 0 ;;
@@ -2026,7 +2039,9 @@ acceptance_seen "$2" "2026-10-28T03:00:00Z"
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == expected, proc.stderr
-    assert (COMPACT in sql_log.read_text()) == has_compaction
+    sql = sql_log.read_text(encoding="utf-8")
+    assert (COMPACT in sql) == has_compaction
+    assert (REPLAY in sql) == has_replay
 
 
 # ---- #1980: доставка в любой час, защёлка на sha, запись на попытку ---------------------------
@@ -2084,7 +2099,8 @@ def test_three_failed_attempts_in_one_day_shut_the_automaton_off(stand: Stand) -
 def test_the_busy_check_and_the_deadline_ask_the_metadb_about_the_right_dags(stand: Stand) -> None:
     """Занятость — актуалка, ручной ingest и обслуживание; дедлайн — по расписаниям
     актуалки и обслуживания, только DAG не на паузе; история (@continuous) в дедлайн
-    не входит — её осушает deploy.sh; retired-триггеры #1370 нигде не спрашиваются."""
+    не входит — её осушает deploy.sh; retired-триггеры #1370 и перегрузка raw (schedule=None,
+    paused-on-create, #1367) нигде не спрашиваются: REPLAY — не контроль автомата."""
     stand.put("busy", "1")
     stand.run()
     sql = [c for c in stand.calls("docker") if "sofascore-airflow-metadb" in c]
@@ -2096,6 +2112,7 @@ def test_the_busy_check_and_the_deadline_ask_the_metadb_about_the_right_dags(sta
     for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
         assert f"'{retired}'" not in nxt[0], nxt[0]
     assert HIST not in nxt[0] and "'dag_ingest_sofascore'" not in nxt[0] and "NOT is_paused" in nxt[0]
+    assert REPLAY not in nxt[0] and REPLAY not in busy[0], (nxt[0], busy[0])
     for dag in ("dag_ingest_sofascore", REFRESH, MAINT, COMPACT):
         assert f"'{dag}'" in busy[0], busy[0]
     for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):

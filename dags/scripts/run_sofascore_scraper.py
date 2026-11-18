@@ -1221,6 +1221,10 @@ def _signed_history_match_ids(
     explicit_ids = _history_match_ids()
     if explicit_ids is None:
         return None
+    if offline_replay and workload_plan is None and not force_replace:
+        # #1367: the offline replay lane has no signed plan by design; the
+        # scope cycle already validated and normalized this exact universe.
+        return explicit_ids
     if workload_plan is None or force_replace or offline_replay:
         raise RuntimeError("history match IDs require a signed plan without force/offline overrides")
     workload_plan.verify()
@@ -2342,6 +2346,20 @@ def _run_player_capture(
                 registered_ids | observed_ids,
                 key=int,
             )
+            offline_player_env = os.environ.get("SOFASCORE_OFFLINE_PLAYER_IDS_JSON")
+            if offline_player_env is not None:
+                if not offline_replay:
+                    raise RuntimeError(
+                        "SOFASCORE_OFFLINE_PLAYER_IDS_JSON is only valid with "
+                        "--offline-replay"
+                    )
+                from dags.scripts.prepare_sofascore_workload import (
+                    normalize_explicit_match_ids,
+                )
+
+                full_player_ids = list(
+                    normalize_explicit_match_ids(json.loads(offline_player_env))
+                )
             if workload_plan is not None:
                 from scrapers.sofascore.workload_plan import (
                     parse_qualified_work_unit,
@@ -2715,6 +2733,43 @@ def _save_publication(scraper, results, **kwargs):
     return location
 
 
+# #1367: normalized season-field datasets of a materialized partition. Each
+# entry is (results counter / materialization attribute, bronze table,
+# metadata entity, natural-key columns beyond the league/season partition).
+# Publication order is stable; an empty dataset is a legitimate terminal
+# answer and writes nothing.
+_SEASON_FIELD_TABLES = (
+    ("rounds_rows", "sofascore_rounds", "rounds", ("round_id",)),
+    ("cup_trees_rows", "sofascore_cup_trees", "cup_trees",
+     ("cup_tree_id", "node_id")),
+    ("participants_rows", "sofascore_participants", "participants",
+     ("team_id",)),
+    ("referee_profile_rows", "sofascore_referee_profile", "referee_profile",
+     ("requested_referee_id",)),
+)
+
+
+def _publish_normalized_season_fields(scraper, results, materialized) -> None:
+    """Publish the non-empty #1367 season datasets inside the writer lock."""
+
+    import pandas as pd
+
+    for counter, table_name, entity, key_columns in _SEASON_FIELD_TABLES:
+        rows = getattr(materialized, counter)
+        if not rows:
+            continue
+        frame = scraper._add_metadata(pd.DataFrame(rows), entity)
+        path = _save_publication(
+            scraper, results,
+            df=frame,
+            table_name=table_name,
+            partition_cols=["league", "season"],
+            natural_keys=["league", "season", *key_columns],
+        )
+        results["tables"].append(path)
+        results[counter] = len(frame)
+
+
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     traffic = payload.get("traffic")
@@ -2831,6 +2886,10 @@ def _run_season_capture_engine(
         "tables": [],
         "schedule_rows": 0,
         "league_table_rows": 0,
+        "rounds_rows": 0,
+        "cup_trees_rows": 0,
+        "participants_rows": 0,
+        "referee_profile_rows": 0,
         "errors": [],
     }
     try:
@@ -3012,8 +3071,11 @@ def _run_season_capture_engine(
             for result in repaired:
                 record = result.manifest
                 spec = retained_by_key[record.key]
+                # #1367: referee_profile is a normalized endpoint now; the
+                # endpoint name, not spec.raw_only, identifies the optional
+                # schema-refused profile whose raw must stay replayable.
                 rejected_referee = (
-                    spec.raw_only and spec.key.endpoint == "referee_profile"
+                    spec.key.endpoint == "referee_profile"
                     and record.status.value == "schema_error"
                     and record.error_type in {"SchemaValidationError", "RawPayloadSchemaError"}
                 )
@@ -3103,6 +3165,11 @@ def _run_season_capture_engine(
                 )
                 results["tables"].append(path)
                 results["league_table_rows"] = len(standings_df)
+
+            # #1367: the normalized season fields join the same atomic
+            # publication span before finalize; an empty dataset is a
+            # legitimate terminal answer and writes nothing.
+            _publish_normalized_season_fields(scraper, results, materialized)
 
         # This must be the last state mutation. If either MERGE above fails,
         # normalized endpoints remain replayable and no network retry is needed.

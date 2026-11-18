@@ -1,18 +1,22 @@
 # Изолированный sofascore-стек (#951/#999): монтируется поверх dags/.airflowignore
-# дерева релиза (deploy/sofascore/airflow.compose.yaml). Активны в контуре ровно пять
+# дерева релиза (deploy/sofascore/airflow.compose.yaml). Активны в контуре ровно шесть
 # DAG: dag_ingest_sofascore, dag_backfill_sofascore_all_mens, dag_refresh_sofascore_all_mens
-# и два мини-DAG контура — dag_sofascore_manifest_maintenance,
-# dag_sofascore_schedule_maintenance (лежат в dags/ репозитория; на общем scheduler'е
+# и три DAG контура — dag_sofascore_manifest_maintenance,
+# dag_sofascore_schedule_maintenance, dag_replay_sofascore_raw (ручной оффлайн-реплей,
+# создаётся paused-on-create; лежат в dags/ репозитория; на общем scheduler'е
 # их прячет dags/.airflowignore). Триггеры дейли и её хвоста ушли с #1370.
 # ВНИМАНИЕ: движок regexp здесь RE2 (не Python re) — negative lookahead (?!...)
 # НЕ поддерживается и молча игнорируется. Поэтому — явный блок-лист.
 # dag_backup_whoscored_storage.py содержит WhoScored-якорь на уровне модуля и
 # УРОНИТ импорт DagBag, dag_accept_/dag_trigger_fotmob — чужие.
+# Реплеи чужих источников блокируем явно по источнику; dag_replay_sofascore_raw —
+# наш контурный replay (#1367) и контуром допускается.
 ^configs/
 ^scripts/
 ^sql/
 ^utils/
-^dag_(accept|backup|bootstrap|canary|discover|e3|iceberg|master|proxy|replay|superset|transform)_
+^dag_(accept|backup|bootstrap|canary|discover|e3|iceberg|master|proxy|superset|transform)_
+^dag_replay_(fbref|fotmob|transfermarkt|understat|whoscored)[a-z0-9_]*\.py$
 ^dag_backfill_(fbref|fotmob|transfermarkt|understat|whoscored)\.py$
 ^dag_sofascore_pipeline\.py$
 ^dag_trigger_fotmob_daily\.py$

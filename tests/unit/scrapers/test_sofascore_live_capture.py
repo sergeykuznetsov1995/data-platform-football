@@ -2638,7 +2638,6 @@ def test_dynamic_season_rejected_optional_referee_is_retained_without_retry(tmp_
 
 
 def test_dynamic_optional_referee_does_not_tolerate_manifest_write_failure(tmp_path, monkeypatch):
-    from scrapers.sofascore.manifest import ManifestStatus
     from scrapers.sofascore.season_pipeline import build_referee_profile_spec
 
     runtime, _ = _runtime(tmp_path)
@@ -2647,14 +2646,18 @@ def test_dynamic_optional_referee_does_not_tolerate_manifest_write_failure(tmp_p
         source_tournament_id=17, source_season_id=76986,
         freshness_key="final", paid_proxy=True,
     )
-    upsert = runtime.manifest_store.upsert
+    sink_write = runtime.engine.sink.write
 
-    def fail_success(record):
-        if record.key == profile.key and record.status == ManifestStatus.SUCCESS:
-            raise OSError("referee manifest storage unavailable")
-        upsert(record)
+    def fail_referee_storage(*args, **kwargs):
+        for value in (*args, *kwargs.values()):
+            key = getattr(value, "key", None)
+            if key is None:
+                key = getattr(getattr(value, "manifest", None), "key", None)
+            if key == profile.key or value == profile.key:
+                raise OSError("referee manifest storage unavailable")
+        return sink_write(*args, **kwargs)
 
-    monkeypatch.setattr(runtime.manifest_store, "upsert", fail_success)
+    monkeypatch.setattr(runtime.engine.sink, "write", fail_referee_storage)
     client = _LeaseClient([0, 0, 80], final_total=80)
     capture = _Capture([_record(b'{"referee":{"id":791840,"slug":"sofia-prychyna"}}')])
 
