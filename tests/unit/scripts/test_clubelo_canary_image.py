@@ -126,6 +126,32 @@ def test_dockerfile_no_package_installs_or_downloads():
         assert banned not in lowered
 
 
+def test_dockerfile_preserves_driver_before_replacing_with_tmpfs_symlink():
+    # Pin the complete shell chain: any failed copy/removal/link must fail
+    # the build, and the existing control symlink must take a no-op branch.
+    text = dockerfile_text().replace("\\\n", " ")
+    run_lines = [line for line in text.splitlines() if line.startswith("RUN ")]
+    assert len(run_lines) == 1
+    assert " ".join(run_lines[0].split()) == (
+        "RUN --network=none "
+        "chown 0:0 /usr/local/libexec/clubelo-canary/solver_instrumentation.py "
+        "/usr/local/bin/clubelo-canary-entrypoint "
+        "&& chmod 0444 /usr/local/libexec/clubelo-canary/solver_instrumentation.py "
+        "&& chmod 0555 /usr/local/bin/clubelo-canary-entrypoint "
+        "&& install -d -o 1000 -g 1000 -m 0700 /var/lib/clubelo-canary-run "
+        "&& if test -f /app/chromedriver && test ! -L /app/chromedriver; then "
+        "install -d -o 0 -g 0 -m 0755 /usr/local/share/clubelo-canary "
+        "&& install -o 0 -g 0 -m 0444 /app/chromedriver "
+        "/usr/local/share/clubelo-canary/chromedriver.original "
+        "&& rm /app/chromedriver "
+        "&& ln -s /tmp/clubelo-canary-chromedriver /app/chromedriver "
+        "|| exit 1; "
+        "elif test -L /app/chromedriver "
+        '&& test "$(readlink /app/chromedriver)" = /tmp/whoscored-chromedriver; then '
+        ":; else exit 1; fi"
+    )
+
+
 def test_dockerfile_dumb_init_entrypoint_and_fixed_cmd():
     instructions = dockerfile_instructions()
     assert 'ENTRYPOINT ["/usr/bin/dumb-init", "--"]' in instructions
@@ -185,15 +211,40 @@ def test_entrypoint_safety_block_gated_on_control_only():
         if line.startswith("install -m 0700")
     )
     assert control_gate < safety_start < install_line < candidate_gate
-    candidate_block = "\n".join(lines[candidate_gate : candidate_gate + 3])
+    candidate_end = lines.index("else", candidate_gate)
+    candidate_block = "\n".join(lines[candidate_gate:candidate_end])
     assert "upstream=/app/flaresolverr.py" in candidate_block
     for whoscored_only in (
         "sha256sum",
-        "chromedriver",
+        "whoscored",
         "flaresolverr-extension",
-        "stat ",
     ):
         assert whoscored_only not in candidate_block
+
+
+def test_entrypoint_candidate_validates_original_then_installs_tmpfs_driver():
+    lines = entrypoint_text().splitlines()
+    candidate_gate = lines.index(
+        'elif test "${CLUBELO_CANARY_UPSTREAM:-}" = candidate; then'
+    )
+    candidate_end = lines.index("else", candidate_gate)
+    # Exact ordered branch pins checks before the only candidate copy and
+    # prevents an intervening command from disabling fail-closed startup.
+    assert lines[candidate_gate + 1:candidate_end] == [
+        "driver_original=/usr/local/share/clubelo-canary/chromedriver.original",
+        "test -L /app/chromedriver",
+        'test "$(readlink /app/chromedriver)" = /tmp/clubelo-canary-chromedriver',
+        'test -f "$driver_original"',
+        'test ! -L "$driver_original"',
+        'test "$(stat -c \'%u:%g:%a:%h\' "$driver_original")" = \'0:0:444:1\'',
+        'install -m 0700 "$driver_original" /tmp/clubelo-canary-chromedriver',
+        "upstream=/app/flaresolverr.py",
+    ]
+    assert candidate_end < next(
+        index for index, line in enumerate(lines)
+        if line.startswith("exec /usr/local/bin/python")
+    )
+    assert sum(line.startswith("install -m 0700") for line in lines) == 2
 
 
 def test_entrypoint_candidate_uses_fixed_candidate_upstream():
@@ -291,13 +342,17 @@ def test_entrypoint_no_secret_logging():
         assert message in text
 
 
-def test_dockerfile_creates_only_observer_dir():
+def test_dockerfile_creates_only_observer_and_immutable_driver_dirs():
     text = dockerfile_text()
     assert (
         "install -d -o 1000 -g 1000 -m 0700 /var/lib/clubelo-canary-run"
         in text
     )
-    assert text.count("install -d") == 1
+    assert (
+        "install -d -o 0 -g 0 -m 0755 /usr/local/share/clubelo-canary"
+        in text
+    )
+    assert text.count("install -d") == 2
 
 
 def test_entrypoint_observer_uses_fixed_dir():

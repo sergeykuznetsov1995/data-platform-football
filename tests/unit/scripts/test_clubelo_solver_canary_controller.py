@@ -637,9 +637,9 @@ def runtime_owner_metadata(monkeypatch):
     observer_dir = parent / "observer"
     token = observer_dir / "control_token"
     metadata = {
-        parent: SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_nlink=1),
-        observer_dir: SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000, st_nlink=1),
-        token: SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=50000, st_nlink=1),
+        parent: SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0, st_nlink=1),
+        observer_dir: SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000, st_gid=0, st_nlink=1),
+        token: SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=50000, st_gid=0, st_nlink=1),
     }
 
     def lstat(path):
@@ -653,6 +653,32 @@ def runtime_owner_metadata(monkeypatch):
     monkeypatch.setattr(Path, "read_bytes", forbidden_read)
     monkeypatch.setattr(Path, "read_text", forbidden_read)
     return token, metadata
+
+
+@pytest.mark.parametrize("ancestor,uid,gid,mode,accepted", [
+    ("/canary-fixture", 0, 0, 0o775, True),
+    ("/canary-fixture", 0, 0, 0o777, False),
+    ("/canary-fixture", 0, 1000, 0o775, False),
+    ("/canary-fixture", 1000, 0, 0o775, False),
+    ("/canary-fixture", 0, 0, 0o755, True),
+    ("/canary-fixture", 0, 0, 0o1777, False),
+    ("/tmp", 0, 0, 0o1777, True),
+    ("/tmp", 0, 0, 0o777, False),
+    ("/tmp", 1000, 0, 0o1777, False),
+])
+def test_safe_path_ancestor_write_modes(monkeypatch, ancestor, uid, gid, mode, accepted):
+    parent = Path(ancestor)
+    token = parent / "control_token"
+    metadata = {
+        parent: SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid, st_gid=gid, st_nlink=1),
+        token: SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0, st_nlink=1),
+    }
+    monkeypatch.setattr(Path, "lstat", lambda path: metadata[path])
+    if accepted:
+        assert c.safe_path(str(token), secret=True) == token
+    else:
+        with pytest.raises(c.Refusal):
+            c.safe_path(str(token), secret=True)
 
 
 @pytest.mark.parametrize("uid", [0, 1000, 50000, 24680])
@@ -673,11 +699,22 @@ def test_safe_path_rejects_unexpected_owner(runtime_owner_metadata, ancestor):
 
 @pytest.mark.parametrize("mode", [0o620, 0o602])
 @pytest.mark.parametrize("secret", [False, True])
-def test_runtime_owned_writable_leaf_is_refused(runtime_owner_metadata, mode, secret):
+@pytest.mark.parametrize("uid", [0, 50000])
+def test_runtime_owned_writable_leaf_is_refused(runtime_owner_metadata, mode, secret, uid):
     token, metadata = runtime_owner_metadata
+    metadata[token].st_uid = uid
     metadata[token].st_mode = stat.S_IFREG | mode
     with pytest.raises(c.Refusal):
         c.safe_path(str(token), secret=secret)
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o777])
+def test_root_owned_writable_directory_leaf_is_refused(runtime_owner_metadata, mode):
+    token, metadata = runtime_owner_metadata
+    metadata[token.parent].st_uid = 0
+    metadata[token.parent].st_mode = stat.S_IFDIR | mode
+    with pytest.raises(c.Refusal):
+        c.safe_path(str(token.parent), directory=True)
 
 
 @pytest.mark.parametrize("ancestor", [False, True])

@@ -223,6 +223,106 @@ def test_controller_publishes_atomically(state, monkeypatch):
     assert_invalid(lambda: observer.write_active_run(state, "run-2", "control", 100, 210))
 
 
+@pytest.mark.parametrize("directory_gid", [1000, 1234])
+def test_root_controller_hands_off_private_file_to_solver(tmp_path, monkeypatch, directory_gid):
+    directory = tmp_path / "solver"
+    directory.mkdir(mode=0o700)
+    directory_info = directory.stat()
+    directory_identity = (directory_info.st_dev, directory_info.st_ino)
+    original_fstat = os.fstat
+    original_replace = os.replace
+    owners = {}
+    published = []
+
+    def fstat(fd):
+        info = original_fstat(fd)
+        identity = (info.st_dev, info.st_ino)
+        values = list(info)
+        if identity == directory_identity:
+            values[4:6] = (1000, directory_gid)
+        elif stat.S_ISREG(info.st_mode):
+            values[4:6] = owners.get(identity, (0, 0))
+        return os.stat_result(values)
+
+    def fchown(fd, uid, gid):
+        info = original_fstat(fd)
+        assert stat.S_ISREG(info.st_mode)
+        assert info.st_nlink == 1
+        assert stat.S_IMODE(info.st_mode) == 0o600
+        assert (uid, gid) == (1000, directory_gid)
+        owners[(info.st_dev, info.st_ino)] = (uid, gid)
+
+    def replace(source, destination, **kwargs):
+        info = os.stat(source, dir_fd=kwargs["src_dir_fd"], follow_symlinks=False)
+        assert stat.S_ISREG(info.st_mode)
+        assert stat.S_IMODE(info.st_mode) == 0o600
+        assert owners[(info.st_dev, info.st_ino)] == (1000, directory_gid)
+        published.append(destination)
+        return original_replace(source, destination, **kwargs)
+
+    # Emulate only ownership; real descriptors, modes and publication work on
+    # non-root CI without any privileged chown or skipped coverage.
+    monkeypatch.setattr(observer.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(observer.os, "fstat", fstat)
+    monkeypatch.setattr(observer.os, "fchown", fchown)
+    monkeypatch.setattr(observer.os, "replace", replace)
+    observer.write_active_run(directory, "run-1", "control", 100, 200)
+    assert observer.read_events(directory, "run-1") == []
+    journal(directory, [event()])
+    assert observer.read_events(directory, "run-1") == [event()]
+    with observer._directory(directory) as fd:
+        value = observer._decode(observer._read(fd, observer.ACTIVE_FILE))
+        value["active"] = False
+        observer._atomic(fd, observer.ACTIVE_FILE, value)
+        assert observer._decode(observer._read(fd, observer.ACTIVE_FILE))["active"] is False
+    assert published == [observer.ACTIVE_FILE, observer.ACTIVE_FILE]
+    assert_invalid(lambda: observer.read_events(directory, "run-1"))
+
+
+@pytest.mark.parametrize("euid,owner,allowed", [
+    (0, 0, True), (0, 1000, True), (0, 1001, False),
+    (1000, 1000, True), (1000, 0, False), (1000, 1001, False),
+    (1001, 1001, True), (1001, 1000, False),
+])
+@pytest.mark.parametrize("mode", [0o700, 0o720, 0o702])
+def test_directory_owner_override_is_narrow(tmp_path, monkeypatch, euid, owner, allowed, mode):
+    original_fstat = os.fstat
+    directory_info = tmp_path.stat()
+
+    def fstat(fd):
+        info = original_fstat(fd)
+        if (info.st_dev, info.st_ino) == (directory_info.st_dev, directory_info.st_ino):
+            values = list(info)
+            values[0] = stat.S_IFDIR | mode
+            values[4] = owner
+            return os.stat_result(values)
+        return info
+
+    monkeypatch.setattr(observer.os, "geteuid", lambda: euid)
+    monkeypatch.setattr(observer.os, "fstat", fstat)
+
+    def open_directory():
+        with observer._directory(tmp_path):
+            pass
+
+    if allowed and mode == 0o700:
+        open_directory()
+    else:
+        assert_invalid(open_directory)
+
+
+def test_matching_file_ownership_needs_no_chown(state, monkeypatch):
+    def unexpected_chown(*args):
+        pytest.fail("matching ownership must not require chown")
+
+    monkeypatch.setattr(observer.os, "fchown", unexpected_chown)
+    observer.write_active_run(state, "run-1", "control", 100, 210)
+    info = (state / observer.ACTIVE_FILE).stat()
+    directory_info = state.stat()
+    assert (info.st_uid, info.st_gid) == (directory_info.st_uid, directory_info.st_gid)
+    assert stat.S_IMODE(info.st_mode) == 0o600
+
+
 def test_append_is_flushed_and_fsynced(state, capture, monkeypatch):
     original = observer.os.fsync
     durable = []

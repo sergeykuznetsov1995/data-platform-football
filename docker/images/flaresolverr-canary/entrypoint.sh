@@ -16,6 +16,13 @@ install -m 0700 /usr/local/share/whoscored/chromedriver.original \
   /tmp/whoscored-chromedriver
 upstream=/usr/local/libexec/whoscored/flaresolverr_extended.py
 elif test "${CLUBELO_CANARY_UPSTREAM:-}" = candidate; then
+driver_original=/usr/local/share/clubelo-canary/chromedriver.original
+test -L /app/chromedriver
+test "$(readlink /app/chromedriver)" = /tmp/clubelo-canary-chromedriver
+test -f "$driver_original"
+test ! -L "$driver_original"
+test "$(stat -c '%u:%g:%a:%h' "$driver_original")" = '0:0:444:1'
+install -m 0700 "$driver_original" /tmp/clubelo-canary-chromedriver
 upstream=/app/flaresolverr.py
 else
 echo "clubelo-canary: CLUBELO_CANARY_UPSTREAM must be control or candidate" >&2

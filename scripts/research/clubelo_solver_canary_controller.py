@@ -117,9 +117,9 @@ def canonical(value):
 def safe_path(value, *, directory=False, secret=False):
     """No symlink components, hard links, unsafe owners/modes or runtime trees.
 
-    Root, runtime service and current-user owners are allowed. Writable ancestors
-    are not, except the root-owned sticky /tmp used by isolated tests. The leaf
-    must be private.
+    Root, runtime service and current-user owners are allowed. Group-writable
+    ancestors require uid=gid=0 and no world-write bit. World-writable ancestors
+    are forbidden except root-owned sticky /tmp. The leaf must be private.
     """
     need(isinstance(value, str) and value.startswith("/") and "\x00" not in value)
     path = Path(value)
@@ -138,6 +138,7 @@ def safe_path(value, *, directory=False, secret=False):
         if current != path:
             need(stat.S_ISDIR(info.st_mode))
             need(not info.st_mode & 0o022 or
+                 (info.st_uid == 0 and info.st_gid == 0 and not info.st_mode & 0o002) or
                  (current == Path("/tmp") and info.st_uid == 0 and info.st_mode & stat.S_ISVTX))
     info = path.lstat()
     need(info.st_uid in allowed_owners)

@@ -80,7 +80,8 @@ def _directory(state_dir):
             os.close(fd)
             fd = child
         info = os.fstat(fd)
-        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        euid = os.geteuid()
+        if (info.st_uid != euid and not (euid == 0 and info.st_uid == 1000)) or info.st_mode & 0o022:
             raise _invalid()
         identities = set()
         for name in (ACTIVE_FILE, EVENT_FILE, ERROR_FILE):
@@ -123,6 +124,10 @@ def _atomic(fd, name, value):
     temporary = ".observer-" + uuid.uuid4().hex
     try:
         with os.fdopen(_open(fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), "wb") as stream:
+            directory_info = os.fstat(fd)
+            file_info = os.fstat(stream.fileno())
+            if (file_info.st_uid, file_info.st_gid) != (directory_info.st_uid, directory_info.st_gid):
+                os.fchown(stream.fileno(), directory_info.st_uid, directory_info.st_gid)
             stream.write(_encode(value))
             stream.flush()
             os.fsync(stream.fileno())
