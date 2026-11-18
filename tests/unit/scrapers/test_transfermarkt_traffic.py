@@ -15,6 +15,7 @@ from scrapers.transfermarkt.client import (
     TransfermarktHttpClient,
     redact_sensitive,
 )
+from scrapers.transfermarkt.raw_store import RawResponseStore
 from scrapers.utils.proxy_manager import ProxyManager
 
 
@@ -186,6 +187,82 @@ def test_blocked_status_rotates_proxy_once_and_records_retry(status):
     proxies = manager._proxies
     assert sum(proxy.success_count for proxy in proxies) == 1
     assert sum(proxy.failure_count for proxy in proxies) == 1
+
+
+@pytest.mark.unit
+def test_aws_waf_202_uses_bounded_retry_and_preserves_attempt_chain(tmp_path):
+    challenge = b'<html><script src="https://awswaf.com/challenge.js"></script></html>'
+    raw_store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
+    factory = _ClientFactory([
+        _FakeResp(challenge, status=202),
+        _FakeResp(b'<html>full squad</html>'),
+    ])
+    client = TransfermarktHttpClient(
+        proxy_manager=_manager(2),
+        client_factory=factory,
+        raw_store=raw_store,
+        require_raw_store=True,
+        rate_limiter=_NoWaitLimiter(),
+        sleep_fn=lambda _: None,
+        random_fn=lambda: 0,
+    )
+
+    outcome = client.fetch('https://www.transfermarkt.com/a', as_json=False)
+
+    assert outcome.status is FetchStatus.OK
+    assert outcome.value == '<html>full squad</html>'
+    assert outcome.attempts == 2
+    assert len(outcome.raw_attempt_envelope_ids) == 2
+    attempts = tuple(
+        raw_store.load_attempt_envelope(envelope_id)
+        for envelope_id in outcome.raw_attempt_envelope_ids
+    )
+    assert [item.status_code for item in attempts] == [202, 200]
+    assert raw_store.replay_attempt(attempts[0].envelope_id) == challenge
+    assert client.get_traffic_stats()['retries'] == 1
+
+
+@pytest.mark.unit
+def test_aws_waf_202_terminal_report_preserves_class_status_and_retries():
+    challenge = b'<html><script src="https://awswaf.com/challenge.js"></script></html>'
+    factory = _ClientFactory([_FakeResp(challenge, status=202)] * 2)
+    client = TransfermarktHttpClient(
+        proxy_manager=_manager(2),
+        client_factory=factory,
+        rate_limiter=_NoWaitLimiter(),
+        sleep_fn=lambda _: None,
+        random_fn=lambda: 0,
+    )
+
+    outcome = client.fetch('https://www.transfermarkt.com/a', as_json=False)
+
+    assert outcome.status is FetchStatus.BLOCKED
+    assert outcome.status_code == 202
+    assert outcome.error == 'HTTP 202 AWS WAF challenge'
+    assert outcome.attempts == 2
+    assert client.get_traffic_stats()['retries'] == 1
+    assert client.get_traffic_stats()['status_counts'] == {'202': 2}
+
+
+@pytest.mark.unit
+def test_plain_202_remains_non_retryable():
+    factory = _ClientFactory([_FakeResp(b'<html>accepted</html>', status=202)])
+    client = TransfermarktHttpClient(
+        proxy_manager=_manager(2),
+        client_factory=factory,
+        rate_limiter=_NoWaitLimiter(),
+        sleep_fn=lambda _: None,
+        random_fn=lambda: 0,
+    )
+
+    outcome = client.fetch('https://www.transfermarkt.com/a', as_json=False)
+
+    assert outcome.status is FetchStatus.RETRY_EXHAUSTED
+    assert outcome.status_code == 202
+    assert outcome.error == 'HTTP 202'
+    assert outcome.attempts == 1
+    assert len(factory.calls) == 1
+    assert client.get_traffic_stats()['retries'] == 0
 
 
 @pytest.mark.unit
