@@ -1164,7 +1164,7 @@ jobs:
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
           WHOSCORED_REAL_DOCKER_TEST=1 \
-          python -m pytest -q \
+          "$WHOSCORED_CI_TEST_VENV/bin/python" -m pytest -q \
             tests/unit/scripts/test_generate_whoscored_deployment_attestation.py::test_real_buildx_metadata_and_docker_digest_path_when_ci_provides_it
 
       - name: Cleanup test runtime
