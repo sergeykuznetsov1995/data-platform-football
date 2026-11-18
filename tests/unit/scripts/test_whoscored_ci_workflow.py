@@ -372,6 +372,7 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert production.count(
         "--entrypoint /usr/local/bin/whoscored-production-entrypoint"
     ) == 2
+    assert 'sentinel="$(mktemp -d)"\n          chmod 0777 "$sentinel"' in production
     assert "for alias in python python3 python3.11" in text
     assert "scheduler-bash-python-s" in text
     assert "/usr/local/libexec/whoscored-python-real" in text
