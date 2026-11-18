@@ -16,3 +16,4 @@
 ^dag_transform_(capology|e3|e4|espn|fbref|fotmob|sofifa|xref)[_.]
 ^dag_fbref_history_controller\.py$
 ^dag_fbref_stage_janitor\.py$
+^dag_players_sofascore_all_mens\.py$

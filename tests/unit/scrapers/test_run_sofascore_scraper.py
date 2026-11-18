@@ -329,6 +329,107 @@ def test_season_runner_receipts_are_after_merges_and_noop_does_not_claim_publica
     assert result["status"] == "pass", result
 
 
+# --- #1374/#1244: the players lane fails closed and loads its signed plan ----
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "dag_id, is_production",
+    [
+        ("dag_players_sofascore_all_mens", True),
+        ("dag_players_sofascore_someone_else", False),
+    ],
+)
+def test_the_players_lane_fails_closed_without_a_signed_plan(
+    monkeypatch, dag_id, is_production
+):
+    """A production lane without a plan must stop, not capture unplanned."""
+
+    runner = _runner_module()
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag_id)
+
+    if is_production:
+        with pytest.raises(RuntimeError, match="requires --workload-plan"):
+            runner._load_runtime_workload_plan(
+                None,
+                entity="player_capture",
+                league="SS-7",
+                season="2627",
+                offline_replay=False,
+            )
+        return
+
+    assert runner._load_runtime_workload_plan(
+        None,
+        entity="player_capture",
+        league="SS-7",
+        season="2627",
+        offline_replay=False,
+    ) == (None, ())
+
+
+@pytest.mark.unit
+def test_a_really_signed_players_plan_reaches_the_runtime_loader(tmp_path, monkeypatch):
+    """Both ends of the seam meet on a really signed players plan (#1244).
+
+    The players-phase tests double the planner and the runner, so the path
+    "players plan -> signature -> runner loader under the lane's dag_id ->
+    non-empty player allocations" never ran in one piece. Here the plan is
+    signed for the players lane and handed to the real runner loader."""
+
+    from scrapers.sofascore.scraper import _season_label
+    from scrapers.sofascore.workload_plan import (
+        WorkloadAllocation,
+        _signed_plan,
+        qualify_work_unit,
+    )
+    from scrapers.sofascore.workload_runtime import partition_key, target_ids
+
+    runner = _runner_module()
+    control_token = "c" * 32
+    # The loader resolves the partition through _season_label and matches
+    # allocations by their qualified units, so the fixture qualifies its two
+    # players under exactly that partition key.
+    key = partition_key("SS-7", _season_label("SS-7", "2627"))
+    units = tuple(sorted(
+        (qualify_work_unit(key, "1"), qualify_work_unit(key, "2"))
+    ))
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "1" * 32,
+        task_id="capture_player_batch_00000",
+        scope="player",
+        workload_class="player_batch_50",
+        batch_index=0,
+        units=units,
+        budget_bytes=4096,
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_players_sofascore_all_mens",
+        run_id="players-run-1::players",
+        player_universe_ids=units,
+        allocations=(allocation,),
+        control_token=control_token,
+    )
+    path = tmp_path / "players-plan.json"
+    path.write_text(json.dumps(plan.to_dict()), encoding="utf-8")
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", control_token)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_players_sofascore_all_mens")
+    monkeypatch.setenv("SOFASCORE_RUN_ID", "players-run-1")
+
+    loaded, allocations = runner._load_runtime_workload_plan(
+        str(path),
+        entity="player_capture",
+        league="SS-7",
+        season="2627",
+        offline_replay=False,
+    )
+
+    assert loaded.plan_digest == plan.plan_digest
+    assert loaded.run_id == "players-run-1::players"
+    assert [item.task_id for item in allocations] == [allocation.task_id]
+    assert {item.scope for item in allocations} == {"player"}
+    assert sum(len(target_ids(item)) for item in allocations) == 2
 def _history_match_ids_env(monkeypatch, ids):
     monkeypatch.setenv("SOFASCORE_HISTORY_MATCH_IDS_JSON", json.dumps(ids))
     monkeypatch.setenv("SOFASCORE_HISTORY_PHASE", "matches")

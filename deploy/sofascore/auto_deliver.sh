@@ -107,10 +107,11 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance dag_replay_sofascore_raw"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance dag_replay_sofascore_raw"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
+PLAYERS=dag_players_sofascore_all_mens
 MAINT=dag_sofascore_manifest_maintenance
 COMPACT=dag_sofascore_schedule_maintenance
 REPLAY=dag_replay_sofascore_raw
@@ -120,8 +121,10 @@ REPLAY=dag_replay_sofascore_raw
 # паузе): актуалка, обслуживание расписаний и манифеста. История (@continuous) сюда не входит —
 # её осушает шаг drain deploy.sh; dag_ingest_sofascore расписания не имеет и после вывода
 # daily/tail запускается только вручную. Пересоздание контейнеров после дедлайна оборвало бы прогон.
-NEXT_RUN_DAGS="'dag_refresh_sofascore_all_mens','dag_sofascore_schedule_maintenance','dag_sofascore_manifest_maintenance'"
-NEXT_RUN_COUNT=3
+# Полоса игроков (#1374) попадает в список, только когда её файл есть в ЖИВОМ дереве: бой на
+# релизе до полосы этого DAG ещё не знает, и требование «все DAG активны» навсегда закрыло бы
+# доставку первого релиза с полосой. Когда полоса в бою — как у всех: пропала, значит fail-closed.
+NEXT_RUN_DAGS="dag_refresh_sofascore_all_mens dag_sofascore_schedule_maintenance dag_sofascore_manifest_maintenance"
 # Не дальше 2,5 ч вперёд — длина бывшего окна 03:30–06:00: бюджет осушения deploy.sh (IDLE_WAIT)
 # не больше, чем был ночью (скоупы истории 8–81 мин, p90 остатка ≈ 75 мин).
 DEADLINE_MAX=${DEADLINE_MAX:-9000}
@@ -381,9 +384,10 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
   local new="$1" started="$2" dags errs gw n c line want got dag_sql="" dag_count=0
   for c in $CORE_DAGS; do
     # Необязательные для дерева DAG ($COMPACT — компакция расписаний, $REPLAY — перегрузка
-    # raw): цель отката может быть старее их появления. Нет файла dags/<dag>.py в дереве —
+    # raw, $PLAYERS — полоса игроков): цель отката может быть старее их появления.
+    # Нет файла dags/<dag>.py в дереве —
     # приёмка этот DAG от дерева не требует; на новом дереве требует всех.
-    case "$c" in "$COMPACT"|"$REPLAY") [ -f "$new/dags/$c.py" ] || continue ;; esac
+    case "$c" in "$COMPACT"|"$REPLAY"|"$PLAYERS") [ -f "$new/dags/$c.py" ] || continue ;; esac
     dag_sql="$dag_sql'$c',"
     dag_count=$(( dag_count + 1 ))
   done
@@ -536,7 +540,7 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
   while [ "$left" -gt 0 ] && [ "$(contour_busy)" != 0 ]; do sleep 30; left=$(( left - 30 )); done
   busy_now=$(contour_busy)
   if [ "$busy_now" != 0 ]; then
-    ROLLBACK_NOTE="$ROLLBACK_NOTE ВНИМАНИЕ: откат пересоздавал контейнеры при непустом контуре (dag_run в работе: '$busy_now') — идущий прогон дейли/актуалки/обслуживания оборван, его трафик оплачен впустую."
+    ROLLBACK_NOTE="$ROLLBACK_NOTE ВНИМАНИЕ: откат пересоздавал контейнеры при непустом контуре (dag_run в работе: '$busy_now') — идущий прогон дейли/актуалки/полосы игроков/обслуживания оборван, его трафик оплачен впустую."
     log "ОТКАТ ПРИ ЗАНЯТОМ КОНТУРЕ (dag_run: '$busy_now') — идущий прогон будет оборван"
   fi
   compact_busy=$(metadb "SELECT count(*) FROM dag_run WHERE dag_id='$COMPACT' AND state IN ('queued','running');")
@@ -586,19 +590,26 @@ acceptance_rollback(){
 }
 contour_busy(){
   # Историю сюда НЕ включаем: ею занимается шаг drain внутри deploy.sh. Ручной ingest
-  # ($DAILY) — включаем: пересоздание scheduler'а оборвало бы его прогон.
-  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT','$COMPACT') AND state IN ('queued','running');"
+  # ($DAILY) — включаем: пересоздание scheduler'а оборвало бы его прогон. Полосу игроков
+  # (#1374) — тоже: динамическая доставка не должна обрывать её активный или ручной DagRun.
+  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT','$COMPACT','$PLAYERS') AND state IN ('queued','running');"
 }
 
 # --- дедлайн попытки (#1980) -------------------------------------------------------------
 # Выставляет now и deadline = min(ближайший запуск сбора по расписанию, now + DEADLINE_MAX).
 # 1 — метабаза не ответила: дедлайна нет, тик пропускается (это не провал попытки).
 set_deadline(){
-  local nxt
+  local d nxt dag_sql="" dag_count=0
+  for d in $NEXT_RUN_DAGS "$PLAYERS"; do
+    [ "$d" = "$PLAYERS" ] && [ ! -f "$LIVE_ROOT/dags/$PLAYERS.py" ] && continue
+    dag_sql="$dag_sql'$d',"
+    dag_count=$(( dag_count + 1 ))
+  done
+  dag_sql=${dag_sql%,}
   now=$(date -u +%s)
   # Fail-closed: DAG пропал из метабазы (или неактивен) или у работающего DAG не вычислен следующий запуск —
   # дедлайна нет (-1), тик пропускается. 0 — все на паузе, расписанных запусков нет.
-  nxt=$(metadb "SELECT CASE WHEN count(*) FILTER (WHERE is_active) < $NEXT_RUN_COUNT OR count(*) FILTER (WHERE NOT is_paused AND next_dagrun_create_after IS NULL) > 0 THEN -1 ELSE coalesce(min(extract(epoch FROM next_dagrun_create_after)) FILTER (WHERE NOT is_paused), 0)::bigint END FROM dag WHERE dag_id IN ($NEXT_RUN_DAGS);")
+  nxt=$(metadb "SELECT CASE WHEN count(*) FILTER (WHERE is_active) < $dag_count OR count(*) FILTER (WHERE NOT is_paused AND next_dagrun_create_after IS NULL) > 0 THEN -1 ELSE coalesce(min(extract(epoch FROM next_dagrun_create_after)) FILTER (WHERE NOT is_paused), 0)::bigint END FROM dag WHERE dag_id IN ($dag_sql);")
   case "$nxt" in ''|*[!0-9]*) return 1 ;; esac
   deadline=$(( now + DEADLINE_MAX ))
   if [ "$nxt" != 0 ] && [ $(( nxt - ROLLBACK_RESERVE )) -lt "$deadline" ]; then
@@ -1071,7 +1082,7 @@ if is_plain "$INFLIGHT"; then
     else
       infl_close failed "откат после обрыва доставки подтверждён, бой на $OLD" t
       why=$(streak_tail)
-      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}$why Следующая попытка — с новым коммитом master. Лог: $LOG"
+      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (шесть DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}$why Следующая попытка — с новым коммитом master. Лог: $LOG"
     fi
   else
     infl_close needs-hands "обрыв доставки, откат на $OLD не подтверждён" f

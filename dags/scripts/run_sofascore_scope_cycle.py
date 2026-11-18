@@ -32,6 +32,14 @@ from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
 # allocations (it keeps a margin for the final MERGE and the manifest flush).
 SCOPE_DEADLINE_ENV = "SOFASCORE_SCOPE_DEADLINE_EPOCH"
 WINDOW_DEADLINE_ENV = "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"
+# #1374: the players phase buys player profiles of a closed history scope; it
+# runs as its own lane and never inside ``all``.
+PLAN_PHASES = {"season": "season", "matches": "targets", "players": "players"}
+CAPTURE_ENTITIES = {
+    "season": "all",
+    "matches": "match_capture",
+    "players": "player_capture",
+}
 
 
 def _history_match_ids(environ=None) -> Optional[tuple[str, ...]]:
@@ -165,13 +173,14 @@ def run_phase(
 
     from dags.scripts.prepare_sofascore_workload import (
         CompetitionSeason,
+        PlayerEvidenceNotReady,
         prepare_workload_plan,
     )
     from dags.scripts.run_sofascore_scraper import main as run_capture
     from scrapers.sofascore.pipeline import build_manifest_store
 
-    if phase not in {"season", "matches"}:
-        raise ValueError("phase must be season or matches")
+    if phase not in PLAN_PHASES:
+        raise ValueError("phase must be season, matches or players")
     # #1357: count this phase's Trino round-trips from zero.
     trino_accounting.reset()
     destination = Path(output_dir)
@@ -179,8 +188,8 @@ def run_phase(
     capture_key = str(scope["capture_key"])
     canonical = str(scope["canonical_season"])
     base_run_id = str(scope["run_id"])
-    plan_phase = "season" if phase == "season" else "targets"
-    entity = "all" if phase == "season" else "match_capture"
+    plan_phase = PLAN_PHASES[phase]
+    entity = CAPTURE_ENTITIES[phase]
     dag_id = str(scope.get("dag_id") or "dag_backfill_sofascore_all_mens")
     try:
         manifest_store = build_manifest_store(
@@ -200,9 +209,23 @@ def run_phase(
             allow_inactive_season=True,
             season_freshness_key="final",
             season_evidence=str(scope.get("season_evidence") or "pages"),
+            players_force=True,
             **({"explicit_match_ids": scope["explicit_match_ids"]}
                if "explicit_match_ids" in scope else {}),
         )
+    except PlayerEvidenceNotReady as exc:
+        # #1374: the season's match evidence has not closed yet.  No plan was
+        # written and the runner never started, so zero paid traffic left the
+        # cycle — an everyday early-season wait, not an incident.
+        return {
+            "phase": phase,
+            "status": "deferred",
+            "exit_code": None,
+            "plan": None,
+            "deferral_reason": f"{type(exc).__name__}: {exc}",
+            "source_request_count": 0,
+            "trino_queries": trino_accounting.snapshot(),
+        }
     except Exception as exc:
         # #1351: a plan that cannot be prepared from the scope's stored state
         # (schema-rejected raw, max_pages) is a failed phase with its reason,
@@ -261,7 +284,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-snapshot-id", required=True)
     parser.add_argument("--expected-campaign-id", required=True)
     parser.add_argument(
-        "--phase", choices=("metadata", "season", "matches", "all"), default="all"
+        "--phase", choices=("metadata", "season", "matches", "players", "all"),
+        default="all"
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output", required=True)
@@ -294,10 +318,20 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    from dags.scripts.prepare_sofascore_workload import PlayerEvidenceNotReady
+
     parser = _parser()
     args = parser.parse_args(argv)
     if args.season_evidence == "bronze" and args.phase != "matches":
         parser.error("--season-evidence bronze requires --phase matches")
+    if args.phase == "players" and args.allow_pending_season:
+        # A scope must be captured before its profiles are planned: accepting
+        # a pending season here would plan profiles for matches that never
+        # closed (#1374).
+        parser.error(
+            "--phase players cannot use --allow-pending-season: player "
+            "profiles are planned only for an already captured scope"
+        )
     explicit_ids = _history_match_ids()
     if explicit_ids is not None and (
         args.phase != "matches" or args.season_evidence != "bronze" or args.force_replace
@@ -371,6 +405,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if status == "failed":
             exit_code = 1
+        elif status == "deferred":
+            exit_code = 0
         else:
             exit_code = 0 if _run_bronze_dq(status) else 1
         _atomic_json(output, result)
@@ -433,6 +469,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "metadata": (),
             "season": ("season",),
             "matches": ("matches",),
+            "players": ("players",),
             "all": ("season", "matches"),
         }[args.phase]
         for phase in phases:
@@ -458,6 +495,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     result[field] = partial.get(field)
                 result["capture_elapsed_s"] = partial.get("elapsed_s")
                 return _finish("partial")
+            if phase_result.get("status") == "deferred":
+                # #1374: the players lane waits for the season's match
+                # evidence to close; zero paid traffic left the cycle.
+                # No capture ran, so Bronze DQ does not apply to this wait.
+                result["deferral_reason"] = str(
+                    phase_result.get("deferral_reason") or ""
+                )
+                return _finish("deferred")
             if phase_result.get("status") != "success":
                 if not phase_errors:
                     result["errors"].append(
@@ -469,6 +514,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result["waiting_reason"] = "season_has_no_finished_matches"
                 return _finish("waiting")
         return _finish("success")
+    except PlayerEvidenceNotReady as exc:
+        # #1374: the scope was too early and no paid traffic happened.
+        # No capture ran, so Bronze DQ does not apply to this wait.
+        result["deferral_reason"] = f"{type(exc).__name__}: {exc}"
+        return _finish("deferred")
     except Exception as exc:
         result["errors"].append(f"{type(exc).__name__}: {exc}")
         return _finish("failed")

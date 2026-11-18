@@ -2673,3 +2673,130 @@ def test_dynamic_optional_referee_does_not_tolerate_manifest_write_failure(tmp_p
             optional_schema_endpoints=frozenset({"referee_profile"}),
         )
     assert runtime.manifest_store.get(profile.key).error_type == "OSError"
+
+
+def test_players_dag_enters_the_production_transport_and_strangers_do_not(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_players_sofascore_all_mens")
+    runtime, _ = _runtime(tmp_path)
+    runtime.engine.run_id = "scheduled__players-run::players"
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "6" * 32,
+        task_id="capture",
+        scope="player",
+        workload_class="player_batch_50",
+        batch_index=0,
+        units=("1",),
+        budget_bytes=10_000,
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_players_sofascore_all_mens",
+        run_id=runtime.engine.run_id,
+        player_universe_ids=("1",),
+        allocations=(allocation,),
+        control_token="c" * 32,
+    )
+    client = _LeaseClient([0, 0, 10], final_total=10)
+    factory = _TransportFactory(client, _Capture([_record(b'{"items":[]}')]))
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/player/1",
+        scope="SS-7:2627",
+        entity="player_capture",
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="1",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert traffic["paid_proxy_bytes"] == 10
+    assert client.acquire_calls[0]["dag_id"] == "dag_players_sofascore_all_mens"
+
+    # The production list stays closed to everything else: a stranger dag_id
+    # is refused before any lease is acquired.
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_players_sofascore_someone_else")
+    stranger_client = _LeaseClient([0, 0, 10], final_total=10)
+    stranger_runtime, _ = _runtime(tmp_path / "stranger")
+    stranger_runtime.engine.run_id = "scheduled__players-run::players"
+    with pytest.raises(ValueError):
+        capture_live_specs(
+            stranger_runtime,
+            [_spec(2)],
+            canonical_url="https://www.sofascore.com/player/1",
+            scope="SS-7:2627",
+            entity="player_capture",
+            workload_plan=plan,
+            allocation_id=allocation.allocation_id,
+            attempt_id="1",
+            transport_factory=_TransportFactory(
+                stranger_client, _Capture([_record(b'{"items":[]}')])
+            ),
+        )
+    assert stranger_client.acquire_calls == []
+
+
+def test_terminal_player_endpoints_leave_the_resume_plan_and_never_reopen_a_transport(
+    tmp_path,
+):
+    """#1374: resume buys only the endpoints still pending.
+
+    A season-statistics answer that legitimately had no rows commits
+    ``legitimate_empty`` and is terminal: the resume plan must skip it, and a
+    later pass over it must replay the retained raw for free instead of
+    opening a lease and a browser for an endpoint nobody needs anymore."""
+
+    from scrapers.sofascore.pipeline import build_player_spec, endpoint_resume_plan
+
+    runtime, _ = _runtime(tmp_path)
+    profile = build_player_spec(
+        source_tournament_id=7,
+        source_season_id=96518,
+        target_id=1,
+        endpoint="player_profile",
+        freshness_key="final",
+        paid_proxy=True,
+    )
+    statistics = build_player_spec(
+        source_tournament_id=7,
+        source_season_id=96518,
+        target_id=1,
+        endpoint="player_season_statistics",
+        freshness_key="final",
+        paid_proxy=True,
+    )
+    runtime.raw_store.store_bytes(
+        statistics.raw_target,
+        b'{"statistics": {}}',
+        request_url=statistics.url,
+        http_status=200,
+        response_headers={"content-type": "application/json"},
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a terminal endpoint reopened a paid transport")
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [statistics],
+        canonical_url="https://www.sofascore.com/player/1",
+        scope="SS-7:2627",
+        entity="player_capture",
+        transport_factory=forbidden,
+    )
+
+    assert len(results) == 1
+    assert results[0].replay_hit is True
+    assert results[0].manifest.status.value == "legitimate_empty"
+    assert traffic["paid_proxy_bytes"] == 0
+    assert traffic["source_request_count"] == 0
+
+    # The terminal endpoint drops out of the resume plan; the profile that
+    # was never captured stays in it.
+    assert endpoint_resume_plan(
+        runtime.manifest_store, [profile, statistics]
+    ) == {"1": ("player_profile",)}

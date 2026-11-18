@@ -4,7 +4,9 @@
 # двойной запуск = двойной прогон; dag_replay_sofascore_raw — ручной оффлайн-реплей
 # контура (paused-on-create, #1367), общему scheduler'у не нужен. Триггеры дейли
 # и её хвоста ушли с #1370.
+# Полоса игроков (#1374) — как и вся кампания all-mens: живёт только в контуре.
 # Изолированный контур накрывает этот файл своим deploy/sofascore/.airflowignore.
 ^dag_sofascore_manifest_maintenance\.py$
 ^dag_sofascore_schedule_maintenance\.py$
+^dag_players_sofascore_all_mens\.py$
 ^dag_replay_sofascore_raw\.py$

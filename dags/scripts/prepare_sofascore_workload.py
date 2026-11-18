@@ -96,6 +96,16 @@ def _load_pinned_workload_policy(artifact_path: os.PathLike[str] | str):
     return policy
 
 
+class PlayerEvidenceNotReady(RuntimeError):
+    """The season's match evidence has not closed yet; profiles must wait.
+
+    The players phase replays a scope whose matches already committed Bronze,
+    so an unfinished match raw/manifest is an everyday early-season state,
+    not a defect: the scope defers green (exit 0) and comes back later,
+    instead of poisoning the lane's failure memory (#1374).
+    """
+
+
 @dataclass(frozen=True)
 class CompetitionSeason:
     league: str
@@ -764,7 +774,7 @@ def prepare_workload_plan(
             continue
 
         if pending_matches:
-            raise RuntimeError(
+            raise PlayerEvidenceNotReady(
                 f"{item.league} match raw/manifest is incomplete; "
                 "players cannot be planned"
             )
@@ -807,11 +817,17 @@ def prepare_workload_plan(
     # Isolating one stuck league must not turn into a silent empty run: if
     # NOTHING could be planned, that is a systemic outage, not pagination noise.
     if incomplete_partitions and len(incomplete_partitions) == considered_partitions:
-        raise RuntimeError(
+        message = (
             f"every SofaScore partition was dropped from the {phase} plan — "
             "season raw is incomplete for "
             + ", ".join(incomplete_partitions)
         )
+        if phase == "players":
+            # For the players phase this is "not yet", not "broken": its plan
+            # has no work until every match allocation committed Bronze, so
+            # the scope defers green instead of failing (#1374).
+            raise PlayerEvidenceNotReady(message)
+        raise RuntimeError(message)
     plan = build_partitioned_plan(
         policy,
         dag_id=dag_id,

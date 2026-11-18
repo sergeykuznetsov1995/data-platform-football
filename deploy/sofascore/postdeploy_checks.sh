@@ -19,6 +19,13 @@ GATEWAY_CONTAINERS=(sofascore_gw_951 sofascore_gw_history sofascore_gw_players)
 GATEWAY_STATE_DIRS=("${SOFASCORE_GATEWAY_STATE_HOST_DIR:?}" "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?}" "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?}")
 GATEWAY_SERVICES=(sofascore_proxy_filter sofascore_gw_history sofascore_gw_players)
 WATCHDOG_UNITS=(sofascore-gw-lease-watchdog.service sofascore-gw-lease-watchdog-history.service sofascore-gw-lease-watchdog-players.service)
+# Контур (#1374): список DAG — единственный источник, число выводится из него, а не
+# литералом рядом — рассинхрон списка и числа врал бы «5 из 5» на неполном контуре.
+CONTOUR_DAGS=(dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance dag_replay_sofascore_raw)
+CONTOUR_DAGS_SQL=""
+for d in "${CONTOUR_DAGS[@]}"; do CONTOUR_DAGS_SQL="$CONTOUR_DAGS_SQL'$d',"; done
+CONTOUR_DAGS_SQL=${CONTOUR_DAGS_SQL%,}
+CONTOUR_DAGS_N=${#CONTOUR_DAGS[@]}
 FAILS=0
 fail() { echo "  ✗ $*"; FAILS=$((FAILS + 1)); }
 ok() { echo "  ✓ $*"; }
@@ -100,8 +107,8 @@ errs=$($PSQL "SELECT count(*) FROM import_error;")
 echo "import_error=$errs"
 [ "$errs" = "0" ] && ok "import_error=0" || fail "import_error=$errs"
 $PSQL "SELECT dag_id, is_paused, is_active FROM dag WHERE dag_id LIKE '%sofascore%' ORDER BY 1;"
-active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens','dag_ingest_sofascore','dag_replay_sofascore_raw','dag_sofascore_manifest_maintenance','dag_sofascore_schedule_maintenance') AND is_active=true;")
-[ "$active" = "6" ] && ok "6 DAG контура активны" || fail "активных DAG контура: $active из 6"
+active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ($CONTOUR_DAGS_SQL) AND is_active=true;")
+[ "$active" = "$CONTOUR_DAGS_N" ] && ok "$CONTOUR_DAGS_N DAG контура активны" || fail "активных DAG контура: $active из $CONTOUR_DAGS_N"
 
 echo
 echo "== 5. Состояние кампании =="
@@ -115,6 +122,20 @@ print("completed =", len(s.get("completed", [])), "| файл:", p)
 PY
 ls -1 "$CAMPAIGN/results" 2>/dev/null | wc -l | sed 's/^/results файлов: /'
 [ -f "$CAMPAIGN/failures.json" ] && python3 -c "import json;d=json.load(open('$CAMPAIGN/failures.json'));print('failures ключей:',len(d) if isinstance(d,dict) else len(d))"
+
+echo
+echo "== 5а. Полоса игроков (#1374): состояние и результаты =="
+# Только чтение: это диагностика, машинная приёмка полосы — в auto_deliver.sh. Отсутствие
+# файлов — не провал (прогонов полосы могло ещё не быть), нечитаемый state — провал:
+# молча прогнивший файл никто бы не заметил.
+python3 - "$CAMPAIGN/players-state.json" <<'PY' || fail "players-state.json не читается"
+import json, sys, os
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("players-state.json ещё нет — прогонов полосы не было"); raise SystemExit(0)
+print(json.dumps(json.load(open(p)), ensure_ascii=False)[:600])
+PY
+ls -1 "$CAMPAIGN/players-results" 2>/dev/null | wc -l | sed 's/^/players-results файлов: /'
 
 echo
 echo "== 6. Вотчдоги аренд (по одному на шлюз) =="

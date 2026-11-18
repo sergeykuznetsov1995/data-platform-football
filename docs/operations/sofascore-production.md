@@ -19,9 +19,10 @@
 | Ротация | `freeze_release.sh` → `deploy.sh` → `postdeploy_checks.sh` | — | — |
 | Переменные | `deploy/sofascore/sofascore.env.example` → `/etc/data-platform/sofascore.env` | второй `--env-file` после общего `.env` платформы | — |
 
-В release-контуре шесть DAG: `dag_ingest_sofascore` (расписания не имеет, #1370:
+Рецепт контура включает ровно семь DAG: `dag_ingest_sofascore` (расписания не имеет, #1370:
 триггеры дейли и её хвоста выведены — прогон запускается вручную или полосой актуалки),
 `dag_backfill_sofascore_all_mens`, `dag_refresh_sofascore_all_mens`,
+`dag_players_sofascore_all_mens` (создаётся на паузе; расписание 07:00, 12:00, 17:00 и 22:00 UTC),
 `dag_sofascore_schedule_maintenance` (03:00 UTC), `dag_sofascore_manifest_maintenance`
 (воскресенье 05:00 UTC) и ручной `dag_replay_sofascore_raw` (`schedule=None`,
 создаётся на паузе; [offline raw replay](sofascore-raw-replay.md)). Остальные
@@ -29,29 +30,194 @@
 поэтому блок-лист, а не allow-list). Фактический production roster до отдельной
 доставки этим release-документом не утверждается.
 
-## Три полосы источника (#1244)
+Наличие DAG в рецепте не доказывает доставку или включение в production. Для #1374
+этот PR добавляет тесты и описание: доставка, снятие паузы players и сбор — отдельные
+последующие разрешённые операции. Здесь они не выполняются.
 
-С 03.09.2026 кампания истории, актуалка и дейли не делят один слот аренды: до развода
+## Три полосы источника (#1244, #1374)
+
+С 03.09.2026 источник разделён на три шлюза: до развода
 `--max-active-leases 1` на общем шлюзе давал `HTTP 429: paid-proxy concurrency limit
 reached` почти на каждом запуске истории (03.09 за сутки — 105 упавших запусков
 `run_historical_scope` против 3 успешных).
 
 | Полоса | Шлюз (сервис / контейнер) | Пул Airflow | Дневной потолок |
 | --- | --- | --- | --- |
-| Ручной ingest (бывший дейли) | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
+| Ручной ingest (бывший дейли) + актуалка | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ, общий потолок полосы |
 | Кампания истории | `sofascore_gw_history` / `sofascore_gw_history` | `sofascore_history_pool` | 2000 МБ |
-| Актуалка (#1360; бывшая полоса игроков) | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
+| Игроки (#1374) | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
 
-**Актуалка на своей полосе (#1360).** До #1360 актуалка и дейли делили шлюз `sofascore_gw_951`
-и единственный слот `ingest_scraper_pool`: прогон актуалки 15:30 UTC ждал идущий с 14:00 дейли
-(21–24.09 — 22,3 / 17,3 / 23,2 / 9,3 мин). Полоса игроков #1244 поглощена #1360: её простаивавший
-шлюз и пул отданы актуалке ключами рецепта `SOFASCORE_REFRESH_POOL=sofascore_players_pool` и
-`SOFASCORE_REFRESH_PROXY_CONTROL_URL=http://sofascore_gw_players:8899`
-(`deploy/sofascore/airflow.compose.yaml`; DAG читает их в `REFRESH_POOL` и `REFRESH_TASK_ENV`).
-Имена контейнера, пула, каталога состояния `gateway-state-players` и сторожа
-`sofascore-gw-lease-watchdog-players` сохранены, чтобы не трогать хост; переименование — вместе
-с выводом дейли. Ключей `SOFASCORE_PLAYERS_*` в рецепте больше нет (их никто не читал).
-`deploy.sh`, `postdeploy_checks.sh` и `auto_deliver.sh` не менялись: пул и шлюз там уже были.
+**Распределение после вывода дейли (#1370, #1374).** Временное назначение #1360
+заменено: актуалка возвращается на `gw_951` вместе с ручным ingest, а `gw_players`
+и `sofascore_players_pool` выделены исключительно игрокам. Ключи актуалки:
+`SOFASCORE_REFRESH_POOL=ingest_scraper_pool` и
+`SOFASCORE_REFRESH_PROXY_CONTROL_URL=http://sofascore_proxy_filter:8899` (service alias `gw_951`).
+Ключи игроков: `SOFASCORE_PLAYERS_POOL=sofascore_players_pool` и
+`SOFASCORE_PLAYERS_PROXY_CONTROL_URL=http://sofascore_gw_players:8899`.
+Пустой override пула players возвращает собственный пул, а не общий ingest.
+Каталог `gateway-state-players` и сторож `sofascore-gw-lease-watchdog-players`
+обслуживают игроков. Фактическое применение этих значений проверяется после отдельно
+разрешённой доставки; описание рецепта не является свидетельством состояния хоста.
+
+### Полоса игроков: очередь, учёт и возобновление (#1374)
+
+Точка входа — `dags/dag_players_sofascore_all_mens.py`. Планировщик берёт закрытые
+турнир-сезоны из `state.json` полосы истории, читая её состояние без записи.
+Закрытие истории означает, что матчи скоупа закоммичены в Bronze; перед платным
+планированием players scope-cycle дополнительно проверяет готовность матчевых
+доказательств. Очередь определяется доставленным
+`configs/sofascore/denominator.tsv`: `queue_priority=0` не планируется, все core-скоупы
+всех годов идут раньше disputed. Отдельного исключения турниров ручного ingest нет.
+Исторический статус parked сам по себе не переносится в память игроков.
+
+У игроков отдельные `players-state.json`, `players-failures.json` и каталог результатов
+`SOFASCORE_PLAYERS_RESULT_DIR`; состояние и результаты истории не перезаписываются.
+Каждый элемент плана несёт свой scope key, run ID, путь результата и output directory.
+Цепочка из пяти задач:
+`plan_players_batch` → mapped `run_players_scope` → mapped `validate_players_scope`
+→ `finalize_players_run` → `propagate_players_status`; план также является зависимостью
+validate и finalize. Validate, finalize и propagate используют `all_done`: падение
+одного capture не отменяет независимый зачёт здорового соседа.
+
+Один DagRun активен одновременно; по умолчанию одна capture-задача занимает один слот
+`sofascore_players_pool`. На скоуп — 40 минут и один повтор через 2 минуты, на DagRun —
+4 ч 30 мин. Размер батча ограничен тремя скоупами с учётом обеих попыток; проверка
+при импорте сохраняет минимум 20 минут на validate/finalize. Приоритет capture — 1.
+Увеличение slots/concurrency не является частью #1374.
+
+Scope-cycle использует существующий runner для профилей и сезонной статистики.
+Зачёт требует успешного результата с совпавшими campaign/tournament/season и строгим
+run ID, а также `players.json` с ненулевой вселенной игроков. Ноль записанных строк
+при уже заполненных данных допустим; нулевая вселенная допустима только с явной причиной
+`season_has_no_finished_matches`. Ревизия snapshot может продвинуться после планирования,
+но результат чужой попытки не даёт зачёт. Успех пишет completed и очищает отказ скоупа.
+Провал capture **или** validate попадает в players failures через finalize и делает
+итоговый watcher красным.
+
+`deferred` означает ожидание матчевых доказательств до планирования платного трафика:
+source requests = 0, validate зелёный, completed не записывается. Отдельная память
+отказов считает попытку и может временно park-нуть скоуп до cooldown; обычное ожидание
+не увеличивает no-traffic streak и не переводит его в quarantine. Для настоящих
+отказов учитываются причина, число запросов, релиз и identity сезона: повторяемый
+отказ без трафика может попасть в quarantine до нового релиза. Parked и quarantine
+не означают завершение и не исключают игрока из знаменателя приёмки.
+
+Retry сохраняет тот же подписанный run ID и неизменяемый план шлюза. При возобновлении
+scope-cycle опирается на terminal manifest и сохранённый raw: завершённые allocations
+переигрываются без повторной покупки. `SOFASCORE_PLAYER_FRESHNESS_KEY=final` передаётся
+только в окружение players-задач; глобальное окружение scheduler не должно замораживать
+ротацию профилей других полос. Нельзя выдавать новый run ID, удалять manifest/raw или
+подменять completed ради обхода незавершённой попытки.
+
+### Отсутствие вытеснения и осушение перед доставкой
+
+Игроки используют только `gw_players` / `sofascore_players_pool`; история сохраняет
+свой шлюз и пул, актуалка и ручной ingest разделяют `gw_951` / `ingest_scraper_pool`.
+Игроки не занимают их слоты и аренды. Общий writer-lock по-прежнему сериализует
+Iceberg-коммиты; разделение полос не отменяет этот контракт или общий бюджет источника.
+
+Доставка использует fail-closed drain всего контура из семи DAG. Перед ротацией
+недостаточно увидеть пустой пул игроков или отсутствие процесса capture: активные
+player DagRun и задачи, включая ожидающие повтор `up_for_retry`, остаются препятствием
+для ротации. Drain учитывает queued/running прогоны, незавершённые задачи и аренды
+игроков вместе с остальными полосами; после capture должны завершиться validate и
+finalize. Ошибка чтения метабазы/шлюза, неизвестное состояние или истечение ожидания
+останавливают доставку. Пауза DAG не завершает текущие прогоны и retries. Нельзя
+обходить gate принудительным success, обнулением памяти или переключением релиза
+под живой попыткой. Фиксированного окна доставки в расписании players нет.
+
+### Будущая приёмка #1374: покрытие уникальных игроков core
+
+Приёмка выполняется после отдельно разрешённых доставки, unpause и сбора, только на
+production-данных. Синтетические тесты, локальный manifest, число задач и строки,
+записанные последним запуском, не доказывают покрытие. Метрика issue:
+
+- `total`: distinct non-null `player_id` из **core** `sofascore_lineups`;
+- `covered`: те же IDs, найденные среди предварительно дедуплицированных non-null
+  `player_id` из `sofascore_player_profile`;
+- `ratio = covered / total`; PASS только при непустом знаменателе и `ratio >= 0.95`.
+
+Воспроизводимая read-only процедура для Trino:
+
+1. Зафиксировать SHA доставленного релиза, время UTC и digest его
+   `configs/sofascore/denominator.tsv`. Из этого файла взять именно membership core;
+   не заменять его текущим master, очередью успешно завершённых скоупов или выборкой
+   доступных профилей. Сохранить точный список core-ключей и его соответствие ключам
+   лиги в Bronze по доставленной конфигурации. Неизвестное соответствие — блокер
+   измерения, а не повод выкинуть лигу.
+2. Read-only `SELECT` из `information_schema.columns` проверить физические имена
+   catalog/schema и колонок league/season/player для обеих таблиц. Сохранить выбранные
+   Iceberg snapshot IDs и выполнять обе выборки на тех же snapshot через
+   `FOR VERSION AS OF <snapshot_id>`, чтобы параллельный сбор не менял сравнение.
+3. В шаблоне ниже заменить `<...>` проверенными идентификаторами и списком `VALUES`
+   из шага 1. Ключи league и player привести к одинаковому типу без потери значения;
+   season оставить varchar slug. Это параметры измерения, не пример выдуманного core.
+   Сохранить окончательный SELECT вместе со списком core и результатом; DDL/DML,
+   временные таблицы и запросы к SofaScore не нужны.
+
+```sql
+WITH
+core_leagues(league) AS (
+    -- Например, синтаксис строки: ('<ключ из доставленного denominator.tsv>').
+    -- Подставить ВСЕ core-ключи, экранировав кавычки в строковых значениях.
+    VALUES <core_league_values_from_delivered_denominator>
+),
+lineup_grain AS (
+    SELECT DISTINCT
+        CAST(l.<league_column> AS varchar) AS league,
+        CAST(l.<season_column> AS varchar) AS season,
+        CAST(l.player_id AS varchar) AS player_id
+    FROM <catalog>.<bronze_schema>.sofascore_lineups
+         FOR VERSION AS OF <lineups_snapshot_id> AS l
+    WHERE l.player_id IS NOT NULL
+      AND CAST(l.<league_column> AS varchar) IN (SELECT league FROM core_leagues)
+),
+lineup_players AS (
+    SELECT DISTINCT player_id FROM lineup_grain
+),
+profile_players AS (
+    SELECT DISTINCT CAST(player_id AS varchar) AS player_id
+    FROM <catalog>.<bronze_schema>.sofascore_player_profile
+         FOR VERSION AS OF <profiles_snapshot_id>
+    WHERE player_id IS NOT NULL
+),
+coverage AS (
+    SELECT count(*) AS total, count(p.player_id) AS covered
+    FROM lineup_players AS l
+    LEFT JOIN profile_players AS p ON p.player_id = l.player_id
+)
+SELECT covered, total,
+       CAST(covered AS double) / NULLIF(total, 0) AS ratio,
+       CASE WHEN total > 0 AND
+                 CAST(covered AS double) / NULLIF(total, 0) >= 0.95
+            THEN 'PASS' ELSE 'NOT_PASS' END AS verdict
+FROM coverage;
+```
+
+Обе стороны дедуплицированы **до LEFT JOIN**: повторы матчей, команд и профилей не
+раздувают покрытие, а отсутствующие профили остаются в знаменателе. При `total=0`
+ratio — NULL, PASS невозможен. Профили считаются по player ID, а не по числу версий
+профиля или строк сезонной статистики.
+
+Отдельная диагностика зерна league + season + player использует те же CTE
+`core_leagues`, `lineup_grain`, `profile_players` и те же snapshot IDs; вместо CTE
+`coverage` и итогового SELECT выполнить:
+
+```sql
+SELECT l.league, l.season,
+       count(*) AS total, count(p.player_id) AS covered,
+       CAST(count(p.player_id) AS double) / NULLIF(count(*), 0) AS ratio
+FROM lineup_grain AS l
+LEFT JOIN profile_players AS p ON p.player_id = l.player_id
+GROUP BY l.league, l.season
+ORDER BY l.league, l.season;
+```
+
+Эта диагностика показывает провалы по турнирам и сезонам, но не заменяет distinct-player
+метрику issue: один игрок может встречаться в нескольких league/season, поэтому суммы
+по группам и среднее их ratio не являются итогом #1374. Нулевые/отсутствующие core-лиги
+также сверить с полным списком шага 1: отсутствие lineups не доказывает полноту сбора.
+В этом PR production SELECT не исполнялся и вердикт приёмки не выставлялся.
 
 **История не ждёт дейли (#1360).** Правило «пока у `dag_ingest_sofascore` есть DagRun
 `queued`/`running`, план истории пуст» (`_history_start_allowed`) жило с общего шлюза и снято:

@@ -10,6 +10,7 @@ on:
       - "dags/dag_ingest_sofascore.py"
       - "dags/dag_backfill_sofascore_all_mens.py"
       - "dags/dag_refresh_sofascore_all_mens.py"
+      - "dags/dag_players_sofascore_all_mens.py"
       - "dags/dag_sofascore_manifest_maintenance.py"
       - "dags/dag_sofascore_schedule_maintenance.py"
       - "dags/dag_replay_sofascore_raw.py"
@@ -28,8 +29,11 @@ on:
       - "scrapers/base/**"
       - "scrapers/sofascore/**"
       - "scripts/**/*sofascore*"
+      - "scripts/ci/check_sofascore_dag_imports.py"
       - "scripts/proxy_filter/**"
       - "tests/fixtures/sofascore*"
+      - "tests/airflow_real/test_sofascore_players_lane.py"
+      - "docker/images/airflow/requirements-ci-dag-import-*.lock"
       - "tests/integration/test_compose_validity.py"
       - "tests/unit/dags/test_dag_iceberg_maintenance.py"
       - "tests/unit/dags/test_maintenance_tasks.py"
@@ -74,6 +78,7 @@ jobs:
             dags/dag_ingest_sofascore.py \
             dags/dag_backfill_sofascore_all_mens.py \
             dags/dag_refresh_sofascore_all_mens.py \
+            dags/dag_players_sofascore_all_mens.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
             dags/dag_replay_sofascore_raw.py \
@@ -95,6 +100,8 @@ jobs:
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
             scripts/sofascore_runtime_preflight.py \
+            scripts/ci/check_sofascore_dag_imports.py \
+            tests/airflow_real/test_sofascore_players_lane.py \
             deploy/sofascore/campaign_day.py \
             deploy/sofascore/pipeline_watchdog.py \
             deploy/sofascore/pipeline_metrics.py \
@@ -109,6 +116,7 @@ jobs:
             dags/dag_sofascore_pipeline.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
+            dags/dag_players_sofascore_all_mens.py \
             dags/dag_replay_sofascore_raw.py \
             scripts/migrate_sofascore_production.py \
             scripts/migrate_sofascore_partition_keys.py \
@@ -131,6 +139,7 @@ jobs:
             tests/unit/dags/test_dag_backfill_sofascore_all_mens.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \
+            tests/unit/dags/test_dag_players_sofascore_all_mens.py \
             tests/unit/dags/test_dag_replay_sofascore_raw.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
@@ -239,15 +248,16 @@ jobs:
             --dest "${RUNNER_TEMP}/airflow-wheels" \
             -r "docker/images/airflow/requirements-ci-dag-import-${AIRFLOW_VERSION}.lock"
 
-      - name: Stage production SofaScore DAGs
+      - name: Stage production SofaScore DAGs outside repository ignore rules
         run: |
-          dag_dir="${GITHUB_WORKSPACE}/dags/.sofascore-ci-staged"
+          dag_dir="${RUNNER_TEMP}/sofascore-ci-dags"
           test ! -e "${dag_dir}"
           mkdir -p "${dag_dir}"
           for dag in \
             dag_ingest_sofascore.py \
             dag_backfill_sofascore_all_mens.py \
             dag_refresh_sofascore_all_mens.py \
+            dag_players_sofascore_all_mens.py \
             dag_sofascore_manifest_maintenance.py \
             dag_sofascore_schedule_maintenance.py \
             dag_replay_sofascore_raw.py
@@ -255,52 +265,7 @@ jobs:
             cp "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
           done
 
-      - name: Write the SofaScore DAG import check
-        run: |
-          cat > "${RUNNER_TEMP}/check_sofascore_dag_imports.py" <<'PY'
-          import os
-
-          from airflow.models import DagBag
-
-          dag_bag = DagBag(
-              dag_folder=os.environ["AIRFLOW__CORE__DAGS_FOLDER"],
-              include_examples=False,
-              safe_mode=False,
-          )
-          if dag_bag.import_errors:
-              details = "\n".join(
-                  f"{path}: {error}"
-                  for path, error in sorted(dag_bag.import_errors.items())
-              )
-              raise SystemExit(f"real Airflow DAG import errors:\n{details}")
-
-          expected = {
-              "dag_ingest_sofascore": 70,
-              "dag_backfill_sofascore_all_mens": 6,
-              "dag_refresh_sofascore_all_mens": 7,
-              "dag_sofascore_manifest_maintenance": 1,
-              "dag_sofascore_schedule_maintenance": 1,
-              "dag_replay_sofascore_raw": 3,
-          }
-          actual = set(dag_bag.dag_ids)
-          if actual != set(expected):
-              raise SystemExit(
-                  "real Airflow loaded the wrong SofaScore DAG set: "
-                  f"missing={sorted(set(expected) - actual)}, "
-                  f"unexpected={sorted(actual - set(expected))}"
-              )
-          for dag_id, expected_tasks in sorted(expected.items()):
-              dag = dag_bag.get_dag(dag_id)
-              task_count = len(dag.tasks) if dag is not None else -1
-              print(f"{dag_id}: tasks={task_count}")
-              if dag is None or task_count != expected_tasks:
-                  raise SystemExit(
-                      f"real Airflow DAG {dag_id} must expose exactly "
-                      f"{expected_tasks} tasks, got {task_count}"
-                  )
-          PY
-
-      - name: Check real Airflow DAG imports
+      - name: Check real Airflow imports and mapped players accounting
         env:
           AIRFLOW_IMAGE: ${{ matrix.image }}
           AIRFLOW_VERSION: ${{ matrix.airflow-version }}
@@ -318,30 +283,27 @@ jobs:
             -e PIP_TARGET=/home/airflow/.local/lib/python3.11/site-packages/ci-delta \
             -e PIP_NO_INDEX=1 \
             -e PIP_FIND_LINKS=/ci-wheels \
+            -e PYTHONDONTWRITEBYTECODE=1 \
             -e HOME=/tmp/home \
             -e AIRFLOW_HOME=/tmp/airflow \
             -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
             -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow/airflow.db \
-            -e AIRFLOW__CORE__DAGS_FOLDER=/workspace/dags/.sofascore-ci-staged \
+            -e AIRFLOW__CORE__DAGS_FOLDER=/ci-dags \
+            -e AIRFLOW__CORE__PLUGINS_FOLDER=/tmp/empty-plugins \
             -e PYTHONPATH=/workspace:/workspace/dags \
             -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${RUNNER_TEMP}/sofascore-ci-dags:/ci-dags:ro" \
             -v "${RUNNER_TEMP}/airflow-wheels:/ci-wheels:ro" \
-            -v "${RUNNER_TEMP}/check_sofascore_dag_imports.py:/ci-check/check_sofascore_dag_imports.py:ro" \
             --workdir /workspace \
             --entrypoint /bin/bash \
             "$AIRFLOW_IMAGE" \
             -euc '
-              mkdir -p "$HOME" "$AIRFLOW_HOME"
+              mkdir -p "$HOME" "$AIRFLOW_HOME" /tmp/empty-plugins
               case "$AIRFLOW_VERSION" in
-                2.7.3)
+                2.7.3|2.11.2)
                   python -m pip install \
                     --no-deps --require-hashes --only-binary=:all: \
-                    -r docker/images/airflow/requirements-ci-dag-import-2.7.3.lock
-                  ;;
-                2.11.2)
-                  python -m pip install \
-                    --no-deps --require-hashes --only-binary=:all: \
-                    -r docker/images/airflow/requirements-ci-dag-import-2.11.2.lock
+                    -r "docker/images/airflow/requirements-ci-dag-import-${AIRFLOW_VERSION}.lock"
                   ;;
                 *) exit 1 ;;
               esac
@@ -350,5 +312,6 @@ jobs:
               test "$(airflow version)" = "$AIRFLOW_VERSION"
               airflow db migrate
               airflow dags list-import-errors
-              python /ci-check/check_sofascore_dag_imports.py
+              python /workspace/scripts/ci/check_sofascore_dag_imports.py
+              python -m unittest tests.airflow_real.test_sofascore_players_lane -v
             '
