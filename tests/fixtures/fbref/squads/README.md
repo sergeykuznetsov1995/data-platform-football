@@ -6,3 +6,4 @@
 - Affected target: `fbref:squad:7c76bc53:a667b6f50d092c9f077c`.
 - Regression: DOM tables at source ordinals 5 and 6 both have `id=results2009-20103111_overall`, with 5 and 6 rows respectively. Generic Bronze distinguishes their table instances, but the control manifest originally used only source ID and location.
 - The immutable-manifest conflict stopped `dag_backfill_fbref` recovery on 2026-09-06. The test exercises offline recovery with an already-written manifest prefix and verifies idempotent completion.
+- The C13 regression also verifies the fixture's 10 `tfoot` totals: generic rows and persisted cells carry an explicit `is_total` flag through the offline pipeline, while the 188 non-total rows and all table/row/cell identities remain distinct and stable.

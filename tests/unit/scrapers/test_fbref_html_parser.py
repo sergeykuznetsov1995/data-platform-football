@@ -1364,3 +1364,65 @@ class TestExtractMatchUrlsFromSchedule:
         url_by_home = dict(zip(df['Home'], df['match_url']))
         assert url_by_home['Liverpool'] == '/en/matches/cccccccc/Liverpool-Leeds'
         assert pd.isna(url_by_home['City'])
+
+
+def test_extract_tables_from_comments_preserves_order_duplicates_and_missing_ids():
+    from bs4 import BeautifulSoup
+    from scrapers.fbref.html_parser import extract_tables_from_comments
+
+    soup = BeautifulSoup(
+        """
+        <!-- <table id="first"></table><table></table><table id="second"></table> -->
+        <!-- <table id="first"></table><table id="third"></table> -->
+        """,
+        "html.parser",
+    )
+
+    tables = extract_tables_from_comments(soup)
+
+    assert isinstance(tables, list)
+    assert [table.get("id") for table in tables] == [
+        "first", None, "second", "first", "third"
+    ]
+
+
+def test_parse_table_deduplicates_identical_dom_and_comment_tables():
+    from bs4 import BeautifulSoup
+    from scrapers.fbref.html_parser import extract_tables_from_comments, parse_table
+
+    table = """
+    <table id="stats_standard">
+      <thead><tr><th>Player</th></tr></thead>
+      <tbody><tr><td>Alpha</td></tr></tbody>
+    </table>
+    """
+    soup = BeautifulSoup(f"{table}<!-- {table} -->", "html.parser")
+
+    frame = parse_table(
+        soup, "stats_standard", extract_tables_from_comments(soup)
+    )
+
+    assert frame is not None
+    assert frame["Player"].tolist() == ["Alpha"]
+
+
+@pytest.mark.parametrize("table_in_dom", [False, True])
+def test_parse_table_rejects_conflicting_duplicate_table_ids(table_in_dom):
+    from bs4 import BeautifulSoup
+    from scrapers.fbref.html_parser import extract_tables_from_comments, parse_table
+
+    first = """
+    <table id="stats_standard">
+      <thead><tr><th>Player</th></tr></thead>
+      <tbody><tr><td>Alpha</td></tr></tbody>
+    </table>
+    """
+    second = first.replace("Alpha", "Beta")
+    soup = BeautifulSoup(
+        (first if table_in_dom else f"<!-- {first} -->")
+        + f"<!-- {second} -->",
+        "html.parser",
+    )
+
+    with pytest.raises(ValueError, match="stats_standard"):
+        parse_table(soup, "stats_standard", extract_tables_from_comments(soup))

@@ -6,6 +6,7 @@ import pytest
 
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
+    GENERIC_TABLE_SCHEMAS,
     GenericBronzeBatchUnsupported,
     GenericPagePersistItem,
     GenericPersistenceError,
@@ -35,6 +36,9 @@ def _manager():
 
     manager.insert_dataframe.side_effect = insert
     manager._execute.side_effect = execute
+    manager.get_table_columns.side_effect = lambda _schema, table: dict(
+        GENERIC_TABLE_SCHEMAS[table]
+    )
     return manager
 
 
@@ -385,4 +389,43 @@ def test_generic_merge_takes_the_committing_path():
     assert not any(
         call.args and str(call.args[0]).startswith("MERGE INTO")
         for call in manager._execute.call_args_list
+    )
+
+
+def test_tfoot_cells_persist_with_total_flag_after_additive_schema_evolution():
+    manager = _manager()
+    old_schemas = {
+        table: dict(columns) for table, columns in GENERIC_TABLE_SCHEMAS.items()
+    }
+    old_schemas[TABLE_CELLS_TABLE].pop("is_total", None)
+    manager.get_table_columns.side_effect = lambda _schema, table: dict(
+        old_schemas[table]
+    )
+    page = parse_page_document(
+        """
+        <table id="stats_standard">
+          <thead><tr><th data-stat="squad">Squad</th></tr></thead>
+          <tbody><tr><td data-stat="squad">Alpha</td></tr></tbody>
+          <tfoot><tr><th data-stat="squad">Squad Total</th></tr></tfoot>
+        </table>
+        """,
+        target_id="fbref:squad:totals",
+        page_kind="squad",
+    )
+
+    counts = FBrefGenericBronzeWriter(manager).persist_page(
+        page,
+        canonical_url="https://fbref.com/test",
+        run_id="run",
+    )
+
+    assert counts == {"cells": 2, "tables": 1, "manifest": 1}
+    cell_frames = [
+        call.args[2]
+        for call in manager.insert_dataframe.call_args_list
+        if call.args[1].startswith(TABLE_CELLS_TABLE)
+    ]
+    assert cell_frames[-1]["is_total"].tolist() == [False, True]
+    manager.add_column.assert_called_once_with(
+        "bronze", TABLE_CELLS_TABLE, "is_total", "BOOLEAN"
     )
