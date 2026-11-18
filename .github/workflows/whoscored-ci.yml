@@ -1165,7 +1165,7 @@ jobs:
         run: |
           if test -z "${WHOSCORED_CI_TEST_VENV:-}"; then
             test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"
-            "$test_venv/bin/python" -I -m venv --copies "$test_venv"
+            python -I -m venv --copies "$test_venv"
             "$test_venv/bin/python" -I -m pip install \
               --disable-pip-version-check --no-deps \
               --require-hashes --only-binary=:all: \
