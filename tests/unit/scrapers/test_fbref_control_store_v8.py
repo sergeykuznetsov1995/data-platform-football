@@ -1852,8 +1852,7 @@ def test_competition_disappearance_debounces_two_accepted_snapshots():
     )
 
 
-def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
-    """Run the production reconcile frontier UPDATEs on SQLite JSON/UPDATE FROM."""
+def _new_reconcile_scope_database():
     database = sqlite3.connect(":memory:")
     database.execute("ATTACH DATABASE ':memory:' AS fbref_control")
     database.create_function("clock_timestamp", 0, lambda: "2026-10-29 12:00:00")
@@ -1869,6 +1868,21 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
         "last_content_hash TEXT, last_fetched_at TEXT, last_http_status INTEGER, "
         "updated_at TEXT)"
     )
+    database.execute(
+        "CREATE TABLE fbref_control.incomplete_match_refetch (target_id TEXT, "
+        "attempts INTEGER, logical_refresh_id TEXT, window_started_at TEXT, "
+        "exhausted_at TEXT)"
+    )
+    return database
+
+
+def _reconcile_scope_on_sqlite(
+    registry_rows, frontier_rows, *, database=None, refetch_rows=()
+):
+    """Run the production reconcile frontier UPDATEs on SQLite JSON/UPDATE FROM."""
+    owns_database = database is None
+    if owns_database:
+        database = _new_reconcile_scope_database()
     for row in registry_rows:
         database.execute(
             "INSERT INTO fbref_control.competition_registry VALUES (?,?,?,?,?,?,?)",
@@ -1879,15 +1893,23 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
     for row in frontier_rows:
         database.execute(
             "INSERT INTO fbref_control.page_frontier (target_id, source, source_ids, "
-            "refresh_policy, state, next_fetch_at, last_error_class, "
-            "last_content_hash, last_fetched_at, last_http_status, last_error_message) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "refresh_policy, state, next_fetch_at, retry_after, last_error_class, "
+            "last_content_hash, last_fetched_at, last_http_status, last_error_message, "
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (row["target_id"], "fbref",
              json.dumps({"competition_id": row["competition_id"]}),
              row["refresh_policy"], row["state"], row.get("next_fetch_at"),
-             row.get("last_error_class"), row.get("last_content_hash"),
-             row.get("last_fetched_at"), row.get("last_http_status", 200),
-             row.get("last_error_message")),
+             row.get("retry_after"), row.get("last_error_class"),
+             row.get("last_content_hash"), row.get("last_fetched_at"),
+             row.get("last_http_status", 200), row.get("last_error_message"),
+             row.get("updated_at")),
+        )
+    for row in refetch_rows:
+        database.execute(
+            "INSERT INTO fbref_control.incomplete_match_refetch VALUES (?,?,?,?,?)",
+            (row["target_id"], row.get("attempts", 1),
+             row.get("logical_refresh_id", str(uuid.uuid4())),
+             row.get("window_started_at", "2026-10-20"), row.get("exhausted_at")),
         )
 
     def handler(sql, _params):
@@ -1917,8 +1939,161 @@ def _reconcile_scope_on_sqlite(registry_rows, frontier_rows):
             )
         }
     finally:
-        database.close()
+        if owns_database:
+            database.close()
     return counts, states, messages
+
+
+def _reconcile_refetch_snapshot(database):
+    return {
+        "frontier": database.execute(
+            "SELECT target_id, source, source_ids, refresh_policy, state, "
+            "next_fetch_at, retry_after, last_error_class, last_error_message, "
+            "last_content_hash, last_fetched_at, last_http_status, updated_at "
+            "FROM fbref_control.page_frontier ORDER BY target_id"
+        ).fetchall(),
+        "refetch": database.execute(
+            "SELECT target_id, attempts, logical_refresh_id, window_started_at, "
+            "exhausted_at FROM fbref_control.incomplete_match_refetch "
+            "ORDER BY target_id"
+        ).fetchall(),
+    }
+
+
+def test_reconcile_restores_assigned_incomplete_refetch_after_skip():
+    database = _new_reconcile_scope_database()
+    scheduled_at = "2026-10-30 01:02:03"
+    retry_after = "2026-10-30 04:05:06"
+    discontinued = {
+        "current_scope_lifecycle": "discontinued",
+        "current_scope_reason": "last_source_season_2010",
+    }
+    target = {
+        "target_id": "match", "competition_id": "68",
+        "refresh_policy": "historical_once", "state": "retry",
+        "next_fetch_at": scheduled_at, "retry_after": retry_after,
+        "last_error_class": "IncompleteMatchPageError",
+        "last_error_message": "scored_match_incomplete",
+        "last_content_hash": "incomplete-hash", "last_fetched_at": "2026-10-01",
+        "updated_at": "2026-10-28 01:02:03",
+    }
+    try:
+        first, _, _ = _reconcile_scope_on_sqlite(
+            [{"competition_id": "68", "crawl_state": "skipped"}],
+            [target],
+            database=database,
+            refetch_rows=[{"target_id": "match", "logical_refresh_id": "refresh-1"}],
+        )
+        assert first["frontier_scope_reopened"] == 0
+        assert first["frontier_scope_closed"] == 1
+        assert database.execute(
+            "SELECT state FROM fbref_control.page_frontier WHERE target_id = 'match'"
+        ).fetchone() == ("skipped",)
+        assert database.execute(
+            "SELECT attempts, exhausted_at FROM fbref_control.incomplete_match_refetch "
+            "WHERE target_id = 'match'"
+        ).fetchone() == (1, None)
+
+        database.execute(
+            "UPDATE fbref_control.competition_registry SET metadata = ? "
+            "WHERE competition_id = '68'",
+            (json.dumps(discontinued),),
+        )
+        repaired, states, _ = _reconcile_scope_on_sqlite([], [], database=database)
+        assert repaired["frontier_scope_reopened"] == 1
+        assert repaired["frontier_scope_closed"] == 0
+        assert states["match"] == (
+            "retry", scheduled_at, "IncompleteMatchPageError",
+        )
+        assert database.execute(
+            "SELECT retry_after, last_error_message, last_content_hash, last_fetched_at "
+            "FROM fbref_control.page_frontier WHERE target_id = 'match'"
+        ).fetchone() == (
+            retry_after, "scored_match_incomplete", "incomplete-hash", "2026-10-01",
+        )
+        before = _reconcile_refetch_snapshot(database)
+
+        again, _, _ = _reconcile_scope_on_sqlite([], [], database=database)
+        assert again["frontier_scope_reopened"] == 0
+        assert again["frontier_scope_closed"] == 0
+        assert _reconcile_refetch_snapshot(database) == before
+    finally:
+        database.close()
+
+
+def test_reconcile_refetch_reopen_preserves_priority_and_requires_pending_row():
+    database = _new_reconcile_scope_database()
+    discontinued = {
+        "current_scope_lifecycle": "discontinued",
+        "current_scope_reason": "last_source_season_2010",
+    }
+    scheduled = {
+        "next_fetch_at": "2026-10-30 01:02:03",
+        "retry_after": "2026-10-30 04:05:06",
+        "updated_at": "2026-10-28 01:02:03",
+    }
+    processed = {"last_content_hash": "h", "last_fetched_at": "2026-10-01"}
+
+    def target(name, error="IncompleteMatchPageError", **changes):
+        return {
+            "target_id": name, "competition_id": "68",
+            "refresh_policy": "historical_once", "state": "retry",
+            "last_error_class": error, **processed, **scheduled, **changes,
+        }
+
+    rows = [
+        target("moved_301", last_http_status=301),
+        target("moved_308", last_http_status=308),
+        target("contract", error="ParseContractQuarantined",
+               last_error_message="unusable table shape"),
+        target("without_refetch"),
+        target("without_refetch_or_raw", last_content_hash=None, last_fetched_at=None),
+        target("exhausted"),
+    ]
+    refetch_rows = [
+        {"target_id": name, "logical_refresh_id": f"refresh-{name}"}
+        for name in ("moved_301", "moved_308", "contract")
+    ] + [{
+        "target_id": "exhausted", "logical_refresh_id": "refresh-exhausted",
+        "exhausted_at": "2026-10-28 05:00:00",
+    }]
+    try:
+        _reconcile_scope_on_sqlite(
+            [{"competition_id": "68", "crawl_state": "skipped"}], rows,
+            database=database, refetch_rows=refetch_rows,
+        )
+        database.execute(
+            "UPDATE fbref_control.competition_registry SET metadata = ? "
+            "WHERE competition_id = '68'",
+            (json.dumps(discontinued),),
+        )
+        repaired, states, messages = _reconcile_scope_on_sqlite([], [], database=database)
+        assert repaired["frontier_scope_reopened"] == len(rows)
+        assert states == {
+            "moved_301": ("quarantined", None, "RedirectUnresolved"),
+            "moved_308": ("quarantined", None, "RedirectUnresolved"),
+            "contract": ("quarantined", None, "ParseContractQuarantined"),
+            "without_refetch": ("fetched", None, "IncompleteMatchPageError"),
+            "without_refetch_or_raw": (
+                "queued", "2026-10-29 12:00:00", "IncompleteMatchPageError",
+            ),
+            "exhausted": ("fetched", None, "IncompleteMatchPageError"),
+        }
+        assert messages["moved_301"] == "HTTP 301; awaiting #1933"
+        assert messages["moved_308"] == "HTTP 308; awaiting #1933"
+        assert messages["contract"] == "unusable table shape"
+        assert database.execute(
+            "SELECT count(*) FROM fbref_control.page_frontier "
+            "WHERE retry_after IS NOT NULL"
+        ).fetchone() == (0,)
+        before = _reconcile_refetch_snapshot(database)
+
+        again, _, _ = _reconcile_scope_on_sqlite([], [], database=database)
+        assert again["frontier_scope_reopened"] == 0
+        assert again["frontier_scope_closed"] == 0
+        assert _reconcile_refetch_snapshot(database) == before
+    finally:
+        database.close()
 
 
 def test_reconcile_keeps_and_restores_history_of_discontinued_competitions():
@@ -2090,6 +2265,8 @@ _E2E_SCHEMA = (
     "page_kind TEXT, canonical_url TEXT, source_ids TEXT, refresh_policy TEXT, state TEXT, "
     "next_fetch_at TEXT, retry_after TEXT, last_error_class TEXT, last_error_message TEXT, "
     "last_content_hash TEXT, last_fetched_at TEXT, last_http_status INTEGER, updated_at TEXT)",
+    "CREATE TABLE fbref_control.incomplete_match_refetch (target_id TEXT, "
+    "attempts INTEGER, logical_refresh_id TEXT, window_started_at TEXT, exhausted_at TEXT)",
     "CREATE TABLE fbref_control.fetch_attempt (target_id TEXT, content_hash TEXT, "
     "status TEXT, logical_refresh_id TEXT)",
     "CREATE TABLE fbref_control.observation_processing (logical_refresh_id TEXT, "

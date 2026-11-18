@@ -1059,6 +1059,11 @@ _REDIRECT_PARK_MESSAGE_SQL = "'HTTP ' || last_http_status || '; awaiting #1933'"
 # Quarantine verdicts that only an out-of-band decision may lift; a reconcile
 # that skipped such a target keeps the class, so reopen restores the verdict.
 _TERMINAL_QUARANTINE_CLASSES_SQL = "('ParseContractQuarantined')"
+_PENDING_INCOMPLETE_MATCH_REFETCH_SQL = """EXISTS (
+    SELECT 1 FROM fbref_control.incomplete_match_refetch AS refetch
+    WHERE refetch.target_id = frontier.target_id
+      AND refetch.exhausted_at IS NULL
+)"""
 
 
 class ControlStore:
@@ -4771,6 +4776,9 @@ class ControlStore:
                              {_TERMINAL_QUARANTINE_CLASSES_SQL}
                         THEN 'quarantined'
                         WHEN competition.crawl_state <> 'active'
+                         AND {_PENDING_INCOMPLETE_MATCH_REFETCH_SQL}
+                        THEN 'retry'
+                        WHEN competition.crawl_state <> 'active'
                          AND frontier.last_content_hash IS NOT NULL
                          AND frontier.last_fetched_at IS NOT NULL
                         THEN 'fetched'
@@ -4780,11 +4788,14 @@ class ControlStore:
                         WHEN competition.crawl_state <> 'active'
                          AND ({_REDIRECT_HTTP_STATUS_SQL}
                          OR frontier.last_error_class IN
-                             {_TERMINAL_QUARANTINE_CLASSES_SQL}
-                         OR (
-                           frontier.last_content_hash IS NOT NULL
-                           AND frontier.last_fetched_at IS NOT NULL
-                         ))
+                             {_TERMINAL_QUARANTINE_CLASSES_SQL})
+                        THEN NULL
+                        WHEN competition.crawl_state <> 'active'
+                         AND {_PENDING_INCOMPLETE_MATCH_REFETCH_SQL}
+                        THEN frontier.next_fetch_at
+                        WHEN competition.crawl_state <> 'active'
+                         AND frontier.last_content_hash IS NOT NULL
+                         AND frontier.last_fetched_at IS NOT NULL
                         THEN NULL
                         ELSE clock_timestamp()
                     END,
@@ -4835,7 +4846,28 @@ class ControlStore:
                         THEN 'quarantined'
                         ELSE 'skipped'
                     END,
-                    next_fetch_at = NULL, retry_after = NULL,
+                    next_fetch_at = CASE
+                        WHEN competition.gender = 'male'
+                         AND frontier.refresh_policy = 'historical_once'
+                         AND frontier.state = 'retry'
+                         AND frontier.last_error_class = 'IncompleteMatchPageError'
+                         AND (frontier.last_http_status IS NULL
+                              OR NOT {_REDIRECT_HTTP_STATUS_SQL})
+                         AND {_PENDING_INCOMPLETE_MATCH_REFETCH_SQL}
+                        THEN frontier.next_fetch_at
+                        ELSE NULL
+                    END,
+                    retry_after = CASE
+                        WHEN competition.gender = 'male'
+                         AND frontier.refresh_policy = 'historical_once'
+                         AND frontier.state = 'retry'
+                         AND frontier.last_error_class = 'IncompleteMatchPageError'
+                         AND (frontier.last_http_status IS NULL
+                              OR NOT {_REDIRECT_HTTP_STATUS_SQL})
+                         AND {_PENDING_INCOMPLETE_MATCH_REFETCH_SQL}
+                        THEN frontier.retry_after
+                        ELSE NULL
+                    END,
                     last_error_class = CASE
                         WHEN competition.gender IN ('female', 'unknown')
                         THEN 'ScopeQuarantined'
