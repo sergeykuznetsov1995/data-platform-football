@@ -151,6 +151,8 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
     assert "test -S /run/docker.sock" in unit_step
     assert 'endpoint.connect("/run/docker.sock")' in unit_step
     assert "GITHUB_WORKSPACE=/root/data-platform-football" in unit_step
+    assert 'WHOSCORED_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' in unit_step
+    assert '--env WHOSCORED_CI_HEAD_SHA="$WHOSCORED_CI_HEAD_SHA"' in unit_step
     assert "--workdir /root/data-platform-football" in unit_step
     assert "/root/.secrets/whoscored-runtime-v2.env" in unit_step
     assert "/root/.secrets/whoscored-proxy-v2.env" in unit_step
