@@ -195,6 +195,8 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     contract_job = text.split("  contract:\n", 1)[1].split(
         "  real-airflow-dag-import:\n", 1
     )[0]
+    assert "runs-on: ubuntu-24.04" in contract_job
+    assert "runs-on: ubuntu-latest" not in contract_job
     scheduler_smoke = text.split(
         "- name: Build and smoke the hardened scheduler test image", 1
     )[1].split("- name: Build production targets", 1)[0]
