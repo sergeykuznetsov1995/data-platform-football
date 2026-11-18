@@ -12,6 +12,7 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
+from urllib.parse import parse_qs, urlsplit
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
@@ -67,11 +68,7 @@ def _positive_id(value: object) -> int:
 
 
 def build_heatmap_reference(match_id: int, source_url: str) -> HeatmapReference:
-    """Validate the single supported source shape; construct the wrapper target.
-
-    Raises ValueError for an invalid identity or URL. The source string is passed
-    verbatim to canonicalize_target, including an explicitly specified port 443.
-    """
+    """Validate a direct source URL or its exact relative canonical wrapper."""
     match_id = _positive_id(match_id)
     if not isinstance(source_url, str):
         raise ValueError("heatmap URL must be a string")
@@ -79,12 +76,28 @@ def build_heatmap_reference(match_id: int, source_url: str) -> HeatmapReference:
         r"https://pub\.fotmob\.com(?::443)?/prod/db/api/heatmap/match/"
         + str(match_id)
     )
-    if re.fullmatch(pattern, source_url) is None:
-        raise ValueError("unsupported heatmap URL or match identity")
-    target = canonicalize_target(
-        f"heatmap/match/{match_id}/heatmaps", {"heatmapUrl": source_url}
-    )
-    return HeatmapReference(match_id, source_url, target)
+    if re.fullmatch(pattern, source_url) is not None:
+        heatmap_url = source_url
+        target = canonicalize_target(
+            f"heatmap/match/{match_id}/heatmaps", {"heatmapUrl": heatmap_url}
+        )
+    else:
+        wrapper = urlsplit(source_url)
+        if (
+            wrapper.scheme
+            or wrapper.netloc
+            or wrapper.fragment
+            or wrapper.path != f"/api/data/heatmap/match/{match_id}/heatmaps"
+        ):
+            raise ValueError("unsupported heatmap URL or match identity")
+        params = parse_qs(wrapper.query, keep_blank_values=True, strict_parsing=True)
+        if set(params) != {"heatmapUrl"} or len(params["heatmapUrl"]) != 1:
+            raise ValueError("unsupported heatmap wrapper parameters")
+        heatmap_url = params["heatmapUrl"][0]
+        if re.fullmatch(pattern, heatmap_url) is None:
+            raise ValueError("unsupported heatmap URL or match identity")
+        target = canonicalize_target(source_url)
+    return HeatmapReference(match_id, heatmap_url, target)
 
 
 def extract_heatmap_reference(
