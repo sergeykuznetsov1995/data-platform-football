@@ -1,0 +1,29 @@
+{
+  "attempt": 1000007,
+  "blob_key": "blobs/sha256/24/24b3a9320efb4b1dd2907028e6bfa18e2f76583dd02d6a09decef90296a9bb55.body.gz",
+  "capture_id": "30c5ed919a9b3a280b8cd6ab004ef8f30e46dd4422324c7b65c39bd9d27c4df5",
+  "compression": "gzip",
+  "content_hash": "24b3a9320efb4b1dd2907028e6bfa18e2f76583dd02d6a09decef90296a9bb55",
+  "content_type": "application/json",
+  "cycle_id": "tm-current-cfd30caeca8901779a498b13f8b85a5a",
+  "decoded_bytes": 246953,
+  "endpoint": "current_players",
+  "fetched_at": "2026-11-08T20:47:57.855905+00:00",
+  "hash_algorithm": "sha256",
+  "headers": {
+    "cache-control": "max-age=60, must-revalidate, public",
+    "content-encoding": "gzip",
+    "content-type": "application/json",
+    "date": "Sun, 08 Nov 2026 20:47:57 GMT",
+    "etag": "\"488b4a4dbe7b53cee3ade36c218e999d93f3fce8-gzip\"",
+    "last-modified": "Sun, 08 Nov 2026 20:47:57 GMT",
+    "vary": "Origin,Accept-Language,Accept-Encoding"
+  },
+  "manifest_version": "transfermarkt-raw-v1",
+  "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/24/24b3a9320efb4b1dd2907028e6bfa18e2f76583dd02d6a09decef90296a9bb55.body.gz",
+  "scope_id": "tm-129798751f4cf25e29fe0c19",
+  "source": "transfermarkt",
+  "status_code": 200,
+  "stored_bytes": 26718,
+  "url": "https://tmapi.transfermarkt.technology/players?ids%5B%5D=711544&ids%5B%5D=712181&ids%5B%5D=715558&ids%5B%5D=717411&ids%5B%5D=719673&ids%5B%5D=724129&ids%5B%5D=725912&ids%5B%5D=727089&ids%5B%5D=728733&ids%5B%5D=730861&ids%5B%5D=730893&ids%5B%5D=731466&ids%5B%5D=735570&ids%5B%5D=735571&ids%5B%5D=739443&ids%5B%5D=743384&ids%5B%5D=743386&ids%5B%5D=743413&ids%5B%5D=743498&ids%5B%5D=743591&ids%5B%5D=743599&ids%5B%5D=743600&ids%5B%5D=744149&ids%5B%5D=746357&ids%5B%5D=746740&ids%5B%5D=747951&ids%5B%5D=748319&ids%5B%5D=750903&ids%5B%5D=763079&ids%5B%5D=776890&ids%5B%5D=788283&ids%5B%5D=801734&ids%5B%5D=808348&ids%5B%5D=811779&ids%5B%5D=817613&ids%5B%5D=820374&ids%5B%5D=823231&ids%5B%5D=823486&ids%5B%5D=834397&ids%5B%5D=834742&ids%5B%5D=845289&ids%5B%5D=849410&ids%5B%5D=855256&ids%5B%5D=857079&ids%5B%5D=864121&ids%5B%5D=866246&ids%5B%5D=866655&ids%5B%5D=867688&ids%5B%5D=876631&ids%5B%5D=880245&ids%5B%5D=881116&ids%5B%5D=888785&ids%5B%5D=890721&ids%5B%5D=892160&ids%5B%5D=893658&ids%5B%5D=895937&ids%5B%5D=900195&ids%5B%5D=903611&ids%5B%5D=904802&ids%5B%5D=915418&ids%5B%5D=922462&ids%5B%5D=922693&ids%5B%5D=922769&ids%5B%5D=923504&ids%5B%5D=923535&ids%5B%5D=923757&ids%5B%5D=923831&ids%5B%5D=926309&ids%5B%5D=926952&ids%5B%5D=927353&ids%5B%5D=931838&ids%5B%5D=935230&ids%5B%5D=935231&ids%5B%5D=936874&ids%5B%5D=937941&ids%5B%5D=939290&ids%5B%5D=939964&ids%5B%5D=945021&ids%5B%5D=947411&ids%5B%5D=948272&ids%5B%5D=948275&ids%5B%5D=948279&ids%5B%5D=950091&ids%5B%5D=955357&ids%5B%5D=964426&ids%5B%5D=973085&ids%5B%5D=974982&ids%5B%5D=975347&ids%5B%5D=984096&ids%5B%5D=986288&ids%5B%5D=989112&ids%5B%5D=991487&ids%5B%5D=996897&ids%5B%5D=998101&ids%5B%5D=1004301&ids%5B%5D=1004708&ids%5B%5D=1005575&ids%5B%5D=1005583&ids%5B%5D=1005649&ids%5B%5D=1006411"
+}

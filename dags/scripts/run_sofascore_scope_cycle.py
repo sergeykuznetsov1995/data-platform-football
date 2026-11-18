@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "dags") not in sys.path:
     sys.path.insert(0, str(ROOT / "dags"))
 
+from dags.utils.sofascore_dq import run_scope_bronze_dq  # noqa: E402
 from scrapers.sofascore import trino_accounting  # noqa: E402
 from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
     ScopeOverlayPaths,
@@ -123,6 +124,7 @@ def _phase_report(path: Path) -> dict[str, Any]:
         "endpoint_availability",
         "schedule_inventory",
         "match_phase_ready", "full_complete", "optional_endpoint_errors",
+        "planned_endpoints", "terminal_endpoints", "endpoint_completeness",
     ):
         if field in payload:
             report[field] = payload[field]
@@ -340,6 +342,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     started = time.monotonic()
     result: dict[str, Any] = {"status": "running", "phases": [], "errors": [],
                               "started_at": datetime.now(timezone.utc).isoformat()}
+    scope: Optional[dict[str, Any]] = None
     previous_registry = os.environ.get("SOFASCORE_REGISTRY_PATH")
     previous_medallion = os.environ.get("MEDALLION_CONFIG_DIR")
     previous_run_id = os.environ.get("SOFASCORE_RUN_ID")
@@ -356,13 +359,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             deadline = min(deadline, float(window))
         os.environ[SCOPE_DEADLINE_ENV] = str(deadline)
 
-    def _finish(status: str) -> None:
+    def _run_bronze_dq(status: str) -> bool:
+        if scope is None or not result["phases"]:
+            return True
+        require_complete = status == "success" and args.phase in {"matches", "all"}
+        try:
+            report: Any = run_scope_bronze_dq(
+                scope, result["phases"], require_complete=require_complete
+            )
+        except Exception as exc:
+            report = {
+                "status": "failed",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+        if report is not None:
+            result["bronze_dq"] = report
+        if isinstance(report, Mapping) and report.get("status") == "success":
+            return True
+        details: list[str] = []
+        if isinstance(report, Mapping):
+            for field in ("violations", "errors"):
+                for item in report.get(field) or []:
+                    if isinstance(item, Mapping):
+                        details.append(
+                            str(item.get("message") or item.get("name") or item)
+                        )
+                    else:
+                        details.append(str(item))
+        if details:
+            summary = "; ".join(details[:5])
+        elif isinstance(report, Mapping):
+            summary = f"status={report.get('status')!r}"
+        else:
+            summary = f"unexpected report {type(report).__name__}"
+        result["errors"].append(f"Bronze DQ failed: {summary}")
+        result["status"] = "failed"
+        return False
+
+    def _finish(status: str) -> int:
         result["status"] = status
         result["elapsed_s"] = round(time.monotonic() - started, 1)
         result["finished_at"] = datetime.now(timezone.utc).isoformat()
         result["bytes"] = sum(
             int(phase.get("paid_proxy_bytes") or 0) for phase in result["phases"]
         )
+        if status == "failed":
+            exit_code = 1
+        elif status == "deferred":
+            exit_code = 0
+        else:
+            exit_code = 0 if _run_bronze_dq(status) else 1
         _atomic_json(output, result)
         directory = os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR", "").strip()
         if directory:
@@ -372,6 +418,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # The existing runner remains the sole producer of its result.
             attempt = hashlib.sha256((str(result.get("run_id")) + result["started_at"]).encode()).hexdigest()[:24]
             write_immutable(Path(directory) / "scope-attempts" / (attempt + ".json"), result)
+        return exit_code
 
     try:
         scope = load_exact_scope(
@@ -447,41 +494,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for field in ("remaining_matches", "stop_reason"):
                     result[field] = partial.get(field)
                 result["capture_elapsed_s"] = partial.get("elapsed_s")
-                _finish("partial")
-                return 0
+                return _finish("partial")
             if phase_result.get("status") == "deferred":
                 # #1374: the players lane waits for the season's match
-                # evidence to close; zero paid traffic left the cycle, so
-                # the scope defers green and is planned again later.
+                # evidence to close; zero paid traffic left the cycle.
+                # No capture ran, so Bronze DQ does not apply to this wait.
                 result["deferral_reason"] = str(
                     phase_result.get("deferral_reason") or ""
                 )
-                _finish("deferred")
-                return 0
+                return _finish("deferred")
             if phase_result.get("status") != "success":
                 if not phase_errors:
                     result["errors"].append(
                         f"{phase}: exit_code={phase_result.get('exit_code')}, "
                         "phase report missing"
                     )
-                _finish("failed")
-                return 1
+                return _finish("failed")
             if args.phase == "all" and verified_empty_schedule(phase_result, scope):
                 result["waiting_reason"] = "season_has_no_finished_matches"
-                _finish("waiting")
-                return 0
-        _finish("success")
-        return 0
+                return _finish("waiting")
+        return _finish("success")
     except PlayerEvidenceNotReady as exc:
-        # #1374: a green deferral — the scope was only too early, and no paid
-        # traffic happened, so this is not an incident.
+        # #1374: the scope was too early and no paid traffic happened.
+        # No capture ran, so Bronze DQ does not apply to this wait.
         result["deferral_reason"] = f"{type(exc).__name__}: {exc}"
-        _finish("deferred")
-        return 0
+        return _finish("deferred")
     except Exception as exc:
         result["errors"].append(f"{type(exc).__name__}: {exc}")
-        _finish("failed")
-        return 1
+        return _finish("failed")
     finally:
         for key, previous in (
             ("SOFASCORE_REGISTRY_PATH", previous_registry),
@@ -499,5 +539,5 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["ScopeOverlayPaths", "main", "run_phase", "verified_empty_schedule",
-           "waiting_for_finished_matches"]
+__all__ = ["ScopeOverlayPaths", "main", "run_phase", "run_scope_bronze_dq",
+           "verified_empty_schedule", "waiting_for_finished_matches"]

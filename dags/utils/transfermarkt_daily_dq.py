@@ -379,9 +379,18 @@ def collect_daily_metrics(cur, implementation_at: datetime,
     return metrics, results
 
 
-def _routes() -> dict[str, str]:
-    from scrapers.transfermarkt.denominator import load_denominator
-    return {key: item.route for key, item in load_denominator().rows.items()}
+def _routes(cur) -> dict[str, str]:
+    from dags.utils.transfermarkt_denominator_registry import denominator_source
+    if denominator_source() == 'tsv':
+        from scrapers.transfermarkt.denominator import load_denominator
+        return {key: item.route for key, item in load_denominator().rows.items()}
+    from dags.utils.transfermarkt_denominator_registry import build_registry_denominator
+    from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
+    cur.execute(build_promoted_registry_query(current_only=True))
+    columns = [item[0] for item in (cur.description or ())]
+    rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
+    denominator = build_registry_denominator(rows).denominator
+    return {key: item.route for key, item in denominator.rows.items()}
 
 
 def _unknown(metrics: Mapping[str, Any], checks: list) -> bool:
@@ -441,7 +450,7 @@ def run_daily_bronze_dq(cur, *, state_root: Path = DEFAULT_STATE_ROOT,
                                       pins=pins, zone='full')
             remember({}, checks)
             metrics, daily_checks = collect_daily_metrics(
-                frozen, deployed, routes or _routes(),
+                frozen, deployed, routes or _routes(frozen),
                 progress=lambda m, c: remember(m, checks + c))
             checks += daily_checks
             remember(metrics, checks)

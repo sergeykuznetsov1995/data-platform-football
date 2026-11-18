@@ -1,4 +1,4 @@
-"""Fail CI if the staged SofaScore players DAG is missing or cannot import."""
+"""Validate the four staged SofaScore DAGs and the players task set."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ def main() -> None:
         )
         raise SystemExit(f"real Airflow DAG import errors:\n{details}")
 
-    expected = {"dag_players_sofascore_all_mens"}
+    expected = {
+        "dag_ingest_sofascore",
+        "dag_refresh_sofascore_all_mens",
+        "dag_backfill_sofascore_all_mens",
+        "dag_players_sofascore_all_mens",
+    }
     actual = set(dag_bag.dag_ids)
     if actual != expected:
         raise SystemExit(

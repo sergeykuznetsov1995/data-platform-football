@@ -240,12 +240,19 @@ jobs:
             --dest "${RUNNER_TEMP}/airflow-wheels" \
             -r "docker/images/airflow/requirements-ci-dag-import-${AIRFLOW_VERSION}.lock"
 
-      - name: Stage the players DAG outside repository ignore rules
+      - name: Stage production SofaScore DAGs outside repository ignore rules
         run: |
           dag_dir="${RUNNER_TEMP}/sofascore-ci-dags"
           test ! -e "${dag_dir}"
           mkdir -p "${dag_dir}"
-          cp "${GITHUB_WORKSPACE}/dags/dag_players_sofascore_all_mens.py" "${dag_dir}/"
+          for dag in \
+            dag_ingest_sofascore.py \
+            dag_refresh_sofascore_all_mens.py \
+            dag_backfill_sofascore_all_mens.py \
+            dag_players_sofascore_all_mens.py
+          do
+            cp "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
+          done
 
       - name: Check real Airflow imports and mapped players accounting
         env:
