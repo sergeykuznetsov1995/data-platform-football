@@ -559,11 +559,13 @@ jobs:
               ;;
             ready-v1)
               assert_success_after_gate scheduler-ready \
+                --entrypoint /usr/local/bin/whoscored-production-entrypoint \
                 "$scheduler" bash -c 'touch /sentinel/scheduler-ready'
               assert_success_after_gate scheduler-python-ready \
                 --entrypoint python "$scheduler" -S -c \
                 "open('/sentinel/scheduler-python-ready','w').close()"
               assert_success_after_gate proxy-ready \
+                --entrypoint /usr/local/bin/whoscored-production-entrypoint \
                 "$proxy" bash -c 'touch /sentinel/proxy-ready'
               ;;
             *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
@@ -681,7 +683,7 @@ jobs:
 
       - name: Install test runtime
         run: |
-          test_venv="/tmp/whoscored-ci-test-venv.evidence"
+          test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"
           setup_python_prefix="$("$WHOSCORED_CI_SETUP_PYTHON" -I -S -c \
             'import sys; print(sys.base_prefix)')"
           "$WHOSCORED_CI_SETUP_PYTHON" -I -S -m venv --copies "$test_venv"
@@ -1163,7 +1165,7 @@ jobs:
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
-          test_venv="${WHOSCORED_CI_TEST_VENV:-/tmp/whoscored-ci-test-venv.evidence}"
+          test_venv="$WHOSCORED_CI_TEST_VENV"
           test -x "$test_venv/bin/python"
           test -d "$test_venv/lib/python3.11/site-packages/pytest"
           WHOSCORED_REAL_DOCKER_TEST=1 \
