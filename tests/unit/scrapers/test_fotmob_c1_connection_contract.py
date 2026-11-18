@@ -68,14 +68,17 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
     )
     monkeypatch.setattr(maintenance, "writer_lock", writer_lock)
 
-    def refresh(manager):
+    def refresh(manager, *, writer_lock):
         assert type(manager) is trino_instrumentation.FotMobTrinoTableManager
-        assert authority.held
-        assert manager._write_authority is authority
-        assert manager._authority_required is True
+        assert not authority.held
+        assert manager._write_authority is None
         events.append("refresh")
-        # Exercise real construction, authority binding and connection forwarding.
-        assert manager._create_connection() is connection
+        with writer_lock() as lease:
+            manager.set_write_authority(lease)
+            assert manager._authority_required is True
+            # Exercise real construction, authority binding and connection forwarding.
+            assert manager._create_connection() is connection
+            manager.set_write_authority(None)
         if refresh_fails:
             raise failure
         return result
@@ -90,7 +93,7 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
         assert c1.run_refresh(dag_run=SimpleNamespace(conf={})) is result
 
     assert authority.held is False
-    assert events == ["acquire", "refresh", "check", "connect", "release"]
+    assert events == ["refresh", "acquire", "check", "connect", "release"]
     assert len(calls) == 1
     kwargs = calls[0]
     assert kwargs["source"] == "fotmob:c1-inputs"
