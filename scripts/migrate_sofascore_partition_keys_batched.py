@@ -178,7 +178,9 @@ def _populate_group(
     missing = [pair for pair in chunk if pair not in inventory]
     if existing:
         predicate = _expected_group_predicate(mapping, existing)
-        expected = filtered_winner_select(spec, archive, columns, mapping, predicate)
+        expected = "SELECT * FROM (" + filtered_winner_select(
+            spec, archive, columns, mapping, predicate
+        ) + ") AS expected_rows"
         expected_count = _batch_count(manager, expected)
         actual_count = sum(inventory[pair] for pair in existing)
         if actual_count != expected_count:

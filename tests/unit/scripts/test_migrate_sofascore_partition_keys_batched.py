@@ -283,6 +283,31 @@ def test_completed_batch_is_noop_and_mismatched_stage_fails_closed():
         batched.populate_stage(manager, SPEC, manager.stage, manager.archive, COLUMNS, {"ENG": "SS-17"})
 
 
+def test_existing_group_payload_difference_nests_winner_select_for_trino():
+    manager = BatchedFakeManager()
+    manager._execute(
+        batched.create_stage_sql(
+            batched.stage_spec(SPEC, manager.stage),
+            manager.archive,
+            COLUMNS,
+            {"ENG": "SS-17"},
+            "CREATE TABLE t WITH (format='PARQUET', partitioning=ARRAY['league','season'])",
+        )
+    )
+    batched.populate_stage(manager, SPEC, manager.stage, manager.archive, COLUMNS, {"ENG": "SS-17"})
+    manager.statements.clear()
+
+    batched.populate_stage(manager, SPEC, manager.stage, manager.archive, COLUMNS, {"ENG": "SS-17"})
+
+    differences = [
+        sql for sql in manager.statements
+        if sql.startswith("/* pk:batch_payload_difference */")
+    ]
+    assert differences
+    for sql in differences:
+        assert "FROM ((SELECT * FROM (WITH canonical AS" in sql
+
+
 def test_second_rename_failure_rolls_back_without_row_loss():
     manager = BatchedFakeManager(fail_on_rename=True)
     original = deepcopy(manager.tables[SPEC.name])
