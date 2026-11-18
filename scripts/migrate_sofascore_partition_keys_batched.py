@@ -224,9 +224,14 @@ def populate_stage(
     *,
     partition_group_size: int = 8,
     should_stop: Callable[[], bool] | None = None,
+    resume_batches: list[dict] | None = None,
 ) -> dict:
     if type(partition_group_size) is not int or partition_group_size <= 0:
         raise ValueError("partition_group_size must be a positive integer")
+    if resume_batches is None:
+        resume_batches = []
+    if not isinstance(resume_batches, list):
+        raise ValueError("resume_batches must be a list")
     pairs = partition_batches(manager, archive, mapping)
     inventory = _stage_inventory(manager, stage, set(pairs))
     work_groups = []
@@ -238,9 +243,23 @@ def populate_stage(
             work_groups.append(existing)
         if missing:
             work_groups.append(missing)
+    if len(resume_batches) > len(work_groups):
+        raise ValueError("resume batches exceed current work groups")
+    for index, completed in enumerate(resume_batches):
+        if not isinstance(completed, dict):
+            raise ValueError("invalid resume batch")
+        group = work_groups[index]
+        if completed.get("partitions") != [list(pair) for pair in group]:
+            raise ValueError("resume batches do not match current work-group prefix")
+        if ("inserted_rows" in completed) == ("noop_rows" in completed):
+            raise ValueError("invalid resume batch kind")
+        if any(pair not in inventory for pair in group):
+            raise ValueError("resume checkpoint partition is missing from stage")
+        if completed.get("after_rows") != sum(inventory[pair] for pair in group):
+            raise ValueError("resume checkpoint row count differs from stage")
     batches = []
     complete = True
-    for group in work_groups:
+    for group in work_groups[len(resume_batches):]:
         if should_stop is not None and should_stop():
             complete = False
             break
@@ -358,6 +377,7 @@ def run_batched_rewrite(
     max_duration_seconds: int | float = 6000,
     verification_reserve_seconds: int | float = 1200,
     clock: Callable[[], float] = time.monotonic,
+    previous_result: Mapping[str, Any] | None = None,
 ) -> dict:
     _validate_time_budget(max_duration_seconds, verification_reserve_seconds)
     deadline = clock() + max_duration_seconds
@@ -366,6 +386,32 @@ def run_batched_rewrite(
     legacy = legacy_name(spec, migration_id, archive_schema)
     report = {"migration_id": migration_id, "table": spec.name, "archive": archive, "stage": stage, "legacy": legacy, "success": False, "mutates": False}
     try:
+        resume_batches = []
+        if previous_result is not None:
+            if not isinstance(previous_result, Mapping):
+                raise ValueError("previous_result must be a mapping")
+            identity = {
+                "migration_id": migration_id,
+                "table": spec.name,
+                "archive": archive,
+                "stage": stage,
+                "legacy": legacy,
+            }
+            if any(previous_result.get(key) != value for key, value in identity.items()):
+                raise ValueError("previous result identity mismatch")
+            if (
+                previous_result.get("status") != "stage_incomplete"
+                or previous_result.get("success") is not False
+                or previous_result.get("ready") is not False
+                or previous_result.get("resume_required") is not True
+                or previous_result.get("error")
+                or previous_result.get("rollback_error")
+            ):
+                raise ValueError("previous result is not resumable")
+            resume_batches = previous_result.get("batches")
+            if not isinstance(resume_batches, list):
+                raise ValueError("previous result batches must be a list")
+        report["resumed_groups"] = len(resume_batches)
         before = migration.profile_table(manager, spec, mapping)
         if not manager_call(manager, "table_exists", *archive.split(".")):
             report["mutates"] = True
@@ -391,6 +437,8 @@ def run_batched_rewrite(
         if difference:
             raise ValueError("source differs from full archive")
         if not manager_call(manager, "table_exists", *stage.split(".")):
+            if resume_batches:
+                raise ValueError("resume checkpoint requires existing stage")
             report["mutates"] = True
             manager_call(manager, "_execute", create_stage_sql(
                 stage_spec(spec, stage),
@@ -402,8 +450,9 @@ def run_batched_rewrite(
         progress = populate_stage(
             manager, spec, stage, archive, before["columns"], mapping,
             should_stop=lambda: clock() >= deadline - verification_reserve_seconds,
+            resume_batches=resume_batches,
         )
-        report["batches"] = progress["batches"]
+        report["batches"] = resume_batches + progress["batches"]
         if any("inserted_rows" in item for item in progress["batches"]):
             report["mutates"] = True
         if not progress["complete"] or clock() >= deadline - verification_reserve_seconds:
