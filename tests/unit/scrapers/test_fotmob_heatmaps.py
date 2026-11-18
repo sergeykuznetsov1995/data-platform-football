@@ -167,6 +167,38 @@ def test_reference_checks_identity_and_uses_verbatim_wrapper_parameter():
     assert extract_heatmap_reference({"general": {"matchId": 101}}, 101).outcome == Outcome.URL_MISSING
 
 
+def test_reference_accepts_exact_relative_wrapper():
+    source = (
+        "/api/data/heatmap/match/101/heatmaps?heatmapUrl="
+        + SOURCE.replace("https://", "https%3A%2F%2F")
+    )
+    result = extract_heatmap_reference(
+        {"general": {"matchId": "101"}, "content": {"heatmapUrl": source}}, 101
+    )
+    assert result.outcome is None
+    assert result.reference.heatmap_url == SOURCE
+    assert result.reference.target == canonicalize_target(source)
+    assert result.reference.target == canonicalize_target(
+        "heatmap/match/101/heatmaps", {"heatmapUrl": SOURCE}
+    )
+    for bad in (
+        source.replace("/match/101/", "/match/102/"),
+        source.replace(
+            "/prod/db/api/heatmap/match/101", "/prod/db/api/heatmap/match/102"
+        ),
+        source + "&x=1",
+        source + "#part",
+        source.replace("?heatmapUrl=", "?x="),
+        source + "&heatmapUrl=" + SOURCE,
+        "https://www.fotmob.com" + source,
+    ):
+        invalid = extract_heatmap_reference(
+            {"general": {"matchId": 101}, "content": {"heatmapUrl": bad}}, 101
+        )
+        assert invalid.outcome == Outcome.UNEXPECTED_FORMAT
+        assert invalid.reference is None
+
+
 @pytest.mark.parametrize("source", [
     123, [], {}, " ", SOURCE.replace("https:", "http:"),
     SOURCE.replace("pub.", "www."), SOURCE.replace(".com/", ".com:444/"),
