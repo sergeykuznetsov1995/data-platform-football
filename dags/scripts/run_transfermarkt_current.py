@@ -1837,12 +1837,25 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
     work_deadline = deadline - 120
     from dags.utils.transfermarkt_current_settlement import CurrentSettlement
     settlement = CurrentSettlement('/opt/airflow/gateway-state')
-    if denominator_rows is None:
-        from scrapers.transfermarkt.denominator import load_denominator
-        denominator_rows = list(load_denominator().rows.values())
-    denominator_rows = list(denominator_rows)
-    definition_hash = denominator_definition_hash(denominator_rows)
     registry_rows = list(registry_rows)
+    if denominator_rows is None:
+        from dags.utils.transfermarkt_denominator_registry import build_registry_denominator, denominator_source
+        source = denominator_source()
+        if source == 'registry':
+            registry_denominator = build_registry_denominator(registry_rows)
+            denominator_rows = list(registry_denominator.denominator.rows.values())
+            universe_version = registry_denominator.universe_version
+        else:
+            from scrapers.transfermarkt.denominator import denominator_path, load_denominator
+            path = denominator_path()
+            denominator_rows = list(load_denominator(path).rows.values())
+            universe_version = hashlib.sha256(path.read_bytes()).hexdigest()
+    else:
+        source, universe_version = 'injected', None
+    denominator_rows = list(denominator_rows)
+    report['denominator_source'] = source
+    report['universe_version'] = universe_version
+    definition_hash = denominator_definition_hash(denominator_rows)
     targets = current_scope_targets(denominator_rows, registry_rows)
     report['denominator_competition_ids'] = list(targets.denominator_competition_ids)
     report['blocked_competitions'] = dict(targets.blocked_competitions)

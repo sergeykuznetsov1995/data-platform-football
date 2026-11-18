@@ -117,6 +117,28 @@ def execute_scope(env, timeout):
                         pass
 
 
+def bronze_dq_failure_reason(report):
+    """Why ``report`` is not successful Bronze DQ evidence; ``None`` when it is.
+
+    A result claiming success, a verified partial or a verified waiting scope
+    must carry a structurally valid report: a mapping with
+    ``status='success'``, a positive integer ``checks`` and no violations or
+    errors. Anything less is failed closed, never published.
+    """
+    if not isinstance(report, dict):
+        return "bronze DQ report is missing or malformed in the scope result"
+    if report.get("status") != "success":
+        return f"bronze DQ report status is {report.get('status')!r}, not 'success'"
+    checks = report.get("checks")
+    if isinstance(checks, bool) or not isinstance(checks, int) or checks <= 0:
+        return "bronze DQ report has no positive integer checks count"
+    if report.get("violations"):
+        return "bronze DQ report carries violations"
+    if report.get("errors"):
+        return "bronze DQ report carries errors"
+    return None
+
+
 def scope_outcome(env, exit_code):
     path = Path(env["SOFASCORE_SCOPE_RESULT_PATH"])
     try:
@@ -128,20 +150,32 @@ def scope_outcome(env, exit_code):
                  and result.get("run_id") == env["SOFASCORE_SCOPE_RUN_ID"])
         if not valid:
             raise ValueError("scope result provenance mismatch")
-        if exit_code == 0 and result.get("status") == "success":
-            return {"status": "success", "rejected_endpoints": state.read_scope_rejects(path)}
-        if exit_code == 0:
-            from dags.scripts.run_sofascore_scope_cycle import waiting_for_finished_matches
-            scope = {"tournament_id": int(tournament), "source_season_id": int(season),
-                     "canonical_season": env["SOFASCORE_CANONICAL_SEASON"]}
-            if waiting_for_finished_matches(result, scope):
-                return {"status": "waiting", "reason": result["waiting_reason"]}
-        if exit_code == 0 and result.get("status") == "partial":
-            from dags.utils.sofascore_red_share import season_continuation_proof
-            proof = season_continuation_proof(result, tournament_id=tournament, season_id=season)
-            return {"status": "partial", "partial": proof}
+        report = result.get("bronze_dq")
+        dq_reason = bronze_dq_failure_reason(report)
+        claimed = result.get("status") in {"success", "partial", "waiting"}
+        if exit_code == 0 and claimed and dq_reason is None:
+            if result.get("status") == "success":
+                return {"status": "success", "rejected_endpoints": state.read_scope_rejects(path),
+                        "bronze_dq": report}
+            if result.get("status") == "waiting":
+                from dags.scripts.run_sofascore_scope_cycle import waiting_for_finished_matches
+                scope = {"tournament_id": int(tournament), "source_season_id": int(season),
+                         "canonical_season": env["SOFASCORE_CANONICAL_SEASON"]}
+                if waiting_for_finished_matches(result, scope):
+                    return {"status": "waiting", "reason": result["waiting_reason"],
+                            "bronze_dq": report}
+            elif result.get("status") == "partial":
+                from dags.utils.sofascore_red_share import season_continuation_proof
+                proof = season_continuation_proof(result, tournament_id=tournament, season_id=season)
+                return {"status": "partial", "partial": proof, "bronze_dq": report}
         reason, requests = state.read_scope_outcome(path)
-        return {"status": "failed", "reason": reason or "scope cycle failed", "source_requests": requests}
+        if claimed and dq_reason is not None:
+            reason = dq_reason
+        outcome = {"status": "failed", "reason": reason or "scope cycle failed",
+                   "source_requests": requests}
+        if isinstance(report, dict):
+            outcome["bronze_dq"] = report
+        return outcome
     except (OSError, ValueError, TypeError) as exc:
         return {"status": "failed", "reason": f"scope validation: {exc}", "source_requests": None}
 

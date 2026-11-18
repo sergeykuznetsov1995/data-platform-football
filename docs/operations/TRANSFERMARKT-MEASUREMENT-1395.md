@@ -38,14 +38,49 @@ hashes ограничена точными разрешёнными набора
 
 ## Знаменатель и охват
 
-`daily_denominator` получает live core из `configs/transfermarkt/denominator.tsv`
-и актуальные строки promoted registry через существующий scope query. Его
-`denominator_hash` совпадает с hash текущего runner. Отдельно сохраняется SHA256
-файла знаменателя, версия измерителя и registry snapshot для каждого издания.
-Количество не зашито: сейчас core содержит 547 соревнований. Отсутствующие,
-заблокированные и неизвестные текущие издания остаются в знаменателе. Tail
-и архив в процент не входят. Несколько текущих изданий соревнования требуют
-успеха каждого; единица знаменателя остаётся соревнованием.
+`daily_denominator` получает актуальные строки promoted registry через
+существующий scope query. По умолчанию live core по-прежнему читается из
+`configs/transfermarkt/denominator.tsv` (`TRANSFERMARKT_DENOMINATOR_SOURCE=tsv`),
+а версией знаменателя является SHA256 файла. Новый адаптер
+`dags/utils/transfermarkt_denominator_registry.py` поддерживает opt-in режим
+`registry`: он строит тот же `Denominator` из одного опубликованного snapshot,
+а `universe_version` равен `registry_snapshot_id`. Это не активный production
+режим и не fallback: при ошибке registry режим падает, `tsv` остаётся откатом.
+
+Registry `eligible` не равен актуальному core: адаптер повторяет tier/live
+фильтры канона по `section_label` и текущему изданию. Юношеские/резервные —
+отдельные классы вне приёмки, женские исключены. `title_only` — независимый
+флаг, а quarantine — отдельный список ID/reason без выдуманных строк. Unknown
+live/tier/geography не допускается молча. Известные не-live строки — `archive`
+с сохранением subtype. 1824 competitions / 25754 editions — факты публикации,
+не знаменатель покрытия.
+
+`denominator_hash` совпадает с hash текущего runner. Отдельно сохраняются версия
+знаменателя, версия измерителя и registry snapshot для каждого издания.
+Количество не зашито: исторический TSV core содержит 547 соревнований, новый core
+вычисляется из snapshot. Отсутствующие, заблокированные и неизвестные текущие
+издания остаются в знаменателе. Tail и архив в процент не входят. Несколько
+текущих изданий соревнования требуют успеха каждого; единица знаменателя
+остаётся соревнованием.
+
+Один dual-run строит legacy и registry знаменатели на одних строках/day/as_of:
+
+```bash
+python dags/scripts/transfermarkt_daily_report.py \
+  --day 2026-11-16 --as-of 2026-11-17T00:00:00+00:00 \
+  --registry-json inputs/promoted-current.json \
+  --denominator configs/transfermarkt/denominator.tsv \
+  --denominator-dual-run \
+  --discovery-manifest-json inputs/discovery-manifest.json
+```
+
+Offline-режим выводит оба SQL+params и построчный diff. Замена
+`--registry-json` на `--execute --registry-snapshot-id tm-discovery-ea6e9c4edb2a29303527f0d3`
+выполняет оба daily SELECT на одном cursor и возвращает оба отчёта.
+Это read-only диагностика, не production
+переключение или приёмка. `diff.complete` требует объяснения каждой строки и
+отсутствия исчезновения legacy core в quarantine; `migration_clean=false`
+при unresolved классах. Production rollout и приёмка выполняются отдельно.
 
 Сутки — `[00:00, 00:00 следующих суток)` МСК. SQL timestamp(6) хранит UTC.
 Успех требует complete listing, players и injury, полный expected/observed

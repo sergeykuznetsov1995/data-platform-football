@@ -671,7 +671,8 @@ def _connect(trino: Any, password: str) -> Any:
     return trino.dbapi.connect(host=os.environ.get("TRINO_HOST", "127.0.0.1"), port=int(os.environ.get("TRINO_PORT", "8082")),
                               user=SOURCE_USER, auth=trino.auth.BasicAuthentication(SOURCE_USER, password),
                               http_scheme=os.environ.get("TRINO_HTTP_SCHEME", "http"), catalog="iceberg", schema="bronze", timezone="UTC",
-                              source="fotmob_load_meter", request_timeout=10, max_attempts=1)
+                              source="fotmob_load_meter", request_timeout=10, max_attempts=1,
+                              verify=False)  # self-signed certificate
 
 
 def _fetch(connection: Any, sql: str) -> tuple[list[dict[str, Any]], str | None]:

@@ -18,6 +18,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -1465,6 +1466,36 @@ def _numeric_source_id_mismatch(column: str, expected: str | int) -> str:
     return f"{numeric} IS NULL OR {numeric} <> CAST({expected_id} AS double)"
 
 
+def _required_endpoint_completeness_parts(
+    doc: Mapping[str, Any],
+    league: str,
+    season: str,
+    source_tournament_id: str | int,
+    source_season_id: str | int,
+) -> dict[str, str]:
+    """Shared SQL fragments for the required-endpoint completeness gates."""
+
+    league_sql = _sql_literal(league)
+    season_sql = _sql_literal(str(season))
+    required_endpoints = doc["committed_state_dq"]["required_event_endpoints"]
+    return {
+        "league_sql": league_sql,
+        "season_sql": season_sql,
+        "source_tournament_sql": _sql_literal(str(source_tournament_id)),
+        "source_season_sql": _sql_literal(str(source_season_id)),
+        "schedule_scope": f"s.league = {league_sql} AND s.season = {season_sql}",
+        "endpoint_values": ", ".join(
+            f"({_sql_literal(endpoint)})" for endpoint in required_endpoints
+        ),
+        "endpoint_names": ", ".join(
+            _sql_literal(endpoint) for endpoint in required_endpoints
+        ),
+        "accepted_states": ", ".join(
+            _sql_literal(state) for state in sorted(REQUIRED_ACCEPTABLE_STATES)
+        ),
+    }
+
+
 def build_partition_dq_queries(
     league: str,
     season: str,
@@ -1704,16 +1735,12 @@ def build_partition_dq_queries(
             ),
         ]
     )
-    required_endpoints = doc["committed_state_dq"]["required_event_endpoints"]
-    endpoint_values = ", ".join(
-        f"({_sql_literal(endpoint)})" for endpoint in required_endpoints
+    completeness = _required_endpoint_completeness_parts(
+        doc, league, season, source_tournament_id, source_season_id
     )
-    endpoint_names = ", ".join(
-        _sql_literal(endpoint) for endpoint in required_endpoints
-    )
-    accepted_states = ", ".join(
-        _sql_literal(state) for state in sorted(REQUIRED_ACCEPTABLE_STATES)
-    )
+    endpoint_values = completeness["endpoint_values"]
+    endpoint_names = completeness["endpoint_names"]
+    accepted_states = completeness["accepted_states"]
     queries.append(
         DQQuery(
             name="required_endpoint_completeness",
@@ -1736,6 +1763,101 @@ def build_partition_dq_queries(
                 f"({accepted_states})) FROM expected x LEFT JOIN "
                 "latest_manifest m ON m.target_id = x.target_id AND "
                 "m.endpoint = x.endpoint"
+            ),
+            expected_value=0,
+        )
+    )
+    return queries
+
+
+def _bronze_required_endpoint_completeness_sql(parts: Mapping[str, str]) -> str:
+    """Quarantine-aware twin of the generic required-endpoint completeness SQL."""
+
+    return (
+        "WITH required_endpoints(endpoint) AS (VALUES "
+        f"{parts['endpoint_values']}), expected AS (SELECT DISTINCT s.league, "
+        "s.season, CAST(s.game_id AS varchar) AS target_id, e.endpoint FROM "
+        "iceberg.bronze.sofascore_schedule s CROSS JOIN required_endpoints e "
+        f"WHERE {parts['schedule_scope']} AND s.status_type = 'finished'), "
+        "rejected_matches AS (SELECT DISTINCT r.league, r.season, "
+        "json_extract_scalar(r.row_json, '$.match_id') AS match_id FROM "
+        "iceberg.bronze.sofascore_rejected_rows r WHERE r.league = "
+        f"{parts['league_sql']} AND r.season = {parts['season_sql']}), "
+        "ranked_manifest AS (SELECT target_id, endpoint, status, "
+        "ROW_NUMBER() OVER (PARTITION BY target_id, endpoint ORDER BY "
+        "updated_at DESC, attempts DESC) AS rn FROM "
+        "iceberg.ops.sofascore_capture_manifest WHERE source_tournament_id = "
+        f"{parts['source_tournament_sql']} AND source_season_id = "
+        f"{parts['source_season_sql']} AND target_type = 'event' AND "
+        f"freshness_key = 'final' AND endpoint IN ({parts['endpoint_names']})), "
+        "latest_manifest AS (SELECT target_id, endpoint, status FROM "
+        "ranked_manifest WHERE rn = 1) SELECT COUNT_IF(m.status IS NULL OR "
+        f"(m.status NOT IN ({parts['accepted_states']}) AND NOT (m.status = "
+        "'schema_error' AND EXISTS (SELECT 1 FROM rejected_matches r WHERE "
+        "r.match_id = x.target_id AND r.league = x.league AND r.season = "
+        "x.season)))) FROM expected x LEFT JOIN latest_manifest m ON "
+        "m.target_id = x.target_id AND m.endpoint = x.endpoint"
+    )
+
+
+def build_bronze_partition_dq_queries(
+    league: str,
+    season: str,
+    source_tournament_id: str | int,
+    source_season_id: str | int,
+    *,
+    contract: Mapping[str, Any] | None = None,
+    require_complete: bool = True,
+) -> list[DQQuery]:
+    """Build the Bronze-readable committed-state gates for one partition.
+
+    The generic committed-state queries are reused and filtered to the ones
+    whose SQL reads only Bronze and the ops manifest, a game_id claimed by
+    two schedule seasons is failed explicitly, and the required-endpoint
+    completeness gate additionally accepts a ``schema_error`` manifest state
+    only when a quarantined match in ``iceberg.bronze.sofascore_rejected_rows``
+    proves the rejection.  ``require_complete=False`` omits the completeness
+    gate for partial refreshes.
+    """
+
+    parts = _required_endpoint_completeness_parts(
+        contract or load_coverage_contract(),
+        league,
+        season,
+        source_tournament_id,
+        source_season_id,
+    )
+    queries: list[DQQuery] = []
+    for query in build_partition_dq_queries(
+        league,
+        season,
+        source_tournament_id,
+        source_season_id,
+        contract=contract,
+    ):
+        lowered = query.sql.lower()
+        if "iceberg.silver" in lowered or "iceberg.gold" in lowered:
+            continue
+        if query.name == "required_endpoint_completeness":
+            if require_complete:
+                queries.append(
+                    DQQuery(
+                        name=query.name,
+                        sql=_bronze_required_endpoint_completeness_sql(parts),
+                        expected_value=query.expected_value,
+                        comparator=query.comparator,
+                    )
+                )
+            continue
+        queries.append(query)
+    queries.append(
+        DQQuery(
+            name="schedule_game_id_season_conflicts",
+            sql=(
+                "SELECT COUNT(*) FROM (SELECT league, game_id FROM "
+                "iceberg.bronze.sofascore_schedule WHERE league = "
+                f"{parts['league_sql']} GROUP BY league, game_id HAVING "
+                "COUNT(DISTINCT season) > 1)"
             ),
             expected_value=0,
         )
@@ -1826,6 +1948,95 @@ def run_committed_partition_dq(
     }
 
 
+def _json_safe_scalar(value: Any) -> Any:
+    """Coerce one observed scalar to a value ``json.dumps`` can serialize."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return str(value)
+
+
+def run_bronze_partition_dq(
+    partition: ActiveRegistryPartition,
+    connection: Any,
+    *,
+    contract: Mapping[str, Any] | None = None,
+    require_complete: bool = True,
+) -> dict[str, Any]:
+    """Execute the Bronze-only gates for one partition and report, not raise.
+
+    Unlike ``run_committed_partition_dq`` a failed gate does not raise: the
+    partition report carries violations and errors so a caller can aggregate
+    a complete picture.  A SQL exception still stops the remaining queries
+    because their results could no longer be trusted, while scalar
+    mismatches keep accumulating for the full report.
+    """
+
+    if not isinstance(partition, ActiveRegistryPartition):
+        raise TypeError("partition must be ActiveRegistryPartition")
+    queries = build_bronze_partition_dq_queries(
+        partition.league,
+        partition.season,
+        partition.source_tournament_id,
+        partition.source_season_id,
+        contract=contract,
+        require_complete=require_complete,
+    )
+    results: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for query in queries:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(query.sql)
+            row = cursor.fetchone()
+        except Exception as exc:
+            errors.append(
+                {
+                    "league": partition.league,
+                    "season": partition.season,
+                    "source_tournament_id": partition.source_tournament_id,
+                    "source_season_id": partition.source_season_id,
+                    "query": query.name,
+                    "error": str(exc),
+                    "message": (
+                        f"{partition.league}/{partition.season} {query.name} "
+                        f"query failed: {exc}"
+                    ),
+                }
+            )
+            break
+        finally:
+            cursor.close()
+        observed = row[0] if row else None
+        passed = _dq_query_passed(query, observed)
+        result = {
+            "name": query.name,
+            "observed": _json_safe_scalar(observed),
+            "expected": query.expected_value,
+            "comparator": query.comparator,
+            "passed": passed,
+        }
+        results.append(result)
+        if not passed:
+            violations.append(result)
+    return {
+        "league": partition.league,
+        "season": partition.season,
+        "source_tournament_id": partition.source_tournament_id,
+        "source_season_id": partition.source_season_id,
+        "status": "failed" if violations or errors else "success",
+        "checks": len(queries),
+        "results": results,
+        "violations": violations,
+        "errors": errors,
+    }
+
+
 def run_active_registry_committed_dq(
     *,
     registry_path: str | os.PathLike[str] | None = None,
@@ -1861,6 +2072,337 @@ def run_active_registry_committed_dq(
     }
 
 
+_SCOPE_COUNTER_FIELDS = (
+    "planned_endpoints",
+    "terminal_endpoints",
+    "rejected_endpoints",
+)
+
+
+def _json_safe_value(value: Any) -> Any:
+    """Deeply coerce a report fragment to a value ``json.dumps`` accepts."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return _json_safe_scalar(value)
+
+
+def _scope_identity_value(scope: Any, key: str) -> Any:
+    if not isinstance(scope, Mapping):
+        raise SofaScoreContractError("scope must be a mapping")
+    if key not in scope:
+        raise SofaScoreContractError(f"scope.{key} is required")
+    value = scope[key]
+    if value is None or isinstance(value, bool):
+        raise SofaScoreContractError(f"scope.{key} must not be empty")
+    if isinstance(value, str) and not value.strip():
+        raise SofaScoreContractError(f"scope.{key} must not be empty")
+    return value
+
+
+def _scope_positive_int(scope: Mapping[str, Any], key: str) -> int:
+    value = _scope_identity_value(scope, key)
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SofaScoreContractError(f"scope.{key} must be a positive integer") from exc
+    if number <= 0 or str(value).strip() != str(number):
+        raise SofaScoreContractError(f"scope.{key} must be a positive integer")
+    return number
+
+
+def _scope_active_registry_partition(scope: Any) -> ActiveRegistryPartition:
+    """Validate one capture-scope mapping and derive its partition identity."""
+
+    return ActiveRegistryPartition(
+        league=str(_scope_identity_value(scope, "capture_key")),
+        season=str(_scope_identity_value(scope, "canonical_season")),
+        source_tournament_id=_scope_positive_int(scope, "tournament_id"),
+        source_season_id=_scope_positive_int(scope, "source_season_id"),
+    )
+
+
+def _phase_label(phase: Any, index: int) -> str:
+    label = phase.get("phase") if isinstance(phase, Mapping) else None
+    if isinstance(label, str) and label.strip():
+        return label
+    return f"#{index}"
+
+
+def _scope_counter_violation(
+    name: str,
+    message: str,
+    *,
+    observed: Any,
+    expected: Any,
+    comparator: str,
+    phase: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "phase": phase,
+        "observed": _json_safe_value(observed),
+        "expected": _json_safe_value(expected),
+        "comparator": comparator,
+        "passed": False,
+        "message": message,
+    }
+
+
+def _merge_rejected_row_counts(
+    target: dict[str, Any], incoming: Mapping[str, Any]
+) -> None:
+    """Merge flat ``code -> count`` and nested ``table -> code -> count`` rows.
+
+    Counts under the same key are summed; the table/code nesting survives the
+    merge so no evidence is flattened away.
+    """
+
+    for key, value in incoming.items():
+        name = str(key)
+        if isinstance(value, Mapping):
+            nested = target.get(name)
+            if not isinstance(nested, Mapping):
+                nested = (
+                    {"_count": nested}
+                    if isinstance(nested, int) and not isinstance(nested, bool)
+                    else {}
+                )
+                target[name] = nested
+            _merge_rejected_row_counts(nested, value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            existing = target.get(name)
+            if isinstance(existing, Mapping):
+                existing["_count"] = existing.get("_count", 0) + value
+            elif isinstance(existing, int) and not isinstance(existing, bool):
+                target[name] = existing + value
+            elif existing is None:
+                target[name] = value
+        else:
+            target.setdefault(name, _json_safe_value(value))
+
+
+def _aggregate_scope_counters(
+    phases: Iterable[Mapping[str, Any]] | None,
+    *,
+    require_complete: bool,
+) -> tuple[dict[str, int], dict[str, Any], list[dict[str, Any]]]:
+    """Sum the integer endpoint counters and rejected rows across phases.
+
+    ``require_complete`` additionally demands the reconciliation a finished
+    capture must show (positive planned, terminal + rejected == planned);
+    partial runs tolerate remaining work but never invalid, negative or
+    overplanned counters.
+    """
+
+    counters = {field: 0 for field in _SCOPE_COUNTER_FIELDS}
+    rejected_rows: dict[str, Any] = {}
+    violations: list[dict[str, Any]] = []
+    for index, phase in enumerate(phases if phases is not None else ()):
+        label = _phase_label(phase, index)
+        if not isinstance(phase, Mapping):
+            violations.append(
+                _scope_counter_violation(
+                    "scope_phase_contract",
+                    f"phase entry {label!r} is not a mapping",
+                    observed=phase,
+                    expected="mapping",
+                    comparator="valid",
+                    phase=label,
+                )
+            )
+            continue
+        for counter_field in _SCOPE_COUNTER_FIELDS:
+            if counter_field not in phase:
+                continue
+            value = phase[counter_field]
+            if isinstance(value, bool) or not isinstance(value, int):
+                violations.append(
+                    _scope_counter_violation(
+                        f"scope_counter[{counter_field}]",
+                        f"phase {label!r} reports {counter_field}={value!r}, "
+                        "which is not an integer",
+                        observed=value,
+                        expected="integer",
+                        comparator="valid",
+                        phase=label,
+                    )
+                )
+            elif value < 0:
+                violations.append(
+                    _scope_counter_violation(
+                        f"scope_counter[{counter_field}]",
+                        f"phase {label!r} reports negative {counter_field}={value}",
+                        observed=value,
+                        expected=0,
+                        comparator="gte",
+                        phase=label,
+                    )
+                )
+            else:
+                counters[counter_field] += value
+        rows = phase.get("rejected_rows")
+        if isinstance(rows, Mapping):
+            _merge_rejected_row_counts(rejected_rows, rows)
+    planned = counters["planned_endpoints"]
+    terminal = counters["terminal_endpoints"]
+    rejected = counters["rejected_endpoints"]
+    if require_complete and planned <= 0:
+        violations.append(
+            _scope_counter_violation(
+                "scope_planned_endpoints",
+                f"capture planned {planned} endpoints; a complete capture "
+                "must plan a positive number",
+                observed=planned,
+                expected=1,
+                comparator="gte",
+            )
+        )
+    if terminal > planned or terminal + rejected > planned:
+        violations.append(
+            _scope_counter_violation(
+                "scope_endpoint_overplan",
+                f"capture accounted {terminal} terminal and {rejected} "
+                f"rejected endpoints against {planned} planned",
+                observed={
+                    "planned_endpoints": planned,
+                    "terminal_endpoints": terminal,
+                    "rejected_endpoints": rejected,
+                },
+                expected="terminal_endpoints + rejected_endpoints <= planned_endpoints",
+                comparator="lte",
+            )
+        )
+    if require_complete and terminal + rejected != planned:
+        violations.append(
+            _scope_counter_violation(
+                "scope_endpoint_accounting",
+                f"capture accounted {terminal} terminal and {rejected} "
+                f"rejected of {planned} planned endpoints",
+                observed=terminal + rejected,
+                expected=planned,
+                comparator="eq",
+            )
+        )
+    return counters, rejected_rows, violations
+
+
+def run_scope_bronze_dq(
+    scope: Mapping[str, Any],
+    phases: Iterable[Mapping[str, Any]] | None,
+    *,
+    require_complete: bool,
+    connection: Any | None = None,
+    contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run Bronze DQ for one capture scope and reconcile its phase counters.
+
+    The partition report from ``run_bronze_partition_dq`` keeps its status,
+    results, violations and errors; scope accounting violations are added on
+    top instead of masking SQL findings (nor being masked by them).  An
+    injected connection stays open, while a lazily created
+    ``utils.data_quality._get_conn()`` connection is closed in ``finally``.
+    """
+
+    partition = _scope_active_registry_partition(scope)
+    counters, rejected_rows, counter_violations = _aggregate_scope_counters(
+        phases, require_complete=require_complete
+    )
+    owns_connection = connection is None
+    if owns_connection:
+        from utils.data_quality import _get_conn
+
+        connection = _get_conn()
+    try:
+        partition_report = run_bronze_partition_dq(
+            partition,
+            connection,
+            contract=contract,
+            require_complete=require_complete,
+        )
+    finally:
+        if owns_connection and connection is not None:
+            connection.close()
+    report: dict[str, Any] = dict(partition_report)
+    report.update(
+        {
+            "league": partition.league,
+            "season": partition.season,
+            "source_tournament_id": partition.source_tournament_id,
+            "source_season_id": partition.source_season_id,
+            "planned_endpoints": counters["planned_endpoints"],
+            "terminal_endpoints": counters["terminal_endpoints"],
+            "rejected_endpoints": counters["rejected_endpoints"],
+            "rejected_rows": rejected_rows,
+            "violations": list(partition_report.get("violations") or [])
+            + counter_violations,
+            "errors": list(partition_report.get("errors") or []),
+        }
+    )
+    if counter_violations:
+        report["status"] = "failed"
+    return report
+
+
+def summarize_bronze_dq_reports(
+    reports: Iterable[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Merge scope-level Bronze DQ reports into one JSON-safe summary."""
+
+    materialized = list(reports) if reports is not None else []
+    counters = {field: 0 for field in _SCOPE_COUNTER_FIELDS}
+    rejected_rows: dict[str, Any] = {}
+    violations: list[Any] = []
+    errors: list[Any] = []
+    checks = 0
+    failed = 0
+    for report in materialized:
+        if not isinstance(report, Mapping):
+            failed += 1
+            errors.append(
+                {
+                    "message": "bronze DQ summary received a non-mapping report",
+                    "report": str(report),
+                }
+            )
+            continue
+        if report.get("status") != "success":
+            failed += 1
+        report_checks = report.get("checks")
+        if isinstance(report_checks, (int, float)) and not isinstance(
+            report_checks, bool
+        ):
+            checks += report_checks
+        for counter_field in _SCOPE_COUNTER_FIELDS:
+            value = report.get(counter_field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            counters[counter_field] += value
+        report_violations = report.get("violations")
+        if isinstance(report_violations, (list, tuple)):
+            violations.extend(report_violations)
+        report_errors = report.get("errors")
+        if isinstance(report_errors, (list, tuple)):
+            errors.extend(report_errors)
+        rows = report.get("rejected_rows")
+        if isinstance(rows, Mapping):
+            _merge_rejected_row_counts(rejected_rows, rows)
+    return {
+        "scopes": len(materialized),
+        "checks": checks,
+        "violations": [_json_safe_value(item) for item in violations],
+        "errors": [_json_safe_value(item) for item in errors],
+        "planned_endpoints": counters["planned_endpoints"],
+        "terminal_endpoints": counters["terminal_endpoints"],
+        "rejected_endpoints": counters["rejected_endpoints"],
+        "rejected_rows": _json_safe_value(rejected_rows),
+        "failed": failed,
+        "status": "empty" if not materialized else ("failed" if failed else "success"),
+    }
+
+
 __all__ = [
     "COVERAGE_STATUSES",
     "MANIFEST_STATES",
@@ -1875,16 +2417,20 @@ __all__ = [
     "SofaScoreContractError",
     "SofaScoreDQViolation",
     "active_registry_partitions",
+    "build_bronze_partition_dq_queries",
     "build_partition_dq_queries",
     "compare_schema_fingerprints",
     "load_coverage_contract",
     "manifest_state_for_response",
     "raw_payload_sha256",
     "run_active_registry_committed_dq",
+    "run_bronze_partition_dq",
     "run_committed_partition_dq",
+    "run_scope_bronze_dq",
     "reset_coverage_cache",
     "resolve_json_pointer",
     "schema_fingerprint",
+    "summarize_bronze_dq_reports",
     "validate_bronze_compatibility_columns",
     "validate_coverage_contract",
     "validate_event_participants",
