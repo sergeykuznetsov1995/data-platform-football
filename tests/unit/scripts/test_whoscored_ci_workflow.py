@@ -364,6 +364,14 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert "assert_success_after_gate" in text
     assert "scheduler-ready" in text
     assert "proxy-ready" in text
+    production = text.split(
+        "- name: Build production targets and prove the declared gate state", 1
+    )[1].split(
+        "- name: Build and smoke the immutable WhoScored FlareSolverr image", 1
+    )[0]
+    assert production.count(
+        "--entrypoint /usr/local/bin/whoscored-production-entrypoint"
+    ) == 2
     assert "for alias in python python3 python3.11" in text
     assert "scheduler-bash-python-s" in text
     assert "/usr/local/libexec/whoscored-python-real" in text
