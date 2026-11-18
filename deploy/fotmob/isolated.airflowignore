@@ -48,3 +48,7 @@
 # SofaScore). Общий dags/.airflowignore его тоже прячет, но здесь его подменяет
 # file-bind этого файла. Дописано append-ом: file-bind живёт на иноде.
 ^dag_players_sofascore_all_mens\.py$
+
+# v2.8 (18.11.2026, #1367): новый чужой для изолята FotMob даг — dag_replay_sofascore_raw
+# (SofaScore raw replay). Дописано append-ом: file-bind живёт на иноде.
+^dag_replay_sofascore_raw\.py$

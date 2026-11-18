@@ -1088,6 +1088,7 @@ def test_the_core_dag_count_is_derived_from_the_list_in_both_recipes() -> None:
     contour = re.search(r"^CONTOUR_DAGS=\((.*)\)$", postdeploy, re.M).group(1)
     assert contour.split() == [
         "dag_ingest_sofascore", HIST, REFRESH, PLAYERS, MAINT, COMPACT,
+        "dag_replay_sofascore_raw",
     ], contour
     assert '"$CONTOUR_DAGS_N DAG контура активны"' in postdeploy
 
@@ -1651,6 +1652,7 @@ def test_env_loader_strips_quotes_and_never_expands_or_exports(tmp_path: Path) -
 
 
 def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
     _write(
         bin_dir / "docker",
         f"""\
@@ -1669,7 +1671,12 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
-            *is_active=true*) echo 6 ;;
+            *is_active=true*)
+              n=0
+              for dag in {' '.join(ACTIVE_DAG_ROSTER)}; do
+                case "${{@: -1}}" in *"$dag"*) n=$((n+1)) ;; esac
+              done
+              echo "$n" ;;
             *"pool='sofascore_history_pool'"*) echo 3 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;
@@ -1706,6 +1713,15 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
 
 
 GATEWAY_CONTAINERS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
+ACTIVE_DAG_ROSTER = (
+    "dag_backfill_sofascore_all_mens",
+    "dag_refresh_sofascore_all_mens",
+    "dag_ingest_sofascore",
+    "dag_players_sofascore_all_mens",
+    "dag_replay_sofascore_raw",
+    "dag_sofascore_manifest_maintenance",
+    "dag_sofascore_schedule_maintenance",
+)
 
 
 def _run_postdeploy(
@@ -1826,6 +1842,7 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
     proc = _run_postdeploy(tmp_path, scheduler, gateways)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ПРИЁМКА: ок" in proc.stdout
+    assert "✓ 7 DAG контура активны" in proc.stdout, proc.stdout
     # Три полосы проверяются целиком: health, пулы, сторожа.
     for container in GATEWAY_CONTAINERS:
         assert f"✓ {container} healthy" in proc.stdout, proc.stdout
@@ -1843,9 +1860,9 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
         ("ingest_scraper_pool", 1), ("sofascore_history_pool", 3), ("sofascore_players_pool", 1)
     ):
         assert f"✓ пул {pool} slots={slots}" in proc.stdout, proc.stdout
-    # #1374: контур — шесть DAG, полоса игроков в их числе; её состояния ещё может
+    # #1374: контур — семь DAG, полоса игроков в их числе; её состояния ещё может
     # не быть (прогонов не было) — это диагностика, а не провал выката.
-    assert "✓ 6 DAG контура активны" in proc.stdout, proc.stdout
+    assert "✓ 7 DAG контура активны" in proc.stdout, proc.stdout
     assert "players-state.json ещё нет — прогонов полосы не было" in proc.stdout, proc.stdout
     assert "players-results файлов: 0" in proc.stdout, proc.stdout
 

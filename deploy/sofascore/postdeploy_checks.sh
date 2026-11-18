@@ -21,7 +21,7 @@ GATEWAY_SERVICES=(sofascore_proxy_filter sofascore_gw_history sofascore_gw_playe
 WATCHDOG_UNITS=(sofascore-gw-lease-watchdog.service sofascore-gw-lease-watchdog-history.service sofascore-gw-lease-watchdog-players.service)
 # Контур (#1374): список DAG — единственный источник, число выводится из него, а не
 # литералом рядом — рассинхрон списка и числа врал бы «5 из 5» на неполном контуре.
-CONTOUR_DAGS=(dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance)
+CONTOUR_DAGS=(dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance dag_replay_sofascore_raw)
 CONTOUR_DAGS_SQL=""
 for d in "${CONTOUR_DAGS[@]}"; do CONTOUR_DAGS_SQL="$CONTOUR_DAGS_SQL'$d',"; done
 CONTOUR_DAGS_SQL=${CONTOUR_DAGS_SQL%,}

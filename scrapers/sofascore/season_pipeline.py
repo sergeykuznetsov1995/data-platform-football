@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import Mapping, Optional, Sequence
 
 from dags.utils.sofascore_dq import validate_schedule_rows
@@ -32,6 +32,13 @@ from scrapers.sofascore.manifest import (
     ManifestStore,
 )
 from scrapers.sofascore.season_chunks import SeasonScheduleChunk
+from scrapers.sofascore.season_fields import (
+    assert_natural_keys,
+    parse_cup_trees,
+    parse_participants,
+    parse_referee_profile,
+    parse_rounds,
+)
 from scrapers.sofascore.raw_store import (
     PayloadTarget,
     RawPayloadNotFound,
@@ -68,6 +75,24 @@ REFEREE_PROFILE_PATH = "/referee/{referee_id}"
 # evidence about the season or who played: see
 # SeasonPartitionPlan.match_phase_ready.
 REFEREE_PROFILE_ENDPOINT = "referee_profile"
+
+# #1367: the four season paid fields are normalized, not raw-only. Each
+# endpoint emits exactly one dataset named after the endpoint, parsed with
+# the exact source ids captured in its spec closure.
+_SEASON_FIELD_PARSERS = {
+    "rounds": parse_rounds,
+    "cup_trees": parse_cup_trees,
+    "participants": parse_participants,
+}
+
+# Natural key columns per normalized season-field dataset, enforced at
+# materialization time across every endpoint of the partition.
+_SEASON_FIELD_NATURAL_KEYS = {
+    "rounds": ("round_id",),
+    "cup_trees": ("cup_tree_id", "node_id"),
+    "participants": ("team_id",),
+    REFEREE_PROFILE_ENDPOINT: ("requested_referee_id",),
+}
 
 
 class SeasonPlanningError(RuntimeError):
@@ -160,6 +185,10 @@ class SeasonPartitionMaterialization:
     raw_lineage: Mapping[ManifestKey, Mapping[str, object]]
     endpoint_statuses: Mapping[ManifestKey, ManifestStatus]
     deferred_keys: tuple[ManifestKey, ...]
+    rounds_rows: tuple[dict, ...] = dataclass_field(default_factory=tuple)
+    cup_trees_rows: tuple[dict, ...] = dataclass_field(default_factory=tuple)
+    participants_rows: tuple[dict, ...] = dataclass_field(default_factory=tuple)
+    referee_profile_rows: tuple[dict, ...] = dataclass_field(default_factory=tuple)
 
     @property
     def endpoint_completeness(self) -> float:
@@ -513,7 +542,7 @@ def _collection_empty(collection: str):
     return lambda payload: payload[collection] == []
 
 
-def _raw_only_season_spec(
+def _season_field_spec(
     *,
     source_tournament_id: str | int,
     source_season_id: str | int,
@@ -527,6 +556,15 @@ def _raw_only_season_spec(
         source_tournament_id=tournament,
         source_season_id=season,
     )
+    field_parser = _SEASON_FIELD_PARSERS[endpoint]
+
+    def parse(payload: object) -> list[dict]:
+        return field_parser(
+            payload,
+            source_tournament_id=tournament,
+            source_season_id=season,
+        )
+
     return EndpointSpec(
         key=ManifestKey(
             source_tournament_id=tournament,
@@ -539,22 +577,21 @@ def _raw_only_season_spec(
         url=f"{BASE_URL}{path}",
         schema_validator=_collection_schema(collection),
         empty_predicate=_collection_empty(collection),
-        parsers={},
+        parsers={endpoint: parse},
         paid_proxy=paid_proxy,
-        raw_only=True,
     )
 
 
 def build_rounds_spec(**kwargs) -> EndpointSpec:
-    return _raw_only_season_spec(endpoint="rounds", collection="rounds", **kwargs)
+    return _season_field_spec(endpoint="rounds", collection="rounds", **kwargs)
 
 
 def build_cup_trees_spec(**kwargs) -> EndpointSpec:
-    return _raw_only_season_spec(endpoint="cup_trees", collection="cupTrees", **kwargs)
+    return _season_field_spec(endpoint="cup_trees", collection="cupTrees", **kwargs)
 
 
 def build_participants_spec(**kwargs) -> EndpointSpec:
-    return _raw_only_season_spec(endpoint="participants", collection="teams", **kwargs)
+    return _season_field_spec(endpoint="participants", collection="teams", **kwargs)
 
 
 def build_squad_spec(
@@ -636,6 +673,15 @@ def build_referee_profile_spec(
     tournament, season = _source_ids(source_tournament_id, source_season_id)
     referee = _positive_id(referee_id, "referee_id")
     path = REFEREE_PROFILE_PATH.format(referee_id=referee)
+
+    def parse(payload: object) -> list[dict]:
+        return parse_referee_profile(
+            payload,
+            source_tournament_id=tournament,
+            source_season_id=season,
+            requested_referee_id=referee,
+        )
+
     return EndpointSpec(
         key=ManifestKey(
             source_tournament_id=tournament,
@@ -648,9 +694,8 @@ def build_referee_profile_spec(
         url=f"{BASE_URL}{path}",
         schema_validator=_referee_schema(referee, frozenset(expected_slugs)),
         empty_predicate=lambda payload: payload["referee"] is None,
-        parsers={},
+        parsers={REFEREE_PROFILE_ENDPOINT: parse},
         paid_proxy=paid_proxy,
-        raw_only=True,
     )
 
 
@@ -714,7 +759,7 @@ def _load_stored_payload(
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        if spec.raw_only and spec.key.endpoint == REFEREE_PROFILE_ENDPOINT:
+        if spec.key.endpoint == REFEREE_PROFILE_ENDPOINT:
             return _StoredPayload(None, raw, rejected_schema=True)
         raise SeasonPlanningError(
             f"stored raw is not JSON for {spec.key.stable_id()}"
@@ -726,7 +771,7 @@ def _load_stored_payload(
             f"stored schema validation failed for {spec.key.stable_id()}: {exc}"
         ) from exc
     if valid is False:
-        if spec.raw_only and spec.key.endpoint == REFEREE_PROFILE_ENDPOINT:
+        if spec.key.endpoint == REFEREE_PROFILE_ENDPOINT:
             return _StoredPayload(None, raw, rejected_schema=True)
         raise SeasonPlanningError(f"stored schema rejected for {spec.key.stable_id()}")
     return _StoredPayload(payload, raw)
@@ -1431,6 +1476,16 @@ def materialize_season_partition(
     lineage: dict[ManifestKey, dict[str, object]] = {}
     schedule_rows: list[dict] = []
     standings_rows: list[dict] = []
+    rounds_rows: list[dict] = []
+    cup_trees_rows: list[dict] = []
+    participants_rows: list[dict] = []
+    referee_profile_rows: list[dict] = []
+    season_field_rows = {
+        "rounds": rounds_rows,
+        "cup_trees": cup_trees_rows,
+        "participants": participants_rows,
+        REFEREE_PROFILE_ENDPOINT: referee_profile_rows,
+    }
     deferred_keys: list[ManifestKey] = []
 
     for spec in plan.specs:
@@ -1439,7 +1494,7 @@ def materialize_season_partition(
         statuses[spec.key] = manifest.status
         deferred = _is_deferred_materialization(spec, result)
         rejected_referee = bool(
-            spec.raw_only and spec.key.endpoint == REFEREE_PROFILE_ENDPOINT
+            spec.key.endpoint == REFEREE_PROFILE_ENDPOINT
             and manifest.status == ManifestStatus.SCHEMA_ERROR
             # A manifest persistence failure can use the same status envelope;
             # it must block publication even for an optional profile.
@@ -1476,7 +1531,7 @@ def materialize_season_partition(
                 "http_status": manifest.http_status,
                 "fetched_at": manifest.fetched_at,
             }
-        if spec.raw_only or manifest.status in {
+        if spec.raw_only or rejected_referee or manifest.status in {
             ManifestStatus.LEGITIMATE_EMPTY,
             ManifestStatus.NOT_SUPPORTED,
         }:
@@ -1516,6 +1571,25 @@ def materialize_season_partition(
                     "successful standings endpoint has no league_table dataset"
                 )
             standings_rows.extend(
+                _row_with_partition_and_lineage(
+                    row,
+                    plan=plan,
+                    result=result,
+                    canonical_league=league,
+                    canonical_season=season,
+                    require_event_season=False,
+                )
+                for row in dataset.rows
+            )
+        elif spec.key.endpoint in _SEASON_FIELD_NATURAL_KEYS:
+            # #1367: normalized season fields are independent of schedule
+            # rows; each endpoint contributes exactly its own dataset.
+            dataset = result.datasets.get(spec.key.endpoint)
+            if dataset is None:
+                raise SeasonMaterializationError(
+                    f"successful {spec.key.endpoint} endpoint has no dataset"
+                )
+            season_field_rows[spec.key.endpoint].extend(
                 _row_with_partition_and_lineage(
                     row,
                     plan=plan,
@@ -1607,6 +1681,14 @@ def materialize_season_partition(
             raise SeasonMaterializationError(f"duplicate standings natural key: {key}")
         standings_keys.add(key)
 
+    for endpoint, key_fields in _SEASON_FIELD_NATURAL_KEYS.items():
+        try:
+            assert_natural_keys(season_field_rows[endpoint], key_fields)
+        except ValueError as exc:
+            raise SeasonMaterializationError(
+                f"{endpoint} natural key check failed: {exc}"
+            ) from exc
+
     return SeasonPartitionMaterialization(
         canonical_league=league,
         canonical_season=season,
@@ -1615,6 +1697,10 @@ def materialize_season_partition(
         raw_lineage=lineage,
         endpoint_statuses=statuses,
         deferred_keys=tuple(deferred_keys),
+        rounds_rows=tuple(rounds_rows),
+        cup_trees_rows=tuple(cup_trees_rows),
+        participants_rows=tuple(participants_rows),
+        referee_profile_rows=tuple(referee_profile_rows),
     )
 
 

@@ -149,15 +149,37 @@ class SofaScoreScraper(SoccerdataScraper):
         applies it); ``position`` keeps the per-event -> nominal fallback. The
         nested ``statistics`` Opta block is deliberately NOT duplicated here — it
         is captured in full by ``event_player_stats`` from the SAME /lineups
-        payload, so no source field is lost. The ``player`` identity object is
-        skipped (its id is the anchor).
+        payload, so no source field is lost. From the ``player`` identity object
+        the id stays the anchor and ``name`` is surfaced as ``player_name``.
+        Side-level ``formation`` is stamped on every row, and the side's
+        ``missingPlayers``/``supportStaff`` blocks are kept as canonical JSON
+        (``'[]'`` for absent/empty lists; ``None`` when the source value is not
+        a list/tuple — the schema validator owns type errors).
 
         Schema per row:
-            match_id, player_id, team_side, rating, position, + entry fields.
+            match_id, player_id, player_name, team_side, formation, rating,
+            position, missing_players_json, support_staff_json, + entry fields.
         """
         rows: List[Dict] = []
         if not isinstance(side_payload, dict):
             return rows
+
+        def _side_list_json(value) -> Optional[str]:
+            if not isinstance(value, (list, tuple)):
+                return None
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            )
+
+        missing_players_json = _side_list_json(
+            side_payload.get('missingPlayers', [])
+        )
+        support_staff_json = _side_list_json(
+            side_payload.get('supportStaff', [])
+        )
 
         for entry in side_payload.get('players', []) or []:
             if not isinstance(entry, dict):
@@ -176,7 +198,9 @@ class SofaScoreScraper(SoccerdataScraper):
             row: Dict = {
                 'match_id': str(match_id),
                 'player_id': player_id_str,
+                'player_name': player.get('name'),
                 'team_side': side,
+                'formation': side_payload.get('formation'),
                 # rating raw (Silver drops 0.0); position per-event or nominal.
                 'rating': _coerce_scalar(stats.get('rating')),
                 'position': entry.get('position') or player.get('position') or None,
@@ -191,6 +215,9 @@ class SofaScoreScraper(SoccerdataScraper):
                     if not bool(entry.get('substitute'))
                     else ('substitute_used' if bool(stats) else 'unused_substitute')
                 ),
+                # Side-level blocks repeated on every row of the side.
+                'missing_players_json': missing_players_json,
+                'support_staff_json': support_staff_json,
             }
             _auto_flatten(entry, row, skip=('player', 'statistics'))
             rows.append(row)
@@ -297,8 +324,9 @@ class SofaScoreScraper(SoccerdataScraper):
         Live-verified 2026-06-22 (#751): each ``/lineups`` player entry carries
         the full per-match ``statistics`` block (33 Opta metrics) plus
         ``is_home`` (from the side) and the entry's
-        ``captain``/``substitute``/``position`` anchors. This single payload
-        populates them directly.
+        ``captain``/``substitute``/``position`` anchors, with ``player_name``
+        taken from the nested ``player`` object. This single payload populates
+        them directly.
 
         ``team_id``/``team_name`` are absent from ``/lineups``; they come from
         the captured ``event_payload`` (``homeTeam``/``awayTeam``). A ``None``
@@ -341,6 +369,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 row: Dict = {
                     'match_id': str(match_id),
                     'player_id': player_id_str,
+                    'player_name': player.get('name'),
                     'team_id': team.get('id'),
                     'team_name': team.get('name'),
                     'is_home': side == 'home',

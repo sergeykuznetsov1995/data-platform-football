@@ -16,6 +16,13 @@
         "shirtNumber": 18,
         "substitute": true
       }
+    ],
+    "missingPlayers": [
+      {"id": 98761, "name": "Injured One", "reason": "injury"},
+      {"id": 98762, "name": "Suspended Two", "reason": "red_cards"}
+    ],
+    "supportStaff": [
+      {"id": 55501, "name": "Coach One", "role": "manager"}
     ]
   },
   "away": {
@@ -35,6 +42,8 @@
         "substitute": true,
         "statistics": {"minutesPlayed": 24, "rating": 6.7}
       }
-    ]
+    ],
+    "missingPlayers": [],
+    "supportStaff": []
   }
 }

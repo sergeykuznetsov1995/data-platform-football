@@ -145,6 +145,11 @@ def _payload(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _full_participants_team_count() -> int:
+    """Participants rows the full-evidence fixture parses into (#1367)."""
+    return len(_payload(PLAYER_EVIDENCE_CASES)["full_participants"]["teams"])
+
+
 def _seed_raw(store: RawPayloadStore, spec: EndpointSpec, body: bytes) -> None:
     store.store_bytes(
         spec.raw_target,
@@ -372,16 +377,18 @@ def test_season_plan_has_unique_normalized_and_raw_only_specs():
         "cup_trees",
         "participants",
     }
-    assert {spec.key.endpoint for spec in specs if spec.raw_only} == {
-        "rounds",
-        "cup_trees",
-        "participants",
-    }
+    # #1367: the season fields are normalized now; no planned season endpoint
+    # is raw-only any more (squads is not planned, #1357).
+    assert {spec.key.endpoint for spec in specs if spec.raw_only} == set()
 
 
 @pytest.mark.unit
 def test_raw_only_endpoint_spec_is_parserless_but_standard_specs_are_not():
-    raw = build_rounds_spec(**_common())
+    # #1367: rounds is normalized; squads is the one remaining raw-only spec.
+    normalized = build_rounds_spec(**_common())
+    assert normalized.raw_only is False
+    assert set(normalized.parsers) == {"rounds"}
+    raw = build_squad_spec(team_id=42, **_common())
     assert raw.raw_only is True
     assert raw.parsers == {}
     with pytest.raises(ValueError, match="at least one parser"):
@@ -424,28 +431,45 @@ def test_fixture_offline_replay_retains_exact_raw_without_fake_tables(tmp_path):
         ManifestStatus.LEGITIMATE_EMPTY
     )
     assert by_endpoint["standings_total"].manifest.row_count == 4
+    # #1367: rounds/cup_trees/participants/referee_profile are normalized;
+    # the deferred sink receives their datasets for materialization.
     assert {key.endpoint for key, _, _ in sink.calls} == {
         "schedule_last",
         "standings_total",
-    }
-
-    for endpoint in (
         "rounds",
         "cup_trees",
         "participants",
-        "squads",
         "referee_profile",
-    ):
+    }
+    normalized_row_counts = {
+        "rounds": 3,
+        "cup_trees": 2,
+        "participants": 2,
+        "referee_profile": 1,
+    }
+    for endpoint, expected_rows in normalized_row_counts.items():
         result = by_endpoint[endpoint]
         body = FIXTURE_PATHS[endpoint].read_bytes()
         assert result.manifest.status == ManifestStatus.SUCCESS
-        assert result.manifest.row_count == 1  # one retained raw payload unit
-        assert result.datasets == {}
+        assert result.manifest.row_count == expected_rows
+        assert result.datasets[endpoint].row_count == expected_rows
         assert result.replay_hit is True
         assert result.raw.content_hash == hashlib.sha256(body).hexdigest()
         stored, record = raw_store.load_bytes(result.raw.target)
         assert stored == body
         assert record.content_hash == result.raw.content_hash
+
+    # squads stays raw-only (#1357): retained raw, no normalized datasets.
+    squads = by_endpoint["squads"]
+    body = FIXTURE_PATHS["squads"].read_bytes()
+    assert squads.manifest.status == ManifestStatus.SUCCESS
+    assert squads.manifest.row_count == 1  # one retained raw payload unit
+    assert squads.datasets == {}
+    assert squads.replay_hit is True
+    assert squads.raw.content_hash == hashlib.sha256(body).hexdigest()
+    stored, record = raw_store.load_bytes(squads.raw.target)
+    assert stored == body
+    assert record.content_hash == squads.raw.content_hash
 
 
 @pytest.mark.unit
@@ -672,12 +696,12 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
     durable = InMemoryManifestStore()
     buffered = BatchingManifestStore(durable, max_pending=200)
     if profile_case == "storage":
-        original_upsert = buffered.upsert
+        original_upsert = durable.upsert
         def upsert(record):
-            if record.key == profile.key and record.status == ManifestStatus.SUCCESS:
+            if record.key == profile.key:
                 raise OSError("referee manifest storage unavailable")
             return original_upsert(record)
-        monkeypatch.setattr(buffered, "upsert", upsert)
+        monkeypatch.setattr(durable, "upsert", upsert)
     if profile_case == "lineage":
         original_replay = __import__("scrapers.sofascore.season_pipeline", fromlist=["replay_season_specs"]).replay_season_specs
         def replay(engine, specs):
@@ -1377,6 +1401,12 @@ def test_whole_partition_offline_replay_materializes_with_zero_network(tmp_path)
     assert transport.calls == 0
     assert len(materialized.schedule_rows) == 2
     assert len(materialized.standings_rows) == 4
+    assert [row["round_id"] for row in materialized.rounds_rows] == ["1", "2", "3"]
+    assert len(materialized.cup_trees_rows) == 2
+    assert len(materialized.participants_rows) == _full_participants_team_count()
+    assert [row["requested_referee_id"] for row in materialized.referee_profile_rows] == [
+        "900"
+    ]
     assert materialized.endpoint_completeness == 1.0
     assert all(
         row["league"] == "ENG-Premier League"
@@ -1469,6 +1499,11 @@ def test_optional_standings_not_supported_does_not_break_partition_replay(
     assert transport.calls == 0
     assert len(materialized.schedule_rows) == 2
     assert materialized.standings_rows == ()
+    # #1367: legitimately empty season fields stay empty datasets.
+    assert materialized.rounds_rows == ()
+    assert materialized.cup_trees_rows == ()
+    assert len(materialized.participants_rows) == _full_participants_team_count()
+    assert materialized.referee_profile_rows == ()
     assert materialized.endpoint_statuses[standings.key] == (
         ManifestStatus.NOT_SUPPORTED
     )
@@ -1493,21 +1528,17 @@ def test_deferred_normalized_results_materialize_before_atomic_merge_finalize(
     results = replay_season_specs(engine, plan.specs)
     by_endpoint = {result.manifest.key.endpoint: result for result in results}
     assert transport.calls == 0
-    assert by_endpoint["schedule_last"].manifest.status == (
-        ManifestStatus.RETRYABLE_FAILURE
-    )
-    assert by_endpoint["schedule_last"].manifest.error_type == (
-        "DeferredMaterialization"
-    )
-    assert by_endpoint["standings_total"].manifest.status == (
-        ManifestStatus.RETRYABLE_FAILURE
-    )
     assert by_endpoint["schedule_next"].manifest.status == (
         ManifestStatus.LEGITIMATE_EMPTY
     )
+    # #1367: every normalized endpoint, the four season fields included, is
+    # held by the deferred sink and reaches materialization nonterminal.
     assert all(
-        by_endpoint[endpoint].manifest.is_terminal
+        by_endpoint[endpoint].manifest.status == ManifestStatus.RETRYABLE_FAILURE
+        and by_endpoint[endpoint].manifest.error_type == "DeferredMaterialization"
         for endpoint in (
+            "schedule_last",
+            "standings_total",
             "rounds",
             "cup_trees",
             "participants",
@@ -1523,9 +1554,19 @@ def test_deferred_normalized_results_materialize_before_atomic_merge_finalize(
     )
     assert len(materialized.schedule_rows) == 2
     assert len(materialized.standings_rows) == 4
+    assert [row["round_id"] for row in materialized.rounds_rows] == ["1", "2", "3"]
+    assert len(materialized.cup_trees_rows) == 2
+    assert len(materialized.participants_rows) == _full_participants_team_count()
+    assert [row["requested_referee_id"] for row in materialized.referee_profile_rows] == [
+        "900"
+    ]
     assert {key.endpoint for key in materialized.deferred_keys} == {
         "schedule_last",
         "standings_total",
+        "rounds",
+        "cup_trees",
+        "participants",
+        "referee_profile",
     }
     assert materialized.endpoint_completeness == 1.0
 
@@ -1640,11 +1681,30 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
 
     assert rc == 0
     assert transport.calls == 0
-    assert [
-        call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
-    ] == ["sofascore_schedule", "sofascore_league_table"]
+    season_tables = [
+        "sofascore_schedule",
+        "sofascore_league_table",
+        "sofascore_rounds",
+        "sofascore_cup_trees",
+        "sofascore_participants",
+    ]
+    save_calls = scraper.save_to_iceberg.call_args_list
+    assert [call.kwargs["table_name"] for call in save_calls] == season_tables
+    natural_keys_by_table = {
+        call.kwargs["table_name"]: call.kwargs["natural_keys"] for call in save_calls
+    }
+    assert natural_keys_by_table["sofascore_rounds"] == [
+        "league", "season", "round_id",
+    ]
+    assert natural_keys_by_table["sofascore_cup_trees"] == [
+        "league", "season", "cup_tree_id", "node_id",
+    ]
+    assert natural_keys_by_table["sofascore_participants"] == [
+        "league", "season", "team_id",
+    ]
+    assert "sofascore_referee_profile" not in natural_keys_by_table
     merges = [sql for sql in statements if sql.startswith("MERGE INTO")]
-    assert len(merges) == 2
+    assert len(merges) == len(season_tables)
     schedule_merge = next(sql for sql in merges
                           if sql.startswith("MERGE INTO iceberg.bronze.sofascore_schedule "))
     on_clause = schedule_merge.split(" ON ", 1)[1].split(" WHEN MATCHED", 1)[0]
@@ -1665,6 +1725,16 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["schedule_rows"] == 2
     assert payload["league_table_rows"] == 4
+    assert payload["rounds_rows"] == 3
+    assert payload["cup_trees_rows"] == 2
+    assert payload["participants_rows"] == _full_participants_team_count()
+    assert payload["referee_profile_rows"] == 0
+    assert [
+        receipt["table"] for receipt in payload["publication_receipts"]
+    ] == season_tables
+    assert [receipt["rows"] for receipt in payload["publication_receipts"]] == [
+        2, 4, 3, 2, _full_participants_team_count(),
+    ]
     assert payload["traffic"]["request_count"] == 0
     assert payload["traffic"]["replay_hit_rate"] == 1.0
     inventory = payload["schedule_inventory"]
@@ -1781,9 +1851,21 @@ def test_runner_signed_season_with_player_universe_gap_publishes_at_zero_traffic
     assert transport.calls == 0
     assert [
         call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
-    ] == ["sofascore_schedule", "sofascore_league_table"]
+    ] == [
+        "sofascore_schedule",
+        "sofascore_league_table",
+        "sofascore_rounds",
+        "sofascore_cup_trees",
+        "sofascore_participants",
+    ]
     assert payload["schedule_rows"] == 2
     assert payload["league_table_rows"] == 4
+    assert payload["rounds_rows"] == 3
+    assert payload["cup_trees_rows"] == 2
+    assert payload["participants_rows"] == len(
+        evidence["partial_participants"]["teams"]
+    )
+    assert payload["referee_profile_rows"] == 0
     assert payload["player_universe_gaps"] == [
         "participants omitted scheduled team ids: 17,33,44"
     ]
@@ -1919,9 +2001,21 @@ def test_runner_main_with_a_real_signed_season_plan_publishes_despite_universe_g
     assert transport.calls == 0
     assert [
         call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
-    ] == ["sofascore_schedule", "sofascore_league_table"]
+    ] == [
+        "sofascore_schedule",
+        "sofascore_league_table",
+        "sofascore_rounds",
+        "sofascore_cup_trees",
+        "sofascore_participants",
+    ]
     assert payload["schedule_rows"] == 2
     assert payload["league_table_rows"] == 4
+    assert payload["rounds_rows"] == 3
+    assert payload["cup_trees_rows"] == 2
+    assert payload["participants_rows"] == len(
+        evidence["partial_participants"]["teams"]
+    )
+    assert payload["referee_profile_rows"] == 0
     assert payload["player_universe_gaps"] == [
         "participants omitted scheduled team ids: 17,33,44"
     ]
@@ -1996,9 +2090,95 @@ def test_runner_season_merges_bronze_inside_the_writer_lock(tmp_path, monkeypatc
         "lock:enter",
         "save:sofascore_schedule",
         "save:sofascore_league_table",
+        "save:sofascore_rounds",
+        "save:sofascore_cup_trees",
+        "save:sofascore_participants",
         "lock:exit",
     ]
     assert terminal_at_lock_exit == [False]
+
+
+@pytest.mark.unit
+def test_runner_skips_publication_for_empty_normalized_season_datasets(
+    tmp_path,
+    monkeypatch,
+):
+    """#1367: a legitimately empty season field is a terminal answer — its
+    table is not written, its row counter stays zero and no receipt is
+    recorded, while the non-empty datasets of the same partition publish."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    for spec, payload in (
+        (
+            build_schedule_page_spec(direction="last", page=0, **_common()),
+            _payload(FIXTURE_PATHS["schedule_last"]),
+        ),
+        (
+            build_schedule_page_spec(direction="next", page=0, **_common()),
+            _payload(FIXTURE_PATHS["schedule_next"]),
+        ),
+        (
+            build_standings_total_spec(**_common()),
+            _payload(FIXTURE_PATHS["standings_total"]),
+        ),
+        (build_rounds_spec(**_common()), {"rounds": []}),
+        (build_cup_trees_spec(**_common()), {"cupTrees": []}),
+        (build_participants_spec(**_common()), evidence["full_participants"]),
+    ):
+        _seed_json(raw_store, spec, payload)
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+        sink=DeferredCaptureSink(),
+    )
+    runtime = CaptureRuntime(engine, manifest, raw_store)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID)
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        "iceberg.bronze." + kwargs["table_name"]
+    )
+    output = tmp_path / "season-empty-fields.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, report["errors"]
+    assert transport.calls == 0
+    published = [
+        call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
+    ]
+    assert published == [
+        "sofascore_schedule",
+        "sofascore_league_table",
+        "sofascore_participants",
+    ]
+    assert report["schedule_rows"] == 2
+    assert report["league_table_rows"] == 4
+    assert report["rounds_rows"] == 0
+    assert report["cup_trees_rows"] == 0
+    assert report["participants_rows"] == _full_participants_team_count()
+    assert report["referee_profile_rows"] == 0
+    assert [receipt["table"] for receipt in report["publication_receipts"]] == (
+        published
+    )
 
 
 def _live_season_run(tmp_path, monkeypatch, committed):
@@ -2063,6 +2243,10 @@ def _live_season_run(tmp_path, monkeypatch, committed):
         match_phase_ready=True,
         schedule_rows=(),
         standings_rows=(),
+        rounds_rows=(),
+        cup_trees_rows=(),
+        participants_rows=(),
+        referee_profile_rows=(),
     )
     scraper = MagicMock()
     scraper.__enter__.return_value = scraper
@@ -3209,11 +3393,27 @@ def test_rejected_optional_referee_keeps_raw_and_allows_real_season_commit(
     assert report["traffic"]["endpoint_completeness"] == report["endpoint_completeness"]
     assert report["optional_endpoint_errors"][0]["status"] == "schema_error"
     assert report["schedule_inventory"]["finished_matches"] == 1
+    assert report["rounds_rows"] == 3
+    assert report["cup_trees_rows"] == 2
+    assert report["participants_rows"] == _full_participants_team_count()
+    assert report["referee_profile_rows"] == 0
+    published = [
+        call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
+    ]
+    # The rejected optional profile publishes raw-free normalized tables but
+    # never its own.
+    assert published == [
+        "sofascore_schedule",
+        "sofascore_league_table",
+        "sofascore_rounds",
+        "sofascore_cup_trees",
+        "sofascore_participants",
+    ]
+    assert [receipt["table"] for receipt in report["publication_receipts"]] == published
     rejected = manifests.get(profile.key)
     assert rejected.status == ManifestStatus.SCHEMA_ERROR
     assert rejected.raw_content_hash
     assert raw.load_bytes(profile.raw_target)[0] == profile_body
-    assert scraper.save_to_iceberg.call_count == 2
     # A second planning/replay sees the same local rejection, without paid retry.
     retained = plan_season_partition(raw, manifests, event_freshness_key="final", **_common())
     assert retained.match_phase_ready
@@ -3309,6 +3509,8 @@ def test_optional_referee_manifest_write_failure_stops_real_season_commit(tmp_pa
     report = json.loads(output.read_text())
     assert rc == 1
     assert "manifest_committed" not in report
-    assert any("nonterminal: schema_error" in error for error in report["errors"])
-    assert manifests.get(profile.key).error_type == "OSError"
-    scraper.save_to_iceberg.assert_not_called()
+    assert any("referee manifest storage unavailable" in error for error in report["errors"])
+    record = manifests.get(profile.key)
+    assert record.status == ManifestStatus.RETRYABLE_FAILURE
+    assert record.error_type == "DeferredMaterialization"
+    assert len(report["publication_receipts"]) == 6

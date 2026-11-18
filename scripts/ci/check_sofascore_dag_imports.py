@@ -1,4 +1,4 @@
-"""Validate the four staged SofaScore DAGs and the players task set."""
+"""Validate the seven staged SofaScore DAGs and the players task set."""
 
 from __future__ import annotations
 
@@ -20,18 +20,30 @@ def main() -> None:
         raise SystemExit(f"real Airflow DAG import errors:\n{details}")
 
     expected = {
-        "dag_ingest_sofascore",
-        "dag_refresh_sofascore_all_mens",
-        "dag_backfill_sofascore_all_mens",
-        "dag_players_sofascore_all_mens",
+        "dag_ingest_sofascore": 70,
+        "dag_backfill_sofascore_all_mens": 6,
+        "dag_refresh_sofascore_all_mens": 7,
+        "dag_players_sofascore_all_mens": 5,
+        "dag_sofascore_manifest_maintenance": 1,
+        "dag_sofascore_schedule_maintenance": 1,
+        "dag_replay_sofascore_raw": 3,
     }
     actual = set(dag_bag.dag_ids)
-    if actual != expected:
+    if actual != set(expected):
         raise SystemExit(
             "real Airflow loaded the wrong DAG set: "
-            f"missing={sorted(expected - actual)}, "
-            f"unexpected={sorted(actual - expected)}"
+            f"missing={sorted(set(expected) - actual)}, "
+            f"unexpected={sorted(actual - set(expected))}"
         )
+    for dag_id, expected_count in sorted(expected.items()):
+        dag = dag_bag.dags[dag_id]
+        task_count = len(dag.tasks)
+        print(f"{dag_id}: tasks={task_count}")
+        if task_count != expected_count:
+            raise SystemExit(
+                f"real Airflow DAG {dag_id} must expose exactly "
+                f"{expected_count} tasks, got {task_count}"
+            )
     expected_tasks = {
         "plan_players_batch",
         "run_players_scope",

@@ -182,6 +182,10 @@ def test_table_contract_rejects_duplicates_missing_fields_and_bad_enum():
         "is_bench": False,
         "is_unused_substitute": False,
         "participation_status": "starter",
+        "player_name": "M. Player",
+        "formation": "4-3-3",
+        "missing_players_json": "[]",
+        "support_staff_json": "[]",
         "league": "ENG-Premier League",
         "season": "2526",
         "raw_content_hash": "a" * 64,
@@ -217,6 +221,10 @@ def _valid_lineup_row(**overrides):
         "is_bench": False,
         "is_unused_substitute": False,
         "participation_status": "starter",
+        "player_name": "M. Player",
+        "formation": "4-3-3",
+        "missing_players_json": "[]",
+        "support_staff_json": "[]",
         "source_tournament_id": 17,
         "source_season_id": 76986,
         "league": "ENG-Premier League",
@@ -1082,7 +1090,44 @@ def test_uncaptured_endpoint_cannot_pretend_raw_or_normalized_coverage():
         validate_coverage_contract(contract)
 
     contract = deepcopy(load_coverage_contract())
-    rounds = contract["endpoints"]["rounds"]
-    rounds["destination"] = ["silver.sofascore_round"]
+    stages = contract["endpoints"]["stages"]
+    stages["destination"] = ["bronze.sofascore_stages"]
     with pytest.raises(SofaScoreContractError, match="cannot claim a destination"):
         validate_coverage_contract(contract)
+
+
+def test_committed_state_queries_guard_the_season_capture_tables():
+    contract = load_coverage_contract()
+    queries = build_partition_dq_queries(
+        "ENG-Premier League", "2526", 17, 76986, contract=contract
+    )
+    for table_name, key in (
+        ("bronze.sofascore_rounds", ("league", "season", "round_id")),
+        (
+            "bronze.sofascore_cup_trees",
+            ("league", "season", "cup_tree_id", "node_id"),
+        ),
+        ("bronze.sofascore_participants", ("league", "season", "team_id")),
+        (
+            "bronze.sofascore_referee_profile",
+            ("league", "season", "requested_referee_id"),
+        ),
+    ):
+        duplicate = next(
+            query
+            for query in queries
+            if query.name == f"duplicate_natural_key[{table_name}]"
+        )
+        null_key = next(
+            query
+            for query in queries
+            if query.name == f"null_natural_key[{table_name}]"
+        )
+        assert duplicate.expected_value == 0
+        assert f"FROM iceberg.{table_name}" in duplicate.sql
+        assert "HAVING COUNT(*) > 1" in duplicate.sql
+        assert null_key.expected_value == 0
+        assert f"FROM iceberg.{table_name}" in null_key.sql
+        for column in key:
+            assert f'"{column}"' in duplicate.sql
+            assert f'"{column}" IS NULL' in null_key.sql

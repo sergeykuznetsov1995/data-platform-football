@@ -2,8 +2,17 @@
 Tests for SofaScoreScraper.
 """
 
-import pytest
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+def _load_fixture(name):
+    """Load a synthetic capture fixture from ``tests/fixtures``."""
+    path = Path(__file__).resolve().parents[2] / 'fixtures' / name
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
 class TestSofaScoreScraper:
@@ -303,6 +312,114 @@ class TestFirstClassLineups:
         assert by_id['3']['is_unused_substitute'] is True
 
 
+class TestLineupsFixtureProjection:
+    """Fixture-driven checks for the synthetic /lineups payload (#1367):
+    ``player_name`` and side ``formation`` land in Bronze rows, the side's
+    ``missingPlayers``/``supportStaff`` blocks survive as canonical JSON, and
+    an unused substitute keeps its row."""
+
+    _HOME_MISSING_JSON = (
+        '[{"id":98761,"name":"Injured One","reason":"injury"},'
+        '{"id":98762,"name":"Suspended Two","reason":"red_cards"}]'
+    )
+    _HOME_SUPPORT_JSON = '[{"id":55501,"name":"Coach One","role":"manager"}]'
+
+    def _lineups(self):
+        return _load_fixture('sofascore_event_14023925_lineups.json')
+
+    @pytest.mark.unit
+    def test_home_rows_exact_projection(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_lineup_side(
+            '14023925', 'home', self._lineups()['home'],
+        )
+        assert rows == [
+            {
+                'match_id': '14023925',
+                'player_id': '11111',
+                'player_name': 'Starter One',
+                'team_side': 'home',
+                'formation': '4-3-3',
+                'rating': 8.1,
+                'position': 'ST',
+                'is_starter': True,
+                'is_bench': False,
+                'is_unused_substitute': False,
+                'participation_status': 'starter',
+                'missing_players_json': self._HOME_MISSING_JSON,
+                'support_staff_json': self._HOME_SUPPORT_JSON,
+                'shirt_number': 9,
+                'substitute': False,
+                'captain': True,
+            },
+            {
+                'match_id': '14023925',
+                'player_id': '11112',
+                'player_name': 'Unused Home',
+                'team_side': 'home',
+                'formation': '4-3-3',
+                'rating': None,
+                'position': 'M',
+                'is_starter': False,
+                'is_bench': True,
+                'is_unused_substitute': True,
+                'participation_status': 'unused_substitute',
+                'missing_players_json': self._HOME_MISSING_JSON,
+                'support_staff_json': self._HOME_SUPPORT_JSON,
+                'shirt_number': 18,
+                'substitute': True,
+            },
+        ]
+
+    @pytest.mark.unit
+    def test_away_side_empty_arrays_serialize_as_empty_list(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_lineup_side(
+            '14023925', 'away', self._lineups()['away'],
+        )
+        assert len(rows) == 2
+        assert all(row['formation'] == '4-2-3-1' for row in rows)
+        assert all(row['missing_players_json'] == '[]' for row in rows)
+        assert all(row['support_staff_json'] == '[]' for row in rows)
+        used_away = next(r for r in rows if r['player_id'] == '22222')
+        assert used_away['player_name'] == 'Used Away'
+        assert used_away['is_unused_substitute'] is False
+        assert used_away['participation_status'] == 'substitute_used'
+
+    @pytest.mark.unit
+    def test_non_list_side_blocks_are_not_serialized(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_lineup_side(
+            '1', 'home',
+            {'formation': '4-4-2',
+             'missingPlayers': {'id': 1},
+             'supportStaff': 'coach',
+             'players': [{'player': {'id': 9, 'name': 'X'}}]},
+        )
+        assert rows[0]['missing_players_json'] is None
+        assert rows[0]['support_staff_json'] is None
+        assert rows[0]['formation'] == '4-4-2'
+        assert rows[0]['player_name'] == 'X'
+
+    @pytest.mark.unit
+    def test_event_player_stats_carry_player_name_from_fixture(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '14023925', self._lineups(), None,
+        )
+        names = {row['player_id']: row['player_name'] for row in rows}
+        assert names == {
+            '11111': 'Starter One',
+            '11112': 'Unused Home',
+            '22221': 'Starter Away',
+            '22222': 'Used Away',
+        }
+
+
 class TestIncidentsFlatten:
     @pytest.mark.unit
     def test_goals_cards_substitutions_var_and_derived_key(self):
@@ -396,6 +513,7 @@ class TestEventPlayerStatsFromLineups:
 
         # Anchors — all populated directly from lineups (no overlay needed).
         assert home['match_id'] == '14023959'
+        assert home['player_name'] == 'Keeper'
         assert home['team_id'] == 1
         assert home['team_name'] == 'Team X'
         assert home['is_home'] is True
@@ -404,6 +522,7 @@ class TestEventPlayerStatsFromLineups:
         assert home['position'] == 'G'
         assert home['position_specific'] == 'G'
 
+        assert away['player_name'] == 'Striker'
         assert away['team_id'] == 2
         assert away['is_home'] is False
         # `captain` absent on non-captain entry → False, not None.

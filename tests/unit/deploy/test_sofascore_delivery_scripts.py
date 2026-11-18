@@ -48,6 +48,7 @@ METADB = "sofascore-airflow-metadb"
 MAINT = "dag_sofascore_manifest_maintenance"
 COMPACT = "dag_sofascore_schedule_maintenance"
 PLAYERS = "dag_players_sofascore_all_mens"
+REPLAY = "dag_replay_sofascore_raw"
 # Список ядра контура — единственный источник счётчика приёмки стенда (#1374): число
 # выводится из списка, иначе тест знал бы литерал и рассинхрон увидел бы прод, а не тест.
 CORE_DAGS = tuple(
@@ -204,10 +205,10 @@ exit "$rc"
         )
         for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
             (self.source / "deploy" / "sofascore" / name).write_text("services: {}\n", encoding="utf-8")
-        # Релиз везёт файлы DAG компакции и полосы игроков (#1374): приёмка спрашивает ровно
+        # Релиз везёт файлы DAG компакции, полосы игроков и raw replay (#1374): приёмка спрашивает ровно
         # те DAG, что несёт дерево, а дедлайн — те, что уже в живом дереве.
         (self.source / "dags").mkdir()
-        for dag in (COMPACT, PLAYERS):
+        for dag in (COMPACT, PLAYERS, REPLAY):
             (self.source / "dags" / f"{dag}.py").write_text("# stand probe\n", encoding="utf-8")
         for src in (AUTO, ENV_SH):
             copy = self.source / "deploy" / "sofascore" / src.name
@@ -1991,30 +1992,44 @@ def test_confirmed_rollback_restores_schedule_compaction(stand: Stand) -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("has_compaction,has_players,registered,expected", [
-    (True, True, 6, "1"), (True, True, 5, "0"), (True, False, 6, "0"),
-    (True, False, 5, "1"), (False, False, 4, "1"), (False, True, 5, "1"),
-])
+@pytest.mark.parametrize("has_compaction,has_players,has_replay,registered,expected", [
+    (has_compaction, has_players, has_replay,
+     4 + has_compaction + has_players + has_replay + count_delta, expected)
+    for has_compaction in (False, True)
+    for has_players in (False, True)
+    for has_replay in (False, True)
+    if has_compaction or has_players or has_replay
+    for count_delta, expected in ((0, "1"), (-1, "0"), (1, "0"))
+] + [(False, False, False, 4, "1")])
 def test_acceptance_requires_only_the_dags_the_release_carries(
-    tmp_path: Path, has_compaction: bool, has_players: bool, registered: int, expected: str,
+    tmp_path: Path, has_compaction: bool, has_players: bool, has_replay: bool,
+    registered: int, expected: str,
 ) -> None:
     """Приёмка спрашивает ровно те DAG, что везёт релиз (#1374): компакция — со времён
     деревьев до неё, полоса игроков — так же. Иначе откат на дерево до полосы не сошёлся
     бы никогда, а зелёная доставка становилась бы красной при каждом откате. Выполняется
-    настоящая acceptance_seen офлайн, включая откат на старый релиз."""
+    настоящая acceptance_seen офлайн, включая откат на старый релиз:
+    ростер и счётчик собираются по фактическим файлам dags/ дерева, необязательные DAG
+    (компакция расписаний, полоса игроков, перегрузка raw) требуются только от релизов
+    с их файлом. Все три дают семь DAG; отсутствие каждого уменьшает счётчик на один."""
     tree = tmp_path / "release"
     (tree / "dags").mkdir(parents=True)
     if has_compaction:
         (tree / "dags" / f"{COMPACT}.py").touch()
     if has_players:
         (tree / "dags" / f"{PLAYERS}.py").touch()
+    if has_replay:
+        (tree / "dags" / f"{REPLAY}.py").touch()
     text = AUTO.read_text(encoding="utf-8")
     core = next(line for line in text.splitlines() if line.startswith("CORE_DAGS="))
+    compact = next(line for line in text.splitlines() if line.startswith("COMPACT="))
+    players = next(line for line in text.splitlines() if line.startswith("PLAYERS="))
+    replay = next(line for line in text.splitlines() if line.startswith("REPLAY="))
     acceptance = text.split("acceptance_seen(){", 1)[1].split("\n}", 1)[0]
     sql_log = tmp_path / "sql"
-    script = core + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
-COMPACT=dag_sofascore_schedule_maintenance
-PLAYERS=dag_players_sofascore_all_mens
+    script = core + '\n' + compact + '\n' + players + '\n' + replay + '\nacceptance_seen(){' + acceptance + '\n}\n' + r'''
+CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done)
+CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
 GATEWAY_CONTAINERS="gw1 gw2 gw3"
 WATCHDOG_UNITS=watchdog
 POOLS=""
@@ -2023,7 +2038,7 @@ metadb(){
     *last_parsed_time*)
       echo "$1" > "$SQL_LOG"
       case "$1" in
-        *dag_sofascore_schedule_maintenance*|*dag_players_sofascore_all_mens*) echo "$REGISTERED" ;;
+        *dag_sofascore_schedule_maintenance*|*dag_players_sofascore_all_mens*|*dag_replay_sofascore_raw*) echo "$REGISTERED" ;;
         *) echo 4 ;;
       esac ;;
     *) echo 0 ;;
@@ -2046,6 +2061,7 @@ acceptance_seen "$2" "2026-10-28T03:00:00Z"
     sql = sql_log.read_text(encoding="utf-8")
     assert (COMPACT in sql) == has_compaction
     assert (PLAYERS in sql) == has_players
+    assert (REPLAY in sql) == has_replay
 
 
 # ---- #1980: доставка в любой час, защёлка на sha, запись на попытку ---------------------------
@@ -2105,7 +2121,8 @@ def test_the_busy_check_and_the_deadline_ask_the_metadb_about_the_right_dags(sta
     динамическая доставка не должна обрывать её активный DagRun); дедлайн — по
     расписаниям актуалки, обслуживания и полосы (дерево боя её уже несёт), только DAG
     не на паузе; история (@continuous) в дедлайн не входит — её осушает deploy.sh;
-    retired-триггеры #1370 нигде не спрашиваются."""
+    retired-триггеры #1370 и перегрузка raw (schedule=None,
+    paused-on-create, #1367) нигде не спрашиваются: REPLAY — не контроль автомата."""
     stand.put("busy", "1")
     stand.run()
     sql = [c for c in stand.calls("docker") if "sofascore-airflow-metadb" in c]
@@ -2117,6 +2134,7 @@ def test_the_busy_check_and_the_deadline_ask_the_metadb_about_the_right_dags(sta
     for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
         assert f"'{retired}'" not in nxt[0], nxt[0]
     assert HIST not in nxt[0] and "'dag_ingest_sofascore'" not in nxt[0] and "NOT is_paused" in nxt[0]
+    assert REPLAY not in nxt[0] and REPLAY not in busy[0], (nxt[0], busy[0])
     for dag in ("dag_ingest_sofascore", REFRESH, MAINT, COMPACT, PLAYERS):
         assert f"'{dag}'" in busy[0], busy[0]
     for retired in ("dag_trigger_sofascore_daily", "dag_trigger_sofascore_daily_tail"):
@@ -2136,8 +2154,9 @@ def test_the_acceptance_dag_count_is_derived_from_the_core_dag_list() -> None:
         PLAYERS,
         MAINT,
         COMPACT,
+        REPLAY,
     }, CORE_DAGS
-    assert len(CORE_DAGS) == 6, CORE_DAGS
+    assert len(CORE_DAGS) == 7, CORE_DAGS
 
 
 @pytest.mark.unit
@@ -2202,11 +2221,11 @@ def test_the_deadline_gate_asks_the_players_lane_only_when_the_live_tree_has_it(
 @pytest.mark.unit
 def test_a_rollback_to_a_pre_players_tree_does_not_require_the_players_dag(stand: Stand) -> None:
     """#1374: цель отката — дерево до полосы игроков. Приёмка отката спрашивает только DAG
-    этого дерева (пять из шести), откат подтверждается — иначе первый релиз с полосой
+    этого дерева (шесть из семи), откат подтверждается — иначе первый релиз с полосой
     прожил бы одну ночь и умирал при первом же откате."""
     _git(stand.old_tree, "rm", "-q", f"dags/{PLAYERS}.py")
     _git(stand.old_tree, "commit", "-q", "-m", "drop players lane")
-    stand.put("dags", "5")
+    stand.put("dags", "6")
     stand.put("deploy_rc", "5")
     stand.put("deploy_half")
     stand.put("rollback_root", str(stand.old_tree))

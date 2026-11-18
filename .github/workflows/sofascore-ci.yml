@@ -13,6 +13,7 @@ on:
       - "dags/dag_players_sofascore_all_mens.py"
       - "dags/dag_sofascore_manifest_maintenance.py"
       - "dags/dag_sofascore_schedule_maintenance.py"
+      - "dags/dag_replay_sofascore_raw.py"
       - "dags/.airflowignore"
       - "dags/utils/sofascore_all_mens_state.py"
       - "dags/dag_iceberg_maintenance.py"
@@ -80,9 +81,11 @@ jobs:
             dags/dag_players_sofascore_all_mens.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
+            dags/dag_replay_sofascore_raw.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
+            dags/scripts/replay_sofascore_raw.py \
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
             dags/scripts/run_sofascore_scope_cycle.py \
@@ -114,6 +117,7 @@ jobs:
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_sofascore_schedule_maintenance.py \
             dags/dag_players_sofascore_all_mens.py \
+            dags/dag_replay_sofascore_raw.py \
             scripts/migrate_sofascore_production.py \
             scripts/migrate_sofascore_partition_keys.py \
             scripts/migrate_sofascore_partition_keys_batched.py
@@ -136,6 +140,7 @@ jobs:
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \
             tests/unit/dags/test_dag_players_sofascore_all_mens.py \
+            tests/unit/dags/test_dag_replay_sofascore_raw.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
@@ -175,6 +180,8 @@ jobs:
             tests/unit/scrapers/test_sofascore_pipeline.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \
             tests/unit/scrapers/test_sofascore_workload_runtime.py \
+            tests/unit/scrapers/test_sofascore_raw_fields.py \
+            tests/unit/scrapers/test_sofascore_raw_replay.py \
             tests/unit/scrapers/test_sofascore_raw_store.py \
             tests/unit/scrapers/test_sofascore_registry_v2.py \
             tests/unit/scrapers/test_scrapers_lazy_import.py \
@@ -196,6 +203,7 @@ jobs:
             tests/unit/scripts/test_migrate_sofascore_partition_keys_batched.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
             tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
+            tests/unit/scripts/test_replay_sofascore_raw.py \
             tests/unit/scripts/test_run_sofascore_schedule_refresh.py \
             tests/unit/scripts/test_run_sofascore_scope_cycle.py \
             tests/unit/scripts/test_run_sofascore_workload.py \
@@ -247,9 +255,12 @@ jobs:
           mkdir -p "${dag_dir}"
           for dag in \
             dag_ingest_sofascore.py \
-            dag_refresh_sofascore_all_mens.py \
             dag_backfill_sofascore_all_mens.py \
-            dag_players_sofascore_all_mens.py
+            dag_refresh_sofascore_all_mens.py \
+            dag_players_sofascore_all_mens.py \
+            dag_sofascore_manifest_maintenance.py \
+            dag_sofascore_schedule_maintenance.py \
+            dag_replay_sofascore_raw.py
           do
             cp "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
           done

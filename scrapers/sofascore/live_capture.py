@@ -1632,10 +1632,12 @@ def capture_live_dynamic_specs(
                     _require_publishable(
                         result,
                         tolerate_schema_error=(
-                            spec.raw_only
-                            and spec.key.endpoint in optional_schema_endpoints
-                            # The engine also wraps failed manifest writes as
-                            # schema_error. Only payload rejection is optional.
+                            spec.key.endpoint in optional_schema_endpoints
+                            # Normalized optional endpoint semantics: the
+                            # endpoint opts in regardless of the spec's mode,
+                            # but the engine also wraps failed manifest/sink
+                            # writes as schema_error — only payload rejection
+                            # (never a storage failure) is tolerated.
                             and result.manifest.error_type in {
                                 "SchemaValidationError", "RawPayloadSchemaError",
                             }

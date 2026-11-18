@@ -1,5 +1,6 @@
 """Unit tests for the production exact-JSON Camoufox transport."""
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +14,12 @@ from scrapers.sofascore.camoufox_capture import (
     response_path,
     should_block_request,
 )
+
+
+def _load_fixture(name):
+    """Load a synthetic capture fixture from ``tests/fixtures``."""
+    path = Path(__file__).resolve().parents[2] / "fixtures" / name
+    return json.loads(path.read_text(encoding="utf-8"))
 
 pytestmark = pytest.mark.unit
 
@@ -265,7 +272,8 @@ def test_normalize_standing_flattens_real_liverpool_row():
     rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
     assert normalize_standing(rows[0]) == {
         "team": "Liverpool FC", "mp": 38, "w": 25, "d": 9, "l": 4,
-        "gf": 86, "ga": 41, "gd": 45, "pts": 84, "group": "__total__"}
+        "gf": 86, "ga": 41, "gd": 45, "pts": 84, "position": 1,
+        "promotion": None, "promotion_json": None, "group": "__total__"}
 
 
 def _wc_group_standings_buffer(ut=16, sid=58210):
@@ -326,6 +334,64 @@ def test_normalize_standing_gd_none_when_scores_missing():
     from scrapers.sofascore.camoufox_capture import normalize_standing
     out = normalize_standing({"team": {"name": "X"}, "points": 0})
     assert out["gd"] is None and out["gf"] is None
+
+
+def test_normalize_standing_fixture_rows_carry_position():
+    # Synthetic group-tournament fixture (sid 76986): every row keeps its
+    # table position; no promotion in the fixture leaves both columns NULL.
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    buffer = {
+        "/api/v1/unique-tournament/17/season/76986/standings/total": {
+            "status": 200, "challenge": False,
+            "json": _load_fixture("sofascore_season_76986_standings_total.json"),
+        },
+    }
+    rows = [normalize_standing(r)
+            for r in extract_tournament_standings(buffer, 17, 76986)]
+    assert [r["team"] for r in rows] == [
+        "Arsenal", "Liverpool", "Manchester City", "Chelsea"]
+    assert [r["position"] for r in rows] == [1, 2, 1, 2]
+    assert all(r["promotion"] is None and r["promotion_json"] is None
+               for r in rows)
+    assert rows[0] == {
+        "team": "Arsenal", "mp": 2, "w": 2, "d": 0, "l": 0,
+        "gf": 5, "ga": 1, "gd": 4, "pts": 6, "position": 1,
+        "promotion": None, "promotion_json": None, "group": "Group A"}
+
+
+def test_normalize_standing_keeps_scalar_promotion():
+    from scrapers.sofascore.camoufox_capture import normalize_standing
+    out = normalize_standing({
+        "team": {"name": "X"}, "position": 4,
+        "promotion": "Champions League"})
+    assert out["position"] == 4
+    assert out["promotion"] == "Champions League"
+    assert out["promotion_json"] is None
+
+
+def test_normalize_standing_serializes_nested_promotion_as_canonical_json():
+    # Inline synthetic promotion block (never a production dump): a dict with
+    # a nested list must land in promotion_json, leaving scalar promotion NULL.
+    from scrapers.sofascore.camoufox_capture import normalize_standing
+    out = normalize_standing({
+        "team": {"name": "X"}, "position": 15,
+        "promotion": {
+            "id": 1, "name": "Relegation", "type": "relegation",
+            "winners": [1, 2],
+        },
+    })
+    assert out["position"] == 15
+    assert out["promotion"] is None
+    assert out["promotion_json"] == (
+        '{"id":1,"name":"Relegation","type":"relegation","winners":[1,2]}')
+
+
+def test_normalize_standing_missing_promotion_leaves_both_none():
+    from scrapers.sofascore.camoufox_capture import normalize_standing
+    out = normalize_standing({"team": {"name": "X"}})
+    assert out["promotion"] is None and out["promotion_json"] is None
+    assert out["position"] is None
 
 
 # --------------------------------------------------------------------------- #

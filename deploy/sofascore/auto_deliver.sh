@@ -107,13 +107,14 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_sofascore_manifest_maintenance dag_sofascore_schedule_maintenance dag_replay_sofascore_raw"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
 PLAYERS=dag_players_sofascore_all_mens
 MAINT=dag_sofascore_manifest_maintenance
 COMPACT=dag_sofascore_schedule_maintenance
+REPLAY=dag_replay_sofascore_raw
 
 # Дедлайн попытки и потолки. Переопределяются из окружения только для стенда.
 # Дедлайн — ближайший запуск сбора по расписанию Airflow (dag.next_dagrun_create_after DAG не на
@@ -382,8 +383,11 @@ mounts_all_in(){  # mounts_all_in <дерево>
 acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt scheduler'а>
   local new="$1" started="$2" dags errs gw n c line want got dag_sql="" dag_count=0
   for c in $CORE_DAGS; do
-    # Rollback may target a release predating schedule compaction or the players lane (#1374).
-    case "$c" in "$COMPACT"|"$PLAYERS") [ -f "$new/dags/$c.py" ] || continue ;; esac
+    # Необязательные для дерева DAG ($COMPACT — компакция расписаний, $REPLAY — перегрузка
+    # raw, $PLAYERS — полоса игроков): цель отката может быть старее их появления.
+    # Нет файла dags/<dag>.py в дереве —
+    # приёмка этот DAG от дерева не требует; на новом дереве требует всех.
+    case "$c" in "$COMPACT"|"$REPLAY"|"$PLAYERS") [ -f "$new/dags/$c.py" ] || continue ;; esac
     dag_sql="$dag_sql'$c',"
     dag_count=$(( dag_count + 1 ))
   done
