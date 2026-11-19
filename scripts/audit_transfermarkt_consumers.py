@@ -72,6 +72,7 @@ LEGACY_WRITER_ALLOWLIST = frozenset({
     'dags/scripts/run_transfermarkt_scope_cycle.py',
     'dags/scripts/run_transfermarkt_scraper.py',
     'dags/utils/transfermarkt_bronze_dq.py',
+    'dags/utils/transfermarkt_legacy_season.py',  # #2330: verifies pinned legacy rows for Bronze DQ
     # #1393: the same sequential source writer retains dual-write/coach TTL
     # compatibility reads; this is not a serving consumer or another writer.
     'dags/utils/transfermarkt_current_write.py',
