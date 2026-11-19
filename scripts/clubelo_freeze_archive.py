@@ -18,7 +18,8 @@ statements are CTAS into the *_archive_20260924 copies and row inserts into
 clubelo_api_snapshot_archive.
 
 Usage (from the host, Trino published on 127.0.0.1:8082):
-    export TRINO_HOST=127.0.0.1 TRINO_PORT=8082 TRINO_USER=airflow TRINO_PASSWORD=...
+    export TRINO_HOST=127.0.0.1 TRINO_PORT=8082
+    # Supply TRINO_SRC_CLUBELO_PASSWORD in the environment for live commands.
     python scripts/clubelo_freeze_archive.py copy --dry-run
     python scripts/clubelo_freeze_archive.py copy
     python scripts/clubelo_freeze_archive.py load-csv \\
@@ -35,7 +36,6 @@ import warnings
 from pathlib import Path
 
 import pandas as pd
-import trino
 
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
@@ -78,16 +78,13 @@ SNAPSHOT_COLUMNS = (
 
 
 def _connect():
-    user = os.environ.get('TRINO_USER', 'airflow')
-    return trino.dbapi.connect(
-        host=os.environ.get('TRINO_HOST', 'trino'),
-        port=int(os.environ.get('TRINO_PORT', 8443)),
-        user=user,
-        catalog='iceberg',
-        http_scheme='https',
-        auth=trino.auth.BasicAuthentication(user, os.environ.get('TRINO_PASSWORD', '')),
-        verify=False,
-    )
+    # Direct script execution puts scripts/ on the import path.
+    repo_root = os.fspath(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from scrapers.clubelo.trino_auth import connect
+
+    return connect()
 
 
 def _q(cur, sql):
