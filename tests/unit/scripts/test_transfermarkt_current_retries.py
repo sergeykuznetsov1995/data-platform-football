@@ -70,10 +70,14 @@ def test_recovery_uncertain_streak_releases_resume_slot(offline):
     data = one_scope(offline)
     assert data['cursor']['players_checked_at'] is None
     assert data['recovery_signal_refresh_required']
+    offline.calls.clear()
+    during_hold = offline.run('no-other-work', max_scopes=1)
+    assert not offline.calls
+    assert not during_hold['scopes']
+    assert data['cursor']['last_error_at'] == offline.clock.wall.isoformat()
     report = offline.run('other-work', competitions=('GB1', 'ES1'), max_scopes=1)
     assert not rows(report, 'resume')
     assert rows(report, 'cold_roster')
-    assert not rows(offline.run('no-other-work', max_scopes=1), 'resume')
 
     offline.packet_missing = False
     offline.clock.advance(timedelta(hours=4).total_seconds())

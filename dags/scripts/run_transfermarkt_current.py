@@ -623,11 +623,15 @@ class _Scope:
         return retry
 
     def _count_retry(self, retry):
-        if retry.get('portion') != self.cycle_id:
-            retry['portion'] = self.cycle_id
-            retry['count'] = min(_RETRY_STREAK_LIMIT, retry['count'] + 1)
-            if retry['count'] == _RETRY_STREAK_LIMIT:
-                retry['retry_after'] = (self.now() + ERROR_BACKOFF).isoformat()
+        if retry.get('portion') == self.cycle_id:
+            return None
+        retry['portion'] = self.cycle_id
+        retry['count'] = min(_RETRY_STREAK_LIMIT, retry['count'] + 1)
+        if retry['count'] == _RETRY_STREAK_LIMIT:
+            failed_at = self.now()
+            retry['retry_after'] = (failed_at + ERROR_BACKOFF).isoformat()
+            return failed_at
+        return None
 
     def _record_player_mismatch(self, keys):
         retry = self._retry_record('mismatch_retry', self._pending_change_generation(),
@@ -1537,7 +1541,12 @@ class _Scope:
         if self._missing_refresh_checks():
             retry = self.data.get('recovery_retry', {})
             if retry.get('generation') == refresh and retry.get('uncertain_portion') == self.cycle_id:
-                self._count_retry(retry)
+                failed_at = self._count_retry(retry)
+                if failed_at is not None:
+                    # Recovery is blocked on these very checks. Pace their paid
+                    # retries as well as the ordinary resume until the next window.
+                    self.data.pop('last_error_was_mismatch', None)
+                    self.cursor = replace(self.cursor, last_error_at=failed_at)
             raise SignalRefreshRequired('write recovery requires fresh signals before roster or careers')
         self.data.pop('recovery_signal_refresh_required')
         self.persist()
