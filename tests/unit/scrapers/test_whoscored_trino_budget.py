@@ -255,3 +255,22 @@ def test_driver_does_not_retry_the_initial_post_of_an_ambiguous_insert(
         with pytest.raises(TrinoAmbiguousWriteError):
             manager._execute("INSERT INTO bronze.whoscored_matches VALUES (1)")
     assert post.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("dag", "source"),
+    [
+        ("dag_ingest_whoscored", "whoscored-current"),
+        ("dag_backfill_whoscored", "whoscored-history"),
+        (None, "whoscored-service"),
+    ],
+)
+def test_query_origin_is_independent_of_the_login(monkeypatch, dag, source):
+    monkeypatch.setenv("TRINO_USER", "airflow")
+    monkeypatch.setenv("TRINO_SRC_WHOSCORED_PASSWORD", "source-fixture")
+    if dag:
+        monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag)
+    else:
+        monkeypatch.delenv("AIRFLOW_CTX_DAG_ID", raising=False)
+    with trino.WhoScoredTrinoManager()._create_connection() as connection:
+        assert (connection.user, connection.source) == ("src_whoscored", source)

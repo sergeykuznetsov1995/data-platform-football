@@ -166,7 +166,9 @@ docker exec whoscored-airflow-metadb psql -U airflow -d airflow -At -c \
 в `iceberg.bronze` через `docker exec -i` в `$SCHED`, `python -B` и
 `WhoScoredTrinoManager` из `/opt/whoscored-src`. Клиент использует учётку
 `src_whoscored`, пароль из `TRINO_SRC_WHOSCORED_PASSWORD` и общий для обеих полос
-интервал опроса манифеста. Время доставки проверяется и переводится в UTC.
+интервал опроса манифеста. Поле Trino `source` различает
+`whoscored-current`, `whoscored-history` и `whoscored-service`. Измерение
+доставки использует `whoscored-service`. Время доставки переводится в UTC.
 Ненулевой код завершения,
 неверный ответ и таймаут (60 секунд; в контейнере 55 секунд) блокируют приёмку
 до следующего тика. Диагностика различает отсутствующий executable и ошибку

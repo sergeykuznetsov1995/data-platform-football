@@ -143,7 +143,12 @@ class WhoScoredTrinoManager(TrinoTableManager):
     def _create_connection(self):
         import trino
 
+        source = {
+            "dag_ingest_whoscored": "whoscored-current",
+            "dag_backfill_whoscored": "whoscored-history",
+        }.get(os.environ.get("AIRFLOW_CTX_DAG_ID"), "whoscored-service")
         return trino.dbapi.connect(
+            source=source,
             host=self.host,
             port=self.port,
             user=self.user,
