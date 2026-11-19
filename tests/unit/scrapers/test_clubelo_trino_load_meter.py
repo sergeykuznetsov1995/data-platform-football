@@ -68,13 +68,13 @@ def query(root, sql):
         return db.execute(sql).fetchall()
 
 
-def coverage(root, minutes=1440):
+def coverage(root, minutes=1440, *, day=DAY):
     with club.database(root) as db:
         db.executemany("INSERT INTO minutes VALUES (?,1)",
-                       [(club.midnight(DAY) + n * 60,) for n in range(minutes)])
+                       [(club.midnight(day) + n * 60,) for n in range(minutes)])
 
 
-def monitor(tmp_path, counts):
+def monitor(tmp_path, counts, *, day=DAY):
     # A one-argument executable with the production CSV contract. Reject
     # writes, incorrect metadata names and inclusive/offset day boundaries.
     script = tmp_path / "read-only-client"
@@ -92,8 +92,8 @@ def monitor(tmp_path, counts):
         "    assert len(parts) == len(counts)\n"
         "    for part, key in zip(parts, sorted(counts)):\n"
         "        assert part.startswith(f'''SELECT '{key}', count(*) FROM iceberg.bronze.\"{key}$snapshots\"''')\n"
-        f"        assert \"committed_at >= TIMESTAMP '{DAY} 00:00:00 UTC'\" in part\n"
-        f"        assert \"committed_at < TIMESTAMP '{DAY + club.DAY} 00:00:00 UTC'\" in part\n"
+        f"        assert \"committed_at >= TIMESTAMP '{day} 00:00:00 UTC'\" in part\n"
+        f"        assert \"committed_at < TIMESTAMP '{day + club.DAY} 00:00:00 UTC'\" in part\n"
         "        out.writerow((key, counts[key]))\n",
         encoding="utf-8",
     )
@@ -143,6 +143,95 @@ def test_secondary_failure_preserves_primary_and_withholds_proof(tmp_path, monke
     unavailable = receiver.EventReceiver(tmp_path / "other", clubelo_root=tmp_path / "club" / "clubelo.sqlite3")
     assert send(unavailable, data) == ("kept", 201)
     assert unavailable.clubelo_health() == {"enabled": True, "ready": False}
+
+
+@pytest.mark.parametrize("user,output,verdict", [
+    ("src_clubelo", None, "INCOMPLETE"),
+    ("airflow", TABLE, "VIOLATION"),
+])
+def test_locked_late_mixed_event_invalidates_pass_across_restart(tmp_path, clock, user, output, verdict):
+    root, primary = tmp_path / "club", tmp_path / "fm"
+    obj = receiver.EventReceiver(primary, clubelo_root=root)
+    assert send(obj, event()) == ("filtered", 201)
+    coverage(root)
+    client = monitor(tmp_path, {TABLE: 0})
+    assert club.aggregate(root, DAY, client)["verdict"] == "PASS"
+    assert " PASS " in club.render(root)
+    report_path = root / "daily" / f"{DAY}.json"
+    published = report_path.read_bytes()
+
+    mixed = event(2, reads=(TABLE, "fotmob_matches"), user=user, output=output,
+                  end="2026-03-02T00:59:59+01:00")
+    mixed["createTime"] = "2026-03-01T23:59:54Z"
+    with club.database(root) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        assert send(obj, mixed) == ("kept", 201)
+        assert obj.health()["kept_total"] == 1
+        raw_file, = (primary / "raw").glob("*.jsonl")
+        assert json.loads(raw_file.read_text())["query_id"] == mixed["metadata"]["queryId"]
+        assert query(root, "SELECT count(*) FROM events") == [(1,)]
+        assert query(root, "SELECT count(*) FROM gaps") == [(0,)]
+        assert report_path.read_bytes() == published
+        assert f" {verdict} " in club.render(root)
+        assert obj.clubelo_health()["ready"] is True
+        restarted = receiver.EventReceiver(primary, clubelo_root=root)
+        assert restarted.clubelo_health()["ready"] is True
+        assert f" {verdict} " in club.render(root)
+
+    report = club.aggregate(root, DAY, client)
+    assert report["verdict"] == verdict
+    assert report["incomplete"] == ["dropped_event"]
+    assert report["violations"] == (["airflow_table_use"] if output else [])
+    assert report["source_queries"] == 1
+    assert f" {verdict} " in club.render(root)
+    assert send(restarted, event(3)) == ("filtered", 201)
+    assert f" {verdict} " in club.render(root)  # Published query count is now stale.
+
+    # The same receiver can collect a healthy new day as soon as the lock clears.
+    assert send(obj, event(4, end=NOW.isoformat())) == ("filtered", 201)
+    assert obj.clubelo_health()["event_minutes"] == [int(NOW.timestamp())]
+    coverage(root, day=NOW.date())
+    clock(NOW + club.DAY)
+    assert club.aggregate(root, NOW.date(), monitor(tmp_path, {TABLE: 0}, day=NOW.date()))["verdict"] == "PASS"
+    assert " PASS " in club.render(root)
+
+
+def test_concurrent_unknown_losses_cover_retained_days_and_expire(tmp_path, clock):
+    root = tmp_path / "club"
+    obj = receiver.EventReceiver(tmp_path / "fm", clubelo_root=root)
+    received = NOW.date()
+    oldest = received - club.RETENTION * club.DAY
+    # Include the oldest retained completion and an independently provable
+    # violation on that day, alongside repeated bodies with no usable date.
+    completion = datetime.combine(oldest, datetime.min.time(), timezone.utc)
+    bad = event(4, user="airflow", output=TABLE, end=completion.isoformat())
+    with club.database(root) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            results = list(workers.map(obj.post, [b"INVALID", json.dumps(bad).encode()] * 4))
+        assert results == [("malformed", 201), ("filtered", 201)] * 4
+    assert obj.clubelo_health()["ready"] is True
+    names = {path.name for path, _, _ in club.loss_markers(root)}
+    assert names == {f"clubelo-loss-{received}.unknown_day", f"clubelo-loss-{oldest}.airflow_table_use"}
+    assert all((root / name).read_bytes() == b"" for name in names)
+    for offset in range(club.RETENTION + 1):
+        reasons = club.losses_for_day(root, received - offset * club.DAY)
+        assert "dropped_event" in reasons
+    assert not club.losses_for_day(root, oldest - club.DAY)
+    assert not club.losses_for_day(root, received + club.DAY)
+    report = club.aggregate(root, oldest, monitor(tmp_path, {TABLE: 0}, day=oldest))
+    assert report["violations"] == ["airflow_table_use"]
+    assert report["verdict"] == "VIOLATION" and "dropped_event" in report["incomplete"]
+
+    clock(NOW + club.RETENTION * club.DAY)
+    report = club.aggregate(root, received, monitor(tmp_path, {TABLE: 0}, day=received))
+    assert report["verdict"] == "INCOMPLETE" and "dropped_event" in report["incomplete"]
+    assert [path.name for path, _, _ in club.loss_markers(root)] == [f"clubelo-loss-{received}.unknown_day"]
+    clock(NOW + (club.RETENTION + 1) * club.DAY)
+    next_day = received + club.DAY
+    report = club.aggregate(root, next_day, monitor(tmp_path, {TABLE: 0}, day=next_day))
+    assert "dropped_event" not in report["incomplete"]
+    assert list(club.loss_markers(root)) == []
 
 
 def test_primary_http_progress_during_stalled_capture(tmp_path, monkeypatch, clock):

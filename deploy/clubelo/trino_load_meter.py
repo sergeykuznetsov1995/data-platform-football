@@ -39,6 +39,8 @@ LIMIT = 1440
 TABLE = re.compile(r"clubelo_[a-z0-9_]+", re.ASCII)
 QUERY_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,255}")
 ACTORS = ("source", "monitor", "airflow", "foreign", "unknown")
+LOSS_MARKER = re.compile(r"clubelo-loss-([0-9]{4}-[0-9]{2}-[0-9]{2})\."
+                         r"(unknown_day|dropped_event|airflow_table_use|non_source_output|input_record_limit)")
 PART = r'[a-z0-9_$]+'
 REFERENCE = re.compile(rf'(?<![a-z0-9_$.])(?:(from|join|using)\s+)?((?:{PART}\s*\.\s*){{0,2}}clubelo_[a-z0-9_$]+)(?![a-z0-9_$])')
 LITERALS = re.compile(r"'(?:''|[^'])*'|--[^\n]*|/\*.*?\*/", re.S)
@@ -106,6 +108,60 @@ def unknown_day(db, received):
     # The completion day of a dropped body is unknowable.
     for offset in range(RETENTION + 1):
         mark(db, received.date() - offset * DAY, "dropped_event")
+
+
+def record_loss(root, day, reasons):
+    # The empty directory entry is the evidence. Exclusive creation coalesces
+    # concurrent losses and never opens an existing target.
+    for reason in reasons:
+        path = Path(root) / f"clubelo-loss-{day.isoformat()}.{reason}"
+        try:
+            path.touch(mode=0o600, exist_ok=False)
+        except FileExistsError:
+            pass
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    # A prolonged writer lock can also prevent normal retention maintenance.
+    # Cleanup is retried on the next loss or ordinary prune.
+    try:
+        prune_losses(root, now_utc().date() - RETENTION * DAY)
+    except OSError:
+        pass
+
+
+def loss_markers(root):
+    for name in os.listdir(root):
+        match = LOSS_MARKER.fullmatch(name)
+        if match:
+            yield Path(root) / name, day_value(match[1]), match[2]
+
+
+def prune_losses(root, cutoff):
+    for path, marker_day, _ in loss_markers(root):
+        if marker_day < cutoff:
+            path.unlink(missing_ok=True)
+
+
+def losses_for_day(root, day):
+    reasons = set()
+    for _, marker_day, reason in loss_markers(root):
+        if reason == "unknown_day":
+            if 0 <= (marker_day - day).days <= RETENTION:
+                reasons.add("dropped_event")
+        elif marker_day == day:
+            reasons.add("dropped_event")
+            reasons.add(reason)
+    return reasons
+
+
+def include_losses(report, losses):
+    if losses:
+        report["incomplete"] = sorted(set(report["incomplete"]) | {"dropped_event"})
+        report["violations"] = sorted(set(report["violations"]) | (losses - {"dropped_event"}))
+        report["verdict"] = "VIOLATION" if report["violations"] else "INCOMPLETE"
 
 
 def event_violations(facts):
@@ -216,7 +272,10 @@ def initialize(root):
                 CREATE TABLE IF NOT EXISTS reports(day TEXT PRIMARY KEY, revision TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS inventory(name TEXT PRIMARY KEY, first_day TEXT NOT NULL);
         """)
-        db.execute("INSERT OR IGNORE INTO store VALUES (1,?)", (uuid.uuid4().hex,))
+        # A restarting receiver can attach to an initialized store while
+        # another connection holds its writer reservation.
+        if db.execute("SELECT 1 FROM store WHERE id=1").fetchone() is None:
+            db.execute("INSERT OR IGNORE INTO store VALUES (1,?)", (uuid.uuid4().hex,))
         return identity(db)
 
 
@@ -291,8 +350,12 @@ class Sink:
                 self._minutes.add(stamp)
 
     def gap(self, received_at):
-        with database(self.root, timeout=RECEIVE_DB_TIMEOUT) as db:
-            unknown_day(db, timestamp(received_at))
+        received = timestamp(received_at)
+        try:
+            with database(self.root, timeout=RECEIVE_DB_TIMEOUT) as db:
+                unknown_day(db, received)
+        except sqlite3.Error:
+            record_loss(self.root, received.date(), ("unknown_day",))
 
     def capture(self, event, received_at):
         if event is None:
@@ -309,6 +372,13 @@ class Sink:
         if facts is None:
             self._observe(event, received, end, facts)
             return
+        try:
+            self._store_event(event, received, end, facts)
+        except sqlite3.Error:
+            record_loss(self.root, day, event_violations(facts) or {"dropped_event"})
+
+    def _store_event(self, event, received, end, facts):
+        day = end.date()
         meta = event.get("metadata")
         query_id = meta.get("queryId") if isinstance(meta, dict) else None
         with database(self.root, timeout=RECEIVE_DB_TIMEOUT) as db:
@@ -384,6 +454,7 @@ def prune(root, db, today):
     for table in ("events", "gaps", "reports"):
         db.execute(f"DELETE FROM {table} WHERE day < ?", (cutoff.isoformat(),))
     db.execute("DELETE FROM minutes WHERE start < ?", (midnight(cutoff),))
+    prune_losses(root, cutoff)
     for path in (Path(root) / "daily").glob("????-??-??.json"):
         if path.stem < cutoff.isoformat():
             path.unlink(missing_ok=True)
@@ -574,6 +645,7 @@ def aggregate(root, day, client):
         prune(root, db, today)
         remember(db, names, day)
         report = summarize(db, day, evidence)
+        include_losses(report, losses_for_day(root, day))
         report.update(store=identity(db), revision=revision, generated_at=now_utc().isoformat(), snapshot_evidence=evidence)
         write_report(root, day, report)
     return report
@@ -606,8 +678,18 @@ def render(root, requested=None):
             if db.execute("SELECT revision FROM reports WHERE day=?", (day.isoformat(),)).fetchone() != (report["revision"],):
                 raise ValueError("report revision")
             expected = summarize(db, day, evidence)
+        # A new marker can postdate this revision. Apply the same durable
+        # evidence to both views before checking the other published metrics.
+        losses = losses_for_day(root, day)
+        include_losses(expected, losses)
+        include_losses(report, losses)
         if (any(report[k] != v for k, v in expected.items())
                 or evidence["counts"].keys() - expected["tables"].keys()):
+            # Even a stale snapshot report cannot invalidate a violation
+            # independently established by the listener or its loss markers.
+            proven = set(expected["violations"]) - {"snapshot_limit"}
+            if losses and proven:
+                return f"{prefix} VIOLATION {min(proven)} minutes={expected['covered_minutes']}"
             raise ValueError("stale report")
         if expected["verdict"] == "PASS":
             scans = sum(t["input_records_total"] for t in expected["tables"].values())
