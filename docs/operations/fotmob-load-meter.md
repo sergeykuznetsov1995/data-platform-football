@@ -328,10 +328,9 @@ statement учитывается консервативно; несоответ�
 `platform_ops_total` и `unknown_ops_total` — суммы операций, а не уникальных
 query_id: один запрос с commit и scan даёт две операции.
 
-Чужая нагрузка сохраняется отдельными рядами и блоками. Из src_fotmob ничего
-не вычитается. При ней `foreign_load=true`, N5 формально FAIL и добавляется
-пометка «вопрос засчитывания — решение владельца». Модуль такого решения
-самостоятельно не принимает.
+Все измеренные операции platform и unknown сохраняются в отдельных рядах.
+При любой такой активности `foreign_load=true`. N5 учитывает каждую операцию
+unknown и каждую операцию platform без подтверждённой квитанции из §5.3.
 
 ### 5.3. Нормы и ежедневная сверка вместо К4
 
@@ -341,12 +340,63 @@ query_id: один запрос с commit и scan даёт две операци
 | N2 | polls(manifest/journal table, any minute) ≤ 1 |
 | N3 | commits(table, UTC-day) ≤ 1440 |
 | N4 | scans(table, UTC-day) ≤ 1440; scans = scan_read + scan_write |
-| N5 | Все измеренные запросы к fotmob-таблицам от user=src_fotmob; любая platform/unknown операция нарушает норму |
+| N5 | Число блокирующих операций равно нулю. Считаются все unknown и все platform за вычетом подтверждённого обслуживания |
 
 Poll-eligible только `iceberg.bronze.fotmob_ingest_manifest` и
 `iceberg.bronze.fotmob_squad_snapshots`. Ровно 1 в минуту и ровно 1440 за
 сутки допустимы. `evidence` указывает худшую таблицу и минуту для пиков;
 при равенстве выбор детерминирован.
+
+Для вычета по N5 оператор ведёт отдельный реестр
+`<root>/maintenance-receipts/YYYY-MM-DD.json`. Допустимы только
+`compaction`, `janitor` и `morning_report`. Для каждого запроса оператор
+сверяет запись конкретного запуска производителя с оригиналом отправленного
+SQL и полученным производителем Trino query ID. В реестр переносятся этот ID,
+UTC-день завершения, пользователь, ссылка на исходную запись запуска,
+SHA-256 исходного SQL в UTF-8 (включая пробелы и комментарии) и полный набор
+пар «каноническая таблица FotMob, операция». Допустимые операции —
+`commit`, `scan_write`, `scan_read`.
+
+Шаблон файла для одного запроса (значение хеша требуется заменить):
+
+```json
+{
+  "day_utc": "2026-11-01",
+  "receipts": [{
+    "day_utc": "2026-11-01",
+    "job": "morning_report",
+    "evidence_ref": "producer-runs/report-17/statement-2",
+    "query_id": "20261101_060000_00017_example",
+    "user": "airflow",
+    "sql_sha256": "<64 строчные шестнадцатеричные цифры>",
+    "operations": [["iceberg.bronze.fotmob_matches", "scan_read"]]
+  }]
+}
+```
+
+Каталог доступен на запись только доверенному оператору или производителю
+доказательств. Оператор публикует проверенный файл атомарной заменой.
+Запрещено составлять реестр из raw, событий Trino или суточного отчёта.
+Метка `source`, имя DAG, расписание, совпадение времени и одинаковый SQL
+не доказывают происхождение. Этот комплект не устанавливает выпуск квитанций
+у производителей. Пока нет независимо записанных ID и ссылок, вычет равен нулю.
+
+Обычный `aggregate --root ROOT --day YYYY-MM-DD` сам читает реестр, в том
+числе при `--offline`. Затем `verdict` и `line` с теми же root и днём
+пересчитывают вычеты из сохранённой суточной записи. После исправления
+реестра нужно повторить `aggregate`. Без файла и для старых отчётов N5
+равна исходной сумме platform и unknown. При наличии файла каждая квитанция
+должна однозначно покрывать один завершённый запрос платформы целиком.
+Ошибка формата, повтор ID, конфликт снимков или несовпадение с наблюдением
+отклоняет весь реестр. День получает причину `maintenance_evidence_invalid`.
+
+Например, два запроса `airflow` с одинаковым SELECT и разными ID дают две
+операции чтения. Квитанция на первый оставляет одну блокирующую операцию.
+`platform_ops_total`, `unknown_ops_total`, таблицы по атрибуциям и
+`foreign_load` сохраняют всю измеренную нагрузку. В `maintenance_evidence`
+остаются реестр и наблюдения с атрибуцией, отпечатком и операциями,
+в `maintenance_deductions` — вычтенные пары по ID. Сверка S7 учитывает
+также все подтверждённые коммиты обслуживания.
 
 Внутри обычного суточного `aggregate` после разбора сырых данных:
 
@@ -366,7 +416,7 @@ Poll-eligible только `iceberg.bronze.fotmob_ingest_manifest` и
 Итоговый PASS требует одновременно N1–N5, 1440 покрытых минут без gaps,
 `unparsed_fotmob=false`, `n5_measurable=true`, полной успешной сверки коммитов.
 Причины: N1…N5, `gap`, `unparsed_fotmob`, `n5_unmeasurable`,
-`commit_check_missing`, `commit_mismatch`. Неизвестный SQL без имени
+`commit_check_missing`, `commit_mismatch`, `maintenance_evidence_invalid`. Неизвестный SQL без имени
 discovered-таблицы увеличивает счётчик, но сам по себе PASS не блокирует.
 
 Для одной таблицы 1441 commit за 1440 минут математически требует хотя бы
@@ -494,13 +544,22 @@ CRON_TZ=UTC
 серия не стартовала. Ведущий сохраняет отдельную приёмку и передаёт её
 по действующей процедуре; этот модуль сам журнал приёмки не меняет.
 
+Для каждого из трёх последовательных полных UTC-дней ведущий прикладывает
+суточный технический PASS и отдельные эксплуатационные доказательства штатной
+нагрузки FotMob. На дату дня нужны ссылки на фактические запуски и их
+результаты (например, run ID штатного инкремента и соответствующую запись
+manifest). Ведущий сопоставляет эти факты с действующим режимом инкремента,
+history и C1. Один технический PASS возможен и в пустые сутки.
+Числового минимума для подтверждения штатной нагрузки нет. Совпадение окон
+запусков, продвижение history и успешность C1 не входят в расчёт N1–N5.
+
 ## 8. Строка сводки, сроки и fallback
 
 `line` сохраняет фиксированный порядок ключей, включая плохие дни:
 
 ```text
 Trino fotmob: day=2026-11-01 verdict=PASS coverage=1440/1440 tables=2 user=src_fotmob commits_day_max=720 scans_day_max=1020 peak_commit_min=1 peak_poll_min=1 platform_ops=0 unknown_ops=0 unparsed=0 gaps=0
-Trino fotmob: day=2026-11-01 verdict=FAIL(N1,N5) coverage=1440/1440 tables=2 user=src_fotmob commits_day_max=720 scans_day_max=1020 peak_commit_min=2 peak_poll_min=1 platform_ops=1 unknown_ops=0 unparsed=0 gaps=0
+Trino fotmob: day=2026-11-01 verdict=FAIL(N1,N5) coverage=1440/1440 tables=2 user=src_fotmob commits_day_max=720 scans_day_max=1020 peak_commit_min=2 peak_poll_min=1 platform_ops=2 unknown_ops=0 allowed_platform_ops=1 blocking_ops=1 unparsed=0 gaps=0
 Trino fotmob: day=2026-11-01 verdict=NOT_PASS(gap) coverage=1410/1440 tables=2 user=src_fotmob commits_day_max=0 scans_day_max=0 peak_commit_min=0 peak_poll_min=0 platform_ops=0 unknown_ops=0 unparsed=0 gaps=1(producer_down:02:10-02:40)
 ```
 
@@ -534,7 +593,7 @@ Trino fotmob: day=2026-11-01 verdict=NOT_PASS(gap) coverage=1410/1440 tables=2 u
 | S7 недоступен или snapshots успели expire | `commit_check_missing` / mismatch | День не PASS; обеспечить доступ и сохранность metadata-истории на время дневной сверки |
 | SQL вне P0–P4 | unparsed counters | Имя discovered-таблицы блокирует PASS; расширение грамматики отдельным PR |
 | События сервера ротируются раньше 36 часов | К5 платформы | Скопировать до ротации; иначе вариант (b) не доказан |
-| Регулярная platform-компакция (#1892) | platform_activity, N5 | foreign_load; вопрос засчитывания решает владелец, без вычитания |
+| Регулярная platform-компакция (#1892) | platform_activity, N5 | Сохраняется в platform_activity; для зачёта нужна отдельная квитанция на каждый запрос |
 | Часы/расписание не UTC | К0 и проверка cron платформой | Границы producer по часам Trino в UTC, raw без явного UTC отвергать |
 | Новая/переименованная таблица | S2 каждый poll | Динамический discovery; poll-eligible меняется только PR |
 | Потеря raw/heartbeat, диск, сбой producer | Карта покрытия | producer_down; восстановление не ретуширует исторический gap |

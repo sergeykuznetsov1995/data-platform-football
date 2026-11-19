@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,8 @@ ATTRIBUTIONS = (SOURCE_USER, "platform", "unknown")
 WRITE_TYPES = frozenset({"insert", "merge", "update", "delete", "ctas", "alter_write"})
 TABLE_NAME_RE = re.compile(r"fotmob_[a-z0-9_]+\Z")
 QUERY_ID_RE = re.compile(r"[A-Za-z0-9_]+\Z")
+MAINTENANCE_JOBS = ("compaction", "janitor", "morning_report")
+OPERATION_FIELDS = {"commit": "commits", "scan_read": "scan_reads", "scan_write": "scan_writes"}
 
 S1_SQL = '''SELECT query_id, "user", source, query, state, created, started,
        "end" AS ended, error_code
@@ -505,7 +508,45 @@ def _coverage(heartbeats: Sequence[Mapping[str, Any]], start: datetime, end: dat
     return reasons, relevant
 
 
-def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_counts: Mapping[str, int] | None = None, generated_at: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _operation_pairs(value: Any) -> set[tuple[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("invalid_operations")
+    pairs = set()
+    for item in value:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError("invalid_operations")
+        table, op = item
+        if (not isinstance(table, str) or table != table.lower() or not is_fotmob_io_table(table)
+                or not isinstance(op, str) or op not in OPERATION_FIELDS or (table, op) in pairs):
+            raise ValueError("invalid_operations")
+        pairs.add((table, op))
+    return pairs
+
+
+def _receipt_index(registry: Any, day: str) -> dict[str, dict[str, Any]]:
+    if (not isinstance(registry, dict) or set(registry) != {"day_utc", "receipts"}
+            or registry["day_utc"] != day or not isinstance(registry["receipts"], list)):
+        raise ValueError("invalid_registry")
+    receipts = {}
+    fields = {"day_utc", "job", "evidence_ref", "query_id", "user", "sql_sha256", "operations"}
+    for receipt in registry["receipts"]:
+        if not isinstance(receipt, dict) or set(receipt) != fields:
+            raise ValueError("invalid_receipt")
+        query_id = receipt["query_id"]
+        if (receipt["day_utc"] != day or receipt["job"] not in MAINTENANCE_JOBS
+                or not isinstance(receipt["evidence_ref"], str) or not receipt["evidence_ref"].strip()
+                or not isinstance(query_id, str) or not QUERY_ID_RE.fullmatch(query_id)
+                or not isinstance(receipt["user"], str) or receipt["user"] not in PLATFORM_USERS
+                or not isinstance(receipt["sql_sha256"], str) or not re.fullmatch("[0-9a-f]{64}", receipt["sql_sha256"])):
+            raise ValueError("invalid_receipt")
+        if query_id in receipts:
+            raise ValueError("duplicate_receipt")
+        _operation_pairs(receipt["operations"])
+        receipts[query_id] = receipt
+    return receipts
+
+
+def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_counts: Mapping[str, int] | None = None, generated_at: str | None = None, maintenance_registry: Any = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Pure snapshot → minute → day pipeline. Missing S7 evidence blocks PASS."""
     start, end = day_bounds(day)
     seen: dict[str, Mapping[str, Any]] = {}
@@ -536,6 +577,7 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
     evidence: dict[tuple[str, str, str, str], set[str]] = {}
     unparsed_queries = 0
     unparsed_fotmob = False
+    observed = {}
     for query_id, record in seen.items():
         instant = _query_time(record)
         if not start <= instant < end:
@@ -545,6 +587,14 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
         snapshots = [record, *repeat_records.get(query_id, [])]
         operations, user_attr, uncertain = _query_work(snapshots, parsed, tables)
         unparsed_fotmob |= uncertain
+        if maintenance_registry is not None and operations and user_attr != SOURCE_USER:
+            observed[query_id] = {
+                "user": record.get("user"), "source": record.get("source"), "user_attr": user_attr,
+                "ended": record.get("ended"), "state": record.get("state"), "error_code": record.get("error_code"),
+                "stmt_type": None if uncertain or parsed.unparsed else parsed.stmt_type,
+                "sql_sha256": hashlib.sha256(record["query"].encode("utf-8")).hexdigest(),
+                "operations": [list(pair) for pair in sorted(operations)],
+            }
         for (table, operation), polls in operations.items():
             key = (minute_utc(instant), table, user_attr, operation)
             counts[key] += 1
@@ -609,15 +659,64 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
         "commit_check_complete": all(row["match"] is not None for row in checks),
         "commit_mismatch": any(row["match"] is False for row in checks),
     }
+    if maintenance_registry is not None:
+        report["maintenance_evidence"] = {"observed": observed, "registry": maintenance_registry}
+        try:
+            _receipt_index(maintenance_registry, day)
+        except ValueError as exc:
+            # Do not copy unrecognised fields (possibly SQL) into the day artifact.
+            report["maintenance_evidence"] = {"observed": observed, "registry_error": str(exc)}
     return minute_rows, evaluate_day(report)
+
+
+def _maintenance_deductions(report: Mapping[str, Any], raw: Counter) -> dict[str, list[list[str]]]:
+    evidence = report["maintenance_evidence"]
+    if not isinstance(evidence, dict):
+        raise ValueError("invalid_maintenance_evidence")
+    receipts = _receipt_index(evidence.get("registry"), report["day_utc"])
+    observed = evidence.get("observed")
+    conflicts = report.get("conflicting_query_ids")
+    if not isinstance(observed, dict) or not isinstance(conflicts, list):
+        raise ValueError("invalid_observations")
+    census: Counter = Counter()
+    deductions = {}
+    for query_id, query in observed.items():
+        if not isinstance(query, dict) or query.get("user_attr") not in ("platform", "unknown"):
+            raise ValueError("invalid_observation")
+        pairs = _operation_pairs(query.get("operations"))
+        census.update((query["user_attr"], table, op) for table, op in pairs)
+        receipt = receipts.get(query_id)
+        if receipt is None:
+            continue
+        ended = query.get("ended")
+        if (query["user_attr"] != "platform" or query.get("user") != receipt["user"]
+                or query_id in conflicts or query.get("state") != "FINISHED"
+                or query.get("error_code") is not None or not isinstance(ended, str)
+                or utc_datetime(ended).date().isoformat() != receipt["day_utc"]
+                or query.get("stmt_type") not in (*WRITE_TYPES, "read", "read_exec")
+                or query.get("sql_sha256") != receipt["sql_sha256"]
+                or pairs != _operation_pairs(receipt["operations"])):
+            raise ValueError("receipt_query_mismatch")
+        deductions[query_id] = query["operations"]
+    if receipts.keys() != deductions.keys():
+        raise ValueError("unobserved_receipt")
+    if census != raw:
+        raise ValueError("observation_counts_mismatch")
+    return deductions
 
 
 def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(dict(report))
     # Re-derive totals and reconciliation flags on every verdict invocation.
     # A stale summary flag must never hide a foreign row or an S7 discrepancy.
+    raw: Counter = Counter()
     for attr in ("platform", "unknown"):
         rows = [row for row in result["tables"] if row["user_attr"] == attr]
+        for row in rows:
+            row["scans_total"] = row["scan_reads"] + row["scan_writes"]
+            for op, field in OPERATION_FIELDS.items():
+                if row[field]:
+                    raw[attr, row["table"], op] += row[field]
         result[f"{attr}_activity"] = rows
         result[f"{attr}_ops_total"] = sum(row["commits"] + row["scans_total"] for row in rows)
     sql_commits: Counter[str] = Counter()
@@ -652,15 +751,35 @@ def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
         value = worst[field] if worst else 0
         proof = result.get("peak_evidence", {}).get(norm) if norm in {"N1", "N2"} else (worst["table"] if worst and value else None)
         verdicts[norm] = {"pass": value <= threshold, "value": value, "threshold": label, "evidence": proof}
-    foreign_rows = [row for row in result["tables"] if row["user_attr"] != SOURCE_USER and row["commits"] + row["scans_total"] > 0]
     foreign = result["platform_ops_total"] + result["unknown_ops_total"]
-    verdicts["N5"] = {"pass": foreign == 0, "value": foreign, "threshold": "foreign_ops==0", "evidence": sorted(row["table"] for row in foreign_rows)[0] if foreign_rows else None}
+    blocking = raw.copy()
+    result.pop("maintenance_error", None)
+    deductions = {}
+    if "maintenance_evidence" in result:
+        try:
+            deductions = _maintenance_deductions(result, raw)
+        except ValueError as exc:
+            result["maintenance_error"] = str(exc)
+    for operations in deductions.values():
+        blocking.subtract(("platform", table, op) for table, op in operations)
+    result["maintenance_deductions"] = deductions
+    result["blocking_ops_total"] = sum(blocking.values())
+    result["allowed_platform_ops_total"] = foreign - result["blocking_ops_total"]
+    verdicts["N5"] = {
+        "pass": result["blocking_ops_total"] == 0, "value": result["blocking_ops_total"],
+        "threshold": "blocking_ops==0" if "maintenance_evidence" in result else "foreign_ops==0",
+        "evidence": min((table for (_, table, _), count in blocking.items() if count), default=None),
+    }
     result["foreign_load"] = foreign > 0
-    if foreign:
-        result["foreign_load_note"] = "вопрос засчитывания — решение владельца"
+    if foreign and "maintenance_evidence" in result:
+        result["foreign_load_note"] = "Счётчики platform и unknown показывают все операции, включая подтверждённое обслуживание."
+    elif foreign:
+        result["foreign_load_note"] = "Без реестра квитанций все операции platform и unknown блокируют N5."
     else:
         result.pop("foreign_load_note", None)
     reasons = [norm for norm, verdict in verdicts.items() if not verdict["pass"]]
+    if "maintenance_error" in result:
+        reasons.append("maintenance_evidence_invalid")
     full = result["coverage_minutes_total"] == 1440 and not result["gap_intervals_total"] and result["completeness"] == "full"
     full = full and all(row["coverage_minutes"] == 1440 and not row["gap_intervals"] and row["completeness"] == "full" for row in result["tables"])
     if not full:
@@ -679,6 +798,7 @@ def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def summary_line(report: Mapping[str, Any]) -> str:
+    report = evaluate_day(report)
     reasons = report["pass_reasons"]
     verdict = "PASS" if report["pass"] else ("FAIL" if any(reason in {"N1", "N2", "N3", "N4", "N5"} for reason in reasons) else "NOT_PASS") + "(" + ",".join(reasons) + ")"
     gaps = report["gap_intervals_total"]
@@ -690,12 +810,14 @@ def summary_line(report: Mapping[str, Any]) -> str:
             descriptions.append(f"{gap['reason']}:{gap['start'][11:16]}-{ending}")
         gap_text += "(" + ",".join(descriptions) + ")"
     norms = report["verdicts"]
+    split = (f"allowed_platform_ops={report['allowed_platform_ops_total']} blocking_ops={report['blocking_ops_total']} "
+             if report["foreign_load"] or "maintenance_evidence" in report else "")
     return (f"Trino fotmob: day={report['day_utc']} verdict={verdict} "
             f"coverage={report['coverage_minutes_total']}/1440 tables={len(report['discovered_tables'])} user=src_fotmob "
             f"commits_day_max={norms['N3']['value']} scans_day_max={norms['N4']['value']} "
             f"peak_commit_min={norms['N1']['value']} peak_poll_min={norms['N2']['value']} "
             f"platform_ops={report['platform_ops_total']} unknown_ops={report['unknown_ops_total']} "
-            f"unparsed={report['unparsed_queries']} gaps={gap_text}")
+            f"{split}unparsed={report['unparsed_queries']} gaps={gap_text}")
 
 
 def json_text(value: Any) -> str:
@@ -781,6 +903,23 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("expected a JSON object")
     return result
+
+
+def _load_maintenance_registry(path: Path) -> Any:
+    def unique_keys(items: list) -> dict:
+        obj = dict(items)
+        if len(obj) != len(items):
+            raise ValueError("duplicate registry key")
+        return obj
+
+    try:
+        with path.open(encoding="utf-8") as source:
+            registry = json.load(source, object_pairs_hook=unique_keys)
+        return registry if isinstance(registry, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, RecursionError):
+        return {}  # Present but unusable. Aggregate publishes the diagnostic day.
 
 
 def _rotate(root: Path, now: datetime) -> None:
@@ -1035,7 +1174,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reconciliation = poll(args.root, snapshot_day=args.day, snapshot_tables=write_tables)
                 except Exception as exc:
                     reconciliation = {"counts": {}, "error_type": type(exc).__name__}
-            minute_rows, report = aggregate_day(records, args.day, snapshot_counts=reconciliation["counts"], generated_at=args.generated_at)
+            registry = _load_maintenance_registry(args.root / "maintenance-receipts" / f"{args.day}.json")
+            minute_rows, report = aggregate_day(records, args.day, snapshot_counts=reconciliation["counts"],
+                                               generated_at=args.generated_at, maintenance_registry=registry)
             report["commit_check_evidence"] = {key: value for key, value in reconciliation.items() if key != "counts"}
             _atomic_write(args.root / "minute" / f"{args.day}.jsonl", "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n" for row in minute_rows))
             _atomic_write(day_path, json_text(report))
@@ -1043,10 +1184,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # A measured failure is a successfully produced artifact. This lets
             # cron's aggregate && verdict && line also publish NOT_PASS days.
             return 0
-        report = evaluate_day(_load_json(day_path))
+        report = _load_json(day_path)
         if report["day_utc"] != args.day:
             raise ValueError("day artifact does not match requested day")
         if args.command == "verdict":
+            report = evaluate_day(report)
             _atomic_write(verdict_path, json_text(report))
             print(json_text(report), end="")
         else:
