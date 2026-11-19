@@ -299,17 +299,17 @@ def test_hosted_ci_preflights_the_same_pinned_tls_library():
 
     install_step = "- name: Install test runtime"
     preflight_step = "- name: Preflight pinned TLS library"
-    full_suite_step = "- name: Full unit suite"
+    tests_step = "- name: Affected unit tests"
     assert install_step in workflow
     assert preflight_step in workflow
-    assert full_suite_step in workflow
+    assert tests_step in workflow
     assert (
         workflow.index(install_step)
         < workflow.index(preflight_step)
-        < workflow.index(full_suite_step)
+        < workflow.index(tests_step)
     )
 
-    preflight = workflow.split(preflight_step, 1)[1].split(full_suite_step, 1)[0]
+    preflight = workflow.split(preflight_step, 1)[1].split(tests_step, 1)[0]
 
     official_url = (
         "https://github.com/bogdanfinn/tls-client/releases/download/"
