@@ -35,6 +35,7 @@ import pyarrow as pa
 
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
+from scrapers.whoscored.trino import WhoScoredTrinoManager, WhoScoredWriter
 from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
 from scrapers.whoscored.parsers import (
@@ -1740,7 +1741,7 @@ class WhoScoredRepository:
         catalog: str = "iceberg",
         schema: str = "bronze",
     ) -> None:
-        self.writer = writer or IcebergWriter(catalog=catalog)
+        self.writer = writer or WhoScoredWriter(catalog=catalog)
         self.trino = trino or self.writer._get_trino_manager()
         # An injected Trino manager must also back writes.  Otherwise the
         # writer lazily opens a second connection using environment defaults.
@@ -3331,7 +3332,12 @@ class WhoScoredRepository:
         )
         return [int(row[0]) for row in rows]
 
-    def record_profile_failure(
+    def record_profile_failure(self, **failure) -> Optional[str]:
+        row, outcome = self.build_profile_failure_row(**failure)
+        self.write_profile_failure_rows([row])
+        return outcome
+
+    def build_profile_failure_row(
         self,
         *,
         player_id: int,
@@ -3348,8 +3354,8 @@ class WhoScoredRepository:
         raw_uri: Optional[str] = None,
         attempt_no: int = 1,
         availability_version: str = MATCH_AVAILABILITY_VERSION,
-    ) -> Optional[str]:
-        """Persist a failed profile attempt in the current manifest schema."""
+    ) -> tuple[dict[str, Any], Optional[str]]:
+        """Validate and build one failed attempt before the batch is published."""
         if state not in {
             "retryable",
             "terminal",
@@ -3405,14 +3411,18 @@ class WhoScoredRepository:
             "_profile_batch_id": outcome_batch_id,
             "_entity_type": "profile_manifest",
         }
+        return row, outcome_batch_id
+
+    def write_profile_failure_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
         self.writer.write_dataframe(
-            pd.DataFrame([row]),
+            pd.DataFrame(rows).astype({"http_status": "Int64"}),
             database=self.schema,
             table=PROFILE_MANIFEST_TABLE,
             partition_spec=[("player_id", "bucket(32)")],
             source="whoscored",
         )
-        return outcome_batch_id
 
     def record_event_type_dictionary(
         self,
@@ -4332,79 +4342,85 @@ class WhoScoredRepository:
         """
         prefix = f"{self.catalog}.{self.schema}"
         # A stage with a single played game is resolved by one negative.
-        rows = self.trino.execute_query(f"""
-            WITH schedule AS (
-                SELECT * FROM (
-                    SELECT *, ROW_NUMBER() OVER (
-                        PARTITION BY league, season, game_id ORDER BY _ingested_at DESC
-                    ) AS rn FROM {prefix}.whoscored_schedule_current
-                ) WHERE rn = 1
-            ), na AS (
-                SELECT league, season, game_id, COUNT(*) AS n
-                FROM {self._manifest} WHERE state = 'not_available'
-                GROUP BY league, season, game_id
-            ), stages AS (
-                SELECT s.league, s.season, s.stage_id,
-                       COUNT_IF(s.status = 6 AND s.is_lineup_confirmed = TRUE AND (
-                           s.date < CAST(
-                               CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP
-                           )
-                       )) AS historical_games,
-                       COUNT_IF(s.status = 6 AND COALESCE(s.is_lineup_confirmed, FALSE) = FALSE
-                           AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)
-                           AND s.date > CAST(CURRENT_TIMESTAMP - INTERVAL '30' DAY AS TIMESTAMP)) AS deferred_games,
-                       COUNT_IF(COALESCE(m.state, '') = 'success') AS successes,
-                       COUNT_IF(COALESCE(m.state, '') = 'not_available' AND s.is_lineup_confirmed = TRUE) AS absent,
-                       CASE WHEN COUNT_IF(s.status = 6 AND s.is_lineup_confirmed = TRUE) <= 1
-                            THEN 1 ELSE 2 END AS absent_needed
-                FROM schedule s
-                LEFT JOIN {prefix}.whoscored_match_ingest_latest m
-                  ON (m.league, m.season, m.game_id) = (s.league, s.season, s.game_id)
-                GROUP BY s.league, s.season, s.stage_id
+        sql = f"""
+            WITH publications AS (
+                SELECT league, season, batch_id, dataset_states_json,
+                       {_scope_published_table_sql('whoscored_schedule')} AS publishes_schedule,
+                       ROW_NUMBER() OVER (PARTITION BY league, season, entity_group
+                           ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC) AS group_rank,
+                       ROW_NUMBER() OVER (PARTITION BY league, season
+                           ORDER BY CASE WHEN {_scope_published_table_sql('whoscored_schedule')}
+                                         THEN 0 ELSE 1 END,
+                                    completed_at DESC, _ingested_at DESC, batch_id DESC) AS schedule_rank
+                FROM {self._scope_manifest} WHERE state = 'success'
+            ), scopes AS (
+                SELECT league, season, ARRAY_AGG(batch_id) FILTER (WHERE group_rank = 1) AS visible_batches,
+                       MAX(CASE WHEN schedule_rank = 1 THEN
+                           json_format(json_extract(dataset_states_json, '$.__checked_stage_ids__'))
+                       END) AS checked
+                FROM publications GROUP BY league, season HAVING COUNT_IF(publishes_schedule) > 0
+            ), schedule AS (
+                -- Only scopes with a publication enter coverage. The legacy fallback
+                -- of schedule_current applies exclusively to scopes without one.
+                SELECT s.league, s.season, s.checked, d.game_id, d.date, d.status,
+                       d.is_lineup_confirmed, d.stage_id,
+                       ROW_NUMBER() OVER (PARTITION BY s.league, s.season, d.game_id
+                                          ORDER BY d._ingested_at DESC) AS rn
+                FROM scopes s LEFT JOIN {prefix}.whoscored_schedule d
+                  ON s.league = d.league AND s.season = d.season
+                 AND CONTAINS(s.visible_batches, d._scope_batch_id)
+            ), attempts AS (
+                SELECT league, season, game_id, state, batch_id, raw_uri, payload_sha256,
+                       COALESCE(completed_at, fetched_at) AS closed_at,
+                       COUNT_IF(state = 'not_available') OVER (PARTITION BY league, season, game_id) AS negatives,
+                       ROW_NUMBER() OVER (PARTITION BY league, season, game_id
+                           ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
+                                    batch_id DESC, _batch_id DESC) AS rn
+                FROM {self._manifest}
             ), games AS (
-                SELECT s.*,
-                       (st.successes > 0 OR st.absent < st.absent_needed) AS closeable,
-                       -- A success with stored bytes is covered whatever its
-                       -- parser version: a reparse is a candidate, not a gap.
-                       (m.state = 'success' AND m.batch_id LIKE 'ws2-%'
-                        AND m.raw_uri IS NOT NULL
-                        AND m.payload_sha256 IS NOT NULL) AS success,
-                       (m.state = 'not_available' AND na.n >= 2
-                        AND st.successes > 0) AS final_absent,
-                       COALESCE(m.completed_at, m.fetched_at) AS closed_at
-                FROM schedule s
-                JOIN stages st ON st.league = s.league AND st.season = s.season
-                  AND st.stage_id IS NOT DISTINCT FROM s.stage_id
-                LEFT JOIN {prefix}.whoscored_match_ingest_latest m
-                  ON (m.league, m.season, m.game_id) = (s.league, s.season, s.game_id)
-                LEFT JOIN na ON (na.league, na.season, na.game_id) = (s.league, s.season, s.game_id)
-                WHERE s.status = 6 AND s.is_lineup_confirmed = TRUE
-                  AND s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP)
-            ), stage_counts AS (
-                SELECT league, season,
-                       COUNT_IF(successes = 0 AND absent < absent_needed AND historical_games > 0) AS unknown_stages,
-                       COUNT_IF(deferred_games > 0) AS deferred_stages,
-                       ARRAY_AGG(stage_id) AS stage_ids
-                FROM stages GROUP BY league, season
-            ), counts AS (
-                SELECT league, season, COUNT_IF(closeable) AS closeable,
-                       COUNT_IF(closeable AND (success OR final_absent)) AS closed,
-                       COUNT_IF(closeable AND (success OR final_absent) AND
-                           closed_at >= CAST(CURRENT_TIMESTAMP - INTERVAL '1' DAY AS TIMESTAMP)) AS closed_day
-                FROM games GROUP BY league, season
-            ), schedules AS (
-                SELECT league, season FROM {self._scope_manifest}
-                WHERE state = 'success' AND {_scope_published_table_sql('whoscored_schedule')}
-                GROUP BY league, season
+                SELECT s.*, COALESCE(m.state, '') AS state, COALESCE(m.negatives, 0) AS negatives, m.closed_at,
+                       COALESCE(s.status = 6 AND s.is_lineup_confirmed, FALSE) AS confirmed,
+                       COALESCE(s.date < CAST(CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP), FALSE) AS past_week,
+                       s.date > CAST(CURRENT_TIMESTAMP - INTERVAL '30' DAY AS TIMESTAMP) AS recent,
+                       COALESCE(m.state, '') = 'success' AND m.batch_id LIKE 'ws2-%' AND m.raw_uri IS NOT NULL
+                           AND m.payload_sha256 IS NOT NULL AS covered
+                FROM schedule s LEFT JOIN attempts m ON m.rn = 1 AND
+                    (s.league, s.season, s.game_id) = (m.league, m.season, m.game_id)
+                WHERE s.rn = 1
+            ), stages AS (
+                SELECT league, season, stage_id, MAX(checked) AS checked,
+                       COUNT_IF(confirmed AND past_week) AS historical_games,
+                       COUNT_IF(COALESCE(status = 6, FALSE) AND NOT COALESCE(is_lineup_confirmed, FALSE)
+                                AND past_week AND recent) AS deferred_games,
+                       COUNT_IF(state = 'success') AS successes,
+                       COUNT_IF(state = 'not_available' AND is_lineup_confirmed) AS absent,
+                       CASE WHEN COUNT_IF(confirmed) <= 1 THEN 1 ELSE 2 END AS absent_needed,
+                       COUNT_IF(confirmed AND past_week AND covered) AS covered_games,
+                       COUNT_IF(confirmed AND past_week AND state = 'not_available' AND negatives >= 2) AS final_absent,
+                       COUNT_IF(confirmed AND past_week AND covered
+                           AND closed_at >= CAST(CURRENT_TIMESTAMP - INTERVAL '1' DAY AS TIMESTAMP)) AS covered_day,
+                       COUNT_IF(confirmed AND past_week AND state = 'not_available' AND negatives >= 2
+                           AND closed_at >= CAST(CURRENT_TIMESTAMP - INTERVAL '1' DAY AS TIMESTAMP)) AS absent_day
+                FROM games GROUP BY league, season, stage_id
             )
-            SELECT s.league, s.season, COALESCE(c.closeable, 0), COALESCE(c.closed, 0),
-                   COALESCE(st.unknown_stages, 0), COALESCE(c.closed_day, 0), st.stage_ids, COALESCE(st.deferred_stages, 0)
-            FROM schedules s LEFT JOIN counts c ON s.league = c.league AND s.season = c.season
-            LEFT JOIN stage_counts st ON st.league = s.league AND st.season = s.season
-        """)
+            SELECT league, season,
+                   SUM(CASE WHEN successes > 0 OR absent < absent_needed THEN historical_games ELSE 0 END) AS closeable,
+                   SUM(covered_games + CASE WHEN successes > 0 THEN final_absent ELSE 0 END) AS closed,
+                   COUNT_IF(successes = 0 AND absent < absent_needed AND historical_games > 0),
+                   SUM(covered_day + CASE WHEN successes > 0 THEN absent_day ELSE 0 END) AS closed_day,
+                   ARRAY_AGG(stage_id), COUNT_IF(deferred_games > 0), MAX(checked)
+            FROM stages GROUP BY league, season
+        """
+        if isinstance(self.trino, WhoScoredTrinoManager):
+            rows = self.trino.budget.snapshot(
+                f"history-coverage-v1:{prefix}", lambda: self.trino.execute_query(sql),
+            )
+        else:
+            rows = self.trino.execute_query(sql)
         return {(str(r[0]), str(r[1])): dict(schedule_ready=True, closeable=int(r[2]),
                  closed=int(r[3]), unknown_stages=int(r[4]), closed_day=int(r[5]),
                  stage_ids=tuple(int(sid) for sid in (r[6] or ()) if sid is not None),
+                 checked_stage_ids=tuple(int(sid) for sid in (json.loads(r[8] or "[]") or ())),
                  deferred_stages=int(r[7])) for r in rows}
 
     def list_completed_match_candidates(
@@ -5317,6 +5333,11 @@ class WhoScoredRepository:
         ]
 
     def record_preview_failure(self, failure: PreviewFailure) -> Optional[str]:
+        row, outcome = self.build_preview_failure_row(failure)
+        self.write_preview_failure_rows([row])
+        return outcome
+
+    def build_preview_failure_row(self, failure: PreviewFailure) -> tuple[dict[str, Any], Optional[str]]:
         if failure.state not in {
             "retryable",
             "terminal",
@@ -5352,46 +5373,46 @@ class WhoScoredRepository:
                 availability_version=failure.availability_version,
             )
         now = _utc_now()
+        return {
+            "league": failure.league,
+            "season": failure.season,
+            "game_id": int(failure.game_id),
+            "game": failure.game,
+            "kickoff": failure.kickoff,
+            "batch_id": outcome_batch_id,
+            "payload_sha256": failure.payload_sha256,
+            "raw_uri": failure.raw_uri,
+            "parser_version": failure.parser_version,
+            "availability_version": failure.availability_version,
+            "state": failure.state,
+            "missing_players_count": None,
+            "entity_counts_json": None,
+            "dataset_statuses_json": None,
+            "schema_fingerprint": None,
+            "transport_mode": failure.transport_mode,
+            "proxy_mode": failure.proxy_mode,
+            "http_status": failure.http_status,
+            "failure_code": failure.failure_code,
+            "error": failure.error[:4000],
+            "attempt_no": int(failure.attempt_no),
+            "retry_after": failure.retry_after,
+            "fetched_at": now,
+            "completed_at": (None if failure.state == "retryable" else now),
+            "direct_bytes": int(failure.direct_bytes),
+            "paid_bytes": int(failure.paid_bytes),
+            "_entity_type": "preview_manifest",
+        }, outcome_batch_id
+
+    def write_preview_failure_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
         self.writer.write_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "league": failure.league,
-                        "season": failure.season,
-                        "game_id": int(failure.game_id),
-                        "game": failure.game,
-                        "kickoff": failure.kickoff,
-                        "batch_id": outcome_batch_id,
-                        "payload_sha256": failure.payload_sha256,
-                        "raw_uri": failure.raw_uri,
-                        "parser_version": failure.parser_version,
-                        "availability_version": failure.availability_version,
-                        "state": failure.state,
-                        "missing_players_count": None,
-                        "entity_counts_json": None,
-                        "dataset_statuses_json": None,
-                        "schema_fingerprint": None,
-                        "transport_mode": failure.transport_mode,
-                        "proxy_mode": failure.proxy_mode,
-                        "http_status": failure.http_status,
-                        "failure_code": failure.failure_code,
-                        "error": failure.error[:4000],
-                        "attempt_no": int(failure.attempt_no),
-                        "retry_after": failure.retry_after,
-                        "fetched_at": now,
-                        "completed_at": (None if failure.state == "retryable" else now),
-                        "direct_bytes": int(failure.direct_bytes),
-                        "paid_bytes": int(failure.paid_bytes),
-                        "_entity_type": "preview_manifest",
-                    }
-                ]
-            ),
+            pd.DataFrame(rows).astype({"http_status": "Int64"}),
             database=self.schema,
             table=PREVIEW_MANIFEST_TABLE,
             partition_spec=[("league", "identity"), ("season", "identity")],
             source="whoscored",
         )
-        return outcome_batch_id
 
     def _published_preview_datasets(self, commit: PreviewCommit) -> frozenset[str]:
         """Name the datasets this game already publishes with real rows.

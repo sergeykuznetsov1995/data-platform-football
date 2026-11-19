@@ -89,18 +89,10 @@ _LISTED = 10
 
 
 def _trino_query(sql: str) -> list[tuple[Any, ...]]:
-    from utils.data_quality import _get_conn
+    from scrapers.whoscored.trino import WhoScoredTrinoManager
 
-    conn = _get_conn()
-    try:
-        cursor = conn.cursor()
-        try:
-            cursor.execute(sql)
-            return [tuple(row) for row in cursor.fetchall()]
-        finally:
-            cursor.close()
-    finally:
-        conn.close()
+    with WhoScoredTrinoManager() as trino:
+        return [tuple(row) for row in trino.execute_query(sql)]
 
 
 def _utc_now() -> datetime:

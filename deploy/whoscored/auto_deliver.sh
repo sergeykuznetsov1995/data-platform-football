@@ -24,7 +24,6 @@ METADB="${METADB:-whoscored-airflow-metadb}"
 SCHED="${SCHED:-whoscored-airflow-scheduler}"
 COMPOSE_PROJECT=whoscored-airflow
 COMPOSE_ENV_FILE="${WHOSCORED_COMPOSE_ENV_FILE:-/root/data-platform-football/.env}"
-TRINO_RO="${TRINO_RO:-}"  # необязательный совместимый CSV helper
 TG_ENV="${TG_ENV:-$HOME/.claude/telegram.env}"
 HISTORY_PAT="${HISTORY_PAT:-whoscored_history_backfil[l]/driver}"
 REREAD_TRIES=30                      # × 20 с = 10 мин на перечитывание DAG
@@ -87,7 +86,7 @@ iget() { sed -n "s/^$1=//p" "$INFLIGHT" 2>/dev/null | head -1; }
 # «матчи события манифест»; при ошибке — ненулевой код и безопасная диагностика. Приёмка — по матчам/событиям,
 # манифест только в отчёт: его рост без новых матчей и событий доставку не принимает.
 measure() {
-  python3 - "$1" "$SCHED" "${TRINO_RO:-}" <<'PYMEASURE'
+  python3 - "$1" "$SCHED" <<'PYMEASURE'
 import csv
 from datetime import datetime, timezone
 import io
@@ -103,7 +102,7 @@ def fail(message):
 
 
 # Validate the whole argument before constructing the fixed read-only query.
-raw, scheduler, helper = sys.argv[1:]
+raw, scheduler = sys.argv[1:]
 if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3])(?::?[0-5][0-9])?)?", raw):
     fail("invalid timestamp")
 try:
@@ -114,22 +113,11 @@ try:
 except ValueError:
     fail("invalid timestamp")
 
-# Only constants and the normalized datetime enter SQL; no caller-supplied SQL.
-sql = "select " + ", ".join(
-    "(select count(*) from iceberg.bronze." + table
-    + " where _ingested_at > timestamp '" + timestamp + "')"
-    for table in ("whoscored_matches", "whoscored_events", "whoscored_match_ingest_manifest")
-)
-if helper:
-    if not shutil.which(helper):
-        fail("helper executable missing")
-    command, program = [helper, sql], None
-else:
-    if not shutil.which("docker"):
-        fail("docker executable missing")
-    command = ["docker", "exec", "-i", "-e", "PYTHONPATH=/opt/whoscored-src",
-               scheduler, "python", "-B", "-", timestamp]
-    program = r"""
+if not shutil.which("docker"):
+    fail("docker executable missing")
+command = ["docker", "exec", "-i", "-e", "PYTHONPATH=/opt/whoscored-src",
+           scheduler, "python", "-B", "-", timestamp]
+program = r"""
 import signal
 import sys
 from datetime import datetime
@@ -141,28 +129,25 @@ signal.signal(signal.SIGALRM, expired)
 signal.alarm(55)
 try:
     timestamp = datetime.fromisoformat(sys.argv[1]).isoformat(sep=" ", timespec="microseconds")
-    from scrapers.base.trino_manager import get_trino_connection
-    conn = get_trino_connection(session_properties={"query_max_run_time": "50s"})
-    try:
-        cursor = conn.cursor()
-        cursor.execute("select " + ", ".join(
+    from scrapers.whoscored.trino import WhoScoredTrinoManager
+    with WhoScoredTrinoManager(session_properties={
+        "enable_dynamic_filtering": "false", "query_max_run_time": "50s",
+    }) as manager:
+        rows = manager.execute_query("select " + ", ".join(
             "(select count(*) from iceberg.bronze." + table
             + " where _ingested_at > timestamp '" + timestamp + "')"
             for table in ("whoscored_matches", "whoscored_events", "whoscored_match_ingest_manifest")
         ))
-        rows = cursor.fetchall()
         if len(rows) != 1 or len(rows[0]) != 3 or any(type(v) is not int or v < 0 for v in rows[0]):
             raise ValueError("invalid counts")
         print(",".join(str(v) for v in rows[0]))
-    finally:
-        conn.close()
 except Exception:
     sys.exit(1)
 """
 try:
     result = subprocess.run(command, input=program, text=True, capture_output=True, timeout=60, check=False)
 except FileNotFoundError:
-    fail("helper executable missing" if helper else "docker executable missing")
+    fail("docker executable missing")
 except subprocess.TimeoutExpired:
     fail("query timeout")
 except OSError:
