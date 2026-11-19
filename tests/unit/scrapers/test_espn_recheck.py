@@ -11,6 +11,7 @@ of the wave test, plus a raw store that returns stored bodies by hash.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 import re
 
@@ -110,7 +111,8 @@ def _captured(tmp_path, first_body: bytes | None = None):
 
 
 _JOURNAL_ROW = (
-    r"'([^']*)', (\d+), (\d+), '([a-z_0-9]+)', (?:'[^']*'|NULL), (?:'[^']*'|NULL), '([a-z_]+)'\)"
+    r"'([^']*)', (\d+), (\d+), '([a-z_0-9]+)', "
+    r"('(?:[^']|'')*'|NULL), ('(?:[^']|'')*'|NULL), '([a-z_]+)'\)"
 )
 
 
@@ -130,7 +132,7 @@ def _execute(plan, client, trino, refuse=None):
     journal = [sql for conn in conns for sql in conn.sql if recheck.RECHECK_TABLE in sql]
     # What the journal now holds, for the next run's ``recheck.journalled``.
     for sql in journal:
-        for slug, year, event_id, kind, outcome in re.findall(_JOURNAL_ROW, sql):
+        for slug, year, event_id, kind, _, _, outcome in re.findall(_JOURNAL_ROW, sql):
             trino.rechecks.append((slug, int(year), int(event_id), kind, outcome))
     return outcomes, journal
 
@@ -169,6 +171,18 @@ def _with_stats(trino) -> int:
     )
 
 
+def _assert_raw(client, row, expected: bytes) -> None:
+    assert row["raw_sha256"] == hashlib.sha256(expected).hexdigest()
+    assert client.raw_store.load_exact(row["raw_uri"], row["raw_sha256"]) == expected
+
+
+def _journal_parts(trino, journal, outcome, kind=recheck.RECHECK):
+    assert trino.rechecks == [("eng.1", 2020, EVENT, kind, outcome)]
+    (sql,) = journal
+    ((_, _, _, _, before, after, _),) = re.findall(_JOURNAL_ROW, sql)
+    return tuple(json.loads(value[1:-1].replace("''", "'")) for value in (before, after))
+
+
 # ------------------------------------------------------------ criterion 1
 
 
@@ -194,6 +208,8 @@ def test_full_then_cut_answer_keeps_the_stored_parse(tmp_path, monkeypatch) -> N
     assert "'downgrade_rejected'" in sql and "'recheck'" in sql and "578281" in sql
     assert '"player_stats": 40' in sql and '"player_stats": 0' in sql
     assert '"team_stats": 56' in sql and '"team_stats": 0' in sql
+    _, candidate = _journal_parts(trino, journal, recheck.DOWNGRADE_REJECTED)
+    assert candidate["falling_parts"] == ["player_stats", "team_stats"]
 
 
 def test_compare_parts_on_the_recorded_summary(tmp_path) -> None:
@@ -221,17 +237,149 @@ def test_compare_parts_on_the_recorded_summary(tmp_path) -> None:
 
 
 def test_empty_match_completed_later_is_filled(tmp_path, monkeypatch) -> None:
-    client, trino = _captured(tmp_path, _body(_empty))
-    assert _matches(trino)[EVENT]["disposition"] == "valid_empty"
+    empty, full = _body(_empty), _body()
+    client, trino = _captured(tmp_path, empty)
+    first = _matches(trino)[EVENT]
+    assert first["disposition"] == "valid_empty"
+    _assert_raw(client, first, empty)
 
-    _, journal = _recheck_wave(monkeypatch, client, trino, tmp_path, _body())
+    outcomes, journal = _recheck_wave(monkeypatch, client, trino, tmp_path, full)
 
     row = _matches(trino)[EVENT]
     assert (row["disposition"], row["lineup_state"], row["team_stats_state"]) == (
         "captured", "captured", "captured"
     )
     assert _with_stats(trino) == 40 and row["rechecked_at"] is not None
-    assert "'filled'" in journal[0]
+    assert outcomes[0]["state"] == wave.GREEN
+    _assert_raw(client, row, full)
+    before, after = _journal_parts(trino, journal, recheck.FILLED)
+    assert (before["lineup"], after["lineup"]) == (0, 40)
+
+
+@pytest.mark.parametrize(
+    "old_group,new_group,gain_stats,outcome",
+    [
+        ("Group A", None, False, recheck.DOWNGRADE_REJECTED),
+        ("Group A", None, True, recheck.DOWNGRADE_REJECTED),
+        ("Group A", "Group B", False, recheck.CHANGED),
+        (None, "Group A", False, recheck.CHANGED),
+    ],
+)
+def test_recheck_group_context(
+    tmp_path, monkeypatch, old_group, new_group, gain_stats, outcome
+) -> None:
+    def body(group, cut=False):
+        def mutate(document):
+            competition = document["header"]["competitions"][0]
+            if group is None:
+                competition.pop("altGameNote", None)
+            else:
+                competition["altGameNote"] = group
+            if cut:
+                _cut(document)
+
+        return _body(mutate)
+
+    old, new = body(old_group, cut=gain_stats), body(new_group)
+    client, trino = _captured(tmp_path, old)
+    first = _matches(trino)[EVENT]
+    assert first["group_name"] == old_group
+    _assert_raw(client, first, old)
+
+    outcomes, journal = _recheck_wave(monkeypatch, client, trino, tmp_path, new)
+
+    assert outcomes[0]["state"] == wave.GREEN
+    row = _matches(trino)[EVENT]
+    rejected = outcome == recheck.DOWNGRADE_REJECTED
+    assert row["group_name"] == (old_group if rejected else new_group)
+    _assert_raw(client, row, old if rejected else new)
+    before, after = _journal_parts(trino, journal, outcome)
+    if rejected:
+        assert after["lost_fields"] == ["group_name"]
+    if gain_stats:
+        assert (before["player_stats"], after["player_stats"]) == (0, 40)
+        assert _with_stats(trino) == 0
+    else:
+        assert all(before[part] == after[part] for part in recheck.PARTS)
+        assert _with_stats(trino) == 40
+
+
+def test_zero_part_recheck_keeps_readable_summary(tmp_path, monkeypatch) -> None:
+    def empty(document):
+        _empty(document)
+        document.pop("keyEvents", None)
+        document.pop("commentary", None)
+
+    def malformed(document):
+        empty(document)
+        document["gameInfo"] = "invalid"
+
+    old, new = _body(empty), _body(malformed)
+    client, trino = _captured(tmp_path, old)
+    first = _matches(trino)[EVENT]
+    assert first["disposition"] == "valid_empty"
+    _assert_raw(client, first, old)
+
+    outcomes, journal = _recheck_wave(monkeypatch, client, trino, tmp_path, new)
+
+    assert outcomes[0]["state"] == wave.GREEN
+    row = _matches(trino)[EVENT]
+    assert row["disposition"] == "valid_empty"
+    assert _children(trino, "espn_match_lineup") == []
+    _assert_raw(client, row, old)
+    before, after = _journal_parts(trino, journal, recheck.DOWNGRADE_REJECTED)
+    assert all(before[part] == after[part] == 0 for part in recheck.PARTS)
+    assert (before["disposition"], after["disposition"]) == ("valid_empty", "source_malformed")
+
+
+@pytest.mark.parametrize("swap", [False, True], ids=["starter-lost", "valid-correction"])
+def test_recheck_starter_flags(tmp_path, monkeypatch, swap) -> None:
+    old = _body()
+    document = json.loads(old)
+    players = [
+        player for player in document["rosters"][0]["roster"]
+        if player.get("subbedIn") is False and player.get("subbedOut") is False
+    ]
+    starter = next(player for player in players if player["starter"] is True)
+    reserve = next(player for player in players if player["starter"] is False)
+    starter["starter"] = False
+    if swap:
+        reserve["starter"] = True
+        starter_place = starter.pop("formationPlace", None)
+        if "formationPlace" in reserve:
+            starter["formationPlace"] = reserve.pop("formationPlace")
+        if starter_place is not None:
+            reserve["formationPlace"] = starter_place
+    new = json.dumps(document).encode()
+
+    client, trino = _captured(tmp_path, old)
+    first = _matches(trino)[EVENT]
+    assert first["disposition"] == "captured"
+    _assert_raw(client, first, old)
+
+    def flags():
+        return {r["athlete_id"]: r["starter"] for r in _children(trino, "espn_match_lineup")}
+
+    expected = flags()
+    starter_id = int(starter["athlete"]["id"])
+    reserve_id = int(reserve["athlete"]["id"])
+    assert (expected[starter_id], expected[reserve_id]) == (True, False)
+    if swap:
+        expected[starter_id], expected[reserve_id] = False, True
+    outcomes, journal = _recheck_wave(monkeypatch, client, trino, tmp_path, new)
+
+    assert outcomes[0]["state"] == wave.GREEN
+    row = _matches(trino)[EVENT]
+    assert row["disposition"] == "captured"
+    assert flags() == expected
+    assert sum(flag is True for flag in expected.values()) == 22
+    _assert_raw(client, row, new if swap else old)
+    outcome = recheck.CHANGED if swap else recheck.DOWNGRADE_REJECTED
+    before, after = _journal_parts(trino, journal, outcome)
+    assert all(before[part] == after[part] for part in recheck.PARTS)
+    if not swap:
+        assert (before["disposition"], after["disposition"]) == ("captured", "lineup_anomaly")
+        assert before["anomalies"] == [] and "starters_not_11" in after["anomalies"]
 
 
 def test_edited_value_at_the_same_completeness_is_written(tmp_path, monkeypatch) -> None:
@@ -320,6 +468,52 @@ def test_refused_journal_write_is_recovered_without_a_download(
     assert len(client.network("/summary?")) == downloads + 1
     assert [row[3:] for row in trino.rechecks] == [(kind, "same")]
     assert _matches(trino)[EVENT]["raw_sha256"] == written
+
+
+@pytest.mark.parametrize("kind", [recheck.RECHECK, recheck.SAMPLE_24H, recheck.SAMPLE_72H])
+def test_rejected_group_loss_is_journalled_once_on_retry(tmp_path, monkeypatch, kind) -> None:
+    def grouped(document):
+        document["header"]["competitions"][0]["altGameNote"] = "Group A"
+
+    def ungrouped(document):
+        document["header"]["competitions"][0].pop("altGameNote", None)
+
+    old = _body(grouped)
+    client, trino = _captured(tmp_path, old)
+    plan = _recheck_plan(monkeypatch, client, trino, tmp_path, _body(ungrouped), kind)
+    downloads = len(client.network("/summary?"))
+
+    outcomes, journal = _execute(plan, client, trino, refuse=recheck.RECHECK_TABLE)
+    assert outcomes[0]["state"] == wave.RED and journal == [] and trino.rechecks == []
+    row = _matches(trino)[EVENT]
+    assert row["group_name"] == "Group A"
+    _assert_raw(client, row, old)
+
+    outcomes, journal = _execute(plan, client, trino)
+    assert outcomes[0]["state"] == wave.GREEN
+    _, after = _journal_parts(trino, journal, recheck.DOWNGRADE_REJECTED, kind)
+    assert after["lost_fields"] == ["group_name"]
+
+    outcomes, journal = _execute(plan, client, trino)
+    assert outcomes[0]["state"] == wave.GREEN and journal == []
+    assert trino.rechecks == [("eng.1", 2020, EVENT, kind, recheck.DOWNGRADE_REJECTED)]
+    row = _matches(trino)[EVENT]
+    assert row["group_name"] == "Group A"
+    _assert_raw(client, row, old)
+    assert len(client.network("/summary?")) == downloads + 1
+
+    day_key = _req_key(urls.all_scoreboard_day(YESTERDAY))
+    day = json.loads(client.stored[day_key])
+    event = next(item for item in day["events"] if item["id"] == str(EVENT))
+    event["status"]["type"]["name"] = "STATUS_FINAL_AET"
+    client.stored[day_key] = json.dumps(day).encode()
+    outcomes, journal = _execute(plan, client, trino)
+    assert outcomes[0]["state"] == wave.GREEN and len(journal) == 1
+    assert trino.rechecks[-1][3:] == (recheck.REFRESH, recheck.DOWNGRADE_REJECTED)
+    row = _matches(trino)[EVENT]
+    assert (row["status"], row["group_name"]) == ("STATUS_FINAL_AET", "Group A")
+    _assert_raw(client, row, old)
+    assert len(client.network("/summary?")) == downloads + 1
 
 
 def test_stamped_recheck_without_journal_or_body_is_red_without_a_download(
