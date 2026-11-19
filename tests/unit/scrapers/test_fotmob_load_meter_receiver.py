@@ -83,7 +83,8 @@ def test_event_to_snapshot_full_mapping():
         "user": "src_fotmob", "source": "trino_ui", "query": READ, "state": "FINISHED",
         "created": "2026-11-01T00:00:00Z", "started": "2026-11-01T00:00:01Z",
         "ended": "2026-11-01T00:00:02Z", "stmt_type": "read", "error_code": None,
-        "io_tables": [], "observed_at": RECEIVED_AT, "received_via": "http_event_listener",
+        "io_tables": [], "io_input_tables": [], "io_output_tables": [],
+        "observed_at": RECEIVED_AT, "received_via": "http_event_listener",
     }
     written = receiver.event_to_snapshot(event(query=INSERT, errorCode="SYNTAX_ERROR"), tables=TABLES, received_at=RECEIVED_AT)
     assert written["stmt_type"] == "insert" and written["error_code"] == "SYNTAX_ERROR"
@@ -102,8 +103,11 @@ def test_event_to_snapshot_timestamp_rules():
 
 
 def test_event_to_snapshot_rejects_impossible_events():
-    for overrides in ({"queryId": ""}, {"queryId": "bad id"}, {"queryId": 123}, {"query": ""}, {"query": None}, {"user": ""}, {"user": None}):
+    for overrides in ({"queryId": ""}, {"queryId": "bad id"}, {"queryId": 123}, {"query": ""}, {"query": None}):
         assert receiver.event_to_snapshot(event(**overrides), tables=TABLES, received_at=RECEIVED_AT) is None
+    for user in ("", None):
+        record = receiver.event_to_snapshot(event(user=user), tables=TABLES, received_at=RECEIVED_AT)
+        assert record["user"] == user and meter.attribution(user) == "unknown"
 
 
 @pytest.mark.parametrize(("query", "expected"), [
@@ -126,6 +130,8 @@ def test_keep_event_and_io_tables_from_io_metadata():
     assert receiver.keep_event(event(query="SELECT * FROM other_summary")) is False
     record = receiver.event_to_snapshot(event(query=INSERT, ioMetadata=io), tables=TABLES, received_at=RECEIVED_AT)
     assert record["io_tables"] == ["iceberg.bronze.fotmob_matches", "iceberg.bronze.other_summary"]
+    assert record["io_input_tables"] == [MATCHES]
+    assert record["io_output_tables"] == ["iceberg.bronze.other_summary"]
     # Missing/partial ioMetadata never breaks mapping.
     assert receiver.event_to_snapshot(event(ioMetadata=None), tables=TABLES, received_at=RECEIVED_AT)["io_tables"] == []
 
@@ -142,6 +148,135 @@ def test_handle_post_body_outcomes():
     assert post(b"x" * (receiver.MAX_BODY_BYTES + 1)) == ([], "too_large")
     records, outcome = post(json.dumps(event(queryId="bad id")).encode("utf-8"))
     assert (outcome, records) == ("kept", [])
+
+
+VIEW_READ = "SELECT * FROM reporting.match_view"
+
+
+def physical_table(name):
+    catalog, schema, table = name.split(".")
+    return {"catalogName": catalog, "schema": schema, "table": table}
+
+
+def post_query(query, *, inputs=(), output=None, user="airflow"):
+    io = {"inputs": [physical_table(name) for name in inputs],
+          "output": physical_table(output) if output else None}
+    payload = event(query=query, user=user, ioMetadata=io)
+    if user is None:
+        del payload["context"]["user"]
+    return receiver.handle_post_body(json.dumps(payload).encode(), tables=[], received_at=RECEIVED_AT)
+
+
+def full_day(snapshots, *, commits=0):
+    heartbeats = build_event_day({})
+    counts = dict.fromkeys(TABLES, 0)
+    counts[MATCHES] = commits
+    minutes, report = meter.aggregate_day(heartbeats + snapshots, DAY, snapshot_counts=counts)
+    assert report["coverage_minutes_total"] == 1440
+    return minutes, report
+
+
+@pytest.mark.parametrize("query,inputs", [
+    (VIEW_READ, [MATCHES]),
+    (READ, [MATCHES, MATCHES]),
+    (READ, []),
+])
+def test_physical_and_sql_reads_count_once(query, inputs):
+    snapshots, outcome = post_query(query, inputs=inputs)
+    assert outcome == "kept"
+    record = snapshots[0]
+    assert (record["query"], record["user"], record["source"]) == (query, "airflow", "trino_ui")
+    assert record["io_input_tables"] == sorted(set(inputs))
+    assert record["io_output_tables"] == []
+    minutes, report = full_day(snapshots * 2)
+    assert [(row["table"], row["operation"], row["user_attr"], row["count"], row["source_polls"])
+            for row in minutes] == [(MATCHES, "scan_read", "platform", 1, ["recv"])]
+    assert report["verdicts"]["N5"] == {"pass": False, "value": 1, "threshold": "foreign_ops==0", "evidence": MATCHES}
+    assert report["pass"] is False and report["pass_reasons"] == ["N5"]
+
+
+def test_physical_scope_is_exact_and_independent_of_discovery():
+    unrelated = ["other.bronze.fotmob_matches", "iceberg.silver.fotmob_matches",
+                 "iceberg.bronze.other_fotmob_matches", "iceberg.bronze.fotmob_"]
+    snapshots, outcome = post_query(VIEW_READ, inputs=unrelated, output=unrelated[0])
+    assert outcome == "filtered" and snapshots == []
+    minutes, report = full_day(snapshots)
+    assert minutes == [] and report["verdicts"]["N5"]["value"] == 0 and report["pass"]
+    table = "iceberg.bronze.fotmob_undiscovered"
+    snapshots, outcome = post_query(VIEW_READ, inputs=[table.upper(), *unrelated])
+    assert outcome == "kept"
+    minutes, report = full_day(snapshots)
+    assert [row["table"] for row in minutes] == [table]
+    assert report["verdicts"]["N5"]["evidence"] == table
+
+
+@pytest.mark.parametrize("receiver_first", [False, True])
+def test_receiver_io_survives_poll_duplicate_order(receiver_first):
+    snapshots, _ = post_query(VIEW_READ, inputs=[MATCHES])
+    record = snapshots[0]
+    poll = {key: value for key, value in record.items()
+            if key not in {"io_tables", "io_input_tables", "io_output_tables", "received_via"}}
+    poll["poll_id"] = "poll"
+    minutes, report = full_day([record, poll] if receiver_first else [poll, record])
+    assert [(row["count"], row["source_polls"]) for row in minutes] == [(1, ["recv"])]
+    assert report["verdicts"]["N5"]["value"] == 1
+    assert report["pass_reasons"] == ["N5"]
+
+    poll["user"] = meter.SOURCE_USER
+    minutes, report = full_day([record, poll] if receiver_first else [poll, record])
+    assert minutes[0]["user_attr"] == "unknown" and report["unknown_ops_total"] == 1
+    assert "unparsed_fotmob" in report["pass_reasons"]
+
+
+def test_write_counts_physical_output_and_distinct_inputs():
+    query = "INSERT INTO reporting.summary SELECT * FROM reporting.match_view"
+    snapshots, _ = post_query(query, inputs=[MATCHES, SQUADS, MATCHES], output=MATCHES)
+    assert snapshots[0]["io_output_tables"] == [MATCHES]
+    minutes, report = full_day(snapshots, commits=1)
+    assert {(row["table"], row["operation"]) for row in minutes} == {
+        (MATCHES, "commit"), (MATCHES, "scan_write"), (SQUADS, "scan_write")}
+    assert all(row["user_attr"] == "platform" and row["count"] == 1 for row in minutes)
+    assert report["verdicts"]["N5"]["value"] == 3
+    assert report["pass_reasons"] == ["N5"]
+
+
+def test_missing_actor_on_physical_read_is_unknown():
+    snapshots, outcome = post_query(VIEW_READ, inputs=[MATCHES], user=None)
+    assert outcome == "kept" and snapshots[0]["user"] is None
+    minutes, report = full_day(snapshots)
+    assert minutes[0]["user_attr"] == "unknown"
+    assert report["unknown_ops_total"] == 1 and report["platform_ops_total"] == 0
+    assert report["verdicts"]["N5"]["evidence"] == MATCHES
+
+
+@pytest.mark.parametrize("query,inputs,output", [
+    ("CALL reporting.refresh()", [MATCHES], MATCHES),
+    (VIEW_READ, [], MATCHES),
+])
+def test_uncertain_physical_role_blocks_pass_without_guessing(query, inputs, output):
+    snapshots, outcome = post_query(query, inputs=inputs, output=output, user=meter.SOURCE_USER)
+    assert outcome == "kept"
+    minutes, report = full_day(snapshots)
+    assert minutes == [] and report["verdicts"]["N5"]["value"] == 0
+    assert report["pass"] is False and report["pass_reasons"] == ["unparsed_fotmob"]
+
+
+@pytest.mark.parametrize("query,operation,uncertain", [
+    (VIEW_READ, "scan_read", False),
+    (INSERT, "commit", False),
+    ("INSERT INTO reporting.summary SELECT * FROM reporting.match_view", None, True),
+])
+def test_legacy_flat_io_uses_only_proven_write_roles(query, operation, uncertain):
+    if operation == "commit":
+        snapshots, _ = post_query(query, output=MATCHES, user=meter.SOURCE_USER)
+    else:
+        snapshots, _ = post_query(query, inputs=[MATCHES], user=meter.SOURCE_USER)
+    record = snapshots[0]
+    del record["io_input_tables"], record["io_output_tables"]
+    minutes, report = full_day(snapshots, commits=int(operation == "commit"))
+    assert [(row["table"], row["operation"]) for row in minutes] == ([(MATCHES, operation)] if operation else [])
+    assert report["unparsed_fotmob"] is uncertain
+    assert report["pass"] == (not uncertain)
 
 
 def test_append_records_writes_collides_and_rotates(tmp_path):

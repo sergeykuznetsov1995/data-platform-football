@@ -100,6 +100,11 @@ def attribution(user: Any) -> str:
     return "platform" if isinstance(user, str) and user in PLATFORM_USERS else "unknown"
 
 
+def is_fotmob_io_table(name: str) -> bool:
+    parts = name.lower().split(".")
+    return len(parts) == 3 and parts[:2] == ["iceberg", "bronze"] and bool(TABLE_NAME_RE.fullmatch(parts[2]))
+
+
 def discovered_tables(names: Iterable[str]) -> list[str]:
     result = set()
     for name in names:
@@ -380,6 +385,65 @@ def _query_time(record: Mapping[str, Any]) -> datetime:
     raise ValueError("snapshot has no timestamp")
 
 
+def _query_work(records: Sequence[Mapping[str, Any]], parsed: ParsedSQL, tables: set[str]) -> tuple[dict[tuple[str, str], set[str]], str, bool]:
+    """Combine physical evidence with the first snapshot's SQL for one query ID."""
+    first = records[0]
+
+    def poll_ids(record: Mapping[str, Any]) -> set[str]:
+        return {str(record["poll_id"])} if record.get("poll_id") else set()
+
+    operations = {operation: poll_ids(first) for operation in parsed.operations}
+    physical: dict[tuple[str, str], set[str]] = {}
+    outputs = set()
+    for record in records:
+        for field in ("io_input_tables", "io_output_tables", "io_tables"):
+            for name in record.get(field, []):
+                table = name.lower()
+                if field == "io_output_tables":
+                    outputs.add(table)
+                if is_fotmob_io_table(table):
+                    physical.setdefault((table, field), set()).update(poll_ids(record))
+
+    user = first.get("user")
+    principal_conflict = any(record.get("user") != user for record in records)
+    user_attr = "unknown" if principal_conflict else attribution(user)
+    uncertain = parsed.unparsed_fotmob or (principal_conflict and bool(operations or physical))
+    write = parsed.stmt_type in WRITE_TYPES
+    if physical or principal_conflict:
+        for query in {record["query"] for record in records} - {first["query"]}:
+            other = parse_sql(query, tables)
+            if principal_conflict and (other.operations or other.unparsed_fotmob):
+                uncertain = True
+            if physical and other != parsed:
+                uncertain = True
+                if other.unparsed or (other.stmt_type in WRITE_TYPES) != write:
+                    return operations, user_attr, True
+    if parsed.unparsed:
+        return operations, user_attr, uncertain or bool(physical)
+
+    flat_tables = set()
+    for (table, field), polls in physical.items():
+        if field == "io_output_tables":
+            if not write:
+                continue
+            operation = "commit"
+        elif field == "io_tables" and write:
+            flat_tables.add(table)
+            continue
+        elif field == "io_tables" and table in outputs:
+            continue
+        else:
+            operation = "scan_write" if write else "scan_read"
+        operations.setdefault((table, operation), set()).update(polls)
+    # Old flat snapshots can corroborate a write, but cannot assign a role.
+    if flat_tables - {table for table, _ in operations}:
+        uncertain = True
+    sql_targets = {table for table, operation in parsed.operations if operation == "commit"}
+    if outputs and (physical or operations) and (not write or len(outputs) > 1 or sql_targets - outputs):
+        uncertain = True
+    return operations, user_attr, uncertain
+
+
 def _gap_intervals(reasons: Sequence[str | None], start: datetime) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for index, reason in enumerate(reasons):
@@ -445,6 +509,7 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
     """Pure snapshot → minute → day pipeline. Missing S7 evidence blocks PASS."""
     start, end = day_bounds(day)
     seen: dict[str, Mapping[str, Any]] = {}
+    repeat_records: dict[str, list[Mapping[str, Any]]] = {}
     duplicates = 0
     conflicts = set()
     heartbeats = []
@@ -457,10 +522,12 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
             raise ValueError("invalid raw record")
         query_id = record["query_id"]
         if query_id in seen:
-            if start <= _query_time(seen[query_id]) < end:
+            first = seen[query_id]
+            if start <= _query_time(first) < end:
                 duplicates += 1
-                if any(seen[query_id].get(key) != record.get(key) for key in core_fields):
+                if any(first.get(key) != record.get(key) for key in core_fields):
                     conflicts.add(query_id)
+                repeat_records.setdefault(query_id, []).append(record)
         else:
             seen[query_id] = record
     reasons, relevant = _coverage(heartbeats, start, end)
@@ -469,18 +536,19 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
     evidence: dict[tuple[str, str, str, str], set[str]] = {}
     unparsed_queries = 0
     unparsed_fotmob = False
-    for record in seen.values():
+    for query_id, record in seen.items():
         instant = _query_time(record)
         if not start <= instant < end:
             continue
         parsed = parse_sql(record["query"], tables)
         unparsed_queries += int(parsed.unparsed)
-        unparsed_fotmob |= parsed.unparsed_fotmob
-        for table, operation in parsed.operations:
-            key = (minute_utc(instant), table, attribution(record.get("user")), operation)
+        snapshots = [record, *repeat_records.get(query_id, [])]
+        operations, user_attr, uncertain = _query_work(snapshots, parsed, tables)
+        unparsed_fotmob |= uncertain
+        for (table, operation), polls in operations.items():
+            key = (minute_utc(instant), table, user_attr, operation)
             counts[key] += 1
-            if record.get("poll_id"):
-                evidence.setdefault(key, set()).add(str(record["poll_id"]))
+            evidence.setdefault(key, set()).update(polls)
     tables.update(key[1] for key in counts)
     minute_rows = [{"grain": "minute_table", "minute_utc": key[0], "table": key[1], "user_attr": key[2], "operation": key[3], "count": count, "coverage": "measured", "gap_reason": None, "source_polls": sorted(evidence.get(key, set()))} for key, count in sorted(counts.items())]
     for index, reason in enumerate(reasons):

@@ -1,7 +1,7 @@
 """HTTP receiver for Trino QueryCompleted events (FotMob load meter, #2126 variant (b)).
 
 Receives one JSON QueryCompletedEvent per POST from the coordinator's
-http-event-listener, keeps only queries whose SQL references fotmob tables,
+http-event-listener, keeps queries with FotMob SQL or physical table evidence,
 and appends them as load_meter snapshot records. Stdlib only; no Trino client,
 no credentials, no network egress. A minute heartbeat is written by cron
 (load_meter_receiver heartbeat), not by this server.
@@ -44,30 +44,33 @@ def _event_time(value: Any) -> str | None:
         return None
 
 
-def _io_tables(event: Mapping[str, Any]) -> list[str]:
-    """Full catalog.schema.table names from ioMetadata inputs/output, deduplicated."""
-    names: list[str] = []
+def _io_tables(event: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """Fully qualified physical names, with the input and output roles preserved."""
     io = event.get("ioMetadata")
-    if isinstance(io, dict):
-        for key in ("inputs", "output"):
-            entry = io.get(key)
-            entries = entry if isinstance(entry, list) else [entry] if isinstance(entry, dict) else []
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                parts = [item.get(name) for name in ("catalogName", "schema", "tableName")]
+    if not isinstance(io, dict):
+        return [], []
+
+    def names(entry: Any) -> list[str]:
+        result = set()
+        entries = entry if isinstance(entry, list) else [entry]
+        for item in entries:
+            if isinstance(item, dict):
+                parts = (item.get("catalogName"), item.get("schema"), item.get("table", item.get("tableName")))
                 if all(isinstance(part, str) and part for part in parts):
-                    names.append(".".join(parts))
-    return sorted(set(names))
+                    result.add(".".join(parts))
+        return sorted(result)
+
+    return names(io.get("inputs")), names(io.get("output"))
 
 
 def keep_event(event: Mapping[str, Any]) -> bool:
-    """Deliberately coarse filter; the aggregator re-parses SQL anyway."""
+    """Keep SQL candidates and queries with physical FotMob I/O."""
     metadata = event.get("metadata")
     query = metadata.get("query") if isinstance(metadata, dict) else event.get("query")
     if "fotmob_" in str(query or "").lower():
         return True
-    return any("fotmob_" in name.lower() for name in _io_tables(event))
+    inputs, outputs = _io_tables(event)
+    return any(meter.is_fotmob_io_table(name) for name in inputs + outputs)
 
 
 def event_to_snapshot(event: Mapping[str, Any], *, tables: Sequence[str], received_at: str) -> dict[str, Any] | None:
@@ -90,20 +93,21 @@ def event_to_snapshot(event: Mapping[str, Any], *, tables: Sequence[str], receiv
         return None
     if not isinstance(query, str) or not query:
         return None
-    if not isinstance(user, str) or not user:
-        return None
     created = _event_time(event.get("createTime"))
     started = _event_time(event.get("executionStartTime"))
     ended = _event_time(event.get("endTime"))
     if created is None and started is None and ended is None:
         return None
+    inputs, outputs = _io_tables(event)
     return {
         "grain": "snapshot", "poll_id": "recv", "query_id": query_id,
-        "user": user, "source": source or None, "query": query,
+        "user": user, "source": source, "query": query,
         "state": state, "created": created, "started": started,
         "ended": ended, "stmt_type": meter.parse_sql(query, tables).stmt_type,
         "error_code": error_code, "observed_at": received_at,
-        "io_tables": _io_tables(event), "received_via": RECEIVED_VIA,
+        "io_tables": sorted(set(inputs + outputs)),
+        "io_input_tables": sorted({name.lower() for name in inputs}),
+        "io_output_tables": sorted({name.lower() for name in outputs}), "received_via": RECEIVED_VIA,
     }
 
 
