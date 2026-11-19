@@ -8,7 +8,10 @@ automatic morning reports after separately authorized deployment.
 ## Measurement
 
 The primary 24-hour SLA starts at the **first observed completed report link**
-and ends at successful generic and typed Bronze parse/persistence/validation.
+and ends when generic and typed Bronze processing both succeed for the same
+fetched content hash and the typed completion confirms a score. This includes
+results-only matches where FBref omits lineups or events under #2057.
+An earlier completion without score evidence leaves readiness unconfirmed.
 HTTP success alone is not readiness. `first_seen_at` separately retains the
 earliest observation of the link, including a preview before the final score.
 Migration 11 stores both timestamps and the exact raw fetch-manifest keys.
