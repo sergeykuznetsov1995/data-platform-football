@@ -1,0 +1,50 @@
+{
+  "id": "transfermarkt-1395",
+  "issue": 1395,
+  "source": "transfermarkt",
+  "issue_body_sha256": "606ea3e19f49034e4b42ebda3a400f69921bbf424e5549eae59e51de4b9a752a",
+  "criteria": [
+    {
+      "id": "manual_sql_summary",
+      "kind": "days",
+      "required": 3,
+      "period_seconds": 86400,
+      "min_samples": 1,
+      "title": "Каждые из трёх последовательных московских суток: сохранить боевую строку и независимо выполнить тот же суточный SELECT с той же датой, as_of, источником и версией знаменателя, его хешем и снимком реестра планировщика. Сверить охват и долю записей в Bronze за 24 часа от обнаружения сигнала."
+    },
+    {
+      "id": "immutable_first_seen",
+      "kind": "days",
+      "required": 3,
+      "period_seconds": 86400,
+      "min_samples": 4,
+      "title": "За каждые из тех же суток есть проверка полноты first_seen_at у новых строк и неизменности при сверке с реестром во всех четырёх таблицах: squad_memberships, market_value_points, transfer_events и coach_stints. Указать число новых строк, пропусков и расхождений по таблице."
+    },
+    {
+      "id": "first_seen_refresh_test",
+      "kind": "check",
+      "required": 1,
+      "min_samples": 4,
+      "title": "Тест повторной загрузки по естественному ключу сохраняет первое время во всех четырёх таблицах."
+    },
+    {
+      "id": "daily_bronze_dq",
+      "kind": "days",
+      "required": 3,
+      "period_seconds": 86400,
+      "min_samples": 1,
+      "title": "За каждые из тех же суток есть плановый daily-dq/<день>.json с completed=true. Сохранить статус и проверки полей, долей authoritative_empty по маршрутам, NULL lineage после внедрения, долга карьер, дублей и 0 вместо NULL. Для pokal доля authoritative_empty >5% и для lineage любой новый NULL дают RED."
+    },
+    {
+      "id": "site_control_evidence",
+      "kind": "check",
+      "required": 1,
+      "min_samples": 1,
+      "title": "Проверить свежесть относительно сайта по датированной паре контрольных снимков до и после изменения и подтверждённой записи в Bronze. Зафиксировать исходные часы, проверяемый интервал и отдельно изменения, для которых срок ≤24 часов установить нельзя."
+    }
+  ],
+  "auto_close_issue": false,
+  "metadata": {
+    "close_hold": true
+  }
+}
