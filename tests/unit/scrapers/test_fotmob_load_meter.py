@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 import sys
@@ -409,6 +410,148 @@ def test_snapshot_query_is_read_only_and_window_is_half_open():
 def write_raw(directory, records):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "20261101-000000-fixture.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+def maintenance_receipt(**changes):
+    receipt = {
+        "day_utc": DAY, "job": "compaction", "evidence_ref": "producer-run/17/statement/2",
+        "query_id": "q_0000_0", "user": "airflow",
+        "sql_sha256": hashlib.sha256(UPDATE.encode("utf-8")).hexdigest(),
+        "operations": [[MATCHES, "commit"], [MATCHES, "scan_write"]],
+    }
+    return {**receipt, **changes}
+
+
+def registry(*receipts):
+    return {"day_utc": DAY, "receipts": list(receipts)}
+
+
+def test_receipts_through_normal_cli(tmp_path, capsys):
+    records = list(build_day({"queries": {0: [(UPDATE, "airflow")]}}))
+    query = next(row for row in records if row["grain"] == "snapshot")
+    records.append(dict(query, poll_id="second_poll", io_output_tables=[MATCHES], io_input_tables=[MATCHES]))
+    write_raw(tmp_path / "raw", records)
+    path = tmp_path / "maintenance-receipts" / f"{DAY}.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(registry(maintenance_receipt())), encoding="utf-8")
+    counts = tmp_path / "s7.json"
+    counts.write_text(json.dumps({"day_utc": DAY, "checked_at": "2026-11-02T00:05:00Z", "counts": {MATCHES: 1}}))
+    common = ["--root", str(tmp_path), "--day", DAY]
+    assert meter.main(["aggregate", *common, "--offline", "--snapshot-counts", str(counts)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["pass"] and report["foreign_load"]
+    assert report["verdicts"]["N5"]["value"] == 0 and report["platform_ops_total"] == 2
+    assert table_row(report, attr="platform")["scan_writes"] == report["commit_checks"][0]["sql_commits"] == 1
+    assert report["maintenance_deductions"] == {"q_0000_0": maintenance_receipt()["operations"]}
+    assert UPDATE not in json.dumps(report)
+    report.update(allowed_platform_ops_total=100, blocking_ops_total=90, maintenance_deductions={}, foreign_load=False)
+    (tmp_path / "day" / f"{DAY}.json").write_text(json.dumps(report))
+    assert meter.main(["verdict", *common]) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked["pass"] and checked["foreign_load"] and checked["allowed_platform_ops_total"] == 2
+    assert meter.main(["line", *common]) == 0
+    assert "platform_ops=2 unknown_ops=0 allowed_platform_ops=2 blocking_ops=0" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("job", ["compaction", "janitor", "morning_report"])
+def test_receipt_only_covers_its_own_query(job):
+    receipt = maintenance_receipt(job=job)
+    records = list(build_day({"queries": {0: [(UPDATE, user) for user in ("airflow", "airflow", "other", "src_fotmob")]}}))
+    for row in records:
+        if row.get("grain") == "snapshot":
+            row.update(source=job, maintenance_receipt={**receipt, "query_id": row["query_id"]})
+    _, legacy = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 4})
+    assert legacy["pass_reasons"] == ["N5"] and legacy["verdicts"]["N5"]["value"] == 6
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 4}, maintenance_registry=registry(receipt))
+    assert report["pass_reasons"] == ["N5"] and report["foreign_load"]
+    assert (report["platform_ops_total"], report["unknown_ops_total"], report["allowed_platform_ops_total"]) == (4, 2, 2)
+    assert report["verdicts"]["N5"]["value"] == 4
+    assert report["verdicts"]["N1"]["value"] == report["verdicts"]["N4"]["value"] == 1
+
+
+@pytest.mark.parametrize("bad_registry", [
+    {"day_utc": "2026-11-02", "receipts": [maintenance_receipt()]},
+    registry(maintenance_receipt(day_utc="2026-11-02")),
+    registry(maintenance_receipt(job="airflow")), registry(maintenance_receipt(evidence_ref=" ")),
+    registry(maintenance_receipt(), maintenance_receipt()),
+    registry(maintenance_receipt(), maintenance_receipt(query_id="missing")),
+    registry(maintenance_receipt(sql_sha256=hashlib.sha256((UPDATE + " ").encode()).hexdigest())),
+    registry(maintenance_receipt(operations=[[MATCHES, "commit"]])),
+    registry(maintenance_receipt(operations=[[MATCHES, "commit"]] * 2)),
+    registry(maintenance_receipt(operations=[[MATCHES, "scan_read"], [MATCHES, "commit"]])),
+    registry(maintenance_receipt(query_id="q_0000_2")), registry(maintenance_receipt(user="other")),
+])
+def test_invalid_registry_fails_closed(bad_registry):
+    spec = {"queries": {0: [(UPDATE, "airflow"), (UPDATE, "airflow"), (UPDATE, "other")]}}
+    _, report = meter.aggregate_day(build_day(spec), DAY, snapshot_counts={MATCHES: 3}, maintenance_registry=bad_registry)
+    assert report["pass_reasons"] == ["N5", "maintenance_evidence_invalid"]
+    assert report["verdicts"]["N5"]["value"] == 6 and not report["maintenance_deductions"]
+    assert meter.evaluate_day(report) == report
+
+
+@pytest.mark.parametrize(("spec", "counts", "reason"), [
+    ({"gaps": {40}}, {MATCHES: 1}, "gap"),
+    ({"n5_measurable": False}, {MATCHES: 1}, "n5_unmeasurable"),
+    ({}, {}, "commit_check_missing"), ({}, {MATCHES: 2}, "commit_mismatch"),
+])
+def test_allowed_work_still_requires_full_measurement(spec, counts, reason):
+    records = build_day({**spec, "queries": {0: [(UPDATE, "airflow")]}})
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts=counts, maintenance_registry=registry(maintenance_receipt()))
+    assert report["pass_reasons"] == [reason] and report["verdicts"]["N5"]["value"] == 0
+    assert report["foreign_load"] and report["commit_checks"][0]["sql_commits"] == 1
+
+
+@pytest.mark.parametrize("change", [{"source": "also_airflow"}, {"user": "other"}, {"query": UPDATE + " "}])
+def test_conflicting_observations_cannot_match(change):
+    records = list(build_day({"queries": {0: [(UPDATE, "airflow")]}}))
+    query = next(row for row in records if row["grain"] == "snapshot")
+    records.append({**query, **change})
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 1}, maintenance_registry=registry(maintenance_receipt()))
+    assert report["conflicting_query_ids"] == ["q_0000_0"]
+    assert "maintenance_evidence_invalid" in report["pass_reasons"] and report["blocking_ops_total"] == 2
+
+
+def test_receipt_must_cover_physical_inputs_too():
+    records = list(build_day({"queries": {0: [(UPDATE, "airflow")]}}))
+    query = next(row for row in records if row["grain"] == "snapshot")
+    query.update(io_output_tables=[MATCHES], io_input_tables=[SQUADS])
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 1},
+                                    maintenance_registry=registry(maintenance_receipt()))
+    assert report["blocking_ops_total"] == 3 and not report["maintenance_deductions"]
+    assert table_row(report, SQUADS, "platform")["scan_writes"] == 1
+
+
+def test_producer_receipt_cannot_resolve_unparsed_sql():
+    sql = "CALL synthetic.maintenance('iceberg.bronze.fotmob_matches')"
+    records = list(build_day({"queries": {0: [(sql, "airflow")]}}))
+    query = next(row for row in records if row["grain"] == "snapshot")
+    query["io_output_tables"] = [MATCHES]
+    receipt = maintenance_receipt(sql_sha256=hashlib.sha256(sql.encode()).hexdigest())
+    _, report = meter.aggregate_day(records, DAY, maintenance_registry=registry(receipt))
+    assert {"unparsed_fotmob", "maintenance_evidence_invalid"} <= set(report["pass_reasons"])
+    assert not report["maintenance_deductions"]
+
+
+def test_verdict_rejects_overallocated_observations():
+    records = build_day({"queries": {0: [(UPDATE, "airflow")]}})
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 1}, maintenance_registry=registry(maintenance_receipt()))
+    audit = report["maintenance_evidence"]
+    audit["registry"]["receipts"].append(maintenance_receipt(query_id="extra"))
+    audit["observed"]["extra"] = copy.deepcopy(audit["observed"]["q_0000_0"])
+    checked = meter.evaluate_day(report)
+    assert checked["maintenance_error"] == "observation_counts_mismatch"
+    assert checked["blocking_ops_total"] == 2 and not checked["pass"]
+    assert "allowed_platform_ops=0 blocking_ops=2" in meter.summary_line(report)
+
+
+@pytest.mark.parametrize("content", ["null", "{", '{"day_utc":"stale","day_utc":"2026-11-01","receipts":[]}'])
+def test_unreadable_registry_publishes_diagnostic_day(tmp_path, capsys, content):
+    write_raw(tmp_path / "raw", build_day())
+    path = tmp_path / "maintenance-receipts" / f"{DAY}.json"
+    path.parent.mkdir()
+    path.write_text(content)
+    assert meter.main(["aggregate", "--day", DAY, "--root", str(tmp_path), "--offline"]) == 0
+    assert json.loads(capsys.readouterr().out)["pass_reasons"] == ["maintenance_evidence_invalid"]
 
 
 def test_cli_aggregate_verdict_line_offline(tmp_path, capsys):
