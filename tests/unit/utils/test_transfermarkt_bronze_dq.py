@@ -515,6 +515,36 @@ def test_legacy_allowlist_unions_yaml_and_registry_pairs():
     assert '\n  AND NOT EXISTS' in sql
 
 
+
+@pytest.mark.parametrize('missing', [None, 'bronze', 'competitions', 'editions', 'registry'])
+def test_legacy_season_reconciliation_requires_all_pins_and_registry(monkeypatch, missing):
+    from utils import transfermarkt_legacy_season
+
+    table = 'iceberg.bronze.transfermarkt_coaches'
+    relations = {
+        'bronze': table, 'competitions': dq.COMPETITIONS_REGISTRY_TABLE,
+        'editions': dq.EDITIONS_REGISTRY_TABLE,
+    }
+    pins = {name: i for i, (key, name) in enumerate(relations.items(), 1) if key != missing}
+    calls = []
+
+    def record(*args):
+        calls.append(args)
+        return 'verified_cohort'
+
+    monkeypatch.setattr(transfermarkt_legacy_season, 'historical_season_predicate', record)
+    sql = dq.build_legacy_phantom_sql(
+        table, registry_snapshot_id=None if missing == 'registry' else "snap'1",
+        pins=pins, legacy_allowlist=[('fixture', '2025')],
+    )
+    if missing is None:
+        assert calls == [(table, *(dq._pinned(t, pins) for t in relations.values()), "'snap''1'")]
+        assert 'NOT COALESCE((verified_cohort), FALSE)' in sql
+    else:
+        assert not calls
+        assert 'verified_cohort' not in sql
+
+
 def test_target_coverage_report_math():
     targets = [
         ('2DVB', '2023'), ('ES1', '2024'), ('GB1', '2024'), ('GB1', '2025'),

@@ -677,6 +677,19 @@ def build_legacy_phantom_sql(
             = b.league
         AND e.canonical_season = b.season
   )""")
+    # An edition can change its display season after a legacy write. Only
+    # reconcile the attested October cohort on repeatable, pinned inputs.
+    required_pins = (table, COMPETITIONS_REGISTRY_TABLE, EDITIONS_REGISTRY_TABLE)
+    if registry_snapshot_id is not None and pins and all(t in pins for t in required_pins):
+        from utils.transfermarkt_legacy_season import historical_season_predicate
+
+        historical = historical_season_predicate(
+            table, _pinned(table, pins),
+            _pinned(COMPETITIONS_REGISTRY_TABLE, pins),
+            _pinned(EDITIONS_REGISTRY_TABLE, pins),
+            _sql_literal(registry_snapshot_id),
+        )
+        branches.append(f'NOT COALESCE(({historical}), FALSE)')
     predicate = '\n  AND '.join(branches)
     return f'SELECT COUNT(*)\nFROM {_pinned(table, pins)} b\nWHERE {predicate}'
 
