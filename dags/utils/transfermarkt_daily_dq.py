@@ -379,18 +379,21 @@ def collect_daily_metrics(cur, implementation_at: datetime,
     return metrics, results
 
 
-def _routes(cur) -> dict[str, str]:
-    from dags.utils.transfermarkt_denominator_registry import denominator_source
-    if denominator_source() == 'tsv':
-        from scrapers.transfermarkt.denominator import load_denominator
-        return {key: item.route for key, item in load_denominator().rows.items()}
-    from dags.utils.transfermarkt_denominator_registry import build_registry_denominator
-    from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
-    cur.execute(build_promoted_registry_query(current_only=True))
-    columns = [item[0] for item in (cur.description or ())]
-    rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
-    denominator = build_registry_denominator(rows).denominator
-    return {key: item.route for key, item in denominator.rows.items()}
+def _routes(cur) -> tuple[dict[str, str], str, str]:
+    from dags.utils.transfermarkt_denominator_registry import build_registry_denominator, denominator_source
+    from scrapers.transfermarkt.denominator import load_versioned_denominator
+
+    source = denominator_source()
+    if source == 'registry':
+        from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
+        cur.execute(build_promoted_registry_query(current_only=True))
+        columns = [item[0] for item in (cur.description or ())]
+        rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
+        selected = build_registry_denominator(rows)
+        denominator, version = selected.denominator, selected.universe_version
+    else:
+        denominator, version = load_versioned_denominator()
+    return {key: item.route for key, item in denominator.rows.items()}, source, version
 
 
 def _unknown(metrics: Mapping[str, Any], checks: list) -> bool:
@@ -449,8 +452,13 @@ def run_daily_bronze_dq(cur, *, state_root: Path = DEFAULT_STATE_ROOT,
             checks = dq.run_bronze_dq(frozen, registry_snapshot_id=None,
                                       pins=pins, zone='full')
             remember({}, checks)
+            if routes is None:
+                routes, source, version = _routes(frozen)
+                report.update(denominator_source=source, universe_version=version)
+            else:
+                report.update(denominator_source='injected', universe_version=None)
             metrics, daily_checks = collect_daily_metrics(
-                frozen, deployed, routes or _routes(frozen),
+                frozen, deployed, routes,
                 progress=lambda m, c: remember(m, checks + c))
             checks += daily_checks
             remember(metrics, checks)

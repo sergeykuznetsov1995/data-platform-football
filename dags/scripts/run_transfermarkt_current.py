@@ -1865,10 +1865,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             denominator_rows = list(registry_denominator.denominator.rows.values())
             universe_version = registry_denominator.universe_version
         else:
-            from scrapers.transfermarkt.denominator import denominator_path, load_denominator
-            path = denominator_path()
-            denominator_rows = list(load_denominator(path).rows.values())
-            universe_version = hashlib.sha256(path.read_bytes()).hexdigest()
+            from scrapers.transfermarkt.denominator import load_versioned_denominator
+            denominator, universe_version = load_versioned_denominator()
+            denominator_rows = list(denominator.rows.values())
     else:
         source, universe_version = 'injected', None
     denominator_rows = list(denominator_rows)

@@ -50,6 +50,15 @@ AMATEUR_SPECIAL_IDS = frozenset({"NPAM"})
 CONTINENT_GEOGRAPHY = frozenset(
     {"Africa", "Americas", "Asia", "Europe", "World", "International", "Unknown", ""}
 )
+# Archived profile geography missing from the continental catalogue row.
+# The edition's source_body_hash identifies the exact profile with this metadata.
+PROFILE_COUNTRIES = {
+    (
+        "BRRD",
+        "https://www.transfermarkt.com/campeonato-rondoniense/startseite/pokalwettbewerb/BRRD",
+        "2e1ef6ee432b81fe84130c0b255a73f4355f2cca5afbea9e1788f64fcc3d2d19",
+    ): ("Americas", "Brazil"),
+}
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,7 @@ class UniverseEntry:
     title_only: bool
     live_decision: bool | None
     class_subtype: str | None = None
+    country_evidence_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,23 +101,30 @@ def _duplicate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def registry_snapshot_id(rows: Iterable[Mapping[str, Any]]) -> str:
+    if not rows:
+        raise DenominatorError("registry denominator is empty")
+    snapshots = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise DenominatorError("registry row must be a mapping")
+        version = row.get("registry_snapshot_id")
+        if not isinstance(version, str) or not version or version != version.strip():
+            raise DenominatorError("registry denominator requires one exact snapshot")
+        snapshots.add(version)
+    if len(snapshots) != 1:
+        raise DenominatorError("registry denominator requires one exact snapshot")
+    return snapshots.pop()
+
+
 def _canonical_rows(
     registry_rows: Iterable[Mapping[str, Any]],
 ) -> tuple[dict[str, Mapping[str, Any]], str]:
     rows = tuple(registry_rows)
-    if not rows:
-        raise DenominatorError("registry denominator is empty")
-    if any(not isinstance(row, Mapping) for row in rows):
-        raise DenominatorError("registry row must be a mapping")
-    snapshots = {str(row.get("registry_snapshot_id") or "").strip() for row in rows}
-    if len(snapshots) != 1 or not next(iter(snapshots)):
-        raise DenominatorError("registry denominator requires one exact snapshot")
-    universe_version = next(iter(snapshots))
+    universe_version = registry_snapshot_id(rows)
     canonical: dict[str, Mapping[str, Any]] = {}
     identities: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if not isinstance(row, Mapping):
-            raise DenominatorError("registry row must be a mapping")
         competition_id = str(row.get("competition_id") or "").strip()
         if not competition_id:
             raise DenominatorError("registry row has no competition_id")
@@ -214,18 +231,18 @@ def _live_decision(record, edition) -> bool | None:
     return year >= threshold
 
 
-def _live_class(record, tier: str, route: str) -> str:
+def _live_class(record, tier: str, route: str, country: str) -> str:
     if record.team_type is TeamType.NATIONAL_TEAM:
         return "core_national"
     if record.team_type is not TeamType.CLUB or route == "unknown" or tier == "unknown":
         return "unknown"
     if tier in {"5", "6"} or record.competition_id in AMATEUR_SPECIAL_IDS:
         return "amateur"
-    if record.country == "Germany" and record.name.startswith("Landespokal "):
+    if country == "Germany" and record.name.startswith("Landespokal "):
         return "amateur"
-    if tier == "regional" and record.country in CONTINENT_GEOGRAPHY:
+    if tier == "regional" and country in CONTINENT_GEOGRAPHY:
         return "unknown"
-    if tier == "regional" and record.country != "Brazil":
+    if tier == "regional" and country != "Brazil":
         return "amateur"
     return "core_club"
 
@@ -235,6 +252,18 @@ def _entry(raw: Mapping[str, Any], title_only_ids: frozenset[str]) -> UniverseEn
     edition = _edition_from_joined_row(raw)
     exclusion = _name_exclusion(record)
     tier, labels = _tier(record)
+    country = record.country
+    country_evidence = None
+    proof = PROFILE_COUNTRIES.get(
+        (record.competition_id, record.source_url, edition.source_body_hash)
+    )
+    if proof and tier == "regional":
+        region, profile_country = proof
+        if country == region and record.confederation == region:
+            country = profile_country
+            country_evidence = edition.source_body_hash
+        elif country != profile_country:
+            country = "Unknown"
     route = _route(record)
     live = _live_decision(record, edition)
     subtype = None
@@ -246,7 +275,7 @@ def _entry(raw: Mapping[str, Any], title_only_ids: frozenset[str]) -> UniverseEn
     elif live is None:
         competition_class = "unknown"
     else:
-        base_class = _live_class(record, tier, route)
+        base_class = _live_class(record, tier, route, country)
         if live:
             competition_class = base_class
         else:
@@ -259,7 +288,7 @@ def _entry(raw: Mapping[str, Any], title_only_ids: frozenset[str]) -> UniverseEn
     row = DenominatorRow(
         competition_id=record.competition_id,
         name=record.name,
-        country=record.country,
+        country=country,
         confederation=record.confederation,
         tier=tier,
         competition_class=competition_class,
@@ -282,6 +311,7 @@ def _entry(raw: Mapping[str, Any], title_only_ids: frozenset[str]) -> UniverseEn
         title_only=record.competition_id in title_only_ids,
         live_decision=live,
         class_subtype=subtype,
+        country_evidence_sha256=country_evidence,
     )
 
 
@@ -351,6 +381,8 @@ def _entry_audit(entry: UniverseEntry, version: str) -> dict[str, Any]:
         "current_edition": str(entry.row.current_saison_id),
         "version": version,
         "title_only": entry.title_only,
+        "country": entry.row.country,
+        "country_evidence_sha256": entry.country_evidence_sha256,
     }
 
 
@@ -361,16 +393,24 @@ def diff_status(report: Mapping[str, Any]) -> dict[str, Any]:
         for row in delta
         if not row.get("explanations")
     ]
-    quarantine_disappearance = list(report.get("legacy_core_quarantine_ids", ()))
+    missing = set(report.get("legacy_core_quarantine_ids", ()))
+    missing.update(report.get("legacy_core_publication_absence_ids", ()))
+    missing.update(
+        row["competition_id"]
+        for row in delta
+        if row.get("new") is None
+        and ((row.get("old") or {}).get("membership") or row.get("change") == "removed")
+    )
     unresolved = [
         str(row.get("competition_id", ""))
         for row in delta
         if (row.get("new") or {}).get("competition_class") == "unknown"
     ]
-    complete = not unexplained and not quarantine_disappearance
+    complete = not unexplained and not missing
     return {
         "complete": complete,
         "migration_clean": complete and not unresolved,
+        "missing_legacy_core_ids": sorted(missing),
         "unexplained": unexplained,
     }
 
@@ -426,6 +466,8 @@ def compare_denominators(
             if old["current_edition"] != new["current_edition"]:
                 explanations.append("current_edition")
             if new["competition_class"] == "unknown" and new["tier"] == "regional":
+                explanations.append("geography")
+            elif new_entry.country_evidence_sha256:
                 explanations.append("geography")
         if new_entry and new_entry.title_only:
             explanations.append("title_only")
@@ -493,6 +535,9 @@ def compare_denominators(
             for competition_id, reason in current.quarantined
         ],
         "legacy_core_quarantine_ids": legacy_core_quarantine,
+        "legacy_core_publication_absence_ids": sorted(
+            legacy_ids - entries.keys() - quarantine_ids
+        ),
     }
     report.update(diff_status(report))
     return report
@@ -507,4 +552,5 @@ __all__ = [
     "compare_denominators",
     "denominator_source",
     "diff_status",
+    "registry_snapshot_id",
 ]

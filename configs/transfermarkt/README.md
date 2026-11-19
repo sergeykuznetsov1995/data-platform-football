@@ -41,30 +41,82 @@ threshold. Unknown geography or an unknown live/tier decision cannot silently
 enter core. Known non-live records become `archive`; youth/reserve subtypes are
 retained in audit metadata.
 
-`title_only` is an independent evidence flag, never positive admission or a
-blanket exclusion. Quarantine is a separate snapshot-bound inventory with all
-IDs/reasons, not synthetic registry rows. A published/quarantine collision or a
-legacy-core disappearance into quarantine prevents a clean migration result.
+BRRD (Campeonato Rondoniense) is a live Brazilian regional championship. The
+promoted catalogue row supplies the region Americas. The competition profile
+names Brazil in its keywords, and its archived SHA-256
+`2e1ef6ee432b81fe84130c0b255a73f4355f2cca5afbea9e1788f64fcc3d2d19` matches
+the current edition's source body. The Brazilian catalogue also links to BRRD
+(body SHA-256 `b31ecdc538dc2307427f550987013970669c5d02fbd9c1007ed805253567653d`).
+The adapter applies the existing regional and live rules with the verified
+country when the competition ID, profile URL, source hash and catalogue region
+match. A changed source body with continental geography requires fresh evidence.
+[Competition profile](https://www.transfermarkt.com/campeonato-rondoniense/startseite/pokalwettbewerb/BRRD)
+· [Brazilian catalogue](https://www.transfermarkt.com/wettbewerbe/national/wettbewerbe/26)
 
-For one offline comparison, use exported current rows and the matching
-discovery manifest:
+### Offline migration check and rollback (#2331)
+
+Archive the exact promoted current rows, original discovery manifest and TSV.
+Record SHA-256 for all three. Supply the expected promoted snapshot. The
+manifest must identify that same snapshot and explicitly contain
+`quarantined_competition_ids`, `discovery_report.discovery_quarantined` and
+`discovery_report.title_only_competition_ids`. Each quarantine ID needs its own
+reason. The report keeps every ID and reason, including an explicitly empty
+inventory, and reports title-only evidence independently of membership.
+
+A missing legacy core ID blocks the migration even when quarantine is empty.
+A published/quarantined collision, mismatched snapshot, incomplete manifest
+or unresolved changed classification also blocks the check. Inspect the exit
+code, `complete`, `migration_clean`, `unexplained` and the per-ID delta.
+
+The following command renders the two read-only queries and their bindings
+for the 18 November 2026 Moscow reporting day. Use the original
+`journal-snapshots.json`, which maps the fully qualified checks and signals
+table names to positive integer Iceberg snapshot IDs.
 
 ```bash
 python dags/scripts/transfermarkt_daily_report.py \
-  --day 2026-11-16 --as-of 2026-11-17T00:00:00+00:00 \
+  --day 2026-11-18 --as-of 2026-11-19T19:47:43.279618Z \
+  --registry-snapshot-id tm-discovery-556131e8d5f3a7c9831da251 \
   --registry-json inputs/promoted-current.json \
   --denominator configs/transfermarkt/denominator.tsv \
-  --denominator-dual-run \
-  --discovery-manifest-json inputs/discovery-manifest.json
+  --discovery-manifest-json inputs/discovery-manifest.json \
+  --journal-snapshots-json inputs/journal-snapshots.json --denominator-dual-run
 ```
 
-Add `--execute --registry-snapshot-id tm-discovery-ea6e9c4edb2a29303527f0d3`
-instead of `--registry-json` to run both read-only daily SELECTs against one
-journal. Every added/removed/changed row must have an explanation. `complete`
-means the diff has no unexplained rows and no legacy-core quarantine
-disappearance; `migration_clean` additionally excludes unresolved delta
-classes. Neither flag is a production acceptance. The 1824/25754 publication
-counts are not the coverage denominator, and production switching is separate.
+`sql_only` contains the plan. Execute its SQL with the original bindings on a
+read-only Trino connection for the daily measurements. Alternatively the
+`--execute` dual-run reads the specified promoted snapshot and executes both
+queries. Without a supplied journal map it reads both Iceberg main references
+once and records them. All three scans (checks, current signals, superseded
+signals) use those physical versions. Preserve the exact row export for
+replay after subsequent publications.
+
+To verify rollback, repeat the example with `--denominator-source registry`
+and then `--denominator-source tsv` in place of `--denominator-dual-run`.
+TSV can omit the discovery manifest. Compare the SQL, bindings, core IDs,
+version, definition hash and measured results with the matching dual side.
+The TSV version is the SHA-256 of the bytes actually parsed.
+
+### Three daily observations after an authorized switch
+
+Before the window opens, record one expected registry snapshot, the first
+Moscow reporting day, the deployed release and the rollout authorization.
+Take three consecutive scheduled days. For each day retain the following
+evidence with its timestamp and release from the delivery receipt.
+
+| Producer | Evidence to record for that Moscow day |
+|---|---|
+| Current planner | Current portion's persisted report, cycle ID, `denominator_source` and `universe_version`. Check all current portions used that day. |
+| Daily measurement | Executed daily report, `report_day`, `as_of`, `denominator_source` and `denominator_version`. Keep ordinary coverage and blockers. |
+| Daily Bronze DQ | First completed scheduled daily report, `day_msk`, `cutoff_at`, `denominator_source` and `universe_version`. Keep its original checks and status. A cached report retains its original evidence. |
+| Discovery | Record new canonical publications and times separately from the versions actually used. |
+
+Count a day only when all three producers report registry mode and the
+predeclared version on the verified release and the existing current/DQ
+criteria pass. Missing provenance, a cached TSV result or mixed snapshots
+leave that day unqualified. Archive every observation. If a consumer changes
+snapshot, retain the prior window and explicitly pin a new version and first
+day for a new series. The offline result alone authorizes no production switch.
 
 ### TSV format
 
