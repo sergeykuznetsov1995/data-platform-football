@@ -120,6 +120,16 @@ def statement_keys(sql, catalog):
     return keys
 
 
+class _StatementNotSubmitted(TrinoError):
+    """The connection or its SELECT 1 health check failed before the caller's SQL."""
+
+
+def _write_definitely_rejected(error):
+    return isinstance(
+        error, _StatementNotSubmitted
+    ) or _is_definite_iceberg_commit_conflict(error)
+
+
 class WhoScoredTrinoManager(TrinoTableManager):
     def __init__(
         self,
@@ -128,6 +138,7 @@ class WhoScoredTrinoManager(TrinoTableManager):
         port=None,
         catalog="iceberg",
         session_properties=None,
+        query_max_run_seconds=WRITE_TIMEOUT,
         budget=None,
     ):
         password = os.environ.get("TRINO_SRC_WHOSCORED_PASSWORD")
@@ -141,11 +152,26 @@ class WhoScoredTrinoManager(TrinoTableManager):
         )
         # The shared manager initializes caches and opens connections lazily.
         self._password = password
-        self._session_properties = {
-            "query_max_run_time": f"{WRITE_TIMEOUT}s",
-            **(session_properties or {}),
-        }
+        if (
+            type(query_max_run_seconds) is not int
+            or not 0 < query_max_run_seconds <= WRITE_TIMEOUT
+        ):
+            raise ValueError(
+                f"query_max_run_seconds must be between 1 and {WRITE_TIMEOUT}"
+            )
+        self._session_properties = dict(session_properties or {})
+        if "query_max_run_time" in self._session_properties:
+            raise ValueError("Set query_max_run_seconds to bound the server run time")
+        self._session_properties["query_max_run_time"] = f"{query_max_run_seconds}s"
         self.budget = shared_budget() if budget is None else budget
+
+    @property
+    def connection(self):
+        try:
+            return super().connection
+        except TrinoError as exc:
+            # The shared manager only opens the connection and executes SELECT 1 here.
+            raise _StatementNotSubmitted(str(exc)) from exc
 
     def _create_connection(self):
         import trino
@@ -184,9 +210,7 @@ class WhoScoredTrinoManager(TrinoTableManager):
         # For writes, the caller must reconcile the physical batch first.
         for attempt in range(2):
             try:
-                with self.budget.statement(
-                    keys, rejected=_is_definite_iceberg_commit_conflict
-                ):
+                with self.budget.statement(keys, rejected=_write_definitely_rejected):
                     return super()._execute(
                         sql, fetch=fetch, params=params, replay_safe=False
                     )

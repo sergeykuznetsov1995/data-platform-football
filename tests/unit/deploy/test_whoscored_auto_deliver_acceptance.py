@@ -91,7 +91,8 @@ import os
 
 
 class WhoScoredTrinoManager:
-    def __init__(self, session_properties=None):
+    def __init__(self, session_properties, query_max_run_seconds):
+        session_properties = dict(session_properties, query_max_run_time=f"{query_max_run_seconds}s")
         with open(os.environ["SQL_CAPTURE"], "a") as fh:
             fh.write("session_properties=%r\\n" % (session_properties,))
 
@@ -316,4 +317,4 @@ def test_measure_bounds_client_and_container_time():
     program = _measure_program()
     assert "timeout=60" in program
     assert "signal.alarm(55)" in program
-    assert '"query_max_run_time": "50s"' in program
+    assert "query_max_run_seconds=50" in program

@@ -57,7 +57,7 @@ def test_killed_writer_preserves_pacing_across_process_restart(tmp_path):
     with budget.statement(["poll:m"]):
         assert clock.now == 11 + INTERVAL
     with budget.statement(["commit:a"]):
-        assert clock.now == 10 + WRITE_TIMEOUT + INTERVAL
+        assert clock.now == 11 + INTERVAL + WRITE_TIMEOUT + INTERVAL
 
 
 def test_unknown_commit_is_not_replayed_and_definite_rejection_can_retry(tmp_path):
@@ -315,3 +315,81 @@ def test_injected_query_client_shares_inventory_across_repositories(
     for _ in range(2):
         assert WhoScoredRepository(trino=client).history_coverage() == {}
     client.execute_query.assert_called_once()
+
+
+def test_initial_connection_failure_does_not_fence_unsubmitted_write(
+    tmp_path, monkeypatch
+):
+    from scrapers.base.trino_manager import TrinoError, TrinoTableManager
+
+    clock = Clock(5)
+    budget = TrinoBudget(tmp_path, clock=clock, sleep=clock.sleep)
+    monkeypatch.setenv("TRINO_SRC_WHOSCORED_PASSWORD", "source-fixture")
+    monkeypatch.setattr(TrinoTableManager, "_trino_unreachable", False)
+    manager = trino.WhoScoredTrinoManager(budget=budget)
+    monkeypatch.setattr(manager, "_CONNECT_RETRIES", 1)
+    with patch("trino.dbapi.connect") as connect:
+        cursor = connect.return_value.cursor.return_value
+        cursor.execute.side_effect = OSError(
+            "connection failed in the initial health check"
+        )
+        with pytest.raises(TrinoError):
+            manager._execute("INSERT INTO bronze.whoscored_events VALUES (1)")
+        assert [call.args[0] for call in cursor.execute.call_args_list] == ["SELECT 1"]
+        cursor.execute.side_effect = None
+        manager._reset_connection()
+        manager._execute("INSERT INTO bronze.whoscored_events VALUES (2)")
+    assert clock.now <= 5 + INTERVAL
+
+
+def test_lost_response_fences_even_a_late_submission(tmp_path):
+    clock = Clock(0)
+    budget = TrinoBudget(tmp_path, clock=clock, sleep=clock.sleep)
+    with pytest.raises(OSError):
+        with budget.statement(["commit:a"]):
+            # The connection/statement setup consumed time before the POST.
+            clock.now = 180
+            raise OSError("no response to the write")
+    with budget.statement(["commit:b"]):
+        assert clock.now == 180
+    with budget.statement(["commit:a"]):
+        assert clock.now >= 180 + WRITE_TIMEOUT + INTERVAL
+
+
+def test_uncertain_commit_survives_waiter_restart_and_worker_reboot(
+    tmp_path, monkeypatch
+):
+    clock = Clock(10)
+    boot = tmp_path / "boot"
+    boot.write_text("one")
+    import scrapers.whoscored.trino_budget as pacing
+
+    monkeypatch.setattr(pacing, "_BOOT", boot)
+    budget = TrinoBudget(tmp_path / "slots", clock=clock, sleep=clock.sleep)
+    with pytest.raises(OSError):
+        with budget.statement(["commit:a"]):
+            raise OSError("unknown outcome")
+
+    # First contender observes the ongoing cooldown, then is interrupted.
+    def stop(seconds):
+        raise KeyboardInterrupt
+
+    waiting = TrinoBudget(budget.root, clock=clock, sleep=stop)
+    with pytest.raises(KeyboardInterrupt):
+        with waiting.statement(["commit:a"]):
+            pytest.fail("table still fenced")
+    boot.write_text("two")
+    clock.now = 1
+    with budget.statement(["commit:a"]):
+        assert clock.now >= 1 + WRITE_TIMEOUT + INTERVAL
+
+
+def test_session_cannot_outlive_the_uncertain_commit_fence(monkeypatch):
+    monkeypatch.setenv("TRINO_SRC_WHOSCORED_PASSWORD", "source-fixture")
+    with pytest.raises(ValueError, match="query_max_run"):
+        trino.WhoScoredTrinoManager(session_properties={"query_max_run_time": "2h"})
+    with pytest.raises(ValueError, match="query_max_run"):
+        trino.WhoScoredTrinoManager(query_max_run_seconds=WRITE_TIMEOUT + 1)
+    with patch("trino.dbapi.connect") as connect:
+        trino.WhoScoredTrinoManager(query_max_run_seconds=50)._create_connection()
+    assert connect.call_args.kwargs["session_properties"]["query_max_run_time"] == "50s"

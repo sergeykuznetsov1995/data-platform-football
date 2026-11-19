@@ -14,6 +14,8 @@ INTERVAL = 60
 # Keep a crashed writer fenced for the source query's maximum lifetime.
 WRITE_TIMEOUT = 45 * 60
 _BOOT = Path("/proc/sys/kernel/random/boot_id")
+# Stored in the existing slots.active column. Values 0/1 also occur in older files.
+_COOLING, _IN_FLIGHT, _UNCERTAIN = 0, 1, 2
 
 
 class TrinoBudget:
@@ -70,29 +72,24 @@ class TrinoBudget:
                         if row is None:
                             continue
                         old_boot, due, active = row
-                        if old_boot != boot or active:
-                            # Having the flock proves that the former owner left.
-                            # The coordinator can still be executing its statement.
-                            if old_boot != boot:
-                                due = (
-                                    now
-                                    + INTERVAL
-                                    + (
-                                        WRITE_TIMEOUT
-                                        if active and key.startswith("commit:")
-                                        else 0
-                                    )
-                                )
-                            due = max(due, now + INTERVAL)
+                        if old_boot != boot or active == _IN_FLIGHT:
+                            # We own the flock. A former holder could have submitted
+                            # just before it died, long after acquiring the slot.
+                            uncertain = bool(active) and key.startswith("commit:")
+                            recovered = (
+                                now + INTERVAL + (WRITE_TIMEOUT if uncertain else 0)
+                            )
+                            due = recovered if old_boot != boot else max(due, recovered)
+                            state = _UNCERTAIN if uncertain else _COOLING
                             db.execute(
-                                "UPDATE slots SET boot=?,ready=?,active=0 WHERE key=?",
-                                (boot, due, key),
+                                "UPDATE slots SET boot=?,ready=?,active=? WHERE key=?",
+                                (boot, due, state, key),
                             )
                         ready = max(ready, due)
                     if ready <= now:
                         db.execute(
-                            "DELETE FROM slots WHERE boot=? AND active=0 AND ready<=?",
-                            (boot, now),
+                            "DELETE FROM slots WHERE boot=? AND active!=? AND ready<=?",
+                            (boot, _IN_FLIGHT, now),
                         )
                         db.executemany(
                             "INSERT OR REPLACE INTO slots VALUES (?,?,?,1)",
@@ -112,24 +109,29 @@ class TrinoBudget:
                             ],
                         )
                 if ready <= now:
-                    completed = keys
+                    uncertain = set()
                     try:
                         yield
                     except BaseException as exc:
                         if rejected is None or not rejected(exc):
-                            # An unacknowledged write may still complete remotely.
-                            completed = [
-                                key for key in keys if not key.startswith("commit:")
-                            ]
+                            uncertain = {
+                                key for key in keys if key.startswith("commit:")
+                            }
                         raise
                     finally:
-                        # Survives restarts. A long query's commit can occur just
-                        # before fetchall returns, well after statement admission.
+                        # The last POST may have happened just before the error.
+                        # Keep its full server lifetime, including across reboots.
                         done = self.clock() + INTERVAL
+                        updates = [
+                            (done + WRITE_TIMEOUT, _UNCERTAIN, key)
+                            if key in uncertain
+                            else (done, _COOLING, key)
+                            for key in keys
+                        ]
                         with self._db() as db:
                             db.executemany(
-                                "UPDATE slots SET ready=?,active=0 WHERE key=?",
-                                [(done, key) for key in completed],
+                                "UPDATE slots SET ready=?,active=? WHERE key=?",
+                                updates,
                             )
                     return
             # No relation lock or DB transaction is held during the cooldown.

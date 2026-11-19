@@ -130,9 +130,9 @@ signal.alarm(55)
 try:
     timestamp = datetime.fromisoformat(sys.argv[1]).isoformat(sep=" ", timespec="microseconds")
     from scrapers.whoscored.trino import WhoScoredTrinoManager
-    with WhoScoredTrinoManager(session_properties={
-        "enable_dynamic_filtering": "false", "query_max_run_time": "50s",
-    }) as manager:
+    with WhoScoredTrinoManager(
+        session_properties={"enable_dynamic_filtering": "false"}, query_max_run_seconds=50,
+    ) as manager:
         rows = manager.execute_query("select " + ", ".join(
             "(select count(*) from iceberg.bronze." + table
             + " where _ingested_at > timestamp '" + timestamp + "')"
