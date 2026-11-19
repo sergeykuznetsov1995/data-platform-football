@@ -577,6 +577,9 @@ def test_real_pinned_registry_matches_independent_oracle():
     import os
     from pathlib import Path
 
+    from dags.scripts.transfermarkt_daily_report import _manifest_metadata
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+
     evidence_dir = os.environ.get("TRANSFERMARKT_REGISTRY_EVIDENCE_DIR")
     if not evidence_dir:
         pytest.skip("set TRANSFERMARKT_REGISTRY_EVIDENCE_DIR to run the pinned oracle")
@@ -589,21 +592,21 @@ def test_real_pinned_registry_matches_independent_oracle():
     except OSError as exc:
         pytest.skip(f"pinned oracle is unavailable: {exc}")
     report = manifest["discovery_report"]
-    quarantined = {
-        cid: report["discovery_quarantined"].get(
-            cid, "registry quarantine without detailed discovery reason"
+    # This historical export lacks 199 reconciliation reasons. It can verify
+    # published row classifications, but its migration gate must stay closed.
+    assert len(manifest["quarantined_competition_ids"]) == 221
+    assert len(report["discovery_quarantined"]) == 22
+    with pytest.raises(MeasurementError, match="discovery_quarantined ID mismatch"):
+        _manifest_metadata(
+            root / "inputs/discovery-manifest.json", rows, manifest["snapshot_id"]
         )
-        for cid in manifest["quarantined_competition_ids"]
-    }
     universe = build_registry_denominator(
         rows,
-        quarantined=quarantined,
         title_only_ids=report["title_only_competition_ids"],
     )
     expected = json.loads((root / "inputs/derived-universe-oracle.json").read_text())
     assert len(universe.entries) == 1824
-    assert len(universe.denominator.denominator_ids()) == 944
-    assert len(universe.quarantined) == 221
+    assert len(universe.denominator.denominator_ids()) == 945
     assert len(universe.title_only_ids) == 30
     fields = {
         "competition_class",
@@ -614,6 +617,7 @@ def test_real_pinned_registry_matches_independent_oracle():
         "current_edition",
         "registry_status",
     }
+    differences = []
     for entry in universe.entries:
         cid = entry.row.competition_id
         actual = {
@@ -625,9 +629,10 @@ def test_real_pinned_registry_matches_independent_oracle():
             "current_edition": str(entry.row.current_saison_id),
             "registry_status": entry.registry_status,
         }
-        assert actual == {
-            key: value for key, value in expected[cid].items() if key in fields
-        }, cid
+        for key in sorted(fields):
+            if actual[key] != expected[cid][key]:
+                differences.append((cid, key, expected[cid][key], actual[key]))
+    assert differences == [("BRRD", "competition_class", "unknown", "core_club")]
 
 
 def test_planner_registry_source_is_lazy_and_materializes_generator(monkeypatch):

@@ -63,24 +63,14 @@ live/tier/geography не допускается молча. Известные �
 текущих изданий соревнования требуют успеха каждого; единица знаменателя
 остаётся соревнованием.
 
-Один dual-run строит legacy и registry знаменатели на одних строках/day/as_of:
-
-```bash
-python dags/scripts/transfermarkt_daily_report.py \
-  --day 2026-11-16 --as-of 2026-11-17T00:00:00+00:00 \
-  --registry-json inputs/promoted-current.json \
-  --denominator configs/transfermarkt/denominator.tsv \
-  --denominator-dual-run \
-  --discovery-manifest-json inputs/discovery-manifest.json
-```
-
-Offline-режим выводит оба SQL+params и построчный diff. Замена
-`--registry-json` на `--execute --registry-snapshot-id tm-discovery-ea6e9c4edb2a29303527f0d3`
-выполняет оба daily SELECT на одном cursor и возвращает оба отчёта.
-Это read-only диагностика, не production
-переключение или приёмка. `diff.complete` требует объяснения каждой строки и
-отсутствия исчезновения legacy core в quarantine; `migration_clean=false`
-при unresolved классах. Production rollout и приёмка выполняются отдельно.
+При сравнении обе стороны используют один экспорт текущих изданий, точный
+манифест discovery, одни отчётные сутки МСК и одну отсечку `as_of`.
+Измеритель закрепляет физические Iceberg-снимки журналов проверок и сигналов.
+Сохранённый `--journal-snapshots-json` воспроизводит эти входы для повторного
+измерения и отката. В режиме `--registry-json` CLI выдаёт SQL и параметры;
+режим `--execute` возвращает результаты SELECT. При исчезновении legacy core
+или недостоверных входах сравнение завершается с ненулевым кодом.
+[Команды, критерии сравнения и проверка трёх суток](../../configs/transfermarkt/README.md#offline-migration-check-and-rollback-2331).
 
 Сутки — `[00:00, 00:00 следующих суток)` МСК. SQL timestamp(6) хранит UTC.
 Успех требует complete listing, players и injury, полный expected/observed
