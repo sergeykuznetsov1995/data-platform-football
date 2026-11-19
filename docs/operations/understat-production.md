@@ -161,6 +161,21 @@ complete v2 batch.
 A new unknown source field is a warning (`unknown_source_fields`, #1437), not a
 stop; an unknown non-null value of a known field is still an error.
 
+### Daily deadline report
+
+The deadline falls 26 hours after kickoff. After a partial replacement, the meter
+can recover a kickoff from an unambiguous schedule row in the replacement batch.
+The site result needs independent evidence, and only a complete publication can
+prove on-time coverage. If the denominator cannot be established, the report
+displays «день не измерен» and the day breaks the #1445 streak. A measured day
+without deadlines stays neutral.
+
+The [stand-alone morning report patch](../../deploy/understat/morning-report-2342.patch)
+updates the host report's SQL and its daily state handling together. At cutover,
+the report keeps the older measurements under `previous_criterion` and starts a
+fresh streak. The [offline report tests](../../tests/unit/scrapers/test_understat_morning_deadline.py)
+apply the patch to a frozen copy and check it against the repository SQL.
+
 ## Transport and cache
 
 The native client bootstraps cookies, sends `X-Requested-With:
