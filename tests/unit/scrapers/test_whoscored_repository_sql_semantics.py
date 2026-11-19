@@ -385,7 +385,11 @@ def _history_repository(con):
 
     trino = MagicMock()
     trino.execute_query.side_effect = execute
-    return WhoScoredRepository(writer=MagicMock(), trino=trino)
+    repo = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    # Each call in these SQL tests reads immediately after a fixture mutation.
+    repo.budget = MagicMock()
+    repo.budget.snapshot.side_effect = lambda key, load: load()
+    return repo
 
 
 def test_coverage_takes_checked_stages_from_last_successful_schedule_only():
@@ -749,5 +753,30 @@ def test_history_coverage_only_counts_visible_schedule_rows_and_scans_each_input
         tables = [t.name for t in sqlglot.parse_one(sql, read="trino").find_all(sqlglot.exp.Table) if t.db]
         assert sorted(tables) == ["whoscored_match_ingest_manifest", "whoscored_schedule",
                                   "whoscored_scope_ingest_manifest"]
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        (None, ()),
+        ("{}", ()),
+        ('{"__checked_stage_ids__":null}', ()),
+        ("broken historic payload", ()),
+        ('{"__checked_stage_ids__":[null,4,"5",false]}', (4, 5)),
+        ('{"__checked_stage_ids__":"42"}', ()),
+    ],
+)
+def test_history_checked_stages_require_positive_evidence(states, expected):
+    con = _connection()
+    try:
+        _published_history_schedule(con, 0)
+        con.execute(
+            "UPDATE iceberg.bronze.whoscored_scope_ingest_manifest SET dataset_states_json = ?",
+            [states],
+        )
+        row = _history_repository(con).history_coverage()[(LEAGUE, SEASON)]
+        assert row["checked_stage_ids"] == expected
     finally:
         con.close()

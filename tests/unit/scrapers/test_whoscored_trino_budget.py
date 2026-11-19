@@ -274,3 +274,44 @@ def test_query_origin_is_independent_of_the_login(monkeypatch, dag, source):
         monkeypatch.delenv("AIRFLOW_CTX_DAG_ID", raising=False)
     with trino.WhoScoredTrinoManager()._create_connection() as connection:
         assert (connection.user, connection.source) == ("src_whoscored", source)
+
+
+def test_injected_manager_supplies_direct_writer_budget(tmp_path, monkeypatch):
+    from scrapers.whoscored.repository import WhoScoredRepository
+
+    clock = Clock(10)
+    monkeypatch.setenv("TRINO_SRC_WHOSCORED_PASSWORD", "source-fixture")
+    monkeypatch.setattr(
+        trino,
+        "shared_budget",
+        lambda: TrinoBudget(tmp_path / "default", clock=clock, sleep=clock.sleep),
+    )
+    manager = trino.WhoScoredTrinoManager()
+    manager.budget = TrinoBudget(
+        tmp_path / "configured", clock=clock, sleep=clock.sleep
+    )
+    repo = WhoScoredRepository(trino=manager)
+    with (
+        patch("trino.dbapi.connect"),
+        patch.object(trino.IcebergWriter, "_append_dataframe_pyiceberg") as append,
+    ):
+        append.side_effect = lambda *a, **k: clock.now
+        manager._execute("INSERT INTO bronze.whoscored_events VALUES (1)")
+        observed = repo.writer._append_dataframe_pyiceberg(
+            None, database="bronze", table="whoscored_events"
+        )
+    assert observed == 70
+
+
+def test_injected_query_client_shares_inventory_across_repositories(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import Mock
+    from scrapers.whoscored.repository import WhoScoredRepository
+
+    monkeypatch.setenv("WHOSCORED_LOCK_DIR", str(tmp_path))
+    client = Mock()
+    client.execute_query.return_value = []
+    for _ in range(2):
+        assert WhoScoredRepository(trino=client).history_coverage() == {}
+    client.execute_query.assert_called_once()

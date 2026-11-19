@@ -3360,7 +3360,60 @@ class WhoScoredIngestService:
         failure_rows = []
         failure_outcomes = []
         pending: list[tuple[PreviewCommit, Any]] = []
-        proxy_down: Optional[ProxyUnavailable] = None
+        try:
+            proxy_down = self._collect_preview_pages(
+                candidates, pending, failure_rows, failure_outcomes, result,
+            )
+        finally:
+            self._write_failure_batch(
+                "preview", self.repository.write_preview_failure_rows,
+                failure_rows, failure_outcomes, result,
+            )
+        if pending:
+            try:
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit, _parsed in pending
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_previews(
+                        [commit for commit, _parsed in pending]
+                    )
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "preview repository returned different committed batch ids"
+                    )
+            except Exception as exc:
+                result.errors.append(f"preview batch: {type(exc).__name__}: {exc}")
+            else:
+                result.committed_batches["preview"].extend(committed_batch_ids)
+                result.succeeded += len(pending)
+                for _commit, parsed in pending:
+                    for name, dataset in parsed.datasets.items():
+                        result.counts[name] = (
+                            result.counts.get(name, 0) + dataset.row_count
+                        )
+        if proxy_down is not None:
+            raise proxy_down
+        if candidates:
+            result.tables.extend(
+                [
+                    "iceberg.bronze.whoscored_missing_players",
+                    "iceberg.bronze.whoscored_preview_lineups",
+                    "iceberg.bronze.whoscored_preview_sections",
+                    "iceberg.bronze.whoscored_preview_ingest_manifest",
+                ]
+            )
+        return result
+
+    def _collect_preview_pages(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
+        pending: list[tuple[PreviewCommit, Any]],
+        failure_rows: list[dict[str, Any]],
+        failure_outcomes: list[tuple[str, str]],
+        result: EntityResult,
+    ) -> Optional[ProxyUnavailable]:
         for candidate in candidates:
             target = preview_page_target(candidate["game_id"])
             parsed_holder: dict[str, Any] = {}
@@ -3482,11 +3535,6 @@ class WhoScoredIngestService:
                         # has already persisted the raw payload.
                         result.errors.append(f"preview {candidate['game_id']}: {exc}")
                 continue
-            except Exception:
-                if failure_rows:
-                    self._write_failure_batch("preview", self.repository.write_preview_failure_rows,
-                                              failure_rows, failure_outcomes, result)
-                raise
 
             try:
                 parsed = parsed_holder["preview"]
@@ -3549,51 +3597,12 @@ class WhoScoredIngestService:
                     )
                 result.errors.append(f"preview {candidate['game_id']}: {exc}")
             except ProxyUnavailable as exc:
-                proxy_down = exc
-                break
+                return exc
             except Exception as exc:
                 result.errors.append(
                     f"preview {candidate['game_id']}: {type(exc).__name__}: {exc}"
                 )
-        if failure_rows:
-            self._write_failure_batch("preview", self.repository.write_preview_failure_rows,
-                                      failure_rows, failure_outcomes, result)
-        if pending:
-            try:
-                expected_batch_ids = tuple(
-                    commit.batch_id for commit, _parsed in pending
-                )
-                committed_batch_ids = tuple(
-                    self.repository.commit_previews(
-                        [commit for commit, _parsed in pending]
-                    )
-                )
-                if committed_batch_ids != expected_batch_ids:
-                    raise RuntimeError(
-                        "preview repository returned different committed batch ids"
-                    )
-            except Exception as exc:
-                result.errors.append(f"preview batch: {type(exc).__name__}: {exc}")
-            else:
-                result.committed_batches["preview"].extend(committed_batch_ids)
-                result.succeeded += len(pending)
-                for _commit, parsed in pending:
-                    for name, dataset in parsed.datasets.items():
-                        result.counts[name] = (
-                            result.counts.get(name, 0) + dataset.row_count
-                        )
-        if proxy_down is not None:
-            raise proxy_down
-        if candidates:
-            result.tables.extend(
-                [
-                    "iceberg.bronze.whoscored_missing_players",
-                    "iceberg.bronze.whoscored_preview_lineups",
-                    "iceberg.bronze.whoscored_preview_sections",
-                    "iceberg.bronze.whoscored_preview_ingest_manifest",
-                ]
-            )
-        return result
+        return None
 
     def _profile_candidate_scopes(
         self,
@@ -3671,6 +3680,58 @@ class WhoScoredIngestService:
         failure_rows = []
         failure_outcomes = []
         pending_commits: list[ProfileCommit] = []
+        try:
+            self._collect_profile_pages(
+                selected_player_ids, pending_commits, failure_rows, failure_outcomes, result,
+            )
+        finally:
+            self._write_failure_batch(
+                "profile", self.repository.write_profile_failure_rows,
+                failure_rows, failure_outcomes, result,
+            )
+        if pending_commits:
+            try:
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit in pending_commits
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_profiles(pending_commits)
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "profile repository returned different committed batch ids"
+                    )
+            except Exception as exc:
+                result.errors.append(f"profile batch: {type(exc).__name__}: {exc}")
+            else:
+                result.committed_batches["profile"].extend(committed_batch_ids)
+                result.succeeded += len(pending_commits)
+                result.counts["player_profile_versions"] = len(pending_commits)
+                result.counts["player_stage_participations"] = sum(
+                    len(commit.participations) for commit in pending_commits
+                )
+                result.counts["player_characteristics"] = sum(
+                    len(commit.characteristics) for commit in pending_commits
+                )
+        if selected_player_ids:
+            result.tables.extend(
+                [
+                    "iceberg.bronze.whoscored_player_profile_versions",
+                    "iceberg.bronze.whoscored_player_stage_participations",
+                    "iceberg.bronze.whoscored_player_characteristics",
+                    "iceberg.bronze.whoscored_profile_ingest_manifest",
+                ]
+            )
+        return result
+
+    def _collect_profile_pages(
+        self,
+        selected_player_ids: Sequence[int],
+        pending_commits: list[ProfileCommit],
+        failure_rows: list[dict[str, Any]],
+        failure_outcomes: list[tuple[str, str]],
+        result: EntityResult,
+    ) -> None:
         parser_replays = self.repository.list_profile_parser_replays(
             selected_player_ids
         )
@@ -3805,11 +3866,6 @@ class WhoScoredIngestService:
                     else:
                         failure_outcomes.append((state, str(player_id)))
                 continue
-            except Exception:
-                if failure_rows:
-                    self._write_failure_batch("profile", self.repository.write_profile_failure_rows,
-                                              failure_rows, failure_outcomes, result)
-                raise
 
             try:
                 parsed = parsed_holder["profile"]
@@ -3858,43 +3914,6 @@ class WhoScoredIngestService:
                     characteristics=parsed.characteristics.rows,
                 )
             )
-        if failure_rows:
-            self._write_failure_batch("profile", self.repository.write_profile_failure_rows,
-                                      failure_rows, failure_outcomes, result)
-        if pending_commits:
-            try:
-                expected_batch_ids = tuple(
-                    commit.batch_id for commit in pending_commits
-                )
-                committed_batch_ids = tuple(
-                    self.repository.commit_profiles(pending_commits)
-                )
-                if committed_batch_ids != expected_batch_ids:
-                    raise RuntimeError(
-                        "profile repository returned different committed batch ids"
-                    )
-            except Exception as exc:
-                result.errors.append(f"profile batch: {type(exc).__name__}: {exc}")
-            else:
-                result.committed_batches["profile"].extend(committed_batch_ids)
-                result.succeeded += len(pending_commits)
-                result.counts["player_profile_versions"] = len(pending_commits)
-                result.counts["player_stage_participations"] = sum(
-                    len(commit.participations) for commit in pending_commits
-                )
-                result.counts["player_characteristics"] = sum(
-                    len(commit.characteristics) for commit in pending_commits
-                )
-        if selected_player_ids:
-            result.tables.extend(
-                [
-                    "iceberg.bronze.whoscored_player_profile_versions",
-                    "iceberg.bronze.whoscored_player_stage_participations",
-                    "iceberg.bronze.whoscored_player_characteristics",
-                    "iceberg.bronze.whoscored_profile_ingest_manifest",
-                ]
-            )
-        return result
 
     def traffic_stats(self) -> dict[str, Any]:
         return self.transport.get_traffic_stats()

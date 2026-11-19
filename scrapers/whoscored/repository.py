@@ -35,7 +35,7 @@ import pyarrow as pa
 
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
-from scrapers.whoscored.trino import WhoScoredTrinoManager, WhoScoredWriter
+from scrapers.whoscored.trino import WhoScoredTrinoManager, WhoScoredWriter, shared_budget
 from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
 from scrapers.whoscored.parsers import (
@@ -222,6 +222,31 @@ STAGE_XG_CATEGORIES = MappingProxyType(
 STAGE_XG_FEED_POLICY = "xg-only-v1"
 _STAGE_XG_READ_PAGE_ROWS = 20_000
 _STAGE_XG_STAGE_CHUNK = 100
+
+
+def _checked_schedule_stage_ids(payload: Optional[str]) -> tuple[int, ...]:
+    """A missing or damaged stage marker leaves the stage open for inspection."""
+    if not payload:
+        return ()
+    try:
+        states = json.loads(payload)
+    except (TypeError, ValueError):
+        return ()
+    ids = states.get("__checked_stage_ids__") if isinstance(states, dict) else None
+    if not isinstance(ids, list):
+        return ()
+    checked = []
+    for value in ids:
+        if (
+            isinstance(value, str)
+            and len(value) <= 19
+            and value.isascii()
+            and value.isdecimal()
+        ):
+            value = int(value)
+        if type(value) is int and 0 < value < 2**63:
+            checked.append(value)
+    return tuple(checked)
 
 
 def _scope_published_table_sql(table: str) -> str:
@@ -1747,6 +1772,14 @@ class WhoScoredRepository:
         # writer lazily opens a second connection using environment defaults.
         if writer is None and trino is not None:
             self.writer._trino_manager = trino
+        if isinstance(self.trino, WhoScoredTrinoManager):
+            self.budget = self.trino.budget
+        elif isinstance(self.writer, WhoScoredWriter):
+            self.budget = self.writer.budget
+        else:
+            self.budget = shared_budget()
+        if isinstance(self.writer, WhoScoredWriter):
+            self.writer.budget = self.budget
         self.catalog = catalog
         self.schema = schema
         self._published_preview_datasets_cache: dict[
@@ -4355,9 +4388,7 @@ class WhoScoredRepository:
                 FROM {self._scope_manifest} WHERE state = 'success'
             ), scopes AS (
                 SELECT league, season, ARRAY_AGG(batch_id) FILTER (WHERE group_rank = 1) AS visible_batches,
-                       MAX(CASE WHEN schedule_rank = 1 THEN
-                           json_format(json_extract(dataset_states_json, '$.__checked_stage_ids__'))
-                       END) AS checked
+                       MAX(CASE WHEN schedule_rank = 1 THEN dataset_states_json END) AS checked
                 FROM publications GROUP BY league, season HAVING COUNT_IF(publishes_schedule) > 0
             ), schedule AS (
                 -- Only scopes with a publication enter coverage. The legacy fallback
@@ -4411,16 +4442,13 @@ class WhoScoredRepository:
                    ARRAY_AGG(stage_id), COUNT_IF(deferred_games > 0), MAX(checked)
             FROM stages GROUP BY league, season
         """
-        if isinstance(self.trino, WhoScoredTrinoManager):
-            rows = self.trino.budget.snapshot(
-                f"history-coverage-v1:{prefix}", lambda: self.trino.execute_query(sql),
-            )
-        else:
-            rows = self.trino.execute_query(sql)
+        rows = self.budget.snapshot(
+            f"history-coverage-v2:{prefix}", lambda: self.trino.execute_query(sql),
+        )
         return {(str(r[0]), str(r[1])): dict(schedule_ready=True, closeable=int(r[2]),
                  closed=int(r[3]), unknown_stages=int(r[4]), closed_day=int(r[5]),
                  stage_ids=tuple(int(sid) for sid in (r[6] or ()) if sid is not None),
-                 checked_stage_ids=tuple(int(sid) for sid in (json.loads(r[8] or "[]") or ())),
+                 checked_stage_ids=_checked_schedule_stage_ids(r[8]),
                  deferred_stages=int(r[7])) for r in rows}
 
     def list_completed_match_candidates(
@@ -4519,8 +4547,7 @@ class WhoScoredRepository:
             f"AND state = 'success' AND {_scope_published_table_sql('whoscored_schedule')} "
             "ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
         )
-        states = json.loads(str(rows[0][0])) if rows and rows[0][0] else {}
-        return tuple(int(sid) for sid in states.get("__checked_stage_ids__", ()))
+        return _checked_schedule_stage_ids(rows[0][0] if rows else None)
 
     def latest_stage_feed_snapshot(
         self, league: str, season: str

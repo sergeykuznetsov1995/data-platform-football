@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from functools import cached_property
 from pathlib import Path
 
 from scrapers.base.iceberg_writer import IcebergWriter
@@ -121,7 +122,13 @@ def statement_keys(sql, catalog):
 
 class WhoScoredTrinoManager(TrinoTableManager):
     def __init__(
-        self, *, host=None, port=None, catalog="iceberg", session_properties=None
+        self,
+        *,
+        host=None,
+        port=None,
+        catalog="iceberg",
+        session_properties=None,
+        budget=None,
     ):
         password = os.environ.get("TRINO_SRC_WHOSCORED_PASSWORD")
         if not password:
@@ -138,7 +145,7 @@ class WhoScoredTrinoManager(TrinoTableManager):
             "query_max_run_time": f"{WRITE_TIMEOUT}s",
             **(session_properties or {}),
         }
-        self.budget = shared_budget()
+        self.budget = shared_budget() if budget is None else budget
 
     def _create_connection(self):
         import trino
@@ -193,12 +200,17 @@ class WhoScoredTrinoManager(TrinoTableManager):
 
 
 class WhoScoredWriter(IcebergWriter):
+    @cached_property
+    def budget(self):
+        return shared_budget()
+
     def _get_trino_manager(self):
         if self._trino_manager is None:
             self._trino_manager = WhoScoredTrinoManager(
                 host=self.trino_host,
                 port=self.trino_port,
                 catalog=self.catalog,
+                budget=self.budget,
             )
         return self._trino_manager
 
@@ -206,7 +218,7 @@ class WhoScoredWriter(IcebergWriter):
         from pyiceberg.exceptions import CommitFailedException
 
         key = f"commit:{self.catalog}.{database}.{table}".lower()
-        with shared_budget().statement(
+        with self.budget.statement(
             [key], rejected=lambda exc: isinstance(exc, CommitFailedException)
         ):
             return super()._append_dataframe_pyiceberg(
@@ -217,7 +229,7 @@ class WhoScoredWriter(IcebergWriter):
         self, arrow_tables, *, database, table, partition_column, partition_value
     ):
         key = f"commit:{self.catalog}.{database}.{table}".lower()
-        with shared_budget().statement([key]):
+        with self.budget.statement([key]):
             return super().replace_identity_partition_arrow_batches(
                 arrow_tables,
                 database=database,

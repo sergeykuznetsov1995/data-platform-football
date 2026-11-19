@@ -4710,20 +4710,36 @@ def test_truncated_retry_skips_the_cache_even_on_a_parser_replay(tmp_path):
 
 @pytest.mark.parametrize("entity", ["preview", "profile"])
 @pytest.mark.parametrize("acknowledged", [True, False])
-def test_not_available_is_batched_and_reported_only_after_publication(tmp_path, entity, acknowledged):
+def test_not_available_is_batched_and_reported_only_after_publication(
+    tmp_path, entity, acknowledged
+):
     service, repository, _ = _service(tmp_path)
     player_ids = [404, 410]
     repository.profile_candidates = player_ids
     repository.preview_candidates = [
-        dict(game_id=value, game="A-B", date=datetime(2026, 1, 2), home_team="A", away_team="B",
-             attempt_no=1, force_refresh=False)
+        dict(
+            game_id=value,
+            game="A-B",
+            date=datetime(2026, 1, 2),
+            home_team="A",
+            away_team="B",
+            attempt_no=1,
+            force_refresh=False,
+        )
         for value in player_ids
     ]
-    service.transport = _FailingTransport(WhoScoredTransportError(
-        "missing", kind=FailureKind.HTTP_STATUS, url="https://example.test/fixture",
-        route=TransportRoute.DIRECT_HTTP, status_code=404, retryable=False,
-    ))
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "missing",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://example.test/fixture",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=404,
+            retryable=False,
+        )
+    )
     batches = []
+
     def publish(rows):
         batches.append(list(rows))
         if not acknowledged:
@@ -4734,5 +4750,47 @@ def test_not_available_is_batched_and_reported_only_after_publication(tmp_path, 
     assert [len(rows) for rows in batches] == [2]
     assert result.attempted == 2
     assert result.succeeded == (2 if acknowledged else 0)
-    assert len(set(result.committed_batches[f"{entity}_not_available"])) == result.succeeded
+    assert (
+        len(set(result.committed_batches[f"{entity}_not_available"]))
+        == result.succeeded
+    )
     assert result.status == ("success" if acknowledged else "failed")
+
+
+@pytest.mark.parametrize("entity", ["preview", "profile"])
+def test_task_interruption_publishes_accumulated_failures_once(entity, tmp_path):
+    service, repository, _ = _service(tmp_path)
+    if entity == "preview":
+        repository.preview_candidates = [
+            {
+                "game_id": game,
+                "game": "Home-Away",
+                "date": datetime(2026, 1, 1),
+                "attempt_no": 1,
+                "force_refresh": False,
+            }
+            for game in (101, 102)
+        ]
+        sync = service.sync_previews
+    else:
+        repository.profile_candidates = [101, 102]
+        sync = service.sync_profiles
+    service._fetch = MagicMock(
+        side_effect=[
+            WhoScoredTransportError(
+                "first event",
+                kind=FailureKind.TIMEOUT,
+                url="https://example.test/fixture",
+                retryable=True,
+            ),
+            KeyboardInterrupt("task stopped during the next event"),
+        ]
+    )
+    write = MagicMock(wraps=getattr(repository, f"write_{entity}_failure_rows"))
+    setattr(repository, f"write_{entity}_failure_rows", write)
+    with pytest.raises(KeyboardInterrupt, match="task stopped"):
+        sync()
+    write.assert_called_once()
+    rows = getattr(repository, f"{entity}_failures")
+    assert len(rows) == 1
+    assert (rows[0].game_id if entity == "preview" else rows[0]["player_id"]) == 101
