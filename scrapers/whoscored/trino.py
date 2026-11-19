@@ -9,6 +9,8 @@ from pathlib import Path
 
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import (
+    TrinoAmbiguousWriteError,
+    TrinoError,
     TrinoTableManager,
     _is_definite_iceberg_commit_conflict,
 )
@@ -121,39 +123,68 @@ class WhoScoredTrinoManager(TrinoTableManager):
     def __init__(
         self, *, host=None, port=None, catalog="iceberg", session_properties=None
     ):
-        properties = {
+        password = os.environ.get("TRINO_SRC_WHOSCORED_PASSWORD")
+        if not password:
+            raise ValueError("Missing Trino credential: TRINO_SRC_WHOSCORED_PASSWORD")
+        super().__init__(
+            host=host or os.environ.get("TRINO_HOST", "trino"),
+            port=port or int(os.environ.get("TRINO_PORT", 8443)),
+            user="src_whoscored",
+            catalog=catalog,
+        )
+        # The shared manager initializes caches and opens connections lazily.
+        self._password = password
+        self._session_properties = {
             "query_max_run_time": f"{WRITE_TIMEOUT}s",
             **(session_properties or {}),
         }
-        super().__init__(
-            host=host or os.environ.get("TRINO_HOST", "trino"),
-            port=port,
-            user="src_whoscored",
-            catalog=catalog,
-            password_env="TRINO_SRC_WHOSCORED_PASSWORD",
-            # The driver otherwise reposts an ambiguous INSERT within one slot.
-            max_attempts=1,
-            session_properties=properties,
-        )
         self.budget = shared_budget()
+
+    def _create_connection(self):
+        import trino
+
+        return trino.dbapi.connect(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            catalog=self.catalog,
+            http_scheme="https",
+            auth=trino.auth.BasicAuthentication(self.user, self._password),
+            verify=False,  # same self-signed source endpoint as the shared client
+            session_properties=self._session_properties,
+            # Retrying an initial POST can publish a second, ambiguous write.
+            max_attempts=1,
+        )
 
     def _execute_committing(self, sql, *, replay_safe=False):
         return super()._execute_committing(sql, replay_safe=False)
 
-    def _statement_slot(self, sql):
-        return self.budget.statement(
-            statement_keys(sql, self.catalog),
-            rejected=_is_definite_iceberg_commit_conflict,
-        )
-
     def _execute(self, sql, fetch=False, params=None, *, replay_safe=True):
-        # The repository verifies physical batch identities when recovering a
-        # write. A DBAPI reconnect cannot prove whether the first write landed.
-        if _WRITE.match(_NOISE.sub(" ", sql)):
-            replay_safe = False
-        return super()._execute(
-            sql, fetch=fetch, params=params, replay_safe=replay_safe
-        )
+        keys = statement_keys(sql, self.catalog)
+        writes = _WRITE.match(_NOISE.sub(" ", sql)) is not None
+        if not keys and not writes:
+            return super()._execute(
+                sql, fetch=fetch, params=params, replay_safe=replay_safe
+            )
+
+        # Run one driver attempt per reservation, including fetching all pages.
+        # A disconnected read may be resubmitted after its next poll slot.
+        # For writes, the caller must reconcile the physical batch first.
+        for attempt in range(2):
+            try:
+                with self.budget.statement(
+                    keys, rejected=_is_definite_iceberg_commit_conflict
+                ):
+                    return super()._execute(
+                        sql, fetch=fetch, params=params, replay_safe=False
+                    )
+            except TrinoAmbiguousWriteError as exc:
+                if writes or not replay_safe:
+                    raise
+                if attempt:
+                    raise TrinoError(
+                        "Connection lost while retrying a WhoScored poll"
+                    ) from exc
 
 
 class WhoScoredWriter(IcebergWriter):

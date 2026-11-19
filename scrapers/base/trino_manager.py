@@ -15,7 +15,6 @@ import random
 import threading
 import time
 import uuid
-from contextlib import nullcontext
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -134,10 +133,6 @@ class TrinoTableManager:
         port: int = None,
         user: str = 'airflow',
         catalog: str = 'iceberg',
-        *,
-        password_env: Optional[str] = None,
-        max_attempts: Optional[int] = None,
-        session_properties: Optional[Dict[str, str]] = None,
     ):
         if not TRINO_AVAILABLE:
             raise RuntimeError("trino package not installed. Run: pip install trino")
@@ -145,11 +140,7 @@ class TrinoTableManager:
         self.host = host
         self.user = user
         self.catalog = catalog
-        self._password = os.environ.get(password_env or 'TRINO_PASSWORD')
-        if password_env and not self._password:
-            raise ValueError(f"Missing Trino credential: {password_env}")
-        self._max_attempts = max_attempts
-        self._session_properties = session_properties
+        self._password = os.environ.get('TRINO_PASSWORD')
         if self._password:
             self.port = port or int(os.environ.get('TRINO_PORT', 8443))
         else:
@@ -207,18 +198,23 @@ class TrinoTableManager:
 
     def _create_connection(self):
         """Create a new Trino connection."""
-        options = {}
-        if self._max_attempts is not None:
-            options["max_attempts"] = self._max_attempts
-        if self._session_properties:
-            options["session_properties"] = self._session_properties
         if self._password:
-            options.update(http_scheme="https",
-                           auth=trino.auth.BasicAuthentication(self.user, self._password),
-                           verify=False)  # self-signed certificate
-        return trino.dbapi.connect(
-            host=self.host, port=self.port, user=self.user, catalog=self.catalog, **options
-        )
+            return trino.dbapi.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                catalog=self.catalog,
+                http_scheme='https',
+                auth=trino.auth.BasicAuthentication(self.user, self._password),
+                verify=False,  # self-signed certificate
+            )
+        else:
+            return trino.dbapi.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                catalog=self.catalog,
+            )
 
     def _connect_with_retry(self):
         """Connect to Trino with retry and exponential backoff."""
@@ -287,10 +283,6 @@ class TrinoTableManager:
     _COMMIT_BASE = 0.5
     _COMMIT_CAP = 8.0
 
-    def _statement_slot(self, sql: str):
-        """Optional source-specific pacing for one physical DBAPI attempt."""
-        return nullcontext()
-
     def _execute(self, sql: str, fetch: bool = False,
                  params: Optional[tuple] = None, *,
                  replay_safe: bool = True) -> Optional[List[Any]]:
@@ -324,14 +316,17 @@ class TrinoTableManager:
                 cursor = self.connection.cursor()
                 try:
                     logger.debug(f"Executing SQL: {sql[:200]}...")
-                    with self._statement_slot(sql):
-                        if params:
-                            cursor.execute(sql, params)
-                        else:
-                            cursor.execute(sql)
-                        # Consume results even for DDL/DML to ensure query completes.
-                        rows = cursor.fetchall()
-                        return rows if fetch else None
+                    if params:
+                        cursor.execute(sql, params)
+                    else:
+                        cursor.execute(sql)
+
+                    if fetch:
+                        return cursor.fetchall()
+
+                    # Consume results even for DDL/DML to ensure query completes
+                    cursor.fetchall()
+                    return None
 
                 except Exception as e:
                     error_str = str(e)
