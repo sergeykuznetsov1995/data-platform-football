@@ -234,6 +234,7 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
     if not fm_ids:
         return snapshot
     fm_list = ",".join("'" + fid + "'" for fid in fm_ids)
+    # FotMob stores UTC timestamps without a zone. Mark their ISO strings as UTC.
     snapshot["fotmob_seasons"] = read("fotmob_season_manifest", trino, f"""
         WITH evidence AS (
           SELECT *, coalesce(
@@ -243,8 +244,8 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
           FROM iceberg.bronze.fotmob_ingest_manifest
         )
         SELECT competition_id,source_season_key AS season_key,
-               to_iso8601(with_timezone(max(fetched_at), 'UTC')) AS fetched_at,
-               to_iso8601(with_timezone(max(validated_at), 'UTC')) AS validated_at
+               to_iso8601(max(fetched_at)) || 'Z' AS fetched_at,
+               to_iso8601(max(validated_at)) || 'Z' AS validated_at
         FROM evidence
         WHERE target_type = 'league_season' AND competition_id IN ({fm_list})
           AND status IN ('success','not_modified') AND NOT coalesce(stale,false)
@@ -275,8 +276,8 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
         )
         SELECT CAST(s.competition_id AS varchar) AS competition_id,
                s.source_season_key AS season_key,
-               to_iso8601(with_timezone(m.fetched_at, 'UTC')) AS fetched_at,
-               to_iso8601(with_timezone(m.validated_at, 'UTC')) AS validated_at
+               to_iso8601(m.fetched_at) || 'Z' AS fetched_at,
+               to_iso8601(m.validated_at) || 'Z' AS validated_at
         FROM catalogs m JOIN iceberg.bronze.fotmob_competition_seasons s
           ON s._target_batch_id=m.batch_id
         WHERE m.rn=1 AND NOT coalesce(m.stale,false)

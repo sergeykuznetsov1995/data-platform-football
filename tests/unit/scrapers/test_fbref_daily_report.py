@@ -464,7 +464,9 @@ def test_1792_reader_uses_source_validation_and_guards_cutoff():
         return []
     collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
     query = next(q for q in queries if "fotmob_ingest_manifest" in q)
-    assert "$.source_observed_at" in query and "max(validated_at)" in query
+    assert "$.source_observed_at" in query
+    assert "to_iso8601(max(fetched_at)) || 'Z' AS fetched_at" in query
+    assert "to_iso8601(max(validated_at)) || 'Z' AS validated_at" in query
     assert "validated_at >= fetched_at" in query and "AND validated_at <=" in query
     assert "AND completed_at <=" in query and "NOT coalesce(stale,false)" in query
     assert "completed_at)" not in query  # ingestion time alone never proves freshness
@@ -481,7 +483,8 @@ def test_1792_reader_phase_catalog_uses_source_validation_after_304():
     collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
     query = next(q for q in queries if "target_type='competition_seasons'" in q)
     assert "$.source_observed_at" in query
-    assert "with_timezone(m.validated_at, 'UTC')) AS validated_at" in query
+    assert "to_iso8601(m.fetched_at) || 'Z' AS fetched_at" in query
+    assert "to_iso8601(m.validated_at) || 'Z' AS validated_at" in query
     assert "validated_at >= fetched_at" in query and "AND validated_at <=" in query
     assert "AND completed_at <=" in query and "NOT coalesce(m.stale,false)" in query
 
@@ -836,26 +839,41 @@ def test_1792_scope_aliases_deduplicate_generic_and_phase_matches(cid, fid):
     assert result["milestone_day_pass"]
 
 
-@pytest.mark.parametrize("source,forbidden_reason", [
-    ("fotmob_season_manifest", "missing_fotmob_season"),
-    ("fotmob_phase_catalog", "missing_or_incomplete_fotmob_phase_catalog"),
-    ("fotmob_matches", "missing_fotmob_season"),
+@pytest.mark.parametrize("source,table,query_fragment,forbidden_reason", [
+    ("fotmob_season_manifest", "fotmob_seasons", "'league_season'", "missing_fotmob_season"),
+    ("fotmob_phase_catalog", "fotmob_phase_catalog", "fotmob_competition_seasons",
+     "missing_or_incomplete_fotmob_phase_catalog"),
+    ("fotmob_matches", "fotmob_matches", "fotmob_matches_current", "missing_fotmob_season"),
 ])
-def test_1792_read_failure_is_not_missing_reference_or_count_divergence(source, forbidden_reason):
+def test_1792_read_failure_is_not_missing_reference_or_count_divergence(
+    source, table, query_fragment, forbidden_reason,
+):
     from scrapers.fbref.daily_report import summary_line
     data = snapshot()
     mapping = MAP
-    if source == "fotmob_season_manifest":
-        data["fotmob_seasons"] = []
-    elif source == "fotmob_matches":
-        data["fotmob_matches"] = []
-    else:
+    if source == "fotmob_phase_catalog":
         data["fotmob_seasons"][0]["season_key"] = "2026/2027 - Apertura"
         data["fotmob_matches"][0]["season_key"] = "2026/2027 - Apertura"
+        data["fotmob_phase_catalog"] = deepcopy(data["fotmob_seasons"])
         mapping = {"9": {"fotmob_ids": ["47"], "season_keys": {
             "2026-2027": {"47": ["2026/2027 - Apertura"]}}}}
-    data["errors"] = [{"source": source, "reason": "read_failed"}]
+    assert build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)["on_time_percent"] == 100
+
+    def pg(sql):
+        return {"competitions": data["competitions"]} if "'competitions'" in sql else []
+
+    def trino(sql):
+        if query_fragment in sql:
+            raise OSError("reading the selected table failed")
+        return []
+
+    collected = collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert collected["errors"] == [{"source": source, "reason": "read_failed"}]
+    assert collected[table] == []
+    data["errors"] = collected["errors"]
+    data[table] = collected[table]
     result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result["on_time_percent"] is None
     assert result["fotmob"] is None
     assert result["competitions"][0]["fotmob"] is None
     assert result["competitions"][0]["difference"] is None

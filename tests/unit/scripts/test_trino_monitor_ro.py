@@ -1,5 +1,6 @@
 """No Docker, credentials, or network: exercise the gate and transport contracts."""
 import contextlib
+from datetime import date, datetime, timezone
 import io
 import subprocess
 import sys
@@ -22,6 +23,35 @@ from scripts.ops import trino_monitor_ro as client
 ])
 def test_accepts_monitor_queries(sql):
     client.validate_sql(sql)
+
+
+def test_fbref_daily_fotmob_queries_pass_monitor_policy(monkeypatch):
+    from scripts.report_fbref_daily import collect_snapshot, host_trino
+
+    validated = []
+
+    def run(argv, **kwargs):
+        query = argv[1]
+        client.validate_sql(query)
+        validated.append("catalog" if "fotmob_competition_seasons" in query else "manifest")
+        return SimpleNamespace(stdout=",".join(["fbref_report_end"] * 5) + "\n")
+
+    def pg(query):
+        if "competition_registry" in query:
+            return {"competitions": [{"competition_id": "9", "name": "Example", "gender": "male"}]}
+        return []
+
+    def trino(query):
+        # Both FotMob queries read the manifest, including the catalog join.
+        return host_trino(query) if "iceberg.bronze.fotmob_ingest_manifest" in query else []
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result = collect_snapshot(pg, trino, day=date(2026, 10, 7),
+                              as_of=datetime(2026, 10, 9, tzinfo=timezone.utc),
+                              mapping={"9": {"fotmob_ids": ["47"]}})
+    assert result["errors"] == []
+    assert sorted(validated) == ["catalog", "manifest"]
+    assert result["fotmob_seasons"] == result["fotmob_phase_catalog"] == []
 
 
 @pytest.mark.parametrize("sql", [
