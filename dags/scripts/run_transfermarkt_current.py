@@ -35,7 +35,7 @@ if str(ROOT / 'dags') not in sys.path:
     sys.path.append(str(ROOT / 'dags'))
 
 from dags.utils.transfermarkt_current_state import (
-    CURRENT_POLICY_VERSION, CurrentWork, EditionCheck, ScopeCursor, SignalObservation,
+    CURRENT_POLICY_VERSION, ERROR_BACKOFF, CurrentWork, EditionCheck, ScopeCursor, SignalObservation,
     SignalState, build_check_merge, build_current_state_tables, build_measurement_kind_migration_sql,
     build_signal_merge, build_signals_merge, build_player_signature_migration, build_check_fingerprint_migrations_sql,
     denominator_definition_hash, edition_measurement_fingerprint, current_scope_targets, daily_complete, mark_applied,
@@ -65,6 +65,13 @@ class PortionDeadlineError(CurrentPortionError):
 
 class SignalRefreshRequired(CurrentPortionError):
     """A recovered write waits for fresh signals; not a scope failure (#2068)."""
+
+
+class SourceMismatch(CurrentPortionError):
+    """A complete candidate contradicts the pending source observation."""
+
+
+_RETRY_STREAK_LIMIT = 3
 
 
 def _deadline_retained(exc):
@@ -282,6 +289,16 @@ class _CurrentStore:
             self.index['scopes'][self.active_scope_id] = {
                 'scope_file': relative, 'cursor': self.active_data.get('cursor'),
                 'denominator_hash': self.active_data.get('denominator_hash')}
+            # Older writers strictly validate cursor fields. Keep optional
+            # scheduling metadata in the extensible index entry for rollback.
+            retry_times = [self.active_data.get(name, {}).get('retry_after')
+                           for name in ('mismatch_retry', 'recovery_retry')]
+            until = max((_utc(value) for value in retry_times if value), default=None)
+            entry = self.index['scopes'][self.active_scope_id]
+            if until is not None:
+                entry['ordinary_retry_after'] = until.isoformat()
+            if self.active_data.get('last_error_was_mismatch'):
+                entry['last_error_was_mismatch'] = True
             if self.active_data.get('settlement_attempted_at'):
                 self.index['scopes'][self.active_scope_id]['settlement_attempted_at'] = self.active_data['settlement_attempted_at']
         _atomic(self.index_path, self.index)
@@ -590,6 +607,33 @@ class _Scope:
         if self.snapshot is not None:
             self.resume.setdefault('squad_year', self.snapshot.squad_saison_id)
 
+    def _pending_change_generation(self):
+        pending = sorted((state.observation.entity, state.observation.entity_id,
+                          state.observation.signal_version, state.observation.signature,
+                          state.first_detected_at.isoformat())
+                         for state in self.signals.values() if state.pending
+                         and state.observation.entity in {'listing', 'club', 'player'})
+        required = sorted(set(self.resume.get('required', [])))
+        return semantic_signature([self.target.scope_id, pending, required])
+
+    def _retry_record(self, name, generation, confirmed=None):
+        retry = self.data.get(name, {})
+        if retry.get('generation') != generation or retry.get('confirmed') != confirmed:
+            retry = self.data[name] = {'generation': generation, 'confirmed': confirmed, 'count': 0}
+        return retry
+
+    def _count_retry(self, retry):
+        if retry.get('portion') != self.cycle_id:
+            retry['portion'] = self.cycle_id
+            retry['count'] = min(_RETRY_STREAK_LIMIT, retry['count'] + 1)
+            if retry['count'] == _RETRY_STREAK_LIMIT:
+                retry['retry_after'] = (self.now() + ERROR_BACKOFF).isoformat()
+
+    def _record_player_mismatch(self, keys):
+        retry = self._retry_record('mismatch_retry', self._pending_change_generation(),
+                                   semantic_signature(sorted(keys)))
+        self._count_retry(retry)
+
     def persist(self):
         for endpoint, ids in self.resume.get('careers', {}).items():
             self.resume['careers'][endpoint] = sorted(set(ids), key=int)
@@ -602,9 +646,16 @@ class _Scope:
             or any(state.pending and (state.observation.entity in {'club', 'listing'}
                                       or (state.observation.entity == 'player' and self.cursor.cold_complete))
                    for state in self.signals.values()))
-        self.cursor = replace(self.cursor, resume_json=json.dumps(self.resume, sort_keys=True,
-                                                               default=lambda value: value.isoformat()),
-                              change_pending=change)
+        mismatch = self.data.get('mismatch_retry')
+        if mismatch and mismatch['generation'] != self._pending_change_generation():
+            self.data.pop('mismatch_retry')
+        recovery = self.data.get('recovery_retry')
+        if recovery and recovery['generation'] != self.data.get('recovery_signal_refresh_required'):
+            self.data.pop('recovery_retry')
+        self.cursor = replace(
+            self.cursor, change_pending=change,
+            resume_json=json.dumps(self.resume, sort_keys=True, default=lambda value: value.isoformat()),
+        )
         self.data['cursor'] = self.cursor.as_dict()
         self.data['signals'] = {key: value.as_dict() for key, value in self.signals.items()}
         if self.snapshot is not None:
@@ -670,7 +721,8 @@ class _Scope:
             self.persist()
         return self.signals[key]
 
-    def check(self, kind, raws, expected, observed, *, status='complete', result='checked', checked_at=None):
+    def check(self, kind, raws, expected, observed, *, status='complete', result='checked', checked_at=None,
+              retained_deadline=False):
         if checked_at is None and raws:
             # Cache/recovery must retain the earliest original source clock.
             records = [self.scraper._http_client._raw_store.load_capture(raw)[1] for raw in raws]
@@ -684,6 +736,7 @@ class _Scope:
                              denominator_definition_hash=self.data.get('denominator_definition_hash'))
         _sql(self.scraper, build_check_merge(check))
         self.data.setdefault('checks', {})[kind] = check.as_dict()
+        missing = self._missing_refresh_checks()
         if checked_at is None:
             self.cursor = record_check(self.cursor, check)
         else:
@@ -691,6 +744,14 @@ class _Scope:
             if status == 'complete':
                 changes[f'{kind}_checked_at'] = check.checked_at
             self.cursor = replace(self.cursor, **changes)
+        if kind in missing:
+            refresh = self.data['recovery_signal_refresh_required']
+            if status == 'complete' and kind not in self._missing_refresh_checks():
+                # The first complete proof across the boundary is progress for
+                # this portion even if a different required packet fails later.
+                self.data['recovery_retry'] = {'generation': refresh, 'portion': self.cycle_id, 'count': 0}
+            elif status == 'uncertain' and not retained_deadline:
+                self._retry_record('recovery_retry', refresh)['uncertain_portion'] = self.cycle_id
         self.persist()
 
     def _player_fact(self, player_id, packets):
@@ -1175,8 +1236,9 @@ class _Scope:
         for offset in range(0, len(failed), 300):
             _sql(self.scraper, build_signals_merge(state for _, state in failed[offset:offset + 300]))
         self.signals.update(dict(failed))
+        self._record_player_mismatch(key for key, _ in failed)
         self.persist()
-        raise CurrentPortionError('source_mismatch: pending player changes have no matching complete squad proof')
+        raise SourceMismatch('source_mismatch: pending player changes have no matching complete squad proof')
 
     def roster(self, *, weekly=False):
         from scrapers.transfermarkt.scraper import _parse_squad_page, _CLUB_SQUAD_PATH, _TM_BASE, _squad_page_is_empty_roster
@@ -1459,16 +1521,24 @@ class _Scope:
                 'original_attempt_count': outcome.attempts, 'evidenced_attempt_count': len(envelopes),
                 'prefix_unknown': legacy['prefix_unknown'] if legacy is not None else False}
 
+    def _missing_refresh_checks(self):
+        refresh = self.data.get('recovery_signal_refresh_required')
+        if not refresh:
+            return set()
+        required = refresh.get('required_checks', ['listing', 'players']) if isinstance(refresh, Mapping) else ['listing', 'players']
+        boundary = _utc(refresh['reconciled_at']) if isinstance(refresh, Mapping) else None
+        return {kind for kind in required if getattr(self.cursor, kind + '_checked_at') is None
+                or (boundary is not None and getattr(self.cursor, kind + '_checked_at') < boundary)}
+
     def _require_reconciled_signals(self):
         refresh = self.data.get('recovery_signal_refresh_required')
         if not refresh:
             return
-        required = refresh.get('required_checks', ['listing', 'players']) if isinstance(refresh, Mapping) else ['listing', 'players']
-        boundary = _utc(refresh['reconciled_at']) if isinstance(refresh, Mapping) else None
-        for kind in required:
-            stamp = getattr(self.cursor, kind + '_checked_at')
-            if stamp is None or (boundary is not None and stamp < boundary):
-                raise SignalRefreshRequired('write recovery requires fresh signals before roster or careers')
+        if self._missing_refresh_checks():
+            retry = self.data.get('recovery_retry', {})
+            if retry.get('generation') == refresh and retry.get('uncertain_portion') == self.cycle_id:
+                self._count_retry(retry)
+            raise SignalRefreshRequired('write recovery requires fresh signals before roster or careers')
         self.data.pop('recovery_signal_refresh_required')
         self.persist()
 
@@ -1511,6 +1581,7 @@ class _Scope:
         self.resume['required'], self.resume['captured'] = [], {}
         self.resume['capture_proofs'] = {}
         if reconciliation is not None or drifted:
+            self.data.pop('recovery_retry', None)
             self.data['recovery_signal_refresh_required'] = (
                 {'reconciled_at': reconciliation['reconciled_at'], 'required_checks': ['listing', 'players', 'injury']}
                 if reconciliation is not None else True)
@@ -1648,6 +1719,7 @@ class _Scope:
                 if proof.get('signal_generations', {}).get(player) is not None
                 and proof['signal_generations'][player] != self.scraper._current_career_signal_generations.get(player)]
             mismatched_ids = list(stale_generation_ids)
+            failed_keys = []
             if endpoint == 'market_value_points':
                 from scrapers.transfermarkt.scraper import _parse_mv_history
                 outcomes = self.scraper.get_fetch_outcomes().get(endpoint, {})
@@ -1674,6 +1746,8 @@ class _Scope:
                                     signal = mark_failed(signal, 'source_mismatch: CEAPI latest point differs from tmapi')
                                     _sql(self.scraper, build_signal_merge(signal))
                                     self.signals[key] = signal
+                                    if player_id not in stale_generation_ids:
+                                        failed_keys.append(key)
             pending[endpoint] = sorted(rest | set(deferred) | set(mismatched_ids), key=int)
             proof = {**dict(proof), 'collector_window': {
                 'requested_player_ids': ids,
@@ -1682,6 +1756,8 @@ class _Scope:
                 'stale_generation_ids': stale_generation_ids}}
             self.data.setdefault('career_proofs', {})[endpoint] = dict(proof)
             self.data.setdefault('career_receipts', []).append(dict(proof))
+            if failed_keys:
+                self._record_player_mismatch(failed_keys)
             self.persist()
         if only is not None:
             self._acknowledge_players({player for player in only
@@ -1946,6 +2022,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 settlement.recover(data, scope_id=scope_id, directory=directory, now=now(),
                                    save=store.save, deadline=recovery_end, clock=clock)
                 if old_timeout:
+                    data.pop('last_error_was_mismatch', None)
                     data['cursor'] = replace(cursor, last_error_at=None).as_dict()
                     store.save()
             except Exception as exc:
@@ -1955,6 +2032,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     outcome.update(status='retained', retained=message)
                 else:
                     outcome.update(status='failed', error=message)
+                    data.pop('last_error_was_mismatch', None)
                     data['cursor'] = replace(cursor, last_error_at=cursor.last_error_at or now()).as_dict()
                     store.save()
             report['scopes'].append(outcome)
@@ -1992,7 +2070,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                                     'edition_id': target.edition_id, 'tier': _tier_json(target.tier)}
                                    for target in targets.targets]
         ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes,
-                                     staff_enabled=staff_writer is not None)
+                                     staff_enabled=staff_writer is not None, scope_index=state['scopes'])
         closing_work = tuple(CurrentWork(target, 'season_close') for target in sorted(
             closing.values(), key=lambda target: (
                 cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
@@ -2131,7 +2209,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         except Exception as exc:
                             error = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
                             result.setdefault('check_failures', {})[kind] = error
-                            scope.check(kind, [], 0, 0, status='uncertain', result=error)
+                            scope.check(kind, [], 0, 0, status='uncertain', result=error,
+                                        retained_deadline=_deadline_retained(exc))
                 elif item.kind == 'apply_change':
                     scope.apply_change()
                 elif item.kind == 'weekly_staff':
@@ -2181,6 +2260,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         and not scope.resume.get('required') and not scope.resume.get('coaches_pending')):
                         scope.cursor = replace(scope.cursor, cold_complete=True)
                         scope.resume = {}
+                data.pop('last_error_was_mismatch', None)
                 scope.cursor = replace(scope.cursor, last_work_at=now(), last_error_at=None)
                 scope.persist()
                 if daily_complete(scope.cursor, now()):
@@ -2229,6 +2309,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     if 'baseline_required:' in str(exc):
                         result['status'] = 'baseline_required'
                     changes['last_error_at'] = changes['last_work_at']
+                    data['last_error_was_mismatch'] = isinstance(exc, SourceMismatch)
                 if scope is not None:
                     scope.cursor = replace(scope.cursor, **changes)
                     scope.persist()

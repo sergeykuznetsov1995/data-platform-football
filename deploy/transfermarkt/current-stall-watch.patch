@@ -1,0 +1,149 @@
+--- a/transfermarkt_stall_watch.py
++++ b/transfermarkt_stall_watch.py
+@@ -5,8 +5,8 @@
+ «красный TM» в сводке — без эскалации, счётчика серии, задачи и хозяина. Здесь каждые
+ 15 минут три условия; первые два — признаки ОДНОГО эпизода «downtime» (простой), третье —
+ свой эпизод:
+-  no_manifests_24h        — 0 строк в iceberg.ops.transfermarkt_scope_manifest_v2 с
+-                            committed_at за последние 24 ч (Trino, trino-ro.sh);
++  no_current_completions  — за 24 ч current не подтвердил ни полный состав в курсоре,
++                            ни дневные проверки скоупа в отчёте завершённой порции;
+   transport_errors_90pct  — последний завершённый плановый ран dag_ingest_transfermarkt
+                             красный на транспорте: ≥ 90 % mapped-кусков run_exact_child_cycle
+                             failed с транспортной ошибкой в scope-status.json, ИЛИ ран упал
+@@ -16,7 +16,7 @@
+                             dag_backfill_transfermarkt не на паузе (пока история на паузе —
+                             молчим, иначе вечный красный шум до #1401).
+ Один простой — одна тревога и одна issue (Astra r1 #2, r2 #2): «downtime» активен, пока верен
+-хотя бы один из двух признаков, и переход между ними (транспорт → 0 манифестов и обратно) не
++хотя бы один из двух признаков, и переход между ними (транспорт → отсутствие завершений и обратно) не
+ сбрасывает ни начало эпизода, ни номер issue; класс причины («транспорт/шлюз» или «нет закрытых
+ скоупов 24 ч») уточняется в тексте и заголовке, пока issue не заведена.
+ Эпизод: первая тревога с классом причины; тот же ключ — молчим, «продолжается N ч» не
+@@ -24,11 +24,11 @@
+ Astra r3 #3); через 24 ч от первой тревоги — issue (labels source:transfermarkt, area:bronze,
+ type:bug) + карточка на доску в Blocked, номер в state, вторая тревога «issue #N заведена»;
+ открытая issue с тем же заголовком не дублируется. Условие снято — эпизод забыт, отбой
+-одной строкой. «Метабаза недоступна» ≠ «всё хорошо» — эпизоды не трогаем; Trino недоступен —
+-не трогаем только no_manifests_24h. Telegram — напрямую через API бота с проверкой ответа,
++одной строкой. «Метабаза недоступна» ≠ «всё хорошо» — эпизоды не трогаем; доказательства current недоступны —
++сохраняем эпизод простоя до следующей проверки. Telegram — напрямую через API бота с проверкой ответа,
+ неподтверждённое ждёт в state.pending (образец — sofascore_stall_watch.py).
+ Cron: */15 * * * *. Ручной прогон: --dry-run --state <ОТДЕЛЬНЫЙ файл> [--now ISO]
+-[--fake-manifest-count N] (state пишется и в --dry-run; issue в --dry-run не заводится —
++[--current-dir PATH] [--fake-completion-count N] (state пишется и в --dry-run; issue в --dry-run не заводится —
+ печатается, что завёл бы).
+ """
+ import argparse
+@@ -41,6 +41,8 @@
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+
++from transfermarkt_current_activity import has_recent_completion
++
+ METADB = "transfermarkt-airflow-metadb"   # свой контур (#1387, 25.09.2026)
+ SCHEDULER = "transfermarkt-airflow-scheduler"
+ DAG_ID = "dag_ingest_transfermarkt"
+@@ -50,8 +52,7 @@
+ LOGS = Path("/root/transfermarkt-runtime/logs")
+ CYCLES = LOGS / "transfermarkt-native-v2" / "cycles"   # RESULT_ROOT transfermarkt_scope_planner.py
+ STATE_DEFAULT = Path("/root/watchdog/state/transfermarkt_stall_state.json")
+-TRINO = "/root/.claude/bin/trino-ro.sh"
+-MANIFEST = "iceberg.ops.transfermarkt_scope_manifest_v2"
++CURRENT = LOGS / "transfermarkt-native-v2" / "current"
+ TRANSPORT_SHARE = 0.9
+ PROBE_TASK = "plan_exact_scopes"   # #1389: проба сети — последний шаг планирования (после одобрений)
+ ISSUE_AFTER_H = 24
+@@ -63,7 +64,7 @@
+ TG_ENV = Path("/root/.claude/telegram.env")
+ CLASS_TITLE = {
+     "downtime": "простой",
+-    "no_manifests_24h": "нет закрытых скоупов 24 ч",
++    "no_current_completions": "нет закрытых скоупов 24 ч",
+     "transport_errors_90pct": "транспорт/шлюз",
+     "history_token_missing": "токен истории не задан",
+ }
+@@ -86,26 +87,6 @@
+
+ def fmt_ts(dt):
+     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+-
+-
+-def trino_manifests(now):
+-    """(n за 24 ч, последний committed_at строкой) или None — Trino недоступен/упал."""
+-    hi = now.strftime("%Y-%m-%d %H:%M:%S")
+-    lo = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+-    sql = (f"SELECT count_if(committed_at > timestamp '{lo}'), "
+-           f"coalesce(cast(max(committed_at) AS varchar), 'нет') FROM {MANIFEST} "
+-           f"WHERE committed_at <= timestamp '{hi}'")
+-    try:
+-        r = subprocess.run([TRINO, sql], capture_output=True, text=True, timeout=240)
+-    except (subprocess.TimeoutExpired, OSError):
+-        return None
+-    if r.returncode != 0:
+-        return None
+-    for line in r.stdout.splitlines():
+-        cells = [c.strip('"') for c in line.strip().split('","')]
+-        if len(cells) == 2 and cells[0].isdigit():
+-            return int(cells[0]), cells[1][:16]
+-    return None
+
+
+ def last_run(now):
+@@ -373,8 +354,9 @@
+                     help="не слать в Telegram и не заводить issue (state пишется)")
+     ap.add_argument("--state", type=Path, default=STATE_DEFAULT)
+     ap.add_argument("--now", help="подмена «сейчас», ISO UTC (токен истории и пауза — живые)")
+-    ap.add_argument("--fake-manifest-count", type=int, default=None,
+-                    help="тест: подменить число манифестов за 24 ч")
++    ap.add_argument("--current-dir", type=Path, default=CURRENT)
++    ap.add_argument("--fake-completion-count", "--fake-manifest-count", type=int,
++                    help="тест: подменить число подтверждённых завершений current за 24 ч")
+     args = ap.parse_args()
+
+     args.state.parent.mkdir(parents=True, exist_ok=True)
+@@ -402,24 +384,21 @@
+     msgs, bits = [], []
+     run_txt = f"{run_id} {run_state} {run_end} UTC" if run_id else "нет завершённых плановых"
+
+-    manifests = trino_manifests(now)
+-    if args.fake_manifest_count is not None:
+-        manifests = (args.fake_manifest_count, manifests[1] if manifests else "нет (trino)")
+-    stalled = None if manifests is None else manifests[0] == 0
+-    if stalled is None and not transport_on:
+-        # Trino молчит, транспорт чист — «не знаю» ≠ «простоя нет»: эпизод не трогаем.
+-        bits.append("downtime=trino_unavailable")
++    completed = (has_recent_completion(args.current_dir, now) if args.fake_completion_count is None
++                 else args.fake_completion_count > 0)
++    if completed is None and not transport_on:
++        bits.append("downtime=current_unavailable")
+     else:
+-        if stalled:
+-            text = (f"🔴 Transfermarkt: за 24 ч не закрыто ни одного скоупа (манифесты v2: 0, последний "
+-                    f"{manifests[1]} UTC); последний плановый ран {run_txt}"
++        if completed is False:
++            text = (f"🔴 Transfermarkt: за 24 ч нет подтверждённого состава или завершённых дневных проверок "
++                    f"current; последний плановый ран {run_txt}"
+                     + (f"; класс причины: {transport_txt}" if transport_on else "") + ". #1389")
+         else:
+             text = (f"🔴 Transfermarkt: ран {run_txt} красный на транспорте — {transport_txt}. "
+                     f"Смотреть /health шлюза proxy_filter и пул выходов. #1389")
+-        episode(state, "downtime", bool(stalled) or transport_on, "downtime", text,
++        episode(state, "downtime", completed is False or transport_on, "downtime", text,
+                 now, msgs, bits, args.dry_run,
+-                cls=CLASS_TITLE["transport_errors_90pct" if transport_on else "no_manifests_24h"])
++                cls=CLASS_TITLE["transport_errors_90pct" if transport_on else "no_current_completions"])
+
+     episode(state, "history_token_missing", token_on, "missing",
+             f"🔴 Transfermarkt: {token_txt} — история не сможет взять аренду. #1389",
+@@ -434,8 +413,8 @@
+             state["pending"].append({"text": text, "at": fmt_ts(now)})
+         failed = send_pending(state, now)
+     save_state(args.state, state)
+-    m_txt = "?" if manifests is None else manifests[0]
+-    print(f"transfermarkt_stall_watch: alerts={len(msgs)} manifests24h={m_txt} last_run={run_id or '-'}:{run_state or '-'} "
++    completion_txt = {True: "yes", False: "no", None: "unknown"}[completed]
++    print(f"transfermarkt_stall_watch: alerts={len(msgs)} current_completion24h={completion_txt} last_run={run_id or '-'}:{run_state or '-'} "
+           f"transport={'on' if transport_on else 'off'} token={'on' if token_on else 'off'} "
+           f"{' '.join(bits)}{' now=' + args.now if args.now else ''}"
+           + (f" send_failed={failed} pending={len(state['pending'])}" if failed or state["pending"] else ""))
