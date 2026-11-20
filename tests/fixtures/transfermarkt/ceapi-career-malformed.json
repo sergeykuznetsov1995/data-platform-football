@@ -1,0 +1,34 @@
+{
+  "market_value": {
+    "last_change": "not-a-date",
+    "list": [
+      null,
+      "invalid point",
+      {"datum_mw": "not-a-date", "y": 25000},
+      {
+        "x": 1751328000000,
+        "datum_mw": "2025-07-01",
+        "mw": null,
+        "y": 0,
+        "age": "not-an-age",
+        "wappen": null
+      }
+    ]
+  },
+  "transfers": {
+    "transfers": [
+      null,
+      "invalid transfer",
+      {
+        "id": "malformed-source-1",
+        "date": "2025-07-01",
+        "season": "25/26",
+        "from": "invalid club",
+        "to": [],
+        "fee": null,
+        "marketValue": "?",
+        "upcoming": false
+      }
+    ]
+  }
+}
