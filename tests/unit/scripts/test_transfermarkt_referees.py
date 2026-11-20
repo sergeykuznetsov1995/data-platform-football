@@ -161,10 +161,16 @@ def test_parser_failure_is_not_reclassified_as_success(tmp_path):
     assert report['continuation_required'] is True
 
 
-def test_production_factory_checks_policy_and_passes_exact_registry_record(monkeypatch, tmp_path):
-    value = referee_scopes([registry_row(scope())])[0]
+@pytest.mark.parametrize('historical', [False, True])
+def test_production_factory_checks_policy_and_passes_exact_registry_record(
+    monkeypatch, tmp_path, historical,
+):
+    value = referee_scopes([
+        registry_row(scope(current=not historical, edition='2024' if historical else '2025')),
+    ], historical=historical)[0]
     monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
     monkeypatch.delenv('TM_PROXY_CONTROL_URL', raising=False)
+    monkeypatch.delenv('TM_BACKFILL_PROXY_CONTROL_URL', raising=False)
     monkeypatch.delenv('TRANSFERMARKT_REQUIRE_RAW_STORE', raising=False)
     with pytest.raises(Exception, match='standing_policy_gate_required'):
         production_referee_scraper(value)
@@ -181,6 +187,7 @@ def test_production_factory_checks_policy_and_passes_exact_registry_record(monke
     policy_path.write_text(json.dumps(policy))
     monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
     monkeypatch.setenv('TM_PROXY_CONTROL_URL', 'http://offline.invalid')
+    monkeypatch.setenv('TM_BACKFILL_PROXY_CONTROL_URL', 'http://history.offline.invalid')
     monkeypatch.setenv('TRANSFERMARKT_REQUIRE_RAW_STORE', 'true')
     monkeypatch.setenv('TM_STANDING_POLICY_PATH', str(policy_path))
     constructed = []
@@ -192,7 +199,11 @@ def test_production_factory_checks_policy_and_passes_exact_registry_record(monke
     from scrapers.transfermarkt import scraper as tm
     monkeypatch.setattr(tm, 'TransfermarktScraper', create)
     assert production_referee_scraper(value) == 'scraper'
-    assert constructed[0]['leagues'] == ['XY1'] and constructed[0]['seasons'] == [2025]
+    assert constructed[0]['leagues'] == ['XY1']
+    assert constructed[0]['seasons'] == [2024 if historical else 2025]
+    assert constructed[0]['proxy_control_url'] == (
+        'http://history.offline.invalid' if historical else 'http://offline.invalid'
+    )
     assert constructed[0]['canonical_season'] == value['canonical_season']
     assert constructed[0]['competition_records'][0].competition_id == 'XY1'
     assert constructed[0]['lease_metadata']['scope'] == value['scope_id']

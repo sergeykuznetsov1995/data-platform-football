@@ -148,7 +148,12 @@ def production_referee_scraper(scope: Mapping[str, Any]):
 
     if os.environ.get('TM_STANDING_POLICY_ENABLED', '').lower() not in {'true', '1'}:
         raise RefereeCaptureError('standing_policy_gate_required')
-    if not os.environ.get('TM_PROXY_CONTROL_URL'):
+    control_variable = (
+        'TM_PROXY_CONTROL_URL' if scope.get('current') is True
+        else 'TM_BACKFILL_PROXY_CONTROL_URL'
+    )
+    control_url = os.environ.get(control_variable)
+    if not control_url:
         raise RefereeCaptureError('metered_proxy_required')
     if os.environ.get('TRANSFERMARKT_REQUIRE_RAW_STORE', '').lower() not in {'true', '1'}:
         raise RefereeCaptureError('raw_store_required')
@@ -162,6 +167,7 @@ def production_referee_scraper(scope: Mapping[str, Any]):
     return TransfermarktScraper(
         leagues=[scope['competition_id']], seasons=[int(scope['edition_id'])],
         canonical_season=scope['canonical_season'],
+        proxy_control_url=control_url,
         competition_records=(_competition_from_joined_row(scope['_registry_row']),),
         traffic_ledger=SharedTrafficLedger(
             hard_provider_bytes=SCOPE_HARD_PROVIDER_BYTE_CAP,

@@ -46,6 +46,8 @@ def test_history_dag_is_manual_paused_and_separate(tmp_path):
     assert history.dag.dag_id == 'dag_backfill_transfermarkt_referees'
     assert history.dag._dag_kwargs['schedule'] is None
     assert history.dag._dag_kwargs['is_paused_upon_creation'] is True
+    assert history.dag._dag_kwargs['default_args']['pool'] == 'transfermarkt_backfill_control'
+    assert history.capture._init_kwargs['pool'] == 'transfermarkt_backfill_proxy'
     command = history.capture.bash_command
     assert '--mode history' in command and 'spielbericht' not in command
 

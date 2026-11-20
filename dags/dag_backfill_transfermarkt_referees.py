@@ -64,7 +64,7 @@ def _validate_referee_history(**context):
 
 with DAG(
     dag_id='dag_backfill_transfermarkt_referees',
-    default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
+    default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_backfill_control'},
     description='Historical referee season aggregates from directory pages only',
     schedule=None,
     start_date=datetime(2024, 1, 1),
@@ -91,7 +91,7 @@ exec python dags/scripts/run_transfermarkt_referees.py \
   --max-seconds "$TM_REFEREE_MAX_SECONDS"''',
         append_env=True,
         retries=0,
-        pool='transfermarkt_proxy',
+        pool='transfermarkt_backfill_proxy',
         pool_slots=1,
         max_active_tis_per_dag=1,
         execution_timeout=timedelta(seconds=4200),
