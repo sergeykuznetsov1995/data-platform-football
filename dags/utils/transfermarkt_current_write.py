@@ -117,7 +117,7 @@ def _rows(frame):
     return sorted(rows, key=lambda row: json.dumps(row))
 
 
-def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None, player_ids=()):
+def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None, player_ids=(), natural_keys=()):
     table = 'iceberg.bronze.' + output.table_name
     relation = table + (f' FOR VERSION AS OF {snapshot_id}' if snapshot_id else '')
     if snapshot_id == 0 and frame.empty:
@@ -166,6 +166,22 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
     batch_id = run._frame_batch_id(frame, cycle_id)
     predicate = '_batch_id = ?'
     params = [batch_id]
+    if natural_keys:
+        keys = list(natural_keys)
+        if (len(set(keys)) != len(keys)
+                or any(list(frame.columns).count(key) != 1 for key in keys)):
+            raise CurrentWriteError(f'natural key columns unavailable for {output.key}')
+        key_frame = frame.loc[:, keys]
+        if key_frame.isna().any().any() or key_frame.duplicated().any():
+            raise CurrentWriteError(f'invalid natural key identity for {output.key}')
+        key_rows = [tuple(_cell(key, value) for key, value in zip(keys, row))
+                    for row in key_frame.itertuples(index=False, name=None)]
+        if any(value is None for row in key_rows for value in row) or len(set(key_rows)) != len(key_rows):
+            raise CurrentWriteError(f'invalid natural key identity for {output.key}')
+        placeholders = '(' + ', '.join('?' for _ in keys) + ')'
+        predicate += ' AND (' + ', '.join(keys) + ') IN (' + ', '.join(
+            placeholders for _ in key_rows) + ')'
+        params.extend(value for row in key_rows for value in row)
     if output.replace_keys:
         predicate += ' AND (' + scraper._build_partition_delete_filter(frame, list(output.replace_keys)) + ')'
     elif {'competition_id', 'edition_id'} <= set(frame.columns):
