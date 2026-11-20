@@ -521,22 +521,6 @@ TABLE_CONTRACTS = (
         'configs/openmetadata/descriptions/bronze_transfermarkt_coach_stints.yaml',
         ('iceberg.silver.transfermarkt_coach_stints_v2',),
     ),
-    TableContract(
-        'bronze', 'achievement_observations',
-        'iceberg.bronze.transfermarkt_achievement_observations',
-        'one achievement detail or conclusive recipient status per raw capture row',
-        ('recipient_type', 'recipient_id', 'source_capture_id', 'source_row_id'),
-        (
-            'iceberg.bronze.transfermarkt_player_attribute_observations',
-            'iceberg.bronze.transfermarkt_squad_memberships',
-            'iceberg.bronze.transfermarkt_coach_profiles',
-        ),
-        ('captured_at DESC', 'source_row_id ASC'), _RAW_LINEAGE,
-        ('schema', 'natural_key', 'source_target_reconciliation', 'completeness', 'freshness'),
-        'run_achievement_portion',
-        'configs/openmetadata/descriptions/bronze_transfermarkt_achievement_observations.yaml',
-        ('iceberg.ops.transfermarkt_achievement_receipts_v1',),
-    ),
 )
 
 
@@ -716,7 +700,7 @@ def validate_table_contracts() -> dict[str, Any]:
         layer: sum(item.layer == layer for item in TABLE_CONTRACTS)
         for layer in ('bronze', 'silver', 'gold')
     }
-    if counts != {'bronze': 10, 'silver': 12, 'gold': 4}:
+    if counts != {'bronze': 9, 'silver': 12, 'gold': 4}:
         errors.append(f'unexpected layer counts: {counts}')
     if errors:
         raise StateInvariantError('; '.join(errors))
