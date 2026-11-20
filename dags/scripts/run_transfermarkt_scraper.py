@@ -47,6 +47,7 @@ from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY, CAREER_TTL,
 # scraper modules stay lazy inside _run_entity.
 from scrapers.transfermarkt.models import (
     CAREER_WINDOW_POLICY_VERSION,
+    ATTENDANCE_ENTITY_BUDGET,
     MAX_ROSTER_WINDOW,
     PRODUCTION_ENTITY_BUDGETS,
     PROVIDER_GRANT_ENV_VAR,
@@ -119,8 +120,10 @@ ENTITY_PLAYERS = 'players'
 ENTITY_MV_HISTORY = 'market_value_history'
 ENTITY_TRANSFERS = 'transfers'
 ENTITY_COACHES = 'coaches'
+ENTITY_ATTENDANCE = 'attendance'
 VALID_ENTITIES = {
     ENTITY_PLAYERS, ENTITY_MV_HISTORY, ENTITY_TRANSFERS, ENTITY_COACHES,
+    ENTITY_ATTENDANCE,
 }
 
 REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
@@ -141,6 +144,12 @@ PENDING_CHECKPOINT_TTL_DAYS = int(
 # The shared cycle ledger caps ONE exact scope cycle; the parent (daily)
 # aggregate is enforced by the scope-cycle wrapper against the PARENT_* canon.
 PRODUCTION_CYCLE_BUDGET_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
+
+
+def _entity_budget(entity: str) -> Mapping[str, Any]:
+    if entity == ENTITY_ATTENDANCE:
+        return ATTENDANCE_ENTITY_BUDGET
+    return PRODUCTION_ENTITY_BUDGETS[entity]
 
 
 @dataclass(frozen=True)
@@ -256,6 +265,17 @@ ENTITY_SPECS: Dict[str, EntitySpec] = {
                 ('league', 'season', 'current_club_id'),
                 'coach_id', True,
             ),
+        ),
+    ),
+    ENTITY_ATTENDANCE: EntitySpec(
+        name=ENTITY_ATTENDANCE,
+        id_column='club_id',
+        count_field='clubs_with_rows',
+        state_endpoint=None,
+        native_reader='read_attendance',
+        legacy_reader='',
+        outputs=(
+            OutputSpec('attendance', 'transfermarkt_attendance_observations'),
         ),
     ),
 }
@@ -3912,6 +3932,11 @@ def _run_entity_unbounded(
     proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
 
     try:
+        if spec.name == ENTITY_ATTENDANCE:
+            if os.environ.get('TM_ATTENDANCE_ENABLED', '').lower() not in {'true', '1'}:
+                raise RuntimeError('TM_ATTENDANCE_ENABLED must be true for attendance history')
+            if mode != 'native-only' or os.environ.get('TM_EDITION_CURRENT') != 'false':
+                raise RuntimeError('attendance history requires native-only closed-edition capture')
         if expected_reader_revision is not None:
             # This connection is read-only. It must complete before the shared
             # paid-byte reservation and before TransfermarktScraper constructs
@@ -3924,7 +3949,7 @@ def _run_entity_unbounded(
             # PROVIDER-metered bytes; decoded-body ceilings stay a separate,
             # per-entity client budget (TM_DECODED_BODY_BUDGET_MB).
             reserve_request = int(
-                PRODUCTION_ENTITY_BUDGETS[spec.name]['provider_reserve_bytes']
+                _entity_budget(spec.name)['provider_reserve_bytes']
             )
             cycle_budget = _prepare_cycle_budget(
                 cycle_ledger_key,
@@ -3969,6 +3994,54 @@ def _run_entity_unbounded(
             ),
         ) as scraper:
             _reconcile_pending_fetch_state(scraper)
+            if spec.name == ENTITY_ATTENDANCE:
+                from dags.utils.transfermarkt_attendance import ATTENDANCE_TABLE
+                from dags.utils.transfermarkt_attendance_history import (
+                    capture_attendance_history, expected_attendance_clubs,
+                )
+
+                failure_phase = 'source'
+                extraction, receipt = capture_attendance_history(
+                    scraper,
+                    competition_record=competition_record,
+                    edition_id=str(season),
+                    expected_club_ids=expected_attendance_clubs(
+                        os.environ.get('TM_EXPECTED_CLUB_IDS_JSON')),
+                    run_key=run_key,
+                    write_mode=mode,
+                    reader_revision=int(expected_reader_revision),
+                )
+                failure_phase = 'platform'
+                row_count = len(extraction.rows)
+                results.update({
+                    'rows': row_count,
+                    spec.count_field: len({row['club_id'] for row in extraction.rows}),
+                    'tables': [ATTENDANCE_TABLE],
+                    'outputs': {
+                        'attendance': {
+                            'rows': row_count,
+                            'table': ATTENDANCE_TABLE,
+                            'applicability_status': 'ok' if row_count else 'authoritative_empty',
+                        },
+                    },
+                    'native_write_complete': True,
+                    'native_write_manifest_complete': True,
+                    'native_write_manifest': {
+                        'status': 'success',
+                        'rows': [{
+                            'entity': 'attendance_observations',
+                            'native_rows': row_count,
+                            'native_hash': receipt['physical_hash'],
+                            'status': 'success',
+                        }],
+                    },
+                    'attendance_receipt': dict(receipt),
+                    'authoritative_empty': row_count == 0,
+                    'valid_empty': row_count == 0,
+                })
+                data_committed = True
+                exit_code = 0
+                raise _EntityRunComplete(exit_code)
             if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS} and not dry_run:
                 if _reconcile_native_career_intent(scraper, write_spec, mode, expected_reader_revision,
                         league, season, results):
@@ -4120,7 +4193,7 @@ def _run_entity_unbounded(
                 ):
                     decoded_cap = int(float(os.environ.get(
                         'TM_DECODED_BODY_BUDGET_MB',
-                        PRODUCTION_ENTITY_BUDGETS[spec.name]['decoded_mb'],
+                        _entity_budget(spec.name)['decoded_mb'],
                     )) * 1024 * 1024)
                     career_soft_stop = decoded_cap * 3 // 4
                 frames, authoritative_key, used_native = _read_frames(
@@ -4968,7 +5041,7 @@ def main() -> int:
             parser.error('--retry-budget is required for metered proxy runs')
         if args.cycle_budget_bytes is not None and args.cycle_budget_bytes <= 0:
             parser.error('--cycle-budget-bytes must be positive')
-        entity_budget = PRODUCTION_ENTITY_BUDGETS[entity]
+        entity_budget = _entity_budget(entity)
         if (
             args.decoded_body_budget_mb is not None
             and args.decoded_body_budget_mb > entity_budget['decoded_mb']
@@ -5008,7 +5081,7 @@ def main() -> int:
         })
         return 1
 
-    entity_budget = PRODUCTION_ENTITY_BUDGETS[entity]
+    entity_budget = _entity_budget(entity)
     os.environ['TM_DECODED_BODY_BUDGET_MB'] = str(
         args.decoded_body_budget_mb
         if args.decoded_body_budget_mb is not None

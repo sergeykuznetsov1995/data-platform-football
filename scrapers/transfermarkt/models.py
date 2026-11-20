@@ -203,6 +203,11 @@ PRODUCTION_ENTITY_BUDGETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+ATTENDANCE_ENTITY_BUDGET: Dict[str, Any] = {
+    'decoded_mb': 4.0, 'requests': 20,
+    'provider_reserve_bytes': 2_097_152,
+}
+
 
 def parent_byte_caps_valid(hard: Optional[int], soft: Optional[int]) -> bool:
     """The one rule for a parent (hard, soft) provider-byte pair.
@@ -247,7 +252,9 @@ def _assert_budget_canon() -> None:
             'backfill batch soft stop must fit between scope hard and the '
             'batch hard cap'
         )
-    for entity, budget in PRODUCTION_ENTITY_BUDGETS.items():
+    for entity, budget in (
+        *PRODUCTION_ENTITY_BUDGETS.items(), ('attendance', ATTENDANCE_ENTITY_BUDGET),
+    ):
         if not 0 < int(budget['provider_reserve_bytes']) < SCOPE_HARD_PROVIDER_BYTE_CAP:
             raise AssertionError(
                 f'{entity} provider reserve must fit inside one scope cap'
@@ -258,7 +265,9 @@ def _assert_budget_canon() -> None:
         <= PROVIDER_GRANT_SOFT_MARGIN_BYTES
         < min(
             int(budget['provider_reserve_bytes'])
-            for budget in PRODUCTION_ENTITY_BUDGETS.values()
+            for budget in (
+                *PRODUCTION_ENTITY_BUDGETS.values(), ATTENDANCE_ENTITY_BUDGET,
+            )
         )
     ):
         raise AssertionError(
