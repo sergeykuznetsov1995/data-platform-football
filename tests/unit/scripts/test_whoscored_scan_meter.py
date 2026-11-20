@@ -143,6 +143,27 @@ def test_query_boundaries_inventory_and_zero_sql():
             qualify(inventory, windows, [line], [receipt])
 
 
+def test_reversed_control_windows_and_the_gap_across_midnight():
+    early = workload({A: 1}, end="2026-11-19T23:59:59.500Z")
+    late = workload({B: 1}, query_id="second", start="2026-11-20T00:00:01Z")
+    a, b = pair(at="2026-11-19T23:59:59Z"), pair(B, at="2026-11-20T00:00:01Z")
+    controls, lines, reports = [late, early], [b[0], a[0]], [a[1], b[1]]
+    rows = qualify([A, B], controls, lines, reports)
+    assert [(r["table"], r["query_id"]) for r in rows] == [(A, QID), (B, "second")]
+    gap, receipt = pair(ns=7, at="2026-11-20T00:00:00Z")
+    with pytest.raises(ValueError, match="outside a known query window"):
+        qualify([A, B], controls, lines + [gap], reports + [receipt])
+
+
+def test_unlisted_concurrent_scan_is_observed_and_invalidates_a_closed_control():
+    one, other = pair(), pair(ns=8)
+    native, rest = [one[0], other[0]], [other[1], one[1]]
+    observed = meter.paired_scans("stand-node-1", [A], native, rest)
+    assert len(observed) == 2 and all("query_id" not in row for row in observed)
+    with pytest.raises(ValueError, match="differ from workload"):
+        qualify([A], [workload({A: 1})], native, rest)
+
+
 def test_malformed_native_or_truncated_capture():
     line, receipt = pair()
     for broken in (

@@ -5,11 +5,14 @@ DEBUG and the isolated REST receiver's JSONL rows {at, table, report}. The recei
 records the qualified table from its route. Use a stable --origin for the coordinator
 instance. Events use the native timestamp and retain their identity on replay.
 
-With --workload, each independent, non-overlapping control interval declares start,
-end, expected_scans per table and either query_id or a concurrent group of query_ids.
-Only individual controls attribute physical scans to a query. --paired-only emits
-observed events without certifying completeness. Both paths share the upstream
-Iceberg report; only independent workload controls can reveal common loss.
+Use --paired-only to count observed scans of the inventory under arbitrary concurrency.
+It does not attribute scans to SQL or certify that both reporters saw every scan.
+
+Use --workload only for an isolated experiment with a known list of submitted queries.
+Provide disjoint [start, end) intervals in any order, the expected counts per table,
+and either one query_id or a concurrent group of query_ids. A scan in a gap or a
+count mismatch invalidates the experiment. Only a single-query control supplies
+a query ID. Iceberg's two reporting paths do not independently establish it.
 """
 
 import argparse
