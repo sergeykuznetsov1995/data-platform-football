@@ -369,6 +369,50 @@ tm_profile AS (
     WHERE rn = 1
 ),
 
+tm_edition_bounds AS (
+    SELECT
+        competition_id,
+        edition_id,
+        COALESCE(
+            start_date,
+            CASE
+                WHEN season_format = 'single_year' THEN CAST(
+                    CONCAT(canonical_season, '-01-01') AS date
+                )
+                WHEN season_format = 'split_year' THEN CAST(
+                    CONCAT(edition_id, '-07-01') AS date
+                )
+            END
+        ) AS edition_start_date,
+        COALESCE(
+            end_date,
+            CASE
+                WHEN season_format = 'single_year' THEN CAST(
+                    CONCAT(canonical_season, '-12-31') AS date
+                )
+                WHEN season_format = 'split_year' THEN CAST(
+                    CONCAT(
+                        CAST(TRY_CAST(edition_id AS integer) + 1 AS varchar),
+                        '-06-30'
+                    ) AS date
+                )
+            END
+        ) AS edition_end_date
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, edition_id
+                ORDER BY discovered_at DESC, _ingested_at DESC,
+                         _batch_id DESC, source_body_hash DESC
+            ) AS rn
+        FROM iceberg.bronze.transfermarkt_competition_editions b
+        WHERE competition_id IS NOT NULL
+          AND edition_id IS NOT NULL
+    ) b
+    WHERE rn = 1
+),
+
 tm_coach AS (
     -- One coach row per (coach_id, league, season). Coach stints are global,
     -- so league/season is projected only through a native membership of the
@@ -405,18 +449,18 @@ tm_coach AS (
         FROM iceberg.bronze.transfermarkt_coach_stints s
         JOIN (
             SELECT DISTINCT
-                CAST(club_id AS varchar) AS club_id,
-                league,
-                season,
-                TRY_CAST(
-                    CONCAT('20', SUBSTR(season, 1, 2), '-07-01') AS date
-                ) AS season_start,
-                TRY_CAST(
-                    CONCAT('20', SUBSTR(season, 3, 2), '-06-30') AS date
-                ) AS season_end
-            FROM iceberg.bronze.transfermarkt_squad_memberships
-            WHERE club_id IS NOT NULL
-              AND REGEXP_LIKE(season, '^[0-9]{4}$')
+                CAST(m.club_id AS varchar) AS club_id,
+                m.league,
+                m.season,
+                b.edition_start_date AS season_start,
+                b.edition_end_date AS season_end
+            FROM iceberg.bronze.transfermarkt_squad_memberships m
+            JOIN tm_edition_bounds b
+              ON b.competition_id = m.competition_id
+             AND b.edition_id = m.edition_id
+            WHERE m.club_id IS NOT NULL
+              AND b.edition_start_date IS NOT NULL
+              AND b.edition_end_date IS NOT NULL
         ) m ON m.club_id = CAST(s.club_id AS varchar)
         LEFT JOIN tm_profile p
           ON CAST(p.coach_id AS varchar) = CAST(s.coach_id AS varchar)

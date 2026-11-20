@@ -9,7 +9,7 @@ import sys
 from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1866,8 +1866,12 @@ def test_reader_registry_and_bootstrap_adapters_are_exhaustive():
     coaches = control.transfermarkt_coaches_adapter_sql()
     transfer = control.legacy_transfer_adapter_sql()
     team_value = control.legacy_team_season_market_value_adapter_sql()
-    assert 'transfermarkt_player_attributes_v2' in players
+    assert 'transfermarkt_player_attributes_v2' not in players
+    assert 'transfermarkt_player_attribute_observations_v2' in players
+    assert 'transfermarkt_player_contract_observations_v2' in players
+    assert 'transfermarkt_market_value_points_v2' in players
     assert 'transfermarkt_squad_memberships_v2' in players
+    assert 'iceberg.silver.xref_player' in players
     assert 'transfermarkt_coach_stints_v2' in coaches
     assert 'transfermarkt_coach_profiles_v2' in coaches
     assert 'transfermarkt_competition_editions_v2_a' in coaches
@@ -1889,6 +1893,144 @@ def test_reader_registry_and_bootstrap_adapters_are_exhaustive():
     assert ' league' not in transfer.split('FROM ')[0].lower()
     assert 'transfermarkt_players_legacy' in team_value
     assert 'ambiguous_players_excluded' in team_value
+
+
+def test_player_adapter_preserves_scoped_attributes_and_canonical_ids():
+    duckdb = pytest.importorskip('duckdb')
+    sqlglot = pytest.importorskip('sqlglot')
+    mod = _load()
+    sql = sqlglot.transpile(
+        mod.control.transfermarkt_players_adapter_sql(),
+        read='trino',
+        write='duckdb',
+    )[0].replace('iceberg.silver.', 'silver.')
+
+    con = duckdb.connect(':memory:')
+    con.execute('CREATE SCHEMA silver')
+    con.execute('''CREATE TABLE silver.transfermarkt_squad_memberships_v2_a (
+        player_id varchar, player_slug varchar, player_name varchar,
+        club_id varchar, club_name varchar, competition_id varchar,
+        edition_id varchar, league varchar, season varchar,
+        observed_at timestamp, _bronze_ingested_at timestamp
+    )''')
+    con.execute('''CREATE TABLE silver.transfermarkt_player_attributes_v2_a (
+        player_id varchar, canonical_id varchar, player_slug varchar,
+        name varchar, position varchar, dob date, age integer,
+        height_cm integer, foot varchar, nationality varchar,
+        contract_until date, current_market_value_eur bigint,
+        current_market_value_date date, _bronze_ingested_at timestamp
+    )''')
+    con.execute('''CREATE TABLE silver.transfermarkt_player_attribute_observations_v2_a (
+        player_id varchar, player_slug varchar, name varchar, position varchar,
+        dob date, age integer, height_cm integer, foot varchar,
+        nationality varchar, contract_until date, market_value_eur bigint,
+        club_id varchar, club_name varchar, competition_id varchar,
+        edition_id varchar, league varchar, season varchar,
+        observed_at timestamp, _bronze_ingested_at timestamp,
+        _batch_id varchar, source_body_hash varchar
+    )''')
+    con.execute('''CREATE TABLE silver.transfermarkt_player_contract_observations_v2_a (
+        competition_id varchar, edition_id varchar, team_id varchar,
+        player_id varchar, contract_until date, observed_at timestamp,
+        applicability_status varchar, _bronze_ingested_at timestamp,
+        _batch_id varchar, source_body_hash varchar
+    )''')
+    con.execute('''CREATE TABLE silver.transfermarkt_market_value_points_v2_a (
+        player_id varchar, mv_date date, value_eur bigint,
+        _bronze_ingested_at timestamp
+    )''')
+    con.execute('''CREATE TABLE silver.transfermarkt_player_xref_global_v2_a (
+        player_id varchar, canonical_id varchar, resolution_status varchar
+    )''')
+    con.execute('''CREATE TABLE silver.xref_player (
+        canonical_id varchar, source varchar, source_id varchar,
+        league varchar, season varchar, confidence varchar
+    )''')
+
+    memberships = [
+        ('p1', 'old-player', 'Old Player', 'old_club', 'Old Club',
+         'GB1', '2024', 'ENG', '2425', '2025-06-01', '2025-06-01'),
+        ('p1', 'new-player', 'New Player', 'new_club', 'New Club',
+         'GB1', '2025', 'ENG', '2526', '2026-06-01', '2026-06-01'),
+    ]
+    con.executemany(
+        'INSERT INTO silver.transfermarkt_squad_memberships_v2_a '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?)', memberships,
+    )
+    con.execute(
+        "INSERT INTO silver.transfermarkt_player_attributes_v2_a VALUES "
+        "('p1', 'fb_new', 'new-player', 'New Player', 'Forward', "
+        "DATE '2000-01-01', 21, 181, 'left', 'Newland', "
+        "DATE '2030-06-30', 10000000, DATE '2026-06-01', '2026-06-01')"
+    )
+    observations = [
+        ('p1', 'old-player', 'Old Player', 'Back', date(2000, 1, 1), 20,
+         180, 'right', 'Oldland', date(2025, 6, 30), 5_000_000,
+         'old_club', 'Old Club', 'GB1', '2024', 'ENG', '2425',
+         '2025-06-01', '2025-06-01', 'batch-old', 'hash-old'),
+        ('p1', 'new-player', 'New Player', 'Forward', date(2000, 1, 1), 21,
+         181, 'left', 'Newland', date(2030, 6, 30), 10_000_000,
+         'new_club', 'New Club', 'GB1', '2025', 'ENG', '2526',
+         '2026-06-01', '2026-06-01', 'batch-new', 'hash-new'),
+    ]
+    con.executemany(
+        'INSERT INTO silver.transfermarkt_player_attribute_observations_v2_a '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', observations,
+    )
+    con.executemany(
+        'INSERT INTO silver.transfermarkt_player_contract_observations_v2_a '
+        'VALUES (?,?,?,?,?,?,?,?,?,?)',
+        [
+            ('GB1', '2024', 'old_club', 'p1', date(2025, 6, 30),
+             '2025-06-01', 'applicable', '2025-06-01', 'batch-old', 'hash-old'),
+            ('GB1', '2025', 'new_club', 'p1', date(2030, 6, 30),
+             '2026-06-01', 'applicable', '2026-06-01', 'batch-new', 'hash-new'),
+        ],
+    )
+    con.executemany(
+        'INSERT INTO silver.transfermarkt_market_value_points_v2_a '
+        'VALUES (?,?,?,?)',
+        [
+            ('p1', date(2025, 5, 1), 4_000_000, '2025-06-01'),
+            ('p1', date(2026, 6, 1), 20_000_000, '2026-06-01'),
+        ],
+    )
+    con.execute(
+        "INSERT INTO silver.transfermarkt_player_xref_global_v2_a "
+        "VALUES ('p1', NULL, 'source_conflict')"
+    )
+    con.executemany(
+        'INSERT INTO silver.xref_player VALUES (?,?,?,?,?,?)',
+        [
+            ('fb_old', 'transfermarkt', 'p1', 'ENG', '2425', 'exact'),
+            ('fb_new', 'transfermarkt', 'p1', 'ENG', '2526', 'exact'),
+        ],
+    )
+
+    con.execute(sql)
+    rows = con.execute(
+        'SELECT * FROM silver.transfermarkt_players_v2_a ORDER BY season'
+    ).fetchall()
+    names = [column[0] for column in con.description]
+    by_season = {
+        result['season']: result
+        for result in (dict(zip(names, row)) for row in rows)
+    }
+
+    assert by_season['2425']['canonical_id'] == 'fb_old'
+    assert by_season['2425']['name'] == 'Old Player'
+    assert by_season['2425']['slug'] == 'old-player'
+    assert by_season['2425']['position'] == 'Back'
+    assert by_season['2425']['age'] == 20
+    assert by_season['2425']['height_cm'] == 180
+    assert by_season['2425']['foot'] == 'right'
+    assert by_season['2425']['nationality'] == 'Oldland'
+    assert by_season['2425']['contract_until'] == date(2025, 6, 30)
+    assert by_season['2425']['current_market_value_eur'] == 5_000_000
+    assert by_season['2425']['mv_last_update'] == date(2026, 6, 1)
+    assert by_season['2526']['canonical_id'] == 'fb_new'
+    assert by_season['2526']['name'] == 'New Player'
+    assert by_season['2526']['current_market_value_eur'] == 10_000_000
 
 
 def test_coach_adapter_uses_epl_and_world_cup_edition_windows():
