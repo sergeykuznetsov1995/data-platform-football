@@ -59,7 +59,8 @@ ENTITY_GROUPS = {
                 'player_contract_observations'},
     'market_value_history': {'market_value_history', 'market_value_points', 'mv_history'},
     'transfers': {'transfers', 'transfer_events'},
-    'coaches': {'coaches', 'coach_history', 'coach_profile', 'club_staff', 'coach_profiles', 'coach_stints'},
+    'coaches': {'coaches', 'coach_history', 'coach_profile', 'club_staff', 'club_profile', 'club_stadium',
+                'coach_profiles', 'coach_stints'},
 }
 _ENTITY_GROUP = {name: group for group, names in ENTITY_GROUPS.items() for name in names}
 
