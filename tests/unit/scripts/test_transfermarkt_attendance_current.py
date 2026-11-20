@@ -111,9 +111,11 @@ def test_writer_failure_keeps_pending_and_recovers(offline):
     writer, calls = attendance_writer_for(offline, fail_once=True)
     offline.run('failed-write', attendance_writer=writer)
     assert data(offline)['cursor']['attendance_pending']
+    offline.clock.advance(3600)
     offline.run('resume', attendance_writer=writer)
     assert len(calls) == 2
     assert not data(offline)['cursor']['attendance_pending']
+    assert data(offline)['cursor']['attendance_completed_at'] == offline.clock.wall.isoformat()
     assert 'attendance_receipt' in data(offline)
 
 
@@ -192,6 +194,17 @@ def test_failed_final_attendance_blocks_historical_handoff(offline):
     assert result['status'] == 'pending'
     assert not result.get('historical_handoff')
     assert data(offline)['cursor']['attendance_pending']
+    assert 'season_close_handed_off_at' not in data(offline)
+
+
+def test_enabled_but_unavailable_attendance_blocks_historical_handoff(offline, monkeypatch):
+    monkeypatch.setenv('TM_ATTENDANCE_ENABLED', 'true')
+    report = close_report(offline, None)
+    result, = report['scopes']
+    assert result['kind'] == 'season_close'
+    assert result['status'] == 'pending'
+    assert not result.get('historical_handoff')
+    assert 'attendance_final_receipt' not in data(offline)
     assert 'season_close_handed_off_at' not in data(offline)
 
 

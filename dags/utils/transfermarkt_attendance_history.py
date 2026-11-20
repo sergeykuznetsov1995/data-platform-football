@@ -87,7 +87,7 @@ def capture_attendance_history(
         registry_snapshot_id,
         extracted_at,
         final_season=True,
-        final_season_proof=f'season-close:{registry_snapshot_id}',
+        final_season_proof=f'history-backfill:{registry_snapshot_id}',
     )
     preflight = {
         'paid_io_allowed': True,

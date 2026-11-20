@@ -67,7 +67,7 @@ def test_history_attendance_extends_existing_cycle_and_noop_resumes(tmp_path, mo
             'verified': True,
             'receipt_readback': True,
             'final_season': True,
-            'final_season_proof': 'season-close:registry-snapshot-20260711',
+            'final_season_proof': 'history-backfill:registry-snapshot-20260711',
             'expected_club_ids': expected,
             'observed_club_ids': expected,
             'observed_at': CAPTURED,
@@ -202,6 +202,7 @@ def test_history_capture_uses_raw_pages_and_real_parser(tmp_path, monkeypatch):
     assert calls[0][0] == START
     assert calls[0][1]['label'] == 'attendance'
     assert extraction.final_season is True
+    assert extraction.final_season_proof.startswith('history-backfill:')
     assert {row['club_id'] for row in extraction.rows} == {'11', '631'}
     assert {row['observed_at'] for row in extraction.rows} == {CAPTURED}
     assert written[0][1] == ('11', '631')

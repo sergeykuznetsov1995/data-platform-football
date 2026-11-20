@@ -1324,7 +1324,8 @@ def _validate_run_contract(
         if not isinstance(receipt, Mapping) or receipt.get('verified') is not True \
                 or receipt.get('receipt_readback') is not True \
                 or receipt.get('final_season') is not True \
-                or not receipt.get('final_season_proof'):
+                or receipt.get('final_season_proof') != (
+                    f'history-backfill:{identity.registry_snapshot_id}'):
             raise ScopeCycleError('attendance edition receipt is incomplete')
         row = manifest_rows.get(ATTENDANCE_OUTPUT_ENTITY)
         if not isinstance(row, Mapping) \

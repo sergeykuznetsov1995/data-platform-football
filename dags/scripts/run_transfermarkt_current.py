@@ -1915,7 +1915,7 @@ class _Scope:
             )
             observed_at = pages[0].captured_at
             run_id = 'tm-attendance-' + hashlib.sha256(json.dumps([
-                self.target.scope_id, observed_at, final,
+                'current', self.target.scope_id, observed_at, final,
             ]).encode()).hexdigest()[:32]
             extraction = AttendanceExtraction(
                 result, self.target.scope_id, run_id, self.target.registry_snapshot_id,
@@ -1942,7 +1942,7 @@ class _Scope:
             self.persist()
             return
         self.cursor = replace(
-            self.cursor, attendance_completed_at=started_at, attendance_pending=False,
+            self.cursor, attendance_completed_at=_utc(self.now()), attendance_pending=False,
         )
         self.data['attendance_receipt'] = proof
         if final:
@@ -2379,9 +2379,15 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 scope.persist()
                 if daily_complete(scope.cursor, now()):
                     report['daily_complete_scope_ids'].append(target.scope_id)
+                attendance_close_missing = (
+                    item.kind == 'season_close'
+                    and (attendance_writer is not None or os.environ.get(
+                        'TM_ATTENDANCE_ENABLED', '').lower() in {'true', '1'})
+                    and not data.get('attendance_final_receipt')
+                )
                 result['status'] = (
                     'complete' if not scope.resume and not scope.cursor.attendance_pending
-                    and item.kind != 'cold_roster' else 'pending'
+                    and not attendance_close_missing and item.kind != 'cold_roster' else 'pending'
                 )
                 if item.kind == 'season_close' and result['status'] == 'complete':
                     if not data.get('season_close_roster_captured'):
