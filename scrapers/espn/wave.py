@@ -1186,8 +1186,8 @@ class _Again:
     summary: SummaryParseResult
     raw: RawRef
     outcome: str
-    before: Mapping[str, int] | None
-    after: Mapping[str, int] | None
+    before: recheck.JournalParts | None
+    after: recheck.JournalParts | None
     # False when the body equals the stored one (nothing to journal).
     new_body: bool = True
     # The failed forced download (``failed``): the tournament is red.
@@ -1265,8 +1265,7 @@ def _summary_again(
         parts = recheck.summary_parts(new)
         return _Again(new, _raw_ref(result), recheck.SAME, parts, parts, new_body=False)
     old = _stored_summary(client, known, schedule, competition, edition)
-    outcome = recheck.compare_parts(old, new)
-    before, after = recheck.summary_parts(old), recheck.summary_parts(new)
+    before, after, outcome = recheck.compare_summaries(old, new)
     if outcome == recheck.DOWNGRADE_REJECTED:
         logger.warning(
             "ESPN %s %s: downgrade rejected, stored Summary kept: %s -> %s",
@@ -1422,8 +1421,12 @@ def run_tournament(
                     summary_errors.append(
                         f"{kind} of {event_id}: failed in an earlier attempt of this wave"
                     )
-                if found is None and presence is None and event_id not in work.statuses:
-                    continue  # planned for the recheck only: written by the first attempt
+                if (
+                    presence is None
+                    and event_id not in work.statuses
+                    and (found is None or not _changed(found[0], known, found[1].fetched_at))
+                ):
+                    continue  # The journalled attempt already covered this day state.
                 kind = None
             if (
                 kind is not None

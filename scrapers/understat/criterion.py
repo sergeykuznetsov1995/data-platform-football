@@ -14,6 +14,9 @@ SQL text below verbatim, so change it only together with that copy):
   ``date`` is UTC for the current seasons, so the deadline is
   ``date + 26 h`` (24 h after a ~2 h match).
 * The day key D is the UTC day of the deadline.
+* If the complete schedule has been replaced, only its successor's matched
+  physical rows can supply kickoffs. Played IDs come from source lists.
+  Missing evidence makes the affected day unmeasured and interrupts the streak.
 * *On time* (``ok``): a ``complete`` manifest attempt of the scope with
   ``kickoff < completed_at <= deadline`` covered the match
   (``quality_json.covered_game_ids`` = games with shots and player rows).
@@ -69,123 +72,177 @@ played AS (
 )"""
 
 DAILY_CRITERION_SQL = """WITH
-lc AS (
-    SELECT league, season, batch_id
-    FROM (
-        SELECT league, season, batch_id,
-               ROW_NUMBER() OVER (
-                   PARTITION BY league, season
-                   ORDER BY completed_at DESC, attempt_id DESC
-               ) AS rn
-        FROM iceberg.ops.understat_ingest_manifest_v1
-        WHERE contract_version = 'understat-bronze-v2' AND status = 'complete'
-    )
-    WHERE rn = 1
+-- Bound undated evidence by the ordinary July-to-June season. Actual dates
+-- also include matches in extended seasons.
+seasons AS (
+    SELECT DISTINCT substr(CAST(year(k - INTERVAL '6' MONTH) AS varchar), 3, 2)
+                  || substr(CAST(year(k + INTERVAL '6' MONTH) AS varchar), 3, 2) AS season
+    FROM (VALUES (TIMESTAMP '{day} 00:00:00' - INTERVAL '26' HOUR),
+                 (TIMESTAMP '{day} 00:00:00' - INTERVAL '2' HOUR)) AS bounds(k)
 ),
-sched AS (
-    SELECT s.league, s.season, CAST(s.game_id AS varchar) AS game_id,
-           s.date AS kickoff, s.is_result,
-           CASE WHEN s.is_result THEN count_if(s.is_result) OVER (
-               PARTITION BY s.league, s.season ORDER BY s.date
-           ) END AS ordinal
-    FROM iceberg.bronze.understat_schedule s
-    JOIN lc ON lc.league = s.league AND lc.season = s.season
-    WHERE s._batch_id = lc.batch_id
+dated_scopes AS (
+    SELECT DISTINCT league, season
+    FROM iceberg.bronze.understat_schedule
+    WHERE date >= TIMESTAMP '{day} 00:00:00' - INTERVAL '26' HOUR
+      AND date < TIMESTAMP '{day} 00:00:00' - INTERVAL '2' HOUR
 ),
-cand AS (
-    SELECT league, season, game_id, kickoff, is_result, ordinal,
-           kickoff + INTERVAL '26' HOUR AS deadline
-    FROM sched
-    WHERE kickoff + INTERVAL '26' HOUR >= TIMESTAMP '{day} 00:00:00'
-      AND kickoff + INTERVAL '26' HOUR < TIMESTAMP '{day} 00:00:00' + INTERVAL '1' DAY
-),
-att AS (
-    SELECT league, season,
+manifest AS (
+    SELECT m.*,
            CAST(from_iso8601_timestamp(completed_at) AT TIME ZONE 'UTC'
-                AS timestamp(6)) AS done,
+                AS timestamp(6)) AS done
+    FROM iceberg.ops.understat_ingest_manifest_v1 m
+    LEFT JOIN dated_scopes d ON d.league = m.league AND d.season = m.season
+    WHERE contract_version = 'understat-bronze-v2'
+      AND (m.season IN (SELECT season FROM seasons) OR d.league IS NOT NULL)
+),
+ranked AS (
+    SELECT m.*, row_number() OVER (PARTITION BY league, season
+                   ORDER BY done DESC, attempt_id DESC) AS latest,
+           row_number() OVER (PARTITION BY league, season, batch_id
+                   ORDER BY done DESC, attempt_id DESC) AS in_batch,
+           max(CASE WHEN status = 'complete' THEN done END)
+               OVER (PARTITION BY league, season) AS last_complete
+    FROM manifest m
+),
+observations AS (
+    SELECT league, season, batch_id, attempt_id, done, status = 'complete' AS complete,
            CAST(json_extract_scalar(quality_json, '$.completed_game_count')
                 AS integer) AS cg,
            CAST(json_extract(quality_json, '$.covered_game_ids')
                 AS array(varchar)) AS covered,
-           CAST(json_extract(quality_json, '$.site_result_game_ids')
-                AS array(varchar)) AS site
-    FROM iceberg.ops.understat_ingest_manifest_v1
-    WHERE contract_version = 'understat-bronze-v2' AND status = 'complete'
-),
-journal AS (
-    SELECT f.league, f.season,
+           CASE WHEN status = 'upstream_pending' THEN CAST(ARRAY[] AS array(varchar))
+                WHEN coalesce(json_extract_scalar(quality_json, '$.site_result_known'), 'true') = 'true'
+                THEN CAST(json_extract(quality_json, '$.site_result_game_ids') AS array(varchar))
+           END AS site
+    FROM manifest WHERE status IN ('complete', 'upstream_pending')
+    UNION ALL
+    SELECT f.league, f.season, f.batch_id, f.attempt_id,
            CAST(from_iso8601_timestamp(f.completed_at) AT TIME ZONE 'UTC'
                 AS timestamp(6)) AS done,
+           false AS complete, NULL AS cg, NULL AS covered,
            CAST(json_extract(f.quality_json, '$.site_result_game_ids')
                 AS array(varchar)) AS site
     FROM {failures} f
+    LEFT JOIN dated_scopes d ON d.league = f.league AND d.season = f.season
     WHERE f.contract_version = 'understat-bronze-v2'
+      AND (f.season IN (SELECT season FROM seasons) OR d.league IS NOT NULL)
       AND json_extract_scalar(f.quality_json, '$.site_result_known') = 'true'
 ),
-seen AS (
-    SELECT league, season, done, site FROM att WHERE site IS NOT NULL
-    UNION ALL
-    SELECT league, season, done, site FROM journal
+first_seen AS (
+    SELECT league, season, game_id, min(done) AS seen_at
+    FROM observations CROSS JOIN UNNEST(site) AS ids(game_id)
+    GROUP BY league, season, game_id
 ),
-seen_by_deadline AS (
-    SELECT DISTINCT c.league, c.season, c.game_id
-    FROM cand c
-    JOIN seen v
-      ON v.league = c.league AND v.season = c.season
-     AND v.done <= c.deadline AND contains(v.site, c.game_id)
+known_attempts AS (
+    SELECT league, season, batch_id,
+           CASE WHEN NOT bool_or(complete) AND min(attempt_id) = max(attempt_id)
+                     AND count(DISTINCT site) = 1 THEN min(attempt_id) END AS unpublished_attempt,
+           max(max(done)) OVER (PARTITION BY league, season) AS last_list
+    FROM observations WHERE site IS NOT NULL GROUP BY league, season, batch_id
 ),
-due AS (
-    SELECT c.league, c.season, c.game_id, c.kickoff, c.ordinal, c.deadline
-    FROM cand c
-    LEFT JOIN seen_by_deadline sd
-      ON sd.league = c.league AND sd.season = c.season AND sd.game_id = c.game_id
-    WHERE c.is_result OR sd.game_id IS NOT NULL
+physical AS (
+    SELECT m.league, m.season, m.done, j.last_list, m.status = 'complete' AS certified,
+           s._batch_id IS NOT NULL AND (m.status = 'complete' OR j.unpublished_attempt IS NOT NULL)
+               AND min(s._batch_id) OVER (PARTITION BY m.league, m.season)
+                 = max(s._batch_id) OVER (PARTITION BY m.league, m.season) AS usable,
+           CAST(s.game_id AS varchar) AS game_id, s.date AS kickoff, s.is_result,
+           dense_rank() OVER (PARTITION BY m.league, m.season ORDER BY
+               CASE WHEN m.status = 'complete' AND s._batch_id IS NOT NULL THEN 0
+                    WHEN m.latest = 1 THEN 1 ELSE 2 END) AS preference
+    FROM ranked m
+    LEFT JOIN iceberg.bronze.understat_schedule s
+      ON s.league = m.league AND s.season = m.season AND s._batch_id = m.batch_id
+    LEFT JOIN known_attempts j
+      ON j.league = m.league AND j.season = m.season AND j.batch_id = m.batch_id
+     -- A surviving write marker and its terminal failure have different attempt IDs.
+     AND (j.unpublished_attempt = m.attempt_id OR m.status = 'in_progress')
+    -- Ignore stale rows from generations preceding the last publication.
+    -- Several surviving candidate generations cannot establish a single calendar.
+    WHERE m.in_batch = 1 AND (m.latest = 1 OR (s._batch_id IS NOT NULL
+          AND (m.last_complete IS NULL OR m.done >= m.last_complete)))
 ),
-journal_seen AS (
-    SELECT d.league, d.game_id, count(*) AS hits
-    FROM due d
-    JOIN journal j
-      ON j.league = d.league AND j.season = d.season
-     AND j.done > d.kickoff AND j.done <= d.deadline
-     AND contains(j.site, d.game_id)
-    GROUP BY d.league, d.game_id
+games AS (
+    SELECT league, season, game_id, certified, usable, done, last_list,
+           min(kickoff) AS kickoff, max(kickoff) AS last_kickoff,
+           count(*) = 1 AND count(kickoff) = 1 AND game_id IS NOT NULL AS unique_kickoff,
+           count(kickoff) < count(*) AS missing_kickoff,
+           count_if(kickoff >= TIMESTAMP '{day} 00:00:00' - INTERVAL '26' HOUR
+                AND kickoff < TIMESTAMP '{day} 00:00:00' - INTERVAL '2' HOUR) > 0 AS in_day,
+           certified AND bool_or(coalesce(is_result, false)) AS played
+    FROM physical WHERE preference = 1
+    GROUP BY league, season, game_id, certified, usable, done, last_list
+),
+schedule AS (
+    SELECT g.*, CASE WHEN played THEN count_if(played) OVER (
+               PARTITION BY league, season ORDER BY kickoff
+           ) END AS ordinal
+    FROM games g
+),
+facts AS (
+    SELECT coalesce(g.league, v.league) AS league, coalesce(g.season, v.season) AS season,
+           coalesce(g.game_id, v.game_id) AS game_id, g.kickoff, g.ordinal,
+           g.kickoff + INTERVAL '26' HOUR AS deadline,
+           g.usable, g.played, g.certified, g.last_list, v.seen_at, g.in_day,
+           CASE WHEN g.played AND (v.seen_at IS NULL OR g.done < v.seen_at)
+                THEN g.done ELSE v.seen_at END AS first_played,
+           coalesce(g.missing_kickoff, true) OR
+               (NOT g.certified AND v.seen_at < g.last_kickoff) AS date_unknown,
+           coalesce(g.unique_kickoff, false)
+               AND (g.certified OR v.seen_at IS NULL OR v.seen_at >= g.kickoff) AS located
+    FROM schedule g FULL JOIN first_seen v
+      ON v.league = g.league AND v.season = g.season AND v.game_id = g.game_id
+),
+assessment AS (
+    SELECT f.*,
+           coalesce(usable AND located AND in_day AND (played OR seen_at <= deadline),
+                    false) AS due_game,
+           CASE
+               WHEN NOT usable THEN true
+               WHEN NOT certified AND in_day AND last_list < kickoff THEN true
+               -- A missing ID/date can belong to any earlier deadline day in
+               -- this season, up to the first reliable observation plus 26 h.
+               WHEN NOT located AND (seen_at IS NOT NULL OR played OR game_id IS NULL)
+               THEN in_day OR (date_unknown AND (first_played IS NULL OR
+                                TIMESTAMP '{day} 00:00:00' <= first_played + INTERVAL '26' HOUR))
+               ELSE false
+           END AS uncertain
+    FROM facts f
 ),
 per_game AS (
-    SELECT d.league, d.game_id,
-           count_if(a.done IS NOT NULL) AS attempts,
-           count_if(coalesce(
-               CASE WHEN a.covered IS NOT NULL
-                    THEN contains(a.covered, d.game_id)
-                    ELSE a.cg >= d.ordinal END,
-               false
-           )) AS covered_hits,
-           count_if(coalesce(
-               CASE WHEN a.site IS NOT NULL
-                    THEN contains(a.site, d.game_id)
-                    ELSE a.cg >= d.ordinal END,
-               false
-           )) AS site_hits
-    FROM due d
-    LEFT JOIN att a
-      ON a.league = d.league AND a.season = d.season
-     AND a.done > d.kickoff AND a.done <= d.deadline
-    GROUP BY d.league, d.game_id
+    SELECT d.league, d.season, d.game_id, d.due_game, d.uncertain,
+           count_if(coalesce(a.complete, false)) AS attempts,
+           count_if(coalesce(a.complete AND CASE WHEN a.covered IS NOT NULL
+               THEN contains(a.covered, d.game_id) ELSE a.cg >= d.ordinal END, false)) AS covered_hits,
+           count_if(coalesce(CASE WHEN a.site IS NOT NULL
+               THEN contains(a.site, d.game_id) ELSE a.cg >= d.ordinal END, false)) AS site_hits,
+           count_if(coalesce(NOT d.certified AND a.complete AND a.cg > 0
+                    AND (a.covered IS NULL OR (a.site IS NULL AND NOT d.due_game)),
+                    false)) AS uncertain_legacy
+    FROM assessment d
+    LEFT JOIN observations a ON d.in_day AND d.located AND d.usable
+      AND a.league = d.league AND a.season = d.season
+      AND a.done > d.kickoff AND a.done <= d.deadline
+    WHERE d.due_game OR d.uncertain OR (NOT d.certified AND d.in_day)
+    GROUP BY d.league, d.season, d.game_id, d.due_game, d.uncertain
 ),
 graded AS (
-    SELECT p.league,
+    SELECT p.*,
            p.covered_hits > 0 AS ok,
-           p.covered_hits = 0 AND p.attempts > 0
-               AND p.site_hits = 0 AND coalesce(js.hits, 0) = 0 AS site_late
+           p.covered_hits = 0 AND p.attempts > 0 AND p.site_hits = 0 AS site_late
     FROM per_game p
-    LEFT JOIN journal_seen js
-      ON js.league = p.league AND js.game_id = p.game_id
 )
 SELECT league,
-       count_if(NOT site_late) AS due,
-       count_if(ok) AS ok,
-       count_if(site_late) AS site_late
+       count_if(due_game AND NOT site_late) AS due,
+       count_if(due_game AND ok) AS ok,
+       count_if(due_game AND site_late) AS site_late,
+       CASE WHEN count_if(uncertain OR (uncertain_legacy > 0 AND NOT (due_game AND ok))) > 0
+            THEN 0 ELSE 1 END AS measured
 FROM graded
 GROUP BY league
+UNION ALL
+-- No publication evidence at all cannot establish a neutral day.
+SELECT CAST(NULL AS varchar), 0, 0, 0, 0
+WHERE NOT EXISTS (SELECT 1 FROM manifest)
 ORDER BY league"""
 
 COMPLETENESS_SQL = (
@@ -298,22 +355,25 @@ class DayResult:
     due: int
     ok: int
     site_late: int = 0
+    measured: bool = True
 
     @property
     def pct(self) -> Optional[Decimal]:
-        return pct(self.ok, self.due)
+        return pct(self.ok, self.due) if self.measured else None
 
 
 def summarize_days(days: Iterable[DayResult]) -> int:
     """Streak of consecutive days with deadlines meeting the target.
 
-    Walks back from the newest day; days with ``due = 0`` are neutral (skipped),
-    the first day with deadlines below ``TARGET_PCT`` ends the streak.  The
+    Walks back from the newest day. Measured days with ``due = 0`` are neutral.
+    An unmeasured day or a day below ``TARGET_PCT`` ends the streak. The
     threshold is checked on the exact ratio, not on the rounded display value
     (95/96 = 98.96 % rounds to 99.0 but misses the target).
     """
     streak = 0
     for result in sorted(days, key=lambda item: item.day, reverse=True):
+        if not result.measured:
+            break
         if result.due <= 0:
             continue
         if Decimal(100) * result.ok < TARGET_PCT * result.due:

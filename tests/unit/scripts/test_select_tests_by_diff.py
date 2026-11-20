@@ -123,6 +123,8 @@ def test_mapping_selects_expected_tests(changed, expected):
         ('requirements-ci.txt', 'requirements'),
         ('requirements/test/fbref-py312.lock', 'requirements'),
         ('requirements/test/x.in', 'requirements'),
+        ('.github/workflows/ci.yml', 'workflow'),
+        ('scripts/select_tests_by_diff.py', 'test-selector'),
         ('scrapers/base/scraper.py', 'scraper-base'),
         ('scrapers/utils/proxy_manager.py', 'scraper-shared-utils'),
         ('scrapers/fotmob/__init__.py', 'package-init'),
@@ -185,7 +187,7 @@ def test_code_without_tests_escalates():
 
 def test_docs_and_github_contribute_nothing():
     verdict, payload = mod.select_tests(
-        ['README.md', 'docs/design/x.md', '.github/workflows/nightly-unit-suite.yml'],
+        ['README.md', 'docs/design/x.md', '.github/ISSUE_TEMPLATE/task.md'],
         AVAILABLE,
     )
     assert verdict == 'list'

@@ -3252,7 +3252,9 @@ class WhoScoredIngestService:
                             )
                     self._record_event_type_dictionaries(pending, result)
         finally:
-            self._write_match_failures(failure_rows, failure_outcomes, result)
+            if failure_rows:
+                self._write_failure_batch("match", self.repository.write_failure_rows,
+                                          failure_rows, failure_outcomes, result)
         if proxy_down is not None:
             raise proxy_down
         if candidates or result.succeeded:
@@ -3295,8 +3297,10 @@ class WhoScoredIngestService:
                 )
                 return
 
-    def _write_match_failures(
-        self,
+    @staticmethod
+    def _write_failure_batch(
+        entity: str,
+        write_rows: Callable,
         rows: list[dict[str, Any]],
         outcomes: list[tuple[str, str]],
         result: EntityResult,
@@ -3304,16 +3308,16 @@ class WhoScoredIngestService:
         if not rows:
             return
         try:
-            self.repository.write_failure_rows(rows)
+            write_rows(rows)
         except Exception as exc:
             result.errors.append(
-                f"match failure manifests ({len(rows)} rows): "
+                f"{entity} failure manifests ({len(rows)} rows): "
                 f"{type(exc).__name__}: {exc}"
             )
             return
         for state, value in outcomes:
             if state == "not_available":
-                result.committed_batches["match_not_available"].append(value)
+                result.committed_batches[f"{entity}_not_available"].append(value)
                 result.succeeded += 1
                 result.counts["not_available"] = (
                     result.counts.get("not_available", 0) + 1
@@ -3353,8 +3357,63 @@ class WhoScoredIngestService:
                 int(candidate["game_id"]) for candidate in candidates
             ),
         }
+        failure_rows = []
+        failure_outcomes = []
         pending: list[tuple[PreviewCommit, Any]] = []
-        proxy_down: Optional[ProxyUnavailable] = None
+        try:
+            proxy_down = self._collect_preview_pages(
+                candidates, pending, failure_rows, failure_outcomes, result,
+            )
+        finally:
+            self._write_failure_batch(
+                "preview", self.repository.write_preview_failure_rows,
+                failure_rows, failure_outcomes, result,
+            )
+        if pending:
+            try:
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit, _parsed in pending
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_previews(
+                        [commit for commit, _parsed in pending]
+                    )
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "preview repository returned different committed batch ids"
+                    )
+            except Exception as exc:
+                result.errors.append(f"preview batch: {type(exc).__name__}: {exc}")
+            else:
+                result.committed_batches["preview"].extend(committed_batch_ids)
+                result.succeeded += len(pending)
+                for _commit, parsed in pending:
+                    for name, dataset in parsed.datasets.items():
+                        result.counts[name] = (
+                            result.counts.get(name, 0) + dataset.row_count
+                        )
+        if proxy_down is not None:
+            raise proxy_down
+        if candidates:
+            result.tables.extend(
+                [
+                    "iceberg.bronze.whoscored_missing_players",
+                    "iceberg.bronze.whoscored_preview_lineups",
+                    "iceberg.bronze.whoscored_preview_sections",
+                    "iceberg.bronze.whoscored_preview_ingest_manifest",
+                ]
+            )
+        return result
+
+    def _collect_preview_pages(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
+        pending: list[tuple[PreviewCommit, Any]],
+        failure_rows: list[dict[str, Any]],
+        failure_outcomes: list[tuple[str, str]],
+        result: EntityResult,
+    ) -> Optional[ProxyUnavailable]:
         for candidate in candidates:
             target = preview_page_target(candidate["game_id"])
             parsed_holder: dict[str, Any] = {}
@@ -3408,7 +3467,7 @@ class WhoScoredIngestService:
                         tzinfo=None
                     ) + timedelta(hours=delay_hours)
                 try:
-                    failure_batch_id = self.repository.record_preview_failure(
+                    row, failure_batch_id = self.repository.build_preview_failure_row(
                         PreviewFailure(
                             game_id=int(candidate["game_id"]),
                             league=self.scope.competition_id,
@@ -3427,6 +3486,7 @@ class WhoScoredIngestService:
                             raw_uri=getattr(exc, "raw_uri", None),
                         )
                     )
+                    failure_rows.append(row)
                 except Exception as manifest_exc:
                     result.errors.append(
                         f"preview {candidate['game_id']} failure manifest: "
@@ -3434,7 +3494,7 @@ class WhoScoredIngestService:
                     )
                 else:
                     if state == "retryable":
-                        result.retryable.append(str(candidate["game_id"]))
+                        failure_outcomes.append(("retryable", str(candidate["game_id"])))
                     elif state == "not_available":
                         expected_failure_batch_id = (
                             deterministic_preview_not_available_batch_id(
@@ -3467,15 +3527,9 @@ class WhoScoredIngestService:
                                 "no exact not-available outcome identity"
                             )
                         else:
-                            result.committed_batches["preview_not_available"].append(
-                                failure_batch_id
-                            )
-                            result.succeeded += 1
-                            result.counts["not_available"] = (
-                                result.counts.get("not_available", 0) + 1
-                            )
+                            failure_outcomes.append(("not_available", failure_batch_id))
                     elif state == "terminal":
-                        result.terminal.append(str(candidate["game_id"]))
+                        failure_outcomes.append(("terminal", str(candidate["game_id"])))
                     else:
                         # Parser/content drift must fail visibly. Transport
                         # has already persisted the raw payload.
@@ -3515,7 +3569,7 @@ class WhoScoredIngestService:
                 pending.append((commit, parsed))
             except WhoScoredParseError as exc:
                 try:
-                    self.repository.record_preview_failure(
+                    row, _ = self.repository.build_preview_failure_row(
                         PreviewFailure(
                             game_id=int(candidate["game_id"]),
                             league=self.scope.competition_id,
@@ -3535,6 +3589,7 @@ class WhoScoredIngestService:
                             direct_bytes=response.wire_bytes,
                         )
                     )
+                    failure_rows.append(row)
                 except Exception as manifest_exc:
                     result.errors.append(
                         f"preview {candidate['game_id']} failure manifest: "
@@ -3542,48 +3597,12 @@ class WhoScoredIngestService:
                     )
                 result.errors.append(f"preview {candidate['game_id']}: {exc}")
             except ProxyUnavailable as exc:
-                proxy_down = exc
-                break
+                return exc
             except Exception as exc:
                 result.errors.append(
                     f"preview {candidate['game_id']}: {type(exc).__name__}: {exc}"
                 )
-        if pending:
-            try:
-                expected_batch_ids = tuple(
-                    commit.batch_id for commit, _parsed in pending
-                )
-                committed_batch_ids = tuple(
-                    self.repository.commit_previews(
-                        [commit for commit, _parsed in pending]
-                    )
-                )
-                if committed_batch_ids != expected_batch_ids:
-                    raise RuntimeError(
-                        "preview repository returned different committed batch ids"
-                    )
-            except Exception as exc:
-                result.errors.append(f"preview batch: {type(exc).__name__}: {exc}")
-            else:
-                result.committed_batches["preview"].extend(committed_batch_ids)
-                result.succeeded += len(pending)
-                for _commit, parsed in pending:
-                    for name, dataset in parsed.datasets.items():
-                        result.counts[name] = (
-                            result.counts.get(name, 0) + dataset.row_count
-                        )
-        if proxy_down is not None:
-            raise proxy_down
-        if candidates:
-            result.tables.extend(
-                [
-                    "iceberg.bronze.whoscored_missing_players",
-                    "iceberg.bronze.whoscored_preview_lineups",
-                    "iceberg.bronze.whoscored_preview_sections",
-                    "iceberg.bronze.whoscored_preview_ingest_manifest",
-                ]
-            )
-        return result
+        return None
 
     def _profile_candidate_scopes(
         self,
@@ -3658,7 +3677,61 @@ class WhoScoredIngestService:
             "count": result.attempted,
             "payload_sha256": entity_id_payload_sha256(selected_player_ids),
         }
+        failure_rows = []
+        failure_outcomes = []
         pending_commits: list[ProfileCommit] = []
+        try:
+            self._collect_profile_pages(
+                selected_player_ids, pending_commits, failure_rows, failure_outcomes, result,
+            )
+        finally:
+            self._write_failure_batch(
+                "profile", self.repository.write_profile_failure_rows,
+                failure_rows, failure_outcomes, result,
+            )
+        if pending_commits:
+            try:
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit in pending_commits
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_profiles(pending_commits)
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "profile repository returned different committed batch ids"
+                    )
+            except Exception as exc:
+                result.errors.append(f"profile batch: {type(exc).__name__}: {exc}")
+            else:
+                result.committed_batches["profile"].extend(committed_batch_ids)
+                result.succeeded += len(pending_commits)
+                result.counts["player_profile_versions"] = len(pending_commits)
+                result.counts["player_stage_participations"] = sum(
+                    len(commit.participations) for commit in pending_commits
+                )
+                result.counts["player_characteristics"] = sum(
+                    len(commit.characteristics) for commit in pending_commits
+                )
+        if selected_player_ids:
+            result.tables.extend(
+                [
+                    "iceberg.bronze.whoscored_player_profile_versions",
+                    "iceberg.bronze.whoscored_player_stage_participations",
+                    "iceberg.bronze.whoscored_player_characteristics",
+                    "iceberg.bronze.whoscored_profile_ingest_manifest",
+                ]
+            )
+        return result
+
+    def _collect_profile_pages(
+        self,
+        selected_player_ids: Sequence[int],
+        pending_commits: list[ProfileCommit],
+        failure_rows: list[dict[str, Any]],
+        failure_outcomes: list[tuple[str, str]],
+        result: EntityResult,
+    ) -> None:
         parser_replays = self.repository.list_profile_parser_replays(
             selected_player_ids
         )
@@ -3738,7 +3811,7 @@ class WhoScoredIngestService:
                     else None
                 )
                 try:
-                    failure_batch_id = self.repository.record_profile_failure(
+                    row, failure_batch_id = self.repository.build_profile_failure_row(
                         player_id=player_id,
                         state=state,
                         failure_code=exc.kind.value,
@@ -3750,6 +3823,7 @@ class WhoScoredIngestService:
                         payload_sha256=getattr(exc, "payload_sha256", None),
                         raw_uri=getattr(exc, "raw_uri", None),
                     )
+                    failure_rows.append(row)
                 except Exception as manifest_exc:
                     result.errors.append(
                         f"profile {player_id} failure manifest: "
@@ -3788,20 +3862,9 @@ class WhoScoredIngestService:
                                 "not-available outcome identity"
                             )
                         else:
-                            result.committed_batches["profile_not_available"].append(
-                                failure_batch_id
-                            )
-                            result.succeeded += 1
-                            result.counts["not_available"] = (
-                                result.counts.get("not_available", 0) + 1
-                            )
+                            failure_outcomes.append(("not_available", failure_batch_id))
                     else:
-                        target_list = (
-                            result.retryable
-                            if state == "retryable"
-                            else result.terminal
-                        )
-                        target_list.append(str(player_id))
+                        failure_outcomes.append((state, str(player_id)))
                 continue
 
             try:
@@ -3813,7 +3876,7 @@ class WhoScoredIngestService:
                     )
             except (WhoScoredParseError, ValueError) as exc:
                 try:
-                    self.repository.record_profile_failure(
+                    row, _ = self.repository.build_profile_failure_row(
                         player_id=player_id,
                         state="parse_failed",
                         failure_code=FailureKind.CONTENT.value,
@@ -3826,6 +3889,7 @@ class WhoScoredIngestService:
                         payload_sha256=response.sha256,
                         raw_uri=raw_uri,
                     )
+                    failure_rows.append(row)
                 except Exception as manifest_exc:
                     result.errors.append(
                         f"profile {player_id} failure manifest: "
@@ -3850,40 +3914,6 @@ class WhoScoredIngestService:
                     characteristics=parsed.characteristics.rows,
                 )
             )
-        if pending_commits:
-            try:
-                expected_batch_ids = tuple(
-                    commit.batch_id for commit in pending_commits
-                )
-                committed_batch_ids = tuple(
-                    self.repository.commit_profiles(pending_commits)
-                )
-                if committed_batch_ids != expected_batch_ids:
-                    raise RuntimeError(
-                        "profile repository returned different committed batch ids"
-                    )
-            except Exception as exc:
-                result.errors.append(f"profile batch: {type(exc).__name__}: {exc}")
-            else:
-                result.committed_batches["profile"].extend(committed_batch_ids)
-                result.succeeded += len(pending_commits)
-                result.counts["player_profile_versions"] = len(pending_commits)
-                result.counts["player_stage_participations"] = sum(
-                    len(commit.participations) for commit in pending_commits
-                )
-                result.counts["player_characteristics"] = sum(
-                    len(commit.characteristics) for commit in pending_commits
-                )
-        if selected_player_ids:
-            result.tables.extend(
-                [
-                    "iceberg.bronze.whoscored_player_profile_versions",
-                    "iceberg.bronze.whoscored_player_stage_participations",
-                    "iceberg.bronze.whoscored_player_characteristics",
-                    "iceberg.bronze.whoscored_profile_ingest_manifest",
-                ]
-            )
-        return result
 
     def traffic_stats(self) -> dict[str, Any]:
         return self.transport.get_traffic_stats()

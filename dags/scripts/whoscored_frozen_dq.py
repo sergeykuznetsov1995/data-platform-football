@@ -394,10 +394,10 @@ def stage_frozen_population(
     set-based proof detects any row-level corruption against that marker.
     """
 
-    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.whoscored.trino import WhoScoredWriter
 
     marker = _stage_population_marker(population)
-    writer = writer or IcebergWriter(catalog="iceberg")
+    writer = writer or WhoScoredWriter(catalog="iceberg")
     trino = writer._get_trino_manager()
     trino._execute(_stage_table_ddl())
     for query in _stage_table_migrations():

@@ -10,7 +10,6 @@ import pytest
 
 from scrapers.understat.criterion import (
     COMPLETENESS_SQL,
-    DAILY_CRITERION_SQL,
     QUARANTINE_SQL,
     DayResult,
     pct,
@@ -46,13 +45,14 @@ def test_site_delay_is_subtracted_from_due_and_counted_separately():
     assert day.pct == Decimal("100.0")
     assert summarize_days([day]) == 1
 
-    sql = re.sub(r"\s+", " ", DAILY_CRITERION_SQL)
-    assert "count_if(NOT site_late) AS due" in sql
-    assert "count_if(site_late) AS site_late" in sql
-    assert (
-        "p.covered_hits = 0 AND p.attempts > 0 AND p.site_hits = 0 "
-        "AND coalesce(js.hits, 0) = 0 AS site_late" in sql
-    )
+
+@pytest.mark.parametrize("due,ok", [(0, 0), (1, 1)])
+def test_unmeasured_day_interrupts_the_streak(due, ok):
+    unknown = DayResult("2026-10-12", due, ok, measured=False)
+    assert unknown.pct is None
+    days = [DayResult("2026-10-11", 1, 1), unknown, DayResult("2026-10-13", 0, 0)]
+    assert summarize_days(days) == 0
+    assert summarize_days(days + [DayResult("2026-10-14", 1, 1)]) == 1
 
 
 def test_pct_rounds_half_up_like_the_fotmob_line():
@@ -74,11 +74,7 @@ def test_sql_reads_through_the_manifest_fence_with_a_26_hour_deadline():
     assert "ORDER BY completed_at DESC, attempt_id DESC" in COMPLETENESS_SQL
     assert "m.status = 'complete'" in COMPLETENESS_SQL
     assert re.search(r"\w+\._batch_id = m\.batch_id", COMPLETENESS_SQL)
-    # Daily: schedule of the latest COMPLETE attempt (plan decision 10).
-    assert re.search(
-        r"status = 'complete'\s*\)\s*WHERE rn = 1", daily
-    ), "the daily schedule must rank only complete attempts"
-    assert "s._batch_id = lc.batch_id" in daily
+    # Daily batch selection and the legacy ordinal are exercised on rows below.
     assert "iceberg.ops.understat_ingest_failures_v1 f" in daily
     assert "contract_version = 'understat-bronze-v2'" in daily
     assert "kickoff + INTERVAL '26' HOUR" in daily
@@ -305,11 +301,12 @@ def synthetic():
             "iceberg.bronze.", "bronze."
         )
         rows = con.execute(sql).fetchall()
-        assert len(rows) <= 1
-        if not rows:
-            return DayResult(day, due=0, ok=0)
-        _, due, ok, site_late = rows[0]
-        return DayResult(day, due=due, ok=ok, site_late=site_late)
+        assert all(len(row) == 5 and row[4] in (0, 1) for row in rows)
+        assert len({row[0] for row in rows}) == len(rows)
+        return DayResult(
+            day, due=sum(row[1] for row in rows), ok=sum(row[2] for row in rows),
+            site_late=sum(row[3] for row in rows), measured=all(row[4] == 1 for row in rows),
+        )
 
     run.con = con
     return run
@@ -434,6 +431,198 @@ def test_site_result_seen_by_a_journaled_failure_is_not_a_site_delay(synthetic):
     assert synthetic("2026-10-12") == DayResult(
         "2026-10-12", due=3, ok=1, site_late=0
     )
+
+
+def _replace_schedule(con, status="contract_failure"):
+    _add_unplayed_game_7(con)
+    con.execute(
+        "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
+        ("L", "2627", "understat-bronze-v2", "batch-a4", "a4", status,
+         "2026-10-14T09:30:00+00:00", "{}"),
+    )
+    # Includes the stale extra game 99. None of these result flags is certified.
+    con.execute("UPDATE bronze.understat_schedule SET _batch_id='batch-a4', is_result=true")
+
+
+def _healthy_game(con, league="M", season="2627", game=8,
+                  kickoff="2026-10-13 18:00", done="2026-10-14T09:30:00+00:00"):
+    quality = dict(covered_game_ids=[str(game)], site_result_game_ids=[str(game)])
+    con.execute(
+        "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
+        (league, season, "understat-bronze-v2", "healthy", "h", "complete", done,
+         json.dumps(quality)),
+    )
+    con.execute(
+        "INSERT INTO bronze.understat_schedule VALUES (?,?,?,?,?,?)",
+        (league, season, game, kickoff, True, "healthy"),
+    )
+
+
+def test_replaced_schedule_recovers_the_miss_alongside_a_healthy_league(synthetic):
+    con = synthetic.con
+    _replace_schedule(con)
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", ["7"])
+    _healthy_game(con)
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", due=2, ok=1)
+
+    # Proposed coverage and counts from the failed write cannot repair the miss.
+    con.execute(
+        "UPDATE ops.understat_ingest_manifest_v1 SET quality_json=? WHERE attempt_id='a4'",
+        (json.dumps(dict(completed_game_count=999, covered_game_ids=["7"])),),
+    )
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", due=2, ok=1)
+    assert not synthetic("2026-10-11").measured  # b1's count needs the lost ordinal
+
+
+def test_write_marker_recovers_from_the_unique_failure_of_its_batch(synthetic):
+    con = synthetic.con
+    _replace_schedule(con, status="in_progress")
+    # The marker gets its own attempt_id before writes. If the terminal manifest
+    # append fails, the journal still identifies the same batch and scope.
+    con.execute("UPDATE ops.understat_ingest_manifest_v1 SET attempt_id='marker' "
+                "WHERE status='in_progress'")
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", ["7"])
+    _healthy_game(con)
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 2, 1)
+
+    _journal(con, "another", "contract_failure", "2026-10-14T10:00:00+00:00", [])
+    con.execute("UPDATE ops.understat_ingest_failures_v1 SET batch_id='batch-a4' "
+                "WHERE attempt_id='another'")
+    assert not synthetic("2026-10-14").measured
+
+
+def test_pending_future_schedule_does_not_obscure_a_measurable_day(synthetic):
+    con = synthetic.con
+    con.execute(
+        "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
+        ("P", "2627", "understat-bronze-v2", "pending", "p", "upstream_pending",
+         "2026-10-14T09:30:00+00:00", "{}"),
+    )
+    con.execute("INSERT INTO bronze.understat_schedule VALUES "
+                "('P','2627',700,'2026-10-23 17:00',false,'pending')")
+    _healthy_game(con)
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 1, 1)
+    # Once its kickoff passes, that pre-season observation cannot settle the day.
+    assert not synthetic("2026-10-24").measured
+
+
+def test_partial_flags_and_an_empty_known_list(synthetic):
+    con = synthetic.con
+    _replace_schedule(con)
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", [])
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 0, 0)
+    con.execute("UPDATE bronze.understat_schedule SET is_result=false")
+    _journal(con, "pre", "dq_failure", "2026-10-14T07:30:00+00:00", ["7"])
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 1, 0)
+
+
+def test_reconstructed_game_uses_independent_complete_coverage(synthetic):
+    con = synthetic.con
+    _replace_schedule(con)
+    con.execute(
+        "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
+        _attempt("prior", "prior-batch", "2026-10-14T08:00:00+00:00",
+                 covered_game_ids=["7"], site_result_game_ids=["7"]),
+    )
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", [])
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 1, 1)
+
+
+@pytest.mark.parametrize("defect", ["hard_kill", "unknown_list", "other_attempt", "other_batch",
+                                    "residual_batch", "no_rows", "no_kickoff", "duplicate",
+                                    "conflicting_kickoff", "no_id", "before_kickoff"])
+def test_partial_scope_can_make_a_healthy_league_day_unmeasured(synthetic, defect):
+    con = synthetic.con
+    _replace_schedule(con, status="in_progress" if defect == "hard_kill" else "contract_failure")
+    if defect != "hard_kill":
+        _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00",
+                 ["7"], known=defect != "unknown_list")
+    if defect == "other_attempt":
+        con.execute("UPDATE ops.understat_ingest_failures_v1 SET attempt_id='other'")
+    if defect == "other_batch":
+        con.execute("UPDATE ops.understat_ingest_failures_v1 SET batch_id='other'")
+    if defect == "residual_batch":
+        con.execute("UPDATE bronze.understat_schedule SET _batch_id='b2'")
+    if defect == "no_rows":
+        con.execute("DELETE FROM bronze.understat_schedule")
+    if defect == "no_kickoff":
+        con.execute("UPDATE bronze.understat_schedule SET date=NULL WHERE game_id=7")
+    if defect in ("duplicate", "conflicting_kickoff"):
+        second = "2026-10-13 18:00" if defect == "duplicate" else "2026-10-13 17:30"
+        con.execute("INSERT INTO bronze.understat_schedule VALUES ('L','2627',7,?,true,'batch-a4')",
+                    (second,))
+    if defect == "no_id":
+        con.execute("UPDATE bronze.understat_schedule SET game_id=NULL WHERE game_id=7")
+    if defect == "before_kickoff":
+        _journal(con, "pre", "dq_failure", "2026-10-13T17:59:59+00:00", ["7"])
+    _healthy_game(con)
+    result = synthetic("2026-10-14")
+    assert not result.measured and result.pct is None
+    assert result.ok == 1
+
+
+def test_first_partial_publication_without_a_complete_predecessor(synthetic):
+    con = synthetic.con
+    _replace_schedule(con)
+    con.execute("DELETE FROM ops.understat_ingest_manifest_v1 WHERE status='complete'")
+    assert not synthetic("2026-10-14").measured
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", ["7"])
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 1, 0)
+
+
+def test_missing_journal_id_has_an_upper_deadline_bound(synthetic):
+    con = synthetic.con
+    _journal(con, "pre", "dq_failure", "2026-10-14T09:30:00+00:00", ["700"])
+    _journal(con, "again", "dq_failure", "2026-10-18T09:30:00+00:00", ["700"])
+    for day in ["2026-10-12", "2026-10-14", "2026-10-15"]:
+        assert not synthetic(day).measured
+    assert synthetic("2026-10-16") == DayResult("2026-10-16", 0, 0)
+    con.execute("UPDATE ops.understat_ingest_failures_v1 SET season='2526'")
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 0, 0)
+
+
+def test_july_deadlines_include_both_seasons_and_preserve_game_identity(synthetic):
+    con = synthetic.con
+    # Same ID/league on each side of the season boundary; exactly one was covered.
+    _healthy_game(con, league="X", season="2526", game=8, kickoff="2026-06-30 23:00",
+                  done="2026-07-02T01:00:00+00:00")
+    _healthy_game(con, league="X", season="2627", game=8, kickoff="2026-07-01 00:00",
+                  done="2026-07-02T02:00:01+00:00")
+    assert synthetic("2026-07-02") == DayResult("2026-07-02", 2, 1)
+
+
+def test_deadline_follows_kickoff_in_an_extended_season(synthetic):
+    _healthy_game(synthetic.con, league="X", season="2526", kickoff="2026-08-10 18:00",
+                  done="2026-08-11T09:30:00+00:00")
+    assert synthetic("2026-08-11") == DayResult("2026-08-11", 1, 1)
+
+
+def test_no_publication_evidence_cannot_certify_a_neutral_day(synthetic):
+    synthetic.con.execute("DELETE FROM ops.understat_ingest_manifest_v1")
+    synthetic.con.execute("DELETE FROM bronze.understat_schedule")
+    assert synthetic("2026-10-14") == DayResult("2026-10-14", 0, 0, measured=False)
+
+
+def test_two_plausible_generations_with_different_kickoffs_are_unmeasured(synthetic):
+    con = synthetic.con
+    _replace_schedule(con)
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", ["7"])
+    con.execute("INSERT INTO bronze.understat_schedule VALUES "
+                "('L','2627',7,'2026-10-15 18:00',false,'b3')")
+    _healthy_game(con)
+    result = synthetic("2026-10-14")
+    assert not result.measured and result.pct is None
+
+
+def test_partial_schedule_cannot_grade_a_game_after_its_last_known_list(synthetic):
+    con = synthetic.con
+    _replace_schedule(con)
+    _journal(con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00", [])
+    con.execute("UPDATE bronze.understat_schedule SET date='2026-10-15 09:30' WHERE game_id=7")
+    _journal(con, "unknown", "dq_failure", "2026-10-16T10:00:00+00:00", ["7"], known=False)
+    assert synthetic("2026-10-16") == DayResult("2026-10-16", 0, 0, measured=False)
+    _journal(con, "late", "dq_failure", "2026-10-16T12:00:00+00:00", ["7"])
+    assert synthetic("2026-10-16") == DayResult("2026-10-16", 0, 0)
 
 
 def test_fotmob_summary_counts_scores_unmatched_ambiguity_and_unavailable():

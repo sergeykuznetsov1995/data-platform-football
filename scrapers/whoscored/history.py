@@ -18,9 +18,7 @@ def inventory(catalog, repository, *, today):
             (season.scope.competition_id, season.scope.season_id),
             dict(schedule_ready=False, closeable=0, closed=0, unknown_stages=0, closed_day=0),
         ).copy()
-        checked = repository.latest_schedule_stage_ids(
-            season.scope.competition_id, season.scope.season_id,
-        ) if row["schedule_ready"] else ()
+        checked = row.get("checked_stage_ids", ())
         missing = set(season.stage_ids) - set(row.get("stage_ids", ())) - set(checked)
         row["unknown_stages"] += len(missing) or int(not season.stage_ids)
         if missing:

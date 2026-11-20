@@ -202,9 +202,9 @@ class IcebergDailyStore:
 
     def __init__(self, writer=None, database: str = DATABASE) -> None:
         if writer is None:
-            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.clubelo.trino_client import ClubEloIcebergWriter
 
-            writer = IcebergWriter()
+            writer = ClubEloIcebergWriter()
         self.writer = writer
         self.database = database
 
