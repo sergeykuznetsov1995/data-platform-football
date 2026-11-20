@@ -1,7 +1,7 @@
 """Offline regressions from saved CEAPI responses for #1408."""
 import copy
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -221,3 +221,85 @@ def test_cached_guard_checks_original_projection_before_schema_evolution(changed
             writer.guard_cached_frames(scraper, outputs, {'market_value_points': mixed})
     else:
         writer.guard_cached_frames(scraper, outputs, {'market_value_points': mixed})
+
+
+def _career_case(name):
+    path = Path(__file__).parents[2] / 'fixtures/transfermarkt' / f'ceapi-career-{name}.json'
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def test_empty_career_frames_keep_requested_columns():
+    case = _career_case('empty')
+    points = tm._parse_mv_history(case['market_value'], '7001')
+    transfers = tm._parse_transfers(case['transfers'], '7001')
+    assert points == []
+    assert transfers == []
+
+    for rows, columns, entity in (
+        (points, tm.MARKET_VALUE_POINT_COLUMNS, 'market_value_points'),
+        (transfers, tm.TRANSFER_EVENT_COLUMNS, 'transfer_events'),
+    ):
+        frame = tm._with_metadata(
+            rows, columns, entity_type=entity, batch_id='batch-empty',
+            ingested_at=datetime(2026, 1, 8),
+        )
+        assert frame.empty
+        assert list(frame.columns) == [*columns, *tm._METADATA_COLUMNS]
+
+
+def test_malformed_career_entries_preserve_zero_and_missing_fields():
+    case = _career_case('malformed')
+    player_id = '7001'
+    point, = tm._parse_mv_history(case['market_value'], player_id)
+    assert point['player_id'] == player_id
+    assert point['value_eur'] == 0
+    for field in ('is_value_removed', 'club_id', 'mv_last_change', 'age'):
+        assert point[field] is None, field
+
+    raw_transfers = case['transfers']
+    transfer, = tm._parse_transfers(raw_transfers, player_id)
+    assert transfer['player_id'] == player_id
+    assert transfer['event_season'] == '2526'
+    for field in (
+        'from_club_id', 'to_club_id', 'from_is_special', 'to_is_special',
+        'fee_text', 'fee_eur', 'is_loan_end',
+    ):
+        assert transfer[field] is None, field
+
+    transfer_id = transfer['transfer_id']
+    assert transfer_id
+    assert tm._parse_transfers(raw_transfers, player_id)[0]['transfer_id'] == transfer_id
+    assert tm._parse_transfers(raw_transfers, '7002')[0]['transfer_id'] != transfer_id
+    other_source = copy.deepcopy(raw_transfers)
+    other_source['transfers'][-1]['id'] = 'malformed-source-2'
+    assert tm._parse_transfers(other_source, player_id)[0]['transfer_id'] != transfer_id
+
+
+def test_repeated_career_entries_replay_with_the_same_metadata():
+    def parse_frames():
+        case = _career_case('repeated')
+        metadata = {'batch_id': 'batch-repeat', 'ingested_at': datetime(2026, 1, 8)}
+        points = tm._with_metadata(
+            tm._parse_mv_history(case['market_value'], '7001'),
+            tm.MARKET_VALUE_POINT_COLUMNS, entity_type='market_value_points', **metadata,
+        )
+        transfers = tm._with_metadata(
+            tm._parse_transfers(case['transfers'], '7001'),
+            tm.TRANSFER_EVENT_COLUMNS, entity_type='transfer_events', **metadata,
+        )
+        return points, transfers
+
+    points, transfers = parse_frames()
+    replay_points, replay_transfers = parse_frames()
+    pd.testing.assert_frame_equal(points, replay_points)
+    pd.testing.assert_frame_equal(transfers, replay_transfers)
+    assert points['_batch_id'].tolist() == ['batch-repeat', 'batch-repeat']
+    assert transfers['_batch_id'].tolist() == ['batch-repeat', 'batch-repeat']
+    transfer_ids = transfers['transfer_id'].tolist()
+    assert transfer_ids[0]
+    assert transfer_ids[0] == transfer_ids[1]
+    assert transfers['from_club_id'].tolist() == ['101', '101']
+    assert transfers['to_club_id'].tolist() == ['202', '202']
+    assert transfers['event_season'].tolist() == ['2526', '2526']
+    assert transfers['fee_text'].tolist() == ['Loan fee: €100K', 'Loan fee: €100K']
+    assert transfers['fee_eur'].tolist() == [100000, 100000]
