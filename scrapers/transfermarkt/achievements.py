@@ -174,18 +174,35 @@ def _json_rows(source, kind, owner):
         )
         groups[award] = (f"aggregated:{index}", _text(group.get("name")), published)
 
+    trophies = {}
+    published_trophies = data.get("trophies", [])
+    if not isinstance(published_trophies, list):
+        raise AchievementParseError("invalid_trophies")
+    for item in published_trophies:
+        trophy = _object(item, "invalid_trophy")
+        trophy_id = _id(trophy.get("id"), zero_absent=True)
+        if trophy_id is None or trophy_id in trophies:
+            raise AchievementParseError("invalid_trophy_id")
+        trophies[trophy_id] = _text(trophy.get("name"))
+
     rows = []
     counts = Counter()
     observations = Counter()
     for index, item in enumerate(details):
         row = _object(item, "invalid_row")
         award = _id(row.get("id"))
+        info = _nested(row, "details")
+        trophy = _agree(
+            _id(row.get("trophyId"), zero_absent=True),
+            _id(info.get("trophyId"), zero_absent=True), reason="trophy_id_conflict",
+        )
         title = _text(row.get("name"))
         if title is None and award in groups:
             title = groups[award][1]
         if title is None:
+            title = trophies.get(trophy)
+        if title is None:
             raise AchievementParseError("missing_title")
-        info = _nested(row, "details")
         player = _id(info.get("playerId"), zero_absent=True)
         if kind == "player" and player is not None and player != owner:
             raise AchievementParseError("owner_conflict")
@@ -226,10 +243,6 @@ def _json_rows(source, kind, owner):
             display = season.get("year")
         if type(display) is int and display >= 0:
             display = str(display)
-        trophy = _agree(
-            _id(row.get("trophyId"), zero_absent=True),
-            _id(info.get("trophyId"), zero_absent=True), reason="trophy_id_conflict",
-        )
         result = _agree(_text(row.get("result")), _text(info.get("result")), reason="result_conflict")
         club_name = _text(club.get("name")) or _text(row.get("clubName"))
         rows.append(Achievement(

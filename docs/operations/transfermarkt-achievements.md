@@ -20,12 +20,14 @@ encoded = result.canonical_json().encode("utf-8")
 For a player or club, pass a decoded tmapi dictionary. A response envelope
 must have boolean `success: true` and a dictionary in `data`. The inner
 dictionary alone is also accepted. It must contain the list `achievements`.
-The optional `aggregated` field is a list. Input files, URLs, and undecoded
-JSON strings are outside this API.
+The optional `aggregated` and `trophies` fields are lists. Input files, URLs,
+and undecoded JSON strings are outside this API.
 
 - Each detail's `id` identifies the award. `trophyId` identifies the trophy.
   A nonblank detail `name` supplies the title. Otherwise the parser uses
-  the name of the aggregate with the same canonical award ID.
+  the name of the aggregate with the same canonical award ID, then the name
+  of the trophy with the same canonical trophy ID. The trophy fallback covers
+  published participations/runner-up records that have no aggregate group.
 - `seasonId` and `season.id` must agree when both are present. The display
   comes from `season.display`, with `season.name` and `season.year` as fallbacks. Whitespace is
   normalized. The strings `2022` and `25/26` retain their original meanings.

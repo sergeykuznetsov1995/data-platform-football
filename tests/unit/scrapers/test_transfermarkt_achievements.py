@@ -165,6 +165,8 @@ def test_external_empty_requires_proof(kind):
     ({"achievements": [{"name": "Cup", "club": {"id": -2}}]}, "invalid_id"),
     ({"achievements": [{"name": "Cup", "seasonId": "2.0"}]}, "invalid_id"),
     ({"achievements": [], "aggregated": {}}, "invalid_aggregated"),
+    ({"achievements": [], "trophies": {}}, "invalid_trophies"),
+    ({"achievements": [], "trophies": [{"id": 0, "name": "Cup"}]}, "invalid_trophy_id"),
     ({"achievements": [], "aggregated": [{"id": 1, "count": True}]}, "invalid_count"),
     ({"achievements": [], "aggregated": [{"id": 1, "count": 3}]}, "aggregate_count_mismatch"),
     ({"achievements": [{"id": 1, "name": "Cup"}] * 2, "aggregated": [{"id": 1, "count": 1}]},
@@ -234,6 +236,21 @@ def test_donor_received_count_fails_closed(aggregated, reason):
     with pytest.raises(AchievementParseError) as exc:
         parse(source)
     assert exc.value.reason == reason
+
+
+def test_club_trophy_name_fallback_without_aggregate_preserves_rows():
+    parsed = replay({
+        "trophies": [{"id": 6, "name": "Champions League Participant"}],
+        "achievements": [
+            {"id": 6, "trophyId": 6, "season": {"id": 2025, "display": "25/26"}},
+            {"id": 6, "trophyId": 6, "season": {"id": 2024, "display": "24/25"}},
+        ],
+    }, "club")
+    assert parsed.status == "observed_present"
+    assert [row.title for row in parsed.rows] == ["Champions League Participant"] * 2
+    assert [row.season for row in parsed.rows] == ["25/26", "24/25"]
+    assert [row.source_row_id for row in parsed.rows] == ["achievements:0", "achievements:1"]
+    assert parsed.reconciliation == ()
 
 
 def box(heading, rows):
