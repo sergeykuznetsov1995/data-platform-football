@@ -184,37 +184,44 @@ def _ts(value: datetime) -> str:
 def build_candidates_sql(now: datetime) -> str:
     """``competition_slug, season_year, event_id, kind`` due in the 00 wave at ``now``."""
 
+    parts = ("lineup_state", "team_stats_state", "events_state")
     missing = " OR ".join(
-        f"(m.{column} <> 'captured' AND l.{column}_share >= {LEAGUE_SHARE})"
-        for column in ("lineup_state", "team_stats_state", "events_state")
+        f"({column} <> 'captured' AND {column}_share >= {LEAGUE_SHARE})"
+        for column in parts
     )
     shares = ",\n           ".join(
-        f"avg(IF({column} = 'captured', 1.0, 0.0)) AS {column}_share"
-        for column in ("lineup_state", "team_stats_state", "events_state")
+        f"avg(IF(league_match, IF({column} = 'captured', 1.0, 0.0), NULL)) "
+        f"OVER league AS {column}_share"
+        for column in parts
     )
-    samples = "\nUNION ALL\n".join(
-        f"""SELECT competition_slug, season_year, event_id, '{kind}' AS kind
-FROM {_MATCH}
-WHERE played_final AND first_published_at IS NOT NULL AND event_id % {SAMPLE_MOD} = 0
-  AND first_published_at > {_ts(now - age - SAMPLE_WINDOW)}
-  AND first_published_at <= {_ts(now - age)}"""
+    samples = ",\n           ".join(
+        f"(event_id % {SAMPLE_MOD} = 0 AND first_published_at > {_ts(now - age - SAMPLE_WINDOW)} "
+        f"AND first_published_at <= {_ts(now - age)}) AS {kind}"
         for kind, age in SAMPLE_AGES.items()
     )
-    return f"""WITH league AS (
-    SELECT competition_slug,
-           {shares}
+    kinds = ", ".join(f"('{kind}')" for kind in (RECHECK, *SAMPLE_AGES))
+    due_samples = " OR ".join(f"(kind = '{kind}' AND {kind})" for kind in SAMPLE_AGES)
+    return f"""WITH matches AS (
+    SELECT competition_slug, season_year, event_id, kickoff, disposition, rechecked_at,
+           lineup_state, team_stats_state, events_state,
+           (lineup_state <> 'pending' AND kickoff >= {_ts(now - timedelta(days=LEAGUE_DAYS))}
+            AND kickoff < {_ts(now)}) AS league_match,
+           {samples}
     FROM {_MATCH}
-    WHERE played_final AND lineup_state <> 'pending'
-      AND kickoff >= {_ts(now - timedelta(days=LEAGUE_DAYS))} AND kickoff < {_ts(now)}
-    GROUP BY competition_slug
+    WHERE played_final
+), scored AS (
+    SELECT matches.*, {shares}
+    FROM matches
+    WHERE league_match OR {" OR ".join(SAMPLE_AGES)}
+    WINDOW league AS (PARTITION BY competition_slug ORDER BY event_id
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
 )
-SELECT m.competition_slug, m.season_year, m.event_id, '{RECHECK}' AS kind
-FROM {_MATCH} m JOIN league l ON l.competition_slug = m.competition_slug
-WHERE m.played_final AND m.lineup_state <> 'pending' AND m.rechecked_at IS NULL
-  AND m.kickoff >= {_ts(now - RECHECK_MAX_AGE)} AND m.kickoff <= {_ts(now - RECHECK_MIN_AGE)}
-  AND (m.disposition IN ('valid_empty', 'lineup_anomaly') OR {missing})
-UNION ALL
-{samples}"""
+SELECT competition_slug, season_year, event_id, kind
+FROM scored CROSS JOIN (VALUES {kinds}) AS kinds(kind)
+WHERE (kind = '{RECHECK}' AND league_match AND competition_slug IS NOT NULL AND rechecked_at IS NULL
+       AND kickoff >= {_ts(now - RECHECK_MAX_AGE)} AND kickoff <= {_ts(now - RECHECK_MIN_AGE)}
+       AND (disposition IN ('valid_empty', 'lineup_anomaly') OR {missing}))
+   OR {due_samples}"""
 
 
 def select_candidates(rows: Sequence[Sequence[Any]]) -> dict[int, tuple[str, int, str]]:

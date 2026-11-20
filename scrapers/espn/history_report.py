@@ -84,30 +84,30 @@ ORDER BY competition_slug, season_year"""
 _DAY = "TIMESTAMP '{day} 00:00:00'"
 _IN_DAY = f"updated_at >= {_DAY} AND updated_at < {_DAY} + INTERVAL '1' DAY"
 
-HISTORY_QUEUE_SQL = f"""WITH seasons AS (
-    SELECT slug, season_year,
+HISTORY_QUEUE_SQL = f"""WITH queue_groups AS (
+    SELECT slug <> '(run)' AND season_year > 0 AS is_season,
            bool_and(state IN ('done', 'empty')) AS finished,
            bool_or(state = 'red') AS red,
-           max(updated_at) AS last_at
+           max(updated_at) AS last_at,
+           count(*) FILTER (WHERE slug <> '(run)' AND season_year = 0
+                                  AND state = 'red') AS discovery_errors,
+           sum(matches) FILTER (WHERE slug = '(run)') AS run_matches,
+           count(*) FILTER (WHERE slug = '(run)' AND state = 'live_debt') AS run_pauses,
+           count(*) FILTER (WHERE slug = '(run)' AND state = 'error') AS run_errors
     FROM iceberg.ops.espn_history_queue_v1
-    WHERE slug <> '(run)' AND season_year > 0
+    WHERE (slug <> '(run)' AND season_year >= 0)
+       OR (slug = '(run)' AND {_IN_DAY})
     GROUP BY slug, season_year
-),
-runs AS (
-    SELECT state, matches
-    FROM iceberg.ops.espn_history_queue_v1
-    WHERE slug = '(run)' AND {_IN_DAY}
 )
-SELECT (SELECT count(*) FROM seasons) AS seasons,
-       (SELECT count_if(finished AND last_at >= {_DAY}
-                        AND last_at < {_DAY} + INTERVAL '1' DAY) FROM seasons) AS finished_day,
-       (SELECT count_if(finished) FROM seasons) AS finished,
-       (SELECT count_if(red) FROM seasons)
-         + (SELECT count_if(state = 'red') FROM iceberg.ops.espn_history_queue_v1
-            WHERE slug <> '(run)' AND season_year = 0) AS red,
-       (SELECT coalesce(sum(matches), 0) FROM runs) AS matches,
-       (SELECT count_if(state = 'live_debt') FROM runs) AS pauses,
-       (SELECT count_if(state = 'error') FROM runs) AS errors"""
+SELECT count(*) FILTER (WHERE is_season) AS seasons,
+       count(*) FILTER (WHERE is_season AND finished AND last_at >= {_DAY}
+                          AND last_at < {_DAY} + INTERVAL '1' DAY) AS finished_day,
+       count(*) FILTER (WHERE is_season AND finished) AS finished,
+       count(*) FILTER (WHERE is_season AND red) + coalesce(sum(discovery_errors), 0) AS red,
+       coalesce(sum(run_matches), 0) AS matches,
+       coalesce(sum(run_pauses), 0) AS pauses,
+       coalesce(sum(run_errors), 0) AS errors
+FROM queue_groups"""
 
 # Network requests only: a raw-store hit or a closed lane has no attempt.
 HISTORY_JOURNAL_SQL = """SELECT count(*) AS requests, coalesce(sum(direct_bytes), 0) AS bytes

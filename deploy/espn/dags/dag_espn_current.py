@@ -96,13 +96,13 @@ def _window_note(context: dict[str, Any]) -> str | None:
 
 
 def prepare(**_: Any) -> None:
-    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.espn.trino_manager import EspnIcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
     from scrapers.espn.journal import ensure_journal_table
     from scrapers.espn.recheck import ensure_recheck_table
     from scrapers.espn.wave_log import ensure_wave_log_table
 
-    ensure_bronze_tables(IcebergWriter())
+    ensure_bronze_tables(EspnIcebergWriter())
     connection = _trino().connection
     ensure_journal_table(connection)
     ensure_wave_log_table(connection)

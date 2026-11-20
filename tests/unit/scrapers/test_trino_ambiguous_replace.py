@@ -7,6 +7,7 @@ genuine Iceberg commit conflicts still retry, and the atomic swap retains its
 stage on ambiguity while dropping it on success.
 """
 
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -194,12 +195,12 @@ class EspnConnectionFactoryTests(unittest.TestCase):
     """The ESPN factories must opt out of the SDK's hidden HTTP retries."""
 
     def _connect_kwargs(self, password):
-        manager = EspnTrinoTableManager()
-        manager._password = password
         connect = Mock(return_value=object())
-        with patch.object(base.trino.dbapi, "connect", connect):
-            connection = manager._create_connection()
-        self.assertIs(connection, connect.return_value)
+        with patch.dict(os.environ, {"TRINO_SRC_ESPN_PASSWORD": password}), patch.object(
+            base.trino.dbapi, "connect", connect
+        ):
+            EspnTrinoTableManager()._create_connection()
+        connect.assert_called_once()
         return connect.call_args.kwargs
 
     def test_https_factory_passes_max_attempts_one(self):
@@ -210,10 +211,14 @@ class EspnConnectionFactoryTests(unittest.TestCase):
             kwargs["auth"], base.trino.auth.BasicAuthentication
         )
 
-    def test_http_factory_passes_max_attempts_one(self):
-        kwargs = self._connect_kwargs(None)
-        self.assertEqual(kwargs["max_attempts"], 1)
-        self.assertNotIn("auth", kwargs)
+    def test_no_http_factory_without_dedicated_password(self):
+        with patch.dict(os.environ, {"TRINO_PASSWORD": "synthetic-generic"}), patch.object(
+            base.trino.dbapi, "connect"
+        ) as connect:
+            os.environ.pop("TRINO_SRC_ESPN_PASSWORD", None)
+            with self.assertRaisesRegex(TrinoError, "TRINO_SRC_ESPN_PASSWORD"):
+                EspnTrinoTableManager()._create_connection()
+        connect.assert_not_called()
 
 
 class StrictConflictRetryTests(unittest.TestCase):

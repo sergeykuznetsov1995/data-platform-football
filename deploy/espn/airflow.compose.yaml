@@ -46,8 +46,8 @@ x-espn-live-common: &espn-live-common
     PYTHONPYCACHEPREFIX: /tmp/pycache
     TRINO_HOST: trino
     TRINO_PORT: ${TRINO_PORT:?}
-    TRINO_USER: ${TRINO_USER:?}
-    TRINO_PASSWORD: ${TRINO_PASSWORD:?}
+    TRINO_USER: src_espn
+    TRINO_SRC_ESPN_PASSWORD: ${TRINO_SRC_ESPN_PASSWORD:?ESPN Trino password required}
     S3_ACCESS_KEY: ${S3_ACCESS_KEY:?}
     S3_SECRET_KEY: ${S3_SECRET_KEY:?}
     ESPN_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE:?}/raw/espn

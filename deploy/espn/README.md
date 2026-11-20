@@ -394,8 +394,10 @@ FROM iceberg.ops.espn_history_queue_v1 ORDER BY updated_at DESC LIMIT 20;
   `/opt/airflow/configs/espn`; `PYTHONPATH=/opt/airflow`. Файловых монтирований нет (rename при
   checkout теряет файловый bind-mount). Тест: замыкание импортов DAG ⊆ смонтированных каталогов.
 - **Env** — `/root/.secrets/espn.env` (0600), только секреты: `AIRFLOW__CORE__FERNET_KEY`,
-  `AIRFLOW__WEBSERVER__SECRET_KEY`, `ESPN_LIVE_DB_PASSWORD` (hex), `TRINO_PORT`, `TRINO_USER`,
-  `TRINO_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `ICEBERG_WAREHOUSE`. Никаких `*_PROXY`
+  `AIRFLOW__WEBSERVER__SECRET_KEY`, `ESPN_LIVE_DB_PASSWORD` (hex), `TRINO_PORT`,
+  `TRINO_SRC_ESPN_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `ICEBERG_WAREHOUSE`.
+  Compose задаёт пользователя Trino `src_espn`. Пароль этой роли предоставляет частный профиль ESPN.
+  Никаких `*_PROXY`
   (транспорт ESPN падает `AmbientProxyError`), `ESPN_RELEASE_ROOT`, canary-state, контрольной БД,
   `RELEASE_COMMIT/TREE_SHA256` — автомат отказывается работать с таким env-файлом.
 - **Пулы — кодом:** `deploy/espn/pools.json` (`espn_live`: 4 слота = `max_active_tis_per_dag`;

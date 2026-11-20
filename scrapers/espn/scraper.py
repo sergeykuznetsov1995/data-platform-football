@@ -46,7 +46,10 @@ class ESPNScraper(SoccerdataScraper):
         seasons: Optional[List[int]] = None,
         **kwargs
     ):
+        from scrapers.espn.trino_manager import EspnIcebergWriter
+
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
+        self._iceberg_writer = EspnIcebergWriter()
         self._reader = None
         # #817: guards the one-shot COVID-season calendar seed (see
         # _seed_2021_season_calendar) so it re-downloads at most once per run.

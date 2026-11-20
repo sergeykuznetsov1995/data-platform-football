@@ -140,14 +140,16 @@ def test_wave_summary_is_red_when_the_plan_failed(dag_module) -> None:
 
 @pytest.mark.unit
 def test_prepare_creates_the_wave_log_table(dag_module, log_conn, monkeypatch) -> None:
-    import scrapers.base.iceberg_writer as iceberg_writer
-    import scrapers.espn.bronze_schema as bronze_schema
+    from scrapers.espn import bronze_schema, trino_manager
 
-    monkeypatch.setattr(iceberg_writer, "IcebergWriter", lambda: None)
-    monkeypatch.setattr(bronze_schema, "ensure_bronze_tables", lambda writer: None)
+    writer = object()
+    ensured_writers = []
+    monkeypatch.setattr(trino_manager, "EspnIcebergWriter", lambda: writer)
+    monkeypatch.setattr(bronze_schema, "ensure_bronze_tables", ensured_writers.append)
 
     dag_module.prepare()
 
+    assert ensured_writers == [writer]
     assert any(
         "CREATE TABLE IF NOT EXISTS iceberg.ops.espn_wave_tournament_v1" in sql
         for sql in log_conn.sql

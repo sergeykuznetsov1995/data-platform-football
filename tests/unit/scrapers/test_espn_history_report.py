@@ -131,6 +131,61 @@ def test_capability_is_read_from_the_season_data(db) -> None:
     assert empty_defects(rows) == 1
 
 
+def test_empty_history_queue_returns_seven_zeros(db) -> None:
+    assert db.run(render_queue_sql(DAY)) == [(0, 0, 0, 0, 0, 0, 0)]
+
+
+def test_history_queue_groups_seasons_and_counts_discovery_and_run_rows(db) -> None:
+    start = datetime.fromisoformat(DAY)
+    end = start + timedelta(days=1)
+    tick = timedelta(microseconds=1)
+    db.con.executemany(
+        "INSERT INTO iceberg.ops.espn_history_queue_v1 "
+        "(slug, season_year, state, matches, updated_at) VALUES (?, ?, ?, ?, ?)",
+        [
+            # NULL state is ignored by bool_and, but its timestamp still counts.
+            ("eng.1", 2020, "done", 100, start - tick),
+            ("eng.1", 2020, None, None, start),
+            ("eng.1", 2021, "empty", 0, end - tick),
+            ("eng.1", 2021, "done", 0, end),
+            ("ger.2", 2020, None, None, start),
+            ("ger.2", 2021, "red", 0, start),
+            ("ger.2", 2021, "red", 0, start),
+            # Discovery failures count individually, even outside the report day.
+            ("ger.2", 0, "red", 0, start - tick),
+            ("ger.2", 0, "red", 0, start - tick),
+            ("ger.2", 0, "error", 90, start),
+            ("ger.2", -1, "red", 0, start),
+            ("ger.2", None, "red", 0, start),
+            (None, 0, "red", 0, start),
+            (None, 2020, "red", 0, start),
+            # Run rows can carry any year, and identical runs both count.
+            ("(run)", 2020, "live_debt", 4, start),
+            ("(run)", 2020, "live_debt", 4, start),
+            ("(run)", None, "error", 7, end - tick),
+            ("(run)", -1, "idle", 16, start),
+            ("(run)", 0, "red", None, start),
+            ("(run)", 0, "error", 60, start - tick),
+            ("(run)", 0, "live_debt", 80, end),
+        ],
+    )
+
+    assert db.run(render_queue_sql(DAY)) == [(4, 1, 2, 3, 31, 2, 1)]
+
+
+def test_history_queue_plan_scans_populated_table_once(db) -> None:
+    sqlglot = pytest.importorskip("sqlglot")
+    db.con.execute(
+        "INSERT INTO iceberg.ops.espn_history_queue_v1 (slug, season_year, state, updated_at) "
+        "VALUES ('eng.1', 2020, 'done', TIMESTAMP '2026-09-28 00:00:00'), "
+        "('ger.2', 0, 'red', TIMESTAMP '2026-09-28 00:00:00'), "
+        "('(run)', 0, 'idle', TIMESTAMP '2026-09-28 00:00:00')"
+    )
+    sql = sqlglot.transpile(render_queue_sql(DAY), read="trino", write="duckdb")[0]
+    plan = dict(db.con.execute("EXPLAIN " + sql).fetchall())["physical_plan"]
+    assert plan.count("SEQ_SCAN") + plan.count("TABLE_SCAN") == 1, plan
+
+
 def test_history_line_from_the_queue_and_the_journal(db) -> None:
     today = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
     yesterday = today - timedelta(days=1)

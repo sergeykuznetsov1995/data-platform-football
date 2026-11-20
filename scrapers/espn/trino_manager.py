@@ -12,9 +12,26 @@ as is (it is sealed in the WhoScored runtime contract).
 
 from __future__ import annotations
 
-from scrapers.base import trino_manager as base
+import os
 
-SESSION_PROPERTIES = {"enable_dynamic_filtering": "false"}
+from trino.exceptions import Http502Error, Http503Error, Http504Error, TrinoConnectionError
+
+from scrapers.base.iceberg_writer import IcebergWriter
+from scrapers.base import trino_manager as base
+from scrapers.espn.trino_budget import (
+    BudgetConnection,
+    DEFAULT_SCHEMA,
+    default_budget,
+    may_change_data,
+)
+from scrapers.whoscored.trino_budget import WRITE_TIMEOUT
+
+ESPN_USER = "src_espn"
+AMBIGUOUS_TRANSPORT_ERRORS = (TrinoConnectionError, Http502Error, Http503Error, Http504Error)
+SESSION_PROPERTIES = {
+    "enable_dynamic_filtering": "false",
+    "query_max_run_time": f"{WRITE_TIMEOUT}s",
+}
 
 
 class EspnTrinoTableManager(base.TrinoTableManager):
@@ -25,34 +42,60 @@ class EspnTrinoTableManager(base.TrinoTableManager):
     ``TrinoAmbiguousWriteError`` instead of replaying the insert rows.
     """
 
+    def __init__(self, host="trino", port=None, user=ESPN_USER, catalog="iceberg",
+                 *, budget=None):
+        # Keep the base constructor's positional API and its connection/cache locks.
+        super().__init__(host, port or int(os.environ.get("TRINO_PORT", 8443)),
+                         ESPN_USER, catalog)
+        self._password = os.environ.get("TRINO_SRC_ESPN_PASSWORD")
+        self._budget = default_budget() if budget is None else budget
+
+    def _require_password(self):
+        self._password = os.environ.get("TRINO_SRC_ESPN_PASSWORD")
+        if not self._password:
+            raise base.TrinoError("ESPN Trino requires TRINO_SRC_ESPN_PASSWORD")
+        return self._password
+
+    def _connect_with_retry(self):
+        self._require_password()
+        return super()._connect_with_retry()
+
     def _create_connection(self):
-        # max_attempts=1 disables the trino client's internal HTTP retry
-        # loop: after a network exception it silently re-POSTs the same
-        # statement, which would replay a possibly-committed write and
-        # defeat the strict no-replay protection of _execute_replacement.
-        # Resilience stays where replay is safe: _connect_with_retry keeps
-        # re-trying connections (its probe is a read-only SELECT 1), and
-        # commit retries remain explicit in _execute_committing.
-        if self._password:
-            return base.trino.dbapi.connect(
-                host=self.host,
-                port=self.port,
-                user=self.user,
-                catalog=self.catalog,
-                http_scheme="https",
-                auth=base.trino.auth.BasicAuthentication(self.user, self._password),
-                verify=False,  # self-signed certificate
-                session_properties=dict(SESSION_PROPERTIES),
-                max_attempts=1,
-            )
-        return base.trino.dbapi.connect(
+        password = self._require_password()
+        connection = base.trino.dbapi.connect(
             host=self.host,
             port=self.port,
-            user=self.user,
+            user=ESPN_USER,
             catalog=self.catalog,
+            schema=DEFAULT_SCHEMA,
+            http_scheme="https",
+            auth=base.trino.auth.BasicAuthentication(ESPN_USER, password),
+            verify=False,
             session_properties=dict(SESSION_PROPERTIES),
+            # A retry of the initial HTTP POST could replay a committed write.
             max_attempts=1,
         )
+        return BudgetConnection(connection, self._budget, self.catalog)
+
+    def _execute(self, sql, fetch=False, params=None, *, replay_safe=True):
+        mutation = may_change_data(sql)
+        try:
+            return super()._execute(sql, fetch, params, replay_safe=replay_safe and not mutation)
+        except base.TrinoAmbiguousWriteError:
+            raise
+        except base.TrinoError as error:
+            # The base wraps statement failures with their driver cause. An
+            # exhausted connection probe raises a TrinoError without one.
+            cause = error.__cause__
+            if mutation and isinstance(cause, AMBIGUOUS_TRANSPORT_ERRORS):
+                raise base.TrinoAmbiguousWriteError(
+                    f"ESPN write may have committed and must not be replayed: {cause}"
+                ) from cause
+            raise
+
+    def _execute_committing(self, sql, *, replay_safe=False):
+        # Only a structured, definite commit rejection permits another attempt.
+        return super()._execute_committing(sql, replay_safe=False)
 
     def _execute_replacement(self, sql: str) -> None:
         """Run the tombstone replace-MERGE with strict replay protection.
@@ -64,3 +107,12 @@ class EspnTrinoTableManager(base.TrinoTableManager):
         replaying.
         """
         return self._execute_committing(sql, replay_safe=False)
+
+
+class EspnIcebergWriter(IcebergWriter):
+    def _get_trino_manager(self):
+        if self._trino_manager is None:
+            self._trino_manager = EspnTrinoTableManager(
+                host=self.trino_host, port=self.trino_port, catalog=self.catalog
+            )
+        return self._trino_manager
