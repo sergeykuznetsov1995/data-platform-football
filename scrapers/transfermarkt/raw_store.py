@@ -59,6 +59,7 @@ _API_REGULATION_PATH_RE = re.compile(
     r"^/competition/[A-Za-z0-9_-]+/regulation$", re.ASCII
 )
 _API_CLUB_PATH_RE = re.compile(r"^/competition/[A-Za-z0-9_-]+/club$", re.ASCII)
+_API_CLUB_PROFILE_PATH_RE = re.compile(r"^/club/[1-9][0-9]*(?:/stadium)?$", re.ASCII)
 _ERROR_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$", re.ASCII)
 _ATTEMPT_KINDS = frozenset({"response", "transport_error"})
 _TRANSPORT_ERROR_KINDS = frozenset(
@@ -147,6 +148,9 @@ def _safe_url(value: object) -> str:
     host = (parsed.hostname or "").lower()
     if host == _TRANSFERMARKT_API_HOST:
         if _API_REGULATION_PATH_RE.fullmatch(parsed.path):
+            if query:
+                raise ValueError(invalid)
+        elif _API_CLUB_PROFILE_PATH_RE.fullmatch(parsed.path):
             if query:
                 raise ValueError(invalid)
         elif _API_CLUB_PATH_RE.fullmatch(parsed.path):

@@ -114,7 +114,34 @@ class Offline:
             def get(self, url, **kwargs):
                 outer.calls.append((target.scope_id, url))
                 parsed = urlsplit(url)
-                if '/ceapi/marketValueDevelopment/' in parsed.path:
+                if parsed.netloc == 'tmapi.transfermarkt.technology' and parsed.path.startswith('/club/'):
+                    club = parsed.path.split('/')[2]
+                    if parsed.path.endswith('/stadium'):
+                        if getattr(outer, 'stadium_status', {}).get(club) == 404:
+                            value = {'success': False, 'message': 'not found'}
+                            return _FakeResp(json.dumps(value).encode(), status=404, json_value=value)
+                        value = getattr(outer, 'stadium_json', {}).get(club, {
+                            'success': True, 'data': {
+                                'id': str(700 + int(club)), 'clubId': club,
+                                'name': f'Stadium {club}', 'capacity': 10000 + int(club),
+                            },
+                        })
+                    else:
+                        value = getattr(outer, 'profile_json', {}).get(club, {
+                            'success': True, 'data': {
+                                'id': club, 'name': f'Club {club}',
+                                'relativeUrl': f'/club-{club}/startseite/verein/{club}',
+                                'baseDetails': {
+                                    'isNationalTeam': False,
+                                    'superiorClub': {
+                                        'name': f'Club {club} Official',
+                                        'location': {'countryId': 4, 'city': 'Example City'},
+                                        'colors': {'firstColor': '#000000'},
+                                    },
+                                },
+                            },
+                        })
+                elif '/ceapi/marketValueDevelopment/' in parsed.path:
                     value = outer.mv_payloads.get(parsed.path.rsplit('/', 1)[-1], {'list': []})
                 elif '/ceapi/transferHistory/' in parsed.path:
                     value = {'transfers': []}

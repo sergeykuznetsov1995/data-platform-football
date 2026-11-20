@@ -10,6 +10,7 @@ from scrapers.transfermarkt.writer import execute_statement
 
 import fcntl
 import argparse
+import csv
 import hashlib
 import json
 import logging
@@ -90,7 +91,7 @@ _ENTITY_LABELS = {
     'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury'),
     'market_value_history': ('market_value_points', 'mv_history'),
     'transfers': ('transfer_events', 'transfers'),
-    'coaches': ('coach_history', 'coach_profile', 'club_staff'),
+    'coaches': ('coach_history', 'coach_profile', 'club_staff', 'club_profile', 'club_stadium'),
 }
 
 
@@ -675,7 +676,8 @@ class _Scope:
         if total >= SCOPE_REQUEST_LIMIT:
             raise CurrentPortionError('scope attempt budget reached')
 
-    def fetch(self, url, label, *, as_json=False, fresh=True, generation=None, operation='players'):
+    def fetch(self, url, label, *, as_json=False, fresh=True, generation=None, operation='players',
+              allow_404=False):
         self.admission()
         refresh = self.data.get('recovery_signal_refresh_required')
         epoch = refresh.get('reconciled_at') if isinstance(refresh, Mapping) else None
@@ -690,11 +692,14 @@ class _Scope:
                      'edition_id': self.target.edition_id,
                      'traffic_reason': 'signal' if fresh else self.resume.get('reason', 'continuation')},
         )
-        if outcome.status != FetchStatus.OK or not outcome.raw_capture_id or not outcome.raw_fetched_at or not outcome.raw_body_hash:
+        confirmed_404 = allow_404 and outcome.status_code == 404
+        if ((not confirmed_404 and outcome.status != FetchStatus.OK)
+                or not outcome.raw_capture_id or not outcome.raw_fetched_at or not outcome.raw_body_hash):
             raise CurrentPortionError(f'{label} has no successful raw-first evidence')
         # Verify the durable receipt, rather than trusting mutable cache JSON.
         raw, receipt = self.scraper._http_client._raw_store.load_capture(outcome.raw_capture_id)
         if (receipt.url != url or receipt.scope_id != self.target.scope_id
+            or receipt.status_code != (404 if confirmed_404 else 200)
             or hashlib.sha256(raw).hexdigest() != outcome.raw_body_hash
             or _utc(receipt.fetched_at) != _utc(outcome.raw_fetched_at)):
             raise CurrentPortionError('source response lineage differs from durable raw receipt')
@@ -1871,6 +1876,83 @@ class _Scope:
             self.data.pop('staff_sweep', None)
             self.persist()
 
+    def stadiums(self, writer):
+        """Monthly paired club/stadium captures with exact per-club receipts."""
+        if writer is None or self.snapshot is None:
+            return
+        from scrapers.transfermarkt.club_stadiums import PARSER_REVISION
+        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+        from scrapers.transfermarkt.models import TrafficBudgetExceeded, TrafficMeterError
+
+        sweep = self.data.get('stadium_sweep')
+        if sweep is None or self.now() - _utc(sweep['started_at']) >= timedelta(days=30):
+            checked = self.cursor.stadium_completed_at
+            if not self.cursor.stadium_pending and checked is not None and self.now() - checked < timedelta(days=30):
+                return
+            clubs = self.data.get('listing_clubs') or {
+                club_id: {'club_slug': urlsplit(club.source_url).path.split('/')[1]}
+                for club_id, club in self.snapshot.clubs.items()}
+            if set(clubs) != set(self.snapshot.expected_team_ids):
+                raise CurrentPortionError('stadium sweep requires verified current club listing')
+            sweep = {'started_at': self.now().isoformat(), 'clubs': clubs,
+                     'pending': list(self.snapshot.expected_team_ids), 'deferred': {}, 'completed': {}}
+            self.data['stadium_sweep'] = sweep
+        self.cursor = replace(self.cursor, stadium_pending=True)
+        self.persist()
+        with (ROOT / 'dags/configs/transfermarkt/countries.tsv').open(encoding='utf-8', newline='') as handle:
+            countries = {row['country_id']: row['country'] for row in csv.DictReader(handle, delimiter='\t')}
+        run_id = 'tm-club-stadiums-' + hashlib.sha256(
+            (self.target.scope_id + sweep['started_at']).encode()).hexdigest()[:32]
+        for club_id in list(sweep['pending']):
+            self.admission()
+            self.scraper._begin_operation_budget('coaches')
+            profile_url = f'https://tmapi.transfermarkt.technology/club/{club_id}'
+            stadium_url = profile_url + '/stadium'
+            try:
+                profile = self.fetch(profile_url, 'club_profile', as_json=True, operation='coaches',
+                                     generation=[PARSER_REVISION, sweep['started_at']])
+                stadium = self.fetch(stadium_url, 'club_stadium', as_json=True, operation='coaches',
+                                     generation=[PARSER_REVISION, sweep['started_at']], allow_404=True)
+                proof = writer(
+                    self.scraper, self.scope, self.preflight, self.cycle_id, club_id=club_id,
+                    profile_outcome=profile, profile_url=profile_url,
+                    stadium_outcome=stadium, stadium_url=stadium_url,
+                    country_names=countries, universe_version=self.target.registry_snapshot_id,
+                    run_id=run_id,
+                )
+                _proof(proof)
+                if (proof.get('club_id') != club_id
+                        or proof.get('profile_raw_capture_id') != profile.raw_capture_id
+                        or proof.get('stadium_raw_capture_id') != stadium.raw_capture_id
+                        or proof.get('profile_raw_body_hash') != profile.raw_body_hash
+                        or proof.get('stadium_raw_body_hash') != stadium.raw_body_hash):
+                    raise CurrentPortionError('club stadium receipt differs from paired captures')
+                sweep['completed'][club_id] = {
+                    'receipt_id': proof['receipt_id'], 'status': proof['stadium_status'],
+                }
+            except (CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited,
+                    TrafficBudgetExceeded, TrafficMeterError):
+                raise
+            except Exception as exc:
+                sweep['deferred'][club_id] = type(exc).__name__ + ': ' + redact_sensitive(str(exc))
+                continue
+            finally:
+                if club_id in sweep['pending'] and club_id in sweep['completed']:
+                    sweep['pending'].remove(club_id)
+                self.persist()
+            sweep['deferred'].pop(club_id, None)
+            self.persist()
+        if not sweep['pending']:
+            self.cursor = replace(
+                self.cursor, stadium_completed_at=_utc(sweep['started_at']), stadium_pending=False)
+            self.data['stadium_last_sweep'] = {
+                'started_at': sweep['started_at'], 'completed_at': self.now().isoformat(),
+                'clubs': sweep['clubs'], 'completed': sweep['completed'],
+                'universe_version': self.target.registry_snapshot_id, 'run_id': run_id,
+            }
+            self.data.pop('stadium_sweep', None)
+            self.persist()
+
     def coaches(self):
         if self.data.get('authoritative_empty_scope'):
             return
@@ -1908,7 +1990,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         max_scopes=8, scraper_factory=None, roster_writer=None,
                         career_writer=None, coach_writer=None, now_fn=None, monotonic_fn=None,
                         deadline_monotonic=None, baseline_verifier=None, bootstrap_verifier=None,
-                        staff_writer=None):
+                        staff_writer=None, stadium_writer=None):
     """Collect real source work with offline dependency injection for integration QA."""
     if not preflight.get('paid_io_allowed') or preflight.get('write_mode') not in {'dual', 'native-only'}:
         raise CurrentPortionError('reader preflight did not authorize current collection')
@@ -1998,6 +2080,17 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             logging.getLogger(__name__).warning('staff not authorized: skipping staff collection')
         else:
             staff_writer = staff_writer or write_current_staff
+        from dags.utils.transfermarkt_club_stadiums import (
+            validate_club_stadium_write_policy, write_current_club_stadium,
+        )
+        try:
+            validate_club_stadium_write_policy(policy)
+        except CurrentWriteError:
+            stadium_writer = None
+            report['stadium_status'] = 'club stadiums not authorized'
+            logging.getLogger(__name__).warning('club stadiums not authorized: skipping monthly collection')
+        else:
+            stadium_writer = stadium_writer or write_current_club_stadium
     factory = scraper_factory or _production_factory
     directory = Path(state_dir or os.environ.get('TM_CURRENT_STATE_DIR', '/opt/airflow/logs/transfermarkt-native-v2/current'))
     directory.mkdir(parents=True, exist_ok=True)
@@ -2079,7 +2172,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                                     'edition_id': target.edition_id, 'tier': _tier_json(target.tier)}
                                    for target in targets.targets]
         ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes,
-                                     staff_enabled=staff_writer is not None, scope_index=state['scopes'])
+                                     staff_enabled=staff_writer is not None,
+                                     stadium_enabled=stadium_writer is not None, scope_index=state['scopes'])
         closing_work = tuple(CurrentWork(target, 'season_close') for target in sorted(
             closing.values(), key=lambda target: (
                 cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
@@ -2224,17 +2318,23 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     scope.apply_change()
                 elif item.kind == 'weekly_staff':
                     scope.staff(staff_writer)
+                    scope.stadiums(stadium_writer)
                     if (not scope.resume.get('required')
                         and not any(scope.resume.get('careers', {}).values())
                         and not scope.resume.get('coaches_pending')):
                         scope.resume = {}
+                elif item.kind == 'monthly_club_stadiums':
+                    scope.stadiums(stadium_writer)
+                    scope.staff(staff_writer)
                 else:
                     if item.kind == 'season_close':
                         # Staff is current-only work. Retain its unfinished journal
                         # for diagnosis without blocking the historical handoff.
                         if data.get('staff_sweep'):
                             data['staff_sweep_at_close'] = data.pop('staff_sweep')
-                        scope.cursor = replace(scope.cursor, staff_pending=False)
+                        if data.get('stadium_sweep'):
+                            data['stadium_sweep_at_close'] = data.pop('stadium_sweep')
+                        scope.cursor = replace(scope.cursor, staff_pending=False, stadium_pending=False)
                         if not data.get('season_close_roster_captured'):
                             first_close_portion = not data.get('season_close_roster_started')
                             if first_close_portion:
@@ -2252,6 +2352,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             scope.listing()
                         scope.roster(weekly=item.kind == 'weekly_roster')
                         scope.staff(staff_writer)
+                        scope.stadiums(stadium_writer)
                     # #2068: a cold roster only commits the roster; its careers
                     # and coaches remain in resume_json for continuation work.
                     roster_only = item.kind == 'cold_roster' and not data.get('authoritative_empty_scope')
@@ -2275,6 +2376,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 if daily_complete(scope.cursor, now()):
                     report['daily_complete_scope_ids'].append(target.scope_id)
                 result['status'] = 'complete' if not scope.resume and item.kind != 'cold_roster' else 'pending'
+                if data.get('stadium_sweep'):
+                    result['status'] = 'pending'
                 if item.kind == 'season_close' and result['status'] == 'complete':
                     if not data.get('season_close_roster_captured'):
                         raise CurrentPortionError('season close requires a final committed full roster')

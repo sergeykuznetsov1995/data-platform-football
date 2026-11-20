@@ -443,6 +443,8 @@ def test_only_known_safe_transfermarkt_query_fields_are_allowed(tmp_path):
     [
         "https://tmapi.transfermarkt.technology/competition/CL/regulation",
         "https://tmapi.transfermarkt.technology/competition/CL/club?season=2025",
+        "https://tmapi.transfermarkt.technology/club/131",
+        "https://tmapi.transfermarkt.technology/club/131/stadium",
         "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&ids%5B%5D=418",
     ],
 )
@@ -464,6 +466,11 @@ def test_first_party_discovery_api_routes_are_raw_storable(tmp_path, url):
         "https://tmapi.transfermarkt.technology/competition/CL/regulation?season=2025",
         "https://tmapi.transfermarkt.technology/competition/CL/club",
         "https://tmapi.transfermarkt.technology/competition/CL/club?season=all",
+        "https://tmapi.transfermarkt.technology/club/0",
+        "https://tmapi.transfermarkt.technology/club/01",
+        "https://tmapi.transfermarkt.technology/club/131?token=secret",
+        "https://tmapi.transfermarkt.technology/club/131/stadium?season=2025",
+        "https://tmapi.transfermarkt.technology/club/131/other",
         "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&token=secret",
         "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1&token=secret",
     ],
