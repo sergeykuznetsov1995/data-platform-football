@@ -77,6 +77,8 @@ LEGACY_WRITER_ALLOWLIST = frozenset({
     # compatibility reads; this is not a serving consumer or another writer.
     'dags/utils/transfermarkt_current_write.py',
     'dags/utils/transfermarkt_native_v2.py',
+    # #1403: read-only native/legacy acceptance reconciliation.
+    'dags/utils/transfermarkt_top5_history.py',
     'scrapers/transfermarkt/scraper.py',
     'scripts/transfermarkt_native_v2.py',
 })
