@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -138,3 +139,10 @@ def test_stichtag_url_uses_the_current_competition_endpoint():
     assert with_stichtag(URLS['vie1-current'], '2010-11-01') == URLS['vie1-current'] + '/stichtag/2010-11-01'
     with pytest.raises(ClubValueParseError, match='stichtag_base_url_invalid'):
         with_stichtag(URLS['vie1-2013-04-15'], '2010-11-01')
+
+
+def test_extraction_rejects_mixed_capture_lineage():
+    result = parse('vie1-current')
+    rows = (dict(result.rows[0], raw_capture_id='b' * 64),) + tuple(result.rows[1:])
+    with pytest.raises(ClubValueParseError, match='capture_mismatch:raw_capture_id'):
+        replace(result, rows=rows)

@@ -182,8 +182,8 @@ def _receipt_values(extraction: ClubValueExtraction, club_id: str,
         'schema_revision': CLUB_VALUE_SCHEMA_REVISION,
         'expected_points': len(extraction.club_rows(club_id)),
         'status_counts_json': canonical_json(extraction.club_status_counts(club_id)).decode('utf-8'),
-        'differing_table_points': sum(row['reconciliation_status'] == 'value_differs'
-                                      for row in extraction.club_rows(club_id)),
+        'differing_table_points': len({row['value_date'] for row in extraction.club_rows(club_id)
+                                       if row['reconciliation_status'] == 'value_differs'}),
         'plan_sha256': extraction.plan_sha256(),
         'physical_hash': physical_hash,
         'committed_batch': first['_batch_id'],
@@ -274,7 +274,7 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
         raise current.CurrentWriteError('committed_at must be timezone-aware')
     output = SimpleNamespace(
         table_name='transfermarkt_club_value_observations', key='club_values',
-        is_legacy=False, replace_keys=())
+        is_legacy=False, replace_keys=('club_id',))
     receipts = []
     with writer_deadline(getattr(scraper, '_current_deadline_monotonic', None)), writer_lock():
         _authorize(preflight)

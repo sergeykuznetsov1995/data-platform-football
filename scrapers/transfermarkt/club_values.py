@@ -167,6 +167,23 @@ class ClubValueExtraction:
             for column in CLUB_VALUE_COLUMNS:
                 if column != 'value_amount' and (row[column] is None or row[column] == ''):
                     raise ClubValueParseError('lineage_missing:' + column)
+            expected_capture = {
+                'competition_id': self.capture.competition_id, 'source_url': self.capture.source_url,
+                'raw_capture_id': self.capture.raw_capture_id,
+                'source_body_hash': self.capture.source_body_hash,
+                'captured_at': self.capture.captured_at, 'observed_at': self.capture.captured_at,
+                'extracted_at': self.capture.extracted_at,
+                'parser_revision': CLUB_VALUE_PARSER_REVISION,
+                'schema_revision': CLUB_VALUE_SCHEMA_REVISION,
+                'scope_id': self.capture.scope_id, 'run_id': self.capture.run_id,
+                'cycle_id': self.capture.cycle_id,
+                'universe_version': self.capture.universe_version,
+                '_source': 'transfermarkt', '_entity_type': 'club_value_observation',
+                '_batch_id': self.capture.batch_id, '_ingested_at': self.capture.extracted_at,
+            }
+            for column, expected in expected_capture.items():
+                if row[column] != expected:
+                    raise ClubValueParseError('capture_mismatch:' + column)
 
     @property
     def status_counts(self) -> dict[str, int]:

@@ -105,21 +105,20 @@ def page(club_id='10', value=150_000, current=None):
 
 def extraction(instance, club_ids=('10',), *, value=150_000, current=None, observed=CAPTURED, extracted=EXTRACTED):
     captures = []
+    url = 'https://www.transfermarkt.com/v-league-1/marktwerteverein/wettbewerb/VIE1/stichtag/2020-01-01'
+    raw = instance.test_store.store_attempt(
+        url=url, body=page(club_ids[0], value, current).encode(), status_code=200, headers={},
+        fetched_at=observed.isoformat(), cycle_id='raw-' + observed.isoformat(),
+        scope_id='scope-1', endpoint='club_values', attempt=0,
+    )
+    capture = ClubValueCapture(
+        competition_id='VIE1', source_url=url, raw_capture_id=raw.capture_id,
+        source_body_hash=raw.content_hash, captured_at=raw.fetched_at,
+        extracted_at=extracted.isoformat(), scope_id='scope-1', run_id='run-1',
+        cycle_id='cycle-1', universe_version='registry-test',
+    )
     for club_id in club_ids:
-        html = page(club_id, value, current)
-        url = 'https://www.transfermarkt.com/v-league-1/marktwerteverein/wettbewerb/VIE1/stichtag/2020-01-01'
-        raw = instance.test_store.store_attempt(
-            url=url, body=html.encode(), status_code=200, headers={},
-            fetched_at=observed.isoformat(), cycle_id='raw-' + observed.isoformat(),
-            scope_id='scope-1', endpoint='club_values', attempt=0,
-        )
-        capture = ClubValueCapture(
-            competition_id='VIE1', source_url=url, raw_capture_id=raw.capture_id,
-            source_body_hash=raw.content_hash, captured_at=raw.fetched_at,
-            extracted_at=extracted.isoformat(), scope_id='scope-1', run_id='run-1',
-            cycle_id='cycle-1', universe_version='registry-test',
-        )
-        captures.append(parse_club_values(html, capture))
+        captures.append(parse_club_values(page(club_id, value, current), capture))
     rows = tuple(row for result in captures for row in result.rows)
     first = captures[0]
     return type(first)(
@@ -206,7 +205,7 @@ def test_same_observation_conflict_and_stale_extraction_are_rejected(physical):
 def test_value_differs_is_counted_and_both_values_are_committed(physical):
     result = extraction(physical, current=140_000)
     receipt = write(physical, result)
-    assert receipt['receipts'][0]['differing_table_points'] == 2
+    assert receipt['receipts'][0]['differing_table_points'] == 1
     assert set(business_table(physical)['value_amount'].dropna()) == {140_000, 150_000}
 
 
