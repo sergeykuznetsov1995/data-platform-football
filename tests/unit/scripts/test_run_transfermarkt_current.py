@@ -743,6 +743,8 @@ def test_weekly_rechecks_all_squads_without_repeating_careers(offline):
 
 
 def test_weekly_current_collects_club_values_when_enabled(offline, monkeypatch):
+    monkeypatch.delenv('TM_REQUIRE_METERED_PROXY', raising=False)
+    monkeypatch.delenv('TM_PROXY_CONTROL_URL', raising=False)
     calls = []
 
     def collect(scraper, payload, preflight, *, mode):
