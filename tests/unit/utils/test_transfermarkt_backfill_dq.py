@@ -299,3 +299,21 @@ def test_attendance_manifest_fingerprint_matches_writer_physical_hash():
     assert result['row_count'] == 1
     assert 'WHERE run_id = \'history-child\'' in cur.sql[0]
     assert 'FOR VERSION AS OF 42' in cur.sql[0]
+
+
+def test_attendance_manifest_rejects_supplied_pins_without_attendance():
+    manifest = SimpleNamespace(entities=[SimpleNamespace(entity=dq.ATTENDANCE_ENTITY)])
+    with pytest.raises(dq.BackfillDqError, match='supplied attendance snapshot pin'):
+        dq.run_backfill_batch_dq(
+            _Cursor(),
+            campaign_id='campaign',
+            batch_id='batch',
+            registry_snapshot_id='registry',
+            manifests=[manifest],
+            child_cycle_ids=(),
+            scope_bindings=(),
+            raw_store=None,
+            attempt_envelopes=(),
+            scope_statuses={},
+            pins={table: 42 for table in dq.BACKFILL_PIN_TABLES},
+        )

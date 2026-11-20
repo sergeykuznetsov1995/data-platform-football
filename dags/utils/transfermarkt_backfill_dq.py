@@ -530,12 +530,15 @@ def run_backfill_batch_dq(
 
     has_attendance = any(
         str(evidence.entity) == ATTENDANCE_ENTITY
-        for manifest in manifests for evidence in manifest.entities
+        for manifest in manifests for evidence in getattr(manifest, 'entities', ())
     )
     pin_tables = BACKFILL_PIN_TABLES + ((ATTENDANCE_TABLE,) if has_attendance else ())
-    if pins is None or (has_attendance and ATTENDANCE_TABLE not in pins):
+    if pins is None:
         snapshots = pin_iceberg_snapshots(cur, tables=pin_tables)
     else:
+        if has_attendance and ATTENDANCE_TABLE not in pins:
+            raise BackfillDqError(
+                'attendance manifest requires a supplied attendance snapshot pin')
         snapshots = dict(pins)
     fingerprints = verify_manifest_entity_fingerprints(cur, pins=snapshots, manifests=manifests)
     historical_presence = {
