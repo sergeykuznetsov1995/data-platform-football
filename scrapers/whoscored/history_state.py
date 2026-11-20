@@ -13,7 +13,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 
-from .catalog import CLASS_A_TOURNAMENT_IDS, PROBE_SCOPE_SPECS
+from .catalog import CLASS_A_TOURNAMENT_IDS, PROBE_SCOPE_SPECS, CatalogSeason
 from .domain import SeasonFormat, base_season_id
 
 CHUNK_SIZE = 25
@@ -42,16 +42,33 @@ def share(key: str, workers: int) -> int:
     return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:16], 16) % workers
 
 
-def _history_start_year(season, base: str, today: date) -> int | None:
+def _history_start_year(season: CatalogSeason, base: str, today: date) -> int | None:
+    """Resolve the nominal start year, including the century omitted by YY pairs."""
     if season.scope.season_format is SeasonFormat.SINGLE_YEAR:
         return int(base)
     short_year = int(base[:2])
-    label = re.fullmatch(
-        r"([0-9]{4})\s*[-/]\s*(?:[0-9]{2}|[0-9]{4})", (season.source_label or "").strip()
-    )
+    compact_label = "".join((season.source_label or "").split())
+    label = re.fullmatch(r"([0-9]{4})[-/]([0-9]{2}|[0-9]{4})", compact_label)
+    # A qualifier may start in December of the preceding year. Dates resolve
+    # the century, while the canonical season determines the year within it.
+    reference_year = None
+    if season.start:
+        reference_year = season.start.year
+    elif season.end:
+        span = (int(base[2:]) - short_year) % 100
+        reference_year = season.end.year - span
+    if reference_year is not None:
+        century = (reference_year - short_year + 50) // 100
+        dated_year = century * 100 + short_year
+    else:
+        dated_year = None
     if label:
         year = int(label[1])
-        return year if year % 100 == short_year else None
+        if label[1][-2:] + label[2][-2:] != base or (dated_year is not None and dated_year != year):
+            return None
+        return year
+    if dated_year is not None:
+        return dated_year
     # A legacy YY pair alone identifies the most recent such season that could have started.
     return today.year - (today.year - short_year) % 100
 
@@ -60,9 +77,7 @@ def queue(catalog, *, today: date) -> list[dict]:
     """Current seasons and probes first, then authorized history through 2015/16."""
     grouped = {}
     for season in catalog.enabled_scopes():
-        if season.start is not None and (
-            season.start > today or season.start.year < FIRST_HISTORY_YEAR
-        ):
+        if season.start is not None and season.start > today:
             continue
         grouped.setdefault(season.scope.competition_id, []).append(season)
     result = []

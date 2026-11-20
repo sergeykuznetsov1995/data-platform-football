@@ -64,6 +64,20 @@ def test_sparse_catalog_respects_oldest_history_season(label, fmt, source_label,
     assert [item["key"] for item in scopes] == ([candidate.scope.spec] if allowed else [])
 
 
+@pytest.mark.parametrize(("source_label", "start", "end", "allowed"), [
+    (None, None, date(1916, 6, 1), False),
+    ("2015/16", date(2014, 12, 20), date(2016, 6, 1), True),
+    (None, date(2014, 12, 20), date(2016, 6, 1), True),
+    ("2015/16", None, date(1916, 6, 1), False),
+])
+def test_history_boundary_uses_nominal_season_and_catalog_dates(source_label, start, end, allowed):
+    league = "ENG-Premier League"
+    candidate = CatalogSeason(WhoScoredScope(league, "1516", "split_year"), source_season_id=7,
+                              source_label=source_label, start=start, end=end)
+    scopes = state.queue(catalog((league, 2, [candidate])), today=NOW.date())
+    assert bool(scopes) is allowed
+
+
 def test_historical_season_with_high_source_id_does_not_take_a_recent_slot():
     seasons = [season(label=label, source=source_id) for label, source_id in
                [("1415", 100), ("2324", 90), ("2223", 80)]]
