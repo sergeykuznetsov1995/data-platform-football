@@ -212,6 +212,18 @@ def test_identical_replay_is_noop_and_later_replay_preserves_source_clock(physic
         write(physical, result)
 
 
+def test_timestamp_offsets_are_normalized_before_stale_and_replay_checks(physical):
+    result = extraction()
+    write(physical, result)
+    india = timezone(timedelta(hours=5, minutes=30))
+    later_at = (EXTRACTED + timedelta(hours=2)).astimezone(india)
+    later = write(physical, extraction(at=later_at), at=COMMITTED + timedelta(hours=2))
+    assert later['verified'] is True
+    assert set(business_table(physical)['extracted_at']) == {'2026-11-20T14:01:00.123456'}
+    with pytest.raises(Exception, match='stale'):
+        write(physical, result)
+
+
 def test_writer_rejects_changed_immutable_payload_at_same_key(physical):
     result = extraction()
     write(physical, result)
