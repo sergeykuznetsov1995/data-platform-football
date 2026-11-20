@@ -2251,6 +2251,19 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             and scope.snapshot is None and scope.resume.get('clubs')):
                             scope.listing()
                         scope.roster(weekly=item.kind == 'weekly_roster')
+                        if (item.kind == 'weekly_roster'
+                                and os.environ.get('TM_CLUB_VALUES_ENABLED', '').lower() in {'true', '1'}):
+                            from dags.scripts.run_transfermarkt_club_values import run_club_values
+                            row = rows[target.competition_id, target.edition_id]
+                            result['club_values'] = run_club_values(scraper, {
+                                'scope_id': target.scope_id,
+                                'competition_id': target.competition_id,
+                                'edition_id': target.edition_id,
+                                'child_cycle_id': child_cycle_id,
+                                'resume_cycle_id': cycle_id,
+                                'registry_snapshot_id': target.registry_snapshot_id,
+                                'source_url': row['edition_source_url'],
+                            }, preflight, mode='current')
                         scope.staff(staff_writer)
                     # #2068: a cold roster only commits the roster; its careers
                     # and coaches remain in resume_json for continuation work.

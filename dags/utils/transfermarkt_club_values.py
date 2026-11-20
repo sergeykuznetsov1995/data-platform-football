@@ -41,7 +41,7 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def club_values_enabled(policy) -> bool:
-    return {CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE} <= set(policy.allowed_write_tables)
+    return {CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE} <= set(getattr(policy, 'allowed_write_tables', ()))
 
 
 def validate_club_value_write_policy(policy) -> None:
