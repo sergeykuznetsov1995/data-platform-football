@@ -221,8 +221,11 @@ def _environment_for_scope(
     finalize_only: bool = False,
 ) -> dict[str, str]:
     scope_id = str(payload["scope_id"])
+    from dags.utils.transfermarkt_club_values import club_values_enabled
+    enabled = club_values_enabled(_load_backfill_policy())
     return {
         "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+        "TM_CLUB_VALUES_ENABLED": "true" if enabled else "false",
         "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
         "TM_REQUIRE_METERED_PROXY": "true",
         "TRANSFERMARKT_REQUIRE_RAW_STORE": "true",
@@ -726,6 +729,11 @@ python dags/scripts/run_transfermarkt_scope_cycle.py \
   --parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP" \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
   --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
+if [[ "${TM_CLUB_VALUES_ENABLED:-false}" == "true" ]]; then
+  python dags/scripts/run_transfermarkt_club_values.py \
+    --mode history \
+    --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-history-result.json}"
+fi
 # The durable finalizer classifies the immutable result/raw evidence. It must
 # run for source failures too; a missing evidence envelope becomes a platform
 # block there rather than being silently retried here.

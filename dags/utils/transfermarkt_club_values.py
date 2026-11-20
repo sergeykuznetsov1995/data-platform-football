@@ -40,10 +40,14 @@ _IMMUTABLE_EXCLUDED = frozenset({'extracted_at', 'run_id', 'cycle_id', '_batch_i
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def club_values_enabled(policy) -> bool:
+    return {CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE} <= set(policy.allowed_write_tables)
+
+
 def validate_club_value_write_policy(policy) -> None:
-    missing = tuple(table for table in (CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE)
-                    if table not in set(policy.allowed_write_tables))
-    if missing:
+    if not club_values_enabled(policy):
+        missing = tuple(table for table in (CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE)
+                        if table not in set(policy.allowed_write_tables))
         raise current.CurrentWriteError(
             'standing policy does not authorize club-value writes to: ' + ', '.join(missing))
 
@@ -331,6 +335,6 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
 
 __all__ = [
     'CLUB_VALUE_CONTRACT', 'CLUB_VALUE_RECEIPTS_TABLE', 'CLUB_VALUE_TABLE',
-    'RECEIPT_COLUMNS', 'club_value_ddl', 'validate_club_value_write_policy',
-    'write_club_values',
+    'RECEIPT_COLUMNS', 'club_value_ddl', 'club_values_enabled',
+    'validate_club_value_write_policy', 'write_club_values',
 ]

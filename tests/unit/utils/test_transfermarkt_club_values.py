@@ -69,7 +69,9 @@ class ClubValueWriter(MemoryWriter):
 @pytest.fixture
 def club_value_policy(monkeypatch, tmp_path):
     policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
-    policy['allowed_write_tables'] += [club_values.CLUB_VALUE_TABLE, club_values.CLUB_VALUE_RECEIPTS_TABLE]
+    policy['allowed_write_tables'] = list(dict.fromkeys(
+        policy['allowed_write_tables'] + [club_values.CLUB_VALUE_TABLE, club_values.CLUB_VALUE_RECEIPTS_TABLE]
+    ))
     policy['expires_at'] = '2999-01-01T00:00:00Z'
     path = tmp_path / 'club-value-policy.json'
     path.write_text(json.dumps(policy))
@@ -93,6 +95,7 @@ def physical(scraper, monkeypatch, tmp_path, club_value_policy):  # noqa: F811
     scraper.test_db = db
     scraper._bronze_connection = lambda: db
     scraper._iceberg_writer = ClubValueWriter(db)
+    scraper._http_client._raw_store = scraper.test_store
     return scraper
 
 

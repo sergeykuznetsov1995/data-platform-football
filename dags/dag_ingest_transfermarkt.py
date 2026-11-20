@@ -134,6 +134,12 @@ def _plan_current_portion(context, registry_rows, preflight, qualification):
 
 def _child_operator_kwargs(environment):
     """Bound current work without cancelling the retained one-shot path."""
+    from dags.utils.transfermarkt_approval import load_standing_policy
+    from dags.utils.transfermarkt_club_values import club_values_enabled
+
+    environment = dict(environment)
+    enabled = club_values_enabled(load_standing_policy(STANDING_POLICY_PATH))
+    environment['TM_CLUB_VALUES_ENABLED'] = 'true' if enabled else 'false'
     return {
         'env': environment,
         'execution_timeout': timedelta(
@@ -1330,7 +1336,7 @@ with DAG(
         bash_command=r'''set -euo pipefail
 cd /opt/airflow
 if [ -n "${TM_CURRENT_JOB:-}" ]; then
-  exec python dags/scripts/run_transfermarkt_current.py \
+  python dags/scripts/run_transfermarkt_current.py \
     --job "$TM_CURRENT_JOB" --report "$TM_CURRENT_REPORT"
 fi
 case "$TM_APPROVAL_MODE" in
@@ -1354,7 +1360,7 @@ case "$TM_APPROVAL_MODE" in
     exit 1
     ;;
 esac
-exec python dags/scripts/run_transfermarkt_scope_cycle.py \
+python dags/scripts/run_transfermarkt_scope_cycle.py \
   --payload-json "$TM_SCOPE_PAYLOAD_JSON" \
   --reader-revision "$TM_READER_REVISION" \
   --candidate-slot "$TM_CANDIDATE_SLOT" \
@@ -1371,7 +1377,12 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --request-limit "$TM_PROXY_REQUEST_LIMIT" \
   --retry-limit "$TM_PROXY_RETRY_LIMIT" \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
-  --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"''',
+  --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
+if [ "${TM_CLUB_VALUES_ENABLED:-false}" = "true" ]; then
+  python dags/scripts/run_transfermarkt_club_values.py \
+    --mode current \
+    --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-result.json}"
+fi''',
         append_env=True,
         retries=0,
         pool='transfermarkt_proxy',
