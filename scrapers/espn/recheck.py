@@ -15,9 +15,8 @@ statistics, no team statistics).  The contour downloads each Summary once;
   when does ESPN complete a match (journal only, ``rechecked_at`` untouched).
 * **not worse** (``compare_parts``) — any repeated Summary (recheck, sample,
   a status change after capture) is compared, parsed, with the stored one:
-  a part poorer than before where the old one had data keeps the stored
-  parse (read back by ``raw_uri``/``raw_sha256``) and journals
-  ``downgrade_rejected``.
+  a loss of part counts, parse quality or protected match fields keeps the
+  stored parse and its exact raw body and journals ``downgrade_rejected``.
 
 Journal ``iceberg.ops.espn_recheck_v1``: one row per attempt with the parts
 before and after and the outcome; the morning report counts
@@ -29,11 +28,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 from .bronze_schema import BRONZE_DATABASE, LINEUP_STAT_COLUMNS, MATCH_TABLE, TEAM_STAT_COLUMNS
 from .journal import JOURNAL_SCHEMA, _execute, _literal
-from .parser_contracts import SummaryParseResult
+from .parser_contracts import SummaryDisposition, SummaryParseResult
 
 RECHECK_TABLE = f"{JOURNAL_SCHEMA}.espn_recheck_v1"
 RECHECK_COLUMNS = (
@@ -64,6 +63,19 @@ DOWNGRADE_REJECTED = "downgrade_rejected"
 FAILED = "failed"
 
 PARTS = ("lineup", "player_stats", "team_stats", "events")
+_MATCH_FIELDS = (
+    "group_name", "season_type_id", "season_type_name", "stage_slug",
+    "season_start_date", "season_end_date", "advance_team_id", "officials_json",
+)
+
+JournalParts = Mapping[str, int | str | list[str]]
+
+
+class PartsComparison(NamedTuple):
+    before: JournalParts
+    after: JournalParts
+    outcome: str
+
 
 RECHECK_MIN_AGE = timedelta(days=7)
 RECHECK_MAX_AGE = timedelta(days=10)
@@ -107,25 +119,56 @@ def _content(summary: SummaryParseResult) -> tuple:
         summary.lineup,
         summary.matchsheet,
         summary.events,
-        summary.advance_team_id,
+        tuple(getattr(summary, field) for field in _MATCH_FIELDS),
     )
 
 
-def compare_parts(old: SummaryParseResult, new: SummaryParseResult) -> str:
-    """Outcome of writing ``new`` over ``old``.
-
-    ``downgrade_rejected`` when any part of ``new`` has fewer filled units
-    than ``old`` (a part ``old`` had no data in can only stay or grow);
-    otherwise ``filled`` when a part grew, ``same`` for an equal parse and
-    ``changed`` for edited values at the same completeness.
-    """
-
+def compare_summaries(old: SummaryParseResult, new: SummaryParseResult) -> PartsComparison:
+    """Select a whole Summary, recording only counts, field names and parser labels."""
     before, after = summary_parts(old), summary_parts(new)
-    if any(after[part] < before[part] for part in PARTS):
-        return DOWNGRADE_REJECTED
+    old_detail: dict[str, str | list[str]] = {}
+    new_detail: dict[str, str | list[str]] = {}
+    falling = [part for part in PARTS if after[part] < before[part]]
+    if falling:
+        new_detail["falling_parts"] = falling
+    lost = [
+        field for field in _MATCH_FIELDS
+        if getattr(old, field) is not None and getattr(new, field) is None
+    ]
+    if lost:
+        new_detail["lost_fields"] = lost
+
+    became_malformed = (
+        new.disposition == SummaryDisposition.SOURCE_MALFORMED
+        and old.disposition != SummaryDisposition.SOURCE_MALFORMED
+    )
+    worse_lineup = new.disposition == SummaryDisposition.LINEUP_ANOMALY and (
+        old.disposition == SummaryDisposition.CAPTURED
+        or (
+            old.disposition == SummaryDisposition.LINEUP_ANOMALY
+            and not set(new.anomalies).issubset(old.anomalies)
+        )
+    )
+    if became_malformed or worse_lineup:
+        old_detail["disposition"] = old.disposition.value
+        new_detail["disposition"] = new.disposition.value
+    if worse_lineup:
+        old_detail["anomalies"] = sorted(set(old.anomalies))
+        new_detail["anomalies"] = sorted(set(new.anomalies))
+
+    if new_detail:
+        return PartsComparison(
+            {**before, **old_detail}, {**after, **new_detail}, DOWNGRADE_REJECTED
+        )
     if any(after[part] > before[part] for part in PARTS):
-        return FILLED
-    return SAME if _content(old) == _content(new) else CHANGED
+        return PartsComparison(before, after, FILLED)
+    outcome = SAME if _content(old) == _content(new) else CHANGED
+    return PartsComparison(before, after, outcome)
+
+
+def compare_parts(old: SummaryParseResult, new: SummaryParseResult) -> str:
+    """Return the recheck outcome, including for offline raw replays."""
+    return compare_summaries(old, new).outcome
 
 
 # ------------------------------------------------------------------ plan
@@ -233,8 +276,8 @@ def recheck_row(
     season_year: int,
     event_id: int,
     kind: str,
-    before: Mapping[str, int] | None,
-    after: Mapping[str, int] | None,
+    before: JournalParts | None,
+    after: JournalParts | None,
     outcome: str,
 ) -> dict[str, Any]:
     if kind not in KINDS:
@@ -281,6 +324,7 @@ __all__ = [
     "SAMPLE_72H",
     "build_candidates_sql",
     "compare_parts",
+    "compare_summaries",
     "ensure_recheck_table",
     "flush_rechecks",
     "journalled",

@@ -51,6 +51,8 @@ R_PACKAGE_INIT = "package-init"
 R_FIXTURES = "fixtures"
 R_CONFIGS = "configs"
 R_DAG_PLUGINS = "dag-plugins"
+R_WORKFLOW = "workflow"
+R_TEST_SELECTOR = "test-selector"
 R_TESTS_NON_UNIT = "tests-non-unit"
 R_SHORT_STEM = "short-stem"
 R_NO_TEST_MAPPING = "no-test-mapping"
@@ -99,6 +101,10 @@ def classify(path: str) -> tuple[str, str]:
         return "full", R_REQUIREMENTS
     if parts and parts[0] == "requirements":
         return "full", R_REQUIREMENTS
+    if path == "scripts/select_tests_by_diff.py":
+        return "full", R_TEST_SELECTOR
+    if len(parts) > 1 and parts[:2] == [".github", "workflows"]:
+        return "full", R_WORKFLOW
 
     def under(prefix: str) -> bool:
         return len(parts) > 1 and parts[0] == prefix

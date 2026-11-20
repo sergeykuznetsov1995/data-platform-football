@@ -67,6 +67,8 @@ SELECT coalesce(jsonb_agg(r), '[]')::text FROM (
   AND p.completed_at <= '{cutoff}'::timestamptz
  LEFT JOIN fbref_control.dataset_manifest t ON t.target_id = f.target_id
   AND t.content_hash = p.content_hash AND t.dataset = 'typed:__complete__'
+  -- The typed writer marks scored content even when the competition has no lineup or event data.
+  AND t.error_message = 'scored_match_requires_rows'
   AND t.parse_status = 'succeeded' AND t.persistence_status = 'succeeded'
   AND t.validation_status = 'succeeded'
   AND t.completed_at >= o.first_completed_seen_at

@@ -351,8 +351,8 @@ def test_idle_cooldown_is_not_reported_as_a_failed_scope(tmp_path):
 def test_checked_empty_or_absent_stage_does_not_repeat_schedule(tmp_path, stage_ids):
     kwargs, s, repo, service = setup_chunk(tmp_path)
     repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id):
-                                         coverage(closed=100, stage_ids=stage_ids)}
-    repo.latest_schedule_stage_ids.return_value = (1, 2)
+                                         coverage(closed=100, stage_ids=stage_ids,
+                                                  checked_stage_ids=(1, 2))}
     scopes = history.inventory(kwargs["catalog"], repo, today=NOW.date())
     assert state.first_wave_ready(scopes) is True
     history.run_chunk(**kwargs)
@@ -493,15 +493,12 @@ def test_runner_records_each_scope_after_skipped_feeds(tmp_path, monkeypatch):
 
 def mixed_stage_coverage():
     from tests.unit.scrapers.test_whoscored_repository_sql_semantics import (
-        LEAGUE, SEASON, _attempt, _connection, _game, _history_repository,
+        LEAGUE, SEASON, _attempt, _connection, _game, _history_repository, _published_history_schedule,
     )
 
     con = _connection()
     try:
-        con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                    "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-        con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                    "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+        _published_history_schedule(con, 2)
         _game(con, 1, 1, 30)
         _attempt(con, 1, "success", 1)
         _game(con, 2, 1, 20, lineup=False)
@@ -533,10 +530,7 @@ def test_deferred_refresh_ends_at_thirty_days(tmp_path, monkeypatch, confirm_day
     monkeypatch.setattr(sql, "NOW", start)
     con = sql._connection()
     try:
-        con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                    "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-        con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                    "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [sql.LEAGUE, sql.SEASON])
+        sql._published_history_schedule(con, 2)
         sql._game(con, 1, 1, 40)
         sql._attempt(con, 1, "success", 1)
         sql._game(con, 2, 1, 28, lineup=False)

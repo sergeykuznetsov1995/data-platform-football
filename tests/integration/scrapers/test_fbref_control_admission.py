@@ -69,11 +69,18 @@ def test_match_report_observation_rejects_naive_time_and_preserves_other_season(
         assert cursor.fetchone()["n"] == 2
 
 
-def test_daily_readiness_requires_both_generic_and_typed_completion(isolated_postgres_uri):
+@pytest.mark.parametrize(("delay", "status"), [
+    (timedelta(hours=24), "on_time"),
+    (timedelta(hours=24, seconds=1), "late"),
+])
+def test_daily_readiness_requires_scored_content(isolated_postgres_uri, delay, status):
     from scrapers.fbref.daily_report_reader import READINESS_SQL
+    from tests.unit.scrapers.test_fbref_daily_report import ANCHOR, AS_OF, report, snapshot
+
     store = ControlStore(isolated_postgres_uri)
-    stamp = datetime(2026, 10, 7, 18, tzinfo=timezone.utc)
-    snapshot_id, run_id, attempt_id, refresh_id, claim_id = [str(uuid.uuid4()) for _ in range(5)]
+    stamp = ANCHOR
+    preview_fetch = stamp - timedelta(hours=6)
+    snapshot_id, run_id = str(uuid.uuid4()), str(uuid.uuid4())
     store.record_match_report_observations(
         competition_id="9", season_id="2026-2027", fetched_at=stamp, raw_key="raw/first",
         records=[{"match_id": "12345678", "match_url": "https://fbref.com/en/matches/12345678/Test", "completed": True}],
@@ -90,28 +97,49 @@ def test_daily_readiness_requires_both_generic_and_typed_completion(isolated_pos
         cursor.execute("""INSERT INTO fbref_control.page_frontier(target_id,page_kind,canonical_url,refresh_policy)
             VALUES ('fbref:match:12345678','match','https://fbref.com/en/matches/12345678/Test','current_completed_once')""")
         cursor.execute("INSERT INTO fbref_control.crawl_run(run_id,run_type,request_limit,byte_limit) VALUES (%s,'current',100,5000)", (run_id,))
-        cursor.execute("""INSERT INTO fbref_control.fetch_attempt(
-            attempt_id,run_id,target_id,logical_refresh_id,attempt_number,claim_token,lease_epoch,status,http_status,content_hash,finished_at)
-            VALUES (%s,%s,'fbref:match:12345678',%s,1,%s,1,'succeeded',200,'abc',%s)""", (attempt_id,run_id,refresh_id,claim_id,stamp))
-        cursor.execute("""INSERT INTO fbref_control.fetch_attempt(
-            attempt_id,run_id,target_id,logical_refresh_id,attempt_number,claim_token,lease_epoch,status,http_status,content_hash,finished_at)
-            VALUES (%s,%s,'fbref:match:12345678',%s,1,%s,2,'succeeded',200,'earlier',%s)""",
-            (str(uuid.uuid4()), run_id, str(uuid.uuid4()), str(uuid.uuid4()), stamp - timedelta(hours=1)))
-        cursor.execute("""INSERT INTO fbref_control.dataset_manifest(target_id,content_hash,parser_version,dataset,availability,
-            parse_status,persistence_status,validation_status,completed_at)
-            VALUES ('fbref:match:12345678','abc','v1','__page__','available','succeeded','succeeded','succeeded',%s)""", (stamp,))
-        query = READINESS_SQL.format(cutoff="2026-10-09T00:00:00+00:00")
-        cursor.execute(query)
-        result = cursor.fetchone()
-        data = result[next(iter(result))]
-        assert json.loads(data)[0]["bronze_ready_at"] is None
-        assert datetime.fromisoformat(json.loads(data)[0]["first_fetch_at"]) == stamp - timedelta(hours=1)
-        cursor.execute("""INSERT INTO fbref_control.dataset_manifest(target_id,content_hash,parser_version,dataset,availability,
-            parse_status,persistence_status,validation_status,completed_at)
-            VALUES ('fbref:match:12345678','abc','v1','typed:__complete__','available','succeeded','succeeded','succeeded',%s)""", (stamp,))
-        cursor.execute(query)
-        result = cursor.fetchone()
-        assert json.loads(result[next(iter(result))])[0]["bronze_ready_at"] is not None
+
+        def fetch(content_hash, at):
+            cursor.execute("""
+                INSERT INTO fbref_control.fetch_attempt(
+                    attempt_id,run_id,target_id,logical_refresh_id,attempt_number,claim_token,
+                    lease_epoch,status,http_status,content_hash,finished_at)
+                VALUES (%s,%s,'fbref:match:12345678',%s,1,%s,1,'succeeded',200,%s,%s)
+            """, (str(uuid.uuid4()), run_id, str(uuid.uuid4()), str(uuid.uuid4()), content_hash, at))
+
+        def complete(content_hash, dataset, at, marker=None):
+            cursor.execute("""
+                INSERT INTO fbref_control.dataset_manifest(
+                    target_id,content_hash,parser_version,dataset,availability,parse_status,
+                    persistence_status,validation_status,completed_at,error_message)
+                VALUES ('fbref:match:12345678',%s,'v1',%s,'available',
+                        'succeeded','succeeded','succeeded',%s,%s)
+            """, (content_hash, dataset, at, marker))
+
+        def check_report(expected_ready, expected_status):
+            cursor.execute(READINESS_SQL.format(cutoff=AS_OF.isoformat()))
+            payload, = cursor.fetchone().values()
+            data = snapshot()
+            data["readiness"] = json.loads(payload)
+            result = report(data)
+            match, = result["matches"]
+            assert match["first_fetch_at"] == preview_fetch.isoformat()
+            assert match["bronze_ready_at"] == (expected_ready.isoformat() if expected_ready else None)
+            assert match["status"] == expected_status
+            assert result["milestone_day_pass"] is (expected_status == "on_time")
+
+        fetch("preview", preview_fetch)
+        complete("preview", "__page__", stamp + timedelta(hours=1))
+        complete("preview", "typed:__complete__", stamp + timedelta(hours=1))
+        check_report(None, "late")
+        fetch("preview", stamp + timedelta(hours=2))
+        check_report(None, "late")
+
+        # A scored page can qualify without lineup/event rows in a #2057 competition.
+        fetch("scored", stamp + timedelta(hours=3))
+        complete("scored", "typed:__complete__", stamp + timedelta(hours=4), "scored_match_requires_rows")
+        check_report(None, "late")  # The generic completion still belongs to the preview.
+        complete("scored", "__page__", stamp + delay)
+        check_report(stamp + delay, status)
 
 
 def test_postponed_kickoff_uses_latest_source_read_and_old_replay_cannot_undo_it(isolated_postgres_uri):

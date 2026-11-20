@@ -2394,6 +2394,13 @@ def test_match_parse_wave_batches_writers_and_completes_each_lease(tmp_path):
             f"observation_complete:{record.target_id}"
         )
         assert availability < typed_complete < page_complete < observation_complete
+        completion, = [
+            m for m in control.manifests
+            if m["target_id"] == record.target_id and m["dataset"] == "typed:__complete__"
+        ]
+        assert (completion["content_hash"], completion["error_message"]) == (
+            record.content_hash, "scored_match_requires_rows",
+        )
 
 
 @pytest.mark.parametrize("writer_name", ["generic", "typed"])
@@ -16718,7 +16725,10 @@ def test_competition_source_gap_persists_scored_match_without_refetch(
     assert typed.calls
     assert control.frontier[records[0].target_id]["state"] == "fetched"
     manifests = [m for m in control.manifests if m["target_id"] == records[0].target_id]
-    assert any(m["dataset"] == "typed:__complete__" for m in manifests)
+    completion, = [m for m in manifests if m["dataset"] == "typed:__complete__"]
+    assert (completion["content_hash"], completion["error_message"]) == (
+        records[0].content_hash, "scored_match_requires_rows",
+    )
     for dataset in ("typed:match_events", "typed:lineups"):
         assert any(
             m["dataset"] == dataset

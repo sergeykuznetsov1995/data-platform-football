@@ -2335,7 +2335,10 @@ class FotMobRepository:
                         f"{missing_keys}"
                     )
                 keys = list(natural_key)
-                quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                column_names = [
+                    '"' + str(column).replace('"', '""') + '"' for column in columns
+                ]
+                quoted_columns = ", ".join(column_names)
                 partition = ", ".join(f'r."{key}"' for key in keys)
                 types = ", ".join(
                     "'" + item.strip().replace("'", "''") + "'"
@@ -2413,31 +2416,57 @@ class FotMobRepository:
                           AND status IN ('success', 'not_modified')
                     )
                     """
+                projection = "r.*"
                 membership = ""
+                membership_order = ""
                 if table == "fotmob_match_payloads":
                     if not trino.table_exists(self.schema, "fotmob_matches"):
                         raise ValueError("payload current requires the matches table")
-                    membership = f"""
-                        WHERE EXISTS (
-                            SELECT 1
-                            FROM {self.catalog}.{self.schema}.fotmob_matches_current m
-                            WHERE CAST(m.competition_id AS VARCHAR) =
-                                  CAST(r.competition_id AS VARCHAR)
-                              AND m.source_season_key = r.source_season_key
-                              AND CAST(m.match_id AS VARCHAR) = CAST(r.match_id AS VARCHAR)
-                        )
+                    committed_cte += f""", calendar_keys AS (
+                        SELECT CAST(competition_id AS VARCHAR) AS competition_id,
+                               CAST(match_id AS VARCHAR) AS match_id,
+                               array_agg(source_season_key) AS seasons
+                        FROM {self.catalog}.{self.schema}.fotmob_matches_current
+                        GROUP BY 1, 2
+                    )"""
+                    membership = """
+                        JOIN calendar_keys m
+                          ON m.competition_id = CAST(r.competition_id AS VARCHAR)
+                         AND m.match_id = CAST(r.match_id AS VARCHAR)
+                         AND contains(m.seasons, r.source_season_key)
+                        CROSS JOIN UNNEST(m.seasons) AS d(season_key)
+                        WHERE d.season_key = r.source_season_key
+                           OR (strpos(r.source_season_key, ' - ') = 0 AND d.season_key IN (
+                               r.source_season_key || ' - Apertura',
+                               r.source_season_key || ' - Clausura'))
+                           OR (strpos(d.season_key, ' - ') = 0 AND r.source_season_key IN (
+                               d.season_key || ' - Apertura', d.season_key || ' - Clausura'))
                     """
+                    projection = ", ".join(
+                        f"d.season_key AS {name}"
+                        if name.lower() == '"source_season_key"' else f"r.{name}"
+                        for name in column_names
+                    )
+                    partition = ", ".join(
+                        "d.season_key" if key.lower() == "source_season_key" else f'r."{key}"'
+                        for key in keys
+                    )
+                    # Historical copies of one batch can have different physical seasons.
+                    membership_order = (
+                        "(d.season_key = r.source_season_key) DESC, r.source_season_key,"
+                    )
                 trino._execute(
                     f"""
                     CREATE OR REPLACE VIEW {self.catalog}.{self.schema}.{view} AS
                     WITH {committed_cte}, ranked AS (
-                        SELECT r.*,
+                        SELECT {projection},
                                ROW_NUMBER() OVER (
                                    PARTITION BY {partition}
                                    ORDER BY
                                             CASE WHEN c.parser_version =
                                                       '{safe_parser_version}'
                                                  THEN 1 ELSE 0 END DESC,
+                                            {membership_order}
                                             r._observed_at DESC, r._ingested_at DESC,
                                             r._target_batch_id DESC
                                ) AS _current_rn

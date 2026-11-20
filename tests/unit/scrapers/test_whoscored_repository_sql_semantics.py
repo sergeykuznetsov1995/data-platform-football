@@ -39,7 +39,9 @@ def _connection():
             batch_id VARCHAR, raw_uri VARCHAR, payload_sha256 VARCHAR,
             parser_version VARCHAR, availability_version VARCHAR,
             retry_after TIMESTAMP, attempt_no BIGINT,
-            fetched_at TIMESTAMP, completed_at TIMESTAMP, failure_code VARCHAR
+            fetched_at TIMESTAMP, completed_at TIMESTAMP, failure_code VARCHAR,
+            _ingested_at TIMESTAMP GENERATED ALWAYS AS (fetched_at),
+            _batch_id VARCHAR GENERATED ALWAYS AS (batch_id)
         )
         """
     )
@@ -359,6 +361,19 @@ def test_history_unknown_stage_probes_second_game_at_once():
     assert _candidates(con, lane="history") == []
 
 
+def _published_history_schedule(con, count):
+    con.execute("""CREATE VIEW iceberg.bronze.whoscored_schedule AS
+        SELECT *, 'published' AS _scope_batch_id FROM iceberg.bronze.whoscored_schedule_current""")
+    con.execute("""CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest (
+        league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR,
+        dataset_states_json VARCHAR, completed_at TIMESTAMP, _ingested_at TIMESTAMP, batch_id VARCHAR,
+        entity_group VARCHAR DEFAULT 'season'
+    )""")
+    con.execute("""INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest
+        (league, season, state, entity_counts_json, batch_id) VALUES (?, ?, 'success', ?, 'published')""",
+        [LEAGUE, SEASON, '{"whoscored_schedule":' + str(count) + '}'])
+
+
 def _history_repository(con):
     from unittest.mock import MagicMock
 
@@ -370,17 +385,39 @@ def _history_repository(con):
 
     trino = MagicMock()
     trino.execute_query.side_effect = execute
-    return WhoScoredRepository(writer=MagicMock(), trino=trino)
+    repo = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    # Each call in these SQL tests reads immediately after a fixture mutation.
+    repo.budget = MagicMock()
+    repo.budget.snapshot.side_effect = lambda key, load: load()
+    return repo
+
+
+def test_coverage_takes_checked_stages_from_last_successful_schedule_only():
+    con = _connection()
+    try:
+        _published_history_schedule(con, 0)
+        insert = """INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'season')"""
+        for batch, state, counts, checked in (
+            ("a", "success", '{"whoscored_schedule":0}', '[1]'),
+            ("b", "success", '{"whoscored_schedule":0}', '[2]'),
+            ("c", "retryable", '{"whoscored_schedule":0}', '[3]'),
+            ("d", "success", '{"other":0}', '[4]'),
+        ):
+            con.execute(insert, [LEAGUE, SEASON, state, counts, '{"__checked_stage_ids__":' + checked + '}',
+                                 NOW, NOW, batch])
+        coverage = _history_repository(con).history_coverage()[(LEAGUE, SEASON)]
+        assert coverage["checked_stage_ids"] == (2,)
+        assert coverage["stage_ids"] == ()
+    finally:
+        con.close()
 
 
 def test_history_unknown_stage_resolves_without_cooldown():
     from scrapers.whoscored.history_state import first_wave_ready
 
     con = _connection()
-    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+    _published_history_schedule(con, 2)
     _game(con, 1, 10, 60)
     _game(con, 2, 10, 50)
     _attempt(con, 2, "not_available", 1)
@@ -406,10 +443,7 @@ def test_single_game_stage_is_resolved_by_one_negative():
     from scrapers.whoscored.history_state import first_wave_ready
 
     con = _connection()
-    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+    _published_history_schedule(con, 2)
     _game(con, 1, 10, 60)  # the stage's only played game, e.g. a play-off final
     _game(con, 2, 20, 50)
     _attempt(con, 2, "success", 40)
@@ -425,10 +459,7 @@ def test_single_game_stage_is_resolved_by_one_negative():
 
 def test_history_coverage_does_not_close_deferred_or_unknown_matches():
     con = _connection()
-    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                "(?, ?, 'success', '{\"whoscored_schedule\":5}')", [LEAGUE, SEASON])
+    _published_history_schedule(con, 5)
     _game(con, 99, 10, 30)
     _attempt(con, 99, "success", 0.5)
     _game(con, 1, 10, 20)
@@ -445,7 +476,8 @@ def test_history_coverage_does_not_close_deferred_or_unknown_matches():
     result = repository.history_coverage()[(LEAGUE, SEASON)]
     result["stage_ids"] = tuple(sorted(result["stage_ids"]))
     assert result == dict(schedule_ready=True, closeable=2, closed=1,
-                          unknown_stages=0, closed_day=1, stage_ids=(10, 20, 30, 40), deferred_stages=1)
+                      unknown_stages=0, closed_day=1, stage_ids=(10, 20, 30, 40),
+                      checked_stage_ids=(), deferred_stages=1)
 
 
 def test_history_profiles_do_not_refresh_old_valid_success():
@@ -501,10 +533,7 @@ def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup(a
     from scrapers.whoscored.history_state import first_wave_ready
 
     con = _connection()
-    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [LEAGUE, SEASON])
+    _published_history_schedule(con, 2)
     _game(con, 1, 10, 20)
     _attempt(con, 1, "success", 1)
     _game(con, 2, 20, age, lineup=False)
@@ -526,10 +555,7 @@ def test_unprobeable_stage_allows_next_wave_and_becomes_probeable_after_lineup(a
 def test_history_deferred_age_window_preserves_coverage(lineup, age, deferred):
     con = _connection()
     try:
-        con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                    "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-        con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                    "(?, ?, 'success', '{\"whoscored_schedule\":4}')", [LEAGUE, SEASON])
+        _published_history_schedule(con, 4)
         _game(con, 1, 10, 40)
         _attempt(con, 1, "success", 0.5)
         _game(con, 2, 10, age, lineup=lineup)
@@ -665,10 +691,7 @@ def test_previous_parser_success_with_raw_stays_covered_legacy_does_not():
     """#1483 round 2: a v8 success is a reparse candidate, not a coverage gap."""
 
     con = _connection()
-    con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
-                "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
-    con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
-                "(?, ?, 'success', '{\"whoscored_schedule\":3}')", [LEAGUE, SEASON])
+    _published_history_schedule(con, 3)
     for game_id in (1, 2, 3):
         _game(con, game_id, 10, 20)
         _attempt(con, game_id, "success", 19)
@@ -711,3 +734,49 @@ def test_profile_parser_replays_are_latest_raw_backed_attempts_of_another_parser
     repository.trino.table_exists.return_value = True
 
     assert repository.list_profile_parser_replays([1, 2, 3, 4, 5, 6]) == {1, 5}
+
+
+def test_history_coverage_only_counts_visible_schedule_rows_and_scans_each_input_once():
+    con = _connection()
+    try:
+        _published_history_schedule(con, 2)
+        for game in (1, 2, 3):
+            _game(con, game, game, 15)
+        con.execute("""CREATE OR REPLACE VIEW iceberg.bronze.whoscored_schedule AS
+            SELECT *, CASE WHEN game_id=2 THEN 'orphan' WHEN game_id=3 THEN NULL
+                           ELSE 'published' END AS _scope_batch_id
+            FROM iceberg.bronze.whoscored_schedule_current""")
+        repository = _history_repository(con)
+        summary = repository.history_coverage()[(LEAGUE, SEASON)]
+        assert (summary["stage_ids"], summary["closeable"]) == ((1,), 1)
+        sql = repository.trino.execute_query.call_args.args[0]
+        tables = [t.name for t in sqlglot.parse_one(sql, read="trino").find_all(sqlglot.exp.Table) if t.db]
+        assert sorted(tables) == ["whoscored_match_ingest_manifest", "whoscored_schedule",
+                                  "whoscored_scope_ingest_manifest"]
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        (None, ()),
+        ("{}", ()),
+        ('{"__checked_stage_ids__":null}', ()),
+        ("broken historic payload", ()),
+        ('{"__checked_stage_ids__":[null,4,"5",false]}', (4, 5)),
+        ('{"__checked_stage_ids__":"42"}', ()),
+    ],
+)
+def test_history_checked_stages_require_positive_evidence(states, expected):
+    con = _connection()
+    try:
+        _published_history_schedule(con, 0)
+        con.execute(
+            "UPDATE iceberg.bronze.whoscored_scope_ingest_manifest SET dataset_states_json = ?",
+            [states],
+        )
+        row = _history_repository(con).history_coverage()[(LEAGUE, SEASON)]
+        assert row["checked_stage_ids"] == expected
+    finally:
+        con.close()

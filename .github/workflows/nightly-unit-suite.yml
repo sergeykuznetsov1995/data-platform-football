@@ -1,12 +1,10 @@
 name: Nightly unit suite
 
-# Сигнал, не гейт (#2244): ночной полный unit suite на master ловит кросс-регрессию,
-# накопленную за день (PR-CI гоняет полный suite на merge-ref каждого PR, но быстрые
-# последовательные merge могут пройти без пересечения), и flakes на зелёном master.
-# Workflow НЕ входит в required checks (branch protection = unit-suite) и ничего
-# не блокирует; при падении открывает/комментирует одну issue с label
-# nightly-unit-suite. Push-триггер не нужен: ci.yml уже гоняет полный suite на
-# каждый push в master. Расписание работает только с default-ветки.
+# Ночной полный suite на master ловит кросс-регрессию и flakes. PR/push CI использует
+# diff-selector и поэтому не заменяет этот полный сигнал. Workflow не входит в required
+# checks и не блокирует доставку; при падении открывает/комментирует одну issue.
+# Пропуск не является PASS: следующий рабочий цикл проверяет его по правилам TESTING.md.
+# Push-триггер не нужен: ci.yml проверяет выбранные тесты на точной master-ревизии.
 
 on:
   schedule:

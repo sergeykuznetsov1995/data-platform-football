@@ -200,6 +200,12 @@ class CurrentSQL:
             f"SELECT competition_id, source_season_key, match_id FROM {table}_current ORDER BY 1,2,3"
         ).fetchall()
 
+    def payload_lineage(self):
+        return self.db.execute(
+            "SELECT competition_id, source_season_key, match_id, _target_batch_id "
+            "FROM fotmob_match_payloads_current ORDER BY 1,2,3"
+        ).fetchall()
+
 
 def test_current_recovers_last_good_through_zero_304_and_preserves_tombstones():
     db = CurrentSQL()
@@ -241,6 +247,83 @@ def test_payload_membership_follows_calendar_with_independent_batch_ids():
     db.rows("04-other", [2], season="2025")
     repo.ensure_current_views()
     assert db.current("fotmob_match_payloads") == [("10618", "2026", "1")]
+
+
+def test_current_payloads_share_only_direct_parent_and_phase_memberships():
+    db = CurrentSQL()
+    cid, year = "71001", "2026"
+    apertura, clausura = "2026 - Apertura", "2026 - Clausura"
+    scopes = [
+        (cid, year), (cid, apertura), (cid, clausura), (cid, "2025"),
+        (cid, "2026 - Apertura Extra"), ("71002", "2025 - Apertura"),
+    ]
+    for index, (comp, season) in enumerate(scopes, 1):
+        batch = f"{index:02d}-calendar"
+        db.manifest(batch, cid=comp, season=season)
+        db.rows(batch, range(11, 15), cid=comp, season=season)
+    for mid, source in [(11, year), (12, apertura), (13, clausura), (14, "2025")]:
+        batch = f"10-card-{mid}"
+        db.manifest(
+            batch, kind="match", entity=str(mid), cid=cid, season=source,
+            version=LEGACY_PARSER_VERSION if mid == 11 else PARSER_VERSION,
+        )
+        db.rows(batch, [mid], table="fotmob_match_payloads", cid=cid, season=source)
+
+    FotMobRepository(writer=db).ensure_current_views()
+    assert db.payload_lineage() == sorted(
+        (cid, season, str(mid), f"10-card-{mid}")
+        for mid, seasons in [
+            (11, (year, apertura, clausura)), (12, (year, apertura)),
+            (13, (year, clausura)), (14, ("2025",)),
+        ]
+        for season in seasons
+    )
+
+
+def test_current_payloads_follow_source_and_destination_removal_and_global_tombstone():
+    db = CurrentSQL()
+    cid, year, phase = "71003", "2026", "2026 - Apertura"
+    for batch, season in [("01-year", year), ("02-phase", phase)]:
+        db.manifest(batch, cid=cid, season=season)
+        db.rows(batch, [21, 22], cid=cid, season=season)
+    for mid, source in [(21, phase), (22, year)]:
+        batch = f"03-card-{mid}"
+        db.manifest(batch, kind="match", entity=str(mid), cid=cid, season=source)
+        db.rows(batch, [mid], table="fotmob_match_payloads", cid=cid, season=source)
+
+    FotMobRepository(writer=db).ensure_current_views()
+    both = sorted(
+        (cid, season, str(mid), f"03-card-{mid}")
+        for mid in (21, 22) for season in (year, phase)
+    )
+    assert db.payload_lineage() == both
+
+    db.manifest("04-phase", cid=cid, season=phase)
+    db.rows("04-phase", [23], cid=cid, season=phase)
+    assert db.payload_lineage() == [(cid, year, "22", "03-card-22")]
+    db.manifest("05-phase", cid=cid, season=phase)
+    db.rows("05-phase", [21, 22], cid=cid, season=phase)
+    assert db.payload_lineage() == both
+
+    db.manifest(
+        "06-gone", kind="match", entity="21", cid=cid, season=year, status="not_available"
+    )
+    assert db.payload_lineage() == [
+        (cid, year, "22", "03-card-22"), (cid, phase, "22", "03-card-22"),
+    ]
+
+    # An older exact copy in the same batch wins for its own destination.
+    db.db.execute(
+        "INSERT INTO fotmob_match_payloads VALUES (?, ?, '22', '03-card-22', '01', '01')",
+        (cid, phase),
+    )
+    assert db.db.execute(
+        "SELECT competition_id, source_season_key, match_id, _target_batch_id, _observed_at "
+        "FROM fotmob_match_payloads_current ORDER BY 1,2,3"
+    ).fetchall() == [
+        (cid, year, "22", "03-card-22", "03-card-22"),
+        (cid, phase, "22", "03-card-22", "01"),
+    ]
 
 
 def test_calendar_batch_presence_handles_duplicate_and_null_physical_batch_keys():
