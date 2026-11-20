@@ -135,7 +135,8 @@ def _club_physical_hash(existing: pd.DataFrame) -> str:
     return hashlib.sha256(canonical_json(rows)).hexdigest()
 
 
-def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...]) -> None:
+def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...],
+                      *, replay: bool = False) -> None:
     physical = _rows_by_key(existing)
     for row in rows:
         key = _natural_key(row)
@@ -145,7 +146,8 @@ def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...
                 f'physical read-back differs for club-value key {key}: '
                 f'expected one row, found {len(committed)}')
         changed = tuple(column for column in CLUB_VALUE_COLUMNS
-                        if _canonical_cell(column, row[column]) != committed[0][column])
+                        if (not replay or column not in _IMMUTABLE_EXCLUDED)
+                        and _canonical_cell(column, row[column]) != committed[0][column])
         if changed:
             raise current.CurrentWriteError(
                 f'physical read-back differs for club-value key {key}: ' + ', '.join(changed))
@@ -305,11 +307,13 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
                 if len(stored) > 1:
                     raise current.CurrentWriteError('multiple receipts for one club-value plan')
                 if len(stored) == 1:
-                    _verify_committed(existing, rows)
+                    _verify_committed(existing, rows, replay=True)
                     _validate_existing(existing, rows)
-                    physical = current._read_back(scraper, output, frame, extraction.capture.run_id)
-                    physical['physical_hash'] = _club_physical_hash(existing)
                     stored_values = _receipt_row_values(stored.iloc[0])
+                    physical = {
+                        'table': CLUB_VALUE_TABLE, 'batch_id': stored_values['committed_batch'],
+                        'rows': len(existing), 'physical_hash': _club_physical_hash(existing),
+                    }
                     expected = _receipt_values(
                         extraction, club_id, physical['physical_hash'],
                         stored_values['committed_at'].replace(tzinfo=timezone.utc))

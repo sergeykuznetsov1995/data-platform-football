@@ -176,7 +176,8 @@ def test_writer_returns_per_club_receipts_and_exact_physical_rows(physical):
 def test_identical_replay_is_noop(physical):
     result = extraction(physical)
     first = write(physical, result)
-    repeat = write(physical, result)
+    reparsed = extraction(physical, extracted=EXTRACTED + timedelta(hours=1))
+    repeat = write(physical, reparsed, at=COMMITTED + timedelta(hours=1))
     assert first['plan_sha256'] == repeat['plan_sha256']
     assert first['receipts'][0]['receipt_id'] == repeat['receipts'][0]['receipt_id']
     assert len(business_table(physical)) == 2
