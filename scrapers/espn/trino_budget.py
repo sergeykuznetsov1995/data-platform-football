@@ -59,9 +59,9 @@ def _tokens(sql):
 
 def may_change_data(sql):
     # Only inspect the prefix on the manager path. The cursor classifies the
-    # complete statement once, including large VALUES batches.
+    # complete statement before submission and permits only queries after WITH.
     return next(_tokens(sql), "") not in {
-        "select", "table", "values", "show", "describe", "desc", "explain"
+        "select", "with", "table", "values", "show", "describe", "desc", "explain"
     }
 
 

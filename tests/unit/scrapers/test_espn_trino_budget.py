@@ -190,6 +190,16 @@ def test_final_page_failure_cools_commit_and_preserves_original_error(pair, erro
     assert [t for t, _, _ in driver.submissions] == [0, 5 + expected_wait]
 
 
+def test_manager_with_select_retries_after_final_page_scan_cooldown(pair):
+    first, _, driver, _ = pair
+    sql = "WITH games AS (SELECT * FROM bronze.espn_game) SELECT * FROM games"
+    driver.pages.append(fail_with(RuntimeError("Connection reset by peer")))
+    first.execute_query(sql)
+    assert [(t, query) for t, query, _ in driver.submissions] == [
+        (0, sql), (5 + INTERVAL, sql)
+    ]
+
+
 def test_manager_insert_with_lost_final_page_never_replays(pair):
     first, second, driver, _ = pair
     sql = "INSERT INTO bronze.espn_game VALUES (1)"
