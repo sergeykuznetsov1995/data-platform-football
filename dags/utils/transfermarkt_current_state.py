@@ -661,6 +661,7 @@ class CurrentWork:
 def plan_current_work(
     targets: Iterable[CurrentTarget], cursors: Mapping[str, ScopeCursor], *,
     now: datetime, limit: int = 8, staff_enabled: bool = False,
+    scope_index: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[CurrentWork, ...]:
     """Every due signal first, then a converging cold/continuation queue (#2068).
 
@@ -682,6 +683,7 @@ def plan_current_work(
     resume: list[tuple[tuple[Any, ...], CurrentWork]] = []
     minimum = datetime.min.replace(tzinfo=timezone.utc)
     seen: set[str] = set()
+    scope_index = scope_index or {}
     for target in targets:
         if target.scope_id in seen:
             raise CurrentStateError('duplicate current target')
@@ -693,14 +695,19 @@ def plan_current_work(
         last_work = cursor.last_work_at or minimum
         backing_off = cursor.last_error_at is not None and timestamp - cursor.last_error_at < ERROR_BACKOFF
         rank = (1, cursor.last_error_at) if backing_off else (0, minimum)
-        # A scope backing off from a real error gets no signal work until the
-        # backoff ends; in a portion, signals alternate with the other work.
-        if due and cursor.roster_completed_at is not None and not backing_off:
+        entry = scope_index.get(target.scope_id, {})
+        # Daily detection can supersede a contradicted generation. Keep its
+        # ordinary error rank while allowing those independent observations.
+        if due and cursor.roster_completed_at is not None and (not backing_off or entry.get('last_error_was_mismatch')):
             oldest = min(getattr(cursor, f'{name}_checked_at') or minimum for name in due)
             # A never-successful scope must move behind due healthy scopes
             # after an attempted check, rather than owning datetime.min forever.
             fresh.append(((max(oldest, last_work), oldest, target.cold_priority),
                           CurrentWork(target, 'signals', due)))
+
+        retry_after = entry.get('ordinary_retry_after')
+        if retry_after is not None and timestamp < _time(retry_after):
+            continue
 
         def queue(phase: int, kind: str, order: tuple[Any, ...], checks: tuple[str, ...] = ()) -> None:
             resume.append(((*rank, phase, order), CurrentWork(target, kind, checks)))
