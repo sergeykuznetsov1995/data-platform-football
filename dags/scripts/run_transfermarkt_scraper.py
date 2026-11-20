@@ -275,7 +275,10 @@ ENTITY_SPECS: Dict[str, EntitySpec] = {
         native_reader='read_attendance',
         legacy_reader='',
         outputs=(
-            OutputSpec('attendance', 'transfermarkt_attendance_observations'),
+            OutputSpec(
+                'attendance', 'transfermarkt_attendance_observations',
+                (), ('competition_id', 'edition_id', 'club_id', 'observed_at'),
+            ),
         ),
     ),
 }

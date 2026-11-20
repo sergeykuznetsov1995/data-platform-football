@@ -55,11 +55,12 @@ class TrafficReportError(ValueError):
 # tests; run scripts are not imported here.
 ENTITY_GROUPS = {
     'players': {'players', 'listing', 'participants_api', 'teilnehmer', 'squad', 'current_players',
-                'current_injury', 'squad_memberships', 'player_attribute_observations',
-                'player_contract_observations'},
+                'current_injury', 'current_player_profile', 'squad_memberships',
+                'player_attribute_observations', 'player_contract_observations'},
     'market_value_history': {'market_value_history', 'market_value_points', 'mv_history'},
     'transfers': {'transfers', 'transfer_events'},
     'coaches': {'coaches', 'coach_history', 'coach_profile', 'club_staff', 'coach_profiles', 'coach_stints'},
+    'attendance': {'attendance', 'attendance_observations'},
 }
 _ENTITY_GROUP = {name: group for group, names in ENTITY_GROUPS.items() for name in names}
 

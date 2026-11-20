@@ -91,10 +91,11 @@ _CONTRACT_PROFILE_CAPTURE_LIMIT = 400
 
 
 _ENTITY_LABELS = {
-    'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury', 'current_player_profile', 'attendance'),
+    'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury', 'current_player_profile'),
     'market_value_history': ('market_value_points', 'mv_history'),
     'transfers': ('transfer_events', 'transfers'),
     'coaches': ('coach_history', 'coach_profile', 'club_staff'),
+    'attendance': ('attendance',),
 }
 
 
