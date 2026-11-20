@@ -7,15 +7,17 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import re
 import sqlite3
 import uuid
 from datetime import date
 from pathlib import Path
 
 from .catalog import CLASS_A_TOURNAMENT_IDS, PROBE_SCOPE_SPECS
-from .domain import SeasonFormat
+from .domain import SeasonFormat, base_season_id
 
 CHUNK_SIZE = 25
+FIRST_HISTORY_YEAR = 2015  # Earlier seasons belong to the separate deep backfill (#1494).
 COOLDOWN_SECONDS = 3600
 # Schedule sync covers the entire season; historical lineups rarely change.
 DEFERRED_REFRESH_SECONDS = 24 * 3600
@@ -40,11 +42,27 @@ def share(key: str, workers: int) -> int:
     return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:16], 16) % workers
 
 
+def _history_start_year(season, base: str, today: date) -> int | None:
+    if season.scope.season_format is SeasonFormat.SINGLE_YEAR:
+        return int(base)
+    short_year = int(base[:2])
+    label = re.fullmatch(
+        r"([0-9]{4})\s*[-/]\s*(?:[0-9]{2}|[0-9]{4})", (season.source_label or "").strip()
+    )
+    if label:
+        year = int(label[1])
+        return year if year % 100 == short_year else None
+    # A legacy YY pair alone identifies the most recent such season that could have started.
+    return today.year - (today.year - short_year) % 100
+
+
 def queue(catalog, *, today: date) -> list[dict]:
-    """N/N-1 + explicit gap/probes, then ten years top-five first, then deeper."""
+    """Current seasons and probes first, then authorized history through 2015/16."""
     grouped = {}
     for season in catalog.enabled_scopes():
-        if season.start is not None and season.start > today:
+        if season.start is not None and (
+            season.start > today or season.start.year < FIRST_HISTORY_YEAR
+        ):
             continue
         grouped.setdefault(season.scope.competition_id, []).append(season)
     result = []
@@ -53,17 +71,22 @@ def queue(catalog, *, today: date) -> list[dict]:
         if tid not in CLASS_A_TOURNAMENT_IDS:
             seasons = [s for s in seasons if s.scope.spec in PROBE_SCOPE_SPECS]
         seasons.sort(key=lambda s: s.source_season_id or 0, reverse=True)
-        for depth, season in enumerate(seasons):
+        admitted = 0
+        for season in seasons:
+            label = base_season_id(season.scope.season_id)
+            start_year = _history_start_year(season, label, today)
+            if start_year is None or not FIRST_HISTORY_YEAR <= start_year <= today.year:
+                continue
             if season.source_season_id is None:
                 raise ValueError(f"history requires source_season_id: {season.scope.spec}")
-            label = str(season.scope.season_id).split("-")[0]
-            start_year = (season.start.year if season.start else
-                          int(label) if season.scope.season_format is SeasonFormat.SINGLE_YEAR
-                          else 2000 + int(label[:2]) if len(label) == 4 and label.isdigit()
-                          else None)
-            wave = (1 if depth < 2 or label in {"2025", "2026", "2526"}
-                    or season.scope.spec in PROBE_SCOPE_SPECS else
-                    2 if start_year is not None and 2015 <= start_year <= 2024 else 3)
+            if (admitted < 2 or label in {"2025", "2026", "2526"}
+                    or season.scope.spec in PROBE_SCOPE_SPECS):
+                wave = 1
+            elif start_year <= 2024:
+                wave = 2
+            else:
+                continue
+            admitted += 1
             result.append({"season": season, "wave": wave, "top": tid in TOP_FIVE,
                            "key": season.scope.spec})
     return sorted(result, key=lambda s: (
