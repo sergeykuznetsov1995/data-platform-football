@@ -273,7 +273,46 @@ def test_explicit_definition_change_resets_progress_with_history(registry):
         'reason': 'Новый утверждённый критерий', 'evidence': [proof]}, now=stamp(1))
     record = progress(store, now=stamp(1))
     assert record['series'] == 2 and record['criteria'][0]['progress'] == 0
+    assert store.show('fotmob-1288')['impact_hold'] is False
     assert any(e['kind'] == 'observation' for e in store.history('fotmob-1288'))
+
+
+def test_definition_revision_preserves_impact_hold_until_explicit_change(registry):
+    store, proof = registry
+    record = store.register(spec(required=1), now=stamp())
+    decision = {'expected_series': 1, 'expected_revision': record['revision'],
+                'impact': 'unknown', 'deployed_revision': 'v2',
+                'reason': 'Влияние не установлено', 'evidence': [proof]}
+    store.change('fotmob-1288', decision, now=stamp(1))
+    held = store.show('fotmob-1288')
+    new = spec(required=1)
+    new['issue_body_sha256'] = 'b' * 64
+    revision = {'spec': new, 'expected_revision': held['revision'],
+                'reason': 'Новый утверждённый критерий', 'evidence': [proof]}
+    store.revise('fotmob-1288', revision, now=stamp(1))
+    revised = store.show('fotmob-1288')
+    assert revised['series'] == 2
+    assert revised['impact_hold'] is True
+    assert not revised['definition'].get('metadata', {}).get('close_hold')
+
+    for criterion in ['data', 'cleanup']:
+        store.observe('fotmob-1288', observation(proof, criterion=criterion, series=2), now=stamp(1))
+    row = progress(store, now=stamp(1))
+    assert all(c['status'] == 'pass' for c in row['criteria'])
+    assert row['status'] == 'on_hold'
+    with pytest.raises(AcceptanceError, match='not all acceptance criteria'):
+        store.prepare_close('fotmob-1288', 'b' * 64, now=stamp(1))
+
+    current = store.show('fotmob-1288')
+    with pytest.raises(AcceptanceError, match='stale definition revision'):
+        store.revise('fotmob-1288', revision, now=stamp(1))
+    assert store.show('fotmob-1288') == current
+
+    decision.update(expected_series=current['series'], expected_revision=current['revision'],
+                    impact='unaffected', deployed_revision='v3', reason='Влияние проверено')
+    store.change('fotmob-1288', decision, now=stamp(1))
+    assert store.show('fotmob-1288')['impact_hold'] is False
+    assert progress(store, now=stamp(1))['status'] == 'ready'
 
 
 def test_source_close_hold_survives_successful_results(registry):
