@@ -74,11 +74,29 @@ def test_peak_at_day_open_includes_previous_minute_even_with_no_new_scans():
         scan(2, "2026-01-01T23:59:00.000000001Z"),
         scan(3, stamp(-5)),
     ]
-    assert audit(rows)["tables"][TABLE] == {
+    result = audit(rows)
+    assert result["events"][0]["at"] == stamp(-60)
+    assert result["tables"][TABLE] == {
         "scans": 0,
         "peak_60s": 2,
         "peak_at": stamp(0),
     }
+
+
+@pytest.mark.parametrize("seconds", [-70, -40, 0, 20, 84])
+def test_foreign_generation_inside_the_checkpoint_bracket_invalidates_counts(seconds):
+    foreign = replace(
+        scan(1, stamp(seconds)), gen="3b8181a6-d692-44bf-b1de-1bfbd33dc051"
+    )
+    with pytest.raises(ValueError, match="generation"):
+        audit([], lambda console, physical: physical.append(foreign))
+
+
+def test_foreign_generation_outside_the_checkpoint_bracket_allows_archived_segments():
+    old = replace(scan(1, stamp(-76)), gen="3b8181a6-d692-44bf-b1de-1bfbd33dc051")
+    new = replace(old, at=stamp(91))
+    result = audit([], lambda console, physical: physical.extend([old, new]))
+    assert result["checked_scan_count"] == 0
 
 
 @pytest.mark.parametrize(

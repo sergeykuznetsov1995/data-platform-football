@@ -219,9 +219,13 @@ def qualify(start, end, inventory, console, journal):
     left, right = nanos(first.at), nanos(last.at)
     by_seq = {}
     for row in journal:
-        if row.gen != first.generation:
-            continue
         event_time = nanos(row.at)
+        if row.gen != first.generation:
+            if left <= event_time < right:
+                raise ValueError(
+                    "scan from another coordinator generation inside the evidence bracket"
+                )
+            continue
         if first.produced < row.seq <= last.produced:
             if not left <= event_time < right or row.table not in inventory:
                 raise ValueError("scan outside the bracket or table inventory")
