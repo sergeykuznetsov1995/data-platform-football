@@ -154,6 +154,21 @@ def test_multi_page_unions_clubs_and_preserves_each_page_lineage():
     assert by_club['631'].source_capture_id == 'capture-page_2.html'
 
 
+def test_multi_page_snapshot_separates_observation_from_page_capture_times():
+    first, second = multi_pages()
+    later = '2026-11-20T12:00:05+00:00'
+    second = replace(second, captured_at=later)
+    result = parse_attendance(
+        [first, second], start_url=START, competition_id='GB1', edition_id=2025,
+        observed_at=first.captured_at,
+    )
+    assert {row.observed_at for row in result.rows} == {CAPTURED}
+    assert {row.captured_at for row in result.rows} == {CAPTURED, later}
+    assert {row.source_capture_id for row in result.rows} == {
+        'capture-page_1.html', 'capture-page_2.html',
+    }
+
+
 def test_multi_page_requires_saved_next_page():
     with pytest.raises(AttendanceParseError, match='pagination_page_missing'):
         parse_attendance([multi_pages()[0]], start_url=START, competition_id='GB1', edition_id=2025)

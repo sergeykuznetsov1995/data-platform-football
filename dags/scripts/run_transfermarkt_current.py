@@ -1911,11 +1911,9 @@ class _Scope:
             result = parse_attendance(
                 pages, start_url=start_url,
                 competition_id=self.target.competition_id, edition_id=self.target.edition_id,
+                observed_at=pages[0].captured_at,
             )
-            observation_times = {page.captured_at for page in pages}
-            if len(observation_times) != 1:
-                raise CurrentPortionError('attendance pages do not share one observation time')
-            observed_at = observation_times.pop()
+            observed_at = pages[0].captured_at
             run_id = 'tm-attendance-' + hashlib.sha256(json.dumps([
                 self.target.scope_id, observed_at, final,
             ]).encode()).hexdigest()[:32]

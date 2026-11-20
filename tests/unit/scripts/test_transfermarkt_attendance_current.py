@@ -120,9 +120,11 @@ def test_writer_failure_keeps_pending_and_recovers(offline):
 def test_multi_page_capture_uses_saved_pages_and_one_observation(offline):
     start = 'https://www.transfermarkt.com/gb1/besucherzahlen/wettbewerb/GB1/saison_id/2026'
     second = start + '?page=2'
-    offline.attendance_pages = lambda url: (
-        attendance_page(('10',), next_url=second) if url == start else attendance_page(('20',))
-    )
+    def pages(url):
+        offline.clock.advance(1)
+        return attendance_page(('10',), next_url=second) if url == start else attendance_page(('20',))
+
+    offline.attendance_pages = pages
     writer, calls = attendance_writer_for(offline)
     offline.run('multi-page', attendance_writer=writer)
     assert len(calls) == 1
@@ -131,6 +133,7 @@ def test_multi_page_capture_uses_saved_pages_and_one_observation(offline):
     assert {row.club_id for row in extraction.result.rows} == {'10', '20'}
     assert len(attendance_calls(offline)) == 2
     assert len({row.observed_at for row in extraction.result.rows}) == 1
+    assert len({row.captured_at for row in extraction.result.rows}) == 2
 
 
 def test_old_cursor_migrates_additive_attendance_fields_without_losing_resume():
