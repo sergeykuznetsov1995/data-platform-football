@@ -7,8 +7,6 @@ from dataclasses import dataclass, replace
 import logging
 from typing import Iterable, Literal, Sequence
 
-from trino.exceptions import TrinoConnectionError
-
 from scrapers.base.trino_manager import TrinoAmbiguousWriteError
 
 from . import bronze_writer, ready_replace, recheck, wave
@@ -56,7 +54,11 @@ def _contains_error(exc: BaseException, types: tuple[type[BaseException], ...]) 
 def ambiguous_write(exc: BaseException, *, journal_write: bool = False) -> bool:
     """Raw journal INSERTs bypass the writer that marks ambiguous commits."""
     if journal_write:
-        return _contains_error(exc, (TrinoAmbiguousWriteError, TrinoConnectionError, TimeoutError))
+        from .trino_manager import AMBIGUOUS_TRANSPORT_ERRORS
+
+        return _contains_error(
+            exc, (TrinoAmbiguousWriteError, TimeoutError, *AMBIGUOUS_TRANSPORT_ERRORS)
+        )
     return _contains_error(exc, (TrinoAmbiguousWriteError,))
 
 

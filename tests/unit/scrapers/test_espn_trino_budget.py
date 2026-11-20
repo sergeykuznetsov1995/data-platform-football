@@ -4,8 +4,12 @@ import multiprocessing
 import os
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from requests import ReadTimeout
+from trino.client import TrinoQuery
+from trino.exceptions import Http502Error, Http503Error, Http504Error, TrinoConnectionError
 
 from scrapers.base import trino_manager as base
 from scrapers.espn import trino_budget
@@ -209,6 +213,65 @@ def test_manager_insert_with_lost_final_page_never_replays(pair):
     assert len(driver.submissions) == len(driver.connections) == 1
     second._execute(sql)
     assert [t for t, _, _ in driver.submissions] == [0, 5 + INTERVAL + WRITE_TIMEOUT]
+
+
+def test_merge_final_response_timeout_surfaces_driver_ambiguity(pair):
+    first, _, driver, _ = pair
+    sql = "MERGE INTO bronze.a t USING bronze.b s ON t.id=s.id WHEN MATCHED THEN DELETE"
+    request = Mock()
+    request.get.side_effect = ReadTimeout("response deadline exceeded")
+    driver.pages.append(TrinoQuery(request, sql).fetch)
+
+    with pytest.raises(base.TrinoAmbiguousWriteError) as caught:
+        first._execute_committing(sql)
+
+    request.get.assert_called_once()
+    cause = caught.value.__cause__
+    assert isinstance(cause, TrinoConnectionError)
+    assert "failed to fetch: response deadline exceeded" in str(cause)
+    assert [query for _, query, _ in driver.submissions] == [sql]
+
+
+@pytest.mark.parametrize("error_type", [Http502Error, Http503Error, Http504Error])
+def test_mutation_gateway_failure_is_ambiguous(pair, error_type):
+    first, _, driver, _ = pair
+    sql = "INSERT INTO bronze.espn_game VALUES (1)"
+    error = error_type("gateway unavailable")
+    driver.pages.append(fail_with(error))
+
+    with pytest.raises(base.TrinoAmbiguousWriteError) as caught:
+        first._execute(sql)
+
+    assert caught.value.__cause__ is error
+    assert [query for _, query, _ in driver.submissions] == [sql]
+
+
+@pytest.mark.parametrize(("sql", "error"), [
+    ("SELECT * FROM bronze.a", TrinoConnectionError("response deadline exceeded")),
+    ("DELETE FROM bronze.a", ValueError("response deadline exceeded")),
+])
+def test_read_or_nontransport_failure_keeps_ordinary_error(pair, sql, error):
+    first, _, driver, _ = pair
+    driver.pages.append(fail_with(error))
+
+    with pytest.raises(base.TrinoError) as caught:
+        first._execute(sql)
+
+    assert type(caught.value) is base.TrinoError
+    assert caught.value.__cause__ is error
+    assert [query for _, query, _ in driver.submissions] == [sql]
+
+
+def test_mutation_probe_failure_is_ordinary_before_submission(pair, monkeypatch):
+    first, _, driver, _ = pair
+    monkeypatch.setattr(first, "_CONNECT_RETRIES", 1)
+    monkeypatch.setattr(Cursor, "fetchall", Mock(side_effect=TrinoConnectionError("probe failed")))
+
+    with pytest.raises(base.TrinoError, match="probe failed") as caught:
+        first._execute("INSERT INTO bronze.a VALUES (1)")
+
+    assert type(caught.value) is base.TrinoError
+    assert driver.submissions == []
 
 
 def test_manager_committing_retries_only_definite_rejection(pair, monkeypatch):

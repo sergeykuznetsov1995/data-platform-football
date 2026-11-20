@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from trino.exceptions import TrinoConnectionError, TrinoUserError
+from trino.exceptions import (
+    Http502Error, Http503Error, Http504Error, TrinoConnectionError, TrinoUserError,
+)
 
 from scrapers.base.trino_manager import TrinoAmbiguousWriteError
 from scrapers.espn import bronze_writer, grouped_wave as grouped, ready_replace, recheck, wave
@@ -332,7 +334,8 @@ def test_journal_retry_uses_receipted_bronze_and_actual_decisions(group, monkeyp
     assert group.calls == ["raw", "raw", "raw", ("write", [("c", 2024)]), "requests"]
 
 
-def test_recheck_insert_losing_final_page_is_terminal(group, monkeypatch):
+@pytest.mark.parametrize("error_type", [TrinoConnectionError, Http502Error, Http503Error, Http504Error])
+def test_recheck_insert_losing_final_page_is_terminal(group, monkeypatch, caplog, error_type):
     provide_matches(group, monkeypatch, [stored("a", 2024, 17), stored("b", 2024, 17)])
     summary = SimpleNamespace(disposition=SimpleNamespace(value="captured"))
     monkeypatch.setattr(
@@ -340,9 +343,10 @@ def test_recheck_insert_losing_final_page_is_terminal(group, monkeypatch):
         lambda *args, **kwargs: wave._Again(summary, object(), recheck.SAME, None, None),
     )
     statements = []
+    failure = error_type("lost final recheck page")
 
     def lose_final_page():
-        raise TrinoConnectionError("response connection reset")
+        raise failure
 
     group.conn.cursor = lambda: SimpleNamespace(
         execute=statements.append, fetchall=lose_final_page, close=lambda: None,
@@ -355,13 +359,15 @@ def test_recheck_insert_losing_final_page_is_terminal(group, monkeypatch):
     assert raised.value.no_retry
     journalled, peer = raised.value.outcomes
     assert journalled.state == wave.RED and journalled.matches == 1
-    assert "response connection reset" in journalled.first_error
+    assert "lost final recheck page" in journalled.first_error
+    assert any(record.exc_info and record.exc_info[1] is failure for record in caplog.records)
     assert peer.state == wave.GREEN and peer.matches == 1
 
 
-def test_read_connection_error_with_ambiguous_write_message_is_retryable(group, monkeypatch):
+@pytest.mark.parametrize("error_type", [TrinoConnectionError, Http502Error, Http503Error, Http504Error])
+def test_read_transport_error_with_ambiguous_write_message_is_retryable(group, monkeypatch, error_type):
     def read(sql, params):
-        raise TrinoConnectionError("ambiguous write")
+        raise error_type("ambiguous write")
 
     monkeypatch.setattr(group.trino, "execute_query", read)
     with pytest.raises(grouped.GroupRunError) as raised:
