@@ -1,0 +1,56 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -2139,40 +2139,20 @@
+             f"(манифесты v2 за 24 ч), {native_txt}; последний прогон {last_run}, {idle}{flag}"]
+
+
+-# #1395: строка измерителя вехи 1 и итог ежедневного DQ bronze Transfermarkt. DQ пишет
+-# daily-dq/<день МСК>.json в контуре TM (≈07:03 МСК); берём последний файл. Измеритель охвата и
+-# свежести читает журнал режима сигнала #1393 (ops.transfermarkt_current_checks_v1) — пока режим
+-# не включён, таблицы нет и охват не измеряется (решение владельца 17.10.2026: строку добавить).
+-TM_DQ_DIR = "/opt/airflow/logs/transfermarkt-native-v2/daily-dq"
+-
+-
++# #1395. Одна строка за предыдущие московские сутки из штатного CLI Transfermarkt.
+ def transfermarkt_measure_dq():
+-    """Измеритель вехи 1 (охват/свежесть, #1393) и последний полный DQ bronze: статус, красные проверки."""
+-    out = run("docker exec transfermarkt-airflow-scheduler python -c \"import glob,json;"
+-              f"f=sorted(glob.glob('{TM_DQ_DIR}/20*.json'))[-1];d=json.load(open(f));"
+-              "print(json.dumps({k:d.get(k) for k in ('day_msk','completed','status','errors')}))\"", timeout=60)
+-    try:
+-        dq = json.loads(out.strip().splitlines()[-1])
+-    except (ValueError, IndexError):
+-        dq = None
+-    if not dq:
+-        dq_txt, flag = "DQ bronze не прочитан ⚠️", "⚠️"
+-    elif not dq.get("completed"):
+-        dq_txt, flag = f"DQ bronze {dq.get('day_msk')}: неполный (UNKNOWN)", "⚠️"
+-    else:
+-        errs = sorted({re.sub(r"\[.*", "", e).removeprefix("tm_") for e in dq.get("errors") or []})
+-        dq_txt = (f"DQ bronze {dq.get('day_msk')}: {dq.get('status')}, ошибок {len(dq.get('errors') or [])}"
+-                  + (f" ({', '.join(errs[:5])}{', …' if len(errs) > 5 else ''})" if errs else ""))
+-        flag = "✅" if dq.get("status") == "GREEN" else "🔴" if dq.get("status") == "RED" else "⚠️"
+-    journal = _trino_row("SELECT count(*) FROM iceberg.information_schema.tables "
+-                         "WHERE table_schema = 'ops' AND table_name = 'transfermarkt_current_checks_v1'", timeout=60)
+-    if journal is None:
+-        measure = "охват вехи 1 не прочитан (trino) ⚠️"
+-    elif journal[0] in ("", "0"):
+-        measure = "охват вехи 1 не измеряется — режим сигнала #1393 не включён"
+-    else:
+-        measure = "охват вехи 1: журнал есть, подключить daily SELECT (#1395)"
+-    return [f"• {measure}; {dq_txt}{flag}"]
++    output = run(
++        "docker exec --workdir /tmp transfermarkt-airflow-scheduler "
++        "python -B /opt/airflow/dags/scripts/transfermarkt_morning_report.py",
++        timeout=180,
++    )
++    try:
++        summary = json.loads(output)["summary"]
++        if not isinstance(summary, str) or not summary.strip():
++            raise ValueError("empty summary")
++    except (KeyError, TypeError, ValueError):
++        return ["• Transfermarkt: измеритель не прочитан; Bronze DQ UNKNOWN ⚠️"]
++    return ["• " + line for line in summary.splitlines() if line.strip()]
+
+
+ # #1430 (эпик Understat #1424): секция «🟣 Understat» — строка «за сутки» по измерителю #1429,
