@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 # exit serves reliably; the .us mirror carries the same English content but a
 # share of exits cannot reach it, which exhausts a scope's retries.
 _TM_BASE = "https://www.transfermarkt.com"
+_PLAYER_PROFILE_PATH = '/{player_slug}/profil/spieler/{player_id}'
 
 # {club_slug}/kader/verein/{club_id}/saison_id/{year}/plus/1  (the /plus/1
 # variant exposes the wider, detailed squad table — same selector contract
@@ -842,7 +843,58 @@ def contract_status(row):
 
 
 def contract_parser_revision(row):
-    return PARSER_REVISION + '-contracts-v2' if '_contract_status' in row else PARSER_REVISION
+    if "_contract_status" not in row:
+        return PARSER_REVISION
+    source = row.get("_contract_source") or {}
+    if "/profil/spieler/" in (source.get("source_url") or ""):
+        return PARSER_REVISION + "-contracts-v3"
+    return PARSER_REVISION + "-contracts-v2"
+
+
+def _parse_player_contract_profile(html, player_id):
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    canonical = soup.find('link', rel='canonical', href=True)
+    if canonical is None or not re.search(
+            r'/profil/spieler/' + re.escape(str(player_id)) + r'(?:/|$)',
+            urlsplit(canonical['href']).path):
+        return None
+    if soup.find('h1', class_='data-header__headline-wrapper') is None:
+        return None
+
+    club = soup.find('span', class_='data-header__club')
+    link = club.select_one('a[href]') if club is not None else None
+    contract_until = None
+    status = 'unknown'
+    header = next((label for label in soup.find_all('span', class_='data-header__label')
+                   if 'contract expires' in label.get_text(' ', strip=True).rstrip(':').lower()), None)
+    if header is not None:
+        value = header.find('span', class_='data-header__content')
+        if value is not None:
+            text = value.get_text(' ', strip=True)
+            if text and text not in {'-', '–'}:
+                contract_until = _parse_tm_date(text)
+                status = 'ok' if contract_until is not None else 'parse_error'
+    else:
+        for label in soup.find_all('span', class_='info-table__content--regular'):
+            if 'contract expires' not in label.get_text(' ', strip=True).rstrip(':').lower():
+                continue
+            value = label.find_next_sibling('span', class_='info-table__content--bold')
+            if value is None:
+                continue
+            text = value.get_text(' ', strip=True)
+            if text and text not in {'-', '–'}:
+                contract_until = _parse_tm_date(text)
+                status = 'ok' if contract_until is not None else 'parse_error'
+            break
+    return {
+        'player_id': player_id,
+        'current_club_id': _extract_club_id_from_href(link['href']) if link is not None else None,
+        'current_club_name': club.get_text(' ', strip=True) if club is not None else None,
+        'contract_until': contract_until,
+        'contract_status': status,
+    }
 
 
 def squad_replay_matches(html, club_id, rows):
