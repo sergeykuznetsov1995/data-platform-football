@@ -5,9 +5,9 @@ yesterday and today (UTC) from ``all/scoreboard`` (a day with exactly 1000
 events is topped up league by league), compares them with bronze and plans
 only the tournament-seasons with something new: a final without a captured
 Summary, a changed status/score/kickoff, or a known match that left its day.
-Each planned tournament runs on its own (mapped task): Summary of new finals
-(cache-first, one download per match), parse, one batch write.  A failing
-tournament is red with its first error; its neighbours publish.
+Each tournament prepares its new finals independently (cache-first Summary,
+one download per match). The current DAG publishes ready editions together.
+Each tournament retains its own outcome and first error.
 
 A match that left its day is checked through fixed core status and event
 metadata endpoints: status 404 -> ``withdrawn``; a known status and validated
@@ -470,7 +470,7 @@ def bronze_edition_terminal(trino) -> dict[str, dict[int, bool]]:
 
 @dataclass(frozen=True, slots=True)
 class TournamentWork:
-    """One mapped unit: a tournament-season and the matches it must write."""
+    """The planned matches and source context of one tournament-season."""
 
     slug: str
     season_year: int
@@ -1344,6 +1344,16 @@ def _absent_payload(
     )
 
 
+@dataclass(slots=True)
+class PreparedTournament:
+    """Bronze rows and decisions that become reportable after publication."""
+
+    batch: TournamentBatch
+    journal: list[dict[str, Any]]
+    outcome: TournamentOutcome
+    error: Exception | None
+
+
 def run_tournament(
     work: TournamentWork, *, client, trino, conn, run_id: str, task_id: str
 ) -> TournamentOutcome:
@@ -1366,169 +1376,11 @@ def run_tournament(
         raise WavePlanError(work.error)
     failure: BaseException | None = None
     try:
-        competition, edition = work.context()
-        targets = {competition.espn_id: competition}
-        rows: dict[int, tuple[ScheduleRow, RawRef]] = {}
-        for day in work.days:
-            result = _fetch(client, urls.all_scoreboard_day(day), force_refresh=False)
-            by_slug, errors = split_day(result.body, targets, day)
-            if work.slug in errors:
-                raise EspnParseError(errors[work.slug])
-            for row in by_slug[work.slug]:
-                rows[row.event_id] = (row, _raw_ref(result))
-        for day in work.topup_days:
-            result = _fetch(
-                client, urls.league_scoreboard_day(work.slug, day), force_refresh=False
-            )
-            for row in _league_day_rows(result.body, competition, day):
-                rows[row.event_id] = (row, _raw_ref(result))
-        stored = bronze_matches(trino, work.slug, work.season_year, work.event_ids)
-        # A retry of the task (or a rerun of the wave) plans from the same
-        # XCom: a recheck or sample already journalled is not downloaded again.
-        done = recheck.journalled(trino, work.slug, work.season_year, work.rechecks)
-        planned_at = datetime.fromisoformat(work.planned_at) if work.planned_at else None
-
-        payloads: list[MatchPayload] = []
-        summary_errors: list[str] = []
-        journal: list[dict[str, Any]] = []
-        now = datetime.now(timezone.utc)
-
-        def note(event_id: int, kind: str, again: _Again) -> None:
-            journal.append(
-                recheck.recheck_row(
-                    checked_at=now,
-                    run_id=run_id,
-                    slug=work.slug,
-                    season_year=work.season_year,
-                    event_id=event_id,
-                    kind=kind,
-                    before=again.before,
-                    after=again.after,
-                    outcome=again.outcome,
-                )
-            )
-
-        for event_id in work.event_ids:
-            presence = work.presence.get(event_id)
-            known = stored.get(event_id)
-            found = rows.get(event_id)
-            if found is not None and found[0].source_season_year != work.season_year:
-                found = None
-            kind = work.rechecks.get(event_id)
-            if kind is not None and event_id in done:
-                if done[event_id] == recheck.FAILED:
-                    # The failure stays the tournament's on every retry.
-                    summary_errors.append(
-                        f"{kind} of {event_id}: failed in an earlier attempt of this wave"
-                    )
-                if (
-                    presence is None
-                    and event_id not in work.statuses
-                    and (found is None or not _changed(found[0], known, found[1].fetched_at))
-                ):
-                    continue  # The journalled attempt already covered this day state.
-                kind = None
-            if (
-                kind is not None
-                and known is not None
-                and known.summary_captured
-                and (found is None or found[0].played_final)
-            ):
-                if found is not None:
-                    schedule, checked = found[0], found[1].fetched_at
-                else:
-                    schedule = known.schedule_row(competition, edition)
-                    checked = known.status_checked_at
-                again = _summary_again(
-                    client,
-                    known,
-                    schedule,
-                    competition,
-                    edition,
-                    force=True,
-                    planned_at=planned_at,
-                    stamped=kind == recheck.RECHECK and known.rechecked_at is not None,
-                )
-                note(event_id, kind, again)
-                if again.error is not None:
-                    summary_errors.append(f"{kind} of {event_id}: {again.error}")
-                payloads.append(
-                    known.carried(
-                        MatchPayload(
-                            schedule,
-                            again.summary,
-                            again.raw,
-                            status_checked_at=checked,
-                            rechecked_at=now if kind == recheck.RECHECK else None,
-                        )
-                    )
-                )
-                continue
-            if found is None:
-                if known is None:
-                    raise LookupError(f"event {event_id}: neither a day nor bronze has it")
-                payloads.append(
-                    _absent_payload(
-                        client, work, known, competition, edition, presence=presence
-                    )
-                )
-                continue
-            schedule, raw = found
-            if not schedule.played_final:
-                payload = MatchPayload(
-                    schedule, None, raw, presence, status_checked_at=raw.fetched_at
-                )
-            else:
-                captured = known is not None and known.summary_captured
-                if captured:
-                    # Written without it, the match would lose its children:
-                    # a failure raises.
-                    again = _summary_again(
-                        client, known, schedule, competition, edition, force=False
-                    )
-                    if again.new_body:
-                        note(event_id, recheck.REFRESH, again)
-                    payloads.append(
-                        known.carried(
-                            MatchPayload(
-                                schedule,
-                                again.summary,
-                                again.raw,
-                                status_checked_at=raw.fetched_at,
-                            )
-                        )
-                    )
-                    continue
-                try:
-                    result = _fetch(client, urls.summary(work.slug, event_id), force_refresh=False)
-                except AllOriginsBlocked:
-                    raise
-                except _STATUS_ERRORS as exc:
-                    # The match is the failure unit (#1505): its row lands
-                    # without Summary (pending), so the meter counts it as a
-                    # miss instead of losing it from the denominator.
-                    summary_errors.append(f"summary of {event_id}: {type(exc).__name__}: {exc}")
-                    payload = MatchPayload(
-                        schedule, None, raw, presence, status_checked_at=raw.fetched_at
-                    )
-                else:
-                    parsed = parse_summary(
-                        result.body, competition=competition, edition=edition, event=schedule
-                    )
-                    payload = MatchPayload(
-                        schedule, parsed, _raw_ref(result), status_checked_at=raw.fetched_at
-                    )
-            payloads.append(known.carried(payload) if known is not None else payload)
-
-        # Bronze rows never point at a raw body that is not written yet.
+        prepared = prepare_tournament(work, client=client, trino=trino, run_id=run_id)
         client.flush()
-        write_tournament_batch(
-            TournamentBatch(work.slug, work.season_year, payloads), trino=trino,
-            state_dir=client_state_dir(client)
-        )
-        # After the write: a journalled outcome is what bronze holds.
-        if journal:
-            recheck.flush_rechecks(conn, journal)
+        write_tournament_batch(prepared.batch, trino=trino, state_dir=client_state_dir(client))
+        if prepared.journal:
+            recheck.flush_rechecks(conn, prepared.journal)
     except BaseException as exc:
         failure = exc
         raise
@@ -1538,14 +1390,179 @@ def run_tournament(
         except Exception:
             if failure is None:
                 raise
-            # The tournament's own error is the one to report.
             logger.exception("ESPN request journal of %s not written", work.slug)
-    if work.error is not None:
-        # Its planned matches are written; the tournament is still red.
+    if prepared.error is not None:
+        raise prepared.error
+    return prepared.outcome
+
+
+def prepare_tournament(
+    work: TournamentWork, *, client, trino, run_id: str,
+    stored: Mapping[int, BronzeMatch] | None = None,
+    done: Mapping[int, str] | None = None,
+) -> PreparedTournament:
+    """Build the edition's replacement rows and the decisions that depend on them."""
+    if work.error is not None and not work.event_ids:
         raise WavePlanError(work.error)
-    if summary_errors:
-        # The rows are written; the tournament is red and the task retries.
-        raise SummaryFetchError(
+    competition, edition = work.context()
+    targets = {competition.espn_id: competition}
+    rows: dict[int, tuple[ScheduleRow, RawRef]] = {}
+    for day in work.days:
+        result = _fetch(client, urls.all_scoreboard_day(day), force_refresh=False)
+        by_slug, errors = split_day(result.body, targets, day)
+        if work.slug in errors:
+            raise EspnParseError(errors[work.slug])
+        for row in by_slug[work.slug]:
+            rows[row.event_id] = (row, _raw_ref(result))
+    for day in work.topup_days:
+        result = _fetch(
+            client, urls.league_scoreboard_day(work.slug, day), force_refresh=False
+        )
+        for row in _league_day_rows(result.body, competition, day):
+            rows[row.event_id] = (row, _raw_ref(result))
+    if stored is None:
+        stored = bronze_matches(trino, work.slug, work.season_year, work.event_ids)
+    if done is None:
+        done = recheck.journalled(trino, work.slug, work.season_year, work.rechecks)
+    planned_at = datetime.fromisoformat(work.planned_at) if work.planned_at else None
+
+    payloads: list[MatchPayload] = []
+    summary_errors: list[str] = []
+    journal: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+
+    def note(event_id: int, kind: str, again: _Again) -> None:
+        journal.append(
+            recheck.recheck_row(
+                checked_at=now,
+                run_id=run_id,
+                slug=work.slug,
+                season_year=work.season_year,
+                event_id=event_id,
+                kind=kind,
+                before=again.before,
+                after=again.after,
+                outcome=again.outcome,
+            )
+        )
+
+    for event_id in work.event_ids:
+        presence = work.presence.get(event_id)
+        known = stored.get(event_id)
+        found = rows.get(event_id)
+        if found is not None and found[0].source_season_year != work.season_year:
+            found = None
+        kind = work.rechecks.get(event_id)
+        if kind is not None and event_id in done:
+            if done[event_id] == recheck.FAILED:
+                # The failure stays the tournament's on every retry.
+                summary_errors.append(
+                    f"{kind} of {event_id}: failed in an earlier attempt of this wave"
+                )
+            if (
+                presence is None
+                and event_id not in work.statuses
+                and (found is None or not _changed(found[0], known, found[1].fetched_at))
+            ):
+                continue  # The journalled attempt already covered this day state.
+            kind = None
+        if (
+            kind is not None
+            and known is not None
+            and known.summary_captured
+            and (found is None or found[0].played_final)
+        ):
+            if found is not None:
+                schedule, checked = found[0], found[1].fetched_at
+            else:
+                schedule = known.schedule_row(competition, edition)
+                checked = known.status_checked_at
+            again = _summary_again(
+                client,
+                known,
+                schedule,
+                competition,
+                edition,
+                force=True,
+                planned_at=planned_at,
+                stamped=kind == recheck.RECHECK and known.rechecked_at is not None,
+            )
+            note(event_id, kind, again)
+            if again.error is not None:
+                summary_errors.append(f"{kind} of {event_id}: {again.error}")
+            payloads.append(
+                known.carried(
+                    MatchPayload(
+                        schedule,
+                        again.summary,
+                        again.raw,
+                        status_checked_at=checked,
+                        rechecked_at=now if kind == recheck.RECHECK else None,
+                    )
+                )
+            )
+            continue
+        if found is None:
+            if known is None:
+                raise LookupError(f"event {event_id}: neither a day nor bronze has it")
+            payloads.append(
+                _absent_payload(
+                    client, work, known, competition, edition, presence=presence
+                )
+            )
+            continue
+        schedule, raw = found
+        if not schedule.played_final:
+            payload = MatchPayload(
+                schedule, None, raw, presence, status_checked_at=raw.fetched_at
+            )
+        else:
+            captured = known is not None and known.summary_captured
+            if captured:
+                # Written without it, the match would lose its children:
+                # a failure raises.
+                again = _summary_again(
+                    client, known, schedule, competition, edition, force=False
+                )
+                if again.new_body:
+                    note(event_id, recheck.REFRESH, again)
+                payloads.append(
+                    known.carried(
+                        MatchPayload(
+                            schedule,
+                            again.summary,
+                            again.raw,
+                            status_checked_at=raw.fetched_at,
+                        )
+                    )
+                )
+                continue
+            try:
+                result = _fetch(client, urls.summary(work.slug, event_id), force_refresh=False)
+            except AllOriginsBlocked:
+                raise
+            except _STATUS_ERRORS as exc:
+                # The match is the failure unit (#1505): its row lands
+                # without Summary (pending), so the meter counts it as a
+                # miss instead of losing it from the denominator.
+                summary_errors.append(f"summary of {event_id}: {type(exc).__name__}: {exc}")
+                payload = MatchPayload(
+                    schedule, None, raw, presence, status_checked_at=raw.fetched_at
+                )
+            else:
+                parsed = parse_summary(
+                    result.body, competition=competition, edition=edition, event=schedule
+                )
+                payload = MatchPayload(
+                    schedule, parsed, _raw_ref(result), status_checked_at=raw.fetched_at
+                )
+        payloads.append(known.carried(payload) if known is not None else payload)
+
+    error = None
+    if work.error is not None:
+        error = WavePlanError(work.error)
+    elif summary_errors:
+        error = SummaryFetchError(
             f"{len(summary_errors)} Summary download(s) failed, first: {summary_errors[0]}"
         )
     dispositions = Counter(
@@ -1553,8 +1570,13 @@ def run_tournament(
         for payload in payloads
         if payload.summary is not None or payload.presence is not None
     )
-    return TournamentOutcome(
-        work.slug, work.season_year, GREEN, len(payloads), dict(sorted(dispositions.items()))
+    outcome = TournamentOutcome(
+        work.slug, work.season_year, GREEN if error is None else RED,
+        len(payloads), dict(sorted(dispositions.items())),
+        None if error is None else f"{type(error).__name__}: {error}",
+    )
+    return PreparedTournament(
+        TournamentBatch(work.slug, work.season_year, payloads), journal, outcome, error
     )
 
 
