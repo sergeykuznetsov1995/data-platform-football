@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 
+from trino.exceptions import Http502Error, Http503Error, Http504Error, TrinoConnectionError
+
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base import trino_manager as base
 from scrapers.espn.trino_budget import (
@@ -25,6 +27,7 @@ from scrapers.espn.trino_budget import (
 from scrapers.whoscored.trino_budget import WRITE_TIMEOUT
 
 ESPN_USER = "src_espn"
+AMBIGUOUS_TRANSPORT_ERRORS = (TrinoConnectionError, Http502Error, Http503Error, Http504Error)
 SESSION_PROPERTIES = {
     "enable_dynamic_filtering": "false",
     "query_max_run_time": f"{WRITE_TIMEOUT}s",
@@ -75,9 +78,20 @@ class EspnTrinoTableManager(base.TrinoTableManager):
         return BudgetConnection(connection, self._budget, self.catalog)
 
     def _execute(self, sql, fetch=False, params=None, *, replay_safe=True):
-        return super()._execute(
-            sql, fetch, params, replay_safe=replay_safe and not may_change_data(sql)
-        )
+        mutation = may_change_data(sql)
+        try:
+            return super()._execute(sql, fetch, params, replay_safe=replay_safe and not mutation)
+        except base.TrinoAmbiguousWriteError:
+            raise
+        except base.TrinoError as error:
+            # The base wraps statement failures with their driver cause. An
+            # exhausted connection probe raises a TrinoError without one.
+            cause = error.__cause__
+            if mutation and isinstance(cause, AMBIGUOUS_TRANSPORT_ERRORS):
+                raise base.TrinoAmbiguousWriteError(
+                    f"ESPN write may have committed and must not be replayed: {cause}"
+                ) from cause
+            raise
 
     def _execute_committing(self, sql, *, replay_safe=False):
         # Only a structured, definite commit rejection permits another attempt.
