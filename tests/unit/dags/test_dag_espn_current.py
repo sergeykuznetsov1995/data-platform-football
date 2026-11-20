@@ -39,13 +39,14 @@ def test_four_waves_a_day_paused_on_creation(dag_module) -> None:
     assert kwargs["dag_id"] == "dag_espn_current"
     assert kwargs["schedule"] == "0 0,6,12,18 * * *"
     assert kwargs["max_active_runs"] == 1
+    assert kwargs["max_active_tasks"] == 3
     assert kwargs["catchup"] is False
     assert kwargs["is_paused_upon_creation"] is True
     assert kwargs["dagrun_timeout"] == timedelta(minutes=55)
 
 
 @pytest.mark.unit
-def test_topology_retries_and_four_concurrent_groups(dag_module) -> None:
+def test_topology_retries_and_three_concurrent_groups(dag_module) -> None:
     prepare, plan = _task("prepare"), _task("plan_wave")
     run, summary = _task("run_tournament"), _task("wave_summary")
 

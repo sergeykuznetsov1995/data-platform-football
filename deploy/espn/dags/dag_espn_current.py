@@ -364,6 +364,7 @@ with DAG(
     start_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
+    max_active_tasks=3,
     is_paused_upon_creation=True,
     dagrun_timeout=timedelta(minutes=55),
     tags=["espn", "bronze", "scraping"],
