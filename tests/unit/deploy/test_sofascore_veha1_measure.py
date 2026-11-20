@@ -77,6 +77,7 @@ def test_status_debt_counts_once_then_finished_keeps_identity(
     journal = measure.read_journal()
     assert len(journal) == 2
     assert journal["1"]["closed_at"] == start + 8000  # первое закрытие переживает replay
+    assert journal["1"]["endpoint_journal_closed_at"] == start + 8000
     assert journal["2"]["latest_status"] == "finished"
     assert journal["2"]["deadline_ts"] == start + 7200 + 86400
     assert journal["2"]["measurement_deadline_ts"] == start + 86400
@@ -298,3 +299,58 @@ def test_game_tournament_prefers_ss_partition_and_falls_back_to_daily():
     # #1370: партиция SS-<id> (полоса актуалки) важнее дейли-реестра.
     assert measure.game_tournament("SS-17", "ENG-Premier League", "17") == (17, "SS", "SS-17")
     assert measure.game_tournament(None, "ENG-Premier League", "17") == (17, "daily", "ENG-Premier League")
+
+
+def test_report_revalidates_legacy_closures_without_rewriting_published_days(tmp_path, monkeypatch):
+    now = datetime(2026, 11, 20, 9, tzinfo=timezone.utc)
+    day = now.date() - timedelta(days=1)
+    prior_day = (day - timedelta(days=1)).isoformat()
+    cutoff = now.replace(hour=0).timestamp()
+    for name, path in (("STATE", tmp_path), ("JOURNAL", tmp_path / "journal.jsonl"),
+                       ("DAILY", tmp_path / "daily.jsonl"), ("OBSERVE_STATE", tmp_path / "observe.json")):
+        monkeypatch.setattr(measure, name, path)
+    monkeypatch.setattr(measure, "status_debt", lambda *_, **kwargs: [])
+    monkeypatch.setattr(measure, "trino_rows", lambda *_: [])
+    monkeypatch.setattr(measure, "unmarked", lambda *_: Counter())
+    recent = int(cutoff - 3 * 86400)
+    old = int(cutoff - 12 * 86400)
+
+    def legacy(gid, start, **values):
+        return dict(game_id=gid, tournament_id=17, lane="SS", league="SS-17", season="2627",
+                    start_ts=start, deadline_ts=start + 86400, closed_at=start + 3600, **values)
+
+    previous = {"day": prior_day, "line": "published legacy line"}
+    rows = [
+        legacy("open", recent),
+        legacy("late", old),
+        legacy("timely", old, reported_day="2026-11-17"),  # interrupted before its daily commit
+        legacy("published", recent, reported_day=prior_day),
+    ]
+    measure.JOURNAL.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    measure.DAILY.write_text(json.dumps(previous) + "\n")
+    sources = {
+        "open": [None, recent, "quarantine", *(["collected"] * 4)],
+        "late": [old + 90000, old, *(["collected"] * 5)],
+        "timely": [old + 7200, old, *(["collected"] * 5)],
+    }
+    requests = []
+
+    def closures(gids):
+        requests.extend(gids)
+        return {gid: sources[gid] for gid in gids}
+
+    monkeypatch.setattr(measure, "closures", closures)
+    args = ({17: "core"}, tmp_path / "denominator.tsv", now, day, cutoff, False)
+    line = measure._report_locked(*args)
+    history = measure.read_daily()
+    assert history[0] == previous
+    assert (history[1]["core_in24"], history[1]["core_total"]) == (1, 3)
+    assert Counter(requests) == {"open": 1, "late": 1, "timely": 1}
+    result = measure.read_journal()
+    assert result["published"] == rows[-1]
+    assert result["open"].get("endpoint_journal_closed_at") is None
+    assert result["timely"]["closed_at"] == rows[2]["closed_at"]
+    assert result["timely"]["endpoint_journal_closed_at"] == old + 7200
+    assert result["late"]["endpoint_journal_closed_at"] == old + 90000
+    assert measure._report_locked(*args) == line
+    assert measure.read_daily() == history

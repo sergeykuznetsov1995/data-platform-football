@@ -316,6 +316,16 @@ UNION ALL SELECT '__sentinel__', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 """, 9)
 
 
+def _remember_endpoint_closures(journal: dict[str, dict], latest: dict[str, list]) -> None:
+    """Keep the first closure witnessed by the endpoint journal and preserve legacy timestamps."""
+    for gid, info in latest.items():
+        rec = journal.get(gid)
+        if rec is not None and info[0] is not None and rec.get("endpoint_journal_closed_at") is None:
+            rec["endpoint_journal_closed_at"] = float(info[0])
+            if rec.get("closed_at") is None:
+                rec["closed_at"] = rec["endpoint_journal_closed_at"]
+
+
 def observe(journal: dict[str, dict], now: datetime, *, debt_rows=None) -> tuple[int, dict[str, list]]:
     """В памяти: (1) дописать finished-матчи со стартом за 7 суток, которых нет в журнале, с отметкой
     прошлого observe; (2) запомнить в записи первое увиденное закрытие (closed_at) — MERGE журнала
@@ -389,11 +399,10 @@ def observe(journal: dict[str, dict], now: datetime, *, debt_rows=None) -> tuple
         added += 1
     horizon = until - CLOSURE_DAYS * 86400
     open_ids = [g for g, rec in journal.items()
-                if rec.get("closed_at") is None and rec["start_ts"] >= horizon]
+                if rec["start_ts"] >= horizon and rec.get("endpoint_journal_closed_at") is None
+                and (rec.get("closed_at") is None or not rec.get("reported_day"))]
     latest = closures(open_ids)
-    for gid, info in latest.items():
-        if info[0] and gid in journal and journal[gid].get("closed_at") is None:
-            journal[gid]["closed_at"] = float(info[0])
+    _remember_endpoint_closures(journal, latest)
     return added, latest
 
 
@@ -504,7 +513,9 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
     # за 9 суток — дочитываем остальных, чтобы counts не были молча неполными.
     pending = [rec["game_id"] for rec in due if rec["game_id"] not in latest]
     if pending:
-        latest.update(closures(pending))
+        remaining = closures(pending)
+        _remember_endpoint_closures(journal, remaining)
+        latest.update(remaining)
     # Записи до #2094 вердикта не имеют — считаются «неизвестно», задним числом не пересчитываются.
     verdicts = Counter(rec.get("late_verdict", "unknown") for rec in late)
     verdicts_by_league: dict[str, Counter] = {}
@@ -517,7 +528,7 @@ def _report_locked(classes, denominator, now, day, cutoff, dry_run: bool) -> str
     ok = 0
     for rec in population:
         info = latest.get(rec["game_id"])
-        closed_at = rec.get("closed_at")
+        closed_at = rec.get("endpoint_journal_closed_at")
         hit = (not rec.get("status_debt") and closed_at is not None
                and closed_at <= rec["deadline_ts"])
         lane = lanes.setdefault(rec["lane"] or "?", [0, 0])
