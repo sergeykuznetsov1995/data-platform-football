@@ -94,11 +94,12 @@ def test_runs_leave_a_delivery_window_between_them(dag_module, monkeypatch, tmp_
 
 
 def test_prepare_creates_the_queue_table(dag_module, monkeypatch) -> None:
-    import scrapers.base.iceberg_writer as iceberg_writer
-    import scrapers.espn.bronze_schema as bronze_schema
+    from scrapers.espn import bronze_schema, trino_manager
 
-    monkeypatch.setattr(iceberg_writer, "IcebergWriter", lambda: None)
-    monkeypatch.setattr(bronze_schema, "ensure_bronze_tables", lambda writer: None)
+    writer = object()
+    ensured_writers = []
+    monkeypatch.setattr(trino_manager, "EspnIcebergWriter", lambda: writer)
+    monkeypatch.setattr(bronze_schema, "ensure_bronze_tables", ensured_writers.append)
     sql: list[str] = []
 
     class Cursor:
@@ -117,6 +118,7 @@ def test_prepare_creates_the_queue_table(dag_module, monkeypatch) -> None:
 
     dag_module.prepare()
 
+    assert ensured_writers == [writer]
     assert any(history.QUEUE_TABLE in statement and "CREATE TABLE" in statement for statement in sql)
     assert any("espn_request_journal_v1" in statement for statement in sql)
 
