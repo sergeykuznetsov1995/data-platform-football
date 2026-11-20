@@ -24,6 +24,9 @@ from scrapers.transfermarkt.writer import writer_deadline, writer_lock
 ACHIEVEMENT_TABLE = "iceberg.bronze.transfermarkt_achievement_observations"
 ACHIEVEMENT_RECEIPTS_TABLE = "iceberg.ops.transfermarkt_achievement_receipts_v1"
 ACHIEVEMENT_DAG_ID = "dag_ingest_transfermarkt_achievements"
+ACHIEVEMENT_BYTE_CAP_BYTES = 16 * 1024 * 1024
+ACHIEVEMENT_REQUEST_LIMIT = 180
+ACHIEVEMENT_RETRY_LIMIT = 360
 DEFAULT_POLICY_PATH = "/opt/airflow/dags/configs/transfermarkt/achievements_standing_approval_policy.json"
 TIMESTAMP_COLUMNS = frozenset({"captured_at", "observed_at", "extracted_at", "_ingested_at"})
 ACHIEVEMENT_WRITER_COLUMNS = (*ACHIEVEMENT_OBSERVATION_COLUMNS, "_source", "_entity_type", "_batch_id", "_ingested_at")
@@ -55,13 +58,21 @@ def achievement_ddl() -> tuple[str, str]:
     )
 
 
-def validate_achievement_write_policy(policy) -> None:
+def validate_achievement_write_policy(policy, *, now: datetime | None = None) -> None:
     if policy.dag_id != ACHIEVEMENT_DAG_ID:
         raise current.CurrentWriteError("achievement policy has the wrong DAG identity")
-    allowed = set(policy.allowed_write_tables)
-    missing = tuple(table for table in (ACHIEVEMENT_TABLE, ACHIEVEMENT_RECEIPTS_TABLE) if table not in allowed)
-    if missing:
-        raise current.CurrentWriteError("achievement policy does not authorize: " + ", ".join(missing))
+    expected_tables = {ACHIEVEMENT_TABLE, ACHIEVEMENT_RECEIPTS_TABLE}
+    if set(policy.allowed_write_tables) != expected_tables:
+        raise current.CurrentWriteError("achievement policy must authorize exactly the achievement tables")
+    paid = policy.paid_proxy
+    if (
+        paid.byte_cap_bytes != ACHIEVEMENT_BYTE_CAP_BYTES
+        or paid.request_limit != ACHIEVEMENT_REQUEST_LIMIT
+        or paid.retry_limit != ACHIEVEMENT_RETRY_LIMIT
+        or paid.concurrency != 1
+    ):
+        raise current.CurrentWriteError("achievement policy paid_proxy caps differ from the bounded contract")
+    policy.assert_not_expired(now or datetime.now(timezone.utc))
 
 
 def _authorize(preflight: Mapping[str, Any]) -> None:

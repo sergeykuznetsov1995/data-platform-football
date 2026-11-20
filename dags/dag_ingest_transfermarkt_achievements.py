@@ -26,6 +26,7 @@ with DAG(
             "TM_DAG_ID": "dag_ingest_transfermarkt_achievements",
             "TM_RUN_ID": "{{ run_id }}",
             "TM_REQUIRE_METERED_PROXY": "true",
+            "TRANSFERMARKT_REQUIRE_RAW_STORE": "true",
             "TM_ACHIEVEMENT_STATE": "/opt/airflow/logs/transfermarkt-achievements/state.sqlite3",
             "TM_ACHIEVEMENT_REPORT": "/opt/airflow/logs/transfermarkt-achievements/last-report.json",
             "TM_ACHIEVEMENT_MAX_RECIPIENTS": "180",

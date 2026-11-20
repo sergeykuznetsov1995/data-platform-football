@@ -272,10 +272,29 @@ def test_policy_denial_happens_before_business_write(physical, achievement_polic
     policy = json.loads(achievement_policy.read_text())
     policy["allowed_write_tables"].remove(achievements.ACHIEVEMENT_TABLE)
     achievement_policy.write_text(json.dumps(policy))
-    with pytest.raises(Exception, match="does not authorize"):
+    with pytest.raises(Exception, match="exactly the achievement tables"):
         write(physical, extraction(physical))
     exists = physical.test_db.sql.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
         ("transfermarkt_achievement_observations",),
     ).fetchone()[0]
     assert exists == 0
+
+
+@pytest.mark.parametrize("mutation", ["extra_table", "byte_cap", "requests", "retries", "expired"])
+def test_policy_requires_exact_bounded_unexpired_contract(achievement_policy, mutation):
+    policy = json.loads(achievement_policy.read_text())
+    if mutation == "extra_table":
+        policy["allowed_write_tables"].append("iceberg.bronze.unrelated")
+    elif mutation == "byte_cap":
+        policy["paid_proxy"]["byte_cap_bytes"] += 1
+    elif mutation == "requests":
+        policy["paid_proxy"]["request_limit"] += 1
+    elif mutation == "retries":
+        policy["paid_proxy"]["retry_limit"] += 1
+    else:
+        policy["expires_at"] = "2026-11-20T12:00:00Z"
+    achievement_policy.write_text(json.dumps(policy))
+    loaded = achievements.load_standing_policy(achievement_policy)
+    with pytest.raises(Exception):
+        achievements.validate_achievement_write_policy(loaded, now=COMMITTED)

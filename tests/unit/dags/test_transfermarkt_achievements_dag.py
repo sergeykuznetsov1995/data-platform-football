@@ -15,6 +15,7 @@ def test_achievement_dag_is_bounded_paused_and_single_stream():
     assert task._init_kwargs["execution_timeout"] == timedelta(minutes=45)
     assert task.env["TM_RUN_ID"] == "{{ run_id }}"
     assert task.env["TM_REQUIRE_METERED_PROXY"] == "true"
+    assert task.env["TRANSFERMARKT_REQUIRE_RAW_STORE"] == "true"
     assert task.env["TM_ACHIEVEMENT_MAX_RECIPIENTS"] == "180"
     assert module.dag._dag_kwargs["catchup"] is False
     assert module.dag._dag_kwargs["max_active_runs"] == 1

@@ -202,3 +202,18 @@ def test_writer_failure_stops_portion_and_preserves_pending_work(tmp_path):
 class FakeWriterFailure:
     def __call__(self, *args, **kwargs):
         raise RuntimeError("commit uncertain")
+
+
+def test_runtime_refuses_unmetered_or_rawless_execution(tmp_path):
+    with pytest.raises(ValueError, match="TM_REQUIRE_METERED_PROXY"):
+        runner._require_metered_proxy_environment({})
+    with pytest.raises(ValueError, match="control URL"):
+        runner._require_metered_proxy_environment({"TM_REQUIRE_METERED_PROXY": "true"})
+    runner._require_metered_proxy_environment({
+        "TM_REQUIRE_METERED_PROXY": "true",
+        "TM_PROXY_CONTROL_URL": "http://proxy-filter.invalid:8899",
+    })
+    with pytest.raises(ValueError, match="immutable raw storage"):
+        runner._require_raw_store(FakeScraper(None))
+    store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
+    runner._require_raw_store(FakeScraper(store))

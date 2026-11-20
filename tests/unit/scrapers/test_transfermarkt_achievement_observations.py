@@ -222,6 +222,7 @@ def test_extraction_rejects_wrong_raw_identity_and_hash():
         {"status_code": 201},
         {"endpoint": "current_players"},
         {"url": "https://tmapi.transfermarkt.technology/player/8/achievement"},
+        {"scope_id": "achievement:player:8"},
         {"content_hash": "0" * 64},
     ):
         with pytest.raises(AchievementObservationError):

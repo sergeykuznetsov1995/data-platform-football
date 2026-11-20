@@ -74,6 +74,9 @@ def test_reconciliation_sql_covers_counts_duplicates_and_all_lineage():
         "row_count <> r.row_count", "distinct_rows <> r.row_count",
         "null_lineage <> 0", "duplicate_keys", "source_body_hash",
         "captured_at", "observed_at", "extracted_at", "assessment_manifest_id",
-        "source_capture_id", "source_row_id",
+        "source_capture_id", "source_row_id", "recipient_type IS NULL",
+        "recipient_id IS NULL", "source_endpoint IS NULL", "scope_id IS NULL",
+        "cycle_id IS NULL", "observation_status IS NULL", "FROM physical p",
+        "r.receipt_id IS NULL",
     ):
         assert marker in sql

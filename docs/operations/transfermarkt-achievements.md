@@ -142,7 +142,7 @@ coverage must account for players, clubs, and coaches, including proven empty
 observations and failures. Monthly and post-season coverage and the three
 required DQ observations need separate operational evidence tied to the
 relevant runs and code revision. Focused replay exercises only saved-input
-behavior. Production authorization and completion of #2288 remain outstanding.
+behavior. Production acceptance and completion of #2288 remain outstanding.
 
 ## Production lane
 
@@ -169,12 +169,15 @@ receipt. Missing receipts can be recovered from the identical committed plan;
 any physical drift fails.
 
 `dag_ingest_transfermarkt_achievements` is paused at creation. Its hourly
-45-minute portions use one metered stream, at most 180 initial requests and 360
-retries under the dedicated achievements policy. Monthly refresh is due after
+45-minute portions use one metered stream, exactly 180 initial requests and 360
+retries under the unexpired dedicated achievements policy, with a 16 MiB provider
+byte cap. The runner refuses unmetered or rawless execution before capture.
+Monthly refresh is due after
 30 days. A completed season-close record, or a completed registry edition with
 a current successor, binds a once-only post-season assessment. DQ reports
 per-type expected/conclusive/unresolved coverage and physical count/key/lineage
-reconciliation. Initial incomplete coverage is RED, not silently green.
+reconciliation, including physical captures without receipts. Initial incomplete
+coverage is RED, not silently green.
 
 Delivery requires the reviewed merge and existing automatic frozen-release
 pipeline. Before any paid E2E, record exact recipient URLs, attempt/byte caps,

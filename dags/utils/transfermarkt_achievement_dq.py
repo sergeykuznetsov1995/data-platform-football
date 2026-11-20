@@ -68,13 +68,16 @@ WITH physical AS (
     SELECT recipient_type, recipient_id, source_capture_id,
            COUNT(*) AS row_count,
            COUNT(DISTINCT source_row_id) AS distinct_rows,
-           SUM(CASE WHEN source_url IS NULL OR source_body_hash IS NULL
-                    OR raw_capture_id IS NULL OR captured_at IS NULL
+           SUM(CASE WHEN recipient_type IS NULL OR recipient_id IS NULL
+                    OR source_capture_id IS NULL OR source_row_id IS NULL
+                    OR source_url IS NULL OR source_body_hash IS NULL
+                    OR raw_capture_id IS NULL OR source_endpoint IS NULL
+                    OR scope_id IS NULL OR cycle_id IS NULL OR captured_at IS NULL
                     OR observed_at IS NULL OR extracted_at IS NULL
-                    OR parser_revision IS NULL OR schema_revision IS NULL
-                    OR run_id IS NULL OR universe_version IS NULL
-                    OR assessment_manifest_id IS NULL OR _batch_id IS NULL
-                    OR _ingested_at IS NULL THEN 1 ELSE 0 END) AS null_lineage
+                    OR observation_status IS NULL OR parser_revision IS NULL
+                    OR schema_revision IS NULL OR run_id IS NULL
+                    OR universe_version IS NULL OR assessment_manifest_id IS NULL
+                    OR _batch_id IS NULL OR _ingested_at IS NULL THEN 1 ELSE 0 END) AS null_lineage
     FROM iceberg.bronze.transfermarkt_achievement_observations
     GROUP BY recipient_type, recipient_id, source_capture_id
 ), duplicate_keys AS (
@@ -94,6 +97,14 @@ SELECT COUNT(*) FROM (
        OR p.distinct_rows <> r.row_count OR p.null_lineage <> 0
     UNION ALL
     SELECT NULL FROM duplicate_keys
+    UNION ALL
+    SELECT NULL
+    FROM physical p
+    LEFT JOIN iceberg.ops.transfermarkt_achievement_receipts_v1 r
+      ON p.recipient_type = r.recipient_type
+     AND p.recipient_id = r.recipient_id
+     AND p.source_capture_id = r.source_capture_id
+    WHERE r.receipt_id IS NULL
 )
 """
 

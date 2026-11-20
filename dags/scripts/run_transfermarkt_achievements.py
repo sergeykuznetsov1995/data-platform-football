@@ -11,6 +11,7 @@ from typing import Any
 from dags.utils.transfermarkt_achievement_dq import run_achievement_dq
 from dags.utils.transfermarkt_achievements import (
     DEFAULT_POLICY_PATH,
+    validate_achievement_write_policy,
     write_achievement_observations,
 )
 from dags.utils.transfermarkt_approval import load_standing_policy
@@ -209,13 +210,29 @@ def _reader_preflight() -> dict[str, Any]:
         connection.close()
 
 
+def _require_metered_proxy_environment(environment: Any) -> None:
+    if str(environment.get("TM_REQUIRE_METERED_PROXY", "")).strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        raise ValueError("achievements require TM_REQUIRE_METERED_PROXY=true")
+    if not str(environment.get("TM_PROXY_CONTROL_URL", "")).strip():
+        raise ValueError("achievements require a metered proxy control URL")
+
+
+def _require_raw_store(scraper) -> None:
+    if scraper._http_client._raw_store is None:
+        raise ValueError("achievements require configured immutable raw storage")
+
+
 def main() -> None:
     from dags.utils import transfermarkt_native_v2 as native
     from scrapers.transfermarkt.scraper import TransfermarktScraper
 
+    _require_metered_proxy_environment(os.environ)
     now = datetime.now(timezone.utc)
     run_id = os.environ.get("TM_RUN_ID") or f"tm-achievements-{now.isoformat()}"
     policy = load_standing_policy(os.environ.get("TM_ACHIEVEMENTS_POLICY_PATH", DEFAULT_POLICY_PATH))
+    validate_achievement_write_policy(policy, now=now)
     ledger = SharedTrafficLedger(
         hard_provider_bytes=policy.paid_proxy.byte_cap_bytes,
         soft_provider_bytes=policy.paid_proxy.byte_cap_bytes * 3 // 4,
@@ -240,6 +257,7 @@ def main() -> None:
         request_deadline_monotonic=deadline,
     )
     try:
+        _require_raw_store(scraper)
         with AchievementState(os.environ.get("TM_ACHIEVEMENT_STATE", DEFAULT_STATE)) as state:
             report = run_achievement_portion(
                 scraper, state, universe, run_id=run_id, now=now,

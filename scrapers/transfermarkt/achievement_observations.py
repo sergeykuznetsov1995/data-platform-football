@@ -203,6 +203,9 @@ def _check_capture(
         raise AchievementObservationError("unexpected endpoint")
     if raw.url != achievement_url(**recipient.inventory_entry()):
         raise AchievementObservationError("unexpected url")
+    expected_scope = f"achievement:{recipient.recipient_type}:{recipient.recipient_id}"
+    if raw.scope_id != expected_scope:
+        raise AchievementObservationError("unexpected scope_id")
     if raw.content_hash != hashlib.sha256(body).hexdigest():
         raise AchievementObservationError("content_hash mismatch")
     for name in ("capture_id", "scope_id", "cycle_id"):
