@@ -25,7 +25,7 @@ from .deep_parser import (PARSER_VERSION, collect_plays, deep_level, mask_xg, pa
                           xg_support)
 from .deep_schema import PLAYS_SCHEMA, PLAYS_TABLE
 from .deep_store import (PLAYER_RETRY_TABLE, Depth, client_state_dir, edition_lock,
-                         load_depth, save_depth, load_retries, save_retry)
+                         load_depth, load_depths, save_depth, load_retries, save_retry)
 from .history import history_stopped
 from .history_report import render_live_debt_sql
 from .journal import flush_journal, journal_rows
@@ -328,13 +328,12 @@ def run_deep(*, client, trino, conn, denominator, run_id, deadline,
         check()
         # Never-probed editions precede retries; an unavailable early league
         # must not consume every run's probe budget before its neighbours.
-        registry = {}
-        for slug in sorted(denominator.targets()):
-            year = denominator.row(slug).current_season_year
-            registry[slug] = load_depth(trino, slug, year) if year is not None else None
+        years = {slug: denominator.row(slug).current_season_year
+                 for slug in sorted(denominator.targets())}
+        registry = load_depths(trino, years.items())
 
         def probe_order(slug):
-            depth = registry[slug]
+            depth = registry.get((slug, years[slug]))
             checked = depth.checked_at if depth is not None else None
             if checked is not None and checked.tzinfo is None:
                 checked = checked.replace(tzinfo=timezone.utc)
