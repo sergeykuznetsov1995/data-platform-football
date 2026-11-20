@@ -75,7 +75,7 @@ def test_airflowignore_leaves_the_existing_and_paused_achievements_dags() -> Non
         rel for rel in _tracked_dag_files()
         if not any(re.search(p, rel) for p in patterns)
     ]
-    # Кроме четырёх DAG виден только пакетный __init__.py (DAG не объявляет).
+    # Кроме пяти DAG виден только пакетный __init__.py (DAG не объявляет).
     assert set(visible) == TM_DAGS | {"__init__.py"}, sorted(visible)
     init = (ROOT / "dags" / "__init__.py").read_text(encoding="utf-8")
     assert "DAG(" not in init and "@dag" not in init
