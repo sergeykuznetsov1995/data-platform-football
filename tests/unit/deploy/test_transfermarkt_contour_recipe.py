@@ -219,7 +219,8 @@ def test_deploy_script_order_and_pool_handling() -> None:
 @pytest.mark.unit
 def test_auto_deliver_window_and_contract() -> None:
     text = (DEPLOY / "auto_deliver.sh").read_text(encoding="utf-8")
-    # #2039: часового окна нет — дедлайн по ближайшему прогону registry.
+    # #2039: часового окна нет — дедлайн по ближайшему прогону registry;
+    # lane_refresh добавляет уже зарегистрированные referee-расписания.
     assert "WINDOW_FROM" not in text and "set_window" not in text
     assert "NEXT_RUN_DAGS=\"'dag_discover_transfermarkt_registry'\"" in text
     assert "FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}" in text
