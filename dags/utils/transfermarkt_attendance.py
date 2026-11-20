@@ -199,12 +199,16 @@ def _validate_existing(existing: pd.DataFrame, extraction: AttendanceExtraction)
         return
     immutable = tuple(column for column in ATTENDANCE_COLUMNS if column not in ASSOCIATION_FIELDS)
     incoming = {_natural_key(row): row for row in extraction.rows}
+    seen = set()
     for values in existing.itertuples(index=False, name=None):
         old = {column: value for column, value in zip(existing.columns, values)}
         key = _natural_key(old)
+        if key in seen:
+            raise current.CurrentWriteError(f'duplicate existing attendance natural key {key}')
+        seen.add(key)
         new = incoming.get(key)
         if new is None:
-            continue
+            raise current.CurrentWriteError(f'unexpected existing attendance row {key}')
         changed = tuple(column for column in immutable
                         if _canonical_cell(column, new[column]) != _canonical_cell(column, old[column]))
         if changed:

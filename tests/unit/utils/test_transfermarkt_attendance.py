@@ -223,6 +223,24 @@ def test_writer_rejects_changed_immutable_payload_at_same_key(physical):
     assert set(business_table(physical)['capacity']) == {60704, 40173}
 
 
+@pytest.mark.parametrize('mutation', ['unexpected', 'duplicate'])
+def test_invalid_existing_edition_rows_fail_before_business_write(physical, mutation):
+    result = extraction()
+    write(physical, result)
+    frame = attendance._frame(result).iloc[[0]].copy()
+    if mutation == 'unexpected':
+        frame['club_id'] = '999'
+    physical._iceberg_writer.write_dataframe(
+        df=frame, database='bronze', table='transfermarkt_attendance_observations',
+        merge_keys=[], add_metadata=False, source='transfermarkt',
+    )
+    assert len(business_table(physical)) == 3
+    with pytest.raises(Exception, match='unexpected existing|duplicate existing'):
+        write(physical, result)
+    assert len(business_table(physical)) == 3
+    assert len(receipt_table(physical)) == 1
+
+
 def test_mixed_observation_times_cannot_form_one_edition_snapshot(physical):
     parsed = source_result()
     later = CAPTURED + timedelta(seconds=1)
