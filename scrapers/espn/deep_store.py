@@ -77,6 +77,28 @@ def load_depth(trino, slug, year):
     return Depth(*rows[0]) if rows else None
 
 
+def load_depths(trino, editions):
+    """Depths for initial probe ordering, keyed by the requested edition."""
+    depths = {(slug, year): None for slug, year in editions if year is not None}
+    if not depths:
+        return depths
+
+    names = ", ".join(name for name, _ in DEPTH_COLUMNS)
+    values = ", ".join("(?, ?)" for _ in depths)
+    rows = trino.execute_query(
+        f"SELECT {names} FROM {DEPTH_TABLE} "
+        f"WHERE (competition_slug, source_season_year) IN (VALUES {values})",
+        tuple(value for edition in depths for value in edition),
+    )
+    for row in rows:
+        depth = Depth(*row)
+        key = (depth.competition_slug, depth.source_season_year)
+        if depths[key] is not None:
+            raise ValueError("duplicate depth registry key")
+        depths[key] = depth
+    return depths
+
+
 def save_depth(conn, depth):
     names = [name for name, _ in DEPTH_COLUMNS]
     values = ", ".join(("true" if depth.has_xg else "false")

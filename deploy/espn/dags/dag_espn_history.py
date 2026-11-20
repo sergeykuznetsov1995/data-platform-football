@@ -64,13 +64,13 @@ def _client():
 
 
 def prepare(**_: Any) -> None:
-    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.espn.trino_manager import EspnIcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
     from scrapers.espn.deep_store import ensure_depth_table
     from scrapers.espn.history import ensure_queue_table
     from scrapers.espn.journal import ensure_journal_table
 
-    ensure_bronze_tables(IcebergWriter())
+    ensure_bronze_tables(EspnIcebergWriter())
     connection = _trino().connection
     ensure_journal_table(connection)
     ensure_queue_table(connection)

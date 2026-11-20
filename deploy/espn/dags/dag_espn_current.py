@@ -1,12 +1,12 @@
-"""ESPN current-data waves: 00/06/12/18 UTC, publication per tournament (#1504).
+"""ESPN current-data waves: 00/06/12/18 UTC, bounded Bronze publications.
 
 Lives in ``deploy/espn/dags/`` — the DAG folder of the ``espn-airflow``
 project (mounted by #1507), not ``dags/``: a new file there changes the
 directory the WhoScored runtime guard pins and the shared stack does not
 collect ESPN (roadmap assumption 8).  Paused on creation all the same.
 
-prepare -> plan_wave -> run_tournament (mapped, one tournament-season each)
--> wave_summary (all_done).  The logic is ``scrapers.espn.wave``; this file
+prepare -> plan_wave -> run_tournament (mapped over groups of tournament-seasons)
+-> wave_summary (all_done).  The logic is in ``wave`` and ``grouped_wave``; this file
 only wires Airflow, the transport and Trino.  ``wave_summary`` writes the wave
 log (``scrapers.espn.wave_log``, #1505) before it turns a red wave red.
 ``prepare`` also creates the recheck journal (``scrapers.espn.recheck``, #1506).
@@ -63,11 +63,10 @@ def _gate_closed(exc: BaseException) -> bool:
 
 
 def _no_retry(exc: BaseException) -> bool:
-    """Gate closed or planning already failed: a retry would change nothing."""
-
+    from scrapers.espn.grouped_wave import ambiguous_write
     from scrapers.espn.wave import WavePlanError
 
-    return _gate_closed(exc) or isinstance(exc, WavePlanError)
+    return _gate_closed(exc) or isinstance(exc, WavePlanError) or ambiguous_write(exc)
 
 
 def _task_name(ti) -> str:
@@ -96,13 +95,13 @@ def _window_note(context: dict[str, Any]) -> str | None:
 
 
 def prepare(**_: Any) -> None:
-    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.espn.trino_manager import EspnIcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
     from scrapers.espn.journal import ensure_journal_table
     from scrapers.espn.recheck import ensure_recheck_table
     from scrapers.espn.wave_log import ensure_wave_log_table
 
-    ensure_bronze_tables(IcebergWriter())
+    ensure_bronze_tables(EspnIcebergWriter())
     connection = _trino().connection
     ensure_journal_table(connection)
     ensure_wave_log_table(connection)
@@ -110,7 +109,7 @@ def prepare(**_: Any) -> None:
 
 
 def plan_wave(**context: Any) -> list[dict[str, Any]]:
-    from scrapers.espn import editions_store, wave
+    from scrapers.espn import editions_store, grouped_wave, wave
     from scrapers.espn.denominator import load_denominator
 
     now = datetime.now(timezone.utc)
@@ -146,6 +145,8 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
         failure = exc
         if _gate_closed(exc):
             raise AirflowFailException(f"ESPN gate closed: {type(exc).__name__}: {exc}") from exc
+        if isinstance(exc, wave.WavePlanError):
+            raise AirflowFailException(f"ESPN wave plan: {exc}") from exc
         raise
     finally:
         try:
@@ -159,13 +160,56 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
             if failure is None:
                 raise
             logger.exception("ESPN plan request journal not written")
-    return [{"work": work.to_xcom()} for work in plan.works]
+    try:
+        groups = grouped_wave.group_works(plan.works)
+    except ValueError as exc:
+        raise AirflowFailException(f"ESPN invalid wave plan: {exc}") from exc
+    return [{"works": [work.to_xcom() for work in group]} for group in groups]
 
 
-def run_tournament(work: dict[str, Any], **context: Any) -> dict[str, Any]:
+def _edition_key(row):
+    if isinstance(row, dict):
+        slug, year = row.get("slug"), row.get("season_year")
+        if isinstance(slug, str) and slug.strip() and str(year).isdecimal() and int(year) > 0:
+            return slug.strip().lower(), int(year)
+    return None
+
+
+def _failed_member(key, cause):
     from scrapers.espn import wave
 
+    return wave.TournamentOutcome(*key, wave.RED, 0, {}, cause).as_dict()
+
+
+def run_tournament(work=None, works=None, **context: Any) -> dict[str, Any]:
+    from scrapers.espn import grouped_wave, wave
+
     ti = context["ti"]
+    if works is not None:
+        try:
+            members = [wave.TournamentWork.from_xcom(row) for row in works]
+            trino = _trino()
+            outcomes = grouped_wave.run_tournament_group(
+                members, client=_client(), trino=trino, conn=trino.connection,
+                child_trino_factory=_trino, run_id=str(context.get("run_id") or "manual"),
+                task_id=_task_name(ti),
+            )
+        except grouped_wave.GroupRunError as exc:
+            ti.xcom_push(key=OUTCOME_KEY, value={"outcomes": [o.as_dict() for o in exc.outcomes]})
+            if exc.no_retry:
+                raise AirflowFailException(f"ESPN {_task_name(ti)}: {exc}") from exc
+            raise
+        except Exception as exc:
+            cause = f"{type(exc).__name__}: {exc}"
+            keys = dict.fromkeys(key for row in works if (key := _edition_key(row)) is not None)
+            ti.xcom_push(key=OUTCOME_KEY, value={"outcomes": [_failed_member(k, cause) for k in keys]})
+            if _no_retry(exc):
+                raise AirflowFailException(f"ESPN {_task_name(ti)}: {cause}") from exc
+            raise
+        result = {"outcomes": [o.as_dict() for o in outcomes]}
+        ti.xcom_push(key=OUTCOME_KEY, value=result)
+        return result
+
     item = wave.TournamentWork.from_xcom(work)
     try:
         trino = _trino()
@@ -192,29 +236,82 @@ def _state(ti) -> str:
     return str(state or "none").casefold().split(".")[-1]
 
 
+def _planned_keys(entry):
+    if isinstance(entry, dict):
+        entry = entry.get("works", [entry.get("work", entry)])
+    if not isinstance(entry, (list, tuple)):
+        return {}
+    return dict.fromkeys(key for row in entry if (key := _edition_key(row)) is not None)
+
+
+def _map_outcomes(result, expected, state):
+    from scrapers.espn import wave
+
+    grouped = isinstance(result, dict) and "outcomes" in result
+    rows = result["outcomes"] if grouped else [result]
+    proved = {}
+    if isinstance(rows, list) and (grouped or expected is None or len(expected) == 1):
+        for row in rows:
+            key = _edition_key(row)
+            if key is None or (expected is not None and key not in expected):
+                continue
+            counts = row.get("dispositions")
+            if (
+                key in proved or row.get("state") not in (wave.GREEN, wave.RED)
+                or not isinstance(row.get("matches"), int) or not isinstance(counts, dict)
+                or not all(isinstance(n, int) for n in counts.values())
+            ):
+                proved[key] = None
+            elif not grouped and state != "success" and row["state"] != wave.RED:
+                proved[key] = {**row, "state": wave.RED, "first_error": f"task {state}"}
+            else:
+                proved[key] = row
+    return {
+        key: proved.get(key) or _failed_member(key, f"task {state}: missing or invalid outcome")
+        for key in (proved if expected is None else expected)
+    }
+
+
+def _wave_outcomes(ti, instances):
+    # The unmapped plan's return value is the full op_kwargs list for this DagRun.
+    plan = ti.xcom_pull(task_ids=PLAN_TASK_ID, map_indexes=-1, key="return_value")
+    if isinstance(plan, dict):
+        plan = [plan]
+    mapped = {i.map_index: i for i in instances if i.task_id == RUN_TASK_ID}
+    outcomes = {}
+    failed = []
+    for index in (mapped if plan is None else range(len(plan))):
+        instance = mapped.get(index)
+        state = _state(instance) if instance is not None else "missing"
+        if index < 0:
+            if state not in {"skipped", "removed"}:
+                failed.append(f"{RUN_TASK_ID}={state}")
+            continue
+        if plan is None and state in {"skipped", "removed"}:
+            continue
+        expected = _planned_keys(plan[index]) if plan is not None else None
+        result = ti.xcom_pull(task_ids=RUN_TASK_ID, map_indexes=index, key=OUTCOME_KEY)
+        rows = _map_outcomes(result, expected, state)
+        if rows:
+            for key in outcomes.keys() & rows.keys():
+                rows[key] = _failed_member(key, "duplicate edition across mapped tasks")
+            outcomes.update(rows)
+        else:
+            failed.append(f"{RUN_TASK_ID}[{index}]={state}")
+    return list(outcomes.values()), failed
+
+
 def wave_summary(**context: Any) -> dict[str, Any]:
     from scrapers.espn import wave, wave_log
 
     dag_run = context["dag_run"]
     ti = context["ti"]
-    outcomes: list[dict[str, Any]] = []
-    failed: list[str] = []
-    plan_error = None
-    for instance in dag_run.get_task_instances():
-        state = _state(instance)
-        if instance.task_id == PLAN_TASK_ID and state != "success":
-            plan_error = state
-        if instance.task_id != RUN_TASK_ID or state in {"skipped", "removed"}:
-            continue
-        outcome = ti.xcom_pull(
-            task_ids=RUN_TASK_ID, map_indexes=instance.map_index, key=OUTCOME_KEY
-        )
-        if outcome:
-            if state != "success" and outcome.get("state") != wave.RED:
-                outcome = {**outcome, "state": wave.RED, "first_error": f"task {state}"}
-            outcomes.append(outcome)
-        else:
-            failed.append(f"{_task_name(instance)}={state}")
+    instances = list(dag_run.get_task_instances())
+    plan_error = next(
+        (_state(i) for i in instances if i.task_id == PLAN_TASK_ID and _state(i) != "success"),
+        None,
+    )
+    outcomes, failed = _wave_outcomes(ti, instances)
     started = getattr(dag_run, "start_date", None)
     finished = datetime.now(timezone.utc)
     duration = (finished - started).total_seconds() if started is not None else None
@@ -262,11 +359,12 @@ def wave_summary(**context: Any) -> dict[str, Any]:
 with DAG(
     dag_id=DAG_ID,
     default_args=DEFAULT_ARGS,
-    description="ESPN current data: four waves a day, one batch per tournament",
+    description="ESPN current data: four waves a day, bounded groups of tournament-seasons",
     schedule=SCHEDULE,
     start_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
+    max_active_tasks=3,
     is_paused_upon_creation=True,
     dagrun_timeout=timedelta(minutes=55),
     tags=["espn", "bronze", "scraping"],

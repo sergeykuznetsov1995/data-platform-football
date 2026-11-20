@@ -152,8 +152,8 @@ def benchmark(trino, store, state_dir: Path, ids, *, count=20, step=None):
             os.fsync(stream.fileno())
         os.replace(temporary, sample_path)
     payloads = cached_payloads(raw, selected, sample['records'])
-    from scrapers.base.iceberg_writer import IcebergWriter
-    result = run_benchmark(trino, IcebergWriter(), store, payloads, step=step)
+    from scrapers.espn.trino_manager import EspnIcebergWriter
+    result = run_benchmark(trino, EspnIcebergWriter(), store, payloads, step=step)
     from .measure_pace import digest
     result['sample_sha256'] = digest(sample)
     result['step'] = step

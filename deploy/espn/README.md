@@ -103,13 +103,12 @@ PY
   `valid_empty` / `malformed`, `pending` до summary), `deep_state` (`pending` до волны 3),
   `first_fetched_at`, `rechecked_at` (NULL до перепроверки #1506), `first_published_at` и
   `status_checked_at` (измеритель свежести #1505, см. «Свежесть и DQ»).
-- Запись: пачка = турнир-сезон = 4 коммита (lineup → team_stats → events → match; строка матча —
-  последней, это признак завершённой публикации, #1504), каждый —
-  `insert_dataframe_atomic(delete_filter="competition_slug=… AND season_year=… AND event_id IN (…)",
-  single_statement_replace=True)`: один MERGE с надгробиями заменяет строки матчей пачки, без
-  окна пустоты. Повтор пачки заменяет, а не дописывает; витринам дедуп не нужен.
-  **Пачка несёт полное состояние каждого своего матча:** матч, пришедший без summary, теряет
-  прежние дочерние строки — уже скачанный матч надо передавать вместе с разобранным summary.
+- У каждого турнир-сезона есть собственные `_batch_id`, счётчики и результат публикации.
+  В текущей волне готовые турнир-сезоны вместе записывают составы, статистику и события.
+  После этих трёх таблиц публикуются строки матчей. Каждый MERGE заменяет строки только
+  для выбранных сочетаний `competition_slug`, `season_year` и `event_id`.
+  Маленькая пачка помещается в один запрос с новыми строками, для большой writer использует
+  промежуточную таблицу. Уже захваченный матч передаётся с выбранным Summary и ссылкой на его raw.
 - Имя `espn_lineup` в bronze занято легаси-таблицей soccerdata (её читает
   `dags/sql/silver/espn_lineup.sql`), поэтому состав — `espn_match_lineup`. `espn_match` и
   `espn_match_events` — тёзки таблиц silver (другая схема; мина #1156: в запросах всегда писать
@@ -154,7 +153,7 @@ ctime каталога, который пинует сторож WhoScored (`scr
 |---|---|---|
 | `prepare` | `ensure_bronze_tables(IcebergWriter())` + `ensure_journal_table` + `ensure_wave_log_table` + `ensure_recheck_table` (#1506) (идемпотентно, каждый прогон) | 2 |
 | `plan_wave` | издания из кэша (лиги с `failed` — перечитываются) → статусы дня `all/scoreboard` за вчера и сегодня UTC (`force_refresh`) → сверка с `bronze.espn_match` → список турнир-сезонов с работой; в волну 00 — ещё проверка зависших POSTPONED/SUSPENDED старше 3 суток и сверка со списком core (#1505) | 2 |
-| `run_tournament` | map по турнир-сезону (`max_active_tis_per_dag=4`): summary новых финалов (cache-first — одна загрузка на матч) → разбор → одна пачка `write_tournament_batch` → журнал запросов | 2, через 3 мин |
+| `run_tournament` | До трёх групп параллельно. Каждая готовит Summary, записывает готовые турнир-сезоны и их журналы. Итог учитывает каждый турнир-сезон отдельно | 2, через 3 мин |
 | `wave_summary` | `all_done`: таблица «турнир → состояние → первая ошибка», счётчики `withdrawn`/`moved`, время волны; журнал волн пишется **до** решения «волна красная» (#1505) | 0 |
 
 - **В волну попадает турнир-сезон**, если у него есть финал без захваченного summary
@@ -202,14 +201,14 @@ ctime каталога, который пинует сторож WhoScored (`scr
   после первого живого прогона, приёмка вехи 1 (#1505). Оценка пиковой волны: 2 статуса дня + 161
   `leagues/{slug}` (раз в сутки) + ≤ 175 summary (самый плотный замеренный день, 20.09) +
   проверки статусов, в день с обрезкой ещё 161 → ≈ 500 запросов ≈ 8–9 мин на S0 = 60/мин + запись
-  (4 турнира параллельно).
+  (до трёх групп параллельно).
 
 | Env / объект | Значение |
 |---|---|
 | `ESPN_EDITIONS_STATE_PATH` | кэш изданий, по умолчанию `$AIRFLOW_HOME/state/espn/editions.json` (рядом с `gate.json`); старше 24 ч или потерян — пересчитывается из core (`leagues/{slug}` → `plan_editions`), потеря безвредна |
 | `ESPN_GATE_STEP_CEILING` | ступень заслонки (S0 по умолчанию), полоса `live` |
 | `ESPN_RAW_STORE_URI` | raw store транспорта (#1500) |
-| пул `espn_live` | у `plan_wave` и `run_tournament`; 4 слота, объявлен в `deploy/espn/pools.json` (#1507) |
+| пул `espn_live` | 4 слота для `plan_wave` и `run_tournament` (#1507). Лимит текущего DAG `max_active_tasks=3` ограничивает конкуренцию за минутные интервалы записи в одни и те же таблицы |
 
 **Что включает #1507:** проект `espn-live` с каталогом DAG `deploy/espn/dags`, пул `espn_live`,
 env выше, автодоставку; снятие паузы `dag_espn_current` — после посева; сторож
@@ -394,8 +393,10 @@ FROM iceberg.ops.espn_history_queue_v1 ORDER BY updated_at DESC LIMIT 20;
   `/opt/airflow/configs/espn`; `PYTHONPATH=/opt/airflow`. Файловых монтирований нет (rename при
   checkout теряет файловый bind-mount). Тест: замыкание импортов DAG ⊆ смонтированных каталогов.
 - **Env** — `/root/.secrets/espn.env` (0600), только секреты: `AIRFLOW__CORE__FERNET_KEY`,
-  `AIRFLOW__WEBSERVER__SECRET_KEY`, `ESPN_LIVE_DB_PASSWORD` (hex), `TRINO_PORT`, `TRINO_USER`,
-  `TRINO_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `ICEBERG_WAREHOUSE`. Никаких `*_PROXY`
+  `AIRFLOW__WEBSERVER__SECRET_KEY`, `ESPN_LIVE_DB_PASSWORD` (hex), `TRINO_PORT`,
+  `TRINO_SRC_ESPN_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `ICEBERG_WAREHOUSE`.
+  Compose задаёт пользователя Trino `src_espn`. Пароль этой роли предоставляет частный профиль ESPN.
+  Никаких `*_PROXY`
   (транспорт ESPN падает `AmbientProxyError`), `ESPN_RELEASE_ROOT`, canary-state, контрольной БД,
   `RELEASE_COMMIT/TREE_SHA256` — автомат отказывается работать с таким env-файлом.
 - **Пулы — кодом:** `deploy/espn/pools.json` (`espn_live`: 4 слота = `max_active_tis_per_dag`;

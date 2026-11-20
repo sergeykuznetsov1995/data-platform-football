@@ -1,22 +1,20 @@
 """Tournament-season batch writer of the ESPN bronze tables (#1503).
 
-One batch = one ``competition_slug``/``season_year`` = four Iceberg commits,
-in the order lineup -> team_stats -> events -> match (R-43: batches per
-tournament, not per scope phase).  The match row goes last: its states
-(``lineup_state`` etc.) claim the children, so it is committed only once they
-are — a batch cut after a child commit leaves the old match row and the next
-wave writes the match again (#1504).  Each table is replaced for exactly the
-matches of the batch: ``insert_dataframe_atomic`` with a ``delete_filter`` on
-the partition and the batch event ids and ``single_statement_replace=True``
-(one MERGE with tombstones, no committed empty window; the FBref typed bronze
-pattern).  Repeating a batch replaces the rows of its matches, it never
-appends a generation; other matches of the partition stay untouched.
+Each ``competition_slug`` and ``season_year`` has its own logical batch and stamp.
+``write_ready_batches`` shares four target commits across ready editions and
+replaces exactly the matches of those editions. The children can publish in
+parallel. The match row declares their states and is committed after all three
+child tables succeed (#1504). If a child write fails, the old match row remains
+available for the next wave. Inline and staged MERGEs atomically replace the
+selected rows of each target table.
 ``first_published_at`` of a match the batch publishes first is the moment
 just before the match commit, after the children (#1505).
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Sequence
@@ -37,6 +35,7 @@ from .bronze_schema import (
 
 # Children first, the match row (the completion marker) last.
 WRITE_ORDER = (LINEUP_TABLE, TEAM_STATS_TABLE, EVENTS_TABLE, MATCH_TABLE)
+_PRIOR_TABLES = (MATCH_TABLE, LINEUP_TABLE, TEAM_STATS_TABLE)
 
 
 class BronzeBatchError(RuntimeError):
@@ -89,62 +88,171 @@ def delete_filter(
     )
 
 
-def _write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | None:
-    """Replace the rows of the batch matches in all four tables.
-
-    ``trino`` is a ``TrinoTableManager``.  An empty batch writes nothing and
-    returns None.
-    """
-    event_ids = _validate(batch)
-    if not event_ids:
-        return None
-    stamp = BatchStamp(
+def _new_stamp() -> BatchStamp:
+    return BatchStamp(
         batch_id=uuid.uuid4().hex,
         ingested_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
-    rows = batch_rows(batch.matches, stamp=stamp)
-    _carry_deep(trino, batch, rows)
-    # Matches this batch publishes first (no carried value); their time is
-    # taken just before the match commit below.
-    first_published = [
-        row
-        for row, payload in zip(rows[MATCH_TABLE], batch.matches)
-        if payload.first_published_at is None and row["first_published_at"] == stamp.ingested_at
-    ]
-    scope = delete_filter(batch.competition_slug, batch.season_year, event_ids)
-    # Types of every row are checked against the DDL before the first commit.
-    frames = {}
+
+
+def _check_types(rows):
     for table, schema in TABLES.items():
         pa.Table.from_pylist(rows[table], schema=schema)
-        frames[table] = pd.DataFrame(rows[table], columns=schema.names)
-    written: dict[str, int] = {}
-    for table in WRITE_ORDER:
-        schema = TABLES[table]
-        frame = frames[table]
-        if table == MATCH_TABLE and first_published:
-            # #1505: first publication = the start of the match commit, after
-            # the children (the match row is what makes the match published);
-            # the meter is off by one MERGE at most, never by the whole batch.
-            published_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            for row in first_published:
-                row["first_published_at"] = published_at
-            frame = pd.DataFrame(rows[table], columns=schema.names)
-        inserted = trino.insert_dataframe_atomic(
-            BRONZE_DATABASE,
-            table,
-            frame,
-            delete_filter=scope,
-            # A staging id must start with a letter; a uuid hex may not.
-            staging_id=f"b{stamp.batch_id}",
-            single_statement_replace=True,
-            target_column_types=trino.arrow_schema_to_trino(schema),
+
+
+def preflight_tournament_batch(batch: TournamentBatch) -> None:
+    """Validate a logical batch and its typed source rows without accessing Trino."""
+    if _validate(batch):
+        _check_types(batch_rows(batch.matches, stamp=_new_stamp()))
+
+
+def _ready_scopes(batches):
+    ready = {}
+    seen = set()
+    for batch in batches:
+        event_ids = _validate(batch)
+        key = (batch.competition_slug, batch.season_year)
+        if key in seen:
+            raise ValueError(f"duplicate edition {key}")
+        seen.add(key)
+        if event_ids:
+            ready[key] = (batch, delete_filter(*key, event_ids))
+    return ready
+
+
+def _prior_by_edition(trino, scope, editions):
+    prior = {key: {table: [] for table in _PRIOR_TABLES} for key in editions}
+    for table in _PRIOR_TABLES:
+        for row in stored_rows(trino, table, scope):
+            prior[row["competition_slug"], row["season_year"]][table].append(row)
+    return prior
+
+
+def _publish_ready(ready, *, trino, child_trino_factory=None, replace_frame=None):
+    """Publish validated scopes while the caller holds their edition locks."""
+    if not ready:
+        return {}
+    clauses = [clause for _, clause in ready.values()]
+    scope = clauses[0] if len(clauses) == 1 else " OR ".join(f"({clause})" for clause in clauses)
+    # As in single-edition publication, stamp the input before the prior reads.
+    stamps = {key: _new_stamp() for key in ready}
+    prior = _prior_by_edition(trino, scope, ready)
+    receipts = {}
+    combined = {table: [] for table in WRITE_ORDER}
+    first_published = []
+    for key, (batch, _) in ready.items():
+        stamp = stamps[key]
+        rows = batch_rows(batch.matches, stamp=stamp)
+        before = prior[key]
+        carry_deep_rows(before, rows)
+        published_ids = {row["event_id"] for row in before[MATCH_TABLE]
+                         if row["first_published_at"] is not None}
+        first_published.extend(
+            row for row, payload in zip(rows[MATCH_TABLE], batch.matches)
+            if payload.first_published_at is None
+            and row["first_published_at"] == stamp.ingested_at
+            and row["event_id"] not in published_ids
         )
-        if inserted != len(frame):
-            raise BronzeBatchError(
-                f"{table}: inserted {inserted}, expected {len(frame)}"
+        counts = {table: len(rows[table]) for table in WRITE_ORDER}
+        receipts[key] = BatchReceipt(stamp.batch_id, stamp.ingested_at, counts)
+        for table in WRITE_ORDER:
+            combined[table].extend(rows[table])
+
+    _check_types(combined)
+    # Keep nullable integers at full precision for the grouped literal formatter.
+    frame_dtype = object if replace_frame is not None else None
+    frames = {
+        table: pd.DataFrame(combined[table], columns=schema.names, dtype=frame_dtype)
+        for table, schema in TABLES.items()
+    }
+    physical_id = next(iter(stamps.values())).batch_id if len(ready) == 1 else uuid.uuid4().hex
+    staging_id = f"b{physical_id}"
+    if replace_frame is not None:
+        match_keys = tuple(
+            (slug, year, payload.schedule.event_id)
+            for (slug, year), (batch, _) in ready.items()
+            for payload in batch.matches
+        )
+
+    def write(manager, table):
+        frame = frames[table]
+        if replace_frame is None:
+            inserted = manager.insert_dataframe_atomic(
+                BRONZE_DATABASE,
+                table,
+                frame,
+                delete_filter=scope,
+                staging_id=staging_id,
+                single_statement_replace=True,
+                target_column_types=manager.arrow_schema_to_trino(TABLES[table]),
             )
-        written[table] = inserted
-    return BatchReceipt(stamp.batch_id, stamp.ingested_at, written)
+        else:
+            inserted = replace_frame(
+                manager, table, frame, match_keys=match_keys,
+                delete_filter=scope, staging_id=staging_id,
+            )
+        if inserted != len(frame):
+            raise BronzeBatchError(f"{table}: inserted {inserted}, expected {len(frame)}")
+
+    children = WRITE_ORDER[:-1]
+    if child_trino_factory is None:
+        for table in children:
+            write(trino, table)
+    else:
+        def write_child(table):
+            with child_trino_factory() as manager:
+                write(manager, table)
+
+        with ThreadPoolExecutor(max_workers=len(children)) as pool:
+            futures = [pool.submit(write_child, table) for table in children]
+            errors = []
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            first = errors[0]
+            raise ExceptionGroup(f"{type(first).__name__}: {first}", errors)
+
+    if first_published:
+        published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        for row in first_published:
+            row["first_published_at"] = published_at
+        frames[MATCH_TABLE] = pd.DataFrame(
+            combined[MATCH_TABLE], columns=TABLES[MATCH_TABLE].names, dtype=frame_dtype
+        )
+    write(trino, MATCH_TABLE)
+    return receipts
+
+
+def _write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | None:
+    """Publish one edition with its lock already held."""
+    receipts = _publish_ready(_ready_scopes([batch]), trino=trino)
+    return receipts.get((batch.competition_slug, batch.season_year))
+
+
+def write_ready_batches(
+    batches: Sequence[TournamentBatch], *, trino, state_dir=None, child_trino_factory=None,
+    replace_frame=None,
+) -> dict[tuple[str, int], BatchReceipt]:
+    """Publish ready editions. Pass ready_replace.replace_ready_frame for inline MERGE."""
+    from .deep_store import edition_lock
+
+    ready = _ready_scopes(batches)
+    lock_keys = sorted(ready)
+    # Offline edition_lock uses the same process-wide lock for every edition.
+    if state_dir is None:
+        lock_keys = lock_keys[:1]
+    with ExitStack() as locks:
+        for slug, year in lock_keys:
+            locks.enter_context(edition_lock(slug, year, state_dir))
+        return _publish_ready(
+            ready, trino=trino, child_trino_factory=child_trino_factory,
+            replace_frame=replace_frame,
+        )
 
 
 def stored_rows(trino, table, scope):
@@ -159,9 +267,8 @@ def _carry_deep(trino, batch, rows):
     """Re-read under edition_lock: every Summary path retains deep children."""
     scope = delete_filter(batch.competition_slug, batch.season_year,
                           [payload.schedule.event_id for payload in batch.matches])
-    before = {table: stored_rows(trino, table, scope)
-              for table in (MATCH_TABLE, LINEUP_TABLE, TEAM_STATS_TABLE)}
-    carry_deep_rows(before, rows)
+    key = (batch.competition_slug, batch.season_year)
+    carry_deep_rows(_prior_by_edition(trino, scope, [key])[key], rows)
 
 
 def carry_deep_rows(before, rows):
