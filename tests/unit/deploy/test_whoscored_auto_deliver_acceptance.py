@@ -55,7 +55,7 @@ def test_acceptance_query_reads_both_task_names():
 # --- measure(): fixed Trino SELECT through docker exec, fail closed (#1473).
 
 # Fake `docker`: records argv, then feeds the embedded program from stdin to a
-# real interpreter where scrapers.base.trino_manager is a recording stub.
+# real interpreter where the source Trino manager is a recording stub.
 FAKE_DOCKER = '''\
 import os
 import subprocess
@@ -73,7 +73,7 @@ if mode == "fail":
     sys.stderr.write("SECRET-STDERR-MARKER\\n")
     sys.exit(1)
 if mode == "malformed":
-    sys.stdout.write("not-a-count,?,x\\n")
+    sys.stdout.write(os.environ.get("FAKE_DOCKER_OUTPUT", "not-a-count,?,x") + "\\n")
     sys.exit(0)
 program = sys.stdin.read()
 prog = os.path.join(os.environ["FAKE_WORK"], "embedded.py")
@@ -85,31 +85,26 @@ completed = subprocess.run([sys.executable, "-B", prog, args[-1]], env=env, chec
 sys.exit(completed.returncode)
 '''
 
-# Recording stub of get_trino_connection; the embedded program drives it for real.
+# The embedded program imports the same source client as the DAG.
 TRINO_MANAGER_STUB = '''\
 import os
 
 
-def get_trino_connection(session_properties=None):
-    with open(os.environ["SQL_CAPTURE"], "a") as fh:
-        fh.write("session_properties=%r\\n" % (session_properties,))
-    return _Connection()
+class WhoScoredTrinoManager:
+    def __init__(self, session_properties, query_max_run_seconds):
+        session_properties = dict(session_properties, query_max_run_time=f"{query_max_run_seconds}s")
+        with open(os.environ["SQL_CAPTURE"], "a") as fh:
+            fh.write("session_properties=%r\\n" % (session_properties,))
 
+    def __enter__(self):
+        return self
 
-class _Connection:
-    def cursor(self):
-        return _Cursor()
-
-    def close(self):
+    def __exit__(self, *exc):
         pass
 
-
-class _Cursor:
-    def execute(self, sql):
+    def execute_query(self, sql):
         with open(os.environ["SQL_CAPTURE"], "a") as fh:
             fh.write("sql=%s\\n" % sql)
-
-    def fetchall(self):
         counts = os.environ.get("FAKE_COUNTS", "1,2,3")
         return [tuple(int(v) for v in counts.split(","))]
 '''
@@ -157,11 +152,11 @@ class _MeasureStand:
         if docker_mode is not None:
             _executable(self.bin / "docker", "#!" + sys.executable + "\n" + FAKE_DOCKER)
             self.env["FAKE_DOCKER_MODE"] = docker_mode
-        stub = tmp_path / "trino-stub" / "scrapers" / "base"
+        stub = tmp_path / "trino-stub" / "scrapers" / "whoscored"
         stub.mkdir(parents=True)
         (stub.parent / "__init__.py").write_text("", encoding="utf-8")
         (stub / "__init__.py").write_text("", encoding="utf-8")
-        (stub / "trino_manager.py").write_text(TRINO_MANAGER_STUB, encoding="utf-8")
+        (stub / "trino.py").write_text(TRINO_MANAGER_STUB, encoding="utf-8")
 
     def run(self, timestamp: str, trino_ro: str = "") -> subprocess.CompletedProcess:
         env = dict(self.env, MEASURE_TS=timestamp, MEASURE_TRINO_RO=trino_ro)
@@ -176,7 +171,7 @@ class _MeasureStand:
 def test_measure_has_no_default_helper_dependency():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "trino-ro" not in text
-    assert 'TRINO_RO="${TRINO_RO:-}"' in text
+    assert "WhoScoredTrinoManager" in text
 
 
 @pytest.mark.unit
@@ -207,24 +202,12 @@ def test_measure_runs_fixed_select_through_docker_exec(tmp_path):
 
 
 @pytest.mark.unit
-def test_measure_helper_output_is_accepted(tmp_path):
-    helper = tmp_path / "trino-ro-helper"
-    _executable(helper, "#!/bin/sh\nprintf '7,8,9\\n'\n")
+def test_measure_uses_source_client_even_with_legacy_helper(tmp_path):
     stand = _MeasureStand(tmp_path)
-    completed = stand.run("2026-09-05 03:27:55.446584+00", trino_ro=str(helper))
+    completed = stand.run("2026-09-05T03:27:55Z", trino_ro=str(tmp_path / "obsolete-helper"))
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "7 8 9"
-    assert not stand.args_capture.exists()  # helper mode never touches docker
-
-
-@pytest.mark.unit
-def test_measure_missing_helper_fails_closed(tmp_path):
-    stand = _MeasureStand(tmp_path)
-    completed = stand.run("2026-09-05T03:27:55Z", trino_ro=str(tmp_path / "no-such-helper"))
-    assert completed.returncode != 0
-    assert completed.stdout == ""
-    assert "helper executable missing" in completed.stderr
-    assert not stand.args_capture.exists()
+    assert completed.stdout.strip() == "1 2 3"
+    assert stand.args_capture.is_file()
 
 
 @pytest.mark.unit
@@ -264,10 +247,9 @@ def test_measure_never_leaks_subprocess_stderr(tmp_path):
 @pytest.mark.unit
 @pytest.mark.parametrize("line", ["not-a-count,?,x", "1,2", "1,2,x", "", "1,2,3,4", "-1,2,3"])
 def test_measure_malformed_output_fails_closed(tmp_path, line):
-    helper = tmp_path / "trino-ro-helper"
-    _executable(helper, "#!/bin/sh\nprintf '%s\\n' '" + line + "'\n")
-    stand = _MeasureStand(tmp_path)
-    completed = stand.run("2026-09-05T03:27:55Z", trino_ro=str(helper))
+    stand = _MeasureStand(tmp_path, docker_mode="malformed")
+    stand.env["FAKE_DOCKER_OUTPUT"] = line
+    completed = stand.run("2026-09-05T03:27:55Z")
     assert completed.returncode != 0
     assert completed.stdout == ""
     assert "invalid query result" in completed.stderr
@@ -313,19 +295,16 @@ def test_measure_rejects_invalid_timestamps(tmp_path, timestamp):
 
 
 @pytest.mark.unit
-def test_measure_timeout_fails_closed(monkeypatch, capsys, tmp_path):
-    helper = tmp_path / "trino-ro-helper"
-    _executable(helper, "#!/bin/sh\n")
+def test_measure_timeout_fails_closed(monkeypatch, capsys):
     calls = []
 
     def hung(*args, **kwargs):
         calls.append(kwargs.get("timeout"))
-        raise subprocess.TimeoutExpired(cmd="helper", timeout=kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd="docker", timeout=kwargs.get("timeout"))
 
     monkeypatch.setattr(subprocess, "run", hung)
-    monkeypatch.setattr(
-        sys, "argv", ["-", "2026-09-05 03:27:55.446584+00", "test-scheduler", str(helper)]
-    )
+    monkeypatch.setattr("shutil.which", lambda name: "/fixture/docker")
+    monkeypatch.setattr(sys, "argv", ["-", "2026-09-05 03:27:55.446584+00", "test-scheduler"])
     with pytest.raises(SystemExit) as excinfo:
         exec(compile(_measure_program(), "measure", "exec"), {})
     assert excinfo.value.code == 1
@@ -338,4 +317,4 @@ def test_measure_bounds_client_and_container_time():
     program = _measure_program()
     assert "timeout=60" in program
     assert "signal.alarm(55)" in program
-    assert '"query_max_run_time": "50s"' in program
+    assert "query_max_run_seconds=50" in program

@@ -430,8 +430,13 @@ class _Repository:
     def list_profile_parser_replays(self, player_ids):
         return set(getattr(self, "profile_parser_replays", ())) & set(player_ids)
 
+    def write_profile_failure_rows(self, rows):
+        self.profile_failures.extend(rows)
+
+    def build_profile_failure_row(self, **failure):
+        return failure, self.record_profile_failure(**failure)
+
     def record_profile_failure(self, **failure):
-        self.profile_failures.append(failure)
         if failure["state"] != "not_available":
             return None
         return deterministic_profile_not_available_batch_id(
@@ -450,8 +455,13 @@ class _Repository:
         self.preview_commits.extend(commits)
         return tuple(commit.batch_id for commit in commits)
 
+    def write_preview_failure_rows(self, rows):
+        self.preview_failures.extend(rows)
+
+    def build_preview_failure_row(self, failure):
+        return failure, self.record_preview_failure(failure)
+
     def record_preview_failure(self, failure):
-        self.preview_failures.append(failure)
         if failure.state != "not_available":
             return None
         return deterministic_preview_not_available_batch_id(
@@ -4696,3 +4706,91 @@ def test_truncated_retry_skips_the_cache_even_on_a_parser_replay(tmp_path):
 
     assert result.status == "success", result.as_dict()
     assert transport.network_calls == 1
+
+
+@pytest.mark.parametrize("entity", ["preview", "profile"])
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_not_available_is_batched_and_reported_only_after_publication(
+    tmp_path, entity, acknowledged
+):
+    service, repository, _ = _service(tmp_path)
+    player_ids = [404, 410]
+    repository.profile_candidates = player_ids
+    repository.preview_candidates = [
+        dict(
+            game_id=value,
+            game="A-B",
+            date=datetime(2026, 1, 2),
+            home_team="A",
+            away_team="B",
+            attempt_no=1,
+            force_refresh=False,
+        )
+        for value in player_ids
+    ]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "missing",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://example.test/fixture",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=404,
+            retryable=False,
+        )
+    )
+    batches = []
+
+    def publish(rows):
+        batches.append(list(rows))
+        if not acknowledged:
+            raise RuntimeError("fixture publication failed")
+
+    setattr(repository, f"write_{entity}_failure_rows", publish)
+    result = service.sync_previews() if entity == "preview" else service.sync_profiles()
+    assert [len(rows) for rows in batches] == [2]
+    assert result.attempted == 2
+    assert result.succeeded == (2 if acknowledged else 0)
+    assert (
+        len(set(result.committed_batches[f"{entity}_not_available"]))
+        == result.succeeded
+    )
+    assert result.status == ("success" if acknowledged else "failed")
+
+
+@pytest.mark.parametrize("entity", ["preview", "profile"])
+def test_task_interruption_publishes_accumulated_failures_once(entity, tmp_path):
+    service, repository, _ = _service(tmp_path)
+    if entity == "preview":
+        repository.preview_candidates = [
+            {
+                "game_id": game,
+                "game": "Home-Away",
+                "date": datetime(2026, 1, 1),
+                "attempt_no": 1,
+                "force_refresh": False,
+            }
+            for game in (101, 102)
+        ]
+        sync = service.sync_previews
+    else:
+        repository.profile_candidates = [101, 102]
+        sync = service.sync_profiles
+    service._fetch = MagicMock(
+        side_effect=[
+            WhoScoredTransportError(
+                "first event",
+                kind=FailureKind.TIMEOUT,
+                url="https://example.test/fixture",
+                retryable=True,
+            ),
+            KeyboardInterrupt("task stopped during the next event"),
+        ]
+    )
+    write = MagicMock(wraps=getattr(repository, f"write_{entity}_failure_rows"))
+    setattr(repository, f"write_{entity}_failure_rows", write)
+    with pytest.raises(KeyboardInterrupt, match="task stopped"):
+        sync()
+    write.assert_called_once()
+    rows = getattr(repository, f"{entity}_failures")
+    assert len(rows) == 1
+    assert (rows[0].game_id if entity == "preview" else rows[0]["player_id"]) == 101
