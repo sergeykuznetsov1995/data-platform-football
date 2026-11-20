@@ -373,6 +373,7 @@ def _merge_receipt(connection, values: Mapping[str, Any]) -> None:
 def _return_receipt(values: Mapping[str, Any], physical: Mapping[str, Any]) -> dict[str, Any]:
     receipt = dict(values)
     receipt.update({
+        'bronze_manifest': values['committed_batch'],
         'verified': True,
         'receipt_readback': True,
         'physical': dict(physical),

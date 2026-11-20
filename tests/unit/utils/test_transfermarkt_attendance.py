@@ -87,10 +87,10 @@ def clean_transfermarkt_environment(monkeypatch):
 @pytest.fixture
 def attendance_policy(monkeypatch, tmp_path):
     policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
-    policy['allowed_write_tables'] += [
+    policy['allowed_write_tables'] = sorted(set(policy['allowed_write_tables']) | {
         attendance.ATTENDANCE_TABLE,
         attendance.ATTENDANCE_RECEIPTS_TABLE,
-    ]
+    })
     policy['expires_at'] = '2999-01-01T00:00:00Z'
     path = tmp_path / 'attendance-policy.json'
     path.write_text(json.dumps(policy))

@@ -332,6 +332,14 @@ def _next_url(soup, current_url: str) -> str | None:
     return targets.pop() if targets else None
 
 
+def next_attendance_url(body: bytes, current_url: str) -> str | None:
+    try:
+        html = body.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise AttendanceParseError('invalid_utf8') from exc
+    return _next_url(BeautifulSoup(html, 'html.parser'), current_url)
+
+
 def _row(tr, fields: list[str], *, competition: str, edition: str,
          page: AttendancePage) -> AttendanceRow | None:
     cells = tr.find_all('td', recursive=False)
@@ -616,5 +624,5 @@ __all__ = [
     'AttendanceResult', 'AttendanceRow', 'build_attendance_dq',
     'canonical_club_id', 'canonical_timestamp', 'confirmed_empty_attendance',
     'error_attendance', 'extract_attendance', 'not_applicable_attendance',
-    'parse_attendance', 'unavailable_attendance', 'unknown_attendance',
+    'next_attendance_url', 'parse_attendance', 'unavailable_attendance', 'unknown_attendance',
 ]
