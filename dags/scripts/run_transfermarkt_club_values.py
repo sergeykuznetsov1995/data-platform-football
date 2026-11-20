@@ -87,7 +87,10 @@ def run_club_values(scraper, payload: Mapping[str, Any], preflight: Mapping[str,
         history_url = with_stichtag(url, extraction.available_dates[0])
         if history_url != url:
             outcome, html = _fetch(scraper, history_url, payload)
-            extraction = _extract(scraper, payload, history_url, html, outcome)
+            history_extraction = _extract(scraper, payload, history_url, html, outcome)
+            if history_extraction.club_ids != extraction.club_ids:
+                raise ClubValueRunError('club-value earliest and current club universes differ')
+            extraction = history_extraction
         if not extraction.full_available_history:
             raise ClubValueRunError('club-value earliest capture is not conclusive full history')
     result = write_club_values(scraper, extraction, preflight, committed_at=committed_at)

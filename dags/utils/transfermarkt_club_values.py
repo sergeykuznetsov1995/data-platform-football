@@ -125,6 +125,16 @@ def _rows_by_key(frame: pd.DataFrame) -> dict[tuple[str, ...], list[dict[str, An
     return result
 
 
+def _club_physical_hash(existing: pd.DataFrame) -> str:
+    rows = []
+    for values in existing.itertuples(index=False, name=None):
+        row = {column: _canonical_cell(column, value)
+               for column, value in zip(existing.columns, values)}
+        rows.append(row)
+    rows.sort(key=lambda row: tuple(str(row[column]) for column in CLUB_VALUE_KEY))
+    return hashlib.sha256(canonical_json(rows)).hexdigest()
+
+
 def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...]) -> None:
     physical = _rows_by_key(existing)
     for row in rows:
@@ -298,6 +308,7 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
                     _verify_committed(existing, rows)
                     _validate_existing(existing, rows)
                     physical = current._read_back(scraper, output, frame, extraction.capture.run_id)
+                    physical['physical_hash'] = _club_physical_hash(existing)
                     stored_values = _receipt_row_values(stored.iloc[0])
                     expected = _receipt_values(
                         extraction, club_id, physical['physical_hash'],
@@ -310,8 +321,10 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
                     df=frame, database='bronze', table='transfermarkt_club_value_observations',
                     merge_keys=list(CLUB_VALUE_KEY), add_metadata=False, source='transfermarkt')
                 physical = current._read_back(scraper, output, frame, extraction.capture.run_id)
-                _verify_committed(_read_club(connection, club_id), rows)
-                _validate_existing(_read_club(connection, club_id), rows)
+                committed = _read_club(connection, club_id)
+                _verify_committed(committed, rows)
+                _validate_existing(committed, rows)
+                physical['physical_hash'] = _club_physical_hash(committed)
                 _authorize(preflight)
                 values = _receipt_values(extraction, club_id, physical['physical_hash'], committed_at)
                 _merge_receipt(connection, values)

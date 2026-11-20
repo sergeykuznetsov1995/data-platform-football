@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,6 +6,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import pytest
 
+from dags.scripts import run_transfermarkt_club_values as runner
 from dags.scripts.run_transfermarkt_club_values import ClubValueRunError, club_values_url, run_club_values
 from dags.utils.transfermarkt_club_values import club_values_enabled
 from scrapers.transfermarkt.models import FetchStatus
@@ -79,6 +81,31 @@ def test_history_runner_discovers_earliest_and_writes_full_history(physical, mon
     assert len(result['receipts']) == 14
     rows = pd.read_sql_query('SELECT * FROM transfermarkt_club_value_observations', physical.test_db.sql)
     assert len(rows) == 3499
+
+
+def test_history_runner_rejects_changed_earliest_universe(physical, monkeypatch):  # noqa: F811
+    current_html = (FIXTURES / 'vie1-current.html').read_text()
+    history_html = (FIXTURES / 'vie1-2013-04-15.html').read_text()
+    extraction = runner._extract(physical, PAYLOAD, BASE + '/stichtag/2013-04-15', history_html, outcome(physical, history_html, BASE + '/stichtag/2013-04-15'))
+    monkeypatch.setattr(
+        physical, '_fetch_endpoint_outcome',
+        lambda url, as_json, label: outcome(physical, current_html if url == BASE else history_html, url),
+    )
+    calls = []
+    def changed_earliest(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            return extraction
+        return replace(
+            extraction, club_ids=extraction.club_ids[:-1],
+            rows=tuple(row for row in extraction.rows if row['club_id'] != extraction.club_ids[-1]),
+            full_available_history=True)
+    monkeypatch.setattr(runner, '_extract', changed_earliest)
+    with pytest.raises(ClubValueRunError, match='universes differ'):
+        run_club_values(physical, PAYLOAD, PREFLIGHT, mode='history')
+    assert physical.test_db.sql.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='transfermarkt_club_value_observations'"
+    ).fetchone() == (0,)
 
 
 def test_history_runner_rejects_non_earliest_capture(physical, monkeypatch):  # noqa: F811

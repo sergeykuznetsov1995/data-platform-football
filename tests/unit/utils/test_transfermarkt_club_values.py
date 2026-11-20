@@ -183,6 +183,19 @@ def test_identical_replay_is_noop(physical):
     assert len(receipt_table(physical)) == 1
 
 
+def test_replay_rejects_deletion_of_a_later_observation_outside_the_plan(physical):
+    first = write(physical, extraction(physical))
+    write(physical, extraction(
+        physical, value=160_000, observed=CAPTURED + timedelta(days=7),
+        extracted=EXTRACTED + timedelta(days=7),
+    ), at=COMMITTED + timedelta(days=7))
+    physical.test_db.sql.execute(
+        'DELETE FROM transfermarkt_club_value_observations WHERE value_amount = 160000')
+    with pytest.raises(Exception, match='receipt read-back differs: physical_hash'):
+        write(physical, extraction(physical))
+    assert first['receipts'][0]['receipt_id']
+
+
 def test_later_correction_appends_and_does_not_overwrite_history(physical):
     first = write(physical, extraction(physical))
     later_observed = CAPTURED + timedelta(days=7)
