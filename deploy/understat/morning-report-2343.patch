@@ -1,0 +1,195 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -2442,18 +2442,29 @@
+ SELECT league, game_id, state, first_seen_at, last_checked_at, retry_until
+ FROM quarantine
+ ORDER BY league, game_id"""
+-# Сторож: скоупы с попыткой в манифесте за 7 суток (= окно ежедневного DAG); FotMob-сверка по id
+-# турниров (решение 9 плана: 47 ENG, 87 ESP, 54 GER, 55 ITA, 53 FRA, 63 RUS).
+-UNDERSTAT_WATCH_SQL = """WITH a AS (
++# Последний план суточного DAG хранится в XCom до начала сбора отдельных лиг.
++# Берём режим и пару даже при неудаче всех последующих задач.
++UNDERSTAT_PLAN_SQL = """WITH latest_run AS (
++    SELECT dag_id, run_id FROM dag_run
++    WHERE dag_id = 'dag_ingest_understat' AND run_type = 'scheduled'
++      AND data_interval_end <= TIMESTAMPTZ '{as_of}'
++      AND data_interval_end > TIMESTAMPTZ '{as_of}' - INTERVAL '1 day'
++    ORDER BY data_interval_end DESC LIMIT 1
++)
++SELECT (SELECT coalesce(jsonb_agg(jsonb_build_array(item->>'UNDERSTAT_MODE',
++                  item->>'UNDERSTAT_LEAGUE', item->>'UNDERSTAT_SEASON_SLUG')), '[]'::jsonb)
++        FROM jsonb_array_elements(convert_from(x.value, 'UTF8')::jsonb) AS p(item))
++FROM latest_run r JOIN xcom x USING (dag_id, run_id)
++JOIN task_instance ti USING (dag_id, run_id, task_id, map_index)
++WHERE x.task_id = 'plan_current_scopes' AND x.map_index = -1
++  AND x.key = 'return_value' AND ti.state = 'success'"""
++
++UNDERSTAT_WATCH_SQL = """WITH scopes (league, season) AS (VALUES {scopes}),
++a AS (
+     SELECT league, season, status,
+            CAST(from_iso8601_timestamp(completed_at) AT TIME ZONE 'UTC' AS timestamp(6)) AS done
+     FROM iceberg.ops.understat_ingest_manifest_v1
+     WHERE contract_version = 'understat-bronze-v2'
+-),
+-now_utc AS (SELECT CAST(current_timestamp AT TIME ZONE 'UTC' AS timestamp(6)) AS t),
+-scopes AS (
+-    SELECT DISTINCT a.league, a.season FROM a CROSS JOIN now_utc n
+-    WHERE a.done > n.t - INTERVAL '7' DAY
+ ),
+ agg AS (
+     SELECT a.league, a.season,
+@@ -2477,9 +2488,10 @@
+            max_by(f.status, f.completed_at) AS st,
+            max(f.completed_at) AS jt,
+            max_by(f.error_message, f.completed_at) AS msg
+-    FROM {failures} f CROSS JOIN now_utc n
++    FROM {failures} f JOIN scopes s ON s.league = f.league AND s.season = f.season
+     WHERE f.contract_version = 'understat-bronze-v2'
+-      AND CAST(from_iso8601_timestamp(f.completed_at) AT TIME ZONE 'UTC' AS timestamp(6)) > n.t - INTERVAL '48' HOUR
++      AND CAST(from_iso8601_timestamp(f.completed_at) AT TIME ZONE 'UTC' AS timestamp(6))
++          > TIMESTAMP '{now_utc}' - INTERVAL '48' HOUR
+     GROUP BY f.league, f.season
+ ),
+ lg (league, cid) AS (
+@@ -2492,20 +2504,22 @@
+     JOIN lg ON lg.cid = m.competition_id
+     GROUP BY lg.league, m.source_season_key
+ )
+-SELECT g.league, g.season,
++SELECT s.league, s.season,
+        coalesce(CAST(g.last_final AS varchar), ''), coalesce(g.last_final_status, ''),
+-       g.last_status, CAST(g.last_at AS varchar),
++       coalesce(g.last_status, ''), coalesce(CAST(g.last_at AS varchar), ''),
+        coalesce(CAST(p.pending_since AS varchar), ''),
+        coalesce(j.st, ''), coalesce(substr(j.jt, 1, 16), ''),
+        coalesce(replace(replace(replace(substr(j.msg, 1, 160), '"', ''''), chr(10), ' '), chr(13), ' '), ''),
+        CAST(coalesce(fm.finished, 0) AS varchar)
+-FROM agg g
+-LEFT JOIN pend p ON p.league = g.league AND p.season = g.season
+-LEFT JOIN j ON j.league = g.league AND j.season = g.season
+-LEFT JOIN fm ON fm.league = g.league
+-    AND fm.source_season_key = '20' || substr(g.season, 1, 2) || '/20' || substr(g.season, 3, 2)
++FROM scopes s
++LEFT JOIN agg g ON g.league = s.league AND g.season = s.season
++LEFT JOIN pend p ON p.league = s.league AND p.season = s.season
++LEFT JOIN j ON j.league = s.league AND j.season = s.season
++LEFT JOIN fm ON fm.league = s.league
++    AND fm.source_season_key = '20' || substr(s.season, 1, 2) || '/20' || substr(s.season, 3, 2)
+ UNION ALL
+ SELECT '__sentinel__', '', '', '', '', '', '', '', '', '', '0'
++ORDER BY 1, 2
+ """
+ UNDERSTAT_SENTINEL = "__sentinel__"
+ UNDERSTAT_FINAL_STATUSES = ("complete", "not_published", "upstream_pending")
+@@ -2769,27 +2783,52 @@
+     return None
+
+
+-def _understat_watch_lines(rows, now):
++def _understat_planned_scopes(now):
++    """Пары из плана до выполнения задач. None означает, что план неизвестен."""
++    try:
++        result = subprocess.run(
++            ["docker", "exec", "postgres", "psql", "-XAt", "-v", "ON_ERROR_STOP=1",
++             "-U", "airflow", "-d", "airflow", "-c", UNDERSTAT_PLAN_SQL.format(as_of=now.isoformat())],
++            check=True, capture_output=True, text=True, timeout=30,
++        )
++        plan = json.loads(result.stdout)
++        if not isinstance(plan, list):
++            return None
++        scopes = set()
++        for mode, league, season in plan:
++            if (mode not in ("current", "closed_check") or league not in UNDERSTAT_SHORT
++                    or not re.fullmatch(r"[0-9]{4}", season)
++                    or int(season[2:]) != (int(season[:2]) + 1) % 100):
++                return None
++            if mode == "current" and not _understat_season_closed(season, now.date()):
++                scopes.add((league, season))
++        return scopes
++    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
++        return None
++
++
++def _understat_watch_lines(rows, now, *, calendar_fallback=False):
+     """Сторож итоговой попытки по строкам UNDERSTAT_WATCH_SQL (без заглушки)."""
+     if rows is None:
+         return ["• итоговые попытки Understat: сторож не отработал ⚠️ (trino)"]
+     rows = [r for r in rows if not _understat_season_closed(r[1], now.date())]
+     if not rows:
+-        return ["• итоговые попытки Understat: скоупов с попыткой за 7 суток нет ‼️"]
++        return ["• итоговые попытки Understat: в плане нет открытых скоупов"]
+     alarms = []
++    fresh = 0
+     for (league, season, last_final, last_final_status, last_status, last_at, pending_since,
+          j_status, j_at, j_msg, fotmob_finished) in rows:
+-        name = f"{_understat_short(league)} {season}"
++        name = f"{league} {season}"
+         if j_status:
+             jt = _understat_ts(j_at)
+             j_why = f"{j_status} {jt.strftime('%d.%m %H:%M') if jt else j_at} — " \
+                     f"{j_msg or 'причина не записана'}"
+         else:
+             j_why = None
+-        lt = _understat_ts(last_at)
++        lt = _understat_ts(last_at) if last_at else None
+         running = (last_status == "in_progress" and lt is not None
+                    and now - lt < timedelta(hours=UNDERSTAT_RUNNING_GRACE_H))
+-        if last_status not in UNDERSTAT_FINAL_STATUSES and not running:
++        if last_status and last_status not in UNDERSTAT_FINAL_STATUSES and not running:
+             # Последняя строка манифеста — сбой после маркера записи или брошенный маркер:
+             # ограда потребителей прячет скоуп, даже если предыдущая итоговая попытка моложе 26 ч.
+             when = lt.strftime("%d.%m %H:%M") if lt else last_at
+@@ -2800,12 +2839,14 @@
+         if final_ts is None or now - final_ts > timedelta(hours=UNDERSTAT_FINAL_WINDOW_H):
+             if j_why:
+                 why = j_why
+-            else:
+-                lt = _understat_ts(last_at)
++            elif last_status:
+                 when = lt.strftime("%d.%m %H:%M") if lt else last_at
+                 why = f"{last_status} {when} — причина неизвестна"
+-            alarms.append(f"• ‼️ {name}: нет итоговой попытки за сутки (последняя: {why})")
++            else:
++                why = "записей нет, причина неизвестна"
++            alarms.append(f"• ‼️ {name}: нет итоговой попытки за сутки ({why})")
+             continue
++        fresh += 1
+         since = _understat_ts(pending_since) if pending_since else None
+         if (last_final_status in ("not_published", "upstream_pending") and since is not None
+                 and now - since > timedelta(hours=UNDERSTAT_PENDING_RED_H)
+@@ -2813,16 +2854,30 @@
+             days_ = (now - since).days
+             alarms.append(f"• ‼️ {name}: сайт не публикует {days_} дн. ({last_final_status}), "
+                           f"FotMob видит {int(fotmob_finished)} сыгранных")
+-    if alarms:
+-        return alarms
+-    return [f"• итоговые попытки: {len(rows)}/{len(rows)} скоупов ✅"]
++    if calendar_fallback:
++        alarms.append("• ⚠️ План DAG недоступен. Проверены шесть лиг календарного сезона.")
++    summary = f"• итоговые попытки: {fresh}/{len(rows)} скоупов"
++    return [summary + (" ‼️" if fresh < len(rows) else " ⚠️" if alarms else " ✅"), *alarms]
+
+
+ def understat_watch():
+-    rows = _understat_rows(UNDERSTAT_WATCH_SQL.format(failures=UNDERSTAT_FAILURES), 11)
++    now = datetime.now(timezone.utc)
++    scopes = _understat_planned_scopes(now)
++    calendar_fallback = scopes is None
++    if calendar_fallback:
++        season = _understat_current_season(now.date())
++        scopes = {(league, season) for league in UNDERSTAT_SHORT}
++    if not scopes:
++        return _understat_watch_lines([], now)
++    pairs = ", ".join(f"('{league}', '{season}')" for league, season in sorted(scopes))
++    sql = UNDERSTAT_WATCH_SQL.format(scopes=pairs, failures=UNDERSTAT_FAILURES,
++                                     now_utc=now.strftime("%Y-%m-%d %H:%M:%S.%f"))
++    rows = _understat_rows(sql, 11)
+     if rows is None and _understat_journal_missing():
+         return ["• итоговые попытки Understat: сторож не отработал ⚠️ (журнал ещё не создан)"]
+-    return _understat_watch_lines(rows, datetime.now(timezone.utc))
++    if rows is not None and (len(rows) != len(scopes) or {(r[0], r[1]) for r in rows} != scopes):
++        return ["• итоговые попытки Understat: ответ Trino не совпал с ожидаемыми скоупами ‼️"]
++    return _understat_watch_lines(rows, now, calendar_fallback=calendar_fallback)
+
+
+ def _understat_quarantine_date(value):
