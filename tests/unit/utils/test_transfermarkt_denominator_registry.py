@@ -1179,6 +1179,7 @@ def test_daily_dq_routes_default_and_registry(monkeypatch):
             return [tuple(row.values())]
 
     cursor = Cursor()
+    monkeypatch.setenv("TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID", "registry-1")
     monkeypatch.delenv("TRANSFERMARKT_DENOMINATOR_SOURCE", raising=False)
     legacy, source, version = daily._routes(cursor)
     assert legacy["GB1"] == "wettbewerb"
@@ -1192,3 +1193,59 @@ def test_daily_dq_routes_default_and_registry(monkeypatch):
     monkeypatch.setenv("TRANSFERMARKT_DENOMINATOR_SOURCE", "registry")
     assert daily._routes(cursor) == ({"GB1": "wettbewerb"}, "registry", "registry-1")
     assert len(cursor.calls) == 1
+    assert "registry_snapshot_id = 'registry-1'" in cursor.calls[0]
+    row["registry_snapshot_id"] = "wrong-publication"
+    with pytest.raises(DenominatorError, match="wrong-publication.*registry-1"):
+        daily._routes(cursor)
+
+
+def test_invalid_deployment_pin_cannot_fall_back_to_canonical(monkeypatch):
+    from dags.utils.transfermarkt_denominator_registry import (
+        current_denominator_snapshot_id,
+    )
+
+    monkeypatch.setenv("TRANSFERMARKT_DENOMINATOR_SOURCE", "registry")
+    monkeypatch.setenv(
+        "TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID", " publication-77 "
+    )
+    with pytest.raises(DenominatorError, match="snapshot"):
+        current_denominator_snapshot_id()
+    assert current_denominator_snapshot_id(source="tsv") is None
+    assert current_denominator_snapshot_id("explicit-replay") == "explicit-replay"
+
+
+@pytest.mark.parametrize(
+    "source,requested,expected",
+    [
+        (None, None, "deployed-pin"),
+        ("registry", "historical", "historical"),
+        ("tsv", None, None),
+    ],
+)
+def test_measurement_uses_deployment_pin_only_for_registry(
+    monkeypatch, source, requested, expected
+):
+    from unittest.mock import MagicMock
+
+    from dags.scripts import transfermarkt_daily_report as cli
+    from dags.utils import transfermarkt_native_v2 as native
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+
+    monkeypatch.setenv("TRANSFERMARKT_DENOMINATOR_SOURCE", "registry")
+    monkeypatch.setenv("TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID", "deployed-pin")
+    connection = MagicMock()
+    cursor = connection.cursor.return_value
+    cursor.description = [("registry_snapshot_id",)]
+    cursor.fetchall.return_value = []
+    monkeypatch.setattr(native, "connect", lambda: connection)
+
+    with pytest.raises(MeasurementError, match="no promoted registry"):
+        cli.execute_measure(
+            None, None, None, source=source, registry_snapshot_id=requested
+        )
+    sql = cursor.execute.call_args.args[0]
+    if expected is None:
+        assert "'deployed-pin'" not in sql and "state_key = 'canonical'" in sql
+    else:
+        assert f"registry_snapshot_id = '{expected}'" in sql
+    assert cursor.execute.call_count == 1

@@ -101,6 +101,15 @@ The TSV version is the SHA-256 of the bytes actually parsed.
 
 Before the window opens, record one expected registry snapshot, the first
 Moscow reporting day, the deployed release and the rollout authorization.
+For an authorized switch, set `TRANSFERMARKT_DENOMINATOR_SOURCE=registry`
+and `TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID=<verified snapshot ID>`
+in the isolated Transfermarkt deployment environment. The regular release
+passes both values to scheduled current planning, daily measurement and DQ.
+Discovery can continue promoting new snapshots during the window. Historical
+reports can request their recorded snapshot explicitly. To roll back, set
+`TRANSFERMARKT_DENOMINATOR_SOURCE=tsv` in the same environment and verify
+the resulting scheduled reports. Keep every change to the pin in the window
+record.
 Take three consecutive scheduled days. For each day retain the following
 evidence with its timestamp and release from the delivery receipt.
 

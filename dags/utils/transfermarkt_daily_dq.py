@@ -380,17 +380,27 @@ def collect_daily_metrics(cur, implementation_at: datetime,
 
 
 def _routes(cur) -> tuple[dict[str, str], str, str]:
-    from dags.utils.transfermarkt_denominator_registry import build_registry_denominator, denominator_source
-    from scrapers.transfermarkt.denominator import load_versioned_denominator
+    from dags.utils.transfermarkt_denominator_registry import (
+        build_registry_denominator,
+        current_denominator_snapshot_id,
+        denominator_source,
+    )
+    from scrapers.transfermarkt.denominator import DenominatorError, load_versioned_denominator
 
     source = denominator_source()
     if source == 'registry':
         from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
-        cur.execute(build_promoted_registry_query(current_only=True))
+        snapshot_id = current_denominator_snapshot_id(source=source)
+        cur.execute(build_promoted_registry_query(
+            registry_snapshot_id=snapshot_id,
+            current_only=True,
+        ))
         columns = [item[0] for item in (cur.description or ())]
         rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
         selected = build_registry_denominator(rows)
         denominator, version = selected.denominator, selected.universe_version
+        if snapshot_id and version != snapshot_id:
+            raise DenominatorError(f'DQ registry snapshot {version!r} differs from expected {snapshot_id!r}')
     else:
         denominator, version = load_versioned_denominator()
     return {key: item.route for key, item in denominator.rows.items()}, source, version

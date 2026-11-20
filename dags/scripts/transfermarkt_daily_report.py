@@ -371,15 +371,19 @@ def execute_measure(
 ):
     from dags.utils.transfermarkt_daily_measure import MeasurementError
     from dags.utils import transfermarkt_native_v2 as native
+    from dags.utils.transfermarkt_denominator_registry import (
+        current_denominator_snapshot_id,
+    )
     from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
 
+    snapshot_id = current_denominator_snapshot_id(registry_snapshot_id, source=source)
     connection = native.connect()
     try:
         cur = connection.cursor()
         try:
             cur.execute(
                 build_promoted_registry_query(
-                    registry_snapshot_id=registry_snapshot_id,
+                    registry_snapshot_id=snapshot_id,
                     current_only=True,
                 )
             )
@@ -391,7 +395,7 @@ def execute_measure(
                     registry,
                     path,
                     discovery_manifest_path,
-                    registry_snapshot_id,
+                    snapshot_id,
                     day,
                     as_of,
                     journal_snapshots,
@@ -401,7 +405,7 @@ def execute_measure(
                 source,
                 registry,
                 path,
-                registry_snapshot_id,
+                snapshot_id,
                 discovery_manifest_path,
                 day,
                 as_of,

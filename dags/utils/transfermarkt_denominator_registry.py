@@ -93,6 +93,19 @@ def denominator_source(configured: str | None = None) -> str:
     return value
 
 
+def current_denominator_snapshot_id(
+    requested: str | None = None, *, source: str | None = None
+) -> str | None:
+    """Resolve the exact snapshot for replay or a deployment-pinned current read."""
+    if requested is None or (isinstance(requested, str) and requested == ""):
+        if denominator_source(source) != "registry":
+            return None
+        requested = os.environ.get("TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID", "")
+    if not isinstance(requested, str) or requested != requested.strip():
+        raise DenominatorError("registry snapshot ID must be an exact string")
+    return requested or None
+
+
 def _duplicate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: value
@@ -550,6 +563,7 @@ __all__ = [
     "UniverseEntry",
     "build_registry_denominator",
     "compare_denominators",
+    "current_denominator_snapshot_id",
     "denominator_source",
     "diff_status",
     "registry_snapshot_id",
