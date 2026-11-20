@@ -18,8 +18,9 @@
 ^utils/
 ^dag_(accept|backup|bootstrap|canary|discover|e3|iceberg|master|proxy|superset|transform)_
 ^dag_replay_(fbref|fotmob|transfermarkt|understat|whoscored)[a-z0-9_]*\.py$
-^dag_backfill_(fbref|fotmob|transfermarkt|understat|whoscored)\.py$
+^dag_backfill_(fbref|fotmob|transfermarkt|transfermarkt_referees|understat|whoscored)\.py$
 ^dag_sofascore_pipeline\.py$
 ^dag_trigger_fotmob_daily\.py$
-^dag_ingest_(capology|clubelo|espn|fbref|fotmob|matchhistory|sofifa|transfermarkt|understat|whoscored)\.py$
+^dag_ingest_(capology|clubelo|espn|fbref|fotmob|matchhistory|sofifa|transfermarkt|transfermarkt_referees|understat|whoscored)\.py$
+^dag_dq_transfermarkt_referees\.py$
 ^dag_fbref_history_controller\.py$

@@ -1,10 +1,11 @@
 # Изолированный контур Transfermarkt (#1387): монтируется поверх dags/.airflowignore
-# дерева релиза (deploy/transfermarkt/airflow.compose.yaml). Активны ровно четыре DAG:
+# дерева релиза (deploy/transfermarkt/airflow.compose.yaml). Активны ровно семь DAG:
 # dag_ingest_transfermarkt, dag_discover_transfermarkt_registry, dag_backfill_transfermarkt,
-# dag_transform_transfermarkt_silver. Пин — tests/unit/deploy/test_transfermarkt_contour_recipe.py.
+# dag_transform_transfermarkt_silver и три referee DAG. Пин —
+# tests/unit/deploy/test_transfermarkt_contour_recipe.py.
 # ВНИМАНИЕ: движок regexp здесь RE2 (не Python re) — negative lookahead (?!...)
 # НЕ поддерживается и молча игнорируется. Поэтому — явный блок-лист всего прочего.
-# Новый DAG в dags/ без строки здесь уронит тест «ровно четыре DAG».
+# Новый чужой DAG в dags/ без строки здесь уронит тест «ровно семь DAG».
 ^configs/
 ^plugins/
 ^scripts/
