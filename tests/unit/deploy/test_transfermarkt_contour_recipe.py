@@ -10,6 +10,7 @@ bind — из переменной без дефолта, образ пинов�
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 import shutil
 import subprocess
@@ -260,7 +261,8 @@ def test_env_example_covers_every_fail_closed_compose_variable() -> None:
 
 @pytest.mark.unit
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI is not available")
-def test_compose_config_renders_with_a_fake_env(tmp_path: Path) -> None:
+@pytest.mark.parametrize("configured", [False, True], ids=["default-tsv", "pinned-registry"])
+def test_compose_config_renders_with_a_fake_env(tmp_path: Path, configured: bool) -> None:
     platform = tmp_path / "platform.env"
     platform.write_text(
         "AIRFLOW__CORE__FERNET_KEY=f\nAIRFLOW__WEBSERVER__SECRET_KEY=s\nTRINO_PORT=8443\n"
@@ -277,6 +279,10 @@ def test_compose_config_renders_with_a_fake_env(tmp_path: Path) -> None:
         "TM_PROXY_CONTROL_TOKEN=tm\n",
         encoding="utf-8",
     )
+    if configured:
+        with contour.open("a", encoding="utf-8") as stream:
+            stream.write("TRANSFERMARKT_DENOMINATOR_SOURCE=registry\n"
+                         "TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID=publication-77\n")
     for compose in (AIRFLOW_COMPOSE, GATEWAY_COMPOSE):
         result = subprocess.run(
             ["docker", "compose", "-f", str(compose), "--env-file", str(platform),
@@ -290,3 +296,7 @@ def test_compose_config_renders_with_a_fake_env(tmp_path: Path) -> None:
         rendered = result.stdout
         assert "shared-pool" not in rendered
         assert "http://proxy_filter:8899" not in rendered
+        if compose == AIRFLOW_COMPOSE:
+            env = json.loads(rendered)["services"]["airflow-scheduler"]["environment"]
+            assert env["TRANSFERMARKT_DENOMINATOR_SOURCE"] == ("registry" if configured else "tsv")
+            assert env["TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID"] == ("publication-77" if configured else "")

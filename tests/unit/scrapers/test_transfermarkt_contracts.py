@@ -37,7 +37,8 @@ def test_contract_rendering_in_both_bronze_builders(monkeypatch, header, cell, s
         assert current['contract_observations'].iloc[0]['contract_until'] == date(2028, 6, 30)
 
 
-def scope_with_packet(*, current=True, assigned='10', contract='2028-06-30', corrupt=False):
+def scope_with_packet(*, current=True, assigned='10', contract='2028-06-30', corrupt=False,
+                      endpoint='current_players'):
     body = packet(['110'])
     body['data'][0]['clubAssignments'][0]['clubId'] = assigned
     body['data'][0]['attributes']['contractUntil'] = contract
@@ -45,7 +46,7 @@ def scope_with_packet(*, current=True, assigned='10', contract='2028-06-30', cor
     body = json.dumps(body).encode()
     url = tmapi.players_url(['110'])
     at = datetime(2026, 10, 8, tzinfo=timezone.utc)
-    raw = SimpleNamespace(url=url, content_hash=hashlib.sha256(body).hexdigest(), status_code=200,
+    raw = SimpleNamespace(endpoint=endpoint, url=url, content_hash=hashlib.sha256(body).hexdigest(), status_code=200,
                           fetched_at=at.isoformat(), capture_id='packet-raw')
     store = SimpleNamespace(load_capture=lambda key: (body + b' ' if corrupt else body, raw))
     obs = SimpleNamespace(entity='player', entity_id='110', raw_capture_id='packet-raw', source_url=url,
@@ -98,6 +99,14 @@ def test_corrupt_packet_rejected_before_enrichment():
     scope, _ = scope_with_packet(corrupt=True)
     with pytest.raises(runner.CurrentPortionError, match='raw proof'):
         scope.supplement_contracts(snapshot())
+
+
+def test_contract_override_rejects_wrong_raw_endpoint():
+    scope, _ = scope_with_packet(endpoint='squad')
+    rows = tm._parse_squad_page(squad('10').replace('Jun 30, 2028', '-'), '10')
+    saved = replace(snapshot({'10': club(rows=rows)}, ['10']), changed_club_ids=('10',))
+    with pytest.raises(CurrentCaptureError, match='raw proof'):
+        scope.supplement_contracts(saved)
 
 
 def test_known_conflicting_html_date_is_never_replaced():

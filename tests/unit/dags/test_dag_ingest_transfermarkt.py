@@ -716,6 +716,30 @@ class TestStandingPolicyGate:
 
 
 class TestRegistryRead:
+    def test_only_current_uses_the_deployment_pin(self, dag_module, monkeypatch):
+        from utils import transfermarkt_native_v2 as tm_v2
+
+        connection = MagicMock()
+        cursor = connection.cursor.return_value
+        cursor.description = [('registry_snapshot_id',)]
+        cursor.fetchall.return_value = [('publication-77',)]
+        monkeypatch.setattr(tm_v2, 'connect', lambda: connection)
+        monkeypatch.setenv('TRANSFERMARKT_DENOMINATOR_SOURCE', 'registry')
+        monkeypatch.setenv('TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID', 'publication-77')
+
+        assert dag_module._read_promoted_registry(current_only=True) == [
+            {'registry_snapshot_id': 'publication-77'},
+        ]
+        assert "registry_snapshot_id = 'publication-77'" in cursor.execute.call_args.args[0]
+        cursor.fetchall.return_value = [('publication-78',)]
+        with pytest.raises(dag_module.AirflowException, match='publication-77'):
+            dag_module._read_promoted_registry(current_only=True)
+        dag_module._read_promoted_registry()
+        assert "'publication-77'" not in cursor.execute.call_args.args[0]
+        monkeypatch.setenv('TRANSFERMARKT_DENOMINATOR_SOURCE', 'tsv')
+        dag_module._read_promoted_registry(current_only=True)
+        assert "'publication-77'" not in cursor.execute.call_args.args[0]
+
     def test_query_is_read_only_and_empty_registry_fails(self, dag_module, monkeypatch):
         from utils import transfermarkt_native_v2 as tm_v2
 
