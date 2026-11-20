@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,10 +42,6 @@ def test_history_attendance_extends_existing_cycle_and_noop_resumes(tmp_path, mo
     monkeypatch.setattr(history_portion, 'remaining_seconds', lambda: 2700)
     monkeypatch.setattr(cycle, '_approval_mode', lambda *a: 'standing_policy')
     grant = cycle.PolicyGrant('history-grant', 'a' * 64, 1)
-    monkeypatch.setattr(
-        cycle, '_consume_approvals',
-        lambda *a, **k: {'paid_proxy': grant, 'production_write': grant},
-    )
     monkeypatch.setattr(
         cycle, '_enforce_standing_policy',
         lambda *a, **k: {'paid_proxy': grant, 'production_write': grant},
@@ -138,6 +135,20 @@ def test_backfill_policy_authorizes_attendance_only_for_enabled_history():
         'iceberg.ops.transfermarkt_attendance_receipts_v1',
     }
     assert not attendance_tables & cycle.required_write_tables('native-only')
+
+
+def test_attendance_grants_remain_compatible_with_legacy_policy_hash():
+    policy = cycle.load_standing_policy(
+        Path('dags/configs/transfermarkt/standing_backfill_policy.json'))
+    original = replace(policy, allowed_write_tables=tuple(
+        table for table in policy.allowed_write_tables
+        if table not in cycle.ATTENDANCE_POLICY_TABLES
+    ))
+    assert original.policy_hash != policy.policy_hash
+    assert cycle.standing_policy_hash_compatible(policy, original.policy_hash)
+    resolved = cycle.standing_policy_for_hash(policy, original.policy_hash)
+    assert resolved is not None
+    assert not cycle.ATTENDANCE_POLICY_TABLES & set(resolved.allowed_write_tables)
 
 
 def test_history_capture_uses_raw_pages_and_real_parser(tmp_path, monkeypatch):

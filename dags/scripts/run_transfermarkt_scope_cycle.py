@@ -153,6 +153,10 @@ CAREER_SAFETY_OPS_TABLES = frozenset({
 })
 SEASON_HANDOFF_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_season_close_v1'})
 FIRST_SEEN_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_first_seen_v1'})
+ATTENDANCE_POLICY_TABLES = frozenset({
+    'iceberg.bronze.transfermarkt_attendance_observations',
+    'iceberg.ops.transfermarkt_attendance_receipts_v1',
+})
 SEASON_HANDOFF_POLICY_VERSIONS = {
     'dag_ingest_transfermarkt': (3, 4),
     'dag_backfill_transfermarkt': (1, 2),
@@ -692,8 +696,9 @@ def standing_policy_for_hash(policy, pinned_hash):
 
     Approval dates, caps, concurrency and every Bronze permission stay
     byte-for-byte bound to the old hash. The current policy must authorize all
-    safety tables. Only the career safety, season handoff and first-observation
-    tables, or their explicit unions, may have been absent from the old body.
+    safety tables. Only the career safety, season handoff, first-observation
+    and optional attendance tables, or their explicit unions, may have been
+    absent from the old body.
     """
     if policy.policy_hash == pinned_hash:
         return policy
@@ -702,8 +707,17 @@ def standing_policy_for_hash(policy, pinned_hash):
     from dataclasses import replace
     migrations = (CAREER_SAFETY_OPS_TABLES, SEASON_HANDOFF_OPS_TABLES,
                   CAREER_SAFETY_OPS_TABLES | SEASON_HANDOFF_OPS_TABLES)
-    for additions in (*migrations, FIRST_SEEN_OPS_TABLES,
-                      *(item | FIRST_SEEN_OPS_TABLES for item in migrations)):
+    base_additions = (
+        frozenset(),
+        *migrations, FIRST_SEEN_OPS_TABLES,
+        *(item | FIRST_SEEN_OPS_TABLES for item in migrations),
+    )
+    addition_options = tuple(
+        item | attendance
+        for item in base_additions
+        for attendance in (frozenset(), ATTENDANCE_POLICY_TABLES)
+    )
+    for additions in addition_options:
         if not additions <= set(policy.allowed_write_tables):
             continue
         original = replace(policy, allowed_write_tables=tuple(
@@ -801,8 +815,13 @@ def _consume_approvals(
     entity_limits: Mapping[str, Mapping[str, int]],
 ) -> Mapping[str, Any]:
     expected_requests = int(args.request_limit)
-    if sum(item['requests'] for item in entity_limits.values()) > expected_requests:
+    base_requests = sum(
+        int(entity_limits[name]['requests']) for name in ENTITY_ORDER
+    )
+    if base_requests > expected_requests:
         raise ScopeCycleError('entity request budgets exceed the cycle request limit')
+    # Optional attendance consumes only the remaining shared scope allowance;
+    # its small per-entity cap does not reduce the four base entity budgets.
     if _approval_mode(args) == 'standing_policy':
         return _enforce_standing_policy(args)
     refs = _approval_refs(args)
