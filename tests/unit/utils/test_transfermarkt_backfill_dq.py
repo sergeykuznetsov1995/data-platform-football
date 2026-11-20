@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -228,3 +229,73 @@ def test_history_original_snapshot_raw_lineage_is_checked_after_current_replacem
         manifests=[SimpleNamespace(dq_evidence={'historical_career_receipts': {'market_value_points': [receipt]}})])
     assert result['capture_count'] == 1
     assert any('FOR VERSION AS OF 10 ' in sql for sql in cur.sql)
+
+
+def test_attendance_snapshot_pin_is_opt_in():
+    cur = _Cursor()
+    tables = dq.BACKFILL_PIN_TABLES + (dq.ATTENDANCE_TABLE,)
+    pins = dq.pin_iceberg_snapshots(cur, tables=tables)
+    assert pins == {table: 42 for table in tables}
+    assert len(cur.sql) == len(tables)
+
+
+def test_attendance_lineage_uses_source_capture_and_run_identity():
+    sql = dq.build_raw_lineage_sql(
+        dq.ATTENDANCE_TABLE, snapshot_id=71, child_cycle_ids=('history-child',))
+    assert 'source_capture_id AS raw_capture_id' in sql
+    assert 'run_id AS cycle_id' in sql
+    assert 'WHERE run_id IN' in sql
+    assert 'FOR VERSION AS OF 71' in sql
+
+
+def test_attendance_manifest_fingerprint_matches_writer_physical_hash():
+    from utils.transfermarkt_attendance import _physical
+
+    expected = {column: None for column in dq.ATTENDANCE_COLUMNS}
+    expected.update({
+        'competition_id': 'GB1',
+        'edition_id': '2025',
+        'club_id': '11',
+        'observed_at': '2026-11-20T12:00:00+00:00',
+        'captured_at': '2026-11-20T12:00:00+00:00',
+        'extracted_at': '2026-11-20T12:01:00+00:00',
+        '_ingested_at': '2026-11-20T12:01:00+00:00',
+        'run_id': 'history-child',
+        'scope_id': 'scope-history',
+        'source_capture_id': 'a' * 64,
+        'source_body_hash': 'b' * 64,
+        'final_season': True,
+    })
+    stored = dict(expected)
+    for column in ('observed_at', 'captured_at'):
+        stored[column] = datetime(2026, 11, 20, 12, 0)
+    for column in ('extracted_at', '_ingested_at'):
+        stored[column] = datetime(2026, 11, 20, 12, 1)
+    physical = _physical([expected])
+
+    class Cursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, sql):
+            self.sql.append(sql)
+
+        def fetchall(self):
+            return [tuple(stored[column] for column in dq.ATTENDANCE_COLUMNS)]
+
+    cur = Cursor()
+    manifest = SimpleNamespace(
+        scope_id='scope-history',
+        child_cycle_id='history-child',
+        entities=[SimpleNamespace(
+            entity=dq.ATTENDANCE_ENTITY,
+            dedup_rows=1,
+            key_hash=physical['physical_hash'],
+        )],
+        dq_evidence={},
+    )
+    result = dq.verify_manifest_entity_fingerprints(
+        cur, pins={dq.ATTENDANCE_TABLE: 42}, manifests=[manifest])
+    assert result['row_count'] == 1
+    assert 'WHERE run_id = \'history-child\'' in cur.sql[0]
+    assert 'FOR VERSION AS OF 42' in cur.sql[0]

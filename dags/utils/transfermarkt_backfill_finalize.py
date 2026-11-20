@@ -71,7 +71,13 @@ def _validated_manifest(
     registry_snapshot_id: str | None = None,
 ) -> ScopeManifest:
     manifest = ScopeManifest.from_mapping(value)
-    manifest.validate(tm_v2.NATIVE_ENTITIES)
+    expected_entities = set(tm_v2.NATIVE_ENTITIES)
+    if any(
+        isinstance(item, Mapping) and item.get('entity') == 'attendance_observations'
+        for item in value.get('entities', ())
+    ):
+        expected_entities.add('attendance_observations')
+    manifest.validate(expected_entities)
     if value.get("manifest_digest") != manifest.digest:
         raise BackfillFinalizeError("scope manifest digest mismatch")
     if manifest.dq_evidence.get("silver_trigger_allowed") is not False:

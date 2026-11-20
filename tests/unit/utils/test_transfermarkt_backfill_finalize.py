@@ -137,6 +137,40 @@ def test_manifest_from_another_scope_is_rejected(monkeypatch):
         )
 
 
+def test_history_attendance_manifest_entity_is_accepted(monkeypatch):
+    from utils import transfermarkt_native_v2 as tm_v2
+
+    campaign, scope, _batch = _campaign_and_claim()
+    validated = []
+    manifest = SimpleNamespace(
+        digest='d' * 64,
+        entities=(SimpleNamespace(entity='attendance_observations'),),
+        validate=lambda entities: validated.append(set(entities)),
+        dq_evidence={
+            'silver_trigger_allowed': False,
+            'standing_policy_hash': campaign.policy_sha256,
+        },
+        scope_id=scope.target.scope_id,
+        competition_id=scope.target.competition_id,
+        edition_id=scope.target.edition_id,
+        canonical_competition_id=scope.target.canonical_competition_id,
+        canonical_season=scope.target.canonical_season,
+        registry_snapshot_id=campaign.registry_snapshot_id,
+        parser_revision='v2',
+        schema_revision='2',
+    )
+    monkeypatch.setattr(
+        finalize.ScopeManifest, 'from_mapping', staticmethod(lambda _value: manifest))
+
+    assert finalize._validated_manifest(
+        {'manifest_digest': manifest.digest, 'entities': [{'entity': 'attendance_observations'}]},
+        policy_sha256=campaign.policy_sha256,
+        campaign=campaign,
+        scope=scope,
+    ) is manifest
+    assert validated == [set(tm_v2.NATIVE_ENTITIES) | {'attendance_observations'}]
+
+
 class _Repository:
     def __init__(self, campaign, scope, batch):
         self.campaign = campaign
