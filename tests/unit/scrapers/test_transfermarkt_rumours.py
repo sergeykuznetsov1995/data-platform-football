@@ -6,6 +6,14 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+import re
+from datetime import date
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from bs4 import BeautifulSoup
+
+from scrapers.transfermarkt import rumours as rumour_v2
 from scrapers.transfermarkt.rumours import (
     ASSERTION_KEY_FIELDS,
     ENTITY_TYPE,
@@ -16,6 +24,196 @@ from scrapers.transfermarkt.rumours import (
     RumourParseError,
     parse_rumours,
 )
+
+
+_GB1 = rumour_v2.CompetitionContext("GB1", "Premier League",
+                                     "/premier-league/startseite/wettbewerb/GB1")
+_LISTING = "/premier-league/geruechte/wettbewerb/GB1"
+_SAVED = Path(__file__).resolve().parents[2] / "fixtures/transfermarkt/rumours"
+_GB1_CAPTURES = (
+    (1, "53ae52cdcb469843f3de7d23a9722e3a4b5578e71a59d7cb0f5b6ee107ba3edc",
+     "2026-11-20T21:21:09.485303+00:00"),
+    (2, "33e9f518feea9bccd4463cdfa3d7437a2ad398695381caad4e4b56e700a88687",
+     "2026-11-20T21:21:24.425970+00:00"),
+)
+
+
+def _gb1_html(number):
+    return (_SAVED / f"gb1-page-{number}.html").read_bytes()
+
+
+def _discussion_url(raw):
+    parts = urlsplit(raw[1:] if raw.startswith("//thread/") else raw)
+    return parts._replace(scheme="https", netloc="www.transfermarkt.com").geturl()
+
+
+@pytest.mark.parametrize("number,digest,clock", _GB1_CAPTURES)
+def test_gb1_saved_observations(number, digest, clock):
+    raw = _gb1_html(number)
+    assert hashlib.sha256(raw).hexdigest() == digest
+    html = raw.decode("utf-8")
+    capture = rumour_v2.parse_rumours(html, competition=_GB1, observed_at=clock)
+    assert capture.status == "observed_present"
+    assert capture.parser_version == "transfermarkt-rumours/2"
+    assert capture.schema_version == "transfer_rumour_assertion/2"
+    assert len(capture.observations) == 25
+    assert capture.duplicate_count == 0
+    assert {obs.entity_type for obs in capture.observations} == {"transfer_rumour_assertion"}
+
+    # Compare the player/club/date/post association on every source row. The
+    # parser sorts observations by identity, independently of HTML row order.
+    soup = BeautifulSoup(html, "html.parser")
+    assert soup.select_one("#yw2 table.items") is not None
+    table = soup.select_one("#yw1 table.items")
+    headers = [cell.get_text(" ", strip=True)
+               for cell in table.select(":scope > thead > tr > :is(th, td)")]
+    expected = set()
+    for row in table.select(":scope > tbody > tr"):
+        cells = dict(zip(headers, row.find_all("td", recursive=False)))
+        player = cells["Player"].select_one("a[href*='/spieler/']")["href"]
+        club = cells["Interested club"].select_one("a[href*='/verein/']")["href"]
+        source = cells["Most recent source from"]
+        day, month, year = map(int, re.search(
+            r"\b(\d{2})/(\d{2})/(\d{4})\b", source.get_text(" ", strip=True)
+        ).groups())
+        url = _discussion_url(source.select_one("a[href]")["href"])
+        assert re.search(r"/thread_id/[1-9][0-9]*(?:/|$)", urlsplit(url).path)
+        expected.add((
+            re.search(r"/spieler/(\d+)", player)[1],
+            re.search(r"/verein/(\d+)", club)[1],
+            date(year, month, day).isoformat(), url,
+        ))
+    assert len(expected) == 25
+    assert len({obs.player.id for obs in capture.observations}) > 1
+    assert {(obs.player.id, obs.interested_club.id, obs.last_source_date, obs.thread_link)
+            for obs in capture.observations} == expected
+    for obs in capture.observations:
+        assert obs.subject_id == f"transfermarkt:player:{obs.player.id}"
+        assert obs.rumour_identity == f"thread:{obs.thread_link}"
+
+
+def test_gb1_saved_page_plan():
+    pages = [rumour_v2.parse_rumour_pagination(_gb1_html(n).decode("utf-8"), competition=_GB1)
+             for n in (1, 2)]
+    assert [(page.current_page, page.last_page) for page in pages] == [(1, 5), (2, 5)]
+    plan = rumour_v2.build_rumour_page_plan(pages)
+    assert len(set(plan)) == len(plan) == 5
+    for page in pages:
+        for number, url in page.links:
+            assert url == plan[number - 1]
+            assert urlsplit(url).netloc == "www.transfermarkt.com"
+            assert "/geruechte/wettbewerb/GB1" in urlsplit(url).path
+
+
+_SHORT_POST = "//thread/forum/154/thread_id/1208229/post_id/3426507#3426507"
+_POST = "https://www.transfermarkt.com" + _SHORT_POST[1:]
+_GRID_TABLE = (
+    '<table class="items"><thead><tr><th>Player</th><th>Interested club</th>'
+    '<th>Most recent source from</th><th>Assessment</th></tr></thead><tbody><tr>'
+    '<td><a href="/p/profil/spieler/17">Player P</a></td>'
+    '<td><a href="/c/startseite/verein/27">Club C</a></td>'
+    f'<td><a href="{_POST}">20/11/2026</a></td>'
+    f'<td>-<a href="{_SHORT_POST}"><i></i></a></td></tr></tbody></table>'
+)
+_STANDINGS = _GRID_TABLE.replace("<th>Player</th>", "<th>Rank</th>")
+
+
+def _read_v2(html):
+    return rumour_v2.parse_rumours(html, competition=_GB1, observed_at=_GB1_CAPTURES[0][2])
+
+
+def test_rumour_grid_selection_and_post_identity():
+    for html in (_GRID_TABLE + _STANDINGS,
+                 f'<div id="yw1">{_GRID_TABLE}</div><div id="yw2">{_STANDINGS}</div>'):
+        for source in (_POST, _SHORT_POST):
+            obs, = _read_v2(html.replace(_POST, source)).observations
+            assert obs.thread_link == _POST
+            assert obs.rumour_identity == f"thread:{_POST}"
+            assert obs.last_source_date == "2026-11-20"
+            assert obs.probability_percent is None
+
+
+def test_source_and_assessment_have_independent_values():
+    obs, = _read_v2(_GRID_TABLE.replace("20/11/2026", "06/07/2026")).observations
+    assert obs.last_source_date == "2026-07-06"
+    html = _GRID_TABLE.replace(f'<a href="{_POST}">20/11/2026</a>', "-")
+    obs, = _read_v2(html).observations
+    assert (obs.thread_link, obs.last_source_date, obs.probability_percent) == (_POST, None, None)
+
+
+@pytest.mark.parametrize("html", [
+    _STANDINGS, _GRID_TABLE * 2, f'<div id="yw1">{_GRID_TABLE * 2}</div>',
+    f'<div id="yw1">{_STANDINGS}</div><div id="yw2">{_GRID_TABLE}</div>',
+    f'<div id="yw1"></div>{_GRID_TABLE}',
+])
+def test_invalid_rumour_grid_fails(html):
+    with pytest.raises(rumour_v2.RumourParseError):
+        _read_v2(html)
+
+
+@pytest.mark.parametrize("old,bad,reason", [
+    (_SHORT_POST, "//www.transfermarkt.com/thread/123", "invalid_url"),
+    (_POST, "//other.example/post/123", "invalid_url"),
+    (_POST, "https://other.example/post/123", "invalid_url"),
+    (_SHORT_POST, "//thread/forum/154/thread_id/nope", "invalid_url"),
+    ("20/11/2026", "11/20/2026", "invalid_date"),
+    ("20/11/2026", "1/2/2026", "invalid_date"),
+    ("20/11/2026", "31/02/2026", "invalid_date"),
+])
+def test_bad_rumour_source_or_assessment_fails(old, bad, reason):
+    with pytest.raises(rumour_v2.RumourParseError) as error:
+        _read_v2(_GRID_TABLE.replace(old, bad))
+    assert (error.value.reason, error.value.row) == (reason, 1)
+
+
+def _page_control(n, role="", label=None, href=None):
+    url = href if href is not None else f"{_LISTING}/page/{n}"
+    return (f'<li class="tm-pagination__list-item--{role}"><a class="tm-pagination__link" '
+            f'href="{url}">{n if label is None else label}</a></li>')
+
+
+def _read_pager(controls, **kwargs):
+    html = f'<div id="yw1">{_GRID_TABLE}<ul class="pager">{controls}</ul></div>'
+    return rumour_v2.parse_rumour_pagination(html, competition=_GB1, **kwargs)
+
+
+_PAGE_ONE = _page_control(1, "active")
+_PAGE_LAST = _page_control(3, "icon-last-page", "")
+
+
+@pytest.mark.parametrize("extra", [
+    _page_control(2, href="https://elsewhere.example" + _LISTING + "/page/2"),
+    _page_control(2, href=_LISTING.replace("GB1", "L1") + "/page/2"),
+    _page_control(2, href=_LISTING.replace("geruechte", "tabelle") + "/page/2"),
+    _page_control(2, href=_LISTING + "/page/02"),
+    _page_control(2, href=_LISTING + "?page=2&page=3"),
+    _page_control(2, href=_LISTING + "?page=2&"),
+    _page_control(2, href=_LISTING + "/page/2?page=2"),
+    _page_control(2, label="3"),
+    _page_control(1, "icon-next-page", ""),
+    _page_control(3, "icon-next-page", ""),
+    _page_control(2, "active"),
+    _page_control(4, "icon-last-page", ""),
+    _page_control(2) + _page_control(2, href=_LISTING + "?page=2"),
+])
+def test_pager_rejects_invalid_target(extra):
+    with pytest.raises(rumour_v2.RumourParseError):
+        _read_pager(_PAGE_ONE + extra + _PAGE_LAST)
+
+
+def test_full_page_plan_requires_consistent_contiguous_evidence():
+    partial = _read_pager(_PAGE_ONE + _PAGE_LAST)
+    with pytest.raises(rumour_v2.RumourParseError, match="incomplete_page_plan"):
+        rumour_v2.build_rumour_page_plan([partial])
+    second = _read_pager(_page_control(2, "active") + _PAGE_LAST)
+    assert rumour_v2.build_rumour_page_plan([partial, second]) == tuple(
+        f"https://www.transfermarkt.com{_LISTING}/page/{n}" for n in (1, 2, 3))
+    with pytest.raises(rumour_v2.RumourParseError, match="invalid_page_navigation"):
+        rumour_v2.build_rumour_page_plan([partial, second, partial])
+    with pytest.raises(rumour_v2.RumourParseError, match="invalid_page_navigation"):
+        _read_pager(_PAGE_ONE + _PAGE_LAST, page_url=_LISTING + "/page/2")
+    with pytest.raises(rumour_v2.RumourParseError, match="invalid_pager"):
+        _read_pager(_PAGE_ONE + _page_control(2))
 
 
 CONTEXT = CompetitionContext("GB1", "Example League", "/example/startseite/wettbewerb/GB1")
@@ -138,8 +336,8 @@ def test_replay_and_canonical_json_keys():
     assert isinstance(payload["observations"][0]["nationalities"], list)
     assert first.to_json() == json.dumps(payload, sort_keys=True, ensure_ascii=False,
                                          separators=(",", ":"), allow_nan=False)
-    assert PARSER_VERSION == "transfermarkt-rumours/1"
-    assert SCHEMA_VERSION == "transfer_rumour_assertion/1"
+    assert PARSER_VERSION == "transfermarkt-rumours/2"
+    assert SCHEMA_VERSION == "transfer_rumour_assertion/2"
     assert ASSERTION_KEY_FIELDS == ("rumour_identity", "subject_id")
     assert OBSERVATION_KEY_FIELDS == ("rumour_identity", "subject_id", "observed_at", "correction_identity")
     obs = payload["observations"][0]
