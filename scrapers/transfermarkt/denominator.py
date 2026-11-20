@@ -12,6 +12,8 @@ fails closed: planners must not guess.
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import logging
 import os
 import re
@@ -109,9 +111,15 @@ def denominator_path() -> Path:
 def load_denominator(path: Path | None = None) -> Denominator:
     """Read and validate the file; any format error fails closed."""
 
+    return load_versioned_denominator(path)[0]
+
+
+def load_versioned_denominator(path: Path | None = None) -> tuple[Denominator, str]:
+    """Hash the exact TSV bytes used to build the denominator."""
     source = Path(path) if path is not None else denominator_path()
     try:
-        with source.open(encoding="utf-8", newline="") as handle:
+        content = source.read_bytes()
+        with io.StringIO(content.decode("utf-8"), newline="") as handle:
             reader = csv.reader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
             header = next(reader, None)
             if tuple(header or ()) != COLUMNS:
@@ -128,7 +136,7 @@ def load_denominator(path: Path | None = None) -> Denominator:
         raise DenominatorError(f"cannot read denominator file {source}") from exc
     if not any(row.is_core for row in rows.values()):
         raise DenominatorError(f"{source}: no live core competitions")
-    return Denominator(rows=rows)
+    return Denominator(rows=rows), hashlib.sha256(content).hexdigest()
 
 
 def denominator_ids(path: Path | None = None) -> frozenset[str]:
@@ -195,4 +203,5 @@ __all__ = [
     "denominator_ids",
     "denominator_path",
     "load_denominator",
+    "load_versioned_denominator",
 ]
