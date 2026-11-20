@@ -13,6 +13,8 @@ import argparse
 import json
 import sys
 import threading
+from collections import Counter
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -111,20 +113,39 @@ def event_to_snapshot(event: Mapping[str, Any], *, tables: Sequence[str], receiv
     }
 
 
-def handle_post_body(body: bytes, *, tables: Sequence[str], received_at: str) -> tuple[list[dict[str, Any]], str]:
-    """Return kept snapshot records plus one of kept/filtered/malformed/too_large."""
+def _decode(body: bytes) -> tuple[dict | None, str]:
     if len(body) > MAX_BODY_BYTES:
-        return [], "too_large"
+        return None, "too_large"
     try:
         event = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return [], "malformed"
+        return None, "malformed"
     if not isinstance(event, dict):
-        return [], "malformed"
+        return None, "malformed"
+    return event, ""
+
+
+def _primary(event, error, tables, received_at):
+    if event is None:
+        return [], error
     if not keep_event(event):
         return [], "filtered"
     record = event_to_snapshot(event, tables=tables, received_at=received_at)
     return ([record] if record is not None else []), "kept"
+
+
+def handle_post_body(body: bytes, *, tables: Sequence[str], received_at: str) -> tuple[list[dict[str, Any]], str]:
+    """Return kept snapshot records plus one of kept/filtered/malformed/too_large."""
+    event, error = _decode(body)
+    return _primary(event, error, tables, received_at)
+
+
+def _clubelo_module():
+    try:
+        from deploy.clubelo import trino_load_meter
+    except ImportError:  # standalone host installation
+        import trino_load_meter
+    return trino_load_meter
 
 
 def append_records(root: Path, records: Sequence[Mapping[str, Any]], *, now: datetime, tag: str = "recv") -> Path:
@@ -163,7 +184,8 @@ def build_heartbeat(*, root_tables: Sequence[str], poll_interval_s: int = 60,
 class EventReceiver:
     """Counter state and POST processing; the HTTP layer is a thin adapter."""
 
-    def __init__(self, root: Path, tables_cache: Path | None = None):
+    def __init__(self, root: Path, tables_cache: Path | None = None, *, clubelo_root: Path | None = None,
+                 clubelo_monitor_user: str | None = None):
         self.root = Path(root)
         self.tables_cache = Path(tables_cache) if tables_cache is not None else None
         self._lock = threading.Lock()
@@ -174,6 +196,15 @@ class EventReceiver:
         self.malformed_total = 0
         self.last_event_at: str | None = None
         self.files: list[str] = []
+        self.clubelo_enabled = clubelo_root is not None
+        self._clubelo_lock = threading.Lock()
+        self._clubelo_pending = Counter()
+        self._clubelo = None
+        if self.clubelo_enabled:
+            try:
+                self._clubelo = _clubelo_module().Sink(clubelo_root, clubelo_monitor_user)
+            except Exception as exc:
+                print(f"clubelo_meter: {type(exc).__name__}", file=sys.stderr)
 
     def tables(self) -> list[str]:
         if self.tables_cache is None:
@@ -190,9 +221,15 @@ class EventReceiver:
             self._cache_mtime = None  # retry on the next POST; keep the last good list
         return list(self._cache_tables)
 
-    def post(self, body: bytes) -> tuple[str, int]:
-        received_at = meter.utc_text(datetime.now(meter.UTC))
-        records, outcome = handle_post_body(body, tables=self.tables(), received_at=received_at)
+    def _primary_post(self, body, received_at):
+        event = None
+        with self._lock:
+            tables = self.tables()
+        if self._clubelo is None:
+            records, outcome = handle_post_body(body, tables=tables, received_at=received_at)
+        else:
+            event, error = _decode(body)
+            records, outcome = _primary(event, error, tables, received_at)
         with self._lock:
             if outcome == "kept":
                 self.kept_total += 1
@@ -204,7 +241,61 @@ class EventReceiver:
                 self.filtered_total += 1
             else:
                 self.malformed_total += 1
-        return outcome, 201
+        return outcome, event
+
+    @contextmanager
+    def _delivery(self, body, truncated=False):
+        received = datetime.now(meter.UTC)
+        received_at = meter.utc_text(received)
+        sink = self._clubelo
+        if sink is None:
+            outcome, _ = self._primary_post(body, received_at)
+            yield outcome, 201
+            return
+        minute = int(received.replace(second=0, microsecond=0).timestamp())
+        with self._clubelo_lock:
+            self._clubelo_pending[minute] += 1
+        try:
+            outcome, event = self._primary_post(body, received_at)
+            try:
+                yield outcome, 201  # HTTP acknowledges the persisted primary result here.
+            finally:
+                if truncated:
+                    self._clubelo_gap(received_at)
+                else:
+                    try:
+                        sink.capture(event, received.isoformat())
+                    except Exception:
+                        self._clubelo_gap(received_at)
+        finally:
+            with self._clubelo_lock:
+                self._clubelo_pending[minute] -= 1
+                if not self._clubelo_pending[minute]:
+                    del self._clubelo_pending[minute]
+
+    def post(self, body: bytes) -> tuple[str, int]:
+        with self._delivery(body) as result:
+            return result
+
+    def _clubelo_gap(self, received_at):
+        if self._clubelo is not None:
+            try:
+                self._clubelo.gap(received_at)
+            except Exception:
+                self._clubelo.disable()
+
+    def dropped(self):
+        self._clubelo_gap(meter.utc_text(datetime.now(meter.UTC)))
+
+    def clubelo_health(self):
+        with self._clubelo_lock:
+            if self._clubelo is None:
+                return {"enabled": self.clubelo_enabled, "ready": False}
+            health = self._clubelo.health()
+            # A request in the new minute can overlap the heartbeat for the
+            # previous one. Withhold only minutes still being processed.
+            health["event_minutes"] = [m for m in health["event_minutes"] if m not in self._clubelo_pending]
+            return health
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -220,23 +311,35 @@ class _PostHandler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self) -> None:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(min(length, MAX_BODY_BYTES + 1)) if length > 0 else b""
-            _, code = self.receiver.post(body)
-        except Exception:
-            code = 500
-        self.send_response(code)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        shared = getattr(self.receiver, "clubelo_enabled", False)
+        with ExitStack() as delivery:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(min(length, MAX_BODY_BYTES + 1)) if length > 0 else b""
+                if shared:
+                    truncated = len(body) < min(length, MAX_BODY_BYTES + 1)
+                    _, code = delivery.enter_context(self.receiver._delivery(body, truncated))
+                else:
+                    _, code = self.receiver.post(body)
+            except Exception:
+                if shared:
+                    delivery.callback(self.receiver.dropped)
+                code = 500
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path != "/healthz":
+        if self.path == "/clubelo-healthz" and getattr(self.receiver, "clubelo_enabled", False):
+            health = self.receiver.clubelo_health()
+        elif self.path == "/healthz":
+            health = self.receiver.health()
+        else:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        payload = json.dumps(self.receiver.health(), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        payload = json.dumps(health, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -247,6 +350,8 @@ class _PostHandler(BaseHTTPRequestHandler):
 def _serve(receiver: EventReceiver, host: str, port: int) -> None:
     handler = type("ReceiverHandler", (_PostHandler,), {"receiver": receiver})
     server = ThreadingHTTPServer((host, port), handler)
+    if receiver._clubelo is not None:
+        receiver._clubelo.activate()
     print(f"fotmob_load_meter_receiver: {host}:{port} root={receiver.root}", file=sys.stderr)
     try:
         server.serve_forever()
@@ -262,11 +367,15 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=4849)
     serve.add_argument("--tables-cache", type=Path)
+    serve.add_argument("--clubelo-root", type=Path)
+    serve.add_argument("--clubelo-monitor-user", help="verified dedicated read-only monitor principal")
     beat = commands.add_parser("heartbeat")
     beat.add_argument("--root", type=Path, default=meter.DEFAULT_ROOT)
     beat.add_argument("--discovered", type=Path, required=True)
     beat.add_argument("--status", choices=("ok", "down"), default="ok")
     beat.add_argument("--window-end")
+    beat.add_argument("--clubelo-root", type=Path)
+    beat.add_argument("--clubelo-health-url", default="http://127.0.0.1:4849/clubelo-healthz")
     return parser
 
 
@@ -274,7 +383,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "serve":
-            _serve(EventReceiver(args.root, args.tables_cache), args.host, args.port)
+            _serve(EventReceiver(args.root, args.tables_cache, clubelo_root=args.clubelo_root,
+                                 clubelo_monitor_user=args.clubelo_monitor_user), args.host, args.port)
             return 0
         end = meter.utc_datetime(args.window_end) if args.window_end else datetime.now(meter.UTC).replace(microsecond=0)
         payload = json.loads(args.discovered.read_text(encoding="utf-8"))
@@ -285,6 +395,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                                discovered_tables=payload.get("discovered_tables", []))
         path = append_records(args.root, [beat], now=end, tag="hb")
         print(meter.json_text({"raw_file": str(path), "status": beat["status"]}), end="")
+        if args.clubelo_root is not None:
+            try:
+                _clubelo_module().heartbeat(args.clubelo_root, end, args.status, args.clubelo_health_url)
+            except Exception as exc:
+                print(f"clubelo_heartbeat: {type(exc).__name__}", file=sys.stderr)
         return 0
     except Exception as exc:
         # Raw exception text can contain HTTP headers, credentials or SQL.
