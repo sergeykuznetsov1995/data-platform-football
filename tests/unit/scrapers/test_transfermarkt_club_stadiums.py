@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import json
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+from scrapers.transfermarkt.club_stadiums import (
+    PARSER_REVISION,
+    SCHEMA_REVISION,
+    ClubStadiumError,
+    ClubStadiumRelation,
+    Stadium,
+    confirmed_empty_club_stadium,
+    parse_club_stadium,
+)
+
+
+pytestmark = pytest.mark.unit
+CAPTURE = '2026-10-03T08:05:00+02:00'
+IMAGE_1 = 'https://img.example/stadium-1.jpg'
+IMAGE_2 = 'https://img.example/stadium-2.jpg'
+
+
+@pytest.fixture
+def envelope():
+    return {
+        'success': True,
+        'message': 'OK',
+        'data': {
+            'id': '56',
+            'name': 'Spotify Camp Nou',
+            'url': 'www.fcbarcelona.com/web/index_idiomes.html',
+            'clubId': '131',
+            'isHistorical': False,
+            'capacity': 62657,
+            'internationalCapacity': 62000,
+            'images': [
+                {'url': IMAGE_1, 'source': 'IMAGO'},
+                {'url': IMAGE_2, 'source': 'IMAGO'},
+                {'url': IMAGE_1, 'source': 'Other'},
+            ],
+            'location': {
+                'countryId': 157,
+                'street': ' Carrer d´Aristides Maillol, entrance no 7  ',
+                'postcode': '08028 ',
+                'city': ' Barcelona',
+                'latitude': 41.380896,
+                'longitude': 2.1228198,
+            },
+            'buildingDetails': {
+                'buildYear': 1957,
+                'renovationYear': 1994,
+                'fieldWidth': 68,
+                'fieldLength': 105,
+                'fieldSurface': 'Hybridrasen',
+            },
+        },
+    }
+
+
+def test_full_observation(envelope):
+    result = parse_club_stadium(
+        envelope, club_id=131, observed_at=CAPTURE, country_names={'157': 'España'},
+    )
+    assert (result.status, result.club_id, result.observed_at, result.completeness_proof) == (
+        'observed_present', '131', CAPTURE, None,
+    )
+    assert result.stadium == Stadium(
+        stadium_id='56', name='Spotify Camp Nou', capacity=62657, international_capacity=62000,
+        website='www.fcbarcelona.com/web/index_idiomes.html',
+        address_line_1='Carrer d´Aristides Maillol, entrance no 7', address_line_2='08028 Barcelona',
+        country_id='157', country_name='España', latitude=41.380896, longitude=2.1228198,
+        build_year=1957, renovation_year=1994, field_length=105, field_width=68,
+        field_surface='Hybridrasen', images=(IMAGE_1, IMAGE_2), source_is_historical=False,
+    )
+    assert result.relation == ClubStadiumRelation('131', '56', CAPTURE)
+    with pytest.raises(FrozenInstanceError):
+        result.stadium.capacity = 10
+
+
+def test_confirmed_empty():
+    result = confirmed_empty_club_stadium(
+        club_id=131, observed_at=CAPTURE, completeness_proof='capture/report-17',
+    )
+    assert json.loads(result.canonical_json()) == {
+        'schema_revision': SCHEMA_REVISION, 'parser_revision': PARSER_REVISION,
+        'club_id': '131', 'observed_at': CAPTURE, 'status': 'observed_empty',
+        'completeness_proof': 'capture/report-17', 'stadium': None, 'relation': None,
+    }
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'completeness_proof': None}, {'completeness_proof': '  '}])
+def test_confirmed_empty_requires_external_proof(kwargs):
+    with pytest.raises(ClubStadiumError) as error:
+        confirmed_empty_club_stadium(club_id=131, observed_at=CAPTURE, **kwargs)
+    assert error.value.reason == 'missing_completeness_proof'
+
+
+@pytest.mark.parametrize(('payload', 'reason'), [
+    ([], 'invalid_object'),
+    ({'clubId': '131', 'name': 'Ground'}, 'unsuccessful_envelope'),
+    ({'success': False, 'data': {'name': 'Ground'}}, 'unsuccessful_envelope'),
+    ({'success': 1, 'data': {'name': 'Ground'}}, 'unsuccessful_envelope'),
+    ({'success': True, 'message': []}, 'invalid_text'),
+    ({'success': True}, 'invalid_object'),
+    ({'success': True, 'data': None}, 'invalid_object'),
+    ({'success': True, 'data': []}, 'invalid_object'),
+    ({'success': True, 'data': {}}, 'empty_data'),
+    ({'success': True, 'data': {'unrecognized': True}}, 'invalid_text'),
+])
+def test_broken_envelope_raises(payload, reason):
+    with pytest.raises(ClubStadiumError) as error:
+        parse_club_stadium(payload, club_id='131', observed_at=CAPTURE)
+    assert error.value.reason == reason
+
+
+@pytest.mark.parametrize(('attributes', 'reason', 'field'), [
+    ({'clubId': 132}, 'club_mismatch', 'data.clubId'),
+    ({'clubId': None}, 'invalid_id', 'data.clubId'),
+    ({'id': True}, 'invalid_id', 'data.id'),
+    ({'name': '  '}, 'blank_text', 'data.name'),
+    ({'capacity': True}, 'invalid_integer', 'data.capacity'),
+    ({'internationalCapacity': '90'}, 'invalid_integer', 'data.internationalCapacity'),
+    ({'isHistorical': 1}, 'invalid_boolean', 'data.isHistorical'),
+    ({'url': []}, 'invalid_text', 'data.url'),
+    ({'location': []}, 'invalid_object', 'data.location'),
+    ({'location': {'countryId': 3.5}}, 'invalid_id', 'data.location.countryId'),
+    ({'location': {'street': None}}, 'invalid_text', 'data.location.street'),
+    ({'location': {'postcode': 8028}}, 'invalid_text', 'data.location.postcode'),
+    ({'location': {'latitude': float('nan')}}, 'invalid_coordinate', 'data.location.latitude'),
+    ({'location': {'longitude': float('inf')}}, 'invalid_coordinate', 'data.location.longitude'),
+    ({'location': {'latitude': False}}, 'invalid_coordinate', 'data.location.latitude'),
+    ({'location': {'longitude': -181}}, 'invalid_coordinate', 'data.location.longitude'),
+    ({'buildingDetails': None}, 'invalid_object', 'data.buildingDetails'),
+    ({'buildingDetails': {'fieldLength': 3.5}}, 'invalid_integer', 'data.buildingDetails.fieldLength'),
+    ({'images': {}}, 'invalid_images', 'data.images'),
+    ({'images': [IMAGE_1]}, 'invalid_object', 'data.images[0]'),
+    ({'images': [{}]}, 'invalid_text', 'data.images[0].url'),
+    ({'images': [{'url': 42}]}, 'invalid_text', 'data.images[0].url'),
+    ({'images': [{'url': ' '}]}, 'blank_text', 'data.images[0].url'),
+    ({'images': [{'url': IMAGE_1, 'source': []}]}, 'invalid_text', 'data.images[0].source'),
+])
+def test_invalid_attributes_raise(attributes, reason, field):
+    data = {'name': 'Ground', **attributes}
+    with pytest.raises(ClubStadiumError) as error:
+        parse_club_stadium({'success': True, 'data': data}, club_id=131, observed_at=CAPTURE)
+    assert (error.value.reason, error.value.field) == (reason, field)
+
+
+@pytest.mark.parametrize('timestamp', [
+    None, 'yesterday', '2026-10-03T08:05:00', '2026-10-03 08:05:00+00:00',
+    '2026-02-30T12:00:00Z', '20261003T080500Z', '2026-10-03T08:05:00+01:60',
+])
+def test_rejects_invalid_capture_time(envelope, timestamp):
+    with pytest.raises(ClubStadiumError) as error:
+        parse_club_stadium(envelope, club_id=131, observed_at=timestamp)
+    assert error.value.reason == 'invalid_observed_at'
+
+
+@pytest.mark.parametrize('club_id', [True, 0, -1, 1.5, '0131', '1e2'])
+def test_rejects_invalid_caller_id(envelope, club_id):
+    with pytest.raises(ClubStadiumError) as error:
+        parse_club_stadium(envelope, club_id=club_id, observed_at=CAPTURE)
+    assert error.value.reason == 'invalid_id'
+
+
+def test_replay_and_json_round_trip(envelope):
+    args = {'club_id': '131', 'observed_at': '2026-10-03T06:05:00Z', 'country_names': {157: 'España'}}
+    first = parse_club_stadium(envelope, **args)
+    second = parse_club_stadium(json.loads(json.dumps(envelope)), **args)
+    assert first == second
+    encoded = first.canonical_json().encode('utf-8')
+    assert encoded == second.canonical_json().encode('utf-8')
+    doc = json.loads(encoded)
+    assert encoded == json.dumps(
+        doc, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False,
+    ).encode('utf-8')
+    assert doc['club_id'] == doc['relation']['club_id'] == '131'
+    assert doc['stadium']['stadium_id'] == doc['relation']['stadium_id'] == '56'
+    assert doc['observed_at'] == doc['relation']['observed_at'] == '2026-10-03T06:05:00+00:00'
+    assert doc['stadium']['country_id'] == '157'
+    assert doc['stadium']['images'] == [IMAGE_1, IMAGE_2]
+
+
+def test_missing_id_preserves_club_scoped_observation():
+    result = parse_club_stadium(
+        {'success': True, 'data': {'name': 'Local Ground'}}, club_id='131', observed_at=CAPTURE,
+    )
+    assert result.status == 'observed_present'
+    assert result.stadium.stadium_id is None
+    assert result.relation == ClubStadiumRelation('131', None, CAPTURE)
+    assert all(value is None for key, value in json.loads(result.canonical_json())['stadium'].items()
+               if key != 'name')
+
+
+def test_shared_venue_has_separate_club_relations(envelope):
+    first = parse_club_stadium(envelope, club_id=131, observed_at=CAPTURE)
+    envelope['data']['clubId'] = '132'
+    second = parse_club_stadium(envelope, club_id=132, observed_at=CAPTURE)
+    assert first.stadium == second.stadium
+    assert first.relation == ClubStadiumRelation('131', '56', CAPTURE)
+    assert second.relation == ClubStadiumRelation('132', '56', CAPTURE)
+
+
+@pytest.mark.parametrize('historical', [True, False])
+def test_no_published_period(envelope, historical):
+    envelope['data']['isHistorical'] = historical
+    result = parse_club_stadium(envelope, club_id=131, observed_at=CAPTURE)
+    assert result.stadium.source_is_historical is historical
+    assert (result.stadium.build_year, result.stadium.renovation_year) == (1957, 1994)
+    assert result.relation.observed_at == CAPTURE
+    assert result.relation.valid_from is None
+    assert result.relation.valid_to is None
+
+
+@pytest.mark.parametrize(('parts', 'line_2'), [
+    ({'postcode': '08028'}, '08028'), ({'city': ' Barcelona '}, 'Barcelona'),
+    ({'postcode': ' ', 'city': ''}, None),
+])
+def test_partial_address_and_unresolved_country(parts, line_2):
+    location = {'street': ' ', 'countryId': 157, **parts}
+    result = parse_club_stadium(
+        {'success': True, 'data': {'name': 'Ground', 'location': location}},
+        club_id='131', observed_at=CAPTURE, country_names={5: 'Country Five'},
+    )
+    assert result.stadium.address_line_1 is None
+    assert result.stadium.address_line_2 == line_2
+    assert result.stadium.country_id == '157'
+    assert result.stadium.country_name is None
