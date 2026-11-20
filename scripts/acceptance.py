@@ -209,7 +209,7 @@ class Store:
             require(record['revision'] == revision.get('expected_revision'), 'stale definition revision')
             record.update(definition=spec, series=record['series'] + 1,
                 started_at=spec.get('started_at'), deployed_revision=spec.get('deployed_revision'),
-                definition_confirmed=spec['definition_confirmed'], observations={}, impact_hold=False,
+                definition_confirmed=spec['definition_confirmed'], observations={},
                 checked_at=None, reason=revision['reason'])
             record.pop('close_plan', None)
             self._save(db, record, 'definition_revised',
