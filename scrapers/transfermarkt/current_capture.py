@@ -348,7 +348,7 @@ def verify_contract_overrides(snapshot, store):
         row = next(row for row in club.rows if row['player_id'] == player_id)
         body, raw = store.load_capture(proof['raw_capture_id'])
         ids = parse_qs(urlsplit(raw.url).query).get('ids[]', [])
-        if (raw.url != tmapi.players_url(ids) or raw.status_code != 200
+        if (raw.endpoint != 'current_players' or raw.url != tmapi.players_url(ids) or raw.status_code != 200
             or raw.content_hash != proof['source_body_hash'] or raw.url != proof['source_url']
             or hashlib.sha256(body).hexdigest() != raw.content_hash
             or _timestamp(raw.fetched_at) != _timestamp(proof['fetched_at'])):
