@@ -304,6 +304,22 @@ def test_staff_physical_readback_uses_every_natural_key(physical, monkeypatch):
     assert result['physical']['physical_hash']
 
 
+def test_staff_readback_rejects_unexpected_same_batch_row(physical, monkeypatch):
+    original = physical._iceberg_writer.write_dataframe
+
+    def write_with_extra_row(**kwargs):
+        result = original(**kwargs)
+        extra = kwargs['df'].iloc[[0]].copy()
+        extra['person_id'] = 'unexpected'
+        extra['name'] = 'Unexpected Person'
+        original(**{**kwargs, 'df': extra})
+        return result
+
+    monkeypatch.setattr(physical._iceberg_writer, 'write_dataframe', write_with_extra_row)
+    with pytest.raises(staff.current.CurrentWriteError, match='physical business/lineage mismatch'):
+        write(physical)
+
+
 @pytest.fixture
 def staff_policy(monkeypatch, tmp_path):
     policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
