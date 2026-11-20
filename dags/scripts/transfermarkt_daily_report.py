@@ -88,33 +88,114 @@ def execute_history(day, as_of):
         connection.close()
 
 
-def _manifest_metadata(path):
+def _unique_object(pairs):
     from dags.utils.transfermarkt_daily_measure import MeasurementError
 
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise MeasurementError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _json_document(raw):
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+
+
+def _valid_id(value):
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
+
+
+def _registry_snapshot(registry, expected):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+    from dags.utils.transfermarkt_denominator_registry import registry_snapshot_id
+
+    actual = registry_snapshot_id(registry)
+    if expected is not None and actual != expected:
+        raise MeasurementError(
+            f"expected registry snapshot {expected!r}, got {actual!r}"
+        )
+    return actual
+
+
+def _manifest_ids(section, key):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+
+    values = section.get(key)
+    if (
+        not isinstance(values, list)
+        or not all(_valid_id(value) for value in values)
+        or len(values) != len(set(values))
+    ):
+        raise MeasurementError(f"{key} must be a list of unique nonempty string IDs")
+    return values
+
+
+def _manifest_metadata(path, registry, expected):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+    from dags.utils.transfermarkt_registry_publish import stable_hash
+
+    actual = _registry_snapshot(registry, expected)
     if path is None:
         raise MeasurementError("dual-run requires discovery manifest metadata")
-    document = json.loads(Path(path).read_text())
+    raw = Path(path).read_bytes()
+    document = _json_document(raw)
+    if not isinstance(document, dict):
+        raise MeasurementError("discovery manifest document must be an object")
     manifest = document.get("manifest", document)
-    report = manifest.get("discovery_report") or {}
-    reasons = report.get("discovery_quarantined") or {}
-    quarantined = {
-        str(competition_id): str(
-            reasons.get(competition_id)
-            or "registry quarantine without detailed discovery reason"
+    if not isinstance(manifest, dict):
+        raise MeasurementError("manifest must be an object")
+    snapshot = manifest.get("snapshot_id")
+    if not _valid_id(snapshot) or snapshot != actual:
+        raise MeasurementError(
+            f"manifest snapshot_id {snapshot!r} differs from registry {actual!r}"
         )
-        for competition_id in manifest.get("quarantined_competition_ids", ())
+    section = manifest.get("discovery_report")
+    if not isinstance(section, dict):
+        raise MeasurementError("discovery_report must be an object")
+    quarantine = set(_manifest_ids(manifest, "quarantined_competition_ids"))
+    title_only = _manifest_ids(section, "title_only_competition_ids")
+    reasons = section.get("discovery_quarantined")
+    if not isinstance(reasons, dict):
+        raise MeasurementError("discovery_quarantined must be an object")
+    if set(reasons) != quarantine:
+        raise MeasurementError(
+            f"discovery_quarantined ID mismatch: {sorted(set(reasons) ^ quarantine)}"
+        )
+    for cid, reason in reasons.items():
+        if not isinstance(reason, str) or not reason.strip():
+            raise MeasurementError(
+                f"discovery_quarantined requires a nonblank reason for {cid}"
+            )
+    collisions = quarantine.intersection(
+        str(row.get("competition_id", "")).strip() for row in registry
+    )
+    if collisions:
+        raise MeasurementError(f"published/quarantine collision: {sorted(collisions)}")
+
+    content = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    digest = stable_hash(content)
+    for obj in (document, manifest):
+        if "manifest_hash" in obj and obj["manifest_hash"] != digest:
+            raise MeasurementError(
+                "declared manifest_hash differs from discovery manifest content"
+            )
+    identity = {
+        "manifest_snapshot_id": snapshot,
+        "manifest_hash": digest,
+        "manifest_file_sha256": hashlib.sha256(raw).hexdigest(),
     }
-    title_only = report.get("title_only_competition_ids", ())
-    return quarantined, title_only
+    return reasons, title_only, identity
 
 
 def _selected_denominator(source, registry, path, *, metadata=None):
     from dags.utils.transfermarkt_daily_measure import daily_denominator
     from dags.utils.transfermarkt_denominator_registry import build_registry_denominator
-    from scrapers.transfermarkt.denominator import load_denominator
+    from scrapers.transfermarkt.denominator import load_versioned_denominator
 
     if source == "registry":
-        quarantined, title_only = metadata or ({}, ())
+        quarantined, title_only = metadata[:2] if metadata is not None else ({}, ())
         selected = build_registry_denominator(
             registry,
             quarantined=quarantined,
@@ -125,44 +206,156 @@ def _selected_denominator(source, registry, path, *, metadata=None):
             registry,
             denominator_version=selected.universe_version,
         ), selected
-    legacy = load_denominator(path)
-    version = hashlib.sha256(path.read_bytes()).hexdigest()
+    legacy, version = load_versioned_denominator(path)
     return daily_denominator(
         legacy.rows.values(), registry, denominator_version=version
     ), legacy
 
 
-def _dual_denominators(registry, path, manifest_path):
-    from dags.utils.transfermarkt_denominator_registry import compare_denominators
+def _dual_denominators(registry, path, manifest_path, expected=None):
+    from dags.utils.transfermarkt_daily_measure import daily_denominator
+    from dags.utils.transfermarkt_denominator_registry import (
+        build_registry_denominator,
+        compare_denominators,
+    )
+    from scrapers.transfermarkt.denominator import load_versioned_denominator
 
-    metadata = _manifest_metadata(manifest_path)
-    legacy, legacy_definition = _selected_denominator(
-        "tsv", registry, path, metadata=metadata
+    quarantine, titles, identity = _manifest_metadata(manifest_path, registry, expected)
+    current_definition = build_registry_denominator(
+        registry, quarantined=quarantine, title_only_ids=titles
     )
-    current, current_definition = _selected_denominator(
-        "registry", registry, path, metadata=metadata
-    )
-    version = hashlib.sha256(path.read_bytes()).hexdigest()
+    legacy_definition, version = load_versioned_denominator(path)
     diff = compare_denominators(
         legacy_definition, current_definition, legacy_version=version
+    )
+    diff.update(identity)
+    if not diff["migration_clean"]:
+        return None, None, diff
+    legacy = daily_denominator(
+        legacy_definition.rows.values(), registry, denominator_version=version
+    )
+    current = daily_denominator(
+        current_definition.denominator.rows.values(),
+        registry,
+        denominator_version=current_definition.universe_version,
     )
     return legacy, current, diff
 
 
-def _measure_payload(denominator, day, as_of):
-    from dags.utils.transfermarkt_daily_measure import build_daily_measure_sql
+def _measure_payload(denominator, day, as_of, journal_snapshots=None):
+    from dags.utils.transfermarkt_daily_measure import build_daily_measure_sql, utc
 
-    sql, params = build_daily_measure_sql(denominator, day, as_of=as_of)
+    sql, params = build_daily_measure_sql(
+        denominator, day, as_of=as_of, journal_snapshots=journal_snapshots
+    )
     return {
         "sql": sql,
         "params": params,
         "report_day": day,
+        "as_of": utc(as_of).isoformat(),
+        "journal_snapshots": journal_snapshots,
         "denominator_hash": denominator.denominator_hash,
         "denominator_version": denominator.denominator_version,
         "blocked_competitions": dict(denominator.blocked_competitions),
         "current_editions": denominator.rows,
         "denominator_definition_hash": denominator.denominator_definition_hash,
     }
+
+
+def _main_journal_snapshots(cur):
+    from dags.utils.transfermarkt_current_state import CHECKS_TABLE, SIGNALS_TABLE
+    from dags.utils.transfermarkt_daily_measure import (
+        MeasurementError,
+        validate_journal_snapshots,
+    )
+
+    selects = []
+    for table in (CHECKS_TABLE, SIGNALS_TABLE):
+        schema, name = table.rsplit(".", 1)
+        selects.append(
+            f"SELECT '{table}' AS journal, snapshot_id "
+            f'FROM {schema}."{name}$refs" '
+            "WHERE name = 'main'"
+        )
+    cur.execute(" UNION ALL ".join(selects))
+    pins = {}
+    for row in _read(cur):
+        table = row["journal"]
+        if table in pins:
+            raise MeasurementError(f"multiple main refs for {table}")
+        pins[table] = row["snapshot_id"]
+    return validate_journal_snapshots(pins)
+
+
+def _read_measure(cur, payload):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+
+    cur.execute(payload["sql"], payload["params"])
+    rows = _read(cur)
+    if len(rows) != 1:
+        raise MeasurementError("daily measure must return exactly one row")
+    if rows[0].get("denominator_version") != payload["denominator_version"]:
+        raise MeasurementError(
+            "measured denominator version differs from the selected version"
+        )
+    return rows[0]
+
+
+def _measure_error(exc):
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
+    from scrapers.transfermarkt.denominator import DenominatorError
+
+    if isinstance(exc, (MeasurementError, DenominatorError, json.JSONDecodeError)):
+        return str(exc)
+    return "daily measure input or query failed"
+
+
+def _dual_output(
+    registry, path, manifest_path, expected, day, as_of, pins, *, cur=None
+):
+    from dags.utils.transfermarkt_daily_measure import utc
+
+    normalized = utc(as_of).isoformat()
+    legacy, current, diff = _dual_denominators(registry, path, manifest_path, expected)
+    if not diff["migration_clean"]:
+        return {
+            "status": "blocked",
+            "error": "denominator comparison failed",
+            "diff": diff,
+        }
+    if cur is not None and pins is None:
+        pins = _main_journal_snapshots(cur)
+    result = {
+        "status": "sql_only" if cur is None else "measured",
+        "diff": diff,
+        "journal_snapshots": pins,
+        "report_day": day,
+        "as_of": normalized,
+    }
+    for name, denominator in (("legacy", legacy), ("registry", current)):
+        payload = _measure_payload(denominator, day, normalized, pins)
+        payload["denominator_source"] = "tsv" if name == "legacy" else "registry"
+        if cur is not None:
+            payload["report"] = _read_measure(cur, payload)
+        result[name] = payload
+    return result
+
+
+def _single_payload(source, registry, path, expected, manifest_path, day, as_of, pins):
+    from dags.utils.transfermarkt_denominator_registry import denominator_source
+
+    metadata = None
+    if manifest_path is not None:
+        metadata = _manifest_metadata(manifest_path, registry, expected)
+    elif expected is not None:
+        _registry_snapshot(registry, expected)
+    selected_source = denominator_source(source)
+    denominator, _ = _selected_denominator(
+        selected_source, registry, path, metadata=metadata
+    )
+    payload = _measure_payload(denominator, day, as_of, pins)
+    payload["denominator_source"] = selected_source
+    return payload
 
 
 def execute_measure(
@@ -174,22 +367,23 @@ def execute_measure(
     registry_snapshot_id=None,
     discovery_manifest_path=None,
     dual_run=False,
+    journal_snapshots=None,
 ):
-    from dags.utils.transfermarkt_daily_measure import (
-        MeasurementError,
-        build_daily_measure_sql,
-    )
+    from dags.utils.transfermarkt_daily_measure import MeasurementError
     from dags.utils import transfermarkt_native_v2 as native
-    from dags.utils.transfermarkt_denominator_registry import denominator_source
+    from dags.utils.transfermarkt_denominator_registry import (
+        current_denominator_snapshot_id,
+    )
     from dags.utils.transfermarkt_scope_planner import build_promoted_registry_query
 
+    snapshot_id = current_denominator_snapshot_id(registry_snapshot_id, source=source)
     connection = native.connect()
     try:
         cur = connection.cursor()
         try:
             cur.execute(
                 build_promoted_registry_query(
-                    registry_snapshot_id=registry_snapshot_id,
+                    registry_snapshot_id=snapshot_id,
                     current_only=True,
                 )
             )
@@ -197,33 +391,31 @@ def execute_measure(
             if not registry:
                 raise MeasurementError("no promoted registry available")
             if dual_run:
-                legacy, current, diff = _dual_denominators(
-                    registry, path, discovery_manifest_path
+                return _dual_output(
+                    registry,
+                    path,
+                    discovery_manifest_path,
+                    snapshot_id,
+                    day,
+                    as_of,
+                    journal_snapshots,
+                    cur=cur,
                 )
-                result = {}
-                for name, denominator in (("legacy", legacy), ("registry", current)):
-                    payload = _measure_payload(denominator, day, as_of)
-                    cur.execute(payload["sql"], payload["params"])
-                    rows = _read(cur)
-                    if len(rows) != 1:
-                        raise MeasurementError(
-                            "daily measure must return exactly one row"
-                        )
-                    payload["report"] = rows[0]
-                    result[name] = payload
-                result["diff"] = diff
-                return result
-            denominator, _ = _selected_denominator(
-                denominator_source(source),
+            payload = _single_payload(
+                source,
                 registry,
                 path,
+                snapshot_id,
+                discovery_manifest_path,
+                day,
+                as_of,
+                journal_snapshots,
             )
-            sql, params = build_daily_measure_sql(denominator, day, as_of=as_of)
-            cur.execute(sql, params)
-            rows = _read(cur)
-            if len(rows) != 1:
-                raise MeasurementError("daily measure must return exactly one row")
-            return rows[0]
+            report = _read_measure(cur, payload)
+            report["denominator_source"] = payload["denominator_source"]
+            if journal_snapshots is not None:
+                report["journal_snapshots"] = journal_snapshots
+            return report
         finally:
             cur.close()
     finally:
@@ -238,8 +430,8 @@ def main(argv=None) -> int:
         format_daily_summary,
         import_site_sample,
         utc,
+        validate_journal_snapshots,
     )
-    from dags.utils.transfermarkt_denominator_registry import denominator_source
     from scrapers.transfermarkt.denominator import denominator_path
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -265,6 +457,11 @@ def main(argv=None) -> int:
     parser.add_argument("--denominator-dual-run", action="store_true")
     parser.add_argument("--discovery-manifest-json", type=Path, default=None)
     parser.add_argument("--registry-snapshot-id", default=None)
+    parser.add_argument(
+        "--journal-snapshots-json",
+        type=Path,
+        help="Iceberg journal snapshot IDs for replay",
+    )
     parser.add_argument(
         "--report-json", type=Path, help="one daily SELECT result object"
     )
@@ -296,8 +493,29 @@ def main(argv=None) -> int:
         )
     if args.denominator_dual_run and not (args.registry_json or args.execute):
         parser.error("dual-run requires --registry-json or --execute")
-    if args.denominator_dual_run and not args.discovery_manifest_json:
-        parser.error("dual-run requires --discovery-manifest-json")
+    if args.denominator_dual_run and args.discovery_manifest_json is None:
+        print(
+            json.dumps(
+                {
+                    "status": "not_measured",
+                    "error": "dual-run requires --discovery-manifest-json",
+                }
+            )
+        )
+        return 1
+    pins = None
+    if args.journal_snapshots_json is not None:
+        if not (args.registry_json or args.execute):
+            parser.error(
+                "--journal-snapshots-json requires --registry-json or --execute"
+            )
+        try:
+            pins = validate_journal_snapshots(
+                _json_document(args.journal_snapshots_json.read_bytes())
+            )
+        except (ValueError, OSError) as exc:
+            print(json.dumps({"status": "not_measured", "error": str(exc)}))
+            return 1
     if args.history:
         from dags.utils.transfermarkt_daily_measure import format_history_summary
 
@@ -326,25 +544,39 @@ def main(argv=None) -> int:
         return 0
     path = args.denominator or denominator_path()
     if args.registry_json:
-        registry = json.loads(args.registry_json.read_text())
-        if args.denominator_dual_run:
-            legacy, current, diff = _dual_denominators(
-                registry, path, args.discovery_manifest_json
+        try:
+            registry = _json_document(args.registry_json.read_bytes())
+            if args.denominator_dual_run:
+                output = _dual_output(
+                    registry,
+                    path,
+                    args.discovery_manifest_json,
+                    args.registry_snapshot_id,
+                    args.day,
+                    args.as_of,
+                    pins,
+                )
+            else:
+                output = _single_payload(
+                    args.denominator_source,
+                    registry,
+                    path,
+                    args.registry_snapshot_id,
+                    args.discovery_manifest_json,
+                    args.day,
+                    args.as_of,
+                    pins,
+                )
+                output["status"] = "sql_only"
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {"status": "not_measured", "error": str(exc)}, ensure_ascii=False
+                )
             )
-            output = {
-                "legacy": _measure_payload(legacy, args.day, args.as_of),
-                "registry": _measure_payload(current, args.day, args.as_of),
-                "diff": diff,
-            }
-        else:
-            denominator, _ = _selected_denominator(
-                denominator_source(args.denominator_source),
-                registry,
-                path,
-            )
-            output = _measure_payload(denominator, args.day, args.as_of)
+            return 1
         print(json.dumps(output, default=str, ensure_ascii=False))
-        return 0
+        return int(output.get("status") == "blocked")
     if args.execute and args.denominator_dual_run:
         try:
             output = execute_measure(
@@ -354,13 +586,15 @@ def main(argv=None) -> int:
                 registry_snapshot_id=args.registry_snapshot_id,
                 discovery_manifest_path=args.discovery_manifest_json,
                 dual_run=True,
+                journal_snapshots=pins,
             )
-        except Exception:
+        except Exception as exc:
             print(
                 json.dumps(
                     {
                         "report": None,
                         "status": "not_measured",
+                        "error": _measure_error(exc),
                         "summary": f"Transfermarkt {args.day} МСК: не измерено — ошибка чтения измерителя; Bronze DQ unknown",
                     },
                     ensure_ascii=False,
@@ -368,7 +602,7 @@ def main(argv=None) -> int:
             )
             return 1
         print(json.dumps(output, default=str, ensure_ascii=False))
-        return 0
+        return int(output.get("status") == "blocked")
 
     def ops_clock(value):
         stamp = datetime.fromisoformat(value) if isinstance(value, str) else value
@@ -407,13 +641,16 @@ def main(argv=None) -> int:
                 path,
                 source=args.denominator_source,
                 registry_snapshot_id=args.registry_snapshot_id,
+                discovery_manifest_path=args.discovery_manifest_json,
+                journal_snapshots=pins,
             )
-        except Exception:
+        except Exception as exc:
             print(
                 json.dumps(
                     {
                         "report": None,
                         "status": "not_measured",
+                        "error": _measure_error(exc),
                         "summary": (
                             f"Transfermarkt {args.day} МСК: не измерено — ошибка чтения измерителя; "
                             f"Bronze DQ {dq_status}"
