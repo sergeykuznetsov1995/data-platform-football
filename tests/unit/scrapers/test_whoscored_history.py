@@ -41,7 +41,50 @@ def test_wave_order_source_ids_and_calendar_gap():
     queued = state.queue(catalog(("ENG-Premier League", 2, eng), ("MLS", 85, mls)), today=NOW.date())
     assert [s["season"].scope.season_id for s in queued if s["wave"] == 1] == ["2627", "2526", "2026", "2025"]
     assert [s["season"].scope.season_id for s in queued if s["wave"] == 2] == ["2425", "1516", "2024"]
-    assert queued[-1]["season"].scope.season_id == "1415"
+    assert all(s["wave"] in {1, 2} for s in queued)
+
+
+@pytest.mark.parametrize(("label", "fmt", "source_label", "start", "allowed"), [
+    ("2014", "single_year", None, None, False),
+    ("2015", "single_year", None, None, True),
+    ("1415", "split_year", None, None, False),
+    ("1415", "split_year", "2014/2015", date(2015, 1, 8), False),
+    ("1516-split-ws7", "split_year", None, None, True),
+    ("9899", "split_year", None, None, False),
+    ("1516-split-ws7", "split_year", "1915/1916", None, False),
+    ("1416", "multi_year", "2014/2016", None, False),
+    ("1517", "multi_year", "2015/2017", None, True),
+    ("1516", "split_year", None, date(1915, 8, 1), False),
+])
+def test_sparse_catalog_respects_oldest_history_season(label, fmt, source_label, start, allowed):
+    league = "ENG-Premier League"
+    candidate = CatalogSeason(WhoScoredScope(league, label, fmt), source_season_id=7,
+                              source_label=source_label, start=start)
+    scopes = state.queue(catalog((league, 2, [candidate])), today=NOW.date())
+    assert [item["key"] for item in scopes] == ([candidate.scope.spec] if allowed else [])
+
+
+@pytest.mark.parametrize(("source_label", "start", "end", "allowed"), [
+    (None, None, date(1916, 6, 1), False),
+    ("2015/16", date(2014, 12, 20), date(2016, 6, 1), True),
+    (None, date(2014, 12, 20), date(2016, 6, 1), True),
+    ("2015/16", None, date(1916, 6, 1), False),
+])
+def test_history_boundary_uses_nominal_season_and_catalog_dates(source_label, start, end, allowed):
+    league = "ENG-Premier League"
+    candidate = CatalogSeason(WhoScoredScope(league, "1516", "split_year"), source_season_id=7,
+                              source_label=source_label, start=start, end=end)
+    scopes = state.queue(catalog((league, 2, [candidate])), today=NOW.date())
+    assert bool(scopes) is allowed
+
+
+def test_historical_season_with_high_source_id_does_not_take_a_recent_slot():
+    seasons = [season(label=label, source=source_id) for label, source_id in
+               [("1415", 100), ("2324", 90), ("2223", 80)]]
+    queue = state.queue(catalog((seasons[0].scope.competition_id, 2, seasons)), today=NOW.date())
+    assert [(item["season"].scope.season_id, item["wave"]) for item in queue] == [
+        ("2324", 1), ("2223", 1),
+    ]
 
 
 @pytest.mark.parametrize("changes, ready", [
@@ -106,6 +149,33 @@ def test_chunk_bound_and_reselection_from_journal(tmp_path):
     kwargs["now"] = datetime(2026, 10, 28, tzinfo=timezone.utc)
     history.run_chunk(**kwargs)
     assert service.sync_matches.call_count == 2
+
+
+@pytest.mark.parametrize(("has_second_wave", "boundary_due"), [
+    (True, False), (False, False), (True, True),
+])
+def test_history_stops_at_2015_16(tmp_path, monkeypatch, has_second_wave, boundary_due):
+    kwargs, _, repo, service = setup_chunk(tmp_path)
+    labels = ["2627", "2526"] + (["1516"] if has_second_wave else []) + ["1415"]
+    seasons = [season(label=label, source=100 - index) for index, label in enumerate(labels)]
+    league = seasons[0].scope.competition_id
+    kwargs["catalog"] = catalog((league, 2, seasons))
+    repo.history_coverage.return_value = {
+        (league, label): coverage(closed=100) for label in labels
+        if label != "1415" and not (boundary_due and label == "1516")
+    }
+    repo.list_match_candidates.return_value = []
+    monkeypatch.setattr(history, "final_feeds", lambda *args, **kwargs: True)
+
+    report = history.run_chunk(**kwargs)
+
+    if boundary_due:
+        assert report["scope"] == f"{league}=1516"
+        assert report["wave"] == 2
+        service.sync_schedule.assert_called_once_with()
+    else:
+        kwargs["service_cls"].assert_not_called()
+        assert report["reason"] == "idle"
 
 
 @pytest.mark.parametrize("candidates, expected, from_repository", [

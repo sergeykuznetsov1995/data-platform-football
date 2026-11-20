@@ -66,11 +66,7 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
     moment = clock()
     scopes = inventory(catalog, repository, today=moment.date())
     gate = state.first_wave_ready(scopes)
-    second = [s["coverage"] for s in scopes if s["wave"] == 2]
-    second_ready = all(c["schedule_ready"] and not c["unknown_stages"]
-                       and c["closed"] == c["closeable"] for c in second)
-    eligible = [s for s in scopes if s["wave"] == 1 or
-                (gate and (s["wave"] == 2 or second_ready))]
+    eligible = [s for s in scopes if s["wave"] == 1 or (gate and s["wave"] == 2)]
     # Missing schedules and wave-1 gate blockers first: a scope after ever-busy
     # current seasons is never reached, and one keeps the wave gate shut (#2140).
     eligible.sort(key=lambda s: s["coverage"]["schedule_ready"] and not (
