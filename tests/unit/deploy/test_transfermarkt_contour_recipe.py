@@ -1,7 +1,7 @@
 """Рецепт своего контура Transfermarkt в deploy/transfermarkt/ (#1387).
 
-Статически (без docker): блок-лист .airflowignore оставляет планировщику ровно четыре
-TM-DAG; оба compose-файла самодостаточны (ни одного хостового пути литералом, каждый
+Статически (без docker): блок-лист .airflowignore оставляет четыре существующих
+TM-DAG и paused-at-creation achievements DAG; оба compose-файла самодостаточны (ни одного хостового пути литералом, каждый
 bind — из переменной без дефолта, образ пинован); шлюз — в режиме transfermarkt-only без
 бюджетных флагов; скрипты читают env-файл контура общим загрузчиком. Рендер через
 `docker compose config` — последний тест, пропускается без docker.
@@ -30,6 +30,7 @@ TM_DAGS = {
     "dag_discover_transfermarkt_registry.py",
     "dag_backfill_transfermarkt.py",
     "dag_transform_transfermarkt_silver.py",
+    "dag_ingest_transfermarkt_achievements.py",
 }
 HOST_PATH_LITERAL = re.compile(r"(?<![\w$])/(root/|tmp/|home/(?!airflow/))")
 FAIL_CLOSED_VAR = re.compile(r"^\$\{(?P<name>[A-Z0-9_]+):\?[^}]+\}")
@@ -66,7 +67,7 @@ def _tracked_dag_files() -> list[str]:
 
 
 @pytest.mark.unit
-def test_airflowignore_leaves_exactly_the_four_transfermarkt_dags() -> None:
+def test_airflowignore_leaves_the_existing_and_paused_achievements_dags() -> None:
     patterns = _patterns()
     # RE2 в Airflow: lookahead молча не работает — только явный блок-лист.
     assert "(?!" not in "".join(patterns)

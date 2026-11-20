@@ -144,6 +144,45 @@ required DQ observations need separate operational evidence tied to the
 relevant runs and code revision. Focused replay exercises only saved-input
 behavior. Production authorization and completion of #2288 remain outstanding.
 
+## Production lane
+
+The production extension keeps the offline parser unchanged and adds raw-first
+capture through the existing metered Transfermarkt client. tmapi achievement
+paths are admitted explicitly by the raw store; coach pages use the saved slug
+and numeric ID from the existing coach universe. Direct HTTP fallback is
+forbidden.
+
+The frozen universe is read from player attribute observations, squad
+memberships and coach profiles. `AchievementState` stores every recipient and
+terminal status in durable SQLite, including errors and exact remaining work.
+An assessment completes only after every recipient has a terminal outcome and
+each recipient type has at least 95% verified conclusive observations.
+
+`iceberg.bronze.transfermarkt_achievement_observations` is append-only. Its
+physical key is `(recipient_type,recipient_id,source_capture_id,source_row_id)`.
+The same capture replays without duplicates; a later capture appends history.
+A conclusive empty recipient has one status row with null achievement fields.
+`iceberg.ops.transfermarkt_achievement_receipts_v1` binds each recipient plan to
+its raw hash, parser/schema, universe/run, detail/status counts, batch and full
+physical hash. The writer verifies all physical columns and then rereads the
+receipt. Missing receipts can be recovered from the identical committed plan;
+any physical drift fails.
+
+`dag_ingest_transfermarkt_achievements` is paused at creation. Its hourly
+45-minute portions use one metered stream, at most 180 initial requests and 360
+retries under the dedicated achievements policy. Monthly refresh is due after
+30 days. A completed season-close record, or a completed registry edition with
+a current successor, binds a once-only post-season assessment. DQ reports
+per-type expected/conclusive/unresolved coverage and physical count/key/lineage
+reconciliation. Initial incomplete coverage is RED, not silently green.
+
+Delivery requires the reviewed merge and existing automatic frozen-release
+pipeline. Before any paid E2E, record exact recipient URLs, attempt/byte caps,
+raw destination and writer tables. Unpause only after E2E receipts and physical
+readback pass. Full initial capture, following no-op, three green DQ days and
+post-season refresh remain acceptance evidence; this implementation alone does
+not close #2288.
+
 ## Adaptations and notices
 
 The player and club mappings adapt Felipe Allegretti's achievement service

@@ -28,8 +28,8 @@ def test_native_matrix_has_exact_declared_layer_counts():
     report = tm_v2.validate_table_contracts()
     assert report == {
         'passed': True,
-        'counts': {'bronze': 9, 'silver': 12, 'gold': 4},
-        'relations': 25,
+        'counts': {'bronze': 10, 'silver': 12, 'gold': 4},
+        'relations': 26,
     }
 
 
@@ -115,7 +115,8 @@ def test_bronze_contracts_point_to_real_bounded_airflow_tasks():
         for contract in tm_v2.TABLE_CONTRACTS
         if contract.layer == 'bronze'
     }
-    assert set(bronze) == set(tm_v2.ALL_NATIVE_ENTITIES)
+    assert set(bronze) == set(tm_v2.ALL_NATIVE_ENTITIES) | {'achievement_observations'}
+    assert bronze['achievement_observations'].airflow_task_id == 'run_achievement_portion'
     for name in tm_v2.REGISTRY_ENTITIES:
         assert bronze[name].airflow_task_id == 'discover_registry'
         assert 'DISCOVERY_TASK_ID = "discover_registry"' in discovery_text
@@ -126,7 +127,7 @@ def test_bronze_contracts_point_to_real_bounded_airflow_tasks():
 
 
 def test_unsupported_entities_are_not_advertised_as_tables():
-    unsupported = {'fixtures', 'stages', 'results', 'awards', 'achievements'}
+    unsupported = {'fixtures', 'stages', 'results', 'awards'}
     advertised = {contract.name for contract in tm_v2.TABLE_CONTRACTS}
     assert unsupported.isdisjoint(advertised)
     assert all(
@@ -134,5 +135,5 @@ def test_unsupported_entities_are_not_advertised_as_tables():
         for contract in tm_v2.TABLE_CONTRACTS
     )
     checklist = ' '.join(CHECKLIST.read_text(encoding='utf-8').lower().split())
-    assert 'awards and achievements remain roadmap-only' in checklist
+    assert 'achievement observations have a separate production contract' in checklist
     assert 'fixtures, stages, results' in checklist
