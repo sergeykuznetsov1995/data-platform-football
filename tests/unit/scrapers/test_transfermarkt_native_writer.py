@@ -1,0 +1,361 @@
+"""Unit tests for the stage-B mono-native writer commit path (#2404)."""
+from datetime import datetime, timezone
+import json
+
+import pytest
+
+from scrapers.transfermarkt import native_writer, write_journal
+from scrapers.transfermarkt.native_writer import NativeWritePlan, StaleTransfermarktWrite
+from tests.unit.utils.test_transfermarkt_current_write import MemoryCursor, MemoryDB
+from scrapers.base.iceberg_writer import IcebergWriter
+
+pytestmark = pytest.mark.unit
+
+RECEIPTS = 'transfermarkt_core_receipts_v1'
+UTC = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
+CLOCK = UTC.isoformat()
+LATER = datetime(2026, 11, 21, 13, 0, 0, tzinfo=timezone.utc).isoformat()
+EARLIER = datetime(2026, 11, 21, 11, 0, 0, tzinfo=timezone.utc).isoformat()
+
+MEMBERSHIPS_DDL = (
+    'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_squad_memberships '
+    '(league varchar, season varchar, club_id varchar, player_id varchar, '
+    'player_name varchar, captured_at timestamp(6), source_capture_id varchar) '
+    "WITH (format = 'PARQUET')"
+)
+MV_DDL = (
+    'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_market_value_points '
+    '(player_id varchar, mv_date varchar, value_eur bigint, captured_at timestamp(6), '
+    'source_capture_id varchar) WITH (format = \'PARQUET\')'
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+
+
+class CoreCursor(MemoryCursor):
+    def execute(self, sql, params=()):
+        if 'MERGE INTO iceberg.ops.transfermarkt_core_receipts_v1' in sql:
+            bound = tuple(params)
+            cur = self.db.sql.cursor()
+            cur.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id = ?', (bound[0],))
+            columns = ', '.join(native_writer.RECEIPT_COLUMNS)
+            marks = ', '.join('?' for _ in native_writer.RECEIPT_COLUMNS)
+            cur.execute(f'INSERT INTO {RECEIPTS} ({columns}) VALUES ({marks})', bound)
+            self.description = None
+            return
+        return super().execute(sql, params)
+
+
+class CoreDB(MemoryDB):
+    def cursor(self):
+        return CoreCursor(self)
+
+
+class CoreWriter(IcebergWriter):
+    """Store canonical writer frames in sqlite without donor cell rewriting."""
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.writes = []
+
+    def _write_to_iceberg(self, df, database, table, partition_spec, mode='append',
+                          delete_filter=None, merge_keys=None, bulk_arrow=False):
+        df = self._pandas_to_arrow(df).to_pandas()
+        self.writes.append((table, len(df), tuple(merge_keys or ())))
+        cur = self.db.sql.cursor()
+        columns = list(df.columns)
+        cur.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(col + " TEXT" for col in columns)})')
+        existing = {row[1] for row in cur.execute(f'PRAGMA table_info({table})')}
+        for column in set(columns) - existing:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} TEXT')
+        if delete_filter:
+            cur.execute(f'DELETE FROM {table} WHERE {delete_filter}')
+        marks = ', '.join('?' for _ in columns)
+        for row in df.itertuples(index=False, name=None):
+            if merge_keys:
+                idx = [columns.index(key) for key in merge_keys]
+                cur.execute('DELETE FROM ' + table + ' WHERE ' + ' AND '.join(key + ' = ?' for key in merge_keys),
+                            tuple(row[i] for i in idx))
+            cur.execute(f'INSERT INTO {table} ({", ".join(columns)}) VALUES ({marks})', tuple(row))
+        return 'iceberg.' + database + '.' + table
+
+
+def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace'):
+    rows = [{
+        'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': pid,
+        'player_name': 'Player ' + pid, 'captured_at': clock,
+        'source_capture_id': capture,
+    } for pid in players]
+    return NativeWritePlan(
+        entity='squad_memberships', table='transfermarkt_squad_memberships',
+        ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
+        scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
+        rows=tuple(rows), captured_at=clock, write_mode=mode,
+    )
+
+
+def mv_plan(points, *, clock=CLOCK, capture='cap-mv'):
+    rows = [{
+        'player_id': '1', 'mv_date': day, 'value_eur': value,
+        'captured_at': clock, 'source_capture_id': capture,
+    } for day, value in points]
+    return NativeWritePlan(
+        entity='market_value_points', table='transfermarkt_market_value_points',
+        ddl=MV_DDL, natural_keys=('player_id', 'mv_date'),
+        scope_columns=('player_id',), scope_values=('1',),
+        rows=tuple(rows), captured_at=clock, write_mode='merge',
+    )
+
+
+def write(db, plans, *, run_id='run-1', clock=CLOCK):
+    return native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), plans, run_id=run_id,
+        universe_version='core-universe-v1', committed_at=clock,
+    )
+
+
+# ---------------------------------------------------------------- journal
+
+
+def test_intent_lifecycle_uses_the_index_instead_of_a_directory_scan():
+    path = write_journal.save_intent({'run_id': 'r1'}, {'plans': []}, cycle='c1')
+    matches = write_journal.pending_intents({'run_id': 'r1'})
+    assert [item[0] for item in matches] == [path]
+    assert matches[0][1]['payload'] == {'plans': []}
+    assert write_journal.pending_intents({'run_id': 'other'}) == []
+    write_journal.finish_intent(path)
+    assert write_journal.pending_intents({'run_id': 'r1'}) == []
+    assert not path.exists()
+
+
+def test_index_loss_adopts_only_checksum_verified_orphans():
+    path = write_journal.save_intent({'run_id': 'r1'}, {'plans': [1]})
+    index = write_journal._index_path()
+    index.unlink()  # crash between the file write and the index append
+    matches = write_journal.pending_intents({'run_id': 'r1'})
+    assert [item[0] for item in matches] == [path]
+    path.write_text(path.read_text() + ' ')
+    with pytest.raises(RuntimeError, match='orphan checksum'):
+        write_journal.pending_intents({'run_id': 'r1'})
+
+
+def test_finished_entry_with_leftover_file_never_resurrects():
+    path = write_journal.save_intent({'run_id': 'r1'}, {'plans': []})
+    body = path.read_bytes()
+    write_journal.finish_intent(path)
+    path.write_bytes(body)  # crash between the index append and the unlink
+    assert write_journal.pending_intents({'run_id': 'r1'}) == []
+
+
+def test_torn_index_tail_is_discarded_and_appending_heals():
+    write_journal._index_path().parent.mkdir(parents=True)
+    write_journal._index_path().write_text('{"digest": "broken')  # torn line, no newline
+    path = write_journal.save_intent({'run_id': 'r1'}, {'plans': []})
+    assert [item[0] for item in write_journal.pending_intents({'run_id': 'r1'})] == [path]
+
+
+def test_snapshot_anchors_are_immutable_and_reject_table_drift(tmp_path):
+    class AnchorCursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.description = None
+        def execute(self, sql, params=None):
+            self.last = sql
+        def fetchall(self):
+            if 'transfermarkt_squad_memberships$snapshots' in self.last:
+                return self.rows
+            raise RuntimeError('TABLE_NOT_FOUND: missing')
+        def close(self):
+            pass
+    class AnchorConnection:
+        def __init__(self, rows):
+            self.rows = rows
+        def cursor(self):
+            return AnchorCursor(self.rows)
+
+    connection = AnchorConnection([(77,)])
+    anchors = write_journal.snapshot_anchors('a' * 64, connection, {'transfermarkt_squad_memberships'})
+    assert anchors == {'transfermarkt_squad_memberships': 77}
+    # A missing table anchors as None; re-read is stable.
+    assert write_journal.snapshot_anchors('b' * 64, AnchorConnection([]), {'transfermarkt_market_value_points'}) == {
+        'transfermarkt_market_value_points': None}
+    assert write_journal.read_snapshot_anchors('a' * 64) == anchors
+    with pytest.raises(RuntimeError, match='anchor tables differ'):
+        write_journal.snapshot_anchors('a' * 64, connection, {'transfermarkt_squad_memberships', 'transfermarkt_transfer_events'})
+
+
+def test_receipt_requires_verified_flag_and_round_trips():
+    with pytest.raises(RuntimeError, match='unverified'):
+        write_journal.record_receipt('c' * 64, {'verified': False})
+    write_journal.record_receipt('c' * 64, {'verified': True, 'plan_sha256': 'x'})
+    assert write_journal.read_receipt('c' * 64)['plan_sha256'] == 'x'
+    with pytest.raises(RuntimeError, match='differs'):
+        write_journal.record_receipt('c' * 64, {'verified': True, 'plan_sha256': 'y'})
+
+
+# ---------------------------------------------------------------- plans
+
+
+def test_plan_validation_rejects_broken_contracts():
+    base = dict(entity='squad_memberships', table='transfermarkt_squad_memberships',
+                ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
+                scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
+                rows=({'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': '1',
+                       'captured_at': CLOCK, 'source_capture_id': 'c'},),
+                captured_at=CLOCK)
+    NativeWritePlan(**base)
+    with pytest.raises(ValueError, match='table name'):
+        NativeWritePlan(**{**base, 'table': 'transfermarkt_squad_memberships; DROP TABLE x'})
+    with pytest.raises(ValueError, match='write_mode'):
+        NativeWritePlan(**{**base, 'write_mode': 'upsert'})
+    with pytest.raises(ValueError, match='natural_keys'):
+        NativeWritePlan(**{**base, 'natural_keys': ()})
+    with pytest.raises(ValueError, match='outside its replacement scope'):
+        NativeWritePlan(**{**base, 'scope_values': ('GB1', '2526', '12')})
+    with pytest.raises(ValueError, match='newest row capture'):
+        NativeWritePlan(**{**base, 'captured_at': EARLIER})
+    with pytest.raises(ValueError, match='duplicate core natural key'):
+        NativeWritePlan(**{**base, 'rows': base['rows'] + base['rows']})
+    with pytest.raises(ValueError, match='share one source_capture_id'):
+        NativeWritePlan(**{**base, 'rows': (
+            base['rows'][0],
+            {**base['rows'][0], 'player_id': '2', 'source_capture_id': 'other'})})
+
+
+def test_merge_and_replace_readbacks_use_different_predicates():
+    replace = membership_plan(['1'])
+    assert replace.readback_sql() == ('league = ? AND season = ? AND club_id = ?', ('GB1', '2526', '11'))
+    merge = mv_plan([('2025-01-01', 10), ('2025-02-01', 20)])
+    predicate, params = merge.readback_sql()
+    assert predicate == '(player_id, mv_date) IN ((?, ?), (?, ?))'
+    assert params == ('1', '2025-01-01', '1', '2025-02-01')
+
+
+# ---------------------------------------------------------------- guard
+
+
+class GuardCursor:
+    def __init__(self, rows=None, fail=False):
+        self.rows = rows
+        self.fail = fail
+        self.description = None
+    def execute(self, sql, params=None):
+        if self.fail:
+            raise RuntimeError('TABLE_NOT_FOUND: nope')
+        self.sql = sql
+    def fetchall(self):
+        return self.rows
+    def close(self):
+        pass
+
+
+def test_guard_refuses_older_bundle_and_accepts_equal_or_missing():
+    plan = membership_plan(['1'])
+    for committed, refused in ((LATER, True), (CLOCK, False), (None, False)):
+        cursor = GuardCursor(rows=[(committed,)])
+        connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
+        if refused:
+            with pytest.raises(StaleTransfermarktWrite):
+                native_writer.guard_native_bundle(connection, plan)
+        else:
+            native_writer.guard_native_bundle(connection, plan)
+    missing = type('C', (), {'cursor': lambda self: GuardCursor(fail=True)})()
+    native_writer.guard_native_bundle(missing, plan)  # table absent: nothing to guard
+
+
+# ---------------------------------------------------------------- bundles
+
+
+def test_replace_bundle_removes_departed_players_and_receipts_each_plan():
+    db = CoreDB()
+    first = write(db, [membership_plan(['1', '2'], capture='cap-1')])
+    assert first['verified'] is True and first['receipt_readback'] is True
+    assert [proof['rows'] for proof in first['plans']] == [2]
+    second = write(db, [membership_plan(['1'], capture='cap-2', clock=LATER)],
+                   run_id='run-2', clock=LATER)
+    rows = db.sql.execute('SELECT player_id FROM transfermarkt_squad_memberships ORDER BY player_id').fetchall()
+    assert rows == [('1',)]
+    assert [proof['rows'] for proof in second['plans']] == [1]
+    receipts = db.sql.execute(f'SELECT row_count, expected_rows FROM {RECEIPTS} ORDER BY rowid').fetchall()
+    assert receipts == [(2, 2), (1, 1)]
+
+
+def test_merge_bundle_keeps_earlier_rows_and_updates_same_natural_key():
+    db = CoreDB()
+    write(db, [mv_plan([('2025-01-01', 10), ('2025-02-01', 20)], capture='cap-mv')])
+    second = write(db, [mv_plan([('2025-01-01', 11), ('2025-03-01', 30)], capture='cap-mv2', clock=LATER)],
+                   run_id='run-2', clock=LATER)
+    rows = dict(db.sql.execute('SELECT mv_date, value_eur FROM transfermarkt_market_value_points').fetchall())
+    assert rows == {'2025-01-01': 11, '2025-02-01': 20, '2025-03-01': 30}
+    assert second['plans'][0]['rows'] == 2  # the plan's own rows only
+
+
+def test_bundle_replay_is_idempotent_through_the_journal_receipt():
+    db = CoreDB()
+    writer = CoreWriter(db)
+    plans = [membership_plan(['1'], capture='cap-1')]
+    first = native_writer.write_core_bundle(
+        lambda: db, writer, plans, run_id='r', universe_version='u', committed_at=CLOCK)
+    writes_before = len(writer.writes)
+    again = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), plans, run_id='r', universe_version='u', committed_at=CLOCK)
+    assert again == first and len(writer.writes) == writes_before
+    count = db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0]
+    assert count == 1
+
+
+def test_replay_with_drifted_committed_rows_fails_closed():
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-1')])
+    db.sql.execute("UPDATE transfermarkt_squad_memberships SET player_name = 'mutated'")
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [membership_plan(['1'], capture='cap-1')])
+
+
+def test_empty_replace_bundle_deletes_the_scope_and_receipts_zero_rows():
+    db = CoreDB()
+    write(db, [membership_plan(['1', '2'], capture='cap-1')])
+    empty = NativeWritePlan(
+        entity='squad_memberships', table='transfermarkt_squad_memberships',
+        ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
+        scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
+        rows=(), captured_at=LATER,
+    )
+    receipt = write(db, [empty], run_id='run-2', clock=LATER)
+    assert receipt['plans'][0]['rows'] == 0
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 0
+
+
+def test_stale_bundle_refuses_before_mutation_and_leaves_the_intent_pending():
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-new', clock=LATER)], run_id='run-2', clock=LATER)
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [membership_plan(['1', '9'], capture='cap-old', clock=EARLIER)],
+              run_id='run-3', clock=EARLIER)
+    pending = write_journal.pending_intents({'run_id': 'run-3'})
+    assert len(pending) == 1 and 'cap-old' in json.dumps(pending[0][1])
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
+
+
+def test_physical_readback_mismatch_fails_the_bundle():
+    db = CoreDB()
+    writer = CoreWriter(db)
+
+    original = writer._write_to_iceberg
+
+    def drop_one(df, *args, **kwargs):
+        original(df.iloc[1:], *args, **kwargs)
+
+    writer._write_to_iceberg = drop_one
+    with pytest.raises(RuntimeError, match='physical readback'):
+        native_writer.write_core_bundle(
+            lambda: db, writer, [membership_plan(['1', '2'], capture='cap-1')],
+            run_id='r', universe_version='u', committed_at=CLOCK)
+    pending = write_journal.pending_intents({'run_id': 'r'})
+    assert len(pending) == 1
