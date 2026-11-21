@@ -896,6 +896,19 @@ class RawResponseStore:
         )
         return self._publish_attempt_envelope(identity)
 
+    def load_content(self, content_hash: str) -> bytes:
+        """Load exact content-addressed bytes when no capture ID was persisted."""
+
+        key = self.blob_key(content_hash)
+        compressed = self._read_bytes(key)
+        try:
+            body = gzip.decompress(compressed)
+        except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+            raise RawCaptureCorrupt(f"Invalid gzip blob: {key}") from exc
+        if hashlib.sha256(body).hexdigest() != content_hash:
+            raise RawCaptureCorrupt(f"Content-addressed blob mismatch for {key}")
+        return body
+
     def load_capture(self, capture_id: str) -> tuple[bytes, RawCaptureRecord]:
         """Load and fully verify exact response bytes for offline replay."""
 
