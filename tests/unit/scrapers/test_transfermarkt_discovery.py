@@ -1679,3 +1679,66 @@ def test_unproven_empty_competition_links_still_fail_closed(damage):
         soup.body.append(empty.extract())
     with pytest.raises(DiscoverySchemaError, match="competition link has no name"):
         _participation_candidates(soup, country_page=damage != "not_country")
+
+
+# ---------------------------------------------------------------------------
+# Raw-store mode: page bodies live in the store, not the checkpoint (#2181/#2404)
+# ---------------------------------------------------------------------------
+
+
+def _store_discover(tmp_path, fetch=None, checkpoint=None, ledger=None):
+    from pyarrow import fs as arrow_fs
+
+    from scrapers.transfermarkt.raw_store import RawResponseStore
+
+    store = RawResponseStore(arrow_fs.LocalFileSystem(), str(tmp_path / "raw"))
+    fetch = fetch or FixtureFetch()
+    checkpoint = {} if checkpoint is None else checkpoint
+    ledger = ledger or LedgerSpy()
+    pages = discover_competition_registry(
+        fetch=fetch,
+        checkpoint=checkpoint,
+        traffic_ledger=ledger,
+        clock=lambda: NOW,
+        raw_store=store,
+    )
+    return pages, fetch, checkpoint, ledger, store
+
+
+def test_raw_store_mode_keeps_bodies_out_of_the_checkpoint(tmp_path) -> None:
+    storeless_pages, _, storeless_checkpoint, _ = _discover()
+    pages, _, checkpoint, _, store = _store_discover(tmp_path)
+    assert pages == storeless_pages
+    assert set(checkpoint) == set(storeless_checkpoint)
+    for entry in checkpoint.values():
+        assert "body" not in entry and entry["raw_capture_id"]
+    capture_ids = {entry["raw_capture_id"] for entry in checkpoint.values()}
+    assert len(capture_ids) == len(URL_FIXTURES) == 17
+
+
+def test_raw_store_checkpoint_resumes_without_bodies_or_fetches(tmp_path) -> None:
+    first_pages, _, checkpoint, _, _ = _store_discover(tmp_path)
+    ledger = LedgerSpy()
+
+    def unexpected_fetch(url: str):
+        raise AssertionError(f"fetch called during cached resume: {url}")
+
+    second_pages, _, _, _, _ = _store_discover(
+        tmp_path, fetch=unexpected_fetch, checkpoint=checkpoint, ledger=ledger)
+    assert second_pages == first_pages
+    assert ledger.ensure_calls == 0
+    assert ledger.cache_hits == len(URL_FIXTURES)
+
+
+def test_bodyless_checkpoint_without_store_fails_closed(tmp_path) -> None:
+    _, _, checkpoint, _, _ = _store_discover(tmp_path)
+    with pytest.raises(DiscoveryCheckpointError, match="needs its raw store"):
+        _discover(checkpoint=dict(checkpoint))
+
+
+def test_raw_capture_drift_fails_closed(tmp_path) -> None:
+    _, _, checkpoint, _, _ = _store_discover(tmp_path)
+    key = next(iter(checkpoint))
+    checkpoint[key]["raw_content_hash"] = "0" * 64
+    with pytest.raises(DiscoveryCheckpointError, match="raw capture drift"):
+        _store_discover(tmp_path, checkpoint=checkpoint)
