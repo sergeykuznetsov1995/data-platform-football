@@ -40,10 +40,14 @@ _IMMUTABLE_EXCLUDED = frozenset({'extracted_at', 'run_id', 'cycle_id', '_batch_i
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def club_values_enabled(policy) -> bool:
+    return {CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE} <= set(getattr(policy, 'allowed_write_tables', ()))
+
+
 def validate_club_value_write_policy(policy) -> None:
-    missing = tuple(table for table in (CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE)
-                    if table not in set(policy.allowed_write_tables))
-    if missing:
+    if not club_values_enabled(policy):
+        missing = tuple(table for table in (CLUB_VALUE_TABLE, CLUB_VALUE_RECEIPTS_TABLE)
+                        if table not in set(policy.allowed_write_tables))
         raise current.CurrentWriteError(
             'standing policy does not authorize club-value writes to: ' + ', '.join(missing))
 
@@ -121,7 +125,18 @@ def _rows_by_key(frame: pd.DataFrame) -> dict[tuple[str, ...], list[dict[str, An
     return result
 
 
-def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...]) -> None:
+def _club_physical_hash(existing: pd.DataFrame) -> str:
+    rows = []
+    for values in existing.itertuples(index=False, name=None):
+        row = {column: _canonical_cell(column, value)
+               for column, value in zip(existing.columns, values)}
+        rows.append(row)
+    rows.sort(key=lambda row: tuple(str(row[column]) for column in CLUB_VALUE_KEY))
+    return hashlib.sha256(canonical_json(rows)).hexdigest()
+
+
+def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...],
+                      *, replay: bool = False) -> None:
     physical = _rows_by_key(existing)
     for row in rows:
         key = _natural_key(row)
@@ -131,7 +146,8 @@ def _verify_committed(existing: pd.DataFrame, rows: tuple[Mapping[str, Any], ...
                 f'physical read-back differs for club-value key {key}: '
                 f'expected one row, found {len(committed)}')
         changed = tuple(column for column in CLUB_VALUE_COLUMNS
-                        if _canonical_cell(column, row[column]) != committed[0][column])
+                        if (not replay or column not in _IMMUTABLE_EXCLUDED)
+                        and _canonical_cell(column, row[column]) != committed[0][column])
         if changed:
             raise current.CurrentWriteError(
                 f'physical read-back differs for club-value key {key}: ' + ', '.join(changed))
@@ -291,10 +307,13 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
                 if len(stored) > 1:
                     raise current.CurrentWriteError('multiple receipts for one club-value plan')
                 if len(stored) == 1:
-                    _verify_committed(existing, rows)
+                    _verify_committed(existing, rows, replay=True)
                     _validate_existing(existing, rows)
-                    physical = current._read_back(scraper, output, frame, extraction.capture.run_id)
                     stored_values = _receipt_row_values(stored.iloc[0])
+                    physical = {
+                        'table': CLUB_VALUE_TABLE, 'batch_id': stored_values['committed_batch'],
+                        'rows': len(existing), 'physical_hash': _club_physical_hash(existing),
+                    }
                     expected = _receipt_values(
                         extraction, club_id, physical['physical_hash'],
                         stored_values['committed_at'].replace(tzinfo=timezone.utc))
@@ -306,8 +325,10 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
                     df=frame, database='bronze', table='transfermarkt_club_value_observations',
                     merge_keys=list(CLUB_VALUE_KEY), add_metadata=False, source='transfermarkt')
                 physical = current._read_back(scraper, output, frame, extraction.capture.run_id)
-                _verify_committed(_read_club(connection, club_id), rows)
-                _validate_existing(_read_club(connection, club_id), rows)
+                committed = _read_club(connection, club_id)
+                _verify_committed(committed, rows)
+                _validate_existing(committed, rows)
+                physical['physical_hash'] = _club_physical_hash(committed)
                 _authorize(preflight)
                 values = _receipt_values(extraction, club_id, physical['physical_hash'], committed_at)
                 _merge_receipt(connection, values)
@@ -331,6 +352,6 @@ def write_club_values(scraper, extraction: ClubValueExtraction, preflight: Mappi
 
 __all__ = [
     'CLUB_VALUE_CONTRACT', 'CLUB_VALUE_RECEIPTS_TABLE', 'CLUB_VALUE_TABLE',
-    'RECEIPT_COLUMNS', 'club_value_ddl', 'validate_club_value_write_policy',
-    'write_club_values',
+    'RECEIPT_COLUMNS', 'club_value_ddl', 'club_values_enabled',
+    'validate_club_value_write_policy', 'write_club_values',
 ]

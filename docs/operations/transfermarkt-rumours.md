@@ -1,11 +1,11 @@
-# Transfermarkt rumour assertions: offline parser contract
+# Transfermarkt rumour assertions
 
 ## Scope and provenance
 
 `scrapers.transfermarkt.rumours.parse_rumours` parses one supplied saved HTML
 capture. It does not fetch URLs, read files, consult the clock, import Airflow,
-write data, or combine captures. This implementation is limited to the parser,
-its contract, synthetic tests, and donor attribution for Football #2293.
+write data, or combine captures. Football #2293 also provides a separate offline
+extraction API and an isolated writer for a complete competition listing.
 
 Rumours are **source assertions, never confirmed transfers**. Both the capture
 and every observation have entity type `transfer_rumour_assertion`. The parser
@@ -28,10 +28,13 @@ helpers with BeautifulSoup parsing and strict validation. It adds explicit
 competition and observation time, immutable types, canonical serialization,
 capture-wide failure, duplicate reconciliation, and historical/correction keys.
 Unlike the donor's silent player skip, an invalid row fails the entire capture.
-The interested club is required. A missing source link falls back to the first
-reply link; both cells' links are validated even when only one is retained.
-Every link in each cell is validated: a valid first source link followed by an
-external link fails the entire capture with `invalid_url`.
+The interested club is required. The first source link takes precedence,
+followed by the first reply link and then the first assessment link. Every
+anchor with an href in those three cells undergoes URL validation. The real
+source column identifies a Transfermarkt discussion and dates it. The
+assessment cell may repeat that discussion as an icon beside a dash. The
+observation retains the source date and canonical discussion URL, with a null
+percentage for the dash. It makes no claim about an external publisher.
 
 ## Input
 
@@ -50,8 +53,12 @@ capture = parse_rumours(
 serialized = capture.to_json()
 ```
 
-`saved_html` must be a nonblank string. There must be exactly one `table.items`,
-with one direct `thead`, one header row, and one direct `tbody`. Direct table
+`saved_html` must be a nonblank string. When the page contains `#yw1`, that
+grid must be unique and contain exactly one `table.items` with rumour headers.
+The standings in `#yw2` are independent. A broken or empty target grid fails
+even when a valid table exists elsewhere. For legacy HTML without `#yw1`,
+the parser uses the unique items table with both required rumour headers.
+Each selected table requires one direct `thead`, one header row, and one direct `tbody`. Direct table
 children may also be `caption` or `colgroup`; unrelated outer rows, text, cells,
 and other elements are rejected. Header cells cannot span columns or rows.
 Body rows consist of direct `td` cells matching the header count, without spans
@@ -65,7 +72,7 @@ are permitted. Header text is case-sensitive after whitespace normalization.
 | Nation or Nat. | Optional; flag image `title`, falling back to `alt`. |
 | Age | Optional; one to three ASCII digits or null marker. |
 | Club or Current club | Optional; a named canonical club reference or null marker. |
-| Most recent source | Optional; source date and first link. |
+| Most recent source or Most recent source from | Optional source date and first discussion link. |
 | Last reply | Optional; reply date and fallback first link. |
 | Assessment or User assessment | Optional; percentage or null marker. |
 
@@ -117,13 +124,19 @@ Root-relative links and absolute HTTP(S) URLs on `transfermarkt.com`,
 to `https://www.transfermarkt.com`. Entity path slugs and suffixes are preserved;
 there is no entity lookup or slug inference. Query pairs are sorted and encoded
 deterministically, including blank/repeated values; fragments are preserved.
-Protocol-relative URLs, other hosts/schemes, credentials, explicit ports,
+In source, reply, and assessment cells only, the internal shorthand
+`//thread/forum/<id>/thread_id/<id>` can include a `/post_id/<id>` suffix
+and numeric fragment. For example, `//thread/forum/154/thread_id/1208229/post_id/3426507#3426507`
+resolves to `https://www.transfermarkt.com/thread/forum/154/thread_id/1208229/post_id/3426507#3426507`.
+Other protocol-relative URLs, other hosts/schemes, credentials, explicit ports,
 whitespace/control characters, backslashes, malformed percent escapes, and
 decoded dot path segments are rejected. External publisher URLs are outside
 this version's supported link contract and fail instead of being rewritten.
 
-Dates accept `YYYY-MM-DD`, `D.M.YYYY`/`DD.MM.YYYY`, or English abbreviated
-`Mon D, YYYY`, with a real calendar date. Date cells may contain source labels,
+Dates accept `YYYY-MM-DD`, `D.M.YYYY`/`DD.MM.YYYY`, fixed-width `DD/MM/YYYY`,
+or English abbreviated `Mon D, YYYY`, with a real calendar date. The slash
+form is always day first. For example, `20/11/2026` yields `2026-11-20`.
+Date cells may contain source labels,
 but exactly one recognized date token must occur in a non-null cell. Multiple
 date tokens or an invalid date fail. Both dates are preserved independently as
 ISO `YYYY-MM-DD`; a missing date is not populated from the other cell or clock.
@@ -142,8 +155,8 @@ and no NaN or infinity. Encode that text as UTF-8 for deterministic bytes.
 | Capture field | Type / meaning |
 | --- | --- |
 | entity_type | Literal `transfer_rumour_assertion` |
-| parser_version | `transfermarkt-rumours/1` |
-| schema_version | `transfer_rumour_assertion/1` |
+| parser_version | `transfermarkt-rumours/2` |
+| schema_version | `transfer_rumour_assertion/2` |
 | competition | Object with string `id`, `name`, `url` |
 | observed_at | Canonical UTC timestamp |
 | status | `observed_present` or `observed_empty` |
@@ -199,7 +212,8 @@ or link at a later clock is a new observation. A separately supplied correction
 at the same clock has a different content hash and observation key; for a
 stable thread and player its assertion identity remains the same. No object
 is mutated, no winner is selected, and no supersession/deletion is performed.
-Historical persistence and correction ordering belong to a future writer.
+The Bronze writer preserves each of these keys. Consumers see the original
+observation clocks and correction identities, including ties at the same clock.
 
 Within one capture, identical observations with the same assertion identity
 are retained once; each extra occurrence increments `duplicate_count`.
@@ -221,8 +235,8 @@ final period), and no link, image, or nested table. An empty marker mixed with
 data rows, a wrong colspan, or unrecognized empty text fails. Blank HTML,
 missing tables, altered layout, and partial rows never become empty results.
 
-An empty feed is **not retraction and not missing-state evidence**. It describes
-only the supplied capture; pagination and completeness have not been proved.
+An empty page describes only the supplied capture. Feed completeness requires
+separate evidence for every numbered page.
 No player/club disappearance, transfer confirmation, expiration, or lifecycle
 transition is inferred from either empty or nonempty captures.
 
@@ -241,11 +255,137 @@ entire function; no partial capture is returned.
 | invalid_date, invalid_probability, invalid_age, invalid_nationality | Malformed donor value |
 | invalid_observed_at | Invalid explicit observation clock |
 | conflicting_duplicate | Same assertion identity with different retained content |
+| invalid_pager, invalid_page_ref | Missing or ambiguous controls, or an invalid listing URL or page number |
+| invalid_page_navigation | Current page conflicts with the requested URL, a direction is wrong, or a plan revisits a page |
+| conflicting_page_ref, incomplete_page_plan | References disagree or the numbered plan has gaps |
+
+## Saved GB1 evidence
+
+The two Premier League pages each returned HTTP 200 with 25 rumour rows in
+one attempt and zero retries. The raw-response digests identify acquisition
+evidence. The saved-file digests identify the bytes consumed by parser tests
+under `tests/fixtures/transfermarkt/rumours/`.
+
+| Saved page | Fetched at (UTC) | Saved SHA-256 | Raw SHA-256 |
+| --- | --- | --- | --- |
+| `gb1-page-1.html` | `2026-11-20T21:21:09.485303+00:00` | `53ae52cdcb469843f3de7d23a9722e3a4b5578e71a59d7cb0f5b6ee107ba3edc` | `2f0e474c90688fee4da43d0cacfbeead812c8e677b90e2ed7dbc253318f5161d` |
+| `gb1-page-2.html` | `2026-11-20T21:21:24.425970+00:00` | `33e9f518feea9bccd4463cdfa3d7437a2ad398695381caad4e4b56e700a88687` | `2ed996ad6cbeb089cc7516865df181f557a44c680906af2fe8c7d1c663e255d0` |
+
+## Offline pagination
+
+`parse_rumour_pagination(html, competition=context, page_url=requested_url)`
+reads the selected grid's single pager using `.pager a.tm-pagination__link[href]`.
+Its result contains `current_page`, `last_page`, and numbered canonical URLs.
+The active item identifies the current page. The last-page control identifies
+the upper bound. Number labels must agree with URL page numbers. The first,
+previous and next controls must point to their respective destinations. Passing
+the optional requested URL also checks the returned page identity and listing.
+
+Targets must share one Transfermarkt rumour listing for the supplied
+competition. Page numbers are positive decimal integers in the path or the
+`page` query parameter. The bare listing denotes page one. Repeated links
+to one number must agree on the canonical URL. Foreign listings, conflicting
+references, and malformed controls fail capture planning.
+
+`build_rumour_page_plan(pages)` combines the evidenced references, checks the
+last-page boundary and rejects revisited current pages, conflicts and gaps.
+It returns one URL per page in numeric order. The saved pages identify pages
+1 through 5. Neither helper fetches a page. A complete URL plan provides no
+row-count or acquisition evidence for pages 3 through 5.
 
 ## Verification and remaining boundaries
 
-`tests/unit/scrapers/test_transfermarkt_rumours.py` uses synthetic BeautifulSoup
-fixtures with pytest. It covers complete donor fields, aliases/nulls, minimal
+### Offline extraction
+
+`scrapers.transfermarkt.rumour_observations.extract_rumour_page` takes the
+supplied body, competition, page number, exact canonical listing URL, raw
+capture ID, body SHA-256, capture and extraction clocks, scope, run, cycle and
+universe version. Supply original UTF-8 bytes, or their exact UTF-8 text.
+The digest must match those bytes. A saved fixture with different bytes has
+its own digest. The extractor checks hexadecimal capture identity, converts
+aware clocks to UTC microseconds, and passes the capture clock to parser v2
+as the observation time. Parsing, pager validation or lineage failure rejects
+the page. Extraction requires no clock lookup, storage connection or fetch.
+
+`RumourFeedExtraction(pages)` orders the captures by page number. The
+numbered URL plan from `build_rumour_page_plan` must agree with the acquired
+pages from one through the evidenced last page, with a single competition,
+scope, run, cycle and universe. Each page keeps its capture status, reconciled
+duplicate count, pager links and raw lineage. The feed plan SHA-256 covers
+that evidence, parser and schema revisions, assertion payloads, keys and
+projected rows, including empty pages.
+
+### Bronze observations and page receipts
+
+`dags.utils.transfermarkt_rumours.write_rumours` accepts a complete typed
+feed and current-write preflight. It checks both table grants in the standing
+policy and the existing current authorization before opening a connection and
+again under the writer deadline and lock. The authorized writer creates
+these two Iceberg tables if needed.
+
+| Table | Grain and proof |
+| --- | --- |
+| `iceberg.bronze.transfermarkt_rumour_observations` | One retained assertion per `(rumour_identity, subject_id, observed_at, correction_identity)`. |
+| `iceberg.ops.transfermarkt_rumour_receipts_v1` | One receipt per feed plan SHA-256 and numbered page, including an explicitly empty page. |
+
+Bronze columns retain player, interested club, optional interested competition
+and current club references, position, nationalities as a JSON array, age,
+both source dates, probability and the Transfermarkt discussion link.
+`assertion_json` preserves the complete parser observation. Dates use
+`date`, counts and age use `bigint`, probability uses `double`, and
+timestamps use UTC `timestamp(6)`. Missing optional scalars are SQL NULL.
+Each row carries competition, page URL and number, raw ID and digest, capture
+and extraction clocks, parser and schema revisions, scope, run, cycle and
+universe. The source is `transfermarkt` and the entity type is
+`transfer_rumour_assertion`. The page batch ID is derived from its lineage.
+The ingestion metadata clock is the explicit extraction clock. The receipt
+separately records the commit clock and batch.
+
+Both tables use insert-only MERGE. Before insertion, the writer checks the
+page batch and the incoming natural keys across batches. A stale extraction,
+duplicate physical key, unexpected row or differing payload or lineage fails
+the write. After insertion it compares the complete physical key and payload
+set to the page projection. Only then can the page receive a receipt binding
+its raw lineage, pager, feed hash, expected assertions and distinct subjects,
+source and duplicate counts, capture status, physical row hash and commit
+metadata. The writer rereads every receipt and the full receipt set for the
+plan. A failure between pages can leave proven pages committed. An exact
+retry checks their rows and original receipts and can finish missing writes.
+
+An `observed_empty` page has zero business rows. Its receipt requires a
+physical lookup of the page batch and the SHA-256 of the canonical empty JSON
+array. Replay repeats this lookup. A populated replay verifies all original
+columns and uses the original commit clock. Later observations and same-clock
+corrections with a different correction identity append separate rows.
+
+### Reconciliation and transfer exclusion
+
+`build_rumour_dq` compares expected and terminal pages, retained assertions
+and source rows (including reconciled parser duplicates). It reports distinct
+subjects, page status counts, conflicting payloads or lineage for the same
+natural key, unique and duplicate natural keys, and missing required lineage.
+Fresh conclusive counts validated terminal captures in this feed. Unresolved
+counts outstanding pages against the evidenced last page. With no captures
+the upper bound is unknown. Missing captures, inconsistent plans and repeated
+natural keys prevent structural success. When supplied, receipts must cover
+every expected page exactly once and match the plan, page counts, physical
+hash, commit seal and readback evidence.
+
+`rumour_exclusion_sql()` builds a read-only count against
+`iceberg.bronze.transfermarkt_transfer_events`. A transfer row violates
+exclusion if its `source_url` contains `/geruechte/`, its `parser_revision`
+starts with `transfermarkt-rumours/`, or its `source_body_hash` matches a
+rumour receipt. The current slot runs the query after the writer verifies the
+write and requires a zero count before marking the check complete. Production
+acceptance also verifies the query result.
+The only business output here is rumour assertions. Transfer events, matches,
+Silver and Gold have separate writers and lifecycles.
+
+### Verification status
+
+`tests/unit/scrapers/test_transfermarkt_rumours.py` covers the saved GB1 layout,
+page plan and discussion references alongside synthetic fixtures for malformed
+inputs and the historical contract. The cases cover complete donor fields, aliases/nulls, minimal
 rows, canonical JSON and replay, duplicate reconciliation/conflicts, later
 historical observations, same-clock corrections, surrogate identities, valid
 empty captures, malformed layouts/rows/values, competition/clock validation
@@ -255,16 +395,36 @@ link, rejection of external non-identity links beside valid identities in player
 current club, and interested club cells, and explicit zero match/transfer-event
 output.
 
-The implementation session does not run tests. The lead runs deterministic
-checks after the runner publication gate, verifies the exact diff, and obtains
-the independent review required for the data contract. Test execution and
-review outcomes must be recorded separately; this document does not assert
-that those gates have passed.
+The saved pages provide layout evidence for this parser revision. Passage of
+the final deterministic tests and independent data-contract review is unconfirmed.
+After the runner publication gate, the lead verifies the exact diff and records
+the test and review outcomes separately.
+Source access, standing grants and delivery follow the existing approval
+process. Football #2293 remains open.
 
-No live capture or production compatibility has been demonstrated by synthetic
-fixtures. Live source acquisition, pagination, source access policy, completeness,
-runtime receipt/readback, DQ thresholds, correction persistence, lifecycle and
-retraction rules, writer/storage merge, table DDL, grants, DAGs, schedules,
-delivery, and production acceptance remain outside this package. No Compose,
-Silver, or Gold changes are included. This contract does not claim completion
-of the full three-day issue acceptance, and does not close the issue.
+## Current slot and acceptance for #2293
+
+The rumour collector is integrated into the current runner's daily signals slot. For club
+competitions (including cups), the listing starts at
+`https://www.transfermarkt.com/-/geruechte/wettbewerb/<competition_id>`. Each fetched page
+needs its own raw capture ID, body hash and capture time. Pagination follows the next
+canonical link and must reach a consistent last page before the rumours writer receives
+the feed. Corrections and repeat observations belong to the rumours writer's history.
+
+A complete check needs a verified write, receipt readback, reconciliation, and an exclusion
+query returning one numeric zero for rumour violations in transfer events. These conditions
+also apply to an empty listing. National-team scopes use the complete current listing's
+raw IDs and check time for a zero-row check. The result must identify the registry snapshot,
+team type, `applicability_status=not_applicable`, and the rumour-specific rule
+`league_rumour_listing:club_competitions`.
+
+The local rumour limiter caps each scope portion at 32 request attempts and 16 MiB
+of decoded data. The shared scope and deadline limits also apply. Daily acceptance requires fresh
+listing, players, injury and rumours checks. The rumours clock belongs in
+`resume_json.daily_check_clocks`. The national-team injury and rumours exceptions each
+require the rule for that check kind and the matching registry snapshot.
+
+Production delivery and the bounded E2E remain outstanding. The E2E must
+demonstrate the production write, receipt readback, DQ and a zero exclusion
+count before scheduled daily enablement. Scheduled collection and three-day
+acceptance are still outstanding.

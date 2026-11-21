@@ -65,6 +65,19 @@ class Clock:
 
 class Offline:
     def __init__(self, tmp_path, monkeypatch):
+        def write_empty_rumours(scraper, feed, preflight):
+            receipts = [f'offline-rumours-page-{n}' for n, _ in enumerate(feed.pages, 1)]
+            return {
+                'verified': True, 'receipt_readback': True, 'receipts': receipts,
+                'plan_sha256': '0' * 64,
+                'reconciliation': {
+                    'source_rows': 0, 'retained_assertions': 0,
+                    'status_counts': {'observed_empty': len(receipts)},
+                },
+            }
+
+        monkeypatch.setattr('dags.utils.transfermarkt_rumours.write_rumours', write_empty_rumours)
+
         self.root = tmp_path
         self.clock = Clock()
         self.calls, self.sql, self.writes, self.careers, self.clients = [], [], [], [], []
@@ -198,6 +211,24 @@ class Offline:
                 elif '/teilnehmer/' in parsed.path:
                     value = listing(outer.club_ids, outer.values).replace('<html>', '<html><link rel="alternate" '
                         f'href="https://www.transfermarkt.com/x/teilnehmer/wettbewerb/{target.competition_id}/saison_id/2026">')
+                elif "/geruechte/" in parsed.path:
+                    base = f"https://www.transfermarkt.com/-/geruechte/wettbewerb/{target.competition_id}"
+                    value = f"""
+                        <div id="yw1">
+                            <table class="items">
+                                <thead><tr><th>Player</th><th>Interested club</th></tr></thead>
+                                <tbody></tbody>
+                            </table>
+                            <ul class="pager">
+                                <li class="tm-pagination__list-item--active">
+                                    <a class="tm-pagination__link" href="{base}">1</a>
+                                </li>
+                                <li class="tm-pagination__list-item--icon-last-page">
+                                    <a class="tm-pagination__link" href="{base}">1</a>
+                                </li>
+                            </ul>
+                        </div>
+                    """
                 else:
                     if outer.fail_scope == target.competition_id:
                         value = '<html>invalid layout</html>'
@@ -236,6 +267,8 @@ class Offline:
                             raise RuntimeError(outer.bronze_career_error)
                         return [(player, *([players[player]] if 'MAX(mv_date)' in self.statement else []))
                                 for player in self.params if player in players]
+                if "rumour_violations" in self.statement:
+                    return [(0,)]
                 return []
             def close(self):
                 pass
@@ -457,7 +490,9 @@ def test_cold_real_raw_parser_and_career_pipeline_records_complete_roster(offlin
     assert {endpoint for endpoint, _, _ in offline.careers} == {'market_value_points', 'transfer_events'}
     data = next(iter(offline.state()['scopes'].values()))
     assert data['cursor']['cold_complete']
-    assert data['cursor']['resume_json'] == '{}'
+    resume = json.loads(data['cursor']['resume_json'])
+    assert set(resume) == {'daily_check_clocks'}
+    assert resume['daily_check_clocks']['rumours']
     assert len(data['traffic_receipts']) == 3  # #2068: cold roster, then signals and careers
     assert data['traffic_used']['requests'] > 0
     assert data['grant_cycle_id'] == 'cold-careers'
@@ -767,6 +802,37 @@ def test_weekly_rechecks_all_squads_without_repeating_careers(offline):
     offline.run('weekly')
     assert sum('/kader/' in url for _, url in offline.calls) == 2
     assert offline.careers == []
+
+
+def test_weekly_current_collects_club_values_when_enabled(offline, monkeypatch):
+    monkeypatch.delenv('TM_REQUIRE_METERED_PROXY', raising=False)
+    monkeypatch.delenv('TM_PROXY_CONTROL_URL', raising=False)
+    calls = []
+
+    def collect(scraper, payload, preflight, *, mode):
+        calls.append((payload, preflight, mode))
+        return {'verified': True, 'mode': mode, 'scope_id': payload['scope_id']}
+
+    monkeypatch.setenv('TM_CLUB_VALUES_ENABLED', 'true')
+    monkeypatch.setattr('dags.scripts.run_transfermarkt_club_values.run_club_values', collect)
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-apply')
+    offline.clock.advance(7 * 24 * 3600 + 1)
+    weekly = offline.run('weekly')
+
+    assert len(calls) == 1, weekly['scopes']
+    payload, preflight, mode = calls[0]
+    assert mode == 'current'
+    assert payload['competition_id'] == 'GB1'
+    assert payload['edition_id'] == '2026'
+    assert payload['source_url'] == 'https://example.test/GB1/2026'
+    assert payload['child_cycle_id']
+    assert payload['resume_cycle_id'] == 'weekly'
+    assert preflight['paid_io_allowed'] is True
+    result = next(item for item in weekly['scopes'] if item['kind'] == 'weekly_roster')
+    assert result['club_values']['verified'] is True
 
 
 def test_weekly_new_player_is_queued_without_career_download_in_weekly_portion(offline):
@@ -1522,7 +1588,9 @@ def test_stale_nonempty_value_graph_retains_exact_pending_id_until_current_date(
     offline.run('fresh-graph')
     data = next(iter(offline.state()['scopes'].values()))
     assert data['signals']['player:110']['status'] == 'applied'
-    assert data['cursor']['resume_json'] == '{}'
+    resume = json.loads(data['cursor']['resume_json'])
+    assert set(resume) == {'daily_check_clocks'}
+    assert resume['daily_check_clocks']['rumours']
     assert sum('/marketValueDevelopment/graph/110' in url for _, url in offline.calls) == 1
 
 
@@ -1574,7 +1642,9 @@ def test_zero_value_does_not_block_ack_of_real_roster_change(offline):
     offline.run('becomes-unpriced-apply')  # #2068: the roster change follows its signal portion
     data = next(iter(offline.state()['scopes'].values()))
     assert data['signals']['player:110']['status'] == 'applied'
-    assert data['cursor']['resume_json'] == '{}'
+    resume = json.loads(data['cursor']['resume_json'])
+    assert set(resume) == {'daily_check_clocks'}
+    assert resume['daily_check_clocks']['rumours']
 
 
 def test_unpriced_signature_equivalence_keeps_positive_values_and_dates_strict():
@@ -1733,7 +1803,9 @@ def test_warm_missing_membership_signature_is_baseline_not_new_change(offline):
     data = next(iter(offline.state()['scopes'].values()))
     assert data['signals']['listing:GB1']['result'] == 'baseline_verified'
     assert not any('/kader/' in url for _, url in offline.calls)
-    assert data['cursor']['resume_json'] == '{}'
+    resume = json.loads(data['cursor']['resume_json'])
+    assert set(resume) == {'daily_check_clocks'}
+    assert resume['daily_check_clocks']['rumours']
 
 
 def test_participant_only_removal_updates_memberships_without_squad_or_career_refetch(offline):
@@ -1929,6 +2001,11 @@ def test_physical_replacement_lost_readback_recovers_original_write_intent(offli
         state = offline.state()
         for name in ('listing', 'players', 'injury'):
             state['scopes'][before['cursor']['scope_id']]['cursor'][name + '_checked_at'] = offline.clock.wall.isoformat()
+            cursor_data = state['scopes'][before['cursor']['scope_id']]['cursor']
+            cursor = current.ScopeCursor.from_mapping(cursor_data)
+            cursor = replace(cursor, **cursor.daily_clock_changes(
+                'rumours', offline.clock.wall, 'recovery-test'))
+            state['scopes'][before['cursor']['scope_id']]['cursor'] = cursor.as_dict()
         offline.write_state(state)
     offline.calls.clear()
     offline.run('recover', max_scopes=1, baseline_verifier=write.verify_current_roster_baseline)
