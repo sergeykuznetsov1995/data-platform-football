@@ -174,6 +174,33 @@ def test_physical_slots_for_repository_sql(sql, keys):
     assert trino.statement_keys(sql, "iceberg") == keys
 
 
+@pytest.mark.parametrize("create", ["CREATE TABLE", "CREATE TABLE IF NOT EXISTS"])
+def test_empty_create_paces_the_first_insert_across_lanes(
+    tmp_path, monkeypatch, create
+):
+    clock = Clock(59.9)
+    monkeypatch.setenv("TRINO_SRC_WHOSCORED_PASSWORD", "source-fixture")
+    current, history = [
+        trino.WhoScoredTrinoManager(
+            budget=TrinoBudget(tmp_path, clock=clock, sleep=clock.sleep)
+        )
+        for _ in range(2)
+    ]
+    submitted = []
+
+    def execute(manager, sql, **kwargs):
+        submitted.append(clock())
+        if len(submitted) == 1:
+            clock.now += 0.2
+
+    monkeypatch.setattr(trino.TrinoTableManager, "_execute", execute)
+    current._execute(f'{create} "iceberg"."bronze"."whoscored_events" (id BIGINT)')
+    history._execute("INSERT INTO bronze.whoscored_lineups VALUES (1)")
+    history._execute("INSERT INTO bronze.whoscored_events VALUES (1)")
+
+    assert submitted == pytest.approx([59.9, 60.1, 120.1])
+
+
 def test_sql_and_direct_iceberg_share_the_same_table_slot(tmp_path, monkeypatch):
     clock = Clock(59.9)
     budget = TrinoBudget(tmp_path, clock=clock, sleep=clock.sleep)
