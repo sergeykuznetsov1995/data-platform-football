@@ -1805,6 +1805,8 @@ def test_source_replay_failure_continues_next_scope(
         if replay_failure == "timeout" else int(replay_failure[4:]),
         200,
     ]
+    # #1839: fail on three distinct members before failing only this scope.
+    failures.insert(2, failures[1])
 
     class Session:
         def __init__(self, proxy):
@@ -1844,11 +1846,97 @@ def test_source_replay_failure_continues_next_scope(
     assert [item["status"] for item in report["scopes"]] == ["failed", "success"]
     assert len(service_cls.instances) == 2
     assert len(report["error_details"]) == 1
-    assert len(proxies) == 2 and proxies[0] != proxies[1]
+    assert len(proxies) == len(set(proxies)) == 3
     assert calls == [
         (proxies[0], EGRESS_PROBE_URL), (proxies[0], source),
         (proxies[1], EGRESS_PROBE_URL), (proxies[1], source),
-        (proxies[1], EGRESS_PROBE_URL), (proxies[1], source),
+        (proxies[2], EGRESS_PROBE_URL), (proxies[2], source),
+        (proxies[2], EGRESS_PROBE_URL), (proxies[2], source),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["tls", "http502"])
+def test_mid_run_three_dead_ports_recover_on_live_fourth(monkeypatch, tmp_path, failure):
+    from scrapers.utils.proxy_manager import ProxyManager
+    from scrapers.whoscored.transport import (
+        EGRESS_PROBE_URL, TransportContext, WhoScoredTransport,
+    )
+
+    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(4)]
+    monkeypatch.setattr(
+        ProxyManager,
+        "get_http_proxy_url",
+        lambda self, *, excluded_http_urls=None: next(
+            (url for url in urls if url not in (excluded_http_urls or set())), None
+        ),
+    )
+    pool = tmp_path / "pool.txt"
+    pool.write_text("".join(f"pool.invalid:{10000 + i}:test:secret\n" for i in range(4)))
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    calls = []
+    source_calls = []
+    source = "https://www.whoscored.com/tournaments/25590/data/?d=202610"
+
+    class Session:
+        def __init__(self, proxy):
+            self.proxy = proxy
+
+        def get(self, url, **kwargs):
+            calls.append((self.proxy, url))
+            status = 200
+            if url == EGRESS_PROBE_URL:
+                if self.proxy == urls[1]:
+                    raise RuntimeError("curl: (56) CONNECT tunnel failed, response 522")
+                if self.proxy == urls[2]:
+                    status = 500
+            else:
+                source_calls.append(self.proxy)
+                if len(source_calls) == 2:
+                    if failure == "tls":
+                        raise RuntimeError("curl: (35) TLS connect error")
+                    status = 502
+            return SimpleNamespace(status_code=status, content=b"{}", headers={})
+
+        def close(self):
+            pass
+
+    transport = WhoScoredTransport(
+        http_session_factory=Session,
+        direct_http_attempts=3,
+        direct_http_retry_backoff_seconds=0,
+        context=TransportContext(transport_policy="direct_only"),
+    )
+
+    def schedule():
+        transport.fetch(source)
+        # A custom behavior bypasses the fake service's per-scope digest, and
+        # both scopes succeed here, so each call needs its own batch id.
+        result = SimpleNamespace(**vars(DEFAULT_RESULTS["schedule"]))
+        digest = hashlib.sha256(
+            f"scope\0#1839-mid-run\0{len(source_calls)}".encode("utf-8")
+        ).hexdigest()
+        result.committed_batches = {"scope": ["wss2-" + digest]}
+        return result
+
+    rc, report, service_cls, _ = _run(
+        monkeypatch, tmp_path,
+        ["daily", "--scope", "ENG-Premier League=2526", "--scope", "INT-World Cup=2026", "--skip-profiles"],
+        behaviors={"probe": transport.probe_egress, "schedule": schedule},
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["error_details"] == []
+    assert [item["status"] for item in report["scopes"]] == ["success", "success"]
+    assert len(service_cls.instances) == 2
+    assert [service.probes for service in service_cls.instances] == [1, 1]
+    assert source_calls == [urls[0], urls[0], urls[3]]
+    assert calls == [
+        (urls[0], EGRESS_PROBE_URL), (urls[0], source),
+        (urls[0], EGRESS_PROBE_URL), (urls[0], source),
+        (urls[1], EGRESS_PROBE_URL), (urls[2], EGRESS_PROBE_URL),
+        (urls[3], EGRESS_PROBE_URL), (urls[3], source),
     ]
 
 
