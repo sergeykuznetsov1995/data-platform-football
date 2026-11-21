@@ -389,6 +389,10 @@ def _read_promoted_registry(
     from utils import transfermarkt_native_v2 as tm_v2
     from utils.transfermarkt_scope_planner import build_promoted_registry_query
 
+    if current_only:
+        from dags.utils.transfermarkt_denominator_registry import current_denominator_snapshot_id
+
+        registry_snapshot_id = current_denominator_snapshot_id(registry_snapshot_id)
     query = build_promoted_registry_query(
         registry_snapshot_id=registry_snapshot_id or None,
         current_only=current_only,
@@ -408,7 +412,12 @@ def _read_promoted_registry(
         )
     if any(len(row) != len(columns) for row in rows):
         raise AirflowException('promoted-registry row shape is inconsistent')
-    return [dict(zip(columns, row, strict=True)) for row in rows]
+    records = [dict(zip(columns, row, strict=True)) for row in rows]
+    if current_only and registry_snapshot_id and any(
+        row.get('registry_snapshot_id') != registry_snapshot_id for row in records
+    ):
+        raise AirflowException(f'current registry rows differ from expected snapshot {registry_snapshot_id!r}')
+    return records
 
 
 def _approval_bundle(

@@ -50,6 +50,8 @@ x-tm-airflow-common: &tm-airflow-common
     # Те же имена, что у общего scheduler'а (compose.yaml, блок Transfermarkt).
     TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
     TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
+    TRANSFERMARKT_DENOMINATOR_SOURCE: ${TRANSFERMARKT_DENOMINATOR_SOURCE:-tsv}
+    TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID: ${TRANSFERMARKT_DENOMINATOR_REGISTRY_SNAPSHOT_ID:-}
     TM_HISTORY_STREAMS: ${TM_HISTORY_STREAMS:-0}
     TM_REQUESTS_PER_MINUTE: ${TM_REQUESTS_PER_MINUTE:-12}
     # Хардкод (не из .env): общий .env платформы несёт TM_PROXY_CONTROL_URL общего

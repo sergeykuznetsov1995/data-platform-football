@@ -102,6 +102,17 @@ def test_red_completed_does_not_repeat_full_sweep(tmp_path, full_runner):
     assert len(full_runner) == 1
 
 
+def test_cached_daily_report_keeps_the_original_route_denominator(tmp_path, monkeypatch, full_runner):
+    routes = {'GB1': 'wettbewerb', 'FAC': 'pokal'}
+    monkeypatch.setattr(daily, '_routes', lambda _: (routes, 'registry', 'snapshot-A'))
+    first = daily.run_daily_bronze_dq(Cursor(), state_root=tmp_path, run_id='first', now=NOW)
+    assert first['completed'] and first['universe_version'] == 'snapshot-A'
+    monkeypatch.setattr(daily, '_routes', lambda _: (routes, 'registry', 'snapshot-B'))
+    cached = daily.run_daily_bronze_dq(Cursor(), state_root=tmp_path, run_id='second', now=NOW)
+    assert cached['cached'] and (cached['denominator_source'], cached['universe_version']) == ('registry', 'snapshot-A')
+    assert daily.read_daily_result(state_root=tmp_path, now=NOW)['universe_version'] == 'snapshot-A'
+
+
 def test_pokal_exactly_five_percent_is_not_red(tmp_path, full_runner):
     report = run(Cursor(empty=5), tmp_path)
     assert report['status'] == 'GREEN'

@@ -1270,10 +1270,44 @@ WITH membership AS (
         FROM iceberg.silver.transfermarkt_squad_memberships_v2 m
     )
     WHERE rn = 1
+),
+scoped_attributes AS (
+    SELECT *
+    FROM (
+        SELECT
+            a.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, edition_id, club_id, player_id
+                ORDER BY observed_at DESC, _bronze_ingested_at DESC,
+                         _batch_id DESC, source_body_hash DESC
+            ) AS rn
+        FROM iceberg.silver.transfermarkt_player_attribute_observations_v2 a
+    )
+    WHERE rn = 1
+),
+scoped_contracts AS (
+    SELECT *
+    FROM (
+        SELECT
+            c.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY competition_id, edition_id, team_id, player_id
+                ORDER BY observed_at DESC, _bronze_ingested_at DESC,
+                         _batch_id DESC, source_body_hash DESC
+            ) AS rn
+        FROM iceberg.silver.transfermarkt_player_contract_observations_v2 c
+        WHERE applicability_status <> 'not_applicable'
+    )
+    WHERE rn = 1
+),
+latest_mv AS (
+    SELECT player_id, MAX(mv_date) AS current_market_value_date
+    FROM iceberg.silver.transfermarkt_market_value_points_v2
+    GROUP BY player_id
 )
 SELECT
     m.player_id,
-    a.canonical_id,
+    xp.canonical_id,
     COALESCE(a.name, m.player_name) AS name,
     COALESCE(a.player_slug, m.player_slug) AS slug,
     a.position,
@@ -1282,22 +1316,44 @@ SELECT
     a.height_cm,
     a.foot,
     a.nationality,
-    a.contract_until,
-    a.current_market_value_eur,
-    a.current_market_value_date AS mv_last_update,
+    CASE
+        WHEN c.player_id IS NOT NULL THEN c.contract_until
+        ELSE a.contract_until
+    END AS contract_until,
+    a.market_value_eur AS current_market_value_eur,
+    mv.current_market_value_date AS mv_last_update,
     m.club_id AS current_club_id,
     m.club_name AS current_club_name,
     COALESCE(
-        GREATEST(m._bronze_ingested_at, a._bronze_ingested_at),
+        GREATEST(
+            m._bronze_ingested_at,
+            a._bronze_ingested_at,
+            c._bronze_ingested_at
+        ),
         m._bronze_ingested_at,
-        a._bronze_ingested_at
-    )
-        AS _bronze_ingested_at,
+        a._bronze_ingested_at,
+        c._bronze_ingested_at
+    ) AS _bronze_ingested_at,
     m.league,
     m.season
 FROM membership m
-LEFT JOIN iceberg.silver.transfermarkt_player_attributes_v2 a
-  ON a.player_id = m.player_id
+LEFT JOIN scoped_attributes a
+  ON a.competition_id = m.competition_id
+ AND a.edition_id = m.edition_id
+ AND a.club_id = m.club_id
+ AND a.player_id = m.player_id
+LEFT JOIN scoped_contracts c
+  ON c.competition_id = m.competition_id
+ AND c.edition_id = m.edition_id
+ AND c.team_id = m.club_id
+ AND c.player_id = m.player_id
+LEFT JOIN latest_mv mv ON mv.player_id = m.player_id
+LEFT JOIN iceberg.silver.xref_player xp
+  ON xp.source = 'transfermarkt'
+ AND xp.source_id = m.player_id
+ AND xp.league = m.league
+ AND xp.season = m.season
+ AND xp.confidence <> 'orphan'
 """.strip()
     sql = rewrite_native_relations(sql, selected)
     # The adapter itself is not a model output and therefore needs an explicit

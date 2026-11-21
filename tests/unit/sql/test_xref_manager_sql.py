@@ -142,6 +142,16 @@ class TestXrefManagerStructure:
         assert "try_cast(s.appointed_date as date) <= m.season_end" in sql
         assert "try_cast(s.left_date as date) >= m.season_start" in sql
 
+    def test_tm_single_year_scope_uses_registry_edition_bounds(self):
+        """Single-year editions must not be expanded from a split-year slug."""
+        sql = _read_sql().lower()
+        assert "iceberg.bronze.transfermarkt_competition_editions" in sql
+        assert "iceberg.silver.transfermarkt_competition_editions_v2" not in sql
+        assert "season_format = 'single_year'" in sql
+        assert "concat(canonical_season, '-01-01')" in sql
+        assert "concat(canonical_season, '-12-31')" in sql
+        assert "concat('20', substr(season" not in sql
+
     def test_fotmob_filters_squad_coaches_without_null_rejecting_fallback(self):
         """The coach filter belongs to squad; ps.is_coach stays in LEFT ON."""
         sql_lower = _read_sql().lower()
