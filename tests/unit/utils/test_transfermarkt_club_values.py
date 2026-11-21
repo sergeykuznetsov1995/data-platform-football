@@ -69,7 +69,9 @@ class ClubValueWriter(MemoryWriter):
 @pytest.fixture
 def club_value_policy(monkeypatch, tmp_path):
     policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
-    policy['allowed_write_tables'] += [club_values.CLUB_VALUE_TABLE, club_values.CLUB_VALUE_RECEIPTS_TABLE]
+    policy['allowed_write_tables'] = list(dict.fromkeys(
+        policy['allowed_write_tables'] + [club_values.CLUB_VALUE_TABLE, club_values.CLUB_VALUE_RECEIPTS_TABLE]
+    ))
     policy['expires_at'] = '2999-01-01T00:00:00Z'
     path = tmp_path / 'club-value-policy.json'
     path.write_text(json.dumps(policy))
@@ -93,6 +95,7 @@ def physical(scraper, monkeypatch, tmp_path, club_value_policy):  # noqa: F811
     scraper.test_db = db
     scraper._bronze_connection = lambda: db
     scraper._iceberg_writer = ClubValueWriter(db)
+    scraper._http_client._raw_store = scraper.test_store
     return scraper
 
 
@@ -173,11 +176,25 @@ def test_writer_returns_per_club_receipts_and_exact_physical_rows(physical):
 def test_identical_replay_is_noop(physical):
     result = extraction(physical)
     first = write(physical, result)
-    repeat = write(physical, result)
+    reparsed = extraction(physical, extracted=EXTRACTED + timedelta(hours=1))
+    repeat = write(physical, reparsed, at=COMMITTED + timedelta(hours=1))
     assert first['plan_sha256'] == repeat['plan_sha256']
     assert first['receipts'][0]['receipt_id'] == repeat['receipts'][0]['receipt_id']
     assert len(business_table(physical)) == 2
     assert len(receipt_table(physical)) == 1
+
+
+def test_replay_rejects_deletion_of_a_later_observation_outside_the_plan(physical):
+    first = write(physical, extraction(physical))
+    write(physical, extraction(
+        physical, value=160_000, observed=CAPTURED + timedelta(days=7),
+        extracted=EXTRACTED + timedelta(days=7),
+    ), at=COMMITTED + timedelta(days=7))
+    physical.test_db.sql.execute(
+        'DELETE FROM transfermarkt_club_value_observations WHERE value_amount = 160000')
+    with pytest.raises(Exception, match='receipt read-back differs: physical_hash'):
+        write(physical, extraction(physical))
+    assert first['receipts'][0]['receipt_id']
 
 
 def test_later_correction_appends_and_does_not_overwrite_history(physical):

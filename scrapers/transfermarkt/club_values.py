@@ -196,10 +196,15 @@ class ClubValueExtraction:
         return dict(sorted(Counter(row['observation_status'] for row in self.club_rows(club_id)).items()))
 
     def plan_sha256(self) -> str:
+        volatile = {'extracted_at', 'run_id', 'cycle_id', '_batch_id', '_ingested_at'}
         payload = {
-            'capture': asdict(self.capture), 'available_dates': self.available_dates,
+            'capture': {key: value for key, value in asdict(self.capture).items()
+                        if key not in volatile},
+            'available_dates': self.available_dates,
             'value_dates': self.value_dates, 'club_ids': self.club_ids,
-            'rows': self.rows, 'reconciled_table_points': self.reconciled_table_points,
+            'rows': tuple({key: value for key, value in row.items() if key not in volatile}
+                          for row in self.rows),
+            'reconciled_table_points': self.reconciled_table_points,
             'differing_table_points': self.differing_table_points,
             'full_available_history': self.full_available_history,
         }
