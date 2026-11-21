@@ -1,7 +1,7 @@
 """Рецепт своего контура Transfermarkt в deploy/transfermarkt/ (#1387).
 
-Статически (без docker): блок-лист .airflowignore оставляет планировщику ровно семь
-TM-DAG; оба compose-файла самодостаточны (ни одного хостового пути литералом, каждый
+Статически (без docker): блок-лист .airflowignore оставляет восемь TM-DAG-файлов,
+включая paused-at-creation achievements; оба compose-файла самодостаточны (ни одного хостового пути литералом, каждый
 bind — из переменной без дефолта, образ пинован); шлюз — в режиме transfermarkt-only без
 бюджетных флагов; скрипты читают env-файл контура общим загрузчиком. Рендер через
 `docker compose config` — последний тест, пропускается без docker.
@@ -31,6 +31,7 @@ TM_DAGS = {
     "dag_discover_transfermarkt_registry.py",
     "dag_backfill_transfermarkt.py",
     "dag_transform_transfermarkt_silver.py",
+    "dag_ingest_transfermarkt_achievements.py",
     "dag_ingest_transfermarkt_referees.py",
     "dag_backfill_transfermarkt_referees.py",
     "dag_dq_transfermarkt_referees.py",
@@ -70,7 +71,7 @@ def _tracked_dag_files() -> list[str]:
 
 
 @pytest.mark.unit
-def test_airflowignore_leaves_exactly_the_seven_transfermarkt_dags() -> None:
+def test_airflowignore_leaves_exactly_the_eight_transfermarkt_dag_files() -> None:
     patterns = _patterns()
     # RE2 в Airflow: lookahead молча не работает — только явный блок-лист.
     assert "(?!" not in "".join(patterns)
@@ -78,7 +79,7 @@ def test_airflowignore_leaves_exactly_the_seven_transfermarkt_dags() -> None:
         rel for rel in _tracked_dag_files()
         if not any(re.search(p, rel) for p in patterns)
     ]
-    # Кроме семи DAG виден только пакетный __init__.py (DAG не объявляет).
+    # Кроме восьми DAG-файлов виден только пакетный __init__.py (DAG не объявляет).
     assert set(visible) == TM_DAGS | {"__init__.py"}, sorted(visible)
     init = (ROOT / "dags" / "__init__.py").read_text(encoding="utf-8")
     assert "DAG(" not in init and "@dag" not in init
@@ -194,6 +195,46 @@ def test_env_sh_accepts_only_contour_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_release_contract_includes_paused_achievements() -> None:
+    result = subprocess.run(
+        ["bash", "-c", f'. "{DEPLOY / "env.sh"}"; transfermarkt_release_dags "$1"', "x", str(ROOT)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "dag_ingest_transfermarkt",
+        "dag_discover_transfermarkt_registry",
+        "dag_backfill_transfermarkt",
+        "dag_transform_transfermarkt_silver",
+        "dag_discover_transfermarkt_registry_manual",
+        "dag_ingest_transfermarkt_achievements",
+        "dag_ingest_transfermarkt_referees",
+        "dag_backfill_transfermarkt_referees",
+        "dag_dq_transfermarkt_referees",
+    ]
+
+
+@pytest.mark.unit
+def test_deploy_guards_and_pauses_new_achievements_dag() -> None:
+    text = _code_lines(DEPLOY / "deploy.sh")
+    assert 'GUARD_DAGS="$INGEST $DISCOVER $BACKFILL $SILVER $MANUAL $ACHIEVEMENTS dag_ingest_transfermarkt_referees dag_backfill_transfermarkt_referees dag_dq_transfermarkt_referees"' in text
+    assert '["$ACHIEVEMENTS"]=t' in text
+
+
+@pytest.mark.unit
+def test_release_contract_keeps_legacy_release_compatible(tmp_path: Path) -> None:
+    (tmp_path / "dags").mkdir()
+    shutil.copy(ROOT / "dags" / "dag_discover_transfermarkt_registry.py", tmp_path / "dags")
+    result = subprocess.run(
+        ["bash", "-c", f'. "{DEPLOY / "env.sh"}"; transfermarkt_release_dags "$1"', "x", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "dag_discover_transfermarkt_registry_manual" in result.stdout.split()
+    assert "dag_ingest_transfermarkt_achievements" not in result.stdout.split()
+
+
+@pytest.mark.unit
 def test_deploy_script_order_and_pool_handling() -> None:
     text = _code_lines(DEPLOY / "deploy.sh")
     order = [
@@ -223,6 +264,10 @@ def test_auto_deliver_window_and_contract() -> None:
     # lane_refresh добавляет уже зарегистрированные referee-расписания.
     assert "WINDOW_FROM" not in text and "set_window" not in text
     assert "NEXT_RUN_DAGS=\"'dag_discover_transfermarkt_registry'\"" in text
+    assert 'CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_discover_transfermarkt_registry_manual dag_backfill_transfermarkt dag_transform_transfermarkt_silver dag_ingest_transfermarkt_achievements dag_ingest_transfermarkt_referees dag_backfill_transfermarkt_referees dag_dq_transfermarkt_referees"' in text
+    assert "'dag_transform_transfermarkt_silver','dag_ingest_transfermarkt_achievements'" in text
+    assert 'live_dags=$(transfermarkt_release_dags "$TRANSFERMARKT_RELEASE_ROOT") || return 1' in text
+    assert 'NEXT_RUN_DAGS="$NEXT_RUN_DAGS,\'dag_ingest_transfermarkt_achievements\'"' in text
     assert "FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}" in text
     assert "--drill-rollback" in text
     assert '"$old/deploy/transfermarkt/deploy.sh" "$old"' in text
