@@ -208,8 +208,8 @@ def test_missing_fid_retries_fresh_html_with_day_limit(tmp_path, appears_later):
         assert not repo.writes
 
 
-@pytest.mark.parametrize("failure", ["timeout", "html", "cache", "writer"])
-def test_failures_do_not_change_json_and_retry_tomorrow(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("failure,expected_gets", [("timeout", 2), ("html", 2), ("cache", 2), ("writer", 1)])
+def test_failures_do_not_change_json_and_retry_tomorrow(tmp_path, monkeypatch, failure, expected_gets):
     import scrapers.understat.enrichment as module
 
     repo, session, client, clock, _ = setup(tmp_path)
@@ -237,7 +237,61 @@ def test_failures_do_not_change_json_and_retry_tomorrow(tmp_path, monkeypatch, f
     clock[0] += timedelta(days=1)
     CacheState(tmp_path).count_request(clock[0].date())
     assert run_enrichment(client, repo, now=clock[0])["published"] == 1
-    assert len(session.calls) == 2
+    assert len(session.calls) == expected_gets
+
+
+def test_players_write_outage_recovers_and_reuses_html(tmp_path, monkeypatch):
+    repo, session, client, clock, _ = setup(tmp_path)
+    repo.add_match()
+    healthy_write = repo.write_dataframe
+
+    def fail_players_only(frame, **kwargs):
+        if kwargs["table"] == "understat_player_match_enrichment":
+            raise OSError("synthetic second table outage")
+        return healthy_write(frame, **kwargs)
+
+    monkeypatch.setattr(repo, "write_dataframe", fail_players_only)
+    for day in range(1, 6):
+        clock[0] = NOW + timedelta(days=day - 1)
+        CacheState(tmp_path).count_request(clock[0].date())
+        if day == 4:
+            monkeypatch.setattr(repo, "write_dataframe", healthy_write)
+        if day == 5:
+            repo.batch = "batch-2"
+            repo.schedule[0]["_batch_id"] = repo.batch
+        result = run_enrichment(client, repo, now=clock[0])
+        matches = repo.writes["understat_match_enrichment"]
+        assert len(matches) == 1
+        match = next(iter(matches.values()))
+        players = repo.writes.get("understat_player_match_enrichment", {})
+        state = read_json(tmp_path / "html_enrichment/queue.json")
+        entry = next(iter(state["games"].values()))
+        assert len(session.calls) == 1
+        assert entry.get("status") is None
+        assert entry["failures"] == 0
+        assert entry["html"]
+        assert entry["attempted_on"] == NOW.date().isoformat()
+        assert match["source_batch_id"] == repo.batch
+        if day <= 3:
+            assert result == {"status": "complete", "published": 0, "failed": 1}
+            assert not match["is_valid"]
+            assert not players
+            assert not entry.get("done")
+        else:
+            assert result == {"status": "complete", "published": 1, "failed": 0}
+            assert entry["done"]
+            assert match["is_valid"]
+            assert match["whoscored_game_id"] == 1983568
+            assert len(players) == len(repo.players) > 0
+            assert {(row["team_id"], row["player_id"]) for row in players.values()} == {
+                (row["team_id"], row["player_id"]) for row in repo.players}
+            for row in players.values():
+                assert row["is_valid"]
+                assert row["source_batch_id"] == repo.batch
+                assert row["json_hash"] == match["json_hash"] == entry["hash"]
+                assert row["parser_version"] == match["parser_version"] == "understat-html-v2"
+                assert all(row[column] == match[column] for column in ("league", "season", "game_id"))
+            assert any(json.loads(row["yellow_card_minutes"]) for row in players.values())
 
 
 def test_three_failed_days_stop_retry(tmp_path):
