@@ -1,7 +1,7 @@
 """Paused-at-creation bounded achievements ingest for all recipient types."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
 
@@ -12,6 +12,7 @@ with DAG(
     dag_id="dag_ingest_transfermarkt_achievements",
     default_args=SCRAPER_ARGS,
     description="Monthly and post-season Transfermarkt player/club/coach achievements",
+    start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     schedule="0 * * * *",
     catchup=False,
     max_active_runs=1,
