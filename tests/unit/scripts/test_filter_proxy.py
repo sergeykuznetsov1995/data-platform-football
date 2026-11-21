@@ -1428,6 +1428,10 @@ def test_transfermarkt_dagruns_require_an_explicit_separate_cap(mod, dag_id):
 
 
 def test_transfermarkt_backfill_is_closed_separate_source_and_budget_namespace(mod):
+    assert mod._source_for_dag("dag_ingest_transfermarkt_referees") == "transfermarkt"
+    assert mod._source_for_dag("dag_backfill_transfermarkt_referees") == (
+        "transfermarkt_backfill"
+    )
     production_mgr = _FakeManager(["http://u:p@production.invalid:10000"])
     backfill_mgr = _FakeManager(["http://u:p@backfill.invalid:10000"])
     metadata = {

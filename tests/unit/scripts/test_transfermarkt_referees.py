@@ -207,3 +207,13 @@ def test_production_factory_checks_policy_and_passes_exact_registry_record(
     assert constructed[0]['canonical_season'] == value['canonical_season']
     assert constructed[0]['competition_records'][0].competition_id == 'XY1'
     assert constructed[0]['lease_metadata']['scope'] == value['scope_id']
+
+
+def test_history_referee_lease_uses_dedicated_control_token(monkeypatch):
+    from scrapers.transfermarkt.client import ProxyFilterLeaseProvider
+
+    monkeypatch.setenv('TM_DAG_ID', 'dag_backfill_transfermarkt_referees')
+    monkeypatch.setenv('TM_PROXY_CONTROL_TOKEN', 'c' * 32)
+    monkeypatch.setenv('TM_BACKFILL_PROXY_CONTROL_TOKEN', 'h' * 32)
+    provider = ProxyFilterLeaseProvider('http://offline.invalid')
+    assert provider._control_token == 'h' * 32
