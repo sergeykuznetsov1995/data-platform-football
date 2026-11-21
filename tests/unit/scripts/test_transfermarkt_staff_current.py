@@ -36,7 +36,9 @@ def test_production_current_wires_independent_staff_sweep(offline, production_cu
     from dags.utils.transfermarkt_staff import STAFF_TABLE, STAFF_RECEIPTS_TABLE
 
     policy = json.loads(production_current.policy_path.read_text())
-    policy['allowed_write_tables'] += [STAFF_TABLE, STAFF_RECEIPTS_TABLE]
+    for table in [STAFF_TABLE, STAFF_RECEIPTS_TABLE]:
+        if table not in policy['allowed_write_tables']:
+            policy['allowed_write_tables'].append(table)
     production_current.policy_path.write_text(json.dumps(policy))
     production_current.run('production-wiring')
     assert production_current.writes == ['10', '20']
