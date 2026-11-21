@@ -50,7 +50,9 @@ def test_staff_runs_on_seventh_day_independently_of_roster_and_coach_ttl(offline
     offline.run_cold('cold', staff_writer=writer)
     assert writes == ['10', '20']
     assert data(offline)['cursor']['staff_completed_at']
-    assert data(offline)['cursor']['resume_json'] == '{}'
+    resume = json.loads(data(offline)['cursor']['resume_json'])
+    assert set(resume) == {'daily_check_clocks'}
+    assert resume['daily_check_clocks']['rumours']
     offline.clock.advance(6 * 86400)
     offline.run('six-days', staff_writer=writer)
     assert writes == ['10', '20']
@@ -85,7 +87,9 @@ def test_first_failed_club_does_not_block_second_and_restarts_only_pending(offli
     assert saved['cursor']['staff_completed_at'] is None
     assert saved['cursor']['staff_pending']
     assert saved['cursor']['cold_complete']
-    assert saved['cursor']['resume_json'] == '{}'
+    resume = json.loads(saved['cursor']['resume_json'])
+    assert set(resume) == {'daily_check_clocks'}
+    assert resume['daily_check_clocks']['rumours']
     assert '20' in writes
     offline.staff_html = {}
     resumed_writer, resumed = writer_for(offline)

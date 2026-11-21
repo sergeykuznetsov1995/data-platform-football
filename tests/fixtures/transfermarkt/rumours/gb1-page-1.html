@@ -1,0 +1,2154 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    
+<script type="text/javascript" data-description="sourcepoint stub code">
+    !function () { var e = function () { var e, t = "__tcfapiLocator", a = [], n = window; for (; n;) { try { if (n.frames[t]) { e = n; break } } catch (e) { } if (n === window.top) break; n = n.parent } e || (!function e() { var a = n.document, r = !!n.frames[t]; if (!r) if (a.body) { var i = a.createElement("iframe"); i.style.cssText = "display:none", i.name = t, a.body.appendChild(i) } else setTimeout(e, 5); return !r }(), n.__tcfapi = function () { for (var e, t = arguments.length, n = new Array(t), r = 0; r < t; r++)n[r] = arguments[r]; if (!n.length) return a; if ("setGdprApplies" === n[0]) n.length > 3 && 2 === parseInt(n[1], 10) && "boolean" == typeof n[3] && (e = n[3], "function" == typeof n[2] && n[2]("set", !0)); else if ("ping" === n[0]) { var i = { gdprApplies: e, cmpLoaded: !1, cmpStatus: "stub" }; "function" == typeof n[2] && n[2](i) } else a.push(n) }, n.addEventListener("message", (function (e) { var t = "string" == typeof e.data, a = {}; try { a = t ? JSON.parse(e.data) : e.data } catch (e) { } var n = a.__tcfapiCall; n && window.__tcfapi(n.command, n.version, (function (a, r) { var i = { __tcfapiReturn: { returnValue: a, success: r, callId: n.callId } }; t && (i = JSON.stringify(i)), e.source.postMessage(i, "*") }), n.parameter) }), !1)) }; "undefined" != typeof module ? module.exports = e : e() }();
+</script>
+<script data-description="sourcepoint configuration">
+window._sp_ = {
+    config: {"accountId":1254,"propertyId":7427,"gdpr":{"consentLanguage":"en","targetingParams":{"acps":"false"}},"baseEndpoint":"https://cdn.privacy-mgmt.com","isSPA":true,"cpPropertyId":"7a84b340"}}
+</script>
+<script src="https://cdn.privacy-mgmt.com/wrapperMessagingWithoutDetection.js" async></script>
+<script type="text/javascript" data-description="contentpass integration">
+    (function() {
+        var cpBaseUrl = 'https://cp.transfermarkt.com';
+        var cpController = cpBaseUrl + '/now.js';
+        var cpPropertyId = '7a84b340';
+
+        !function(C,o,n,t,P,a,s){C['CPObject']=n;C[n]||(C[n]=function(){
+        (C[n].q=C[n].q||[]).push(arguments)});C[n].l=+new Date;a=o.createElement(t);
+        s=o.getElementsByTagName(t)[0];a.src=P;s.parentNode.insertBefore(a,s)}
+        (window,document,'cp','script',cpController);
+
+        !function(C,o,n,t,P){if(!C[n].patched){cp('extension','authenticate');P=C[n].q.push;
+        C[n].q.push=function(a){if(a[0]==='authenticate'){if((o['cookie']||'').indexOf('_cpauthhint=')===-1&&
+        !(C['localStorage']||{})['_cpuser']&&C.location.href.toLowerCase().indexOf('cpauthenticated')===-1){
+        t={isLoggedIn:function(){return false;},hasValidSubscription:function(){return false;}};
+        (typeof a[1]==='function'&&a[1](null,t));C[n].afp=true;P.apply(C[n].q,[['authenticate',null]]);
+        return t;}}P.apply(C[n].q,[a]);}}}
+        (window,document,'cp',false);
+
+        cp('create', cpPropertyId, {
+        baseUrl: cpBaseUrl
+        });
+
+        cp('render', {
+        onFullConsent: function() {
+            console.log('[DEMO] onFullConsent');
+        }
+        })
+    })()
+</script>
+
+<script type="text/javascript" data-description="contentpass sourcepoint fast path">
+(function () {
+    cp('authenticate', function(err, user) {
+        if (err || (!user.isLoggedIn() && !user.hasValidSubscription())) {
+        // console.log('[SPCP] Taking fast path');
+        (function spExecMsg() {
+            if (window._sp_ && window._sp_.executeMessaging) {
+            if (!window._sp_.config.isSPA) {
+                // console.warn('[SPCP] Sourcepoint not in SPA mode!');
+            } else if (window._sp_.version) {
+                // console.log('[SPCP] Sourcepoint already running');
+            } else {
+                // console.log('[SPCP] Starting Sourcepoint');
+                window._sp_.executeMessaging();
+            }
+            } else {
+            // console.log('[SPCP] Sourcepoint not loaded yet. Retrying.');
+            setTimeout(spExecMsg, 10);
+            }
+        })();
+        }
+    });
+    })();
+</script>
+    <meta charset="utf-8" />
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon" />
+    <link rel="shortcut icon" sizes="16x16" href="/favicon-16x16.png">
+    <link rel="shortcut icon" sizes="192x192" href="/android-chrome-192x192.png">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=2.0, user-scalable=no" />
+<meta name="keywords" content="Premier League,England" />
+<meta name="description" content="Diese Seite zeigt aktuelle Gerüchte zu den Spielern, die bei den Vereinen in der Premier League im Fokus stehen." />
+<meta property="og:type" content="article" />
+<meta property="og:image" content="https://tmsi.akamaized.net/tm_logo.png" />
+<meta property="og:description" content="" />
+<meta property="og:title" content="Premier League - Latest rumours" />
+<meta property="twitter:title" content="Premier League - Latest rumours" />
+<meta property="og:url" content="https://www.transfermarkt.com/-/geruechte/wettbewerb/GB1" />
+<link hreflang="de" rel="alternate" href="https://www.transfermarkt.de/-/geruechte/wettbewerb/GB1" />
+<link hreflang="de-LU" rel="alternate" href="https://www.transfermarkt.de/-/geruechte/wettbewerb/GB1" />
+<link hreflang="de-AT" rel="alternate" href="https://www.transfermarkt.at/-/geruechte/wettbewerb/GB1" />
+<link hreflang="de-CH" rel="alternate" href="https://www.transfermarkt.ch/-/geruechte/wettbewerb/GB1" />
+<link hreflang="tr" rel="alternate" href="https://www.transfermarkt.com.tr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="it-CH" rel="alternate" href="https://www.transfermarkt.it/-/geruechte/wettbewerb/GB1" />
+<link hreflang="it" rel="alternate" href="https://www.transfermarkt.it/-/geruechte/wettbewerb/GB1" />
+<link hreflang="pl" rel="alternate" href="https://www.transfermarkt.pl/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en-GB" rel="alternate" href="https://www.transfermarkt.co.uk/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en-IE" rel="alternate" href="https://www.transfermarkt.co.uk/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es" rel="alternate" href="https://www.transfermarkt.es/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-ES" rel="alternate" href="https://www.transfermarkt.es/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-CL" rel="alternate" href="https://www.transfermarkt.es/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-VE" rel="alternate" href="https://www.transfermarkt.es/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-EC" rel="alternate" href="https://www.transfermarkt.es/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-CU" rel="alternate" href="https://www.transfermarkt.es/-/geruechte/wettbewerb/GB1" />
+<link hreflang="nl" rel="alternate" href="https://www.transfermarkt.nl/-/geruechte/wettbewerb/GB1" />
+<link hreflang="pt" rel="alternate" href="https://www.transfermarkt.pt/-/geruechte/wettbewerb/GB1" />
+<link hreflang="ru" rel="alternate" href="https://www.transfermarkt.world/-/geruechte/wettbewerb/GB1" />
+<link hreflang="fr-CH" rel="alternate" href="https://www.transfermarkt.fr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="fr" rel="alternate" href="https://www.transfermarkt.fr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="fr-CA" rel="alternate" href="https://www.transfermarkt.fr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="fr-CI" rel="alternate" href="https://www.transfermarkt.fr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="fr-LU" rel="alternate" href="https://www.transfermarkt.fr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="fr-BE" rel="alternate" href="https://www.transfermarkt.fr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="pt-BR" rel="alternate" href="https://www.transfermarkt.com.br/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en-US" rel="alternate" href="https://www.transfermarkt.us/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en-CA" rel="alternate" href="https://www.transfermarkt.us/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en-IN" rel="alternate" href="https://www.transfermarkt.co.in/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en-ZA" rel="alternate" href="https://www.transfermarkt.co.za/-/geruechte/wettbewerb/GB1" />
+<link hreflang="x-default" rel="alternate" href="https://www.transfermarkt.com/-/geruechte/wettbewerb/GB1" />
+<link hreflang="en" rel="alternate" href="https://www.transfermarkt.com/-/geruechte/wettbewerb/GB1" />
+<link hreflang="nl-BE" rel="alternate" href="https://www.transfermarkt.be/-/geruechte/wettbewerb/GB1" />
+<link hreflang="ro" rel="alternate" href="https://www.transfermarkt.ro/-/geruechte/wettbewerb/GB1" />
+<link hreflang="el-GR" rel="alternate" href="https://www.transfermarkt.gr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="ko-KR" rel="alternate" href="https://www.transfermarkt.co.kr/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-AR" rel="alternate" href="https://www.transfermarkt.com.ar/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-MX" rel="alternate" href="https://www.transfermarkt.mx/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-CO" rel="alternate" href="https://www.transfermarkt.co/-/geruechte/wettbewerb/GB1" />
+<link hreflang="es-PE" rel="alternate" href="https://www.transfermarkt.pe/-/geruechte/wettbewerb/GB1" />
+<link hreflang="ja" rel="alternate" href="https://www.transfermarkt.jp/-/geruechte/wettbewerb/GB1" />
+<link hreflang="id" rel="alternate" href="https://www.transfermarkt.co.id/-/geruechte/wettbewerb/GB1" />
+<link rel="next" href="https://www.transfermarkt.com/-/geruechte/wettbewerb/GB1/page/2" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-main.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/css/stylesheets/main_desktop.css?lm=1795172459" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-discover.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-button-list.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-link-list.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-print.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-competition.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-statistics.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-chosen.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/css/stylesheets/main.css?lm=1795172459" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/styles/tm-club-profile.min.css?lm=1795173053" />
+<link rel="stylesheet" type="text/css" href="https://tmssl.akamaized.net/css/stylesheets/paginator.css?lm=1795172459" />
+<style type="text/css">
+/*<![CDATA[*/
+
+                .ad-placement-background {
+                    background: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxODk2IDgwNyI+CiAgPHBhdGggZD0iTTEwNTYuMyA1MzIuNGMwLTE3LjEtMTUuMy0yOS4yLTMyLTMzLjktMTEuNS0zLjItNjUuNi0xMC42LTExNi45IDAtMTQuNiAzLTYxLjUgMTkuNy02MC43IDM4LjQuNSAxMC42IDE4LjQgMTEuOSAyNS43IDExLjkgMzguNyAwIDQ5LjEtMjIuNyA4Mi42LTIyLjdzMjcuMi0xLjQgMjcuMiAxNC44LTMzLjMgMjEuNS0zNy4yIDIyYy0xNy40IDIuNC04NC42IDEyLjQtMTA4LjYgMjUuMy0zNi40IDE5LjUtNDcgNDAuNi00NyA1Mi42IDAgMzcuNyA1MC43IDQwLjYgNzEuNyA0MC42IDMxLjQgMCA0NS42LTEwLjkgNzEuNy0xMC45czMyLjYgNi41IDQyIDYuOWM3LjMuMyAxMy45LTEuNCAxOS45LTMuMyAxNy4yLTUuNSAxOC4yLTIzLjEgMjMuMy0zNC42IDExLjEtMjUuNSAyMS42LTUxLjMgMzEuMS03Ny4yIDMuNC05LjkgNy4zLTE5LjggNy4zLTI5LjlabS0xNDQuOCAxMDljLTYuNyAxLjUtOS44IDIuMS0xNy40IDIuNC04LjUuMy0yNi43LTMuNS0yNi43LTE1LjMgMC0yNC40IDYzLjUtMzMuMiA3Mi43LTMzLjIgMTEuMi0uNCAxOC4zIDIuNyAxOC4zIDkuOSAwIDIwLjgtNDQuNiAzNS43LTQ2LjkgMzYuMlpNNzkzLjkgNTA3LjVjLTQ0LjctMjcuOS0xMDcuMiA1LTEzMC41IDUtMzEuOCAwLTMwLjctMTIuOC02NC44LTE1LTY5LTQuMS05MCAxMi4yLTEwNS4yIDEyLjJzLTkuMy04LjMtMjEuNS02LjdjLTEzLjMgMi4yLTE1LjUgNS0xOS4xIDEwLTQuNSA2LjMtNTMuNSAxMzguOC01Ni41IDE0Ni4xLTExLjEgMjYuMyA1NS43IDI5LjUgNzAuOCA4LjcgMzkuNy01NC45IDMwLjktMTE0LjIgODAuOS0xMjMuOSAxMS44LTIuMyAyMi4zLTIuNiAzMC40IDkuMWwuNC44YzcuMiAxMy4zLTUuNCAzOS44LTEzLjggNjAuNS00LjEgMTAtMTYuNiA0Mi43LTE1LjUgNTQgMS45IDIxLjEgNjYuOCAxNC4xIDc1LjYtMi4xIDE5LjMtMzUuNiAyMy4xLTk2LjkgNDQuMS0xMTMuNCAyNS42LTIwIDQ5LjItNC43IDUxLjMgNC41IDQuMiAxOC4yLTEzLjUgNTIuNy0yMyA3Mi44LTEzLjQgMjguNS03LjMgNTEuMSAyNyA1MS4yIDExLjQgMCAyNy00LjQgMzMuNy0xNC4xIDUuNy04LjMgMTQuNS0zMS42IDI3LjQtNjYuNSAxNC4xLTM4LjEgMjkuMi04MCA4LjMtOTMuMVpNMTIzNSA1MTQuMmMtMS40LTExLTEyLTE1LjYtMjEuMS0xNS4yLTYuNC4yLTE4LjggNS4yLTI4LjYgNS4yLTEwLjcgMC0xNS4yLTIuMS0yOS43LTQuNy0xNy41LTMuMi0zMy4yLTIuNi00My43IDAtMTYuMiA0LTI4LjcgMjAtMzIuMSAzMi44LTUuOCAyMS0xNi42IDQyLjQtMjQuNyA2My4zLTguNyAyMi41LTIzLjcgNjIuMi0yNC40IDcwLjEtLjYgNi45IDcuMiAxNS43IDE1LjIgMTUuNyAwIDAgMzEgLjMgMzcuMS0uMiAyNS0yLjIgMzQuNi0zNi4yIDQwLjMtNTAuNiA0LjctMTEuNyA5LjUtMjQgMTQuMi0zNS42IDMuMS03LjcgNy4zLTE5LjEgMTYuMS0yNy4zIDE3LjItMTYgMzcuNi0xNiA1Ni4zLTIwLjggMTYuOS00LjQgMjYuOC0xOSAyNS4yLTMyLjZaIiBmaWxsPSIjZDdkN2Q3Ii8+CiAgPHBhdGggZD0iTTM3LjcgNDEuOXY3MjEuN2gxODA5LjhWNDEuOUgzNy43Wm0xNzg5LjEgNzAxSDU4LjNWNjIuNWgxNzY4LjV2NjgwLjRaIiBmaWxsPSIjZDdkN2Q3Ii8+CiAgPHBhdGggZD0iTTE2MzIuNCA0OTUuOGMtNy44LTMuMS0xNS4yLTYuMi0xMy42LTE0LjIgMy0xNC41IDQuMy0yNC4zLjctMzAuNC0zLjYtNi0xMi4yLTguMy0yOC45LTcuOC0yNi43LjgtMzYuMiA3LjktNDIgMTcuMS01LjkgOS4xLTguMiAyMC4zLTIwLjQgMjkuMi03LjUgNS40LTE1LjkgNy45LTIzIDExLjItNy4xIDMuMy0xNC44IDguOC0xNC44IDE2LjMuMSA4LjQgNSAxMC45IDEwLjEgMTMuOCA1IDIuOSAxMC4yIDUuMyAxMC43IDEwLjguMyAxNi42LTcuOCAzNS43LTE2IDU0LjYtOC4zIDE4LjgtMTYuNyAzNy4zLTE2LjkgNTIuOC0xLjYgMzYuOSA0Ni43IDMxLjkgNTguMSAzMiAxNi4yLS4yIDU3LjkgMi40IDU4LjYtMjkuOCAwLTktNy43LTEyLTE1LjItMTUuMi03LjUtMy4zLTE0LjgtNi44LTE0LjEtMTYuOS4zLTMuNCA1LjQtMTguNSAxMS0zMy44IDUuNi0xNS4zIDExLjctMzAuNiAxMy45LTM0LjMgNi4yLTEwLjQgMjAuOC0xNS40IDMzLjgtMjAuNCAxMy01IDI0LjQtMTAgMjQuNC0yMC40cy04LjMtMTEuMy0xNi4xLTE0LjVaTTE0MDcuOSA1MDkuNmMtMTMuOCA1LTc3LjUgNDktODguMiAzNC41LTguMy0xNC4xIDMxLjctNzguMyAyNS44LTkwLjgtNy45LTE2LjYtNDQuMi05LTUyLjUtNS0xNS4xIDcuMy0yMC4xIDI0LjgtMjUuNyAzOC44LTEwLjcgMjYuOC02NS42IDE2Ny44LTY4LjkgMTc4LjMtNS42IDE3LjkgNTQuNyAzMCA3NC44LTE2LjcgNi4zLTE0LjUgMjQuNi0zMi4zIDQwLjktMzIuMyAzMS45IDAgMjYuNyA2My43IDcwLjQgNjQuNyA0LjggMCAyMy41LjUgMzYuNy01LjcgMjMuNC0xMS4xLTI4LTc2LjUtMjgtOTYuNnM4Ni44LTU3LjEgNzkuNi02Ny43Yy05LjItMTMuNS00Ny45LTcuNy02NS0xLjVaIiBmaWxsPSIjZDdkN2Q3Ii8+CiAgPHBhdGggZD0iTTMzMC41IDQxMS43WiIgZmlsbD0iI2I0MTAxZiIvPgogIDxwYXRoIGQ9Ik0xNDI0LjQgMjUyLjZoNDAuM2M0LjIgMCAzMiAwIDMxLjMtMTYuOC0uNi0xMy41LTE4LjctMTcuNS0zMy44LTE3LjYtMTIuOS0uMi01NC4yIDYuNS01NC4yIDIzLjZzNS42IDkuOSAxNi41IDEwLjlaTTU3My40IDI4Mi44Yy05LjIgMC03Mi43IDguOC03Mi43IDMzLjJzMTguMiAxNS43IDI2LjcgMTUuM2M3LjYtLjMgMTAuNy0uOSAxNy40LTIuMyAyLjMtLjUgNDYuOS0xNS40IDQ2LjktMzYuMnMtNy4xLTEwLjMtMTguMy05LjlaIiBmaWxsPSIjZDdkN2Q3Ii8+CiAgPHBhdGggZmlsbD0iI2FmMjAwOSIgZD0iTTM0MC40IDc1NC4xeiIvPgogIDxwYXRoIGQ9Ik0zNzcuMiA3MDYuOGMtNi0yMS42LTI1LjktMzYuMS00OC4zLTM1LjItMy44LjEtNy41LjctMTEuMSAxLjctMjUuNiA3LjItNDAuNiAzMy45LTMzLjQgNTkuNSA2LjEgMjEuNiAyNS45IDM2LjEgNDguMyAzNS4yIDMuOC0uMiA3LjUtLjcgMTEuMS0xLjggMTIuNC0zLjUgMjIuNy0xMS42IDI5LTIyLjggNi4zLTExLjIgNy45LTI0LjIgNC40LTM2LjdabS0xNS40IDMwLjVjLTQuNyA4LjMtMTIuMyAxNC4zLTIxLjQgMTYuOC0yLjcuOC01LjUgMS4yLTguMiAxLjNoLTEuNGMtMTYgMC0yOS45LTEwLjUtMzQuMy0yNi0uOS0zLjItMS4zLTYuNC0xLjMtOS42IDAtMTUuNiAxMC4zLTI5LjkgMjYtMzQuMyAyLjctLjcgNS41LTEuMiA4LjItMS4zaDEuNGMxNS45IDAgMjkuOSAxMC41IDM0LjIgMjYgLjkgMy4yIDEuMyA2LjQgMS4zIDkuNiAwIDYtMS42IDEyLTQuNiAxNy40WiIgZmlsbD0iI2Q3ZDdkNyIvPgogIDxwYXRoIGZpbGw9IiNhZjIwMDkiIGQ9Ik0zMjEuMiA2ODUuNXpNMzMwLjQgMzA4LjV6TTMyMy4yIDMwOS43eiIvPgogIDxwYXRoIGQ9Ik0xODA2LjggODEuOEg3OC4zVjQwNmgxNjZjLTM3LjkgMTYuNS03OC4yIDM0LjEtOTEuOCA0MC0xNC40IDYuMS0yMi4xIDIyLjEtMTcuOSAzNy4yIDMuOCAxMy40IDE2LjEgMjIuOCAzMCAyMi44aDEuMmMyLjQgMCA0LjgtLjUgNy4yLTEuMSAxLS4zIDIuMi0uNiAzLjUtMS4xaC4zYzAtLjEgNjgtMzAuOCA2OC0zMC44bC05LjIgMjIuOEwxOTMuOSA1OThsLS4yLjVjLTIuMiA2LjItMi41IDEyLjgtLjcgMTkgMy44IDEzLjYgMTUuOCAyMi44IDI5LjkgMjIuOGgxLjJjLjcgMCAxLjUgMCAyLjEtLjJsLTM0LjQgODQuN3MtMTMuNyAyOC45IDE0LjUgNDEuMWMzMy4xIDE0LjMgNDMuNi0xOC40IDQzLjYtMTguNGw4MC44LTE5OC44IDQxLjItMTAxLjUgMTQuNCA1LjgtMTQuMiAzNC45LTEgMi43LS4yLjljLTEuMiA1LjEtMS4xIDEwLjUuMyAxNS42IDMuOCAxMy40IDE2LjEgMjIuOCAzMCAyMi44aDEuMWMyIDAgNS0uMyA4LjEtMS40IDEwLjctMy43IDE2LjMtOS4yIDIwLjYtMjAuNWwyNS4zLTYyLjJjMi4yLTUuNCA0LTExLjUgMS43LTE5LjQtMi40LTguNy03LjctMTUuMS0xNS0xOC4xbC0uNC0uMmMtLjUtLjItMS4yLS41LTItLjhsLTMuMi0xLjNoMTM2OS40VjgxLjhaTTM0Mi4zIDE4Ni45YzEwLjUtMi42IDI2LjItMy4yIDQzLjcgMCAxNC41IDIuNiAxOSA0LjcgMjkuNyA0LjcgOS44IDAgMjUuNS00LjggMzEuOS00LjkgOC42LS4xIDIxLjUgMi42IDIxLjUgMTQuM3MtMTUuMSAzMC40LTI5IDMzLjdjLTE4LjggNC42LTM5IDQuMy01Ni4xIDIwLjMtOC44IDguMi0xMyAxOS42LTE2LjEgMjcuMy0zIDcuNS02LjEgMTUuMy05LjIgMjMtNS42LTQuNC0xMi4zLTcuNS0xOS42LTguNy0uNSAwLTEuMS0uMi0xLjctLjNoLS4yYy0uNSAwLTEtLjEtMS41LS4ySDMzMGMtMi42IDAtNS4yLjQtNy43IDEtLjguMi0xLjcuNC0yLjUuNi0xLjQuNC0yLjguOS00LjEgMS40cy0yLjcgMS4xLTMuOSAxLjhjLS42LjMtMS4zLjctMS45IDEtNi44IDMuOS0xMi41IDkuNi0xNi40IDE2LjYtNC4zIDcuNi02LjIgMTYuMi01LjUgMjQuNy4yIDIuOS43IDUuOCAxLjUgOC42LjIuOC41IDEuNS43IDIuMyAwIC4yLjEuMy4yLjUuMi42LjQgMS4yLjcgMS44IDAgLjEuMS4yLjIuNGwuOSAyLjFjMS44IDMuNyA0LjEgNy4yIDYuOCAxMC4yaC0yMi43Yy04IDAtMTUuOC04LjgtMTUuMi0xNS43LjctNy45IDE1LjgtNDcuNSAyNC40LTcwLjEgOC0yMC45IDE4LjktNDIuMyAyNC43LTYzLjMgMy41LTEyLjcgMTUuOS0yOC44IDMyLjEtMzIuOFptMjAuNiAxNTIuOWMwIDEzLjctOSAyNi4zLTIyLjggMzAuMS0yLjQuNy00LjggMS03LjIgMS4xaC0xLjNjLTE0IDAtMjYuMy05LjItMzAuMS0yMi44LS44LTIuOC0xLjItNS42LTEuMi04LjQgMC0xMy43IDktMjYuMyAyMi44LTMwLjEgMi4zLS43IDQuOC0xIDcuMi0xLjFoMS4zYzE0IDAgMjYuMiA5LjMgMzAgMjIuOS44IDIuOCAxLjIgNS42IDEuMiA4LjRabS0xNzUuNCAyOWMtMTEuNC0uMS01OS43IDQuOS01OC4xLTMyIC4yLTE1LjQgOC42LTMzLjkgMTYuOS01Mi44IDguMy0xOC44IDE2LjQtMzcuOSAxNi01NC42LS41LTUuNi01LjctOC0xMC43LTEwLjgtNS0yLjktMTAtNS40LTEwLjEtMTMuOCAwLTcuNSA3LjYtMTMgMTQuNy0xNi4zIDcuMS0zLjMgMTUuNi01LjggMjMtMTEuMiAxMi4zLTguOSAxNC42LTIwLjEgMjAuNC0yOS4yIDUuOS05LjEgMTUuMy0xNi4yIDQyLjEtMTcuMSAxNi44LS41IDI1LjMgMS43IDI4LjkgNy44IDMuNiA2IDIuMyAxNS44LS43IDMwLjQtMS42IDggNS44IDExLjEgMTMuNiAxNC4yIDcuOCAzLjIgMTYuMSA2LjMgMTYuMSAxNC41cy0xMS40IDE1LjUtMjQuNCAyMC40Yy0xMyA1LTI3LjUgOS45LTMzLjggMjAuNC0yLjIgMy43LTguMyAxOS0xMy45IDM0LjMtNS42IDE1LjMtMTAuOCAzMC40LTExIDMzLjgtLjcgMTAuMSA2LjYgMTMuNiAxNC4xIDE2LjkgNy41IDMuMyAxNS4yIDYuMyAxNS4yIDE1LjItLjcgMzIuMi00Mi4zIDI5LjctNTguNiAyOS44Wm0zNiAyNTguOGgtLjhjLTguMyAwLTE1LjYtNS41LTE3LjgtMTMuNi0uNS0xLjctLjctMy4zLS43LTUgMC0yLjEuNC00LjMgMS4xLTYuM3MzNy05MC42IDM3LTkwLjZsMzQuMSAxMy45LTM2LjcgOTAuMmMtMi4yIDUuMi02LjcgOS4xLTEyLjIgMTAuNy0xLjMuNC0yLjQuNy00IC44Wm0xNC40IDExNS4zYy0yLjUgNi4xLTYuNiAxMC40LTEyLjcgMTIuMS0xLjQuNC0yLjkuNi00LjMuN2gtLjhjLTguMyAwLTE1LjEtNS40LTE3LjQtMTMuNC0uNS0xLjctLjctMy40LS43LTUuMSAwLTEuNS4yLTMgLjYtNC41cy4zLTEuMy4zLTEuM2wuNy0yIDgxLjItMTk5LjkgMzQuMSAxMy45LTgxIDE5OS41Wk00MzguNCA0MjBjMi4xLjkgMy44IDIuMyA1IDQuMSAxLjIgMS43IDIuMSAzLjcgMi42IDUuNy40IDEuMy42IDIuNi42IDMuOCAwIDIuMy0uNyA0LjYtMS44IDcuNGwtMjUuNCA2Mi40Yy0xLjQgMy44LTIuOCA2LjUtNC44IDguNi0yIDIuMS00LjYgMy40LTguMSA0LjYtMS41LjUtMyAuNy00LjQuN2gtLjhjLTguNCAwLTE1LjctNS41LTE3LjktMTMuNi0uNS0xLjYtLjctMy4zLS43LTVzLjItMi45LjUtNC4zdi0uMmwuNy0xLjggMTguOC00Ni4zLTM3LjYtMTUuMy00MS4yIDEwMS41LTc1LjctMzAuOC0xLjEtLjUgMjEuMy01Mi42LTk2LjMgNDMuNWMtLjguMy0xLjUuNS0yLjIuNy0xLjQuNC0yLjguNi00LjMuN2gtLjhjLTguMyAwLTE1LjctNS41LTE3LjktMTMuNi0uNS0xLjctLjctMy40LS43LTUgMC03LjMgNC40LTE0LjIgMTEuNC0xNy4yIDI0LjctMTAuNyAxMzUuNS01OSAxNjMuMi03MS4xIDQtMS43IDYuMi0yLjcgNi4zLTIuNyAzLjMtMS40IDYuOC0yLjEgMTAuMi0yLjJoMS4yYzQgMCA3LjIuOCAxMS42IDIuNnM4Ni4zIDM1LjEgODYuMyAzNS4xYy43LjIgMS40LjYgMi4xLjlabTE4OS41LTU4LjRjLTYgMS45LTEyLjYgMy43LTE5LjkgMy4zLTkuNS0uNC0zOS42LTYuOS00Mi02LjktMjYuMSAwLTQwLjMgMTAuOS03MS43IDEwLjlzLTcxLjctMi44LTcxLjctNDAuNiAxMC42LTMzLjEgNDctNTIuNmMyNC0xMi45IDkxLjItMjIuOSAxMDguNi0yNS4zIDMuOS0uNSAzNy4yLTMuMSAzNy4yLTIycy0yMS43LTE0LjktMjcuMi0xNC45Yy0zMy41IDAtNDMuOSAyMi44LTgyLjYgMjIuOHMtMjUuMi0xLjItMjUuNy0xMS45Yy0uOC0xOC42IDQ2LjEtMzUuMyA2MC43LTM4LjMgNTEuMy0xMC42IDEwNS41LTMuMiAxMTYuOSAwIDE2LjcgNC42IDMyIDE2LjggMzIgMzMuOXMtMy45IDIwLTcuMyAyOS45Yy05LjQgMjYtMTkuOSA1MS43LTMxIDc3LjItNS4xIDExLjUtNi4xIDI5LTIzLjMgMzQuNVptMjE2LjYgNy4xYy05LjEgMC0yOS4yIDEuNC0yOS4xLTE0LjcgMC0xMC4zIDM1LjYtODQuNSAzNS42LTEwNC40cy0xNi4yLTIyLjMtMjguMi0yMi4zYy0yOC42IDAtNTEuMSAyMC4yLTYzLjIgNTYuMS02LjcgMjAtMjMuMiA1OS43LTI4IDY2LjktMTAuNSAxNS41LTI3IDE4LjYtNDAuOCAxOC42cy0yOC42LS4yLTI4LjYtMTcuMyAyMy45LTY0LjYgMjcuMy03Mi41YzUuNy0xMy41IDE0LjMtMzcuNiAyMC4xLTUxLjYgMTMuNy0zMy40IDE4LjYtMzguMiA1Mi0zOC43IDEwLjUtLjEgMjguNSA1LjIgNDUgNC44IDIxLjQtLjUgNDYuOS05LjIgNjguNy04LjkgMTUuOC4yIDU4IC43IDU5LjggMzQuMS45IDE2LTI3LjcgNzYuMy0zNC43IDk0LjktMTguMiA0OC40LTE4LjggNTQuOS01NS45IDU0LjlabTE4Ni43LTEzMy42YzEuMSAyNS42IDEyNC41IDguMyAxMTYuMyA2MC42LTE0LjYgOTIuOC0yMjcuNiA4NS45LTIzNi43IDQyLjQtMi4xLTEwLjIgMTguMi0yNiAzNi4zLTI1LjMgMjQuNiAxIDM3LjEgMTcuNiA2My43IDE3LjZzNTEuNS0yLjQgNTMuMS0yMWMuOS0xMC43LTIwLjUtMTQuNi0zNi41LTE2LjMtMTExLjUtMTEuNC03Ny43LTYwLTcwLTY5LjkgNDUuMS01OC4yIDIwOC40LTUwIDIwOC40LTE3LjJzLTI5LjcgMjcuMS00Ni41IDIyLjNjLTI2LjctNy42LTg5LjMtMjAuNS04OC4xIDYuN1ptMjU0LjIgNWMtNi4zIDEwLjEtOS4zIDIyLjEtMTMuNCAzMi42LTguNiAyMi4xLTE4LjggNDMuMi0yNi4xIDY1LjMtOS4xIDI3LjQtMzEgMzEtNDkuNyAzMXMtMzEuNiAwLTMxLjYtMTUuOSA0MC42LTk1IDQwLjYtMTE0LjgtMjIuMy0xNy40LTIyLjMtMjguMyA4LjYtMTQuMiAxNi43LTE3LjhjOS4xLTQgMjIuOS03LjEgMzAuOS0xOC44IDI2LjktMzkuMSA1NC44LTUwLjggOTQuNC01MC44czQ0LjMgMTEuOCA0NC40IDE1LjdjLjcgMjIuOS0zMy43IDI3LjktNDYuNyAzNS44LTEuNiAxLTMuNyAzLjgtMy43IDYuMiAwIDEwLjEgMjIuOCA3LjIgMjIuOCAyMS44cy0zOC4yIDI0LjEtNDEuOSAyNS40Yy01LjIgMi0xMC43IDYuNy0xNC4zIDEyLjRabTEzMy4xIDkxLjdjMzMuMyAwIDU4LjgtMjUuOCA4My44LTI1LjhzMjguMiA0LjQgMjguMiAxNi44LTMwLjEgMjQuNy0zOC45IDI5LjNjLTE5LjMgMTAuMS04Ny44IDI1LjMtMTMzLjggMTAuNS01OS0xOS02NC4yLTU5LjctMzUuMy0xMDcuOSAzMC44LTUxLjMgOTUtNzMuMiAxNTIuOC03My4yczg2LjYgMTEgOTIuMyA1OS45YzEuOCAxNS41LTIgMjkuMi0xNi44IDM3LjYtMTkuOCAxMS4yLTExNi42IDEtMTQ1LjUgNi4xLTExLjEgMi0yNS4xIDYuOS0yNS4xIDIwLjRzMjMuOSAyNi4zIDM4LjMgMjYuM1ptMzExLjgtOTcuNmMtMTguNyA0LjgtMzkuMSA0LjgtNTYuMyAyMC44LTguOCA4LjItMTMgMTkuNi0xNi4xIDI3LjMtNC43IDExLjYtOS41IDIzLjktMTQuMiAzNS42LTUuNyAxNC40LTE1LjMgNDguNC00MC4zIDUwLjYtNiAuNS0zNy4xLjItMzcuMS4yLTggMC0xNS44LTguOC0xNS4yLTE1LjguNy03LjkgMTUuOC00Ny42IDI0LjQtNzAuMSA4LTIwLjkgMTguOS00Mi4zIDI0LjctNjMuMyAzLjUtMTIuNyAxNS45LTI4LjggMzIuMS0zMi44IDEwLjUtMi42IDI2LjItMy4yIDQzLjcgMCAxNC41IDIuNiAxOSA0LjcgMjkuNyA0LjcgOS44IDAgMjIuMi01IDI4LjYtNS4yIDkuMS0uMyAxOS43IDQuMyAyMS4xIDE1LjIgMS43IDEzLjYtOC4zIDI4LjItMjUuMiAzMi42WiIgZmlsbD0iI2Q3ZDdkNyIvPgogIDxwYXRoIGZpbGw9IiNhZjIwMDkiIGQ9Ik0yMjUuMiA3NTV6Ii8+Cjwvc3ZnPgo=);
+                    background-size: 143px 61px;
+                    background-repeat: no-repeat;
+                    background-position: center 20px;
+                }
+/*]]>*/
+</style>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/vendor/jquery.min.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/assets/b7c5571cf8957553f95f6d9069eaed67/jquery.ba-bbq.min.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/jquery.bxslider.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/assets/b344ec51bd68be8ed48379c9e69eb01d/js/jquery.scrollTo.min.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/assets/b344ec51bd68be8ed48379c9e69eb01d/js/elinkpagermobile.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/main.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/chosen.ajaxaddition.jquery.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/functions.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/main_desktop.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/chosen.jquery.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/consent/bundle.js"></script>
+<script type="text/javascript">
+/*<![CDATA[*/
+console.info("%c [TM-ADs] Initialize Ads on domain .com (wettbewerb/geruechte)", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Render slot rectangle1 (/58778164/d_side_1) for google", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Render slot rectangle2 (/58778164/d_side_2) for google", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Render slot skyscraper (/58778164/d_right_1) for google", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Render slot billboard (/58778164/d_top_1) for google", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Render slot fullsize_contentad (/58778164/d_bottom_1) for google", "background: #282828; color: #bada55")
+    var oddsServe = function(placement,competition,match,node) {
+        if (!node){
+            var s=document.readyState==='loading'?document.getElementsByTagName('script'):[];
+            node=s.length?s[s.length-1].parentNode:null;
+        }
+        oddsServe.queue.push({contentUnitId:placement,competition:competition,match:match,node:node});
+    }
+    
+    oddsServe.onInit=function(callbacks){
+        if (typeof window.__tcfapi === 'function') {
+            __tcfapi('addEventListener', 2, function(tcdata, success) {
+                let tcf20compatibleString;
+                if(success) {
+                    if (tcdata.eventStatus === 'useractioncomplete') {
+                        tcf20compatibleString = tcdata.tcString;
+                    } else if (tcdata.eventStatus === 'tcloaded') {
+                        tcf20compatibleString = tcdata.tcString;
+                    }
+                    callbacks.setGdprOptions({
+                        gdpr:1,
+                        gdpr_pd:1,
+                        gdpr_consent:tcf20compatibleString,
+                    });
+                }
+            });
+        } else {
+            console.warn('E2: __tcfapi not found');
+        }
+    };
+    oddsServe.options={gdpr_wait:true};
+    oddsServe.queue=[];
+console.info("%c [TM-ADs] Add adslot configuration for 5 ad slots rectangle1 | rectangle2 | skyscraper | billboard | fullsize_contentad", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Adslots without configuration: content_spezial | fireplace | skyscraper-left-bound | skyscraperbtf | richmedia | 1by1px", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Register slots with JS vendor lib", "background: #282828; color: #bada55")
+window.addEventListener('load', () => {
+  const offset = window.matchMedia('(max-width: 768px)').matches ? 80 : 120;
+  document.querySelectorAll('[data-sticky]').forEach(node => {
+    const parent = node.parentElement;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) {
+        parent.style.position = 'sticky';
+        parent.style.top = `${offset}px`;
+        parent.style.zIndex = 12000000;
+        setTimeout(() => {
+          parent.style.removeProperty('position');
+          parent.style.removeProperty('top');
+          parent.style.removeProperty('z-index');
+        }, parseInt(node.dataset?.sticky) || 3000);
+        observer.unobserve(parent);
+      }
+    }, { rootMargin: `-${offset}px 0px 0px 0px`, threshold: 1 });
+    observer.observe(parent);
+  });
+});
+
+console.info("%c [TM-ADs] Render ad slots js for googleinhouse", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Added external ad script https://securepubads.g.doubleclick.net/tag/js/gpt.js for googleadvertising on wettbewerbe_rest", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Added external ad script https://tmsi.akamaized.net/javascript/prebid-11.46.0.js for googleadvertising on wettbewerbe_rest", "background: #282828; color: #bada55")
+console.info("%c [TM-ADs] Added external ad script https://tmsi.akamaized.net/js/ad-setup/prebid/scripts/com.js for googleadvertising on wettbewerbe_rest", "background: #282828; color: #bada55")
+/*]]>*/
+</script>
+<title>Premier League - Latest rumours | Transfermarkt</title>
+    <link rel="apple-touch-icon-precomposed" href="/apple-touch-icon-152x152.png">
+    
+<script type="text/javascript">
+   tmData = {
+       loggedIn : "0",
+       tmTraffic: "0",
+   };
+</script>
+<script>
+    const urlParams = new URLSearchParams(window.location.search);
+    let utmVars = {
+        eVar1: urlParams.get('utm_campaign'),
+        eVar6: urlParams.get('utm_source'),
+        eVar24: urlParams.get('utm_medium')
+    };
+    Object.keys(utmVars).forEach((k) => utmVars[k] == null && delete utmVars[k]);
+
+    window.tmAnalyticsDataLayer = window.tmAnalyticsDataLayer || [];
+    window.tmAnalytics = {
+        dimensions: {
+            eVar11: 'Premier League (GB1)',
+			eVar12: 'England',
+			eVar10: '',
+			...utmVars,
+            evar19: window.location.href,
+            eVar35 : '',
+			eVar37 : '',
+                },
+    properties: {
+        prop2: 'statistik',
+		prop3: 'wettbewerb',
+		prop4: 'geruechte',
+		prop5: 'GB1',
+		prop14: 'statistik_wettbewerb_geruechte_GB1',
+		prop9: window.location.hostname,
+        prop10: window.location.href,
+        prop1 : 'false',
+    },
+    pageDetails: {
+        pageViews: {
+            value: 1
+        },
+        isErrorPage: 'false',
+            isHomepage: 'false',
+            name: 'Premier League - Latest rumours | Transfermarkt',
+            URL: window.location.href,
+            server: 'prod-tm-server-web-1218'
+    },
+    };
+
+function tmEventForLink(category, aTag, label) {
+    const url = new URL(aTag.href);
+    const link = url.pathname + url.search;
+    tmEvent(category, link, label);
+}
+
+function tmEvent(category, action, label, detail = '') {
+    if (typeof gtag === 'function') {
+        gtag('event',
+            action,
+            {
+                'event_category': category,
+                'event_label': label
+            }
+        );
+    }
+
+    const ev = {
+        event: 'tmEvent',
+        tmEvent: {
+            customDimensions: {
+                eVars: {
+                    ...tmAnalytics.dimensions
+                },
+                props: {
+                    prop6: category,
+                    prop7: action,
+                    prop8: label,
+                    prop17: detail,
+                    ...tmAnalytics.properties
+                }
+            },
+            event1to100: {
+                event7: {
+                    value: 1
+                },
+                event8: null,
+            },
+            session: {
+                web: {
+                    webInteraction: {
+                        linkClicks: {
+                            value: 1
+                        }
+                    },
+                    webPageDetails: {
+                        ...tmAnalytics.pageDetails,
+                        ...{
+                            pageViews: {
+                                value: null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+     if (!window._satellite) {
+        once = false;
+        window._satellite = { _monitors: [{
+            ruleTriggered: (e) => {
+                if (once) {
+                    return;
+                }
+                once = true;
+                setTimeout(() => {
+                    tmAnalyticsDataLayer.push(ev);
+                    tmAnalyticsDataLayer.push(function (dl) {
+                        const state = dl.getState();
+                    });
+                }, 1);
+            }
+        }] };
+    } else {
+        tmAnalyticsDataLayer.push(ev);
+        tmAnalyticsDataLayer.push(function (dl) {
+            const state = dl.getState();
+        });
+    }
+}
+function tmTrackingAndAds() {
+    if (typeof gtag === 'function') {
+        gtag("event", "page_view", {
+            page_path: "/jsContent" + window.location.pathname
+        });
+    }
+
+    tmAnalyticsDataLayer.push({
+        event: 'tmTrackingAndAds',
+        tmTrackingAndAds: {
+            customDimensions: {
+                eVars: tmAnalytics.dimensions,
+                props: tmAnalytics.properties
+            },
+            event1to100: {
+                event7: null,
+                event8: {
+                    value: 1
+                }
+            },
+            session: {
+                web: {
+                    webInteraction: {
+                        linkClicks: {
+                            value: null
+                        }
+                    },
+                    webPageDetails: {
+                        ...tmAnalytics.pageDetails,
+                        ...{
+                            pageViews: {
+                                value: 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    tmAnalyticsDataLayer.push(function (dl) {
+        const state = dl.getState();
+    });
+}
+function tmTiming(value, name, event_category, event_label) {
+    console.log('tmTiming', value, name, event_category, event_label);
+}
+
+        !function(e,a,n,t){var i=e.head;if(i){
+            if (a) return;
+            var o=e.createElement("style");
+            o.id="alloy-prehiding",o.innerText=n,i.appendChild(o),setTimeout(function(){o.parentNode&&o.parentNode.removeChild(o)},t)}}
+        (document, document.location.href.indexOf("adobe_authoring_enabled") !== -1, ".personalization-container { opacity: 0 !important }", 3000);
+
+            !function(n,o){o.forEach(function(o){n[o]||((n.__alloyNS=n.__alloyNS||
+                []).push(o),n[o]=function(){var u=arguments;return new Promise(
+                function(i,l){n[o].q.push([i,l,u])})},n[o].q=[])})}
+            (window,["alloy"]);
+</script>
+<tm-consent
+    type="adobeanalytics"
+    no-checkbox
+    embed="PHNjcmlwdCBhc3luYyBzcmM9Imh0dHBzOi8vYXNzZXRzLmFkb2JlZHRtLmNvbS83Y2FkY2E5NWRkOWEvY2Q0YWI4ODRkMjMxL2xhdW5jaC0wMTI3MmI0MDBjNjUubWluLmpzIj48L3NjcmlwdD4=">
+</tm-consent>
+
+    <script type="text/javascript" src="https://tmssl.akamaized.net//ads/ads.js"></script>
+    <script type="text/javascript">
+        window.tmGaId = "UA-3816204-13";
+        // TM-23558 / TM-23709: Allowlist der Transfermarkt-Domains für die Cross-Domain-ECID-Übergabe.
+        // Abgeleitet aus den 27 aktiven Transfermarkt-Web-Domains (domains.yml),
+        // Basis-Domains ohne www. — Subdomains werden per Suffix-Prüfung abgedeckt.
+        window.transfermarktCrossDomainAllowed = ["transfermarkt.com.ar","transfermarkt.at","transfermarkt.be","transfermarkt.com.br","transfermarkt.ch","transfermarkt.co","transfermarkt.com","transfermarkt.de","transfermarkt.es","transfermarkt.fr","transfermarkt.gr","transfermarkt.co.id","transfermarkt.co.in","transfermarkt.it","transfermarkt.jp","transfermarkt.co.kr","transfermarkt.mx","transfermarkt.nl","transfermarkt.pe","transfermarkt.pl","transfermarkt.pt","transfermarkt.ro","transfermarkt.com.tr","transfermarkt.co.uk","transfermarkt.us","transfermarkt.world","transfermarkt.co.za"];
+
+        function sendIvwData() {}
+    </script>
+    </head>
+
+<body class="desktop " itemscope itemtype="http://schema.org/WebPage" data-tm-tld="com" data-cmp-layer-id="910164" data-db-name="com-der-zauberzwerg"  >
+    
+        <div id="main">
+                    <button id="back-to-top" title="Nach oben">
+                <svg xmlns="http://www.w3.org/2000/svg" width="17.795" height="10.009" viewBox="0 0 17.795 10.009">
+                    <path id="angle-up" d="M20.683,17.01a1.112,1.112,0,0,1-.786-.326l-7-7-7,7a1.112,1.112,0,1,1-1.573-1.573l7.785-7.785a1.112,1.112,0,0,1,1.573,0l7.785,7.785a1.112,1.112,0,0,1-.786,1.9Z" transform="translate(-4 -7)" fill="#fff"/>
+                </svg>
+            </button>
+            <div class="werbung-skyscraper-left-bound-container">
+                            </div>
+            <div class="werbung-skyscraper-container">
+                <div class="ad-placement-note werbung werbung-skyscraper"  data-ad-placement-note="Advertisement">
+  <div id="d_right_1" style="min-height: 600px;">
+  </div>
+</div>
+            </div>
+
+            <div class="werbung-skyscraperbtf-container">
+                            </div>
+        
+        <div id="tm-overlay"></div>
+
+                    <div class="tm-header__box">
+                <!-- logo  -->
+                <a href="/" class="tm-header__logo" onclick="tmEvent('hauptnavi', '/', 'TM-Logo');">
+                    <img src="https://tmsi.akamaized.net/head/tm_logo_rebrush.svg"
+                         height="62"
+                         width="156"
+                         title="Transfermarkt"
+                         alt="Transfermarkt"
+                    >
+                </a>
+
+                <!-- domainswitcher  -->
+                <div class="domin-swicher">
+                    <tm-domain-switcher
+                        tld="com"
+                        translations='{&quot;chooseYourDomain&quot;:&quot;Choose your domain&quot;}'></tm-domain-switcher>
+                </div>
+
+                <!-- live -->
+                <tm-live-match-count
+                    class="tm-header__live"
+                    auto-request                    content='{&quot;liveMatches&quot;:&quot;Live matches&quot;,&quot;liveMatch&quot;:&quot;Live maches&quot;,&quot;live&quot;:&quot;Live&quot;}'></tm-live-match-count>
+
+                <!-- Search -->
+                                    <div class="tm-header__search " id="schnellsuche-platz">
+                        <form name="schnellsuche" id="schnellsuche" class="tm-header__form" action="/schnellsuche/ergebnis/schnellsuche">
+                            <input type="text" name="query" class="tm-header__input--search-field" onClick="" placeholder="Enter your search term" autocorrect="off" spellcheck="false" value="" />
+                            <button type="submit" value="" class="tm-header__input--search-send" alt="Search">
+                                <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="18" height="18" viewBox="0 0 18 18">
+                                    <path d="M17.825,16.847 L14.28,13.303 C17.072,9.987 16.756,5.061 13.563,2.13 C10.37,-0.8 5.435,-0.695 2.37,2.37 C-0.695,5.435 -0.8,10.37 2.13,13.563 C5.061,16.756 9.987,17.072 13.303,14.28 L16.847,17.825 C17.121,18.069 17.538,18.057 17.797,17.797 C18.057,17.538 18.069,17.121 17.825,16.847 z M1.418,8.108 C1.417,4.413 4.412,1.417 8.107,1.416 C11.802,1.415 14.798,4.411 14.799,8.106 C14.799,11.801 11.804,14.797 8.108,14.797 C4.414,14.797 1.419,11.803 1.418,8.108 z" fill="#000" />
+                                </svg>
+                            </button>
+                        </form>
+                        <a href="/detailsuche/spielerdetail/suche" title="to detailed player search" id="detailsuche-head" class="tm-header__search-detail">
+                            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="18" height="18" viewBox="0, 0, 18, 18">
+                                <path d="M3.138,3.558 C3.137,1.593 4.727,0 6.69,0 C8.652,-0 10.243,1.592 10.243,3.556 C10.243,5.521 8.653,7.113 6.69,7.113 C4.729,7.113 3.138,5.522 3.138,3.558 z M8.233,13.187 C8.261,11.778 8.861,10.442 9.893,9.486 C9.967,9.418 9.997,9.315 9.971,9.219 C9.946,9.119 9.863,9.044 9.76,9.03 C9.331,8.938 8.893,8.893 8.454,8.895 L4.906,8.895 C3.583,8.808 2.286,9.298 1.35,10.239 C0.414,11.179 -0.07,12.479 0.021,13.804 C-0.085,14.656 0.209,15.509 0.817,16.114 C1.425,16.72 2.279,17.009 3.13,16.897 L9.266,16.897 C9.372,16.895 9.467,16.831 9.508,16.732 C9.549,16.634 9.527,16.521 9.453,16.444 C8.665,15.544 8.232,14.387 8.236,13.191 z M17.805,17.804 C17.68,17.93 17.511,18 17.334,18 C17.158,18 16.989,17.93 16.864,17.804 L15.237,16.177 C13.686,17.242 11.58,16.949 10.378,15.501 C9.176,14.052 9.274,11.926 10.604,10.594 C11.934,9.263 14.058,9.165 15.505,10.368 C16.952,11.571 17.244,13.68 16.181,15.233 L17.805,16.866 C18.065,17.126 18.065,17.548 17.805,17.808 z M15.484,13.182 C15.484,11.911 14.455,10.881 13.186,10.881 C11.917,10.881 10.888,11.911 10.888,13.182 C10.888,14.452 11.917,15.482 13.186,15.482 C14.455,15.482 15.484,14.452 15.484,13.182 z" fill="#000" />
+                            </svg>
+                        </a>
+                                            </div>
+                
+                <!-- login button -->
+                <div class="tm-header__login">
+                    <tm-userbox translations='{&quot;addFavorite&quot;:&quot;Add favourite&quot;,&quot;adminArea&quot;:&quot;Admin area&quot;,&quot;adminTools&quot;:&quot;Admin tools&quot;,&quot;allFavoriteLinkText&quot;:&quot;Go to all my favourite links&quot;,&quot;applyAsModOrDatascout&quot;:&quot;Apply as a moderator or datascout&quot;,&quot;checkAllNews&quot;:&quot;Check all news&quot;,&quot;checkAllRumours&quot;:&quot;Check all rumours&quot;,&quot;chooseYourDomain&quot;:&quot;Choose your domain&quot;,&quot;clickAgain&quot;:&quot;Click again to copy shortlink to your clipboard&quot;,&quot;clubBoard&quot;:&quot;Club forum&quot;,&quot;confirm&quot;:&quot;Alright&quot;,&quot;copied&quot;:&quot;Copied to your clipboard&quot;,&quot;copyLink&quot;:&quot;copy link&quot;,&quot;createAccount&quot;:&quot;Create your account&quot;,&quot;createNewMessage&quot;:&quot;Create a new message&quot;,&quot;createShortlink&quot;:&quot;create a shortlink&quot;,&quot;createShortNews&quot;:&quot;Create memo&quot;,&quot;dashboard&quot;:&quot;Overview&quot;,&quot;dataAdministration&quot;:&quot;Data administration&quot;,&quot;debug&quot;:&quot;Debug&quot;,&quot;deleteAll&quot;:&quot;Delete all&quot;,&quot;deleteConfirm&quot;:&quot;Yes, delete all&quot;,&quot;editText&quot;:&quot;Edit&quot;,&quot;forgotPassword&quot;:&quot;Forgot password?&quot;,&quot;forgotUsername&quot;:&quot;Forgot username?&quot;,&quot;forgotLoginDetails&quot;:&quot;Forgot your login details?&quot;,&quot;forum&quot;:&quot;forum&quot;,&quot;groundhoppingTool&quot;:&quot;Groundhopping Tool&quot;,&quot;lastMatch&quot;:&quot;last match&quot;,&quot;signin&quot;:&quot;Log in&quot;,&quot;login&quot;:&quot;Login&quot;,&quot;logOut&quot;:&quot;Log out&quot;,&quot;manageFavorites&quot;:&quot;Manage favourites&quot;,&quot;marketValue&quot;:&quot;market value&quot;,&quot;matchplan&quot;:&quot;Schedule&quot;,&quot;messages&quot;:&quot;Private messages&quot;,&quot;myClub&quot;:&quot;My club&quot;,&quot;myClubText&quot;:&quot;With a Transfermarkt account you can register your favourite club and find all important information about your club (matches, news, quick links).&quot;,&quot;myDreamTeam&quot;:&quot;My dream team&quot;,&quot;myFavorites&quot;:&quot;My favourites&quot;,&quot;myFavoritesText&quot;:&quot;With a Transfermarkt account, you can save any page as a favourite and then access it with one click.&quot;,&quot;myProfile&quot;:&quot;My profile&quot;,&quot;news&quot;:&quot;News&quot;,&quot;newsAdministration&quot;:&quot;News administration&quot;,&quot;nextMatch&quot;:&quot;next match&quot;,&quot;noNewNotifications&quot;:&quot;No new notifications&quot;,&quot;notifications&quot;:&quot;Notifications&quot;,&quot;notificationsDeletedAutomatically&quot;:&quot;Note: Notifications are automatically deleted after 30 days.&quot;,&quot;notifyDeleteMessage&quot;:&quot;Private messages older than 45 days will be deleted from time to time (except for data scouts and moderators)&quot;,&quot;or&quot;:&quot;or&quot;,&quot;other&quot;:&quot;Miscellaneous&quot;,&quot;overview&quot;:&quot;overview&quot;,&quot;password&quot;:&quot;Password&quot;,&quot;playerRatings&quot;:&quot;Player ratings&quot;,&quot;playerWatchlist&quot;:&quot;Players Watchlist&quot;,&quot;postponed&quot;:&quot;postponed&quot;,&quot;profile&quot;:&quot;Profile&quot;,&quot;progDebug&quot;:&quot;Prog. depanare&quot;,&quot;progProfile&quot;:&quot;Prog. profile&quot;,&quot;registerNow&quot;:&quot;Sign up now&quot;,&quot;rememberMe&quot;:&quot;Remember me&quot;,&quot;removeFavorite&quot;:&quot;Delete favourite&quot;,&quot;rumors&quot;:&quot;Rumours&quot;,&quot;schedule&quot;:&quot;Schedule&quot;,&quot;sessionExpired&quot;:&quot;Your session on Transfermarkt has expired. Please log in again.&quot;,&quot;sessionExpiredTitle&quot;:&quot;Session Expired&quot;,&quot;setting&quot;:&quot;Settings&quot;,&quot;shortlink&quot;:&quot;Shortlink&quot;,&quot;shortLinkCreationError&quot;:&quot;An Error occured creating the shortlink.&quot;,&quot;shortLinkHasBeenCreated&quot;:&quot;Shortlink has been created an was copied to your clipboard&quot;,&quot;shortLinkIsBeingCreated&quot;:&quot;Creating shortlink ...&quot;,&quot;showAllMessages&quot;:&quot;Show all messages&quot;,&quot;totalMarketValue&quot;:&quot;Total market value&quot;,&quot;translation&quot;:&quot;Translation&quot;,&quot;username&quot;:&quot;Username&quot;,&quot;whyRegister&quot;:&quot;Why register?&quot;,&quot;Bitte korrigieren Sie die markierten Felder&quot;:&quot;Please correct the highlighted fields&quot;,&quot;mindestensDreiZeichen&quot;:&quot;At least three characters&quot;,&quot;mindestensAchtZeichen&quot;:&quot;At least eight characters&quot;,&quot;pleaseCorrectFields&quot;:&quot;profil&quot;,&quot;minThreeCharacters&quot;:&quot;At least three characters&quot;,&quot;minEightCharacters&quot;:&quot;At least eight characters&quot;,&quot;noAtCharacter&quot;:&quot;The @ character is not allowed in the username&quot;,&quot;agentProfile&quot;:&quot;My Agency Profile&quot;}' page-title="Premier League - Latest rumours | Transfermarkt" tld="com" agent-profile=""  />
+                </div>
+            </div>
+        
+        
+                        <!-- mobile end -->
+            <nav class="main-navbar">
+                                    <a href="/" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/', 'DISCOVER')">
+                        DISCOVER                    </a>
+                                    <a href="/navigation/transfersundgeruechte" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/navigation/transfersundgeruechte', 'TRANSFERS & RUMOURS')">
+                        TRANSFERS & RUMOURS                    </a>
+                                    <a href="/navigation/marktwerte" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/navigation/marktwerte', 'MARKET VALUES')">
+                        MARKET VALUES                    </a>
+                                    <a href="/navigation/wettbewerbe" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/navigation/wettbewerbe', 'COMPETITIONS')">
+                        COMPETITIONS                    </a>
+                                    <a href="/navigation/statistiken" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/navigation/statistiken', 'STATISTICS')">
+                        STATISTICS                    </a>
+                                    <a href="/navigation/community" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/navigation/community', 'FORUM')">
+                        FORUM                    </a>
+                                    <a href="/navigation/gaming" class="main-navbar__lp-link " onclick="tmEvent('hauptnavi', '/navigation/gaming', 'GAMING')">
+                        GAMING                    </a>
+                                <div class="main-navbar__details">
+                    <div class="hamburger">
+                        <em></em>
+                    </div>
+                    <div class="dropdown-layer"></div>
+                    <div class="main-navbar__dropdown">
+                                                            <div class="recommendation">
+        
+    
+                            <div class="tm-discover__hero-container tm-discover__hero-container-grid tm-discover-container-grid">
+                    
+                                    <section class="tm-button-list__wrapper tm-button-list__wrapper--two-thirds  "><span class="tm-discover__h2">Recommendations</span><ul class="tm-button-list"><li><a
+                        href="/uefa-champions-league/startseite/wettbewerb/CL"
+                        title="UEFA Champions League"
+                        target=""
+                        class="tm-button-list__list-item tm-button-list__list-item--big "
+                        onclick="tmEvent('recommendations_recommendation', '/uefa-champions-league/startseite/wettbewerb/CL' , '1_1', 'buttonList');"
+                    ><img
+                            src="https://img.a.transfermarkt.technology/logo/homepageWappen150x150/cl.png?lm=1789377130"
+                            alt="UEFA Champions League"
+                            class="tm-button-list__image tm-button-list__image--big 1"
+                            width="54"
+                            height="36"
+                        ></a></li><li><a
+                        href="/premier-league/startseite/wettbewerb/GB1"
+                        title="Premier League"
+                        target=""
+                        class="tm-button-list__list-item tm-button-list__list-item--big "
+                        onclick="tmEvent('recommendations_recommendation', '/premier-league/startseite/wettbewerb/GB1' , '1_2', 'buttonList');"
+                    ><img
+                            src="https://img.a.transfermarkt.technology/logo/homepageWappen150x150/gb1.png?lm=1789377131"
+                            alt="Premier League"
+                            class="tm-button-list__image tm-button-list__image--big 1"
+                            width="54"
+                            height="36"
+                        ></a></li><li><a
+                        href="/laliga/startseite/wettbewerb/ES1"
+                        title="LaLiga"
+                        target=""
+                        class="tm-button-list__list-item tm-button-list__list-item--big "
+                        onclick="tmEvent('recommendations_recommendation', '/laliga/startseite/wettbewerb/ES1' , '1_3', 'buttonList');"
+                    ><img
+                            src="https://img.a.transfermarkt.technology/logo/homepageWappen150x150/es1.png?lm=1789377130"
+                            alt="LaLiga"
+                            class="tm-button-list__image tm-button-list__image--big 1"
+                            width="54"
+                            height="36"
+                        ></a></li><li><a
+                        href="/bundesliga/startseite/wettbewerb/L1"
+                        title="Bundesliga"
+                        target=""
+                        class="tm-button-list__list-item tm-button-list__list-item--big "
+                        onclick="tmEvent('recommendations_recommendation', '/bundesliga/startseite/wettbewerb/L1' , '1_4', 'buttonList');"
+                    ><img
+                            src="https://img.a.transfermarkt.technology/logo/homepageWappen150x150/l1.png?lm=1789377132"
+                            alt="Bundesliga"
+                            class="tm-button-list__image tm-button-list__image--big 1"
+                            width="54"
+                            height="36"
+                        ></a></li><li><a
+                        href="/serie-a/startseite/wettbewerb/IT1"
+                        title="Serie A"
+                        target=""
+                        class="tm-button-list__list-item tm-button-list__list-item--big "
+                        onclick="tmEvent('recommendations_recommendation', '/serie-a/startseite/wettbewerb/IT1' , '1_5', 'buttonList');"
+                    ><img
+                            src="https://img.a.transfermarkt.technology/logo/homepageWappen150x150/it1.png?lm=1789377132"
+                            alt="Serie A"
+                            class="tm-button-list__image tm-button-list__image--big 1"
+                            width="54"
+                            height="36"
+                        ></a></li><li><a
+                        href="/ligue-1/startseite/wettbewerb/FR1"
+                        title="Ligue 1"
+                        target=""
+                        class="tm-button-list__list-item tm-button-list__list-item--big "
+                        onclick="tmEvent('recommendations_recommendation', '/ligue-1/startseite/wettbewerb/FR1' , '1_6', 'buttonList');"
+                    ><img
+                            src="https://img.a.transfermarkt.technology/logo/homepageWappen150x150/fr1.png?lm=1789377131"
+                            alt="Ligue 1"
+                            class="tm-button-list__image tm-button-list__image--big 1"
+                            width="54"
+                            height="36"
+                        ></a></li></ul></section>
+                                                                                
+        
+    
+                
+                                    <section class="tm-button-list__wrapper tm-button-list__wrapper--one-third  tm-button-list__desktop"><span class="tm-discover__h2">Player agents</span><ul class="tm-button-list"><li><a
+                        href="/agent-support/beraterIndex/berater"
+                        title="Agent support"
+                        target="_self"
+                        class="tm-button-list__list-item tm-button-list__list-item--big tm-button-list__agent"
+                        onclick="tmEvent('recommendations_recommendation', '/agent-support/beraterIndex/berater' , '2_1', 'buttonList');"
+                    ><img
+                            src="https://tmsi.akamaized.net/rebrush/navigation/agent-support.webp"
+                            alt=""
+                            class="tm-button-list__image tm-button-list__image--big tm-button-list__image--country tm-button-list__image--border"
+                            width="54"
+                            height="36"
+                        >Agent<br>support</a></li><li><a
+                        href="/berater/beraterfirmenuebersicht/berater"
+                        title="Agent statistics"
+                        target="_self"
+                        class="tm-button-list__list-item tm-button-list__list-item--big tm-button-list__agent"
+                        onclick="tmEvent('recommendations_recommendation', '/berater/beraterfirmenuebersicht/berater' , '2_2', 'buttonList');"
+                    ><img
+                            src="https://tmsi.akamaized.net/rebrush/navigation/agent-statistic.webp"
+                            alt=""
+                            class="tm-button-list__image tm-button-list__image--big tm-button-list__image--country tm-button-list__image--border"
+                            width="54"
+                            height="36"
+                        >Agent<br>statistics</a></li><li><a
+                        href="/premium-service/berater"
+                        title="Premium service"
+                        target="_self"
+                        class="tm-button-list__list-item tm-button-list__list-item--big tm-button-list__agent"
+                        onclick="tmEvent('recommendations_recommendation', '/premium-service/berater' , '2_3', 'buttonList');"
+                    ><img
+                            src="https://tmsi.akamaized.net/rebrush/navigation/premium-service.webp"
+                            alt=""
+                            class="tm-button-list__image tm-button-list__image--big tm-button-list__image--country tm-button-list__image--border"
+                            width="54"
+                            height="36"
+                        >Premium<br>service</a></li></ul></section>
+                                                                                
+        
+    
+                
+                                            
+<section class="tm-link-list-container tm-link-list--full ">
+        <div
+        class="tm-link-list-element"
+        role="navigation"
+        aria-label=""
+    >
+                    
+                        
+                                            <ul
+    class="tm-link-list-unordered   recommendation__links"
+>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/statistik/neuestetransfers"
+                    title="Latest transfers"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/statistik/neuestetransfers' , '3_1','linkList');"
+                >
+                    Latest transfers
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/rumour-mill/detail/forum/154"
+                    title="Rumour Mill"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/rumour-mill/detail/forum/154' , '3_2','linkList');"
+                >
+                    Rumour Mill
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/aktuell/newsarchiv"
+                    title="All news"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/aktuell/newsarchiv' , '3_3','linkList');"
+                >
+                    All news
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/whatsMyValue"
+                    title="What's my value?"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/whatsMyValue' , '3_4','linkList');"
+                >
+                    What's my value?
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/spieler-statistik/wertvollstespieler/marktwertetop"
+                    title="Most valuable players in the world"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/spieler-statistik/wertvollstespieler/marktwertetop' , '3_5','linkList');"
+                >
+                    Most valuable players in the world
+                </a>
+                    </li>
+    </ul>
+                                            <ul
+    class="tm-link-list-unordered   recommendation__links"
+>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/spieler-statistik/wertvollstemannschaften/marktwertetop"
+                    title="Most valuable clubs in the world"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/spieler-statistik/wertvollstemannschaften/marktwertetop' , '3_6','linkList');"
+                >
+                    Most valuable clubs in the world
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/marktwertanalyse/detail/forum/357"
+                    title="Market value analysis"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/marktwertanalyse/detail/forum/357' , '3_7','linkList');"
+                >
+                    Market value analysis
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/statistik/vertragslosespieler"
+                    title="Free agents"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/statistik/vertragslosespieler' , '3_8','linkList');"
+                >
+                    Free agents
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/statistik/endendevertraege"
+                    title="Contracts ending"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/statistik/endendevertraege' , '3_9','linkList');"
+                >
+                    Contracts ending
+                </a>
+                    </li>
+            <li
+            class="tm-link-list-item"
+        >
+                            <a
+                    class="tm-link__arrow  "
+                    href="/betting/"
+                    title="Betting"
+                    target="_self"
+                    onclick="tmEvent('recommendations_recommendation', '/betting/' , '3_10','linkList');"
+                >
+                    Betting
+                </a>
+                    </li>
+    </ul>
+                        </div>
+
+    </section>
+                                                                        
+        
+    
+                
+                                    <section class="tm-button-list__wrapper tm-button-list__wrapper--full  tm-button-list__mobile"><span class="tm-discover__h2">Player agents</span><ul class="tm-button-list"><li><a
+                        href="/agent-support/beraterIndex/berater"
+                        title="Agent support"
+                        target="_self"
+                        class="tm-button-list__list-item tm-button-list__list-item--big tm-button-list__agent"
+                        onclick="tmEvent('recommendations_recommendation', '/agent-support/beraterIndex/berater' , '4_1', 'buttonList');"
+                    ><img
+                            src="https://tmsi.akamaized.net/rebrush/navigation/agent-support.webp"
+                            alt=""
+                            class="tm-button-list__image tm-button-list__image--big tm-button-list__image--country tm-button-list__image--border"
+                            width="54"
+                            height="36"
+                        >Agent<br>support</a></li><li><a
+                        href="/berater/beraterfirmenuebersicht/berater"
+                        title="Agent statistics"
+                        target="_self"
+                        class="tm-button-list__list-item tm-button-list__list-item--big tm-button-list__agent"
+                        onclick="tmEvent('recommendations_recommendation', '/berater/beraterfirmenuebersicht/berater' , '4_2', 'buttonList');"
+                    ><img
+                            src="https://tmsi.akamaized.net/rebrush/navigation/agent-statistic.webp"
+                            alt=""
+                            class="tm-button-list__image tm-button-list__image--big tm-button-list__image--country tm-button-list__image--border"
+                            width="54"
+                            height="36"
+                        >Agent<br>statistics</a></li><li><a
+                        href="/premium-service/berater"
+                        title="Premium service"
+                        target="_self"
+                        class="tm-button-list__list-item tm-button-list__list-item--big tm-button-list__agent"
+                        onclick="tmEvent('recommendations_recommendation', '/premium-service/berater' , '4_3', 'buttonList');"
+                    ><img
+                            src="https://tmsi.akamaized.net/rebrush/navigation/premium-service.webp"
+                            alt=""
+                            class="tm-button-list__image tm-button-list__image--big tm-button-list__image--country tm-button-list__image--border"
+                            width="54"
+                            height="36"
+                        >Premium<br>service</a></li></ul></section>
+                                                                                
+                    </div>
+        
+    </div>
+                                                </div>
+                </div>
+            </nav>
+
+            <div class="quick-select-wrapper">
+    
+    <tm-quick-select defaultCountry="189" defaultCompetition="GB1" defaultClub="" defaultPlayer="" dropdown-visible="" translations='{"home":"Home","country":"Country","competition":"Competition","club":"Club","player":"Player","attack":"Striker","midfield":"Midfielder","defense":"Defender","goalkeeper":"Goalkeeper"}'>
+    </tm-quick-select>
+</div>
+
+            
+        
+        <div class="ad-placement-note ad-placement-background werbung werbung-billboard"  data-ad-placement-note="Advertisement">
+  <div id="d_top_1" style="min-width: 1024px; min-height: 250px;">
+  </div>
+</div>
+
+
+        
+        <main id="tm-main">
+            
+<header class="data-header">
+    <div class="data-header__headline-container">
+                    <div class="data-header__headline-wrapper data-header__headline-wrapper--oswald">
+                Premier League            </div>
+                </div>
+    <div class="data-header__box--big">
+                    <a class="data-header__box__club-link" href="/wettbewerbe/national/wettbewerbe/189">
+                                    <img src="https://img.a.transfermarkt.technology/flagge/begegnungslider/189.png?lm=1791356397" alt="
+                    England" width="80" class="data-header__box__flag">
+                                </a>
+                    <div class="data-header__club-info">
+            <span class="data-header__club" itemprop="affiliation">
+                <a href="/wettbewerbe/national/wettbewerbe/189">
+                    England                </a>
+            </span>
+            <span class="data-header__label">
+                League level:                <span itemprop="dataItem" class="data-header__content">
+                    First Tier                </span>
+            </span>
+                            <span class="data-header__label">
+                    Reigning champion:
+                    <span itemprop="dataItem" class="data-header__content">
+                        <a title="Arsenal FC" href="/arsenal-fc/startseite/verein/11">Arsenal FC</a>                    </span>
+                </span>
+                                    <span class="data-header__label">
+                        Record-holding champions:
+                        <span itemprop="dataItem" class="data-header__content">
+                            <a title="Liverpool FC" href="/liverpool-fc/startseite/verein/31">Liverpool FC</a>&nbsp;&nbsp;<span class="data-header__content">20&nbsp;</span><span class="data-header__content">time(s)</span>                        </span>
+                    </span>
+                                                        <span class="data-header__label">
+                        UEFA coefficient:
+                        <span itemprop="dataItem" class="data-header__content">
+                            <a href="/uefa/5jahreswertung/statistik">1. Pos.</a>&nbsp;&nbsp;<span class="data-header__content">107.685 </span><span class="data-header__content">Points</span>                        </span>
+                    </span>
+                                            </div>
+    </div>
+    <div class="data-header__profile-container">
+        <img src="https://img.a.transfermarkt.technology/logo/header/gb1.png?lm=1789377131" title="Premier League" alt="Premier League" class="" />    </div>
+            <div class="data-header__box--small">
+            <a href="" class="data-header__market-value-wrapper">
+                <span class="waehrung">€</span>14.11<span class="waehrung">B</span>                <p class="data-header__last-update">
+                    Total Market Value                </p>
+            </a>
+        </div>
+            <div class="data-header__info-box">
+        <div class="data-header__details">
+            <ul class="data-header__items">
+                <li class="data-header__label">
+                    Number of teams:
+                    <span itemprop="dataItem" class="data-header__content">
+                        20 teams                    </span>
+                </li>
+                <li class="data-header__label">
+                    Players:
+                    <span itemprop="dataItem" class="data-header__content">
+                        547                    </span>
+                </li>
+                <li class="data-header__label">
+                    Foreigners:
+                    <span itemprop="dataItem" class="data-header__content">
+                        <a href="/premier-league/gastarbeiter/wettbewerb/GB1">393&nbsp;Players</a>&nbsp;&nbsp;<span class="tabellenplatz">71.8%</span>                    </span>
+                </li>
+            </ul>
+            <ul class="data-header__items">
+                <li class="data-header__label">
+                    &oslash;-Market value:                    <span itemprop="dataItem" class="data-header__content">
+                        €25.79M                    </span>
+                </li>
+                <li class="data-header__label">
+                                            &oslash;-Age:
+                                            <span itemprop="dataItem" class="data-header__content">
+                        26.3                    </span>
+                </li>
+                                <li class="data-header__label">
+                    Most valuable player:
+                    <span itemprop="dataItem" class="data-header__content">
+                        <a title="Erling Haaland" href="/erling-haaland/profil/spieler/418560">Erling Haaland</a>&nbsp;&nbsp;<span class="tabellenplatz">€220.00M</span>                    </span>
+                </li>
+                            </ul>
+        </div>
+
+    </div>
+</header>
+<a href="https://www.transfermarkt.com/u17-world-cup-124-starlets-with-market-values-and-top-ten-wonderkids-ranked/view/news/490870"
+        target="0"
+    class="db mt10"
+        onclick="tmEvent('banner', 'https://www.transfermarkt.com/u17-world-cup-124-starlets-with-market-values-and-top-ten-wonderkids-ranked/view/news/490870', 'd-day-banner');"
+>
+    <img
+        loading="lazy"
+        src="https://dzjovqk3zamsg.cloudfront.net/u17-wonderkids-desk.png"
+        width="1034"
+        height="99"
+        alt="deadline-day banner"
+    >
+</a>
+
+<script type="text/javascript">
+    (() => {
+        const cookies = document.cookie
+            .split(';')
+            .map(c => c.trim().split('='))
+            .reduce((acc, [key, value]) => ({ ...acc, [key]: value }), {});
+        const isContentPassUser = cookies?._cpauthhint !== undefined;
+        if (isContentPassUser) {
+            const adNodes = document.querySelectorAll('.ad-placement-note');
+            adNodes.forEach(node => node.remove());
+        }
+    })();
+</script>
+
+<script type="text/javascript">
+    (() => {
+        // In-viewport impression tracking (TM-23876). The shared tracker in
+        // js/tm-viewport-tracking.js fires as soon as one pixel of the element
+        // intersects the viewport, which happens at page load while the banner
+        // is still hidden below the sticky header/ads. We track only once the
+        // banner is actually seen and fire the event only once per page view.
+        const links = document.querySelectorAll('.js-track-in-viewport');
+
+        links.forEach((link) => {
+            const track = () => {
+                if (link.__tmTracked || window.__tmBet365ImpressionTracked) {
+                    return;
+                }
+
+                // A page can hold more than one banner (e.g. per matchday,
+                // per tab pane). The event carries no dimension, so it is only
+                // fired once per page view.
+                link.__tmTracked = true;
+                window.__tmBet365ImpressionTracked = true;
+
+                try {
+                    if (window.tmEvent) {
+                        window.tmEvent(
+                            link.getAttribute('data-tracking-category') || 'werbung',
+                            link.getAttribute('data-tracking-action') || 'in-viewport',
+                            link.getAttribute('data-tracking-label') || 'bet365-cl-banner'
+                        );
+                    }
+                } catch (e) {}
+            };
+
+            if (typeof IntersectionObserver === 'undefined') {
+                track();
+
+                return;
+            }
+
+            const observer = new IntersectionObserver((entries) => {
+                if (entries[0].isIntersecting) {
+                    track();
+                    observer.disconnect();
+                }
+            }, { threshold: 0 });
+
+            observer.observe(link);
+        });
+    })();
+</script>
+<tm-subnavigation
+    controller="wettbewerb"
+    id="GB1"
+    season="2026"
+    section="wettbewerb"
+    style="display: block; margin: 0 5px;">
+</tm-subnavigation>
+<div class="row">
+    <div class="large-8 columns">
+                <div class="box">
+            <h1 class="content-box-headline">
+                Latest rumours            </h1>
+            <p class="info-content">
+                These are the latest rumours for the chosen competition.            </p>
+
+                
+<div class="tm-tabs">
+    <a class="tm-tab tm-tab__active--parent" href="/premier-league/geruechte/wettbewerb/GB1/saison_id/2026"><div class=" tm-tab__active"><span>Compact</span></div></a><a class="tm-tab" href="/premier-league/geruechte/wettbewerb/GB1/saison_id/2026/plus/1"><div class=""><span>Detailed</span></div></a></div>
+            <div class="responsive-table">
+                <div id="yw1" class="grid-view">
+<div class="summary"></div>
+<table class="items">
+<thead>
+<tr>
+<th id="yw1_c0">Player</th><th class="zentriert" id="yw1_c1">Nation</th><th class="zentriert" id="yw1_c2">Age</th><th class="zentriert" id="yw1_c3">Club</th><th class="" id="yw1_c4">Interested club</th><th class="zentriert" id="yw1_c5"><a class="sort-link" href="/-/geruechte/wettbewerb/GB1/sort/datum_quelle.desc">Most recent source from</a></th><th class="rechts" id="yw1_c6"><a class="sort-link" href="/-/geruechte/wettbewerb/GB1/sort/wahrscheinlichkeit.desc">Assessment</a></th></tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/931900-1787552211.jpg?lm=4711" title="Gustavo Varela" alt="Gustavo Varela" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Gustavo Varela" href="/gustavo-varela/profil/spieler/931900">Gustavo Varela</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Forward</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/136.png?lm=1791356395" title="Portugal" alt="Portugal" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/32.png?lm=1791356387" title="Cape Verde" alt="Cape Verde" class="flaggenrahmen" /></td><td class="zentriert">21</td><td class="zentriert"><a title="AC Monza" href="/ac-monza/startseite/verein/2919"><img src="https://img.a.transfermarkt.technology/wappen/tiny/2919.png?lm=1789459326" title="AC Monza" alt="AC Monza" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31"><img src="https://img.a.transfermarkt.technology/wappen/tiny/31.png?lm=1789459168" title="Liverpool FC" alt="Liverpool FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31">Liverpool</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208229/post_id/3426507#3426507">20/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208229/post_id/3426507#3426507">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/924117-1787317646.jpg?lm=4711" title="Finn Jeltsch" alt="Finn Jeltsch" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Finn Jeltsch" href="/finn-jeltsch/profil/spieler/924117">Finn Jeltsch</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /></td><td class="zentriert">20</td><td class="zentriert"><a title="VfB Stuttgart" href="/vfb-stuttgart/startseite/verein/79"><img src="https://img.a.transfermarkt.technology/wappen/tiny/79.png?lm=1789459169" title="VfB Stuttgart" alt="VfB Stuttgart" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11"><img src="https://img.a.transfermarkt.technology/wappen/tiny/11.png?lm=1789459167" title="Arsenal FC" alt="Arsenal FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11">Arsenal</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Finn Jeltsch zu FC Arsenal?" href="https://www.transfermarkt.com/finn-jeltsch-zu-fc-arsenal-/thread/forum/154/thread_id/1189775/post_id/3426492#3426492">20/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Finn Jeltsch zu FC Arsenal?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/finn-jeltsch-zu-fc-arsenal-/thread/forum/154/thread_id/1189775/post_id/3426492#3426492">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/924117-1787317646.jpg?lm=4711" title="Finn Jeltsch" alt="Finn Jeltsch" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Finn Jeltsch" href="/finn-jeltsch/profil/spieler/924117">Finn Jeltsch</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /></td><td class="zentriert">20</td><td class="zentriert"><a title="VfB Stuttgart" href="/vfb-stuttgart/startseite/verein/79"><img src="https://img.a.transfermarkt.technology/wappen/tiny/79.png?lm=1789459169" title="VfB Stuttgart" alt="VfB Stuttgart" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31"><img src="https://img.a.transfermarkt.technology/wappen/tiny/31.png?lm=1789459168" title="Liverpool FC" alt="Liverpool FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31">Liverpool</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Finn Jeltsch zu FC Liverpool?" href="https://www.transfermarkt.com/wechselt-finn-jeltsch-zu-fc-liverpool-/thread/forum/154/thread_id/1189776/post_id/3426491#3426491">20/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Finn Jeltsch zu FC Liverpool?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-finn-jeltsch-zu-fc-liverpool-/thread/forum/154/thread_id/1189776/post_id/3426491#3426491">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1044893-1791195649.jpg?lm=4711" title="Yaya Fofana" alt="Yaya Fofana" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Yaya Fofana" href="/yaya-fofana/profil/spieler/1044893">Yaya Fofana</a>                            </td>
+        </tr>
+        <tr>
+            <td>Attacking Midfield</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/38.png?lm=1791356388" title="Cote d'Ivoire" alt="Cote d'Ivoire" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/105.png?lm=1791356389" title="Mali" alt="Mali" class="flaggenrahmen" /></td><td class="zentriert">22</td><td class="zentriert"><a title="Stade Reims" href="/stade-reims/startseite/verein/1421"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1421.png?lm=1789459251" title="Stade Reims" alt="Stade Reims" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Tottenham Hotspur" href="/tottenham-hotspur/startseite/verein/148"><img src="https://img.a.transfermarkt.technology/wappen/tiny/148.png?lm=1789459175" title="Tottenham Hotspur" alt="Tottenham Hotspur" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Tottenham Hotspur" href="/tottenham-hotspur/startseite/verein/148">Tottenham</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208216/post_id/3426474#3426474">20/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208216/post_id/3426474#3426474">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1423966-1795171456.jpg?lm=4711" title="Jaedon Donkor" alt="Jaedon Donkor" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Jaedon Donkor" href="/jaedon-donkor/profil/spieler/1423966">Jaedon Donkor</a>                            </td>
+        </tr>
+        <tr>
+            <td>Right Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/54.png?lm=1791356388" title="Ghana" alt="Ghana" class="flaggenrahmen" /></td><td class="zentriert">17</td><td class="zentriert"><a title="Heart of Midlothian FC U18" href="/heart-of-midlothian-fc-u18/startseite/verein/67276"><img src="https://img.a.transfermarkt.technology/wappen/tiny/67276.png?lm=1789463562" title="Heart of Midlothian FC U18" alt="Heart of Midlothian FC U18" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Newcastle United" href="/newcastle-united/startseite/verein/762"><img src="https://img.a.transfermarkt.technology/wappen/tiny/762.png?lm=1790843083" title="Newcastle United" alt="Newcastle United" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Newcastle United" href="/newcastle-united/startseite/verein/762">Newcastle</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208212/post_id/3426466#3426466">20/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208212/post_id/3426466#3426466">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1423966-1795171456.jpg?lm=4711" title="Jaedon Donkor" alt="Jaedon Donkor" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Jaedon Donkor" href="/jaedon-donkor/profil/spieler/1423966">Jaedon Donkor</a>                            </td>
+        </tr>
+        <tr>
+            <td>Right Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/54.png?lm=1791356388" title="Ghana" alt="Ghana" class="flaggenrahmen" /></td><td class="zentriert">17</td><td class="zentriert"><a title="Heart of Midlothian FC U18" href="/heart-of-midlothian-fc-u18/startseite/verein/67276"><img src="https://img.a.transfermarkt.technology/wappen/tiny/67276.png?lm=1789463562" title="Heart of Midlothian FC U18" alt="Heart of Midlothian FC U18" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Chelsea FC" href="/fc-chelsea/startseite/verein/631"><img src="https://img.a.transfermarkt.technology/wappen/tiny/631.png?lm=1789459205" title="Chelsea FC" alt="Chelsea FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Chelsea FC" href="/fc-chelsea/startseite/verein/631">Chelsea</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208211/post_id/3426465#3426465">20/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208211/post_id/3426465#3426465">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1397546-1771538710.jpg?lm=4711" title="Holmes Júnior" alt="Holmes Júnior" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Holmes Júnior" href="/holmes-junior/profil/spieler/1397546">Holmes Júnior</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/83.png?lm=1791356389" title="Colombia" alt="Colombia" class="flaggenrahmen" /></td><td class="zentriert">17</td><td class="zentriert"><a title="Girona FC" href="/fc-girona/startseite/verein/12321"><img src="https://img.a.transfermarkt.technology/wappen/tiny/12321.png?lm=1789459801" title="Girona FC" alt="Girona FC" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Brighton &amp; Hove Albion" href="/brighton-amp-hove-albion/startseite/verein/1237"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1237.png?lm=1789459242" title="Brighton & Hove Albion" alt="Brighton & Hove Albion" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Brighton &amp; Hove Albion" href="/brighton-amp-hove-albion/startseite/verein/1237">Brighton</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208193/post_id/3426424#3426424">19/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208193/post_id/3426424#3426424">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/636688-1662836200.jpg?lm=4711" title="Alejandro Balde" alt="Alejandro Balde" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Alejandro Balde" href="/alejandro-balde/profil/spieler/636688">Alejandro Balde</a>                            </td>
+        </tr>
+        <tr>
+            <td>Left-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /></td><td class="zentriert">23</td><td class="zentriert"><a title="FC Barcelona" href="/fc-barcelona/startseite/verein/131"><img src="https://img.a.transfermarkt.technology/wappen/tiny/131.png?lm=1789459175" title="FC Barcelona" alt="FC Barcelona" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31"><img src="https://img.a.transfermarkt.technology/wappen/tiny/31.png?lm=1789459168" title="Liverpool FC" alt="Liverpool FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31">Liverpool</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208191/post_id/3426420#3426420">19/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208191/post_id/3426420#3426420">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/536835-1747857754.jpg?lm=4711" title="Amad Diallo" alt="Amad Diallo" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Amad Diallo" href="/amad-diallo/profil/spieler/536835">Amad Diallo</a>                            </td>
+        </tr>
+        <tr>
+            <td>Right Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/38.png?lm=1791356388" title="Cote d'Ivoire" alt="Cote d'Ivoire" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/75.png?lm=1791356388" title="Italy" alt="Italy" class="flaggenrahmen" /></td><td class="zentriert">24</td><td class="zentriert"><a title="Manchester United" href="/manchester-united/startseite/verein/985"><img src="https://img.a.transfermarkt.technology/wappen/tiny/985.png?lm=1789459227" title="Manchester United" alt="Manchester United" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Beşiktaş JK" href="/besiktas-istanbul/startseite/verein/114"><img src="https://img.a.transfermarkt.technology/wappen/tiny/114.png?lm=1789459174" title="Beşiktaş JK" alt="Beşiktaş JK" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Beşiktaş JK" href="/besiktas-istanbul/startseite/verein/114">Beşiktaş</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/174.png?lm=1791356396" title="Türkiye" alt="Türkiye" class="flaggenrahmen" /> <a title="Süper Lig" href="/super-lig/transfers/wettbewerb/TR1">Süper Lig</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Amad Diallo zu Besiktas JK?" href="https://www.transfermarkt.com/wechselt-amad-diallo-zu-besiktas-jk-/thread/forum/154/thread_id/1208190/post_id/3426419#3426419">19/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Amad Diallo zu Besiktas JK?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-amad-diallo-zu-besiktas-jk-/thread/forum/154/thread_id/1208190/post_id/3426419#3426419">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/646750-1749739359.jpg?lm=4711" title="Cristhian Mosquera" alt="Cristhian Mosquera" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Cristhian Mosquera" href="/cristhian-mosquera/profil/spieler/646750">Cristhian Mosquera</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/83.png?lm=1791356389" title="Colombia" alt="Colombia" class="flaggenrahmen" /></td><td class="zentriert">22</td><td class="zentriert"><a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11"><img src="https://img.a.transfermarkt.technology/wappen/tiny/11.png?lm=1789459167" title="Arsenal FC" alt="Arsenal FC" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Inter Milan" href="/inter-mailand/startseite/verein/46"><img src="https://img.a.transfermarkt.technology/wappen/tiny/46.png?lm=1789459168" title="Inter Milan" alt="Inter Milan" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Inter Milan" href="/inter-mailand/startseite/verein/46">Inter</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/75.png?lm=1791356388" title="Italy" alt="Italy" class="flaggenrahmen" /> <a title="Serie A" href="/serie-a/transfers/wettbewerb/IT1">Serie A</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Cristhian Mosquera zu Inter Mailand?" href="https://www.transfermarkt.com/wechselt-cristhian-mosquera-zu-inter-mailand-/thread/forum/154/thread_id/1208181/post_id/3426397#3426397">19/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Cristhian Mosquera zu Inter Mailand?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-cristhian-mosquera-zu-inter-mailand-/thread/forum/154/thread_id/1208181/post_id/3426397#3426397">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/392768-1659969850.png?lm=4711" title="Callum Hudson-Odoi" alt="Callum Hudson-Odoi" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Callum Hudson-Odoi" href="/callum-hudson-odoi/profil/spieler/392768">Callum Hudson-Odoi</a>                            </td>
+        </tr>
+        <tr>
+            <td>Left Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/54.png?lm=1791356388" title="Ghana" alt="Ghana" class="flaggenrahmen" /></td><td class="zentriert">26</td><td class="zentriert"><a title="Nottingham Forest" href="/nottingham-forest/startseite/verein/703"><img src="https://img.a.transfermarkt.technology/wappen/tiny/703.png?lm=1789459206" title="Nottingham Forest" alt="Nottingham Forest" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="AS Roma" href="/as-rom/startseite/verein/12"><img src="https://img.a.transfermarkt.technology/wappen/tiny/12.png?lm=1789459167" title="AS Roma" alt="AS Roma" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="AS Roma" href="/as-rom/startseite/verein/12">Roma</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/75.png?lm=1791356388" title="Italy" alt="Italy" class="flaggenrahmen" /> <a title="Serie A" href="/serie-a/transfers/wettbewerb/IT1">Serie A</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208180/post_id/3426396#3426396">19/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208180/post_id/3426396#3426396">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1455241-1795025119.jpg?lm=4711" title="Enzo Pérez" alt="Enzo Pérez" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Enzo Pérez" href="/enzo-perez/profil/spieler/1455241">Enzo Pérez</a>                            </td>
+        </tr>
+        <tr>
+            <td>Attacking Midfield</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /></td><td class="zentriert">18</td><td class="zentriert"><a title="Real Oviedo" href="/real-oviedo/startseite/verein/2497"><img src="https://img.a.transfermarkt.technology/wappen/tiny/2497.png?lm=1789459298" title="Real Oviedo" alt="Real Oviedo" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Brentford FC" href="/fc-brentford/startseite/verein/1148"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1148.png?lm=1789466435" title="Brentford FC" alt="Brentford FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Brentford FC" href="/fc-brentford/startseite/verein/1148">Brentford</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208157/post_id/3426357#3426357">18/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208157/post_id/3426357#3426357">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/473050-1700560328.jpg?lm=4711" title="Kevin Schade" alt="Kevin Schade" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Kevin Schade" href="/kevin-schade/profil/spieler/473050">Kevin Schade</a>                            </td>
+        </tr>
+        <tr>
+            <td>Left Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/124.png?lm=1791356395" title="Nigeria" alt="Nigeria" class="flaggenrahmen" /></td><td class="zentriert">24</td><td class="zentriert"><a title="Brentford FC" href="/fc-brentford/startseite/verein/1148"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1148.png?lm=1789466435" title="Brentford FC" alt="Brentford FC" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11"><img src="https://img.a.transfermarkt.technology/wappen/tiny/11.png?lm=1789459167" title="Arsenal FC" alt="Arsenal FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11">Arsenal</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208145/post_id/3426339#3426339">18/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208145/post_id/3426339#3426339">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/352041-1733188777.jpg?lm=4711" title="Lucas Perri" alt="Lucas Perri" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Lucas Perri" href="/lucas-perri/profil/spieler/352041">Lucas Perri</a>                            </td>
+        </tr>
+        <tr>
+            <td>Goalkeeper</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/26.png?lm=1791356387" title="Brazil" alt="Brazil" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/75.png?lm=1791356388" title="Italy" alt="Italy" class="flaggenrahmen" /></td><td class="zentriert">28</td><td class="zentriert"><a title="Leeds United" href="/leeds-united/startseite/verein/399"><img src="https://img.a.transfermarkt.technology/wappen/tiny/399.png?lm=1789459190" title="Leeds United" alt="Leeds United" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Clube de Regatas Vasco da Gama" href="/vasco-da-gama-rio-de-janeiro/startseite/verein/978"><img src="https://img.a.transfermarkt.technology/wappen/tiny/978.png?lm=1789459221" title="Clube de Regatas Vasco da Gama" alt="Clube de Regatas Vasco da Gama" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Clube de Regatas Vasco da Gama" href="/vasco-da-gama-rio-de-janeiro/startseite/verein/978">Vasco da Gama</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/26.png?lm=1791356387" title="Brazil" alt="Brazil" class="flaggenrahmen" /> <a title="Série A" href="/campeonato-brasileiro-serie-a/transfers/wettbewerb/BRA1">Série A</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1207834/post_id/3426325#3426325">18/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1207834/post_id/3426325#3426325">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/874223-1727467725.jpg?lm=4711" title="Gustavo Martins" alt="Gustavo Martins" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Gustavo Martins" href="/gustavo-martins/profil/spieler/874223">Gustavo Martins</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/26.png?lm=1791356387" title="Brazil" alt="Brazil" class="flaggenrahmen" /></td><td class="zentriert">24</td><td class="zentriert"><a title="Grêmio Foot-Ball Porto Alegrense" href="/gremio-porto-alegre/startseite/verein/210"><img src="https://img.a.transfermarkt.technology/wappen/tiny/210.png?lm=1789466376" title="Grêmio Foot-Ball Porto Alegrense" alt="Grêmio Foot-Ball Porto Alegrense" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Nottingham Forest" href="/nottingham-forest/startseite/verein/703"><img src="https://img.a.transfermarkt.technology/wappen/tiny/703.png?lm=1789459206" title="Nottingham Forest" alt="Nottingham Forest" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Nottingham Forest" href="/nottingham-forest/startseite/verein/703">Nott'm Forest</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Gustavo Martins zu Nottingham Forest?" href="https://www.transfermarkt.com/wechselt-gustavo-martins-zu-nottingham-forest-/thread/forum/154/thread_id/1208123/post_id/3426285#3426285">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Gustavo Martins zu Nottingham Forest?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-gustavo-martins-zu-nottingham-forest-/thread/forum/154/thread_id/1208123/post_id/3426285#3426285">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/331726-1761563884.jpg?lm=4711" title="Tammy Abraham" alt="Tammy Abraham" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Tammy Abraham" href="/tammy-abraham/profil/spieler/331726">Tammy Abraham</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Forward</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/124.png?lm=1791356395" title="Nigeria" alt="Nigeria" class="flaggenrahmen" /></td><td class="zentriert">29</td><td class="zentriert"><a title="Aston Villa" href="/aston-villa/startseite/verein/405"><img src="https://img.a.transfermarkt.technology/wappen/tiny/405.png?lm=1789459190" title="Aston Villa" alt="Aston Villa" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Valencia CF" href="/fc-valencia/startseite/verein/1049"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1049.png?lm=1789459228" title="Valencia CF" alt="Valencia CF" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Valencia CF" href="/fc-valencia/startseite/verein/1049">Valencia</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /> <a title="LaLiga" href="/laliga/transfers/wettbewerb/ES1">LaLiga</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208118/post_id/3426276#3426276">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208118/post_id/3426276#3426276">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1020191-1738585625.jpg?lm=4711" title="Ismaëlo Ganiou" alt="Ismaëlo Ganiou" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Ismaëlo Ganiou" href="/ismaelo-ganiou/profil/spieler/1020191">Ismaëlo Ganiou</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/50.png?lm=1791356388" title="France" alt="France" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/29.png?lm=1791356387" title="Burkina Faso" alt="Burkina Faso" class="flaggenrahmen" /></td><td class="zentriert">21</td><td class="zentriert"><a title="RC Lens" href="/rc-lens/startseite/verein/826"><img src="https://img.a.transfermarkt.technology/wappen/tiny/826.png?lm=1789459213" title="RC Lens" alt="RC Lens" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31"><img src="https://img.a.transfermarkt.technology/wappen/tiny/31.png?lm=1789459168" title="Liverpool FC" alt="Liverpool FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31">Liverpool</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208114/post_id/3426268#3426268">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208114/post_id/3426268#3426268">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1020191-1738585625.jpg?lm=4711" title="Ismaëlo Ganiou" alt="Ismaëlo Ganiou" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Ismaëlo Ganiou" href="/ismaelo-ganiou/profil/spieler/1020191">Ismaëlo Ganiou</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/50.png?lm=1791356388" title="France" alt="France" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/29.png?lm=1791356387" title="Burkina Faso" alt="Burkina Faso" class="flaggenrahmen" /></td><td class="zentriert">21</td><td class="zentriert"><a title="RC Lens" href="/rc-lens/startseite/verein/826"><img src="https://img.a.transfermarkt.technology/wappen/tiny/826.png?lm=1789459213" title="RC Lens" alt="RC Lens" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Newcastle United" href="/newcastle-united/startseite/verein/762"><img src="https://img.a.transfermarkt.technology/wappen/tiny/762.png?lm=1790843083" title="Newcastle United" alt="Newcastle United" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Newcastle United" href="/newcastle-united/startseite/verein/762">Newcastle</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Ismaëlo Ganiou zu Newcastle United?" href="https://www.transfermarkt.com/wechselt-ismaelo-ganiou-zu-newcastle-united-/thread/forum/154/thread_id/1208113/post_id/3426267#3426267">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Ismaëlo Ganiou zu Newcastle United?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-ismaelo-ganiou-zu-newcastle-united-/thread/forum/154/thread_id/1208113/post_id/3426267#3426267">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/948279-1787317526.jpg?lm=4711" title="Chema Andrés" alt="Chema Andrés" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Chema Andrés" href="/chema-andres/profil/spieler/948279">Chema Andrés</a>                            </td>
+        </tr>
+        <tr>
+            <td>Defensive Midfield</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /></td><td class="zentriert">21</td><td class="zentriert"><a title="Brighton &amp; Hove Albion" href="/brighton-amp-hove-albion/startseite/verein/1237"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1237.png?lm=1789459242" title="Brighton & Hove Albion" alt="Brighton & Hove Albion" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Real Madrid" href="/real-madrid/startseite/verein/418"><img src="https://img.a.transfermarkt.technology/wappen/tiny/418.png?lm=1789459190" title="Real Madrid" alt="Real Madrid" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Real Madrid" href="/real-madrid/startseite/verein/418">Real Madrid</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/157.png?lm=1791356396" title="Spain" alt="Spain" class="flaggenrahmen" /> <a title="LaLiga" href="/laliga/transfers/wettbewerb/ES1">LaLiga</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208110/post_id/3426264#3426264">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208110/post_id/3426264#3426264">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1470255-1787214693.png?lm=4711" title="Gabriel Rajković" alt="Gabriel Rajković" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Gabriel Rajković" href="/gabriel-rajkovic/profil/spieler/1470255">Gabriel Rajković</a>                            </td>
+        </tr>
+        <tr>
+            <td>Left Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/125.png?lm=1791363595" title="Norway" alt="Norway" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/215.png?lm=1791356397" title="Serbia" alt="Serbia" class="flaggenrahmen" /></td><td class="zentriert">15</td><td class="zentriert"><a title="Vålerenga Fotball Elite" href="/valerenga-fotball/startseite/verein/76"><img src="https://img.a.transfermarkt.technology/wappen/tiny/76.png?lm=1789459169" title="Vålerenga Fotball Elite" alt="Vålerenga Fotball Elite" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11"><img src="https://img.a.transfermarkt.technology/wappen/tiny/11.png?lm=1789459167" title="Arsenal FC" alt="Arsenal FC" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Arsenal FC" href="/fc-arsenal/startseite/verein/11">Arsenal</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Gabriel Rajković zu FC Arsenal?" href="https://www.transfermarkt.com/wechselt-gabriel-rajkovic-zu-fc-arsenal-/thread/forum/154/thread_id/1208108/post_id/3426261#3426261">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Gabriel Rajković zu FC Arsenal?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-gabriel-rajkovic-zu-fc-arsenal-/thread/forum/154/thread_id/1208108/post_id/3426261#3426261">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1470255-1787214693.png?lm=4711" title="Gabriel Rajković" alt="Gabriel Rajković" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Gabriel Rajković" href="/gabriel-rajkovic/profil/spieler/1470255">Gabriel Rajković</a>                            </td>
+        </tr>
+        <tr>
+            <td>Left Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/125.png?lm=1791363595" title="Norway" alt="Norway" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/215.png?lm=1791356397" title="Serbia" alt="Serbia" class="flaggenrahmen" /></td><td class="zentriert">15</td><td class="zentriert"><a title="Vålerenga Fotball Elite" href="/valerenga-fotball/startseite/verein/76"><img src="https://img.a.transfermarkt.technology/wappen/tiny/76.png?lm=1789459169" title="Vålerenga Fotball Elite" alt="Vålerenga Fotball Elite" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Manchester United" href="/manchester-united/startseite/verein/985"><img src="https://img.a.transfermarkt.technology/wappen/tiny/985.png?lm=1789459227" title="Manchester United" alt="Manchester United" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Manchester United" href="/manchester-united/startseite/verein/985">Man United</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Wechselt Gabriel Rajković zu Manchester United?" href="https://www.transfermarkt.com/wechselt-gabriel-rajkovic-zu-manchester-united-/thread/forum/154/thread_id/1208107/post_id/3426260#3426260">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="Wechselt Gabriel Rajković zu Manchester United?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/wechselt-gabriel-rajkovic-zu-manchester-united-/thread/forum/154/thread_id/1208107/post_id/3426260#3426260">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/326031-1700659567.jpg?lm=4711" title="Matthijs de Ligt" alt="Matthijs de Ligt" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Matthijs de Ligt" href="/matthijs-de-ligt/profil/spieler/326031">Matthijs de Ligt</a>                            </td>
+        </tr>
+        <tr>
+            <td>Centre-Back</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/122.png?lm=1791356395" title="Netherlands" alt="Netherlands" class="flaggenrahmen" /></td><td class="zentriert">27</td><td class="zentriert"><a title="Manchester United" href="/manchester-united/startseite/verein/985"><img src="https://img.a.transfermarkt.technology/wappen/tiny/985.png?lm=1789459227" title="Manchester United" alt="Manchester United" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Beşiktaş JK" href="/besiktas-istanbul/startseite/verein/114"><img src="https://img.a.transfermarkt.technology/wappen/tiny/114.png?lm=1789459174" title="Beşiktaş JK" alt="Beşiktaş JK" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Beşiktaş JK" href="/besiktas-istanbul/startseite/verein/114">Beşiktaş</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/174.png?lm=1791356396" title="Türkiye" alt="Türkiye" class="flaggenrahmen" /> <a title="Süper Lig" href="/super-lig/transfers/wettbewerb/TR1">Süper Lig</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208099/post_id/3426241#3426241">17/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208099/post_id/3426241#3426241">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/700106-1770733562.jpg?lm=4711" title="Brajan Gruda" alt="Brajan Gruda" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Brajan Gruda" href="/brajan-gruda/profil/spieler/700106">Brajan Gruda</a>                            </td>
+        </tr>
+        <tr>
+            <td>Attacking Midfield</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/3.png?lm=1791356387" title="Albania" alt="Albania" class="flaggenrahmen" /></td><td class="zentriert">22</td><td class="zentriert"><a title="Brighton &amp; Hove Albion" href="/brighton-amp-hove-albion/startseite/verein/1237"><img src="https://img.a.transfermarkt.technology/wappen/tiny/1237.png?lm=1789459242" title="Brighton & Hove Albion" alt="Brighton & Hove Albion" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="FC Bayern Munich" href="/fc-bayern-munchen/startseite/verein/27"><img src="https://img.a.transfermarkt.technology/wappen/tiny/27.png?lm=1789459168" title="FC Bayern Munich" alt="FC Bayern Munich" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="FC Bayern Munich" href="/fc-bayern-munchen/startseite/verein/27">FC Bayern</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /> <a title="Bundesliga" href="/bundesliga/transfers/wettbewerb/L1">Bundesliga</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1207927/post_id/3426220#3426220">16/11/2026</a></td><td class="rechts hauptlink">13 %&nbsp;<span class="icons_sprite green-arrow-ten" style="" title="Probability falling">&nbsp</span>&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1207927/post_id/3426220#3426220">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="even">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1108466-1792007527.jpg?lm=4711" title="Rio Ngumoha" alt="Rio Ngumoha" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Rio Ngumoha" href="/rio-ngumoha/profil/spieler/1108466">Rio Ngumoha</a>                            </td>
+        </tr>
+        <tr>
+            <td>Left Winger</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/124.png?lm=1791356395" title="Nigeria" alt="Nigeria" class="flaggenrahmen" /></td><td class="zentriert">18</td><td class="zentriert"><a title="Liverpool FC" href="/fc-liverpool/startseite/verein/31"><img src="https://img.a.transfermarkt.technology/wappen/tiny/31.png?lm=1789459168" title="Liverpool FC" alt="Liverpool FC" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="FC Bayern Munich" href="/fc-bayern-munchen/startseite/verein/27"><img src="https://img.a.transfermarkt.technology/wappen/tiny/27.png?lm=1789459168" title="FC Bayern Munich" alt="FC Bayern Munich" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="FC Bayern Munich" href="/fc-bayern-munchen/startseite/verein/27">FC Bayern</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /> <a title="Bundesliga" href="/bundesliga/transfers/wettbewerb/L1">Bundesliga</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="Rio Ngumoha zu FC Bayern München?" href="https://www.transfermarkt.com/rio-ngumoha-zu-fc-bayern-munchen-/thread/forum/154/thread_id/1194288/post_id/3426219#3426219">16/11/2026</a></td><td class="rechts hauptlink">30 %&nbsp;<span class="icons_sprite green-arrow-ten" style="" title="Probability falling">&nbsp</span>&nbsp;&nbsp;<a title="Rio Ngumoha zu FC Bayern München?" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="https://www.transfermarkt.com/rio-ngumoha-zu-fc-bayern-munchen-/thread/forum/154/thread_id/1194288/post_id/3426336#3426336">&nbsp;&nbsp;&nbsp;</a></td></tr>
+<tr class="odd">
+<td>    <table class="inline-table">
+        <tr>
+            <td rowspan="2">
+                <img src="data:image/gif;base64,R0lGODlhAQABAIAAAMLCwgAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==" data-src="https://img.a.transfermarkt.technology/portrait/medium/1145971-1790773609.jpg?lm=4711" title="Leonard Prescott" alt="Leonard Prescott" class="bilderrahmen-fixed lazy lazy" />            </td>
+            <td class="hauptlink">
+                <a title="Leonard Prescott" href="/leonard-prescott/profil/spieler/1145971">Leonard Prescott</a>                            </td>
+        </tr>
+        <tr>
+            <td>Goalkeeper</td>
+        </tr>
+    </table>
+</td><td class="zentriert"><img src="https://img.a.transfermarkt.technology/flagge/verysmall/40.png?lm=1791356388" title="Germany" alt="Germany" class="flaggenrahmen" /><br /><img src="https://img.a.transfermarkt.technology/flagge/verysmall/184.png?lm=1791356396" title="United States" alt="United States" class="flaggenrahmen" /></td><td class="zentriert">17</td><td class="zentriert"><a title="FC Bayern Munich II" href="/fc-bayern-munchen-ii/startseite/verein/28"><img src="https://img.a.transfermarkt.technology/wappen/tiny/28.png?lm=1789466368" title="FC Bayern Munich II" alt="FC Bayern Munich II" class="tiny_wappen" /></a></td><td class=""><table class="inline-table">
+    <tr>
+        <td rowspan="2">
+            <a title="Aston Villa" href="/aston-villa/startseite/verein/405"><img src="https://img.a.transfermarkt.technology/wappen/tiny/405.png?lm=1789459190" title="Aston Villa" alt="Aston Villa" class="tiny_wappen" /></a>        </td>
+        <td class="hauptlink">
+            <a title="Aston Villa" href="/aston-villa/startseite/verein/405">Aston Villa</a>        </td>
+    </tr>
+    <tr>
+        <td>
+            <img src="https://img.a.transfermarkt.technology/flagge/verysmall/189.png?lm=1791356397" title="England" alt="England" class="flaggenrahmen" /> <a title="Premier League" href="/premier-league/transfers/wettbewerb/GB1">Premier League</a>        </td>
+    </tr>
+</table>
+    </td><td class="zentriert"><a title="" href="//thread/forum/154/thread_id/1208083/post_id/3426218#3426218">16/11/2026</a></td><td class="rechts hauptlink">-&nbsp;&nbsp;&nbsp;<a title="" class="icons_sprite icon-pinnwand-sprechblase sprechblase-wechselwahrscheinlichkeit" href="//thread/forum/154/thread_id/1208083/post_id/3426218#3426218">&nbsp;&nbsp;&nbsp;</a></td></tr>
+</tbody>
+</table>
+<div class="pager"><ul class="tm-pagination">
+
+<li class="tm-pagination__list-item tm-pagination__list-item--active"><a href="/-/geruechte/wettbewerb/GB1" title="Page 1" class="tm-pagination__link">1</a></li>
+<li class="tm-pagination__list-item"><a href="/-/geruechte/wettbewerb/GB1/page/2" title="Page 2" class="tm-pagination__link">2</a></li>
+<li class="tm-pagination__list-item"><a href="/-/geruechte/wettbewerb/GB1/page/3" title="Page 3" class="tm-pagination__link">3</a></li>
+<li class="tm-pagination__list-item"><a href="/-/geruechte/wettbewerb/GB1/page/4" title="Page 4" class="tm-pagination__link">4</a></li>
+<li class="tm-pagination__list-item"><a href="/-/geruechte/wettbewerb/GB1/page/5" title="Page 5" class="tm-pagination__link">5</a></li>
+<li class="tm-pagination__list-item tm-pagination__list-item--icon-next-page"><a href="/-/geruechte/wettbewerb/GB1/page/2" title="Go to the next page" class="tm-pagination__link">&nbsp;&nbsp;</a></li>
+<li class="tm-pagination__list-item tm-pagination__list-item--icon-last-page"><a href="/-/geruechte/wettbewerb/GB1/page/5" title="Go to the last page (page 5)" class="tm-pagination__link">&nbsp;&nbsp;</a></li></ul></div><div class="keys" style="display:none" title="/-/geruechte/wettbewerb/GB1"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+</div>            </div>
+        </div>
+    </div>
+            <div class="large-4 columns">
+            <div class="ad-placement-note ad-placement-background werbung werbung-rectangle1"  data-ad-placement-note="Advertisement">
+  <div id="d_side_1" style="min-width: 336px; min-height: 280px;">
+  </div>
+</div>
+<tm-latest-transfers 
+    link-mode="transfers" 
+    size="small" 
+    widget-title="Latest transfers"
+    competition-id="GB1"
+    >
+</tm-latest-transfers><div class="content-box-headline ">
+Table Premier League</div>
+<div id="yw2" class="grid-view">
+<div class="summary"></div>
+<table class="items">
+<thead>
+<tr>
+<th class="rechts" id="yw2_c0">#</th><th colspan="2" id="yw2_c1">Club</th><th class="zentriert" id="yw2_c2"><span class="icons_sprite icon-einsaetze-table-header" title="Matches">&nbsp;</span></th><th class="zentriert" id="yw2_c3">+/-</th><th class="zentriert" id="yw2_c4">Pts</th></tr>
+</thead>
+<tbody>
+<tr>
+<td class="rechts hauptlink" style='background-color: #afd179'>1 <span title="previous week 1.place" class="icons_sprite grey-block-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Arsenal FC" href="/fc-arsenal/spielplan/verein/11/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/11.png?lm=1789459167" title="Arsenal FC" alt="Arsenal FC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Arsenal FC" href="/fc-arsenal/spielplan/verein/11/saison_id/2026">Arsenal</a><a href="#"><img src="https://img.a.transfermarkt.technology/erfolge/mini/12.png?lm=1791356700" title="English Champion 2026" alt="English Champion 2026" class="tabelle-erfolg" /></a>
+        </td><td class="zentriert">10</td><td class="zentriert">10</td><td class="zentriert">27</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #c3dc9a'>2 <span title="previous week 3.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Brighton &amp; Hove Albion" href="/brighton-amp-hove-albion/spielplan/verein/1237/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/1237.png?lm=1789459242" title="Brighton & Hove Albion" alt="Brighton & Hove Albion" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Brighton &amp; Hove Albion" href="/brighton-amp-hove-albion/spielplan/verein/1237/saison_id/2026">Brighton</a>
+        </td><td class="zentriert">10</td><td class="zentriert">19</td><td class="zentriert">22</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #c3dc9a'>3 <span title="previous week 2.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Manchester City" href="/manchester-city/spielplan/verein/281/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/281.png?lm=1789459183" title="Manchester City" alt="Manchester City" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Manchester City" href="/manchester-city/spielplan/verein/281/saison_id/2026">Man City</a><a href="#"><img src="https://img.a.transfermarkt.technology/erfolge/mini/29.png?lm=1791356700" title="FA Cup Winner 2026" alt="FA Cup Winner 2026" class="tabelle-erfolg" /></a>
+        </td><td class="zentriert">10</td><td class="zentriert">8</td><td class="zentriert">21</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #c3dc9a'>4 <span title="previous week 5.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Liverpool FC" href="/fc-liverpool/spielplan/verein/31/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/31.png?lm=1789459168" title="Liverpool FC" alt="Liverpool FC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Liverpool FC" href="/fc-liverpool/spielplan/verein/31/saison_id/2026">Liverpool</a>
+        </td><td class="zentriert">10</td><td class="zentriert">4</td><td class="zentriert">18</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #bdd9ef'>5 <span title="previous week 4.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Chelsea FC" href="/fc-chelsea/spielplan/verein/631/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/631.png?lm=1789459205" title="Chelsea FC" alt="Chelsea FC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Chelsea FC" href="/fc-chelsea/spielplan/verein/631/saison_id/2026">Chelsea</a>
+        </td><td class="zentriert">10</td><td class="zentriert">3</td><td class="zentriert">16</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #bdd9ef'>6 <span title="previous week 7.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Everton FC" href="/fc-everton/spielplan/verein/29/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/29.png?lm=1789459168" title="Everton FC" alt="Everton FC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Everton FC" href="/fc-everton/spielplan/verein/29/saison_id/2026">Everton</a>
+        </td><td class="zentriert">10</td><td class="zentriert">2</td><td class="zentriert">16</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #fee492'>7 <span title="previous week 8.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="AFC Bournemouth" href="/afc-bournemouth/spielplan/verein/989/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/989.png?lm=1791205195" title="AFC Bournemouth" alt="AFC Bournemouth" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="AFC Bournemouth" href="/afc-bournemouth/spielplan/verein/989/saison_id/2026">Bournemouth</a>
+        </td><td class="zentriert">10</td><td class="zentriert">2</td><td class="zentriert">15</td></tr>
+<tr>
+<td class="rechts hauptlink">8 <span title="previous week 6.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Brentford FC" href="/fc-brentford/spielplan/verein/1148/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/1148.png?lm=1789466435" title="Brentford FC" alt="Brentford FC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Brentford FC" href="/fc-brentford/spielplan/verein/1148/saison_id/2026">Brentford</a>
+        </td><td class="zentriert">10</td><td class="zentriert">5</td><td class="zentriert">14</td></tr>
+<tr>
+<td class="rechts hauptlink">9 <span title="previous week 12.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Leeds United" href="/leeds-united/spielplan/verein/399/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/399.png?lm=1789459190" title="Leeds United" alt="Leeds United" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Leeds United" href="/leeds-united/spielplan/verein/399/saison_id/2026">Leeds</a>
+        </td><td class="zentriert">10</td><td class="zentriert">2</td><td class="zentriert">14</td></tr>
+<tr>
+<td class="rechts hauptlink">10 <span title="previous week 10.place" class="icons_sprite grey-block-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Aston Villa" href="/aston-villa/spielplan/verein/405/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/405.png?lm=1789459190" title="Aston Villa" alt="Aston Villa" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Aston Villa" href="/aston-villa/spielplan/verein/405/saison_id/2026">Aston Villa</a><a href="#"><img src="https://img.a.transfermarkt.technology/erfolge/mini/264.png?lm=1791356618" title="Europa League Winner 2026" alt="Europa League Winner 2026" class="tabelle-erfolg" /></a>
+        </td><td class="zentriert">10</td><td class="zentriert">-3</td><td class="zentriert">13</td></tr>
+<tr>
+<td class="rechts hauptlink">11 <span title="previous week 9.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Tottenham Hotspur" href="/tottenham-hotspur/spielplan/verein/148/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/148.png?lm=1789459175" title="Tottenham Hotspur" alt="Tottenham Hotspur" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Tottenham Hotspur" href="/tottenham-hotspur/spielplan/verein/148/saison_id/2026">Tottenham</a>
+        </td><td class="zentriert">10</td><td class="zentriert">-1</td><td class="zentriert">12</td></tr>
+<tr>
+<td class="rechts hauptlink">12 <span title="previous week 13.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Newcastle United" href="/newcastle-united/spielplan/verein/762/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/762.png?lm=1790843083" title="Newcastle United" alt="Newcastle United" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Newcastle United" href="/newcastle-united/spielplan/verein/762/saison_id/2026">Newcastle</a>
+        </td><td class="zentriert">10</td><td class="zentriert">-3</td><td class="zentriert">12</td></tr>
+<tr>
+<td class="rechts hauptlink">13 <span title="previous week 11.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Hull City" href="/hull-city/spielplan/verein/3008/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/3008.png?lm=1789459328" title="Hull City" alt="Hull City" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Hull City" href="/hull-city/spielplan/verein/3008/saison_id/2026">Hull City</a><span title="Promoted to 1st league 2026" class="icons_sprite icon-aufsteiger">&nbsp;</span>
+        </td><td class="zentriert">10</td><td class="zentriert">0</td><td class="zentriert">11</td></tr>
+<tr>
+<td class="rechts hauptlink">14 <span title="previous week 14.place" class="icons_sprite grey-block-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Ipswich Town" href="/ipswich-town/spielplan/verein/677/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/677.png?lm=1789459206" title="Ipswich Town" alt="Ipswich Town" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Ipswich Town" href="/ipswich-town/spielplan/verein/677/saison_id/2026">Ipswich</a><span title="Promoted to 1st league 2026" class="icons_sprite icon-aufsteiger">&nbsp;</span>
+        </td><td class="zentriert">10</td><td class="zentriert">-5</td><td class="zentriert">11</td></tr>
+<tr>
+<td class="rechts hauptlink">15 <span title="previous week 15.place" class="icons_sprite grey-block-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Fulham FC" href="/fc-fulham/spielplan/verein/931/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/931.png?lm=1789459221" title="Fulham FC" alt="Fulham FC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Fulham FC" href="/fc-fulham/spielplan/verein/931/saison_id/2026">Fulham</a>
+        </td><td class="zentriert">10</td><td class="zentriert">-2</td><td class="zentriert">10</td></tr>
+<tr>
+<td class="rechts hauptlink">16 <span title="previous week 19.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Nottingham Forest" href="/nottingham-forest/spielplan/verein/703/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/703.png?lm=1789459206" title="Nottingham Forest" alt="Nottingham Forest" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Nottingham Forest" href="/nottingham-forest/spielplan/verein/703/saison_id/2026">Nott'm Forest</a>
+        </td><td class="zentriert">10</td><td class="zentriert">-4</td><td class="zentriert">9</td></tr>
+<tr>
+<td class="rechts hauptlink">17 <span title="previous week 16.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Coventry City" href="/coventry-city/spielplan/verein/990/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/990.png?lm=1789459227" title="Coventry City" alt="Coventry City" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Coventry City" href="/coventry-city/spielplan/verein/990/saison_id/2026">Coventry</a><span title="Promoted to 1st league 2026" class="icons_sprite icon-aufsteiger">&nbsp;</span><a href="#"><img src="https://img.a.transfermarkt.technology/erfolge/mini/869.png?lm=1791356701" title="English 2nd tier champion 2026" alt="English 2nd tier champion 2026" class="tabelle-erfolg" /></a>
+        </td><td class="zentriert">10</td><td class="zentriert">-9</td><td class="zentriert">9</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #f8a7a3'>18 <span title="previous week 17.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Manchester United" href="/manchester-united/spielplan/verein/985/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/985.png?lm=1789459227" title="Manchester United" alt="Manchester United" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Manchester United" href="/manchester-united/spielplan/verein/985/saison_id/2026">Man United</a>
+        </td><td class="zentriert">10</td><td class="zentriert">-5</td><td class="zentriert">8</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #f8a7a3'>19 <span title="previous week 20.place" class="icons_sprite green-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Sunderland AFC" href="/afc-sunderland/spielplan/verein/289/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/289.png?lm=1789459183" title="Sunderland AFC" alt="Sunderland AFC" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Sunderland AFC" href="/afc-sunderland/spielplan/verein/289/saison_id/2026">Sunderland</a>
+        </td><td class="zentriert">10</td><td class="zentriert">-9</td><td class="zentriert">8</td></tr>
+<tr>
+<td class="rechts hauptlink" style='background-color: #f8a7a3'>20 <span title="previous week 18.place" class="icons_sprite red-arrow-ten">&nbsp;</span></td><td class="zentriert no-border-rechts"><a title="Crystal Palace" href="/crystal-palace/spielplan/verein/873/saison_id/2026"><img src="https://img.a.transfermarkt.technology/wappen/small/873.png?lm=1789459219" title="Crystal Palace" alt="Crystal Palace" class="" /></a></td>
+        <td class="no-border-links hauptlink">
+            <a title="Crystal Palace" href="/crystal-palace/spielplan/verein/873/saison_id/2026">Crystal Palace</a><a href="#"><img src="https://img.a.transfermarkt.technology/erfolge/mini/856.png?lm=1791356626" title="Conference League winner 2026" alt="Conference League winner 2026" class="tabelle-erfolg" /></a>
+        </td><td class="zentriert">10</td><td class="zentriert">-14</td><td class="zentriert">7</td></tr>
+</tbody>
+</table>
+<div class="keys" style="display:none" title="/-/geruechte/wettbewerb/GB1"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span><span>11</span><span>12</span><span>13</span><span>14</span><span>15</span><span>16</span><span>17</span><span>18</span><span>19</span></div>
+</div><div class="table-footer">
+    <a title="To complete table" href="/premier-league/tabelle/wettbewerb/GB1/saison_id/2026">To complete table</a></div>
+<div class="ad-placement-note ad-placement-background werbung werbung-rectangle2"  data-ad-placement-note="Advertisement">
+  <div id="d_side_2" style="min-width: 336px; min-height: 280px;">
+  </div>
+</div>
+        </div>
+    </div>
+<div class="ad-placement-note ad-placement-background werbung werbung-fullsize_contentad"  data-ad-placement-note="Advertisement">
+  <div id="d_bottom_1" style="min-width: 1024px; min-height: 250px;">
+  </div>
+</div>
+        </main>
+        <footer class="tm-footer">
+               <section class="tm-footer__section-quick-links">
+        <strong class="tm-footer__headline tm-footer__headline--large">
+            Quick Links        </strong>
+        <div class="tm-footer__link-wrapper">
+            <a href="/spieler-statistik/wertvollstespieler/marktwertetop"
+               onclick="tmEvent('footer', 'quick_links', '/spieler-statistik/wertvollstespieler')"
+               class="tm-footer__link tm-footer__link--arrow"
+            >
+                Most valuable players in the world            </a>
+            <a href="/statistik/neuestetransfers"
+                onclick="tmEvent('footer', 'quick_links', '/statistik/neuestetransfers')"
+               class="tm-footer__link tm-footer__link--arrow"
+            >
+                Latest transfers            </a>
+            <a href="/geruechte/aktuellegeruechte/statistik"
+                onclick="tmEvent('footer', 'quick_links', '/statistik/aktuellegeruechte')"
+               class="tm-footer__link tm-footer__link--arrow"
+            >
+                Latest rumours            </a>
+            <a href="/spieler-statistik/marktwertaenderungen/marktwertetop"
+                onclick="tmEvent('footer', 'quick_links', '/spieler-statistik/marktwertaenderungen/marktwertetop')"
+               class="tm-footer__link tm-footer__link--arrow"
+            >
+                Latest market value updates            </a>
+            <a href="/statistik/weltrangliste"
+                onclick="tmEvent('footer', 'quick_links', '/statistik/weltrangliste')"
+               class="tm-footer__link tm-footer__link--arrow"
+            >
+                FIFA World ranking            </a>
+                        <a href="/betting/sites/"
+                onclick="tmEvent('footer', 'quick_links', '/betting/sites/')"
+               class="tm-footer__link tm-footer__link--arrow"
+            >
+                Best betting sites            </a>
+                    </div>
+    </section>
+                <section class="tm-footer__section-involved">
+            <strong class="tm-footer__headline tm-footer__headline--large">
+                Be Involved            </strong>
+            <div class="tm-footer__link-wrapper">
+                <a href="/intern/paten"
+                    onclick="tmEvent('footer', 'be_involved', 'mods_data_scouts')"
+                   class="tm-footer__link tm-footer__link--arrow"
+                >
+                    Mods & Data Scouts                </a>
+                <a href="/profil/bewerbung"
+                    onclick="tmEvent('footer', 'be_involved', 'apply_mod_datascout')"
+                   class="tm-footer__link tm-footer__link--arrow"
+                >
+                    Apply as Mod or Datascout                </a>
+                <a href="/intern/elfGebote"
+                    onclick="tmEvent('footer', 'be_involved', '11_commandments')"
+                   class="tm-footer__link tm-footer__link--arrow"
+                >
+                    11 commandments                </a>
+                <a href="/intern/fehlermelden"
+                    onclick="tmEvent('footer', 'be_involved', 'found_mistake')"
+                   class="tm-footer__link tm-footer__link--arrow"
+                >
+                    Found a mistake?                </a>
+            </div>
+        </section>
+        <section class="tm-footer__section-career">
+            <strong class="tm-footer__headline tm-footer__headline--large">
+                Career            </strong>
+            <div class="tm-footer__link-wrapper">
+                                <a href="/intern/tmteam"
+                   class="tm-footer__link tm-footer__link--arrow"
+                   onclick="tmEvent('footer', 'career', 'contact')"
+                >
+                    Contact                </a>
+            </div>
+        </section>
+        <section class="tm-footer__section-about">
+            <strong class="tm-footer__headline tm-footer__headline--large">
+                About Us            </strong>
+            <div class="tm-footer__link-wrapper">
+                <a href="/intern/tmteam"
+                   onclick="tmEvent('footer', 'about_us', 'tm_team')"
+                   class="tm-footer__link tm-footer__link--arrow"
+                >
+                    TM-Team                </a>
+                <a href="/intern/faq"
+                   onclick="tmEvent('footer', 'about_us', 'faq')"
+                   class="tm-footer__link tm-footer__link--arrow"
+                >
+                    FAQ                </a>
+            </div>
+        </section>
+            <section class="tm-footer__section-social">
+        <strong class="tm-footer__headline
+            ">
+            Social media        </strong>
+        <div class="tm-footer__social-wrapper">
+                        <a href="https://www.instagram.com/transfermarkt_official/"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'instagram')"
+                >
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/instaRebrush.svg"
+                         alt="instagram"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://www.facebook.com/transfermarkt.global"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'facebook')">
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/fbRebrush.svg"
+                         alt="facebook"
+                         width="25"
+                         height="25"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://www.whatsapp.com/channel/0029Va6Kevx47XeF0gE99J35"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'whatsapp')"
+                >
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/whatsappRebrush.svg"
+                         alt="whatsapp"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://twitter.com/TMuk_news"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'x')">
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/twitter_rebrush.svg"
+                         alt="x"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://www.threads.net/@transfermarkt_official"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'threads')"
+                >
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/threadsRebrush.svg"
+                         alt="threads"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://www.tiktok.com/@transfermarkt"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'tiktok')"
+                >
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/tiktokRebrush.svg"
+                         alt="tiktok"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://www.youtube.com/@TransfermarktEnglish"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'youtube')"
+                >
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/RebrushYoutube.svg"
+                         alt="youtube"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                <a href="https://t.me/transfermarkt_off"
+                   target="_blank"
+                   class="tm-footer__link-social"
+                   onclick="tmEvent('footer', 'social_media', 'telegram')"
+                >
+                    <img src="https://tmsi.akamaized.net/icons/socialMedia/telegramRebrush.svg"
+                         alt="telegram"
+                         width="28"
+                         height="28"
+                         class="tm-footer__icon-social"
+                    >
+                </a>
+                        </div>
+    </section>
+                </footer>
+                <div id="menue_overlay"></div>
+    </div>
+    <section class="tm-footer__mobile tm-footer__transfermarkt-info">
+        <section class="tm-footer__section-desktop-width">
+                            <section class="tm-footer__section-company-links">
+                    <span class="tm-footer__headline tm-footer__headline--medium">
+                        Transfermarkt Company Projects                    </span>
+                    <div class="tm-footer__project-wrapper">
+                        <a href="/wahretabelle"
+                           onclick="tmEvent('footer', 'projects', 'wahretabelle')"
+                           class="tm-footer__link"
+                        >
+                            Wahretabelle                        </a>
+                        <a href="https://www.soccerdonna.de/"
+                           onclick="tmEvent('footer', 'projects', 'soccerdonna')"
+                           class="tm-footer__link"
+                        >
+                            Soccerdonna.de                        </a>
+                        <a href="https://scoutastic.com/de/"
+                           onclick="tmEvent('footer', 'projects', 'scoutastic')"
+                           class="tm-footer__link"
+                        >
+                            Scoutastic.com                        </a>
+                    </div>
+                </section>
+                        <section class="tm-footer__section-company-infos">
+                <span class="tm-footer__headline tm-footer__headline--medium">&copy; Transfermarkt <span id="currentYear">2026</span></span>
+                <div class="tm-footer__company-wrapper">
+                    <a
+                    href="/intern/impressum"
+                    class="tm-footer__link tm-footer__link--blue"
+                    onclick="tmEvent('footer', 'officials', 'impressum')"
+                    >
+                        Legal notice                    </a>
+                    <a
+                        href="/intern/web/datenschutz"
+                        class="tm-footer__link tm-footer__link--blue"
+                        onclick="tmEvent('footer', 'officials', 'data_protection')"
+                        >
+                        Data protection                    </a>
+                    <a
+                        href="javascript:void(0)"
+                        class="cmp-link tm-footer__link tm-footer__link--blue"
+                        onclick="tmEvent('footer', 'officials', 'privacy')"
+                    >
+                        Privacy                    </a>
+                    <a
+                        href="javascript:void(0)"
+                        class="revoke-tracking tm-footer__link tm-footer__link--blue"
+                        onclick="tmEvent('footer', 'officials', 'tracking_revocation')"
+                    >
+                        Revoke Tracking                    </a>
+                    <a
+                        href="/intern/anb"
+                        class="tm-footer__link tm-footer__link--blue"
+                        onclick="tmEvent('footer', 'officials', 'general_conduct_of_use')"
+                        >
+                        Site policy                    </a>
+                                                <a
+                                href="https://tmsi.akamaized.net/media-kit/TM_Pitchdeck_WC26_Sales_final_ENG.pdf"
+                                target="_blank"
+                                class="tm-footer__link tm-footer__link--blue"
+                                onclick="tmEvent('footer', 'officials', 'media-kit')"
+                                >
+                                Media Kit                            </a>
+                                    </div>
+            </section>
+        </section>
+    </section>
+    <script type="text/javascript">
+	if(typeof(adet) == "boolean" && adet == false){
+		img_src="/static/singlepictures/jk99hhfsdh209nbnkjldgh90sghfsdlk";
+	} else {
+		img_src="/static/singlepictures/jku90whjlkjbwbta1g4b8h89fh8sgh8d";
+	}
+	var elem = document.createElement("img");
+	document.body.appendChild(elem);
+	elem.src = img_src;
+</script>
+
+            <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                var cnt = document.querySelectorAll('div.large-4.columns').length;
+                if (cnt == 1) {
+                    var sidebarDiv = document.querySelector('div.large-4.columns');
+                    if (sidebarDiv !== null) {
+                        var sidebar = document.getElementById('werbung_recommender_sidebar_wrapper');
+                        sidebarDiv.appendChild(sidebar);
+                        sidebar.style.display = 'block';
+                    }
+                }
+            });
+        </script>
+        <div id="werbung_recommender_sidebar_wrapper" style="display: none;">
+                    </div>
+    <tm-consent type="adition" no-checkbox embed="PHNjcmlwdCBzcmM9Imh0dHBzOi8vY3JlYXRpdmUtY2RuLm9kZHNzZXJ2ZS5jb20vbG9hZGVyLmpzP3B1Ymxpc2hlcj10bSIgYXN5bmM9ImFzeW5jIj48L3NjcmlwdD4="></tm-consent><tm-consent type='adrenalead' no-checkbox embed='PHNjcmlwdCB0eXBlPSd0ZXh0L2phdmFzY3JpcHQnPgogICAgICAgICAgICB3aW5kb3cuX25BZHpxPXdpbmRvdy5fbkFkenF8fFtdOyhmdW5jdGlvbigpewogICAgICAgICAgICB3aW5kb3cuX25BZHpxLnB1c2goWydzZXRJZHMnLCdkNWE0YzFhNzU4Njc4YTUxJ10pOwogICAgICAgICAgICB2YXIgZT0naHR0cHM6Ly9ub3RpZnB1c2guY29tL3NjcmlwdHMvJzsKICAgICAgICAgICAgdmFyIHQ9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgnc2NyaXB0Jyk7CiAgICAgICAgICAgIHQudHlwZT0ndGV4dC9qYXZhc2NyaXB0JzsKICAgICAgICAgICAgdC5kZWZlcj10cnVlOwogICAgICAgICAgICB0LmFzeW5jPXRydWU7CiAgICAgICAgICAgIHQuc3JjPWUrJ25hZHotc2RrLmpzJzsKICAgICAgICAgICAgdmFyIHM9ZG9jdW1lbnQuZ2V0RWxlbWVudHNCeVRhZ05hbWUoJ3NjcmlwdCcpWzBdOwogICAgICAgICAgICBzLnBhcmVudE5vZGUuaW5zZXJ0QmVmb3JlKHQscyl9KSgpOwogICAgICAgIDwvc2NyaXB0Pg=='></tm-consent>    
+        <tm-modal id="tm-modal-revoke-tracking" additionalClose="Close">
+        <div class="tm-modal__headline">Revoke Tracking</div>
+        <p class="tm-modal__text">Sie haben erfolgreich Ihre Einwilligung in die Nutzung von Transfermarkt mit Tracking und Cookies widerrufen. Sie können sich jetzt zwischen dem Contentpass-Abo und der Nutzung mit personalisierter Werbung, Cookies und Tracking entscheiden.</p>
+    </tm-modal>
+        
+
+<tm-consent type="googleadvertising" no-checkbox embed="PHNjcmlwdCAgc3JjPSJodHRwczovL3NlY3VyZXB1YmFkcy5nLmRvdWJsZWNsaWNrLm5ldC90YWcvanMvZ3B0LmpzIiBhc3luYz0iYXN5bmMiPjwvc2NyaXB0Pg=="></tm-consent>
+<tm-consent type="googleadvertising" no-checkbox embed="PHNjcmlwdCAgc3JjPSJodHRwczovL3Rtc2kuYWthbWFpemVkLm5ldC9qYXZhc2NyaXB0L3ByZWJpZC0xMS40Ni4wLmpzIiBhc3luYz0iYXN5bmMiPjwvc2NyaXB0Pg=="></tm-consent>
+<tm-consent type="googleadvertising" no-checkbox embed="PHNjcmlwdCAgc3JjPSJodHRwczovL3Rtc2kuYWthbWFpemVkLm5ldC9qcy9hZC1zZXR1cC9wcmViaWQvc2NyaXB0cy9jb20uanMiIGFzeW5jPSJhc3luYyI+PC9zY3JpcHQ+"></tm-consent>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/subnavigation/bundle.js"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/assets/aa69c6e9c51f1e811847082c63633956/gridview/jquery.yiigridview.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/latest-transfers/bundle.js"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/custom/tm-cross-domain-link.min.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/custom/vendors.min.js?lm=1795172459"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/domain-switcher/bundle.js"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/quick-select-bar/bundle.js"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/userbox/bundle.js"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/live-match-count/bundle.js"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/modal/bundle.js"></script>
+<script type="text/javascript" src="https://tmsi.akamaized.net/js/svelte-components/hint/bundle.js"></script>
+<script type="text/javascript" src="https://tmssl.akamaized.net/js/custom/tm-skyscraper.min.js?lm=1795172459"></script>
+<script type="text/javascript">
+/*<![CDATA[*/
+	var loginUrl='/profil/login';
+	var onlyDE = '';
+	var onlyMobile = '';
+	var onlyTablet = '';
+	var getUserID = '';
+
+jQuery(function($) {
+jQuery('#yw1').yiiGridView({'ajaxUpdate':['yw1'],'ajaxVar':'ajax','pagerClass':'pager','loadingClass':'grid\x2Dview\x2Dloading','filterClass':'filters','tableClass':'items','selectableRows':1,'enableHistory':false,'updateSelector':'\x7Bpage\x7D,\x20\x7Bsort\x7D','filterSelector':'\x7Bfilter\x7D','pageVar':'page'});
+jQuery('#yw2').yiiGridView({'ajaxUpdate':['yw2'],'ajaxVar':'ajax','pagerClass':'pager','loadingClass':'grid\x2Dview\x2Dloading','filterClass':'filters','tableClass':'items','selectableRows':1,'enableHistory':false,'updateSelector':'\x7Bpage\x7D,\x20\x7Bsort\x7D','filterSelector':'\x7Bfilter\x7D'});
+});
+/*]]>*/
+</script>
+</body>
+
+</html>
