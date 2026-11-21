@@ -1,9 +1,9 @@
 {
-  "policy_version": 7,
+  "policy_version": 8,
   "dag_id": "dag_ingest_transfermarkt",
   "approved_by": "sergeykuznetsov1995",
-  "approved_at": "2026-11-20T00:00:00Z",
-  "expires_at": "2027-11-20T00:00:00Z",
+  "approved_at": "2026-11-20T17:18:44Z",
+  "expires_at": "2027-11-20T17:18:44Z",
   "paid_proxy": {
     "byte_cap_bytes": 25165824,
     "request_limit": 1900,
@@ -17,6 +17,8 @@
     "concurrency": 1
   },
   "allowed_write_tables": [
+    "iceberg.bronze.transfermarkt_rumour_observations",
+    "iceberg.ops.transfermarkt_rumour_receipts_v1",
     "iceberg.bronze.transfermarkt_coach_profiles",
     "iceberg.bronze.transfermarkt_coach_stints",
     "iceberg.bronze.transfermarkt_coaches",
