@@ -2,15 +2,13 @@
 
 import hashlib
 import json
-from dataclasses import FrozenInstanceError
-
-import pytest
-
 import re
+from dataclasses import FrozenInstanceError
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import pytest
 from bs4 import BeautifulSoup
 
 from scrapers.transfermarkt import rumours as rumour_v2
@@ -25,6 +23,152 @@ from scrapers.transfermarkt.rumours import (
     parse_rumours,
 )
 
+
+_OBSERVED_EMPTY_GRID_2293 = (
+    '<div id="yw1"><span class="empty">No information available.</span>'
+    '<div class="keys"></div></div>'
+)
+_CURRENT_LISTING_2293 = "https://www.transfermarkt.com/-/geruechte/wettbewerb/GB1"
+
+
+def _layout_pagination_2293(html, page_url=None):
+    from scrapers.transfermarkt.rumours import parse_rumour_pagination
+
+    return parse_rumour_pagination(html, competition=_GB1, page_url=page_url)
+
+
+def _table_grid_2293(pager=""):
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(_GRID_TABLE, "html.parser")
+    rumours_table = soup.select_one("table.items")
+    assert rumours_table is not None
+    return f'<div id="yw1">{rumours_table}{pager}</div>'
+
+
+def _terminal_pager_2293(numbers, *, next_page=None):
+    anchors = []
+    for number in numbers:
+        active = " tm-pagination__list-item--active" if number == 5 else ""
+        anchors.append(
+            f'<li class="tm-pagination__list-item{active}">'
+            f'<a class="tm-pagination__link" href="{_CURRENT_LISTING_2293}/page/{number}">'
+            f'{number}</a></li>'
+        )
+    for role, number in (("first", 1), ("previous", 4), ("next", next_page)):
+        if number is not None:
+            anchors.append(
+                f'<li class="tm-pagination__list-item--icon-{role}-page">'
+                f'<a class="tm-pagination__link" href="{_CURRENT_LISTING_2293}/page/{number}">'
+                f'{role}</a></li>'
+            )
+    return '<div class="pager"><ul>' + "".join(anchors) + '</ul></div>'
+
+
+def test_observed_empty_grid_capture_2293():
+    capture = parse(_OBSERVED_EMPTY_GRID_2293)
+    assert capture.status == "observed_empty"
+    assert capture.observations == ()
+    assert capture.duplicate_count == 0
+    assert capture.parser_version == "transfermarkt-rumours/2"
+    assert capture.schema_version == "transfer_rumour_assertion/2"
+    assert capture.competition == rumour_v2.CompetitionContext(
+        CONTEXT.id, CONTEXT.name, "https://www.transfermarkt.com/example/startseite/wettbewerb/GB1"
+    )
+    assert capture.observed_at == UTC_CLOCK
+
+
+def test_observed_empty_grid_pagination_2293():
+    from scrapers.transfermarkt.rumours import RumourPagination
+
+    canonical = _CURRENT_LISTING_2293
+    expected = RumourPagination(1, 1, ((1, canonical),))
+    assert _layout_pagination_2293(_OBSERVED_EMPTY_GRID_2293) == expected
+    assert _layout_pagination_2293(_OBSERVED_EMPTY_GRID_2293, canonical) == expected
+    assert _layout_pagination_2293(_OBSERVED_EMPTY_GRID_2293, canonical + "/page/1") == expected
+
+
+@pytest.mark.parametrize("html", [
+    _OBSERVED_EMPTY_GRID_2293.replace("No information available.", "No information available"),
+    _OBSERVED_EMPTY_GRID_2293.replace('class="empty"', 'class="unknown"'),
+    _OBSERVED_EMPTY_GRID_2293.replace("No information available.", ""),
+    _OBSERVED_EMPTY_GRID_2293.replace("No information available.", "<b>No information available.</b>"),
+    _OBSERVED_EMPTY_GRID_2293.replace('<div class="keys"></div>', '<div class="keys">unexpected</div>'),
+    _OBSERVED_EMPTY_GRID_2293.replace('<div class="keys"></div>', '<div class="keys"><i></i></div>'),
+    _OBSERVED_EMPTY_GRID_2293.replace('<div class="keys"></div>', '<a href="/challenge">continue</a>'),
+    _OBSERVED_EMPTY_GRID_2293.replace('<div class="keys"></div>', '<div class="pager"></div>'),
+    _OBSERVED_EMPTY_GRID_2293.replace('<div class="keys"></div>', '<p>unexpected</p>'),
+    _OBSERVED_EMPTY_GRID_2293 + _OBSERVED_EMPTY_GRID_2293,
+    '<div id="yw1"></div>',
+    '<div><span class="empty">No information available.</span><div class="keys"></div></div>',
+])
+def test_broken_empty_grid_remains_error_2293(html):
+    from scrapers.transfermarkt.rumours import RumourParseError
+
+    with pytest.raises(RumourParseError):
+        parse(html)
+    with pytest.raises(RumourParseError):
+        _layout_pagination_2293(html)
+
+
+def test_nonempty_table_without_pager_2293():
+    from scrapers.transfermarkt.rumours import RumourPagination
+
+    html = _table_grid_2293()
+    assert parse(html).observations
+    canonical = _CURRENT_LISTING_2293
+    assert _layout_pagination_2293(html, canonical) == RumourPagination(1, 1, ((1, canonical),))
+
+
+@pytest.mark.parametrize("empty", [True, False])
+def test_no_pager_rejects_second_page_2293(empty):
+    from scrapers.transfermarkt.rumours import RumourParseError
+
+    html = _OBSERVED_EMPTY_GRID_2293 if empty else _table_grid_2293()
+    url = _CURRENT_LISTING_2293 + "/page/2"
+    with pytest.raises(RumourParseError, match="invalid_page_navigation"):
+        _layout_pagination_2293(html, url)
+
+
+def test_terminal_pager_without_last_2293():
+    from scrapers.transfermarkt.rumours import RumourPagination
+
+    html = _table_grid_2293(_terminal_pager_2293(range(1, 6)))
+    expected_links = tuple(
+        (number, f"{_CURRENT_LISTING_2293}/page/{number}") for number in range(1, 6)
+    )
+    assert _layout_pagination_2293(
+        html, f"{_CURRENT_LISTING_2293}/page/5"
+    ) == RumourPagination(5, 5, expected_links)
+
+
+@pytest.mark.parametrize("numbers,next_page", [
+    ([1, 2, 4, 5], None),
+    ([1, 2, 3, 5], None),
+    ([1, 2, 3, 4, 5], 6),
+    ([1, 2, 3, 4, 5, 6], None),
+])
+def test_missing_last_requires_contiguous_terminal_links_2293(numbers, next_page):
+    from scrapers.transfermarkt.rumours import RumourParseError
+
+    html = _table_grid_2293(_terminal_pager_2293(numbers, next_page=next_page))
+    with pytest.raises(RumourParseError, match="invalid_pager"):
+        _layout_pagination_2293(html)
+
+
+def test_legacy_table_without_grid_or_pager_remains_invalid_2293():
+    from scrapers.transfermarkt.rumours import RumourParseError
+
+    with pytest.raises(RumourParseError, match="invalid_pager"):
+        _layout_pagination_2293(_GRID_TABLE)
+
+
+def test_multiple_pagers_remain_invalid_2293():
+    from scrapers.transfermarkt.rumours import RumourParseError
+
+    pager = _terminal_pager_2293(range(1, 6))
+    with pytest.raises(RumourParseError, match="invalid_pager"):
+        _layout_pagination_2293(_table_grid_2293(pager + pager))
 
 _GB1 = rumour_v2.CompetitionContext("GB1", "Premier League",
                                      "/premier-league/startseite/wettbewerb/GB1")

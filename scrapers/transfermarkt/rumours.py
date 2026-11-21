@@ -33,6 +33,43 @@ OBSERVATION_KEY_FIELDS = (
 )
 ASSERTION_KEY_FIELDS = ("rumour_identity", "subject_id")
 _BASE = "https://www.transfermarkt.com"
+
+
+def _confirmed_empty_grid(soup):
+    """Recognize only the observed, table-free empty rumours grid."""
+    grids = soup.select("#yw1")
+    if len(grids) != 1:
+        return False
+    grid = grids[0]
+    if grid.select("table, .pager, a, link"):
+        return False
+    markers = []
+    keys = []
+    for child in grid.children:
+        if getattr(child, "name", None) is None:
+            if str(child).strip():
+                return False
+            continue
+        if child.name == "span" and child.get("class", []) == ["empty"]:
+            if child.find(True) is not None or _text(child) != "No information available.":
+                return False
+            markers.append(child)
+        elif child.name == "div" and child.get("class", []) == ["keys"]:
+            if child.contents:
+                return False
+            keys.append(child)
+        else:
+            return False
+    return len(markers) == 1 and len(keys) == 1
+
+
+def _single_rumour_page(context, page_url):
+    listing = f"/-/geruechte/wettbewerb/{context.id}"
+    if page_url is not None:
+        requested, _, path = _page_ref(page_url, context.id)
+        if requested != 1 or path != listing:
+            raise RumourParseError("invalid_page_navigation")
+    return RumourPagination(1, 1, ((1, _BASE + listing),))
 _HOSTS = {"transfermarkt.com", "www.transfermarkt.com",
           "transfermarkt.de", "www.transfermarkt.de",
           "transfermarkt.co.uk", "www.transfermarkt.co.uk"}
@@ -459,15 +496,22 @@ def parse_rumour_pagination(
     """Read the numbered targets and navigation controls from one saved grid."""
     context = _competition(competition)
     soup = _soup(html)
+    if _confirmed_empty_grid(soup):
+        return _single_rumour_page(context, page_url)
     table = _rumour_table(soup)
     _table_layout(table)
     grid = table.find_parent(id="yw1")
     pagers = (grid if grid is not None else soup).select(".pager")
+    if not pagers:
+        if grid is None:
+            raise RumourParseError("invalid_pager")
+        return _single_rumour_page(context, page_url)
     if len(pagers) != 1:
         raise RumourParseError("invalid_pager")
     controls = {}
     links = {}
     listing = None
+    numbered_links = set()
     for anchor in pagers[0].select("a.tm-pagination__link"):
         number, url, path = _page_ref(anchor.get("href", ""), context.id)
         if listing is None:
@@ -487,6 +531,8 @@ def parse_rumour_pagination(
         if len(roles) > 1:
             raise RumourParseError("invalid_pager")
         label = _text(anchor)
+        if label == str(number):
+            numbered_links.add(number)
         if not roles or roles == ["current"] or re.fullmatch(r"[0-9]+", label):
             if label != str(number):
                 raise RumourParseError("invalid_page_ref")
@@ -498,6 +544,16 @@ def parse_rumour_pagination(
 
     current = controls.get("current")
     last = controls.get("last")
+    if (
+        last is None
+        and current is not None
+        and links
+        and current == max(links)
+        and "next" not in controls
+        and len(numbered_links) == current
+        and all(number in numbered_links for number in range(1, current + 1))
+    ):
+        last = current
     if current is None or last is None or max(links) > last:
         raise RumourParseError("invalid_pager")
     for role, expected in (("first", 1), ("previous", current - 1), ("next", current + 1)):
@@ -543,6 +599,11 @@ def parse_rumours(
     """
     clock = _clock(observed_at)
     context = _competition(competition)
+    if _confirmed_empty_grid(_soup(html)):
+        return RumourCapture(
+            ENTITY_TYPE, PARSER_VERSION, SCHEMA_VERSION, context, clock,
+            "observed_empty", (), 0,
+        )
     observations = {}
     duplicates = 0
     for index, row in enumerate(_rows(html), 1):

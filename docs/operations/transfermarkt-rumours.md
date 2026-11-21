@@ -428,3 +428,28 @@ Production delivery and the bounded E2E remain outstanding. The E2E must
 demonstrate the production write, receipt readback, DQ and a zero exclusion
 count before scheduled daily enablement. Scheduled collection and three-day
 acceptance are still outstanding.
+### Observed pagination and empty-grid layouts (#2293)
+
+A unique `#yw1` with exactly the `span.empty` marker `No information
+available.` and an empty `div.keys`, without tables, pagination, links, or
+other content, represents `observed_empty`. Its observations are empty and
+its duplicate count is zero. Missing or altered markers and unexpected
+content retain the existing parse errors; absence of a table alone does not
+prove that a listing is empty.
+
+This empty grid and a valid rumours table without a pager represent a single
+page (`current=1`, `last=1`) using the canonical bare listing for the requested
+competition. A supplied page URL must identify that same listing's first
+page; `/page/2` and later pages are rejected. Multiple pagers remain invalid.
+When a pager lacks a last-page control, its current page can be the last page
+only if it is the highest linked page, there is no next-page control, and
+numbered links cover every page from 1 through current without gaps. Existing
+navigation, competition, and conflicting-reference checks still apply.
+
+Verification status for this layout patch: synthetic regression cases cover
+the empty-grid capture and pagination, single-page listings without a pager,
+and terminal pagers without a last control. Astra did not execute tests;
+test execution and independent review remain for the lead after the
+publication gate. This patch supplies no new delivery or E2E evidence and
+does not revise those acceptance statuses. Parser and schema versions remain
+unchanged.
