@@ -95,6 +95,7 @@ def test_paid_task_is_native_only_raw_first_and_uses_dedicated_pool(module):
     assert "--refresh-mode historical" in command
     assert "--standing-policy" in command
     assert "exit 0" in command
+    assert '"${TM_BACKFILL_FINALIZE_ONLY:-false}" != "true"' in command
     assert "trigger" not in command.lower()
 
 

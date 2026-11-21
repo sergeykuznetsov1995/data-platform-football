@@ -53,5 +53,8 @@
 # (SofaScore raw replay). Дописано append-ом: file-bind живёт на иноде.
 ^dag_replay_sofascore_raw\.py$
 
-# v2.9 (21.11.2026, #2288): отдельный paused DAG достижений Transfermarkt.
+# v2.9 (21.11.2026, #2292): новые чужие нематчевые referee DAG Transfermarkt.
+^(dag_backfill_transfermarkt_referees|dag_dq_transfermarkt_referees|dag_ingest_transfermarkt_referees)\.py$
+
+# v2.10 (21.11.2026, #2288): отдельный paused DAG достижений Transfermarkt.
 ^dag_ingest_transfermarkt_achievements\.py$

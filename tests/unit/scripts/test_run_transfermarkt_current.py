@@ -742,6 +742,37 @@ def test_weekly_rechecks_all_squads_without_repeating_careers(offline):
     assert offline.careers == []
 
 
+def test_weekly_current_collects_club_values_when_enabled(offline, monkeypatch):
+    monkeypatch.delenv('TM_REQUIRE_METERED_PROXY', raising=False)
+    monkeypatch.delenv('TM_PROXY_CONTROL_URL', raising=False)
+    calls = []
+
+    def collect(scraper, payload, preflight, *, mode):
+        calls.append((payload, preflight, mode))
+        return {'verified': True, 'mode': mode, 'scope_id': payload['scope_id']}
+
+    monkeypatch.setenv('TM_CLUB_VALUES_ENABLED', 'true')
+    monkeypatch.setattr('dags.scripts.run_transfermarkt_club_values.run_club_values', collect)
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-apply')
+    offline.clock.advance(7 * 24 * 3600 + 1)
+    weekly = offline.run('weekly')
+
+    assert len(calls) == 1, weekly['scopes']
+    payload, preflight, mode = calls[0]
+    assert mode == 'current'
+    assert payload['competition_id'] == 'GB1'
+    assert payload['edition_id'] == '2026'
+    assert payload['source_url'] == 'https://example.test/GB1/2026'
+    assert payload['child_cycle_id']
+    assert payload['resume_cycle_id'] == 'weekly'
+    assert preflight['paid_io_allowed'] is True
+    result = next(item for item in weekly['scopes'] if item['kind'] == 'weekly_roster')
+    assert result['club_values']['verified'] is True
+
+
 def test_weekly_new_player_is_queued_without_career_download_in_weekly_portion(offline):
     offline.run('cold')
     offline.clock.advance(21 * 3600)
