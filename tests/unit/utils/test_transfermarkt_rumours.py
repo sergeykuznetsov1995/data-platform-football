@@ -76,7 +76,9 @@ def policy(monkeypatch, tmp_path):
                  'TM_WRITE_MODE', 'TM_READER_REVISION'):
         monkeypatch.delenv(name, raising=False)
     config = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
-    config['allowed_write_tables'] += [writer.RUMOUR_TABLE, writer.RUMOUR_RECEIPTS_TABLE]
+    for table in (writer.RUMOUR_TABLE, writer.RUMOUR_RECEIPTS_TABLE):
+        if table not in config['allowed_write_tables']:
+            config['allowed_write_tables'].append(table)
     config['expires_at'] = '2999-01-01T00:00:00Z'
     path = tmp_path / 'policy.json'
     path.write_text(json.dumps(config))
