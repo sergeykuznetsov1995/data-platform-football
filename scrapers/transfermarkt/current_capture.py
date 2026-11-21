@@ -347,6 +347,26 @@ def verify_contract_overrides(snapshot, store):
         club = snapshot.clubs[club_id]
         row = next(row for row in club.rows if row['player_id'] == player_id)
         body, raw = store.load_capture(proof['raw_capture_id'])
+        if raw.endpoint == 'current_player_profile':
+            from scrapers.transfermarkt.scraper import (
+                _PLAYER_PROFILE_PATH, _TM_BASE, _parse_player_contract_profile,
+            )
+
+            expected_url = _TM_BASE + _PLAYER_PROFILE_PATH.format(
+                player_slug=row['player_slug'], player_id=player_id,
+            )
+            if (raw.url != expected_url or raw.status_code != 200
+                    or raw.content_hash != proof['source_body_hash'] or raw.url != proof['source_url']
+                    or hashlib.sha256(body).hexdigest() != raw.content_hash
+                    or _timestamp(raw.fetched_at) != _timestamp(proof['fetched_at'])):
+                raise CurrentCaptureError('contract override raw proof differs')
+            profile = _parse_player_contract_profile(body.decode('utf-8'), player_id)
+            if (row['contract_until'] is not None or row.get('_contract_status') not in {'unknown', 'not_rendered'}
+                    or profile is None or profile['contract_status'] != 'ok'
+                    or profile['current_club_id'] != club_id
+                    or profile['contract_until'].isoformat() != proof['contract_until']):
+                raise CurrentCaptureError('contract override does not match player membership/date')
+            continue
         ids = parse_qs(urlsplit(raw.url).query).get('ids[]', [])
         if (raw.endpoint != 'current_players' or raw.url != tmapi.players_url(ids) or raw.status_code != 200
             or raw.content_hash != proof['source_body_hash'] or raw.url != proof['source_url']

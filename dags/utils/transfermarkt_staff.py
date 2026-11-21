@@ -141,7 +141,7 @@ def write_current_staff(scraper, scope, preflight, cycle_id, *, club_id, outcome
                 df=frame, database='bronze', table='transfermarkt_club_staff',
                 merge_keys=list(STAFF_KEY), add_metadata=False, source='transfermarkt',
             )
-            physical = current._read_back(scraper, output, frame, cycle_id)
+            physical = current._read_back(scraper, output, frame, cycle_id, natural_keys=STAFF_KEY)
             _authorize(preflight)
             values = {
                 'club_id': str(club_id), 'observed_day': first['observed_day'],
