@@ -24,7 +24,8 @@ def runtime(monkeypatch):
     pipeline.build_capture_runtime = build
     worker = ModuleType("dags.scripts.replay_sofascore_raw")
     worker._replay_manager = manager
-    worker.list_replay_scope_keys = scopes
+    import scrapers.sofascore.raw_replay as raw_replay_lib
+    monkeypatch.setattr(raw_replay_lib, "list_replay_scope_keys", scopes)
     monkeypatch.setitem(sys.modules, pipeline.__name__, pipeline)
     monkeypatch.setitem(sys.modules, worker.__name__, worker)
     yield SimpleNamespace(build=build, manager=manager, scopes=scopes)

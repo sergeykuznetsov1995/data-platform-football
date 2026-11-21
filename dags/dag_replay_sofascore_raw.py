@@ -88,11 +88,9 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
             source_season_id.strip(),
         )
 
-    from dags.scripts.replay_sofascore_raw import (
-        _replay_manager,
-        list_replay_scope_keys,
-    )
+    from dags.scripts.replay_sofascore_raw import _replay_manager
     from scrapers.sofascore.pipeline import build_capture_runtime
+    from scrapers.sofascore.raw_replay import list_replay_scope_keys
 
     run_id = str(context.get("run_id") or "manual")
     capture_runtime = build_capture_runtime(run_id=run_id, task_id="planner")
