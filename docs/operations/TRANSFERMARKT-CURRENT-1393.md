@@ -58,8 +58,28 @@ Mapped child использует `TransfermarktBashOperator`: окружени�
 не доказывает уход из старого состава: его membership проверяет listing/plus1,
 а tmapi остаётся глобальным сигналом игрока с явным ограничением доказательства.
 Контрактная применимость остаётся прежней. Существующий 28-дневный TTL тренеров
-сохраняется; staff detector #1396
+сохраняется; daily coach-change detector
 сюда не входит.
+
+## Независимый weekly staff (#1396)
+
+Staff использует existing current sweep и страницу
+`/{club_slug}/mitarbeiter/verein/{club_id}` раз в 7 дней, с per-club continuation.
+Ошибка отдельного клуба не удаляет его старые наблюдения.
+
+Native table `transfermarkt_club_staff` сохраняет grain и полный ключ
+`STAFF_KEY=(club_id, person_id, section, role, observed_day)`: все sections и raw
+roles, включая несколько ролей одного человека. Sporting Director необязателен.
+`appointed_date` и observed snapshots не представляют полную tenure history.
+
+Physical readback ограничен batch и полным `STAFF_KEY`, сравнивает все
+business/lineage columns и вычисляет physical hash; затем выполняется receipt
+readback. Replay идемпотентен.
+
+Coach role доступен только через SELECT/read view последнего полного receipt.
+`coach_stints`, legacy/dual manifests и daily signal не меняются. Без staff grants
+staff sweep пропускается. Эта offline-правка не выдаёт grants, не активирует
+schedule и не меняет production.
 
 ## Продолжение и предохранители
 

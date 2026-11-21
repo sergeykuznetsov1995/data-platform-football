@@ -79,6 +79,247 @@ class StaffDB(MemoryDB):
         return StaffCursor(self)
 
 
+@pytest.mark.parametrize(
+    'fixture_token,club_id,expected_roles,directors,multiple_roles,extra_sections',
+    [
+        pytest.param(
+            'boca', '189',
+            {
+                'Manager': 1, 'Assistant Manager': 3, 'Goalkeeping Coach': 1,
+                'Fitness coach': 1, 'Sporting Director': 2, 'President': 1,
+                'Vice-President': 1, 'Head of Youth Scouting': 1,
+                'Club Doctor': 1, 'Physiotherapist': 1, 'Academy manager': 1,
+                'Youth Coach': 4,
+            },
+            {'14855', '22804'}, {}, set(), id='boca',
+        ),
+        pytest.param(
+            'bayern', '27',
+            {
+                'Manager': 1, 'Assistant Manager': 4, 'Goalkeeping Coach': 2,
+                'Performance Manager': 1, 'Athletic Coach': 4, 'Rehab coach': 3,
+                'Individual Coach': 1, 'Chief Analyst': 2, 'Match Analyst': 6,
+                'Sporting CEO': 1, 'Sporting Director': 1,
+                'Director of Development': 2, 'Director of Finance': 1,
+                'Director of Marketing and Sales': 1, 'Executive Assistant': 1,
+                'President': 1, 'Vice-President': 1,
+                'Chairman of the Supervisory Board': 1, 'Chairman': 1,
+                'Deputy chairman of the board': 2,
+                'Member of the supervisory board': 5,
+                'Chief Marketing Officer': 1, 'Member of administrative board': 1,
+                'Honorary President': 1, 'Head of Scouting': 1, 'Chief Scout': 1,
+                'Loan Player Manager': 1, 'Scout': 9, 'Youth Chief Scout': 1,
+                'Youth Scouting Co-ordinator': 2, 'Youth Scout': 6,
+                'Club Doctor': 3, 'Medical Director Physiotherapy': 1,
+                'Physiotherapist': 6, 'Sports Scientist': 1, 'Nutritionist': 1,
+                'Director of Media and Communications': 1, 'Press officer': 1,
+                'Team Manager': 3, 'Kit Manager': 4, 'Bus driver': 2,
+                'Stadium Announcer': 1, 'Club representative': 12,
+                'Safety Officer': 1, 'Head of Marketing': 1, 'Academy manager': 1,
+                'Coordinator of talent management': 1,
+                'Academy Goalkeeping coordinator': 1, 'Head of Soccer School': 1,
+            },
+            {'39281'},
+            {
+                '74617': {('Coaching Staff', 'Athletic Coach'),
+                          ('Coaching Staff', 'Rehab coach')},
+                '51283': {('Coaching Staff', 'Athletic Coach'),
+                          ('Coaching Staff', 'Rehab coach')},
+                '6965': {('Board of Directors', 'President'),
+                         ('Board of Directors', 'Chairman of the Supervisory Board')},
+                '5327': {('Board of Directors', 'Vice-President'),
+                         ('Board of Directors', 'Member of the supervisory board')},
+                '5249': {('Board of Directors', 'Member of the supervisory board'),
+                         ('Board of Directors', 'Honorary President')},
+                '135056': {('Other', 'Team Manager'), ('Other', 'Safety Officer')},
+            },
+            {'Other', 'Public Relations'}, id='bayern',
+        ),
+        pytest.param(
+            'paderborn', '127',
+            {
+                'Manager': 1, 'Assistant Manager': 2, 'Goalkeeping Coach': 1,
+                'Athletic Coach': 1, 'Rehab coach': 1, 'Individual Coach': 1,
+                'Video Analyst': 1, 'Match Analyst': 1, 'Managing Director Sport': 1,
+                'Chief Executive Officer': 1, 'Sporting Director': 1,
+                'Head of first team football': 1, 'Director of Development': 1,
+                'President': 1, 'Vice-President': 2,
+                'Chairman of the Supervisory Board': 1,
+                'Deputy chairman of the board': 1,
+                'Member of the supervisory board': 3, 'Economic council': 3,
+                'Counselor of administrative board': 1, 'Chief Scout': 2, 'Scout': 1,
+                'Club Doctor': 4, 'Medical Director Physiotherapy': 1,
+                'Physiotherapist': 2, 'Head of Media and Communications': 1,
+                'Medienmitarbeiter': 1, 'Team Manager': 1, 'Kit Manager': 1,
+                'Academy Manager': 1,
+            },
+            {'112401'},
+            {
+                '80401': {('Coaching Staff', 'Video Analyst'),
+                          ('Coaching Staff', 'Match Analyst')},
+                '131277': {('Board of Directors', 'Chairman of the Supervisory Board'),
+                           ('Board of Directors', 'Economic council')},
+                '131278': {('Board of Directors', 'Deputy chairman of the board'),
+                           ('Board of Directors', 'Economic council')},
+                '131280': {('Board of Directors', 'Member of the supervisory board'),
+                           ('Board of Directors', 'Economic council')},
+            },
+            {'Other', 'Public Relations'}, id='paderborn',
+        ),
+    ],
+)
+def test_real_fixtures_preserve_every_raw_section_and_role(
+    fixture_token, club_id, expected_roles, directors, multiple_roles, extra_sections,
+):
+    fixture_path = FIXTURES / {
+        'boca': 'ca-boca-juniors.html',
+        'bayern': 'fc-bayern-munchen.html',
+        'paderborn': 'sc-paderborn-07.html',
+    }[fixture_token]
+    rows = parse_staff(fixture_path.read_text(encoding='utf-8'), club_id)
+
+    assert {row['section'] for row in rows} == {
+        'Board of Directors', 'Coaching Staff', 'Management',
+        'Medical department', 'Scouting', 'Youth',
+    } | extra_sections
+    assert Counter(row['role'] for row in rows) == Counter(expected_roles)
+    director_rows = [row for row in rows if row['role'] == 'Sporting Director']
+    assert {row['person_id'] for row in director_rows} == directors
+    assert {row['section'] for row in director_rows} == {'Management'}
+    for person_id in directors:
+        assert {
+            (row['section'], row['role']) for row in rows
+            if row['person_id'] == person_id
+        } == {('Management', 'Sporting Director')}
+    for person_id, expected_pairs in multiple_roles.items():
+        assert {
+            (row['section'], row['role']) for row in rows
+            if row['person_id'] == person_id
+        } == expected_pairs
+
+
+def test_sporting_director_is_optional_for_conclusive_staff_observation(physical):
+    html = page((('1', 'Manager'),))
+    rows = parse_staff(html, '10')
+    assert len(rows) == 1
+    assert rows[0]['club_id'] == '10'
+    assert rows[0]['person_id'] == '1'
+    assert rows[0]['person_slug'] == 'person-1'
+    assert rows[0]['name'] == 'Person 1'
+    assert rows[0]['section'] == 'Coaching Staff'
+    assert rows[0]['role'] == 'Manager'
+    assert 'appointed_date' in rows[0]
+
+    result = write(physical, html)
+    assert result['verified'] is True
+    stored = table(physical)
+    assert len(stored) == 1
+    assert stored['role'].tolist() == ['Manager']
+
+
+def test_dated_role_change_keeps_both_natural_keys_and_receipts(physical):
+    first = write(physical, page((('1', 'Head Coach'),)))
+    second_at = NOW + timedelta(days=7)
+    second_html = page((('1', 'Sporting Director'),))
+    second = write(physical, second_html, at=second_at)
+    replay = write(physical, second_html, at=second_at)
+
+    assert first['verified'] is True
+    assert second['verified'] is True
+    assert replay['verified'] is True
+    for field in ('bronze_manifest', 'raw_capture_id'):
+        assert replay[field] == second[field]
+    assert replay['physical']['physical_hash'] == second['physical']['physical_hash']
+
+    first_day = NOW.date().isoformat()
+    second_day = second_at.date().isoformat()
+    stored = table(physical)
+    assert len(stored) == 2
+    assert not stored.duplicated(subset=list(STAFF_KEY)).any()
+    assert set(stored[
+        ['person_id', 'section', 'role', 'observed_day']
+    ].itertuples(index=False, name=None)) == {
+        ('1', 'Coaching Staff', 'Head Coach', first_day),
+        ('1', 'Coaching Staff', 'Sporting Director', second_day),
+    }
+
+    receipts = pd.read_sql_query(
+        'SELECT observed_day, row_count, physical_hash '
+        'FROM transfermarkt_native_write_manifest_v2 WHERE club_id = ?',
+        physical.test_db.sql, params=('10',),
+    )
+    assert len(receipts) == 2
+    assert Counter(receipts['observed_day']) == Counter({first_day: 1, second_day: 1})
+    assert set(receipts.itertuples(index=False, name=None)) == {
+        (first_day, 1, first['physical']['physical_hash']),
+        (second_day, 1, second['physical']['physical_hash']),
+    }
+
+
+def test_staff_physical_readback_uses_every_natural_key(physical, monkeypatch):
+    from inspect import signature
+
+    original = staff.current.run._query_dataframe
+    query_signature = signature(original)
+    queries = []
+
+    def query_dataframe(*args, **kwargs):
+        bound = query_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        queries.append((bound.arguments['sql'], tuple(bound.arguments['params'] or ())))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(staff.current.run, '_query_dataframe', query_dataframe)
+    result = write(physical, page((
+        ('1', 'Manager'), ('2', 'Assistant Manager'), ('3', 'Goalkeeping Coach'),
+    )))
+
+    business_queries = [
+        (sql, params) for sql, params in queries
+        if 'FROM iceberg.bronze.transfermarkt_club_staff WHERE _batch_id = ?'
+        in ' '.join(sql.split())
+    ]
+    assert len(business_queries) == 1
+    sql, params = business_queries[0]
+    compact_sql = ''.join(sql.split())
+    assert '(club_id,person_id,section,role,observed_day)IN' in compact_sql
+    assert compact_sql.count('(?,?,?,?,?)') == 3
+    assert len(params) == 1 + 3 * 5
+    assert params[0] == result['bronze_manifest']
+
+    stored = table(physical)
+    assert len(stored) == 3
+    assert not stored.duplicated(subset=list(STAFF_KEY)).any()
+    assert set(stored[['person_id', 'section', 'role']].itertuples(
+        index=False, name=None,
+    )) == {
+        ('1', 'Coaching Staff', 'Manager'),
+        ('2', 'Coaching Staff', 'Assistant Manager'),
+        ('3', 'Coaching Staff', 'Goalkeeping Coach'),
+    }
+    assert {
+        tuple(params[offset:offset + 5]) for offset in range(1, len(params), 5)
+    } == set(stored[list(STAFF_KEY)].itertuples(index=False, name=None))
+    assert result['verified'] is True
+    assert result['physical']['physical_hash']
+
+
+def test_staff_readback_rejects_unexpected_same_batch_row(physical, monkeypatch):
+    original = physical._iceberg_writer.write_dataframe
+
+    def write_with_extra_row(**kwargs):
+        result = original(**kwargs)
+        extra = kwargs['df'].iloc[[0]].copy()
+        extra['person_id'] = 'unexpected'
+        extra['name'] = 'Unexpected Person'
+        original(**{**kwargs, 'df': extra})
+        return result
+
+    monkeypatch.setattr(physical._iceberg_writer, 'write_dataframe', write_with_extra_row)
+    with pytest.raises(staff.current.CurrentWriteError, match='physical business/lineage mismatch'):
+        write(physical)
+
+
 @pytest.fixture
 def staff_policy(monkeypatch, tmp_path):
     policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
@@ -123,6 +364,45 @@ def write(instance, html=None, at=NOW, **kwargs):
 
 def table(instance):
     return pd.read_sql_query('SELECT * FROM transfermarkt_club_staff', instance.test_db.sql)
+
+
+@pytest.mark.parametrize('key', STAFF_KEY)
+@pytest.mark.parametrize('invalid', ('missing', 'null', 'duplicate_column'))
+def test_staff_readback_rejects_invalid_natural_key_columns(monkeypatch, key, invalid):
+    frame = pd.DataFrame([{
+        'club_id': '10', 'person_id': '1', 'section': 'Coaching Staff',
+        'role': 'Manager', 'observed_day': '2026-10-20', '_batch_id': 'staff-test',
+    }])
+    if invalid == 'missing':
+        frame = frame.drop(columns=[key])
+    elif invalid == 'null':
+        frame.loc[0, key] = None
+    else:
+        frame = pd.concat([frame, frame[[key]]], axis=1)
+    output = SimpleNamespace(key='club_staff', table_name='transfermarkt_club_staff', replace_keys=())
+
+    def unexpected_query(*args, **kwargs):
+        pytest.fail('invalid natural keys must fail before querying physical rows')
+
+    monkeypatch.setattr(staff.current.run, '_query_dataframe', unexpected_query)
+    with pytest.raises(staff.current.CurrentWriteError, match='natural key'):
+        staff.current._read_back(SimpleNamespace(), output, frame, 'staff-test', natural_keys=STAFF_KEY)
+
+
+def test_staff_readback_rejects_duplicate_natural_keys(monkeypatch):
+    row = {
+        'club_id': '10', 'person_id': '1', 'section': 'Coaching Staff',
+        'role': 'Manager', 'observed_day': '2026-10-20', '_batch_id': 'staff-test',
+    }
+    frame = pd.DataFrame([row, row])
+    output = SimpleNamespace(key='club_staff', table_name='transfermarkt_club_staff', replace_keys=())
+
+    def unexpected_query(*args, **kwargs):
+        pytest.fail('duplicate natural keys must fail before querying physical rows')
+
+    monkeypatch.setattr(staff.current.run, '_query_dataframe', unexpected_query)
+    with pytest.raises(staff.current.CurrentWriteError, match='natural key'):
+        staff.current._read_back(SimpleNamespace(), output, frame, 'staff-test', natural_keys=STAFF_KEY)
 
 
 def restrict_staff_policy(path, missing):
@@ -182,8 +462,8 @@ def test_writer_rechecks_staff_grants_before_each_write(physical, staff_policy, 
         monkeypatch.setattr(staff, '_staff_frame', frame)
     else:
         original = staff.current._read_back
-        def read_back(*args):
-            result = original(*args)
+        def read_back(*args, **kwargs):
+            result = original(*args, **kwargs)
             restrict_staff_policy(staff_policy, (staff.STAFF_RECEIPTS_TABLE,))
             return result
         monkeypatch.setattr(staff.current, '_read_back', read_back)
