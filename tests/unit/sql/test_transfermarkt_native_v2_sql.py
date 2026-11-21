@@ -298,82 +298,94 @@ def test_multi_club_assignment_ignores_post_season_transfer_when_executed():
     assert by_player['single_year']['latest_transfer_date'] == date(2026, 12, 20)
 
 
-def test_team_season_value_uses_exact_edition_end_and_single_year_fallback():
-    sql = _text(GOLD / 'transfermarkt_team_season_market_value_v2.sql')
-    assert 'transfermarkt_market_value_points_v2' in sql
-    assert 'transfermarkt_competition_editions_v2' in sql
-    assert 'mv.mv_date <= bounds.edition_end_date' in sql
-    assert 'bounds.competition_id = a.competition_id' in sql
-    assert 'bounds.edition_id = a.edition_id' in sql
-    assert "season_format = 'single_year'" in sql
-    assert "'-12-31'" in sql
-    assert 'SUBSTR(a.season' not in sql
-    assert "'-06-30'" not in sql
-    assert 'ORDER BY mv.mv_date DESC' in sql
-    assert "assignment_status <> 'ambiguous'" in sql
+def test_team_season_value_uses_current_squad_snapshot():
+    sql = ' '.join(_text(GOLD / 'transfermarkt_team_season_market_value_v2.sql').lower().split())
+    for relation in (
+        'iceberg.silver.transfermarkt_squad_memberships_v2',
+        'iceberg.silver.transfermarkt_player_attribute_observations_v2',
+        'iceberg.silver.xref_team',
+    ):
+        assert relation in sql
+    for legacy_input in (
+        'market_value_points', 'competition_editions', 'player_team_season_assignment',
+        'edition_end_date', 'assignment_status',
+    ):
+        assert legacy_input not in sql
+    assert (
+        'partition by player_id, league, season '
+        'order by observed_at desc, _bronze_ingested_at desc, club_id asc'
+    ) in sql
+    assert (
+        'partition by competition_id, edition_id, club_id, player_id '
+        'order by observed_at desc, _bronze_ingested_at desc, _batch_id desc, source_body_hash desc'
+    ) in sql
+    assert 'x.league = p.league' in sql
+    assert 'x.season = p.season' in sql
     assert 'ambiguous_players_excluded' in sql
 
 
-def test_team_season_value_cutoff_executes():
-    con = duckdb.connect(':memory:')
-    con.execute('CREATE SCHEMA silver')
-    con.execute('''CREATE TABLE silver.transfermarkt_player_team_season_assignment_v2 (
-        competition_id varchar, edition_id varchar, player_id varchar,
-        team_id varchar, club_id varchar, club_name varchar,
-        assignment_status varchar, league varchar, season varchar
-    )''')
-    con.execute('''CREATE TABLE silver.transfermarkt_competition_editions_v2 (
-        competition_id varchar, edition_id varchar, end_date date,
-        season_format varchar, canonical_season varchar
-    )''')
-    con.execute('''CREATE TABLE silver.transfermarkt_market_value_points_v2 (
-        player_id varchar, mv_date date, value_eur bigint,
-        _bronze_ingested_at timestamp
-    )''')
-    con.executemany(
-        'INSERT INTO silver.transfermarkt_player_team_season_assignment_v2 '
-        'VALUES (?,?,?,?,?,?,?,?,?)',
-        [
-            (
-                'GB1', '2025', 'p1', 'team_a', 'A', 'Club A',
-                'single_membership', 'ENG', '2526',
-            ),
-            ('GB1', '2025', 'p2', None, None, None, 'ambiguous', 'ENG', '2526'),
-            (
-                'FIWC', '2026', 'wc1', 'world_team', 'W1', 'World Team',
-                'single_membership', 'WORLD', '2026',
-            ),
-        ],
-    )
-    con.executemany(
-        'INSERT INTO silver.transfermarkt_competition_editions_v2 '
-        'VALUES (?,?,?,?,?)',
-        [
-            ('GB1', '2025', date(2026, 5, 24), 'split_year', '2526'),
-            ('FIWC', '2026', date(2026, 7, 19), 'single_year', '2026'),
-        ],
-    )
-    con.executemany(
-        'INSERT INTO silver.transfermarkt_market_value_points_v2 VALUES (?,?,?,?)',
-        [
-            ('p1', date(2026, 5, 24), 10_000_000, '2026-05-24'),
-            ('p1', date(2026, 5, 25), 20_000_000, '2026-05-25'),
-            ('wc1', date(2026, 6, 1), 30_000_000, '2026-06-01'),
-            ('wc1', date(2026, 7, 18), 40_000_000, '2026-07-18'),
-            ('wc1', date(2026, 7, 20), 50_000_000, '2026-07-20'),
-        ],
-    )
-    rows = con.execute(
-        _duckdb_sql(GOLD / 'transfermarkt_team_season_market_value_v2.sql'),
-    ).fetchall()
-    names = [c[0] for c in con.description]
-    by_scope = {
-        (result['league'], result['season']): result
-        for result in (dict(zip(names, row)) for row in rows)
-    }
-    assert by_scope[('ENG', '2526')]['squad_market_value_eur'] == 10_000_000
-    assert by_scope[('ENG', '2526')]['ambiguous_players_excluded'] == 1
-    assert by_scope[('WORLD', '2026')]['squad_market_value_eur'] == 40_000_000
+def test_team_season_value_current_snapshot_executes():
+    import duckdb
+
+    with duckdb.connect() as con:
+        con.execute("CREATE SCHEMA silver")
+        con.execute("""
+            CREATE TABLE silver.transfermarkt_squad_memberships_v2 (
+                competition_id VARCHAR, edition_id VARCHAR, club_id VARCHAR, club_name VARCHAR,
+                player_id VARCHAR, observed_at TIMESTAMP, _bronze_ingested_at TIMESTAMP,
+                league VARCHAR, season VARCHAR
+            )
+        """)
+        con.execute("""
+            INSERT INTO silver.transfermarkt_squad_memberships_v2 VALUES
+                ('eng', '25', 'a', 'Club A', 'p1', '2026-08-01', '2026-08-02', 'ENG', '2526'),
+                ('eng', '25', 'b', 'Club B', 'p2', '2025-08-01', '2025-08-02', 'ENG', '2526'),
+                ('eng', '25', 'a', 'Club A', 'p2', '2026-08-01', '2026-08-02', 'ENG', '2526'),
+                ('eng', '25', 'o', 'Orphan Club', 'p3', '2026-08-01', '2026-08-02', 'ENG', '2526'),
+                ('wc', '26', 'w', 'World Team', 'wc1', '2027-01-01', '2027-01-02', 'WORLD', '2026')
+        """)
+        con.execute("""
+            CREATE TABLE silver.transfermarkt_player_attribute_observations_v2 (
+                competition_id VARCHAR, edition_id VARCHAR, club_id VARCHAR, player_id VARCHAR,
+                market_value_eur BIGINT, observed_at TIMESTAMP, _bronze_ingested_at TIMESTAMP,
+                _batch_id VARCHAR, source_body_hash VARCHAR
+            )
+        """)
+        con.execute("""
+            INSERT INTO silver.transfermarkt_player_attribute_observations_v2 VALUES
+                ('eng', '25', 'a', 'p1', 10000000, '2025-08-01', '2025-08-02', '1', 'a'),
+                ('eng', '25', 'a', 'p1', 20000000, '2026-08-01', '2026-08-02', '2', 'b'),
+                ('eng', '24', 'a', 'p1', 90000000, '2026-09-01', '2026-09-02', '3', 'c'),
+                ('eng', '25', 'b', 'p2', 100000000, '2025-08-01', '2025-08-02', '1', 'd'),
+                ('eng', '25', 'a', 'p2', 5000000, '2026-08-01', '2026-08-02', '2', 'e'),
+                ('eng', '25', 'o', 'p3', NULL, '2026-08-01', '2026-08-02', '2', 'f'),
+                ('wc', '26', 'w', 'wc1', 50000000, '2027-01-01', '2027-01-02', '3', 'g')
+        """)
+        con.execute("""
+            CREATE TABLE silver.xref_team (
+                source VARCHAR, source_id VARCHAR, canonical_id VARCHAR,
+                confidence VARCHAR, league VARCHAR, season VARCHAR
+            )
+        """)
+        con.execute("""
+            INSERT INTO silver.xref_team VALUES
+                ('transfermarkt', 'Club A', 'team_a', 'exact', 'ENG', '2526'),
+                ('transfermarkt', 'Club A', 'unused', 'orphan', 'ENG', '2526'),
+                ('transfermarkt', 'Club A', 'older_team', 'exact', 'ENG', '2425'),
+                ('transfermarkt', 'Club A', 'other_team', 'exact', 'OTHER', '2526'),
+                ('transfermarkt', 'Orphan Club', 'unmatched', 'orphan', 'ENG', '2526'),
+                ('transfermarkt', 'World Team', 'world_team', 'exact', 'WORLD', '2026')
+        """)
+        result = con.execute(_duckdb_sql(GOLD / 'transfermarkt_team_season_market_value_v2.sql'))
+        assert [column[0] for column in result.description] == [
+            'team_id', 'team_name', 'squad_market_value_eur', 'valued_players',
+            'assigned_players', 'ambiguous_players_excluded', 'league', 'season',
+        ]
+        assert sorted(result.fetchall()) == [
+            ('team_a', 'Club A', 25_000_000, 2, 2, 0, 'ENG', '2526'),
+            ('tm_orphan_club', 'Orphan Club', None, 0, 1, 0, 'ENG', '2526'),
+            ('world_team', 'World Team', 50_000_000, 1, 1, 0, 'WORLD', '2026'),
+        ]
 
 
 def test_transfer_gold_v2_primary_key_and_upcoming_contract():
