@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Collection, Iterable, Mapping
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
 from scrapers.sofascore.denominator import Denominator, load_denominator
 from scrapers.sofascore.workload_plan import (
@@ -1106,6 +1106,86 @@ def plan_refresh_batch(
             env["SOFASCORE_REFRESH_DEBT_RESERVE_S"] = str(reserve)
         planned.append(env)
     return planned
+
+
+def plan_season_fields_batch(
+    snapshot: Mapping[str, Any],
+    pairs: Sequence[tuple[str, str]],
+    *,
+    scope_timeout_s: int,
+    snapshot_path: str = "/opt/airflow/runtime/sofascore/all-men/snapshot.json",
+    policy_path: str = "/opt/airflow/configs/sofascore/all_mens_campaign.json",
+    result_dir: str = DEFAULT_REFRESH_RESULT_DIR,
+    workload_artifact: str = (
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    ),
+    dag_run_id: str = "manual",
+    task_env: Mapping[str, str] | None = None,
+) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+    """#1368: scope-task envs for the seasonal fields renewal.
+
+    ``pairs`` are the census-selected ``(capture_key, canonical_season)``
+    partitions, already ordered by the caller (missing tables first, then
+    oldest). Each pair resolves against the snapshot exactly like a match
+    scope; an unresolvable pair is returned unresolved instead of poisoning
+    the batch, and the digest/campaign identity checks match
+    ``plan_refresh_batch``.
+    """
+
+    if (
+        isinstance(scope_timeout_s, bool)
+        or not isinstance(scope_timeout_s, int)
+        or scope_timeout_s <= 0
+    ):
+        raise CampaignPlanningError("scope_timeout_s must be a positive integer")
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
+    if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
+        raise CampaignPlanningError("campaign snapshot digest mismatch")
+    campaign_id = str(snapshot.get("campaign_id") or "")
+    if not campaign_id:
+        raise CampaignPlanningError("campaign_id is missing")
+    index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
+    for tournament_id, capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
+        for season, _season_id, _start_year, canonical in _refresh_snapshot_seasons(
+            tournament_id, seasons, require_start_year=False
+        ):
+            index.setdefault((capture_key, canonical), (tournament_id, season))
+    lane_env = dict(task_env or {})
+    planned: list[dict[str, str]] = []
+    unresolved: list[tuple[str, str]] = []
+    for league, canonical in pairs:
+        entry = index.get((str(league), str(canonical)))
+        if entry is None:
+            logger.warning(
+                "season fields partition %s/%s is not a ready snapshot season; "
+                "skipped",
+                league,
+                canonical,
+            )
+            unresolved.append((str(league), str(canonical)))
+            continue
+        tournament_id, season = entry
+        env = _scope_task_env(
+            "refresh",
+            snapshot_id=snapshot_id,
+            campaign_id=campaign_id,
+            tournament_id=tournament_id,
+            season=season,
+            lane_env=lane_env,
+            snapshot_path=snapshot_path,
+            policy_path=policy_path,
+            result_dir=result_dir,
+            workload_artifact=workload_artifact,
+            dag_run_id=dag_run_id,
+            part="fields",
+        )
+        env["SOFASCORE_SCOPE_TIMEOUT_S"] = str(scope_timeout_s)
+        # The census league itself, so the caller's backoff keys are built
+        # from the exact identity the selection used — never reassembled
+        # from the snapshot's tournament id (#1368).
+        env["SOFASCORE_CAPTURE_KEY"] = str(league)
+        planned.append(env)
+    return planned, unresolved
 
 
 def plan_players_batch(

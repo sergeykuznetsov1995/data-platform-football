@@ -33,10 +33,18 @@ from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
 SCOPE_DEADLINE_ENV = "SOFASCORE_SCOPE_DEADLINE_EPOCH"
 WINDOW_DEADLINE_ENV = "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"
 # #1374: the players phase buys player profiles of a closed history scope; it
-# runs as its own lane and never inside ``all``.
-PLAN_PHASES = {"season": "season", "matches": "targets", "players": "players"}
+# runs as its own lane and never inside ``all``.  #1368: season_fields is the
+# refresh lane's cheap seasonal renewal — the four normalized season
+# endpoints on an admission-day key, no schedule pages.
+PLAN_PHASES = {
+    "season": "season",
+    "season_fields": "season_fields",
+    "matches": "targets",
+    "players": "players",
+}
 CAPTURE_ENTITIES = {
     "season": "all",
+    "season_fields": "season_fields",
     "matches": "match_capture",
     "players": "player_capture",
 }
@@ -180,7 +188,7 @@ def run_phase(
     from scrapers.sofascore.pipeline import build_manifest_store
 
     if phase not in PLAN_PHASES:
-        raise ValueError("phase must be season, matches or players")
+        raise ValueError("phase must be season, season_fields, matches or players")
     # #1357: count this phase's Trino round-trips from zero.
     trino_accounting.reset()
     destination = Path(output_dir)
@@ -207,7 +215,12 @@ def run_phase(
             manifest_store=manifest_store,
             force_replace=bool(scope.get("force_replace")),
             allow_inactive_season=True,
-            season_freshness_key="final",
+            # #1368: the fields renewal resolves its admission-day key in
+            # the preparation itself, so every retry of one day reuses the
+            # same frozen plan (and key) instead of drifting across dates.
+            season_freshness_key=(
+                None if phase == "season_fields" else "final"
+            ),
             season_evidence=str(scope.get("season_evidence") or "pages"),
             players_force=True,
             **({"explicit_match_ids": scope["explicit_match_ids"]}
@@ -284,7 +297,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-snapshot-id", required=True)
     parser.add_argument("--expected-campaign-id", required=True)
     parser.add_argument(
-        "--phase", choices=("metadata", "season", "matches", "players", "all"),
+        "--phase",
+        choices=("metadata", "season", "season_fields", "matches", "players", "all"),
         default="all"
     )
     parser.add_argument("--output-dir", required=True)
@@ -468,6 +482,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         phases = {
             "metadata": (),
             "season": ("season",),
+            "season_fields": ("season_fields",),
             "matches": ("matches",),
             "players": ("players",),
             "all": ("season", "matches"),

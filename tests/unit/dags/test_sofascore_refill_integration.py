@@ -66,7 +66,8 @@ def test_failed_initial_batch_preserves_all_physical_attempts(tmp_path, monkeypa
     summary = module._window_summary({'run_id': 'run', 'ti': SimpleNamespace(
         xcom_pull=lambda task_ids: values[task_ids])})
     assert summary['window_used_s'] == 55.1
-    assert summary['window_budget_s'] == 7200
+    # #1368: the shared scope budget is 90 minutes now.
+    assert summary['window_budget_s'] == 5400
     with pytest.raises(module.AirflowException, match='run_refresh_scope'):
         module._propagate_status(run_id='run', dag_run=dag_run, ti=SimpleNamespace(
             xcom_pull=lambda task_ids: values[task_ids]))
@@ -103,11 +104,15 @@ def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):
             SimpleNamespace(task_id='run_refresh_scope',state='success')]),
         ti=SimpleNamespace(xcom_pull=lambda task_ids: [{'env':env}]))
     assert result['stop_reason'] == 'empty_queue'
-    assert plans[0]['scope_budget_s'] == 4660
+    assert plans[0]['scope_budget_s'] == 2860
     assert plans[0]['dag_run_id'] == 'run:refill:1'
     assert 'exclude_tournament_ids' not in plans[0]  # #1370
-    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '7000'
-    assert executed[0]['SOFASCORE_SCOPE_TIMEOUT_S'] == '3000'
+    # #1368: the shorter 95-minute refill timeout now caps this 7000
+    # deadline; the earlier of window and task cap still wins.
+    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '5800'
+    # The refill's remaining time caps the scope's own timeout (#1368
+    # shortened the refill window: 5800 - 1000 - census 900 - 40 margin).
+    assert executed[0]['SOFASCORE_SCOPE_TIMEOUT_S'] == '2860'
     assert env['SOFASCORE_SCOPE_RESULT_PATH'] == str(initial)
 
 
@@ -149,8 +154,8 @@ def test_refill_deadline_is_capped_by_its_own_task_timeout(tmp_path, monkeypatch
     module, plans, context = _refill_context(tmp_path, monkeypatch, execute=execute)
     result = module._refill_refresh_window(**context)
     assert result['stop_reason'] == 'empty_queue'
-    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '7600'
-    assert plans[0]['scope_budget_s'] == 4660
+    assert executed[0]['SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH'] == '5800'
+    assert plans[0]['scope_budget_s'] == 2860
 
 
 def test_refill_passes_its_retry_knobs_and_a_real_sleep(tmp_path, monkeypatch):
@@ -219,15 +224,15 @@ def test_refill_child_timeout_terminates_process_group(monkeypatch):
     assert child.waits == 3
 
 
-def test_summary_includes_refill_against_original_7200_seconds(monkeypatch):
+def test_summary_includes_refill_against_the_original_scope_budget(monkeypatch):
     module = _module()
     values = {'validate_refresh_scope':[{'status':'partial','elapsed_s':2539.3}],
               'refill_refresh_window':{'outcomes':[{'status':'refreshed','elapsed_s':3000}],
                                        'stop_reason':'empty_queue'}}
     report = module._window_summary({'ti':SimpleNamespace(xcom_pull=lambda task_ids:values[task_ids])})
     assert report['window_used_s'] == 5539.3
-    assert report['window_budget_s'] == 7200
-    assert report['window_use'] == 0.769
+    assert report['window_budget_s'] == 5400
+    assert report['window_use'] == round(5539.3 / 5400, 3)
     assert report['refill_stop_reason'] == 'empty_queue'
 
 
@@ -261,7 +266,7 @@ def test_failed_refill_report_is_counted_without_return_xcom(tmp_path, monkeypat
     summary = module._window_summary(context)
     assert summary['scopes'] == 26
     assert summary['window_used_s'] == 5751.4
-    assert summary['window_use'] == 0.799
+    assert summary['window_use'] == round(5751.4 / 5400, 3)
     assert summary['refill_stop_reason'] == 'scope_failure'
     dag_run.get_task_instances = lambda: [
         SimpleNamespace(task_id='refill_refresh_window', state='failed')]

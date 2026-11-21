@@ -1222,6 +1222,88 @@ def plan_season_partition(
     )
 
 
+def plan_season_fields_partition(
+    raw_store: RawPayloadStore,
+    manifest_store: ManifestStore,
+    *,
+    source_tournament_id: str | int,
+    source_season_id: str | int,
+    freshness_key: str,
+    paid_proxy: bool = True,
+) -> SeasonPartitionPlan:
+    """#1368: plan ONLY the four normalized season-field endpoints.
+
+    The refresh lane's cheap seasonal phase re-buys ``standings_total``,
+    ``rounds``, ``cup_trees`` and ``participants`` on its own freshness key:
+    no schedule pages, no squads and no referee profiles belong to it.  The
+    terminal semantics are the planner's non-schedule branch verbatim — a
+    spec is satisfied only by a terminal manifest backed by valid raw (or an
+    accepted body-less terminal), so an interrupted capture under the same
+    key resumes and a completed one stays a zero-byte no-op.  A fresh key
+    (one admission day) deliberately leaves all four pending: that is the
+    re-purchase this phase exists for.
+    """
+
+    tournament, season = _source_ids(source_tournament_id, source_season_id)
+    freshness = str(freshness_key).strip()
+    if not freshness:
+        raise ValueError("freshness_key must not be empty")
+    common = {
+        "source_tournament_id": tournament,
+        "source_season_id": season,
+        "freshness_key": freshness,
+        "paid_proxy": paid_proxy,
+    }
+    specs = [
+        build_standings_total_spec(**common),
+        build_rounds_spec(**common),
+        build_cup_trees_spec(**common),
+        build_participants_spec(**common),
+    ]
+    pending: list[ManifestKey] = []
+    missing_raw: list[ManifestKey] = []
+    for spec in specs:
+        stored = _load_stored_payload(raw_store, spec)
+        manifest = manifest_store.get(spec.key)
+        _assert_terminal_raw_consistency(spec, stored, manifest)
+        terminal = bool(manifest and manifest.is_terminal)
+        accepted_without_json = bool(
+            manifest
+            and terminal
+            and (
+                manifest.status == ManifestStatus.NOT_SUPPORTED
+                or (
+                    manifest.status == ManifestStatus.LEGITIMATE_EMPTY
+                    and stored.raw is not None
+                )
+            )
+        )
+        if not terminal:
+            pending.append(spec.key)
+        if (
+            not stored.has_valid_json
+            and not accepted_without_json
+            and not stored.rejected_schema
+        ):
+            missing_raw.append(spec.key)
+    return SeasonPartitionPlan(
+        source_tournament_id=tournament,
+        source_season_id=season,
+        freshness_key=freshness,
+        event_freshness_key=freshness,
+        specs=tuple(specs),
+        pending_keys=tuple(pending),
+        missing_raw_keys=tuple(missing_raw),
+        schedule_event_ids=(),
+        team_ids=(),
+        referee_ids=(),
+        # A fields-only plan never walks a schedule chain: the frontier is
+        # complete by construction and ``complete`` reduces to "no pending
+        # field key", exactly the four-endpoint commit check #1368 needs.
+        schedule_frontier=(None, None),
+    )
+
+
 def _canonical_token(value: object, label: str) -> str:
     token = str(value).strip()
     if not token:
