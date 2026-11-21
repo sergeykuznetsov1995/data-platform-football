@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Fail-closed rollback coordinator for FotMob consumers.
+"""Pause/restore coordinator for FotMob writer maintenance.
 
-Rollback is a three-step operation, intentionally split across invocations:
+The #930 consumer-rollback procedure (plan/pause/validate) expired with the
+#1423 legacy drain: the frozen legacy Bronze tables it validated are removed
+by the post-merge migration ``scripts/drop_fotmob_legacy_tables.sql`` (owner
+authorization required), after which a revert to legacy readers is impossible.
+Kept commands:
 
-1. ``plan`` records the exact procedure without changing anything.
-2. ``pause --execute`` pauses all FotMob DAGs and proves no writer is running.
-3. After an operator deploys the reviewed consumer revert, ``validate`` proves
-   the deployed revision and availability of every frozen legacy Bronze table.
+1. ``pause --execute`` pauses all FotMob DAGs and proves no writer is running
+   (also used by the purge and staging-cleanup procedures).
+2. ``restore-maintenance`` restores maintenance DAG pause states from
+   SHA-protected pause evidence plus a reviewed terminal operation report.
 
-The legacy Silver validation run (``run-silver``/``recover-publication``) was
-removed together with the FotMob Silver transform (#1590).
-
-The command never drops, truncates or otherwise mutates native Bronze objects.
-"""
+Historical validate reports and explicitly aborted plan reports (see
+``--aborted-before-mutation``) remain valid terminal evidence for
+``restore-maintenance``. The command never drops, truncates or otherwise
+mutates native Bronze objects."""
 
 from __future__ import annotations
 
@@ -31,10 +34,8 @@ from typing import Any, Callable, Mapping, Sequence
 sys.dont_write_bytecode = True
 
 try:  # package import in tests / ``python -m``
-    from scripts.fotmob_acceptance import QueryClient, connect_from_env
     from scripts import fotmob_runtime as runtime_binding
 except ModuleNotFoundError:  # direct ``python scripts/fotmob_rollback.py``
-    from fotmob_acceptance import QueryClient, connect_from_env
     import fotmob_runtime as runtime_binding
 
 
@@ -54,17 +55,6 @@ PRESERVED_DYNAMIC_CATALOG_EVIDENCE = frozenset(
         "fotmob_competition_scope_observations",
         "fotmob_competition_scope_observations_current",
     }
-)
-LEGACY_TABLES = (
-    "fotmob_match_details",
-    "fotmob_player_details",
-    "fotmob_player_stats",
-    "fotmob_schedule",
-    "fotmob_team_leaderboards",
-    "fotmob_team_profile",
-    "fotmob_team_squad",
-    "fotmob_team_stats",
-    "fotmob_transfers",
 )
 CONFIRM_PAUSE = "PAUSE_FOTMOB_WRITERS"
 CONFIRM_RESTORE_MAINTENANCE = "RESTORE_FOTMOB_MAINTENANCE"
@@ -239,25 +229,6 @@ def validate_live_shared_runtime(
     try:
         return runtime_binding.validate_live_shared_runtime(
             _deployment_context(args), run=run
-        )
-    except runtime_binding.RuntimeBindingError as exc:
-        raise RollbackError(str(exc)) from exc
-
-
-def bind_admitted_trino(
-    args: argparse.Namespace,
-    *,
-    require_running: bool,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> dict[str, Any]:
-    try:
-        return runtime_binding.bind_admitted_trino(
-            _deployment_context(args),
-            project=args.project,
-            compose_file=args.compose_file,
-            env_file=args.env_file,
-            require_running=require_running,
-            run=run,
         )
     except runtime_binding.RuntimeBindingError as exc:
         raise RollbackError(str(exc)) from exc
@@ -520,7 +491,6 @@ print({marker!r} + json.dumps(payload, sort_keys=True))
         raise RollbackError("shared consumer pause/readback is incomplete")
     return dict(payload)
 
-
 def inspect_shared_consumer_pause(
     args: argparse.Namespace,
     *,
@@ -620,7 +590,6 @@ print({marker!r} + json.dumps(payload, sort_keys=True))
     ):
         raise RollbackError("shared consumer is not paused and idle")
     return dict(payload)
-
 
 def _read_protected_json(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
     def reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
@@ -1196,62 +1165,6 @@ def _pause_all_writers(
     return state
 
 
-def rollback_plan(args: argparse.Namespace) -> dict[str, Any]:
-    context = _deployment_context(args)
-    return {
-        "schema_version": "fotmob-rollback-v1",
-        "generated_at": _now(),
-        "passed": True,
-        "mode": "plan",
-        "rollback_mode": "coordinator_only",
-        "mutated": False,
-        "project": args.project,
-        "deployed_git_sha": context["git_sha"],
-        "deployment_report": str(args.deployment_report.resolve()),
-        "native_objects_action": "retain",
-        "dynamic_catalog_evidence_action": "retain",
-        "dynamic_catalog_evidence_objects": sorted(PRESERVED_DYNAMIC_CATALOG_EVIDENCE),
-        "steps": [
-            {
-                "order": 1,
-                "action": "pause_writers",
-                "command": (
-                    "python scripts/fotmob_rollback.py pause --execute "
-                    f"--confirm {CONFIRM_PAUSE} <common options>"
-                ),
-            },
-            {
-                "order": 2,
-                "action": "deploy_consumer_revert",
-                "requirement": (
-                    "Deploy a reviewed immutable commit whose FotMob xref/DQ "
-                    "consumers read the frozen legacy tables. Do not alter native data."
-                ),
-            },
-            {
-                "order": 3,
-                "action": "validate",
-                "command": (
-                    "python scripts/fotmob_rollback.py validate "
-                    "--expected-consumer-sha <40-hex> <common options>"
-                ),
-            },
-            {
-                "order": 4,
-                "action": "restore_maintenance",
-                "command": (
-                    "python scripts/fotmob_rollback.py restore-maintenance --execute "
-                    f"--confirm {CONFIRM_RESTORE_MAINTENANCE} "
-                    "--pause-evidence <pause-report> "
-                    "--pause-evidence-sha256 <sha256> "
-                    "--operation-report <validate-report> "
-                    "--operation-report-sha256 <sha256> <common options>"
-                ),
-            },
-        ],
-    }
-
-
 def pause_writers(
     args: argparse.Namespace,
     *,
@@ -1324,154 +1237,15 @@ def pause_writers(
     }
 
 
-def _validate_sha(value: str) -> str:
-    sha = value.strip().lower()
-    if len(sha) != 40 or any(character not in "0123456789abcdef" for character in sha):
-        raise RollbackError("--expected-consumer-sha must be a full 40-hex Git SHA")
-    return sha
-
-
-def _legacy_counts(
-    client: QueryClient, *, catalog: str, schema: str
-) -> dict[str, int]:
-    for value in (catalog, schema):
-        if not re.fullmatch(r"[A-Za-z0-9_]+", value):
-            raise RollbackError(f"unsafe SQL identifier: {value!r}")
-    counts: dict[str, int] = {}
-    for table in LEGACY_TABLES:
-        rows = client.query(
-            f'-- rollback:legacy:{table}\nSELECT COUNT(*) FROM "{catalog}"."{schema}"."{table}"'
-        )
-        if len(rows) != 1 or len(rows[0]) != 1:
-            raise RollbackError(f"{table}: count query did not return one scalar")
-        count = int(rows[0][0])
-        if count <= 0:
-            raise RollbackError(f"{table}: frozen legacy table is empty")
-        counts[table] = count
-    return counts
-
-
-def validate_rollback(
-    args: argparse.Namespace,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    client_factory: Callable[..., QueryClient] = connect_from_env,
-) -> dict[str, Any]:
-    expected_sha = _validate_sha(args.expected_consumer_sha)
-    context = _deployment_context(args)
-    if context.get("kept_paused") is not True:
-        raise RollbackError(
-            "rollback validation requires a deploy report created with --keep-paused"
-        )
-    if str(context.get("git_sha")) != expected_sha:
-        raise RollbackError("deployment report Git SHA differs from consumer revert SHA")
-    deployed_at = _timestamp(context["generated_at"])
-    validate_live_deployment(args, require_running=True, run=run)
-    env_result = _container_deploy_sha(args, run=run)
-    if env_result != expected_sha:
-        raise RollbackError(
-            f"consumer revert is not deployed: expected={expected_sha}, observed={env_result!r}"
-        )
-
-    writer_state = inspect_writer_state(args, run=run)
-    require_writers_stopped(writer_state)
-
-    handoff = context.get("shared_handoff_final")
-    shared_container_id = (
-        str(handoff.get("shared_scheduler_container") or "")
-        if isinstance(handoff, Mapping)
-        else ""
-    )
-    shared_before = inspect_shared_consumer_pause(
-        args, expected_container_id=shared_container_id, run=run
-    )
-    publication_before = require_no_active_fotmob_publication(args, run=run)
-
-    # Local/ambient Trino variables are not evidence. Bind the query client to
-    # the exact non-secret endpoint and credential configured in the admitted
-    # scheduler container before reading rollback data.
-    trino_binding = bind_admitted_trino(args, require_running=True, run=run)
-    if not args.trino_env_file:
-        raise RollbackError("validate requires --trino-env-file")
-    try:
-        runtime_binding.load_host_trino_environment(args.trino_env_file)
-    except runtime_binding.RuntimeBindingError as exc:
-        raise RollbackError(str(exc)) from exc
-    client = client_factory(catalog=args.catalog, schema=args.bronze_schema)
-    try:
-        marker_before = runtime_binding.validate_data_plane_marker(client, context)
-        counts = _legacy_counts(
-            client, catalog=args.catalog, schema=args.bronze_schema
-        )
-        marker_after = runtime_binding.validate_data_plane_marker(client, context)
-    finally:
-        client.close()
-    live_identity = validate_live_deployment(args, require_running=True, run=run)
-    final_writer_state = inspect_writer_state(args, run=run)
-    require_writers_stopped(final_writer_state)
-    shared_after = inspect_shared_consumer_pause(
-        args, expected_container_id=shared_container_id, run=run
-    )
-    live_identity = validate_live_deployment(args, require_running=True, run=run)
-    publication_after = require_no_active_fotmob_publication(args, run=run)
-    return {
-        "schema_version": "fotmob-rollback-v1",
-        "generated_at": _now(),
-        "passed": True,
-        "mode": "validate",
-        "consumer_git_sha": expected_sha,
-        "deployment_generated_at": deployed_at.isoformat(),
-        "legacy_table_counts": counts,
-        "writers_paused": list(DAGS),
-        "pause_states": final_writer_state["pause_states"],
-        "shared_consumer_readback_before": shared_before,
-        "shared_consumer_readback_after": shared_after,
-        "deployment_identity": {
-            "deployment_id": context["deployment_id"],
-            "git_sha": context["git_sha"],
-            "scheduler_container_id": context["scheduler_container_id"],
-            "shared_scheduler_container_id": shared_container_id,
-            "control_database_bound": publication_after.get(
-                "control_database_bound"
-            )
-            is True,
-            "control_database_fingerprint": publication_after.get(
-                "control_database_fingerprint"
-            ),
-        },
-        "trino_binding": {
-            "runtime": trino_binding["trino"],
-            "data_plane_before": marker_before,
-            "data_plane_after": marker_after,
-        },
-        "live_deployment": live_identity,
-        "publication_quiescence_before": publication_before,
-        "publication_quiescence_after": publication_after,
-        "native_objects_action": "retain",
-        "dynamic_catalog_evidence_action": "retain",
-        "dynamic_catalog_evidence_objects": sorted(PRESERVED_DYNAMIC_CATALOG_EVIDENCE),
-    }
-
-
 def build_parser() -> argparse.ArgumentParser:
     default_compose = Path(__file__).resolve().parents[1] / "deploy/fotmob/airflow.compose.yaml"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=(
-            "plan",
-            "pause",
-            "validate",
-            "restore-maintenance",
-        ),
+        choices=("pause", "restore-maintenance"),
     )
     parser.add_argument("--compose-file", type=Path, default=default_compose)
     parser.add_argument("--env-file", type=Path, required=True)
-    parser.add_argument(
-        "--trino-env-file",
-        type=Path,
-        help="Host-reachable Trino endpoint used only by validate",
-    )
     parser.add_argument("--deployment-report", type=Path, required=True)
     parser.add_argument(
         "--pause-evidence",
@@ -1494,7 +1268,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm")
-    parser.add_argument("--expected-consumer-sha", default="")
     parser.add_argument("--catalog", default="iceberg")
     parser.add_argument("--bronze-schema", default="bronze")
     return parser
@@ -1503,12 +1276,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "plan":
-            report = rollback_plan(args)
-        elif args.command == "pause":
+        if args.command == "pause":
             report = pause_writers(args)
-        elif args.command == "validate":
-            report = validate_rollback(args)
         else:
             report = restore_maintenance(args)
     except Exception as exc:

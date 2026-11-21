@@ -460,90 +460,16 @@ python scripts/fotmob_rollback.py restore-maintenance \
 
 ## Rollback: только coordinator-only
 
-Rollback не включает legacy schedule и не меняет ownership обратно. Native
-Bronze, raw cache и dynamic catalog/evidence сохраняются.
-
-1. Сохранить read-only plan:
-
-   ```bash
-   python scripts/fotmob_rollback.py plan \
-     --env-file "$FOTMOB_ENV" \
-     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --output "$FOTMOB_EVIDENCE/rollback-plan.json"
-   ```
-
-2. Поставить на паузу exact six DAG и shared consumer:
-
-   ```bash
-   python scripts/fotmob_rollback.py pause \
-     --env-file "$FOTMOB_ENV" \
-     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --execute \
-     --confirm PAUSE_FOTMOB_WRITERS \
-     --output "$FOTMOB_EVIDENCE/rollback-pause.json"
-
-   export FOTMOB_PAUSE_REPORT_SHA="$(sha256sum "$FOTMOB_EVIDENCE/rollback-pause.json" | awk '{print $1}')"
-   ```
-
-3. Из pristine checkout reviewed consumer-revert commit выполнить
-   coordinator-only deploy. Сначала развернуть тот же revert commit в shared
-   Airflow, сохранив shared consumer paused и ownership `isolated`. Затем из
-   корня revert checkout заново зафиксировать его путь и SHA. Использовать
-   `--keep-paused` без `--automatic-catalog` и без activation flags:
-
-   ```bash
-   export FOTMOB_RELEASE_ROOT="$PWD"
-   export FOTMOB_RELEASE_SHA="$(git rev-parse HEAD)"
-
-   python deploy/fotmob/deploy.py \
-     --release-root "$FOTMOB_RELEASE_ROOT" \
-     --env-file "$FOTMOB_ENV" \
-     --image "$FOTMOB_AIRFLOW_IMAGE" \
-     --postgres-image "$FOTMOB_POSTGRES_IMAGE" \
-     --evidence-dir "$FOTMOB_EVIDENCE" \
-     --shared-scheduler-container "$FOTMOB_SHARED_SCHEDULER" \
-     --keep-paused \
-     --report "$FOTMOB_DEPLOY_REPORT"
-   ```
-
-   Ожидается `coordinator_rollout.phase=kept_paused`, все шесть DAG paused,
-   shared consumer paused и `fotmob_schedule_owner=isolated`.
-
-4. Проверить revert и frozen legacy tables (fenced Silver/DQ-прогон отката
-   удалён вместе с Silver FotMob, #1590):
-
-   ```bash
-   export FOTMOB_ROLLBACK_SHA="$FOTMOB_RELEASE_SHA"
-
-   python scripts/fotmob_rollback.py validate \
-     --env-file "$FOTMOB_ENV" \
-     --trino-env-file "$FOTMOB_TRINO_ENV" \
-     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --expected-consumer-sha "$FOTMOB_ROLLBACK_SHA" \
-     --output "$FOTMOB_EVIDENCE/rollback-validate.json"
-   ```
-
-5. После зелёного validate вернуть исходное состояние только двух maintenance
-   DAG. SHA берётся от exact проверенного файла:
-
-   ```bash
-   export FOTMOB_OPERATION_REPORT="$FOTMOB_EVIDENCE/rollback-validate.json"
-   export FOTMOB_OPERATION_REPORT_SHA="$(sha256sum "$FOTMOB_OPERATION_REPORT" | awk '{print $1}')"
-
-   python scripts/fotmob_rollback.py restore-maintenance \
-     --env-file "$FOTMOB_ENV" \
-     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --pause-evidence "$FOTMOB_EVIDENCE/rollback-pause.json" \
-     --pause-evidence-sha256 "$FOTMOB_PAUSE_REPORT_SHA" \
-     --operation-report "$FOTMOB_OPERATION_REPORT" \
-     --operation-report-sha256 "$FOTMOB_OPERATION_REPORT_SHA" \
-     --execute \
-     --confirm RESTORE_FOTMOB_MAINTENANCE \
-     --output "$FOTMOB_EVIDENCE/rollback-maintenance-restore.json"
-   ```
-
-После validate все шесть DAG и shared consumer остаются paused. Чтобы снова
-запустить production, нужен новый pristine automatic rollout с шага 1.
+Процедура отката потребителей #930 закрыта решением #1423 (ноябрь 2026):
+замороженные легаси-таблицы bronze FotMob, доступность которых проверял
+`validate`, удаляются ручной post-merge миграцией
+`scripts/drop_fotmob_legacy_tables.sql` (только с отдельного разрешения
+владельца); после её выполнения возврат к легаси-читалкам невозможен.
+Команды `plan` и `validate` удалены из `scripts/fotmob_rollback.py` (их вызовы
+завершаются ошибкой выбора команды). `pause` и `restore-maintenance`
+остаются рабочими командами для процедур purge и staging-cleanup; допустимое
+terminal-evidence для `restore-maintenance` — исторические validate-отчёты и
+явно прерванные plan-отчёты (`--aborted-before-mutation`).
 
 ## Historical issue #930
 

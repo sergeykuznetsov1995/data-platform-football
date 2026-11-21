@@ -12,11 +12,6 @@ Examples::
       --scopes deploy/fotmob/acceptance-scopes.example.json \
       --lifecycle-report /var/lib/fotmob-evidence/replay.json \
       --output /var/lib/fotmob-evidence/verify.json
-
-    python scripts/fotmob_acceptance.py parity \
-      --scopes deploy/fotmob/acceptance-scopes.example.json \
-      --lifecycle-report /var/lib/fotmob-evidence/replay.json \
-      --output /var/lib/fotmob-evidence/parity.json
 """
 
 from __future__ import annotations
@@ -53,22 +48,6 @@ APPROVED_SCOPE_ARTIFACT = (
 APPROVED_SCOPE_ARTIFACT_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
 )
-APPROVED_PARITY_SCOPE_ARTIFACT = (
-    Path(__file__).resolve().parents[1] / "deploy/fotmob/issue-930-parity-scopes.json"
-)
-APPROVED_PARITY_SCOPE_ARTIFACT_SHA256 = (
-    "2fceb11fd69dcd136f4879b6dad85193924b1a7d7484cf00fc9f7f4a7305568d"
-)
-APPROVED_PARITY_SCOPES = frozenset(
-    {
-        (47, "2025/2026", "ENG-Premier League", 2025),
-        (87, "2025/2026", "ESP-La Liga", 2025),
-        (54, "2025/2026", "GER-Bundesliga", 2025),
-        (55, "2025/2026", "ITA-Serie A", 2025),
-        (53, "2025/2026", "FRA-Ligue 1", 2025),
-    }
-)
-APPROVED_PARITY_SCOPE_COUNT = len(APPROVED_PARITY_SCOPES)
 REQUIRED_SCOPE_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players"}
 )
@@ -201,8 +180,6 @@ class TrinoQueryClient:
 class Scope:
     competition_id: int
     source_season_key: str
-    legacy_league: str | None = None
-    legacy_season: int | None = None
 
     @property
     def identity(self) -> str:
@@ -351,7 +328,6 @@ def _qualified(catalog: str, schema: str, table: str) -> str:
 def load_scopes(
     path: Path,
     *,
-    parity: bool = False,
     content: bytes | None = None,
 ) -> list[Scope]:
     try:
@@ -365,10 +341,6 @@ def load_scopes(
         except json.JSONDecodeError as exc:
             raise ValueError(f"cannot read scope JSON {path}: {exc}") from exc
     else:
-        if parity:
-            raise ValueError(
-                "parity scopes must be JSON with legacy_league and legacy_season"
-            )
         payload = []
         for line_number, raw_line in enumerate(text.splitlines(), start=1):
             line = raw_line.strip()
@@ -401,12 +373,6 @@ def load_scopes(
             raise ValueError(f"scope[{index}] has invalid native identity") from exc
         if competition_id <= 0 or not season_key:
             raise ValueError(f"scope[{index}] has invalid native identity")
-        legacy_league = item.get("legacy_league")
-        legacy_season = item.get("legacy_season")
-        if parity and (not legacy_league or legacy_season is None):
-            raise ValueError(
-                f"scope[{index}] requires legacy_league and legacy_season for parity"
-            )
         identity = (competition_id, season_key)
         if identity in identities:
             raise ValueError(f"duplicate scope: {competition_id}={season_key}")
@@ -415,12 +381,6 @@ def load_scopes(
             Scope(
                 competition_id=competition_id,
                 source_season_key=season_key,
-                legacy_league=(
-                    str(legacy_league).strip() if legacy_league is not None else None
-                ),
-                legacy_season=(
-                    int(legacy_season) if legacy_season is not None else None
-                ),
             )
         )
     return scopes
@@ -475,62 +435,7 @@ def validate_approved_scope_contract(
             "scope_file_sha256": artifact_sha256,
         }
 
-    if command != "parity":
-        raise ValueError(f"unsupported acceptance command: {command!r}")
-    observed_parity = frozenset(
-        (
-            scope.competition_id,
-            scope.source_season_key,
-            scope.legacy_league,
-            scope.legacy_season,
-        )
-        for scope in scopes
-    )
-    if observed_parity != APPROVED_PARITY_SCOPES:
-        missing = sorted(APPROVED_PARITY_SCOPES - observed_parity)[:10]
-        unexpected = sorted(observed_parity - APPROVED_PARITY_SCOPES)[:10]
-        raise ValueError(
-            "approved parity scope mismatch: "
-            f"observed={len(observed_parity)}, "
-            f"expected={APPROVED_PARITY_SCOPE_COUNT}, "
-            f"missing={missing!r}, unexpected={unexpected!r}"
-        )
-    try:
-        parity_artifact_bytes = APPROVED_PARITY_SCOPE_ARTIFACT.read_bytes()
-    except OSError as exc:
-        raise ValueError(
-            "cannot read approved parity artifact "
-            f"{APPROVED_PARITY_SCOPE_ARTIFACT}: {exc}"
-        ) from exc
-    parity_artifact_sha256 = hashlib.sha256(parity_artifact_bytes).hexdigest()
-    if parity_artifact_sha256 != APPROVED_PARITY_SCOPE_ARTIFACT_SHA256:
-        raise ValueError(
-            "approved #930 parity artifact differs from its pinned SHA-256"
-        )
-    artifact_scopes = load_scopes(
-        APPROVED_PARITY_SCOPE_ARTIFACT,
-        parity=True,
-        content=parity_artifact_bytes,
-    )
-    artifact_identities = frozenset(
-        (
-            scope.competition_id,
-            scope.source_season_key,
-            scope.legacy_league,
-            scope.legacy_season,
-        )
-        for scope in artifact_scopes
-    )
-    if artifact_identities != APPROVED_PARITY_SCOPES:
-        raise ValueError("approved #930 parity artifact has unexpected identities")
-    return {
-        "name": "issue-930-parity",
-        "expected_scope_count": APPROVED_PARITY_SCOPE_COUNT,
-        "identities": [list(identity) for identity in sorted(APPROVED_PARITY_SCOPES)],
-        "identity_artifact": str(APPROVED_PARITY_SCOPE_ARTIFACT),
-        "identity_artifact_sha256": parity_artifact_sha256,
-        "scope_file_sha256": parity_artifact_sha256,
-    }
+    raise ValueError(f"unsupported acceptance command: {command!r}")
 
 
 def _validated_plan_signature(value: str) -> str:
@@ -2139,210 +2044,6 @@ def _field_inventory_check(
         "duplicate_keys": int(duplicates),
     }
 
-
-def _fetch_set(
-    client: QueryClient,
-    sql: str,
-    *,
-    width: int,
-) -> set[tuple[str, ...]]:
-    rows = client.query(sql)
-    output: set[tuple[str, ...]] = set()
-    for row in rows:
-        if len(row) != width:
-            raise RuntimeError(f"set query returned width {len(row)}, expected {width}")
-        output.add(tuple("<NULL>" if value is None else str(value) for value in row))
-    return output
-
-
-def _set_comparison(
-    client: QueryClient,
-    *,
-    name: str,
-    native_sql: str,
-    legacy_sql: str,
-    width: int,
-    minimum_overlap: float | None = None,
-    allow_native_extras: bool = False,
-) -> Mapping[str, Any]:
-    native = _fetch_set(client, native_sql, width=width)
-    legacy = _fetch_set(client, legacy_sql, width=width)
-    both = native & legacy
-    only_native = native - legacy
-    only_legacy = legacy - native
-    if not native and not legacy:
-        raise RuntimeError(f"{name}: both native and legacy sets are empty")
-    denominator = len(legacy)
-    overlap = len(both) / denominator if denominator else (1.0 if not native else 0.0)
-    if minimum_overlap is None:
-        passed = not only_native and not only_legacy
-    else:
-        passed = overlap >= minimum_overlap and (allow_native_extras or not only_native)
-    return {
-        "passed": passed,
-        "native": len(native),
-        "legacy": len(legacy),
-        "both": len(both),
-        "only_native": len(only_native),
-        "only_legacy": len(only_legacy),
-        "legacy_coverage": overlap,
-        "only_native_sample": [list(item) for item in sorted(only_native)[:25]],
-        "only_legacy_sample": [list(item) for item in sorted(only_legacy)[:25]],
-    }
-
-
-def _scope_parity_checks(
-    client: QueryClient,
-    scope: Scope,
-    *,
-    catalog: str,
-    bronze_schema: str,
-) -> list[Check]:
-    assert scope.legacy_league is not None and scope.legacy_season is not None
-
-    def q(table: str) -> str:
-        return _qualified(catalog, bronze_schema, table)
-
-    cid = scope.competition_id
-    season = _literal(scope.source_season_key)
-    league = _literal(scope.legacy_league)
-    legacy_season = scope.legacy_season
-    comparisons = (
-        (
-            "matches",
-            f"""-- parity:{scope.identity}:matches:native
-            SELECT DISTINCT CAST(match_id AS VARCHAR)
-            FROM {q("fotmob_matches_current")}
-            WHERE CAST(competition_id AS BIGINT) = {cid}
-              AND source_season_key = {season}
-            """,
-            f"""-- parity:{scope.identity}:matches:legacy
-            SELECT DISTINCT CAST(match_id AS VARCHAR)
-            FROM {q("fotmob_schedule")}
-            WHERE league = {league} AND season = {legacy_season}
-            """,
-            1,
-            None,
-        ),
-        (
-            "payloads",
-            f"""-- parity:{scope.identity}:payloads:native
-            SELECT DISTINCT CAST(match_id AS VARCHAR)
-            FROM {q("fotmob_match_payloads_current")}
-            WHERE CAST(competition_id AS BIGINT) = {cid}
-              AND source_season_key = {season}
-            """,
-            f"""-- parity:{scope.identity}:payloads:legacy
-            SELECT DISTINCT CAST(match_id AS VARCHAR)
-            FROM {q("fotmob_match_details")}
-            WHERE league = {league} AND season = {legacy_season}
-            """,
-            1,
-            None,
-        ),
-        (
-            "standings",
-            f"""-- parity:{scope.identity}:standings:native
-            SELECT DISTINCT CAST(team_id AS VARCHAR)
-            FROM {q("fotmob_standings_current")}
-            WHERE CAST(competition_id AS BIGINT) = {cid}
-              AND source_season_key = {season}
-              AND LOWER(COALESCE(table_type, 'all')) = 'all'
-            """,
-            f"""-- parity:{scope.identity}:standings:legacy
-            SELECT DISTINCT CAST(team_id AS VARCHAR)
-            FROM {q("fotmob_team_stats")}
-            WHERE league = {league} AND season = {legacy_season}
-            """,
-            1,
-            None,
-        ),
-        (
-            "roster",
-            f"""-- parity:{scope.identity}:roster:native
-            SELECT DISTINCT CAST(s.team_id AS VARCHAR), CAST(s.member_id AS VARCHAR)
-            FROM {q("fotmob_squad_snapshots_current")} s
-            JOIN {q("fotmob_season_teams_current")} t
-              ON CAST(t.team_id AS VARCHAR) = CAST(s.team_id AS VARCHAR)
-            WHERE CAST(t.competition_id AS BIGINT) = {cid}
-              AND t.source_season_key = {season}
-              AND s.member_type = 'player'
-            """,
-            f"""-- parity:{scope.identity}:roster:legacy
-            SELECT DISTINCT CAST(team_id AS VARCHAR), CAST(player_id AS VARCHAR)
-            FROM {q("fotmob_team_squad")}
-            WHERE league = {league} AND season = {legacy_season}
-            """,
-            2,
-            0.90,
-        ),
-    )
-    checks: list[Check] = []
-    for name, native_sql, legacy_sql, width, minimum_overlap in comparisons:
-        checks.append(
-            _run_check(
-                f"{scope.identity}:{name}",
-                lambda name=name, native_sql=native_sql, legacy_sql=legacy_sql, width=width, minimum_overlap=minimum_overlap: (
-                    _set_comparison(
-                        client,
-                        name=name,
-                        native_sql=native_sql,
-                        legacy_sql=legacy_sql,
-                        width=width,
-                        minimum_overlap=minimum_overlap,
-                        allow_native_extras=minimum_overlap is not None,
-                    )
-                ),
-            )
-        )
-    return checks
-
-
-def parity(
-    client: QueryClient,
-    scopes: Sequence[Scope],
-    *,
-    catalog: str,
-    bronze_schema: str,
-    parser_version: str,
-    lineage: AcceptanceLineage,
-) -> dict[str, Any]:
-    parser_version = _validated_parser_version(parser_version)
-    plan_signature = _validated_plan_signature(lineage.plan_signature)
-    completed_since, completed_since_sql = _completed_since_sql(lineage.completed_since)
-    manifest = _qualified(catalog, bronze_schema, "fotmob_ingest_manifest")
-    checks: list[Check] = [
-        _run_check(
-            "target_scope_completion",
-            lambda: _scope_completion_check(
-                client,
-                scopes,
-                manifest=manifest,
-                parser_version=parser_version,
-                plan_signature=plan_signature,
-                completed_since_sql=completed_since_sql,
-                runner_run_id=lineage.runner_run_id,
-                catalog=catalog,
-                schema=bronze_schema,
-            ),
-        )
-    ]
-    for scope in scopes:
-        checks.extend(
-            _scope_parity_checks(
-                client,
-                scope,
-                catalog=catalog,
-                bronze_schema=bronze_schema,
-            )
-        )
-    report = _report("parity", scopes, checks, parser_version=parser_version)
-    report["plan_signature"] = plan_signature
-    report["completed_since"] = completed_since
-    report["runner_run_id"] = lineage.runner_run_id
-    return report
-
-
 def _report(
     kind: str,
     scopes: Sequence[Scope],
@@ -2401,15 +2102,12 @@ def build_parser() -> argparse.ArgumentParser:
         Path(__file__).resolve().parents[1] / "deploy/fotmob/airflow.compose.yaml"
     )
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("verify", "parity"))
+    parser.add_argument("command", choices=("verify",))
     parser.add_argument(
         "--scopes",
         type=Path,
         required=True,
-        help=(
-            "Verify accepts JSON or ID=season; parity requires JSON with the "
-            "legacy identity. Both commands enforce their reviewed #930 set."
-        ),
+        help="Verify accepts JSON or ID=season; both forms enforce the reviewed #930 set.",
     )
     parser.add_argument(
         "--scope-sha256",
@@ -2472,7 +2170,6 @@ def main(
             )
         scopes = load_scopes(
             args.scopes,
-            parity=args.command == "parity",
             content=scope_bytes,
         )
         scope_contract = validate_approved_scope_contract(args.command, scopes)
@@ -2516,24 +2213,14 @@ def main(
         client = client_factory(catalog=args.catalog, schema=args.bronze_schema)
         try:
             marker_before = runtime_binding.validate_data_plane_marker(client, context)
-            if args.command == "verify":
-                report = verify(
-                    client,
-                    scopes,
-                    catalog=args.catalog,
-                    bronze_schema=args.bronze_schema,
-                    parser_version=args.parser_version,
-                    lineage=lineage,
-                )
-            else:
-                report = parity(
-                    client,
-                    scopes,
-                    catalog=args.catalog,
-                    bronze_schema=args.bronze_schema,
-                    parser_version=args.parser_version,
-                    lineage=lineage,
-                )
+            report = verify(
+                client,
+                scopes,
+                catalog=args.catalog,
+                bronze_schema=args.bronze_schema,
+                parser_version=args.parser_version,
+                lineage=lineage,
+            )
             marker_after = runtime_binding.validate_data_plane_marker(client, context)
         finally:
             client.close()

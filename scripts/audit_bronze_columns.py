@@ -829,12 +829,11 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
     },
     "fotmob": {
-        # Frozen legacy archive retained by the owner for rollback evidence;
-        # fotmob_transfers is also an intentional Silver history bridge (#930).
-        # The removed legacy scraper no longer writes these 9 tables. Keep their
-        # last-known contract auditable without treating it as the source-native
+        # Frozen legacy archive: drained and dropped from bronze in #1423
+        # (absence is asserted via EXPECTED_ABSENT). Keep the last-known
+        # contract auditable without treating it as the source-native
         # ``fotmob_*_current`` contract. All are partitioned by ['league',
-        # 'season']; extra live columns remain informational rather than errors.
+        # 'season']; extra live columns were informational rather than errors.
         "fotmob_schedule": {
             "league",
             "season",
@@ -1618,6 +1617,19 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
 # instead of a missing-table failure.
 EXPECTED_ABSENT: dict[str, set[str]] = {
     "fbref": {"fbref_shot_events"},  # FBref Feb-2026 shot-data restriction (#276)
+    # #1423 legacy drain (2026-11): the frozen legacy FotMob tables were dropped
+    # from bronze; their last-known contracts stay in EXPECTED_TABLES for history.
+    "fotmob": {
+        "fotmob_match_details",
+        "fotmob_player_details",
+        "fotmob_player_stats",
+        "fotmob_schedule",
+        "fotmob_team_leaderboards",
+        "fotmob_team_profile",
+        "fotmob_team_squad",
+        "fotmob_team_stats",
+        "fotmob_transfers",
+    },
 }
 
 # Source prefix → group label for the report

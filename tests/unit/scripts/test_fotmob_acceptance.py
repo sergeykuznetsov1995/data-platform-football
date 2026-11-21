@@ -390,56 +390,10 @@ class FakeAcceptanceClient:
         self.closed = True
 
 
-class FakeParityClient:
-    def __init__(
-        self,
-        *,
-        runner_run_id=RUNNER_RUN_ID,
-        scope_identities=((47, "2025/2026"),),
-    ):
-        self.runner_run_id = runner_run_id
-        self.scope_identities = tuple(scope_identities)
-        self.closed = False
-
-    def query(self, sql):
-        if "runtime-binding:data-plane-marker" in sql:
-            return [(1,)]
-        if "acceptance:scope-completion" in sql:
-            counts, capabilities = fake_completion_payload()
-            return [
-                (
-                    competition_id,
-                    season_key,
-                    self.runner_run_id,
-                    datetime(2026, 7, 21),
-                    json.dumps(counts),
-                    json.dumps(capabilities),
-                )
-                for competition_id, season_key in self.scope_identities
-            ]
-        coverage_rows = fake_scope_coverage_rows(sql, self.scope_identities)
-        if coverage_rows is not None:
-            return coverage_rows
-        if ":roster:native" in sql:
-            return [("1", str(index)) for index in range(1, 10)] + [
-                ("1", "native-extra")
-            ]
-        if ":roster:legacy" in sql:
-            return [("1", str(index)) for index in range(1, 11)]
-        if ":native" in sql or ":legacy" in sql:
-            return [("101",), ("102",)]
-        raise AssertionError(f"unexpected SQL: {sql}")
-
-    def close(self):
-        self.closed = True
-
-
 def scope():
     return mod.Scope(
         competition_id=47,
         source_season_key="2025/2026",
-        legacy_league="ENG-Premier League",
-        legacy_season=2025,
     )
 
 
@@ -480,18 +434,6 @@ def test_approved_verify_scope_artifact_is_exact_and_runnable():
     assert (
         contract["identity_artifact_sha256"]
         == hashlib.sha256(mod.APPROVED_SCOPE_ARTIFACT.read_bytes()).hexdigest()
-    )
-
-
-def test_versioned_parity_scope_is_the_exact_approved_five():
-    path = mod.APPROVED_PARITY_SCOPE_ARTIFACT
-    scopes = mod.load_scopes(path, parity=True)
-
-    contract = mod.validate_approved_scope_contract("parity", scopes)
-    assert contract["name"] == "issue-930-parity"
-    assert contract["expected_scope_count"] == 5
-    assert (
-        contract["scope_file_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     )
 
 
@@ -1171,24 +1113,6 @@ def test_scope_completion_rejects_mixed_runner_lineage():
     assert not any("acceptance:scope-coverage:" in sql for sql in client.sql)
 
 
-def test_parity_requires_exact_sets_and_roster_90_percent():
-    report = mod.parity(
-        FakeParityClient(),
-        [scope()],
-        catalog="iceberg",
-        bronze_schema="bronze",
-        parser_version="fotmob-native-v2",
-        lineage=fake_lineage(),
-    )
-    assert report["passed"] is True
-    by_name = {check["name"]: check for check in report["checks"]}
-    roster = by_name["47=2025/2026:roster"]
-    assert roster["details"]["legacy_coverage"] == 0.9
-    assert roster["details"]["only_legacy"] == 1
-    # #1590: the legacy Silver transfer-preservation check is removed.
-    assert "silver_transfer_legacy_identity_preservation" not in by_name
-
-
 def test_main_writes_valid_red_json_and_nonzero_on_missing_sql(tmp_path):
     scopes = tmp_path / "scopes.txt"
     scopes.write_bytes(mod.APPROVED_SCOPE_ARTIFACT.read_bytes())
@@ -1231,7 +1155,7 @@ def test_main_writes_valid_red_json_and_nonzero_on_missing_sql(tmp_path):
     assert payload["lifecycle_report"]["live_publication_after"]["released"] is True
 
 
-def test_verify_and_parity_use_the_same_158_scope_lifecycle_report(tmp_path):
+def test_verify_uses_the_158_scope_lifecycle_report(tmp_path):
     options = runtime_options(tmp_path)
     lifecycle_path, lifecycle = write_lifecycle_report(tmp_path, options)
     generation_id = lifecycle["publication"]["generation_id"]
@@ -1263,44 +1187,15 @@ def test_verify_and_parity_use_the_same_158_scope_lifecycle_report(tmp_path):
         publication_reader=reader,
     )
 
-    parity_scopes = mod.load_scopes(mod.APPROVED_PARITY_SCOPE_ARTIFACT, parity=True)
-    parity_client = FakeParityClient(
-        runner_run_id=generation_id,
-        scope_identities=[
-            (item.competition_id, item.source_season_key) for item in parity_scopes
-        ],
-    )
-    parity_output = tmp_path / "parity-green.json"
-    parity_code = mod.main(
-        [
-            "parity",
-            "--scopes",
-            str(mod.APPROVED_PARITY_SCOPE_ARTIFACT),
-            "--scope-sha256",
-            mod.APPROVED_PARITY_SCOPE_ARTIFACT_SHA256,
-            "--lifecycle-report",
-            str(lifecycle_path),
-            "--output",
-            str(parity_output),
-            *options,
-        ],
-        client_factory=lambda **_: parity_client,
-        runtime_binder=fake_runtime_binding,
-        publication_reader=reader,
-    )
-
     verify_report = json.loads(verify_output.read_text(encoding="utf-8"))
-    parity_report = json.loads(parity_output.read_text(encoding="utf-8"))
-    assert verify_code == parity_code == 0
-    assert verify_report["passed"] is parity_report["passed"] is True
+    assert verify_code == 0
+    assert verify_report["passed"] is True
     assert verify_report["lifecycle_report"]["scope"]["count"] == 158
-    assert parity_report["lifecycle_report"]["scope"]["count"] == 158
     assert (
         verify_report["lifecycle_report"]["report_sha256"]
-        == (parity_report["lifecycle_report"]["report_sha256"])
+        == hashlib.sha256(lifecycle_path.read_bytes()).hexdigest()
     )
     assert verify_report["runner_run_id"] == generation_id
-    assert parity_report["runner_run_id"] == generation_id
 
 
 def test_same_count_wrong_verify_identities_are_rejected_before_trino(tmp_path):

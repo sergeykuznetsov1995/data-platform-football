@@ -181,12 +181,6 @@ HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     "understat_team_match_stats",
     "matchhistory_results",  # #307: was matchhistory_games (legacy table dropped)
     *FOTMOB_NATIVE_HIGH_CHURN,
-    # Frozen FotMob tables retain old snapshots/orphans during the #930 rollback
-    # window. Remove these only through an explicit legacy drain follow-up;
-    # they are no longer writers and must never be added back to that path.
-    "fotmob_match_details",
-    "fotmob_player_details",
-    "fotmob_player_stats",
     "sofascore_player_ratings",
     "sofascore_player_universe",
     "sofascore_player_profile",
