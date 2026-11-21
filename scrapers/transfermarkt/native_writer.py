@@ -550,8 +550,8 @@ def _verify_receipts(connection, receipts) -> None:
 def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
     if not plans:
         raise ValueError('core bundle requires at least one plan')
-    if len({plan.entity for plan in plans}) != len(plans):
-        raise ValueError('core bundle requires distinct entities')
+    # One entity may appear in several plans (one club per memberships plan);
+    # natural-key uniqueness across plans is the real collision contract.
     if not all((run_id, universe_version, committed_at)):
         raise ValueError('core run_id, universe_version and committed_at must be non-empty')
     _timestamp(committed_at)
