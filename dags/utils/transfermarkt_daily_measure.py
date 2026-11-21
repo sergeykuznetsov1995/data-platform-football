@@ -88,7 +88,17 @@ def daily_denominator(denominator_rows: Iterable[Any], registry_rows: Iterable[M
                             denominator_definition_hash(denominator_rows))
 
 
-def build_daily_measure_sql(denominator: DailyDenominator, day: date | str, *, as_of: datetime | str
+def validate_journal_snapshots(snapshots: Mapping[str, int]) -> dict[str, int]:
+    if not isinstance(snapshots, Mapping) or set(snapshots) != {CHECKS_TABLE, SIGNALS_TABLE}:
+        raise MeasurementError(f'journal snapshots require exactly {CHECKS_TABLE} and {SIGNALS_TABLE}')
+    for table, version in snapshots.items():
+        if type(version) is not int or not 0 < version <= 2**63 - 1:
+            raise MeasurementError(f'{table}: snapshot ID must be a positive signed BIGINT')
+    return dict(snapshots)
+
+
+def build_daily_measure_sql(denominator: DailyDenominator, day: date | str, *, as_of: datetime | str,
+                            journal_snapshots: Mapping[str, int] | None = None
                             ) -> tuple[str, tuple[Any, ...]]:
     """A single parameterized Trino SELECT; timestamp(6) ops clocks are UTC.
 
@@ -102,6 +112,11 @@ def build_daily_measure_sql(denominator: DailyDenominator, day: date | str, *, a
         raise MeasurementError('as_of predates the report day')
     if not denominator.rows:
         raise MeasurementError('empty denominator')
+    checks, signals = CHECKS_TABLE, SIGNALS_TABLE
+    if journal_snapshots is not None:
+        versions = validate_journal_snapshots(journal_snapshots)
+        checks = f'{CHECKS_TABLE} FOR VERSION AS OF {versions[CHECKS_TABLE]}'
+        signals = f'{SIGNALS_TABLE} FOR VERSION AS OF {versions[SIGNALS_TABLE]}'
     values = ',\n'.join('(CAST(? AS varchar), CAST(? AS varchar), CAST(? AS varchar), CAST(? AS varchar), CAST(? AS varchar), CAST(? AS varchar))'
                         for _ in denominator.rows)
     params = (start.replace(tzinfo=None), end.replace(tzinfo=None), observed.replace(tzinfo=None),
@@ -114,7 +129,7 @@ args(day_start, day_end, as_of, denominator_hash, denominator_version, measureme
 ),
 core(competition_id, scope_id, edition_id, registry_snapshot_id, team_type, edition_fingerprint) AS (VALUES {values}),
 valid_checks AS (
- SELECT c.scope_id, c.check_kind FROM {CHECKS_TABLE} c
+ SELECT c.scope_id, c.check_kind FROM {checks} c
  JOIN core d ON c.scope_id = d.scope_id
  CROSS JOIN args a
  WHERE ((c.registry_snapshot_id = d.registry_snapshot_id AND c.denominator_hash = a.denominator_hash)
@@ -142,16 +157,16 @@ competition_coverage AS (
 signal_events AS (
  SELECT scope_id, entity, entity_id, observed_signature AS signature, signal_version,
  first_detected_at, status, result, bronze_manifest, committed_at,
- COALESCE(measurement_kind, 'unknown') AS measurement_kind FROM {SIGNALS_TABLE}
+ COALESCE(measurement_kind, 'unknown') AS measurement_kind FROM {signals}
  UNION ALL
  SELECT s.scope_id, s.entity, s.entity_id, json_extract_scalar(json_parse(e), '$.signature'),
  json_extract_scalar(json_parse(e), '$.signal_version'),
- CAST(at_timezone(from_iso8601_timestamp(json_extract_scalar(json_parse(e), '$.first_detected_at')), 'UTC') AS timestamp(6)),
+ CAST(from_iso8601_timestamp(json_extract_scalar(json_parse(e), '$.first_detected_at')) AT TIME ZONE 'UTC' AS timestamp(6)),
  json_extract_scalar(json_parse(e), '$.status'), json_extract_scalar(json_parse(e), '$.result'),
  json_extract_scalar(json_parse(e), '$.bronze_manifest'),
- CAST(at_timezone(from_iso8601_timestamp(json_extract_scalar(json_parse(e), '$.committed_at')), 'UTC') AS timestamp(6)),
+ CAST(from_iso8601_timestamp(json_extract_scalar(json_parse(e), '$.committed_at')) AT TIME ZONE 'UTC' AS timestamp(6)),
  COALESCE(json_extract_scalar(json_parse(e), '$.measurement_kind'), 'unknown')
- FROM {SIGNALS_TABLE} s CROSS JOIN UNNEST(CAST(json_parse(s.superseded_evidence_json) AS array(varchar))) AS u(e)
+ FROM {signals} s CROSS JOIN UNNEST(CAST(json_parse(s.superseded_evidence_json) AS array(varchar))) AS u(e)
 ),
 cohort AS (
  SELECT DISTINCT e.* FROM signal_events e JOIN core d ON d.scope_id = e.scope_id CROSS JOIN args a

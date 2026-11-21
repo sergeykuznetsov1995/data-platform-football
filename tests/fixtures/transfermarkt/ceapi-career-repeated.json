@@ -1,0 +1,40 @@
+{
+  "market_value": {
+    "list": [
+      {
+        "x": 1751328000000,
+        "datum_mw": "2025-07-01",
+        "mw": "€200K",
+        "y": 200000
+      },
+      {
+        "x": 1751328000000,
+        "datum_mw": "2025-07-01",
+        "mw": "€200K",
+        "y": 200000
+      }
+    ]
+  },
+  "transfers": {
+    "transfers": [
+      {
+        "id": "repeat-source-1",
+        "date": "2025-07-01",
+        "season": "25/26",
+        "from": {"href": "/club-a/startseite/verein/101"},
+        "to": {"href": "/club-b/startseite/verein/202"},
+        "fee": "Loan fee:<br /><i>€100K</i>",
+        "upcoming": false
+      },
+      {
+        "id": "repeat-source-1",
+        "date": "2025-07-01",
+        "season": "25/26",
+        "from": {"href": "/club-a/startseite/verein/101"},
+        "to": {"href": "/club-b/startseite/verein/202"},
+        "fee": "Loan fee:<br /><i>€100K</i>",
+        "upcoming": false
+      }
+    ]
+  }
+}

@@ -52,6 +52,7 @@ from scrapers.transfermarkt.models import (
     SCOPE_REQUEST_LIMIT, SCOPE_RETRY_LIMIT,
 )
 from scrapers.transfermarkt import tmapi
+from scrapers.transfermarkt import scraper as tm_scraper
 from scrapers.transfermarkt.client import LeaseConcurrencyLimited, redact_sensitive
 
 
@@ -86,8 +87,11 @@ def _deadline_retained(exc):
     return False
 
 
+_CONTRACT_PROFILE_CAPTURE_LIMIT = 400
+
+
 _ENTITY_LABELS = {
-    'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury'),
+    'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury', 'current_player_profile'),
     'market_value_history': ('market_value_points', 'mv_history'),
     'transfers': ('transfer_events', 'transfers'),
     'coaches': ('coach_history', 'coach_profile', 'club_staff'),
@@ -1193,6 +1197,37 @@ class _Scope:
                             'contract_until': signal.contract_until, 'source_url': raw.url,
                             'source_body_hash': raw.content_hash, 'fetched_at': raw.fetched_at,
                             'raw_capture_id': raw.capture_id}
+        profile_attempts = 0
+        stop_profiles = False
+        for club_id in snapshot.changed_club_ids:
+            if stop_profiles:
+                break
+            for row in snapshot.clubs[club_id].rows:
+                key = club_id + ':' + row['player_id']
+                if stop_profiles or profile_attempts >= _CONTRACT_PROFILE_CAPTURE_LIMIT:
+                    stop_profiles = True
+                    break
+                if key in overrides or row['contract_until'] is not None or row.get('_contract_status') not in {'unknown', 'not_rendered'}:
+                    continue
+                url = tm_scraper._TM_BASE + tm_scraper._PLAYER_PROFILE_PATH.format(
+                    player_slug=row['player_slug'], player_id=row['player_id'],
+                )
+                profile_attempts += 1
+                try:
+                    outcome = self.fetch(url, 'current_player_profile')
+                except CurrentPortionError as exc:
+                    if _deadline_retained(exc):
+                        raise
+                    stop_profiles = True
+                    break
+                profile = tm_scraper._parse_player_contract_profile(outcome.value, row['player_id'])
+                if (profile is not None and profile['contract_status'] == 'ok'
+                    and profile['current_club_id'] == club_id and profile['contract_until']):
+                    overrides[key] = {
+                'contract_until': profile['contract_until'].isoformat(), 'source_url': url,
+                        'source_body_hash': outcome.raw_body_hash, 'fetched_at': outcome.raw_fetched_at,
+                        'raw_capture_id': outcome.raw_capture_id,
+                    }
         enriched = replace(snapshot, contract_overrides=overrides)
         verify_contract_overrides(enriched, store)
         return enriched
@@ -1950,10 +1985,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             denominator_rows = list(registry_denominator.denominator.rows.values())
             universe_version = registry_denominator.universe_version
         else:
-            from scrapers.transfermarkt.denominator import denominator_path, load_denominator
-            path = denominator_path()
-            denominator_rows = list(load_denominator(path).rows.values())
-            universe_version = hashlib.sha256(path.read_bytes()).hexdigest()
+            from scrapers.transfermarkt.denominator import load_versioned_denominator
+            denominator, universe_version = load_versioned_denominator()
+            denominator_rows = list(denominator.rows.values())
     else:
         source, universe_version = 'injected', None
     denominator_rows = list(denominator_rows)

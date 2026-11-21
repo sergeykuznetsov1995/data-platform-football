@@ -1,0 +1,27 @@
+services:
+  trino:
+    volumes:
+      - type: bind
+        source: ${WHOSCORED_SCAN_METER_RELEASE:?}/football-whoscored-scan.jar
+        target: /usr/lib/trino/lib/football-whoscored-scan.jar
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${WHOSCORED_SCAN_METER_RELEASE:?}/jvm.config
+        target: /etc/trino/jvm.config
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${WHOSCORED_SCAN_METER_RELEASE:?}/logging.properties
+        target: /etc/trino/whoscored-scan.logging.properties
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${WHOSCORED_SCAN_METER_STATE:?}/control
+        target: /etc/trino/whoscored-scan-control
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${WHOSCORED_SCAN_METER_STATE:?}/journal
+        target: /scan-journal
+        bind: {create_host_path: false}

@@ -866,7 +866,7 @@ def test_cli_sql_failure_preserves_independent_dq(
 ):
     from dags.utils.transfermarkt_daily_dq import VERSION
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("query failed: private connection details")
 
     monkeypatch.setattr(cli, "execute_measure", fail)
@@ -883,7 +883,7 @@ def test_cli_sql_failure_preserves_independent_dq(
     assert output["status"] == "not_measured"
     assert "не измерено" in output["summary"]
     assert "охват 0/" not in output["summary"]
-    assert "private connection details" not in output["summary"]
+    assert "private connection details" not in json.dumps(output)
     assert output["summary"].endswith(f"Bronze DQ {expected}")
 
 
