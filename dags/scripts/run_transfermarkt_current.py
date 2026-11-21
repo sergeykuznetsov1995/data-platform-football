@@ -2416,6 +2416,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         production_handoff = roster_writer.__module__ == 'dags.utils.transfermarkt_current_write'
         if production_handoff:
             from dags.utils import transfermarkt_native_v2 as season_control
+            from scrapers.transfermarkt.registry import deterministic_scope_id
             connection = _bound_connection(season_control.connect(), deadline, clock)
             cursor = connection.cursor()
             try:
