@@ -18,9 +18,11 @@ is recorded only after a separately approved production cycle.
 | Reused team scope plus coach history/profile | `coach_profiles` | `transfermarkt_coach_profiles` | `transfermarkt_coach_profiles_v2` | `dim_manager_v2` |
 | Reused team scope plus coach history/profile | `coach_stints` | `transfermarkt_coach_stints` | `transfermarkt_coach_stints_v2` | `dim_manager_v2`, canonical coaches |
 
-Fixtures, stages, results, awards and achievements are not advertised as
-supported entities: there is no production table contract for them. Awards and
-achievements remain roadmap-only until source grain, tables and DQ are added.
+Fixtures, stages, results and awards are not advertised as supported entities:
+there is no production table contract for them. Achievement observations have a separate production contract
+for player, club and coach detail rows, with raw lineage, receipts and DQ. They
+are intentionally absent from `ALL_NATIVE_ENTITIES`, so the existing current
+scope writer does not acquire a new entity as a side effect.
 
 Every concrete table is also registered in
 `dags/utils/transfermarkt_native_v2.py::TABLE_CONTRACTS` with grain, natural
