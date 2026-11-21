@@ -117,7 +117,7 @@ def _rows(frame):
     return sorted(rows, key=lambda row: json.dumps(row))
 
 
-def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None, player_ids=()):
+def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None, player_ids=(), natural_keys=()):
     table = 'iceberg.bronze.' + output.table_name
     relation = table + (f' FOR VERSION AS OF {snapshot_id}' if snapshot_id else '')
     if snapshot_id == 0 and frame.empty:
@@ -171,6 +171,24 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
     elif {'competition_id', 'edition_id'} <= set(frame.columns):
         predicate += ' AND competition_id = ? AND edition_id = ?'
         params += [str(frame.iloc[0]['competition_id']), str(frame.iloc[0]['edition_id'])]
+    batch_predicate = predicate
+    batch_params = list(params)
+    if natural_keys:
+        keys = list(natural_keys)
+        if (len(set(keys)) != len(keys)
+                or any(list(frame.columns).count(key) != 1 for key in keys)):
+            raise CurrentWriteError(f'natural key columns unavailable for {output.key}')
+        key_frame = frame.loc[:, keys]
+        if key_frame.isna().any().any() or key_frame.duplicated().any():
+            raise CurrentWriteError(f'invalid natural key identity for {output.key}')
+        key_rows = [tuple(_cell(key, value) for key, value in zip(keys, row))
+                    for row in key_frame.itertuples(index=False, name=None)]
+        if any(value is None for row in key_rows for value in row) or len(set(key_rows)) != len(key_rows):
+            raise CurrentWriteError(f'invalid natural key identity for {output.key}')
+        placeholders = '(' + ', '.join('?' for _ in keys) + ')'
+        predicate += ' AND (' + ', '.join(keys) + ') IN (' + ', '.join(
+            placeholders for _ in key_rows) + ')'
+        params.extend(value for row in key_rows for value in row)
     try:
         persisted = run._query_dataframe(scraper._bronze_connection(),
             f'SELECT {", ".join(frame.columns)} FROM {relation} WHERE {predicate}', params)
@@ -178,6 +196,15 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
         raise CurrentWriteError(f'physical read-back failed for {table}') from exc
     if list(persisted.columns) != list(frame.columns) or _rows(persisted) != _rows(frame):
         raise CurrentWriteError(f'physical business/lineage mismatch in {table}')
+    if natural_keys:
+        try:
+            batch_count = run._execute_cursor(scraper._bronze_connection(),
+                f'SELECT COUNT(*) FROM {relation} WHERE {batch_predicate}', batch_params, fetch=True)
+            persisted_count = batch_count[0][0]
+        except Exception as exc:
+            raise CurrentWriteError(f'physical read-back failed for {table}') from exc
+        if persisted_count != len(frame):
+            raise CurrentWriteError(f'physical business/lineage mismatch in {table}')
     digest = hashlib.sha256(json.dumps(_rows(persisted), sort_keys=True).encode()).hexdigest()
     club_column = next((column for column in ('club_id', 'team_id', 'current_club_id') if column in persisted), None)
     club_hashes = ({str(club): {'rows': len(part), 'physical_hash': hashlib.sha256(json.dumps(_rows(part), sort_keys=True).encode()).hexdigest()}
