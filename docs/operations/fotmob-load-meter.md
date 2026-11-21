@@ -343,12 +343,18 @@ unknown и каждую операцию platform без подтверждён�
 `iceberg.bronze.fotmob_ingest_manifest` — журнал волны и C1: пакетные MERGE
 волны дают measured пики до 8 commit/мин, а бакетный EXCEPT ALL-дифф манифеста
 у C1 — ограниченный веер опросов (≤64 корзины × 2 направления + 2
-discovery-запроса ≤ 130 в минуту); для неё действуют отдельные пороги, N3
-остаётся общей.
+discovery-запроса ≤ 130 в минуту); для неё действуют отдельные пороги N2/N4, N3
+остаётся общей. Отдельный набор **журнал-таблиц волны** (манифест,
+scope-наблюдения, competition_seasons, competition_season_history,
+season_stages, squad/team snapshots, transfer_events) получает контрольный
+порог N1 ≤8 commit/мин: волна MERGE-ит их по разу на батч скоупа, и каденция
+коммитов повторяет ритм батчей (измерено 16–19.11: пики 2–8/мин, сутки ≤167),
+тогда как таблицы данных матчей остаются ≤1/мин. Расширение обоих наборов —
+отдельным PR.
 
 | Норма | Условие PASS, только src_fotmob кроме N5 |
 | --- | --- |
-| N1 | commits/мин: ≤1 для каждой постоянной таблицы; ≤8 для `fotmob_ingest_manifest` |
+| N1 | commits/мин: ≤1 для каждой постоянной таблицы; ≤8 для журнал-таблиц волны (см. ниже) |
 | N2 | polls/мин: ≤1 для `fotmob_squad_snapshots`; ≤130 для `fotmob_ingest_manifest` |
 | N3 | commits(table, UTC-day) ≤ 1440 для каждой постоянной таблицы, включая манифест |
 | N4 | scans(table, UTC-day) ≤ 1440; ≤5760 для `fotmob_ingest_manifest`; scans = scan_read + scan_write |

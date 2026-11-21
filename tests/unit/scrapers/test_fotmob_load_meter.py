@@ -266,6 +266,31 @@ def test_manifest_thresholds_on_saved_day_rows(commit_peak, poll_peak, scans, co
         }
 
 
+@pytest.mark.parametrize(("table", "peak", "failure"), [
+    ("iceberg.bronze.fotmob_competition_seasons", 5, None),  # Observed 18 November.
+    ("iceberg.bronze.fotmob_competition_scope_observations", 4, None),  # Observed 19 November.
+    ("iceberg.bronze.fotmob_team_snapshots", 5, None),
+    ("iceberg.bronze.fotmob_transfer_events", 2, None),
+    ("iceberg.bronze.fotmob_competition_seasons", 9, "N1"),
+    # Data tables keep the regular limit even while journals pass.
+    ("iceberg.bronze.fotmob_matches", 2, "N1"),
+    ("iceberg.bronze.fotmob_match_payloads", 2, "N1"),
+])
+def test_n1_wave_journal_tables_get_control_limit_data_tables_do_not(table, peak, failure):
+    _, report = report_for({"queries": {0: [(f"INSERT INTO {table} VALUES (1)", "src_fotmob")]}}, {table: 1})
+    table_row(report, table).update(commits=peak, peak_commits_per_min=peak, peak_polls_per_min=0,
+                                    scan_reads=0, scans_total=0)
+    for check in report["commit_checks"]:
+        check.update(sql_commits=peak, snapshot_commits=peak)
+    checked = meter.evaluate_day(report)
+    verdict = checked["verdicts"]["N1"]
+    assert verdict["pass"] == (failure is None)
+    assert verdict["value"] == peak
+    assert verdict["threshold"] == ("<=%d/min (control)" % meter.CONTROL_N1_MAX_COMMITS_PER_MIN
+                                    if table in meter.WAVE_JOURNAL_TABLES else "<=1/min")
+    assert checked["pass_reasons"] == ([] if failure is None else ["N1"])
+
+
 def test_boundary_1440_commits_and_scans_with_one_per_minute_pass():
     _, report = report_for({"each_minute": [(UPDATE, "src_fotmob"), (POLL, "src_fotmob")]}, {MATCHES: 1440})
     assert report["pass"]
