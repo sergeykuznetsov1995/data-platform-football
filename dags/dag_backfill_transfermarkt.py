@@ -736,9 +736,13 @@ python dags/scripts/run_transfermarkt_scope_cycle.py \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
   --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
 if [[ "${TM_CLUB_VALUES_ENABLED:-false}" == "true" && "${TM_BACKFILL_FINALIZE_ONLY:-false}" != "true" ]]; then
+  club_values_rc=0
   python dags/scripts/run_transfermarkt_club_values.py \
     --mode history \
-    --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-history-result.json}"
+    --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-history-result.json}" || club_values_rc=$?
+  if [[ "$club_values_rc" -ne 0 ]]; then
+    exit "$club_values_rc"
+  fi
 fi
 # The durable finalizer classifies the immutable result/raw evidence. It must
 # run for source failures too; a missing evidence envelope becomes a platform

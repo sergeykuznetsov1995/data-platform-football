@@ -591,3 +591,18 @@ def test_bounded_task_refuses_start_inside_quiet_window(module, monkeypatch):
 
     with pytest.raises(module.AirflowException, match="deadline or delivery window"):
         _probe()
+
+
+def test_history_club_values_propagates_failure_and_finalizer_is_all_done(module):
+    scope = _bash('run_historical_scope')
+    command = scope['bash_command'] if isinstance(scope, dict) else scope.bash_command
+    club_values = command.index('python dags/scripts/run_transfermarkt_club_values.py')
+    initialized = command.rfind('club_values_rc=0', 0, club_values)
+    captured = command.index('|| club_values_rc=$?', club_values)
+    checked = command.index('if [[ "$club_values_rc" -ne 0 ]]; then', captured)
+    propagated = command.index('exit "$club_values_rc"', checked)
+    final_success = command.rindex('exit 0')
+    assert 0 <= initialized < club_values < captured < checked < propagated < final_success
+    finalizer = _python('finalize_historical_batch')
+    trigger_rule = finalizer._init_kwargs['trigger_rule']
+    assert trigger_rule == 'all_done'

@@ -20,9 +20,9 @@ class _Cursor:
         self.sql.append(sql)
         if '$snapshots' in sql:
             self._rows = [(42,)]
-        elif 'SELECT DISTINCT raw_capture_id' in sql:
+        elif 'SELECT DISTINCT source_body_hash' in sql:
             self._rows = list(self.lineage_rows) if not any(
-                'SELECT DISTINCT raw_capture_id' in item
+                'SELECT DISTINCT source_body_hash' in item
                 for item in self.sql[:-1]
             ) else []
         else:
@@ -33,6 +33,11 @@ class _Cursor:
 
 
 class _RawStore:
+    def load_content(self, content_hash):
+        if content_hash != hashlib.sha256(self.body).hexdigest():
+            raise dq.BackfillDqError('raw content hash differs from requested hash')
+        return self.body
+
     def __init__(self, capture_id, body):
         self.capture_id = capture_id
         self.body = body
@@ -78,7 +83,7 @@ def test_partial_raw_lineage_has_exact_inventory_for_closing_states(
     capture_id = 'a' * 64
     body_hash = hashlib.sha256(body).hexdigest()
     cur = _Cursor(lineage_rows=[(
-        capture_id, body_hash, 'GB1__2024', 'tm-child-one',
+        body_hash, 'GB1__2024', 'tm-child-one',
     )])
 
     result = dq.verify_raw_lineage(
@@ -88,6 +93,7 @@ def test_partial_raw_lineage_has_exact_inventory_for_closing_states(
         raw_store=_RawStore(capture_id, body),
         attempt_envelopes=[SimpleNamespace(
             outcome_kind='response', capture_id=capture_id,
+            raw_body_hash=body_hash,
             scope_id='GB1__2024', cycle_id='tm-child-one',
         )],
         manifest_scope_cycles=(),
@@ -110,7 +116,7 @@ def test_partial_raw_lineage_has_exact_inventory_for_closing_states(
 def test_raw_lineage_hash_drift_fails_closed():
     capture_id = 'a' * 64
     cur = _Cursor(lineage_rows=[(
-        capture_id, 'b' * 64, 'GB1__2024', 'tm-child-one',
+        'b' * 64, 'GB1__2024', 'tm-child-one',
     )])
 
     with pytest.raises(dq.BackfillDqError, match='differs from Bronze'):
@@ -121,6 +127,7 @@ def test_raw_lineage_hash_drift_fails_closed():
             raw_store=_RawStore(capture_id, b'actual'),
             attempt_envelopes=[SimpleNamespace(
                 outcome_kind='response', capture_id=capture_id,
+            raw_body_hash='b' * 64,
                 scope_id='GB1__2024', cycle_id='tm-child-one',
             )],
             manifest_scope_cycles=(),
@@ -217,12 +224,13 @@ def test_history_original_snapshot_raw_lineage_is_checked_after_current_replacem
         def execute(self, sql):
             self.sql.append(sql)
         def fetchall(self):
-            return [(capture_id, body_hash, 'historical-scope', 'historical-cycle', '1', 'original-10')] if 'FOR VERSION AS OF 10 ' in self.sql[-1] else []
+            return [(body_hash, 'historical-scope', 'historical-cycle', '1', 'original-10')] if 'FOR VERSION AS OF 10 ' in self.sql[-1] else []
     cur = Cursor()
     result = dq.verify_raw_lineage(cur,
         pins={table: 99 for table in dq.BACKFILL_PIN_TABLES},
         child_cycle_ids=['historical-cycle'], raw_store=_RawStore(capture_id, body),
         attempt_envelopes=[SimpleNamespace(outcome_kind='response', capture_id=capture_id,
+             raw_body_hash=body_hash,
              scope_id='historical-scope', cycle_id='historical-cycle')],
         manifest_scope_cycles=[('historical-scope', 'historical-cycle')],
         scope_statuses={'historical-scope': 'complete'},
@@ -239,10 +247,10 @@ def test_attendance_snapshot_pin_is_opt_in():
     assert len(cur.sql) == len(tables)
 
 
-def test_attendance_lineage_uses_source_capture_and_run_identity():
+def test_attendance_lineage_uses_body_hash_and_run_identity():
     sql = dq.build_raw_lineage_sql(
         dq.ATTENDANCE_TABLE, snapshot_id=71, child_cycle_ids=('history-child',))
-    assert 'source_capture_id AS raw_capture_id' in sql
+    assert 'source_body_hash' in sql
     assert 'run_id AS cycle_id' in sql
     assert 'WHERE run_id IN' in sql
     assert 'FOR VERSION AS OF 71' in sql
@@ -317,3 +325,93 @@ def test_attendance_manifest_rejects_supplied_pins_without_attendance():
             scope_statuses={},
             pins={table: 42 for table in dq.BACKFILL_PIN_TABLES},
         )
+
+
+def test_raw_lineage_without_matching_attempt_envelope_fails_closed():
+    body = b'<html>raw</html>'
+    body_hash = hashlib.sha256(body).hexdigest()
+    cur = _Cursor(lineage_rows=[(body_hash, 'GB1__2024', 'tm-child-one')])
+
+    with pytest.raises(dq.BackfillDqError, match='outside exact attempt evidence'):
+        dq.verify_raw_lineage(
+            cur,
+            pins={table: 42 for table in dq.BACKFILL_ENTITY_TABLES},
+            child_cycle_ids=('tm-child-one',),
+            raw_store=_RawStore('a' * 64, body),
+            attempt_envelopes=[],
+            manifest_scope_cycles=(('GB1__2024', 'tm-child-one'),),
+            scope_statuses={'GB1__2024': 'complete'},
+        )
+
+
+def test_raw_lineage_verifies_every_capture_with_same_body_hash():
+    body = b'<html>shared-body</html>'
+    body_hash = hashlib.sha256(body).hexdigest()
+    capture_ids = ('a' * 64, 'c' * 64)
+    cur = _Cursor(lineage_rows=[(body_hash, 'GB1__2024', 'tm-child-one')])
+    verified = []
+
+    class RawStore:
+        def load_capture(self, capture_id):
+            verified.append(capture_id)
+            return body, SimpleNamespace(
+                capture_id=capture_id, content_hash=body_hash,
+            )
+
+    result = dq.verify_raw_lineage(
+        cur,
+        pins={table: 42 for table in dq.BACKFILL_ENTITY_TABLES},
+        child_cycle_ids=('tm-child-one',),
+        raw_store=RawStore(),
+        attempt_envelopes=[
+            SimpleNamespace(
+                outcome_kind='response', capture_id=capture_id,
+                raw_body_hash=body_hash, scope_id='GB1__2024',
+                cycle_id='tm-child-one',
+            ) for capture_id in capture_ids
+        ],
+        manifest_scope_cycles=(('GB1__2024', 'tm-child-one'),),
+        scope_statuses={'GB1__2024': 'complete'},
+    )
+
+    assert sorted(verified) == sorted(capture_ids)
+    assert result['capture_count'] == 2
+
+
+def test_cached_original_lineage_verifies_content_without_current_attempt():
+    body = b'original full career'
+    body_hash = hashlib.sha256(body).hexdigest()
+    receipt = {
+        'snapshot_id': 10, 'player_ids': ['1'], 'row_count': 1,
+        'physical_refs': [['1', 'original-10', 1]],
+        'key_hash': 'a' * 64, 'scope_id': 'historical-scope',
+        'cycle_id': 'historical-cycle', 'result_sha256': 'c' * 64,
+        'native_batch_id': 'current-batch',
+    }
+
+    class Cursor:
+        def execute(self, sql):
+            self.sql = getattr(self, 'sql', []) + [sql]
+
+        def fetchall(self):
+            if 'FOR VERSION AS OF 10 ' in self.sql[-1]:
+                return [(
+                    body_hash, 'historical-scope', 'historical-cycle',
+                    '1', 'original-10',
+                )]
+            return []
+
+    result = dq.verify_raw_lineage(
+        Cursor(),
+        pins={table: 99 for table in dq.BACKFILL_PIN_TABLES},
+        child_cycle_ids=['historical-cycle'],
+        raw_store=_RawStore('b' * 64, body),
+        attempt_envelopes=[],
+        manifest_scope_cycles=[('historical-scope', 'historical-cycle')],
+        scope_statuses={'historical-scope': 'complete'},
+        manifests=[SimpleNamespace(dq_evidence={
+            'historical_career_receipts': {'market_value_points': [receipt]},
+        })],
+    )
+
+    assert result['capture_count'] == 1
