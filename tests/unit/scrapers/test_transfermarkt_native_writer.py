@@ -23,6 +23,7 @@ MEMBERSHIPS_DDL = (
     'player_name varchar, captured_at timestamp(6), source_capture_id varchar) '
     "WITH (format = 'PARQUET')"
 )
+
 MV_DDL = (
     'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_market_value_points '
     '(player_id varchar, mv_date varchar, value_eur bigint, captured_at timestamp(6), '
@@ -86,17 +87,25 @@ class CoreWriter(IcebergWriter):
         return 'iceberg.' + database + '.' + table
 
 
-def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace'):
+def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
+                    status='observed_present', proof='', run='run-1'):
     rows = [{
         'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': pid,
         'player_name': 'Player ' + pid, 'captured_at': clock,
         'source_capture_id': capture,
+        'source_url': 'https://www.transfermarkt.com/x/kader/verein/11/saison_id/2025/plus/1',
+        'source_endpoint': 'squad', 'raw_capture_id': capture,
+        'source_body_hash': 'b' * 64, 'run_id': run, 'universe_version': 'u',
+        'parser_revision': 'core-v1', 'schema_revision': '1',
+        '_batch_id': native_writer._batch_id_for_run(run), '_ingested_at': clock,
     } for pid in players]
     return NativeWritePlan(
         entity='squad_memberships', table='transfermarkt_squad_memberships',
         ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
         scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
         rows=tuple(rows), captured_at=clock, write_mode=mode,
+        status=status, status_reason='squad_page' if status == 'observed_present'
+        else 'empty_roster', proof=proof,
     )
 
 
@@ -104,12 +113,18 @@ def mv_plan(points, *, clock=CLOCK, capture='cap-mv'):
     rows = [{
         'player_id': '1', 'mv_date': day, 'value_eur': value,
         'captured_at': clock, 'source_capture_id': capture,
+        'source_url': 'https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/1',
+        'source_endpoint': 'market_value_points', 'raw_capture_id': capture,
+        'source_body_hash': 'c' * 64, 'run_id': 'run-1', 'universe_version': 'u',
+        'parser_revision': 'core-v1', 'schema_revision': '1',
+        '_batch_id': 'tm-core-batch-1', '_ingested_at': clock,
     } for day, value in points]
     return NativeWritePlan(
         entity='market_value_points', table='transfermarkt_market_value_points',
         ddl=MV_DDL, natural_keys=('player_id', 'mv_date'),
         scope_columns=('player_id',), scope_values=('1',),
         rows=tuple(rows), captured_at=clock, write_mode='merge',
+        status_reason='career_page',
     )
 
 
@@ -207,8 +222,12 @@ def test_plan_validation_rejects_broken_contracts():
                 ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
                 scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
                 rows=({'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': '1',
-                       'captured_at': CLOCK, 'source_capture_id': 'c'},),
-                captured_at=CLOCK)
+                       'captured_at': CLOCK, 'source_capture_id': 'c',
+                       'source_url': 'u', 'source_endpoint': 'squad', 'raw_capture_id': 'c',
+                       'source_body_hash': 'b', 'run_id': 'r', 'universe_version': 'u',
+                       'parser_revision': 'p', 'schema_revision': 's',
+                       '_batch_id': 'b1', '_ingested_at': CLOCK},),
+                captured_at=CLOCK, status_reason='squad_page')
     NativeWritePlan(**base)
     with pytest.raises(ValueError, match='table name'):
         NativeWritePlan(**{**base, 'table': 'transfermarkt_squad_memberships; DROP TABLE x'})
@@ -233,8 +252,10 @@ def test_merge_and_replace_readbacks_use_different_predicates():
     assert replace.readback_sql() == ('league = ? AND season = ? AND club_id = ?', ('GB1', '2526', '11'))
     merge = mv_plan([('2025-01-01', 10), ('2025-02-01', 20)])
     predicate, params = merge.readback_sql()
-    assert predicate == '(player_id, mv_date) IN ((?, ?), (?, ?))'
-    assert params == ('1', '2025-01-01', '1', '2025-02-01')
+    # Every bound parameter stays varchar: date/timestamp key columns never
+    # receive string casts against typed columns.
+    assert predicate == 'player_id = ? AND source_capture_id = ?'
+    assert params == ('1', 'cap-mv')
 
 
 # ---------------------------------------------------------------- guard
@@ -325,7 +346,8 @@ def test_empty_replace_bundle_deletes_the_scope_and_receipts_zero_rows():
         entity='squad_memberships', table='transfermarkt_squad_memberships',
         ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
         scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
-        rows=(), captured_at=LATER,
+        rows=(), captured_at=LATER, status='observed_empty', status_reason='empty_roster',
+        proof='empty_roster:no_data_rows',
     )
     receipt = write(db, [empty], run_id='run-2', clock=LATER)
     assert receipt['plans'][0]['rows'] == 0
@@ -359,3 +381,103 @@ def test_physical_readback_mismatch_fails_the_bundle():
             run_id='r', universe_version='u', committed_at=CLOCK)
     pending = write_journal.pending_intents({'run_id': 'r'})
     assert len(pending) == 1
+
+
+# ---------------------------------------------------------------- review round-1 regressions
+
+
+def test_query_rows_fetches_when_the_cursor_execute_returns_the_cursor():
+    class SelfReturningCursor:
+        description = [('n',)]
+        def __init__(self):
+            self.fetched = False
+        def execute(self, sql, params=None):
+            return self
+        def fetchall(self):
+            self.fetched = True
+            return [(4,)]
+    cursor = SelfReturningCursor()
+    assert native_writer._query_rows(cursor, 'SELECT n FROM t') == [(4,)]
+    assert cursor.fetched
+
+
+def test_empty_replacement_keeps_the_fresher_capture_clock_via_receipts():
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-new', clock=LATER)], run_id='run-2', clock=LATER)
+    db.sql.execute('DELETE FROM transfermarkt_squad_memberships')  # proven empty scope
+    older = membership_plan(['1', '9'], capture='cap-old', clock=EARLIER)
+    with pytest.raises(StaleTransfermarktWrite):
+        native_writer.guard_native_bundle(db, older)
+
+
+def test_reobservation_of_the_same_capture_refreshes_run_lineage():
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-1')], run_id='run-1')
+    second = write(db, [membership_plan(['1'], capture='cap-1', run='run-2')], run_id='run-2')
+    assert second['verified'] is True
+    rows = db.sql.execute('SELECT run_id, _batch_id FROM transfermarkt_squad_memberships').fetchall()
+    assert len(rows) == 1 and rows[0][0] == 'run-2'
+
+
+def test_bundle_rejects_two_replacements_of_one_scope():
+    plans = [membership_plan(['1']), membership_plan(['2'])]
+    with pytest.raises(ValueError, match='duplicate core replacement scope'):
+        native_writer.write_core_bundle(
+            lambda: CoreDB(), CoreWriter(CoreDB()), plans,
+            run_id='r', universe_version='u', committed_at=CLOCK)
+
+
+def test_receipt_batch_names_the_same_batch_as_the_rows():
+    db = CoreDB()
+    receipt = write(db, [membership_plan(['1'], capture='cap-1', run='run-9')], run_id='run-9')
+    (row_batch,) = db.sql.execute('SELECT _batch_id FROM transfermarkt_squad_memberships').fetchone()
+    assert receipt['committed_batch'] == row_batch
+    stored = db.sql.execute('SELECT committed_batch FROM transfermarkt_core_receipts_v1').fetchall()
+    assert stored == [(row_batch,)]
+
+
+def test_pending_intent_replays_after_a_crash_without_another_request():
+    db = CoreDB()
+    writer = CoreWriter(db)
+    plans = [membership_plan(['1'], capture='cap-1')]
+    broken = CoreWriter(db)
+    broken._write_to_iceberg = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('crash mid-write'))
+    with pytest.raises(RuntimeError, match='crash mid-write'):
+        native_writer.write_core_bundle(
+            lambda: db, broken, plans, run_id='r', universe_version='u', committed_at=CLOCK)
+    assert write_journal.pending_intents({'run_id': 'r'})
+    receipts = native_writer.replay_pending_intents(lambda: db, writer)
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert write_journal.pending_intents({'run_id': 'r'}) == []
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
+
+
+def test_acknowledgement_rewrites_a_deleted_warehouse_receipt_row():
+    db = CoreDB()
+    plans = [membership_plan(['1'], capture='cap-1')]
+    first = write(db, plans)
+    db.sql.execute('DELETE FROM transfermarkt_core_receipts_v1')
+    again = write(db, plans)
+    assert again == first
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1
+
+
+def test_acknowledgement_finishes_a_leftover_intent(monkeypatch):
+    db = CoreDB()
+    plans = [membership_plan(['1'], capture='cap-1')]
+    crashed = {"once": True}
+
+    def crash_after_receipt(path):
+        if crashed["once"]:
+            crashed["once"] = False
+            raise RuntimeError('crash between record_receipt and finish_intent')
+
+    original = write_journal.finish_intent
+    monkeypatch.setattr(write_journal, 'finish_intent', crash_after_receipt)
+    with pytest.raises(RuntimeError, match='crash between'):
+        write(db, plans)
+    monkeypatch.setattr(write_journal, 'finish_intent', original)
+    assert write_journal.pending_intents({'run_id': 'run-1'})
+    again = write(db, plans)
+    assert again['verified'] is True
+    assert write_journal.pending_intents({'run_id': 'run-1'}) == []

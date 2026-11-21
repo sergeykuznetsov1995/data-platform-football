@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import date
 import gzip
 import json
 from pathlib import Path
@@ -64,8 +65,22 @@ def _fixture_fetch(records):
         if entry is None:
             return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error="fixture_missing")
         record, blob = entry
+        if record["status_code"] != 200:
+            return FetchOutcome(
+                status=FetchStatus.RETRY_EXHAUSTED, error=f"http_{record['status_code']}",
+                status_code=record["status_code"],
+            )
         text = gzip.decompress(blob.read_bytes()).decode("utf-8")
-        value = json.loads(text) if as_json else text
+        if as_json:
+            try:
+                value = json.loads(text)
+            except ValueError:
+                return FetchOutcome(
+                    status=FetchStatus.SCHEMA_ERROR, error="invalid_json",
+                    status_code=record["status_code"],
+                )
+        else:
+            value = text
         return FetchOutcome(
             status=FetchStatus.OK,
             value=value,
@@ -100,9 +115,6 @@ class _RawRecord:
 def _report(report, plan, path):
     if path:
         summary = asdict(plan)
-        for key in ("season_start", "season_end"):
-            if summary[key] is not None:
-                summary[key] = summary[key].isoformat()
         path.write_text(
             json.dumps({**asdict(report), "plan": summary}, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -114,21 +126,23 @@ def _report(report, plan, path):
         print(f"DQ passed: {report.dq['passed']}")
 
 
-def _season_window(year, season):
-    from scrapers.transfermarkt import parsing
-    from scrapers.transfermarkt.registry import SeasonFormat
-
-    season_format = SeasonFormat.SINGLE_YEAR if season == str(year + 1) else SeasonFormat.SPLIT_YEAR
-    return parsing._season_window(year, season_format)
-
-
 def _season_year(season):
+    """The saison year of a slug, with the century window of season.py."""
     if len(season) != 4 or not season.isdecimal():
         raise ValueError(f"Cannot infer a saison year from {season!r}; supply --edition-id")
     first, second = int(season[:2]), int(season[2:])
     if second == (first + 1) % 100:
-        return 2000 + first
+        candidate = 2000 + first
+        return candidate if candidate <= date.today().year + 1 else 1900 + first
     return int(season) - 1
+
+
+def _squad_season_matches(url, season):
+    """A squad fixture belongs to the run only when its saison year matches."""
+    parts = urlsplit(url).path.strip("/").split("/")
+    if len(parts) < 6 or parts[1] != "kader" or parts[4] != "saison_id" or not parts[5].isdecimal():
+        raise ValueError(f"Unrecognised squad fixture URL {url!r}")
+    return int(parts[5]) == _season_year(season)
 
 
 def _club_parts(value):
@@ -151,7 +165,6 @@ def _live_plan(args):
     )
 
     year = int(args.edition_id) if args.edition_id else _season_year(args.season)
-    start, end = _season_window(year, args.season)
     clubs = tuple(
         ClubTarget(club_id, slug, name, squad_url(slug, club_id, year),
                    coach_history_url(slug, club_id))
@@ -159,7 +172,7 @@ def _live_plan(args):
     )
     return CoreScopePlan(
         league=args.league, season=args.season, scope_id=args.scope_id, cycle_id=args.cycle_id,
-        edition_id=args.edition_id or str(year), season_start=start, season_end=end, clubs=clubs,
+        edition_id=args.edition_id or str(year), clubs=clubs,
         market_value_player_ids=tuple(args.player),
         transfer_player_ids=tuple(args.player),
         coach_profile_ids=tuple(map(_coach_parts, args.coach)),
@@ -185,8 +198,10 @@ def _offline_plan(args, records):
         parts = urlsplit(url).path.strip("/").split("/")
         match parts:
             case [slug, "kader", "verein", club_id, "saison_id", year, "plus", "1"]:
-                squad_year = int(year)
-                clubs.setdefault(club_id, {"club_slug": slug})["squad_url"] = url
+                # The sample mixes seasons; a run owns exactly one of them.
+                if _squad_season_matches(url, season):
+                    squad_year = int(year)
+                    clubs.setdefault(club_id, {"club_slug": slug})["squad_url"] = url
             case [slug, "mitarbeiterhistorie", "verein", club_id, "plus", "1"]:
                 clubs.setdefault(club_id, {"club_slug": slug})["coach_history_url"] = url
             case ["ceapi", "marketValueDevelopment", "graph", player_id]:
@@ -200,11 +215,10 @@ def _offline_plan(args, records):
 
     edition = args.edition_id or first.get("edition_id") or squad_year
     year = squad_year or (int(edition) if edition else _season_year(season))
-    start, end = _season_window(year, season)
     return CoreScopePlan(
         league=args.league, season=season,
         scope_id=args.scope_id or first["scope_id"], cycle_id=args.cycle_id or first["cycle_id"],
-        edition_id=str(edition or year), season_start=start, season_end=end,
+        edition_id=str(edition or year),
         clubs=tuple(ClubTarget(club_id=key, **value) for key, value in clubs.items()),
         market_value_player_ids=tuple(sorted(set(mv_players))),
         transfer_player_ids=tuple(sorted(set(transfer_players))),
@@ -261,9 +275,11 @@ def main(argv=None):
             from scrapers.transfermarkt.client import TransfermarktHttpClient
 
             plan = _live_plan(args)
-            fetch = TransfermarktHttpClient().fetch
+            client = TransfermarktHttpClient()
+            fetch = client.fetch
+            raw_loader = getattr(client, "_raw_store", None)
+            raw_loader = raw_loader.load_capture if raw_loader is not None else None
         write_args = _write_options(args) if args.write else {}
-        raw_loader = raw_loader if args.mode == "offline" else None
         report = CoreRun(fetch, raw_loader=raw_loader).run(plan, **write_args)
         _report(report, plan, args.report_out)
     except (ValueError, KeyError, OSError, CoreRunError) as exc:

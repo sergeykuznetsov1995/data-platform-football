@@ -1,5 +1,4 @@
 """Offline core-lane tests on the recorded stage-A capture sample (#2404)."""
-from datetime import date
 import gzip
 import hashlib
 import json
@@ -50,6 +49,26 @@ def _expected(endpoint, capture):
 
 
 # ---------------------------------------------------------------- capture/scope contracts
+
+
+def test_canonical_timestamp_accepts_zero_microseconds_but_requires_them():
+    assert core.canonical_timestamp('2026-01-01T00:00:00.000000+00:00') == \
+        '2026-01-01T00:00:00.000000+00:00'
+    with pytest.raises(CoreParseError):
+        core.canonical_timestamp('2026-01-01T00:00:00+00:00')
+    with pytest.raises(CoreParseError):
+        core.canonical_timestamp('2026-01-01T00:00:00Z')
+
+
+def test_plan_scope_is_cross_checked_against_the_capture_url():
+    capture = _load('squad')
+    club_id = capture.url.split('/verein/')[1].split('/')[0]
+    outcomes = core.extract_squad_observations(
+        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core.plan_for_outcome(
+            outcomes[0], captured_at=capture.captured_at,
+            scope_values={'league': 'GB1', 'season': '2526', 'club_id': '999'})
 
 
 def test_source_capture_verifies_body_hash_and_lineage():
@@ -215,12 +234,11 @@ def test_coach_profile_extraction(index):
 
 
 @pytest.mark.parametrize('index', range(4))
-def test_coach_stints_extraction_uses_the_season_window(index):
+def test_coach_stints_extraction_covers_the_whole_club_history(index):
     capture = _load('coach_history', index)
     club_id = capture.url.split('/verein/')[1].split('/')[0]
     outcome = core.extract_coach_stints(
-        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
-        season_start=date(2025, 7, 1), season_end=date(2026, 6, 30))
+        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert outcome.entity == 'coach_stints'
     if outcome.status == 'observed_present':
         assert outcome.rows
@@ -232,16 +250,11 @@ def test_coach_stints_extraction_uses_the_season_window(index):
         assert outcome.rows == ()
 
 
-def test_coach_stints_require_the_club_scope_and_ordered_window():
+def test_coach_stints_require_the_club_scope():
     capture = _load('coach_history')
     with pytest.raises(CoreParseError):
         core.extract_coach_stints(
-            capture, _scope(club_id=None), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
-            season_start=date(2025, 7, 1), season_end=date(2026, 6, 30))
-    with pytest.raises(CoreParseError):
-        core.extract_coach_stints(
-            capture, _scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
-            season_start=date(2026, 6, 30), season_end=date(2025, 7, 1))
+            capture, _scope(club_id=None), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
 
 
 # ---------------------------------------------------------------- DQ and plans

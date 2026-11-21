@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 import hashlib
 from typing import Any
 
@@ -63,8 +63,6 @@ class CoreScopePlan:
     scope_id: str
     cycle_id: str
     edition_id: str = ""
-    season_start: date | None = None
-    season_end: date | None = None
     clubs: tuple[ClubTarget, ...] = ()
     market_value_player_ids: tuple[str, ...] = ()
     transfer_player_ids: tuple[str, ...] = ()
@@ -101,10 +99,12 @@ class _Request:
 
     def scope_values(self, plan):
         # The replacement scope follows the entity's own scope columns:
-        # club lanes replace (league, season, club_id); career and coach
-        # profile lanes replace the single entity id.
-        if self.club:
+        # squad lanes replace (league, season, club_id), stints replace the
+        # club's whole history, career and coach profiles the single id.
+        if self.label == "squad":
             return {"league": plan.league, "season": plan.season, "club_id": self.club.club_id}
+        if self.label == "coach_history":
+            return {"club_id": self.club.club_id}
         if self.player_id:
             return {"player_id": self.player_id}
         if self.coach_id:
@@ -113,9 +113,6 @@ class _Request:
 
 
 def _requests(plan: CoreScopePlan):
-    if any(club.coach_history_url for club in plan.clubs):
-        if plan.season_start is None or plan.season_end is None:
-            raise CoreRunError("coach_history requires season_start and season_end")
     for club in plan.clubs:
         if club.squad_url:
             yield _Request("squad", club.squad_url, club=club)
@@ -191,6 +188,15 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     )
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
+    if result.status is FetchStatus.NOT_APPLICABLE:
+        return tuple(
+            core.captureless_outcome(
+                entity, scope, status="not_applicable",
+                reason=f"{request.label}:transport_not_applicable",
+                proof=f"transport:not_applicable:{request.label}",
+                run_id=run_id, **metadata)
+            for entity in _ENTITIES[request.label]
+        ), None
     if result.status not in _SUCCESS or not result.raw_capture_id:
         status = "unavailable"
         reason = f"{request.label}:{result.status.value}"
@@ -209,9 +215,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     if request.label == "squad":
         unit = core.extract_squad_observations(capture, scope, **metadata)
     elif request.label == "coach_history":
-        unit = core.extract_coach_stints(
-            capture, scope, season_start=plan.season_start, season_end=plan.season_end, **metadata
-        )
+        unit = core.extract_coach_stints(capture, scope, **metadata)
     elif request.player_id:
         unit = core.extract_career_observations(capture, scope, **metadata)
     else:
@@ -256,7 +260,6 @@ class CoreRun:
             if captured_at is not None and writer is not None and connection_factory is not None:
                 captured_units.append((unit, captured_at, request.scope_values(plan)))
 
-        dq = core.build_core_dq(outcomes)
         bundles = []
         for unit, captured_at, values in captured_units:
             conclusive = [item for item in unit if item.status in core.CONCLUSIVE_CORE_STATUSES]
@@ -275,6 +278,15 @@ class CoreRun:
             if not isinstance(receipt, dict):
                 raise CoreRunError(f"Missing receipt for capture run {run_id}")
             receipts.append(receipt)
+        verified = None
+        if receipts:
+            verified = {
+                "verified": all(item.get("verified") is True for item in receipts),
+                "receipt_readback": all(item.get("receipt_readback") is True for item in receipts),
+                "plan_sha256": "|".join(item.get("plan_sha256", "") for item in receipts),
+                "committed_batch": receipts[0].get("committed_batch", ""),
+            }
+        dq = core.build_core_dq(outcomes, verified_receipt=verified)
         return CoreRunReport(
             run_id=outcomes[0].run_id if outcomes else "",
             scope_id=plan.scope_id,

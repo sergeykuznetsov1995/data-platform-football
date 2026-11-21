@@ -1289,6 +1289,8 @@ class TransfermarktCompetitionDiscovery:
         body = cached.get("body")
         if body is None and "raw_capture_id" in cached:
             body = self._cached_body_from_store(key, cached)
+        elif isinstance(body, str) and self._raw_store is not None and "raw_capture_id" not in cached:
+            body = self._migrate_body_entry(key, cached, body)
         expected_hash = cached.get("payload_hash")
         if cached.get("status") != FetchStatus.OK.value or not isinstance(body, str):
             raise DiscoveryCheckpointError(
@@ -1305,6 +1307,18 @@ class TransfermarktCompetitionDiscovery:
         document = _Document(key, body, actual_hash)
         self._documents[key] = document
         return document
+
+    def _migrate_body_entry(self, key: str, cached: Mapping[str, Any], body: str) -> str:
+        """Convert a legacy body-bearing entry to its raw-store reference.
+
+        Legacy entries never recorded a fetch time; the store stamps the
+        migration moment, and the body itself is byte-identical.
+        """
+        from scrapers.transfermarkt.models import FetchOutcome
+
+        placeholder = FetchOutcome(status=FetchStatus.OK)
+        self._checkpoint[key] = self._store_page(key, body, placeholder)
+        return body
 
     def _cached_body_from_store(self, key: str, cached: Mapping[str, Any]) -> str:
         """Reload a stored registry page body from its raw capture (#2181)."""

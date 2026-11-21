@@ -172,12 +172,17 @@ def canonical_json(value: object) -> bytes:
 
 
 def canonical_timestamp(value: str) -> str:
-    """Validate a tz-aware ISO string already in canonical UTC form."""
+    """Validate a tz-aware ISO string already in canonical UTC form.
+
+    Microseconds are mandatory but may be zero: ``.000000`` must survive the
+    round trip, while a timestamp without a fraction is not canonical.
+    """
     try:
         moment = datetime.fromisoformat(value)
     except (ValueError, TypeError) as exc:
         raise CoreParseError('timestamp_not_canonical') from exc
-    if moment.tzinfo is None or not value.endswith('+00:00') or moment.isoformat() != value:
+    if (moment.tzinfo is None or not value.endswith('+00:00')
+            or moment.isoformat(timespec='microseconds') != value):
         raise CoreParseError('timestamp_not_canonical')
     return value
 
@@ -472,12 +477,14 @@ def extract_coach_profile(
 
 def extract_coach_stints(
     capture: SourceCapture, scope: ScopeContext, *, extracted_at: str, universe_version: str,
-    season_start: date, season_end: date,
 ) -> LaneOutcome:
+    """Observe the club's complete manager history.
+
+    The page always serves the full history; a season-window filter here
+    would make the club-wide replacement delete every other season's rows.
+    """
     if capture.endpoint != 'coach_history' or scope.club_id is None:
         raise CoreParseError('coach_history_requires_club_scope')
-    if type(season_start) is not date or type(season_end) is not date or season_end < season_start:
-        raise CoreParseError('invalid_season_window')
     context = _context(capture, scope, extracted_at, universe_version)
     entity = 'coach_stints'
     try:
@@ -486,22 +493,16 @@ def extract_coach_stints(
         if problem is not None:
             return LaneOutcome(entity, 'error', 'schema:' + problem, **context)
         stints = parsing._parse_coach_history(html, scope.club_id)
-        overlapping = [
-            stint for stint in stints if parsing._stint_overlaps_season(stint, season_start, season_end)
-        ]
-        if not overlapping:
-            if parsing._coach_history_page_is_empty(html):
-                proof = 'empty_history:no_stints_on_record'
-            elif stints:
-                proof = 'window_filter:no_overlapping_stints'
-            else:
-                proof = 'empty_history:no_header_mapped_rows'
-            return LaneOutcome(entity, 'observed_empty', proof.split(':')[0], proof=proof, **context)
+        if not stints:
+            proof = ('empty_history:no_stints_on_record'
+                     if parsing._coach_history_page_is_empty(html)
+                     else 'empty_history:no_header_mapped_rows')
+            return LaneOutcome(entity, 'observed_empty', 'empty_history', proof=proof, **context)
     except _SOURCE_ERRORS:
         return LaneOutcome(entity, 'error', 'schema:invalid_coach_history', **context)
 
     rows = []
-    for stint in overlapping:
+    for stint in stints:
         identity = {
             'club_id': scope.club_id,
             'coach_id': _require_id(stint['coach_id'], 'coach_id'),
@@ -521,9 +522,9 @@ def extract_coach_stints(
 
 def captureless_outcome(
     entity: str, scope: ScopeContext, *, status: str, reason: str, extracted_at: str,
-    run_id: str, universe_version: str,
+    run_id: str, universe_version: str, proof: str | None = None,
 ) -> LaneOutcome:
-    if status not in {'unknown', 'unavailable', 'error'}:
+    if status not in {'unknown', 'unavailable', 'error', 'not_applicable'}:
         raise CoreParseError('invalid_captureless_status')
     canonical_timestamp(extracted_at)
     if not _nonempty(run_id) or not _nonempty(universe_version):
@@ -561,13 +562,34 @@ def plan_for_outcome(
 
     from scrapers.transfermarkt.native_writer import NativeWritePlan
 
+    _check_scope_against_capture(entity, scope_values, outcome.capture)
     return NativeWritePlan(
         entity=entity, table=CORE_TABLES[entity], ddl=core_ddl(entity),
         natural_keys=CORE_NATURAL_KEYS[entity], scope_columns=scope_columns,
         scope_values=tuple(scope_values[column] for column in scope_columns),
         rows=outcome.rows, captured_at=captured_at,
         write_mode=CORE_WRITE_MODES[entity],
+        status=outcome.status, status_reason=outcome.status_reason,
+        proof=outcome.proof or '',
     )
+
+
+def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
+    """Empty outcomes have no rows to cross-check; the capture URL still names
+    the entity it belongs to, so a swapped club/player scope fails here."""
+    if capture is None:
+        return
+    path = urlsplit(capture.url).path
+    for column, pattern in (
+        ('club_id', r'/(?:kader|mitarbeiterhistorie)/verein/([1-9][0-9]*)'),
+        ('player_id', r'/ceapi/(?:marketValueDevelopment/graph|transferHistory/list)/([1-9][0-9]*)'),
+        ('coach_id', r'/profil/trainer/([1-9][0-9]*)'),
+    ):
+        if column not in scope_values:
+            continue
+        match = re.search(pattern, path)
+        if match is not None and match.group(1) != scope_values[column]:
+            raise CoreParseError('row_scope_mismatch')
 
 
 def _receipt_diagnostics(receipt: Mapping | None) -> list[str]:
@@ -627,6 +649,8 @@ def build_core_dq(
             key = (entity, *(row.get(col) for col in CORE_NATURAL_KEYS[entity]))
             if key in seen_keys:
                 errors.add('duplicate_natural_key')
+            if any(value is None or value == '' for value in key[1:]):
+                errors.add('empty_natural_key')
             seen_keys.add(key)
 
     entities = {}

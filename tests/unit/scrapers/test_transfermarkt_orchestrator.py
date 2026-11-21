@@ -37,7 +37,7 @@ def isolated_paths(monkeypatch, tmp_path):
 def _plan(**overrides):
     values = dict(
         league='GB1', season='2627', scope_id='tm-scope-test', cycle_id='tm-cycle-test',
-        edition_id='2026', season_start=None, season_end=None,
+        edition_id='2026',
         clubs=(ClubTarget(club_id='11', club_slug='arsenal', club_name='Arsenal',
                           squad_url=squad_url('arsenal', '11', YEAR)),),
         market_value_player_ids=(), transfer_player_ids=(), coach_profile_ids=(),
@@ -160,8 +160,6 @@ def test_json_capture_without_raw_loader_fails_closed():
 
 def test_planned_urls_cover_every_target_kind():
     plan = _plan(
-        season_start=__import__('datetime').date(2026, 7, 1),
-        season_end=__import__('datetime').date(2027, 6, 30),
         clubs=(ClubTarget('11', 'arsenal', squad_url=squad_url('arsenal', '11', YEAR),
                           coach_history_url=coach_history_url('arsenal', '11')),),
         market_value_player_ids=('110',),
@@ -177,13 +175,31 @@ def test_planned_urls_cover_every_target_kind():
     )
 
 
-def test_coach_history_requires_the_season_window():
-    plan = _plan(
-        season_start=None, season_end=None,
-        clubs=(ClubTarget('11', 'arsenal', coach_history_url=coach_history_url('arsenal', '11')),),
-    )
-    with pytest.raises(CoreRunError, match='season_start'):
-        CoreRun(lambda *a, **k: None).run(plan)
+def test_coach_history_writes_the_club_scoped_stint_bundle():
+    replay = _ReplayFetch({'coach_history'})
+    capture = _load('coach_history')
+    club_id = capture.url.split('/verein/')[1].split('/')[0]
+    plan = _plan(clubs=(ClubTarget(club_id=club_id, club_slug='club',
+                                   coach_history_url=capture.url),))
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader,
+                  universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert report.outcomes[0]['entity'] == 'coach_stints'
+    assert report.dq['verified_write_coverage'] == 1.0
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_coach_stints').fetchone()[0] == \
+        report.outcomes[0]['rows']
+
+
+def test_dq_reports_verified_coverage_only_after_receipts():
+    replay = _ReplayFetch({'squad'})
+    capture = _load('squad')
+    club_id = capture.url.split('/verein/')[1].split('/')[0]
+    plan = _plan(clubs=(ClubTarget(club_id=club_id, club_slug='club', squad_url=capture.url),))
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader,
+                  universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    unwritten = run.run(plan)
+    assert unwritten.dq['receipt_diagnostics'] == ['receipt_absent']
 
 
 def test_offline_cli_acceptance_over_the_recorded_sample(tmp_path, capsys):
@@ -201,10 +217,22 @@ def test_offline_cli_acceptance_over_the_recorded_sample(tmp_path, capsys):
     assert ('squad_memberships', 'observed_empty') in statuses
     assert ('market_value_points', 'observed_present') in statuses
     assert ('transfer_events', 'observed_present') in statuses
-    assert ('coach_stints', 'observed_empty') in statuses
+    assert ('coach_stints', 'observed_present') in statuses  # full club history now
     assert report['dq']['passed'] is True and report['dq']['errors'] == []
     assert report['receipt'] is None and report['receipts'] == []
-    assert report['fetched'] == 20 and report['cache_hits'] == 0
+    # The sample mixes seasons: this run owns the three 2026 squads plus the
+    # season-independent career and coach captures.
+    assert report['fetched'] == 19 and report['cache_hits'] == 0
+
+    other_season = tmp_path / 'report-2223.json'
+    assert cli.main([
+        'offline', '--fixtures-root', str(FIXTURES),
+        '--league', 'GB1', '--season', '2223', '--report-out', str(other_season),
+    ]) == 0
+    second = json.loads(other_season.read_text())
+    squad_rows = {item['rows'] for item in second['outcomes']
+                  if item['entity'] == 'squad_memberships'}
+    assert squad_rows == {55}  # the 2022 Japan squad alone
 
 
 def test_offline_cli_fails_fast_on_missing_planned_fixture(tmp_path):

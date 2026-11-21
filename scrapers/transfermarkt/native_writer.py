@@ -176,12 +176,14 @@ def locked_write(function):
 
 
 CORE_RECEIPTS_TABLE = 'iceberg.ops.transfermarkt_core_receipts_v1'
+_RECEIPTS_ANCHOR_NAME = 'ops.transfermarkt_core_receipts_v1'
 RECEIPT_COLUMNS = (
     'receipt_id', 'target_table', 'entity', 'scope_id', 'cycle_id', 'run_id',
     'universe_version', 'source_capture_id', 'source_body_hash',
     'parser_revision', 'schema_revision', 'natural_key_columns_json',
-    'replace_key_columns_json', 'expected_rows', 'row_count',
-    'status_counts_json', 'plan_sha256', 'physical_hash', 'committed_batch',
+    'replace_key_columns_json', 'scope_values_json', 'expected_rows',
+    'row_count', 'status_counts_json', 'observation_status', 'status_reason',
+    'status_proof', 'plan_sha256', 'physical_hash', 'committed_batch',
     'committed_at', 'captured_at',
 )
 _RECEIPT_BIGINT_COLUMNS = frozenset({'expected_rows', 'row_count'})
@@ -207,6 +209,19 @@ def _timestamp(value) -> datetime:
 
 def _digest(value) -> str:
     return sha256(write_journal._canonical(value)).hexdigest()
+
+
+# Every written row proves its source; a plan that cannot state this
+# lineage is rejected before any mutation, not audited after the fact.
+_REQUIRED_ROW_COLUMNS = frozenset({
+    'captured_at', 'source_capture_id', 'source_url', 'source_endpoint',
+    'raw_capture_id', 'source_body_hash', 'run_id', 'universe_version',
+    'parser_revision', 'schema_revision', '_batch_id', '_ingested_at',
+})
+
+
+def _nonempty(value) -> bool:
+    return isinstance(value, str) and bool(value)
 
 
 def _check_columns(columns) -> None:
@@ -242,6 +257,9 @@ class NativeWritePlan:
     rows: tuple[dict, ...] = ()
     captured_at: str = ''
     write_mode: str = 'replace'
+    status: str = 'observed_present'
+    status_reason: str = ''
+    proof: str = ''
 
     def __post_init__(self) -> None:
         if not isinstance(self.table, str) or not fullmatch(r'transfermarkt_[a-z0-9_]+', self.table):
@@ -260,6 +278,10 @@ class NativeWritePlan:
             raise ValueError('core captured_at must be non-empty')
         if self.write_mode not in ('replace', 'merge'):
             raise ValueError('core write_mode must be replace or merge')
+        if not _nonempty(self.status) or not _nonempty(self.status_reason):
+            raise ValueError('core plan needs its observation status and reason')
+        if self.status in ('observed_empty', 'not_applicable') and not _nonempty(self.proof):
+            raise ValueError('core plan proof is required for empty observations')
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
@@ -271,22 +293,25 @@ class NativeWritePlan:
         """Parameterised physical read-back predicate for this plan.
 
         A replace plan owns its whole scope, so the scope predicate is the
-        read-back. A merge plan only owns its natural-key rows: the scope
-        still holds rows committed by earlier captures.
+        read-back. A merge plan owns exactly its capture's rows inside the
+        scope: earlier captures keep their rows there. Scope plus
+        ``source_capture_id`` keeps every bound parameter varchar, so date
+        and timestamp key columns never receive string casts.
         """
-        if self.write_mode == 'replace' or not self.rows:
-            return self.scope_sql(), tuple(self.scope_values)
-        keys = ', '.join(self.natural_keys)
-        tuples = ', '.join(
-            '(' + ', '.join('?' for _ in self.natural_keys) + ')' for _ in self.rows
-        )
-        return f'({keys}) IN ({tuples})', tuple(
-            value for row in self.rows for value in (row[column] for column in self.natural_keys)
-        )
+        predicate = self.scope_sql()
+        params = list(self.scope_values)
+        if self.write_mode == 'merge':
+            predicate += ' AND source_capture_id = ?'
+            params.append(self.capture_id)
+        return predicate, tuple(params)
+
+    @property
+    def capture_id(self) -> str:
+        return self.rows[0]['source_capture_id'] if self.rows else ''
 
     def _check_rows(self) -> None:
         keys = set(self.natural_keys) | set(self.scope_columns)
-        required = keys | {'captured_at', 'source_capture_id'}
+        required = keys | _REQUIRED_ROW_COLUMNS
         seen = set()
         for row in self.rows:
             if not isinstance(row, dict):
@@ -297,7 +322,7 @@ class NativeWritePlan:
             if any(value is not None and not isinstance(value, (int, str)) for value in row.values()):
                 raise ValueError('core plan row values must be strings, integers or null')
             if any(row[col] in ('', None) for col in required):
-                raise ValueError('core plan row has an empty key, captured_at or source_capture_id')
+                raise ValueError('core plan row has empty lineage, key or capture columns')
             if any(str(row[col]) != str(value) for col, value in zip(self.scope_columns, self.scope_values)):
                 raise ValueError('core plan row is outside its replacement scope')
             if row['source_capture_id'] != self.rows[0]['source_capture_id']:
@@ -317,34 +342,64 @@ class NativeWritePlan:
         return ' AND '.join(f'{col} = ?' for col in self.scope_columns)
 
     def plan_sha256(self) -> str:
-        """Hash the logical plan independently of row order."""
+        """Hash the logical plan independently of row order.
+
+        The capture clock, write mode and observation status belong to the
+        identity: two empty captures of one scope at different times are
+        different plans, not one reusable acknowledgement.
+        """
         return _digest({
             'entity': self.entity, 'table': self.table, 'natural_keys': self.natural_keys,
             'scope': list(zip(self.scope_columns, self.scope_values)),
+            'write_mode': self.write_mode, 'captured_at': self.captured_at,
+            'status': self.status, 'status_reason': self.status_reason, 'proof': self.proof,
             'rows': _sorted_rows(self.rows, self.natural_keys),
         })
 
 
 def _query_rows(cursor, sql, params=None):
     result = execute_statement(cursor, sql, params)
-    if result is None or result is cursor:
-        return cursor.fetchall()
-    return result
+    if isinstance(result, list):
+        return result
+    # Read paths hand back the (possibly wrapped) cursor, not rows.
+    return cursor.fetchall()
 
 
-def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
-    """An older bundle must not overwrite a fresher committed capture."""
+def _committed_clock(connection, table_sql: str, params: tuple) -> object:
     cursor = connection.cursor()
-    sql = f'SELECT MAX(captured_at) FROM {plan.full_table} WHERE {plan.scope_sql()}'
     try:
-        rows = _query_rows(cursor, sql, plan.scope_values)
+        rows = _query_rows(cursor, table_sql, params)
     except Exception as exc:
         if write_journal._table_not_found(exc):
-            return
+            return None
         raise
     finally:
         cursor.close()
-    if rows and rows[0][0] is not None and _timestamp(rows[0][0]) > _timestamp(plan.captured_at):
+    return rows[0][0] if rows else None
+
+
+def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
+    """An older bundle must not overwrite a fresher committed capture.
+
+    The data table proves freshness while rows exist; a proven-empty
+    replacement leaves none, so the per-scope warehouse receipts carry the
+    newest committed capture clock for empty scopes too.
+    """
+    committed = _committed_clock(
+        connection,
+        f'SELECT MAX(captured_at) FROM {plan.full_table} WHERE {plan.scope_sql()}',
+        tuple(plan.scope_values),
+    )
+    if committed is None:
+        scope_json = write_journal._canonical(
+            list(zip(plan.scope_columns, plan.scope_values))).decode()
+        committed = _committed_clock(
+            connection,
+            f'SELECT MAX(captured_at) FROM {CORE_RECEIPTS_TABLE} '
+            'WHERE target_table = ? AND scope_values_json = ?',
+            (plan.full_table, scope_json),
+        )
+    if committed is not None and _timestamp(committed) > _timestamp(plan.captured_at):
         raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
@@ -401,6 +456,17 @@ def _rows_equal(left: Sequence[Mapping], right: Sequence[Mapping]) -> bool:
     )
 
 
+# A re-observation of the same capture regenerates run identity only.
+_LINEAGE_ONLY_COLUMNS = frozenset({'run_id', '_batch_id', '_ingested_at'})
+
+
+def _rows_equal_ignoring_lineage(left, right) -> bool:
+    strip = lambda rows: [
+        {column: value for column, value in row.items()
+         if column not in _LINEAGE_ONLY_COLUMNS} for row in rows]
+    return _rows_equal(strip(left), strip(right))
+
+
 def _already_written(connection, plan: NativeWritePlan) -> bool:
     existing = _read_plan_rows(connection, plan)
     if not plan.rows:
@@ -408,6 +474,10 @@ def _already_written(connection, plan: NativeWritePlan) -> bool:
     capture = plan.rows[0]['source_capture_id']
     matching = [row for row in existing if row.get('source_capture_id') == capture]
     if matching and not _rows_equal(matching, plan.rows):
+        if _rows_equal_ignoring_lineage(matching, plan.rows):
+            # Same source bytes observed under a new run: rewrite the
+            # lineage instead of failing the whole bundle.
+            return False
         raise RuntimeError('core replay differs from committed capture: ' + plan.table)
     return bool(matching)
 
@@ -449,6 +519,17 @@ def _mutate_plan(connection, writer, plan: NativeWritePlan) -> None:
 
 def _physical_proof(connection, plan: NativeWritePlan) -> dict:
     if _uses_merge(plan) and not plan.rows:
+        cursor = connection.cursor()
+        try:
+            counts = _query_rows(
+                cursor,
+                f'SELECT COUNT(*) FROM {plan.full_table} WHERE {plan.scope_sql()}',
+                tuple(plan.scope_values),
+            )
+        finally:
+            cursor.close()
+        if len(counts) != 1 or counts[0][0]:
+            raise RuntimeError('core physical readback differs: ' + plan.table)
         return {
             'entity': plan.entity, 'table': plan.table, 'rows': 0,
             'physical_hash': _digest([]), 'expected_rows': 0, 'status_counts': {},
@@ -477,7 +558,8 @@ def _physical_proof(connection, plan: NativeWritePlan) -> dict:
     }
 
 
-def _plan_receipt(plan, proof, plan_hash, run_id, universe_version, batch, committed_at) -> dict:
+def _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
+                  batch, committed_at) -> dict:
     first = plan.rows[0] if plan.rows else {}
     evidence = {
         col: first.get(col, '') for col in (
@@ -485,15 +567,22 @@ def _plan_receipt(plan, proof, plan_hash, run_id, universe_version, batch, commi
             'parser_revision', 'schema_revision',
         )
     }
-    receipt_hash = sha256((plan_hash + run_id).encode('utf-8')).hexdigest()
+    # Bind the receipt to this bundle: the same plan committed inside a
+    # different bundle gets its own append-only receipt, never an UPDATE
+    # that would contradict the earlier immutable acknowledgement.
+    receipt_hash = sha256((plan_hash + run_id + digest).encode('utf-8')).hexdigest()
     return {
         **evidence, 'receipt_id': 'tm-core-receipt-' + receipt_hash[:32],
         'target_table': plan.full_table, 'entity': plan.entity,
         'run_id': run_id, 'universe_version': universe_version,
         'natural_key_columns_json': write_journal._canonical(plan.natural_keys).decode(),
         'replace_key_columns_json': write_journal._canonical(plan.scope_columns).decode(),
+        'scope_values_json': write_journal._canonical(
+            list(zip(plan.scope_columns, plan.scope_values))).decode(),
         'expected_rows': proof['expected_rows'], 'row_count': proof['rows'],
         'status_counts_json': write_journal._canonical(proof['status_counts']).decode(),
+        'observation_status': plan.status, 'status_reason': plan.status_reason,
+        'status_proof': plan.proof,
         'plan_sha256': plan_hash, 'physical_hash': proof['physical_hash'],
         'committed_batch': batch, 'committed_at': committed_at, 'captured_at': plan.captured_at,
     }
@@ -560,12 +649,18 @@ def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
         raise ValueError('core run_id, universe_version and committed_at must be non-empty')
     _timestamp(committed_at)
     seen = set()
+    scopes = set()
     for plan in plans:
         for row in plan.rows:
             key = (plan.table, tuple(row[col] for col in plan.natural_keys))
             if key in seen:
                 raise ValueError('duplicate core natural key across plans')
             seen.add(key)
+        if plan.write_mode == 'replace':
+            scope = (plan.table, plan.scope_values)
+            if scope in scopes:
+                raise ValueError('duplicate core replacement scope across plans')
+            scopes.add(scope)
 
 
 def _commit_plans(connection, writer, plans) -> list[dict]:
@@ -580,6 +675,21 @@ def _commit_plans(connection, writer, plans) -> list[dict]:
     return [_physical_proof(connection, plan) for plan in plans]
 
 
+def _batch_id_for_run(run_id: str) -> str:
+    """The batch printed on the rows; the receipt must name the same one."""
+    return 'tm-core-batch-' + sha256(run_id.encode('utf-8')).hexdigest()[:32]
+
+
+def _finish_leftover_intent(digest: str, run_id: str) -> None:
+    """A crash between record_receipt and finish_intent must not strand it.
+
+    Journal files are named by their own body checksum, not the bundle
+    digest, so the leftover unit is found through the identity index.
+    """
+    for path, _body in write_journal.pending_intents({'run_id': run_id, 'digest': digest}):
+        write_journal.finish_intent(path)
+
+
 def write_core_bundle(
     connection_factory, writer, plans: Sequence[NativeWritePlan], *,
     run_id: str, universe_version: str, committed_at: str, deadline: float | None = None,
@@ -589,34 +699,46 @@ def write_core_bundle(
         _validate_bundle(plans, run_id, universe_version, committed_at)
         plan_hashes = [plan.plan_sha256() for plan in plans]
         digest = _digest({'plans': plan_hashes, 'run_id': run_id})
-        receipt = write_journal.read_receipt(digest)
-        if receipt is not None:
-            if receipt.get('plan_sha256') != digest:
+        batch = _batch_id_for_run(run_id)
+        stored = write_journal.read_receipt(digest)
+        if stored is not None:
+            if stored.get('plan_sha256') != digest:
                 raise RuntimeError('core journal receipt plan_sha256 differs')
-            # An acknowledgement re-verifies the physical rows: committed
-            # rows that drifted since the receipt fail closed, deleted rows
-            # replay through the idempotent commit path.
+            # An acknowledgement re-verifies the whole physical tail: drifted
+            # rows fail closed, a deleted receipt row is rewritten and
+            # re-read, and a leftover intent is finally finished.
             connection = connection_factory()
             try:
-                write_journal.snapshot_anchors(digest, connection, {plan.table for plan in plans})
-                _commit_plans(connection, writer, plans)
+                write_journal.snapshot_anchors(
+                    digest, connection, {plan.table for plan in plans} | {_RECEIPTS_ANCHOR_NAME})
+                proofs = _commit_plans(connection, writer, plans)
+                plan_receipts = [
+                    _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
+                                  batch, stored['committed_at'])
+                    for plan, proof, plan_hash in zip(plans, proofs, plan_hashes, strict=True)
+                ]
+                _merge_receipts(connection, plan_receipts)
+                _verify_receipts(connection, plan_receipts)
             finally:
                 connection.close()
-            return receipt
+            _finish_leftover_intent(digest, run_id)
+            return stored
 
         descriptors = [asdict(plan) for plan in plans]
         for descriptor, plan in zip(descriptors, plans):
             descriptor['rows'] = _sorted_rows(plan.rows, plan.natural_keys)
         intent_path = write_journal.save_intent(
-            {'run_id': run_id, 'digest': digest}, {'plans': descriptors}, run_id=run_id
+            {'run_id': run_id, 'digest': digest}, {'plans': descriptors},
+            run_id=run_id, universe_version=universe_version, committed_at=committed_at,
         )
         connection = connection_factory()
         try:
-            write_journal.snapshot_anchors(digest, connection, {plan.table for plan in plans})
+            write_journal.snapshot_anchors(
+                digest, connection, {plan.table for plan in plans} | {_RECEIPTS_ANCHOR_NAME})
             proofs = _commit_plans(connection, writer, plans)
-            batch = 'tm-core-batch-' + digest[:32]
             plan_receipts = [
-                _plan_receipt(plan, proof, plan_hash, run_id, universe_version, batch, committed_at)
+                _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
+                              batch, committed_at)
                 for plan, proof, plan_hash in zip(plans, proofs, plan_hashes, strict=True)
             ]
             _merge_receipts(connection, plan_receipts)
@@ -631,3 +753,29 @@ def write_core_bundle(
         write_journal.record_receipt(digest, receipt)
         write_journal.finish_intent(intent_path)
         return receipt
+
+
+def replay_pending_intents(connection_factory, writer, *, run_id: str | None = None) -> list[dict]:
+    """Replay journaled units after a crash without another paid request.
+
+    Each pending intent carries its exact plans; the recomputed bundle digest
+    matches the saved one, so an acknowledged unit replays as its own
+    idempotent acknowledgement.
+    """
+    receipts = []
+    for path, body in write_journal.pending_intents({'run_id': run_id} if run_id else {}):
+        plans = []
+        for descriptor in body['payload']['plans']:
+            descriptor = dict(descriptor)
+            descriptor['rows'] = [dict(row) for row in descriptor['rows']]
+            descriptor['natural_keys'] = tuple(descriptor['natural_keys'])
+            descriptor['scope_columns'] = tuple(descriptor['scope_columns'])
+            descriptor['scope_values'] = tuple(descriptor['scope_values'])
+            plans.append(NativeWritePlan(**descriptor))
+        run = body['identity']['run_id']
+        receipts.append(write_core_bundle(
+            connection_factory, writer, plans, run_id=run,
+            universe_version=body['evidence'].get('universe_version', 'core-universe-v1'),
+            committed_at=body['evidence'].get('committed_at', ''),
+        ))
+    return receipts

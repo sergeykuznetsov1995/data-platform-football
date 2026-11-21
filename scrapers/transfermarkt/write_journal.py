@@ -170,8 +170,7 @@ def _index_entry(line: bytes) -> dict:
     raise RuntimeError('core write journal index is corrupt')
 
 
-def _load_index() -> list[dict]:
-    root = _root()
+def _load_index_entries() -> list[dict]:
     entries = {}
     try:
         with _index_path().open('rb') as stream:
@@ -181,10 +180,21 @@ def _load_index() -> list[dict]:
                     entries[entry['digest']] = entry
     except FileNotFoundError:
         pass
+    return entries
+
+
+def _load_index() -> list[dict]:
+    root = _root()
+    entries = _load_index_entries()
 
     files = {path.stem: path for path in root.glob('*.json')}
     for digest, entry in entries.items():
         if entry['status'] == 'pending' and digest not in files:
+            # A writer may have finished this unit between our index read and
+            # this listing; re-reading the index settles it without guessing.
+            if any(item['digest'] == digest and item['status'] == 'finished'
+                   for item in _load_index_entries()):
+                continue
             raise RuntimeError('core write journal pending intent file is missing')
     for digest in files.keys() - entries.keys():
         body = _intent_body(files[digest], 'core write journal orphan checksum differs')
@@ -239,11 +249,15 @@ def _table_not_found(exc: Exception) -> bool:
 
 
 def snapshot_anchors(digest: str, connection, tables: Iterable[str]) -> dict[str, int | None]:
-    """Save the pre-write snapshot for each target exactly once."""
+    """Save the pre-write snapshot for each target exactly once.
+
+    Names may carry a schema prefix (``ops.<table>``); bare names address
+    the Bronze schema like the rest of the core writer.
+    """
     from .native_writer import _query_rows
 
     names = set(tables)
-    if any(not re.fullmatch(r'[a-z_][a-z0-9_]*', name) for name in names):
+    if any(not re.fullmatch(r'(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*', name) for name in names):
         raise ValueError('invalid core snapshot table name')
     path = _record_path('anchors', digest)
     if path.exists():
@@ -254,11 +268,13 @@ def snapshot_anchors(digest: str, connection, tables: Iterable[str]) -> dict[str
 
     anchors = {}
     for name in sorted(names):
+        schema = name.rsplit('.', 1)[0] if '.' in name else 'bronze'
+        table = name.rsplit('.', 1)[-1]
         cursor = connection.cursor()
         try:
             rows = _query_rows(
                 cursor,
-                f'SELECT snapshot_id FROM iceberg.bronze."{name}$snapshots" '
+                f'SELECT snapshot_id FROM iceberg.{schema}."{table}$snapshots" '
                 'ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1',
             )
             row = rows[0] if rows else None
