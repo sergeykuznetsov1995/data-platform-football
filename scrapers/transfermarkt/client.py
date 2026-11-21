@@ -1893,17 +1893,21 @@ class TransfermarktHttpClient:
                                     "cached raw attempt chain identity/order drift"
                                 )
                             previous_ordinal = envelope.attempt
-                    expected_child_cycle, _ = self._raw_attempt_identity(
-                        label=label, context=context or {},
+                    expected_child_cycle, expected_scope = (
+                        self._raw_attempt_identity(
+                            label=label, context=context or {},
+                        )
                     )
+                    # DeepSeek round-1 review: identity is (cycle, scope). A
+                    # run-shared lease_metadata run_id must not let one
+                    # scope's capture serve as another scope's same-cycle
+                    # evidence; the donor env encoded a per-scope child id.
                     prior_cycle = any(
                         envelope.cycle_id != expected_child_cycle
+                        or envelope.scope_id != expected_scope
                         for envelope in loaded_envelopes
                     )
                     if resume_squad:
-                        _, expected_scope = self._raw_attempt_identity(
-                            label=label, context=context or {},
-                        )
                         fetched_at = datetime.fromisoformat(record.fetched_at.replace('Z', '+00:00'))
                         age = self._time() - fetched_at.timestamp()
                         if (
