@@ -19,6 +19,7 @@
   "allowed_write_tables": [
     "iceberg.bronze.transfermarkt_attendance_observations",
     "iceberg.bronze.transfermarkt_coach_profiles",
+    "iceberg.bronze.transfermarkt_club_value_observations",
     "iceberg.bronze.transfermarkt_coach_stints",
     "iceberg.bronze.transfermarkt_market_value_points",
     "iceberg.bronze.transfermarkt_player_attribute_observations",
@@ -28,6 +29,7 @@
     "iceberg.ops.transfermarkt_season_close_v1",
     "iceberg.ops.proxy_traffic_runs",
     "iceberg.ops.transfermarkt_attendance_receipts_v1",
+    "iceberg.ops.transfermarkt_club_value_receipts_v1",
     "iceberg.ops.transfermarkt_career_capture_refs_v1",
     "iceberg.ops.transfermarkt_career_snapshot_anchors_v1",
     "iceberg.ops.transfermarkt_fetch_state",

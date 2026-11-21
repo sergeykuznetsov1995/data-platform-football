@@ -99,7 +99,9 @@ def _current_schedule():
     return TransfermarktCurrentTimetable(reserve_discovery=True)
 
 
-def _plan_current_portion(context, registry_rows, preflight, qualification):
+def _plan_current_portion(
+    context, registry_rows, preflight, qualification, *, collect_club_values=False,
+):
     from dags.utils.transfermarkt_current_timetable import work_deadline
 
     started = context['dag_run'].start_date
@@ -129,6 +131,7 @@ def _plan_current_portion(context, registry_rows, preflight, qualification):
         'TM_WRITE_MODE': str(preflight['write_mode']),
         'TM_STANDING_POLICY_PATH': STANDING_POLICY_PATH,
         'TM_CURRENT_JOB': str(job), 'TM_CURRENT_REPORT': str(report),
+        'TM_CLUB_VALUES_ENABLED': 'true' if collect_club_values else 'false',
     }]
 
 
@@ -522,13 +525,18 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
         )
         approval_mode = 'standing_policy'
 
+    from dags.utils.transfermarkt_club_values import club_values_enabled
+    collect_club_values = standing_policy is not None and club_values_enabled(standing_policy)
     qualification = (context.get('_tm_current_qualification') or _current_qualification()) if approval_mode == 'standing_policy' else None
     registry_options: dict[str, Any] = {'registry_snapshot_id': str(params.get('registry_snapshot_id') or '')}
     if qualification is not None:
         registry_options['current_only'] = True
     registry_rows = _read_promoted_registry(**registry_options)
     if qualification is not None:
-        return _plan_current_portion(context, registry_rows, preflight, qualification)
+        return _plan_current_portion(
+            context, registry_rows, preflight, qualification,
+            collect_club_values=collect_club_values,
+        )
     plan = plan_transfermarkt_scopes(
         params,
         parent_cycle_id=str(context['run_id']),
@@ -601,6 +609,7 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             'TM_PARENT_REQUEST_LIMIT': str(PARENT_REQUEST_LIMIT),
             'TM_PARENT_RETRY_LIMIT': str(PARENT_RETRY_LIMIT),
             'TM_PENDING_CHECKPOINT_DIR': PENDING_CHECKPOINT_DIR,
+            'TM_CLUB_VALUES_ENABLED': 'true' if collect_club_values else 'false',
         }
         if approval_mode == 'standing_policy':
             environment.update({
@@ -1363,7 +1372,7 @@ case "$TM_APPROVAL_MODE" in
     exit 1
     ;;
 esac
-exec python dags/scripts/run_transfermarkt_scope_cycle.py \
+python dags/scripts/run_transfermarkt_scope_cycle.py \
   --payload-json "$TM_SCOPE_PAYLOAD_JSON" \
   --reader-revision "$TM_READER_REVISION" \
   --candidate-slot "$TM_CANDIDATE_SLOT" \
@@ -1380,7 +1389,10 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --request-limit "$TM_PROXY_REQUEST_LIMIT" \
   --retry-limit "$TM_PROXY_RETRY_LIMIT" \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
-  --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"''',
+  --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
+if [ "${TM_CLUB_VALUES_ENABLED:-false}" = "true" ]; then
+  python dags/scripts/run_transfermarkt_club_values.py --mode current --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-result.json}"
+fi''',
         append_env=True,
         retries=0,
         pool='transfermarkt_proxy',
