@@ -134,5 +134,5 @@ def test_unsupported_entities_are_not_advertised_as_tables():
         for contract in tm_v2.TABLE_CONTRACTS
     )
     checklist = ' '.join(CHECKLIST.read_text(encoding='utf-8').lower().split())
-    assert 'awards and achievements remain roadmap-only' in checklist
+    assert 'achievement observations have a separate production contract' in checklist
     assert 'fixtures, stages, results' in checklist

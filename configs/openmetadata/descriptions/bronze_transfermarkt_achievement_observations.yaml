@@ -1,0 +1,23 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_achievement_observations
+  description: Append-only Transfermarkt achievements and conclusive-empty recipient observations. One row per recipient, raw capture and source row; aggregate counts never replace details.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: recipient_type
+    description: Recipient kind — player, club or coach.
+  - name: recipient_id
+    description: Global Transfermarkt recipient ID.
+  - name: title
+    description: Source achievement title; null only for a conclusive-empty recipient observation.
+  - name: season_id
+    description: Source season ID without calendar/cyclical conversion.
+  - name: season
+    description: Source season or year display.
+  - name: result
+    description: Explicit source result or note; never inferred from an aggregate count.
+  - name: source_capture_id
+    description: Immutable raw capture ID; part of the physical natural key.
+  - name: source_row_id
+    description: Source row or deterministic within-capture observation locator; preserves identical repeated titles.
+  - name: observation_status
+    description: observed_present for every detail or observed_empty for a conclusive recipient status.

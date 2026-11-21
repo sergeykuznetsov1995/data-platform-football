@@ -33,10 +33,11 @@ DISCOVER=dag_discover_transfermarkt_registry
 BACKFILL=dag_backfill_transfermarkt
 SILVER=dag_transform_transfermarkt_silver
 MANUAL=dag_discover_transfermarkt_registry_manual
+ACHIEVEMENTS=dag_ingest_transfermarkt_achievements
 TM_DAGS=$(transfermarkt_release_dags "$RELEASE") || exit 2
 TM_DAGS_SQL=$(transfermarkt_dags_sql "$TM_DAGS")
 TM_DAG_COUNT=$(wc -w <<< "$TM_DAGS")
-GUARD_DAGS="$INGEST $DISCOVER $BACKFILL $SILVER $MANUAL dag_ingest_transfermarkt_referees dag_backfill_transfermarkt_referees dag_dq_transfermarkt_referees"
+GUARD_DAGS="$INGEST $DISCOVER $BACKFILL $SILVER $MANUAL $ACHIEVEMENTS dag_ingest_transfermarkt_referees dag_backfill_transfermarkt_referees dag_dq_transfermarkt_referees"
 GUARD_DAGS_SQL=$(transfermarkt_dags_sql "$GUARD_DAGS")
 # Таймаут обязателен: зависший `docker exec` держал бы выкат (и автомат из cron) вечно.
 PSQL="timeout -k 5 ${TRANSFERMARKT_DEPLOY_METADB_TIMEOUT:-30} docker exec $METADB psql -U airflow -d airflow -At -c"
@@ -265,9 +266,9 @@ log "mounts of $SCHED and $GW lead into $RELEASE"
 STEP="pauses"
 # Паузы — как были до выката: ручная пауза оператора выкат не снимает. DAG, которого до
 # выката в метабазе не было (первый подъём), получает дефолт решения 10 #1387:
-# ingest/discover работают, backfill/silver/manual/referees — на паузе. Откат возвращает
-# паузы из снимка — это делает автомат после этого скрипта.
-declare -A DEFAULT_PAUSED=(["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t ["$MANUAL"]=t ["dag_ingest_transfermarkt_referees"]=t ["dag_backfill_transfermarkt_referees"]=t ["dag_dq_transfermarkt_referees"]=t)
+# ingest/discover работают, achievements/backfill/silver/manual/referees — на паузе. Откат
+# возвращает паузы из снимка — это делает автомат после этого скрипта.
+declare -A DEFAULT_PAUSED=(["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t ["$MANUAL"]=t ["$ACHIEVEMENTS"]=t ["dag_ingest_transfermarkt_referees"]=t ["dag_backfill_transfermarkt_referees"]=t ["dag_dq_transfermarkt_referees"]=t)
 summary=""
 for d in $TM_DAGS; do
   want="${WAS_PAUSED[$d]:-${DEFAULT_PAUSED[$d]}}"
