@@ -46,7 +46,6 @@ from scrapers.transfermarkt.raw_store import (
     RawStoreError,
 )
 from scrapers.utils.proxy_manager import ErrorType
-from .history_portion import HistoryContinuation
 
 
 logger = logging.getLogger(__name__)
@@ -573,9 +572,6 @@ class ProxyFilterLeaseProvider:
             )
         request = dict(metadata)
         request.update({"max_bytes": int(max_bytes), "ttl_seconds": int(ttl_seconds)})
-        from .history_portion import reconcile_leases, journal_lease
-        scope = str(metadata.get('scope') or metadata.get('scope_id') or '')
-        reconcile_leases(self, scope)
         for delay in (*_LEASE_CONCURRENCY_RETRY_DELAYS, None):
             status, body = self._exchange("POST", "/v1/leases", payload=request)
             if not (status == 429 and isinstance(body, dict) and body.get("code") == "concurrency_limited"):
@@ -615,7 +611,6 @@ class ProxyFilterLeaseProvider:
             if lease.stream_id:
                 from .streams import browser_profile
                 browser_profile(lease.stream_id)
-            journal_lease(lease, scope)
         except Exception:
             self.close(lease)
             raise
@@ -962,8 +957,7 @@ class TransfermarktHttpClient:
                     )
                     break
                 except SourceStreamPaused as exc:
-                    from .history_portion import enabled as history_enabled
-                    if history_enabled() or self._request_deadline_monotonic is None:
+                    if self._request_deadline_monotonic is None:
                         raise
                     delay = max(0.0, exc.resume_at_epoch - self._time()) + 0.1
                     remaining = (
@@ -1066,10 +1060,7 @@ class TransfermarktHttpClient:
                 raise TrafficBudgetExceeded(
                     "Transfermarkt provider hard byte budget exhausted"
                 )
-            from .history_portion import enabled as history_enabled, remaining_seconds
-            if history_enabled():
-                ttl_seconds = min(self._lease_ttl_seconds, max(1, int(remaining_seconds())))
-            elif self._request_deadline_monotonic is not None:
+            if self._request_deadline_monotonic is not None:
                 # #2068: a lease that outlives the portion holds the single
                 # current stream until the gateway reaper expires it.
                 portion_left = self._request_deadline_monotonic - self._monotonic()
@@ -1238,8 +1229,6 @@ class TransfermarktHttpClient:
             return
         try:
             snapshot = self._lease_provider.close(lease)
-            from .history_portion import journal_lease
-            journal_lease(lease, str(self._lease_metadata.get('scope') or self._lease_metadata.get('scope_id') or ''), snapshot=snapshot)
             delta_up, delta_down = self._observe_lease_snapshot(snapshot)
             if delta_up or delta_down:
                 self._traffic_ledger.record_unattributed_provider(
@@ -2059,9 +2048,6 @@ class TransfermarktHttpClient:
         """
 
         context = dict(context or {})
-        from .history_portion import recovery_probe
-        if recovery_probe():
-            cache_key = None
         cache_started = self._monotonic()
         cached = self._load_cached_outcome(
             cache_key, as_json=as_json, label=label, context=context, url=url,
@@ -2118,8 +2104,6 @@ class TransfermarktHttpClient:
                         if not self._rate_limiter.acquire(timeout=max(0.0, remaining)):
                             raise CurrentPortionDeadlineExceeded("Transfermarkt limiter reached portion tail")
                 self._request_timeout()
-                from .history_portion import reserve_attempt
-                reserve_attempt()
                 self._consume_source_request_permit(
                     url=url,
                     label=label,
@@ -2544,7 +2528,7 @@ class TransfermarktHttpClient:
                             proxy_status,
                         )
                     break
-            except (CurrentPortionDeadlineExceeded, HistoryContinuation):
+            except CurrentPortionDeadlineExceeded:
                 raise
             except TrafficBudgetExceeded:
                 self._budget_exhausted = True

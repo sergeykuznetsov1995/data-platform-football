@@ -1560,9 +1560,8 @@ class _Scope:
         if not isinstance(checkpoint, Mapping):
             raise CurrentPortionError('unfinished squad requires a raw attempt checkpoint')
         version = checkpoint.get('outcome', {}).get('version')
-        if version != 4 and not (version == 3 and checkpoint.get('legacy_proof', {}).get('kind')
-                                == 'legacy_v3_success_response'):
-            raise CurrentPortionError('unfinished squad requires v4 or typed legacy raw attempt proof')
+        if version != 4:
+            raise CurrentPortionError('unfinished squad requires v4 raw attempt proof')
         value = json.loads(json.dumps(checkpoint))
         value['outcome'].pop('value', None)
         return value
@@ -1579,8 +1578,7 @@ class _Scope:
             checkpoint = self.resume.get('capture_proofs', {}).get(saved.club_id)
         if checkpoint is not None:
             version = checkpoint.get('outcome', {}).get('version')
-            if version != 4 and not (version == 3 and checkpoint.get('legacy_proof', {}).get('kind')
-                                    == 'legacy_v3_success_response'):
+            if version != 4:
                 raise CurrentPortionError('unfinished squad has no typed raw attempt proof')
             try:
                 FetchOutcome.from_checkpoint(checkpoint['outcome'])
@@ -1597,20 +1595,6 @@ class _Scope:
             or _utc(outcome.raw_fetched_at) != saved.raw_fetched_at
             or not squad_replay_matches(outcome.value, saved.club_id, saved.rows)):
             raise CurrentPortionError('unfinished squad parsed rows differ from verified raw attempt chain')
-        checkpoint = self.scraper._http_client._cache[url]
-        if checkpoint['outcome'].get('version') == 3:
-            # Only the existing client publishes the verified legacy success
-            # envelope. Keep the original transport count and v3 schema clean.
-            proof = {'kind': 'legacy_v3_success_response',
-                     'original_attempt_count': outcome.attempts,
-                     'evidenced_attempt_count': len(outcome.raw_attempt_envelope_ids),
-                     'prefix_unknown': outcome.attempts != len(outcome.raw_attempt_envelope_ids),
-                     'raw_attempt_envelope_ids': list(outcome.raw_attempt_envelope_ids)}
-            if checkpoint.get('legacy_proof') is not None and checkpoint['legacy_proof'] != proof:
-                raise CurrentPortionError('legacy squad sidecar differs from verified successful attempt')
-            checkpoint = {**checkpoint, 'legacy_proof': proof}
-            self._verify_reconciliation_capture(saved, url, checkpoint)
-            self.scraper._http_client._cache[url] = checkpoint
         self.scraper._http_client._record_cache_hit(label='squad', duration_seconds=0)
         return True
 
@@ -1671,23 +1655,10 @@ class _Scope:
         """Validate a complete write's historical inputs, independently of HTTP cache."""
         from scrapers.transfermarkt.scraper import squad_replay_matches
         version = checkpoint.get('outcome', {}).get('version')
-        if version not in (3, 4):
+        if version != 4:
             raise CurrentPortionError('write reconciliation requires typed raw attempt evidence')
         outcome = FetchOutcome.from_checkpoint(checkpoint['outcome'])
-        legacy = checkpoint.get('legacy_proof') if version == 3 else None
-        if version == 3:
-            keys = {'kind', 'original_attempt_count', 'evidenced_attempt_count', 'prefix_unknown',
-                    'raw_attempt_envelope_ids'}
-            if (not isinstance(legacy, Mapping) or set(legacy) != keys
-                or legacy['kind'] != 'legacy_v3_success_response'
-                or type(legacy['original_attempt_count']) is not int or outcome.attempts < 1
-                or legacy['original_attempt_count'] != outcome.attempts
-                or type(legacy['evidenced_attempt_count']) is not int or legacy['evidenced_attempt_count'] != 1
-                or type(legacy['prefix_unknown']) is not bool or legacy['prefix_unknown'] != (outcome.attempts != 1)
-                or not isinstance(legacy['raw_attempt_envelope_ids'], list)
-                or len(legacy['raw_attempt_envelope_ids']) != 1):
-                raise CurrentPortionError('write reconciliation legacy sidecar/counts differ')
-        envelope_ids = legacy['raw_attempt_envelope_ids'] if legacy is not None else outcome.raw_attempt_envelope_ids
+        envelope_ids = outcome.raw_attempt_envelope_ids
         store = self.scraper._http_client._raw_store
         body, record = store.load_capture(saved.raw_capture_id)
         replay = body.decode('utf-8')
@@ -1715,7 +1686,7 @@ class _Scope:
                 raise CurrentPortionError('write reconciliation attempt identity/order differs')
             previous = envelope.attempt
         final = envelopes[-1]
-        if ((legacy is None and len(envelopes) != outcome.attempts) or final.outcome_kind != 'response'
+        if (len(envelopes) != outcome.attempts or final.outcome_kind != 'response'
             or final.capture_id != record.capture_id or final.status_code != 200
             or final.raw_body_hash != record.content_hash or final.attempt != record.attempt):
             raise CurrentPortionError('write reconciliation final attempt differs from successful raw capture')
@@ -1724,9 +1695,9 @@ class _Scope:
             self.scraper._http_client._cache_sources[envelope.envelope_id] = envelope
         return {'raw_capture_id': record.capture_id, 'raw_fetched_at': record.fetched_at,
                 'source_age_seconds': age, 'source_url': record.url, 'source_body_hash': record.content_hash,
-                'proof_kind': legacy['kind'] if legacy is not None else 'v4_complete_attempt_chain',
+                'proof_kind': 'v4_complete_attempt_chain',
                 'original_attempt_count': outcome.attempts, 'evidenced_attempt_count': len(envelopes),
-                'prefix_unknown': legacy['prefix_unknown'] if legacy is not None else False}
+                'prefix_unknown': False}
 
     def _missing_refresh_checks(self):
         refresh = self.data.get('recovery_signal_refresh_required')
