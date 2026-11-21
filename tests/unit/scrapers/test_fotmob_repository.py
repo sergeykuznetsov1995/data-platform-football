@@ -1827,7 +1827,8 @@ def test_2302_pre_fix_momentum_mask_orphan_is_rewritten_not_merged():
     ]
 
 
-def test_confirmed_batch_with_mismatched_count_still_fails_closed():    # Зеркало предыдущего теста: строка в манифесте есть, значит пачка была
+def test_confirmed_batch_with_mismatched_count_still_fails_closed():
+    # Зеркало предыдущего теста: строка в манифесте есть, значит пачка была
     # завершена, и другое число строк — настоящая порча, а не обломок.
     writer = ReconcileWriter()
     commit = _commit(target_key="https://example/m/confirmed")
