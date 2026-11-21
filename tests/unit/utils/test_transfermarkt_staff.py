@@ -323,7 +323,9 @@ def test_staff_readback_rejects_unexpected_same_batch_row(physical, monkeypatch)
 @pytest.fixture
 def staff_policy(monkeypatch, tmp_path):
     policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
-    policy['allowed_write_tables'] += [staff.STAFF_TABLE, staff.STAFF_RECEIPTS_TABLE]
+    for table in [staff.STAFF_TABLE, staff.STAFF_RECEIPTS_TABLE]:
+        if table not in policy['allowed_write_tables']:
+            policy['allowed_write_tables'].append(table)
     policy['expires_at'] = '2999-01-01T00:00:00Z'
     path = tmp_path / 'staff-policy.json'
     path.write_text(json.dumps(policy))
