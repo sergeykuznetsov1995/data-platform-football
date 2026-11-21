@@ -173,6 +173,37 @@ def test_riverplate_header_and_rows(riverplate_html):
     assert first["has_result"] is True
 
 
+def test_header_without_best_block_parses(riverplate_html):
+    html = riverplate_html
+    old = " (Best: 1866, reached on 1986-07-24)"
+    assert old in html
+    baseline = parse_club_page(html, "riverplate")
+    page = parse_club_page(html.replace(old, "", 1), "riverplate")
+    assert page.header == {"elo": 1732, "elo_best": None,
+                           "elo_best_reached_on": None, "golo": 1.12}
+    assert page.captured_rating_date == baseline.captured_rating_date
+    assert page.club_name == baseline.club_name
+    assert page.points == baseline.points
+    assert page.matches == baseline.matches
+
+
+def test_header_without_best_and_golo_parses(riverplate_html):
+    html = riverplate_html
+    old = " (Best: 1866, reached on 1986-07-24),                     Golo: 1.12"
+    assert old in html
+    page = parse_club_page(html.replace(old, "", 1), "riverplate")
+    assert page.header == {"elo": 1732, "elo_best": None,
+                           "elo_best_reached_on": None, "golo": None}
+
+
+def test_non_numeric_header_elo_fails_closed(riverplate_html):
+    html = riverplate_html
+    old = "Elo: <b>1732</b>"
+    assert old in html
+    with pytest.raises(LayoutChanged, match="header 'Elo: …' not found"):
+        parse_club_page(html.replace(old, "Elo: <b>soon</b>", 1), "riverplate")
+
+
 def test_six_cell_row_is_a_fixture_without_result(riverplate_html):
     rows = [m for m in parse_club_page(riverplate_html, "riverplate").matches if not m["has_result"]]
     row = next(m for m in rows if m["match_date"] == date(2026, 8, 12))
@@ -253,6 +284,19 @@ def test_missing_header_fails_closed(riverplate_html):
         parse_club_page(riverplate_html.replace("reached on", "reached"), "riverplate")
 
 
+@pytest.mark.parametrize("corrupt", [
+    " Best: 1866, reached on 1986-07-24)",    # opening paren dropped
+    " (Best 1866, reached on 1986-07-24)",    # colon dropped
+    " (best: 1866, reached on 1986-07-24)",   # lowercase remnant
+    ", Best: 1866, reached on 1986-07-24)",   # comma instead of paren
+])
+def test_malformed_best_block_without_paren_fails_closed(riverplate_html, corrupt):
+    html = riverplate_html.replace(" (Best: 1866, reached on 1986-07-24)", corrupt)
+    assert html != riverplate_html
+    with pytest.raises(LayoutChanged, match="header"):
+        parse_club_page(html, "riverplate")
+
+
 def test_header_of_14_th_required(riverplate_html):
     with pytest.raises(LayoutChanged, match="14 th"):
         parse_club_page(riverplate_html.replace("<th>New Rank</th>", ""), "riverplate")
@@ -281,6 +325,8 @@ def test_confirmed_h1_aliases_are_accepted(riverplate_html, slug, page_slug):
     ("riverplate", "l-r-vicenza"),    # a canonical slug of someone else's pair
     ("l-r-vicenza", "Vicenza"),       # the alias direction is not reversible
     ("Juventude", "criciuma-sc"),     # canonical slug of a foreign pair
+    ("Antequera", "arenas-de-getxo"),
+    ("antequera-cf", "Antequera"),
     ("Porto B", "riverplate"),
 ])
 def test_unconfirmed_h1_mismatch_still_fails_closed(riverplate_html, slug, page_slug):

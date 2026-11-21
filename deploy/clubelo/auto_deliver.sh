@@ -206,7 +206,8 @@ g archive "$SHA" | tar -x -C "$COMPAT" || stop "ОТМЕНА: git archive кан
 CHECKER="$COMPAT/deploy/clubelo/check_compatibility.py"
 CHECK_PY="${CHECK_PY:-/root/.venvs/dpf-test/bin/python}"
 # Внешний timeout покрывает также чтение/копирование и ошибки тестового окружения.
-timeout 300 "$CHECK_PY" -I "$CHECKER" prepare "$COMPAT" "$TREE" $SHARED_PATHS \
+# 990 с: внутренний бюджет чекера поднят до 900 с — набор ClubElo вырос до ~442 с (21.11).
+timeout 990 "$CHECK_PY" -I "$CHECKER" prepare "$COMPAT" "$TREE" $SHARED_PATHS \
   || stop "ОТМЕНА: совместимость ClubElo с общими модулями не подтверждена"
 log "база ${ACC:0:7} → master ${SHA:0:7}; совместимость общих модулей проверена"
 

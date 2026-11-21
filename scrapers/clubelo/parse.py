@@ -30,8 +30,16 @@ MATCH_ROW_CELLS = (6, 14)  # 6 = fixture without a result, 14 = played match
 
 _H1_HREF = re.compile(r'<h1><a href="/(\d{4}-\d{2}-\d{2})/([^"]+)">')
 _H1_HREF_EXACT = re.compile(r"/(\d{4}-\d{2}-\d{2})/([^\"]+)")
-_HEADER = re.compile(
-    r"Elo:\s*(-?\d+)\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\)"
+_HEADER_LINE = re.compile(
+    # The club header lives in its own <p> (after lxml repairs the nested
+    # "Spain, <p>Elo: ..." markup into siblings). The "(Best: N, reached
+    # on D)" block is either complete or absent (clubs without a recorded
+    # best, observed 2026-11-21). fullmatch over that paragraph alone
+    # fails closed on ANY remnant — case ("best:"), punctuation or a
+    # missing paren cannot hide behind the match like they could in a
+    # whole-document search (Astra review rounds 1–2).
+    r"Elo:\s*(-?\d+)"
+    r"(?:\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\))?"
     r"(?:,\s*Golo:\s*(-?\d+(?:\.\d+)?))?"
 )
 _VEGA_MARKER = "var vegaJson = "
@@ -283,6 +291,8 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
 # or case aliasing: any other requested-slug → h1 mismatch stays
 # LayoutChanged.
 H1_SLUG_ALIASES = {
+    "Antequera": "antequera-cf",
+    "ArenasdeGetxo": "arenas-de-getxo",
     "Vicenza": "l-r-vicenza",
     "Juventude": "juventude-rs",
     "Criciuma": "criciuma-sc",
@@ -358,6 +368,27 @@ H1_SLUG_ALIASES = {
 }
 
 
+def _header_match(doc):
+    """fullmatch of ``_HEADER_LINE`` over the single club-header ``<p>``.
+
+    Exactly one ``<p>`` whose flattened text starts with ``Elo:`` must exist
+    (a decoy or a missing paragraph fails closed); the whole paragraph must
+    be exactly the known grammar, so no malformed ``(Best: …)`` remnant can
+    stay unread after a successful match.
+    """
+
+    lines = [_text(p) for p in doc.xpath("//p")]
+    elo_lines = [text for text in lines if text.startswith("Elo:")]
+    if len(elo_lines) != 1:
+        raise LayoutChanged(
+            f"expected one 'Elo:' header paragraph, got {len(elo_lines)}"
+        )
+    match = _HEADER_LINE.fullmatch(elo_lines[0])
+    if not match:
+        raise LayoutChanged("header 'Elo: …' not found")
+    return match
+
+
 def parse_club_page(html: str, slug: str) -> ClubPage:
     """Parse ``/{slug}``: h1, header, vega points, last-16 match table.
 
@@ -400,17 +431,17 @@ def parse_club_page(html: str, slug: str) -> ClubPage:
         # Dateless variant: a single non-empty ``<h1>Club</h1>`` without any
         # link, so no rating date can be captured from it.
         captured = None
-    header_match = _HEADER.search(_text(doc))
-    if not header_match:
-        raise LayoutChanged("header 'Elo: … (Best: …, reached on …)' not found")
+    header_match = _header_match(doc)
     elo, best, reached, golo = header_match.groups()
     return ClubPage(
         captured_rating_date=captured,
         club_name=_text(h1s[0]),
         header={
             "elo": int(elo),
-            "elo_best": int(best),
-            "elo_best_reached_on": _iso_date(reached, "Best reached on"),
+            "elo_best": None if best is None else int(best),
+            "elo_best_reached_on": (
+                None if reached is None else _iso_date(reached, "Best reached on")
+            ),
             "golo": None if golo is None else float(golo),
         },
         points=_vega_points(html),

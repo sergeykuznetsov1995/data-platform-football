@@ -128,8 +128,10 @@ def main():
     env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1")
     for name in ("PYTHONPATH", "PYTHONHOME", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
         env.pop(name, None)
+    # 900 s: the offline ClubElo set outgrew the old 240 s budget
+    # (1125 tests ≈ 442 s on 2026-11-21 after #2246/#2251/#2360 merged).
     return subprocess.run([sys.executable, "-I", __file__, "test", str(work), str(tree)],
-                          cwd=work, env=env, timeout=240).returncode
+                          cwd=work, env=env, timeout=900).returncode
 
 
 if __name__ == "__main__":
