@@ -39,6 +39,7 @@ from scrapers.sofascore.scraper import SofaScoreScraper, _season_label
 from scrapers.sofascore.season_pipeline import (
     REFEREE_PROFILE_ENDPOINT,
     SeasonPlanningError,
+    plan_season_fields_partition,
     plan_season_partition,
     squad_player_ids,
 )
@@ -61,7 +62,7 @@ from scrapers.sofascore.workload_runtime import (
 )
 
 
-VALID_PHASES = frozenset({"season", "targets", "players"})
+VALID_PHASES = frozenset({"season", "season_fields", "targets", "players"})
 SEASON_EVIDENCE = frozenset({"pages", "bronze"})
 SOFASCORE_BUDGET_ARTIFACT_ID_ENV = "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -446,6 +447,24 @@ def _season_freshness_key() -> str:
     ).strip() or "day-" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _season_fields_freshness_key() -> str:
+    """#1368: one admission day, one key — not an ISO week.
+
+    A weekly key plus an "older than 7 days" admission gate cannot honour a
+    rolling <= 7-day freshness contract (two consecutive-week captures drift
+    past seven days apart).  The refresh lane admits a partition at a renewal
+    interval below the contract instead, and the admission day's key makes
+    every retry of that day a zero-byte no-op while a terminal manifest
+    exists.  Values must stay distinct from "final", the ingest day keys and
+    "repair-*".
+    """
+    return os.environ.get(
+        "SOFASCORE_SEASON_FIELDS_FRESHNESS_KEY", ""
+    ).strip() or "season-fields-" + datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d"
+    )
+
+
 def _player_freshness_key() -> str:
     return os.environ.get(
         "SOFASCORE_PLAYER_FRESHNESS_KEY", ""
@@ -509,6 +528,8 @@ def prepare_workload_plan(
         if season_freshness_key is not None
         else f"repair-{base_run_id}"
         if force_replace
+        else _season_fields_freshness_key()
+        if phase == "season_fields"
         else _season_freshness_key()
     )
     player_freshness = (
@@ -615,17 +636,33 @@ def prepare_workload_plan(
         )
         drop_reason = None
         season_plan = None
-        if season_evidence == "pages":
+        fields_only = phase == "season_fields"
+        if fields_only or season_evidence == "pages":
             try:
-                season_plan = plan_season_partition(
-                    runtime.raw_store,
-                    runtime.manifest_store,
-                    source_tournament_id=tournament.unique_tournament_id,
-                    source_season_id=source_season.season_id,
-                    freshness_key=season_freshness,
-                    event_freshness_key="final",
-                    paid_proxy=True,
-                    max_pages=max_pages,
+                # #1368: the fields phase plans ONLY the four normalized
+                # season endpoints on its own admission-day key.  Dispatching
+                # it before the generic branch keeps unrelated schedule or
+                # referee evidence from failing a cheap renewal.
+                season_plan = (
+                    plan_season_fields_partition(
+                        runtime.raw_store,
+                        runtime.manifest_store,
+                        source_tournament_id=tournament.unique_tournament_id,
+                        source_season_id=source_season.season_id,
+                        freshness_key=season_freshness,
+                        paid_proxy=True,
+                    )
+                    if fields_only
+                    else plan_season_partition(
+                        runtime.raw_store,
+                        runtime.manifest_store,
+                        source_tournament_id=tournament.unique_tournament_id,
+                        source_season_id=source_season.season_id,
+                        freshness_key=season_freshness,
+                        event_freshness_key="final",
+                        paid_proxy=True,
+                        max_pages=max_pages,
+                    )
                 )
             except SeasonPlanningError as exc:
                 # A defect in ONE league's stored state (schema-rejected raw,
@@ -640,7 +677,10 @@ def prepare_workload_plan(
             # season, the team-count band from competitions.yaml.  An
             # unconfigured season raises MedallionConfigError here and fails
             # the phase — a silently skipped league is exactly the fail-open
-            # we refuse.
+            # we refuse.  #1368 signs the fields capture under the SAME
+            # measured season class: its four endpoints are a subset of the
+            # class's static endpoints, so the signed byte ceiling stays an
+            # upper bound of what the phase can spend.
             shape = production_season_shape(
                 season_format=source_season.format,
                 team_count_band=team_count_band(
@@ -652,7 +692,7 @@ def prepare_workload_plan(
         # plan: inactive competitions and leagues outside this week's rotation
         # already skipped above and must not dilute the all-dropped guard.
         considered_partitions += 1
-        if phase == "season" and season_plan is not None:
+        if phase in {"season", "season_fields"} and season_plan is not None:
             workloads.append(
                 PartitionWorkload(
                     item.league,
@@ -663,7 +703,13 @@ def prepare_workload_plan(
                         source_season.season_id,
                         shape,
                         pending=bool(season_plan.missing_raw_keys) or force_replace,
-                        schedule_chunk=getattr(season_plan, "schedule_chunk", None),
+                        # #1368: a fields-only renewal never signs a schedule
+                        # chunk; its allocation unit stays the scope identity.
+                        schedule_chunk=(
+                            None
+                            if fields_only
+                            else getattr(season_plan, "schedule_chunk", None)
+                        ),
                     ),
                 )
             )

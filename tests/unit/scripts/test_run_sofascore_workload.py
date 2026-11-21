@@ -7,18 +7,23 @@ import pytest
 from dags.scripts.run_sofascore_scraper import (
     ENTITY_MATCH_CAPTURE,
     ENTITY_PLAYER_CAPTURE,
+    ENTITY_SEASON_FIELDS,
     _load_runtime_workload_plan,
     _logical_capture_traffic,
     _merge_live_traffic,
     _planned_freshness_key,
 )
 from scrapers.sofascore.workload_plan import (
+    SeasonWorkload,
     WorkloadBudgetPolicy,
     WorkloadClassBudget,
     match_workload_class,
     player_workload_class,
     production_match_shape,
     production_player_shape,
+    production_season_shape,
+    season_workload_class,
+    team_count_band,
     workload_shape_digest,
 )
 from scrapers.sofascore.workload_runtime import (
@@ -221,6 +226,93 @@ def test_runner_rejects_target_plan_for_season_capture(tmp_path, monkeypatch):
             entity="all",
             league="ENG-Premier League",
             season=2025,
+            offline_replay=False,
+        )
+
+
+def _season_fields_plan(tmp_path, *, run_id="scheduled-1::season_fields"):
+    shape = production_season_shape(
+        season_format="split_year",
+        team_count_band=team_count_band(20),
+        max_pages_per_direction=50,
+    )
+    season_class = season_workload_class(shape)
+    policy = WorkloadBudgetPolicy(
+        "c" * 64,
+        {
+            MATCH_WORKLOAD_CLASS: _match_budget(),
+            season_class: WorkloadClassBudget(
+                season_class,
+                "season",
+                1,
+                300,
+                ("schedule_last",),
+                workload_shape_digest(shape),
+            ),
+        },
+    )
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_refresh_sofascore_all_mens",
+        run_id=run_id,
+        freshness_keys={
+            "season": "season-fields-2026-11-21",
+            "match": "final",
+            "player": "week-signed",
+        },
+        partitions=[
+            PartitionWorkload(
+                "SS-17",
+                "2526",
+                17,
+                season_workload=SeasonWorkload(
+                    17,
+                    76986,
+                    shape,
+                    pending=True,
+                    schedule_chunk=None,
+                ),
+            )
+        ],
+        control_token=TOKEN,
+    )
+    return write_plan(tmp_path / "season-fields.json", plan)
+
+
+def test_runner_binds_season_fields_to_its_own_plan_phase(tmp_path, monkeypatch):
+    # #1368: the fields entity accepts exactly the ::season_fields plan and
+    # resolves the one legacy-pair season allocation under the season scope.
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_refresh_sofascore_all_mens")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-1")
+    path = _season_fields_plan(tmp_path)
+
+    plan, allocations = _load_runtime_workload_plan(
+        str(path),
+        entity=ENTITY_SEASON_FIELDS,
+        league="SS-17",
+        season=2526,
+        offline_replay=False,
+    )
+
+    assert plan.run_id == "scheduled-1::season_fields"
+    assert len(allocations) == 1
+    assert allocations[0].scope == "season"
+    assert target_ids(allocations[0]) == ("17:76986",)
+
+
+def test_runner_rejects_a_fields_plan_for_the_full_season_entity(tmp_path, monkeypatch):
+    # The paid four-endpoint renewal must never authorize the full season
+    # walk, and a full-season plan must never authorize the fields entity.
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_refresh_sofascore_all_mens")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-1")
+    with pytest.raises(RuntimeError, match="wrong workload-plan phase"):
+        _load_runtime_workload_plan(
+            str(_season_fields_plan(tmp_path)),
+            entity="all",
+            league="SS-17",
+            season=2526,
             offline_replay=False,
         )
 

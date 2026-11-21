@@ -44,6 +44,7 @@ from scrapers.sofascore.season_pipeline import (
     _SCHEDULE_IDENTITY_COLUMNS,
     _is_schedule_identity_conflict,
     materialize_season_partition,
+    plan_season_fields_partition,
     plan_season_partition,
     replay_season_partition,
     replay_season_specs,
@@ -3514,3 +3515,193 @@ def test_optional_referee_manifest_write_failure_stops_real_season_commit(tmp_pa
     assert record.status == ManifestStatus.RETRYABLE_FAILURE
     assert record.error_type == "DeferredMaterialization"
     assert len(report["publication_receipts"]) == 6
+
+
+@pytest.mark.unit
+def test_season_fields_plan_is_exactly_the_four_field_specs(tmp_path):
+    plan = plan_season_fields_partition(
+        _raw_store(tmp_path), InMemoryManifestStore(), **_common()
+    )
+
+    assert [spec.key.endpoint for spec in plan.specs] == [
+        "standings_total",
+        "rounds",
+        "cup_trees",
+        "participants",
+    ]
+    assert all(
+        spec.key.target_type == "season" and spec.key.freshness_key == FRESHNESS
+        for spec in plan.specs
+    )
+    # A fresh admission-day key deliberately leaves every endpoint pending:
+    # that is the re-purchase the phase exists for.
+    assert plan.schedule_chain_complete
+    assert not plan.complete
+    assert {key.endpoint for key in plan.pending_keys} == {
+        "standings_total",
+        "rounds",
+        "cup_trees",
+        "participants",
+    }
+    assert {key.endpoint for key in plan.missing_raw_keys} == {
+        "standings_total",
+        "rounds",
+        "cup_trees",
+        "participants",
+    }
+    assert plan.team_ids == () and plan.referee_ids == ()
+
+
+@pytest.mark.unit
+def test_season_fields_plan_is_a_zero_byte_noop_once_terminal(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    specs = [
+        build_standings_total_spec(**_common()),
+        build_rounds_spec(**_common()),
+        build_cup_trees_spec(**_common()),
+        build_participants_spec(**_common()),
+    ]
+    for spec in specs:
+        _seed_raw(raw_store, spec, FIXTURE_PATHS[spec.key.endpoint].read_bytes())
+    engine, transport = _engine(
+        tmp_path, raw_store=raw_store, manifest_store=manifests
+    )
+    results = replay_season_specs(engine, specs)
+    assert transport.calls == 0
+    for result in results:
+        manifests.upsert(result.manifest)
+
+    plan = plan_season_fields_partition(raw_store, manifests, **_common())
+
+    assert plan.complete
+    assert plan.pending_keys == ()
+    assert plan.missing_raw_keys == ()
+    # The four retained payloads replay without any schedule evidence.
+    assert plan.schedule_chain_complete
+
+
+@pytest.mark.unit
+def test_season_fields_plan_rejects_a_blank_freshness_key(tmp_path):
+    with pytest.raises(ValueError, match="freshness_key"):
+        plan_season_fields_partition(
+            _raw_store(tmp_path),
+            InMemoryManifestStore(),
+            **{**_common(), "freshness_key": "  "},
+        )
+
+
+@pytest.mark.unit
+def test_runner_season_fields_publishes_four_datasets_without_schedule(tmp_path, monkeypatch):
+    """#1368: the fields entity replays and publishes ONLY the four season
+    endpoints — no schedule pages, no referee profiles, no schedule
+    inventory that a consumer could misread as season evidence."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.base.base_scraper import BaseScraper
+    from scrapers.sofascore import SofaScoreScraper
+
+    monkeypatch.setattr(
+        "utils.proxy_traffic.record_traffic_run", lambda *args, **kwargs: False
+    )
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    # Retained raw for exactly the four field endpoints, no manifests yet:
+    # the run must publish from local replay without any source access.
+    for builder in (
+        build_standings_total_spec,
+        build_rounds_spec,
+        build_cup_trees_spec,
+        build_participants_spec,
+    ):
+        spec = builder(**_common())
+        _seed_raw(raw_store, spec, FIXTURE_PATHS[spec.key.endpoint].read_bytes())
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+        sink=DeferredCaptureSink(),
+    )
+    runtime = CaptureRuntime(engine, manifest, raw_store)
+    monkeypatch.setenv("SOFASCORE_SEASON_FIELDS_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID)
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame.assign(
+        _entity_type=entity,
+        _ingested_at="fixture",
+    )
+    real_scraper = SofaScoreScraper(leagues=["ENG-Premier League"], seasons=[2025])
+    writer = real_scraper._iceberg_writer
+    manager = writer._get_trino_manager()
+    monkeypatch.setattr(manager, "table_exists", lambda *args: True)
+    monkeypatch.setattr(writer, "_evolve_schema", lambda *args: None)
+    staged = []
+    statements = []
+
+    def insert(schema, table, frame, *args, **kwargs):
+        staged[:] = [frame]
+        return len(frame)
+
+    def execute(sql, fetch=False):
+        statements.append(sql)
+        return [[len(staged[0])]] if fetch else None
+
+    monkeypatch.setattr(manager, "insert_dataframe", insert)
+    monkeypatch.setattr(manager, "_execute", execute)
+    monkeypatch.setattr(manager, "get_table_columns", lambda *args: {
+        "league": "varchar", "season": "varchar",
+    })
+    scraper._iceberg_writer = writer
+    scraper._stats = {"tables_written": []}
+    scraper.SOURCE_NAME = "sofascore"
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        BaseScraper.save_to_iceberg(scraper, **kwargs)
+    )
+    output = tmp_path / "season-fields.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["SS-17"],
+            season=2025,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+            entity="season_fields",
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["entity"] == "season_fields"
+    assert payload["freshness_key"] == FRESHNESS
+    assert payload["planned_endpoints"] == 4
+    assert payload["pending_endpoints"] == 0
+    assert payload["schedule_rows"] == 0
+    assert payload["league_table_rows"] == 4
+    assert payload["rounds_rows"] == 3
+    assert payload["cup_trees_rows"] == 2
+    # The base participants fixture carries two teams; the fields phase
+    # publishes exactly what the endpoint returned.
+    assert payload["participants_rows"] == 2
+    assert payload["referee_profile_rows"] == 0
+    assert "schedule_inventory" not in payload
+    assert [
+        receipt["table"] for receipt in payload["publication_receipts"]
+    ] == [
+        "sofascore_league_table",
+        "sofascore_rounds",
+        "sofascore_cup_trees",
+        "sofascore_participants",
+    ]
+    merges = [sql for sql in statements if sql.startswith("MERGE INTO")]
+    assert not any(
+        sql.startswith("MERGE INTO iceberg.bronze.sofascore_schedule ") for sql in merges
+    )
+    committed = plan_season_fields_partition(
+        raw_store, manifest, **_common()
+    )
+    assert committed.complete

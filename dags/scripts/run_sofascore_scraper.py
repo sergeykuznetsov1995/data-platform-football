@@ -76,6 +76,9 @@ ENTITY_MATCH_CAPTURE = "match_capture"
 # #751 PR3 + PR3b — one warmed session writes both player_profile and exact
 # target-season player_season_stats. Replaces the blocked tls passes.
 ENTITY_PLAYER_CAPTURE = "player_capture"
+# #1368 — the refresh lane's cheap seasonal renewal: the four normalized
+# season-field endpoints on their own admission-day freshness key.
+ENTITY_SEASON_FIELDS = "season_fields"
 _MATCH_CAPTURE_STATUS_TABLE = "sofascore_match_capture_status"
 
 VALID_ENTITIES = {
@@ -87,6 +90,7 @@ VALID_ENTITIES = {
     ENTITY_MATCH_STATS,
     ENTITY_MATCH_CAPTURE,
     ENTITY_PLAYER_CAPTURE,
+    ENTITY_SEASON_FIELDS,
 }
 
 # Keep the stable marker/exit code for writer DQ or replace-guard refusals. All
@@ -118,6 +122,18 @@ def _season_freshness_key(
         "SOFASCORE_SEASON_FRESHNESS_KEY", ""
     ).strip() or "day-" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if force_replace and not offline_replay:
+        return f"repair-{capture_runtime.engine.run_id}"
+    return key
+
+
+def _season_fields_freshness_key(capture_runtime, *, force_replace: bool) -> str:
+    """#1368: the plan-less fallback mirrors the preparation's admission-day
+    key (a signed plan always overrides it via ``_planned_freshness_key``)."""
+
+    key = os.environ.get(
+        "SOFASCORE_SEASON_FIELDS_FRESHNESS_KEY", ""
+    ).strip() or "season-fields-" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if force_replace:
         return f"repair-{capture_runtime.engine.run_id}"
     return key
 
@@ -2848,6 +2864,7 @@ def _run_season_capture_engine(
     offline_replay: bool,
     workload_plan=None,
     workload_allocations=(),
+    season_fields: bool = False,
 ) -> int:
     """Materialize schedule/standings through the canonical raw manifest.
 
@@ -2856,6 +2873,11 @@ def _run_season_capture_engine(
     zero-byte no-op. Offline replay validates every retained payload, performs
     the two incremental Bronze MERGEs, and only then finalizes deferred
     normalized manifest records.
+
+    ``season_fields`` (#1368) narrows the plan to the four normalized season
+    endpoints on the run's admission-day key: no schedule pages, no squads,
+    no referee profiles, and a four-key terminal commit check instead of the
+    full-season one.
     """
     from contextlib import ExitStack
 
@@ -2871,6 +2893,7 @@ def _run_season_capture_engine(
     from scrapers.sofascore.season_pipeline import (
         initial_season_chunk,
         materialize_season_partition,
+        plan_season_fields_partition,
         plan_season_partition,
         replay_season_specs,
     )
@@ -2902,7 +2925,12 @@ def _run_season_capture_engine(
         freshness_key = _planned_freshness_key(
             workload_plan,
             "season",
-            _season_freshness_key(
+            _season_fields_freshness_key(
+                capture_runtime,
+                force_replace=force_replace,
+            )
+            if season_fields
+            else _season_freshness_key(
                 capture_runtime,
                 force_replace=force_replace,
                 offline_replay=offline_replay,
@@ -2926,7 +2954,30 @@ def _run_season_capture_engine(
         else:
             preload_manifest_scope(capture_runtime.manifest_store, source_tournament_id, source_season_id)
         chunk = None
-        if workload_plan is not None and workload_allocations:
+        if season_fields:
+            # #1368: paid traffic must trace to a signed allocation bound to
+            # THIS scope's identity — never a schedule chunk unit, and never
+            # another partition's legacy pair.
+            if workload_plan is not None and workload_allocations:
+                if len(workload_allocations) != 1:
+                    raise RuntimeError(
+                        "season fields capture requires exactly one signed allocation"
+                    )
+                allocation = workload_allocations[0]
+                if allocation.scope != "season":
+                    raise RuntimeError(
+                        "season fields allocation has an unexpected scope"
+                    )
+                unit, = target_ids(allocation)
+                if decode_season_chunk_unit(unit) is not None:
+                    raise RuntimeError(
+                        "season fields allocation must not carry a schedule chunk unit"
+                    )
+                if unit != f"{source_tournament_id}:{source_season_id}":
+                    raise RuntimeError(
+                        "season fields allocation belongs to another scope"
+                    )
+        elif workload_plan is not None and workload_allocations:
             if len(workload_allocations) != 1:
                 raise RuntimeError("season capture requires exactly one signed allocation")
             unit, = target_ids(workload_allocations[0])
@@ -2937,17 +2988,30 @@ def _run_season_capture_engine(
                 chunk = initial_season_chunk(
                     source_tournament_id, source_season_id, freshness_key, max_pages=_season_max_pages(),
                 )
-        plan = plan_season_partition(
-            capture_runtime.raw_store,
-            capture_runtime.manifest_store,
-            source_tournament_id=source_tournament_id,
-            source_season_id=source_season_id,
-            freshness_key=freshness_key,
-            event_freshness_key=event_freshness_key,
-            paid_proxy=True,
-            max_pages=_season_max_pages(),
-            schedule_chunk=chunk,
-        )
+
+        def build_fields_aware_plan():
+            if season_fields:
+                return plan_season_fields_partition(
+                    capture_runtime.raw_store,
+                    capture_runtime.manifest_store,
+                    source_tournament_id=source_tournament_id,
+                    source_season_id=source_season_id,
+                    freshness_key=freshness_key,
+                    paid_proxy=True,
+                )
+            return plan_season_partition(
+                capture_runtime.raw_store,
+                capture_runtime.manifest_store,
+                source_tournament_id=source_tournament_id,
+                source_season_id=source_season_id,
+                freshness_key=freshness_key,
+                event_freshness_key=event_freshness_key,
+                paid_proxy=True,
+                max_pages=_season_max_pages(),
+                schedule_chunk=chunk,
+            )
+
+        plan = build_fields_aware_plan()
         chunk = getattr(plan, "schedule_chunk", chunk)
         results.update(
             {
@@ -3005,17 +3069,7 @@ def _run_season_capture_engine(
             )
 
             def replan():
-                return plan_season_partition(
-                    capture_runtime.raw_store,
-                    capture_runtime.manifest_store,
-                    source_tournament_id=source_tournament_id,
-                    source_season_id=source_season_id,
-                    freshness_key=freshness_key,
-                    event_freshness_key=event_freshness_key,
-                    paid_proxy=True,
-                    max_pages=_season_max_pages(),
-                    schedule_chunk=chunk,
-                )
+                return build_fields_aware_plan()
 
             if workload_plan is not None and len(workload_allocations) != 1:
                 raise RuntimeError(
@@ -3039,7 +3093,14 @@ def _run_season_capture_engine(
                 canonical_url=canonical_url,
                 scope=f"{league}:{canonical_season}",
                 entity="season_capture",
-                optional_schema_endpoints=frozenset({"referee_profile"}),
+                # #1368: a fields-only renewal has no optional endpoints at
+                # all; optionality belongs to the full season's referee
+                # profiles alone.
+                optional_schema_endpoints=(
+                    frozenset()
+                    if season_fields
+                    else frozenset({"referee_profile"})
+                ),
                 **allocation_kwargs,
             )
             results.update(
@@ -3174,25 +3235,17 @@ def _run_season_capture_engine(
         # This must be the last state mutation. If either MERGE above fails,
         # normalized endpoints remain replayable and no network retry is needed.
         finalize_materialized_results(capture_runtime, replayed)
-        committed = plan_season_partition(
-            capture_runtime.raw_store,
-            capture_runtime.manifest_store,
-            source_tournament_id=source_tournament_id,
-            source_season_id=source_season_id,
-            freshness_key=freshness_key,
-            event_freshness_key=event_freshness_key,
-            paid_proxy=True,
-            max_pages=_season_max_pages(),
-            schedule_chunk=chunk,
-        )
+        committed = build_fields_aware_plan()
         # `match_phase_ready`, not `complete`: a referee profile is an
         # attribute of the match, discovered from event pages and captured on
         # a later run, so one still pending is not a failed season commit.
-        if not committed.match_phase_ready:
+        # #1368: a fields-only run has no referee profiles, so its commit
+        # check is the strict four-key `complete`.
+        if not (committed.complete if season_fields else committed.match_phase_ready):
             raise RuntimeError(
                 "season manifest stayed nonterminal after successful Bronze MERGEs"
             )
-        if committed.pending_keys:
+        if committed.pending_keys and not season_fields:
             logger.warning(
                 "season committed with %d referee profile(s) still pending: %s",
                 len(committed.pending_keys),
@@ -3207,10 +3260,24 @@ def _run_season_capture_engine(
                     and not result.manifest.is_terminal
                 )
             ],
-            canonical_freshness_key=_season_freshness_key(
-                capture_runtime,
-                force_replace=False,
-                offline_replay=offline_replay,
+            # #1368: a fields run promotes under its own admission-day key;
+            # a non-repair capture is validated and left in place, so this
+            # stays an identity operation for the ordinary renewal, and a
+            # force-replace capture promotes to a fresh non-repair key.
+            canonical_freshness_key=(
+                (
+                    freshness_key
+                    if not freshness_key.startswith("repair-")
+                    else _season_fields_freshness_key(
+                        capture_runtime, force_replace=False
+                    )
+                )
+                if season_fields
+                else _season_freshness_key(
+                    capture_runtime,
+                    force_replace=False,
+                    offline_replay=offline_replay,
+                )
             ),
         )
         _flush_manifest_store(capture_runtime.manifest_store)
@@ -3233,17 +3300,21 @@ def _run_season_capture_engine(
             if result.manifest.key.endpoint == "referee_profile"
             and not result.manifest.is_terminal
         ]
-        results["schedule_inventory"] = {
-            "verified": True,
-            "tournament_id": source_tournament_id,
-            "source_season_id": source_season_id,
-            "canonical_season": canonical_season,
-            "finished_matches": sum(
-                row.get("status_type") == "finished"
-                for row in materialized.schedule_rows
-            ),
-            "schedule_events": len(materialized.schedule_rows),
-        }
+        # #1368: a fields-only run owns no schedule evidence and must not
+        # publish an inventory that consumers could read as "this season has
+        # no finished matches".
+        if not season_fields:
+            results["schedule_inventory"] = {
+                "verified": True,
+                "tournament_id": source_tournament_id,
+                "source_season_id": source_season_id,
+                "canonical_season": canonical_season,
+                "finished_matches": sum(
+                    row.get("status_type") == "finished"
+                    for row in materialized.schedule_rows
+                ),
+                "schedule_events": len(materialized.schedule_rows),
+            }
         results["traffic"] = _logical_capture_traffic(
             capture_runtime.engine,
             live_traffic,
@@ -3290,6 +3361,7 @@ def _run_legacy(
         offline_replay=offline_replay,
         workload_plan=workload_plan,
         workload_allocations=workload_allocations,
+        season_fields=entity == ENTITY_SEASON_FIELDS,
     )
 
 
@@ -3343,6 +3415,7 @@ def _load_runtime_workload_plan(
     ).strip()
     if base_run_id and plan.run_id not in {
         f"{base_run_id}::season",
+        f"{base_run_id}::season_fields",
         f"{base_run_id}::targets",
         f"{base_run_id}::players",
     }:
@@ -3362,7 +3435,13 @@ def _load_runtime_workload_plan(
         else "season"
     )
     expected_phase = (
-        "season" if scope == "season" else "players" if scope == "player" else "targets"
+        "season_fields"
+        if entity == ENTITY_SEASON_FIELDS
+        else "season"
+        if scope == "season"
+        else "players"
+        if scope == "player"
+        else "targets"
     )
     if not plan.run_id.endswith(f"::{expected_phase}"):
         raise RuntimeError(f"{scope} capture received the wrong workload-plan phase")

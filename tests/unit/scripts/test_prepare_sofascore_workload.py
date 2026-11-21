@@ -1956,3 +1956,89 @@ def test_needs_network_treats_retained_404_204_as_offline_terminal(http_status, 
     )
 
     assert _needs_network(runtime, spec) is needs_network
+
+
+def test_season_fields_phase_signs_the_legacy_pair_on_its_own_key(tmp_path, monkeypatch):
+    """#1368: the fields phase plans ONLY the four endpoints, signs the legacy
+    scope pair (never a chunk), and freezes its admission-day key."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_SEASON_FIELDS_FRESHNESS_KEY", "season-fields-fixed")
+    monkeypatch.delenv("SOFASCORE_SEASON_FRESHNESS_KEY", raising=False)
+    fields_plan = _season_plan("standings_total")
+    runtime = SimpleNamespace(raw_store=MagicMock(), manifest_store=MagicMock())
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
+            return_value=_policy(),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.build_capture_runtime",
+            return_value=runtime,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.SofaScoreCatalog.load",
+            return_value=_catalog(),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_fields_partition",
+            return_value=fields_plan,
+        ) as fields_planner,
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_partition",
+            side_effect=AssertionError("fields phase must not walk the full season plan"),
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="fields-run",
+            phase="season_fields",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "fields-plan.json",
+        )
+
+    fields_planner.assert_called_once()
+    signed = load_plan(path, control_token=TOKEN)
+    assert signed.run_id == "fields-run::season_fields"
+    assert dict(signed.freshness_keys)["season"] == "season-fields-fixed"
+    assert len(signed.allocations) == 1
+    allocation = signed.allocations[0]
+    assert allocation.scope == "season"
+    assert target_ids(allocation) == ("17:76986",)
+
+
+def test_season_fields_phase_waits_when_the_days_key_is_terminal(tmp_path, monkeypatch):
+    """A terminal admission-day key signs no allocation: the runner's no-op."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_SEASON_FIELDS_FRESHNESS_KEY", "season-fields-fixed")
+    fields_plan = _season_plan()
+    runtime = SimpleNamespace(raw_store=MagicMock(), manifest_store=MagicMock())
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
+            return_value=_policy(),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.build_capture_runtime",
+            return_value=runtime,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.SofaScoreCatalog.load",
+            return_value=_catalog(),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_fields_partition",
+            return_value=fields_plan,
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="fields-noop",
+            phase="season_fields",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "fields-noop.json",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    assert signed.allocations == ()

@@ -74,10 +74,11 @@ def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatc
     assert datetime.fromisoformat(window["started_at"]) > context["dag_run"].start_date
     assert datetime.fromisoformat(window["deadline_at"]).timestamp() == int(
         selected[0]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
-    assert 13499 <= (datetime.fromisoformat(window["deadline_at"])
-                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 13500
+    assert 11699 <= (datetime.fromisoformat(window["deadline_at"])
+                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 11700
     # #2117: the plan declares the debt reserve it applied, not the ceiling.
-    assert window["scope_budget_s"] == 7200 and window["debt_reserve_s"] == 90
+    # #1368: the shared scope budget ceded 30 minutes to the fields renewal.
+    assert window["scope_budget_s"] == 5400 and window["debt_reserve_s"] == 90
 
 
 def test_disabled_evidence_has_no_input_or_filesystem_effect(clean_env, monkeypatch):
@@ -143,6 +144,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         "run_refresh_scope",
         "validate_refresh_scope",
         "refill_refresh_window",
+        "refresh_season_fields",
         "enrich_season_metadata",
         "propagate_refresh_status",
     }
@@ -215,13 +217,14 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     # #2134: refill stops starting scopes 15 min short of its own timeout.
     refill = operators["refill_refresh_window"]
     assert refill._init_kwargs["execution_timeout"] == module.REFILL_TIMEOUT
-    assert module.REFILL_TIMEOUT == timedelta(hours=2, minutes=5)
+    # #1368: 90-minute scope budget + the refill's 5-minute margin.
+    assert module.REFILL_TIMEOUT == timedelta(minutes=95)
     assert module.REFILL_CENSUS_RESERVE == timedelta(minutes=15)
     # #1358: 7 h hold the sweep, the scopes' shared window, the reserve for
     # their retries and the metadata enrichment; #2107 adds the sweep's retry
     # delay, #2118 one scope retry delay past the window deadline:
     # 150 min + 10 min + 2 h + 10 min + 1 h 45 min + 25 min.
-    assert module.REFRESH_SCOPE_BUDGET == timedelta(hours=2)
+    assert module.REFRESH_SCOPE_BUDGET == timedelta(minutes=90)
     assert module.REFRESH_RETRY_RESERVE == timedelta(hours=1, minutes=45)
     assert (
         module.REFRESH_FETCH_TIMEOUT
@@ -294,7 +297,12 @@ def test_refresh_dag_has_one_all_done_leaf(clean_env, monkeypatch):
     assert operators["enrich_season_metadata"].upstream_task_ids == {
         "validate_refresh_scope", "run_refresh_scope", "refill_refresh_window"
     }
-    assert propagate.upstream_task_ids == {"enrich_season_metadata"}
+    assert operators["refresh_season_fields"].upstream_task_ids == {
+        "validate_refresh_scope", "refill_refresh_window"
+    }
+    assert propagate.upstream_task_ids == {
+        "enrich_season_metadata", "refresh_season_fields"
+    }
 
 
 @pytest.mark.unit
@@ -337,7 +345,8 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     # #1358: the env value is only the upper bound on the number of scopes;
     # the shared window decides how many actually go.
     assert kwargs["batch_size"] == 3
-    assert kwargs["scope_budget_s"] == 2 * 3600
+    # #1368: the scope budget is 90 minutes now, not two hours.
+    assert kwargs["scope_budget_s"] == 90 * 60
     assert kwargs["debt_reserve_s"] == 1800
     assert kwargs["seconds_per_match"] == 15
     assert kwargs["result_dir"] == "/tmp/refresh"
@@ -432,7 +441,7 @@ def test_plan_task_feeds_bronze_partitions_without_daily_exclusions(
     # #1358: the batch size (128) is only the upper bound on the number of
     # scopes; the planner fills the 2 h scope window by their estimates.
     assert kwargs["batch_size"] == 128
-    assert kwargs["scope_budget_s"] == 7200
+    assert kwargs["scope_budget_s"] == 5400
     assert kwargs["dag_run_id"] == "manual__1"
     assert kwargs["snapshot_path"] == module.SNAPSHOT_PATH
     assert kwargs["workload_artifact"] == module.WORKLOAD_ARTIFACT
@@ -945,12 +954,13 @@ def test_plan_task_maps_each_scope_with_its_own_timeout(clean_env, monkeypatch):
     )
 
     # Every scope, and every retry of it, stops by the batch's own deadline:
-    # plan time + the 2 h window + the 1 h 45 min retry reserve (#2107, #2118).
+    # plan time + the 90 min window (#1368) + the 1 h 45 min retry reserve
+    # (#2107, #2118).
     assert items == [{
         "env": {
             "SOFASCORE_SCOPE_TIMEOUT_S": "1030",
             "X": "1",
-            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600 - 900),
+            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600 - 900 - 1800),
         },
         "execution_timeout": timedelta(seconds=1030),
     }]
@@ -977,7 +987,7 @@ def test_propagate_reports_partial_scopes_and_window_use(clean_env, monkeypatch)
         {"scope_key": "c:2:2", "stop_reason": "time_budget", "remaining_matches": 12}
     ]
     assert verdict["window_used_s"] == 5_400.0
-    assert verdict["window_use"] == 0.75
+    assert verdict["window_use"] == 1.0
 
 
 _BLIP = ('SofaScore endpoint did not reach a publishable state: ["25","97078","event","16395967","event","final"] '
