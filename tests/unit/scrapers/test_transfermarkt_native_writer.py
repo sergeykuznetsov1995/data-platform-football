@@ -562,3 +562,52 @@ def test_empty_plan_receipt_carries_full_capture_evidence():
         'SELECT source_capture_id, source_body_hash, observation_status, status_proof '
         'FROM transfermarkt_core_receipts_v1').fetchone()
     assert row == ('cap-empty', 'h' * 64, 'observed_empty', 'empty_roster:no_data_rows')
+
+
+# ---------------------------------------------------------------- review round-3 regressions
+
+
+def test_populated_plan_derives_its_capture_id_from_the_rows():
+    plan = membership_plan(['1'], capture='cap-1')
+    rebuilt = NativeWritePlan(
+        entity=plan.entity, table=plan.table, ddl=plan.ddl,
+        natural_keys=plan.natural_keys, scope_columns=plan.scope_columns,
+        scope_values=plan.scope_values, rows=plan.rows, captured_at=plan.captured_at,
+        status_reason=plan.status_reason,
+    )
+    assert rebuilt.capture_id == 'cap-1'
+
+
+def test_plan_evidence_must_name_the_same_capture_and_carry_real_values():
+    def empty_plan(**overrides):
+        values = dict(
+            entity='squad_memberships', table='transfermarkt_squad_memberships',
+            ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
+            scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
+            rows=(), captured_at=CLOCK, status='observed_empty', status_reason='empty_roster',
+            proof='p', capture_id='cap-B',
+            evidence=(
+                ('source_url', 'u'), ('source_endpoint', 'squad'),
+                ('raw_capture_id', 'cap-B'), ('source_capture_id', 'cap-B'),
+                ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
+                ('parser_revision', 'p'), ('schema_revision', 's'),
+            ),
+        )
+        values.update(overrides)
+        return NativeWritePlan(**values)
+
+    empty_plan()  # a consistent plan validates
+    mismatched = (
+        ('raw_capture_id', 'cap-A'), ('source_capture_id', 'cap-B'),
+        ('source_url', 'u'), ('source_endpoint', 'squad'),
+        ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
+        ('parser_revision', 'p'), ('schema_revision', 's'),
+    )
+    with pytest.raises(ValueError, match='different capture'):
+        empty_plan(evidence=mismatched)
+    valid = empty_plan()
+    hollow_evidence = tuple(
+        (column, '' if column == 'source_body_hash' else value)
+        for column, value in valid.evidence)
+    with pytest.raises(ValueError, match='non-empty'):
+        empty_plan(evidence=hollow_evidence)

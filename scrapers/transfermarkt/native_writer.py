@@ -294,8 +294,17 @@ class NativeWritePlan:
             missing = _EVIDENCE_COLUMNS.difference(column for column, _ in self.evidence)
             if missing:
                 raise ValueError(f'core empty plan lacks capture evidence: {sorted(missing)}')
+            if any(not _nonempty(value) for _, value in self.evidence):
+                raise ValueError('core empty plan evidence values must be non-empty')
             if not _nonempty(self.capture_id):
                 raise ValueError('core empty plan lacks its capture id')
+        evidence_map = dict(self.evidence)
+        for column in ('raw_capture_id', 'source_capture_id'):
+            if evidence_map.get(column, self.capture_id) != self.capture_id:
+                raise ValueError('core plan evidence names a different capture')
+        # Populated plans keep deriving the capture from their rows.
+        if not self.capture_id and self.rows:
+            object.__setattr__(self, 'capture_id', self.rows[0]['source_capture_id'])
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
