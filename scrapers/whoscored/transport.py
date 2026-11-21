@@ -957,6 +957,9 @@ class _BrowserBatchOutcome:
 class WhoScoredTransport:
     """Direct-first WhoScored fetcher with typed failure and traffic accounting."""
 
+    # #1839: initial source request plus two replays on distinct pool members.
+    _POOL_SOURCE_ATTEMPTS = 3
+
     def __init__(
         self,
         *,
@@ -1432,7 +1435,6 @@ class WhoScoredTransport:
             started = time.monotonic()
             success = False
             authorization = False
-            transient = False
             try:
                 raw = self._direct_http.get(
                     EGRESS_PROBE_URL, timeout=min(float(self.request_timeout), 30.0)
@@ -1441,7 +1443,6 @@ class WhoScoredTransport:
                 detail = f"HTTP {status}"
                 success = 200 <= status < 300
                 authorization = status == 407
-                transient = status in {502, 503, 504}
             except Exception as exc:
                 # Never expose proxy URLs, credentials or raw exception text.
                 detail = type(exc).__name__
@@ -1451,14 +1452,6 @@ class WhoScoredTransport:
                 if connect_status:
                     detail += f" CONNECT {connect_status.group(1)}"
                 authorization = bool(re.search(r"\b407\b", str(exc)))
-                transient = (
-                    _is_proxy_failure(exc)
-                    or _is_tls_connect_failure(exc, pooled=True)
-                    # curl_cffi Timeout is an OSError, not built-in TimeoutError.
-                    # Code 28 is transient here; source timeouts keep their policy.
-                    or getattr(exc, "code", None) == 28
-                    or isinstance(exc, (ConnectionError, TimeoutError))
-                ) and not authorization
             log_probe = logger.info if success else logger.warning
             log_probe(
                 "WhoScored egress probe attempt=%d member=%d duration_ms=%d "
@@ -1472,9 +1465,10 @@ class WhoScoredTransport:
                     len(tested), replaced,
                 )
                 return
-            if authorization or not transient:
+            # #1839: only authorization evidence shortens the member budget.
+            if authorization:
                 limit = min(limit, 2)
-                reason = "authorization" if authorization else "budget_exhausted"
+                reason = "authorization"
             replace_first = True
         logger.warning(
             "WhoScored egress recovery members=%d replacement_succeeded=False reason=%s",
@@ -1826,9 +1820,8 @@ class WhoScoredTransport:
                     if not retryable_direct or attempt + 1 >= self.direct_http_attempts:
                         raise
                     if (
-                        _is_tls_connect_failure(
-                            exc.__cause__, pooled=self._is_pool_session(self._direct_http)
-                        )
+                        not self._is_pool_session(self._direct_http)
+                        and _is_tls_connect_failure(exc.__cause__)
                         and _is_schedule_month_url(url)
                     ):
                         self._renew_schedule_http_session(url)
@@ -2435,35 +2428,42 @@ class WhoScoredTransport:
             # which would defeat the browser endpoint's no-follow policy.
             request_kwargs["allow_redirects"] = False
         pooled = self._is_pool_session(session)
-        for attempt in range(2):
+        source_attempts = self._POOL_SOURCE_ATTEMPTS if pooled else 1
+        # #1839: retain exclusions across source replays and egress probes.
+        tested = {self._pool_proxy_url} if pooled and self._pool_proxy_url else set()
+        for attempt in range(source_attempts):
+            last_attempt = attempt + 1 >= source_attempts
             authorization = False
             try:
                 raw = session.get(url, **request_kwargs)
             except Exception as exc:
+                authorization = pooled and bool(re.search(r"\b407\b", str(exc)))
                 if not (
                     pooled and (
                         _is_proxy_failure(exc) or _is_tls_connect_failure(exc, pooled=True)
                     )
-                ) or (attempt and _is_tls_connect_failure(exc, pooled=pooled)):
+                ) or (last_attempt and not authorization):
                     try:
                         self._raise_http_request_failure(url, route=route, exc=exc)
                     except WhoScoredTransportError as failure:
-                        if attempt:
-                            # The replacement passed ipify; a source timeout
-                            # does not establish pool failure. Replay is spent.
+                        if not pooled or not attempt:
+                            raise
+                        if last_attempt:
+                            # #1839: the source member budget is spent; keep this scope-local.
                             failure.retryable = False
-                        raise
-                if self._source_probe_active():
-                    # The caller preserves an uncertain half-open result;
-                    # it is not evidence that the pool is unavailable.
-                    self._raise_http_request_failure(url, route=route, exc=exc)
-                self._record_proxy_failure(url, route=route, exc=exc)
-                if attempt:
-                    raise ProxyUnavailable(
-                        "WhoScored access check exhausted: reason=source_replay_failed; "
-                        f"{type(exc).__name__}"
-                    ) from None
-                authorization = bool(re.search(r"\b407\b", str(exc)))
+                            failure.args = (f"HTTP request failed: {type(exc).__name__}",)
+                            raise failure from None
+                else:
+                    if self._source_probe_active():
+                        # The caller preserves an uncertain half-open result;
+                        # it is not evidence that the pool is unavailable.
+                        self._raise_http_request_failure(url, route=route, exc=exc)
+                    self._record_proxy_failure(url, route=route, exc=exc)
+                    if last_attempt or (attempt and authorization):
+                        raise ProxyUnavailable(
+                            "WhoScored access check exhausted: reason=source_replay_failed; "
+                            f"{type(exc).__name__}"
+                        ) from None
             else:
                 content = bytes(raw.content or b"")
                 response = self._response(
@@ -2496,19 +2496,24 @@ class WhoScoredTransport:
                 try:
                     self._validate(response, None)
                 except WhoScoredTransportError as exc:
-                    if exc.kind is not FailureKind.HTTP_STATUS or self._source_probe_active():
+                    if (
+                        exc.kind is not FailureKind.HTTP_STATUS
+                        or self._source_probe_active()
+                    ):
                         raise
-                    if attempt:
+                    if last_attempt:
                         exc.retryable = False
                         raise
             if authorization:
                 # Preserve the separate two-member authorization path.
-                if not self._rotate_pool_proxy():
+                source_attempts = min(source_attempts, 2)
+                if not self._rotate_pool_proxy(tested):
                     raise ProxyUnavailable(
                         "WhoScored access check exhausted: reason=replacement_unavailable"
                     ) from None
+                if self._pool_proxy_url:
+                    tested.add(self._pool_proxy_url)
             else:
-                tested = {self._pool_proxy_url} if self._pool_proxy_url else set()
                 self._probe_pool_egress(tested, replace_first=True)
             # A new member has neither the old cookie jar nor its source token.
             if "headers" in request_kwargs:
