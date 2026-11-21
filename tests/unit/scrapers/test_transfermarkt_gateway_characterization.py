@@ -278,10 +278,11 @@ def test_pseudo_status_zero_is_transport_not_raw_store_failure(tmp_path):
     stats = client.get_traffic_stats()
     assert stats["status_counts"] == {"0": 1, "200": 1}
     envelopes = client.get_raw_attempt_records()
-    assert [record["outcome_kind"] for record in envelopes] == [
-        "transport_error", "response",
-    ]
-    assert envelopes[0]["error_kind"] == "connection"
+    by_kind = {record["outcome_kind"]: record for record in envelopes}
+    assert set(by_kind) == {"transport_error", "response"}
+    # Envelope records are hash-ordered; attempt ordinals carry the chronology.
+    assert by_kind["transport_error"]["attempt"] < by_kind["response"]["attempt"]
+    assert by_kind["transport_error"]["error_kind"] == "connection"
     # A pseudo response has no real HTTP status: no capture may be committed.
     assert client.get_raw_capture_records()[0]["status_code"] == 200
 

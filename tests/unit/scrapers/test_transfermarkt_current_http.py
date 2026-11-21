@@ -273,14 +273,14 @@ def test_generation_raw_roundtrip_same_cycle_retry_and_fresh_next_cycle(tmp_path
     cache = {}
     clock = Clock()
     clock.now = datetime.now(timezone.utc).timestamp()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
+    args = dict(as_json=False, label='listing', cache_key=URL, cache_ttl_seconds=86400)
     first, _ = client(clock, [_FakeResp(b'old')], deadline=None, cache=cache, raw_store=store, require_raw_store=True)
-    args = dict(as_json=False, label='listing', context={'scope': 'GB1:2025'}, cache_key=URL, cache_ttl_seconds=86400)
-    old = first.fetch(URL, cache_generation='signal-day-A', **args)
+    old = first.fetch(URL, cache_generation='signal-day-A',
+                      context={'scope': 'GB1:2025', 'cycle_id': 'child-A'}, **args)
     assert cache[URL]['cache_generation'] == 'signal-day-A'
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
     retry, retry_factory = client(clock, [], deadline=None, cache=cache, raw_store=store, require_raw_store=True)
-    replay = retry.fetch(URL, cache_generation='signal-day-A', **args)
+    replay = retry.fetch(URL, cache_generation='signal-day-A',
+                         context={'scope': 'GB1:2025', 'cycle_id': 'child-B'}, **args)
     assert replay.cache_hit and replay.raw_fetched_at == old.raw_fetched_at
     assert retry_factory.calls == []
     assert retry.get_raw_attempt_records() == ()
@@ -288,7 +288,8 @@ def test_generation_raw_roundtrip_same_cycle_retry_and_fresh_next_cycle(tmp_path
     # A stale signal is rejected before even reading its obsolete raw evidence.
     cache[URL]['outcome']['raw_capture_id'] = 'unavailable-old-generation'
     fresh, fresh_factory = client(clock, [_FakeResp(b'new')], deadline=None, cache=cache, raw_store=store, require_raw_store=True)
-    result = fresh.fetch(URL, cache_generation='signal-day-B', **args)
+    result = fresh.fetch(URL, cache_generation='signal-day-B',
+                         context={'scope': 'GB1:2025', 'cycle_id': 'child-B'}, **args)
     assert not result.cache_hit and result.value == 'new'
     assert len(fresh_factory.clients[0].get_calls) == 1
     assert result.raw_capture_id != old.raw_capture_id
@@ -299,11 +300,9 @@ def test_changed_club_generation_invalidates_otherwise_verified_48h_squad(tmp_pa
     cache = {}
     clock = Clock()
     clock.now = datetime.now(timezone.utc).timestamp()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
     args = dict(as_json=False, label='squad', context={'scope': 'BRC:2025'}, cache_key=URL, cache_ttl_seconds=86400)
     old, _ = client(clock, [_FakeResp(b'old')], deadline=None, cache=cache, raw_store=store, require_raw_store=True, resume_squad_cache=True)
     old.fetch(URL, cache_generation='club-signature-A', **args)
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
     clock.now += 25 * 3600
     resumed, factory = client(clock, [], deadline=None, cache=cache, raw_store=store, require_raw_store=True, resume_squad_cache=True)
     assert resumed.fetch(URL, cache_generation='club-signature-A', **args).cache_hit

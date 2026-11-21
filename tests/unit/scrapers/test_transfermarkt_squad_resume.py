@@ -21,11 +21,14 @@ URL = 'https://www.transfermarkt.com/team/kader/verein/1/saison_id/2025/plus/1'
 CONTEXT = {'scope': 'BRC:2025'}
 
 
-def _client(store, cache, bodies, *, resume=True, clock=None):
+def _client(store, cache, bodies, *, resume=True, clock=None, cycle_id=None):
     factory = _ClientFactory(bodies)
+    # #2403: portion identity is explicit context/lease_metadata; the
+    # TM_CHILD_CYCLE_ID environment no longer reaches the transport.
     client = TransfermarktHttpClient(
         proxy_manager=_manager(3), raw_store=store, require_raw_store=True,
         cache=cache, resume_squad_cache=resume, client_factory=factory,
+        lease_metadata=({'run_id': cycle_id} if cycle_id else None),
         rate_limiter=_NoWaitLimiter(), sleep_fn=lambda _: None,
         time_fn=clock or time.time,
     )
@@ -41,12 +44,12 @@ def test_verified_squad_resume_keeps_original_lineage_and_separate_attempts(tmp_
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     cache = {}
     now = time.time()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
-    first, _ = _client(store, cache, [_FakeResp(b'full squad')], clock=lambda: now)
+    first, _ = _client(store, cache, [_FakeResp(b'full squad')], clock=lambda: now,
+                       cycle_id='child-A')
     paid = _fetch(first)
     expires = cache[URL]['expires_at']
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
-    second, factory = _client(store, cache, [], clock=lambda: now + 25 * 3600)
+    second, factory = _client(store, cache, [], clock=lambda: now + 25 * 3600,
+                              cycle_id='child-B')
     replay = _fetch(second)
     assert replay.cache_hit and replay.value == 'full squad'
     assert replay.raw_capture_id == paid.raw_capture_id
@@ -61,13 +64,14 @@ def test_verified_squad_resume_keeps_original_lineage_and_separate_attempts(tmp_
     assert second.get_traffic_stats()['decoded_response_body_bytes'] == 0
 
 
-@pytest.mark.parametrize('reason', ['expired', 'boundary', 'future', 'scope', 'url', 'disabled', 'listing', 'missing_raw', 'no_child', 'no_scope'])
+# 'no_child' is gone: a portion identity is always explicit (#2403).
+@pytest.mark.parametrize('reason', ['expired', 'boundary', 'future', 'scope', 'url', 'disabled', 'listing', 'missing_raw', 'no_scope'])
 def test_squad_resume_rejects_ineligible_cache(tmp_path, monkeypatch, reason):
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     cache = {}
     now = time.time()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
-    first, _ = _client(store, cache, [_FakeResp(b'old')], clock=lambda: now)
+    first, _ = _client(store, cache, [_FakeResp(b'old')], clock=lambda: now,
+                       cycle_id='child-A')
     _fetch(first)
     # The immutable capture time must bound reuse even if cache expiry drifts.
     cache[URL]['expires_at'] = now + 10 * 86400
@@ -75,15 +79,13 @@ def test_squad_resume_rejects_ineligible_cache(tmp_path, monkeypatch, reason):
         cache[URL + '/wrong'] = cache.pop(URL)
     if reason == 'missing_raw':
         cache[URL]['outcome']['raw_capture_id'] = None
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
-    if reason == 'no_child':
-        monkeypatch.delenv('TM_CHILD_CYCLE_ID')
     fetched_at = datetime.fromisoformat(cache.get(URL, cache.get(URL + '/wrong'))['outcome']['raw_fetched_at']).timestamp()
     target_time = fetched_at + 48 * 3600 if reason == 'boundary' else (
         now + 48 * 3600 + 1 if reason == 'expired' else (now - 60 if reason == 'future' else now + 3600)
     )
     second, factory = _client(store, cache, [_FakeResp(b'fresh')],
-                              resume=reason != 'disabled', clock=lambda: target_time)
+                              resume=reason != 'disabled', clock=lambda: target_time,
+                              cycle_id='child-B')
     result = _fetch(second, url=URL + '/wrong' if reason == 'url' else URL,
                     label='listing' if reason == 'listing' else 'squad',
                     context=({'scope': 'BRC:2024'} if reason == 'scope'
@@ -96,12 +98,10 @@ def test_squad_resume_rejects_ineligible_cache(tmp_path, monkeypatch, reason):
 def test_squad_resume_fails_closed_on_corrupt_raw(tmp_path, monkeypatch):
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     cache = {}
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
-    first, _ = _client(store, cache, [_FakeResp(b'old')])
+    first, _ = _client(store, cache, [_FakeResp(b'old')], cycle_id='child-A')
     _fetch(first)
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
     monkeypatch.setattr(store, 'load_capture', lambda _: (_ for _ in ()).throw(RawStoreError('corrupt')))
-    second, factory = _client(store, cache, [])
+    second, factory = _client(store, cache, [], cycle_id='child-B')
     with pytest.raises(RawStoreError, match='corrupt'):
         _fetch(second)
     assert factory.calls == []
@@ -111,14 +111,12 @@ def test_current_resume_does_not_extend_default_same_cycle_cache_ttl(tmp_path, m
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     cache = {}
     now = time.time()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
-    monkeypatch.setenv('AIRFLOW_CTX_TRY_NUMBER', '1')
-    first, _ = _client(store, cache, [_FakeResp(b'old')], clock=lambda: now)
+    first, _ = _client(store, cache, [_FakeResp(b'old')], clock=lambda: now,
+                       cycle_id='child-A')
     _fetch(first)
     assert cache[URL]['expires_at'] == now + 86400
-    monkeypatch.setenv('AIRFLOW_CTX_TRY_NUMBER', '2')
     force, _ = _client(store, cache, [_FakeResp(b'fresh')], resume=False,
-                       clock=lambda: now + 25 * 3600)
+                       clock=lambda: now + 25 * 3600, cycle_id='child-B')
     result = _fetch(force)
     assert not result.cache_hit and result.value == 'fresh'
     assert force.get_traffic_stats()['requests'] == 1
@@ -128,13 +126,13 @@ def test_prior_squad_retry_chain_is_exported_as_cache_sources(tmp_path, monkeypa
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     cache = {}
     now = time.time()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
     first, _ = _client(store, cache, [_FakeResp(b'blocked', status=405),
-                                     _FakeResp(b'full squad')], clock=lambda: now)
+                                     _FakeResp(b'full squad')], clock=lambda: now,
+                       cycle_id='child-A')
     paid = _fetch(first)
     assert paid.attempts == 2
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
-    second, factory = _client(store, cache, [], clock=lambda: now + 25 * 3600)
+    second, factory = _client(store, cache, [], clock=lambda: now + 25 * 3600,
+                              cycle_id='child-B')
     replay = _fetch(second)
     assert replay.cache_hit and replay.attempts == 0 and not factory.calls
     assert second.get_raw_attempt_records() == ()
@@ -221,11 +219,10 @@ def test_brc_2025_full_roster_finishes_after_exact_decoded_cap_failure(tmp_path,
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     cache = {}
     now = time.time()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-A')
     first, _ = _client(store, cache, [
         _FakeResp(pad(payload, 1139)), _FakeResp(b'x' * 86239, status=405),
         _FakeResp(pad(listing, 86240)), *squad_responses,
-    ], clock=lambda: now)
+    ], clock=lambda: now, cycle_id='child-A')
     scraper = tm.TransfermarktScraper(response_cache=cache, cache_ttl_seconds=86400,
                                       resume_squad_cache=True, competition_records=[BRC])
     scraper._http_client = first
@@ -233,10 +230,9 @@ def test_brc_2025_full_roster_finishes_after_exact_decoded_cap_failure(tmp_path,
         scraper.read_squad_data('BRC', 2025)
     assert first.get_traffic_stats()['requests'] == 105
     assert len([u for u in cache if '/kader/' in u]) == 101
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-B')
     second, factory = _client(store, cache, [
         _FakeResp(payload), _FakeResp(listing), *squad_responses[101:],
-    ], clock=lambda: now + 25 * 3600)
+    ], clock=lambda: now + 25 * 3600, cycle_id='child-B')
     scraper = tm.TransfermarktScraper(response_cache=cache, cache_ttl_seconds=86400,
                                       resume_squad_cache=True, competition_records=[BRC])
     scraper._http_client = second
@@ -269,9 +265,9 @@ def test_brc_2025_full_roster_finishes_after_exact_decoded_cap_failure(tmp_path,
     monkeypatch.setattr(tm, '_parse_participant_table', lambda _: changed)
     new_payload = json.dumps({'success': True, 'data': {'competitionId': 'BRC',
                              'seasonId': 2025, 'clubIds': [c['club_id'] for c in changed]}}).encode()
-    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'child-C')
     third, _ = _client(store, cache, [_FakeResp(new_payload), _FakeResp(listing),
-                                    _FakeResp(_squad('127'))], clock=lambda: now + 26 * 3600)
+                                    _FakeResp(_squad('127'))], clock=lambda: now + 26 * 3600,
+                       cycle_id='child-C')
     scraper._http_client = third
     updated = scraper.read_squad_data('BRC', 2025)
     assert set(updated['memberships']['club_id']) == {c['club_id'] for c in changed}

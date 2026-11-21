@@ -1041,9 +1041,9 @@ class TestPartialScrapeRatio:
         statuses = capture.get('endpoint_status_by_team') or {}
         assert statuses.get('0') == 'ok' and statuses.get('1') == 'ok'
         assert {'0', '1'} <= set(capture.get('observed_team_ids') or [])
-        # the empty roster is recorded as a valid empty fetch, not OK/0 rows
+        # the empty roster is recorded as an authoritative empty fetch, not OK/0 rows
         assert scraper._fetch_records['squad']['0'].status == (
-            FetchStatus.VALID_EMPTY
+            FetchStatus.AUTHORITATIVE_EMPTY
         )
         # the fetch validator must accept the same page instead of burning
         # six attempts on 'missing table.items'
@@ -1676,7 +1676,7 @@ class TestEmptyCoachHistoryPage:
 
         # No PartialScrapeError: the empty club counts towards coverage.
         outcomes = scraper.get_fetch_outcomes()['coach_history']
-        assert outcomes['2']['status'] == 'valid_empty'
+        assert outcomes['2']['status'] == 'authoritative_empty'
         # The staffed club still produced its stint; the empty one produced none.
         assert len(bundle['stints']) == 1
 
@@ -2447,7 +2447,7 @@ class TestEmptyShellListing:
         record = scraper.get_fetch_outcomes()['listing'][
             'ENG-Premier League:2025'
         ]
-        assert record['status'] == 'valid_empty'
+        assert record['status'] == 'authoritative_empty'
         assert bundle['memberships'].empty
         assert (
             bundle['memberships'].attrs['fetch_status']
@@ -2474,7 +2474,7 @@ class TestEmptyShellListing:
         record = scraper.get_fetch_outcomes()['listing'][
             'ENG-Premier League:2025'
         ]
-        assert record['status'] == 'valid_empty'
+        assert record['status'] == 'authoritative_empty'
 
     def test_populated_scope_cannot_become_authoritative_empty(
         self, monkeypatch,

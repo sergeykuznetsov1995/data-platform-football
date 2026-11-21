@@ -1247,7 +1247,7 @@ class TransfermarktScraper(BaseScraper):
                 raw_attempt_envelope_id=record.raw_attempt_envelope_id,
                 raw_attempt_envelope_ids=record.raw_attempt_envelope_ids,
             )
-            if record.status in (FetchStatus.OK, FetchStatus.VALID_EMPTY):
+            if record.status in (FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY):
                 self._materialization_failure_streak = 0
 
     def _bronze_scope_has_roster(self, league: str, season_short: str) -> bool:
@@ -1299,7 +1299,7 @@ class TransfermarktScraper(BaseScraper):
             # Mirror _mark_schema_error: create the terminal record even when
             # the transport layer left none behind.
             self._fetch_records[label][source_id] = FetchRecord(
-                status=FetchStatus.VALID_EMPTY,
+                status=FetchStatus.AUTHORITATIVE_EMPTY,
                 row_count=0,
                 payload_hash=None,
                 error=None,
@@ -1308,7 +1308,7 @@ class TransfermarktScraper(BaseScraper):
             )
         else:
             self._fetch_records[label][source_id] = FetchRecord(
-                status=FetchStatus.VALID_EMPTY,
+                status=FetchStatus.AUTHORITATIVE_EMPTY,
                 row_count=0,
                 payload_hash=record.payload_hash,
                 error=None,
