@@ -659,9 +659,8 @@ TABLE_CONTRACTS += (
         'transfermarkt_team_season_market_value_v2',
         ('team_id', 'league', 'season'),
         (
-            'iceberg.silver.transfermarkt_player_team_season_assignment_v2',
-            'iceberg.silver.transfermarkt_market_value_points_v2',
-            'iceberg.silver.transfermarkt_competition_editions_v2',
+            'iceberg.silver.transfermarkt_squad_memberships_v2',
+            'iceberg.silver.transfermarkt_player_attribute_observations_v2',
         ),
         'gold.transfermarkt_team_season_market_value',
     ),
@@ -844,9 +843,8 @@ MODEL_CONTRACTS = (
         'iceberg.gold.transfermarkt_team_season_market_value_v2',
         ('team_id', 'league', 'season'),
         (
-            'iceberg.silver.transfermarkt_player_team_season_assignment_v2',
-            'iceberg.silver.transfermarkt_market_value_points_v2',
-            'iceberg.silver.transfermarkt_competition_editions_v2',
+            'iceberg.silver.transfermarkt_squad_memberships_v2',
+            'iceberg.silver.transfermarkt_player_attribute_observations_v2',
         ),
     ),
 )
@@ -5715,7 +5713,7 @@ def disable_legacy_writers(
     apply: bool = False,
     quiesced: bool = False,
 ) -> dict[str, Any]:
-    """Persist the writer shutdown only after every other cleanup guard passes."""
+    """Persist writer shutdown before retention expiry; cleanup stays separate."""
     revision = _normalise_revision(expected_revision)
     state = assert_reader_revision(cur, revision)
     report = cleanup_check(
@@ -5725,6 +5723,7 @@ def disable_legacy_writers(
         key: value for key, value in report['guards'].items()
         if key not in {
             'legacy_writers_disabled_persisted',
+            'retention_expired',
             'active_slot_native_only_evidence',
             'previous_slot_native_only_evidence',
             'post_cleanup_slot_rollback_verified',
