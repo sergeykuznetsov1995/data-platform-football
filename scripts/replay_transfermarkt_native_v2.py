@@ -9,7 +9,10 @@ from contextlib import closing
 from pathlib import Path
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    project_root = Path(__file__).resolve().parents[1]
+    for path in (project_root, project_root / "dags"):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
 
 try:
     from dags.utils import transfermarkt_native_v2 as control

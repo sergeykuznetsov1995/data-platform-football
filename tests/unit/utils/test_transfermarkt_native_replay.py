@@ -1,6 +1,10 @@
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -279,3 +283,19 @@ def test_driver_error_writes_fail_closed_report(tmp_path, monkeypatch):
     assert report["reason"] == "replay driver failure"
     assert report["queries"] == []
     assert "sensitive driver detail" not in output.read_text(encoding="utf-8")
+
+
+def test_cli_adds_dags_to_isolated_import_path(tmp_path):
+    from scripts import replay_transfermarkt_native_v2 as replay
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, str(Path(replay.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
