@@ -1,1 +1,2 @@
 tests/fixtures/transfermarkt/club_values/*.html whitespace=-blank-at-eol
+tests/fixtures/transfermarkt/rumours/gb1-page-[12].html -whitespace
