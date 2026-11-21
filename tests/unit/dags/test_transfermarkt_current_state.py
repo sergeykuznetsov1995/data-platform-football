@@ -204,12 +204,14 @@ def test_complete_check_requires_full_coverage_and_raw(changes):
         check(**changes)
 
 
-def test_daily_coverage_needs_all_three_checks_and_uses_separate_20h_planning_target():
+def test_daily_coverage_needs_all_four_checks_and_uses_separate_20h_planning_target():
     cursor = state.ScopeCursor(SCOPE_ID)
     for kind in ('listing', 'players'):
         cursor = state.record_check(cursor, check(kind=kind))
     assert not state.daily_complete(cursor, NOW)
     cursor = state.record_check(cursor, check(kind='injury'))
+    assert not state.daily_complete(cursor, NOW)
+    cursor = state.record_check(cursor, check(kind='rumours'))
     assert state.daily_complete(cursor, NOW + timedelta(hours=23))
     assert cursor.daily_due(NOW + timedelta(hours=19)) == ()
     assert cursor.daily_due(NOW + timedelta(hours=20)) == state.DAILY_CHECKS
@@ -322,8 +324,12 @@ def _gb_es_it():
 
 
 def _started(scope_id, **changes):
-    return state.ScopeCursor(scope_id, generation='generation-1', roster_completed_at=NOW - timedelta(hours=1),
-                             resume_json='{"careers":{"transfer_events":["101"]}}', **changes)
+    rumours_checked_at = changes.pop('rumours_checked_at', None)
+    cursor = state.ScopeCursor(scope_id, generation='generation-1', roster_completed_at=NOW - timedelta(hours=1),
+                               resume_json='{"careers":{"transfer_events":["101"]}}', **changes)
+    if rumours_checked_at is not None:
+        cursor = replace(cursor, **cursor.daily_clock_changes('rumours', rumours_checked_at, 'generation-1'))
+    return cursor
 
 
 def test_cold_rosters_precede_started_careers_and_both_follow_cold_priority():
@@ -485,3 +491,41 @@ def test_current_target_does_not_trust_eligible_label_without_classification_pro
     assert targets.targets == ()
     assert targets.denominator_competition_ids == ('GB1',)
     assert dict(targets.blocked_competitions)['GB1']
+
+
+def test_rumour_clock_round_trips_inside_existing_cursor_schema():
+    import json
+    from dataclasses import asdict
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    old = state.ScopeCursor(scope_id='test-scope', listing_checked_at=now,
+                            players_checked_at=now, injury_checked_at=now)
+    old_payload = asdict(old)
+    restored = state.ScopeCursor(**old_payload)
+    assert restored.daily_due(now) == ('rumours',)
+    fresh = replace(restored, **restored.daily_clock_changes('rumours', now, 'cycle-2293'))
+    payload = asdict(fresh)
+    assert set(payload) == set(old_payload)
+    assert 'rumours_checked_at' not in payload
+    resume = json.loads(payload['resume_json'])
+    assert payload['generation'] == 'cycle-2293'
+    assert 'generation' not in resume
+    assert resume['daily_check_clocks']['rumours'] == now.isoformat()
+    round_trip = state.ScopeCursor(**payload)
+    assert round_trip.rumours_checked_at == now
+    assert round_trip.daily_due(now) == ()
+    assert 'rumours' in round_trip.daily_due(now + timedelta(days=2))
+
+
+@pytest.mark.parametrize('clocks', [[], None, {'rumours': None}, {'rumours': 'yesterday'}])
+def test_malformed_reserved_daily_clocks_fail_closed(clocks):
+    import json
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    cursor = state.ScopeCursor(scope_id='test-scope')
+    resume = json.loads(cursor.daily_clock_changes('rumours', now, 'cycle-2293')['resume_json'])
+    resume['daily_check_clocks'] = clocks
+    with pytest.raises(ValueError):
+        replace(cursor, resume_json=json.dumps(resume)).daily_due(now)

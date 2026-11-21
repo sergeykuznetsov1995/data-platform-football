@@ -24,7 +24,7 @@ DAILY_INTERVAL = timedelta(hours=20)
 WEEKLY_INTERVAL = timedelta(days=7)
 ERROR_BACKOFF = timedelta(hours=4)
 TOP_LEAGUES = ('GB1', 'ES1', 'IT1', 'L1', 'FR1')
-DAILY_CHECKS = ('listing', 'players', 'injury')
+DAILY_CHECKS = ('listing', 'players', 'injury', 'rumours')
 
 
 class CurrentStateError(ValueError):
@@ -463,6 +463,40 @@ def build_check_merge(check: EditionCheck) -> str:
 
 @dataclass(frozen=True)
 class ScopeCursor:
+    @property
+    def rumours_checked_at(self) -> datetime | None:
+        """Read the fourth daily clock without extending the cursor wire schema."""
+        return self._rumour_clock(json.loads(self.resume_json))
+
+    @staticmethod
+    def _rumour_clock(resume):
+        clocks = resume.get('daily_check_clocks', {})
+        if not isinstance(clocks, dict):
+            raise ValueError('invalid daily_check_clocks')
+        if 'rumours' not in clocks:
+            return None
+        value = clocks['rumours']
+        if not isinstance(value, str):
+            raise ValueError('invalid rumours daily check clock')
+        clock = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if clock.utcoffset() is None:
+            raise ValueError('rumours daily check clock must have a UTC offset')
+        return clock
+
+    def daily_clock_changes(self, kind, checked_at, cycle_id):
+        if kind != 'rumours':
+            return {f'{kind}_checked_at': checked_at}
+        resume = json.loads(self.resume_json) if self.resume_json else {}
+        clocks = resume.setdefault('daily_check_clocks', {})
+        self._rumour_clock(resume)
+        if checked_at.utcoffset() is None:
+            raise ValueError('rumours daily check clock must have a UTC offset')
+        clocks[kind] = checked_at.isoformat()
+        changes = {'resume_json': json.dumps(resume, sort_keys=True)}
+        if not self.generation:
+            changes['generation'] = cycle_id
+        return changes
+
     scope_id: str
     policy_version: str = CURRENT_POLICY_VERSION
     generation: str = ''
@@ -494,6 +528,8 @@ class ScopeCursor:
                 object.__setattr__(self, name, _time(getattr(self, name)))
         try:
             resume = json.loads(self.resume_json)
+            if isinstance(resume, dict):
+                self._rumour_clock(resume)
         except (ValueError, TypeError) as exc:
             raise CurrentStateError('resume cursor must be JSON') from exc
         if not isinstance(resume, dict):
@@ -535,12 +571,12 @@ def record_check(cursor: ScopeCursor, check: EditionCheck) -> ScopeCursor:
         raise CurrentStateError('out-of-order cursor check')
     changes: dict[str, Any] = {'last_work_at': check.checked_at}
     if check.status == 'complete' and check.check_kind in DAILY_CHECKS:
-        changes[f'{check.check_kind}_checked_at'] = check.checked_at
+        changes.update(cursor.daily_clock_changes(check.check_kind, check.checked_at, check.cycle_id))
     return replace(cursor, **changes)
 
 
 def daily_complete(cursor: ScopeCursor, now: datetime) -> bool:
-    """24h coverage requires all three checks; planning uses a 20h target."""
+    """24h coverage requires all four checks. Planning uses a 20h target."""
     current = _time(now)
     return all(getattr(cursor, f'{name}_checked_at') is not None
                and timedelta(0) <= current - getattr(cursor, f'{name}_checked_at') <= timedelta(hours=24)
@@ -713,14 +749,15 @@ def plan_current_work(
             resume.append(((*rank, phase, order), CurrentWork(target, kind, checks)))
 
         pending = json.loads(cursor.resume_json)
+        pending_work = {key: value for key, value in pending.items() if key != 'daily_check_clocks'}
         # Old staff cursors contain roster metadata even without roster work.
         # Keep it for membership reconciliation, but allow a due full roster.
-        staff_metadata = (cursor.staff_pending and not pending.get('required')
-                          and not any(pending.get('careers', {}).values())
-                          and not pending.get('coaches_pending')
-                          and set(pending) <= {'clubs', 'squad_year', 'reason', 'captured', 'capture_proofs',
-                                              'squad_generations', 'required', 'careers',
-                                              'coaches_pending', 'coach_club_ids'})
+        staff_metadata = (cursor.staff_pending and not pending_work.get('required')
+                          and not any(pending_work.get('careers', {}).values())
+                          and not pending_work.get('coaches_pending')
+                          and set(pending_work) <= {'clubs', 'squad_year', 'reason', 'captured', 'capture_proofs',
+                                                   'squad_generations', 'required', 'careers',
+                                                   'coaches_pending', 'coach_club_ids'})
         if cursor.roster_due(timestamp) and staff_metadata:
             queue(4, 'weekly_roster', (last_work, target.cold_priority))
         elif cursor.change_pending and cursor.roster_completed_at is not None:
@@ -732,7 +769,7 @@ def plan_current_work(
             queue(1, 'cold_roster', (minimum, target.cold_priority), tuple(name for name in due if name == 'listing'))
         elif not cursor.cold_complete:
             queue(2, 'resume', (minimum, target.cold_priority))
-        elif pending:
+        elif pending_work:
             # A closed scope's TTL continuation shares capacity in turn;
             # by priority it would starve every unfinished lower scope.
             queue(3, 'resume', (last_work, target.cold_priority))

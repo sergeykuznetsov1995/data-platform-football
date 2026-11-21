@@ -102,6 +102,9 @@ def build_daily_measure_sql(denominator: DailyDenominator, day: date | str, *, a
                             ) -> tuple[str, tuple[Any, ...]]:
     """A single parameterized Trino SELECT; timestamp(6) ops clocks are UTC.
 
+    Coverage requires listing, players, injury and rumours for every current
+    edition. National injury and rumours checks each need their own N/A rule.
+
     Freshness is a detection-day cohort. Only deadlines already elapsed at as_of
     enter the rate. Immature changes and old unknown provenance remain explicit.
     Re-run after day_end+24h to finalize the cohort.
@@ -139,15 +142,17 @@ valid_checks AS (
    AND c.status = 'complete' AND c.expected_ids = c.observed_ids
    AND c.checked_at >= a.day_start AND c.checked_at < a.day_end AND c.checked_at <= a.as_of
    AND cardinality(CAST(json_parse(c.raw_capture_ids_json) AS array(varchar))) > 0
-   AND c.check_kind IN ('listing', 'players', 'injury')
-   AND (c.check_kind <> 'injury' OR d.team_type <> 'national_team'
+   AND c.check_kind IN ('listing','players','injury','rumours')
+   AND (c.check_kind NOT IN ('injury','rumours') OR d.team_type <> 'national_team'
         OR (json_extract_scalar(TRY(json_parse(c.result)), '$.applicability_status') = 'not_applicable'
-            AND json_extract_scalar(TRY(json_parse(c.result)), '$.rule') = 'league_injury_listing:club_competitions'
+            AND json_extract_scalar(TRY(json_parse(c.result)), '$.rule') = CASE c.check_kind
+                WHEN 'injury' THEN 'league_injury_listing:club_competitions'
+                WHEN 'rumours' THEN 'league_rumour_listing:club_competitions' END
             AND json_extract_scalar(TRY(json_parse(c.result)), '$.registry_snapshot_id') = c.registry_snapshot_id))
  GROUP BY c.scope_id, c.check_kind
 ),
 edition_coverage AS (
- SELECT d.competition_id, d.scope_id, count(DISTINCT c.check_kind) = 3 AS checked
+ SELECT d.competition_id, d.scope_id, count(DISTINCT c.check_kind) = 4 AS checked
  FROM core d LEFT JOIN valid_checks c ON d.scope_id = c.scope_id
  GROUP BY d.competition_id, d.scope_id
 ),
