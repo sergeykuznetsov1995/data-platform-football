@@ -446,6 +446,8 @@ def test_only_known_safe_transfermarkt_query_fields_are_allowed(tmp_path):
         "https://tmapi.transfermarkt.technology/club/131",
         "https://tmapi.transfermarkt.technology/club/131/stadium",
         "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&ids%5B%5D=418",
+        "https://tmapi.transfermarkt.technology/player/281/achievement",
+        "https://tmapi.transfermarkt.technology/club/418/achievement",
     ],
 )
 def test_first_party_discovery_api_routes_are_raw_storable(tmp_path, url):
@@ -473,6 +475,14 @@ def test_first_party_discovery_api_routes_are_raw_storable(tmp_path, url):
         "https://tmapi.transfermarkt.technology/club/131/other",
         "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&token=secret",
         "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1&token=secret",
+        "https://tmapi.transfermarkt.technology/players/1/achievement",
+        "https://tmapi.transfermarkt.technology/club/1/achievements",
+        "https://tmapi.transfermarkt.technology/club/0/achievement",
+        "https://tmapi.transfermarkt.technology/player/-1/achievement",
+        "https://tmapi.transfermarkt.technology/club/+1/achievement",
+        "https://tmapi.transfermarkt.technology/player/1a/achievement",
+        "https://tmapi.transfermarkt.technology/club/1/achievement?token=secret",
+        "https://tmapi.transfermarkt.technology/player/1/achievement/extra",
     ],
 )
 def test_unknown_discovery_api_routes_and_queries_are_rejected(tmp_path, url):

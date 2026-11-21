@@ -171,6 +171,9 @@ def _safe_url(value: object) -> str:
                 or len({value for _, value in query}) != len(query)
             ):
                 raise ValueError(invalid)
+        elif _ACHIEVEMENT_API_PATH.fullmatch(parsed.path):
+            if parsed.query:
+                raise ValueError(invalid)
         else:
             raise ValueError(invalid)
     else:
@@ -220,6 +223,9 @@ def _error_type(value: object) -> str:
     if _ERROR_TYPE_RE.fullmatch(candidate) is None:
         raise ValueError("error_type must be a safe exception class name")
     return candidate
+
+
+_ACHIEVEMENT_API_PATH = re.compile(r"/(?:player|club)/[1-9][0-9]*/achievement")
 
 
 @dataclass(frozen=True)
