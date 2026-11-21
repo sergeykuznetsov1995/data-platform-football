@@ -619,3 +619,27 @@ def test_object_store_manifest_publication_verifies_winning_bytes(tmp_path):
             b"expected manifest",
             require_exact_bytes=True,
         )
+
+
+def test_load_content_round_trip_by_body_hash(tmp_path):
+    store = _store(tmp_path)
+    body = b"<html>content-only-lineage</html>"
+    capture = _capture(store, body=body)
+
+    assert store.load_content(capture.content_hash) == body
+
+
+def test_load_content_missing_fails_closed(tmp_path):
+    store = _store(tmp_path)
+
+    with pytest.raises(RawCaptureNotFound):
+        store.load_content("a" * 64)
+
+
+def test_load_content_invalid_gzip_fails_closed(tmp_path):
+    store = _store(tmp_path)
+    content_hash = "b" * 64
+    store._write_bytes(store.blob_key(content_hash), b"not-gzip")
+
+    with pytest.raises(RawCaptureCorrupt):
+        store.load_content(content_hash)

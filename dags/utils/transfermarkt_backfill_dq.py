@@ -117,7 +117,7 @@ def build_raw_lineage_sql(
     if not cycles or any(not value for value in cycles):
         raise BackfillDqError('raw-lineage query requires child cycle ids')
     values = ', '.join(_quoted(value) for value in cycles)
-    return f"""SELECT DISTINCT raw_capture_id, source_body_hash, scope_id, cycle_id
+    return f"""SELECT DISTINCT source_body_hash, scope_id, cycle_id
 FROM {table} FOR VERSION AS OF {int(snapshot_id)}
 WHERE cycle_id IN ({values})"""
 
@@ -242,7 +242,7 @@ def historical_career_sql(entity, receipt, *, lineage=False):
     if type(snapshot) is not int or snapshot <= 0:
         raise BackfillDqError('historical career snapshot must be positive')
     refs = _historical_physical_refs(receipt)
-    columns = 'raw_capture_id, source_body_hash, scope_id, cycle_id, player_id, _batch_id' if lineage else ', '.join(ENTITY_FINGERPRINT_COLUMNS[entity])
+    columns = 'source_body_hash, scope_id, cycle_id, player_id, _batch_id' if lineage else ', '.join(ENTITY_FINGERPRINT_COLUMNS[entity])
     return (f"SELECT {columns} FROM {bronze_dq.ENTITY_BRONZE_TABLES[entity]} FOR VERSION AS OF {snapshot} "
             "WHERE " + ' OR '.join(f"(player_id = {_quoted(pid)} AND _batch_id = {_quoted(batch)})"
                                    for pid, batch, _ in refs))
@@ -332,20 +332,26 @@ def verify_raw_lineage(
     """Resolve every newly written Bronze capture to exact immutable bytes."""
 
     allowed: dict[str, tuple[str, str]] = {}
+    allowed_body_hashes: dict[str, str] = {}
     for envelope in attempt_envelopes:
         if str(getattr(envelope, 'outcome_kind', '')) != 'response':
             continue
         capture_id = str(getattr(envelope, 'capture_id', '') or '')
+        body_hash = str(getattr(envelope, 'raw_body_hash', '') or '')
         identity = (
             str(getattr(envelope, 'scope_id', '') or ''),
             str(getattr(envelope, 'cycle_id', '') or ''),
         )
-        if len(capture_id) != 64 or not all(identity):
+        if len(capture_id) != 64 or len(body_hash) != 64 or not all(identity):
             raise BackfillDqError('attempt envelope response identity is incomplete')
         existing = allowed.get(capture_id)
         if existing is not None and existing != identity:
             raise BackfillDqError('capture is bound to conflicting attempt identities')
+        existing_hash = allowed_body_hashes.get(capture_id)
+        if existing_hash is not None and existing_hash != body_hash:
+            raise BackfillDqError('capture is bound to conflicting body hashes')
         allowed[capture_id] = identity
+        allowed_body_hashes[capture_id] = body_hash
 
     captures: dict[str, str] = {}
     partial_capture_ids: set[str] = set()
@@ -354,7 +360,8 @@ def verify_raw_lineage(
         (str(item[0]), str(item[1])) for item in manifest_scope_cycles
     }
     rows_by_table: dict[str, int] = {}
-    cached_origins = {}
+    cached_origins: dict[str, tuple[str, str]] = {}
+    cached_content: set[tuple[str, str, str]] = set()
     for table in BACKFILL_ENTITY_TABLES:
         snapshot = pins.get(table)
         if snapshot is None:
@@ -375,66 +382,83 @@ def verify_raw_lineage(
                         cur.execute(historical_career_sql(entity, receipt, lineage=True))
                         original_rows = list(cur.fetchall())
                         for row in original_rows:
-                            if len(row) != 6:
+                            if len(row) != 5:
                                 raise BackfillDqError('original career lineage lacks physical player/batch identity')
-                            capture_id, body_hash, original_scope, original_cycle, player_id, physical_batch = row
-                            # A fresh capture must still belong to the exact paid
-                            # attempt inventory. Only existing physical cache can
-                            # rely on its original retained snapshot/raw proof.
-                            if capture_id not in allowed and receipt.get('native_batch_id') and physical_batch != receipt['native_batch_id']:
-                                origin = (str(original_scope), str(original_cycle))
-                                if capture_id in cached_origins and cached_origins[capture_id] != origin:
+                            body_hash, original_scope, original_cycle, player_id, physical_batch = row
+                            body_hash = str(body_hash or '').strip()
+                            origin = (str(original_scope), str(original_cycle))
+                            if len(body_hash) != 64 or not all(origin):
+                                raise BackfillDqError('original career raw lineage is incomplete')
+                            if receipt.get('native_batch_id') and physical_batch != receipt['native_batch_id']:
+                                content_id = f'content:{body_hash}'
+                                if cached_origins.get(content_id, origin) != origin:
                                     raise BackfillDqError('cached career capture ownership drifted')
-                                cached_origins[capture_id] = origin
-                        rows.extend(row[:4] for row in original_rows)
+                                cached_origins[content_id] = origin
+                                cached_content.add((body_hash, *origin))
+                        rows.extend(row[:3] for row in original_rows)
         rows_by_table[table] = len(rows)
         for row in rows:
-            if len(row) != 4:
+            if len(row) != 3:
                 raise BackfillDqError(f'{table}: malformed lineage row')
-            capture_id = str(row[0] or '').strip()
-            body_hash = str(row[1] or '').strip()
-            scope_id = str(row[2] or '').strip()
-            cycle_id = str(row[3] or '').strip()
-            if len(capture_id) != 64 or len(body_hash) != 64:
+            body_hash = str(row[0] or '').strip()
+            scope_id = str(row[1] or '').strip()
+            cycle_id = str(row[2] or '').strip()
+            origin = (scope_id, cycle_id)
+            if len(body_hash) != 64 or not all(origin):
                 raise BackfillDqError(f'{table}: incomplete raw lineage')
-            cached = cached_origins.get(capture_id) == (scope_id, cycle_id)
-            if allowed.get(capture_id) != (scope_id, cycle_id) and not cached:
+            candidate_ids = sorted(
+                capture_id for capture_id, allowed_origin in allowed.items()
+                if allowed_origin == origin
+                and allowed_body_hashes[capture_id] == body_hash
+            )
+            cached = (body_hash, scope_id, cycle_id) in cached_content
+            if candidate_ids:
+                evidence_ids = candidate_ids
+            elif cached:
+                evidence_ids = [f'content:{body_hash}']
+            else:
                 raise BackfillDqError(
                     f'{table}: Bronze capture is outside exact attempt evidence'
                 )
-            if (scope_id, cycle_id) not in manifested and not cached:
-                # A source attempt may have committed earlier entities before
-                # a later endpoint failed.  The batch may close with that scope
-                # retryable, provided every partial row is exact raw-backed;
-                # its campaign-stable checkpoint will resume in a later batch.
-                partial_capture_ids.add(capture_id)
-                partial_inventory.setdefault(
-                    (scope_id, cycle_id, table), set()
-                ).add(capture_id)
-            existing = captures.get(capture_id)
-            if existing is not None and existing != body_hash:
-                raise BackfillDqError(
-                    f'{capture_id}: one capture has conflicting body hashes'
-                )
-            captures[capture_id] = body_hash
+            for evidence_id in evidence_ids:
+                if origin not in manifested and not cached:
+                    partial_capture_ids.add(evidence_id)
+                    partial_inventory.setdefault(
+                        (scope_id, cycle_id, table), set()
+                    ).add(evidence_id)
+                existing = captures.get(evidence_id)
+                if existing is not None and existing != body_hash:
+                    raise BackfillDqError(
+                        f'{evidence_id}: one capture has conflicting body hashes'
+                    )
+                captures[evidence_id] = body_hash
 
-    for capture_id, expected_hash in sorted(captures.items()):
+    for evidence_id, expected_hash in sorted(captures.items()):
+        record = None
         try:
-            body, record = raw_store.load_capture(capture_id)
-        except Exception as exc:  # storage adapters expose source-specific errors
+            if evidence_id == f'content:{expected_hash}':
+                body = raw_store.load_content(expected_hash)
+            else:
+                body, record = raw_store.load_capture(evidence_id)
+        except Exception as exc:
             raise BackfillDqError(
-                f'raw capture cannot be verified: {capture_id}'
+                f'raw capture cannot be verified: {evidence_id}'
             ) from exc
         actual_hash = hashlib.sha256(body).hexdigest()
         if (
-            str(getattr(record, 'capture_id', '')) != capture_id
-            or str(getattr(record, 'content_hash', '')) != expected_hash
-            or actual_hash != expected_hash
+            actual_hash != expected_hash
+            or (
+                record is not None
+                and (
+                    str(getattr(record, 'capture_id', '')) != evidence_id
+                    or str(getattr(record, 'content_hash', '')) != expected_hash
+                )
+            )
         ):
             raise BackfillDqError(
-                f'raw capture hash differs from Bronze: {capture_id}'
+                f'raw capture hash differs from Bronze: {evidence_id}'
             )
-        if capture_id in cached_origins and cached_origins[capture_id] != (
+        if record is not None and evidence_id in cached_origins and cached_origins[evidence_id] != (
             str(getattr(record, 'scope_id', '')), str(getattr(record, 'cycle_id', ''))
         ):
             raise BackfillDqError('cached career raw capture ownership differs from original snapshot')
