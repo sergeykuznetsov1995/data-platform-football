@@ -287,6 +287,8 @@ def test_missing_header_fails_closed(riverplate_html):
 @pytest.mark.parametrize("corrupt", [
     " Best: 1866, reached on 1986-07-24)",    # opening paren dropped
     " (Best 1866, reached on 1986-07-24)",    # colon dropped
+    " (best: 1866, reached on 1986-07-24)",   # lowercase remnant
+    ", Best: 1866, reached on 1986-07-24)",   # comma instead of paren
 ])
 def test_malformed_best_block_without_paren_fails_closed(riverplate_html, corrupt):
     html = riverplate_html.replace(" (Best: 1866, reached on 1986-07-24)", corrupt)
