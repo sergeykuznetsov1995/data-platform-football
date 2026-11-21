@@ -35,8 +35,8 @@ def test_committed_policy_parses_into_a_standing_policy():
     assert policy.dag_id == STANDING_POLICY_DAG_ID
     assert policy.dag_id == 'dag_ingest_transfermarkt'
     assert len(policy.policy_hash) == 64
-    # Renewal keeps the existing per-scope caps and adds only referee targets.
-    assert policy.policy_version == 7
+    # Policy v8 preserves existing caps and includes referee and rumour targets.
+    assert policy.policy_version == 8
     assert 'iceberg.ops.transfermarkt_season_close_v1' in policy.allowed_write_tables
     assert 'iceberg.ops.transfermarkt_referee_receipts_v1' in policy.allowed_write_tables
     assert 'iceberg.bronze.transfermarkt_referee_profiles' in policy.allowed_write_tables
@@ -69,6 +69,10 @@ def test_committed_policy_covers_both_write_modes():
 
     for write_mode in ('dual', 'native-only'):
         assert required_write_tables(write_mode) <= allowed
+    assert {
+        'iceberg.bronze.transfermarkt_rumour_observations',
+        'iceberg.ops.transfermarkt_rumour_receipts_v1',
+    } <= allowed
 
 
 def test_committed_policy_validity_window_is_well_formed():
@@ -102,7 +106,7 @@ def test_backfill_policy_is_native_only_and_matches_the_same_scope_caps():
 
 
 @pytest.mark.parametrize('path,version,approved', [
-    (POLICY_PATH, 7, datetime(2026, 11, 20, tzinfo=timezone.utc)),
+    (POLICY_PATH, 8, datetime(2026, 11, 20, 17, 18, 44, tzinfo=timezone.utc)),
     (BACKFILL_POLICY_PATH, 4, datetime(2026, 10, 28, tzinfo=timezone.utc)),
 ])
 def test_committed_policy_renewal_has_twelve_calendar_months(path, version, approved):
