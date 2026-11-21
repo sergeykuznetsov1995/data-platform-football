@@ -304,7 +304,10 @@ def _ledger_from_provider_grant(
 def _control_token_from_environment() -> str:
     """Return the Transfermarkt-only proxy-filter control token."""
 
-    if os.environ.get("TM_DAG_ID", "").strip() == "dag_backfill_transfermarkt":
+    if os.environ.get("TM_DAG_ID", "").strip() in {
+        "dag_backfill_transfermarkt",
+        "dag_backfill_transfermarkt_referees",
+    }:
         return str(os.environ.get("TM_BACKFILL_PROXY_CONTROL_TOKEN", "")).strip()
     return str(os.environ.get("TM_PROXY_CONTROL_TOKEN", "")).strip()
 
