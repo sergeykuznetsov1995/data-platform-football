@@ -197,26 +197,6 @@ def _terminal_operation_report(tmp_path, payload=None):
     return path
 
 
-def test_rollback_plan_explicitly_retains_native_objects(tmp_path):
-    report = mod.rollback_plan(args(tmp_path))
-    assert report["passed"] is True
-    assert report["mutated"] is False
-    assert report["deployed_git_sha"] == "a" * 40
-    assert report["native_objects_action"] == "retain"
-    assert report["dynamic_catalog_evidence_action"] == "retain"
-    assert report["dynamic_catalog_evidence_objects"] == sorted(
-        mod.PRESERVED_DYNAMIC_CATALOG_EVIDENCE
-    )
-    assert report["rollback_mode"] == "coordinator_only"
-    assert [step["action"] for step in report["steps"]] == [
-        "pause_writers",
-        "deploy_consumer_revert",
-        "validate",
-        "restore_maintenance",
-    ]
-    assert not hasattr(mod, "restore_legacy_owners")
-
-
 def test_rollback_writer_fence_covers_exact_seven_writer_inventory():
     assert mod.DAGS == (
         "dag_orchestrate_fotmob",
@@ -651,29 +631,6 @@ def test_pause_all_writers_runs_require_even_when_atomic_inspection_fails(
     assert "secret-inspection-detail" not in message
 
 
-class LegacyClient:
-    def __init__(self, count):
-        self.count = count
-
-    def query(self, _sql):
-        return [(self.count,)]
-
-    def close(self):
-        pass
-
-
-def test_legacy_validation_requires_every_table_nonempty():
-    counts = mod._legacy_counts(LegacyClient(1), catalog="iceberg", schema="bronze")
-    assert set(counts) == set(mod.LEGACY_TABLES)
-    with pytest.raises(mod.RollbackError, match="legacy table is empty"):
-        mod._legacy_counts(LegacyClient(0), catalog="iceberg", schema="bronze")
-
-
-def test_legacy_validation_rejects_identifier_injection():
-    with pytest.raises(mod.RollbackError, match="unsafe SQL identifier"):
-        mod._legacy_counts(LegacyClient(1), catalog='iceberg"."bronze', schema="bronze")
-
-
 @pytest.mark.parametrize("active_downstream", [False, True])
 def test_publication_quiescence_is_read_only_and_runtime_bound(
     tmp_path, active_downstream
@@ -766,10 +723,13 @@ def test_publication_quiescence_is_read_only_and_runtime_bound(
         ["run-silver"],
         ["recover-publication"],
         ["validate", "--silver-run-id", "rollback_silver__x"],
+        ["plan"],
+        ["validate"],
     ),
 )
-def test_removed_silver_rollback_commands_are_rejected(tmp_path, argv):
-    # #1590: the legacy Silver validation run is gone with the FotMob Silver DAG.
+def test_removed_rollback_commands_are_rejected(tmp_path, argv):
+    # #1590 removed the legacy Silver validation run; #1423 closed the #930
+    # rollback window and removed plan/validate with the legacy Bronze drain.
     arguments = args(tmp_path)
     with pytest.raises(SystemExit):
         mod.build_parser().parse_args(

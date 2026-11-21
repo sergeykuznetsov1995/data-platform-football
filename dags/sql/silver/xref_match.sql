@@ -241,7 +241,7 @@ fotmob_league_map (competition_id, league) AS (
 ),
 
 fm_native AS (
-    -- FotMob (#930 cutover): legacy bronze.fotmob_schedule → native
+    -- FotMob (#930 cutover): the retired legacy schedule source → native
     -- fotmob_matches_current. match_id is BIGINT in native (was varchar) →
     -- CAST to varchar so source_id stays the exact same string. utc_time is
     -- the same ISO-8601 `status.utcTime` legacy `date` carried; Trino's

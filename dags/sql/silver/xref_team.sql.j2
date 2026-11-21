@@ -58,7 +58,7 @@
 --                          (NB: whoscored_events has only `team`, not home/away)
 --   sofascore_schedule    : home_team, away_team, league, season (varchar)
 --   fotmob_matches_current: home_team_name, away_team_name (same source strings
---                          as legacy fotmob_schedule home.name/away.name),
+--                          as the retired legacy schedule source home.name/away.name),
 --                          competition_id (BIGINT → league via league_map CTE),
 --                          source_season_key (varchar '2025/2026' | '2026' →
 --                          season slug) — #930 native cutover
@@ -158,7 +158,7 @@ league_map (competition_id, league) AS (
 ),
 
 fotmob_matches AS (
-    -- #930 cutover: native replacement for legacy bronze.fotmob_schedule.
+    -- #930 cutover: native replacement for the retired legacy schedule table.
     -- season: source_season_key is the EXACT source string ('2025/2026' club,
     -- '2026' single-year) — year-start = substr(key, 1, 4), then the existing
     -- legacy slug CASE (#404 + #913): WC → 4-digit year, everything else

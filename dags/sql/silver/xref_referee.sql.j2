@@ -51,7 +51,7 @@
 --   matchhistory_results.referee : varchar ('Initial Surname', e.g. 'M Oliver')
 --   fotmob_match_payloads_current.match_facts_json : varchar JSON; referee at
 --       $.infoBox.Referee.text — full name, e.g. 'Michael Oliver' (issue #270;
---       json path unchanged vs legacy fotmob_match_details — verified live).
+--       json path unchanged vs the retired legacy match-details source — verified live).
 --       The `_current` view already yields ONE committed row per match
 --       (manifest identity entity_id = match_id) → no in-SQL snapshot dedup.
 --       No league/season columns natively: league ← league_map(competition_id),

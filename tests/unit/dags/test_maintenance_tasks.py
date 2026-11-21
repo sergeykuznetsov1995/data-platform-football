@@ -86,8 +86,8 @@ class TestHighChurnBronzeAllowlist:
         assert DEFAULT_RETENTION == "30d"
         assert set(NON_WHOSCORED_HIGH_CHURN).isdisjoint(WHOSCORED_HIGH_CHURN)
 
-    def test_native_fotmob_contract_and_legacy_drain_tables_are_listed(self):
-        """#930: maintain every native writer and the bounded legacy drain."""
+    def test_native_fotmob_contract_lists_native_writers_and_drained_legacy(self):
+        """#930 native writers; the frozen legacy trio was drained in #1423."""
         from scrapers.fotmob.repository import TABLE_PARTITIONS
         from utils.maintenance_tasks import (
             FOTMOB_NATIVE_HIGH_CHURN,
@@ -97,16 +97,24 @@ class TestHighChurnBronzeAllowlist:
         assert set(FOTMOB_NATIVE_HIGH_CHURN) == set(TABLE_PARTITIONS)
         assert set(FOTMOB_NATIVE_HIGH_CHURN) <= set(HIGH_CHURN_BRONZE)
 
+        # #1423 legacy drain: these frozen tables were dropped from bronze and
+        # must never re-enter the maintenance allowlist.
         for table in (
             "fotmob_match_details",
             "fotmob_player_details",
             "fotmob_player_stats",
+        ):
+            assert table not in HIGH_CHURN_BRONZE, (
+                f"{table!r} was drained in #1423 and must stay out of HIGH_CHURN_BRONZE."
+            )
+        # Other sources keep their own frozen tables until their own drains.
+        for table in (
             "sofascore_player_ratings",
             "espn_lineup",
             "espn_matchsheet",
         ):
             assert table in HIGH_CHURN_BRONZE, (
-                f"{table!r} must remain until the explicit legacy drain."
+                f"{table!r} must remain until its own explicit legacy drain."
             )
 
 
