@@ -460,11 +460,14 @@ def _rows_equal(left: Sequence[Mapping], right: Sequence[Mapping]) -> bool:
 _LINEAGE_ONLY_COLUMNS = frozenset({'run_id', '_batch_id', '_ingested_at'})
 
 
-def _rows_equal_ignoring_lineage(left, right) -> bool:
-    strip = lambda rows: [
+def _strip_run_lineage(rows) -> list[dict]:
+    return [
         {column: value for column, value in row.items()
          if column not in _LINEAGE_ONLY_COLUMNS} for row in rows]
-    return _rows_equal(strip(left), strip(right))
+
+
+def _rows_equal_ignoring_lineage(left, right) -> bool:
+    return _rows_equal(_strip_run_lineage(left), _strip_run_lineage(right))
 
 
 def _already_written(connection, plan: NativeWritePlan) -> bool:
