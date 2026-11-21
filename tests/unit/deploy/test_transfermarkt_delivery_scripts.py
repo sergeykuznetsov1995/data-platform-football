@@ -57,9 +57,13 @@ case "$cmd" in
       case "$sql" in
         *last_parsed_time*) cat "$S/dags" ;;
         *import_error*) cat "$S/import_errors" 2>/dev/null || echo 0 ;;
+        *string_agg*is_active*) cat "$S/referee_schedules" 2>/dev/null || echo R ;;
         *timetable_description*) cat "$S/lane" 2>/dev/null || echo "Ldag_backfill_transfermarkt,dag_ingest_transfermarkt" ;;
         *next_dagrun_create_after*) cat "$S/next_run" 2>/dev/null || echo 0 ;;
         *task_instance*)
+          if [[ "$sql" == *dag_ingest_transfermarkt_referees* ]] && [ -e "$S/referee_busy" ]; then
+            cat "$S/referee_busy"; exit 0
+          fi
           # busy_countdown: порция идёт ещё N опросов простоя, потом контур пуст.
           if [ -e "$S/busy_countdown" ]; then
             n=$(cat "$S/busy_countdown"); [ "$n" -gt 0 ] && { echo $(( n - 1 )) > "$S/busy_countdown"; echo 1; } || echo 0
@@ -311,6 +315,24 @@ def test_exit_trap_uses_old_snapshot_when_new_deploy_did_not_finish(stand: Stand
 
 
 @pytest.mark.unit
+def test_referee_release_dags_are_included_in_delivery_acceptance(stand: Stand) -> None:
+    for pool in POOLS:
+        slots = "0" if "backfill" in pool else "1"
+        stand.put(f"pool_{pool}", slots)
+        stand.put(f"want_{pool}", slots)
+    for name in (
+        "dag_ingest_transfermarkt_referees.py",
+        "dag_backfill_transfermarkt_referees.py",
+        "dag_dq_transfermarkt_referees.py",
+    ):
+        (stand.new / "dags" / name).write_text("")
+    stand.put("dags", "7")
+    result = stand.acceptance()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1", stand.log()
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("state", "value", "predicate"),
     [
@@ -444,9 +466,12 @@ case "$cmd" in
         printf '%s/dags\n%s/deploy/transfermarkt/.airflowignore\n%s/scrapers\n%s/scripts\n%s/configs\n' \
           "$r" "$r" "$r" "$r" "$r" > "$S/mounts_transfermarkt-airflow-scheduler"
         echo healthy > "$S/health_transfermarkt-airflow-scheduler"
-        if grep -q '^MANUAL_DAG_ID' "$r/dags/dag_discover_transfermarkt_registry.py"; then
-          echo 5 > "$S/registered"
-        else echo 4 > "$S/registered"; fi ;;
+        n=4
+        grep -q '^MANUAL_DAG_ID' "$r/dags/dag_discover_transfermarkt_registry.py" && n=5
+        for d in dag_ingest_transfermarkt_referees dag_backfill_transfermarkt_referees dag_dq_transfermarkt_referees; do
+          [ ! -f "$r/dags/$d.py" ] || n=$((n + 1))
+        done
+        echo "$n" > "$S/registered" ;;
     esac ;;
   inspect)
     fmt=""; [ "$1" = -f ] && { fmt=$2; shift 2; }
@@ -462,6 +487,7 @@ case "$cmd" in
     c=$1; shift
     if [ "$c" = transfermarkt-airflow-metadb ]; then
       sql=${@: -1}
+      echo "$sql" >> "$S/queries"
       if [[ "$sql" == *dag_discover_transfermarkt_registry_manual* && "$sql" == *dag_run* ]] && [ -e "$S/manual_busy" ]; then
         cat "$S/manual_busy"; exit 0
       fi
@@ -1125,11 +1151,59 @@ def test_manual_never_enters_next_scheduled_run_query(stand: Stand) -> None:
 
 
 @pytest.mark.unit
+def test_first_referee_release_does_not_require_unregistered_dags(stand: Stand) -> None:
+    result = stand.probe('lane_refresh\nset_deadline')
+    assert result.returncode == 0, result.stderr
+    queries = (stand.state / 'queries').read_text().splitlines()
+    scheduled = [q for q in queries if 'next_dagrun_create_after' in q]
+    assert scheduled and all('transfermarkt_referees' not in q for q in scheduled)
+
+
+@pytest.mark.unit
+def test_referee_work_and_schedules_block_delivery(stand: Stand) -> None:
+    stand.put('referee_busy', '1')
+    stand.put(
+        'referee_schedules',
+        'Rdag_dq_transfermarkt_referees,dag_ingest_transfermarkt_referees',
+    )
+    result = stand.probe('lane_refresh\nouter_busy\ncontour_busy\nset_deadline')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == '01'
+    queries = (stand.state / 'queries').read_text().splitlines()
+    scheduled = [q for q in queries if 'next_dagrun_create_after' in q]
+    assert scheduled
+    assert all('dag_ingest_transfermarkt_referees' in q for q in scheduled)
+    assert all('dag_dq_transfermarkt_referees' in q for q in scheduled)
+    assert all('dag_backfill_transfermarkt_referees' not in q for q in scheduled)
+
+
+@pytest.mark.unit
 def test_invalid_manual_contract_fails_closed(stand: Stand) -> None:
     add_manual_contract(stand.new)
     source = stand.new / 'dags' / 'dag_discover_transfermarkt_registry.py'
     source.write_text(source.read_text().replace('manual=True', 'manual=False'))
     assert stand.acceptance().stdout.strip() == 'X'
+
+
+@pytest.mark.unit
+def test_direct_deploy_registers_referee_dags_paused(tmp_path: Path) -> None:
+    state, _runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    (state / 'registered').write_text('4')
+    referee_dags = (
+        'dag_ingest_transfermarkt_referees',
+        'dag_backfill_transfermarkt_referees',
+        'dag_dq_transfermarkt_referees',
+    )
+    for dag in referee_dags:
+        (release / 'dags' / f'{dag}.py').write_text('')
+    result = _run_deploy(release, stubs, env_file)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (state / 'registered').read_text().strip() == '7'
+    for dag in referee_dags:
+        assert (state / f'paused_{dag}').read_text().strip() == 't'
+    queries = (state / 'queries').read_text().splitlines()
+    busy = [q for q in queries if 'task_instance' in q]
+    assert busy and all(all(dag in q for dag in referee_dags) for q in busy)
 
 
 @pytest.mark.unit

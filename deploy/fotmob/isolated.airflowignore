@@ -52,3 +52,6 @@
 # v2.8 (18.11.2026, #1367): новый чужой для изолята FotMob даг — dag_replay_sofascore_raw
 # (SofaScore raw replay). Дописано append-ом: file-bind живёт на иноде.
 ^dag_replay_sofascore_raw\.py$
+
+# v2.9 (21.11.2026, #2292): новые чужие нематчевые referee DAG Transfermarkt.
+^(dag_backfill_transfermarkt_referees|dag_dq_transfermarkt_referees|dag_ingest_transfermarkt_referees)\.py$

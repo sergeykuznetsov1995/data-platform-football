@@ -120,14 +120,15 @@ transfermarkt_mounts_in() {  # transfermarkt_mounts_in <контейнер> <к�
 }
 
 # Read the release contract without importing Airflow or executing release code.
-# Legacy releases expose four DAGs; the factory adds an explicitly declared manual DAG.
+# Legacy releases expose four DAGs; later releases add the manual registry and referee DAGs.
 transfermarkt_release_dags() {
   python3 -I - "$1/dags/dag_discover_transfermarkt_registry.py" <<'PY'
 import ast
 from pathlib import Path
 import sys
 try:
-    tree = ast.parse(Path(sys.argv[1]).read_text())
+    registry_path = Path(sys.argv[1])
+    tree = ast.parse(registry_path.read_text())
     assignments = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
                    for target in node.targets if isinstance(target, ast.Name)}
     assert isinstance(assignments.get('DAG_ID'), ast.Constant) and assignments['DAG_ID'].value == 'dag_discover_transfermarkt_registry'
@@ -144,6 +145,15 @@ try:
         assert len(manual.args) == 1 and isinstance(manual.args[0], ast.Name) and manual.args[0].id == 'MANUAL_DAG_ID'
         assert any(k.arg == 'manual' and isinstance(k.value, ast.Constant) and k.value.value is True for k in manual.keywords)
         dags.append(marker.value)
+    referee_files = (
+        'dag_ingest_transfermarkt_referees.py',
+        'dag_backfill_transfermarkt_referees.py',
+        'dag_dq_transfermarkt_referees.py',
+    )
+    referee_present = [(registry_path.parent / name).is_file() for name in referee_files]
+    assert all(referee_present) or not any(referee_present)
+    if all(referee_present):
+        dags.extend(name.removesuffix('.py') for name in referee_files)
     print(' '.join(dags))
 except (OSError, UnicodeError, SyntaxError, AssertionError):
     print('invalid Transfermarkt release DAG contract', file=sys.stderr)
