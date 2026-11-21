@@ -352,10 +352,15 @@ class RefreshManager(ManifestManager):
         self.current = {table: 900 + i for i, table in enumerate(c1.SOURCES)}
         self.current[c1.MANIFEST] = NEW
         previous = dict(self.current, **{c1.MANIFEST: OLD})
-        self.files = {table: {} for table in (c1.MATCHES, c1.PAYLOADS, c1.SCOPE, c1.SEASONS)}
-        self.files[c1.MATCHES] = {(str(cid), "2026/27"): "unchanged" for cid in (10, 20, 30, 40)}
+        self.files = {
+            c1.MATCHES: {(str(cid), "2026/27"): "unchanged" for cid in (10, 20, 30, 40)},
+            c1.PAYLOADS: {},
+        }
         self.checkpoint = {
             "contract_version": c1.CONTRACT_VERSION,
+            "detection": 2,
+            "scope_decisions": [],
+            "seasons_latest": [],
             "parser_versions": [c1.PARSER_VERSION, c1.LEGACY_PARSER_VERSION],
             "first_day": str(DAY), "last_day": str(DAY), "snapshots": previous,
             "files": {table: c1._encoded_pairs(values) for table, values in self.files.items()},
@@ -387,17 +392,8 @@ def setup_refresh(monkeypatch, manager):
     monkeypatch.setattr(c1, "datetime", FrozenDatetime)
     monkeypatch.setattr(c1, "snapshots", lambda _: dict(manager.current))
     monkeypatch.setattr(c1, "partition_fingerprints", lambda _, table: manager.files[table])
-
-
-@pytest.mark.parametrize("rewrite", [False, True])
-def test_refresh_consumes_sequential_buckets_before_publishing(monkeypatch, rewrite):
-    before = [row(target_type, cid=str(cid)) for target_type, cid in zip(TYPES, (10, 20, 30, 40))]
-    after = list(reversed(before)) if rewrite else [
-        row(target_type, cid=str(cid), error="changed wide evidence " * 1024)
-        for target_type, cid in zip(TYPES, (10, 20, 30, 40))
-    ]
-    manager = RefreshManager(before, after)
-    setup_refresh(monkeypatch, manager)
+    monkeypatch.setattr(c1, "scope_decisions", lambda _, before: {})
+    monkeypatch.setattr(c1, "seasons_latest", lambda _, before: {})
     staged = []
     real_stage_rows = c1._stage_rows
 
@@ -409,6 +405,18 @@ def test_refresh_consumes_sequential_buckets_before_publishing(monkeypatch, rewr
         return real_stage_rows(manager_arg, stage, rows)
 
     monkeypatch.setattr(c1, "_stage_rows", stage_rows)
+    return staged
+
+
+@pytest.mark.parametrize("rewrite", [False, True])
+def test_refresh_consumes_sequential_buckets_before_publishing(monkeypatch, rewrite):
+    before = [row(target_type, cid=str(cid)) for target_type, cid in zip(TYPES, (10, 20, 30, 40))]
+    after = list(reversed(before)) if rewrite else [
+        row(target_type, cid=str(cid), error="changed wide evidence " * 1024)
+        for target_type, cid in zip(TYPES, (10, 20, 30, 40))
+    ]
+    manager = RefreshManager(before, after)
+    staged = setup_refresh(monkeypatch, manager)
     result = c1.refresh(manager)
 
     assert result["seasons"] == (0 if rewrite else 4)
@@ -480,3 +488,35 @@ def test_refresh_equal_snapshot_ids_skip_manifest_work(monkeypatch):
     assert manager.batches == []
     assert not any("FOR VERSION AS OF" in sql for sql in manager.queries)
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
+
+
+def test_refresh_legacy_checkpoint_triggers_one_full_pass(monkeypatch):
+    manager = RefreshManager([], [])
+    for key in ("detection", "scope_decisions", "seasons_latest"):
+        del manager.checkpoint[key]
+    manager.checkpoint["files"].update({c1.SCOPE: [], c1.SEASONS: []})
+    manager.checkpoint["snapshots"][c1.MANIFEST] = NEW
+    manager.required_discoveries = []
+    staged = setup_refresh(monkeypatch, manager)
+
+    result = c1.refresh(manager)
+
+    pairs = set(manager.files[c1.MATCHES])
+    assert result["seasons"] == len(pairs)
+    for table in (c1.MATCHES, c1.PAYLOADS):
+        predicate = c1.pairs_sql(pairs, physical=table == c1.MATCHES)
+        source = c1.source_sql(table, manager.current, predicate)
+        assert f"SELECT DISTINCT match_id FROM {source}" in manager.queries
+    existing = "SELECT deadline_day, competition_id, source_season_key, match_id, kind"
+    for selection in (existing, "SELECT DISTINCT match_id"):
+        assert any(sql.startswith(f"{selection} FROM {c1.TABLE} ")
+                   and sql.endswith(f"AND {c1.pairs_sql(pairs)}") for sql in manager.queries)
+    (checkpoint,) = [json.loads(row[-1]) for row in staged if row[4] == "checkpoint"]
+    assert checkpoint["detection"] == 2
+    assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
+
+    manager.checkpoint = checkpoint
+    manager.queries.clear()
+    assert c1.refresh(manager)["seasons"] == 0
+    assert not any(sql.startswith("SELECT DISTINCT match_id FROM ") for sql in manager.queries)
+    assert any(sql.startswith(existing) and sql.endswith("AND false") for sql in manager.queries)

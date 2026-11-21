@@ -7,7 +7,7 @@ import pytest
 
 from scrapers.base import trino_manager as base
 from scrapers.fotmob import c1_inputs as c1
-from scrapers.fotmob import maintenance, trino_instrumentation
+from scrapers.fotmob import trino_instrumentation
 
 
 @pytest.mark.unit
@@ -66,7 +66,19 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
         ),
         raising=False,
     )
-    monkeypatch.setattr(maintenance, "writer_lock", writer_lock)
+    manager_init = trino_instrumentation.FotMobTrinoTableManager.__init__
+
+    def construct(self, **kwargs):
+        events.append("construct")
+        manager_init(self, **kwargs)
+
+    def build_writer_lock():
+        events.append("build_lock")
+        return writer_lock
+
+    monkeypatch.setattr(c1, "wait_for_wave", lambda: events.append("wave"))
+    monkeypatch.setattr(trino_instrumentation.FotMobTrinoTableManager, "__init__", construct)
+    monkeypatch.setattr(c1, "build_writer_lock", build_writer_lock)
 
     def refresh(manager, *, writer_lock):
         assert type(manager) is trino_instrumentation.FotMobTrinoTableManager
@@ -93,7 +105,7 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
         assert c1.run_refresh(dag_run=SimpleNamespace(conf={})) is result
 
     assert authority.held is False
-    assert events == ["refresh", "acquire", "check", "connect", "release"]
+    assert events == ["wave", "construct", "build_lock", "refresh", "acquire", "check", "connect", "release"]
     assert len(calls) == 1
     kwargs = calls[0]
     assert kwargs["source"] == "fotmob:c1-inputs"
@@ -126,10 +138,11 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
 ])
 def test_run_refresh_rejects_conf_before_construction_or_lock(monkeypatch, conf):
     def unexpected(*args, **kwargs):
-        pytest.fail("C1 conf must be rejected before construction, lock or refresh")
+        pytest.fail("C1 conf must be rejected before wave wait, construction, lock or refresh")
 
+    monkeypatch.setattr(c1, "wait_for_wave", unexpected)
     monkeypatch.setattr(trino_instrumentation, "FotMobTrinoTableManager", unexpected)
-    monkeypatch.setattr(maintenance, "writer_lock", unexpected)
+    monkeypatch.setattr(c1, "build_writer_lock", unexpected)
     monkeypatch.setattr(c1, "refresh", unexpected)
 
     with pytest.raises(ValueError, match="C1 bootstrap is manual and requires an approved window"):

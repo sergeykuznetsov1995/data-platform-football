@@ -28,6 +28,10 @@ N1_MAX_COMMITS_PER_MIN = 1
 N2_MAX_POLLS_PER_MIN = 1
 N3_MAX_COMMITS_PER_DAY = 1440
 N4_MAX_SCANS_PER_DAY = 1440
+CONTROL_TABLES = frozenset({"iceberg.bronze.fotmob_ingest_manifest"})
+CONTROL_N1_MAX_COMMITS_PER_MIN = 8
+CONTROL_N2_MAX_POLLS_PER_MIN = 130
+CONTROL_N4_MAX_SCANS_PER_DAY = 5760
 POLL_ELIGIBLE_TABLES = frozenset({
     "iceberg.bronze.fotmob_ingest_manifest",
     "iceberg.bronze.fotmob_squad_snapshots",
@@ -42,7 +46,14 @@ MINUTE = timedelta(minutes=1)
 ATTRIBUTIONS = (SOURCE_USER, "platform", "unknown")
 WRITE_TYPES = frozenset({"insert", "merge", "update", "delete", "ctas", "alter_write"})
 TABLE_NAME_RE = re.compile(r"fotmob_[a-z0-9_]+\Z")
+EPHEMERAL_STAGE_RE = re.compile(r"fotmob_[a-z0-9_]+__stg_[0-9a-f]{6,}\Z")
 QUERY_ID_RE = re.compile(r"[A-Za-z0-9_]+\Z")
+_SQL_IDENTIFIER = r'(?:"(?:[^"]|"")*"|[\w$]+)'
+MAINTENANCE_PROCEDURE_RE = re.compile(
+    rf"^\s*ALTER\s+TABLE\s+{_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER}){{0,2}}"
+    r"\s+EXECUTE\s+(?a:optimize|expire_snapshots|remove_orphan_files)\s*\(",
+    re.IGNORECASE | re.DOTALL,
+)
 MAINTENANCE_JOBS = ("compaction", "janitor", "morning_report")
 OPERATION_FIELDS = {"commit": "commits", "scan_read": "scan_reads", "scan_write": "scan_writes"}
 
@@ -108,6 +119,11 @@ def is_fotmob_io_table(name: str) -> bool:
     return len(parts) == 3 and parts[:2] == ["iceberg", "bronze"] and bool(TABLE_NAME_RE.fullmatch(parts[2]))
 
 
+def is_ephemeral_stage(name: str) -> bool:
+    parts = name.lower().split(".")
+    return (len(parts) == 1 or parts[:-1] == ["iceberg", "bronze"]) and bool(EPHEMERAL_STAGE_RE.fullmatch(parts[-1]))
+
+
 def discovered_tables(names: Iterable[str]) -> list[str]:
     result = set()
     for name in names:
@@ -133,13 +149,9 @@ class ParsedSQL:
     unparsed_fotmob: bool = False
 
 
-def _tokens(sql: str) -> list[Token]:
-    """P0: discard comments; keep literals opaque and quoted identifiers distinct."""
-    result: list[Token] = []
-    index = 0
+def _skip_sql_trivia(sql: str, index: int) -> int:
     while index < len(sql):
-        char = sql[index]
-        if char.isspace():
+        if sql[index].isspace():
             index += 1
         elif sql.startswith("--", index):
             end = sql.find("\n", index + 2)
@@ -159,7 +171,18 @@ def _tokens(sql: str) -> list[Token]:
                     index += 1
             if depth:
                 raise ValueError("unterminated comment")
-        elif char in "'\"":
+        else:
+            break
+    return index
+
+
+def _tokens(sql: str) -> list[Token]:
+    """P0: discard comments; keep literals opaque and quoted identifiers distinct."""
+    result: list[Token] = []
+    index = _skip_sql_trivia(sql, 0)
+    while index < len(sql):
+        char = sql[index]
+        if char in "'\"":
             quote = char
             index += 1
             value = []
@@ -193,6 +216,7 @@ def _tokens(sql: str) -> list[Token]:
             index += 1
         else:
             raise ValueError("unsupported token")
+        index = _skip_sql_trivia(sql, index)
     if result and result[-1].value == ";":
         result.pop()
     if not result or any(t.value == ";" and t.kind == "punct" for t in result):
@@ -508,6 +532,11 @@ def _coverage(heartbeats: Sequence[Mapping[str, Any]], start: datetime, end: dat
     return reasons, relevant
 
 
+def _valid_operation(table: Any, op: Any) -> bool:
+    return (isinstance(table, str) and table == table.lower() and is_fotmob_io_table(table)
+            and isinstance(op, str) and op in OPERATION_FIELDS)
+
+
 def _operation_pairs(value: Any) -> set[tuple[str, str]]:
     if not isinstance(value, list) or not value:
         raise ValueError("invalid_operations")
@@ -516,8 +545,7 @@ def _operation_pairs(value: Any) -> set[tuple[str, str]]:
         if not isinstance(item, list) or len(item) != 2:
             raise ValueError("invalid_operations")
         table, op = item
-        if (not isinstance(table, str) or table != table.lower() or not is_fotmob_io_table(table)
-                or not isinstance(op, str) or op not in OPERATION_FIELDS or (table, op) in pairs):
+        if not _valid_operation(table, op) or (table, op) in pairs:
             raise ValueError("invalid_operations")
         pairs.add((table, op))
     return pairs
@@ -544,6 +572,27 @@ def _receipt_index(registry: Any, day: str) -> dict[str, dict[str, Any]]:
         _operation_pairs(receipt["operations"])
         receipts[query_id] = receipt
     return receipts
+
+
+def _norm_limit(norm: str, table: str | None) -> int:
+    control = table in CONTROL_TABLES
+    if norm == "N1":
+        return CONTROL_N1_MAX_COMMITS_PER_MIN if control else N1_MAX_COMMITS_PER_MIN
+    if norm == "N2":
+        return CONTROL_N2_MAX_POLLS_PER_MIN if control else N2_MAX_POLLS_PER_MIN
+    if norm == "N3":
+        return N3_MAX_COMMITS_PER_DAY
+    if norm == "N4":
+        return CONTROL_N4_MAX_SCANS_PER_DAY if control else N4_MAX_SCANS_PER_DAY
+    raise ValueError("unknown source norm")
+
+
+def _norm_order(norm: str, table: str, value: int) -> tuple[int, int, str]:
+    """Largest excess first, otherwise largest measurement. Break ties by table."""
+    limit = _norm_limit(norm, table)
+    if value > limit:
+        return (0, limit - value, table)
+    return (1, -value, table)
 
 
 def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_counts: Mapping[str, int] | None = None, generated_at: str | None = None, maintenance_registry: Any = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -574,6 +623,7 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
     reasons, relevant = _coverage(heartbeats, start, end)
     tables = set(discovered_tables(name for beat in relevant for name in beat.get("discovered_tables", [])))
     counts: Counter[tuple[str, str, str, str]] = Counter()
+    procedure_ops: Counter[tuple[str, str]] = Counter()
     evidence: dict[tuple[str, str, str, str], set[str]] = {}
     unparsed_queries = 0
     unparsed_fotmob = False
@@ -582,19 +632,31 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
         instant = _query_time(record)
         if not start <= instant < end:
             continue
-        parsed = parse_sql(record["query"], tables)
+        sql = record["query"]
+        parsed = parse_sql(sql, tables)
         unparsed_queries += int(parsed.unparsed)
         snapshots = [record, *repeat_records.get(query_id, [])]
         operations, user_attr, uncertain = _query_work(snapshots, parsed, tables)
         unparsed_fotmob |= uncertain
+        maintenance_procedure = (
+            user_attr == "platform" and parsed.stmt_type == "alter_write"
+            and not parsed.unparsed and not uncertain
+            and MAINTENANCE_PROCEDURE_RE.match(sql[_skip_sql_trivia(sql, 0):]) is not None
+            and all(snapshot["query"] == sql for snapshot in snapshots)
+        )
+        if maintenance_procedure:
+            procedure_ops.update(operations.keys())
         if maintenance_registry is not None and operations and user_attr != SOURCE_USER:
             observed[query_id] = {
                 "user": record.get("user"), "source": record.get("source"), "user_attr": user_attr,
                 "ended": record.get("ended"), "state": record.get("state"), "error_code": record.get("error_code"),
                 "stmt_type": None if uncertain or parsed.unparsed else parsed.stmt_type,
-                "sql_sha256": hashlib.sha256(record["query"].encode("utf-8")).hexdigest(),
+                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
                 "operations": [list(pair) for pair in sorted(operations)],
             }
+            if maintenance_procedure:
+                # A receipt for this query can corroborate the same operations.
+                observed[query_id]["maintenance_procedure"] = True
         for (table, operation), polls in operations.items():
             key = (minute_utc(instant), table, user_attr, operation)
             counts[key] += 1
@@ -626,11 +688,13 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
             })
     peak_evidence = {}
     for norm, operation in (("N1", "commit"), ("N2", "scan_read")):
-        candidates = [(count, key) for key, count in counts.items() if key[2] == SOURCE_USER and key[3] == operation and (norm != "N2" or key[1] in POLL_ELIGIBLE_TABLES)]
-        worst = sorted(candidates, key=lambda item: (-item[0], item[1]))
-        peak_evidence[norm] = f"{worst[0][1][1]}@{worst[0][1][0]}" if worst else None
+        candidates = ((table, minute, count) for (minute, table, attr, op), count in counts.items()
+                      if attr == SOURCE_USER and op == operation and not is_ephemeral_stage(table)
+                      and (norm != "N2" or table in POLL_ELIGIBLE_TABLES))
+        worst = min(candidates, key=lambda item: (_norm_order(norm, item[0], item[2]), item[1]), default=None)
+        peak_evidence[norm] = f"{worst[0]}@{worst[1]}" if worst else None
     checks = []
-    for table in sorted({key[1] for key in counts if key[3] == "commit"}):
+    for table in sorted({key[1] for key in counts if key[3] == "commit" and not is_ephemeral_stage(key[1])}):
         sql_commits = sum(value for key, value in counts.items() if key[1] == table and key[3] == "commit")
         snapshots = None if snapshot_counts is None else snapshot_counts.get(table)
         if snapshots is not None and (type(snapshots) is not int or snapshots < 0):
@@ -655,6 +719,7 @@ def aggregate_day(records: Iterable[Mapping[str, Any]], day: str, *, snapshot_co
         "platform_ops_total": sum(row["commits"] + row["scans_total"] for row in platform_rows),
         "unknown_ops_total": sum(row["commits"] + row["scans_total"] for row in unknown_rows),
         "tables": day_rows, "platform_activity": platform_rows, "unknown_activity": unknown_rows,
+        "maintenance_procedure_ops": {"platform": [[table, op, count] for (table, op), count in sorted(procedure_ops.items())]},
         "peak_evidence": peak_evidence, "commit_checks": checks,
         "commit_check_complete": all(row["match"] is not None for row in checks),
         "commit_mismatch": any(row["match"] is False for row in checks),
@@ -705,6 +770,40 @@ def _maintenance_deductions(report: Mapping[str, Any], raw: Counter) -> dict[str
     return deductions
 
 
+def _maintenance_procedure_counts(report: Mapping[str, Any], raw: Counter) -> Counter:
+    stored = report.get("maintenance_procedure_ops", {"platform": []})
+    if not isinstance(stored, dict) or set(stored) != {"platform"} or not isinstance(stored["platform"], list):
+        raise ValueError("invalid_maintenance_procedure_ops")
+    counts: Counter = Counter()
+    for item in stored["platform"]:
+        if not isinstance(item, list) or len(item) != 3:
+            raise ValueError("invalid_maintenance_procedure_ops")
+        table, op, count = item
+        key = ("platform", table, op)
+        if (not _valid_operation(table, op) or op == "scan_read" or type(count) is not int
+                or not 0 < count <= raw[key] or key in counts):
+            raise ValueError("invalid_maintenance_procedure_ops")
+        counts[key] = count
+    return counts
+
+
+def _observed_procedure_ids(report: Mapping[str, Any], counts: Counter) -> set[str]:
+    """Cross-check the optional receipt census before combining the two deductions."""
+    procedure_ids = set()
+    census: Counter = Counter()
+    for query_id, query in report["maintenance_evidence"]["observed"].items():
+        flag = query.get("maintenance_procedure", False)
+        if flag is False:
+            continue
+        if flag is not True or query["user_attr"] != "platform" or query.get("stmt_type") != "alter_write":
+            raise ValueError("invalid_maintenance_procedure_observation")
+        procedure_ids.add(query_id)
+        census.update(("platform", table, op) for table, op in query["operations"])
+    if census != counts:
+        raise ValueError("maintenance_procedure_counts_mismatch")
+    return procedure_ids
+
+
 def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(dict(report))
     # Re-derive totals and reconciliation flags on every verdict invocation.
@@ -721,9 +820,9 @@ def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
         result[f"{attr}_ops_total"] = sum(row["commits"] + row["scans_total"] for row in rows)
     sql_commits: Counter[str] = Counter()
     for row in result["tables"]:
-        if row["commits"]:
+        if row["commits"] and not is_ephemeral_stage(row["table"]):
             sql_commits[row["table"]] += row["commits"]
-    saved_checks = result.get("commit_checks", [])
+    saved_checks = [check for check in result.get("commit_checks", []) if not is_ephemeral_stage(check["table"])]
     checks_by_table = {check["table"]: check for check in saved_checks}
     if len(checks_by_table) != len(saved_checks):
         raise ValueError("duplicate table in commit reconciliation")
@@ -738,43 +837,64 @@ def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
     result["commit_checks"] = checks
     result["commit_check_complete"] = all(check["match"] is not None for check in checks)
     result["commit_mismatch"] = any(check["match"] is False for check in checks)
-    source_rows = sorted((row for row in result["tables"] if row["user_attr"] == SOURCE_USER), key=lambda row: row["table"])
+    source_rows = [row for row in result["tables"] if row["user_attr"] == SOURCE_USER and not is_ephemeral_stage(row["table"])]
     verdicts = {}
-    for norm, field, threshold, label in (
-        ("N1", "peak_commits_per_min", N1_MAX_COMMITS_PER_MIN, "<=1/min"),
-        ("N2", "peak_polls_per_min", N2_MAX_POLLS_PER_MIN, "<=1/min"),
-        ("N3", "commits", N3_MAX_COMMITS_PER_DAY, "<=1440/day"),
-        ("N4", "scans_total", N4_MAX_SCANS_PER_DAY, "<=1440/day"),
+    for norm, field, unit in (
+        ("N1", "peak_commits_per_min", "min"),
+        ("N2", "peak_polls_per_min", "min"),
+        ("N3", "commits", "day"),
+        ("N4", "scans_total", "day"),
     ):
-        candidates = [row for row in source_rows if norm != "N2" or row["table"] in POLL_ELIGIBLE_TABLES]
-        worst = max(candidates, key=lambda row: row[field], default=None)
+        candidates = (row for row in source_rows if norm != "N2" or row["table"] in POLL_ELIGIBLE_TABLES)
+        worst = min(candidates, key=lambda row: _norm_order(norm, row["table"], row[field]), default=None)
+        table = worst["table"] if worst else None
         value = worst[field] if worst else 0
-        proof = result.get("peak_evidence", {}).get(norm) if norm in {"N1", "N2"} else (worst["table"] if worst and value else None)
+        threshold = _norm_limit(norm, table)
+        label = f"<={threshold}/{unit}"
+        if table in CONTROL_TABLES and norm != "N3":
+            label += " (control)"
+        proof = table if value else None
+        if norm in {"N1", "N2"}:
+            peak = result.get("peak_evidence", {}).get(norm)
+            if peak is not None:
+                if proof and peak.startswith(proof + "@"):
+                    proof = peak
+                else:
+                    # Older days may only have the minute for a different table.
+                    result["peak_evidence"][norm] = None
         verdicts[norm] = {"pass": value <= threshold, "value": value, "threshold": label, "evidence": proof}
     foreign = result["platform_ops_total"] + result["unknown_ops_total"]
+    procedure_counts = _maintenance_procedure_counts(result, raw)
     blocking = raw.copy()
+    blocking.subtract(procedure_counts)
+    result["maintenance_procedure_ops_total"] = sum(procedure_counts.values())
     result.pop("maintenance_error", None)
     deductions = {}
+    procedure_ids: set[str] = set()
     if "maintenance_evidence" in result:
         try:
             deductions = _maintenance_deductions(result, raw)
         except ValueError as exc:
             result["maintenance_error"] = str(exc)
-    for operations in deductions.values():
-        blocking.subtract(("platform", table, op) for table, op in operations)
+        else:
+            if "maintenance_procedure_ops" in result:
+                procedure_ids = _observed_procedure_ids(result, procedure_counts)
+    for query_id, operations in deductions.items():
+        if query_id not in procedure_ids:
+            blocking.subtract(("platform", table, op) for table, op in operations)
     result["maintenance_deductions"] = deductions
     result["blocking_ops_total"] = sum(blocking.values())
     result["allowed_platform_ops_total"] = foreign - result["blocking_ops_total"]
     verdicts["N5"] = {
         "pass": result["blocking_ops_total"] == 0, "value": result["blocking_ops_total"],
-        "threshold": "blocking_ops==0" if "maintenance_evidence" in result else "foreign_ops==0",
+        "threshold": "blocking_ops==0" if procedure_counts or "maintenance_evidence" in result else "foreign_ops==0",
         "evidence": min((table for (_, table, _), count in blocking.items() if count), default=None),
     }
     result["foreign_load"] = foreign > 0
-    if foreign and "maintenance_evidence" in result:
+    if foreign and (procedure_counts or "maintenance_evidence" in result):
         result["foreign_load_note"] = "Счётчики platform и unknown показывают все операции, включая подтверждённое обслуживание."
     elif foreign:
-        result["foreign_load_note"] = "Без реестра квитанций все операции platform и unknown блокируют N5."
+        result["foreign_load_note"] = "Все учтённые операции platform и unknown за день блокируют N5."
     else:
         result.pop("foreign_load_note", None)
     reasons = [norm for norm, verdict in verdicts.items() if not verdict["pass"]]
@@ -969,6 +1089,8 @@ def poll(root: Path = DEFAULT_ROOT, *, poll_interval_s: int = 60, qualification:
             errors = {}
             for table in sorted(set(snapshot_tables)):
                 try:
+                    if is_ephemeral_stage(table):
+                        continue
                     rows, _ = _fetch(connection, snapshot_sql(table, snapshot_day))
                     value = rows[0]["snapshots"]
                     if type(value) is not int or value < 0:

@@ -1,8 +1,12 @@
-"""Offline C1 closure query batching regressions."""
+"""Offline C1 change detection, closure batching and publication regressions."""
 
+from contextlib import contextmanager
 from datetime import date, datetime
 import json
 import re
+import sys
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,7 +60,7 @@ class ClosureManager:
     """Evaluate closure predicates against synthetic snapshot/target relations."""
 
     def __init__(self, pairs=(), *, changed=(), rows=None, target=(), seed_ids=(),
-                 budget=200_000, fail_batch=None):
+                 budget=200_000, fail_batch=None, scope_decisions=None, seasons_latest=None):
         self.pairs = set(pairs)
         self.changed = set(changed)
         self.seed_ids = set(seed_ids)
@@ -66,20 +70,30 @@ class ClosureManager:
         self.fail_batch = fail_batch
         self.old = {table: OLD for table in c1.SOURCES}
         self.current = {table: NEW for table in c1.SOURCES}
-        self.files = {table: {} for table in (c1.MATCHES, c1.PAYLOADS, c1.SCOPE, c1.SEASONS)}
+        self.files = {table: {} for table in (c1.MATCHES, c1.PAYLOADS)}
         self.files[c1.MATCHES] = {pair: "stable" for pair in self.pairs}
+        self.scope_decisions = ({cid: "included" for cid, _ in self.pairs}
+                                if scope_decisions is None else dict(scope_decisions))
+        self.seasons_latest = (dict.fromkeys(self.pairs, True)
+                               if seasons_latest is None else dict(seasons_latest))
         checkpoint = {
             "contract_version": c1.CONTRACT_VERSION,
+            "detection": 2,
+            "scope_decisions": [list(row) for row in sorted(self.scope_decisions.items())],
+            "seasons_latest": c1._encoded_pairs(self.seasons_latest),
             "parser_versions": [c1.PARSER_VERSION, c1.LEGACY_PARSER_VERSION],
             "first_day": str(DAY), "last_day": str(DAY), "snapshots": self.old,
             "files": {table: c1._encoded_pairs(values) for table, values in self.files.items()},
         }
         for pair in self.changed:
             self.files[c1.MATCHES][pair] = "changed"
-        self.controls = [(None, None, None, "checkpoint", "old", True, json.dumps(checkpoint))]
+        self.set_checkpoint(checkpoint)
         self.queries, self.closure, self.scans = [], [], []
         self.writes, self.staged = [], []
         self.existing_pairs = None
+
+    def set_checkpoint(self, checkpoint):
+        self.controls = [(None, None, None, "checkpoint", "old", True, json.dumps(checkpoint))]
 
     def execute_query(self, sql):
         self.queries.append(sql)
@@ -151,15 +165,22 @@ class ClosureManager:
             self.writes.append(sql)
             if sql.startswith("MERGE INTO "):
                 self.controls = [(r[1], r[2], r[3], r[4], r[12], r[13], r[14])
-                                 for r in self.staged if r[4] in ("checkpoint", "checkpoint_part")]
+                                 for r in self.staged
+                                 if r[13] and r[4] in ("checkpoint", "checkpoint_part")]
             return []
         raise AssertionError(f"unexpected SQL: {sql}")
 
 
 def setup_refresh(monkeypatch, manager):
+    def pinned(values, pins):
+        assert pins == manager.current
+        return dict(values)
+
     monkeypatch.setattr(c1, "datetime", FrozenDatetime)
     monkeypatch.setattr(c1, "snapshots", lambda _: dict(manager.current))
     monkeypatch.setattr(c1, "partition_fingerprints", lambda _, table: manager.files[table])
+    monkeypatch.setattr(c1, "scope_decisions", lambda _, pins: pinned(manager.scope_decisions, pins))
+    monkeypatch.setattr(c1, "seasons_latest", lambda _, pins: pinned(manager.seasons_latest, pins))
     monkeypatch.setattr(c1, "manifest_changes", lambda *_: iter(
         (None, None, "match", mid) for mid in sorted(manager.seed_ids)
     ))
@@ -167,7 +188,7 @@ def setup_refresh(monkeypatch, manager):
 
     def stage_rows(manager_arg, stage, rows):
         rows = list(rows)
-        manager.staged.extend(rows)
+        manager.staged = rows
         return real_stage_rows(manager_arg, stage, rows)
 
     monkeypatch.setattr(c1, "_stage_rows", stage_rows)
@@ -186,6 +207,137 @@ def full_set_oracle(manager):
         affected.update((cid, season) for cid, season, mid in manager.target if mid in ids)
         if known == affected:
             return affected, ids, iterations
+
+
+@pytest.mark.parametrize("reader,table,columns,rows,expected", [
+    (c1.scope_decisions, c1.SCOPE, "competition_id, decision",
+     [(10, "included"), (20, "excluded")], {"10": "included", "20": "excluded"}),
+    (c1.seasons_latest, c1.SEASONS, "competition_id, source_season_key, is_latest",
+     [(10, 2025, False), (10, 2026, True)], {("10", "2025"): False, ("10", "2026"): True}),
+])
+def test_semantic_state_reads_one_current_pinned_projection(reader, table, columns, rows, expected):
+    pins = {source: i for i, source in enumerate(c1.SOURCES, 1)}
+    queries = []
+
+    def execute_query(sql):
+        queries.append(sql)
+        return rows
+
+    assert reader(SimpleNamespace(execute_query=execute_query), pins) == expected
+    assert queries == [f"SELECT {columns} FROM ({c1.current_sql(table, pins)})"]
+
+
+@pytest.mark.parametrize("invalid", [None, 0, "false"])
+def test_seasons_latest_refuses_ambiguous_source_flags(invalid):
+    manager = SimpleNamespace(execute_query=lambda _: [(10, "2026", invalid)])
+    with pytest.raises(RuntimeError, match="invalid source is_latest"):
+        c1.seasons_latest(manager, {c1.SEASONS: NEW, c1.MANIFEST: OLD})
+
+
+@pytest.mark.parametrize("old,new", [
+    ({"10": "included"}, {"10": "excluded"}),
+    ({}, {"10": "included"}),
+    ({"10": "included"}, {}),
+])
+def test_refresh_scope_change_affects_just_that_competition(monkeypatch, old, new):
+    competition = {("10", "2025"), ("10", "2026")}
+    stable = {"20": "included"}
+    manager = ClosureManager(competition | {("20", "2026")}, scope_decisions=stable | old)
+    manager.scope_decisions = stable | new
+    setup_refresh(monkeypatch, manager)
+
+    result = c1.refresh(manager)
+
+    assert result["seasons"] == len(competition)
+    assert manager.existing_pairs == competition
+
+
+@pytest.mark.parametrize("old,new,other_latest", [
+    (True, False, True), (False, True, True), (None, False, True), (False, None, True),
+    (True, False, False), (False, True, False),
+])
+def test_refresh_season_change_expands_only_if_any_latest_flips(monkeypatch, old, new, other_latest):
+    pair, sibling, other = ("10", "2026"), ("10", "2025"), ("20", "2026")
+    stable = {sibling: other_latest, other: True}
+    manager = ClosureManager([pair, sibling, other], seasons_latest=(
+        stable if old is None else {**stable, pair: old}
+    ))
+    manager.seasons_latest = stable if new is None else {**stable, pair: new}
+    setup_refresh(monkeypatch, manager)
+
+    result = c1.refresh(manager)
+
+    expected = {pair} if other_latest else {pair, sibling}
+    assert manager.existing_pairs == expected
+    assert result["seasons"] == len(expected)
+
+
+@pytest.mark.parametrize("target_type", ["competition_profile", "competition_seasons"])
+def test_refresh_keeps_manifest_and_payload_changes_with_stable_semantics(monkeypatch, target_type):
+    competition = {("10", "2025"), ("10", "2026")}
+    payload = ("20", "2025")
+    manager = ClosureManager(competition | {payload, ("20", "2026")})
+    manager.files[c1.PAYLOADS][payload] = "new"
+    setup_refresh(monkeypatch, manager)
+    monkeypatch.setattr(c1, "manifest_changes", lambda *_: iter([("10", None, target_type, None)]))
+
+    c1.refresh(manager)
+
+    assert manager.existing_pairs == competition | {payload}
+
+
+@pytest.mark.parametrize("detection", [None, 1])
+def test_refresh_migrates_unknown_detection_in_one_full_pass(monkeypatch, detection):
+    pairs = {("20", "2025"), ("10", "2026"), ("10", "2025")}
+    manager = ClosureManager(pairs, seasons_latest={pair: pair[1] == "2026" for pair in pairs})
+    previous = c1._read_checkpoint(manager.controls)
+    for name in ("detection", "scope_decisions", "seasons_latest"):
+        del previous[name]
+    if detection is not None:
+        previous["detection"] = detection
+    for table in (c1.SCOPE, c1.SEASONS):
+        previous["files"][table] = [["10", "", "old"], ["20", "", "old"]]
+    manager.set_checkpoint(previous)
+    setup_refresh(monkeypatch, manager)
+
+    assert c1.refresh(manager)["seasons"] == len(pairs)
+    assert manager.existing_pairs == pairs
+    migrated = c1._read_checkpoint(manager.controls)
+    assert migrated["detection"] == 2
+    assert migrated["contract_version"] == 1
+    assert migrated["scope_decisions"] == [["10", "included"], ["20", "included"]]
+    assert migrated["seasons_latest"] == [
+        ["10", "2025", False], ["10", "2026", True], ["20", "2025", False],
+    ]
+    assert set(migrated["files"]) == {c1.MATCHES, c1.PAYLOADS}
+    assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
+
+    assert c1.refresh(manager)["seasons"] == 0
+    assert manager.existing_pairs == set()
+    assert c1._read_checkpoint(manager.controls) == migrated
+
+
+@pytest.mark.parametrize("field,invalid", [
+    ("scope_decisions", None), ("scope_decisions", {}), ("scope_decisions", ["ab"]),
+    ("scope_decisions", [[10, "included"]]), ("scope_decisions", [["10", False]]),
+    ("scope_decisions", [["10", "included"], ["10", "excluded"]]),
+    ("seasons_latest", None), ("seasons_latest", [["10", "2025"]]),
+    ("seasons_latest", [["10", 2025, True]]), ("seasons_latest", [["10", "2025", 0]]),
+    ("seasons_latest", [["10", "2025", True], ["10", "2025", False]]),
+])
+def test_refresh_rejects_malformed_semantic_checkpoint_before_staging(monkeypatch, field, invalid):
+    manager = ClosureManager()
+    checkpoint = c1._read_checkpoint(manager.controls)
+    if invalid is None:
+        del checkpoint[field]
+    else:
+        checkpoint[field] = invalid
+    manager.set_checkpoint(checkpoint)
+    setup_refresh(monkeypatch, manager)
+
+    with pytest.raises(RuntimeError, match=f"C1 invalid checkpoint {field}"):
+        c1.refresh(manager)
+    assert manager.writes == []
 
 
 def test_refresh_large_id_inventory_stays_below_query_limit(monkeypatch):
@@ -224,7 +376,12 @@ def test_refresh_large_id_inventory_stays_below_query_limit(monkeypatch):
                for sql in reverse_sql for column in ("competition_id", "source_season_key"))
     assert max(len(sql.encode("utf-8")) for sql in reverse_sql) <= c1.REVERSE_QUERY_BYTES
     assert len([scan for scan in manager.scans if not scan[0] and scan[1] == c1.TABLE]) == 6
-    assert c1._read_checkpoint(manager.controls)["snapshots"] == manager.current
+    checkpoint = c1._read_checkpoint(manager.controls)
+    assert checkpoint["snapshots"] == manager.current
+    assert dict(checkpoint["scope_decisions"]) == manager.scope_decisions
+    assert c1._decoded_pairs(checkpoint["seasons_latest"]) == manager.seasons_latest
+    assert len(manager.controls) > 1
+    assert all(len(row[-1].encode()) <= 32_000 for row in manager.controls)
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
 
 
@@ -318,6 +475,10 @@ def test_refresh_empty_sets_do_not_issue_empty_closure_queries(monkeypatch, mode
     assert result["seasons"] == (1 if mode == "pairs_without_ids" else 0)
     if mode == "unchanged":
         assert manager.closure == []
+        assert manager.existing_pairs == set()
+        assert not any("fotmob_c1_candidates__stg_" in sql for sql in manager.queries)
+        assert [row[4] for row in manager.staged] == ["day", "checkpoint"]
+        assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
     elif mode == "pairs_without_ids":
         assert len(manager.closure) == 5
         assert all(sql.startswith(FORWARD) for sql in manager.closure)
@@ -541,12 +702,11 @@ def test_refresh_mid_loop_batch_failure_prevents_publication(monkeypatch, fail_b
 
 @pytest.mark.parametrize("bootstrap", [False, True])
 def test_refresh_locks_only_shared_writes_and_unbinds_released_lease(monkeypatch, bootstrap):
-    from contextlib import contextmanager
-    from types import SimpleNamespace
-
     pair = ("10", "2026/27")
     manager = ClosureManager([pair], changed={pair})
     setup_refresh(monkeypatch, manager)
+    if bootstrap:
+        monkeypatch.setattr(c1, "C1_MAX_LOCK_HOLD_SECONDS", 0.0)
     authority = SimpleNamespace(held=False)
     authority.check = lambda: pytest.fail("unexpected direct authority check") if not authority.held else None
     events = []
@@ -588,6 +748,7 @@ def test_refresh_locks_only_shared_writes_and_unbinds_released_lease(monkeypatch
     manager.execute_query = execute_query
 
     def snapshots(manager_arg):
+        assert (manager_arg is manager) == (bootstrap or not authority.held)
         events.append(("snapshots", authority.held))
         return dict(manager_arg.current)
 
@@ -611,3 +772,180 @@ def test_refresh_locks_only_shared_writes_and_unbinds_released_lease(monkeypatch
         assert any(
             event[0] == "bootstrap" and event[1] and event[2] for event in events
         )
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    def sleep(seconds):
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(c1, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(c1, "_sleep", sleep)
+    return clock
+
+
+@pytest.mark.parametrize("mode,budget,sleeps", [
+    ("retry", 900.0, [20.0]), ("exhausted", 30.0, []), ("exhausted_in_backoff", 50.0, [20.0]),
+    ("lost", 900.0, []), ("busy_after_acquisition", 900.0, []),
+])
+def test_build_writer_lock_retries_only_busy_acquisitions(monkeypatch, clock, mode, budget, sleeps):
+    from scrapers.fotmob import writer_lock as locks
+
+    attempts = []
+    lease = object()
+    failure = locks.WriterLockLost("lost") if mode == "lost" else locks.WriterLockBusy("busy")
+
+    @contextmanager
+    def writer_lock(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1 and mode != "busy_after_acquisition":
+            clock.now += kwargs["wait_seconds"]
+            raise failure
+        yield lease
+
+    monkeypatch.setitem(sys.modules, "dags.scripts.run_fotmob_scraper",
+                        SimpleNamespace(_WRITER_LOCK_KEY=83))
+    monkeypatch.setattr(locks, "writer_lock", writer_lock)
+    monkeypatch.setattr(c1, "C1_LOCK_RETRY_BUDGET_SECONDS", budget)
+    lock = c1.build_writer_lock()
+
+    if mode == "retry":
+        with lock() as authority:
+            assert authority is lease
+    else:
+        with pytest.raises(type(failure)) as caught:
+            with lock():
+                assert mode == "busy_after_acquisition"
+                raise failure
+        assert caught.value is failure
+    assert attempts == [{"key": 83, "wait_seconds": 30.0, "poll_seconds": 2.0}] * (
+        2 if mode == "retry" else 1
+    )
+    assert clock.sleeps == sleeps
+
+
+@pytest.mark.parametrize("states,budget,sleeps", [
+    ([True, True, False], 600.0, [60.0, 60.0]),
+    ([True, True, True], 125.0, [60.0, 60.0, 5.0]),
+])
+def test_wait_for_wave_stops_on_idle_or_deadline(monkeypatch, clock, states, budget, sleeps):
+    from scrapers.fotmob import maintenance
+
+    observations = iter(states)
+    monkeypatch.setattr(maintenance, "probe_wave", lambda: (next(observations), None))
+    monkeypatch.setattr(c1, "C1_WAVE_WAIT_SECONDS", budget)
+
+    assert c1.wait_for_wave() is None
+    assert clock.sleeps == sleeps
+    assert list(observations) == []
+
+
+def test_wait_for_wave_propagates_probe_failure(monkeypatch, clock):
+    from scrapers.fotmob import maintenance
+
+    failure = RuntimeError("synthetic wave probe failure")
+
+    def probe_wave():
+        raise failure
+
+    monkeypatch.setattr(maintenance, "probe_wave", probe_wave)
+    with pytest.raises(RuntimeError) as caught:
+        c1.wait_for_wave()
+    assert caught.value is failure
+    assert clock.sleeps == []
+
+
+def test_hold_deadline_spans_multiple_short_queries(clock):
+    calls = []
+
+    def execute_query(sql):
+        calls.append(sql)
+        clock.now += c1.C1_MAX_LOCK_HOLD_SECONDS * 0.6
+        return [sql]
+
+    raw = SimpleNamespace(execute_query=execute_query, current=NEW)
+    publisher = c1._HoldDeadlineManager(raw)
+    assert publisher.current == raw.current
+    assert publisher.execute_query("first") == ["first"]
+    with pytest.raises(c1.C1LockHoldOverrun):
+        publisher.execute_query("second")
+    with pytest.raises(c1.C1LockHoldOverrun):
+        publisher.execute_query("third")
+    assert calls == ["first", "second"]
+
+
+@pytest.mark.parametrize("has_cancel", [False, True])
+def test_fired_deadline_fences_queries_when_cancellation_is_unavailable(has_cancel):
+    def cancel():
+        raise RuntimeError("synthetic cancellation failure")
+
+    raw = SimpleNamespace(execute_query=lambda _: pytest.fail("query after deadline"))
+    if has_cancel:
+        raw.cancel_active_query = cancel
+    publisher = c1._HoldDeadlineManager(raw)
+    publisher._expire()
+    with pytest.raises(c1.C1LockHoldOverrun):
+        publisher.execute_query("fenced")
+
+
+@pytest.mark.parametrize("slow_statement,cancelled_query", [
+    ("CREATE TABLE ", True), ("INSERT INTO ", False), ("MERGE INTO ", False),
+])
+def test_refresh_overrun_cancels_query_drops_stage_and_releases_lease(
+    monkeypatch, slow_statement, cancelled_query,
+):
+    manager = ClosureManager()
+    setup_refresh(monkeypatch, manager)
+    monkeypatch.setattr(c1, "C1_MAX_LOCK_HOLD_SECONDS", 0.1)
+    cancelled = threading.Event()
+    released = threading.Event()
+    cancel_finished = threading.Event()
+    events = []
+    authority = object()
+    failure = RuntimeError("synthetic query cancelled")
+
+    @contextmanager
+    def lock():
+        events.append("acquire")
+        try:
+            yield authority
+        finally:
+            events.append("release")
+            released.set()
+
+    def cancel_active_query():
+        events.append("cancel")
+        cancelled.set()
+        # The statement can finish while cancellation I/O is still outstanding.
+        if cancelled_query and not released.wait(5):
+            events.append("cancellation blocked release")
+        cancel_finished.set()
+
+    raw_execute_query = manager.execute_query
+
+    def execute_query(sql):
+        result = raw_execute_query(sql)
+        if sql.startswith(slow_statement):
+            assert cancelled.wait(5), "the in-flight statement must receive cancellation"
+            if cancelled_query:
+                raise failure
+        if sql.startswith(f"DROP TABLE IF EXISTS {c1.PREFIX}fotmob_c1_inputs__stg_"):
+            events.append("drop")
+            raise RuntimeError("synthetic cleanup failure")
+        return result
+
+    manager.execute_query = execute_query
+    manager.cancel_active_query = cancel_active_query
+    manager.set_write_authority = lambda value: events.append(("bind", value))
+    with pytest.raises(RuntimeError if cancelled_query else c1.C1LockHoldOverrun) as caught:
+        c1.refresh(manager, writer_lock=lock)
+    if cancelled_query:
+        assert caught.value is failure
+    assert cancel_finished.wait(5)
+    assert events == ["acquire", ("bind", authority), "cancel", "drop", ("bind", None), "release"]
+    assert manager.writes[-1].startswith(f"DROP TABLE IF EXISTS {c1.PREFIX}fotmob_c1_inputs__stg_")
+    if slow_statement != "MERGE INTO ":
+        assert not any(sql.startswith("MERGE INTO ") for sql in manager.writes)
