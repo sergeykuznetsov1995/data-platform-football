@@ -349,6 +349,10 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
 
 
 def _canonical_cell(value) -> Any:
+    if isinstance(value, bool):
+        # Engines return booleans differently (0/1, True/False); the
+        # canonical comparison form is an integer.
+        return int(value)
     if isinstance(value, datetime):
         return _timestamp(value).isoformat(timespec='microseconds')
     if value is None or isinstance(value, int):
