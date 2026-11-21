@@ -1,0 +1,26 @@
+{
+ "attempt": 1000008,
+ "blob_key": "blobs/sha256/4d/4d4dbfbc0a039e69b7debbb4fa4f565644ed20c739c8e2fcb5c2d61dc6a8124e.body.gz",
+ "capture_id": "7358912aa131f664a0597936a86a97aed879c4fe461b23dfef51263fe5698976",
+ "compression": "gzip",
+ "content_hash": "4d4dbfbc0a039e69b7debbb4fa4f565644ed20c739c8e2fcb5c2d61dc6a8124e",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-675ab01fce997a5e34ba1f918715b88f",
+ "decoded_bytes": 114180,
+ "endpoint": "current_injury",
+ "fetched_at": "2026-11-18T23:05:28.585191+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Wed, 18 Nov 2026 23:05:28 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/4d/4d4dbfbc0a039e69b7debbb4fa4f565644ed20c739c8e2fcb5c2d61dc6a8124e.body.gz",
+ "scope_id": "tm-165a92baf9a69fab1b4e4aa6",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 24729,
+ "url": "https://www.transfermarkt.com/azadegan-league/verletztespieler/wettbewerb/IRN2"
+}

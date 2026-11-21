@@ -1,0 +1,21 @@
+{
+ "attempt": 1000026,
+ "capture_id": "09bf91be6345326d36308193ef41940ec155481bf17b909ee24de3b2fcf5a686",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/09/09bf91be6345326d36308193ef41940ec155481bf17b909ee24de3b2fcf5a686.json",
+ "cycle_id": "tm-child-507b6e735e923f569c6ffcd5",
+ "endpoint": "squad",
+ "envelope_id": "59eacf63df5803f999a21156cdab01710993fb9dc3381e2cf59328164fa31f83",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/59/59eacf63df5803f999a21156cdab01710993fb9dc3381e2cf59328164fa31f83.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-08-14T04:02:59.216592+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "15f6a4c8f1fe5b8261e68275dea366e255ee6abdd0f9c5fb81eca85353a56c23",
+ "record_hash": "59eacf63df5803f999a21156cdab01710993fb9dc3381e2cf59328164fa31f83",
+ "scope_id": "tm-b6c19b099af45474f026f6b4",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/angusht-nazran/kader/verein/12041/saison_id/2025/plus/1"
+}

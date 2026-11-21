@@ -1,0 +1,13 @@
+{
+ "capture_id": "4932515b53013d35fd5dd700ac6db76f588daa5bbc2c4d9377f72cbca8a3a0d2",
+ "endpoint": "current_player_profile",
+ "parser_rows": {
+  "contract_status": "unknown",
+  "contract_until": null,
+  "current_club_id": "6504",
+  "current_club_name": "Daegu FC",
+  "player_id": "261405"
+ },
+ "url": "https://www.transfermarkt.com/jae-moon-ryu/profil/spieler/261405",
+ "validator_problem": null
+}

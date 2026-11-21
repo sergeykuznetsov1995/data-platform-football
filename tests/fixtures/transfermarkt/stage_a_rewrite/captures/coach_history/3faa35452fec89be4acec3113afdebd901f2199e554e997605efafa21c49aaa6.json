@@ -1,0 +1,26 @@
+{
+ "attempt": 1000068,
+ "blob_key": "blobs/sha256/05/055439815936c66562063846c6c2538c83fcd5aff7199dcc8a87f2116fc87af0.body.gz",
+ "capture_id": "3faa35452fec89be4acec3113afdebd901f2199e554e997605efafa21c49aaa6",
+ "compression": "gzip",
+ "content_hash": "055439815936c66562063846c6c2538c83fcd5aff7199dcc8a87f2116fc87af0",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-932c5ce1d411b9b1b83062b2",
+ "decoded_bytes": 103256,
+ "endpoint": "coach_history",
+ "fetched_at": "2026-10-09T09:51:30.981664+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 09 Oct 2026 09:51:30 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/05/055439815936c66562063846c6c2538c83fcd5aff7199dcc8a87f2116fc87af0.body.gz",
+ "scope_id": "tm-2e88e60a827db8396df72cdc",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 23060,
+ "url": "https://www.transfermarkt.com/ji-parana-futebol-clube-ro-/mitarbeiterhistorie/verein/64303/plus/1"
+}

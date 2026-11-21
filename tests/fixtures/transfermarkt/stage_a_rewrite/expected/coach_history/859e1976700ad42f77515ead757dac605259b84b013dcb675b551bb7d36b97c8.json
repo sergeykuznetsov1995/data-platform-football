@@ -1,0 +1,980 @@
+{
+ "capture_id": "859e1976700ad42f77515ead757dac605259b84b013dcb675b551bb7d36b97c8",
+ "endpoint": "coach_history",
+ "parser_rows": [
+  {
+   "appointed_date": "2026-03-19",
+   "club_id": "221",
+   "coach_id": "4732",
+   "coach_slug": "cuca",
+   "left_date": null,
+   "name": "Cuca",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-08-25",
+   "club_id": "221",
+   "coach_id": "45679",
+   "coach_slug": "juan-pablo-vojvoda",
+   "left_date": "2026-03-19",
+   "name": "Juan Pablo Vojvoda",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-04-29",
+   "club_id": "221",
+   "coach_id": "86178",
+   "coach_slug": "cleber-xavier",
+   "left_date": "2025-08-17",
+   "name": "Cléber Xavier",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-04-15",
+   "club_id": "221",
+   "coach_id": "37807",
+   "coach_slug": "cesar-sampaio",
+   "left_date": "2025-04-29",
+   "name": "César Sampaio",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-01-01",
+   "club_id": "221",
+   "coach_id": "6175",
+   "coach_slug": "pedro-caixinha",
+   "left_date": "2025-04-14",
+   "name": "Pedro Caixinha",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-11-18",
+   "club_id": "221",
+   "coach_id": "96240",
+   "coach_slug": "leandro-zago",
+   "left_date": "2024-12-09",
+   "name": "Leandro Zago",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-01-01",
+   "club_id": "221",
+   "coach_id": "47350",
+   "coach_slug": "fabio-carille",
+   "left_date": "2024-11-18",
+   "name": "Fábio Carille",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2023-09-17",
+   "club_id": "221",
+   "coach_id": "39634",
+   "coach_slug": "marcelo-fernandes",
+   "left_date": "2023-12-08",
+   "name": "Marcelo Fernandes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2023-08-07",
+   "club_id": "221",
+   "coach_id": "11780",
+   "coach_slug": "diego-aguirre",
+   "left_date": "2023-09-15",
+   "name": "Diego Aguirre",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2023-06-28",
+   "club_id": "221",
+   "coach_id": "50891",
+   "coach_slug": "paulo-turra",
+   "left_date": "2023-08-06",
+   "name": "Paulo Turra",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2022-11-16",
+   "club_id": "221",
+   "coach_id": "41640",
+   "coach_slug": "odair-hellmann",
+   "left_date": "2023-06-22",
+   "name": "Odair Hellmann",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2022-09-12",
+   "club_id": "221",
+   "coach_id": "108199",
+   "coach_slug": "orlando-ribeiro",
+   "left_date": "2022-11-15",
+   "name": "Orlando Ribeiro",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2022-07-22",
+   "club_id": "221",
+   "coach_id": "37824",
+   "coach_slug": "lisca",
+   "left_date": "2022-09-12",
+   "name": "Lisca",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2022-07-07",
+   "club_id": "221",
+   "coach_id": "39634",
+   "coach_slug": "marcelo-fernandes",
+   "left_date": "2022-07-27",
+   "name": "Marcelo Fernandes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2022-03-04",
+   "club_id": "221",
+   "coach_id": "26897",
+   "coach_slug": "fabian-bustos",
+   "left_date": "2022-07-07",
+   "name": "Fabián Bustos",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-09-10",
+   "club_id": "221",
+   "coach_id": "47350",
+   "coach_slug": "fabio-carille",
+   "left_date": "2022-02-18",
+   "name": "Fábio Carille",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-05-10",
+   "club_id": "221",
+   "coach_id": "41120",
+   "coach_slug": "fernando-diniz",
+   "left_date": "2021-09-05",
+   "name": "Fernando Diniz",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-04-27",
+   "club_id": "221",
+   "coach_id": "39634",
+   "coach_slug": "marcelo-fernandes",
+   "left_date": "2021-05-10",
+   "name": "Marcelo Fernandes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-02-27",
+   "club_id": "221",
+   "coach_id": "41113",
+   "coach_slug": "ariel-holan",
+   "left_date": "2021-04-26",
+   "name": "Ariel Holan",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-02-23",
+   "club_id": "221",
+   "coach_id": "39634",
+   "coach_slug": "marcelo-fernandes",
+   "left_date": "2021-02-27",
+   "name": "Marcelo Fernandes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2020-08-07",
+   "club_id": "221",
+   "coach_id": "4732",
+   "coach_slug": "cuca",
+   "left_date": "2021-02-22",
+   "name": "Cuca",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2020-01-01",
+   "club_id": "221",
+   "coach_id": "1572",
+   "coach_slug": "jesualdo-ferreira",
+   "left_date": "2020-08-05",
+   "name": "Jesualdo Ferreira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2018-12-17",
+   "club_id": "221",
+   "coach_id": "10819",
+   "coach_slug": "jorge-sampaoli",
+   "left_date": "2019-12-09",
+   "name": "Jorge Sampaoli",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2018-07-31",
+   "club_id": "221",
+   "coach_id": "4732",
+   "coach_slug": "cuca",
+   "left_date": "2018-12-03",
+   "name": "Cuca",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2018-07-23",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "2018-07-31",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2018-01-04",
+   "club_id": "221",
+   "coach_id": "22198",
+   "coach_slug": "jair-ventura",
+   "left_date": "2018-07-23",
+   "name": "Jair Ventura",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2017-10-30",
+   "club_id": "221",
+   "coach_id": "53809",
+   "coach_slug": "elano",
+   "left_date": "2017-12-31",
+   "name": "Elano",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2017-06-06",
+   "club_id": "221",
+   "coach_id": "7592",
+   "coach_slug": "levir-culpi",
+   "left_date": "2017-10-29",
+   "name": "Levir Culpi",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2015-07-09",
+   "club_id": "221",
+   "coach_id": "4724",
+   "coach_slug": "dorival-junior",
+   "left_date": "2017-06-04",
+   "name": "Dorival Júnior",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2015-03-06",
+   "club_id": "221",
+   "coach_id": "39634",
+   "coach_slug": "marcelo-fernandes",
+   "left_date": "2015-07-09",
+   "name": "Marcelo Fernandes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2014-09-02",
+   "club_id": "221",
+   "coach_id": "8226",
+   "coach_slug": "enderson-moreira",
+   "left_date": "2015-03-05",
+   "name": "Enderson Moreira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2014-01-01",
+   "club_id": "221",
+   "coach_id": "7573",
+   "coach_slug": "oswaldo-de-oliveira",
+   "left_date": "2014-09-02",
+   "name": "Oswaldo de Oliveira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2013-06-01",
+   "club_id": "221",
+   "coach_id": "30162",
+   "coach_slug": "claudinei-oliveira",
+   "left_date": "2013-12-31",
+   "name": "Claudinei Oliveira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2011-04-08",
+   "club_id": "221",
+   "coach_id": "4729",
+   "coach_slug": "muricy-ramalho",
+   "left_date": "2013-05-31",
+   "name": "Muricy Ramalho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2011-03-01",
+   "club_id": "221",
+   "coach_id": "16828",
+   "coach_slug": "marcelo-martelotte",
+   "left_date": "2011-04-07",
+   "name": "Marcelo Martelotte",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2011-01-01",
+   "club_id": "221",
+   "coach_id": "5668",
+   "coach_slug": "adilson-batista",
+   "left_date": "2011-02-27",
+   "name": "Adilson Batista",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2010-09-22",
+   "club_id": "221",
+   "coach_id": "16828",
+   "coach_slug": "marcelo-martelotte",
+   "left_date": "2010-12-31",
+   "name": "Marcelo Martelotte",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2009-12-12",
+   "club_id": "221",
+   "coach_id": "4724",
+   "coach_slug": "dorival-junior",
+   "left_date": "2010-09-22",
+   "name": "Dorival Júnior",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2009-07-20",
+   "club_id": "221",
+   "coach_id": "1976",
+   "coach_slug": "vanderlei-luxemburgo",
+   "left_date": "2009-12-31",
+   "name": "Vanderlei Luxemburgo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2009-07-14",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "2009-07-20",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2009-02-16",
+   "club_id": "221",
+   "coach_id": "5667",
+   "coach_slug": "vagner-mancini",
+   "left_date": "2009-07-13",
+   "name": "Vagner Mancini",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2009-02-13",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "2009-02-16",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2008-08-09",
+   "club_id": "221",
+   "coach_id": "7391",
+   "coach_slug": "marcio-fernandes",
+   "left_date": "2009-02-13",
+   "name": "Márcio Fernandes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2008-06-03",
+   "club_id": "221",
+   "coach_id": "4732",
+   "coach_slug": "cuca",
+   "left_date": "2008-08-07",
+   "name": "Cuca",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2007-12-16",
+   "club_id": "221",
+   "coach_id": "1352",
+   "coach_slug": "emerson-leao",
+   "left_date": "2008-05-26",
+   "name": "Emerson Leão",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2006-01-01",
+   "club_id": "221",
+   "coach_id": "1976",
+   "coach_slug": "vanderlei-luxemburgo",
+   "left_date": "2007-12-31",
+   "name": "Vanderlei Luxemburgo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2005-11-21",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "2005-12-05",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2005-09-27",
+   "club_id": "221",
+   "coach_id": "5267",
+   "coach_slug": "nelsinho-baptista",
+   "left_date": "2005-11-20",
+   "name": "Nelsinho Baptista",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2005-03-22",
+   "club_id": "221",
+   "coach_id": "4733",
+   "coach_slug": "alexandre-gallo",
+   "left_date": "2005-09-26",
+   "name": "Alexandre Gallo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2005-03-18",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "2005-03-24",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2005-01-01",
+   "club_id": "221",
+   "coach_id": "7573",
+   "coach_slug": "oswaldo-de-oliveira",
+   "left_date": "2005-03-21",
+   "name": "Oswaldo de Oliveira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2004-05-08",
+   "club_id": "221",
+   "coach_id": "1976",
+   "coach_slug": "vanderlei-luxemburgo",
+   "left_date": "2004-12-31",
+   "name": "Vanderlei Luxemburgo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2002-05-20",
+   "club_id": "221",
+   "coach_id": "1352",
+   "coach_slug": "emerson-leao",
+   "left_date": "2004-05-06",
+   "name": "Emerson Leão",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2002-01-01",
+   "club_id": "221",
+   "coach_id": "4730",
+   "coach_slug": "celso-roth",
+   "left_date": "2002-05-16",
+   "name": "Celso Roth",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2001-09-10",
+   "club_id": "221",
+   "coach_id": "11563",
+   "coach_slug": "cabralzinho",
+   "left_date": "2001-12-27",
+   "name": "Cabralzinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2001-08-28",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "2001-09-10",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2000-12-12",
+   "club_id": "221",
+   "coach_id": "4726",
+   "coach_slug": "geninho",
+   "left_date": "2001-08-27",
+   "name": "Geninho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2000-10-26",
+   "club_id": "221",
+   "coach_id": "2121",
+   "coach_slug": "carlos-alberto-parreira",
+   "left_date": "2000-11-22",
+   "name": "Carlos Alberto Parreira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2000-05-10",
+   "club_id": "221",
+   "coach_id": "4930",
+   "coach_slug": "giba",
+   "left_date": "2000-10-23",
+   "name": "Giba",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1999-12-16",
+   "club_id": "221",
+   "coach_id": "18295",
+   "coach_slug": "carlos-alberto-silva",
+   "left_date": "2000-05-07",
+   "name": "Carlos Alberto Silva",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1999-08-24",
+   "club_id": "221",
+   "coach_id": "2699",
+   "coach_slug": "paulo-autuori",
+   "left_date": "1999-11-23",
+   "name": "Paulo Autuori",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1997-12-22",
+   "club_id": "221",
+   "coach_id": "1352",
+   "coach_slug": "emerson-leao",
+   "left_date": "1999-08-20",
+   "name": "Emerson Leão",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1996-12-10",
+   "club_id": "221",
+   "coach_id": "1976",
+   "coach_slug": "vanderlei-luxemburgo",
+   "left_date": "1997-12-21",
+   "name": "Vanderlei Luxemburgo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1996-11-01",
+   "club_id": "221",
+   "coach_id": "153781",
+   "coach_slug": "orlando-lele",
+   "left_date": "1996-11-25",
+   "name": "Orlando Lelé",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1996-06-13",
+   "club_id": "221",
+   "coach_id": "81120",
+   "coach_slug": "jose-teixeira",
+   "left_date": "1996-10-31",
+   "name": "José Teixeira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1996-03-16",
+   "club_id": "221",
+   "coach_id": "153781",
+   "coach_slug": "orlando-lele",
+   "left_date": "1996-06-11",
+   "name": "Orlando Lelé",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1996-01-05",
+   "club_id": "221",
+   "coach_id": "83607",
+   "coach_slug": "candinho",
+   "left_date": "1996-03-15",
+   "name": "Candinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1995-09-01",
+   "club_id": "221",
+   "coach_id": "11563",
+   "coach_slug": "cabralzinho",
+   "left_date": "1996-01-03",
+   "name": "Cabralzinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1995-08-29",
+   "club_id": "221",
+   "coach_id": "154076",
+   "coach_slug": "coutinho",
+   "left_date": "1995-08-31",
+   "name": "Coutinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1994-11-19",
+   "club_id": "221",
+   "coach_id": "146394",
+   "coach_slug": "joaozinho-rosa",
+   "left_date": "1995-08-28",
+   "name": "Joãozinho Rosa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1994-03-08",
+   "club_id": "221",
+   "coach_id": "9299",
+   "coach_slug": "serginho-chulapa",
+   "left_date": "1994-11-19",
+   "name": "Serginho Chulapa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1993-10-16",
+   "club_id": "221",
+   "coach_id": "37928",
+   "coach_slug": "pepe",
+   "left_date": "1994-03-07",
+   "name": "Pepe",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1993-06-21",
+   "club_id": "221",
+   "coach_id": "4725",
+   "coach_slug": "antonio-lopes",
+   "left_date": "1993-10-15",
+   "name": "Antônio Lopes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1992-12-05",
+   "club_id": "221",
+   "coach_id": "10685",
+   "coach_slug": "evaristo-de-macedo",
+   "left_date": "1993-06-10",
+   "name": "Evaristo de Macedo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1992-02-27",
+   "club_id": "221",
+   "coach_id": "4726",
+   "coach_slug": "geninho",
+   "left_date": "1992-11-27",
+   "name": "Geninho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1991-12-18",
+   "club_id": "221",
+   "coach_id": "75281",
+   "coach_slug": "rubens-minelli",
+   "left_date": "1992-02-24",
+   "name": "Rubens Minelli",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1991-01-04",
+   "club_id": "221",
+   "coach_id": "11563",
+   "coach_slug": "cabralzinho",
+   "left_date": "1991-05-25",
+   "name": "Cabralzinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1989-10-23",
+   "club_id": "221",
+   "coach_id": "37928",
+   "coach_slug": "pepe",
+   "left_date": "1990-12-19",
+   "name": "Pepe",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1989-03-06",
+   "club_id": "221",
+   "coach_id": "59336",
+   "coach_slug": "nicanor",
+   "left_date": "1989-10-23",
+   "name": "Nicanor",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1988-10-18",
+   "club_id": "221",
+   "coach_id": "28481",
+   "coach_slug": "marinho-peres",
+   "left_date": "1989-02-11",
+   "name": "Marinho Peres",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1988-07-19",
+   "club_id": "221",
+   "coach_id": "80717",
+   "coach_slug": "carlos-gainete",
+   "left_date": "1988-10-17",
+   "name": "Carlos Gainete",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1987-10-27",
+   "club_id": "221",
+   "coach_id": "4726",
+   "coach_slug": "geninho",
+   "left_date": "1988-07-19",
+   "name": "Geninho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1987-03-30",
+   "club_id": "221",
+   "coach_id": "83607",
+   "coach_slug": "candinho",
+   "left_date": "1987-10-26",
+   "name": "Candinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1987-03-27",
+   "club_id": "221",
+   "coach_id": "122559",
+   "coach_slug": "cidinho",
+   "left_date": "1987-03-30",
+   "name": "Cidinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1986-08-18",
+   "club_id": "221",
+   "coach_id": "114035",
+   "coach_slug": "chico-formiga",
+   "left_date": "1987-03-27",
+   "name": "Chico Formiga",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1986-02-22",
+   "club_id": "221",
+   "coach_id": "130983",
+   "coach_slug": "julio-espinosa",
+   "left_date": "1986-08-15",
+   "name": "Júlio Espinosa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1984-05-09",
+   "club_id": "221",
+   "coach_id": "76267",
+   "coach_slug": "castilho",
+   "left_date": "1986-02-21",
+   "name": "Castilho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1984-04-17",
+   "club_id": "221",
+   "coach_id": "76381",
+   "coach_slug": "emanuele-del-vecchio",
+   "left_date": "1984-05-09",
+   "name": "Emanuele Del Vecchio",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1982-11-19",
+   "club_id": "221",
+   "coach_id": "114035",
+   "coach_slug": "chico-formiga",
+   "left_date": "1984-04-16",
+   "name": "Chico Formiga",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1982-08-27",
+   "club_id": "221",
+   "coach_id": "80716",
+   "coach_slug": "cilinho",
+   "left_date": "1982-11-18",
+   "name": "Cilinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1982-05-03",
+   "club_id": "221",
+   "coach_id": "54562",
+   "coach_slug": "paulo-emilio",
+   "left_date": "1982-08-23",
+   "name": "Paulo Emilio",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1981-09-14",
+   "club_id": "221",
+   "coach_id": "155136",
+   "coach_slug": "daltro-menezes",
+   "left_date": "1981-12-21",
+   "name": "Daltro Menezes",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1981-07-14",
+   "club_id": "221",
+   "coach_id": "154076",
+   "coach_slug": "coutinho",
+   "left_date": "1981-09-14",
+   "name": "Coutinho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1979-10-06",
+   "club_id": "221",
+   "coach_id": "37928",
+   "coach_slug": "pepe",
+   "left_date": "1980-11-23",
+   "name": "Pepe",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1979-08-03",
+   "club_id": "221",
+   "coach_id": "76399",
+   "coach_slug": "ilton-chaves",
+   "left_date": "1979-10-04",
+   "name": "Ílton Chaves",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1978-04-21",
+   "club_id": "221",
+   "coach_id": "114035",
+   "coach_slug": "chico-formiga",
+   "left_date": "1979-07-31",
+   "name": "Chico Formiga",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1977-05-09",
+   "club_id": "221",
+   "coach_id": "32773",
+   "coach_slug": "otto-gloria",
+   "left_date": "1977-11-07",
+   "name": "Otto Glória",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1975-04-17",
+   "club_id": "221",
+   "coach_id": "37928",
+   "coach_slug": "pepe",
+   "left_date": "1975-10-06",
+   "name": "Pepe",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1974-04-21",
+   "club_id": "221",
+   "coach_id": "12174",
+   "coach_slug": "timtm",
+   "left_date": "1975-04-16",
+   "name": "Tim",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1972-08-04",
+   "club_id": "221",
+   "coach_id": "37928",
+   "coach_slug": "pepe",
+   "left_date": "1974-04-21",
+   "name": "Pepe",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1967-01-26",
+   "club_id": "221",
+   "coach_id": "47215",
+   "coach_slug": "antoninho",
+   "left_date": "1971-04-08",
+   "name": "Antoninho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1967-01-04",
+   "club_id": "221",
+   "coach_id": "47215",
+   "coach_slug": "antoninho",
+   "left_date": "1967-01-25",
+   "name": "Antoninho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1954-06-02",
+   "club_id": "221",
+   "coach_id": "37174",
+   "coach_slug": "lula",
+   "left_date": "1967-01-26",
+   "name": "Lula",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1951-09-12",
+   "club_id": "221",
+   "coach_id": "25446",
+   "coach_slug": "aymore-moreira",
+   "left_date": "1952-11-14",
+   "name": "Aymoré Moreira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1950-10-07",
+   "club_id": "221",
+   "coach_id": "47215",
+   "coach_slug": "antoninho",
+   "left_date": "1950-10-12",
+   "name": "Antoninho",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1948-03-21",
+   "club_id": "221",
+   "coach_id": "34672",
+   "coach_slug": "osvaldo-brandao",
+   "left_date": "1950-03-17",
+   "name": "Osvaldo Brandão",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1943-01-02",
+   "club_id": "221",
+   "coach_id": "27870",
+   "coach_slug": "adhemar-pimenta",
+   "left_date": "1943-06-25",
+   "name": "Adhemar Pimenta",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1938-04-19",
+   "club_id": "221",
+   "coach_id": "26446",
+   "coach_slug": "flavio-costa",
+   "left_date": "1938-07-10",
+   "name": "Flávio Costa",
+   "role": "Manager"
+  }
+ ],
+ "url": "https://www.transfermarkt.com/fc-santos/mitarbeiterhistorie/verein/221/plus/1",
+ "validator_problem": null
+}

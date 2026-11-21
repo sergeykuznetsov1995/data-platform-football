@@ -1,0 +1,12 @@
+{
+ "capture_id": "1821a6f3d1b106773f85623dc6be74dd1274f5dfbed2629f455dfa6a680795db",
+ "endpoint": "coach_profile",
+ "parser_rows": {
+  "coach_id": "7898",
+  "dob": "1972-08-05",
+  "name": "Theodore Whitmore",
+  "nationality": "Jamaica"
+ },
+ "url": "https://www.transfermarkt.com/theodore-whitmore/profil/trainer/7898",
+ "validator_problem": null
+}

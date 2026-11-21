@@ -1,0 +1,26 @@
+{
+ "attempt": 1000002,
+ "blob_key": "blobs/sha256/03/03aa853bd770e6b03cf22ec34c44e2e015f3759784bbe2bf7cacff40e3fbd432.body.gz",
+ "capture_id": "a3a7e0ffbab8325033776a8bc7f013cc519b543ef838c6324f0e7c5fb324d6ea",
+ "compression": "gzip",
+ "content_hash": "03aa853bd770e6b03cf22ec34c44e2e015f3759784bbe2bf7cacff40e3fbd432",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-c6c070d70a526e07b8847ebeb801144d",
+ "decoded_bytes": 287447,
+ "endpoint": "listing",
+ "fetched_at": "2026-11-20T23:59:42.160191+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 20 Nov 2026 23:59:41 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/03/03aa853bd770e6b03cf22ec34c44e2e015f3759784bbe2bf7cacff40e3fbd432.body.gz",
+ "scope_id": "tm-8c2be5da617a4540a10fc71d",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 40160,
+ "url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2/plus/?saison_id=2025"
+}

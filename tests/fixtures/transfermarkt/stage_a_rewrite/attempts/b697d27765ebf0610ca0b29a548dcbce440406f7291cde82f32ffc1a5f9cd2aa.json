@@ -1,0 +1,21 @@
+{
+ "attempt": 1000002,
+ "capture_id": "5bc58f64b2fe0d16aba4f1c53dd87a61627ee2b6a513ccd0d5bfed2f3cd7b690",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/5b/5bc58f64b2fe0d16aba4f1c53dd87a61627ee2b6a513ccd0d5bfed2f3cd7b690.json",
+ "cycle_id": "tm-current-5424bc81ab970eb58662cfc2873b8c12",
+ "endpoint": "listing",
+ "envelope_id": "b697d27765ebf0610ca0b29a548dcbce440406f7291cde82f32ffc1a5f9cd2aa",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/b6/b697d27765ebf0610ca0b29a548dcbce440406f7291cde82f32ffc1a5f9cd2aa.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-20T15:52:37.784198+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "436f826ea6aa48f9d0ca912f6169b973b10fa40ce1132d6474bb06558b3146bd",
+ "record_hash": "b697d27765ebf0610ca0b29a548dcbce440406f7291cde82f32ffc1a5f9cd2aa",
+ "scope_id": "tm-d24bd7201397fe8997c2b54d",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/malaysia-super-league/startseite/wettbewerb/MYS1/plus/?saison_id=2026"
+}

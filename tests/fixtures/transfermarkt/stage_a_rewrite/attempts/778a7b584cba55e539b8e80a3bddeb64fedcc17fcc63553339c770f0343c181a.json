@@ -1,0 +1,21 @@
+{
+ "attempt": 1000057,
+ "capture_id": "73f8de86b9d8a1ca614b1541c6c496c36e026b3fe9fb53af4bc8153ebba0f02b",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/73/73f8de86b9d8a1ca614b1541c6c496c36e026b3fe9fb53af4bc8153ebba0f02b.json",
+ "cycle_id": "scheduled__2026-11-12T06:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "778a7b584cba55e539b8e80a3bddeb64fedcc17fcc63553339c770f0343c181a",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/77/778a7b584cba55e539b8e80a3bddeb64fedcc17fcc63553339c770f0343c181a.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-12T07:14:06.638305+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "5e0d3ce303c1ad8ea24602bd7079a5835f8514e1dc3f01d5c291137137f6efe6",
+ "record_hash": "778a7b584cba55e539b8e80a3bddeb64fedcc17fcc63553339c770f0343c181a",
+ "scope_id": "tm-registry-d651a788aa0111865b23cfd0",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/coupe-de-la-ligue-luxemburg/startseite/wettbewerb/LUCL"
+}

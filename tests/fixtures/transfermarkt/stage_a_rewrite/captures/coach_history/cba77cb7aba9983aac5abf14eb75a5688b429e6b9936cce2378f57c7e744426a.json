@@ -1,0 +1,26 @@
+{
+ "attempt": 1000105,
+ "blob_key": "blobs/sha256/ba/ba04756604c0229e78ce343c0fc04d4a7b5b396bc7bcc3deecb7bfc8fa98b024.body.gz",
+ "capture_id": "cba77cb7aba9983aac5abf14eb75a5688b429e6b9936cce2378f57c7e744426a",
+ "compression": "gzip",
+ "content_hash": "ba04756604c0229e78ce343c0fc04d4a7b5b396bc7bcc3deecb7bfc8fa98b024",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-06395645b20f6fd7dc860319",
+ "decoded_bytes": 104370,
+ "endpoint": "coach_history",
+ "fetched_at": "2026-10-30T05:30:53.900110+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 30 Oct 2026 05:30:53 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/ba/ba04756604c0229e78ce343c0fc04d4a7b5b396bc7bcc3deecb7bfc8fa98b024.body.gz",
+ "scope_id": "tm-2e88e60a827db8396df72cdc",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 23651,
+ "url": "https://www.transfermarkt.com/porto-velho-esporte-clube-ro-/mitarbeiterhistorie/verein/72477/plus/1"
+}

@@ -1,0 +1,26 @@
+{
+ "attempt": 1000018,
+ "blob_key": "blobs/sha256/e3/e358de161a0f8920e3668019bf896747a50cf965c351bcae33ab720b22d3e155.body.gz",
+ "capture_id": "1821a6f3d1b106773f85623dc6be74dd1274f5dfbed2629f455dfa6a680795db",
+ "compression": "gzip",
+ "content_hash": "e358de161a0f8920e3668019bf896747a50cf965c351bcae33ab720b22d3e155",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-c389157dbad1a6a34c1ba68a",
+ "decoded_bytes": 117708,
+ "endpoint": "coach_profile",
+ "fetched_at": "2026-10-30T13:19:01.732411+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 30 Oct 2026 13:19:01 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/e3/e358de161a0f8920e3668019bf896747a50cf965c351bcae33ab720b22d3e155.body.gz",
+ "scope_id": "tm-ef78d791f619f0872976ac61",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 25275,
+ "url": "https://www.transfermarkt.com/theodore-whitmore/profil/trainer/7898"
+}

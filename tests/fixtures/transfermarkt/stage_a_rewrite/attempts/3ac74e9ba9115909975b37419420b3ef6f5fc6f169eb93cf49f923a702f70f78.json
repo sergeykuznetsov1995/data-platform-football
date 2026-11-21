@@ -1,0 +1,21 @@
+{
+ "attempt": 1000138,
+ "capture_id": "0cdfd4ca32cad81b72bd4b0c27d64d2654ebe8972924b793feedbe6586a464f2",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/0c/0cdfd4ca32cad81b72bd4b0c27d64d2654ebe8972924b793feedbe6586a464f2.json",
+ "cycle_id": "scheduled__2026-11-12T05:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "3ac74e9ba9115909975b37419420b3ef6f5fc6f169eb93cf49f923a702f70f78",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/3a/3ac74e9ba9115909975b37419420b3ef6f5fc6f169eb93cf49f923a702f70f78.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-12T06:23:09.866531+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "bf89b7becbf0e51903bc7c25f59dc0cd6071c7be2c7f18ecf2bfb64c45cd4704",
+ "record_hash": "3ac74e9ba9115909975b37419420b3ef6f5fc6f169eb93cf49f923a702f70f78",
+ "scope_id": "tm-registry-d05506f02b958549bd3c9140",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/weltmeisterschaft/startseite/pokalwettbewerb/FIWC"
+}

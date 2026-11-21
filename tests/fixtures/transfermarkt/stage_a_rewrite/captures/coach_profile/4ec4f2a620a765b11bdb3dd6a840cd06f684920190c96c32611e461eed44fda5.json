@@ -1,0 +1,26 @@
+{
+ "attempt": 1000011,
+ "blob_key": "blobs/sha256/21/21fffe433fc72ce188362a8afb5673fdbb41f37ae2527dd047a611b5d53b0f42.body.gz",
+ "capture_id": "4ec4f2a620a765b11bdb3dd6a840cd06f684920190c96c32611e461eed44fda5",
+ "compression": "gzip",
+ "content_hash": "21fffe433fc72ce188362a8afb5673fdbb41f37ae2527dd047a611b5d53b0f42",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-c389157dbad1a6a34c1ba68a",
+ "decoded_bytes": 104265,
+ "endpoint": "coach_profile",
+ "fetched_at": "2026-10-30T13:18:25.945491+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 30 Oct 2026 13:18:25 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/21/21fffe433fc72ce188362a8afb5673fdbb41f37ae2527dd047a611b5d53b0f42.body.gz",
+ "scope_id": "tm-ef78d791f619f0872976ac61",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 23601,
+ "url": "https://www.transfermarkt.com/arturo-berroa/profil/trainer/139997"
+}

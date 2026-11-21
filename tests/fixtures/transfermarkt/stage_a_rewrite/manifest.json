@@ -1,0 +1,754 @@
+{
+ "source": "s3://warehouse/raw/transfermarkt",
+ "seed": 20261121,
+ "source_totals": {
+  "captures_listed": 354495,
+  "attempts_listed": 363009,
+  "captures_sampled": 2500
+ },
+ "fixtures": [
+  {
+   "endpoint": "coach_history",
+   "capture_id": "859e1976700ad42f77515ead757dac605259b84b013dcb675b551bb7d36b97c8",
+   "fetched_at": "2026-10-09T09:48:26.156170+00:00",
+   "decoded_bytes": 207486,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_history/859e1976700ad42f77515ead757dac605259b84b013dcb675b551bb7d36b97c8.json",
+   "blob_file": "blobs/b58f2bafec29dcbb2ad0ee5ea2b29080db13030215e548a86cfc205aa1c3aea4.body.gz",
+   "blob_bytes": 32394
+  },
+  {
+   "endpoint": "coach_history",
+   "capture_id": "3faa35452fec89be4acec3113afdebd901f2199e554e997605efafa21c49aaa6",
+   "fetched_at": "2026-10-09T09:51:30.981664+00:00",
+   "decoded_bytes": 103256,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_history/3faa35452fec89be4acec3113afdebd901f2199e554e997605efafa21c49aaa6.json",
+   "blob_file": "blobs/055439815936c66562063846c6c2538c83fcd5aff7199dcc8a87f2116fc87af0.body.gz",
+   "blob_bytes": 23060
+  },
+  {
+   "endpoint": "coach_history",
+   "capture_id": "720ac4c8b7385b2926fbfd33311a3e4f595d370c52c455f05ea9d2d016feeb68",
+   "fetched_at": "2026-10-20T15:44:55.660001+00:00",
+   "decoded_bytes": 108621,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_history/720ac4c8b7385b2926fbfd33311a3e4f595d370c52c455f05ea9d2d016feeb68.json",
+   "blob_file": "blobs/4ac03e49417c2675af1fc8ab020b914a9a2b67ddf256bafe6ead4f8957dc21bd.body.gz",
+   "blob_bytes": 23192
+  },
+  {
+   "endpoint": "coach_history",
+   "capture_id": "cba77cb7aba9983aac5abf14eb75a5688b429e6b9936cce2378f57c7e744426a",
+   "fetched_at": "2026-10-30T05:30:53.900110+00:00",
+   "decoded_bytes": 104370,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_history/cba77cb7aba9983aac5abf14eb75a5688b429e6b9936cce2378f57c7e744426a.json",
+   "blob_file": "blobs/ba04756604c0229e78ce343c0fc04d4a7b5b396bc7bcc3deecb7bfc8fa98b024.body.gz",
+   "blob_bytes": 23651
+  },
+  {
+   "endpoint": "coach_profile",
+   "capture_id": "5de4db1d55d1365defb7663db064116ec5f2c6c47f5959cc08458460896b459d",
+   "fetched_at": "2026-10-22T08:35:11.405224+00:00",
+   "decoded_bytes": 106196,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_profile/5de4db1d55d1365defb7663db064116ec5f2c6c47f5959cc08458460896b459d.json",
+   "blob_file": "blobs/be7998c6ab3a7c0dbae5fb9adc59f88416a2c7a3fdba7b50c255e1219d769e20.body.gz",
+   "blob_bytes": 24118
+  },
+  {
+   "endpoint": "coach_profile",
+   "capture_id": "d6a1b07a71095ab2744d847345de7b4d4942066f4a079b9d3ca5cc164f837da3",
+   "fetched_at": "2026-10-29T08:41:30.365248+00:00",
+   "decoded_bytes": 104743,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_profile/d6a1b07a71095ab2744d847345de7b4d4942066f4a079b9d3ca5cc164f837da3.json",
+   "blob_file": "blobs/a9d3cab365999789800935c4fbca59241a0a809d5476113c93004380c6f8b2f9.body.gz",
+   "blob_bytes": 23792
+  },
+  {
+   "endpoint": "coach_profile",
+   "capture_id": "4ec4f2a620a765b11bdb3dd6a840cd06f684920190c96c32611e461eed44fda5",
+   "fetched_at": "2026-10-30T13:18:25.945491+00:00",
+   "decoded_bytes": 104265,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_profile/4ec4f2a620a765b11bdb3dd6a840cd06f684920190c96c32611e461eed44fda5.json",
+   "blob_file": "blobs/21fffe433fc72ce188362a8afb5673fdbb41f37ae2527dd047a611b5d53b0f42.body.gz",
+   "blob_bytes": 23601
+  },
+  {
+   "endpoint": "coach_profile",
+   "capture_id": "1821a6f3d1b106773f85623dc6be74dd1274f5dfbed2629f455dfa6a680795db",
+   "fetched_at": "2026-10-30T13:19:01.732411+00:00",
+   "decoded_bytes": 117708,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/coach_profile/1821a6f3d1b106773f85623dc6be74dd1274f5dfbed2629f455dfa6a680795db.json",
+   "blob_file": "blobs/e358de161a0f8920e3668019bf896747a50cf965c351bcae33ab720b22d3e155.body.gz",
+   "blob_bytes": 25275
+  },
+  {
+   "endpoint": "competition_registry",
+   "capture_id": "d67ebd60abc0f9c3aad1df39ca20b8b2290e825e014157584dd07a64827fdc87",
+   "fetched_at": "2026-11-21T05:44:29.464977+00:00",
+   "decoded_bytes": 3097,
+   "content_type": "application/json",
+   "capture_file": "captures/competition_registry/d67ebd60abc0f9c3aad1df39ca20b8b2290e825e014157584dd07a64827fdc87.json",
+   "blob_file": "blobs/0f02a4d04bb96d0b9a8b6dbcbefb0d3980c1497ba80aa0e5452d72379ec15662.body.gz",
+   "blob_bytes": 533
+  },
+  {
+   "endpoint": "competition_registry",
+   "capture_id": "9d4a5a2ff5a349638066c9ad613e328346775ff3586a014414fb65d30e31145f",
+   "fetched_at": "2026-11-21T05:46:35.480471+00:00",
+   "decoded_bytes": 435,
+   "content_type": "application/json",
+   "capture_file": "captures/competition_registry/9d4a5a2ff5a349638066c9ad613e328346775ff3586a014414fb65d30e31145f.json",
+   "blob_file": "blobs/caff1c187a81cf9b866709cdf87db65430e60b046c8688c9143250a8ee717c69.body.gz",
+   "blob_bytes": 298
+  },
+  {
+   "endpoint": "competition_registry",
+   "capture_id": "dc12111cfe0a8febeb58095453396cdf9c5ca3c77f435322c7184e37c83c4d35",
+   "fetched_at": "2026-11-21T05:48:29.793455+00:00",
+   "decoded_bytes": 5578,
+   "content_type": "application/json",
+   "capture_file": "captures/competition_registry/dc12111cfe0a8febeb58095453396cdf9c5ca3c77f435322c7184e37c83c4d35.json",
+   "blob_file": "blobs/a68729f81031b8fc2a875b7496e3ed70bdab52e157ce6d49da6555352c0793d3.body.gz",
+   "blob_bytes": 759
+  },
+  {
+   "endpoint": "competition_registry",
+   "capture_id": "ab6c7d920528509bcb2f105b481181cf5f0e3ae825359c2e59f039057e00b81f",
+   "fetched_at": "2026-11-21T06:06:58.436052+00:00",
+   "decoded_bytes": 4514,
+   "content_type": "application/json",
+   "capture_file": "captures/competition_registry/ab6c7d920528509bcb2f105b481181cf5f0e3ae825359c2e59f039057e00b81f.json",
+   "blob_file": "blobs/109f3becf8ebf34ed67dd507d2400d611d6a462faa384ae2afd1d26cb1c2fc36.body.gz",
+   "blob_bytes": 694
+  },
+  {
+   "endpoint": "current_injury",
+   "capture_id": "e4d1597441f7a8e054caa42f5f57ce506f70f4802ce5fb7b16425da4e92562b7",
+   "fetched_at": "2026-11-18T16:18:05.858996+00:00",
+   "decoded_bytes": 118582,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_injury/e4d1597441f7a8e054caa42f5f57ce506f70f4802ce5fb7b16425da4e92562b7.json",
+   "blob_file": "blobs/a08b4a2c938ab512f2203d5f33e388903007da9db55bd3558fb32142c2704aa9.body.gz",
+   "blob_bytes": 24873
+  },
+  {
+   "endpoint": "current_injury",
+   "capture_id": "7358912aa131f664a0597936a86a97aed879c4fe461b23dfef51263fe5698976",
+   "fetched_at": "2026-11-18T23:05:28.585191+00:00",
+   "decoded_bytes": 114180,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_injury/7358912aa131f664a0597936a86a97aed879c4fe461b23dfef51263fe5698976.json",
+   "blob_file": "blobs/4d4dbfbc0a039e69b7debbb4fa4f565644ed20c739c8e2fcb5c2d61dc6a8124e.body.gz",
+   "blob_bytes": 24729
+  },
+  {
+   "endpoint": "current_injury",
+   "capture_id": "9db64dfffb6607ada25add0ae39f2843ccb67fa6ffb1df6d872ef3fa508aaae1",
+   "fetched_at": "2026-11-19T16:31:49.954527+00:00",
+   "decoded_bytes": 118154,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_injury/9db64dfffb6607ada25add0ae39f2843ccb67fa6ffb1df6d872ef3fa508aaae1.json",
+   "blob_file": "blobs/b11a90cd8e756b14ef6d4aded7ff94960c0ee92893bfb8408b8b49d2607a72f3.body.gz",
+   "blob_bytes": 25010
+  },
+  {
+   "endpoint": "current_injury",
+   "capture_id": "367cd09533f4eb154cfb7c65288d93198d23724664c2afb3062808cd382a442f",
+   "fetched_at": "2026-11-19T22:51:24.875102+00:00",
+   "decoded_bytes": 136869,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_injury/367cd09533f4eb154cfb7c65288d93198d23724664c2afb3062808cd382a442f.json",
+   "blob_file": "blobs/a7c120be8f7e5961afb176da1ed876b6f672e17a3fd85bfd21ae0f962e8cbf91.body.gz",
+   "blob_bytes": 26585
+  },
+  {
+   "endpoint": "current_player_profile",
+   "capture_id": "4932515b53013d35fd5dd700ac6db76f588daa5bbc2c4d9377f72cbca8a3a0d2",
+   "fetched_at": "2026-11-21T07:06:13.479762+00:00",
+   "decoded_bytes": 121699,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_player_profile/4932515b53013d35fd5dd700ac6db76f588daa5bbc2c4d9377f72cbca8a3a0d2.json",
+   "blob_file": "blobs/6ae171b578c536c7ef31ff38f64f51446de05e2f38a8e5568b4703da91b571b3.body.gz",
+   "blob_bytes": 28640
+  },
+  {
+   "endpoint": "current_player_profile",
+   "capture_id": "85ee391437d584034c6cbfe03e76a88f690f436afcfc4d593419bc8cfa9690cc",
+   "fetched_at": "2026-11-21T10:36:09.823220+00:00",
+   "decoded_bytes": 111838,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_player_profile/85ee391437d584034c6cbfe03e76a88f690f436afcfc4d593419bc8cfa9690cc.json",
+   "blob_file": "blobs/3b1d0b29de6cc4be9907dda051b0ecadd366a425be3276fd9d4620bf1a010547.body.gz",
+   "blob_bytes": 25533
+  },
+  {
+   "endpoint": "current_player_profile",
+   "capture_id": "cf0e6976b1ab0634f144c7f15230b5f222dc3683aa3c5c18680d43bed5eea6d8",
+   "fetched_at": "2026-11-21T10:36:29.907549+00:00",
+   "decoded_bytes": 110298,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_player_profile/cf0e6976b1ab0634f144c7f15230b5f222dc3683aa3c5c18680d43bed5eea6d8.json",
+   "blob_file": "blobs/caf7c2ee4249ba5292e70497b59735680e27eb94d26277e3159fe0c97b0d68c6.body.gz",
+   "blob_bytes": 25301
+  },
+  {
+   "endpoint": "current_player_profile",
+   "capture_id": "07fcd9447e190391f1249e791294f2c899218873a994ba22fc30245737866a3b",
+   "fetched_at": "2026-11-21T11:27:20.508077+00:00",
+   "decoded_bytes": 122039,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/current_player_profile/07fcd9447e190391f1249e791294f2c899218873a994ba22fc30245737866a3b.json",
+   "blob_file": "blobs/a4b0a48e02e02d03fcf39e32dadc7db33336a4f84ec10b4edc8deb4b285f863e.body.gz",
+   "blob_bytes": 28568
+  },
+  {
+   "endpoint": "current_players",
+   "capture_id": "5ed7d1afff072612a799b89dd51afd29d0a1a0bd3687c3465e78b57f1896d6ee",
+   "fetched_at": "2026-11-20T11:36:53.890531+00:00",
+   "decoded_bytes": 110359,
+   "content_type": "application/json",
+   "capture_file": "captures/current_players/5ed7d1afff072612a799b89dd51afd29d0a1a0bd3687c3465e78b57f1896d6ee.json",
+   "blob_file": "blobs/1cccef277b9f9bf9acab97403d5278849dfac83cfe36648e95eebe556d58e711.body.gz",
+   "blob_bytes": 6939
+  },
+  {
+   "endpoint": "current_players",
+   "capture_id": "1f0f863113b9ee801f8f4704ec0e888d2727fae3f1875e63573b9ecf72402bb2",
+   "fetched_at": "2026-11-20T21:28:09.890505+00:00",
+   "decoded_bytes": 209403,
+   "content_type": "application/json",
+   "capture_file": "captures/current_players/1f0f863113b9ee801f8f4704ec0e888d2727fae3f1875e63573b9ecf72402bb2.json",
+   "blob_file": "blobs/cc2d6b80585b30493afb9f67ab2c27aff5adfe92e4bbd5821f344f71abf3b8cd.body.gz",
+   "blob_bytes": 20786
+  },
+  {
+   "endpoint": "current_players",
+   "capture_id": "43a36ba070503e222fa3e347fb1a86854ba8baa7b92d045dcde74e3c363b5509",
+   "fetched_at": "2026-11-20T22:37:37.206732+00:00",
+   "decoded_bytes": 201479,
+   "content_type": "application/json",
+   "capture_file": "captures/current_players/43a36ba070503e222fa3e347fb1a86854ba8baa7b92d045dcde74e3c363b5509.json",
+   "blob_file": "blobs/567ca5eae5d757da07ffeb372eae543aa1f8bfba73cbedfe27554ae954923c55.body.gz",
+   "blob_bytes": 22142
+  },
+  {
+   "endpoint": "current_players",
+   "capture_id": "42f23400872d0c029ce110e44b391d40b1fc90ceca72a39bdbdf6fec3d42a73f",
+   "fetched_at": "2026-11-21T07:52:10.291759+00:00",
+   "decoded_bytes": 1273,
+   "content_type": "application/json",
+   "capture_file": "captures/current_players/42f23400872d0c029ce110e44b391d40b1fc90ceca72a39bdbdf6fec3d42a73f.json",
+   "blob_file": "blobs/6b4cc65c602fbe18cafb63ff003f20fa09d45ba7c1d45eb7d6f4de098dc13f87.body.gz",
+   "blob_bytes": 636
+  },
+  {
+   "endpoint": "gateway_probe",
+   "capture_id": "27fdccebf6fee6675fcbda38cb37711a1ed1f517ca5a89bca149f0ff55d4f9ab",
+   "fetched_at": "2026-10-30T04:00:26.331500+00:00",
+   "decoded_bytes": 249585,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/gateway_probe/27fdccebf6fee6675fcbda38cb37711a1ed1f517ca5a89bca149f0ff55d4f9ab.json",
+   "blob_file": "blobs/e0947f19a18b3a390425775f7430f07cfe3556eb0f1e37b998139be41b5b295d.body.gz",
+   "blob_bytes": 36021
+  },
+  {
+   "endpoint": "listing",
+   "capture_id": "726b9897a421f1b7ec601f5cfbfb169a85aeeaca72e4f715e5e2356ff38155b2",
+   "fetched_at": "2026-11-20T15:37:58.263076+00:00",
+   "decoded_bytes": 179502,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/listing/726b9897a421f1b7ec601f5cfbfb169a85aeeaca72e4f715e5e2356ff38155b2.json",
+   "blob_file": "blobs/a23021690e7d5377fdb6d76d6918d9fcc99f62a6824163bbc38af94148ac82d5.body.gz",
+   "blob_bytes": 31398
+  },
+  {
+   "endpoint": "listing",
+   "capture_id": "a3a7e0ffbab8325033776a8bc7f013cc519b543ef838c6324f0e7c5fb324d6ea",
+   "fetched_at": "2026-11-20T23:59:42.160191+00:00",
+   "decoded_bytes": 287447,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/listing/a3a7e0ffbab8325033776a8bc7f013cc519b543ef838c6324f0e7c5fb324d6ea.json",
+   "blob_file": "blobs/03aa853bd770e6b03cf22ec34c44e2e015f3759784bbe2bf7cacff40e3fbd432.body.gz",
+   "blob_bytes": 40160
+  },
+  {
+   "endpoint": "listing",
+   "capture_id": "ccde20f3489ed9e14d87f2b246562f74a9cf04e846bd1437f6e8bff2a2bf501b",
+   "fetched_at": "2026-11-21T08:09:31.508561+00:00",
+   "decoded_bytes": 194537,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/listing/ccde20f3489ed9e14d87f2b246562f74a9cf04e846bd1437f6e8bff2a2bf501b.json",
+   "blob_file": "blobs/15b5f20286f285c8a2ab613f6ffdb274a80f704bf4260fc6c3287f6c04a827f8.body.gz",
+   "blob_bytes": 32730
+  },
+  {
+   "endpoint": "listing",
+   "capture_id": "5ad3fa9a99a9df024113ae93695faa1f0bb0d9d3fa3dc9a7491acabb3094da71",
+   "fetched_at": "2026-11-21T09:25:53.336751+00:00",
+   "decoded_bytes": 192387,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/listing/5ad3fa9a99a9df024113ae93695faa1f0bb0d9d3fa3dc9a7491acabb3094da71.json",
+   "blob_file": "blobs/d348999ac83c2bc04d15a2a6274b5d693bbccd605b715d66af068d240a95ec63.body.gz",
+   "blob_bytes": 31807
+  },
+  {
+   "endpoint": "market_value_points",
+   "capture_id": "a62889de44a64eacabc25a77b472ac828c11340930e9bd5bb172c61df295cb62",
+   "fetched_at": "2026-11-02T17:27:39.570084+00:00",
+   "decoded_bytes": 5215,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/market_value_points/a62889de44a64eacabc25a77b472ac828c11340930e9bd5bb172c61df295cb62.json",
+   "blob_file": "blobs/87007ab79c19bd51fd8d47521d1ec5cb163349c80438ef76b80ab70d4c1b2502.body.gz",
+   "blob_bytes": 1171
+  },
+  {
+   "endpoint": "market_value_points",
+   "capture_id": "8659c4c263a03470f0e2ce8790fd1bb4dd98d0cb5a0adb28e2dc15b47ee888ff",
+   "fetched_at": "2026-11-02T17:32:09.999271+00:00",
+   "decoded_bytes": 5316,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/market_value_points/8659c4c263a03470f0e2ce8790fd1bb4dd98d0cb5a0adb28e2dc15b47ee888ff.json",
+   "blob_file": "blobs/2f953b35c3052fba72ce682e8fdf233c5c95a38fbf2998c4d7c3f444d8ea60db.body.gz",
+   "blob_bytes": 1152
+  },
+  {
+   "endpoint": "market_value_points",
+   "capture_id": "76099cdddae1c43066d1930ee5c23b1abcce1a19a88c4ef083d08499637bd4a0",
+   "fetched_at": "2026-11-02T17:41:40.857048+00:00",
+   "decoded_bytes": 4999,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/market_value_points/76099cdddae1c43066d1930ee5c23b1abcce1a19a88c4ef083d08499637bd4a0.json",
+   "blob_file": "blobs/33fca96f82a39733daeab07e8bbbeb05f75c85e6245080b5ab229e4f2404c6b3.body.gz",
+   "blob_bytes": 1184
+  },
+  {
+   "endpoint": "market_value_points",
+   "capture_id": "b36549bdbb0da6898dac13c483977d0d543707cde0af241a9866fce3425c1d5d",
+   "fetched_at": "2026-11-02T17:58:22.253161+00:00",
+   "decoded_bytes": 4152,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/market_value_points/b36549bdbb0da6898dac13c483977d0d543707cde0af241a9866fce3425c1d5d.json",
+   "blob_file": "blobs/8cb5af726349d35d8377523472fd2418bd7ae0541fb1fe8e07d35cca71f6e7b5.body.gz",
+   "blob_bytes": 1009
+  },
+  {
+   "endpoint": "participants_api",
+   "capture_id": "51d21f951b9911542618e55478daca5c907aed5f6b777c7981a42470445bfb62",
+   "fetched_at": "2026-10-08T04:00:32.361570+00:00",
+   "decoded_bytes": 662,
+   "content_type": "application/json",
+   "capture_file": "captures/participants_api/51d21f951b9911542618e55478daca5c907aed5f6b777c7981a42470445bfb62.json",
+   "blob_file": "blobs/f50c5aec996b1597e44cd044d4104e65242a2b514e5d09c5bc494121f2ef70f8.body.gz",
+   "blob_bytes": 353
+  },
+  {
+   "endpoint": "squad",
+   "capture_id": "883abcc28c49340f6a217f967699794ca1ae869523844a457a84a6e534ec246b",
+   "fetched_at": "2026-11-20T12:36:22.985854+00:00",
+   "decoded_bytes": 167828,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/squad/883abcc28c49340f6a217f967699794ca1ae869523844a457a84a6e534ec246b.json",
+   "blob_file": "blobs/54e0e4a93cb61474e05cb5e4dd71bfa0ef6868f13db93e9d519b4458bf2d8481.body.gz",
+   "blob_bytes": 29053
+  },
+  {
+   "endpoint": "squad",
+   "capture_id": "371a65a4d39aa5e03132455f3a215cfab0e3275238b1dfca075814977e308c48",
+   "fetched_at": "2026-11-20T18:57:36.535963+00:00",
+   "decoded_bytes": 156729,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/squad/371a65a4d39aa5e03132455f3a215cfab0e3275238b1dfca075814977e308c48.json",
+   "blob_file": "blobs/f4df12f6d98f00c02181d2c89aabe3e5a22b338c59fb655523a8bd3bc759c427.body.gz",
+   "blob_bytes": 28568
+  },
+  {
+   "endpoint": "squad",
+   "capture_id": "420d92c56f213257e97ed5582cb9c3612e79da853eb1374420a86715321de4c1",
+   "fetched_at": "2026-11-20T22:41:40.776890+00:00",
+   "decoded_bytes": 192476,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/squad/420d92c56f213257e97ed5582cb9c3612e79da853eb1374420a86715321de4c1.json",
+   "blob_file": "blobs/e55d67f4ab6acc32b82fde48da45cef318a4f4e9add02a7c2400000a71788d03.body.gz",
+   "blob_bytes": 32210
+  },
+  {
+   "endpoint": "squad",
+   "capture_id": "26a5533a44ef3a6a6da53a3351250833a742540e8dc2cdc7655cbdb94a93c083",
+   "fetched_at": "2026-11-21T08:12:46.460046+00:00",
+   "decoded_bytes": 100737,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/squad/26a5533a44ef3a6a6da53a3351250833a742540e8dc2cdc7655cbdb94a93c083.json",
+   "blob_file": "blobs/21a0a94720cf30da3f19ddb4824f006c0034d55cd43ae936b9edab35dcf767ae.body.gz",
+   "blob_bytes": 22995
+  },
+  {
+   "endpoint": "teilnehmer",
+   "capture_id": "43fb574d7c14bd70b7a519f1560597c78e1c7b0fdf1e2bd9180887eacfa56e72",
+   "fetched_at": "2026-10-03T08:52:45.713752+00:00",
+   "decoded_bytes": 105776,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/teilnehmer/43fb574d7c14bd70b7a519f1560597c78e1c7b0fdf1e2bd9180887eacfa56e72.json",
+   "blob_file": "blobs/fb9b301483a28c256a7ac43f22725593fd775c47c090f4437374dd32c81b46ea.body.gz",
+   "blob_bytes": 22545
+  },
+  {
+   "endpoint": "teilnehmer",
+   "capture_id": "c23ddd54001e6c148f8b342c4939cce21a34ca2f3fb5d9ac8aed5f33389ceb05",
+   "fetched_at": "2026-10-18T04:00:37.369113+00:00",
+   "decoded_bytes": 131229,
+   "content_type": "text/html; charset=UTF-8",
+   "capture_file": "captures/teilnehmer/c23ddd54001e6c148f8b342c4939cce21a34ca2f3fb5d9ac8aed5f33389ceb05.json",
+   "blob_file": "blobs/207717bd8288d7b8fb413b9b5dc2d4bca60cc9e9bd0eeaf4df417d213661f9bb.body.gz",
+   "blob_bytes": 25824
+  },
+  {
+   "endpoint": "transfer_events",
+   "capture_id": "4ea12717d3e87cefd433782ba4b4a171eefae83c8cf1d1cbbfabf824969bd74b",
+   "fetched_at": "2026-11-02T09:55:43.086149+00:00",
+   "decoded_bytes": 16990,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/transfer_events/4ea12717d3e87cefd433782ba4b4a171eefae83c8cf1d1cbbfabf824969bd74b.json",
+   "blob_file": "blobs/89d5cd0240174d523434d5f0f768e6f87fed4cac7a53a37308ba1615c0061ea8.body.gz",
+   "blob_bytes": 1537
+  },
+  {
+   "endpoint": "transfer_events",
+   "capture_id": "c9ddf05897244c657a517c80eeba4ed4cf8e29b260497e00435eb8f2d5a5f4cf",
+   "fetched_at": "2026-11-02T10:36:40.418759+00:00",
+   "decoded_bytes": 1869,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/transfer_events/c9ddf05897244c657a517c80eeba4ed4cf8e29b260497e00435eb8f2d5a5f4cf.json",
+   "blob_file": "blobs/22e069fad1d981558d235df6d8c617118d94b07ead94bc22dda82a35b6d867b1.body.gz",
+   "blob_bytes": 605
+  },
+  {
+   "endpoint": "transfer_events",
+   "capture_id": "21be69dc9945984a9536f58ca76ccb6a38ae03022fc7fccaffe0e5f648a645b3",
+   "fetched_at": "2026-11-02T11:24:21.341692+00:00",
+   "decoded_bytes": 11863,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/transfer_events/21be69dc9945984a9536f58ca76ccb6a38ae03022fc7fccaffe0e5f648a645b3.json",
+   "blob_file": "blobs/4aa8e2cd209d8f7c5f51d47cff6223f34da597bee4e0c316daa3e47f39e323c5.body.gz",
+   "blob_bytes": 1227
+  },
+  {
+   "endpoint": "transfer_events",
+   "capture_id": "ccb774f7f86f9f6055249e8384ba6c8d9003bef592921b75d265a671d821b6d6",
+   "fetched_at": "2026-11-21T08:31:53.124191+00:00",
+   "decoded_bytes": 11502,
+   "content_type": "application/json; charset=utf-8",
+   "capture_file": "captures/transfer_events/ccb774f7f86f9f6055249e8384ba6c8d9003bef592921b75d265a671d821b6d6.json",
+   "blob_file": "blobs/4dfd01a6e65cbb1b5a0fc9440be96baee1e462befa6a105efac8870d9d7b93dc.body.gz",
+   "blob_bytes": 1215
+  }
+ ],
+ "skipped_big_blobs": [],
+ "attempts": [
+  {
+   "file": "attempts/f711f4f9ccaec2860b4393eacc18491048ad1e35dfaf8be20fe9e7a615814e85.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000188
+  },
+  {
+   "file": "attempts/732e6ff3da90e756e06f6f5ea5a73d5b99b58e144203d6385fdd8d997499e64a.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000021
+  },
+  {
+   "file": "attempts/1e029a4da7f1a6cd999b0d2f46687f736982ebe8210311137fc46741ba89b450.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000435
+  },
+  {
+   "file": "attempts/6a57bceac079bbc0de0a1e77cfd89da934b48b0e3b11c368eb71120924489e57.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000290
+  },
+  {
+   "file": "attempts/eff99ee426bce21b3839f53c4fee350d62dd88cacb05b8786a36d6711ef9e982.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000298
+  },
+  {
+   "file": "attempts/82ae7d339fa7df68f84d49b2f7f60be2a3b5ddd6bf271ccd5b81db99d16e862e.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000057
+  },
+  {
+   "file": "attempts/b5136e8a8575f9a0327f9735b330b63900b3d4cec372bd1e8ada91ed68c0c63f.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000292
+  },
+  {
+   "file": "attempts/2a8a14e32ed756abf93c67f68d0559eabce042c84a39a37264534a455ef2438f.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000227
+  },
+  {
+   "file": "attempts/3e65015b1a57b76d4cd2e750ac7469260b5ba68afcc81d167ead4752d834673e.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000218
+  },
+  {
+   "file": "attempts/cc9d874c9761e204d4643fd818b565cc71a1604818ac7e2ffe2f9414c0732c24.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000140
+  },
+  {
+   "file": "attempts/15095d071ba85f555449c283e84559a031520e58d3925697f3e4242fb63ec5ed.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000132
+  },
+  {
+   "file": "attempts/57c28ac59478ecf1afe3985ade3e07486474e4f10875da562199a1cda8809b8f.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000232
+  },
+  {
+   "file": "attempts/949d9fa0ad6961b668f0c48159e48b67423aa5a0ea9b9119cc8dee31b30acf35.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000396
+  },
+  {
+   "file": "attempts/564432875bd5a76bd642323997306c160a03380708faaa10b88ec6e0ab99deb3.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000091
+  },
+  {
+   "file": "attempts/86c6842219e1fa015cc3eb3cbc7082a2b5a66ec21bbbcac16ac2114ad0309dd2.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000344
+  },
+  {
+   "file": "attempts/7a4fdcefe9c2e34bee805311e7bc2c2182ae7c794fdc8fc1e6dbf9fe72b0befd.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000388
+  },
+  {
+   "file": "attempts/39b4352a84d1521aa1205722621039c15e23ae7b8e6e6a8c54c88ca52a16b1de.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000434
+  },
+  {
+   "file": "attempts/3ac74e9ba9115909975b37419420b3ef6f5fc6f169eb93cf49f923a702f70f78.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000138
+  },
+  {
+   "file": "attempts/9cd532baa3d5e7fd955cdb80a3e48459dddec25954ef1c447ad9016c0802c40e.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000396
+  },
+  {
+   "file": "attempts/cb07851cceb2b60d0784ba6a7e14fab394632b2525985bfe3d6a93a918f83c52.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000088
+  },
+  {
+   "file": "attempts/49018b7b7672d2a1e24cea8481bf43be41bfcdd37d89d7cb3203aa7986147dc0.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000041
+  },
+  {
+   "file": "attempts/4990773613eb0fcad6523985cdd24d1e045e2bced61643502eda856b22ba2eab.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000346
+  },
+  {
+   "file": "attempts/21fc61d95ee43c64c569188fdd42ea4c26db69a283159bdb916823cad43af8cb.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000273
+  },
+  {
+   "file": "attempts/37e7b578dbd2649f2e28929d964437e2a0fbaf0b82e25a4242724d16a0f6d1e8.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000039
+  },
+  {
+   "file": "attempts/ea5f02142dedd765ce478f048b18f419b8b8fd6b3562ddb784fd178fa62db685.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000493
+  },
+  {
+   "file": "attempts/6dcd6e7f8947455579d4610dd41b419e7d2eb3312b766c57a2f9525b7db19543.json",
+   "endpoint": "competition_registry",
+   "attempt": 1001807
+  },
+  {
+   "file": "attempts/b697d27765ebf0610ca0b29a548dcbce440406f7291cde82f32ffc1a5f9cd2aa.json",
+   "endpoint": "listing",
+   "attempt": 1000002
+  },
+  {
+   "file": "attempts/bcf0b30fccd81ef75190be4c1eadf63e013f3c148de79c07402396a25498917c.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000211
+  },
+  {
+   "file": "attempts/03f45933f7de08185090bb93e554ed64545e3b85467255ca60b766a01be9b1cb.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000207
+  },
+  {
+   "file": "attempts/7cfd55765b776212eeb3105abdf69eb5c11a334134df2512e78d6ee0fa2b7aac.json",
+   "endpoint": "listing",
+   "attempt": 1000001
+  },
+  {
+   "file": "attempts/2a351f12649a11a0876027d6f7f64de03558987b2d3c1a1c013ac602baf068a9.json",
+   "endpoint": "coach_history",
+   "attempt": 1000012
+  },
+  {
+   "file": "attempts/54908bcb5c5867fcd765551574af1f4dce4800cfc7760c1929ddca36068be5e9.json",
+   "endpoint": "competition_registry",
+   "attempt": 1001196
+  },
+  {
+   "file": "attempts/175f5c89389571f777915aaa12dbc9b7979c92fde57f1e8ee5ffa4cbf87d7dd0.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000177
+  },
+  {
+   "file": "attempts/778a7b584cba55e539b8e80a3bddeb64fedcc17fcc63553339c770f0343c181a.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000057
+  },
+  {
+   "file": "attempts/ef19378d4d90ef988877f6d2d7f6f5c43591a341d67eb616985c21524909951d.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000087
+  },
+  {
+   "file": "attempts/97b80722400d679e1049e0e9ee0ad8acc55e5aa8664082a919697f1409d3e558.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000138
+  },
+  {
+   "file": "attempts/6b63c521915def7a8835818ff7f019194e32c4ad23eece7032c1198295c85bb4.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000398
+  },
+  {
+   "file": "attempts/5d2d9dffe1b86a064ba99aa64f8cb8636e7bbb6d3957168849c99a7a91e9dff7.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000062
+  },
+  {
+   "file": "attempts/48c6d01859e6089edd4641d096048664a3d8ed90a84a3fcc62045c0b88a54a83.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000361
+  },
+  {
+   "file": "attempts/addd7ebadb99fa0f699ee5c10dbc5c19e807644e261de6e929763efdd8fdbbf1.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000302
+  },
+  {
+   "file": "attempts/a47d5ed72a36d9ccde364948ae50123ed0da476c424b53e95252dfde0291697a.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000499
+  },
+  {
+   "file": "attempts/4d8a03ce7e28135f44098bf9104ea2d607737f1ac65035f0b9568deb790339fe.json",
+   "endpoint": "transfer_events",
+   "attempt": 2000175
+  },
+  {
+   "file": "attempts/0cee13b92f761dde9481f2779cd351f73b4995f2517061b1f5a993a130b70fa0.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000298
+  },
+  {
+   "file": "attempts/cb262571770ef33dc2d783be26f22cb64a4cf869c526f14f7dd0931e42566f8e.json",
+   "endpoint": "current_players",
+   "attempt": 1000006
+  },
+  {
+   "file": "attempts/5217c75b7de7e2844edc478a29dac98bde156795e16e3db682217ccf6b2e44b0.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000296
+  },
+  {
+   "file": "attempts/2b6a016470bcebcd6f9896e0e1839322c7f224b77d5f9e33668be5a3ca262c21.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000122
+  },
+  {
+   "file": "attempts/7d23f777a5c08b7016c22359222227dbfe140817097c3ca732d82d9f41aa0f5f.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000029
+  },
+  {
+   "file": "attempts/59eacf63df5803f999a21156cdab01710993fb9dc3381e2cf59328164fa31f83.json",
+   "endpoint": "squad",
+   "attempt": 1000026
+  },
+  {
+   "file": "attempts/5ad5ab7bf6c428a9d8f7a8efb3e6fa65d89ba2d15323a3de99112719d2a3aaa8.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000166
+  },
+  {
+   "file": "attempts/e411a67524ac086867a72c72679c8c410e060a59e7e587727289a36191b9aaf7.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000535
+  },
+  {
+   "file": "attempts/8215c3b0e37e1495b6ccfc4433671cf5c29d082869b48b149a8629c42c1fee2c.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000176
+  },
+  {
+   "file": "attempts/6be9193ced8cd1800b571501d4c638d41d28ad5d7d5e9e1a62561e201947d3ee.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000179
+  },
+  {
+   "file": "attempts/f7da7eb48ef10bb00f122997619d182e597c505ab6ad4037eb332185e237d684.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000416
+  },
+  {
+   "file": "attempts/d39268e538e5435fbca97312d057e12a5b146742be0207ce269d9bc226207461.json",
+   "endpoint": "competition_registry",
+   "attempt": 1000698
+  },
+  {
+   "file": "attempts/ff776479ab42ce9da65e663bc3422e298249f8698258eec04f811f7e9fd1d3d0.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000048
+  },
+  {
+   "file": "attempts/df87b64e4644d8dd6ad262ea9136a8100960353a2d82da8b97d47d3761a98dd7.json",
+   "endpoint": "transfer_events",
+   "attempt": 1000015
+  },
+  {
+   "file": "attempts/fa11bb6b7e2086bd9c2fd1d6518008240c481314028a556c0c853b87837933d6.json",
+   "endpoint": "squad",
+   "attempt": 1000015
+  },
+  {
+   "file": "attempts/2fd3e6a70c7cbfc083b7ace8e7dddd426acf740a9ec89c61b32145cbcaa73d8f.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000399
+  },
+  {
+   "file": "attempts/215f91a0033eb3d03e1ca2f817a33163f2c54c034f781bc334cbcbf0dba1564a.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000019
+  },
+  {
+   "file": "attempts/eb275f9422616f330b08721d00365c97e877fd0aa505f7a0a3bb971312d8f6c9.json",
+   "endpoint": "market_value_points",
+   "attempt": 1000277
+  }
+ ]
+}

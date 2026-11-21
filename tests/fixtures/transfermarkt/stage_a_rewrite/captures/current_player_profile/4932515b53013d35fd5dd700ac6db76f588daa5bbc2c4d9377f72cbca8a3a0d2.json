@@ -1,0 +1,28 @@
+{
+ "attempt": 1000165,
+ "blob_key": "blobs/sha256/6a/6ae171b578c536c7ef31ff38f64f51446de05e2f38a8e5568b4703da91b571b3.body.gz",
+ "capture_id": "4932515b53013d35fd5dd700ac6db76f588daa5bbc2c4d9377f72cbca8a3a0d2",
+ "compression": "gzip",
+ "content_hash": "6ae171b578c536c7ef31ff38f64f51446de05e2f38a8e5568b4703da91b571b3",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-2b62c0375f08790588c26b83830bcfaa",
+ "decoded_bytes": 121699,
+ "endpoint": "current_player_profile",
+ "fetched_at": "2026-11-21T07:06:13.479762+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "public, max-age=600, must-revalidate, stale-while-revalidate=30, stale-if-error=300",
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 21 Nov 2026 07:06:13 GMT",
+  "last-modified": "Tue, 09 Jun 2026 22:00:00 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/6a/6ae171b578c536c7ef31ff38f64f51446de05e2f38a8e5568b4703da91b571b3.body.gz",
+ "scope_id": "tm-9e19151d5c12a4efb08d9e27",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 28640,
+ "url": "https://www.transfermarkt.com/jae-moon-ryu/profil/spieler/261405"
+}

@@ -1,0 +1,12 @@
+{
+ "capture_id": "d6a1b07a71095ab2744d847345de7b4d4942066f4a079b9d3ca5cc164f837da3",
+ "endpoint": "coach_profile",
+ "parser_rows": {
+  "coach_id": "42897",
+  "dob": "1977-12-07",
+  "name": "Baye Bah",
+  "nationality": "Mali"
+ },
+ "url": "https://www.transfermarkt.com/baye-bah/profil/trainer/42897",
+ "validator_problem": null
+}

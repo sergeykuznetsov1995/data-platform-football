@@ -1,0 +1,13 @@
+{
+ "capture_id": "07fcd9447e190391f1249e791294f2c899218873a994ba22fc30245737866a3b",
+ "endpoint": "current_player_profile",
+ "parser_rows": {
+  "contract_status": "unknown",
+  "contract_until": null,
+  "current_club_id": "105",
+  "current_club_name": "Darmstadt 98",
+  "player_id": "279009"
+ },
+ "url": "https://www.transfermarkt.com/marco-richter/profil/spieler/279009",
+ "validator_problem": null
+}

@@ -1,0 +1,13 @@
+{
+ "capture_id": "85ee391437d584034c6cbfe03e76a88f690f436afcfc4d593419bc8cfa9690cc",
+ "endpoint": "current_player_profile",
+ "parser_rows": {
+  "contract_status": "unknown",
+  "contract_until": null,
+  "current_club_id": "6889",
+  "current_club_name": "César Vallejo",
+  "player_id": "1558069"
+ },
+ "url": "https://www.transfermarkt.com/guillermo-espinel/profil/spieler/1558069",
+ "validator_problem": null
+}

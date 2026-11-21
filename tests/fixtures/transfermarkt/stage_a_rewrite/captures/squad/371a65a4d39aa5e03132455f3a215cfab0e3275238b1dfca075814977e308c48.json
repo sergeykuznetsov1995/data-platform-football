@@ -1,0 +1,26 @@
+{
+ "attempt": 1000003,
+ "blob_key": "blobs/sha256/f4/f4df12f6d98f00c02181d2c89aabe3e5a22b338c59fb655523a8bd3bc759c427.body.gz",
+ "capture_id": "371a65a4d39aa5e03132455f3a215cfab0e3275238b1dfca075814977e308c48",
+ "compression": "gzip",
+ "content_hash": "f4df12f6d98f00c02181d2c89aabe3e5a22b338c59fb655523a8bd3bc759c427",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-d6f43fe9d6f2a596b147061e943e2c1c",
+ "decoded_bytes": 156729,
+ "endpoint": "squad",
+ "fetched_at": "2026-11-20T18:57:36.535963+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 20 Nov 2026 18:57:36 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/f4/f4df12f6d98f00c02181d2c89aabe3e5a22b338c59fb655523a8bd3bc759c427.body.gz",
+ "scope_id": "tm-40283fbb950ec674aae7784e",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 28568,
+ "url": "https://www.transfermarkt.com/ironi-kiryat-shmona/kader/verein/6028/saison_id/2026/plus/1"
+}

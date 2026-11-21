@@ -1,0 +1,28 @@
+{
+ "attempt": 1000058,
+ "blob_key": "blobs/sha256/10/109f3becf8ebf34ed67dd507d2400d611d6a462faa384ae2afd1d26cb1c2fc36.body.gz",
+ "capture_id": "ab6c7d920528509bcb2f105b481181cf5f0e3ae825359c2e59f039057e00b81f",
+ "compression": "gzip",
+ "content_hash": "109f3becf8ebf34ed67dd507d2400d611d6a462faa384ae2afd1d26cb1c2fc36",
+ "content_type": "application/json",
+ "cycle_id": "scheduled__2026-11-21T05:00:00+00:00",
+ "decoded_bytes": 4514,
+ "endpoint": "competition_registry",
+ "fetched_at": "2026-11-21T06:06:58.436052+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "max-age=60, public, s-maxage=300",
+  "content-encoding": "gzip",
+  "content-length": "704",
+  "content-type": "application/json",
+  "date": "Sat, 21 Nov 2026 06:06:58 GMT",
+  "vary": "Accept-Language,Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/10/109f3becf8ebf34ed67dd507d2400d611d6a462faa384ae2afd1d26cb1c2fc36.body.gz",
+ "scope_id": "tm-registry-40e670b1183fd4211755435b",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 694,
+ "url": "https://tmapi.transfermarkt.technology/competition/THA2/regulation"
+}

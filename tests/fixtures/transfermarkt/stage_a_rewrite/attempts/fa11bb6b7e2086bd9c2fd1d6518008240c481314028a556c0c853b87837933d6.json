@@ -1,0 +1,21 @@
+{
+ "attempt": 1000015,
+ "capture_id": "e655867724e9d5e0473d1f65d0fe7d445b0cc13c81b5ec9c0d077b7401858cd2",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/e6/e655867724e9d5e0473d1f65d0fe7d445b0cc13c81b5ec9c0d077b7401858cd2.json",
+ "cycle_id": "tm-current-2180a9ae41029c520a6501df21788ab7",
+ "endpoint": "squad",
+ "envelope_id": "fa11bb6b7e2086bd9c2fd1d6518008240c481314028a556c0c853b87837933d6",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/fa/fa11bb6b7e2086bd9c2fd1d6518008240c481314028a556c0c853b87837933d6.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-05T08:52:51.076042+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "ad3b47cf4fc8785559e3d144603827459ad968f569e8eeca5b5519bc81a336b5",
+ "record_hash": "fa11bb6b7e2086bd9c2fd1d6518008240c481314028a556c0c853b87837933d6",
+ "scope_id": "tm-e177c85af32cf6c6f7bca2a0",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/cd-tondela/kader/verein/7179/saison_id/2026/plus/1"
+}

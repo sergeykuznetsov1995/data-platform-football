@@ -1,0 +1,26 @@
+{
+ "attempt": 1000002,
+ "blob_key": "blobs/sha256/fb/fb9b301483a28c256a7ac43f22725593fd775c47c090f4437374dd32c81b46ea.body.gz",
+ "capture_id": "43fb574d7c14bd70b7a519f1560597c78e1c7b0fdf1e2bd9180887eacfa56e72",
+ "compression": "gzip",
+ "content_hash": "fb9b301483a28c256a7ac43f22725593fd775c47c090f4437374dd32c81b46ea",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-3c8666c98879e1dd64c74b3c",
+ "decoded_bytes": 105776,
+ "endpoint": "teilnehmer",
+ "fetched_at": "2026-10-03T08:52:45.713752+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 03 Oct 2026 08:52:45 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/fb/fb9b301483a28c256a7ac43f22725593fd775c47c090f4437374dd32c81b46ea.body.gz",
+ "scope_id": "tm-dedcc488bd74b8eac8e3447c",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 22545,
+ "url": "https://www.transfermarkt.com/asian-cup-qualifikation/teilnehmer/pokalwettbewerb/ACQU/saison_id/2024"
+}

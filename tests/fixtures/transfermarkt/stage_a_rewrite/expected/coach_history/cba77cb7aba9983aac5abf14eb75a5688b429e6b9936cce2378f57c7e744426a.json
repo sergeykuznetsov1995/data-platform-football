@@ -1,0 +1,71 @@
+{
+ "capture_id": "cba77cb7aba9983aac5abf14eb75a5688b429e6b9936cce2378f57c7e744426a",
+ "endpoint": "coach_history",
+ "parser_rows": [
+  {
+   "appointed_date": "2026-05-05",
+   "club_id": "72477",
+   "coach_id": "96260",
+   "coach_slug": "rodrigo-fonseca",
+   "left_date": null,
+   "name": "Rodrigo Fonseca",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2026-01-12",
+   "club_id": "72477",
+   "coach_id": "142511",
+   "coach_slug": "felipe-romario",
+   "left_date": "2026-05-29",
+   "name": "Felipe Romário",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-07-05",
+   "club_id": "72477",
+   "coach_id": "90906",
+   "coach_slug": "tiago-batizoco",
+   "left_date": "2024-08-05",
+   "name": "Tiago Batizoco",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-04-26",
+   "club_id": "72477",
+   "coach_id": "128823",
+   "coach_slug": "paulo-eduardo-pereira",
+   "left_date": "2026-05-05",
+   "name": "Paulo Eduardo Pereira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-02-14",
+   "club_id": "72477",
+   "coach_id": "126137",
+   "coach_slug": "marcio-parreiras",
+   "left_date": "2024-03-28",
+   "name": "Márcio Parreiras",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2023-02-24",
+   "club_id": "72477",
+   "coach_id": "126137",
+   "coach_slug": "marcio-parreiras",
+   "left_date": "2023-05-22",
+   "name": "Márcio Parreiras",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2020-07-15",
+   "club_id": "72477",
+   "coach_id": "90906",
+   "coach_slug": "tiago-batizoco",
+   "left_date": "2022-09-07",
+   "name": "Tiago Batizoco",
+   "role": "Manager"
+  }
+ ],
+ "url": "https://www.transfermarkt.com/porto-velho-esporte-clube-ro-/mitarbeiterhistorie/verein/72477/plus/1",
+ "validator_problem": null
+}

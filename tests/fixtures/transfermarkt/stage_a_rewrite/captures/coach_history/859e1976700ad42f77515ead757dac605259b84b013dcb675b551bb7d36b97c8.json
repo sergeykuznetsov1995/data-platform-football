@@ -1,0 +1,26 @@
+{
+ "attempt": 1000031,
+ "blob_key": "blobs/sha256/b5/b58f2bafec29dcbb2ad0ee5ea2b29080db13030215e548a86cfc205aa1c3aea4.body.gz",
+ "capture_id": "859e1976700ad42f77515ead757dac605259b84b013dcb675b551bb7d36b97c8",
+ "compression": "gzip",
+ "content_hash": "b58f2bafec29dcbb2ad0ee5ea2b29080db13030215e548a86cfc205aa1c3aea4",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-932c5ce1d411b9b1b83062b2",
+ "decoded_bytes": 207486,
+ "endpoint": "coach_history",
+ "fetched_at": "2026-10-09T09:48:26.156170+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 09 Oct 2026 09:48:25 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/b5/b58f2bafec29dcbb2ad0ee5ea2b29080db13030215e548a86cfc205aa1c3aea4.body.gz",
+ "scope_id": "tm-2e88e60a827db8396df72cdc",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 32394,
+ "url": "https://www.transfermarkt.com/fc-santos/mitarbeiterhistorie/verein/221/plus/1"
+}

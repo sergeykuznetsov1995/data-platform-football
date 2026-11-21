@@ -1,0 +1,21 @@
+{
+ "attempt": 1000021,
+ "capture_id": "0f89d0846bdda7e1c8fa3d25d553bc94dc67c9d08b6b46ea5f37565abf2187dd",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/0f/0f89d0846bdda7e1c8fa3d25d553bc94dc67c9d08b6b46ea5f37565abf2187dd.json",
+ "cycle_id": "scheduled__2026-11-05T23:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "732e6ff3da90e756e06f6f5ea5a73d5b99b58e144203d6385fdd8d997499e64a",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/73/732e6ff3da90e756e06f6f5ea5a73d5b99b58e144203d6385fdd8d997499e64a.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-06T03:05:02.281956+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "85d2eaecd6968f254f53171d80c55607ed034465230e7eff116ca0a9a6a7c7fa",
+ "record_hash": "732e6ff3da90e756e06f6f5ea5a73d5b99b58e144203d6385fdd8d997499e64a",
+ "scope_id": "tm-registry-5f4f478097b0d243daf9796e",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://tmapi.transfermarkt.technology/competition/BPO4/regulation"
+}

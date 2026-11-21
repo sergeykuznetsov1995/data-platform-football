@@ -1,0 +1,30 @@
+{
+ "capture_id": "c9ddf05897244c657a517c80eeba4ed4cf8e29b260497e00435eb8f2d5a5f4cf",
+ "endpoint": "transfer_events",
+ "parser_rows": [
+  {
+   "event_season": "1819",
+   "fee_eur": null,
+   "fee_text": "-",
+   "from_club_id": "88855",
+   "from_club_name": "Meux B",
+   "from_country_flag": "https://img.a.transfermarkt.technology/flagge/verysmall/19.png?lm=1791356387",
+   "from_country_id": "19",
+   "from_is_special": false,
+   "is_loan_end": false,
+   "is_upcoming": false,
+   "market_value_eur": null,
+   "player_id": "688749",
+   "season": "18/19",
+   "to_club_id": "11939",
+   "to_club_name": "RFC Meux",
+   "to_country_flag": "https://img.a.transfermarkt.technology/flagge/verysmall/19.png?lm=1791356387",
+   "to_country_id": "19",
+   "to_is_special": false,
+   "transfer_date": "2018-07-01",
+   "transfer_id": "c0413fcbd1eaa8c2fa2c9525303f357199ec7db018e6e8a5eb261fae25649e6d"
+  }
+ ],
+ "url": "https://www.transfermarkt.com/ceapi/transferHistory/list/688749",
+ "validator_problem": null
+}

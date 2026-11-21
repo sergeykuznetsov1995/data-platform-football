@@ -1,0 +1,26 @@
+{
+ "attempt": 1000012,
+ "blob_key": "blobs/sha256/e5/e55d67f4ab6acc32b82fde48da45cef318a4f4e9add02a7c2400000a71788d03.body.gz",
+ "capture_id": "420d92c56f213257e97ed5582cb9c3612e79da853eb1374420a86715321de4c1",
+ "compression": "gzip",
+ "content_hash": "e55d67f4ab6acc32b82fde48da45cef318a4f4e9add02a7c2400000a71788d03",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-e04c36f9b400699fd275b6ee5b66368e",
+ "decoded_bytes": 192476,
+ "endpoint": "squad",
+ "fetched_at": "2026-11-20T22:41:40.776890+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 20 Nov 2026 22:41:40 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/e5/e55d67f4ab6acc32b82fde48da45cef318a4f4e9add02a7c2400000a71788d03.body.gz",
+ "scope_id": "tm-c4b38a39ecc5f7a5bffd0dff",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 32210,
+ "url": "https://www.transfermarkt.com/japan/kader/verein/3435/saison_id/2022/plus/1"
+}

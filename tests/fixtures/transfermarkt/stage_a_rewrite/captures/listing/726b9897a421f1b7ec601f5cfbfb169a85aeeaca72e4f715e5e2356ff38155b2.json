@@ -1,0 +1,26 @@
+{
+ "attempt": 1000001,
+ "blob_key": "blobs/sha256/a2/a23021690e7d5377fdb6d76d6918d9fcc99f62a6824163bbc38af94148ac82d5.body.gz",
+ "capture_id": "726b9897a421f1b7ec601f5cfbfb169a85aeeaca72e4f715e5e2356ff38155b2",
+ "compression": "gzip",
+ "content_hash": "a23021690e7d5377fdb6d76d6918d9fcc99f62a6824163bbc38af94148ac82d5",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-9e14d731c93fd26afdb67d4c08cdcd4a",
+ "decoded_bytes": 179502,
+ "endpoint": "listing",
+ "fetched_at": "2026-11-20T15:37:58.263076+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 20 Nov 2026 15:37:58 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/a2/a23021690e7d5377fdb6d76d6918d9fcc99f62a6824163bbc38af94148ac82d5.body.gz",
+ "scope_id": "tm-ef3ab50d6f67e800dd2760fa",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 31398,
+ "url": "https://www.transfermarkt.com/liga-panamena-de-futbol-clausura/startseite/wettbewerb/PN1C/plus/?saison_id=2025"
+}
