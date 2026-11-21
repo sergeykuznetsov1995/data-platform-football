@@ -121,8 +121,9 @@ transfermarkt_mounts_in() {  # transfermarkt_mounts_in <контейнер> <к�
 
 # Read the release contract without importing Airflow or executing release code.
 # Legacy releases expose four DAGs; the factory adds an explicitly declared manual DAG.
+# Achievements are included only when their paused-at-creation DAG contract exists.
 transfermarkt_release_dags() {
-  python3 -I - "$1/dags/dag_discover_transfermarkt_registry.py" <<'PY'
+  python3 -I - "$1/dags/dag_discover_transfermarkt_registry.py" "$1/dags/dag_ingest_transfermarkt_achievements.py" <<'PY'
 import ast
 from pathlib import Path
 import sys
@@ -144,6 +145,20 @@ try:
         assert len(manual.args) == 1 and isinstance(manual.args[0], ast.Name) and manual.args[0].id == 'MANUAL_DAG_ID'
         assert any(k.arg == 'manual' and isinstance(k.value, ast.Constant) and k.value.value is True for k in manual.keywords)
         dags.append(marker.value)
+    achievement_path = Path(sys.argv[2])
+    if achievement_path.exists():
+        achievement_tree = ast.parse(achievement_path.read_text())
+        contexts = [item.context_expr for node in achievement_tree.body if isinstance(node, ast.With)
+                    for item in node.items]
+        calls = [node for node in contexts if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == 'DAG']
+        assert len(calls) == 1
+        keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+        assert isinstance(keywords.get('dag_id'), ast.Constant)
+        assert keywords['dag_id'].value == 'dag_ingest_transfermarkt_achievements'
+        assert isinstance(keywords.get('is_paused_upon_creation'), ast.Constant)
+        assert keywords['is_paused_upon_creation'].value is True
+        dags.append(keywords['dag_id'].value)
     print(' '.join(dags))
 except (OSError, UnicodeError, SyntaxError, AssertionError):
     print('invalid Transfermarkt release DAG contract', file=sys.stderr)

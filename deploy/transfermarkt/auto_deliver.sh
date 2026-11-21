@@ -12,8 +12,8 @@
 #     Airflow 2 не двигает прогоны паузного DAG). Паузы ДО дренажа — в $DRAIN; дренаж
 #     многотиковый (заморозка, самоустановка), его прерывание возвращает паузы из файла;
 #   * откат — deploy.sh СТАРОГО дерева (он принимает любое дерево контура) плюс возврат
-#     пауз четырёх DAG и слотов пулов из снимка;
-#   * приёмка — 4 DAG + 1 шлюз, привязана к факту пересоздания scheduler'а (.Created);
+#     пауз DAG из release contract и слотов пулов из снимка;
+#   * приёмка — DAG из release contract + 1 шлюз, привязана к факту пересоздания scheduler'а (.Created);
 #   * режим --drill-rollback: копия принятого дерева с намеренно сломанным
 #     dags/dag_ingest_transfermarkt.py (только в копии, не в git) проходит штатную
 #     доставку, приёмка падает, откат обязан подтвердиться — «откат проверен».
@@ -75,7 +75,7 @@ DRAIN=$STATE/transfermarkt-drain.env           # дренаж полосы ид�
 # Запись попытки: transfermarkt-window-<UTC-дата>T<ЧЧММ>.env (старые — <дата>); WIN — открытая.
 WIN=""
 POOLS="transfermarkt_control transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
-CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_discover_transfermarkt_registry_manual dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
+CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_discover_transfermarkt_registry_manual dag_backfill_transfermarkt dag_transform_transfermarkt_silver dag_ingest_transfermarkt_achievements"
 # Полоса — непрерывный сбор порциями (TransfermarktCurrentTimetable): у неё next_dagrun ≈ now,
 # дедлайну она не годится — её закрывает пауза дренажа.
 LANE_DAGS="dag_ingest_transfermarkt dag_backfill_transfermarkt"
@@ -239,7 +239,7 @@ pool_desc(){
 }
 paused_key(){ printf 'PAUSED_%s' "$1"; }
 
-# Паузы четырёх DAG возвращаются к снимку. Слоты OLD восстанавливаются точно;
+# Паузы DAG из release contract возвращаются к снимку. Слоты OLD восстанавливаются точно;
 # после успешного deploy NEW сохраняет свои TM-пулы по контракту streams.
 RESTORE_PENDING=""
 RESTORE_NOTE=""
@@ -400,13 +400,19 @@ flag_clear(){ is_plain "$(drain_flag)" && { rm -f "$(drain_flag)" 2>/dev/null ||
 # считается внешним: его прогон не дренируем, а ждём, его ближайший запуск входит в дедлайн.
 # Выставляет LANE, OUTER_DAGS_SQL, NEXT_RUN_DAGS, NEXT_RUN_COUNT; 1 — метабаза не ответила.
 lane_refresh(){
-  local got d sql=""
+  local got d live_dags sql=""
   for d in $LANE_DAGS; do sql="$sql,'$d'"; done
   got=$(metadb "SELECT 'L' || coalesce(string_agg(dag_id, ',' ORDER BY dag_id), '') FROM dag WHERE dag_id IN (${sql#,}) AND timetable_description LIKE 'Continuous Transfermarkt current%';")
   case "$got" in L*) ;; *) return 1 ;; esac
   LANE=${got#L}; LANE=${LANE//,/ }
-  OUTER_DAGS_SQL="'dag_discover_transfermarkt_registry','dag_discover_transfermarkt_registry_manual','dag_transform_transfermarkt_silver'"
+  OUTER_DAGS_SQL="'dag_discover_transfermarkt_registry','dag_discover_transfermarkt_registry_manual','dag_transform_transfermarkt_silver','dag_ingest_transfermarkt_achievements'"
   NEXT_RUN_DAGS="'dag_discover_transfermarkt_registry'"; NEXT_RUN_COUNT=1
+  live_dags=$(transfermarkt_release_dags "$TRANSFERMARKT_RELEASE_ROOT") || return 1
+  case " $live_dags " in
+    *" dag_ingest_transfermarkt_achievements "*)
+      NEXT_RUN_DAGS="$NEXT_RUN_DAGS,'dag_ingest_transfermarkt_achievements'"
+      NEXT_RUN_COUNT=$(( NEXT_RUN_COUNT + 1 )) ;;
+  esac
   for d in $LANE_DAGS; do
     case " $LANE " in *" $d "*) continue ;; esac
     OUTER_DAGS_SQL="$OUTER_DAGS_SQL,'$d'"; NEXT_RUN_DAGS="$NEXT_RUN_DAGS,'$d'"

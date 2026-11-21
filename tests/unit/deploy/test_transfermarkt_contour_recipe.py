@@ -192,6 +192,43 @@ def test_env_sh_accepts_only_contour_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_release_contract_includes_paused_achievements() -> None:
+    result = subprocess.run(
+        ["bash", "-c", f'. "{DEPLOY / "env.sh"}"; transfermarkt_release_dags "$1"', "x", str(ROOT)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "dag_ingest_transfermarkt",
+        "dag_discover_transfermarkt_registry",
+        "dag_backfill_transfermarkt",
+        "dag_transform_transfermarkt_silver",
+        "dag_discover_transfermarkt_registry_manual",
+        "dag_ingest_transfermarkt_achievements",
+    ]
+
+
+@pytest.mark.unit
+def test_deploy_guards_and_pauses_new_achievements_dag() -> None:
+    text = _code_lines(DEPLOY / "deploy.sh")
+    assert 'GUARD_DAGS="$INGEST $DISCOVER $BACKFILL $SILVER $MANUAL $ACHIEVEMENTS"' in text
+    assert '["$ACHIEVEMENTS"]=t' in text
+
+
+@pytest.mark.unit
+def test_release_contract_keeps_legacy_release_compatible(tmp_path: Path) -> None:
+    (tmp_path / "dags").mkdir()
+    shutil.copy(ROOT / "dags" / "dag_discover_transfermarkt_registry.py", tmp_path / "dags")
+    result = subprocess.run(
+        ["bash", "-c", f'. "{DEPLOY / "env.sh"}"; transfermarkt_release_dags "$1"', "x", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "dag_discover_transfermarkt_registry_manual" in result.stdout.split()
+    assert "dag_ingest_transfermarkt_achievements" not in result.stdout.split()
+
+
+@pytest.mark.unit
 def test_deploy_script_order_and_pool_handling() -> None:
     text = _code_lines(DEPLOY / "deploy.sh")
     order = [
@@ -220,6 +257,10 @@ def test_auto_deliver_window_and_contract() -> None:
     # #2039: часового окна нет — дедлайн по ближайшему прогону registry.
     assert "WINDOW_FROM" not in text and "set_window" not in text
     assert "NEXT_RUN_DAGS=\"'dag_discover_transfermarkt_registry'\"" in text
+    assert 'CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_discover_transfermarkt_registry_manual dag_backfill_transfermarkt dag_transform_transfermarkt_silver dag_ingest_transfermarkt_achievements"' in text
+    assert "'dag_transform_transfermarkt_silver','dag_ingest_transfermarkt_achievements'" in text
+    assert 'live_dags=$(transfermarkt_release_dags "$TRANSFERMARKT_RELEASE_ROOT") || return 1' in text
+    assert 'NEXT_RUN_DAGS="$NEXT_RUN_DAGS,\'dag_ingest_transfermarkt_achievements\'"' in text
     assert "FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}" in text
     assert "--drill-rollback" in text
     assert '"$old/deploy/transfermarkt/deploy.sh" "$old"' in text
