@@ -244,3 +244,38 @@ def test_cli_input_requires_snapshot_and_watermark_metadata(tmp_path):
     pairs, metadata = replay._read_pairs(path)
     assert len(pairs) == 1
     assert metadata["common_watermark"] == "2026-11-21T00:00:00Z"
+
+
+def test_driver_error_writes_fail_closed_report(tmp_path, monkeypatch):
+    from scripts import replay_transfermarkt_native_v2 as replay
+
+    spec = {
+        "metadata": {
+            "legacy_snapshot_ids": {"players": 10},
+            "native_snapshot_ids": {"memberships": 11},
+            "common_watermark": "2026-11-21T00:00:00Z",
+        },
+        "queries": [{
+            "name": "players",
+            "legacy_sql": "SELECT 1 AS id",
+            "native_sql": "SELECT 1 AS id",
+            "key_columns": ["id"],
+        }],
+    }
+    source = tmp_path / "input.json"
+    output = tmp_path / "report.json"
+    source.write_text(json.dumps(spec), encoding="utf-8")
+    monkeypatch.setattr(
+        replay.control, "connect",
+        lambda: (_ for _ in ()).throw(RuntimeError("sensitive driver detail")),
+    )
+    assert replay.main([
+        "--input", str(source), "--output", str(output),
+        "--code-sha", "test-revision", "--candidate-slot", "a",
+        "--expected-reader-revision", "0",
+    ]) == 1
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["passed"] is False
+    assert report["reason"] == "replay driver failure"
+    assert report["queries"] == []
+    assert "sensitive driver detail" not in output.read_text(encoding="utf-8")

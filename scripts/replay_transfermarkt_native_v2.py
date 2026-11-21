@@ -51,16 +51,18 @@ def main(argv: list[str] | None = None) -> int:
         print("Invalid replay input.", file=sys.stderr)
         return 1
 
+    report = {
+        "code_sha": args.code_sha,
+        "candidate_slot": args.candidate_slot,
+        "expected_reader_revision": args.expected_reader_revision,
+        "input_metadata": input_metadata,
+        "passed": False,
+        "queries": [],
+    }
     try:
         with closing(control.connect()) as conn, closing(conn.cursor()) as cur:
             state = control.read_reader_state(cur)
-            report = {
-                "code_sha": args.code_sha,
-                "candidate_slot": args.candidate_slot,
-                "expected_reader_revision": args.expected_reader_revision,
-                "reader_state": state.to_dict(),
-                "input_metadata": input_metadata,
-            }
+            report["reader_state"] = state.to_dict()
             if (
                 state.revision == args.expected_reader_revision
                 and state.active_version == "legacy"
@@ -68,14 +70,17 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 report.update(compare_many(cur, pairs))
             else:
-                report.update(passed=False, reason="pre-cutover reader state mismatch", queries=[])
+                report["reason"] = "pre-cutover reader state mismatch"
+    except Exception:
+        # Driver errors can contain SQL text and connection details.
+        report["reason"] = "replay driver failure"
+    try:
         args.output.write_text(
             json.dumps(report, default=str, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-    except Exception:
-        # Driver errors can contain SQL text and connection details.
-        print("Unable to complete replay or write its report.", file=sys.stderr)
+    except OSError:
+        print("Unable to write replay report.", file=sys.stderr)
         return 1
     return 0 if report["passed"] else 1
 
