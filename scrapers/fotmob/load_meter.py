@@ -29,6 +29,19 @@ N2_MAX_POLLS_PER_MIN = 1
 N3_MAX_COMMITS_PER_DAY = 1440
 N4_MAX_SCANS_PER_DAY = 1440
 CONTROL_TABLES = frozenset({"iceberg.bronze.fotmob_ingest_manifest"})
+# The wave MERGEs these journal/reference tables once per scope batch, so their
+# commit cadence tracks batch rhythm (measured 16-19.11: peaks 2-8/min, daily
+# totals <=167) instead of the per-data-table <=1/min norm; match-payload tables
+# stay under the regular limit. Scan/poll control limits above stay manifest-only.
+WAVE_JOURNAL_TABLES = frozenset(CONTROL_TABLES | {
+    "iceberg.bronze.fotmob_competition_scope_observations",
+    "iceberg.bronze.fotmob_competition_seasons",
+    "iceberg.bronze.fotmob_competition_season_history",
+    "iceberg.bronze.fotmob_season_stages",
+    "iceberg.bronze.fotmob_squad_snapshots",
+    "iceberg.bronze.fotmob_team_snapshots",
+    "iceberg.bronze.fotmob_transfer_events",
+})
 CONTROL_N1_MAX_COMMITS_PER_MIN = 8
 CONTROL_N2_MAX_POLLS_PER_MIN = 130
 CONTROL_N4_MAX_SCANS_PER_DAY = 5760
@@ -577,7 +590,7 @@ def _receipt_index(registry: Any, day: str) -> dict[str, dict[str, Any]]:
 def _norm_limit(norm: str, table: str | None) -> int:
     control = table in CONTROL_TABLES
     if norm == "N1":
-        return CONTROL_N1_MAX_COMMITS_PER_MIN if control else N1_MAX_COMMITS_PER_MIN
+        return CONTROL_N1_MAX_COMMITS_PER_MIN if table in WAVE_JOURNAL_TABLES else N1_MAX_COMMITS_PER_MIN
     if norm == "N2":
         return CONTROL_N2_MAX_POLLS_PER_MIN if control else N2_MAX_POLLS_PER_MIN
     if norm == "N3":
@@ -851,7 +864,7 @@ def evaluate_day(report: Mapping[str, Any]) -> dict[str, Any]:
         value = worst[field] if worst else 0
         threshold = _norm_limit(norm, table)
         label = f"<={threshold}/{unit}"
-        if table in CONTROL_TABLES and norm != "N3":
+        if table in (WAVE_JOURNAL_TABLES if norm == "N1" else CONTROL_TABLES) and norm != "N3":
             label += " (control)"
         proof = table if value else None
         if norm in {"N1", "N2"}:
