@@ -1,0 +1,21 @@
+{
+ "attempt": 1001196,
+ "capture_id": "0707228ece9dbf71a1ee49e0e916c996e2fddd3a69df3a7942c4fb5fb39313b4",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/07/0707228ece9dbf71a1ee49e0e916c996e2fddd3a69df3a7942c4fb5fb39313b4.json",
+ "cycle_id": "scheduled__2026-10-07T18:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "54908bcb5c5867fcd765551574af1f4dce4800cfc7760c1929ddca36068be5e9",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/54/54908bcb5c5867fcd765551574af1f4dce4800cfc7760c1929ddca36068be5e9.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-10-08T20:00:24.548483+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "e0794d5f93c24faed09090ec4569dcd7ac7efddf834de9077f3e64751a68244a",
+ "record_hash": "54908bcb5c5867fcd765551574af1f4dce4800cfc7760c1929ddca36068be5e9",
+ "scope_id": "tm-registry-8fa6c190af75355381b8a35a",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/primera-division-apertura/startseite/wettbewerb/SL1A"
+}

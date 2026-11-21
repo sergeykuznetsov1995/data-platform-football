@@ -738,6 +738,7 @@ class TransfermarktHttpClient:
         time_fn: Callable[[], float] = time.time,
         monotonic_fn: Callable[[], float] = time.monotonic,
         request_deadline_monotonic: Optional[float] = None,
+        attempt_ordinal_base: int = 0,
     ) -> None:
         if lease_provider is not None and (proxy_manager is not None or proxy):
             raise ValueError(
@@ -760,6 +761,9 @@ class TransfermarktHttpClient:
             )
         self._traffic_ledger = traffic_ledger
         self._lease_metadata = dict(lease_metadata or {})
+        if type(attempt_ordinal_base) is not int or attempt_ordinal_base < 0:
+            raise ValueError("attempt_ordinal_base must be a non-negative int")
+        self._attempt_ordinal_base = attempt_ordinal_base
         self._lease_ttl_seconds = max(1, int(lease_ttl_seconds))
         self._lease: Optional[ProxyLease] = None
         self._lease_provider_bytes = 0
@@ -1412,12 +1416,10 @@ class TransfermarktHttpClient:
         return body.decode("utf-8", errors="replace")
 
     def _capture_attempt_ordinal(self) -> int:
-        raw_try = os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "0").strip()
-        try:
-            task_try = max(0, int(raw_try))
-        except ValueError:
-            task_try = 0
-        return task_try * 1_000_000 + self._attempts + 1
+        # #2403: the Airflow try number is supplied explicitly by the portion
+        # runner instead of AIRFLOW_CTX_TRY_NUMBER; the base keeps ordinal
+        # spaces of separate task tries disjoint.
+        return self._attempt_ordinal_base + self._attempts + 1
 
     def _raw_attempt_identity(
         self,
@@ -1425,11 +1427,12 @@ class TransfermarktHttpClient:
         label: str,
         context: Mapping[str, Any],
     ) -> tuple[str, str]:
+        # #2403: portion identity is explicit context, never the environment.
+        # The donor runners already pass cycle_id in context and run_id in
+        # lease_metadata, so behaviour is unchanged for them.
         cycle_id = str(
-            os.environ.get("TM_CHILD_CYCLE_ID")
-            or context.get("cycle_id")
+            context.get("cycle_id")
             or self._lease_metadata.get("run_id")
-            or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
             or "manual"
         )
         scope_id = str(
@@ -1865,18 +1868,12 @@ class TransfermarktHttpClient:
                         envelope = self._raw_store.load_attempt_envelope(envelope_id)
                         loaded_envelopes.append(envelope)
                     if not loaded_envelopes:
-                        # Read-compatible migration for successful v3
-                        # checkpoints: publish evidence from the already
-                        # verified capture, with no paid source request.
-                        if checkpoint_version != 3:
-                            raise RawStoreError(
-                                "only a v3 checkpoint may synthesize raw attempt evidence"
-                            )
-                        envelope = self._raw_store.store_response_envelope(record)
-                        envelope = self._raw_store.load_attempt_envelope(
-                            envelope.envelope_id
+                        # #2403: v3 checkpoints retired with the demolished
+                        # warehouse; a v4 outcome always carries its chain, so
+                        # an empty chain is corruption, not a migration.
+                        raise RawStoreError(
+                            "cached outcome carries no raw attempt evidence"
                         )
-                        loaded_envelopes.append(envelope)
                     if checkpoint_version == 4:
                         if len(loaded_envelopes) != outcome.attempts:
                             raise RawStoreError(
@@ -1896,22 +1893,25 @@ class TransfermarktHttpClient:
                                     "cached raw attempt chain identity/order drift"
                                 )
                             previous_ordinal = envelope.attempt
-                    expected_child_cycle = os.environ.get(
-                        "TM_CHILD_CYCLE_ID", ""
-                    ).strip()
-                    prior_cycle = bool(expected_child_cycle) and any(
+                    expected_child_cycle, expected_scope = (
+                        self._raw_attempt_identity(
+                            label=label, context=context or {},
+                        )
+                    )
+                    # DeepSeek round-1 review: identity is (cycle, scope). A
+                    # run-shared lease_metadata run_id must not let one
+                    # scope's capture serve as another scope's same-cycle
+                    # evidence; the donor env encoded a per-scope child id.
+                    prior_cycle = any(
                         envelope.cycle_id != expected_child_cycle
+                        or envelope.scope_id != expected_scope
                         for envelope in loaded_envelopes
                     )
                     if resume_squad:
-                        _, expected_scope = self._raw_attempt_identity(
-                            label=label, context=context or {},
-                        )
                         fetched_at = datetime.fromisoformat(record.fetched_at.replace('Z', '+00:00'))
                         age = self._time() - fetched_at.timestamp()
                         if (
-                            not expected_child_cycle
-                            or expected_scope == 'global'
+                            expected_scope == 'global'
                             or fetched_at.utcoffset() is None
                             or not 0 <= age < CURRENT_SQUAD_CACHE_TTL_SECONDS
                             or record.scope_id != expected_scope

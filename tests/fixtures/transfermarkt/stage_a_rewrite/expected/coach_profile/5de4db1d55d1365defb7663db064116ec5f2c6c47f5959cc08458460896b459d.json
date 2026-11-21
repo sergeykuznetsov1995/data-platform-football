@@ -1,0 +1,12 @@
+{
+ "capture_id": "5de4db1d55d1365defb7663db064116ec5f2c6c47f5959cc08458460896b459d",
+ "endpoint": "coach_profile",
+ "parser_rows": {
+  "coach_id": "116235",
+  "dob": "1975-03-21",
+  "name": "Flávio Tanajura",
+  "nationality": "Brazil"
+ },
+ "url": "https://www.transfermarkt.com/flavio-tanajura/profil/trainer/116235",
+ "validator_problem": null
+}

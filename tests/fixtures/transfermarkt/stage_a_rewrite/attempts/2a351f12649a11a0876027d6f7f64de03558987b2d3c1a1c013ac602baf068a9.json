@@ -1,0 +1,21 @@
+{
+ "attempt": 1000012,
+ "capture_id": "bb28def6fd6bf736d579716fc39fea2e2662f0bc627ec3fd64a263808aaf1cc2",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/bb/bb28def6fd6bf736d579716fc39fea2e2662f0bc627ec3fd64a263808aaf1cc2.json",
+ "cycle_id": "tm-child-d1223f6fe8942967b297546c",
+ "endpoint": "coach_history",
+ "envelope_id": "2a351f12649a11a0876027d6f7f64de03558987b2d3c1a1c013ac602baf068a9",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/2a/2a351f12649a11a0876027d6f7f64de03558987b2d3c1a1c013ac602baf068a9.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-10-03T07:02:16.295759+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "44321c36e4801e7778cecceb2dfea02561656583597029b442161542efeaa76c",
+ "record_hash": "2a351f12649a11a0876027d6f7f64de03558987b2d3c1a1c013ac602baf068a9",
+ "scope_id": "tm-4e98b77f9f95fd6a8828367a",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/medeama-sc/mitarbeiterhistorie/verein/31855/plus/1"
+}

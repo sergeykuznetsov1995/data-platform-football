@@ -1,0 +1,21 @@
+{
+ "attempt": 1000132,
+ "capture_id": "41b4fd4e59a53c3f08408295a4882cf3f23b387589d753b3a15b319d4adef30f",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/41/41b4fd4e59a53c3f08408295a4882cf3f23b387589d753b3a15b319d4adef30f.json",
+ "cycle_id": "tm-child-8b593fcc4e01a1efe815c406",
+ "endpoint": "market_value_points",
+ "envelope_id": "15095d071ba85f555449c283e84559a031520e58d3925697f3e4242fb63ec5ed",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/15/15095d071ba85f555449c283e84559a031520e58d3925697f3e4242fb63ec5ed.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-10-28T10:58:26.349984+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "c4eb357b7925a0735d4cfa1b776e4d25510b544db77a523738f364acf181c63c",
+ "record_hash": "15095d071ba85f555449c283e84559a031520e58d3925697f3e4242fb63ec5ed",
+ "scope_id": "tm-3e88eea9796424772868c67e",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/907917"
+}

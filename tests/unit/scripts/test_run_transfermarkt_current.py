@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -248,7 +249,12 @@ class Offline:
             cache=cache, resume_squad_cache=True, raw_store=self.store, require_raw_store=True,
             request_deadline_monotonic=deadline, monotonic_fn=lambda: self.clock.elapsed,
             time_fn=lambda: self.clock.wall.timestamp(), sleep_fn=lambda seconds: self.clock.advance(seconds),
-            traffic_ledger=SharedTrafficLedger(), lease_metadata={'scope': target.scope_id},
+            traffic_ledger=SharedTrafficLedger(),
+            # Mirror the runner's own client (#2403): lease_metadata carries
+            # the child cycle as run_id now that the transport no longer
+            # reads TM_CHILD_CYCLE_ID from the environment.
+            lease_metadata={'scope': target.scope_id,
+                            'run_id': os.environ.get('TM_CHILD_CYCLE_ID', '')},
         )
 
         class Cursor:
@@ -580,11 +586,17 @@ def test_interrupted_full_roster_resumes_verified_paid_pages_under48h(offline, c
     offline.clock.advance(3600)
     offline.run('continue')
     assert len(offline.writes) == 1
-    assert not any('/verein/10/' in url and '/kader/' in url for _, url in offline.calls)
-    assert offline.writes[0].clubs['10'].raw_fetched_at.isoformat() == original['raw_fetched_at']
-    assert offline.writes[0].clubs['10'].raw_capture_id == original['raw_capture_id']
-    data = next(iter(offline.state()['scopes'].values()))
-    assert any(receipt['cache_sources'] for receipt in data['traffic_receipts'])
+    if cache_version == 3:
+        # #2403: a v3 checkpoint is retired instead of replayed, so the
+        # interrupted club is bought again with a fresh verified chain.
+        assert sum('/verein/10/' in url and '/kader/' in url for _, url in offline.calls) == 1
+        assert offline.writes[0].clubs['10'].raw_capture_id != original['raw_capture_id']
+    else:
+        assert not any('/verein/10/' in url and '/kader/' in url for _, url in offline.calls)
+        assert offline.writes[0].clubs['10'].raw_fetched_at.isoformat() == original['raw_fetched_at']
+        assert offline.writes[0].clubs['10'].raw_capture_id == original['raw_capture_id']
+        data = next(iter(offline.state()['scopes'].values()))
+        assert any(receipt['cache_sources'] for receipt in data['traffic_receipts'])
 
 
 def test_adaptive_career_exact_remainder_survives_next_portion(offline):
@@ -2161,9 +2173,9 @@ def _legacy_retry_intent(offline, *, keep_captured=True):
     original_ids = list(checkpoint['raw_attempt_envelope_ids'])
     statuses = [offline.store.load_attempt_envelope(key).status_code for key in original_ids]
     assert statuses == [503, 200]
-    checkpoint['version'] = 3
-    checkpoint.pop('raw_attempt_envelope_ids')
-    checkpoint.pop('raw_attempt_envelope_id')
+    # #2403: the client no longer resurrects v3 checkpoints, so the verified
+    # v4 chain itself is what resumes across portions; the legacy sidecar
+    # family of proofs cannot be produced anymore.
     resume.pop('capture_proofs', None)
     if not keep_captured:
         resume['captured'] = {}
@@ -2178,12 +2190,9 @@ def _legacy_retry_intent(offline, *, keep_captured=True):
     state = offline.state()
     data = next(iter(state['scopes'].values()))
     checkpoint = data['roster_write_intent']['capture_proofs']['10']
-    assert checkpoint['outcome']['version'] == 3 and checkpoint['outcome']['attempts'] == 2
-    assert not {'raw_attempt_envelope_ids', 'raw_attempt_envelope_id'} & checkpoint['outcome'].keys()
-    assert checkpoint['legacy_proof'] == {
-        'kind': 'legacy_v3_success_response', 'original_attempt_count': 2,
-        'evidenced_attempt_count': 1, 'prefix_unknown': True,
-        'raw_attempt_envelope_ids': [original_ids[-1]]}
+    assert checkpoint['outcome']['version'] == 4 and checkpoint['outcome']['attempts'] == 2
+    assert checkpoint['outcome']['raw_attempt_envelope_ids'] == original_ids
+    assert 'legacy_proof' not in checkpoint
     assert any(row['cache_sources'] for row in data['traffic_receipts'])
     return state
 
@@ -2201,32 +2210,33 @@ def test_authentic_legacy_retry_resume_and_complete_intent_reconcile_without_cou
     assert 'roster_write_intent' not in data and data['snapshot']
     assert offline.calls == []
     source = data['roster_proof']['reconciliation']['source_ages']['10']
-    assert source['proof_kind'] == 'legacy_v3_success_response'
-    assert source['original_attempt_count'] == 2 and source['evidenced_attempt_count'] == 1
-    assert source['prefix_unknown'] is True
+    assert source['proof_kind'] == 'v4_complete_attempt_chain'
+    assert source['original_attempt_count'] == 2 and source['evidenced_attempt_count'] == 2
+    assert source['prefix_unknown'] is False
     assert source['source_age_seconds'] >= 49 * 3600
     assert data['recovery_signal_refresh_required']
 
 
-@pytest.mark.parametrize('mutation', ['foreign_envelope', 'count', 'kind', 'missing', 'v4_count_mismatch'])
+@pytest.mark.parametrize('mutation', ['foreign_checkpoint', 'count', 'stale_status', 'missing', 'v4_count_mismatch'])
 def test_legacy_retry_sidecar_and_modern_chain_corruption_refused(offline, mutation):
     state = _legacy_retry_intent(offline)
     state['turn'] = 1
     data = next(iter(state['scopes'].values()))
     intent = data['roster_write_intent']
     proof = intent['capture_proofs']['10']
-    if mutation == 'foreign_envelope':
-        proof['legacy_proof']['raw_attempt_envelope_ids'] = intent['capture_proofs']['20']['outcome']['raw_attempt_envelope_ids']
+    if mutation == 'foreign_checkpoint':
+        proof['outcome'] = dict(intent['capture_proofs']['20']['outcome'])
     elif mutation == 'count':
-        proof['legacy_proof']['original_attempt_count'] = 1
-    elif mutation == 'kind':
-        proof['legacy_proof']['kind'] = 'complete_v4'
+        proof['outcome']['attempts'] = 1
+    elif mutation == 'stale_status':
+        # A status spelling retired with the demolished warehouse (#2403).
+        proof['outcome']['status'] = 'valid_empty'
     elif mutation == 'missing':
-        proof.pop('legacy_proof')
+        proof['outcome'].pop('raw_attempt_envelope_ids')
+        proof['outcome'].pop('raw_attempt_envelope_id')
     else:
-        proof['outcome']['version'] = 4
-        proof['outcome']['raw_attempt_envelope_ids'] = proof['legacy_proof']['raw_attempt_envelope_ids']
-        proof['outcome']['raw_attempt_envelope_id'] = proof['legacy_proof']['raw_attempt_envelope_ids'][-1]
+        proof['outcome']['raw_attempt_envelope_ids'] = proof['outcome']['raw_attempt_envelope_ids'][-1:]
+        proof['outcome']['raw_attempt_envelope_id'] = proof['outcome']['raw_attempt_envelope_ids'][-1]
     intent['intent_hash'] = current.semantic_signature({key: value for key, value in intent.items() if key != 'intent_hash'})
     offline.write_state(state)
     offline.bad_proof = False

@@ -1,0 +1,161 @@
+{
+ "capture_id": "720ac4c8b7385b2926fbfd33311a3e4f595d370c52c455f05ea9d2d016feeb68",
+ "endpoint": "coach_history",
+ "parser_rows": [
+  {
+   "appointed_date": "2026-02-27",
+   "club_id": "4790",
+   "coach_id": "152027",
+   "coach_slug": "vinicius-la-porta",
+   "left_date": "2026-03-23",
+   "name": "Vinicius La Porta",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-12-19",
+   "club_id": "4790",
+   "coach_id": "100627",
+   "coach_slug": "daniel-franco",
+   "left_date": "2026-02-23",
+   "name": "Daniel Franco",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-01-31",
+   "club_id": "4790",
+   "coach_id": "111788",
+   "coach_slug": "leonardo-roquete",
+   "left_date": "2025-08-11",
+   "name": "Leonardo Roquete",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2025-01-20",
+   "club_id": "4790",
+   "coach_id": "111541",
+   "coach_slug": "mario-henrique",
+   "left_date": "2025-01-30",
+   "name": "Mário Henrique",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-08-30",
+   "club_id": "4790",
+   "coach_id": "40963",
+   "coach_slug": "augusto-cesar",
+   "left_date": "2024-10-07",
+   "name": "Augusto César",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-04-02",
+   "club_id": "4790",
+   "coach_id": "138757",
+   "coach_slug": "marcus-vinicius",
+   "left_date": "2021-04-05",
+   "name": "Marcus Vinicius",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-02-19",
+   "club_id": "4790",
+   "coach_id": "158710",
+   "coach_slug": "bruno-lessa",
+   "left_date": "2021-04-12",
+   "name": "Bruno Lessa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2019-05-24",
+   "club_id": "4790",
+   "coach_id": "38790",
+   "coach_slug": "paulo-pereira",
+   "left_date": "2019-06-10",
+   "name": "Paulo Pereira",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2019-01-23",
+   "club_id": "4790",
+   "coach_id": "90498",
+   "coach_slug": "victor-santana",
+   "left_date": "2019-05-20",
+   "name": "Victor Santana",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2018-02-23",
+   "club_id": "4790",
+   "coach_id": "9601",
+   "coach_slug": "reinaldo-gueldini",
+   "left_date": "2018-03-05",
+   "name": "Reinaldo Gueldini",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2018-01-19",
+   "club_id": "4790",
+   "coach_id": "90498",
+   "coach_slug": "victor-santana",
+   "left_date": "2018-04-09",
+   "name": "Victor Santana",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2017-02-03",
+   "club_id": "4790",
+   "coach_id": "40963",
+   "coach_slug": "augusto-cesar",
+   "left_date": "2017-04-27",
+   "name": "Augusto César",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2016-01-29",
+   "club_id": "4790",
+   "coach_id": "162793",
+   "coach_slug": "elio-martins",
+   "left_date": "2016-04-14",
+   "name": "Elio Martins",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2013-04-15",
+   "club_id": "4790",
+   "coach_id": "101619",
+   "coach_slug": "joao-carlos-cavalo",
+   "left_date": "2013-04-26",
+   "name": "João Carlos Cavalo",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2012-12-04",
+   "club_id": "4790",
+   "coach_id": "22290",
+   "coach_slug": "branco",
+   "left_date": "2013-01-28",
+   "name": "Branco",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2012-07-03",
+   "club_id": "4790",
+   "coach_id": "9601",
+   "coach_slug": "reinaldo-gueldini",
+   "left_date": "2012-08-27",
+   "name": "Reinaldo Gueldini",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "1996-07-01",
+   "club_id": "4790",
+   "coach_id": "100536",
+   "coach_slug": "luiz-carlos-cruz",
+   "left_date": "1998-06-30",
+   "name": "Luiz Carlos Cruz",
+   "role": "Manager"
+  }
+ ],
+ "url": "https://www.transfermarkt.com/sobradinho-esporte-clube-df-/mitarbeiterhistorie/verein/4790/plus/1",
+ "validator_problem": null
+}

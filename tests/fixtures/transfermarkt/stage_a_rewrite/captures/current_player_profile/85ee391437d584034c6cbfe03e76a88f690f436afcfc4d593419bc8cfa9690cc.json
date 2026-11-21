@@ -1,0 +1,28 @@
+{
+ "attempt": 1000045,
+ "blob_key": "blobs/sha256/3b/3b1d0b29de6cc4be9907dda051b0ecadd366a425be3276fd9d4620bf1a010547.body.gz",
+ "capture_id": "85ee391437d584034c6cbfe03e76a88f690f436afcfc4d593419bc8cfa9690cc",
+ "compression": "gzip",
+ "content_hash": "3b1d0b29de6cc4be9907dda051b0ecadd366a425be3276fd9d4620bf1a010547",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-99278fcf11a2baa4bcb0fb3d50302d1c",
+ "decoded_bytes": 111838,
+ "endpoint": "current_player_profile",
+ "fetched_at": "2026-11-21T10:36:09.823220+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "public, max-age=600, must-revalidate, stale-while-revalidate=30, stale-if-error=300",
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 21 Nov 2026 10:36:09 GMT",
+  "last-modified": "Mon, 28 Sep 2026 22:00:00 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/3b/3b1d0b29de6cc4be9907dda051b0ecadd366a425be3276fd9d4620bf1a010547.body.gz",
+ "scope_id": "tm-b3e42b686343299c62cc4730",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 25533,
+ "url": "https://www.transfermarkt.com/guillermo-espinel/profil/spieler/1558069"
+}

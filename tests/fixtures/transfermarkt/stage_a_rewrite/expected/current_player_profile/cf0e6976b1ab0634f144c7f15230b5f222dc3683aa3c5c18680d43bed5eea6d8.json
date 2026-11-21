@@ -1,0 +1,13 @@
+{
+ "capture_id": "cf0e6976b1ab0634f144c7f15230b5f222dc3683aa3c5c18680d43bed5eea6d8",
+ "endpoint": "current_player_profile",
+ "parser_rows": {
+  "contract_status": "unknown",
+  "contract_until": null,
+  "current_club_id": "6889",
+  "current_club_name": "César Vallejo",
+  "player_id": "1370551"
+ },
+ "url": "https://www.transfermarkt.com/diego-ulloa/profil/spieler/1370551",
+ "validator_problem": null
+}

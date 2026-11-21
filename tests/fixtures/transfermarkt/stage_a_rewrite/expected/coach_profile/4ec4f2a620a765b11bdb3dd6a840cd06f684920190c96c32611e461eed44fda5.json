@@ -1,0 +1,12 @@
+{
+ "capture_id": "4ec4f2a620a765b11bdb3dd6a840cd06f684920190c96c32611e461eed44fda5",
+ "endpoint": "coach_profile",
+ "parser_rows": {
+  "coach_id": "139997",
+  "dob": "1982-10-14",
+  "name": "Arturo Berroa",
+  "nationality": "Dominican Republic"
+ },
+ "url": "https://www.transfermarkt.com/arturo-berroa/profil/trainer/139997",
+ "validator_problem": null
+}

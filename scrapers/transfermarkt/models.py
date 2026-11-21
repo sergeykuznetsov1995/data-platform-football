@@ -316,21 +316,15 @@ class FetchStatus(str, Enum):
     OK = "ok"
     AUTHORITATIVE_EMPTY = "authoritative_empty"
     NOT_APPLICABLE = "not_applicable"
-    # Kept for persisted checkpoints produced before native-v2. New code must
-    # write AUTHORITATIVE_EMPTY; readers accept both during the migration.
-    VALID_EMPTY = "valid_empty"
     BLOCKED = "blocked"
     RETRY_EXHAUSTED = "retry_exhausted"
     SCHEMA_ERROR = "schema_error"
 
     @classmethod
     def from_checkpoint(cls, value: Any) -> "FetchStatus":
-        """Read both the old ``valid_empty`` and the production-v2 spelling."""
+        """Read the production-v2 spelling; ``valid_empty`` no longer parses."""
 
-        parsed = cls(str(value))
-        if parsed is cls.VALID_EMPTY:
-            return cls.AUTHORITATIVE_EMPTY
-        return parsed
+        return cls(str(value))
 
 
 @dataclass(frozen=True)
@@ -364,15 +358,13 @@ class FetchOutcome(Generic[T]):
         """Whether the source gave an authoritative result.
 
         Authoritative empty and typed not-applicable outcomes are safe to
-        checkpoint and must not be retried forever. ``valid_empty`` remains a
-        temporary read-compatible alias for old checkpoints.
+        checkpoint and must not be retried forever.
         """
 
         return self.status in (
             FetchStatus.OK,
             FetchStatus.AUTHORITATIVE_EMPTY,
             FetchStatus.NOT_APPLICABLE,
-            FetchStatus.VALID_EMPTY,
         )
 
     def with_status(
@@ -441,7 +433,7 @@ class FetchOutcome(Generic[T]):
         """Restore a successful outcome and reject corrupt cached payloads."""
 
         version = value.get("version")
-        if isinstance(version, bool) or version not in {3, 4}:
+        if isinstance(version, bool) or version != 4:
             raise ValueError("unsupported Transfermarkt checkpoint version")
         status = FetchStatus.from_checkpoint(value.get("status"))
         if status not in (
@@ -483,11 +475,6 @@ class FetchOutcome(Generic[T]):
                 envelope_ids = (last_envelope_id,)
         elif envelope_ids:
             last_envelope_id = envelope_ids[-1]
-        if version == 3 and (
-            "raw_attempt_envelope_id" in value
-            or "raw_attempt_envelope_ids" in value
-        ):
-            raise ValueError("v3 checkpoint cannot claim v4 raw attempt evidence")
         attempts = int(value.get("attempts", 0))
         has_raw_capture = value.get("raw_capture_id") is not None
         if version == 4 and has_raw_capture and (

@@ -765,28 +765,34 @@ def test_integrity_checked_cache_hit_has_zero_network_requests():
 
 
 @pytest.mark.unit
-def test_checkpoint_migrates_valid_empty_and_rejects_hash_tampering():
-    legacy = FetchOutcome(
-        status=FetchStatus.VALID_EMPTY,
+def test_checkpoint_statuses_and_versions_are_strict():
+    v4 = FetchOutcome(
+        status=FetchStatus.AUTHORITATIVE_EMPTY,
         value=[],
-        payload_hash=None,
-        raw_capture_id="a" * 64,
     ).as_checkpoint()
-    legacy['version'] = 3
-    legacy.pop('raw_attempt_envelope_id')
-    legacy.pop('raw_attempt_envelope_ids')
 
-    restored = FetchOutcome.from_checkpoint(legacy)
+    restored = FetchOutcome.from_checkpoint(v4)
     assert restored.status is FetchStatus.AUTHORITATIVE_EMPTY
     assert restored.is_success is True
-    assert restored.raw_capture_id == "a" * 64
-    assert restored.with_status(FetchStatus.OK).raw_capture_id == "a" * 64
+    assert restored.value == []
     assert FetchOutcome(
         status=FetchStatus.NOT_APPLICABLE,
         value=None,
     ).is_success is True
 
-    corrupt = dict(legacy)
+    # #2403: the demolished warehouse retired every persisted valid_empty
+    # checkpoint; a stray legacy status or version no longer parses at all.
+    stale_status = dict(v4)
+    stale_status["status"] = "valid_empty"
+    with pytest.raises(ValueError):
+        FetchOutcome.from_checkpoint(stale_status)
+
+    v3 = dict(v4)
+    v3["version"] = 3
+    with pytest.raises(ValueError, match="unsupported Transfermarkt checkpoint version"):
+        FetchOutcome.from_checkpoint(v3)
+
+    corrupt = dict(v4)
     corrupt["value"] = ["unexpected"]
     with pytest.raises(ValueError, match="hash mismatch"):
         FetchOutcome.from_checkpoint(corrupt)
@@ -930,11 +936,9 @@ def test_transport_and_response_attempts_are_enveloped_before_retry(
 
 
 @pytest.mark.unit
-def test_backfill_raw_envelope_prefers_frozen_child_cycle_identity(
+def test_backfill_raw_envelope_uses_explicit_portion_cycle_identity(
     tmp_path,
-    monkeypatch,
 ):
-    monkeypatch.setenv("TM_CHILD_CYCLE_ID", "tm-child-frozen-scope")
     raw_store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     client = TransfermarktHttpClient(
         proxy="http://paid-proxy.invalid:8000",
@@ -952,13 +956,15 @@ def test_backfill_raw_envelope_prefers_frozen_child_cycle_identity(
         label="listing",
         context={
             "scope_id": "GB1__2020",
-            "cycle_id": "parent-batch-run",
+            "cycle_id": "tm-child-frozen-scope",
         },
     )
 
     envelope = raw_store.verify_attempt_envelope(
         outcome.raw_attempt_envelope_id
     )
+    # #2403: the explicit portion context wins over lease_metadata run_id;
+    # the environment no longer has a say.
     assert envelope.cycle_id == "tm-child-frozen-scope"
     assert envelope.scope_id == "GB1__2020"
 
@@ -1091,13 +1097,11 @@ def test_cache_hit_is_replayed_from_verified_raw_without_network(tmp_path):
 
 @pytest.mark.unit
 def test_cache_from_another_child_cycle_is_a_paid_miss(
-    monkeypatch,
     tmp_path,
 ):
     raw_store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     cache = {}
     url = "https://www.transfermarkt.com/ceapi/cycle-bound"
-    monkeypatch.setenv("TM_CHILD_CYCLE_ID", "tm-child-A")
     first = TransfermarktHttpClient(
         proxy="http://paid-proxy.invalid:8000",
         raw_store=raw_store,
@@ -1110,12 +1114,12 @@ def test_cache_from_another_child_cycle_is_a_paid_miss(
         as_json=False,
         cache_key=url,
         cache_ttl_seconds=3600,
+        context={"cycle_id": "tm-child-A"},
     )
     envelope_a = raw_store.verify_attempt_envelope(
         paid_a.raw_attempt_envelope_id
     )
 
-    monkeypatch.setenv("TM_CHILD_CYCLE_ID", "tm-child-B")
     second_factory = _TlsFactory([_Response(b"cycle-B")])
     second = TransfermarktHttpClient(
         proxy="http://paid-proxy.invalid:8000",
@@ -1129,6 +1133,7 @@ def test_cache_from_another_child_cycle_is_a_paid_miss(
         as_json=False,
         cache_key=url,
         cache_ttl_seconds=3600,
+        context={"cycle_id": "tm-child-B"},
     )
     envelope_b = raw_store.verify_attempt_envelope(
         paid_b.raw_attempt_envelope_id
@@ -1143,7 +1148,7 @@ def test_cache_from_another_child_cycle_is_a_paid_miss(
 
 
 @pytest.mark.unit
-def test_v3_cache_migrates_to_response_envelope_without_network(tmp_path):
+def test_v3_checkpoint_cache_is_retired_as_a_paid_miss(tmp_path):
     raw_store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     cache = {}
     url = "https://www.transfermarkt.com/ceapi/cached"
@@ -1164,13 +1169,13 @@ def test_v3_cache_migrates_to_response_envelope_without_network(tmp_path):
     cached["version"] = 3
     cached.pop("raw_attempt_envelope_id")
     cached.pop("raw_attempt_envelope_ids")
-    empty_factory = _TlsFactory([])
+    refetch_factory = _TlsFactory([_Response(b'{"items":[]}')])
     second = TransfermarktHttpClient(
         proxy="http://paid-proxy.invalid:8000",
         raw_store=raw_store,
         require_raw_store=True,
         cache=cache,
-        client_factory=empty_factory,
+        client_factory=refetch_factory,
     )
 
     reused = second.fetch(
@@ -1180,23 +1185,23 @@ def test_v3_cache_migrates_to_response_envelope_without_network(tmp_path):
         cache_ttl_seconds=60,
     )
 
-    assert reused.cache_hit is True
-    assert reused.raw_capture_id == paid.raw_capture_id
-    assert reused.raw_attempt_envelope_id
-    envelope = raw_store.verify_attempt(reused.raw_attempt_envelope_id)
-    assert envelope.capture_id == paid.raw_capture_id
-    assert empty_factory.calls == []
+    # #2403: a v3 checkpoint is not migration input anymore; the URL is
+    # re-paid rather than replayed as unearned evidence.
+    assert reused.cache_hit is False
+    assert reused.status is FetchStatus.OK
+    assert reused.raw_capture_id != paid.raw_capture_id
+    assert len(refetch_factory.clients[0].calls) == 1
 
 
 @pytest.mark.unit
-def test_airflow_try_number_raw_ordinal_is_accepted(monkeypatch, tmp_path):
-    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+def test_explicit_attempt_ordinal_base_spaces_task_tries(tmp_path):
     raw_store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     client = TransfermarktHttpClient(
         proxy="http://paid-proxy.invalid:8000",
         raw_store=raw_store,
         require_raw_store=True,
         client_factory=_TlsFactory([_Response(b"ok")]),
+        attempt_ordinal_base=1_000_000,
     )
 
     outcome = client.fetch(

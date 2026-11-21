@@ -1,0 +1,27 @@
+{
+ "attempt": 1000001,
+ "blob_key": "blobs/sha256/f5/f50c5aec996b1597e44cd044d4104e65242a2b514e5d09c5bc494121f2ef70f8.body.gz",
+ "capture_id": "51d21f951b9911542618e55478daca5c907aed5f6b777c7981a42470445bfb62",
+ "compression": "gzip",
+ "content_hash": "f50c5aec996b1597e44cd044d4104e65242a2b514e5d09c5bc494121f2ef70f8",
+ "content_type": "application/json",
+ "cycle_id": "tm-child-e8264b5956ad17affadadaa2",
+ "decoded_bytes": 662,
+ "endpoint": "participants_api",
+ "fetched_at": "2026-10-08T04:00:32.361570+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "max-age=60, public, s-maxage=300",
+  "content-length": "662",
+  "content-type": "application/json",
+  "date": "Thu, 08 Oct 2026 04:00:32 GMT",
+  "vary": "Accept-Encoding,Accept-Language"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/f5/f50c5aec996b1597e44cd044d4104e65242a2b514e5d09c5bc494121f2ef70f8.body.gz",
+ "scope_id": "tm-ebb914ab17af749fb3e98420",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 353,
+ "url": "https://tmapi.transfermarkt.technology/competition/ARCA/club?season=2025"
+}

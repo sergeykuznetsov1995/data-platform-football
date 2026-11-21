@@ -1,0 +1,26 @@
+{
+ "attempt": 1000065,
+ "blob_key": "blobs/sha256/a9/a9d3cab365999789800935c4fbca59241a0a809d5476113c93004380c6f8b2f9.body.gz",
+ "capture_id": "d6a1b07a71095ab2744d847345de7b4d4942066f4a079b9d3ca5cc164f837da3",
+ "compression": "gzip",
+ "content_hash": "a9d3cab365999789800935c4fbca59241a0a809d5476113c93004380c6f8b2f9",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-bad13d4fae81c1330e91e1a2",
+ "decoded_bytes": 104743,
+ "endpoint": "coach_profile",
+ "fetched_at": "2026-10-29T08:41:30.365248+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Thu, 29 Oct 2026 08:41:29 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/a9/a9d3cab365999789800935c4fbca59241a0a809d5476113c93004380c6f8b2f9.body.gz",
+ "scope_id": "tm-f3f697f017e05cf087f91370",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 23792,
+ "url": "https://www.transfermarkt.com/baye-bah/profil/trainer/42897"
+}

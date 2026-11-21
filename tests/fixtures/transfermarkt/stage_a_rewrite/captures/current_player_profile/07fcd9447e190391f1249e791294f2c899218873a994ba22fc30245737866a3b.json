@@ -1,0 +1,28 @@
+{
+ "attempt": 1000047,
+ "blob_key": "blobs/sha256/a4/a4b0a48e02e02d03fcf39e32dadc7db33336a4f84ec10b4edc8deb4b285f863e.body.gz",
+ "capture_id": "07fcd9447e190391f1249e791294f2c899218873a994ba22fc30245737866a3b",
+ "compression": "gzip",
+ "content_hash": "a4b0a48e02e02d03fcf39e32dadc7db33336a4f84ec10b4edc8deb4b285f863e",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-e32b4641a7ea93a5947253e6187e497f",
+ "decoded_bytes": 122039,
+ "endpoint": "current_player_profile",
+ "fetched_at": "2026-11-21T11:27:20.508077+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "public, max-age=600, must-revalidate, stale-while-revalidate=30, stale-if-error=300",
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 21 Nov 2026 11:27:20 GMT",
+  "last-modified": "Mon, 28 Sep 2026 22:00:00 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/a4/a4b0a48e02e02d03fcf39e32dadc7db33336a4f84ec10b4edc8deb4b285f863e.body.gz",
+ "scope_id": "tm-11fdfb78c7592ab638b2cf1b",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 28568,
+ "url": "https://www.transfermarkt.com/marco-richter/profil/spieler/279009"
+}

@@ -1,0 +1,26 @@
+{
+ "attempt": 1000003,
+ "blob_key": "blobs/sha256/54/54e0e4a93cb61474e05cb5e4dd71bfa0ef6868f13db93e9d519b4458bf2d8481.body.gz",
+ "capture_id": "883abcc28c49340f6a217f967699794ca1ae869523844a457a84a6e534ec246b",
+ "compression": "gzip",
+ "content_hash": "54e0e4a93cb61474e05cb5e4dd71bfa0ef6868f13db93e9d519b4458bf2d8481",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-da661d7315cfcc3d217d57029d0d28c0",
+ "decoded_bytes": 167828,
+ "endpoint": "squad",
+ "fetched_at": "2026-11-20T12:36:22.985854+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 20 Nov 2026 12:36:20 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/54/54e0e4a93cb61474e05cb5e4dd71bfa0ef6868f13db93e9d519b4458bf2d8481.body.gz",
+ "scope_id": "tm-84aad1809acbbf6d921e4bf6",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 29053,
+ "url": "https://www.transfermarkt.com/siwelele-football-club/kader/verein/132785/saison_id/2026/plus/1"
+}

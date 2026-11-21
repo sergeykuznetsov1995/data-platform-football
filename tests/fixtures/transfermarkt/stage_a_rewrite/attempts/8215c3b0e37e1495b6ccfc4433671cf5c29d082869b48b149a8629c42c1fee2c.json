@@ -1,0 +1,21 @@
+{
+ "attempt": 1000176,
+ "capture_id": "fd091290c2dcf6550129ff14ef979607af28a081cff42627dada20826f4778f4",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/fd/fd091290c2dcf6550129ff14ef979607af28a081cff42627dada20826f4778f4.json",
+ "cycle_id": "scheduled__2026-11-08T07:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "8215c3b0e37e1495b6ccfc4433671cf5c29d082869b48b149a8629c42c1fee2c",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/82/8215c3b0e37e1495b6ccfc4433671cf5c29d082869b48b149a8629c42c1fee2c.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-08T11:21:18.057307+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "9a7a3cc42ac4eafce9429c1ed42dbd85ac32f571657f80e382de676f0d047442",
+ "record_hash": "8215c3b0e37e1495b6ccfc4433671cf5c29d082869b48b149a8629c42c1fee2c",
+ "scope_id": "tm-registry-64351b5f453d23cd5617546a",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/major-league-soccer/startseite/wettbewerb/MLS1"
+}

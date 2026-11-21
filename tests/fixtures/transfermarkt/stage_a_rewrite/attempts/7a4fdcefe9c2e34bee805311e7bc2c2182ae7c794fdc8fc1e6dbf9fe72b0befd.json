@@ -1,0 +1,21 @@
+{
+ "attempt": 1000388,
+ "capture_id": "e1a10f1b58efa91fe01bd6bd2169ab7069c9eaf0cd9fa0e67fd86e71a1f3f528",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/e1/e1a10f1b58efa91fe01bd6bd2169ab7069c9eaf0cd9fa0e67fd86e71a1f3f528.json",
+ "cycle_id": "scheduled__2026-11-09T15:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "7a4fdcefe9c2e34bee805311e7bc2c2182ae7c794fdc8fc1e6dbf9fe72b0befd",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/7a/7a4fdcefe9c2e34bee805311e7bc2c2182ae7c794fdc8fc1e6dbf9fe72b0befd.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-09T19:39:54.872660+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "bf21fa49f76a21aff155fc853c1077fb4631085740b7a7faac32b2bc02b1cc51",
+ "record_hash": "7a4fdcefe9c2e34bee805311e7bc2c2182ae7c794fdc8fc1e6dbf9fe72b0befd",
+ "scope_id": "tm-registry-db094121481acfd052f81721",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://tmapi.transfermarkt.technology/competition/VLHS/regulation"
+}

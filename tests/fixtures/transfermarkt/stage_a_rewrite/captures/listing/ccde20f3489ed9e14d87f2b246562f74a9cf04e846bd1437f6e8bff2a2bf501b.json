@@ -1,0 +1,26 @@
+{
+ "attempt": 1000001,
+ "blob_key": "blobs/sha256/15/15b5f20286f285c8a2ab613f6ffdb274a80f704bf4260fc6c3287f6c04a827f8.body.gz",
+ "capture_id": "ccde20f3489ed9e14d87f2b246562f74a9cf04e846bd1437f6e8bff2a2bf501b",
+ "compression": "gzip",
+ "content_hash": "15b5f20286f285c8a2ab613f6ffdb274a80f704bf4260fc6c3287f6c04a827f8",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-d7ed6da68dc29d09786b76aa558952e3",
+ "decoded_bytes": 194537,
+ "endpoint": "listing",
+ "fetched_at": "2026-11-21T08:09:31.508561+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 21 Nov 2026 08:09:27 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/15/15b5f20286f285c8a2ab613f6ffdb274a80f704bf4260fc6c3287f6c04a827f8.body.gz",
+ "scope_id": "tm-e256e33fabbf1e88f5b655c6",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 32730,
+ "url": "https://www.transfermarkt.com/liga-de-ascenso/startseite/wettbewerb/CL2B/plus/?saison_id=2025"
+}

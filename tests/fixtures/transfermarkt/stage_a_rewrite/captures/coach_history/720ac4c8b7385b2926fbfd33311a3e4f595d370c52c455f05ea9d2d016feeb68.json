@@ -1,0 +1,26 @@
+{
+ "attempt": 1000002,
+ "blob_key": "blobs/sha256/4a/4ac03e49417c2675af1fc8ab020b914a9a2b67ddf256bafe6ead4f8957dc21bd.body.gz",
+ "capture_id": "720ac4c8b7385b2926fbfd33311a3e4f595d370c52c455f05ea9d2d016feeb68",
+ "compression": "gzip",
+ "content_hash": "4ac03e49417c2675af1fc8ab020b914a9a2b67ddf256bafe6ead4f8957dc21bd",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-f9f3a99d4483d348c2a6c6c5",
+ "decoded_bytes": 108621,
+ "endpoint": "coach_history",
+ "fetched_at": "2026-10-20T15:44:55.660001+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Tue, 20 Oct 2026 15:44:55 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/4a/4ac03e49417c2675af1fc8ab020b914a9a2b67ddf256bafe6ead4f8957dc21bd.body.gz",
+ "scope_id": "tm-88a6e74b7296508f64e5fd64",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 23192,
+ "url": "https://www.transfermarkt.com/sobradinho-esporte-clube-df-/mitarbeiterhistorie/verein/4790/plus/1"
+}

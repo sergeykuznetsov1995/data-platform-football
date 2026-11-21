@@ -1,0 +1,21 @@
+{
+ "attempt": 1000062,
+ "capture_id": "77eefbee61a2707b7366c71338dc8333454375809778143880d49e64654effae",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/77/77eefbee61a2707b7366c71338dc8333454375809778143880d49e64654effae.json",
+ "cycle_id": "tm-child-e777adac054630cc0bdaf00e",
+ "endpoint": "transfer_events",
+ "envelope_id": "5d2d9dffe1b86a064ba99aa64f8cb8636e7bbb6d3957168849c99a7a91e9dff7",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/5d/5d2d9dffe1b86a064ba99aa64f8cb8636e7bbb6d3957168849c99a7a91e9dff7.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-08-15T07:55:43.290785+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "1e50aa741ee648e1805f9223923e59aa96d36e4c5e5bd30b1027bf3a8a56099f",
+ "record_hash": "5d2d9dffe1b86a064ba99aa64f8cb8636e7bbb6d3957168849c99a7a91e9dff7",
+ "scope_id": "tm-8c2be5da617a4540a10fc71d",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/ceapi/transferHistory/list/300308"
+}

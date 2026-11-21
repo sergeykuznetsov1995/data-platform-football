@@ -1,0 +1,21 @@
+{
+ "attempt": 1000001,
+ "capture_id": "46fa7eb3b5004b06050bec832be8fd309f8d1e0fdf01e76a4ea74cf502681e0c",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/46/46fa7eb3b5004b06050bec832be8fd309f8d1e0fdf01e76a4ea74cf502681e0c.json",
+ "cycle_id": "tm-current-89b927f4fe5183e251d0bc32342f31ee",
+ "endpoint": "listing",
+ "envelope_id": "7cfd55765b776212eeb3105abdf69eb5c11a334134df2512e78d6ee0fa2b7aac",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/7c/7cfd55765b776212eeb3105abdf69eb5c11a334134df2512e78d6ee0fa2b7aac.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-03T09:47:48.801255+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "e09481eea1866e02570b6a1f4aa4c61e330a900e22fc19781e0435ebab5b7657",
+ "record_hash": "7cfd55765b776212eeb3105abdf69eb5c11a334134df2512e78d6ee0fa2b7aac",
+ "scope_id": "tm-32cf2ffe810cc0d3cb77f39c",
+ "source": "transfermarkt",
+ "status_code": 405,
+ "url": "https://www.transfermarkt.com/prva-liga/startseite/wettbewerb/SL1/plus/?saison_id=2026"
+}

@@ -1,0 +1,28 @@
+{
+ "attempt": 1000456,
+ "blob_key": "blobs/sha256/8c/8cb5af726349d35d8377523472fd2418bd7ae0541fb1fe8e07d35cca71f6e7b5.body.gz",
+ "capture_id": "b36549bdbb0da6898dac13c483977d0d543707cde0af241a9866fce3425c1d5d",
+ "compression": "gzip",
+ "content_hash": "8cb5af726349d35d8377523472fd2418bd7ae0541fb1fe8e07d35cca71f6e7b5",
+ "content_type": "application/json; charset=utf-8",
+ "cycle_id": "tm-current-1b97c0c9e209a04cb554aa7a8533581e",
+ "decoded_bytes": 4152,
+ "endpoint": "market_value_points",
+ "fetched_at": "2026-11-02T17:58:22.253161+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "public, max-age=300",
+  "content-encoding": "gzip",
+  "content-type": "application/json; charset=utf-8",
+  "date": "Mon, 02 Nov 2026 17:58:22 GMT",
+  "last-modified": "Mon, 02 Nov 2026 17:58:22 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/8c/8cb5af726349d35d8377523472fd2418bd7ae0541fb1fe8e07d35cca71f6e7b5.body.gz",
+ "scope_id": "tm-779e8230374c631ee565cfe1",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 1009,
+ "url": "https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/525578"
+}

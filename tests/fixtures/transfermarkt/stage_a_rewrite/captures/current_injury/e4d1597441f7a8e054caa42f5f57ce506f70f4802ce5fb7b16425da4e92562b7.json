@@ -1,0 +1,26 @@
+{
+ "attempt": 1000008,
+ "blob_key": "blobs/sha256/a0/a08b4a2c938ab512f2203d5f33e388903007da9db55bd3558fb32142c2704aa9.body.gz",
+ "capture_id": "e4d1597441f7a8e054caa42f5f57ce506f70f4802ce5fb7b16425da4e92562b7",
+ "compression": "gzip",
+ "content_hash": "a08b4a2c938ab512f2203d5f33e388903007da9db55bd3558fb32142c2704aa9",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-0fe1a2cdc57ad09a1dda5feeb617308a",
+ "decoded_bytes": 118582,
+ "endpoint": "current_injury",
+ "fetched_at": "2026-11-18T16:18:05.858996+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Wed, 18 Nov 2026 16:18:05 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/a0/a08b4a2c938ab512f2203d5f33e388903007da9db55bd3558fb32142c2704aa9.body.gz",
+ "scope_id": "tm-18671cbf1d5fb6b4e0d03bd9",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 24873,
+ "url": "https://www.transfermarkt.com/segunda-division-torneo-competencia/verletztespieler/wettbewerb/UR2T"
+}

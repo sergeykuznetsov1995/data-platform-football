@@ -1,0 +1,26 @@
+{
+ "attempt": 1000008,
+ "blob_key": "blobs/sha256/b1/b11a90cd8e756b14ef6d4aded7ff94960c0ee92893bfb8408b8b49d2607a72f3.body.gz",
+ "capture_id": "9db64dfffb6607ada25add0ae39f2843ccb67fa6ffb1df6d872ef3fa508aaae1",
+ "compression": "gzip",
+ "content_hash": "b11a90cd8e756b14ef6d4aded7ff94960c0ee92893bfb8408b8b49d2607a72f3",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-56eb9174638a5b81941a9014a25b06a8",
+ "decoded_bytes": 118154,
+ "endpoint": "current_injury",
+ "fetched_at": "2026-11-19T16:31:49.954527+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Thu, 19 Nov 2026 16:31:49 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/b1/b11a90cd8e756b14ef6d4aded7ff94960c0ee92893bfb8408b8b49d2607a72f3.body.gz",
+ "scope_id": "tm-6d2ee584448d5017d4742829",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 25010,
+ "url": "https://www.transfermarkt.com/saudi-first-division-league/verletztespieler/wettbewerb/SA2L"
+}

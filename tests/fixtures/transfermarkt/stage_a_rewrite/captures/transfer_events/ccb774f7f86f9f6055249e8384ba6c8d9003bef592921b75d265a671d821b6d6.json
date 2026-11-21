@@ -1,0 +1,28 @@
+{
+ "attempt": 1000002,
+ "blob_key": "blobs/sha256/4d/4dfd01a6e65cbb1b5a0fc9440be96baee1e462befa6a105efac8870d9d7b93dc.body.gz",
+ "capture_id": "ccb774f7f86f9f6055249e8384ba6c8d9003bef592921b75d265a671d821b6d6",
+ "compression": "gzip",
+ "content_hash": "4dfd01a6e65cbb1b5a0fc9440be96baee1e462befa6a105efac8870d9d7b93dc",
+ "content_type": "application/json; charset=utf-8",
+ "cycle_id": "tm-child-1cc6b204b0b2af6becdead84",
+ "decoded_bytes": 11502,
+ "endpoint": "transfer_events",
+ "fetched_at": "2026-11-21T08:31:53.124191+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "public, max-age=60",
+  "content-encoding": "gzip",
+  "content-type": "application/json; charset=utf-8",
+  "date": "Sat, 21 Nov 2026 08:31:52 GMT",
+  "last-modified": "Sat, 21 Nov 2026 08:31:52 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/4d/4dfd01a6e65cbb1b5a0fc9440be96baee1e462befa6a105efac8870d9d7b93dc.body.gz",
+ "scope_id": "tm-fe4b63b6c926c1956687fce1",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 1215,
+ "url": "https://www.transfermarkt.com/ceapi/transferHistory/list/62547"
+}

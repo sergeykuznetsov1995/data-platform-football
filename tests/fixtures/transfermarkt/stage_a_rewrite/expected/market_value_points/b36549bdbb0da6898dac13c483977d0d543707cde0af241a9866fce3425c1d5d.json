@@ -1,0 +1,272 @@
+{
+ "capture_id": "b36549bdbb0da6898dac13c483977d0d543707cde0af241a9866fce3425c1d5d",
+ "endpoint": "market_value_points",
+ "parser_rows": [
+  {
+   "age": 23,
+   "club_id": "976",
+   "club_name": "CF União Madeira (-2021)",
+   "is_value_removed": false,
+   "mv_date": "2017-09-08",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€50.0K",
+   "player_id": "525578",
+   "value_eur": 50000
+  },
+  {
+   "age": 23,
+   "club_id": null,
+   "club_name": "CF União Madeira (-2021)",
+   "is_value_removed": false,
+   "mv_date": "2018-02-23",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€200.0K",
+   "player_id": "525578",
+   "value_eur": 200000
+  },
+  {
+   "age": 24,
+   "club_id": null,
+   "club_name": "CF União Madeira (-2021)",
+   "is_value_removed": false,
+   "mv_date": "2018-06-29",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€275.0K",
+   "player_id": "525578",
+   "value_eur": 275000
+  },
+  {
+   "age": 24,
+   "club_id": "3329",
+   "club_name": "FC Famalicão",
+   "is_value_removed": false,
+   "mv_date": "2019-02-12",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€350.0K",
+   "player_id": "525578",
+   "value_eur": 350000
+  },
+  {
+   "age": 25,
+   "club_id": null,
+   "club_name": "FC Famalicão",
+   "is_value_removed": false,
+   "mv_date": "2019-06-29",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€450.0K",
+   "player_id": "525578",
+   "value_eur": 450000
+  },
+  {
+   "age": 25,
+   "club_id": "16486",
+   "club_name": "CF Fuenlabrada",
+   "is_value_removed": false,
+   "mv_date": "2019-09-10",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€500.0K",
+   "player_id": "525578",
+   "value_eur": 500000
+  },
+  {
+   "age": 25,
+   "club_id": null,
+   "club_name": "CF Fuenlabrada",
+   "is_value_removed": false,
+   "mv_date": "2019-12-20",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€400.0K",
+   "player_id": "525578",
+   "value_eur": 400000
+  },
+  {
+   "age": 26,
+   "club_id": null,
+   "club_name": "CF Fuenlabrada",
+   "is_value_removed": false,
+   "mv_date": "2020-04-08",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€325.0K",
+   "player_id": "525578",
+   "value_eur": 325000
+  },
+  {
+   "age": 26,
+   "club_id": null,
+   "club_name": "CF Fuenlabrada",
+   "is_value_removed": false,
+   "mv_date": "2020-10-08",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€500.0K",
+   "player_id": "525578",
+   "value_eur": 500000
+  },
+  {
+   "age": 26,
+   "club_id": null,
+   "club_name": "CF Fuenlabrada",
+   "is_value_removed": false,
+   "mv_date": "2021-01-08",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€600.0K",
+   "player_id": "525578",
+   "value_eur": 600000
+  },
+  {
+   "age": 27,
+   "club_id": null,
+   "club_name": "CF Fuenlabrada",
+   "is_value_removed": false,
+   "mv_date": "2021-06-24",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€800.0K",
+   "player_id": "525578",
+   "value_eur": 800000
+  },
+  {
+   "age": 27,
+   "club_id": "367",
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2021-10-13",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€1.20M",
+   "player_id": "525578",
+   "value_eur": 1200000
+  },
+  {
+   "age": 27,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2021-12-30",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€1.20M",
+   "player_id": "525578",
+   "value_eur": 1200000
+  },
+  {
+   "age": 28,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2022-06-03",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€2.00M",
+   "player_id": "525578",
+   "value_eur": 2000000
+  },
+  {
+   "age": 28,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2022-09-23",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€4.00M",
+   "player_id": "525578",
+   "value_eur": 4000000
+  },
+  {
+   "age": 28,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2022-11-07",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€4.00M",
+   "player_id": "525578",
+   "value_eur": 4000000
+  },
+  {
+   "age": 29,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2023-06-13",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€3.00M",
+   "player_id": "525578",
+   "value_eur": 3000000
+  },
+  {
+   "age": 29,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2023-12-22",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€3.00M",
+   "player_id": "525578",
+   "value_eur": 3000000
+  },
+  {
+   "age": 30,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2024-03-21",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€2.50M",
+   "player_id": "525578",
+   "value_eur": 2500000
+  },
+  {
+   "age": 30,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2024-06-07",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€2.50M",
+   "player_id": "525578",
+   "value_eur": 2500000
+  },
+  {
+   "age": 30,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2024-12-27",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€2.00M",
+   "player_id": "525578",
+   "value_eur": 2000000
+  },
+  {
+   "age": 31,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2025-06-09",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€2.00M",
+   "player_id": "525578",
+   "value_eur": 2000000
+  },
+  {
+   "age": 31,
+   "club_id": null,
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2025-12-12",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€2.00M",
+   "player_id": "525578",
+   "value_eur": 2000000
+  },
+  {
+   "age": 32,
+   "club_id": "367",
+   "club_name": "Rayo Vallecano",
+   "is_value_removed": false,
+   "mv_date": "2026-06-05",
+   "mv_last_change": "2026-06-05",
+   "mv_raw": "€1.80M",
+   "player_id": "525578",
+   "value_eur": 1800000
+  }
+ ],
+ "url": "https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/525578",
+ "validator_problem": null
+}

@@ -1,0 +1,30 @@
+{
+ "attempt": 1000005,
+ "blob_key": "blobs/sha256/6b/6b4cc65c602fbe18cafb63ff003f20fa09d45ba7c1d45eb7d6f4de098dc13f87.body.gz",
+ "capture_id": "42f23400872d0c029ce110e44b391d40b1fc90ceca72a39bdbdf6fec3d42a73f",
+ "compression": "gzip",
+ "content_hash": "6b4cc65c602fbe18cafb63ff003f20fa09d45ba7c1d45eb7d6f4de098dc13f87",
+ "content_type": "application/json",
+ "cycle_id": "tm-current-74bf27cbb1a3d9e389061f8bcd3f63ab",
+ "decoded_bytes": 1273,
+ "endpoint": "current_players",
+ "fetched_at": "2026-11-21T07:52:10.291759+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "cache-control": "max-age=60, must-revalidate, public",
+  "content-encoding": "gzip",
+  "content-length": "646",
+  "content-type": "application/json",
+  "date": "Sat, 21 Nov 2026 07:52:10 GMT",
+  "etag": "\"341195aeb5ba4f147ba9ed6bbec0eb3447c59e3f-gzip\"",
+  "last-modified": "Sat, 21 Nov 2026 07:14:22 GMT",
+  "vary": "Origin,Accept-Language,Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/6b/6b4cc65c602fbe18cafb63ff003f20fa09d45ba7c1d45eb7d6f4de098dc13f87.body.gz",
+ "scope_id": "tm-444bb2bcdc8c7aa433121b53",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 636,
+ "url": "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1614098"
+}

@@ -1,0 +1,26 @@
+{
+ "attempt": 1000001,
+ "blob_key": "blobs/sha256/d3/d348999ac83c2bc04d15a2a6274b5d693bbccd605b715d66af068d240a95ec63.body.gz",
+ "capture_id": "5ad3fa9a99a9df024113ae93695faa1f0bb0d9d3fa3dc9a7491acabb3094da71",
+ "compression": "gzip",
+ "content_hash": "d348999ac83c2bc04d15a2a6274b5d693bbccd605b715d66af068d240a95ec63",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-current-e99916509caa1ee1fc364f01f77979ed",
+ "decoded_bytes": 192387,
+ "endpoint": "listing",
+ "fetched_at": "2026-11-21T09:25:53.336751+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 21 Nov 2026 09:25:52 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/d3/d348999ac83c2bc04d15a2a6274b5d693bbccd605b715d66af068d240a95ec63.body.gz",
+ "scope_id": "tm-d24bd7201397fe8997c2b54d",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 31807,
+ "url": "https://www.transfermarkt.com/malaysia-super-league/startseite/wettbewerb/MYS1/plus/?saison_id=2026"
+}

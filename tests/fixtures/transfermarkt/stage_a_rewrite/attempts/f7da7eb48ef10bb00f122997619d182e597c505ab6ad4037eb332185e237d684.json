@@ -1,0 +1,21 @@
+{
+ "attempt": 1000416,
+ "capture_id": "3f55750164346b4a6a22bb2d1f71ca77204936264d67cd994d108c422ec17953",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/3f/3f55750164346b4a6a22bb2d1f71ca77204936264d67cd994d108c422ec17953.json",
+ "cycle_id": "scheduled__2026-11-21T04:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "f7da7eb48ef10bb00f122997619d182e597c505ab6ad4037eb332185e237d684",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/f7/f7da7eb48ef10bb00f122997619d182e597c505ab6ad4037eb332185e237d684.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-21T05:41:53.469181+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "f5f8174a7ff23a691c7f80670f576f19b00a3eb90f0b7ceeaaa05b59f9016ff2",
+ "record_hash": "f7da7eb48ef10bb00f122997619d182e597c505ab6ad4037eb332185e237d684",
+ "scope_id": "tm-registry-16285fe12fedd999fe7a7386",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://tmapi.transfermarkt.technology/competition/RSK2/regulation"
+}

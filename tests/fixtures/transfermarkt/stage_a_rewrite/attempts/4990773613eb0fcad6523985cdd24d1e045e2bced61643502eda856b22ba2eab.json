@@ -1,0 +1,21 @@
+{
+ "attempt": 1000346,
+ "capture_id": "01985507c037f81cd34191e14ef402912a329dd86c77e8d72507aca061dce8e2",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/01/01985507c037f81cd34191e14ef402912a329dd86c77e8d72507aca061dce8e2.json",
+ "cycle_id": "scheduled__2026-11-12T07:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "4990773613eb0fcad6523985cdd24d1e045e2bced61643502eda856b22ba2eab",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/49/4990773613eb0fcad6523985cdd24d1e045e2bced61643502eda856b22ba2eab.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-11-12T11:35:58.719046+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "affff3315d7347e75362f538354284927294e4c443b3b2110faa710c9a5a6313",
+ "record_hash": "4990773613eb0fcad6523985cdd24d1e045e2bced61643502eda856b22ba2eab",
+ "scope_id": "tm-registry-3b6694c2da82d6edb2e5cfe8",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://www.transfermarkt.com/copa-constitucio/startseite/wettbewerb/ANDP"
+}

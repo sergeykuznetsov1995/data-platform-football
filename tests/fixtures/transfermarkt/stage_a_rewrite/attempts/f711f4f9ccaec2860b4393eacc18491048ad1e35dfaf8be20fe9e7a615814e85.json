@@ -1,0 +1,21 @@
+{
+ "attempt": 1000188,
+ "capture_id": "a3196e849982dff92c9376778862382aa67aa4fcee0cd9df10742f84ca8db2c5",
+ "capture_manifest_uri": "s3://warehouse/raw/transfermarkt/captures/sha256/a3/a3196e849982dff92c9376778862382aa67aa4fcee0cd9df10742f84ca8db2c5.json",
+ "cycle_id": "scheduled__2026-10-02T18:00:00+00:00",
+ "endpoint": "competition_registry",
+ "envelope_id": "f711f4f9ccaec2860b4393eacc18491048ad1e35dfaf8be20fe9e7a615814e85",
+ "envelope_uri": "s3://warehouse/raw/transfermarkt/attempts/sha256/f7/f711f4f9ccaec2860b4393eacc18491048ad1e35dfaf8be20fe9e7a615814e85.json",
+ "error_kind": null,
+ "error_type": null,
+ "hash_algorithm": "sha256",
+ "manifest_version": "transfermarkt-attempt-v1",
+ "observed_at": "2026-10-03T18:18:09.487059+00:00",
+ "outcome_kind": "response",
+ "raw_body_hash": "35e7d2024ca9848da7d274e50058948119c02884993792f96c219f84e78a69d4",
+ "record_hash": "f711f4f9ccaec2860b4393eacc18491048ad1e35dfaf8be20fe9e7a615814e85",
+ "scope_id": "tm-registry-1866cb8b2f7012ea7b77e667",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "url": "https://tmapi.transfermarkt.technology/competition/BRTO/regulation"
+}

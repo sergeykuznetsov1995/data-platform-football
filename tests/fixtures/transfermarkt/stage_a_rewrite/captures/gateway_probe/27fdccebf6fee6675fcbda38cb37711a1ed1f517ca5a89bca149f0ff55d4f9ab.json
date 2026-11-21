@@ -1,0 +1,26 @@
+{
+ "attempt": 1000001,
+ "blob_key": "blobs/sha256/e0/e0947f19a18b3a390425775f7430f07cfe3556eb0f1e37b998139be41b5b295d.body.gz",
+ "capture_id": "27fdccebf6fee6675fcbda38cb37711a1ed1f517ca5a89bca149f0ff55d4f9ab",
+ "compression": "gzip",
+ "content_hash": "e0947f19a18b3a390425775f7430f07cfe3556eb0f1e37b998139be41b5b295d",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "scheduled__2026-10-29T04:00:00+00:00",
+ "decoded_bytes": 249585,
+ "endpoint": "gateway_probe",
+ "fetched_at": "2026-10-30T04:00:26.331500+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Fri, 30 Oct 2026 04:00:26 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/e0/e0947f19a18b3a390425775f7430f07cfe3556eb0f1e37b998139be41b5b295d.body.gz",
+ "scope_id": "gateway_probe",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 36021,
+ "url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1"
+}

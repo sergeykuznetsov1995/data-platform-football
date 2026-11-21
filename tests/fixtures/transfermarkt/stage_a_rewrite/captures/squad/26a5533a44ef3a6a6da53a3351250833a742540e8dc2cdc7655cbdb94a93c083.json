@@ -1,0 +1,26 @@
+{
+ "attempt": 1000009,
+ "blob_key": "blobs/sha256/21/21a0a94720cf30da3f19ddb4824f006c0034d55cd43ae936b9edab35dcf767ae.body.gz",
+ "capture_id": "26a5533a44ef3a6a6da53a3351250833a742540e8dc2cdc7655cbdb94a93c083",
+ "compression": "gzip",
+ "content_hash": "21a0a94720cf30da3f19ddb4824f006c0034d55cd43ae936b9edab35dcf767ae",
+ "content_type": "text/html; charset=UTF-8",
+ "cycle_id": "tm-child-1cc6b204b0b2af6becdead84",
+ "decoded_bytes": 100737,
+ "endpoint": "squad",
+ "fetched_at": "2026-11-21T08:12:46.460046+00:00",
+ "hash_algorithm": "sha256",
+ "headers": {
+  "content-encoding": "gzip",
+  "content-type": "text/html; charset=UTF-8",
+  "date": "Sat, 21 Nov 2026 08:12:46 GMT",
+  "vary": "Accept-Encoding"
+ },
+ "manifest_version": "transfermarkt-raw-v1",
+ "raw_uri": "s3://warehouse/raw/transfermarkt/blobs/sha256/21/21a0a94720cf30da3f19ddb4824f006c0034d55cd43ae936b9edab35dcf767ae.body.gz",
+ "scope_id": "tm-fe4b63b6c926c1956687fce1",
+ "source": "transfermarkt",
+ "status_code": 200,
+ "stored_bytes": 22995,
+ "url": "https://www.transfermarkt.com/ab-argir/kader/verein/30484/saison_id/2026/plus/1"
+}

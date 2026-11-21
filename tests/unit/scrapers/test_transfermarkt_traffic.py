@@ -611,7 +611,7 @@ def test_career_soft_stop_only_at_whole_player_boundary(empty, soft_stop, expect
     if empty:
         outcomes = scraper.get_fetch_outcomes()['transfer_events']
         assert set(outcomes) == set(window['attempted_ids'])
-        assert all(v['status'] == 'valid_empty' for v in outcomes.values())
+        assert all(v['status'] == 'authoritative_empty' for v in outcomes.values())
 
 
 def test_career_soft_stop_keeps_hard_cap_failure():
@@ -799,7 +799,7 @@ def test_rate_limit_override_is_clamped_to_safe_range(requested, expected):
 
 
 @pytest.mark.unit
-def test_200_empty_list_is_authoritative_valid_empty_fetch_outcome(monkeypatch):
+def test_200_empty_list_is_authoritative_empty_fetch_outcome(monkeypatch):
     scraper = TransfermarktScraper(proxy='http://user:pass@proxy.invalid:1')
     factory = _ClientFactory([
         _FakeResp(b'{"list":[]}', json_value={'list': []}),
@@ -816,7 +816,7 @@ def test_200_empty_list_is_authoritative_valid_empty_fetch_outcome(monkeypatch):
 
     assert frame.empty
     outcome = scraper.get_fetch_outcomes()['market_value_points']['42']
-    assert outcome['status'] == 'valid_empty'
+    assert outcome['status'] == 'authoritative_empty'
     assert outcome['status_code'] == 200
     assert outcome['row_count'] == 0
     assert outcome['payload_hash']

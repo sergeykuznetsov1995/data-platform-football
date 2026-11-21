@@ -1,0 +1,80 @@
+{
+ "capture_id": "3faa35452fec89be4acec3113afdebd901f2199e554e997605efafa21c49aaa6",
+ "endpoint": "coach_history",
+ "parser_rows": [
+  {
+   "appointed_date": "2026-01-13",
+   "club_id": "64303",
+   "coach_id": "100735",
+   "coach_slug": "bruno-monteiro",
+   "left_date": null,
+   "name": "Bruno Monteiro",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-04-19",
+   "club_id": "64303",
+   "coach_id": "100735",
+   "coach_slug": "bruno-monteiro",
+   "left_date": "2024-04-29",
+   "name": "Bruno Monteiro",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-04-02",
+   "club_id": "64303",
+   "coach_id": "126137",
+   "coach_slug": "marcio-parreiras",
+   "left_date": "2024-04-15",
+   "name": "Márcio Parreiras",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2024-02-21",
+   "club_id": "64303",
+   "coach_id": "41223",
+   "coach_slug": "omar-feitosa",
+   "left_date": "2024-04-02",
+   "name": "Omar Feitosa",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2023-05-09",
+   "club_id": "64303",
+   "coach_id": "100735",
+   "coach_slug": "bruno-monteiro",
+   "left_date": "2023-11-30",
+   "name": "Bruno Monteiro",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2021-01-19",
+   "club_id": "64303",
+   "coach_id": "140867",
+   "coach_slug": "bebeto",
+   "left_date": "2021-01-22",
+   "name": "Bebeto",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2020-11-06",
+   "club_id": "64303",
+   "coach_id": "142518",
+   "coach_slug": "elton-bassi",
+   "left_date": "2020-11-09",
+   "name": "Elton Bassi",
+   "role": "Manager"
+  },
+  {
+   "appointed_date": "2020-03-06",
+   "club_id": "64303",
+   "coach_id": "100735",
+   "coach_slug": "bruno-monteiro",
+   "left_date": "2020-11-30",
+   "name": "Bruno Monteiro",
+   "role": "Manager"
+  }
+ ],
+ "url": "https://www.transfermarkt.com/ji-parana-futebol-clube-ro-/mitarbeiterhistorie/verein/64303/plus/1",
+ "validator_problem": null
+}
