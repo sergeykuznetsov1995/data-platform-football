@@ -187,6 +187,9 @@ class Offline:
                         value['data'] = value['data'][:-1]
                 elif '/verletztespieler/' in parsed.path:
                     value = outer.injury_html
+                elif '/besucherzahlen/' in parsed.path:
+                    from tests.unit.scripts.test_transfermarkt_attendance_current import attendance_html
+                    value = attendance_html(url, outer)
                 elif '/mitarbeiter/' in parsed.path:
                     from pathlib import Path
                     club = parsed.path.rsplit('/', 1)[-1]
@@ -379,7 +382,7 @@ def production_current(offline, monkeypatch):
 
     monkeypatch.setattr('dags.utils.transfermarkt_staff.write_current_staff', staff_writer)
 
-    def run(cycle, *, rows=None, max_scopes=8):
+    def run(cycle, *, rows=None, max_scopes=8, attendance_writer=None):
         return current.run_current_portion(
             rows if rows is not None else [_joined_row(_competition('GB1'), _edition('GB1', '2026'))],
             {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, cycle,
@@ -387,6 +390,7 @@ def production_current(offline, monkeypatch):
             state_dir=offline.root / 'state', qualification=offline.qualification,
             max_seconds=2400, max_scopes=max_scopes, roster_writer=offline.roster_writer,
             career_writer=offline.career_writer, coach_writer=offline.coach_writer,
+            attendance_writer=attendance_writer,
             now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed,
         )
 

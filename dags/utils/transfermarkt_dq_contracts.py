@@ -27,6 +27,7 @@ AUTHORITATIVE_EMPTY_ALLOWED_ENTITIES = {
     'transfer_events',
     'coach_profiles',
     'coach_stints',
+    'attendance_observations',
 }
 SUPPORTED_ENTITIES = (
     REQUIRED_NONEMPTY_ENTITIES | AUTHORITATIVE_EMPTY_ALLOWED_ENTITIES

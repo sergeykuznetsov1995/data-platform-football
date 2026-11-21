@@ -512,6 +512,8 @@ class ScopeCursor:
     staff_pending: bool = False
     stadium_completed_at: datetime | None = None
     stadium_pending: bool = False
+    attendance_completed_at: datetime | None = None
+    attendance_pending: bool = False
     last_error_at: datetime | None = None
     change_pending: bool = False
 
@@ -525,11 +527,13 @@ class ScopeCursor:
             raise CurrentStateError('staff_pending must be boolean')
         if not isinstance(self.stadium_pending, bool):
             raise CurrentStateError('stadium_pending must be boolean')
+        if not isinstance(self.attendance_pending, bool):
+            raise CurrentStateError('attendance_pending must be boolean')
         if not isinstance(self.change_pending, bool):
             raise CurrentStateError('change_pending must be boolean')
         for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at',
                      'roster_completed_at', 'last_work_at', 'staff_completed_at',
-                     'stadium_completed_at', 'last_error_at'):
+                     'stadium_completed_at', 'attendance_completed_at', 'last_error_at'):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _time(getattr(self, name)))
         try:
@@ -550,11 +554,14 @@ class ScopeCursor:
     def from_mapping(cls, value: Mapping[str, Any]) -> 'ScopeCursor':
         values = {'staff_completed_at': None, 'staff_pending': False,
                   'stadium_completed_at': None, 'stadium_pending': False,
+                  'attendance_completed_at': None, 'attendance_pending': False,
                   'last_error_at': None, 'change_pending': False, **value}
         cursor = cls(**_mapping(cls, values))
         resume = json.loads(cursor.resume_json)
         if isinstance(resume, dict) and resume.pop('staff_pending', False):
             cursor = replace(cursor, staff_pending=True, resume_json=_json(resume))
+        if isinstance(resume, dict) and resume.pop('attendance_pending', False):
+            cursor = replace(cursor, attendance_pending=True, resume_json=_json(resume))
         return cursor
 
     def daily_due(self, now: datetime) -> tuple[str, ...]:
@@ -710,6 +717,7 @@ def plan_current_work(
     targets: Iterable[CurrentTarget], cursors: Mapping[str, ScopeCursor], *,
     now: datetime, limit: int = 8, staff_enabled: bool = False,
     stadium_enabled: bool = False,
+    attendance_enabled: bool = False,
     scope_index: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[CurrentWork, ...]:
     """Every due signal first, then a converging cold/continuation queue (#2068).
@@ -793,6 +801,9 @@ def plan_current_work(
         elif staff_enabled and (cursor.staff_pending or cursor.staff_completed_at is None
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
             queue(4, 'weekly_staff', (last_work, target.cold_priority))
+        elif attendance_enabled and (cursor.attendance_pending or cursor.attendance_completed_at is None
+                                    or timestamp - cursor.attendance_completed_at >= WEEKLY_INTERVAL):
+            queue(4, 'weekly_attendance', (last_work, target.cold_priority))
     chosen = [item[1] for item in sorted(fresh, key=lambda pair: pair[0])]
     chosen += [item[1] for item in sorted(resume, key=lambda pair: pair[0])][:limit]
     return tuple(chosen)

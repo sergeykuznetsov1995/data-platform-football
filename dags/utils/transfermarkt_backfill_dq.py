@@ -11,6 +11,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from utils import transfermarkt_bronze_dq as bronze_dq
 from utils.transfermarkt_scope_state import SCOPE_MANIFEST_TABLE
+from scrapers.transfermarkt.attendance import ATTENDANCE_COLUMNS, ATTENDANCE_TABLE
+
+ATTENDANCE_ENTITY = 'attendance_observations'
+BACKFILL_ENTITY_TABLE_MAP = {
+    **bronze_dq.ENTITY_BRONZE_TABLES,
+    ATTENDANCE_ENTITY: ATTENDANCE_TABLE,
+}
 
 
 BACKFILL_PIN_TABLES = tuple(sorted({
@@ -50,6 +57,7 @@ ENTITY_FINGERPRINT_COLUMNS = {
     'coach_stints': (
         'club_id', 'club_name', 'coach_id', 'coach_slug', 'name', 'role',
     ),
+    ATTENDANCE_ENTITY: ATTENDANCE_COLUMNS,
 }
 
 
@@ -83,6 +91,7 @@ def pin_iceberg_snapshots(
     """Pin every input once after the mapped batch has stopped writing."""
 
     pins: dict[str, int] = {}
+    tables = tuple(tables)
     for table in sorted(set(tables)):
         try:
             catalog, schema, name = table.split('.', 2)
@@ -98,7 +107,10 @@ def pin_iceberg_snapshots(
                 f'no unique positive Iceberg snapshot for {table}'
             )
         pins[table] = int(rows[0][0])
-    if set(pins) != set(BACKFILL_PIN_TABLES):
+    required = set(BACKFILL_PIN_TABLES)
+    if ATTENDANCE_TABLE in tables:
+        required.add(ATTENDANCE_TABLE)
+    if set(pins) != required:
         raise BackfillDqError('backfill snapshot set is incomplete')
     return pins
 
@@ -109,7 +121,7 @@ def build_raw_lineage_sql(
     snapshot_id: int,
     child_cycle_ids: Sequence[str],
 ) -> str:
-    if table not in BACKFILL_ENTITY_TABLES:
+    if table not in {*BACKFILL_ENTITY_TABLES, ATTENDANCE_TABLE}:
         raise BackfillDqError(f'raw-lineage table is not native Bronze: {table}')
     if int(snapshot_id) <= 0:
         raise BackfillDqError('raw-lineage snapshot must be positive')
@@ -117,6 +129,10 @@ def build_raw_lineage_sql(
     if not cycles or any(not value for value in cycles):
         raise BackfillDqError('raw-lineage query requires child cycle ids')
     values = ', '.join(_quoted(value) for value in cycles)
+    if table == ATTENDANCE_TABLE:
+        return f"""SELECT DISTINCT source_body_hash, scope_id, run_id AS cycle_id
+FROM {table} FOR VERSION AS OF {int(snapshot_id)}
+WHERE run_id IN ({values})"""
     return f"""SELECT DISTINCT source_body_hash, scope_id, cycle_id
 FROM {table} FOR VERSION AS OF {int(snapshot_id)}
 WHERE cycle_id IN ({values})"""
@@ -129,16 +145,17 @@ def build_manifest_entity_rows_sql(
     child_cycle_id: str,
     scope_id: str,
 ) -> str:
-    table = bronze_dq.ENTITY_BRONZE_TABLES.get(entity)
+    table = BACKFILL_ENTITY_TABLE_MAP.get(entity)
     columns = ENTITY_FINGERPRINT_COLUMNS.get(entity)
     if table is None or columns is None:
         raise BackfillDqError(f'unknown manifest entity: {entity}')
     if int(snapshot_id) <= 0:
         raise BackfillDqError('manifest entity snapshot must be positive')
     projection = ', '.join(columns)
+    cycle_column = 'run_id' if entity == ATTENDANCE_ENTITY else 'cycle_id'
     return f"""SELECT {projection}
 FROM {table} FOR VERSION AS OF {int(snapshot_id)}
-WHERE cycle_id = {_quoted(child_cycle_id)}
+WHERE {cycle_column} = {_quoted(child_cycle_id)}
   AND scope_id = {_quoted(scope_id)}"""
 
 
@@ -192,7 +209,7 @@ def verify_manifest_entity_fingerprints(
                     f'duplicate manifest entity identity: {identity}'
                 )
             seen.add(identity)
-            table = bronze_dq.ENTITY_BRONZE_TABLES.get(entity)
+            table = BACKFILL_ENTITY_TABLE_MAP.get(entity)
             if table is None or table not in pins:
                 raise BackfillDqError(f'{entity}: pinned Bronze table is absent')
             receipts = getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {}).get(entity)
@@ -203,7 +220,14 @@ def verify_manifest_entity_fingerprints(
                     entity, snapshot_id=int(pins[table]),
                     child_cycle_id=child_cycle_id, scope_id=scope_id))
                 rows = list(cur.fetchall())
-            count, digest = _fingerprint_rows(rows)
+            if entity == ATTENDANCE_ENTITY:
+                from utils.transfermarkt_attendance import _physical
+
+                physical = _physical(
+                    dict(zip(ATTENDANCE_COLUMNS, row, strict=True)) for row in rows)
+                count, digest = physical['rows'], physical['physical_hash']
+            else:
+                count, digest = _fingerprint_rows(rows)
             if (
                 count != int(evidence.dedup_rows)
                 or digest != str(evidence.key_hash)
@@ -362,7 +386,10 @@ def verify_raw_lineage(
     rows_by_table: dict[str, int] = {}
     cached_origins: dict[str, tuple[str, str]] = {}
     cached_content: set[tuple[str, str, str]] = set()
-    for table in BACKFILL_ENTITY_TABLES:
+    entity_tables = list(BACKFILL_ENTITY_TABLES)
+    if ATTENDANCE_TABLE in pins:
+        entity_tables.append(ATTENDANCE_TABLE)
+    for table in entity_tables:
         snapshot = pins.get(table)
         if snapshot is None:
             raise BackfillDqError(f'raw-lineage snapshot is absent: {table}')
@@ -525,7 +552,18 @@ def run_backfill_batch_dq(
 ) -> BackfillBatchDqReport:
     """Run existing scope-set DQ and the additional raw-lineage gate."""
 
-    snapshots = dict(pins or pin_iceberg_snapshots(cur))
+    has_attendance = any(
+        str(evidence.entity) == ATTENDANCE_ENTITY
+        for manifest in manifests for evidence in getattr(manifest, 'entities', ())
+    )
+    pin_tables = BACKFILL_PIN_TABLES + ((ATTENDANCE_TABLE,) if has_attendance else ())
+    if pins is None:
+        snapshots = pin_iceberg_snapshots(cur, tables=pin_tables)
+    else:
+        if has_attendance and ATTENDANCE_TABLE not in pins:
+            raise BackfillDqError(
+                'attendance manifest requires a supplied attendance snapshot pin')
+        snapshots = dict(pins)
     fingerprints = verify_manifest_entity_fingerprints(cur, pins=snapshots, manifests=manifests)
     historical_presence = {
         (str(manifest.scope_id), str(evidence.entity)): int(evidence.dedup_rows)

@@ -98,6 +98,7 @@ _ENTITY_LABELS = {
     'market_value_history': ('market_value_points', 'mv_history'),
     'transfers': ('transfer_events', 'transfers'),
     'coaches': ('coach_history', 'coach_profile', 'club_staff', 'club_profile', 'club_stadium'),
+    'attendance': ('attendance',),
 }
 
 
@@ -2150,6 +2151,86 @@ class _Scope:
             self.data.pop('stadium_sweep', None)
             self.persist()
 
+    def attendance(self, writer, *, final=False):
+        """Capture one complete edition aggregate with an immutable edition receipt."""
+        if writer is None or self.snapshot is None:
+            return
+        from scrapers.transfermarkt.attendance import (
+            AttendanceExtraction, AttendancePage, next_attendance_url, parse_attendance,
+        )
+        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+        from scrapers.transfermarkt.models import TrafficBudgetExceeded, TrafficMeterError
+
+        checked = self.cursor.attendance_completed_at
+        if not final and not self.cursor.attendance_pending and checked is not None \
+                and self.now() - checked < timedelta(days=7):
+            return
+        if final and self.data.get('attendance_final_receipt'):
+            return
+        started_at = _utc(self.data.get('attendance_sweep_started_at') or self.now())
+        self.data['attendance_sweep_started_at'] = started_at.isoformat()
+        self.cursor = replace(self.cursor, attendance_pending=True)
+        self.persist()
+        competition = self.scope['record']
+        start_url = (
+            f'https://www.transfermarkt.com/{competition.slug}/besucherzahlen/'
+            f'wettbewerb/{self.target.competition_id}/saison_id/{self.target.edition_id}'
+        )
+        pages = []
+        try:
+            url = start_url
+            while True:
+                outcome = self.fetch(url, 'attendance')
+                body, raw = self.scraper._http_client._raw_store.load_capture(outcome.raw_capture_id)
+                pages.append(AttendancePage(
+                    raw.url, body, raw.capture_id, raw.content_hash, raw.fetched_at, raw.status_code,
+                ))
+                url = next_attendance_url(body, url)
+                if url is None:
+                    break
+            result = parse_attendance(
+                pages, start_url=start_url,
+                competition_id=self.target.competition_id, edition_id=self.target.edition_id,
+                observed_at=pages[0].captured_at,
+            )
+            observed_at = pages[0].captured_at
+            run_id = 'tm-attendance-' + hashlib.sha256(json.dumps([
+                'current', self.target.scope_id, observed_at, final,
+            ]).encode()).hexdigest()[:32]
+            extraction = AttendanceExtraction(
+                result, self.target.scope_id, run_id, self.target.registry_snapshot_id,
+                self.now().isoformat(), final_season=final,
+                final_season_proof=(
+                    'season-close:' + self.target.registry_snapshot_id if final else None),
+            )
+            proof = writer(
+                self.scraper, extraction, self.snapshot.expected_team_ids, self.preflight,
+                competition_id=self.target.competition_id, edition_id=self.target.edition_id,
+                observed_at=observed_at,
+            )
+            expected_clubs = sorted(self.snapshot.expected_team_ids, key=int)
+            if (not _proof(proof)[0] or proof.get('receipt_readback') is not True
+                    or proof.get('expected_club_ids') != expected_clubs
+                    or proof.get('observed_at') != observed_at
+                    or proof.get('final_season') is not final):
+                raise CurrentPortionError('attendance writer receipt differs from edition proof')
+        except (CurrentPortionDeadlineExceeded, LeaseConcurrencyLimited,
+                TrafficBudgetExceeded, TrafficMeterError):
+            raise
+        except Exception as exc:
+            self.data['attendance_error'] = redact_sensitive(str(exc))
+            self.persist()
+            return
+        self.cursor = replace(
+            self.cursor, attendance_completed_at=_utc(self.now()), attendance_pending=False,
+        )
+        self.data['attendance_receipt'] = proof
+        if final:
+            self.data['attendance_final_receipt'] = proof
+        self.data.pop('attendance_error', None)
+        self.data.pop('attendance_sweep_started_at', None)
+        self.persist()
+
     def coaches(self):
         if self.data.get('authoritative_empty_scope'):
             return
@@ -2187,7 +2268,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         max_scopes=8, scraper_factory=None, roster_writer=None,
                         career_writer=None, coach_writer=None, now_fn=None, monotonic_fn=None,
                         deadline_monotonic=None, baseline_verifier=None, bootstrap_verifier=None,
-                        staff_writer=None, stadium_writer=None):
+                        staff_writer=None, stadium_writer=None, attendance_writer=None):
     """Collect real source work with offline dependency injection for integration QA."""
     if not preflight.get('paid_io_allowed') or preflight.get('write_mode') not in {'dual', 'native-only'}:
         raise CurrentPortionError('reader preflight did not authorize current collection')
@@ -2287,6 +2368,20 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
             logging.getLogger(__name__).warning('club stadiums not authorized: skipping monthly collection')
         else:
             stadium_writer = stadium_writer or write_current_club_stadium
+        if attendance_writer is None:
+            if os.environ.get('TM_ATTENDANCE_ENABLED', '').lower() not in {'true', '1'}:
+                report['attendance_status'] = 'attendance disabled'
+            else:
+                from dags.utils.transfermarkt_attendance import (
+                    validate_attendance_write_policy, write_attendance_observations,
+                )
+                try:
+                    validate_attendance_write_policy(policy)
+                except CurrentWriteError:
+                    report['attendance_status'] = 'attendance not authorized'
+                    logging.getLogger(__name__).warning('attendance not authorized: skipping attendance collection')
+                else:
+                    attendance_writer = write_attendance_observations
     factory = scraper_factory or _production_factory
     directory = Path(state_dir or os.environ.get('TM_CURRENT_STATE_DIR', '/opt/airflow/logs/transfermarkt-native-v2/current'))
     directory.mkdir(parents=True, exist_ok=True)
@@ -2369,7 +2464,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                                    for target in targets.targets]
         ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes,
                                      staff_enabled=staff_writer is not None,
-                                     stadium_enabled=stadium_writer is not None, scope_index=state['scopes'])
+                                     stadium_enabled=stadium_writer is not None,
+                                     attendance_enabled=attendance_writer is not None,
+                                     scope_index=state['scopes'])
         closing_work = tuple(CurrentWork(target, 'season_close') for target in sorted(
             closing.values(), key=lambda target: (
                 cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
@@ -2518,6 +2615,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 elif item.kind == 'weekly_staff':
                     scope.staff(staff_writer)
                     scope.stadiums(stadium_writer)
+                    scope.attendance(attendance_writer)
+                elif item.kind == 'weekly_attendance':
+                    scope.attendance(attendance_writer)
                     if (not scope.resume.get('required')
                         and not any(scope.resume.get('careers', {}).values())
                         and not scope.resume.get('coaches_pending')):
@@ -2543,6 +2643,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             scope.roster(weekly=first_close_portion)
                             data['season_close_roster_captured'] = True
                             scope.persist()
+                        scope.attendance(attendance_writer, final=True)
                     else:
                         # An unfinished cold capture re-proves a due listing;
                         # a fresh one gets it from roster(), a recovered write needs none.
@@ -2565,6 +2666,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             }, preflight, mode='current')
                         scope.staff(staff_writer)
                         scope.stadiums(stadium_writer)
+                        scope.attendance(attendance_writer)
                     # #2068: a cold roster only commits the roster; its careers
                     # and coaches remain in resume_json for continuation work.
                     roster_only = item.kind == 'cold_roster' and not data.get('authoritative_empty_scope')
@@ -2587,7 +2689,16 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 scope.persist()
                 if daily_complete(scope.cursor, now()):
                     report['daily_complete_scope_ids'].append(target.scope_id)
-                result['status'] = 'complete' if not scope.has_resume_work() and item.kind != 'cold_roster' else 'pending'
+                attendance_close_missing = (
+                    item.kind == 'season_close'
+                    and (attendance_writer is not None or os.environ.get(
+                        'TM_ATTENDANCE_ENABLED', '').lower() in {'true', '1'})
+                    and not data.get('attendance_final_receipt')
+                )
+                result['status'] = (
+                    'complete' if not scope.has_resume_work() and not scope.cursor.attendance_pending
+                    and not attendance_close_missing and item.kind != 'cold_roster' else 'pending'
+                )
                 if data.get('stadium_sweep'):
                     result['status'] = 'pending'
                 if item.kind == 'season_close' and result['status'] == 'complete':

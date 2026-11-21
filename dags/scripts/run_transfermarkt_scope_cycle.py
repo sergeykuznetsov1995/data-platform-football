@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run one exact Transfermarkt ``competition x edition`` child cycle.
 
-The wrapper is intentionally sequential.  Four isolated Bronze runners share
-one parent-cycle byte ledger, while their immutable results and the final scope
-manifest stay content-addressed under the planner-provided result directory.
+The wrapper is intentionally sequential. Four standard Bronze runners and an
+optional gated attendance runner share one parent-cycle byte ledger, while their
+immutable results and the final scope manifest stay content-addressed under the
+planner-provided result directory.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from dags.utils.transfermarkt_scope_state import (
 )
 from scrapers.transfermarkt.models import (
     CAREER_WINDOW_POLICY_VERSION,
+    ATTENDANCE_ENTITY_BUDGET,
     CURRENT_SQUAD_CACHE_POLICY_VERSION,
     CAREER_ENTITY_TIMEOUT_SECONDS,  # noqa: F401 - public compatibility export
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
@@ -102,6 +104,8 @@ ENTITY_ORDER = (
     'transfers',
     'coaches',
 )
+ATTENDANCE_ENTITY = 'attendance'
+ATTENDANCE_OUTPUT_ENTITY = 'attendance_observations'
 EXPECTED_ENTITIES = (
     'squad_memberships',
     'player_attribute_observations',
@@ -125,11 +129,17 @@ ENTITY_OUTPUTS = {
         ('profiles', 'coach_profiles'),
         ('stints', 'coach_stints'),
     ),
+    ATTENDANCE_ENTITY: (
+        ('attendance', ATTENDANCE_OUTPUT_ENTITY),
+    ),
 }
 ENTITY_TABLES = {
     entity: f'iceberg.bronze.transfermarkt_{entity}'
     for entity in EXPECTED_ENTITIES
 }
+ENTITY_TABLES[ATTENDANCE_OUTPUT_ENTITY] = (
+    f'iceberg.bronze.transfermarkt_{ATTENDANCE_OUTPUT_ENTITY}'
+)
 LEGACY_TABLES = {
     'iceberg.bronze.transfermarkt_players',
     'iceberg.bronze.transfermarkt_market_value_history',
@@ -143,6 +153,10 @@ CAREER_SAFETY_OPS_TABLES = frozenset({
 })
 SEASON_HANDOFF_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_season_close_v1'})
 FIRST_SEEN_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_first_seen_v1'})
+ATTENDANCE_POLICY_TABLES = frozenset({
+    'iceberg.bronze.transfermarkt_attendance_observations',
+    'iceberg.ops.transfermarkt_attendance_receipts_v1',
+})
 SEASON_HANDOFF_POLICY_VERSIONS = {
     'dag_ingest_transfermarkt': (3, 4),
     'dag_backfill_transfermarkt': (1, 2),
@@ -163,6 +177,7 @@ DEFAULT_ENTITY_LIMITS = {
         'requests': int(budget['requests']),
     }
     for name, budget in PRODUCTION_ENTITY_BUDGETS.items()
+    if name in ENTITY_ORDER
 }
 _APPROVAL_FLAGS = {
     '--approval-journal',
@@ -178,6 +193,22 @@ _APPROVAL_FLAGS = {
 }
 STANDING_POLICY_DAG_ID = 'dag_ingest_transfermarkt'
 STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
+
+
+def attendance_history_enabled() -> bool:
+    return (
+        os.environ.get('TM_ATTENDANCE_ENABLED', '').lower() in {'true', '1'}
+        and os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt'
+        and history_portion.enabled()
+    )
+
+
+def _entity_order(include_attendance: bool = False) -> tuple[str, ...]:
+    return ENTITY_ORDER + ((ATTENDANCE_ENTITY,) if include_attendance else ())
+
+
+def _expected_entities(include_attendance: bool = False) -> tuple[str, ...]:
+    return EXPECTED_ENTITIES + ((ATTENDANCE_OUTPUT_ENTITY,) if include_attendance else ())
 
 
 class ScopeCycleError(RuntimeError):
@@ -230,10 +261,15 @@ class EntityRun:
     resumed: bool
 
 
-def required_write_tables(write_mode: str) -> set[str]:
-    tables = set(ENTITY_TABLES.values()) | OPS_WRITE_TABLES | {
+def required_write_tables(write_mode: str, *, include_attendance: bool = False) -> set[str]:
+    tables = {ENTITY_TABLES[entity] for entity in EXPECTED_ENTITIES} | OPS_WRITE_TABLES | {
         SCOPE_MANIFEST_TABLE,
     }
+    if include_attendance:
+        tables |= {
+            ENTITY_TABLES[ATTENDANCE_OUTPUT_ENTITY],
+            'iceberg.ops.transfermarkt_attendance_receipts_v1',
+        }
     if write_mode == 'dual':
         tables |= LEGACY_TABLES | {
             'iceberg.ops.transfermarkt_dual_write_manifest_v2',
@@ -614,6 +650,7 @@ def validate_standing_policy_for_scope_cycle(
     request_limit: int,
     retry_limit: int,
     expected_dag_id: str = STANDING_POLICY_DAG_ID,
+    include_attendance: bool = False,
 ) -> None:
     """Check one standing policy against this wrapper's exact pinned limits."""
 
@@ -643,7 +680,8 @@ def validate_standing_policy_for_scope_cycle(
     ):
         raise ScopeCycleError('standing policy production_write caps are unsafe')
     required_tables = {
-        value.split('.')[-1] for value in required_write_tables(write_mode)
+        value.split('.')[-1] for value in required_write_tables(
+            write_mode, include_attendance=include_attendance)
     }
     allowed_tables = {
         str(value).split('.')[-1] for value in policy.allowed_write_tables
@@ -658,8 +696,9 @@ def standing_policy_for_hash(policy, pinned_hash):
 
     Approval dates, caps, concurrency and every Bronze permission stay
     byte-for-byte bound to the old hash. The current policy must authorize all
-    safety tables. Only the career safety, season handoff and first-observation
-    tables, or their explicit unions, may have been absent from the old body.
+    safety tables. Only the career safety, season handoff, first-observation
+    and optional attendance tables, or their explicit unions, may have been
+    absent from the old body.
     """
     if policy.policy_hash == pinned_hash:
         return policy
@@ -668,8 +707,17 @@ def standing_policy_for_hash(policy, pinned_hash):
     from dataclasses import replace
     migrations = (CAREER_SAFETY_OPS_TABLES, SEASON_HANDOFF_OPS_TABLES,
                   CAREER_SAFETY_OPS_TABLES | SEASON_HANDOFF_OPS_TABLES)
-    for additions in (*migrations, FIRST_SEEN_OPS_TABLES,
-                      *(item | FIRST_SEEN_OPS_TABLES for item in migrations)):
+    base_additions = (
+        frozenset(),
+        *migrations, FIRST_SEEN_OPS_TABLES,
+        *(item | FIRST_SEEN_OPS_TABLES for item in migrations),
+    )
+    addition_options = tuple(
+        item | attendance
+        for item in base_additions
+        for attendance in (frozenset(), ATTENDANCE_POLICY_TABLES)
+    )
+    for additions in addition_options:
         if not additions <= set(policy.allowed_write_tables):
             continue
         original = replace(policy, allowed_write_tables=tuple(
@@ -731,6 +779,7 @@ def _enforce_standing_policy(
             os.environ.get('TM_DAG_ID', '').strip()
             or STANDING_POLICY_DAG_ID
         ),
+        include_attendance=attendance_history_enabled(),
     )
     grant = PolicyGrant(
         packet_id=f'standing-policy-v{authorization_policy.policy_version}',
@@ -766,8 +815,13 @@ def _consume_approvals(
     entity_limits: Mapping[str, Mapping[str, int]],
 ) -> Mapping[str, Any]:
     expected_requests = int(args.request_limit)
-    if sum(item['requests'] for item in entity_limits.values()) > expected_requests:
+    base_requests = sum(
+        int(entity_limits[name]['requests']) for name in ENTITY_ORDER
+    )
+    if base_requests > expected_requests:
         raise ScopeCycleError('entity request budgets exceed the cycle request limit')
+    # Optional attendance consumes only the remaining shared scope allowance;
+    # its small per-entity cap does not reduce the four base entity budgets.
     if _approval_mode(args) == 'standing_policy':
         return _enforce_standing_policy(args)
     refs = _approval_refs(args)
@@ -792,7 +846,8 @@ def _consume_approvals(
     ):
         raise ApprovalDriftError('production_write approval limits are unsafe')
     required_tables = {
-        value.split('.')[-1] for value in required_write_tables(args.write_mode)
+        value.split('.')[-1] for value in required_write_tables(
+            args.write_mode, include_attendance=attendance_history_enabled())
     }
     for action, packet in packets.items():
         approved_tables = {
@@ -823,17 +878,23 @@ def _consume_approvals(
     return packets
 
 
-def _entity_limits(args: argparse.Namespace) -> Mapping[str, Mapping[str, int]]:
+def _entity_limits(args: argparse.Namespace, *, include_attendance: bool = False) -> Mapping[str, Mapping[str, int]]:
     limits = {
         name: dict(value) for name, value in DEFAULT_ENTITY_LIMITS.items()
     }
+    if include_attendance:
+        budget = ATTENDANCE_ENTITY_BUDGET
+        limits[ATTENDANCE_ENTITY] = {
+            'decoded_bytes': int(budget['decoded_mb'] * MIB),
+            'requests': int(budget['requests']),
+        }
     if args.entity_limits_json:
         loaded = _load_json_value(
             args.entity_limits_json, name='entity_limits_json',
         )
-        if not isinstance(loaded, Mapping) or set(loaded) != set(ENTITY_ORDER):
+        if not isinstance(loaded, Mapping) or set(loaded) != set(_entity_order(include_attendance)):
             raise ScopeCycleError(
-                'entity_limits_json must define exactly the four parser entities'
+                'entity_limits_json must define exactly the enabled parser entities'
             )
         for name, value in loaded.items():
             if not isinstance(value, Mapping):
@@ -843,7 +904,13 @@ def _entity_limits(args: argparse.Namespace) -> Mapping[str, Mapping[str, int]]:
                 'requests': int(value.get('requests', 0)),
             }
     for name, value in limits.items():
-        maximum = DEFAULT_ENTITY_LIMITS[name]
+        maximum = (
+            {
+                'decoded_bytes': int(ATTENDANCE_ENTITY_BUDGET['decoded_mb'] * MIB),
+                'requests': int(ATTENDANCE_ENTITY_BUDGET['requests']),
+            }
+            if name == ATTENDANCE_ENTITY else DEFAULT_ENTITY_LIMITS[name]
+        )
         if not 0 < value['decoded_bytes'] <= maximum['decoded_bytes']:
             raise ScopeCycleError(f'{name} decoded byte budget is out of bounds')
         if not 0 < value['requests'] <= maximum['requests']:
@@ -861,7 +928,8 @@ def _entity_timeout_seconds(
     3600 s (see CAREER_ENTITY_TIMEOUT_SECONDS for the arithmetic), and a
     TimeoutExpired burns attempt-guard budget without result evidence — so
     the career entities get the canon timeout while players/coaches keep the
-    caller-supplied one.  The worst-case sum of the four subprocess timeouts
+    caller-supplied one. The worst-case sum of the four standard subprocess
+    timeouts
     (3600 + 5400 + 5400 + 3600 = 18000 s) is what the mapped task's own
     execution timeout is derived from: SCOPE_WALL_CLOCK_TIMEOUT_SECONDS =
     18900 s (5 h 15 m), which adds SCOPE_OPS_OVERHEAD_SECONDS for the scope's
@@ -872,10 +940,11 @@ def _entity_timeout_seconds(
 
     # The caller may only shorten a small entity's timeout (_validate_args
     # bounds it by DEFAULT_ENTITY_TIMEOUT_SECONDS), so the worst-case sum of
-    # the four subprocess timeouts can never exceed the canon's
-    # SCOPE_WALL_CLOCK_TIMEOUT_SECONDS the mapped task is given.
+    # the four standard subprocess timeouts can never exceed the canon's
+    # SCOPE_WALL_CLOCK_TIMEOUT_SECONDS the mapped task is given. Optional
+    # historical attendance is additionally bounded by the history deadline.
     timeout = int(args.entity_timeout_seconds)
-    canon = int(ENTITY_TIMEOUT_SECONDS[parser_entity])
+    canon = int(ENTITY_TIMEOUT_SECONDS.get(parser_entity, DEFAULT_ENTITY_TIMEOUT_SECONDS))
     if canon > DEFAULT_ENTITY_TIMEOUT_SECONDS:
         return max(timeout, canon)
     return min(timeout, canon)
@@ -940,6 +1009,8 @@ def _runner_environment(
     retry_budget: int,
     listing_authoritative_empty: bool = False,
     request_deadline_monotonic: float | None = None,
+    expected_club_ids: Sequence[str] | None = None,
+    expected_club_proof: Mapping[str, Any] | None = None,
 ) -> Mapping[str, str]:
     env = dict(os.environ)
     if request_deadline_monotonic is not None:
@@ -1010,6 +1081,14 @@ def _runner_environment(
         )
     else:
         env.pop('TM_EXPECTED_PARTICIPANT_COUNT', None)
+    if expected_club_ids is None:
+        env.pop('TM_EXPECTED_CLUB_IDS_JSON', None)
+    else:
+        env['TM_EXPECTED_CLUB_IDS_JSON'] = _stable_json(list(expected_club_ids))
+    if expected_club_proof is None:
+        env.pop('TM_EXPECTED_CLUB_PROOF_JSON', None)
+    else:
+        env['TM_EXPECTED_CLUB_PROOF_JSON'] = _stable_json(dict(expected_club_proof))
     return env
 
 
@@ -1259,6 +1338,19 @@ def _validate_run_contract(
         _validate_participant_capture(
             identity, run.result.get('scope_capture'), entity_statuses,
         )
+    elif run.parser_entity == ATTENDANCE_ENTITY:
+        receipt = run.result.get('attendance_receipt')
+        if not isinstance(receipt, Mapping) or receipt.get('verified') is not True \
+                or receipt.get('receipt_readback') is not True \
+                or receipt.get('final_season') is not True \
+                or receipt.get('final_season_proof') != (
+                    f'history-backfill:{identity.registry_snapshot_id}'):
+            raise ScopeCycleError('attendance edition receipt is incomplete')
+        row = manifest_rows.get(ATTENDANCE_OUTPUT_ENTITY)
+        if not isinstance(row, Mapping) \
+                or row.get('native_hash') != receipt.get('physical_hash') \
+                or int(row.get('native_rows', -1)) != int(receipt.get('row_count', -2)):
+            raise ScopeCycleError('attendance receipt differs from native write evidence')
 
 
 def _build_scope_manifest(
@@ -1266,7 +1358,10 @@ def _build_scope_manifest(
     args: argparse.Namespace,
     runs: Sequence[EntityRun],
 ) -> Mapping[str, Any]:
-    if tuple(run.parser_entity for run in runs) != ENTITY_ORDER:
+    include_attendance = any(run.parser_entity == ATTENDANCE_ENTITY for run in runs)
+    entity_order = _entity_order(include_attendance)
+    expected_entities = _expected_entities(include_attendance)
+    if tuple(run.parser_entity for run in runs) != entity_order:
         raise ScopeCycleError('scope cycle has missing or out-of-order parser entities')
     evidence: list[EntityEvidence] = []
     parser_runs: dict[str, Any] = {}
@@ -1371,6 +1466,13 @@ def _build_scope_manifest(
     scope_capture = runs[0].result.get('scope_capture')
     if not isinstance(scope_capture, Mapping):
         raise ScopeCycleError('players scope_capture evidence is missing')
+    for run in runs:
+        if run.parser_entity != ATTENDANCE_ENTITY:
+            continue
+        receipt = run.result['attendance_receipt']
+        expected_clubs = sorted(scope_capture.get('expected_team_ids') or (), key=int)
+        if receipt.get('expected_club_ids') != expected_clubs:
+            raise ScopeCycleError('attendance receipt differs from players participant checkpoint')
     entity_statuses = {
         item.entity: item.applicability_status for item in evidence
     }
@@ -1497,14 +1599,14 @@ def _build_scope_manifest(
         entities=tuple(evidence),
         dq_evidence=dq_evidence,
     )
-    scope.validate(EXPECTED_ENTITIES)
+    scope.validate(expected_entities)
     payload = asdict(scope)
     payload.update({
         'manifest_digest': scope.digest,
         'status': 'complete',
         'dq': {
             'status': 'passed',
-            'expected_entities': list(EXPECTED_ENTITIES),
+            'expected_entities': list(expected_entities),
             'missing_entities': [],
             'participant_contract': dict(participant_dq),
             # A campaign capture is Bronze-only even when it is complete.
@@ -1678,7 +1780,7 @@ def _bigint_sql(value: int | None) -> str:
 
 
 def proxy_ledger_merge_sql(parent_ledger: Mapping[str, Any]) -> str:
-    """Build one cumulative seven-row parent-cycle proxy ledger MERGE."""
+    """Build one cumulative parent-cycle proxy ledger MERGE."""
 
     hard_limit, soft_limit = _parent_byte_caps(
         parent_ledger.get('hard_provider_byte_budget', -1),
@@ -1688,14 +1790,15 @@ def proxy_ledger_merge_sql(parent_ledger: Mapping[str, Any]) -> str:
         parent_ledger.get('parent_cycle_id'), 'parent ledger cycle id',
     )
     by_entity = parent_ledger.get('by_entity') or {}
-    if not isinstance(by_entity, Mapping) or set(by_entity) != set(EXPECTED_ENTITIES):
-        raise ScopeCycleError('parent proxy ledger must contain seven entities')
+    entities = _expected_entities(ATTENDANCE_OUTPUT_ENTITY in by_entity)
+    if not isinstance(by_entity, Mapping) or set(by_entity) != set(entities):
+        raise ScopeCycleError('parent proxy ledger entity set is incomplete')
     fields = (
         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes', 'requests',
         'retries', 'cache_hits', 'duration_ms',
     )
     rows = []
-    for entity in EXPECTED_ENTITIES:
+    for entity in entities:
         item = by_entity[entity]
         if not isinstance(item, Mapping):
             raise ScopeCycleError(f'parent proxy ledger {entity} row is invalid')
@@ -1908,7 +2011,8 @@ def _update_parent_ledger(
                 }
                 for item in manifest_entities
             }
-            if set(scope_by_entity) != set(EXPECTED_ENTITIES):
+            scope_entities = _expected_entities(ATTENDANCE_OUTPUT_ENTITY in scope_by_entity)
+            if set(scope_by_entity) != set(scope_entities):
                 raise ScopeCycleError('scope manifest entity traffic is incomplete')
             entry = {
                 'child_cycle_id': identity.child_cycle_id,
@@ -1918,7 +2022,7 @@ def _update_parent_ledger(
             }
             portion_metrics = manifest.get('traffic', {}).get('portion_by_entity')
             if portion_metrics is not None:
-                if set(portion_metrics) != set(EXPECTED_ENTITIES):
+                if set(portion_metrics) != set(scope_entities):
                     raise ScopeCycleError('historical portion entity traffic is incomplete')
                 entry['by_entity'] = portion_metrics
                 entry.update({field: sum(int(item[field]) for item in portion_metrics.values()) for field in entity_fields})
@@ -1930,15 +2034,18 @@ def _update_parent_ledger(
                 field: sum(int(item[field]) for item in scopes.values())
                 for field in fields
             }
+            entities = _expected_entities(any(
+                ATTENDANCE_OUTPUT_ENTITY in item['by_entity'] for item in scopes.values()
+            ))
             by_entity = {
                 entity: {
                     field: sum(
-                        int(item['by_entity'][entity][field])
+                        int(item['by_entity'].get(entity, {}).get(field, 0))
                         for item in scopes.values()
                     )
                     for field in fields
                 }
-                for entity in EXPECTED_ENTITIES
+                for entity in entities
             }
             for field in fields:
                 if sum(item[field] for item in by_entity.values()) != totals[field]:
@@ -2180,7 +2287,9 @@ def _checkpoint_identity(
         'career_window_limit': int(args.career_window_limit),
         'coach_history_ttl_days': int(args.coach_history_ttl_days),
         'lease_ttl_seconds': int(args.lease_ttl_seconds),
-        'entity_limits': entity_limits,
+        'entity_limits': {
+            name: value for name, value in entity_limits.items() if name in ENTITY_ORDER
+        },
     })
 
 
@@ -2189,6 +2298,7 @@ def _resume_runs(
     args: argparse.Namespace,
     checkpoint: Mapping[str, Any],
     checkpoint_identity: str,
+    entity_order: tuple[str, ...] = ENTITY_ORDER,
 ) -> list[EntityRun]:
     if checkpoint.get('identity_hash') != checkpoint_identity:
         return []
@@ -2196,7 +2306,7 @@ def _resume_runs(
     if not isinstance(entries, Mapping):
         raise ScopeCycleError('scope checkpoint entity map is invalid')
     runs: list[EntityRun] = []
-    for parser_entity in ENTITY_ORDER:
+    for parser_entity in entity_order:
         item = entries.get(parser_entity)
         if not isinstance(item, Mapping) or item.get('status') != 'success':
             break
@@ -2347,13 +2457,17 @@ def _run_scope_cycle(
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
 ) -> Mapping[str, Any]:
     identity = _scope_identity(args)
-    limits = _entity_limits(args)
+    include_attendance = attendance_history_enabled()
+    if include_attendance and _approval_mode(args) != 'standing_policy':
+        raise ScopeCycleError('attendance history requires the standing backfill policy')
+    entity_order = _entity_order(include_attendance)
+    limits = _entity_limits(args, include_attendance=include_attendance)
     checkpoint_path = Path(identity.result_base_dir) / 'scope-cycle-checkpoint.json'
     checkpoint_identity = _checkpoint_identity(identity, args, limits)
     checkpoint: Mapping[str, Any] = {}
     if checkpoint_path.exists():
         checkpoint = _load_json_file(checkpoint_path)
-    runs = _resume_runs(identity, args, checkpoint, checkpoint_identity)
+    runs = _resume_runs(identity, args, checkpoint, checkpoint_identity, entity_order)
     if history_portion.enabled() and history_portion.recovery_probe():
         # Probe a fresh listing even when the full players checkpoint exists.
         # It cannot replace that checkpoint or finish any historical entity.
@@ -2363,7 +2477,7 @@ def _run_scope_cycle(
     if manifest_path.exists():
         manifest = _load_json_file(manifest_path)
         scope_manifest_merge_sql(manifest)
-        if len(runs) != len(ENTITY_ORDER):
+        if len(runs) != len(entity_order):
             raise ScopeCycleError('final manifest exists without exact checkpoints')
         checkpoint_complete = (
             checkpoint.get('status') == 'complete'
@@ -2579,7 +2693,7 @@ def _run_scope_cycle(
             'status': 'in_progress',
         }, immutable=False)
 
-    for parser_entity in ENTITY_ORDER[len(runs):]:
+    for parser_entity in entity_order[len(runs):]:
         if history_portion.enabled() and history_portion.remaining_seconds() <= history_portion.HISTORY_SETTLE_SECONDS + 180:
             _atomic_json(checkpoint_path, {'version': 1, 'identity_hash': checkpoint_identity,
                          'entities': entity_checkpoint, 'status': 'in_progress'}, immutable=False)
@@ -2727,6 +2841,14 @@ def _run_scope_cycle(
                         and run.result['scope_capture'].get('listing_status')
                         == 'authoritative_empty'
                         for run in runs
+                    ),
+                    expected_club_ids=(
+                        runs[0].result['scope_capture'].get('expected_team_ids')
+                        if parser_entity == ATTENDANCE_ENTITY else None
+                    ),
+                    expected_club_proof=(
+                        runs[0].result['scope_capture']
+                        if parser_entity == ATTENDANCE_ENTITY else None
                     ),
                 ),
                 shell=False,
@@ -3094,7 +3216,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ScopeCycleError(f'{field} must be positive')
     # A caller-supplied entity timeout may only be shorter than the canon's
     # small-entity timeout; anything longer could push the worst-case sum of
-    # the four subprocesses past the mapped task's execution timeout, and a
+    # the four standard subprocesses past the mapped task's execution timeout, and a
     # SIGKILL mid-crawl loses the attempt guard and the entity's evidence.
     if int(args.entity_timeout_seconds) > DEFAULT_ENTITY_TIMEOUT_SECONDS:
         raise ScopeCycleError(

@@ -332,8 +332,16 @@ def _next_url(soup, current_url: str) -> str | None:
     return targets.pop() if targets else None
 
 
+def next_attendance_url(body: bytes, current_url: str) -> str | None:
+    try:
+        html = body.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise AttendanceParseError('invalid_utf8') from exc
+    return _next_url(BeautifulSoup(html, 'html.parser'), current_url)
+
+
 def _row(tr, fields: list[str], *, competition: str, edition: str,
-         page: AttendancePage) -> AttendanceRow | None:
+         page: AttendancePage, observed_at: str | None = None) -> AttendanceRow | None:
     cells = tr.find_all('td', recursive=False)
     if len(cells) != len(fields):
         raise AttendanceParseError('attendance_row_shape_changed')
@@ -386,7 +394,7 @@ def _row(tr, fields: list[str], *, competition: str, edition: str,
         else:
             observation_status, status_reason = 'explicit_none', 'published_values_missing'
     return AttendanceRow(
-        competition, edition, canonical_club_id(club_id), page.captured_at,
+        competition, edition, canonical_club_id(club_id), observed_at or page.captured_at,
         club_name, stadium_name, stadium_url,
         parsed['capacity'], raw['capacity'],
         parsed['spectators_total'], raw['spectators_total'],
@@ -398,7 +406,7 @@ def _row(tr, fields: list[str], *, competition: str, edition: str,
 
 
 def _parse_page(page: AttendancePage, *, competition: str,
-                edition: str) -> tuple[list[AttendanceRow], str | None]:
+                edition: str, observed_at: str | None = None) -> tuple[list[AttendanceRow], str | None]:
     try:
         html = page.body.decode('utf-8')
     except UnicodeDecodeError as exc:
@@ -411,15 +419,18 @@ def _parse_page(page: AttendancePage, *, competition: str,
     table = tables[0]
     fields = _headers(table)
     tbody = table.find('tbody', recursive=False)
-    rows = [_row(tr, fields, competition=competition, edition=edition, page=page)
+    rows = [_row(tr, fields, competition=competition, edition=edition, page=page,
+                 observed_at=observed_at)
             for tr in tbody.find_all('tr', recursive=False)]
     return [row for row in rows if row is not None], _next_url(soup, page.url)
 
 
 def parse_attendance(pages: Iterable[AttendancePage], *, start_url: str,
-                     competition_id: Any, edition_id: Any) -> AttendanceResult:
+                     competition_id: Any, edition_id: Any,
+                     observed_at: Any = None) -> AttendanceResult:
     competition = _competition_id(competition_id)
     edition = _edition_id(edition_id)
+    observation = canonical_timestamp(observed_at) if observed_at is not None else None
     start_parts = urlsplit(start_url)
     start = _validate_attendance_url(
         start_url, host=start_parts.netloc, path=start_parts.path,
@@ -454,7 +465,8 @@ def parse_attendance(pages: Iterable[AttendancePage], *, start_url: str,
         if page.status_code != 200:
             return AttendanceResult('unavailable', status_reason=f'http_{page.status_code}',
                                     page_count=len(visited))
-        page_rows, next_url = _parse_page(page, competition=competition, edition=edition)
+        page_rows, next_url = _parse_page(
+            page, competition=competition, edition=edition, observed_at=observation)
         for row in page_rows:
             previous = rows_by_club.get(row.club_id)
             if previous is None:
@@ -616,5 +628,5 @@ __all__ = [
     'AttendanceResult', 'AttendanceRow', 'build_attendance_dq',
     'canonical_club_id', 'canonical_timestamp', 'confirmed_empty_attendance',
     'error_attendance', 'extract_attendance', 'not_applicable_attendance',
-    'parse_attendance', 'unavailable_attendance', 'unknown_attendance',
+    'next_attendance_url', 'parse_attendance', 'unavailable_attendance', 'unknown_attendance',
 ]
