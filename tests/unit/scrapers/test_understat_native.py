@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, datetime, timezone
+import json
+from urllib.parse import urljoin
 import pandas as pd
 import pytest
 
@@ -93,6 +95,206 @@ def test_client_bootstraps_cookie_headers_and_honors_retry_after_without_real_sl
     assert session.calls[2][1]["headers"] == {"X-Requested-With": "XMLHttpRequest"}
     assert clock.sleeps == [2.0, 3.0]
     assert "Mozilla" in session.headers["User-Agent"]
+
+
+@pytest.mark.parametrize("location", ["/fresh", "https://other.invalid/x"])
+def test_redirect_chain_is_counted_and_paced_per_hop(tmp_path, location):
+    base = "https://fixture.invalid"
+    session = _Session(
+        [
+            _Response(200),
+            _Response(302, headers={"Location": location}),
+            _Response(200, {"stat": []}),
+        ]
+    )
+    clock = _Clock()
+    client = UnderstatClient(
+        session=session,
+        base_url=base,
+        requests_per_minute=30,
+        max_attempts=1,
+        cache_dir=tmp_path,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    assert client.get_stat_data() == {"stat": []}
+    assert len(session.calls) == 3
+    assert [url for url, _ in session.calls] == [
+        base, base + "/getStatData", urljoin(base, location),
+    ]
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in session.calls)
+    assert session.calls[2][1]["headers"] == {"X-Requested-With": "XMLHttpRequest"}
+    assert (client.request_count, client.retry_count) == (3, 0)
+    ledger = json.loads(
+        (tmp_path / "daily-http-2026-07-27.json").read_text(encoding="utf-8")
+    )
+    assert ledger["requests"] == 3
+    assert clock.sleeps == [2.0, 2.0]
+
+
+@pytest.mark.parametrize("headers", [{}, {"Location": ""}])
+def test_redirect_without_location_raises_counted_http_error(tmp_path, headers):
+    session = _Session([_Response(200), _Response(302, headers=headers)])
+    clock = _Clock()
+    client = UnderstatClient(
+        session=session,
+        requests_per_minute=30,
+        cache_dir=tmp_path,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(UnderstatHTTPError) as caught:
+        client.get_stat_data()
+
+    assert caught.value.status_code == 302
+    assert len(session.calls) == 2
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in session.calls)
+    assert (client.request_count, client.retry_count) == (2, 0)
+    ledger = json.loads(
+        (tmp_path / "daily-http-2026-07-27.json").read_text(encoding="utf-8")
+    )
+    assert ledger["requests"] == 2
+    assert clock.sleeps == [2.0]
+
+
+def test_redirect_loop_stops_at_cap(tmp_path):
+    session = _Session(
+        [_Response(200)]
+        + [_Response(302, headers={"Location": "/getStatData"}) for _ in range(6)]
+    )
+    clock = _Clock()
+    client = UnderstatClient(
+        session=session,
+        requests_per_minute=30,
+        cache_dir=tmp_path,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(UnderstatHTTPError) as caught:
+        client.get_stat_data()
+
+    assert caught.value.status_code == 302
+    assert len(session.calls) == 6
+    assert len(session.responses) == 1
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in session.calls)
+    assert (client.request_count, client.retry_count) == (6, 0)
+    ledger = json.loads(
+        (tmp_path / "daily-http-2026-07-27.json").read_text(encoding="utf-8")
+    )
+    assert ledger["requests"] == 6
+    assert clock.sleeps == [2.0] * 5
+
+
+def test_cookie_bootstrap_redirect_is_counted_and_paced(tmp_path):
+    base = "https://fixture.invalid"
+    session = _Session(
+        [
+            _Response(302, headers={"Location": "/cookies"}),
+            _Response(200),
+            _Response(200, {"stat": []}),
+        ]
+    )
+    clock = _Clock()
+    client = UnderstatClient(
+        session=session,
+        base_url=base,
+        requests_per_minute=30,
+        max_attempts=1,
+        cache_dir=tmp_path,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    assert client.get_stat_data() == {"stat": []}
+    assert [url for url, _ in session.calls] == [
+        base, base + "/cookies", base + "/getStatData",
+    ]
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in session.calls)
+    assert session.calls[0][1]["headers"] == {}
+    assert session.calls[1][1]["headers"] == {}
+    assert (client.request_count, client.retry_count) == (3, 0)
+    ledger = json.loads(
+        (tmp_path / "daily-http-2026-07-27.json").read_text(encoding="utf-8")
+    )
+    assert ledger["requests"] == 3
+    assert clock.sleeps == [2.0, 2.0]
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_non_redirect_requests_and_retries_are_counted_in_daily_ledger(tmp_path, retry):
+    responses = [_Response(200)]
+    if retry:
+        responses.append(_Response(429, headers={"Retry-After": "3"}))
+    responses.append(_Response(200, {"stat": []}))
+    session = _Session(responses)
+    clock = _Clock()
+    client = UnderstatClient(
+        session=session,
+        requests_per_minute=30,
+        cache_dir=tmp_path,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        jitter=lambda *_: 0,
+        now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    assert client.get_stat_data() == {"stat": []}
+    expected_requests = 3 if retry else 2
+    assert len(session.calls) == expected_requests
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in session.calls)
+    assert (client.request_count, client.retry_count) == (
+        expected_requests, 1 if retry else 0,
+    )
+    ledger = json.loads(
+        (tmp_path / "daily-http-2026-07-27.json").read_text(encoding="utf-8")
+    )
+    assert ledger["requests"] == expected_requests
+    assert clock.sleeps == ([2.0, 3.0] if retry else [2.0])
+
+
+def test_retry_restarts_redirect_chain_as_one_attempt(tmp_path):
+    base = "https://fixture.invalid"
+    session = _Session(
+        [
+            _Response(200),
+            _Response(302, headers={"Location": "/fresh"}),
+            _Response(429, headers={"Retry-After": "3"}),
+            _Response(302, headers={"Location": "/fresh"}),
+            _Response(200, {"stat": []}),
+        ]
+    )
+    clock = _Clock()
+    client = UnderstatClient(
+        session=session,
+        base_url=base,
+        requests_per_minute=30,
+        max_attempts=2,
+        cache_dir=tmp_path,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        jitter=lambda *_: 0,
+        now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    assert client.get_stat_data() == {"stat": []}
+    assert [url for url, _ in session.calls] == [
+        base, base + "/getStatData", base + "/fresh",
+        base + "/getStatData", base + "/fresh",
+    ]
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in session.calls)
+    assert (client.request_count, client.retry_count) == (5, 1)
+    ledger = json.loads(
+        (tmp_path / "daily-http-2026-07-27.json").read_text(encoding="utf-8")
+    )
+    assert ledger["requests"] == 5
+    assert clock.sleeps == [2.0, 2.0, 3.0, 2.0]
 
 
 def test_client_context_manager_closes_the_session():
