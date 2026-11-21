@@ -1314,7 +1314,12 @@ def run_bronze_dq(
     pair_counts: dict[str, dict[tuple[str, str], int]] = {}
     pair_counts_error: str | None = None
     try:
-        for entity, table in ENTITY_BRONZE_TABLES.items():
+        entity_tables = dict(ENTITY_BRONZE_TABLES)
+        if 'iceberg.bronze.transfermarkt_attendance_observations' in pins:
+            entity_tables['attendance_observations'] = (
+                'iceberg.bronze.transfermarkt_attendance_observations'
+            )
+        for entity, table in entity_tables.items():
             cur.execute(build_scope_pair_counts_sql(table, pins=pins))
             pair_counts[entity] = {
                 (str(row[0]), str(row[1])): int(row[2])

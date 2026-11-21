@@ -18,6 +18,9 @@ from utils.transfermarkt_backfill_attempts import (
     verify_envelope_set,
 )
 from utils.transfermarkt_backfill_dq import (
+    ATTENDANCE_ENTITY,
+    ATTENDANCE_TABLE,
+    BACKFILL_PIN_TABLES,
     pin_iceberg_snapshots,
     run_backfill_batch_dq,
 )
@@ -71,7 +74,13 @@ def _validated_manifest(
     registry_snapshot_id: str | None = None,
 ) -> ScopeManifest:
     manifest = ScopeManifest.from_mapping(value)
-    manifest.validate(tm_v2.NATIVE_ENTITIES)
+    expected_entities = set(tm_v2.NATIVE_ENTITIES)
+    if any(
+        isinstance(item, Mapping) and item.get('entity') == 'attendance_observations'
+        for item in value.get('entities', ())
+    ):
+        expected_entities.add('attendance_observations')
+    manifest.validate(expected_entities)
     if value.get("manifest_digest") != manifest.digest:
         raise BackfillFinalizeError("scope manifest digest mismatch")
     if manifest.dq_evidence.get("silver_trigger_allowed") is not False:
@@ -1069,7 +1078,18 @@ def finalize_backfill_batch(
             raise
         if batch.status is state.BatchStatus.RUNNING:
             try:
-                pins = pin_iceberg_snapshots(repository.cursor)
+                has_attendance = any(
+                    str(evidence.entity) == ATTENDANCE_ENTITY
+                    for _payload, manifest in captured
+                    for evidence in getattr(manifest, 'entities', ())
+                )
+                if has_attendance:
+                    pins = pin_iceberg_snapshots(
+                        repository.cursor,
+                        tables=BACKFILL_PIN_TABLES + (ATTENDANCE_TABLE,),
+                    )
+                else:
+                    pins = pin_iceberg_snapshots(repository.cursor)
             except Exception as exc:
                 _persist_batch_platform_incident(
                     repository,
