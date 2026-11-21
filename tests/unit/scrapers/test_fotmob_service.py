@@ -271,6 +271,19 @@ def test_2302_momentum_false_is_source_sentinel_not_availability():
     assert row["missing_expected_sections_json"] == []
     assert repository.commits[-1].status == ManifestStatus.SUCCESS
     assert repository.commits[-1].error_code is None
+    # Re-parsing the same bytes after a committed manifest must reuse that
+    # batch instead of re-buffering rows for a mismatching confirm — even
+    # when the stored batch still carries the pre-#2302 mask (momentum=true),
+    # as every already-written batch does. Identity is content+parser, not
+    # the mask, so the stored row stays untouched.
+    row["available_sections_json"] = {**row["available_sections_json"], "momentum": True}
+    service.mode = RunMode.REPLAY
+    replayed = service.sync_match_payloads(bundle)
+    assert replayed.ok and replayed.succeeded == 1
+    assert len(repository.tables["fotmob_match_payloads"]) == 1
+    stored = repository.tables["fotmob_match_payloads"][0]
+    assert stored["available_sections_json"]["momentum"] is True
+    assert repository.commits[-1].status == ManifestStatus.SUCCESS
 
 
 @pytest.mark.parametrize("source_id", [999, "999", None, False, True, 100.0, "bad"])
