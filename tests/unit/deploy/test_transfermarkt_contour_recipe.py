@@ -1,6 +1,6 @@
 """Рецепт своего контура Transfermarkt в deploy/transfermarkt/ (#1387).
 
-Статически (без docker): блок-лист .airflowignore оставляет планировщику ровно четыре
+Статически (без docker): блок-лист .airflowignore оставляет планировщику ровно семь
 TM-DAG; оба compose-файла самодостаточны (ни одного хостового пути литералом, каждый
 bind — из переменной без дефолта, образ пинован); шлюз — в режиме transfermarkt-only без
 бюджетных флагов; скрипты читают env-файл контура общим загрузчиком. Рендер через
@@ -31,6 +31,9 @@ TM_DAGS = {
     "dag_discover_transfermarkt_registry.py",
     "dag_backfill_transfermarkt.py",
     "dag_transform_transfermarkt_silver.py",
+    "dag_ingest_transfermarkt_referees.py",
+    "dag_backfill_transfermarkt_referees.py",
+    "dag_dq_transfermarkt_referees.py",
 }
 HOST_PATH_LITERAL = re.compile(r"(?<![\w$])/(root/|tmp/|home/(?!airflow/))")
 FAIL_CLOSED_VAR = re.compile(r"^\$\{(?P<name>[A-Z0-9_]+):\?[^}]+\}")
@@ -67,7 +70,7 @@ def _tracked_dag_files() -> list[str]:
 
 
 @pytest.mark.unit
-def test_airflowignore_leaves_exactly_the_four_transfermarkt_dags() -> None:
+def test_airflowignore_leaves_exactly_the_seven_transfermarkt_dags() -> None:
     patterns = _patterns()
     # RE2 в Airflow: lookahead молча не работает — только явный блок-лист.
     assert "(?!" not in "".join(patterns)
@@ -75,7 +78,7 @@ def test_airflowignore_leaves_exactly_the_four_transfermarkt_dags() -> None:
         rel for rel in _tracked_dag_files()
         if not any(re.search(p, rel) for p in patterns)
     ]
-    # Кроме четырёх DAG виден только пакетный __init__.py (DAG не объявляет).
+    # Кроме семи DAG виден только пакетный __init__.py (DAG не объявляет).
     assert set(visible) == TM_DAGS | {"__init__.py"}, sorted(visible)
     init = (ROOT / "dags" / "__init__.py").read_text(encoding="utf-8")
     assert "DAG(" not in init and "@dag" not in init
@@ -216,7 +219,8 @@ def test_deploy_script_order_and_pool_handling() -> None:
 @pytest.mark.unit
 def test_auto_deliver_window_and_contract() -> None:
     text = (DEPLOY / "auto_deliver.sh").read_text(encoding="utf-8")
-    # #2039: часового окна нет — дедлайн по ближайшему прогону registry.
+    # #2039: часового окна нет — дедлайн по ближайшему прогону registry;
+    # lane_refresh добавляет уже зарегистрированные referee-расписания.
     assert "WINDOW_FROM" not in text and "set_window" not in text
     assert "NEXT_RUN_DAGS=\"'dag_discover_transfermarkt_registry'\"" in text
     assert "FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}" in text
