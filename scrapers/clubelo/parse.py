@@ -34,8 +34,9 @@ _HEADER = re.compile(
     # The "(Best: N, reached on D)" block is either complete or absent
     # (clubs without a recorded best, observed 2026-11-21). A present but
     # malformed block fails closed: after the Elo digits no digit may trail
-    # (backtracking guard) and no "(" may open a Best block.
-    r"Elo:\s*(-?\d+)(?:\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\)|(?!\d|\s*\())"
+    # (backtracking guard) and neither "(" nor a bare "Best" word may open
+    # the block (Astra review: a paren-less "Best: ..." remnant slipped by).
+    r"Elo:\s*(-?\d+)(?:\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\)|(?!\d|\s*\(|\s*\(?Best\b))"
     r"(?:,\s*Golo:\s*(-?\d+(?:\.\d+)?))?"
 )
 _VEGA_MARKER = "var vegaJson = "

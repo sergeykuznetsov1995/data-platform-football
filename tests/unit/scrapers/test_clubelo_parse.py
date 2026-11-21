@@ -284,6 +284,17 @@ def test_missing_header_fails_closed(riverplate_html):
         parse_club_page(riverplate_html.replace("reached on", "reached"), "riverplate")
 
 
+@pytest.mark.parametrize("corrupt", [
+    " Best: 1866, reached on 1986-07-24)",    # opening paren dropped
+    " (Best 1866, reached on 1986-07-24)",    # colon dropped
+])
+def test_malformed_best_block_without_paren_fails_closed(riverplate_html, corrupt):
+    html = riverplate_html.replace(" (Best: 1866, reached on 1986-07-24)", corrupt)
+    assert html != riverplate_html
+    with pytest.raises(LayoutChanged, match="header"):
+        parse_club_page(html, "riverplate")
+
+
 def test_header_of_14_th_required(riverplate_html):
     with pytest.raises(LayoutChanged, match="14 th"):
         parse_club_page(riverplate_html.replace("<th>New Rank</th>", ""), "riverplate")
