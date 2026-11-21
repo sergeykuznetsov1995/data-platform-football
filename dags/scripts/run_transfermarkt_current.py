@@ -22,7 +22,7 @@ import tempfile
 import time
 import signal
 from contextlib import contextmanager
-from typing import Any, Mapping
+from typing import Mapping
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlsplit
 
@@ -88,9 +88,11 @@ def _deadline_retained(exc):
 
 
 _CONTRACT_PROFILE_CAPTURE_LIMIT = 400
+_RUMOUR_BUDGET = {'decoded_mb': 16, 'requests': 32}
 
 
 _ENTITY_LABELS = {
+    'rumours': ('rumour_listing',),
     'players': ('listing', 'participants_api', 'teilnehmer', 'squad', 'current_players', 'current_injury', 'current_player_profile'),
     'market_value_history': ('market_value_points', 'mv_history'),
     'transfers': ('transfer_events', 'transfers'),
@@ -135,7 +137,7 @@ def _seasonal_club_contradiction(values, rows):
 def _install_entity_limits(scraper, data):
     """The native per-player readers may reset operation limits repeatedly."""
     def begin(operation):
-        budget = PRODUCTION_ENTITY_BUDGETS[operation]
+        budget = _RUMOUR_BUDGET if operation == 'rumours' else PRODUCTION_ENTITY_BUDGETS[operation]
         decoded = int(budget['decoded_mb'] * 1024 * 1024) - _entity_used(data, scraper, operation, 'decoded_bytes')
         requests = int(budget['requests']) - _entity_used(data, scraper, operation, 'requests')
         if decoded <= 0 or requests <= 0:
@@ -564,7 +566,165 @@ def _bound_connection(connection, deadline, clock):
     return connection
 
 
+def _collect_rumour_feed(competition_id, competition, read_page, now, *,
+                         scope_id, run_id, cycle_id, universe_version):
+    """Collect contiguous pages before handing any assertions to the writer.
+
+    read_page supplies the HTML, raw capture ID, body hash and capture timestamp
+    from the same raw-first fetch.
+    """
+    from urllib.parse import urlsplit
+
+    from scrapers.transfermarkt.rumour_observations import RumourFeedExtraction, extract_rumour_page
+    from scrapers.transfermarkt.rumours import parse_rumour_pagination
+
+    url = f'https://www.transfermarkt.com/-/geruechte/wettbewerb/{competition_id}'
+    pages = []
+    raw_ids = []
+    seen = set()
+    last_page = None
+    while True:
+        number = len(pages) + 1
+        if url in seen:
+            raise ValueError('rumour pagination cycle')
+        seen.add(url)
+        html, raw_id, body_hash, captured_at = read_page(url)
+        if not raw_id or not body_hash or not captured_at:
+            raise ValueError('rumour page has incomplete raw lineage')
+        pagination = parse_rumour_pagination(html, competition=competition, page_url=url)
+        if last_page is None:
+            last_page = pagination.last_page
+        if (pagination.current_page != number or pagination.last_page != last_page
+                or number > last_page):
+            raise ValueError('inconsistent rumour pagination')
+        next_urls = set()
+        for link_number, link_url in pagination.links:
+            parts = urlsplit(link_url)
+            path = parts.path.strip('/').split('/')
+            if (parts.scheme != 'https' or parts.netloc != 'www.transfermarkt.com'
+                    or len(path) < 4 or path[1:4] != ['geruechte', 'wettbewerb', competition_id]
+                    or not 1 <= link_number <= last_page):
+                raise ValueError('foreign or out-of-range rumour pagination link')
+            if link_number == number + 1:
+                next_urls.add(link_url)
+        pages.append(extract_rumour_page(
+            html, competition=competition, page_number=number, source_page_url=url,
+            raw_capture_id=raw_id, source_body_hash=body_hash, captured_at=captured_at,
+            extracted_at=now(), scope_id=scope_id, run_id=run_id, cycle_id=cycle_id,
+            universe_version=universe_version,
+        ))
+        raw_ids.append(raw_id)
+        if number == last_page:
+            return RumourFeedExtraction(tuple(pages)), tuple(raw_ids)
+        if len(next_urls) != 1:
+            raise ValueError('missing or ambiguous next rumour page')
+        url = next_urls.pop()
+
+
+def _check_rumour_exclusion(rows):
+    from numbers import Number
+
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise ValueError('expected one rumour exclusion count')
+    count = rows[0][0]
+    if isinstance(count, bool) or not isinstance(count, Number) or count != 0:
+        raise ValueError('rumour exclusion check requires numeric zero')
+
+
 class _Scope:
+    def has_resume_work(self) -> bool:
+        return any(key != 'daily_check_clocks' for key in self.resume)
+
+    def clear_resume(self) -> None:
+        try:
+            resume = json.loads(self.cursor.resume_json)
+        except (ValueError, TypeError):
+            resume = {}
+        clocks = resume.get("daily_check_clocks") if isinstance(resume, dict) else None
+        self.resume = {"daily_check_clocks": clocks} if isinstance(clocks, dict) else {}
+
+    def rumours(self):
+        from scrapers.transfermarkt.rumours import CompetitionContext
+
+        self.initialize_resume()
+        record = self.scope['record']
+        if record.team_type.value == 'national_team':
+            listing = self.data.get('checks', {}).get('listing')
+            if (not listing or listing.get('status') != 'complete'
+                    or not listing.get('raw_capture_ids') or not all(listing['raw_capture_ids'])
+                    or not listing.get('checked_at')):
+                raise CurrentPortionError('national rumours require a complete listing')
+            self._check_national_rumours(
+                listing['raw_capture_ids'], _utc(listing['checked_at']), record.team_type.value,
+            )
+            return
+
+        context = CompetitionContext(
+            id=self.target.competition_id, name=record.name, url=f'https://www.transfermarkt.com/-/geruechte/wettbewerb/{self.target.competition_id}',
+        )
+
+        def decode_page(outcome):
+            return outcome.value, outcome.raw_body_hash
+
+        def exclusion_rows(sql):
+            connection = self.scraper._bronze_connection()
+            try:
+                cursor = connection.cursor()
+                try:
+                    execute_statement(cursor, sql)
+                    return cursor.fetchall()
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+
+        self._check_rumour_feed(self.target.competition_id, context, decode_page, exclusion_rows)
+
+    def _check_national_rumours(self, listing_raws, listing_clock, team_type):
+        if (not isinstance(listing_raws, (tuple, list)) or not listing_raws
+                or not all(isinstance(raw, str) and raw.strip() for raw in listing_raws)
+                or listing_clock is None):
+            raise ValueError('national rumours check requires complete current listing evidence')
+        self.check('rumours', listing_raws, 0, 0, checked_at=listing_clock, result=json.dumps({
+            'applicability_status': 'not_applicable',
+            'rule': 'league_rumour_listing:club_competitions',
+            'team_type': team_type,
+            'registry_snapshot_id': self.target.registry_snapshot_id,
+        }, sort_keys=True))
+
+    def _check_rumour_feed(self, competition_id, competition, decode_page, exclusion_rows):
+        from dags.utils.transfermarkt_rumours import write_rumours
+        from scrapers.transfermarkt.rumour_observations import rumour_exclusion_sql
+
+        def read_page(url):
+            outcome = self.fetch(url, 'rumour_listing', operation='rumours')
+            html, body_hash = decode_page(outcome)
+            return html, outcome.raw_capture_id, body_hash, outcome.raw_fetched_at
+
+        feed, raw_ids = _collect_rumour_feed(
+            competition_id, competition, read_page, self.now, scope_id=self.target.scope_id,
+            run_id=self.cycle_id, cycle_id=self.scraper._current_child_cycle_id,
+            universe_version=self.target.registry_snapshot_id,
+        )
+        proof = write_rumours(self.scraper, feed, self.preflight)
+        if (proof['verified'] is not True or proof['receipt_readback'] is not True
+                or not proof['plan_sha256'] or not proof['receipts']):
+            raise ValueError('unverified rumour write or missing receipt evidence')
+        dq = proof['reconciliation']
+        source_rows = dq['source_rows']
+        if type(source_rows) is not int or source_rows < 0:
+            raise ValueError('invalid reconciled rumour source row count')
+        _check_rumour_exclusion(exclusion_rows(rumour_exclusion_sql()))
+        self.check('rumours', raw_ids, source_rows, source_rows, result=json.dumps({
+            'plan_sha256': proof['plan_sha256'],
+            'pages': len(raw_ids),
+            'receipt_readback': proof['receipt_readback'],
+            'receipt_count': len(proof['receipts']),
+            'status_counts': dq['status_counts'],
+            'reconciliation': dq,
+            'rumour_violations': 0,
+        }, sort_keys=True))
+
     def __init__(self, target, row, data, scraper, cycle_id, denominator_hash, save, now, clock, deadline,
                  preflight, roster_writer, career_writer, coach_writer, player_facts, save_player_packet,
                  baseline_verifier, invalidate_player_fact):
@@ -751,8 +911,10 @@ class _Scope:
         else:
             changes = {'last_work_at': self.now()}
             if status == 'complete':
-                changes[f'{kind}_checked_at'] = check.checked_at
+                changes.update(self.cursor.daily_clock_changes(kind, check.checked_at, check.cycle_id))
             self.cursor = replace(self.cursor, **changes)
+        if kind == 'rumours' and status == 'complete':
+            self.resume = json.loads(self.cursor.resume_json)
         if kind in missing:
             refresh = self.data['recovery_signal_refresh_required']
             if status == 'complete' and kind not in self._missing_refresh_checks():
@@ -880,7 +1042,7 @@ class _Scope:
                 raws = [api.raw_capture_id, outcome.raw_capture_id]
                 self.data['authoritative_empty_scope'] = {'raw_capture_ids': raws,
                                                          'checked_at': self.now().isoformat()}
-                self.resume = {}
+                self.clear_resume()
                 self.cursor = replace(self.cursor, cold_complete=True, roster_completed_at=self.now())
                 self.check('listing', raws, 0, 0, result='tmapi+teilnehmer authoritative empty')
                 self.check('players', raws, 0, 0, result='no participants; no player denominator')
@@ -916,7 +1078,7 @@ class _Scope:
                 raws = [outcome.raw_capture_id]
                 self.data['authoritative_empty_scope'] = {'raw_capture_ids': raws,
                                                          'checked_at': self.now().isoformat()}
-                self.resume = {}
+                self.clear_resume()
                 self.cursor = replace(self.cursor, cold_complete=True, roster_completed_at=self.now())
                 self.check('listing', raws, 0, 0, result='authoritative empty source listing')
                 self.check('players', raws, 0, 0, result='no participants; no player denominator')
@@ -1852,7 +2014,7 @@ class _Scope:
             self.careers(only=changed)
         if (self.cursor.cold_complete and not self.resume.get('required')
                 and not any(self.resume.get('careers', {}).values()) and not self.resume.get('coaches_pending')):
-            self.resume = {}
+            self.clear_resume()
 
     def staff(self, writer):
         """An independent weekly full sweep; acknowledge each club after read-back."""
@@ -2343,7 +2505,10 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 if item.kind == 'signals':
                     for kind in item.checks_due:
                         try:
-                            getattr(scope, {'listing': 'listing', 'players': 'players', 'injury': 'injuries'}[kind])()
+                            getattr(scope, {
+                                'listing': 'listing', 'players': 'players',
+                                'injury': 'injuries', 'rumours': 'rumours',
+                            }[kind])()
                         except LeaseConcurrencyLimited:
                             raise
                         except Exception as exc:
@@ -2365,7 +2530,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     if (not scope.resume.get('required')
                         and not any(scope.resume.get('careers', {}).values())
                         and not scope.resume.get('coaches_pending')):
-                        scope.resume = {}
+                        scope.clear_resume()
                 else:
                     if item.kind == 'season_close':
                         # Staff is current-only work. Retain its unfinished journal
@@ -2421,7 +2586,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     if (not roster_only and not any(scope.resume.get('careers', {}).values())
                         and not scope.resume.get('required') and not scope.resume.get('coaches_pending')):
                         scope.cursor = replace(scope.cursor, cold_complete=True)
-                        scope.resume = {}
+                        scope.clear_resume()
                 data.pop('last_error_was_mismatch', None)
                 scope.cursor = replace(scope.cursor, last_work_at=now(), last_error_at=None)
                 scope.persist()
@@ -2434,7 +2599,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                     and not data.get('attendance_final_receipt')
                 )
                 result['status'] = (
-                    'complete' if not scope.resume and not scope.cursor.attendance_pending
+                    'complete' if not scope.has_resume_work() and not scope.cursor.attendance_pending
                     and not attendance_close_missing and item.kind != 'cold_roster' else 'pending'
                 )
                 if item.kind == 'season_close' and result['status'] == 'complete':

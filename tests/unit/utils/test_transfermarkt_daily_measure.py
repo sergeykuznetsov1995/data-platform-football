@@ -104,7 +104,7 @@ def checks(snapshot, *, at=START + timedelta(hours=1)):
             2,
             2,
         )
-        for kind in ("listing", "players", "injury")
+        for kind in state.DAILY_CHECKS
     ]
 
 
@@ -164,7 +164,8 @@ def test_coverage_keeps_missing_core_excludes_tail_and_requires_all_checks():
     assert snap.blocked_competitions == (
         ("MISSING", "missing current edition in promoted registry"),
     )
-    assert execute(checks(snap)[:2], snapshot=snap)["checked_editions"] == 0
+    without_rumours = [check for check in checks(snap) if check.check_kind != "rumours"]
+    assert execute(without_rumours, snapshot=snap)["checked_editions"] == 0
     assert report["denominator_version"] == "file-sha256"
 
 
@@ -630,29 +631,49 @@ def test_daily_promotion_preserves_equivalent_edition_coverage_but_invalidates_d
     assert execute(proved, snapshot=replacement)["checked_editions"] == 0
 
 
-def test_multiple_current_editions_require_all_and_national_injury_requires_rule():
+def test_multiple_current_editions_require_all_checks_for_each_edition():
     snap = denominator()
     another = (snap.rows[0][0], "another-scope", "2027", "registry-1", "club", "f" * 64)
     both = replace(snap, rows=(*snap.rows, another))
     assert execute(checks(snap), snapshot=both)["checked_editions"] == 0
     extra = [replace(check, scope_id="another-scope") for check in checks(snap)]
     assert execute([*checks(snap), *extra], snapshot=both)["checked_editions"] == 1
+
+
+def test_national_injury_and_rumours_require_kind_specific_na_evidence():
+    snap = denominator()
     national = replace(
         snap, rows=(tuple([*snap.rows[0][:4], "national_team", snap.rows[0][5]]),)
     )
-    assert execute(checks(snap), snapshot=national)["checked_editions"] == 0
-    passed = checks(snap)
-    passed[2] = replace(
-        passed[2],
-        result=json.dumps(
-            {
-                "applicability_status": "not_applicable",
-                "rule": "league_injury_listing:club_competitions",
-                "registry_snapshot_id": "registry-1",
-            }
-        ),
-    )
-    assert execute(passed, snapshot=national)["checked_editions"] == 1
+    rows = {check.check_kind: check for check in checks(national)}
+    assert execute(rows.values(), snapshot=national)["checked_editions"] == 0
+
+    injury = {
+        "applicability_status": "not_applicable",
+        "rule": "league_injury_listing:club_competitions",
+        "registry_snapshot_id": rows["injury"].registry_snapshot_id,
+    }
+    rumour = {
+        **injury,
+        "rule": "league_rumour_listing:club_competitions",
+        "registry_snapshot_id": rows["rumours"].registry_snapshot_id,
+    }
+    rows["injury"] = replace(rows["injury"], result=json.dumps(injury))
+    assert execute(rows.values(), snapshot=national)["checked_editions"] == 0
+    for invalid in (
+        {**rumour, "rule": "unknown"},
+        {key: value for key, value in rumour.items() if key != "rule"},
+        {**rumour, "rule": injury["rule"]},
+        {**rumour, "applicability_status": "applicable"},
+        {**rumour, "registry_snapshot_id": "stale"},
+    ):
+        rows["rumours"] = replace(rows["rumours"], result=json.dumps(invalid))
+        assert execute(rows.values(), snapshot=national)["checked_editions"] == 0, invalid
+
+    rows["rumours"] = replace(rows["rumours"], result=json.dumps(rumour))
+    assert execute(rows.values(), snapshot=national)["checked_editions"] == 1
+    rows["injury"] = replace(rows["injury"], result=json.dumps({**injury, "rule": rumour["rule"]}))
+    assert execute(rows.values(), snapshot=national)["checked_editions"] == 0
 
 
 def endpoint_sample(tmp_path, kind):

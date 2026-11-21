@@ -54,6 +54,7 @@ class TrafficReportError(ValueError):
 # group names), scraper labels listing/club_staff (scraper.py). Drift is guarded by
 # tests; run scripts are not imported here.
 ENTITY_GROUPS = {
+    "rumours": {"rumours", "rumour_listing"},
     'players': {'players', 'listing', 'participants_api', 'teilnehmer', 'squad', 'current_players',
                 'current_injury', 'current_player_profile', 'squad_memberships',
                 'player_attribute_observations', 'player_contract_observations'},
