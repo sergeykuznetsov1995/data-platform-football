@@ -1,0 +1,428 @@
+{
+  "version": 1,
+  "issue": 1403,
+  "entities": {
+    "squad_memberships": {
+      "table": "iceberg.bronze.transfermarkt_squad_memberships",
+      "scope_columns": [
+        "competition_id",
+        "edition_id"
+      ]
+    },
+    "player_attribute_observations": {
+      "table": "iceberg.bronze.transfermarkt_player_attribute_observations",
+      "scope_columns": [
+        "competition_id",
+        "edition_id"
+      ]
+    },
+    "player_contract_observations": {
+      "table": "iceberg.bronze.transfermarkt_player_contract_observations",
+      "scope_columns": [
+        "competition_id",
+        "edition_id"
+      ]
+    },
+    "market_value_points": {
+      "table": "iceberg.bronze.transfermarkt_market_value_points",
+      "scope_columns": [
+        "source_competition_id",
+        "source_edition_id"
+      ]
+    },
+    "transfer_events": {
+      "table": "iceberg.bronze.transfermarkt_transfer_events",
+      "scope_columns": [
+        "source_competition_id",
+        "source_edition_id"
+      ]
+    }
+  },
+  "scopes": [
+    {
+      "competition_id": "GB1",
+      "edition_id": "2015",
+      "scope_id": "tm-92272332b68140c4c9c03e8e",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "1516"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2016",
+      "scope_id": "tm-7b70feee67c8283c95cf1589",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "1617"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2017",
+      "scope_id": "tm-63d4fe5dfcf7f0537ba1290a",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "1718"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2018",
+      "scope_id": "tm-5f4e49defb80be341ac29323",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "1819"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2019",
+      "scope_id": "tm-96ae06cfbf55f3598ebefffe",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "1920"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2020",
+      "scope_id": "tm-b42c1297336200777e7cd1f4",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "2021"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2021",
+      "scope_id": "tm-be2e3ed1ff418af8cee75c71",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "2122"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2022",
+      "scope_id": "tm-4505b0fba8c0324dee53d950",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "2223"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2023",
+      "scope_id": "tm-e022435a5f04abf7827002bf",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "2324"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2024",
+      "scope_id": "tm-b44efc47af7ed6a06e7d5462",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "2425"
+    },
+    {
+      "competition_id": "GB1",
+      "edition_id": "2025",
+      "scope_id": "tm-f44c62b652c1bbb7abb963f0",
+      "legacy_league": "ENG-Premier League",
+      "legacy_season": "2526"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2015",
+      "scope_id": "tm-4bed450b00c06527ad5ba33b",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "1516"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2016",
+      "scope_id": "tm-60542a388e8aa9f6af6d2996",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "1617"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2017",
+      "scope_id": "tm-1efc40f742468e91fb721459",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "1718"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2018",
+      "scope_id": "tm-c3c9bee9ba264d9a4f3cc800",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "1819"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2019",
+      "scope_id": "tm-aa4c824da752a1eb795796fd",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "1920"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2020",
+      "scope_id": "tm-891975e4bdb4eabe339a8398",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "2021"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2021",
+      "scope_id": "tm-23e6342980c8d6ce57db6d9a",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "2122"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2022",
+      "scope_id": "tm-f516a31380fd45fc7604a71f",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "2223"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2023",
+      "scope_id": "tm-c3bbe5b1c82aefb73c1a5331",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "2324"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2024",
+      "scope_id": "tm-ee01adc85c555a5e8937262c",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "2425"
+    },
+    {
+      "competition_id": "ES1",
+      "edition_id": "2025",
+      "scope_id": "tm-9db3a83916aeea3f2ffe2107",
+      "legacy_league": "ESP-La Liga",
+      "legacy_season": "2526"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2015",
+      "scope_id": "tm-bef492a8d6da7b0bfe7da771",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "1516"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2016",
+      "scope_id": "tm-f812654321ff057d82986979",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "1617"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2017",
+      "scope_id": "tm-14d61dff3612819120c07b7f",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "1718"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2018",
+      "scope_id": "tm-10cc6dcc8e3b8495f7e18ecf",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "1819"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2019",
+      "scope_id": "tm-a13c17a5e374538f1b19cd83",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "1920"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2020",
+      "scope_id": "tm-e373cbc086dc706636c578cd",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "2021"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2021",
+      "scope_id": "tm-67e24893946307f1df185bbf",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "2122"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2022",
+      "scope_id": "tm-56af32663d0d427b41ca0bcf",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "2223"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2023",
+      "scope_id": "tm-b44faca6112d17968c856638",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "2324"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2024",
+      "scope_id": "tm-58531bef5beef2028f689854",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "2425"
+    },
+    {
+      "competition_id": "IT1",
+      "edition_id": "2025",
+      "scope_id": "tm-3aac50e3150f4d787e9a52c4",
+      "legacy_league": "ITA-Serie A",
+      "legacy_season": "2526"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2015",
+      "scope_id": "tm-1a7434884308d0b0f235cc2a",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "1516"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2016",
+      "scope_id": "tm-5c6abbe88bd0f58201b74b3b",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "1617"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2017",
+      "scope_id": "tm-fb7bfd859b209bacc2ed4d6e",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "1718"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2018",
+      "scope_id": "tm-5edb63946251d9d33a306668",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "1819"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2019",
+      "scope_id": "tm-199865b3bb276fdf3244a05c",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "1920"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2020",
+      "scope_id": "tm-5f365fc5ee4429955e1faf0e",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "2021"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2021",
+      "scope_id": "tm-3a4ca9c89c8eda3ad3c43e94",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "2122"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2022",
+      "scope_id": "tm-29fa638c9435c53b68bf471a",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "2223"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2023",
+      "scope_id": "tm-c1c5a1d9b5a4581d26c5ce20",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "2324"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2024",
+      "scope_id": "tm-a6fdb556f4f9d06a34c691aa",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "2425"
+    },
+    {
+      "competition_id": "L1",
+      "edition_id": "2025",
+      "scope_id": "tm-b8109e13feeaece062b0ff9d",
+      "legacy_league": "GER-Bundesliga",
+      "legacy_season": "2526"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2015",
+      "scope_id": "tm-1008063c623c7c32c7c2a452",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "1516"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2016",
+      "scope_id": "tm-2940b1eee1630782b37d4348",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "1617"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2017",
+      "scope_id": "tm-540c6bcc3cc48e7050264d87",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "1718"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2018",
+      "scope_id": "tm-43f9de78a4370acecf510968",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "1819"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2019",
+      "scope_id": "tm-0e87207753d9a9ab5be85ee8",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "1920"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2020",
+      "scope_id": "tm-602b8d4328b4f71187551c0b",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "2021"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2021",
+      "scope_id": "tm-e365c2ae7b748622fd7d048b",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "2122"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2022",
+      "scope_id": "tm-27a3adb0cd9f7b033dbbe34d",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "2223"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2023",
+      "scope_id": "tm-cdf70650c786fb448a46d57c",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "2324"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2024",
+      "scope_id": "tm-c15acad0acfa8d0c45c46624",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "2425"
+    },
+    {
+      "competition_id": "FR1",
+      "edition_id": "2025",
+      "scope_id": "tm-95d80109fc513551c3debfc0",
+      "legacy_league": "FRA-Ligue 1",
+      "legacy_season": "2526"
+    }
+  ]
+}
