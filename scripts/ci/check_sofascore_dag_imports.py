@@ -22,7 +22,8 @@ def main() -> None:
     expected = {
         "dag_ingest_sofascore": 70,
         "dag_backfill_sofascore_all_mens": 6,
-        "dag_refresh_sofascore_all_mens": 7,
+        # #1368: the seasonal fields renewal is the lane's eighth task.
+        "dag_refresh_sofascore_all_mens": 8,
         "dag_players_sofascore_all_mens": 5,
         "dag_sofascore_manifest_maintenance": 1,
         "dag_sofascore_schedule_maintenance": 1,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1230,3 +1230,57 @@ def test_pending_match_evidence_defers_the_phase_without_touching_the_runner(
     result = json.loads((tmp_path / "result.json").read_text())
     assert result["status"] == "deferred"
     assert "players cannot be planned" in result["deferral_reason"]
+
+
+@pytest.mark.unit
+def test_cycle_runs_the_season_fields_phase_and_forwards_no_forced_key(
+    tmp_path, monkeypatch
+):
+    """#1368: the fields phase dispatches through the real run_phase and
+    leaves the admission-day key to the preparation (``None``, not the match
+    lane's forced ``final``); the capture runs as the season_fields entity."""
+    seen = {}
+
+    def load_exact_scope(*_args, **kwargs):
+        return _scope()
+
+    def prepare_workload_plan(**kwargs):
+        seen["prepare"] = kwargs
+        plan = tmp_path / "season_fields-plan.json"
+        plan.write_text("{}", encoding="utf-8")
+        return plan
+
+    def run_capture(argv, manifest_store=None):
+        seen["capture"] = list(argv)
+        return 0
+
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", load_exact_scope)
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    import dags.scripts.prepare_sofascore_workload as prepare
+    import scrapers.sofascore.pipeline as scraper_pipeline
+
+    monkeypatch.setattr(prepare, "prepare_workload_plan", prepare_workload_plan)
+    monkeypatch.setattr(
+        scraper_pipeline, "build_manifest_store", lambda *a, **k: MagicMock()
+    )
+    monkeypatch.setattr(
+        "dags.scripts.run_sofascore_scraper.main", run_capture
+    )
+
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "season_fields")) == 0
+
+    assert seen["prepare"]["phase"] == "season_fields"
+    assert seen["prepare"]["season_freshness_key"] is None
+    assert "--entity" in seen["capture"]
+    entity = seen["capture"][seen["capture"].index("--entity") + 1]
+    assert entity == "season_fields"
+
+
+@pytest.mark.unit
+def test_season_fields_phase_maps_to_its_own_entity_and_plan_phase():
+    assert cycle.PLAN_PHASES["season_fields"] == "season_fields"
+    assert cycle.CAPTURE_ENTITIES["season_fields"] == "season_fields"

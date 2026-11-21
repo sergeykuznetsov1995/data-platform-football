@@ -212,3 +212,134 @@ def test_history_summary_exposes_dq_totals():
     # summary callable is exposed; it avoids constructing a real DAG run.
     summary = history._summarize_bronze_dq(reports)
     _assert_totals(summary)
+
+
+def test_season_fields_admission_counts_core_and_league_table_freshness():
+    from datetime import datetime, timedelta, timezone
+
+    as_of = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+    census = [
+        ("SS-17", "2526", as_of - timedelta(days=3)),
+        ("SS-8", "2526", as_of - timedelta(days=9)),
+        # Naive timestamps arrive from Trino; they are read as UTC.
+        ("SS-9", "2526", (as_of - timedelta(days=8)).replace(tzinfo=None)),
+        ("SS-11", "2526", None),
+        # Ingest-owned lanes stay in the denominator, whatever their age.
+        ("ENG-Premier League", "2526", as_of - timedelta(days=1)),
+        # Not core: invisible to both the ratio and the selection.
+        ("SS-999", "2526", as_of - timedelta(days=30)),
+    ]
+
+    admission = refresh._season_fields_admission(
+        census,
+        as_of=as_of,
+        core_keys=frozenset(
+            {"SS-17", "SS-8", "SS-9", "SS-11", "ENG-Premier League"}
+        ),
+    )
+
+    assert admission["core_ongoing"] == 5
+    assert admission["fresh_7d"] == 2
+    assert admission["ratio"] == 0.4
+    missing = next(
+        item for item in admission["entries"] if item["league"] == "SS-11"
+    )
+    assert missing["age_days"] is None
+    assert missing["fresh"] is False
+
+
+def test_season_fields_selection_orders_and_respects_backoff():
+    from datetime import datetime, timedelta, timezone
+
+    as_of = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+    admission = refresh._season_fields_admission(
+        [
+            ("SS-17", "2526", as_of - timedelta(days=9)),
+            ("SS-8", "2526", as_of - timedelta(days=30)),
+            ("SS-9", "2526", None),
+            ("SS-50", "2526", as_of - timedelta(days=20)),
+            ("SS-40", "2526", as_of - timedelta(days=7)),
+            ("SS-11", "2526", as_of - timedelta(days=2)),
+            ("ENG-Premier League", "2526", as_of - timedelta(days=30)),
+        ],
+        as_of=as_of,
+        core_keys=frozenset(
+            {"SS-17", "SS-8", "SS-9", "SS-40", "SS-50", "SS-11",
+             "ENG-Premier League"}
+        ),
+    )
+
+    pairs, skipped = refresh._select_season_fields_work(
+        admission,
+        as_of=as_of,
+        backoff={"SS-8|2526": (as_of + timedelta(hours=1)).isoformat()},
+        max_scopes=3,
+        renewal_days=6,
+    )
+
+    # Missing table first, then the OLDEST tables (review r1: ascending age
+    # would buy the youngest due table first and starve the stalest under
+    # the cap); the ingest league never gets a refresh purchase, the
+    # too-fresh partition waits, and a scope in backoff does not consume a
+    # slot.
+    assert pairs == [
+        ("SS-9", "2526"),
+        ("SS-50", "2526"),
+        ("SS-17", "2526"),
+    ]
+    # The 7-day-old table is fourth in line: the stalest go first.
+    assert ("SS-40", "2526") not in pairs
+    assert "SS-8|2526:backoff" in skipped
+    assert "SS-11|2526:not_due" in skipped
+
+
+def test_window_summary_carries_the_season_fields_line():
+    ti = FakeTI(pulls={
+        ("refresh_season_fields", "return_value"): {
+            "run_id": "unit-test",
+            "season_fields_freshness": {
+                "core_ongoing": 40, "fresh_7d": 39, "ratio": 0.975,
+            },
+            "executed": 5, "failed": 0, "stop_reason": "completed",
+        },
+    })
+
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run())
+
+    assert summary["season_fields"]["season_fields_freshness"] == {
+        "core_ongoing": 40, "fresh_7d": 39, "ratio": 0.975,
+    }
+    assert summary["season_fields"]["stop_reason"] == "completed"
+    json.dumps(summary)  # the summary must stay XCom-safe.
+
+
+def test_season_fields_scope_timeout_is_a_failed_outcome(monkeypatch, tmp_path):
+    """#1368 review r1: a scope timeout must not abort the renewal — it is
+    one failed outcome, so backoff and the report survive it."""
+    import subprocess as subprocess_module
+    from datetime import datetime, timezone
+
+    env = {
+        "SOFASCORE_CAMPAIGN_SNAPSHOT": str(tmp_path / "snapshot.json"),
+        "SOFASCORE_TOURNAMENT_ID": "17",
+        "SOFASCORE_SOURCE_SEASON_ID": "76986",
+        "SOFASCORE_EXPECTED_SNAPSHOT_ID": "a" * 64,
+        "SOFASCORE_EXPECTED_CAMPAIGN_ID": "c" * 64,
+        "SOFASCORE_SCOPE_OUTPUT_DIR": str(tmp_path / "out"),
+        "SOFASCORE_SCOPE_RESULT_PATH": str(tmp_path / "result.json"),
+        "SOFASCORE_WORKLOAD_ARTIFACT": str(tmp_path / "artifact.json"),
+        "SOFASCORE_SCOPE_RUN_ID": "run--17-76986--fields",
+        "SOFASCORE_SCOPE_KEY": "c:17:76986",
+        "SOFASCORE_SCOPE_TIMEOUT_S": "60",
+    }
+
+    def expired(*args, **kwargs):
+        raise subprocess_module.TimeoutExpired(cmd="scope", timeout=60)
+
+    monkeypatch.setattr(refresh.subprocess, "run", expired)
+    outcome = refresh._execute_season_fields_scope(env)
+    assert outcome["exit_code"] is None
+    assert outcome["status"] == "timeout"
+    assert outcome["scope_key"] == "c:17:76986"
+    # The caller treats this as a failure: None != 0 -> backoff applies.
+    assert outcome["exit_code"] != 0

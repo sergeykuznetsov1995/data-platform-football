@@ -24,7 +24,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from airflow import DAG
 from airflow.exceptions import AirflowException, AirflowSkipException
@@ -91,31 +91,58 @@ METADATA_TIMEOUT = timedelta(minutes=25)
 # ceiling stops taking allocations and ends ``partial`` — the rest of it is
 # the next run's.  The other half of the old window is the reserve for the
 # retries (REFRESH_SCOPE_RETRIES: the workload plan supports a resumed retry).
-REFRESH_SCOPE_BUDGET = timedelta(hours=2)
+# #1368: 30 minutes moved from this shared budget to the seasonal fields
+# renewal below, so the serial DagRun still fits its 7 h exactly.
+REFRESH_SCOPE_BUDGET = timedelta(minutes=90)
 # #1751: transport-only scope losses in one run before it is red.
 MAX_INITIAL_TRANSIENT_FAILURES = 3
-# 15 min short of 2 h: they pay for the sweep's retry delay (#2107) and for
-# one scope retry delay after the window deadline (#2118: a scope that lost
-# its transport right at the deadline is retried 10 min later and its third
-# try ends at once past the deadline).
+# 15 min short of the (now 90 min) scope budget: they pay for the sweep's
+# retry delay (#2107) and for one scope retry delay after the window
+# deadline (#2118: a scope that lost its transport right at the deadline is
+# retried 10 min later and its third try ends at once past the deadline).
 REFRESH_RETRY_RESERVE = timedelta(hours=1, minutes=45)
 # #2134: the refill task's own timeout.  A census of the remaining work takes
 # 1-12 min (Trino), so the refill stops starting scopes REFILL_CENSUS_RESERVE
 # short of it and ends with its own stop reason instead of being killed.
 REFILL_TIMEOUT = REFRESH_SCOPE_BUDGET + timedelta(minutes=5)
 REFILL_CENSUS_RESERVE = timedelta(minutes=15)
+# #1368: the seasonal fields renewal window — re-buying standings_total,
+# rounds, cup_trees and participants (4 requests per partition) for ongoing
+# core partitions whose league table is older than the renewal interval.
+# The lane is serial, so this reservation is real time taken from the scope
+# budget above, and a scope stops being admitted in time to publish, flush
+# the manifest and write the report inside the task timeout.
+SEASON_FIELDS_TIMEOUT = timedelta(minutes=30)
+SEASON_FIELDS_SCOPE_TIMEOUT = timedelta(minutes=10)
+# Cap per run; the window (wall clock) decides how many actually go.
+SEASON_FIELDS_MAX_SCOPES = state.env_int(
+    "SOFASCORE_SEASON_FIELDS_MAX_SCOPES", 40, 1, 500
+)
+# Admission age in days, strictly below the 7-day contract so a rolling
+# renewal can never breach it (допущение а задачи #1368). The cap is 6 for
+# the same reason: 7 would only start admitting once the freshness limit is
+# already reached, and the 3x/day cadence adds further delay (#1368 r1).
+SEASON_FIELDS_RENEWAL_DAYS = state.env_int(
+    "SOFASCORE_SEASON_FIELDS_RENEWAL_DAYS", 6, 1, 6
+)
+# A failed or no-credit scope waits this long before consuming a slot again.
+SEASON_FIELDS_BACKOFF_HOURS = state.env_int(
+    "SOFASCORE_SEASON_FIELDS_BACKOFF_HOURS", 6, 1, 168
+)
 if (
     REFRESH_FETCH_TIMEOUT
     + REFRESH_FETCH_RETRY_DELAY
     + REFRESH_SCOPE_BUDGET
     + REFRESH_SCOPE_RETRY_DELAY
     + REFRESH_RETRY_RESERVE
+    + SEASON_FIELDS_TIMEOUT
     + METADATA_TIMEOUT
     > REFRESH_DAGRUN_TIMEOUT
 ):
     raise AirflowException(
         "refresh window does not fit the DagRun: sweep + its retry delay + "
-        "scope budget + scope retry delay + retry reserve + metadata > dagrun_timeout"
+        "scope budget + scope retry delay + retry reserve + season fields + "
+        "metadata > dagrun_timeout"
     )
 # Pace of the match phase, re-measured 29-30.09 on the refresh lane (~12 s a
 # match, ``state.DEFAULT_REFRESH_SECONDS_PER_MATCH``); an env override retunes
@@ -274,6 +301,352 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, 
         ]
     finally:
         conn.close()
+
+
+# #1368: the seasonal fields census. "Ongoing" reuses the sweep's due
+# predicate verbatim (a latest schedule row kicking off inside the window);
+# freshness is the league table's own max(_ingested_at) — a recent
+# participants write must not mask stale standings, and a missing table
+# partition is stale (допущение а задачи: критерий по таблицам лиг).
+SEASON_FIELDS_CENSUS_SQL = """
+WITH ranked AS (
+    SELECT league, CAST(season AS varchar) AS season, game_id, start_timestamp,
+           row_number() OVER (
+               PARTITION BY league, season, game_id ORDER BY _ingested_at DESC
+           ) AS rn
+    FROM iceberg.bronze.sofascore_schedule
+), ongoing AS (
+    SELECT DISTINCT league, season
+    FROM ranked
+    WHERE rn = 1
+      AND start_timestamp >= to_unixtime(current_timestamp) - {hours} * 3600
+      AND start_timestamp <= to_unixtime(current_timestamp) + 6 * 3600
+), table_age AS (
+    SELECT league, CAST(season AS varchar) AS season, max(_ingested_at) AS last_ingested
+    FROM iceberg.bronze.sofascore_league_table
+    GROUP BY 1, 2
+)
+SELECT o.league, o.season, t.last_ingested
+FROM ongoing o
+LEFT JOIN table_age t ON t.league = o.league AND t.season = o.season
+"""
+
+
+def _season_fields_census() -> list[tuple[str, str, Any]]:
+    """Ongoing partitions with their league-table age; query at task runtime."""
+
+    from utils.silver_tasks import _get_trino_connection
+
+    conn = _get_trino_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(SEASON_FIELDS_CENSUS_SQL.format(hours=int(REFRESH_WINDOW_HOURS)))
+        return [(str(league), str(season), last) for league, season, last in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def _season_fields_admission(
+    census: list[tuple[str, str, Any]],
+    *,
+    as_of: datetime,
+    core_keys: frozenset[str],
+) -> dict[str, Any]:
+    """One shared definition for the acceptance ratio and the work selection.
+
+    Returns the census counts (every core ongoing partition, ingest lanes
+    included — they stay in the denominator) plus the refresh-owned
+    admission list: SS partitions only, missing tables first, then oldest,
+    each past the renewal interval and outside its backoff window.
+    """
+
+    entries: list[dict[str, Any]] = []
+    for league, season, last_ingested in census:
+        if league not in core_keys:
+            continue
+        age_days: float | None
+        if last_ingested is None or str(last_ingested) == "":
+            age_days = None
+        else:
+            if not isinstance(last_ingested, datetime):
+                stamp = datetime.fromisoformat(str(last_ingested))
+            else:
+                stamp = last_ingested if last_ingested.tzinfo else last_ingested.replace(
+                    tzinfo=timezone.utc
+                )
+            age_days = (as_of - stamp).total_seconds() / 86400
+        entries.append({
+            "league": league,
+            "season": season,
+            "age_days": age_days,
+            "fresh": age_days is not None and age_days <= 7,
+        })
+    core_ongoing = len(entries)
+    fresh_7d = sum(1 for item in entries if item["fresh"])
+    return {
+        "as_of": as_of.isoformat(),
+        "core_ongoing": core_ongoing,
+        "fresh_7d": fresh_7d,
+        "ratio": (fresh_7d / core_ongoing) if core_ongoing else None,
+        "entries": entries,
+    }
+
+
+def _season_fields_backoff_path() -> Path:
+    return Path(RESULT_DIR) / "season-fields-backoff.json"
+
+
+def _load_season_fields_backoff() -> dict[str, str]:
+    try:
+        payload = json.loads(_season_fields_backoff_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _select_season_fields_work(
+    admission: dict[str, Any],
+    *,
+    as_of: datetime,
+    backoff: Mapping[str, str],
+    max_scopes: int,
+    renewal_days: int,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Pick this run's renewal scopes and the admission reasons it skipped."""
+
+    selected: list[tuple[float, str, str]] = []
+    skipped: list[str] = []
+    for item in admission["entries"]:
+        league = item["league"]
+        if not league.startswith("SS-"):
+            # Lane ownership: the configured ingest leagues buy their own
+            # season fields daily; they stay counted, never double-purchased.
+            continue
+        key = f"{league}|{item['season']}"
+        not_before = backoff.get(key)
+        if not_before:
+            try:
+                threshold = datetime.fromisoformat(not_before)
+            except ValueError:
+                threshold = None
+            if threshold is not None and as_of < threshold:
+                skipped.append(f"{key}:backoff")
+                continue
+        age = item["age_days"]
+        if age is not None and age < renewal_days:
+            skipped.append(f"{key}:not_due")
+            continue
+        # Missing tables first, then the OLDEST table (its freshness deadline
+        # is the earliest), stable by identity (#1368 review r1: ascending
+        # age would buy the youngest due table first and starve the stalest
+        # partitions under the scope/time cap).
+        selected.append((age if age is not None else -1.0, league, item["season"]))
+    selected.sort(
+        key=lambda item: (
+            item[0] >= 0,   # missing (age < 0) before any known age
+            -item[0],       # among known ages, the largest first
+            item[1],
+            item[2],
+        )
+    )
+    pairs = [(league, season) for _age, league, season in selected[:max_scopes]]
+    return pairs, skipped
+
+
+def _execute_season_fields_scope(env: dict[str, str]) -> dict[str, Any]:
+    """Run one fields scope cycle under its own run id and timeout."""
+
+    command = [
+        "/opt/legacy-scraper-venv/bin/python",
+        "/opt/airflow/dags/scripts/run_sofascore_scope_cycle.py",
+        "--snapshot", env["SOFASCORE_CAMPAIGN_SNAPSHOT"],
+        "--tournament-id", env["SOFASCORE_TOURNAMENT_ID"],
+        "--source-season-id", env["SOFASCORE_SOURCE_SEASON_ID"],
+        "--expected-snapshot-id", env["SOFASCORE_EXPECTED_SNAPSHOT_ID"],
+        "--expected-campaign-id", env["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
+        "--phase", "season_fields", "--allow-pending-season",
+        "--registry-overlay",
+        "--output-dir", env["SOFASCORE_SCOPE_OUTPUT_DIR"],
+        "--output", env["SOFASCORE_SCOPE_RESULT_PATH"],
+        "--workload-artifact", env["SOFASCORE_WORKLOAD_ARTIFACT"],
+        "--run-id", env["SOFASCORE_SCOPE_RUN_ID"],
+    ]
+    started = time.monotonic()
+    try:
+        child = subprocess.run(
+            command,
+            cwd="/opt/airflow",
+            env={**os.environ, **env, "AIRFLOW_CTX_DAG_ID": DAG_ID,
+                 "AIRFLOW_CTX_TASK_ID": "refresh_season_fields"},
+            timeout=max(60, int(env["SOFASCORE_SCOPE_TIMEOUT_S"])),
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        # run() kills the child before raising; the timeout is one scope's
+        # failed outcome, never a reason to lose the backoff persistence,
+        # the remaining scopes and the report (#1368 review r1).
+        return {
+            "scope_key": env["SOFASCORE_SCOPE_KEY"],
+            "run_id": env["SOFASCORE_SCOPE_RUN_ID"],
+            "exit_code": None,
+            "status": "timeout",
+            "errors": ["scope exceeded SOFASCORE_SCOPE_TIMEOUT_S"],
+            "elapsed_s": round(time.monotonic() - started, 1),
+        }
+    result: Any = None
+    try:
+        result = json.loads(
+            Path(env["SOFASCORE_SCOPE_RESULT_PATH"]).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        result = None
+    outcome: dict[str, Any] = {
+        "scope_key": env["SOFASCORE_SCOPE_KEY"],
+        "run_id": env["SOFASCORE_SCOPE_RUN_ID"],
+        "exit_code": child.returncode,
+        "elapsed_s": round(time.monotonic() - started, 1),
+    }
+    if isinstance(result, dict):
+        phases = result.get("phases") or []
+        for field in ("status", "errors", "bytes"):
+            if field in result:
+                outcome[field] = result[field]
+        if phases and isinstance(phases[0], dict):
+            for field in ("league_table_rows", "rounds_rows", "cup_trees_rows",
+                          "participants_rows", "source_request_count"):
+                if field in phases[0]:
+                    outcome[field] = phases[0][field]
+    if child.returncode != 0:
+        outcome["stderr_tail"] = child.stderr.splitlines()[-5:]
+    return outcome
+
+
+def _season_fields_report_path(run_id: str) -> Path:
+    safe_run = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id)
+    return Path(RESULT_DIR) / f"season-fields-{safe_run}.json"
+
+
+def _refresh_season_fields(**context: Any) -> dict[str, Any]:
+    """#1368: renew the season fields of ongoing core SS partitions.
+
+    One census before (work selection and the freshness line share it), the
+    bounded renewal loop, one census after.  Failures of individual scopes
+    back off instead of monopolizing the cap; the task itself fails only on
+    the census or the snapshot identity.
+    """
+
+    from dags.scripts.run_sofascore_scope_cycle import _atomic_json
+    from scrapers.sofascore.denominator import load_denominator
+
+    run_id = str(context.get("run_id") or "manual")
+    as_of = datetime.now(timezone.utc)
+    deadline = time.monotonic() + (
+        SEASON_FIELDS_TIMEOUT - SEASON_FIELDS_SCOPE_TIMEOUT - timedelta(minutes=2)
+    ).total_seconds()
+    try:
+        census = _season_fields_census()
+    except Exception as exc:
+        raise AirflowException(f"season fields census failed: {exc}") from exc
+    core_keys = load_denominator().core_capture_keys()
+    admission = _season_fields_admission(census, as_of=as_of, core_keys=core_keys)
+    backoff = _load_season_fields_backoff()
+    pairs, skipped = _select_season_fields_work(
+        admission,
+        as_of=as_of,
+        backoff=backoff,
+        max_scopes=SEASON_FIELDS_MAX_SCOPES,
+        renewal_days=SEASON_FIELDS_RENEWAL_DAYS,
+    )
+    snapshot = state.read_refresh_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+    envs, unresolved = state.plan_season_fields_batch(
+        snapshot,
+        pairs,
+        scope_timeout_s=int(SEASON_FIELDS_SCOPE_TIMEOUT.total_seconds()),
+        snapshot_path=SNAPSHOT_PATH,
+        policy_path=POLICY_PATH,
+        result_dir=RESULT_DIR,
+        workload_artifact=WORKLOAD_ARTIFACT,
+        dag_run_id=run_id,
+        task_env=REFRESH_TASK_ENV,
+    )
+    outcomes: list[dict[str, Any]] = []
+    stop_reason = "completed"
+    for env in envs:
+        if time.monotonic() >= deadline:
+            stop_reason = "time_budget"
+            break
+        outcome = _execute_season_fields_scope(env)
+        outcomes.append(outcome)
+        key = (
+            f"{env['SOFASCORE_CAPTURE_KEY']}"
+            f"|{env['SOFASCORE_CANONICAL_SEASON']}"
+        )
+        if outcome.get("exit_code") != 0:
+            backoff[key] = (
+                as_of + timedelta(hours=SEASON_FIELDS_BACKOFF_HOURS)
+            ).isoformat()
+        elif not outcome.get("league_table_rows"):
+            # A terminal empty standings answer earns no freshness credit
+            # (the table stays missing); it must not burn a slot every run.
+            backoff[key] = (
+                as_of + timedelta(days=SEASON_FIELDS_RENEWAL_DAYS)
+            ).isoformat()
+        else:
+            backoff.pop(key, None)
+    try:
+        _atomic_json(_season_fields_backoff_path(), backoff)
+    except OSError as exc:
+        raise AirflowException(f"season fields backoff write failed: {exc}") from exc
+    try:
+        after_census = _season_fields_census()
+    except Exception as exc:
+        raise AirflowException(f"season fields post-census failed: {exc}") from exc
+    after = _season_fields_admission(
+        after_census, as_of=datetime.now(timezone.utc), core_keys=core_keys
+    )
+    summary = {
+        "run_id": run_id,
+        "before": {
+            name: admission[name]
+            for name in ("as_of", "core_ongoing", "fresh_7d", "ratio")
+        },
+        "after": {
+            name: after[name]
+            for name in ("as_of", "core_ongoing", "fresh_7d", "ratio")
+        },
+        # допущение а: the contract line is the league-table freshness of
+        # ongoing core partitions; target ratio >= 0.95.
+        "season_fields_freshness": {
+            "core_ongoing": after["core_ongoing"],
+            "fresh_7d": after["fresh_7d"],
+            "ratio": after["ratio"],
+        },
+        "selected": len(pairs),
+        "executed": len(outcomes),
+        "failed": sum(1 for item in outcomes if item.get("exit_code") != 0),
+        "no_credit": sum(
+            1
+            for item in outcomes
+            if item.get("exit_code") == 0 and not item.get("league_table_rows")
+        ),
+        "unresolved": [f"{league}|{season}" for league, season in unresolved],
+        "skipped": len(skipped),
+        "stop_reason": stop_reason,
+        "outcomes": outcomes,
+    }
+    try:
+        _atomic_json(_season_fields_report_path(run_id), summary)
+    except OSError as exc:
+        raise AirflowException(f"season fields report write failed: {exc}") from exc
+    return {
+        name: summary[name]
+        for name in (
+            "run_id", "before", "after", "season_fields_freshness", "selected",
+            "executed", "failed", "no_credit", "unresolved", "skipped",
+            "stop_reason",
+        )
+    }
 
 
 def _dag_run_type_name(dag_run: Any) -> str:
@@ -807,6 +1180,7 @@ def _window_summary(
     dq_reports: list[Any] = []
     refill_reason = None
     refill = None
+    season_fields = None
     ti = context.get("ti")
     if ti is not None:
         try:
@@ -849,6 +1223,13 @@ def _window_summary(
             refill = ti.xcom_pull(task_ids="refill_refresh_window")
         except Exception as exc:
             print(f"refresh refill summary unavailable: {exc}")
+        try:
+            # #1368: the seasonal renewal's own line — its post-run census
+            # ratio, not a claim about this window's match work.
+            season_fields = ti.xcom_pull(task_ids="refresh_season_fields")
+        except Exception as exc:
+            print(f"season fields summary unavailable: {exc}")
+            season_fields = None
     # Failed tasks do not return an XCom; their persisted report still records
     # spent time. Only accept this run's report, including after filename sanitization.
     run_id = context.get("run_id")
@@ -905,6 +1286,9 @@ def _window_summary(
         # #1371: the run's merged Bronze DQ verdict. No reports at all is
         # "empty" (zero checks), never a data-quality PASS.
         "bronze_dq": summarize_bronze_dq_reports(dq_reports),
+        # #1368: the freshness line of the seasonal renewal (допущение а) —
+        # present only when the fields task ran and reported.
+        **({"season_fields": season_fields} if isinstance(season_fields, dict) else {}),
     }
 
 
@@ -1095,6 +1479,20 @@ with DAG(
         trigger_rule="all_done", pool=REFRESH_POOL, priority_weight=5,
         retries=0, execution_timeout=REFILL_TIMEOUT,
     )
+    season_fields = PythonOperator(
+        task_id="refresh_season_fields",
+        python_callable=_refresh_season_fields,
+        # The renewal works whatever the match lane did; its reservation is
+        # SEASON_FIELDS_TIMEOUT minutes of the same serial window (#1368).
+        trigger_rule="all_done",
+        pool=REFRESH_POOL,
+        priority_weight=1,
+        # NO retry: a re-run would re-census and re-walk the same paid
+        # selection on the run's remaining time; the next scheduled run
+        # continues from the backoff state.
+        retries=0,
+        execution_timeout=SEASON_FIELDS_TIMEOUT,
+    )
     enrich = PythonOperator(
         task_id="enrich_season_metadata",
         python_callable=_enrich_season_metadata,
@@ -1121,6 +1519,11 @@ with DAG(
     validate >> refill
     run >> enrich
     refill >> enrich
+    # #1368: the seasonal renewal runs after the match work and the status
+    # propagation waits for it alongside the metadata enrichment.
+    validate >> season_fields
+    refill >> season_fields
+    season_fields >> propagate
 
 
 __all__ = ["DAG_ID", "dag"]
