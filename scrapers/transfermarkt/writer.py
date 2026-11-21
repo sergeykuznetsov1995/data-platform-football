@@ -199,5 +199,3 @@ def guard_cached_frames(scraper, outputs, frames):
                 raise StaleTransfermarktWrite('cached career physical captures changed: ' + output.table_name)
     finally:
         connection.close()
-
-
