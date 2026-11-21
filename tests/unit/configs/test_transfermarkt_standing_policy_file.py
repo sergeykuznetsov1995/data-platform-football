@@ -16,6 +16,8 @@ from dags.scripts.run_transfermarkt_scope_cycle import (
     required_write_tables,
 )
 from dags.utils.transfermarkt_approval import StandingPolicy, load_standing_policy
+from dags.utils.transfermarkt_staff import validate_staff_write_policy
+from scrapers.transfermarkt.staff import STAFF_TABLE, STAFF_RECEIPTS_TABLE
 
 
 POLICY_PATH = (
@@ -66,6 +68,14 @@ def test_committed_policy_covers_both_write_modes():
 
     for write_mode in ('dual', 'native-only'):
         assert required_write_tables(write_mode) <= allowed
+
+
+def test_committed_policy_authorizes_staff_writes():
+    policy = load_standing_policy(POLICY_PATH)
+
+    assert STAFF_TABLE in policy.allowed_write_tables
+    assert STAFF_RECEIPTS_TABLE in policy.allowed_write_tables
+    validate_staff_write_policy(policy)
 
 
 def test_committed_policy_validity_window_is_well_formed():

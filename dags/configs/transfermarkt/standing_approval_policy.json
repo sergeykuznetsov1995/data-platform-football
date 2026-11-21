@@ -17,6 +17,7 @@
     "concurrency": 1
   },
   "allowed_write_tables": [
+    "iceberg.bronze.transfermarkt_club_staff",
     "iceberg.bronze.transfermarkt_coach_profiles",
     "iceberg.bronze.transfermarkt_coach_stints",
     "iceberg.bronze.transfermarkt_coaches",
@@ -31,6 +32,7 @@
     "iceberg.ops.proxy_traffic_runs",
     "iceberg.ops.transfermarkt_career_capture_refs_v1",
     "iceberg.ops.transfermarkt_career_snapshot_anchors_v1",
+    "iceberg.ops.transfermarkt_club_staff_receipts_v1",
     "iceberg.ops.transfermarkt_season_close_v1",
     "iceberg.ops.transfermarkt_current_checks_v1",
     "iceberg.ops.transfermarkt_current_signals_v1",
