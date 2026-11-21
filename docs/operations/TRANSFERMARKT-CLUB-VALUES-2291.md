@@ -38,8 +38,10 @@ Every row retains club/competition/date/currency, raw value, source point kind, 
 
 ## Writer and DQ
 
-The isolated writer accepts only a structurally valid extraction. Merge key is `(club_id, value_date, observed_at, source_point_id)`. Per-club receipt contains expected point/status counts and a physical hash. Physical readback compares the complete club set; the receipt is reread. No DAG, schedule, production grant, backfill or Silver/Gold change is enabled by this implementation.
+The isolated writer accepts only a structurally valid extraction. Merge key is `(club_id, value_date, observed_at, source_point_id)`. Per-club receipt contains expected point/status counts and a physical hash. Physical readback compares the complete club set; the receipt is reread.
+
+The existing current and historical lanes invoke the collector only when their bound standing policy grants both the observation and receipt tables. Qualified current collects once during each weekly roster portion; historical collection is skipped for finalize-only replay. The writer independently rechecks the current standing policy before every physical write. Silver/Gold are unchanged.
 
 ## Remaining live proof
 
-Full universe coverage and the earliest-date capture remain unproven until separately authorized runs. Weekly scheduled continuation, three green DQ windows and production acceptance are outside the bounded capture authorization.
+Full universe coverage, earliest-date backfill, bounded production receipt/readback/DQ, weekly scheduled continuation and three green DQ windows require runtime evidence. The source-capture authorization alone does not establish production acceptance.

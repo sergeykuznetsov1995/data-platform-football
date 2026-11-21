@@ -219,10 +219,12 @@ def _environment_for_scope(
     claim_generation: int,
     attempt_sequence: int = 1,
     finalize_only: bool = False,
+    club_values_allowed: bool = False,
 ) -> dict[str, str]:
     scope_id = str(payload["scope_id"])
     return {
         "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+        "TM_CLUB_VALUES_ENABLED": "true" if club_values_allowed else "false",
         "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
         "TM_REQUIRE_METERED_PROXY": "true",
         "TRANSFERMARKT_REQUIRE_RAW_STORE": "true",
@@ -279,6 +281,7 @@ def _render_planned_environments(
     payloads: tuple[dict[str, Any], ...],
     preflight: Mapping[str, Any],
     policy_hash: str,
+    policy: Any,
     run_id: str,
 ) -> list[dict[str, str]]:
     if batch is None:
@@ -297,6 +300,10 @@ def _render_planned_environments(
     if tuple(item["scope_id"] for item in payloads) != batch.scope_ids:
         raise AirflowException("mapped plan differs from durable batch membership")
     policy_hash = batch.policy_sha256 or campaign.policy_sha256
+    from dags.utils.transfermarkt_club_values import club_values_enabled
+    from utils.transfermarkt_approval import StandingPolicy
+    bound_policy = StandingPolicy(**batch.standing_policy) if batch.standing_policy else policy
+    collect_club_values = club_values_enabled(bound_policy)
     planned_environments: list[dict[str, str]] = []
     for payload in payloads:
         scope_id = str(payload["scope_id"])
@@ -366,6 +373,7 @@ def _render_planned_environments(
                 )
                 in persisted_attempt_ids
             ),
+            club_values_allowed=collect_club_values,
         ))
         planned_environments[-1]["TM_STREAM_ID"] = payload["stream_id"]
         planned_environments[-1]["TM_HISTORY_RECOVERY_PROBE"] = "true" if batch.recovery_probe else "false"
@@ -608,6 +616,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
             payloads=payloads,
             preflight=preflight,
             policy_hash=batch.policy_sha256 or campaign.policy_sha256,
+            policy=policy,
             run_id=run_id,
         )
     except Exception as exc:
@@ -726,6 +735,11 @@ python dags/scripts/run_transfermarkt_scope_cycle.py \
   --parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP" \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
   --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
+if [[ "${TM_CLUB_VALUES_ENABLED:-false}" == "true" && "${TM_BACKFILL_FINALIZE_ONLY:-false}" != "true" ]]; then
+  python dags/scripts/run_transfermarkt_club_values.py \
+    --mode history \
+    --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-history-result.json}"
+fi
 # The durable finalizer classifies the immutable result/raw evidence. It must
 # run for source failures too; a missing evidence envelope becomes a platform
 # block there rather than being silently retried here.
