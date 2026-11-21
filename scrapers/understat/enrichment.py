@@ -171,6 +171,7 @@ def run_enrichment(client: Any, repository: Any, *, now: datetime | None = None)
                         entry["row"] = row
                         entry.pop("done", None)  # rebind cached HTML to new publication
                     atomic_json(journal, state)
+                    write_outage = consumed_failure_day = False
                     try:
                         writer = repository._get_writer()
                         if entry.get("invalidate"):
@@ -193,6 +194,7 @@ def run_enrichment(client: Any, repository: Any, *, now: datetime | None = None)
                             entry["attempted_on"] = today
                             # A killed worker has consumed a failed day, too.
                             entry["failures"] += 1
+                            consumed_failure_day = True
                             atomic_json(journal, state)
                             html = client.get_match_html(game)
                             if html is None:
@@ -210,14 +212,26 @@ def run_enrichment(client: Any, repository: Any, *, now: datetime | None = None)
                         if (repository.latest_attempt(scope).batch_id != attempt.batch_id
                                 or not repository.verify_physical_batch(attempt)):
                             continue
-                        _write(writer, entry, valid=True, result=result)
+                        try:
+                            _write(writer, entry, valid=True, result=result)
+                        except Exception:
+                            try:
+                                _write(writer, entry, valid=False)
+                            except Exception:
+                                logger.warning("Optional Understat HTML tombstone failed for %s", key, exc_info=True)
+                            write_outage = True
+                            raise
                         entry.update(done=True, failures=0, published_players=players)
                         published += 1
                     except Exception:
                         failed += 1
-                        if entry["failures"] >= 3:
-                            entry["status"] = "unavailable"
-                        entry.pop("html", None)
+                        if write_outage:
+                            if consumed_failure_day:
+                                entry["failures"] -= 1
+                        else:
+                            if entry["failures"] >= 3:
+                                entry["status"] = "unavailable"
+                            entry.pop("html", None)
                         logger.warning("Optional Understat HTML failed for %s", key, exc_info=True)
                     atomic_json(journal, state)
             except Exception:
