@@ -222,6 +222,57 @@ def test_1291_new_match_key_preserves_bronze_and_success():
     }
 
 
+@pytest.mark.parametrize(
+    ("momentum", "available"),
+    [
+        # missing / null / false / empty / valid / unexpected, #2302: the
+        # source's JSON false is an explicit no-section sentinel.
+        ("<missing>", False),
+        (None, False),
+        (False, False),
+        ({}, False),
+        ([], False),
+        ({"main": {"data": [{"minute": 1.0, "value": 5}]}}, True),
+        ([{"minute": 1.0, "value": 5}], True),
+        (0, False),
+        ("false", False),
+        (True, False),
+    ],
+)
+def test_2302_section_availability_mask_cases(momentum, available):
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    content = {"matchFacts": {"events": []}}
+    if momentum != "<missing>":
+        content["momentum"] = momentum
+    row, _ = FotMobIngestService._match_payload_row(bundle.matches[0], {
+        "general": {"matchId": 100}, "content": content,
+    })
+    assert row["available_sections_json"]["momentum"] is available
+    assert row["momentum_json"] == (
+        None if momentum == "<missing>" else momentum
+    )
+
+
+def test_2302_momentum_false_is_source_sentinel_not_availability():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    payload = {
+        "general": {"matchId": 100},
+        "content": {"matchFacts": {"events": []}, "momentum": False},
+    }
+    service, _, repository = _service({url: payload})
+    result = service.sync_match_payloads(bundle)
+    assert result.ok and result.succeeded == 1
+    row = repository.tables["fotmob_match_payloads"][0]
+    # Raw false is preserved verbatim; the mask must not advertise momentum.
+    assert row["momentum_json"] is False
+    assert row["available_sections_json"]["momentum"] is False
+    # An absent optional section is a source omission, not a parse error.
+    assert row["missing_expected_sections_json"] == []
+    assert repository.commits[-1].status == ManifestStatus.SUCCESS
+    assert repository.commits[-1].error_code is None
+
+
 @pytest.mark.parametrize("source_id", [999, "999", None, False, True, 100.0, "bad"])
 def test_1291_match_identity_drift_preserves_last_good(source_id):
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))

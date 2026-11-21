@@ -144,6 +144,29 @@ MATCH_CONTENT_SECTIONS = (
     "momentum",
 )
 
+
+def _section_content_available(value: Any) -> bool:
+    """Explicit availability cases for one match-content section value.
+
+    The source answers with JSON ``false`` when a section has no content
+    (#2302: 436210 stored momentum observations were masked available on it),
+    and public FotMob parsers read that ``false`` as an explicit no-section
+    sentinel.  Availability therefore means usable content, not key presence:
+    ``missing``/``null``/``false``/``empty`` containers are unavailable, a
+    non-empty object/list (``valid``) is available, and any other scalar
+    (``unexpected``) carries no section content either.  An unavailable
+    section is a source omission, never a parse error.
+    """
+
+    if value is None or value is False:
+        return False
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    return False
+
+
 # The source's own ``hits`` counter for a transfer stream routinely overstates
 # the number of events it actually serves by one or two (#1074: six
 # competitions, every page fetched and parsed cleanly, zero duplicates, and
@@ -2722,7 +2745,7 @@ class FotMobIngestService:
         if not isinstance(content, Mapping):
             content = payload
         available = {
-            section: section in content and content.get(section) not in (None, {}, [])
+            section: _section_content_available(content.get(section))
             for section in MATCH_CONTENT_SECTIONS
         }
         # Only match facts are universally expected for a finished fixture;
