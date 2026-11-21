@@ -144,6 +144,7 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
 RUN_REPLAY_SCOPE_COMMAND = f"""
 set -euo pipefail
 cd /opt/airflow
+export PYTHONPATH=/opt/airflow:/opt/airflow/dags
 mkdir -p "$(dirname "${{SOFASCORE_REPLAY_OUTPUT}}")"
 exec /opt/legacy-scraper-venv/bin/python {REPLAY_WORKER_SCRIPT} \\
     --mode "${{SOFASCORE_REPLAY_MODE}}" \\
