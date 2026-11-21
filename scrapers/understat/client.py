@@ -12,7 +12,7 @@ from pathlib import Path
 import random
 import time
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 from .cache_state import CacheState, atomic_json
 
@@ -24,6 +24,7 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+MAX_REDIRECTS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -299,20 +300,34 @@ class UnderstatClient:
         self._get_with_retry(self.base_url, headers={})
         self._cookies_initialized = True
 
-    def _get_with_retry(self, url: str, *, headers: Mapping[str, str]) -> Any:
-        last_error: Optional[BaseException] = None
-        for attempt in range(1, self.max_attempts + 1):
+    def _get_following_redirects(self, url: str, *, headers: Mapping[str, str]) -> Any:
+        """Count and pace every GET in a chain capped at MAX_REDIRECTS requests."""
+        for _ in range(MAX_REDIRECTS):
             self._pacer.acquire()
             CacheState(self.cache_dir).count_request(self.now().date())
             self.request_count += 1
+            response = self.session.get(
+                url,
+                headers=dict(headers),
+                timeout=self.timeout_seconds,
+                allow_redirects=False,
+            )
+            status = int(getattr(response, "status_code", 0))
+            if 300 <= status < 400:
+                location = (getattr(response, "headers", {}) or {}).get("Location")
+                if location:
+                    url = urljoin(url, location)
+                    continue
+            return response
+        raise UnderstatHTTPError(url, status)
+
+    def _get_with_retry(self, url: str, *, headers: Mapping[str, str]) -> Any:
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, self.max_attempts + 1):
             if attempt > 1:
                 self.retry_count += 1
             try:
-                response = self.session.get(
-                    url,
-                    headers=dict(headers),
-                    timeout=self.timeout_seconds,
-                )
+                response = self._get_following_redirects(url, headers=headers)
                 status = int(getattr(response, "status_code", 0))
                 if 200 <= status < 300:
                     return response
