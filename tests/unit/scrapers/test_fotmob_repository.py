@@ -1777,6 +1777,56 @@ def test_orphan_batch_without_manifest_row_is_overwritten():
     ]
 
 
+def test_2302_pre_fix_momentum_mask_orphan_is_rewritten_not_merged():
+    # #2302: обломок прерванной записи мог остаться от старого представления
+    # парсера — маска ещё объявляла momentum доступной, а momentum_json лёг в
+    # колонку legacy-представлением (голый False, BOOLEAN). Новый парсинг тех
+    # же байтов даёт тот же детерминированный batch с другой маской: сверка
+    # обязана увидеть разные строки, стереть обломок и записать новые, а не
+    # упасть и не смешать два представления одной пачки.
+    writer = ReconcileWriter()
+    commit = _commit(
+        target_type="match", target_key="https://example/m/2302",
+        entity_id="100",
+    )
+    pre_fix_mask = json.dumps(
+        {"matchFacts": True, "momentum": True}, sort_keys=True, separators=(",", ":")
+    )
+    writer.rows["fotmob_match_payloads"] = [{
+        "_target_batch_id": commit.batch_id,
+        "competition_id": "47",
+        "source_season_key": "2025/2026",
+        "match_id": "100",
+        "available_sections_json": pre_fix_mask,
+        "momentum_json": False,
+    }]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        commit,
+        [TableRows(
+            "fotmob_match_payloads",
+            normalize_rows([{
+                "competition_id": "47",
+                "source_season_key": "2025/2026",
+                "match_id": "100",
+                "available_sections_json": {"matchFacts": True, "momentum": False},
+                "momentum_json": False,
+            }]),
+            "match_payloads",
+        )],
+    )
+
+    repository.flush()
+
+    stored = writer.rows["fotmob_match_payloads"]
+    assert len(stored) == 1, "обломок обязан быть стёрт, а не дополнен"
+    assert json.loads(stored[0]["available_sections_json"])["momentum"] is False
+    assert stored[0]["momentum_json"] == "false"
+    assert [row["batch_id"] for row in writer.rows["fotmob_ingest_manifest"]] == [
+        commit.batch_id
+    ]
+
+
 def test_confirmed_batch_with_mismatched_count_still_fails_closed():
     # Зеркало предыдущего теста: строка в манифесте есть, значит пачка была
     # завершена, и другое число строк — настоящая порча, а не обломок.
