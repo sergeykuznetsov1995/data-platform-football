@@ -259,6 +259,37 @@ def test_finished_matchfacts_omission_requires_schema_evidence_for_parse_failure
     assert audit.section_results(row, True, [manifest(status="schema_drift")])[0]["category"] == "parse_failed"
 
 
+@pytest.mark.parametrize("section", audit.SECTIONS)
+def test_2302_false_sentinel_with_stale_mask_is_definite_source_omission(section):
+    # Pre-#2302 batches stored the source's JSON false sentinel while the
+    # mask still claimed the section available (fixed in e46256b5). Raw and
+    # typed evidence both prove absence, so the recount must return a
+    # definite source_unavailable instead of unknown:available_mask_disagrees.
+    row = payload(**{"typed_" + section: False, "raw_" + section: False})
+    item = next(item for item in audit.section_results(row, True) if item["section"] == section)
+    assert item["category"] == "source_unavailable"
+    assert item["reason"] == "stored_source_omission_mask_stale"
+    assert item["available"] is True
+
+
+def test_2302_momentum_column_unparseable_stays_unknown_not_guessable():
+    row = payload(typed_momentum=None)
+    item = next(item for item in audit.section_results(row, True) if item["section"] == "momentum")
+    assert item["category"] == "unknown" and item["reason"] == "malformed_or_unresolved_json"
+
+
+def test_2302_payload_sql_classifies_false_sentinel_as_absent():
+    sql = (SCRIPT.parents[0] / "fotmob_completion_audit/current_payloads.sql").read_text(encoding="utf-8")
+    # The false sentinel never counts as content, in any section, on both the
+    # typed and the raw side.
+    assert sql.count("IN ('null', 'false', '{{}}', '[]')") == 12
+    # momentum_json is BOOLEAN-typed in Bronze and may hold the legacy Python
+    # spelling 'False': read it through VARCHAR and normalize the spelling.
+    assert "lower(trim(CAST(momentum_json AS VARCHAR))) = 'false'" in sql
+    assert "json_parse(momentum_json)" not in sql
+    assert "json_parse(CAST(momentum_json AS VARCHAR))" in sql
+
+
 def test_marker_decodes_families_and_explicit_scopes():
     row = manifest(capabilities_json='{"coverage":{"scope_entities":["matches","match_payloads"]}}')
     assert audit.marker_scopes(row)[1:] == (True, True)
