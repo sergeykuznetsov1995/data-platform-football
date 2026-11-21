@@ -213,6 +213,10 @@ def _digest(value) -> str:
 
 # Every written row proves its source; a plan that cannot state this
 # lineage is rejected before any mutation, not audited after the fact.
+_EVIDENCE_COLUMNS = frozenset({
+    'source_url', 'source_endpoint', 'raw_capture_id', 'source_capture_id',
+    'source_body_hash', 'scope_id', 'cycle_id', 'parser_revision', 'schema_revision',
+})
 _REQUIRED_ROW_COLUMNS = frozenset({
     'captured_at', 'source_capture_id', 'source_url', 'source_endpoint',
     'raw_capture_id', 'source_body_hash', 'run_id', 'universe_version',
@@ -260,6 +264,8 @@ class NativeWritePlan:
     status: str = 'observed_present'
     status_reason: str = ''
     proof: str = ''
+    capture_id: str = ''
+    evidence: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.table, str) or not fullmatch(r'transfermarkt_[a-z0-9_]+', self.table):
@@ -282,6 +288,14 @@ class NativeWritePlan:
             raise ValueError('core plan needs its observation status and reason')
         if self.status in ('observed_empty', 'not_applicable') and not _nonempty(self.proof):
             raise ValueError('core plan proof is required for empty observations')
+        # An empty plan has no row to carry its capture lineage; the evidence
+        # mapping stands in for it so the receipt stays fully attributable.
+        if not self.rows:
+            missing = _EVIDENCE_COLUMNS.difference(column for column, _ in self.evidence)
+            if missing:
+                raise ValueError(f'core empty plan lacks capture evidence: {sorted(missing)}')
+            if not _nonempty(self.capture_id):
+                raise ValueError('core empty plan lacks its capture id')
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
@@ -304,10 +318,6 @@ class NativeWritePlan:
             predicate += ' AND source_capture_id = ?'
             params.append(self.capture_id)
         return predicate, tuple(params)
-
-    @property
-    def capture_id(self) -> str:
-        return self.rows[0]['source_capture_id'] if self.rows else ''
 
     def _check_rows(self) -> None:
         keys = set(self.natural_keys) | set(self.scope_columns)
@@ -457,7 +467,7 @@ def _rows_equal(left: Sequence[Mapping], right: Sequence[Mapping]) -> bool:
 
 
 # A re-observation of the same capture regenerates run identity only.
-_LINEAGE_ONLY_COLUMNS = frozenset({'run_id', '_batch_id', '_ingested_at'})
+_LINEAGE_ONLY_COLUMNS = frozenset({'run_id', '_batch_id', '_ingested_at', 'extracted_at'})
 
 
 def _strip_run_lineage(rows) -> list[dict]:
@@ -526,8 +536,9 @@ def _physical_proof(connection, plan: NativeWritePlan) -> dict:
         try:
             counts = _query_rows(
                 cursor,
-                f'SELECT COUNT(*) FROM {plan.full_table} WHERE {plan.scope_sql()}',
-                tuple(plan.scope_values),
+                f'SELECT COUNT(*) FROM {plan.full_table} WHERE {plan.scope_sql()} '
+                'AND source_capture_id = ?',
+                (*plan.scope_values, plan.capture_id),
             )
         finally:
             cursor.close()
@@ -563,7 +574,9 @@ def _physical_proof(connection, plan: NativeWritePlan) -> dict:
 
 def _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
                   batch, committed_at) -> dict:
-    first = plan.rows[0] if plan.rows else {}
+    first = {**dict(plan.evidence)}
+    if plan.rows:
+        first.update(plan.rows[0])
     evidence = {
         col: first.get(col, '') for col in (
             'scope_id', 'cycle_id', 'source_capture_id', 'source_body_hash',

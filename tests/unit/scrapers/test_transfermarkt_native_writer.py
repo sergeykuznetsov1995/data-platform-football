@@ -88,7 +88,7 @@ class CoreWriter(IcebergWriter):
 
 
 def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
-                    status='observed_present', proof='', run='run-1'):
+                    status='observed_present', proof='', run='run-1', ingested=None):
     rows = [{
         'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': pid,
         'player_name': 'Player ' + pid, 'captured_at': clock,
@@ -97,7 +97,7 @@ def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
         'source_endpoint': 'squad', 'raw_capture_id': capture,
         'source_body_hash': 'b' * 64, 'run_id': run, 'universe_version': 'u',
         'parser_revision': 'core-v1', 'schema_revision': '1',
-        '_batch_id': native_writer._batch_id_for_run(run), '_ingested_at': clock,
+        '_batch_id': native_writer._batch_id_for_run(run), '_ingested_at': ingested or clock,
     } for pid in players]
     return NativeWritePlan(
         entity='squad_memberships', table='transfermarkt_squad_memberships',
@@ -105,7 +105,14 @@ def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
         scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
         rows=tuple(rows), captured_at=clock, write_mode=mode,
         status=status, status_reason='squad_page' if status == 'observed_present'
-        else 'empty_roster', proof=proof,
+        else 'empty_roster', proof=proof, capture_id=capture,
+        evidence=(
+            ('source_url', 'https://www.transfermarkt.com/x/kader/verein/11/saison_id/2025/plus/1'),
+            ('source_endpoint', 'squad'), ('raw_capture_id', capture),
+            ('source_capture_id', capture), ('source_body_hash', 'b' * 64),
+            ('scope_id', 'tm-scope'), ('cycle_id', 'tm-cycle'),
+            ('parser_revision', 'core-v1'), ('schema_revision', '1'),
+        ) if not rows else (),
     )
 
 
@@ -124,7 +131,7 @@ def mv_plan(points, *, clock=CLOCK, capture='cap-mv'):
         ddl=MV_DDL, natural_keys=('player_id', 'mv_date'),
         scope_columns=('player_id',), scope_values=('1',),
         rows=tuple(rows), captured_at=clock, write_mode='merge',
-        status_reason='career_page',
+        status_reason='career_page', capture_id=capture,
     )
 
 
@@ -227,7 +234,15 @@ def test_plan_validation_rejects_broken_contracts():
                        'source_body_hash': 'b', 'run_id': 'r', 'universe_version': 'u',
                        'parser_revision': 'p', 'schema_revision': 's',
                        '_batch_id': 'b1', '_ingested_at': CLOCK},),
-                captured_at=CLOCK, status_reason='squad_page')
+                captured_at=CLOCK, status_reason='squad_page',
+                capture_id='c',
+                evidence=(
+                    ('source_url', 'u'), ('source_endpoint', 'squad'),
+                    ('raw_capture_id', 'c'), ('source_capture_id', 'c'),
+                    ('source_body_hash', 'b'), ('scope_id', 's'),
+                    ('cycle_id', 'c'), ('parser_revision', 'p'),
+                    ('schema_revision', 's'),
+                ))
     NativeWritePlan(**base)
     with pytest.raises(ValueError, match='table name'):
         NativeWritePlan(**{**base, 'table': 'transfermarkt_squad_memberships; DROP TABLE x'})
@@ -347,7 +362,13 @@ def test_empty_replace_bundle_deletes_the_scope_and_receipts_zero_rows():
         ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
         scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
         rows=(), captured_at=LATER, status='observed_empty', status_reason='empty_roster',
-        proof='empty_roster:no_data_rows',
+        proof='empty_roster:no_data_rows', capture_id='cap-empty',
+        evidence=(
+            ('source_url', 'u'), ('source_endpoint', 'squad'),
+            ('raw_capture_id', 'cap-empty'), ('source_capture_id', 'cap-empty'),
+            ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
+            ('parser_revision', 'p'), ('schema_revision', 's'),
+        ),
     )
     receipt = write(db, [empty], run_id='run-2', clock=LATER)
     assert receipt['plans'][0]['rows'] == 0
@@ -481,3 +502,63 @@ def test_acknowledgement_finishes_a_leftover_intent(monkeypatch):
     again = write(db, plans)
     assert again['verified'] is True
     assert write_journal.pending_intents({'run_id': 'run-1'}) == []
+
+
+# ---------------------------------------------------------------- review round-2 regressions
+
+
+def test_reobservation_with_a_later_extraction_time_refreshes_lineage():
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-1', run='run-1')], run_id='run-1')
+    # Same capture bytes, later extraction: only the run lineage may differ.
+    second = write(db, [membership_plan(['1'], capture='cap-1', run='run-2', ingested=LATER)],
+                   run_id='run-2', clock=LATER)
+    assert second['verified'] is True
+    rows = db.sql.execute(
+        'SELECT run_id, _ingested_at FROM transfermarkt_squad_memberships').fetchall()
+    assert len(rows) == 1 and rows[0][0] == 'run-2' and rows[0][1] == LATER
+
+
+def test_empty_merge_plan_after_populated_scope_keeps_earlier_rows():
+    db = CoreDB()
+    write(db, [mv_plan([('2025-01-01', 10)], capture='cap-mv')])
+    empty = NativeWritePlan(
+        entity='market_value_points', table='transfermarkt_market_value_points',
+        ddl=MV_DDL, natural_keys=('player_id', 'mv_date'),
+        scope_columns=('player_id',), scope_values=('1',),
+        rows=(), captured_at=LATER, write_mode='merge',
+        status='observed_empty', status_reason='empty_collection',
+        proof='empty_collection:market_value_points', capture_id='cap-mv2',
+        evidence=(
+            ('source_url', 'u'), ('source_endpoint', 'market_value_points'),
+            ('raw_capture_id', 'cap-mv2'), ('source_capture_id', 'cap-mv2'),
+            ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
+            ('parser_revision', 'p'), ('schema_revision', 's'),
+        ),
+    )
+    receipt = write(db, [empty], run_id='run-2', clock=LATER)
+    assert receipt['plans'][0]['rows'] == 0
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_market_value_points').fetchone()[0] == 1
+
+
+def test_empty_plan_receipt_carries_full_capture_evidence():
+    db = CoreDB()
+    empty = NativeWritePlan(
+        entity='squad_memberships', table='transfermarkt_squad_memberships',
+        ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
+        scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
+        rows=(), captured_at=CLOCK, status='observed_empty', status_reason='empty_roster',
+        proof='empty_roster:no_data_rows', capture_id='cap-empty',
+        evidence=(
+            ('source_url', 'https://www.transfermarkt.com/x/kader/verein/11/saison_id/2025/plus/1'),
+            ('source_endpoint', 'squad'), ('raw_capture_id', 'cap-empty'),
+            ('source_capture_id', 'cap-empty'), ('source_body_hash', 'h' * 64),
+            ('scope_id', 'tm-scope'), ('cycle_id', 'tm-cycle'),
+            ('parser_revision', 'core-v1'), ('schema_revision', '1'),
+        ),
+    )
+    write(db, [empty])
+    row = db.sql.execute(
+        'SELECT source_capture_id, source_body_hash, observation_status, status_proof '
+        'FROM transfermarkt_core_receipts_v1').fetchone()
+    assert row == ('cap-empty', 'h' * 64, 'observed_empty', 'empty_roster:no_data_rows')

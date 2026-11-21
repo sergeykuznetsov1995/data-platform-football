@@ -180,12 +180,12 @@ def _load_index_entries() -> list[dict]:
                     entries[entry['digest']] = entry
     except FileNotFoundError:
         pass
-    return entries
+    return list(entries.values())
 
 
 def _load_index() -> list[dict]:
     root = _root()
-    entries = _load_index_entries()
+    entries = {entry['digest']: entry for entry in _load_index_entries()}
 
     files = {path.stem: path for path in root.glob('*.json')}
     for digest, entry in entries.items():

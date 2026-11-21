@@ -529,8 +529,9 @@ def captureless_outcome(
     canonical_timestamp(extracted_at)
     if not _nonempty(run_id) or not _nonempty(universe_version):
         raise CoreParseError('incomplete_lineage')
-    return LaneOutcome(entity, status, reason, scope=scope, extracted_at=extracted_at,
-                       run_id=run_id, universe_version=universe_version)
+    return LaneOutcome(entity, status, reason, proof=proof, scope=scope,
+                       extracted_at=extracted_at, run_id=run_id,
+                       universe_version=universe_version)
 
 
 def core_ddl(entity: str) -> str:
@@ -563,6 +564,20 @@ def plan_for_outcome(
     from scrapers.transfermarkt.native_writer import NativeWritePlan
 
     _check_scope_against_capture(entity, scope_values, outcome.capture)
+    capture = outcome.capture
+    evidence = ()
+    if capture is not None:
+        evidence = (
+            ('source_url', capture.url),
+            ('source_endpoint', capture.endpoint),
+            ('raw_capture_id', capture.capture_id),
+            ('source_capture_id', capture.capture_id),
+            ('source_body_hash', capture.body_hash),
+            ('scope_id', outcome.scope.scope_id),
+            ('cycle_id', outcome.scope.cycle_id),
+            ('parser_revision', CORE_PARSER_REVISION),
+            ('schema_revision', CORE_SCHEMA_REVISION),
+        )
     return NativeWritePlan(
         entity=entity, table=CORE_TABLES[entity], ddl=core_ddl(entity),
         natural_keys=CORE_NATURAL_KEYS[entity], scope_columns=scope_columns,
@@ -571,6 +586,8 @@ def plan_for_outcome(
         write_mode=CORE_WRITE_MODES[entity],
         status=outcome.status, status_reason=outcome.status_reason,
         proof=outcome.proof or '',
+        capture_id=capture.capture_id if capture is not None else '',
+        evidence=evidence,
     )
 
 

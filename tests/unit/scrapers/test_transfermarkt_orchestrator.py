@@ -148,6 +148,17 @@ def test_unavailable_fetch_records_captureless_outcomes_without_bundles():
     assert report.dq['passed'] is True  # structural DQ; coverage stays 0
 
 
+def test_not_applicable_transport_outcome_keeps_its_proof_and_status():
+    def fetch(url, *, as_json, label, context=None, validator=None, **kwargs):
+        return FetchOutcome(status=FetchStatus.NOT_APPLICABLE, status_code=200)
+
+    run = CoreRun(fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    report = run.run(_plan())
+    assert [item['status'] for item in report.outcomes] == ['not_applicable'] * 3
+    assert report.dq['outcome_status_counts'] == {'not_applicable': 3}
+    assert report.receipts == ()
+
+
 def test_json_capture_without_raw_loader_fails_closed():
     replay = _ReplayFetch({'market_value_points'})
     capture = _load('market_value_points')
