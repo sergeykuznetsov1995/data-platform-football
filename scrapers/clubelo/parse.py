@@ -31,7 +31,11 @@ MATCH_ROW_CELLS = (6, 14)  # 6 = fixture without a result, 14 = played match
 _H1_HREF = re.compile(r'<h1><a href="/(\d{4}-\d{2}-\d{2})/([^"]+)">')
 _H1_HREF_EXACT = re.compile(r"/(\d{4}-\d{2}-\d{2})/([^\"]+)")
 _HEADER = re.compile(
-    r"Elo:\s*(-?\d+)\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\)"
+    # The "(Best: N, reached on D)" block is either complete or absent
+    # (clubs without a recorded best, observed 2026-11-21). A present but
+    # malformed block fails closed: after the Elo digits no digit may trail
+    # (backtracking guard) and no "(" may open a Best block.
+    r"Elo:\s*(-?\d+)(?:\s*\(Best:\s*(-?\d+),\s*reached on (\d{4}-\d{2}-\d{2})\)|(?!\d|\s*\())"
     r"(?:,\s*Golo:\s*(-?\d+(?:\.\d+)?))?"
 )
 _VEGA_MARKER = "var vegaJson = "
@@ -283,6 +287,8 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
 # or case aliasing: any other requested-slug → h1 mismatch stays
 # LayoutChanged.
 H1_SLUG_ALIASES = {
+    "Antequera": "antequera-cf",
+    "ArenasdeGetxo": "arenas-de-getxo",
     "Vicenza": "l-r-vicenza",
     "Juventude": "juventude-rs",
     "Criciuma": "criciuma-sc",
@@ -402,15 +408,17 @@ def parse_club_page(html: str, slug: str) -> ClubPage:
         captured = None
     header_match = _HEADER.search(_text(doc))
     if not header_match:
-        raise LayoutChanged("header 'Elo: … (Best: …, reached on …)' not found")
+        raise LayoutChanged("header 'Elo: …' not found")
     elo, best, reached, golo = header_match.groups()
     return ClubPage(
         captured_rating_date=captured,
         club_name=_text(h1s[0]),
         header={
             "elo": int(elo),
-            "elo_best": int(best),
-            "elo_best_reached_on": _iso_date(reached, "Best reached on"),
+            "elo_best": None if best is None else int(best),
+            "elo_best_reached_on": (
+                None if reached is None else _iso_date(reached, "Best reached on")
+            ),
             "golo": None if golo is None else float(golo),
         },
         points=_vega_points(html),
