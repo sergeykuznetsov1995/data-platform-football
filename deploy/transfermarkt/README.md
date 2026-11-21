@@ -4,7 +4,7 @@
 127.0.0.1:8084) и свой платный шлюз (`transfermarkt-gw`: `transfermarkt_gw`,
 `filter_proxy.py --source-mode transfermarkt-only`, без суточного бюджета). Код — из
 замороженного дерева `/opt/transfermarkt/releases/release-<sha8>`; логи и состояние —
-в `/root/transfermarkt-runtime`, вне дерева. В DagBag пять DAG (`.airflowignore`):
+в `/root/transfermarkt-runtime`, вне дерева. В DagBag шесть DAG (`.airflowignore`):
 ingest и discover работают, achievements создан paused, backfill и silver на паузе.
 
 ## Установка (один раз, ничего на общем стеке)
