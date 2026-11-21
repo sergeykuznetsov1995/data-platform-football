@@ -1885,8 +1885,24 @@ def test_reader_registry_and_bootstrap_adapters_are_exhaustive():
         'transfermarkt_team_season_market_value_v2'
     ]
     assert (
-        'iceberg.silver.transfermarkt_competition_editions_v2'
+        'iceberg.silver.transfermarkt_squad_memberships_v2'
         in team_value_contract.source_tables
+    )
+    assert (
+        'iceberg.silver.transfermarkt_player_attribute_observations_v2'
+        in team_value_contract.source_tables
+    )
+    assert (
+        'iceberg.silver.transfermarkt_player_team_season_assignment_v2'
+        not in team_value_contract.source_tables
+    )
+    assert (
+        'iceberg.silver.transfermarkt_market_value_points_v2'
+        not in team_value_contract.source_tables
+    )
+    assert (
+        'iceberg.silver.transfermarkt_competition_editions_v2'
+        not in team_value_contract.source_tables
     )
     assert 'fct_transfer_legacy_source' in transfer
     assert 'transfer_id' in transfer and 'event_season' in transfer
@@ -2952,3 +2968,67 @@ def test_bootstrap_cli_retries_mutation_before_advancing(monkeypatch):
     monkeypatch.setattr(mod, 'bootstrap_sql', lambda: ['INSERT INTO iceberg.ops.fixture VALUES (1)', 'INSERT INTO iceberg.ops.fixture VALUES (2)'])
     assert mod.main(['bootstrap', '--apply']) == 0
     assert cur.calls == ['INSERT INTO iceberg.ops.fixture VALUES (1)', 'INSERT INTO iceberg.ops.fixture VALUES (1)', 'INSERT INTO iceberg.ops.fixture VALUES (2)']
+
+
+def _freeze_prerequisites(retention_present=True):
+    guards = {
+        'active_v2': True,
+        'approved_cycle_matches': True,
+        'approved_league_matches': True,
+        'approved_season_matches': True,
+        'retention_timestamp_present': retention_present,
+        'retention_expired': False,
+        'rollback_state_evidence': True,
+        'rollback_history_evidence': True,
+        'physical_legacy_dq_still_green': True,
+        'readiness_still_green': True,
+        'canonical_reader_views_verified': True,
+        'legacy_writers_disabled_persisted': False,
+        'active_slot_native_only_evidence': False,
+        'previous_slot_native_only_evidence': False,
+        'post_cleanup_slot_rollback_verified': False,
+    }
+    return {'guards': guards}
+
+
+def _freeze_state(control, retention):
+    return control.ReaderState(
+        exists=True, active_version='v2', active_slot='a',
+        approved_cycle_id='cycle', approved_league='ENG-Premier League',
+        approved_season=2025, approved_model_revision=1, revision=4,
+        retention_until=retention,
+        rollback_verified_at=datetime(2026, 11, 21, tzinfo=timezone.utc),
+        legacy_writers_disabled_at=None,
+    )
+
+
+def test_writer_freeze_dry_run_does_not_require_retention_expiry(monkeypatch):
+    control = _load().control
+    now = datetime(2026, 11, 21, tzinfo=timezone.utc)
+    state = _freeze_state(control, now + timedelta(days=30))
+    monkeypatch.setattr(control, 'assert_reader_revision', lambda *a, **k: state)
+    monkeypatch.setattr(control, 'cleanup_check', lambda *a, **k: _freeze_prerequisites())
+    report = control.disable_legacy_writers(
+        object(), cycle_id='cycle', league='ENG-Premier League', season=2025,
+        expected_revision=4, actor='operator', apply=False, quiesced=False,
+    )
+    assert report['status'] == 'dry_run'
+    assert report['action'] == 'disable_legacy_writers'
+    assert report['quiesced_confirmed'] is False
+    assert 'retention_expired' not in report['prerequisite_guards']
+    assert report['prerequisite_guards']['retention_timestamp_present'] is True
+
+
+def test_writer_freeze_still_requires_retention_timestamp(monkeypatch):
+    control = _load().control
+    state = _freeze_state(control, None)
+    monkeypatch.setattr(control, 'assert_reader_revision', lambda *a, **k: state)
+    monkeypatch.setattr(
+        control, 'cleanup_check',
+        lambda *a, **k: _freeze_prerequisites(retention_present=False),
+    )
+    with pytest.raises(control.ReadinessError):
+        control.disable_legacy_writers(
+            object(), cycle_id='cycle', league='ENG-Premier League', season=2025,
+            expected_revision=4, actor='operator', apply=False, quiesced=False,
+        )
