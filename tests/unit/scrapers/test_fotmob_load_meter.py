@@ -27,6 +27,7 @@ UPDATE = "UPDATE iceberg.bronze.fotmob_matches SET synthetic_value = 1"
 INSERT = "INSERT INTO iceberg.bronze.fotmob_matches VALUES (1)"
 READ = "SELECT * FROM iceberg.bronze.fotmob_matches"
 POLL = "SELECT * FROM iceberg.bronze.fotmob_ingest_manifest"
+EXPIRE_SNAPSHOTS = f"ALTER TABLE {MATCHES} EXECUTE expire_snapshots(retention_threshold => '3d')"
 
 
 def snapshot(query_id, query, ended, *, user="src_fotmob", poll_id="synthetic"):
@@ -200,24 +201,69 @@ def test_quiet_full_day_pass():
     assert table_row(report)["scan_reads"] == 1
 
 
-def test_n1_two_commits_in_one_minute():
-    _, report = report_for({"queries": {15: [(INSERT, "src_fotmob")] * 2}}, {MATCHES: 2})
+@pytest.mark.parametrize("manifest_commits", [0, 8])
+def test_n1_two_commits_in_one_minute(manifest_commits):
+    queries = {
+        0: [(f"INSERT INTO {MANIFEST} VALUES (1)", "src_fotmob")] * manifest_commits,
+        15: [(INSERT, "src_fotmob")] * 2,
+    }
+    _, report = report_for({"queries": queries}, {MATCHES: 2, MANIFEST: manifest_commits})
+    assert table_row(report, MANIFEST)["peak_commits_per_min"] == manifest_commits
     assert report["pass_reasons"] == ["N1"]
     assert report["verdicts"]["N1"]["value"] == 2
+    assert report["verdicts"]["N1"]["threshold"] == "<=1/min"
     assert report["verdicts"]["N1"]["evidence"] == MATCHES + "@2026-11-01T00:15:00Z"
     assert all(report["verdicts"][key]["pass"] for key in ("N2", "N3", "N4", "N5"))
 
 
 def test_n2_only_read_scans_of_poll_eligible_tables():
-    _, report = report_for({"queries": {0: [(POLL, "src_fotmob")] * 2}})
+    queries = {
+        0: [(f"SELECT * FROM {SQUADS}", "src_fotmob")] * 2,
+        1: [(POLL, "src_fotmob")] * 3,
+    }
+    _, report = report_for({"queries": queries})
+    assert table_row(report, MANIFEST)["peak_polls_per_min"] == 3
     assert report["pass_reasons"] == ["N2"]
-    assert report["verdicts"]["N2"]["evidence"] == MANIFEST + "@2026-11-01T00:00:00Z"
+    assert report["verdicts"]["N2"] == {
+        "pass": False, "value": 2, "threshold": "<=1/min", "evidence": SQUADS + "@2026-11-01T00:00:00Z",
+    }
     _, other = report_for({"queries": {0: [(READ, "src_fotmob")] * 2}})
     assert other["verdicts"]["N2"]["value"] == 0
     assert other["pass"]
     _, write_scan = report_for({"queries": {0: [("INSERT INTO fotmob_matches SELECT * FROM fotmob_ingest_manifest", "src_fotmob")] * 2}}, {MATCHES: 2})
     assert table_row(write_scan, MANIFEST)["scan_writes"] == 2
     assert write_scan["verdicts"]["N2"]["value"] == 0
+
+
+@pytest.mark.parametrize(("commit_peak", "poll_peak", "scans", "commits", "failure"), [
+    (8, 102, 4761, 1440, None),  # Observed minute peaks and scan total on 18 November.
+    (8, 130, 5760, 1440, None),
+    (9, 102, 4761, 1440, "N1"),
+    (8, 131, 4761, 1440, "N2"),
+    (8, 102, 4761, 1441, "N3"),
+    (8, 102, 5761, 1440, "N4"),
+])
+def test_manifest_thresholds_on_saved_day_rows(commit_peak, poll_peak, scans, commits, failure):
+    queries = {0: [(f"INSERT INTO {MANIFEST} VALUES (1)", "src_fotmob"), (POLL, "src_fotmob")]}
+    _, report = report_for({"queries": queries}, {MANIFEST: 1})
+    table_row(report, MANIFEST).update(
+        commits=commits, peak_commits_per_min=commit_peak, peak_polls_per_min=poll_peak,
+        scan_reads=scans, scans_total=scans,
+    )
+    report["commit_checks"][0].update(sql_commits=commits, snapshot_commits=commits)
+    checked = meter.evaluate_day(report)
+    assert checked["pass"] == (failure is None)
+    assert checked["pass_reasons"] == ([] if failure is None else [failure])
+    peak = MANIFEST + "@2026-11-01T00:00:00Z"
+    for norm, value, threshold, evidence in (
+        ("N1", commit_peak, "<=8/min (control)", peak),
+        ("N2", poll_peak, "<=130/min (control)", peak),
+        ("N3", commits, "<=1440/day", MANIFEST),
+        ("N4", scans, "<=5760/day (control)", MANIFEST),
+    ):
+        assert checked["verdicts"][norm] == {
+            "pass": norm != failure, "value": value, "threshold": threshold, "evidence": evidence,
+        }
 
 
 def test_boundary_1440_commits_and_scans_with_one_per_minute_pass():
@@ -325,6 +371,75 @@ def test_unparsed_sql_without_source_name_does_not_block_pass():
     assert report["pass"]
 
 
+@pytest.mark.parametrize("sql", [
+    EXPIRE_SNAPSHOTS,
+    f"ALTER TABLE {MATCHES} EXECUTE optimize()",
+    f"ALTER TABLE {MATCHES} EXECUTE remove_orphan_files(retention_threshold => '3d')",
+])
+def test_n5_deducts_platform_procedure_operations(sql):
+    parsed = meter.parse_sql(sql, TABLES)
+    assert not parsed.unparsed and parsed.stmt_type == "alter_write"
+    records = list(build_day({"queries": {0: [(sql, "airflow")] * 2}}))
+    first = next(row for row in records if row["grain"] == "snapshot")
+    first.update(io_output_tables=[MATCHES], io_input_tables=[MATCHES])
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 2})
+    assert report["maintenance_procedure_ops"] == {"platform": [[MATCHES, "commit", 2], [MATCHES, "scan_write", 1]]}
+    assert report["maintenance_procedure_ops_total"] == report["platform_ops_total"] == 3
+    assert report["blocking_ops_total"] == report["verdicts"]["N5"]["value"] == 0
+    assert report["pass"] and report["foreign_load"]
+
+
+@pytest.mark.parametrize(("sql", "user", "attr", "ops"), [
+    (EXPIRE_SNAPSHOTS, "other", "unknown", 1),
+    (INSERT, "airflow", "platform", 1),
+    (f"MERGE INTO {MATCHES} t USING {MANIFEST} s ON t.id=s.id WHEN MATCHED THEN UPDATE SET x=1", "airflow", "platform", 2),
+    (f"CREATE TABLE {MATCHES} AS SELECT * FROM {MANIFEST}", "airflow", "platform", 2),
+    (f"ALTER TABLE {MATCHES} EXECUTE optimize", "airflow", "platform", 1),
+])
+def test_n5_foreign_writes_without_procedure_deductions(sql, user, attr, ops):
+    _, report = report_for({"queries": {0: [(sql, user)]}}, {MATCHES: 1})
+    assert report["maintenance_procedure_ops"] == {"platform": []}
+    assert report["maintenance_procedure_ops_total"] == 0
+    assert report[f"{attr}_ops_total"] == report["blocking_ops_total"] == ops
+    assert report["pass_reasons"] == ["N5"] and report["verdicts"]["N5"]["value"] == ops
+
+
+def test_n5_deducts_only_the_platform_procedure_on_a_mixed_day():
+    queries = {0: [(EXPIRE_SNAPSHOTS, "airflow"), (EXPIRE_SNAPSHOTS, "other"), (INSERT, "airflow")]}
+    _, report = report_for({"queries": queries}, {MATCHES: 3})
+    assert (report["platform_ops_total"], report["unknown_ops_total"]) == (2, 1)
+    assert report["maintenance_procedure_ops"] == {"platform": [[MATCHES, "commit", 1]]}
+    assert report["maintenance_procedure_ops_total"] == 1
+    assert report["pass_reasons"] == ["N5"]
+    assert report["blocking_ops_total"] == report["verdicts"]["N5"]["value"] == 2
+
+
+def test_unparsed_platform_procedure_sql_blocks_even_with_a_write_observation():
+    sql = EXPIRE_SNAPSHOTS + "; SELECT 1"
+    records = list(build_day({"queries": {0: [(sql, "airflow")]}}))
+    query = next(row for row in records if row["grain"] == "snapshot")
+    query.update(stmt_type="alter_write", io_output_tables=[MATCHES], io_input_tables=[])
+    _, report = meter.aggregate_day(records, DAY, snapshot_counts={MATCHES: 1})
+    # An unparsed statement never qualifies for the procedure exemption, and
+    # per the #2346 contract it contributes no attributed operations either:
+    # the day is blocked by unparsed_fotmob itself, not by an N5 count.
+    assert report["unparsed_queries"] == 1 and report["unparsed_fotmob"]
+    assert report["pass_reasons"] == ["unparsed_fotmob"]
+    assert report["maintenance_procedure_ops"] == {"platform": []}
+    assert report["maintenance_procedure_ops_total"] == 0
+    assert report["platform_ops_total"] == 0 and not report["pass"]
+
+
+def test_saved_day_without_procedure_counts_deducts_zero():
+    _, report = report_for({"queries": {0: [(EXPIRE_SNAPSHOTS, "airflow")]}}, {MATCHES: 1})
+    del report["maintenance_procedure_ops"]
+    del report["maintenance_procedure_ops_total"]
+    checked = meter.evaluate_day(report)
+    assert checked["maintenance_procedure_ops_total"] == 0
+    assert checked["blocking_ops_total"] == checked["platform_ops_total"] == 1
+    assert checked["pass_reasons"] == ["N5"]
+
+
 @pytest.mark.parametrize(("count", "reason"), [(0, "commit_mismatch"), (2, "commit_mismatch"), (None, "commit_check_missing")])
 def test_daily_commit_reconciliation_is_mandatory(count, reason):
     counts = {} if count is None else {MATCHES: count}
@@ -334,6 +449,71 @@ def test_daily_commit_reconciliation_is_mandatory(count, reason):
     assert check["sql_commits"] == 1 and check["snapshot_commits"] == count
     assert check["difference"] == (None if count is None else count - 1)
     assert report["commit_mismatch"] == (count is not None)
+
+
+@pytest.mark.parametrize(("name", "expected"), [
+    ("fotmob_matches__stg_abc123", True),
+    ("iceberg.bronze.fotmob_matches__stg_abc123", True),
+    ("fotmob_c1_inputs__stg_0123456789abcdef0123456789abcdef", True),
+    ("iceberg.bronze.fotmob_c1_inputs__stg_0123456789abcdef0123456789abcdef", True),
+    ("fotmob_matches", False),
+    ("fotmob_c1_inputs", False),
+    ("fotmob_matches__stg_abcdefg", False),
+    # Table identity is case-insensitive, like is_fotmob_io_table: an
+    # uppercase suffix is the same staging table Trino would fold to lowercase.
+    ("fotmob_matches__stg_ABCDEF", True),
+    ("fotmob_matches__stg_abcde", False),
+    ("iceberg.silver.fotmob_matches__stg_abc123", False),
+])
+def test_is_ephemeral_stage(name, expected):
+    assert meter.is_ephemeral_stage(name) is expected
+
+
+def test_commit_reconciliation_checks_only_persistent_write_targets():
+    inputs = "iceberg.bronze.fotmob_c1_inputs"
+    suffix = "0123456789abcdef0123456789abcdef"
+    inputs_stage = f"{inputs}__stg_{suffix}"
+    stages = [inputs_stage, f"iceberg.bronze.fotmob_c1_candidates__stg_{suffix}", MATCHES + "__stg_0123456789ab"]
+    merge = (f"MERGE INTO {inputs} t USING {inputs_stage} s ON t.id=s.id "
+             "WHEN MATCHED THEN UPDATE SET x=1")
+    queries = {0: [], 1: [(merge, "src_fotmob")], 2: [(INSERT, "src_fotmob")]}
+    for stage in stages:
+        queries[0].extend([
+            (f"CREATE TABLE {stage} AS SELECT 1 AS id", "src_fotmob"),
+            (f"INSERT INTO {stage} VALUES (2)", "src_fotmob"),
+        ])
+    _, report = report_for({"tables": [inputs, MATCHES, *stages], "queries": queries}, {inputs: 1, MATCHES: 1})
+    assert report["pass"] and report["commit_check_complete"] and not report["commit_mismatch"]
+    assert [(row["table"], row["sql_commits"], row["snapshot_commits"]) for row in report["commit_checks"]] == [
+        (inputs, 1, 1), (MATCHES, 1, 1),
+    ]
+    assert set(stages) <= set(report["discovered_tables"])
+    assert all(table_row(report, stage)["commits"] == 2 for stage in stages)
+    assert report["peak_evidence"]["N1"] == inputs + "@2026-11-01T00:01:00Z"
+
+
+def test_ephemeral_only_day_has_no_commit_checks_or_source_norm_candidates():
+    stage = SQUADS + "__stg_abc123"
+    write = (f"UPDATE {stage} SET x=1", "src_fotmob")
+    queries = {0: [write, write, (f"SELECT * FROM {stage}", "src_fotmob")]}
+    _, report = report_for({"tables": [stage], "queries": queries})
+    row = table_row(report, stage)
+    assert (row["commits"], row["scan_writes"], row["scan_reads"]) == (2, 2, 1)
+    assert report["commit_checks"] == [] and report["commit_check_complete"] is True
+    assert report["pass"]
+    assert report["peak_evidence"] == {"N1": None, "N2": None}
+    for norm in ("N1", "N2", "N3", "N4"):
+        assert report["verdicts"][norm]["value"] == 0
+        assert report["verdicts"][norm]["evidence"] is None
+
+
+def test_ephemeral_writes_keep_platform_and_unknown_attribution():
+    stage = MATCHES + "__stg_0123456789ab"
+    sql = f"INSERT INTO {stage} VALUES (1)"
+    _, report = report_for({"tables": [stage], "queries": {0: [(sql, "airflow"), (sql, "other")]}})
+    assert table_row(report, stage, "platform")["commits"] == report["platform_ops_total"] == 1
+    assert table_row(report, stage, "unknown")["commits"] == report["unknown_ops_total"] == 1
+    assert report["pass_reasons"] == ["N5"] and report["blocking_ops_total"] == 2
 
 
 def test_snapshot_counts_are_strict_nonnegative_integers():

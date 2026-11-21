@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
@@ -24,6 +26,14 @@ SEASONS = "fotmob_competition_seasons"
 SOURCES = (MATCHES, PAYLOADS, MANIFEST, SCOPE, SEASONS)
 CONTROL_DAY = date(1970, 1, 1)
 CONTRACT_VERSION = 1
+C1_LOCK_WAIT_SECONDS = 30.0
+C1_LOCK_POLL_SECONDS = 2.0
+C1_LOCK_RETRY_SLEEP_SECONDS = 20.0
+C1_LOCK_RETRY_BUDGET_SECONDS = 600.0
+C1_MAX_LOCK_HOLD_SECONDS = 300.0
+C1_WAVE_WAIT_SECONDS = 600.0
+C1_WAVE_POLL_SECONDS = 60.0
+_sleep = time.sleep
 COLUMNS = (
     "deadline_day", "competition_id", "source_season_key", "match_id", "kind",
     "deadline", "first_ingested", "na_runs", "na_spread_s", "success_count",
@@ -289,6 +299,28 @@ def partition_fingerprints(manager, table):
     return {(str(cid), str(sk)): str(value) for cid, sk, value in rows}
 
 
+def scope_decisions(manager, snapshots):
+    """Current scope decision per competition at the pinned snapshot."""
+    rows = manager.execute_query(
+        f"SELECT competition_id, decision FROM ({current_sql(SCOPE, snapshots)})"
+    )
+    return {str(cid): str(decision) for cid, decision in rows}
+
+
+def seasons_latest(manager, snapshots):
+    """Current is_latest flag per (competition, season) at the pinned snapshot."""
+    rows = manager.execute_query(
+        "SELECT competition_id, source_season_key, is_latest "
+        f"FROM ({current_sql(SEASONS, snapshots)})"
+    )
+    flags = {}
+    for cid, sk, latest in rows:
+        if type(latest) is not bool:
+            raise RuntimeError("C1 invalid source is_latest flag")
+        flags[(str(cid), str(sk))] = latest
+    return flags
+
+
 def changed_pairs(previous, current):
     return {key for key in previous.keys() | current.keys()
             if previous.get(key) != current.get(key)}
@@ -385,6 +417,12 @@ def _stage_rows(manager, stage, rows):
         manager.execute_query(f"INSERT INTO {stage} VALUES " + ",".join(chunk))
 
 
+def _checkpoint_header(checkpoint):
+    """Keep unbounded inventories in the checksummed parts of a split checkpoint."""
+    return {k: v for k, v in checkpoint.items()
+            if k not in ("files", "scope_decisions", "seasons_latest")}
+
+
 def _checkpoint_payloads(checkpoint_json, generation):
     """Keep legacy small checkpoints; bound SQL literals for larger inventories.
 
@@ -395,11 +433,26 @@ def _checkpoint_payloads(checkpoint_json, generation):
         return [(None, "checkpoint", checkpoint_json)]
     parts = [checkpoint_json[i:i + 32_000]
              for i in range(0, len(checkpoint_json), 32_000)]
-    header = json.loads(checkpoint_json)
-    del header["files"]
+    header = _checkpoint_header(json.loads(checkpoint_json))
     header["checkpoint_storage"] = {"version": 1, "parts": len(parts), "sha256": generation}
     return [(None, "checkpoint", json.dumps(header, sort_keys=True)),
             *[(str(i), "checkpoint_part", part) for i, part in enumerate(parts)]]
+
+
+def _validated_checkpoint(checkpoint):
+    """Each semantic key must have one typed value before a delta can be trusted."""
+    if checkpoint.get("detection") == 2:
+        for name, types in (
+            ("scope_decisions", (str, str)),
+            ("seasons_latest", (str, str, bool)),
+        ):
+            rows = checkpoint.get(name)
+            if (not isinstance(rows, list)
+                    or any(not isinstance(row, list) or tuple(map(type, row)) != types
+                           for row in rows)
+                    or len({tuple(row[:-1]) for row in rows}) != len(rows)):
+                raise RuntimeError(f"C1 invalid checkpoint {name}")
+    return checkpoint
 
 
 def _read_checkpoint(rows):
@@ -416,7 +469,7 @@ def _read_checkpoint(rows):
     if storage is None:
         if parts:
             raise RuntimeError("C1 unexpected checkpoint parts")
-        return header
+        return _validated_checkpoint(header)
     if (not isinstance(storage, dict) or storage.get("version") != 1
             or type(storage.get("parts")) is not int or storage["parts"] < 1
             or len(parts) != storage["parts"] or storage.get("sha256") != generation):
@@ -434,11 +487,99 @@ def _read_checkpoint(rows):
     if hashlib.sha256(payload.encode()).hexdigest() != generation:
         raise RuntimeError("C1 checkpoint checksum mismatch")
     checkpoint = json.loads(payload)
-    if {k: v for k, v in checkpoint.items() if k != "files"} != {
+    if _checkpoint_header(checkpoint) != {
         k: v for k, v in header.items() if k != "checkpoint_storage"
     }:
         raise RuntimeError("C1 checkpoint header mismatch")
-    return checkpoint
+    return _validated_checkpoint(checkpoint)
+
+
+def build_writer_lock():
+    """Retry acquisition on the wave's lock. A granted lease is never replayed."""
+    from dags.scripts.run_fotmob_scraper import _WRITER_LOCK_KEY
+    from scrapers.fotmob.writer_lock import WriterLockBusy, WriterLockLost, writer_lock
+
+    @contextmanager
+    def acquire():
+        deadline = time.monotonic() + C1_LOCK_RETRY_BUDGET_SECONDS
+        acquired = False
+        while True:
+            try:
+                with writer_lock(
+                    key=_WRITER_LOCK_KEY, wait_seconds=C1_LOCK_WAIT_SECONDS,
+                    poll_seconds=C1_LOCK_POLL_SECONDS,
+                ) as lease:
+                    acquired = True
+                    yield lease
+                return
+            except WriterLockLost:
+                raise
+            except WriterLockBusy:
+                if acquired or time.monotonic() >= deadline:
+                    raise
+                _sleep(C1_LOCK_RETRY_SLEEP_SECONDS)
+                if time.monotonic() >= deadline:
+                    raise
+
+    return acquire
+
+
+def wait_for_wave():
+    """Give a running wave a bounded head start before opening Trino."""
+    from scrapers.fotmob.maintenance import probe_wave
+
+    deadline = time.monotonic() + C1_WAVE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        running, _ = probe_wave()
+        if not running:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            _sleep(min(C1_WAVE_POLL_SECONDS, remaining))
+
+
+class C1LockHoldOverrun(RuntimeError):
+    """Publication held the writer lock longer than C1_MAX_LOCK_HOLD_SECONDS."""
+
+
+class _HoldDeadlineManager:
+    """Fence every publication statement against the same monotonic lease deadline."""
+
+    def __init__(self, manager):
+        self._manager = manager
+        self._deadline = time.monotonic() + C1_MAX_LOCK_HOLD_SECONDS
+        self._fired = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(self._manager, name)
+
+    def remaining(self):
+        remaining = self._deadline - time.monotonic()
+        if self._fired.is_set() or remaining <= 0:
+            raise C1LockHoldOverrun("C1 publication exceeded its writer lock hold deadline")
+        return remaining
+
+    def _expire(self):
+        self._fired.set()
+        try:
+            cancel = getattr(self._manager, "cancel_active_query", None)
+            if cancel is not None:
+                cancel()
+        except Exception:
+            pass  # Best effort. The deadline still fences the next statement.
+
+    def execute_query(self, sql):
+        timer = threading.Timer(self.remaining(), self._expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            result = self._manager.execute_query(sql)
+        finally:
+            # Cancellation I/O is best effort and may outlive the statement.
+            # Releasing the writer lease must never wait for the timer thread.
+            timer.cancel()
+        self.remaining()
+        return result
 
 
 @contextmanager
@@ -490,10 +631,17 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
         last_day = max(date.fromisoformat(previous["last_day"]),
                        datetime.now(timezone.utc).date() - timedelta(days=1))
     before = snapshots(manager)
+    semantic = {
+        "scope": scope_decisions(manager, before),
+        "seasons": seasons_latest(manager, before),
+    }
     files = {table: partition_fingerprints(manager, table)
-             for table in (MATCHES, PAYLOADS, SCOPE, SEASONS)}
+             for table in (MATCHES, PAYLOADS)}
     all_pairs = set(files[MATCHES])
-    affected = set(all_pairs) if previous is None else set()
+    # A legacy checkpoint gets one full pass while retaining its evidence for
+    # deletions and shared-ID closure. The same MERGE upgrades its detector.
+    has_semantics = previous is not None and previous.get("detection") == 2
+    affected = set() if has_semantics else set(all_pairs)
     if previous is not None:
         for table in (MATCHES, PAYLOADS):
             affected |= changed_pairs(_decoded_pairs(previous["files"][table]), files[table])
@@ -511,10 +659,17 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
                         affected.add((str(cid), str(sk)))
                 else:
                     affected.add((str(cid), str(sk)))
-        for table in (SCOPE, SEASONS):
-            changed_competitions |= {pair[0] for pair in changed_pairs(
-                _decoded_pairs(previous["files"][table]), files[table]
-            )}
+        if has_semantics:
+            changed_competitions |= changed_pairs(
+                dict(previous["scope_decisions"]), semantic["scope"]
+            )
+            old_seasons = _decoded_pairs(previous["seasons_latest"])
+            affected |= changed_pairs(old_seasons, semantic["seasons"])
+            # Unfinished-match candidacy also depends on the existence of any
+            # latest season in the competition, including outside all_pairs.
+            old_latest = {cid for (cid, _), latest in old_seasons.items() if latest}
+            new_latest = {cid for (cid, _), latest in semantic["seasons"].items() if latest}
+            changed_competitions |= old_latest ^ new_latest
         affected |= {pair for pair in all_pairs if pair[0] in changed_competitions}
         # Pool legacy evidence across natural keys. Find IDs in changed physical
         # seasons in both snapshots, then every season containing them. Deleted
@@ -563,6 +718,9 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
         )}
     checkpoint = {
         "contract_version": CONTRACT_VERSION,
+        "detection": 2,
+        "scope_decisions": [list(row) for row in sorted(semantic["scope"].items())],
+        "seasons_latest": _encoded_pairs(semantic["seasons"]),
         "parser_versions": [PARSER_VERSION, LEGACY_PARSER_VERSION],
         "first_day": str(first_day), "last_day": str(last_day), "snapshots": before,
         "files": {table: _encoded_pairs(values) for table, values in files.items()},
@@ -616,26 +774,39 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
             replacements[key] = (*key, *([None] * 7), generation, False, None)
     stage = PREFIX + "fotmob_c1_inputs__stg_" + uuid4().hex
     with _write_lease(manager, writer_lock):
-        manager.execute_query(f"CREATE TABLE {stage} {DDL}")
+        publisher = manager if bootstrap else _HoldDeadlineManager(manager)
+        created = published = False
         try:
-            _stage_rows(manager, stage, replacements.values())
+            publisher.execute_query(f"CREATE TABLE {stage} {DDL}")
+            created = True
+            _stage_rows(publisher, stage, replacements.values())
             # Metadata was read outside time travel; reject a mixed file inventory.
             # Source commits during a lost lease can never advance our checkpoint.
-            if snapshots(manager) != before:
+            if snapshots(publisher) != before:
                 raise RuntimeError("C1 source snapshots changed during refresh")
-            manager.execute_query(merge_sql(stage))
+            publisher.execute_query(merge_sql(stage))
+            published = True
         finally:
-            manager.execute_query(f"DROP TABLE IF EXISTS {stage}")
+            # A cancelled CREATE may already have made the stage visible.
+            # Preserve the publication error if raw cleanup also fails.
+            if created or not bootstrap:
+                try:
+                    manager.execute_query(f"DROP TABLE IF EXISTS {stage}")
+                except Exception:
+                    if published or bootstrap:
+                        raise
+        if not bootstrap:
+            publisher.remaining()
     return {"generation": generation, "seasons": len(affected), "rows": len(replacements)}
 
 
 def run_refresh(**context):
-    from scrapers.fotmob.maintenance import writer_lock
-    from scrapers.fotmob.trino_instrumentation import FotMobTrinoTableManager
-
     conf = (context.get("dag_run").conf or {}) if context.get("dag_run") else {}
     if conf:
         raise ValueError("C1 bootstrap is manual and requires an approved window")
+    wait_for_wave()
+    from scrapers.fotmob.trino_instrumentation import FotMobTrinoTableManager
+
     # Day/checkpoint rows have nullable MERGE keys matched with IS NOT DISTINCT
     # FROM; disable dynamic filtering for these C1 joins.
     manager = FotMobTrinoTableManager(
@@ -646,4 +817,4 @@ def run_refresh(**context):
             "enable_dynamic_filtering": "false",
         },
     )
-    return refresh(manager, writer_lock=writer_lock)
+    return refresh(manager, writer_lock=build_writer_lock())

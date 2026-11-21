@@ -66,11 +66,14 @@ class SyntheticManager:
         self.files = {
             c1.MATCHES: {pair: "stable" for pair in (PAIR, OLD_RELATED, NEW_RELATED)},
             c1.PAYLOADS: {PAIR: "stable"},
-            c1.SCOPE: {("10", ""): "stable"},
-            c1.SEASONS: {("10", ""): "stable"},
         }
+        self.scope_decisions = {PAIR[0]: "included"}
+        self.seasons_latest = {PAIR: True}
         self.checkpoint = {
             "contract_version": c1.CONTRACT_VERSION,
+            "detection": 2,
+            "scope_decisions": [list(row) for row in self.scope_decisions.items()],
+            "seasons_latest": c1._encoded_pairs(self.seasons_latest),
             "parser_versions": [c1.PARSER_VERSION, c1.LEGACY_PARSER_VERSION],
             "first_day": str(DAY), "last_day": str(DAY), "snapshots": self.old,
             "files": {table: c1._encoded_pairs(values) for table, values in self.files.items()},
@@ -115,6 +118,18 @@ class SyntheticManager:
         if "$files" in sql:
             table = re.search(r'"(\w+)\$files"', sql).group(1)
             return [(*pair, value) for pair, value in self.files[table].items()]
+        if sql.startswith("SELECT competition_id, decision FROM ("):
+            assert selections == [
+                (c1.SCOPE, self.current[c1.SCOPE], set(), "true"),
+                (c1.MANIFEST, self.current[c1.MANIFEST], set(), "target_type='competition_profile'"),
+            ]
+            return list(self.scope_decisions.items())
+        if sql.startswith("SELECT competition_id, source_season_key, is_latest FROM ("):
+            assert selections == [
+                (c1.SEASONS, self.current[c1.SEASONS], set(), "true"),
+                (c1.MANIFEST, self.current[c1.MANIFEST], set(), "target_type='competition_seasons'"),
+            ]
+            return [(*pair, latest) for pair, latest in self.seasons_latest.items()]
         if sql.startswith("SELECT DISTINCT match_id FROM ("):
             assert len(selections) == 1
             table, version, pairs, _ = selections[0]
@@ -147,12 +162,17 @@ class SyntheticManager:
         raise AssertionError(f"unexpected SQL: {sql}")
 
 
+def setup_physical_refresh(monkeypatch, changed):
+    monkeypatch.setattr(c1, "datetime", FrozenDatetime)
+    monkeypatch.setattr(c1, "scope_decisions", lambda manager, _: manager.scope_decisions)
+    monkeypatch.setattr(c1, "seasons_latest", lambda manager, _: manager.seasons_latest)
+    return SyntheticManager(changed)
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("changed", [c1.PAYLOADS, c1.MATCHES])
 def test_refresh_changed_physical_pairs_use_table_types_and_both_snapshots(monkeypatch, changed):
-    monkeypatch.setattr(c1, "datetime", FrozenDatetime)
-    manager = SyntheticManager(changed)
-
+    manager = setup_physical_refresh(monkeypatch, changed)
     result = c1.refresh(manager)
 
     # Each old/new association expands closure, including one absent from the
@@ -185,8 +205,7 @@ def test_refresh_changed_physical_pairs_use_table_types_and_both_snapshots(monke
 
 @pytest.mark.unit
 def test_refresh_unchanged_inputs_skips_physical_closure(monkeypatch):
-    monkeypatch.setattr(c1, "datetime", FrozenDatetime)
-    manager = SyntheticManager(None)
+    manager = setup_physical_refresh(monkeypatch, None)
 
     result = c1.refresh(manager)
 
@@ -198,6 +217,25 @@ def test_refresh_unchanged_inputs_skips_physical_closure(monkeypatch):
     assert any(sql.endswith("AND false") for sql in manager.queries)
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.queries) == 1
     assert sum("$history" in sql for sql in manager.queries) == 2 * len(c1.SOURCES)
+
+
+@pytest.mark.unit
+def test_refresh_pinned_scope_change_uses_typed_pair_predicates(monkeypatch):
+    monkeypatch.setattr(c1, "datetime", FrozenDatetime)
+    manager = SyntheticManager(c1.MATCHES)
+    # The scope entry for OLD_RELATED disappeared while PAIR's match file changed.
+    manager.checkpoint["scope_decisions"].append([OLD_RELATED[0], "included"])
+    manager.current[c1.SCOPE] += 100
+
+    result = c1.refresh(manager)
+
+    for table in (c1.SCOPE, c1.SEASONS):
+        assert manager.scans.count((table, manager.current[table], set(), "true")) == 1
+    initial_pairs = {PAIR, OLD_RELATED}
+    for table in (c1.MATCHES, c1.PAYLOADS):
+        assert any(t == table and pairs == initial_pairs for t, _, pairs, _ in manager.scans)
+    assert initial_pairs in manager.target_pairs
+    assert result["seasons"] == 3  # Shared match 102 also pulls in NEW_RELATED.
 
 
 @pytest.mark.unit
