@@ -125,10 +125,13 @@ TRANSFERMARKT_DAG_IDS = frozenset(
     {
         "dag_ingest_transfermarkt",
         "dag_discover_transfermarkt_registry",
+        "dag_ingest_transfermarkt_referees",
     }
 )
 TRANSFERMARKT_BACKFILL_DAG_ID = "dag_backfill_transfermarkt"
-TRANSFERMARKT_BACKFILL_DAG_IDS = frozenset({TRANSFERMARKT_BACKFILL_DAG_ID})
+TRANSFERMARKT_BACKFILL_DAG_IDS = frozenset(
+    {TRANSFERMARKT_BACKFILL_DAG_ID, "dag_backfill_transfermarkt_referees"}
+)
 TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 0
 # ClubElo modes share durable DagRun/URL counters; zero disables admission.
 CLUBELO_DAG_IDS = frozenset({"dag_ingest_clubelo"})
