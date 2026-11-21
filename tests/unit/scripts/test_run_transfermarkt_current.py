@@ -338,6 +338,10 @@ def test_production_current_staff_policy_preserves_other_work(offline, productio
     from dags.utils.transfermarkt_staff import STAFF_TABLE, STAFF_RECEIPTS_TABLE
 
     policy = json.loads(production_current.policy_path.read_text())
+    policy['allowed_write_tables'] = [
+        table for table in policy['allowed_write_tables']
+        if table not in {STAFF_TABLE, STAFF_RECEIPTS_TABLE}
+    ]
     if grants in {'staff_only', 'both'}:
         policy['allowed_write_tables'].append(STAFF_TABLE)
     if grants in {'receipts_only', 'both'}:
