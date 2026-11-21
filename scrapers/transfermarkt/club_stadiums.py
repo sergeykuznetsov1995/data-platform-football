@@ -242,3 +242,91 @@ def confirmed_empty_club_stadium(
         raise ClubStadiumError('missing_completeness_proof', 'completeness_proof')
     proof = _text(completeness_proof, 'completeness_proof')
     return ClubStadiumObservation('observed_empty', club, timestamp, None, proof)
+
+
+@dataclass(frozen=True)
+class ClubProfileObservation:
+    club_id: str
+    observed_at: str
+    url: str | None
+    name: str
+    short_name: str | None
+    abbreviation: str | None
+    club_code: str | None
+    official_name: str | None
+    image: str | None
+    address_line_1: str | None
+    address_line_2: str | None
+    address_line_3: str | None
+    country_id: str | None
+    colors: tuple[str, ...]
+    is_national_team: bool | None
+
+    def as_dict(self):
+        result = asdict(self)
+        result['colors'] = list(self.colors)
+        if hasattr(self.observed_at, 'isoformat'):
+            result['observed_at'] = self.observed_at.isoformat()
+        return result
+
+    def to_dict(self):
+        return self.as_dict()
+
+    def canonical_json(self):
+        return json.dumps(self.as_dict(), ensure_ascii=False, sort_keys=True,
+                          separators=(',', ':'), allow_nan=False)
+
+
+def parse_club_profile(payload, *, club_id, observed_at, country_names=None):
+    envelope = _object(payload, 'profile')
+    if envelope.get('success') is not True:
+        raise ClubStadiumError('unsuccessful_response', 'success')
+    data = _object(envelope.get('data'), 'data')
+    club = _id(club_id, 'club_id')
+    if not club or _id(data.get('id'), 'data.id') != club:
+        raise ClubStadiumError('club_id_mismatch', 'data.id')
+    name = _text(data.get('name'), 'data.name')
+    if not name or not name.strip():
+        raise ClubStadiumError('missing_name', 'data.name')
+    base = _optional(data, 'baseDetails', 'data', _object) or {}
+    prefs = _optional(data, 'preferences', 'data', _object) or {}
+    superior_path = 'data.baseDetails.superiorClub'
+    superior = _optional(base, 'superiorClub', 'data.baseDetails', _object) or {}
+    location = _optional(superior, 'location', superior_path, _object) or {}
+    location_path = superior_path + '.location'
+    national = _optional(base, 'isNationalTeam', 'data.baseDetails', _boolean)
+    official = _optional(superior, 'name', superior_path, _text)
+    street = (_optional(location, 'street', location_path, _text) or '').strip()
+    postcode = (_optional(location, 'postcode', location_path, _text) or '').strip()
+    city = (_optional(location, 'city', location_path, _text) or '').strip()
+    country_id = _optional(location, 'countryId', location_path, _id)
+    country = None
+    if country_names is not None:
+        if not isinstance(country_names, Mapping):
+            raise ClubStadiumError('invalid_type', 'country_names')
+        if country_id is not None:
+            for key, value in country_names.items():
+                if str(key) == str(country_id):
+                    country = _text(value, 'country_names.' + str(key))
+                    break
+    palette = _optional(superior, 'colors', superior_path, _object) or {}
+    colors = []
+    for key, value in palette.items():
+        if value is None or value is False:
+            continue
+        color = _text(value, superior_path + '.colors.' + str(key))
+        if color and color.strip():
+            colors.append(color)
+    return ClubProfileObservation(
+        club_id=club, observed_at=_timestamp(observed_at),
+        url=_optional(data, 'relativeUrl', 'data', _text), name=name,
+        short_name=_optional(base, 'shortName', 'data.baseDetails', _text),
+        abbreviation=_optional(base, 'abbreviation', 'data.baseDetails', _text),
+        club_code=_optional(prefs, 'clubCode', 'data.preferences', _text),
+        official_name=None if national is True else official,
+        image=_optional(data, 'crestUrl', 'data', _text),
+        address_line_1=street or None,
+        address_line_2=' '.join(part for part in (postcode, city) if part) or None,
+        address_line_3=country, country_id=country_id, colors=tuple(colors),
+        is_national_team=national,
+    )

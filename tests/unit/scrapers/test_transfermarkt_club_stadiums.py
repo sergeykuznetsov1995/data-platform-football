@@ -228,3 +228,85 @@ def test_partial_address_and_unresolved_country(parts, line_2):
     assert result.stadium.address_line_2 == line_2
     assert result.stadium.country_id == '157'
     assert result.stadium.country_name is None
+
+
+def _club_profile_payload():
+    return {'success': True, 'data': {
+        'id': 17, 'name': 'Example FC', 'relativeUrl': '/example/startseite/verein/17',
+        'crestUrl': 'https://images.example/17.png',
+        'preferences': {'clubCode': 'EFC'},
+        'baseDetails': {
+            'shortName': 'Example', 'abbreviation': 'EX', 'isNationalTeam': False,
+            'superiorClub': {
+                'name': 'Example Football Club',
+                'colors': {'second': 'blue', 'unset': False, 'blank': '', 'first': 'red'},
+                'location': {'street': '  Main Road  ', 'postcode': ' 020 ',
+                             'city': ' Example City ', 'countryId': 4},
+            },
+        },
+    }}
+
+
+def _parse_profile_fixture(payload, **kwargs):
+    from scrapers.transfermarkt.club_stadiums import parse_club_profile
+
+    return parse_club_profile(payload, club_id='17', observed_at='2025-06-17T00:00:00Z',
+                              **kwargs)
+
+
+def test_profile_official_fields_and_deterministic_json():
+    import json
+    from dataclasses import FrozenInstanceError
+
+    profile = _parse_profile_fixture(_club_profile_payload(), country_names={'4': 'Exampleland'})
+    assert profile.colors == ('blue', 'red')
+    assert profile.is_national_team is False
+    actual = json.loads(profile.canonical_json())
+    assert actual.pop('observed_at')
+    assert actual == {
+        'club_id': '17', 'url': '/example/startseite/verein/17', 'name': 'Example FC',
+        'short_name': 'Example', 'abbreviation': 'EX', 'club_code': 'EFC',
+        'official_name': 'Example Football Club', 'image': 'https://images.example/17.png',
+        'address_line_1': 'Main Road', 'address_line_2': '020 Example City',
+        'address_line_3': 'Exampleland', 'country_id': '4', 'colors': ['blue', 'red'],
+        'is_national_team': False,
+    }
+    assert profile.canonical_json() == _parse_profile_fixture(
+        _club_profile_payload(), country_names={'4': 'Exampleland'}).canonical_json()
+    with pytest.raises(FrozenInstanceError):
+        profile.name = 'changed'
+
+
+def test_profile_national_team_and_missing_optional_fields():
+    payload = _club_profile_payload()
+    payload['data']['baseDetails']['isNationalTeam'] = True
+    result = _parse_profile_fixture(payload)
+    assert result.is_national_team is True
+    assert result.official_name is None
+    assert result.address_line_3 is None
+    minimal = _parse_profile_fixture({'success': True, 'data': {'id': '17', 'name': 'X'}})
+    assert minimal.colors == ()
+    for key, value in minimal.as_dict().items():
+        if key not in {'club_id', 'observed_at', 'colors', 'name'}:
+            assert value is None, key
+
+
+@pytest.mark.parametrize(('path', 'value'), [
+    (('success',), 1), (('data',), []), (('data', 'id'), '18'),
+    (('data', 'name'), ' '), (('data', 'relativeUrl'), 23),
+    (('data', 'baseDetails'), False), (('data', 'preferences'), []),
+    (('data', 'baseDetails', 'isNationalTeam'), 1),
+    (('data', 'baseDetails', 'superiorClub', 'colors'), []),
+    (('data', 'baseDetails', 'superiorClub', 'colors', 'second'), True),
+    (('data', 'baseDetails', 'superiorClub', 'location', 'postcode'), 20),
+])
+def test_profile_rejects_malformed_present_values(path, value):
+    from scrapers.transfermarkt.club_stadiums import ClubStadiumError
+
+    payload = _club_profile_payload()
+    parent = payload
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = value
+    with pytest.raises(ClubStadiumError):
+        _parse_profile_fixture(payload)

@@ -22,6 +22,7 @@ CHECKS_TABLE = 'iceberg.ops.transfermarkt_current_checks_v1'
 CURRENT_POLICY_VERSION = 'change-signals-v1'
 DAILY_INTERVAL = timedelta(hours=20)
 WEEKLY_INTERVAL = timedelta(days=7)
+MONTHLY_INTERVAL = timedelta(days=30)
 ERROR_BACKOFF = timedelta(hours=4)
 TOP_LEAGUES = ('GB1', 'ES1', 'IT1', 'L1', 'FR1')
 DAILY_CHECKS = ('listing', 'players', 'injury', 'rumours')
@@ -509,6 +510,8 @@ class ScopeCursor:
     resume_json: str = '{}'
     staff_completed_at: datetime | None = None
     staff_pending: bool = False
+    stadium_completed_at: datetime | None = None
+    stadium_pending: bool = False
     attendance_completed_at: datetime | None = None
     attendance_pending: bool = False
     last_error_at: datetime | None = None
@@ -522,13 +525,15 @@ class ScopeCursor:
             raise CurrentStateError('cold_complete must be boolean')
         if not isinstance(self.staff_pending, bool):
             raise CurrentStateError('staff_pending must be boolean')
+        if not isinstance(self.stadium_pending, bool):
+            raise CurrentStateError('stadium_pending must be boolean')
         if not isinstance(self.attendance_pending, bool):
             raise CurrentStateError('attendance_pending must be boolean')
         if not isinstance(self.change_pending, bool):
             raise CurrentStateError('change_pending must be boolean')
         for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at',
                      'roster_completed_at', 'last_work_at', 'staff_completed_at',
-                     'attendance_completed_at', 'last_error_at'):
+                     'stadium_completed_at', 'attendance_completed_at', 'last_error_at'):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _time(getattr(self, name)))
         try:
@@ -548,6 +553,7 @@ class ScopeCursor:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'ScopeCursor':
         values = {'staff_completed_at': None, 'staff_pending': False,
+                  'stadium_completed_at': None, 'stadium_pending': False,
                   'attendance_completed_at': None, 'attendance_pending': False,
                   'last_error_at': None, 'change_pending': False, **value}
         cursor = cls(**_mapping(cls, values))
@@ -568,6 +574,11 @@ class ScopeCursor:
         return self.cold_complete and (
             self.roster_completed_at is None
             or _time(now) - self.roster_completed_at >= WEEKLY_INTERVAL
+        )
+
+    def stadium_due(self, now: datetime) -> bool:
+        return self.stadium_pending or self.stadium_completed_at is None or (
+            _time(now) - self.stadium_completed_at >= MONTHLY_INTERVAL
         )
 
 
@@ -705,6 +716,7 @@ class CurrentWork:
 def plan_current_work(
     targets: Iterable[CurrentTarget], cursors: Mapping[str, ScopeCursor], *,
     now: datetime, limit: int = 8, staff_enabled: bool = False,
+    stadium_enabled: bool = False,
     attendance_enabled: bool = False,
     scope_index: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[CurrentWork, ...]:
@@ -784,6 +796,8 @@ def plan_current_work(
             queue(3, 'resume', (last_work, target.cold_priority))
         elif cursor.roster_due(timestamp):
             queue(4, 'weekly_roster', (last_work, target.cold_priority))
+        elif stadium_enabled and cursor.stadium_due(timestamp):
+            queue(4, 'monthly_club_stadiums', (last_work, target.cold_priority))
         elif staff_enabled and (cursor.staff_pending or cursor.staff_completed_at is None
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
             queue(4, 'weekly_staff', (last_work, target.cold_priority))
