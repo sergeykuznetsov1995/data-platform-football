@@ -13,7 +13,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from dags.utils.transfermarkt_club_values import write_club_values
 from scrapers.transfermarkt.club_values import ClubValueCapture, parse_club_values, with_stichtag
-from scrapers.transfermarkt.models import FetchStatus
+from scrapers.transfermarkt.history_portion import enabled as history_portion_enabled
+from scrapers.transfermarkt.models import FetchStatus, PROVIDER_GRANT_ENV_VAR
 from scrapers.transfermarkt.scraper import TransfermarktScraper
 
 
@@ -115,20 +116,94 @@ def _atomic_report(path: Path, report: Mapping[str, Any]) -> None:
 
 
 def main() -> int:
+    from dags.scripts.run_transfermarkt_scraper import (
+        _normalise_traffic,
+        _prepare_cycle_budget,
+        _record_cycle_traffic,
+    )
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=('current', 'history'), required=True)
     parser.add_argument('--report', required=True)
     args = parser.parse_args()
     payload = _scope(json.loads(os.environ['TM_SCOPE_PAYLOAD_JSON']))
-    scraper = TransfermarktScraper(
-        leagues=[str(payload['competition_id'])], seasons=[int(payload['edition_id'])],
-        canonical_season=str(payload.get('canonical_season') or ''),
+    limit_bytes = int(os.environ['TM_PROVIDER_HARD_CAP_BYTES'])
+    run_key = str(payload['child_cycle_id'])
+    history_enabled = history_portion_enabled()
+    if history_enabled:
+        run_key += ':' + os.environ['TM_HISTORY_PORTION_ID']
+    os.environ['TM_CYCLE_LEDGER_KEY'] = run_key
+    budget = _prepare_cycle_budget(
+        run_key, limit_bytes, entity='club_values', reserve_bytes=2 * 1024 * 1024,
     )
+    scraper = None
+    primary_error = None
     try:
+        os.environ[PROVIDER_GRANT_ENV_VAR] = str(budget['reserved_bytes'])
+        if history_enabled:
+            os.environ['TM_HISTORY_GRANT_JSON'] = json.dumps({
+                'ledger_path': str(budget['path']),
+                'reservation_id': budget['reservation_id'],
+                'cycle_ledger_key': run_key,
+                'entity': 'club_values',
+                'limit_bytes': budget['limit_bytes'],
+                'reserved_bytes': budget['reserved_bytes'],
+            })
+        scraper = TransfermarktScraper(
+            leagues=[str(payload['competition_id'])], seasons=[int(payload['edition_id'])],
+            canonical_season=str(payload.get('canonical_season') or ''),
+        )
         report = run_club_values(scraper, payload, _preflight_from_env(), mode=args.mode)
         _atomic_report(Path(args.report), report)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        scraper.close()
+        cleanup_errors = []
+        traffic = None
+        if scraper is not None:
+            try:
+                traffic = _normalise_traffic(scraper)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            try:
+                scraper.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        try:
+            if scraper is not None and (
+                traffic is None or traffic.get('provider_metered_bytes') is None
+            ):
+                error = ClubValueRunError(
+                    'club_values provider metered telemetry is unknown; '
+                    'retaining the active reservation'
+                )
+                try:
+                    _record_cycle_traffic(
+                        run_key, limit_bytes, 'club_values:telemetry_unknown',
+                        budget['remaining_after_reservation_bytes'],
+                    )
+                except Exception as exc:
+                    error.add_note(f'Failed to reserve remaining provider budget: {exc!r}')
+                raise error
+            _record_cycle_traffic(
+                run_key, limit_bytes, 'club_values',
+                0 if scraper is None else traffic['provider_metered_bytes'],
+                reservation_id=budget['reservation_id'],
+            )
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            if primary_error is not None:
+                for error in cleanup_errors:
+                    primary_error.add_note(f'Club-values reservation cleanup: {error!r}')
+                    for note in getattr(error, '__notes__', ()):
+                        primary_error.add_note(note)
+            else:
+                error = cleanup_errors[-1]
+                for earlier in cleanup_errors[:-1]:
+                    error.add_note(f'Club-values reservation cleanup: {earlier!r}')
+                raise error
     return 0
 
 
