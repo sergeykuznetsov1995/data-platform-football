@@ -216,3 +216,23 @@ def test_main_unavailable_report_still_prints_two_lines(monkeypatch, capsys):
     lines = capsys.readouterr().out.strip().splitlines()
     assert lines[0] == "история: не посчитана — ошибка чтения Bronze"
     assert json.loads(lines[1])["status"] == "unavailable"
+
+
+def test_read_report_rejects_malformed_page_digest():
+    trino = _client([[("2026-10-01",)], [("aGk=", "x")], []])
+    report = read_report(trino, today=TODAY)
+    assert report["status"] == "unavailable"
+    assert report["reason"].startswith("очередь не читается: ")
+
+
+def test_main_invalid_today_prints_unavailable(monkeypatch, capsys):
+    import json
+
+    from scrapers.clubelo.history_coverage import main
+
+    monkeypatch.setattr("scrapers.clubelo.history_coverage.subprocess.run",
+                        _fake_run("", returncode=0))
+    assert main(["--trino", "trino-ro.sh", "--today", "2026-02-30"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert lines[0].startswith("история: не посчитана — некорректная дата --today")
+    assert json.loads(lines[1])["status"] == "unavailable"

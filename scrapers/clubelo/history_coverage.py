@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import base64
 import gzip
+import re
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from scrapers.clubelo.parse import LayoutChanged, parse_ranking_slugs  # noqa: E
 MANIFEST_TABLE = "iceberg.bronze.clubelo_history_manifest"
 RAW_PAGE_TABLE = "iceberg.bronze.clubelo_raw_page"
 KNOWN_STATUSES = frozenset({"done", "no_page", "failed"})
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 BUCKETS = ("done", "no_page", "failed", "pending", "unknown")
 LATEST_MANIFEST_SQL = (
     "SELECT slug, status FROM (SELECT slug, status, row_number() OVER "
@@ -87,8 +89,10 @@ def read_report(trino, *, today: date) -> dict:
             if not page_rows:
                 return _unavailable("страница очереди /Ranking не найдена")
             body, sha256 = page_rows[0]
-            if not isinstance(sha256, str) or not sha256:
-                raise ValueError("missing queue page digest")
+            # The digest is the queue identity the summary prints: anything but
+            # a real sha256 hex fails closed instead of showing "sha x" (Astra r1).
+            if not isinstance(sha256, str) or not _SHA256_HEX.fullmatch(sha256):
+                raise ValueError("queue page digest")
             compressed = base64.b64decode(body, validate=True)
             page_date, slugs = parse_ranking_slugs(gzip.decompress(compressed).decode("utf-8"))
         except Exception as exc:
@@ -160,10 +164,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="ClubElo history queue coverage (#2280)")
     parser.add_argument("--trino", default="/root/.claude/bin/trino-ro.sh",
                         help="read-only Trino CLI wrapper")
-    parser.add_argument("--today", default=date.today().isoformat(),
+    parser.add_argument("--today", default=datetime.now(timezone.utc).date().isoformat(),
                         help="ISO date of the report day (UTC)")
     args = parser.parse_args(argv)
-    report = read_report(CliTrino(args.trino), today=date.fromisoformat(args.today))
+    try:
+        today = date.fromisoformat(args.today)
+    except ValueError:
+        today = None
+    report = (read_report(CliTrino(args.trino), today=today)
+              if today is not None
+              else _unavailable(f"некорректная дата --today: {args.today}"))
     print(format_line(report))
     print(json.dumps(report, ensure_ascii=False, default=str))
     return 0
