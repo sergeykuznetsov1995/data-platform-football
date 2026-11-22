@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import datetime
 import json
 import re
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from bs4 import ParserRejectedMarkup
 
@@ -53,6 +53,38 @@ def _unavailable_capture(section: str, entity: str, capture: core.SourceCapture,
     return _outcome(entity, 'unavailable', f'{section}:http_{capture.status_code}', **context)
 
 
+def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_id: str):
+    """Why the supplied pages are not exactly one walk from the edition's first page.
+
+    Returns the reason, or None when the donor's own walk is the one to report.
+    """
+    parts = urlsplit(start_url)
+    if parts.netloc != core.TRANSFERMARKT_HOST:
+        return 'pagination_identity_invalid'
+    if parse_qs(parts.query).get('page', ['1']) != ['1']:
+        return 'pagination_start_not_first_page'
+
+    def validate(url):
+        return attendance._validate_attendance_url(
+            url, host=parts.netloc, path=parts.path, competition=competition_id, edition=edition_id)
+
+    by_url = {attendance._canonical_url(capture.url): capture for capture in captures}
+    visited = []
+    try:
+        current = validate(start_url)
+        while current is not None and current not in visited:
+            visited.append(current)
+            capture = by_url.get(current)
+            if capture is None:
+                return None
+            current = attendance.next_attendance_url(capture.body, current)
+            if current is not None:
+                current = validate(current)
+    except ValueError:
+        return None
+    return None if set(visited) == set(by_url) else 'pagination_captures_differ'
+
+
 def extract_attendance_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *, start_url: str,
     competition_id: str, edition_id: str, extracted_at: str, universe_version: str,
@@ -71,6 +103,11 @@ def extract_attendance_observations(
         raise core.CoreParseError('attendance:final_season_proof_missing')
 
     context = core._context(captures[-1], scope, extracted_at, universe_version)
+    walk = _attendance_walk(captures, start_url, competition_id=competition_id, edition_id=edition_id)
+    if walk is not None:
+        # A terminal page offered as the start, or captures the walk never
+        # visits, must not become a replacement of the whole edition.
+        return _outcome(entity, 'error', 'attendance:' + walk, **context)
     try:
         pages = [
             attendance.AttendancePage(
@@ -133,6 +170,11 @@ def extract_representation_observations(
         return (_unavailable_capture('representation', 'player_representation_observations', capture, scope,
                                      extracted_at, universe_version),)
     context = core._context(capture, scope, extracted_at, universe_version)
+    requested = parse_qs(urlsplit(capture.url).query).get('ids[]', [])
+    if len(requested) != len(expected_ids) or set(requested) != set(expected_ids):
+        # The packet must answer the whole request its URL made: a narrowed
+        # expectation would certify a capture that never asked for the rest.
+        return (_outcome(entity, 'error', 'representation:requested_ids_differ', **context),)
     try:
         try:
             payload = json.loads(capture.text)
@@ -193,13 +235,18 @@ def _referee_walk_failure(captures):
     page closes: a trailing next link means pages are missing and nothing of
     the directory is certified. Returns that page's capture and the reason.
     """
-    scope = None
+    scope = identity = None
     for index, capture in enumerate(captures, 1):
-        match = _DIRECTORY_PAGE.fullmatch(urlsplit(capture.url).path)
-        if match is None:
+        url = urlsplit(capture.url)
+        match = _DIRECTORY_PAGE.fullmatch(url.path)
+        if match is None or url.netloc != core.TRANSFERMARKT_HOST:
             return capture, 'directory_identity_invalid'
         if scope is None:
             scope = match.groupdict()
+            identity = (match['route'], match['competition_id'], match['edition_id'])
+        # Every page continues the very directory the first page started.
+        if (match['route'], match['competition_id'], match['edition_id']) != identity:
+            return capture, 'directory_identity_invalid'
         if int(match['page'] or '1') != index:
             return capture, 'directory_pagination_incomplete'
     del scope['page']
@@ -233,8 +280,6 @@ def extract_referee_directory_observations(
                                      extracted_at, universe_version),)
     competition_id, edition_id = core._referee_directory_identity(urlsplit(captures[0].url).path)
     directory = {'competition_id': competition_id, 'edition_id': edition_id}
-    for capture in captures[1:]:
-        core._check_scope_against_capture(entity, directory, capture)
 
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
@@ -295,8 +340,11 @@ def extract_referee_profile_observations(
     if capture.status_code != 200:
         return _unavailable_capture('referees', 'referee_profiles', capture, scope,
                                     extracted_at, universe_version)
-    core._check_scope_against_capture(entity, {'referee_id': referee_id}, capture)
     context = core._context(capture, scope, extracted_at, universe_version)
+    try:
+        core._check_scope_against_capture(entity, {'referee_id': referee_id}, capture)
+    except core.CoreParseError as exc:
+        return _outcome(entity, 'error', 'referees:' + exc.reason, **context)
     try:
         profile = referees.parse_referee_profile(capture.text, referee_id=referee_id)
     except referees.RefereeParseError as exc:
@@ -318,7 +366,7 @@ def extract_referee_profile_observations(
 def extract_rumour_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *,
     competition: rumours.CompetitionContext, extracted_at: str, universe_version: str,
-    failure: str | None = None,
+    failure: str | None = None, broken: core.SourceCapture | None = None,
 ) -> tuple[core.LaneOutcome, ...]:
     """Observe one COMPLETE rumour feed, one write-plan outcome per page.
 
@@ -335,11 +383,12 @@ def extract_rumour_observations(
     if failed is not None:
         return (_unavailable_capture('rumours', 'rumour_observations', failed, scope,
                                      extracted_at, universe_version),)
-    newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
+    newest = broken or max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
     if failure is not None:
         # The walk stopped on conflicting or unreadable evidence of its own:
-        # the pages it did fetch are not the feed.
+        # the pages it did fetch are not the feed. The page that broke it,
+        # when there is one, backs the error.
         return (_outcome(entity, 'error', 'rumours:' + failure, **context),)
     try:
         # The supplied pages must form the complete plan their pagers evidence
@@ -375,10 +424,11 @@ def extract_rumour_observations(
             soup = rumours._soup(capture.text)
             if rumours._confirmed_empty_grid(soup):
                 proof, reason = 'rumours:confirmed_empty_grid', 'rumours:empty_grid'
-            elif soup.select('td.no-entries'):
-                proof = reason = 'rumours:no_entries_row'
             else:
-                proof = reason = 'rumours:empty_table_body'
+                # Only the rumour table itself can carry the donor's marker.
+                table = rumours._rumour_table(soup)
+                proof = reason = ('rumours:no_entries_row' if table.select('td.no-entries')
+                                  else 'rumours:empty_table_body')
             outcomes.append(_outcome(entity, 'observed_empty', reason, proof=proof, **page_context))
             continue
         rows = []

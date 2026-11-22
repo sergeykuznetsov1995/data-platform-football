@@ -21,6 +21,7 @@ from scrapers.transfermarkt import parsing
 
 CORE_PARSER_REVISION = 'core-v1'
 CORE_SCHEMA_REVISION = '1'
+TRANSFERMARKT_HOST = 'www.transfermarkt.com'
 CORE_STATUSES = frozenset({
     'observed_present', 'observed_empty', 'explicit_none', 'not_applicable',
     'unknown', 'unavailable', 'error',
@@ -377,15 +378,17 @@ def _status_matches_rows(entity, status, rows) -> bool:
         if not isinstance(verdict, str) or verdict not in allowed:
             return False
         verdicts.append(verdict)
-        if (contract and status == 'observed_present' and verdict != status
-                and verdict != _CONTRACT_STATUSES.get(row.get('contract_status'))):
+        # Each contract cell carries its own verdict, in both directions.
+        if contract and verdict != _CONTRACT_STATUSES.get(row.get('contract_status')):
             return False
     # A populated squad page carries each contract cell's own verdict.
     if contract and status == 'observed_present':
         return True
-    # The donors' summarise rule for the aggregate verdict.
+    # The donors' summarise rule for the aggregate verdict. Rows of the other
+    # section lanes are an observed page, never an aggregate absence.
     if status == 'explicit_none':
-        return all(verdict == 'explicit_none' for verdict in verdicts)
+        return entity in _PRESENCE_ENTITIES and all(
+            verdict == 'explicit_none' for verdict in verdicts)
     if status == 'observed_present':
         return entity not in _PRESENCE_ENTITIES or 'observed_present' in verdicts
     # unknown never hides a present row, and in a presence lane it needs a row
@@ -799,6 +802,8 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         return
     if entity == 'referee_profiles':
         match = re.fullmatch(r'/-/profil/schiedsrichter/([1-9][0-9]*)', path)
+        if url.hostname != TRANSFERMARKT_HOST:
+            raise CoreParseError('row_scope_mismatch')
         if match is None or match[1] != scope_values['referee_id']:
             raise CoreParseError('row_scope_mismatch')
         return
@@ -834,7 +839,7 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
 
         try:
             attendance._validate_attendance_url(
-                capture.url, host=url.netloc, path=path,
+                capture.url, host=TRANSFERMARKT_HOST, path=path,
                 competition=scope_values['competition_id'], edition=scope_values['edition_id'])
         except attendance.AttendanceParseError as exc:
             raise CoreParseError('row_scope_mismatch') from exc

@@ -1955,7 +1955,8 @@ def test_referee_walk_follows_the_exact_pages_the_links_name():
     elsewhere = _referee_page(REFEREE_DIRECTORY_URL.replace('/wettbewerb/', '/pokalwettbewerb/')
                               + '/page/2', _referee_second_page_body())
     outcome = _directory_error((page_1, elsewhere))
-    assert outcome.status_reason == 'referees:directory_pagination_incomplete'
+    # Round 3 named the precise reason: it is another directory altogether.
+    assert outcome.status_reason == 'referees:directory_identity_invalid'
 
 
 def test_unparsable_referee_next_link_is_contained():

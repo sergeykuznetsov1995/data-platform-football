@@ -270,6 +270,23 @@ def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
     return tuple(request.url for request, _ in _requests(plan))
 
 
+def _run_requests(plan: CoreScopePlan):
+    """The run's requests: one scope is never replaced twice in a run.
+
+    Two replacements of one scope are two verified deletions of each other,
+    whichever of them is fetched first.
+    """
+    requests = list(_requests(plan))
+    seen = set()
+    for request, _competition in requests:
+        if any(core.CORE_WRITE_MODES[entity] == 'replace' for entity in _ENTITIES[request.label]):
+            target = (request.label, tuple(sorted(request.scope_values(plan).items())))
+            if target in seen:
+                raise CoreRunError(f"{request.label}:duplicate_target")
+            seen.add(target)
+    return requests
+
+
 def _capture(request, result, raw_loader):
     if raw_loader is not None:
         body, record = raw_loader(result.raw_capture_id)
@@ -351,13 +368,17 @@ def _request_subject(request, plan) -> str:
 
 
 def _observations(request, result, plan, extracted_at, universe_version, raw_loader, captures=(),
-                  competition=None, walk_failure=None):
+                  competition=None, walk_failure=None, walk_failed=None):
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
         edition_id=request.edition_id or plan.edition_id or None, player_id=request.player_id or None,
         club_id=request.club.club_id if request.club else None,
         club_name=request.club.club_name if request.club else None,
     )
+    if request.label == "club_values":
+        # The stichtag page belongs to the target's competition, not to the
+        # league that happens to enclose the run.
+        scope = replace(scope, league=request.competition_id)
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
     subject = _request_subject(request, plan)
@@ -404,7 +425,8 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
                 "rumour_observations", scope, status="error",
                 reason=f"rumours:{walk_failure}", run_id=run_id, subject=subject, **metadata),), None
         unit = sections.extract_rumour_observations(
-            captures, scope, competition=competition, failure=walk_failure, **metadata)
+            captures, scope, competition=competition, failure=walk_failure, broken=walk_failed,
+            **metadata)
         return tuple(unit), max(capture.captured_at for capture in captures)
     if request.label == "attendance":
         outcome = sections.extract_attendance_observations(
@@ -477,6 +499,7 @@ class _RumourWalk:
         self.last_page = None
         self.pages = {}       # validated page number -> its capture
         self.captures = []    # every page handed to extraction, failures included
+        self.failed = None    # the page whose evidence broke the walk
         self.aliases = set()  # visited URLs that are no plan page
 
     def ordered(self):
@@ -550,12 +573,12 @@ class CoreRun:
         outcomes = []
         captured_units = []
         fetched = cache_hits = 0
-        for request, competition in _requests(plan):
+        for request, competition in _run_requests(plan):
             as_json = request.as_json
             page = request
             captures = []
             walk = _RumourWalk(competition) if request.label == "rumours" else None
-            walk_failure = None
+            walk_failure, walk_failed = None, None
             while True:
                 result = self._fetch(
                     page.url, label=request.label, as_json=as_json, context=context,
@@ -574,6 +597,7 @@ class CoreRun:
                         # The walk's own evidence conflicts or is unreadable:
                         # the feed is reported from it, never certified in part.
                         walk_failure = getattr(exc, "reason", None) or "invalid_source_data"
+                        walk_failed = walk.captures[-1]
                         break
                     if next_url is None:
                         break
@@ -617,7 +641,8 @@ class CoreRun:
             extracted_at = pinned or datetime.now(timezone.utc).isoformat(timespec="microseconds")
             unit, captured_at = _observations(
                 request, result, plan, extracted_at, self._universe_version, self._raw_loader,
-                captures, competition=competition, walk_failure=walk_failure)
+                captures, competition=competition, walk_failure=walk_failure,
+                walk_failed=walk_failed)
             outcomes.extend(unit)
             if captured_at is not None and writer is not None and connection_factory is not None:
                 # A multi-page merge writes one plan per contributing page capture.
@@ -653,7 +678,8 @@ class CoreRun:
             }
         dq = core.build_core_dq(outcomes, verified_receipt=verified)
         return CoreRunReport(
-            run_id=outcomes[0].run_id if outcomes else "",
+            # The compatibility run id names the target of the first receipt.
+            run_id=receipts[0]["run_id"] if receipts else (outcomes[0].run_id if outcomes else ""),
             scope_id=plan.scope_id,
             cycle_id=plan.cycle_id,
             outcomes=tuple(_summary(item) for item in outcomes),
