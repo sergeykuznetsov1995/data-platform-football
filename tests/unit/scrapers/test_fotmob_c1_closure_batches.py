@@ -843,19 +843,34 @@ def test_wait_for_wave_stops_on_idle_or_deadline(monkeypatch, clock, states, bud
     assert list(observations) == []
 
 
-def test_wait_for_wave_propagates_probe_failure(monkeypatch, clock):
+def test_wait_for_wave_tolerates_probe_failures_then_recovers(monkeypatch, clock):
     from scrapers.fotmob import maintenance
 
     failure = RuntimeError("synthetic wave probe failure")
+    probes = []
 
     def probe_wave():
-        raise failure
+        probes.append(None)
+        if len(probes) < c1.C1_WAVE_PROBE_ATTEMPTS:
+            raise failure
+        return (False, None)  # recovered: idle right after the blips
 
     monkeypatch.setattr(maintenance, "probe_wave", probe_wave)
-    with pytest.raises(RuntimeError) as caught:
-        c1.wait_for_wave()
-    assert caught.value is failure
-    assert clock.sleeps == []
+    c1.wait_for_wave()
+    assert len(probes) == c1.C1_WAVE_PROBE_ATTEMPTS
+    assert clock.sleeps == [60.0] * (c1.C1_WAVE_PROBE_ATTEMPTS - 1)
+
+
+def test_wait_for_wave_proceeds_after_exhausted_probe_attempts(monkeypatch, clock):
+    from scrapers.fotmob import maintenance
+
+    def probe_wave():
+        raise RuntimeError("synthetic transient DNS failure")
+
+    monkeypatch.setattr(maintenance, "probe_wave", probe_wave)
+    monkeypatch.setattr(c1, "C1_WAVE_PROBE_ATTEMPTS", 2)
+    assert c1.wait_for_wave() is None
+    assert clock.sleeps == [60.0]
 
 
 def test_hold_deadline_spans_multiple_short_queries(clock):

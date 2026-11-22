@@ -33,6 +33,7 @@ C1_LOCK_RETRY_BUDGET_SECONDS = 600.0
 C1_MAX_LOCK_HOLD_SECONDS = 300.0
 C1_WAVE_WAIT_SECONDS = 600.0
 C1_WAVE_POLL_SECONDS = 60.0
+C1_WAVE_PROBE_ATTEMPTS = 3
 _sleep = time.sleep
 COLUMNS = (
     "deadline_day", "competition_id", "source_season_key", "match_id", "kind",
@@ -525,12 +526,27 @@ def build_writer_lock():
 
 
 def wait_for_wave():
-    """Give a running wave a bounded head start before opening Trino."""
+    """Give a running wave a bounded head start before opening Trino.
+
+    The probe is best effort: the writer lock, not this courtesy wait, guards
+    correctness, so an infra failure (a live run saw transient docker DNS take
+    down name resolution for the isolated metadb) must not fail the refresh.
+    Retry the probe briefly, then proceed without waiting; acquisition of the
+    lock itself stays fail-closed.
+    """
     from scrapers.fotmob.maintenance import probe_wave
 
     deadline = time.monotonic() + C1_WAVE_WAIT_SECONDS
+    failures = 0
     while time.monotonic() < deadline:
-        running, _ = probe_wave()
+        try:
+            running, _ = probe_wave()
+        except Exception:
+            failures += 1
+            if failures >= C1_WAVE_PROBE_ATTEMPTS:
+                return
+            _sleep(min(C1_WAVE_POLL_SECONDS, deadline - time.monotonic()))
+            continue
         if not running:
             return
         remaining = deadline - time.monotonic()
