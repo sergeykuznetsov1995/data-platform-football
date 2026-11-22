@@ -486,6 +486,10 @@ class _Repository:
     def latest_stage_feed_snapshot(self, league, season):
         return self.stage_snapshot
 
+    def published_stage_xg_counts(self, league, season, *, stage_ids):
+        # #1899: no published rows in this fake unless a test seeds shrink data.
+        return {}
+
     def iter_stage_xg_rows(self, league, season, *, table, stage_ids, batch_id=None):
         return iter(
             row
@@ -4019,6 +4023,24 @@ def _xg_service(tmp_path, *, final=False, stages=(700,)):
     from scrapers.whoscored.parsers import PARSER_VERSION
 
     service, repository, _ = _service(tmp_path)
+
+    def published_stage_xg_counts(league, season, *, stage_ids):
+        requested = set(stage_ids)
+        counts = {}
+        for table, category in (
+            ("whoscored_team_stage_stats", "xg-teamstats"),
+            ("whoscored_player_stage_stats", "xg-stats"),
+        ):
+            for row in getattr(repository, "stage_rows", {}).get(table, []):
+                if (
+                    row["stage_id"] in requested
+                    and row["source_category"] == category
+                ):
+                    key = (row["stage_id"], category)
+                    counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    repository.published_stage_xg_counts = published_stage_xg_counts
     now = datetime.now(timezone.utc)
     kickoffs = (-10,) if final else (-1, 10)
     service._collect_season_schedule = lambda: SimpleNamespace(
@@ -4126,6 +4148,76 @@ def _xg_previous(
             ("whoscored_player_stage_stats", "xg-stats"),
         )
     }
+
+
+@pytest.mark.parametrize("shrinking_category", ["xg-teamstats", "xg-stats"])
+def test_xg_shrink_retains_only_shrinking_stage(tmp_path, shrinking_category):
+    service, repo, now, _, _, _, version = _xg_service(
+        tmp_path, stages=(700, 701)
+    )
+    _xg_previous(repo, now, version, days_ago=8)
+    for table, published_rows in repo.stage_rows.items():
+        if published_rows[0]["source_category"] == shrinking_category:
+            published_rows.append({
+                **published_rows[0],
+                "entity_key": hashlib.sha256(
+                    f"700:{shrinking_category}:extra".encode()
+                ).hexdigest(),
+                "statistic": "xGA",
+                "value": 0.25,
+            })
+    previous_rows = {
+        table: [dict(row) for row in values]
+        for table, values in repo.stage_rows.items()
+    }
+    previous_check = dict(repo.stage_snapshot["feed_checks"]["700"])
+    prechecks = []
+    published_counts = repo.published_stage_xg_counts
+
+    def precheck(league, season, *, stage_ids):
+        prechecks.append((league, season, set(stage_ids)))
+        return published_counts(league, season, stage_ids=stage_ids)
+
+    repo.published_stage_xg_counts = precheck
+    committed = []
+    commit = repo.commit_scope_bundle
+
+    def capture_commit(**kwargs):
+        committed.append({
+            **kwargs,
+            "datasets": {
+                table: list(values) for table, values in kwargs["datasets"].items()
+            },
+        })
+        return commit(**kwargs)
+
+    repo.commit_scope_bundle = capture_commit
+
+    result = service.sync_stage_feeds()
+
+    assert result.status == "success", result.errors
+    assert result.errors == []
+    assert prechecks == [
+        (service.scope.competition_id, service.scope.season_id, {700, 701})
+    ]
+    assert result.metadata["stage_xg_shrink_retained"] == [{
+        "stage_id": 700,
+        "counts": {
+            category: {"old": 2 if category == shrinking_category else 1, "new": 1}
+            for category in ("xg-teamstats", "xg-stats")
+        },
+    }]
+    assert result.metadata["stage_xg_checked"] == [701]
+    assert len(committed) == 1
+    assert committed[0]["feed_checks"]["700"] == previous_check
+    for table, values in committed[0]["datasets"].items():
+        retained = [row for row in values if row["stage_id"] == 700]
+        assert sorted(retained, key=lambda row: row["entity_key"]) == sorted(
+            previous_rows[table], key=lambda row: row["entity_key"]
+        )
+        fresh = [row for row in values if row["stage_id"] == 701]
+        assert len(fresh) == 1
+        assert fresh[0]["value"] == 1.0
 
 
 def test_xg_only_two_feeds_and_persistent_check_metadata(tmp_path):

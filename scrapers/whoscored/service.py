@@ -2613,6 +2613,7 @@ class WhoScoredIngestService:
                     "stage_xg_retained": [],
                     "stage_xg_deferred": [],
                     "stage_xg_redirected": [],
+                    "stage_xg_shrink_retained": [],
                 }
             )
             previous = (
@@ -2651,6 +2652,11 @@ class WhoScoredIngestService:
             checked_stages: list[int] = []
             now = datetime.now(timezone.utc)
             changed = False
+            published = self.repository.published_stage_xg_counts(
+                self.scope.competition_id,
+                self.scope.season_id,
+                stage_ids=stage_ids,
+            )
             for stage in collected.stage_rows:
                 stage_id = int(stage["stage_id"])
                 key = str(stage_id)
@@ -2698,9 +2704,9 @@ class WhoScoredIngestService:
                     result.metadata["stage_xg_deferred"].append(stage_id)
                     continue
                 bootstrap_url = getattr(collected, "stage_statistics_urls", {}).get(stage_id) or (
-                    f"https://www.whoscored.com/Regions/{self.competition.region_id}"
-                    f"/Tournaments/{self.competition.tournament_id}"
-                    f"/Seasons/{collected.source_season_id}/Stages/{stage_id}/TeamStatistics"
+                    f"https://www.whoscored.com/regions/{self.competition.region_id}"
+                    f"/tournaments/{self.competition.tournament_id}"
+                    f"/seasons/{collected.source_season_id}/stages/{stage_id}/teamstatistics"
                 )
                 cache_ttl = STAGE_XG_REFRESH
                 team = self._team_stage_statistics_spec(
@@ -2754,6 +2760,7 @@ class WhoScoredIngestService:
                     observations = [bootstrap.observed_at]
                     stage_inputs = [(bootstrap_uri, bootstrap.sha256)]
                     stage_states = {}
+                    stage_counts = {}
                     for (feed_key, table), (response, uri, parsed) in zip(
                         contracts, structured
                     ):
@@ -2763,7 +2770,11 @@ class WhoScoredIngestService:
                                 f"stage {stage_id} xG structure is unavailable"
                             )
                         stage_states[feed_key] = parsed.status.value
+                        count_before = len(rows[table])
                         rows[table].append_entity_rows(parsed.rows)
+                        stage_counts[feed_key.split(":")[2]] = (
+                            len(rows[table]) - count_before
+                        )
                         observations.append(response.observed_at)
                         stage_inputs.append((uri, response.sha256))
                     stage_inputs.extend(
@@ -2815,6 +2826,21 @@ class WhoScoredIngestService:
                         spool.rollback_stage()
                     raise
                 else:
+                    counts = {
+                        category: {
+                            "old": published.get((stage_id, category), 0),
+                            "new": count,
+                        }
+                        for category, count in stage_counts.items()
+                    }
+                    if any(count["new"] < count["old"] for count in counts.values()):
+                        for spool in spools:
+                            spool.rollback_stage()
+                        retained.add(stage_id)
+                        result.metadata["stage_xg_shrink_retained"].append(
+                            {"stage_id": stage_id, "counts": counts}
+                        )
+                        continue
                     for spool in spools:
                         spool.commit_stage()
                     feed_states.update(stage_states)

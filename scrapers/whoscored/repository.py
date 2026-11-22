@@ -4578,6 +4578,29 @@ class WhoScoredRepository:
             "feed_policy": states.get("__feed_policy__"),
         }
 
+    def published_stage_xg_counts(
+        self, league: str, season: str, *, stage_ids: Iterable[int]
+    ) -> dict[tuple[int, str], int]:
+        """Read published per-stage counts for the #1899 retention precheck."""
+        requested = {int(stage_id) for stage_id in stage_ids}
+        counts: dict[tuple[int, str], int] = {}
+        if not requested:
+            return counts
+        for table, category in STAGE_XG_CATEGORIES.items():
+            if not self.trino.table_exists(self.schema, table):
+                continue
+            previous = self.trino.execute_query(
+                f"SELECT stage_id, source_category, COUNT(*) "
+                f"FROM {self.catalog}.{self.schema}.{table}_current "
+                f"WHERE league = {_sql_string(league)} "
+                f"AND season = {_sql_string(season)} "
+                f"AND source_category = {_sql_string(category)} GROUP BY stage_id, source_category"
+            )
+            for stage_id, old_category, old_count in previous:
+                if int(stage_id) in requested:
+                    counts[(int(stage_id), str(old_category))] = int(old_count)
+        return counts
+
     def iter_stage_xg_rows(
         self,
         league: str,
