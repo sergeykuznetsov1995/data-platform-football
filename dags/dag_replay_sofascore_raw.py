@@ -120,13 +120,17 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
     )
     if not keys:
         if mode == "fields" and not include_blocked:
+            # Review r1 F3: query exactly the blocked triples (positive
+            # EXISTS), never every candidate — a second unrestricted query
+            # could sweep in a clean scope that became replayable between
+            # the two reads.
             blocked = list_replay_scope_keys(
                 manager,
                 mode=mode,
                 exact_scope=exact_scope,
                 limit=scope_cap,
                 catalog=catalog,
-                include_blocked=True,
+                blocked_only=True,
             )
             if blocked:
                 logger.warning(

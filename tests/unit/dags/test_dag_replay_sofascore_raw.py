@@ -118,7 +118,8 @@ def _assert_planner_call(scopes, **expected):
     assert isinstance(kwargs["catalog"], SofaScoreCatalog)
     if expected_calls == 2:
         probe = scopes.call_args_list[1]
-        assert probe.kwargs["include_blocked"] is True
+        assert probe.kwargs["blocked_only"] is True
+        assert probe.kwargs.get("include_blocked", False) is False
 
 
 def test_params_and_default_planner_arguments(replay, runtime):
@@ -389,7 +390,10 @@ def test_planner_empty_fields_plan_distinguishes_blocked_from_drained(
     with caplog.at_level(logging.WARNING):
         assert replay.plan_replay_scopes() == []
     assert runtime.scopes.call_count == 2
-    assert runtime.scopes.call_args.kwargs["include_blocked"] is True
+    # Review r1 F3: the probe must query exactly the blocked triples, not
+    # every candidate an unrestricted second query could sweep in.
+    assert runtime.scopes.call_args.kwargs["blocked_only"] is True
+    assert runtime.scopes.call_args.kwargs.get("include_blocked", False) is False
     assert any("schema_error season blockers" in message for message in caplog.messages)
 
 

@@ -73,7 +73,7 @@ class _FakeTournament:
 class _FakeCatalog:
     def __init__(self):
         self._tournament = _FakeTournament(
-            "england/premier-league", [_FakeSeason(int(SEASON), "25/26")]
+            "england/premier-league", [_FakeSeason(int(SEASON), "2526")]
         )
 
     def tournament(self, unique_tournament_id):
@@ -270,7 +270,7 @@ def test_load_scope_prefilters_exact_triple_without_sql():
         resolved.source_season_id,
         resolved.freshness_key,
     ) == (TOURNAMENT, SEASON, FRESHNESS)
-    assert resolved.canonical_season == "25/26"
+    assert resolved.canonical_season == "2526"
     assert isinstance(resolved.league, str) and resolved.league
     assert plan is not None
     assert plan.scope == ReplayScopeKey(TOURNAMENT, SEASON, FRESHNESS)
@@ -1327,7 +1327,8 @@ def test_scope_overlay_rekeys_registry_row_and_preserves_eligibility():
         assert competitions[0]["seasons"][0]["id"] == 2026
 
 
-def test_scope_overlay_binds_and_restores_both_configurations():
+@pytest.mark.parametrize("outer_env", [None, "preset"])
+def test_scope_overlay_binds_and_restores_both_configurations(outer_env):
     import dags.utils.medallion_config as medallion_config
     from dags.scripts.replay_sofascore_raw import _scope_overlay
     from scrapers.sofascore import scraper as scraper_module
@@ -1339,25 +1340,51 @@ def test_scope_overlay_binds_and_restores_both_configurations():
     )
     previous_config_dir = medallion_config.CONFIG_DIR
     previous_module_catalog = scraper_module._SOFASCORE_CATALOG
+    previous_env = {
+        name: os.environ.get(name)
+        for name in ("SOFASCORE_REGISTRY_PATH", "MEDALLION_CONFIG_DIR")
+    }
+    if outer_env is not None:
+        os.environ["SOFASCORE_REGISTRY_PATH"] = outer_env
+        os.environ["MEDALLION_CONFIG_DIR"] = outer_env
     try:
-        with _scope_overlay(resolved, catalog) as (registry_path, medallion_dir):
-            assert os.environ["SOFASCORE_REGISTRY_PATH"] == registry_path
-            assert os.environ["MEDALLION_CONFIG_DIR"] == medallion_dir
-            assert Path(medallion_config.CONFIG_DIR) == Path(medallion_dir)
-            overlay_entry = scraper_module._SOFASCORE_CATALOG.competition("SS-16")
-            assert overlay_entry.unique_tournament_id == 16
-            assert overlay_entry.capture_allowed is True
-            assert any(
-                item["id"] == "SS-16"
-                for item in medallion_config.load_competitions()["competitions"]
-            )
-        assert os.environ.get("SOFASCORE_REGISTRY_PATH") is None
-        assert os.environ.get("MEDALLION_CONFIG_DIR") is None
+        with pytest.raises(RuntimeError, match="boom"):
+            with _scope_overlay(resolved, catalog) as (registry_path, medallion_dir):
+                assert os.environ["SOFASCORE_REGISTRY_PATH"] == registry_path
+                assert os.environ["MEDALLION_CONFIG_DIR"] == medallion_dir
+                assert Path(medallion_config.CONFIG_DIR) == Path(medallion_dir)
+                overlay_entry = scraper_module._SOFASCORE_CATALOG.competition("SS-16")
+                assert overlay_entry.unique_tournament_id == 16
+                assert overlay_entry.capture_allowed is True
+                assert any(
+                    item["id"] == "SS-16"
+                    for item in medallion_config.load_competitions()["competitions"]
+                )
+                raise RuntimeError("boom")
+        # Restoration also covers the exceptional exit (review r1).
+        assert os.environ.get("SOFASCORE_REGISTRY_PATH") == outer_env
+        assert os.environ.get("MEDALLION_CONFIG_DIR") == outer_env
         assert medallion_config.CONFIG_DIR is previous_config_dir
         assert scraper_module._SOFASCORE_CATALOG is previous_module_catalog
     finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         medallion_config.CONFIG_DIR = previous_config_dir
         scraper_module._SOFASCORE_CATALOG = previous_module_catalog
+
+
+def test_scope_overlay_refuses_legacy_five_field_scope():
+    from dags.scripts.replay_sofascore_raw import _scope_overlay
+    from scrapers.sofascore.raw_replay import ResolvedReplayScope
+
+    legacy = ResolvedReplayScope("16", "58210", "2026", "SS-16", "2026")
+
+    with pytest.raises(ReplayScopeError, match="no registry identity"):
+        with _scope_overlay(legacy, _single_year_catalog()):
+            pass
 
 
 def test_replay_season_label_guard_uses_overlay_format():

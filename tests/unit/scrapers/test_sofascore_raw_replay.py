@@ -770,9 +770,99 @@ def test_replay_eligible_scope_pairs_skips_incomplete_seasons():
         SimpleNamespace(
             season_id=3, canonical_season="2526", season_format="unknown"
         ),
+        # review r1 F1: a non-numeric canonical season can resolve but the
+        # worker overlay needs a numeric slug — enumeration must agree.
+        SimpleNamespace(
+            season_id=4, canonical_season="25/26", season_format="split_year"
+        ),
     )
 
     assert replay_eligible_scope_pairs(catalog) == ()
+
+
+def test_replay_eligible_scope_pairs_skips_ambiguous_tournament():
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = (
+        SimpleNamespace(
+            season_id=76986, canonical_season="2526", season_format="split_year"
+        ),
+        SimpleNamespace(
+            season_id=76986, canonical_season="2627", season_format="split_year"
+        ),
+    )
+
+    assert replay_eligible_scope_pairs(catalog) == ()
+
+
+def test_resolve_replay_scope_rejects_non_numeric_canonical_season():
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = (
+        SimpleNamespace(
+            season_id=76986, canonical_season="25/26", season_format="split_year"
+        ),
+    )
+
+    with pytest.raises(ReplayPlanningError, match="numeric slug"):
+        resolve_replay_scope(ReplayScopeKey("17", "76986", FRESHNESS), catalog)
+
+
+def test_validate_replay_scope_pair_rejects_ambiguous_season():
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = (
+        SimpleNamespace(
+            season_id=76986, canonical_season="2526", season_format="split_year"
+        ),
+        SimpleNamespace(
+            season_id=76986, canonical_season="2627", season_format="split_year"
+        ),
+    )
+
+    with pytest.raises(ReplayPlanningError, match="ambiguous"):
+        validate_replay_scope_pair(("17", "76986"), catalog)
+
+
+def test_validate_replay_scope_pair_rejects_non_numeric_canonical_season():
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = (
+        SimpleNamespace(
+            season_id=76986, canonical_season="25/26", season_format="split_year"
+        ),
+    )
+
+    with pytest.raises(ReplayPlanningError, match="numeric canonical season"):
+        validate_replay_scope_pair(("17", "76986"), catalog)
+
+
+def test_resolved_scope_keeps_five_field_construction():
+    legacy = ResolvedReplayScope("17", "76986", FRESHNESS, "SS-17", "2526")
+
+    assert legacy.canonical_id == ""
+    assert legacy.season_format == ""
+
+
+def test_list_replay_scope_keys_blocked_only_queries_exact_blockers():
+    manager = FakeManager([("17", "76986", FRESHNESS)])
+
+    keys = list_replay_scope_keys(manager, mode=MODE_FIELDS, blocked_only=True)
+
+    sql = manager.calls[0]["sql"]
+    assert " NOT EXISTS " not in sql
+    assert " EXISTS (" in sql
+    assert "schema_error" in sql
+    assert keys == (ReplayScopeKey("17", "76986", FRESHNESS),)
+
+
+def test_list_replay_scope_keys_blocked_only_validates_arguments():
+    manager = FakeManager()
+
+    with pytest.raises(ReplayPlanningError, match="mutually exclusive"):
+        list_replay_scope_keys(
+            manager, mode=MODE_FIELDS, include_blocked=True, blocked_only=True
+        )
+    with pytest.raises(ReplayPlanningError, match="fields mode"):
+        list_replay_scope_keys(manager, mode=MODE_DRAIN, blocked_only=True)
+
+    assert manager.calls == []
 
 
 def test_validate_replay_scope_pair_accepts_eligible_pair():

@@ -527,6 +527,16 @@ def _scope_overlay(
     import yaml
     from scrapers.sofascore.catalog import SofaScoreCatalog
 
+    if not resolved.canonical_id.strip() or resolved.season_format not in (
+        "single_year",
+        "split_year",
+    ):
+        raise ReplayScopeError(
+            "replay scope carries no registry identity (canonical_id="
+            f"{resolved.canonical_id!r}, season_format="
+            f"{resolved.season_format!r}); resolve it through "
+            "resolve_replay_scope before replaying"
+        )
     capture_key = resolved.league
     try:
         tournament = catalog.tournament(int(resolved.source_tournament_id))
@@ -640,7 +650,18 @@ def _assert_replay_season_label(resolved: ResolvedReplayScope) -> None:
     """
     from scrapers.sofascore.scraper import _season_label, _season_to_short
 
+    if resolved.season_format not in ("single_year", "split_year"):
+        raise ReplayScopeError(
+            "replay scope carries no registry season format "
+            f"({resolved.season_format!r}); resolve it through "
+            "resolve_replay_scope before replaying"
+        )
     if resolved.season_format == "single_year":
+        # The single-year label formula is exactly the partition writer's
+        # own (``_season_label`` returns ``str(int(season))``, the rule the
+        # refresh lane used for the existing partition); a literal compare
+        # would false-positive on any zero-padded canonical whose writer
+        # also strips the padding (review r1 F2 dispute).
         expected = str(int(resolved.canonical_season))
     else:
         expected = _season_to_short(resolved.canonical_season)
