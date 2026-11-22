@@ -160,7 +160,10 @@ def test_memory_sizing_fits_compose_limit():
     assert xmx * 2 <= limit, "heap must leave >= 50% of the cgroup for off-heap"
     assert per_node + headroom <= xmx
     assert headroom >= 3, "planning memory of 100k-file bronze tables lives in headroom"
-    assert props["query.min-expire-age"] == "10s" and props["task.info.max-age"] == "10s"
+    # #1620 kept task graphs at 10s; #2126 raised only query history to 600s for
+    # the load-meter watermark (K2 needs >=300s) — QueryInfo retention is cheap
+    # next to task graphs, and the heap doubled (5g -> 10g) between the two.
+    assert props["query.min-expire-age"] == "600s" and props["task.info.max-age"] == "10s"
 
 
 @pytest.mark.unit
