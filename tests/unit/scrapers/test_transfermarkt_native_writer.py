@@ -770,3 +770,16 @@ def test_pre_upgrade_intent_is_finished_after_verified_recovery():
     assert write_journal.pending_intents({'run_id': 'run-old'}) == []
     assert write_journal.read_receipt(old_digest)['verified'] is True
     assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == []
+
+
+def test_plan_rejects_a_column_of_mixed_value_types_before_mutation():
+    # Round-3 finding 4, same class: Arrow refuses a mixed column only inside
+    # the insertion, after a replacement has deleted the scope.
+    db = CoreDB()
+    write(db, [membership_plan(['1', '2'], capture='cap-1')])
+    plan = membership_plan(['1', '2'], capture='cap-2', clock=LATER)
+    mixed = list(plan.rows)
+    mixed[1] = {**mixed[1], 'player_name': 7}
+    with pytest.raises(ValueError, match='mixes value types'):
+        write(db, [dataclasses_replace(plan, rows=tuple(mixed), capture_id='')], run_id='run-2', clock=LATER)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 2
