@@ -700,3 +700,13 @@ def test_plan_evidence_must_name_the_same_capture_and_carry_real_values():
         for column, value in valid.evidence)
     with pytest.raises(ValueError, match='non-empty'):
         empty_plan(evidence=hollow_evidence)
+
+
+def test_same_capture_merge_keeps_its_exact_rule_outside_multi_capture_lanes():
+    # Round-2 self-review: only pages of one unit re-own rows (finding 7); a
+    # capture of any other merge lane is still exactly its committed rows.
+    db = CoreDB()
+    write(db, [mv_plan([('2025-01-01', 10)], capture='cap-mv')])
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [mv_plan([('2025-01-01', 10), ('2025-02-01', 20)], capture='cap-mv')],
+              run_id='run-2', clock=LATER)

@@ -649,15 +649,16 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
         return 'refresh' if refreshed else 'written'
     if not existing:
         return 'pending'
+    partner = plan.rows
     if plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES:
         # Pages of one unit re-own rows between walks (the donor keeps the
         # first page that lists a referee): only the keys this plan still
         # holds are compared; the other committed rows stay the observations
-        # they were.
+        # they were. Every other merge lane keeps the exact same-capture rule.
         held = {_plan_key(plan, row) for row in plan.rows}
         existing = [row for row in existing if _plan_key(plan, row) in held]
-    committed_keys = {_plan_key(plan, row) for row in existing}
-    partner = [row for row in plan.rows if _plan_key(plan, row) in committed_keys]
+        committed_keys = {_plan_key(plan, row) for row in existing}
+        partner = [row for row in plan.rows if _plan_key(plan, row) in committed_keys]
     if existing and not _rows_equal(existing, partner):
         if not _rows_equal_ignoring_lineage(existing, partner):
             raise RuntimeError('core replay differs from committed capture: ' + plan.table)
