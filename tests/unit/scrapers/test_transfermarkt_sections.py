@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from scrapers.transfermarkt import core, sections
+from scrapers.transfermarkt import core, native_writer, sections
 from scrapers.transfermarkt.attendance import AttendancePage
 from scrapers.transfermarkt.core import CoreParseError, LaneOutcome, ScopeContext, SourceCapture
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+from scrapers.transfermarkt.native_writer import StaleTransfermarktWrite
 from scrapers.transfermarkt.orchestrator import (
     AttendanceEditionTarget,
     ClubValueTarget,
@@ -990,3 +991,90 @@ def test_achievement_adapter_treats_http_failure_as_unavailable():
     assert outcome.status == 'unavailable'
     assert outcome.status_reason == 'achievements:http_404'
     assert outcome.rows == ()
+
+
+# ------------------------------------- review r1 deferred pins (r2 cycle, #2405)
+STALE_CAPTURED = '2026-11-20T11:00:00.000000+00:00'
+NEWER_PAGE_CAPTURED = '2026-11-20T12:30:00.000000+00:00'
+LATER_EXTRACTED_AT = '2026-11-20T13:00:00.000000+00:00'
+
+
+def _attendance_plan(captures, extracted_at=EXTRACTED_AT):
+    outcome = sections.extract_attendance_observations(
+        captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
+    return core.plan_for_outcome(
+        outcome, captured_at=max(capture.captured_at for capture in captures),
+        scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+
+
+def _bundle(db, plans, committed_at):
+    return native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), plans, run_id=plans[0].rows[0]['run_id'],
+        universe_version=UNIVERSE, committed_at=committed_at)
+
+
+def test_stale_page_cannot_overwrite_a_fresher_committed_snapshot():
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    # An older observation of page 1 of the same edition: same URL, other body.
+    older_body = (ATTENDANCE_FIXTURES / 'page_1.html').read_bytes().replace(
+        b'Emirates Stadium', b'Ashburton Grove')
+    older_digest = hashlib.sha256(older_body).hexdigest()
+    older_page_1 = SourceCapture(
+        url=ATTENDANCE_START, endpoint='attendance', body=older_body,
+        capture_id=older_digest, body_hash=older_digest, captured_at=STALE_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    # The replay mixes the stale page 1 with the unchanged page 2: its newest
+    # clock equals the committed one, so only a per-page check can refuse it.
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [_attendance_plan((older_page_1, page_2), LATER_EXTRACTED_AT)],
+                LATER_EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT stadium_name FROM transfermarkt_attendance_observations WHERE club_id = ?',
+        ('11',)).fetchone()[0] == 'Emirates Stadium'
+
+
+def test_refreshed_page_reuses_its_unchanged_sibling_pages():
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    # A later capture of the same page: same body, its own capture identity.
+    newer_page_1 = SourceCapture(
+        url=ATTENDANCE_START, endpoint='attendance', body=page_1.body,
+        capture_id=hashlib.sha256(b'newer page 1').hexdigest(), body_hash=page_1.body_hash,
+        captured_at=NEWER_PAGE_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    # A refreshed snapshot may reuse the cached page 2 beside a newer page 1.
+    receipt = _bundle(db, [_attendance_plan((newer_page_1, page_2), LATER_EXTRACTED_AT)],
+                      LATER_EXTRACTED_AT)
+    assert receipt['verified'] is True
+    clocks = dict(db.sql.execute(
+        'SELECT club_id, captured_at FROM transfermarkt_attendance_observations').fetchall())
+    assert clocks == {'11': NEWER_PAGE_CAPTURED, '631': PAGE_2_CAPTURED}
+
+
+def test_reobserved_multi_page_merge_refreshes_lineage_beside_a_newer_sibling_page():
+    pages = (_rumour_capture(1, RUMOUR_PAGE_1_CAPTURED), _rumour_capture(2, RUMOUR_PAGE_2_CAPTURED))
+    later = '2026-11-20T21:45:00.000000+00:00'  # after both saved page clocks
+
+    def plans(extracted_at):
+        outcomes = sections.extract_rumour_observations(
+            pages, _rumour_scope(), competition=_rumour_competition(),
+            extracted_at=extracted_at, universe_version=UNIVERSE)
+        return [core.plan_for_outcome(
+            outcome, captured_at=outcome.capture.captured_at,
+            scope_values={'competition_id': 'GB1'}) for outcome in outcomes]
+
+    db = CoreDB()
+    _bundle(db, plans(RUMOUR_EXTRACTED_AT), RUMOUR_EXTRACTED_AT)
+    # The same two captures in a later run: page 1 is not stale merely because
+    # its sibling page 2 carries the newer clock of the same feed.
+    again = _bundle(db, plans(later), later)
+    assert again['verified'] is True
+    later_run = plans(later)[0].rows[0]['run_id']
+    rows = db.sql.execute(
+        'SELECT run_id, page_number FROM transfermarkt_rumour_observations ORDER BY page_number'
+    ).fetchall()
+    assert rows == [(later_run, 1), (later_run, 2)]  # lineage refreshed, no duplicate rows

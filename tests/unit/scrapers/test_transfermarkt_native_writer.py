@@ -1,4 +1,5 @@
 """Unit tests for the stage-B mono-native writer commit path (#2404)."""
+from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timezone
 import json
 
@@ -283,8 +284,9 @@ def test_merge_and_replace_readbacks_use_different_predicates():
 
 
 class GuardCursor:
-    def __init__(self, rows=None, fail=False):
+    def __init__(self, rows=None, pages=None, fail=False):
         self.rows = rows
+        self.pages = pages or []
         self.fail = fail
         self.description = None
     def execute(self, sql, params=None):
@@ -292,7 +294,7 @@ class GuardCursor:
             raise RuntimeError('TABLE_NOT_FOUND: nope')
         self.sql = sql
     def fetchall(self):
-        return self.rows
+        return self.pages if 'GROUP BY source_url' in self.sql else self.rows
     def close(self):
         pass
 
@@ -309,6 +311,60 @@ def test_guard_refuses_older_bundle_and_accepts_equal_or_missing():
             native_writer.guard_native_bundle(connection, plan)
     missing = type('C', (), {'cursor': lambda self: GuardCursor(fail=True)})()
     native_writer.guard_native_bundle(missing, plan)  # table absent: nothing to guard
+
+
+# ---------------------------------------------------------------- stage-C review (#2405)
+
+ATTENDANCE_PAGE_1 = 'https://www.transfermarkt.com/x/besucherzahlen/wettbewerb/GB1/saison_id/2025'
+ATTENDANCE_PAGE_2 = ATTENDANCE_PAGE_1 + '?page=2'
+SIBLING_CLOCK = datetime(2026, 11, 21, 12, 30, 0, tzinfo=timezone.utc).isoformat()
+NEWEST = datetime(2026, 11, 21, 14, 0, 0, tzinfo=timezone.utc).isoformat()
+
+
+def _page_snapshot(first_clock, first_capture):
+    """A replace snapshot of two source pages captured at different clocks."""
+    template = membership_plan(['1'], clock=first_clock, capture=first_capture).rows[0]
+    first = {**template, 'source_url': ATTENDANCE_PAGE_1}
+    second = {**template, 'player_id': '2', 'captured_at': SIBLING_CLOCK,
+              'source_capture_id': 'cap-2', 'raw_capture_id': 'cap-2',
+              'source_url': ATTENDANCE_PAGE_2}
+    plan = membership_plan(['1', '2'], clock=SIBLING_CLOCK, capture='cap-2')
+    return dataclasses_replace(
+        plan, rows=(first, second), capture_id='',
+        captured_at=max(first_clock, SIBLING_CLOCK))
+
+
+def test_guard_refuses_a_stale_page_hidden_behind_a_fresh_sibling_page():
+    plan = _page_snapshot(EARLIER, 'cap-old')
+    cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
+                         pages=[(ATTENDANCE_PAGE_1, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+    connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
+    # The scope maximum equals the plan's own clock: only the per-page
+    # comparison sees that page 1 would regress a fresher committed page.
+    with pytest.raises(StaleTransfermarktWrite):
+        native_writer.guard_native_bundle(connection, plan)
+
+
+def test_guard_accepts_equal_newer_and_unrelated_pages_of_a_snapshot():
+    # A committed page the snapshot no longer contains is replaced by design.
+    cursor = GuardCursor(
+        rows=[(SIBLING_CLOCK,)],
+        pages=[(ATTENDANCE_PAGE_1, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK),
+               (ATTENDANCE_PAGE_1 + '?page=3', SIBLING_CLOCK)])
+    connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
+    native_writer.guard_native_bundle(connection, _page_snapshot(CLOCK, 'cap-1'))
+    # A newer page 1 beside the unchanged page 2 is a legitimate refresh.
+    native_writer.guard_native_bundle(connection, _page_snapshot(NEWEST, 'cap-new'))
+
+
+def test_guard_keeps_scope_freshness_for_clockless_merge_lanes():
+    # market_value_points keys carry no capture clock: an older capture could
+    # overwrite fresher values and stays refused by the scope maximum.
+    plan = mv_plan([('2025-01-01', 10)], clock=EARLIER, capture='cap-old')
+    cursor = GuardCursor(rows=[(LATER,)])
+    connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
+    with pytest.raises(StaleTransfermarktWrite):
+        native_writer.guard_native_bundle(connection, plan)
 
 
 # ---------------------------------------------------------------- bundles
