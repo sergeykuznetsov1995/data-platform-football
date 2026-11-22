@@ -2,6 +2,8 @@
 
 Run with --dry-run first. Writes require exclusive ownership of the selected
 matches: the four child-to-match commits are not a cross-table transaction.
+``--resume-state FILE`` records each committed batch so that a ``--write``
+stopped by a restart continues with the first batch that is not in the file.
 """
 
 from __future__ import annotations
@@ -317,6 +319,67 @@ def _code_sha(value):
     return value
 
 
+def _append_checkpoint(path, entry):
+    """One durable line per committed batch of a ``--resume-state`` run.
+
+    The line is written only after the batch receipt exists: a crash before
+    it reaches the disk just writes that batch again.  A crash inside the
+    append leaves a torn last line, which the loader ignores.
+    """
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _load_checkpoint(path, identity):
+    """Batches an earlier segment committed: ``{event_id: batch_id}`` and receipts.
+
+    ``identity`` holds what every line must share with this run, so a
+    checkpoint of another manifest, editions snapshot, parser or batch size
+    is refused instead of silently skipped.  A torn last line is not durable
+    evidence and is ignored; damage anywhere else cannot be trusted.
+    """
+    done = {}
+    receipts = []
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return done, receipts
+    # Every complete line ends with a newline; a tail without one is torn.
+    torn_tail = bool(text) and not text.endswith("\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for index, raw in enumerate(lines):
+        try:
+            entry = json.loads(raw)
+        except ValueError as exc:
+            if index == len(lines) - 1 and torn_tail:
+                break
+            raise ValueError(f"unusable checkpoint {path}: line {index + 1}") from exc
+        if not isinstance(entry, dict) or any(
+            entry.get(name) != value for name, value in identity.items()
+        ):
+            raise ValueError("checkpoint belongs to another replay")
+        try:
+            event_ids = entry["event_ids"]
+            batch_id = entry["receipt"]["batch_id"]
+            if (
+                not isinstance(event_ids, list)
+                or not event_ids
+                or any(type(i) is not int or i < 1 for i in event_ids)
+                or batch_id != entry["batch_id"]
+                or any(i in done for i in event_ids)
+            ):
+                raise ValueError("malformed checkpoint entry")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError(f"unusable checkpoint {path}: line {index + 1}") from exc
+        receipts.append(entry["receipt"])
+        done.update((event_id, batch_id) for event_id in event_ids)
+    return done, receipts
+
+
 def run(
     manifest,
     editions,
@@ -328,10 +391,19 @@ def run(
     code_sha=None,
     require_complete_editions=False,
     state_dir=None,
+    resume_state=None,
 ):
-    """Only the injected raw reader and (in write mode) Bronze manager do IO."""
+    """Only the injected raw reader and (in write mode) Bronze manager do IO.
+
+    ``resume_state`` is an append-only checkpoint of committed batches: a
+    restarted write parses every match again, for one report equal to a
+    single full run, but does not write the batches an earlier segment
+    committed (#2108).
+    """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if resume_state is not None and trino is None:
+        raise ValueError("resume state requires --write")
     manifest_bytes = Path(manifest).read_bytes()
     edition_bytes = Path(editions).read_bytes()
     snapshot = load_editions(Path(editions))
@@ -408,10 +480,38 @@ def run(
         "matches": [],
         "receipts": [],
     }
+    done, prior_receipts = {}, []
+    if resume_state is not None:
+        done, prior_receipts = _load_checkpoint(
+            resume_state,
+            {
+                "manifest_sha256": report["manifest_sha256"],
+                "editions_sha256": report["editions_sha256"],
+                "parser_version": PARSER_VERSION,
+                "batch_size": batch_size,
+            },
+        )
+        unknown = set(done) - {key[2] for key in grouped}
+        if unknown:
+            raise ValueError(
+                f"checkpoint names {len(unknown)} events outside the manifest"
+            )
+        report["resume"] = {
+            "state": str(resume_state),
+            "prior_receipts": prior_receipts,
+        }
     batches = defaultdict(list)
 
     def flush(key):
         pending = batches[key]
+        if not pending:
+            return
+        # A batch an earlier segment committed is parsed, never written again.
+        resumed = [item for item in pending if item[0].schedule.event_id in done]
+        pending[:] = [item for item in pending if item[0].schedule.event_id not in done]
+        for chosen, record, _, _ in resumed:
+            record["outcome"] = "written"
+            record["resumed_from"] = done[chosen.schedule.event_id]
         if not pending:
             return
         slug, year = key
@@ -459,6 +559,23 @@ def run(
         report["receipts"].append(asdict(receipt))
         for _, record in ready:
             record["outcome"] = "written"
+        if resume_state is not None:
+            # Only a committed batch with its duplicates marked reaches the file.
+            _append_checkpoint(
+                resume_state,
+                {
+                    "manifest_sha256": report["manifest_sha256"],
+                    "editions_sha256": report["editions_sha256"],
+                    "parser_version": PARSER_VERSION,
+                    "batch_size": batch_size,
+                    "edition": [slug, year],
+                    "code_sha": report["code_sha"],
+                    "event_ids": sorted(p.schedule.event_id for p, _ in ready),
+                    "batch_id": receipt.batch_id,
+                    "receipt": asdict(receipt),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
         pending.clear()
 
     for (cid, year, event_id), variants in sorted(grouped.items()):
@@ -542,6 +659,11 @@ def run(
             {r["competition"] for r in report["matches"] if r["competition"]}
         )
     }
+    if resume_state is not None:
+        report["resume"].update(
+            resumed_events=sum("resumed_from" in r for r in report["matches"]),
+            resumed_batches=len(prior_receipts),
+        )
     return report
 
 
@@ -561,6 +683,11 @@ def main(argv=None):
     from .gate import default_state_path
 
     parser.add_argument("--state-dir", type=Path, default=default_state_path().parent)
+    parser.add_argument(
+        "--resume-state", type=Path,
+        help="append-only checkpoint of committed batches; a restarted --write "
+             "skips the batches recorded there",
+    )
     parser.add_argument("--report", type=Path)
     parser.add_argument("--code-sha", help="release commit in containers without .git")
     args = parser.parse_args(argv)
@@ -579,6 +706,7 @@ def main(argv=None):
         code_sha=args.code_sha,
         require_complete_editions=args.require_complete_editions,
         state_dir=args.state_dir,
+        resume_state=args.resume_state,
     )
     output = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
     if args.report:
