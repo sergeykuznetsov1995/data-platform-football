@@ -28,6 +28,13 @@ from scrapers.whoscored.trino_budget import WRITE_TIMEOUT
 
 ESPN_USER = "src_espn"
 AMBIGUOUS_TRANSPORT_ERRORS = (TrinoConnectionError, Http502Error, Http503Error, Http504Error)
+# The driver default is a 30-second per-request timeout. Submitting the
+# statement itself — an offline replay batch carries one INSERT with tens of
+# thousands of literal rows — can block past it while Trino parses the body,
+# surfacing as an ambiguous-write stop (#2108: 28,022-row events INSERT).
+# 300s covers statement submission with margin; execution stays bounded
+# server-side by ``query_max_run_time``.
+REQUEST_TIMEOUT = 300
 SESSION_PROPERTIES = {
     "enable_dynamic_filtering": "false",
     "query_max_run_time": f"{WRITE_TIMEOUT}s",
@@ -74,6 +81,8 @@ class EspnTrinoTableManager(base.TrinoTableManager):
             session_properties=dict(SESSION_PROPERTIES),
             # A retry of the initial HTTP POST could replay a committed write.
             max_attempts=1,
+            # Large literal INSERTs outrun the driver's 30s default (#2108).
+            request_timeout=REQUEST_TIMEOUT,
         )
         return BudgetConnection(connection, self._budget, self.catalog)
 
