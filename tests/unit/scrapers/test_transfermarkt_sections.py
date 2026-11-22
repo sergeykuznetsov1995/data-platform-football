@@ -1589,5 +1589,7 @@ def test_malformed_referee_next_link_fails_only_its_directory():
     assert fetcher.calls == [REFEREE_DIRECTORY_URL]  # the broken link is not followed
     assert db.sql.execute(
         'SELECT COUNT(*) FROM transfermarkt_achievement_observations').fetchone()[0] == 2
+    # The broken directory produced no plan at all: not even its table.
     assert db.sql.execute(
-        'SELECT COUNT(*) FROM transfermarkt_referee_aggregate_observations').fetchone()[0] == 0
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'transfermarkt_referee_aggregate_observations'").fetchone()[0] == 0

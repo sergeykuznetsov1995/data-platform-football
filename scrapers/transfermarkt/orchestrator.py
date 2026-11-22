@@ -19,7 +19,9 @@ from urllib.parse import urlsplit
 
 from . import attendance, core, native_writer, parsing, rumours, sections
 from .models import FetchOutcome, FetchStatus
-from .referee_capture import _next_directory_page, referee_directory_url, referee_profile_url
+from .referee_capture import (
+    RefereeCaptureError, _next_directory_page, referee_directory_url, referee_profile_url,
+)
 
 
 class CoreRunError(RuntimeError):
@@ -556,8 +558,9 @@ class CoreRun:
                     number = len(captures)
                     try:
                         has_next = _next_directory_page(capture.text, request.directory_scope, number)
-                    except UnicodeDecodeError:
-                        # Extraction reports the invalid source text with the capture evidence.
+                    except (UnicodeDecodeError, RefereeCaptureError):
+                        # The adapter checks the same links against the whole
+                        # walk and reports the failing page with its capture.
                         break
                     if not has_next:
                         break

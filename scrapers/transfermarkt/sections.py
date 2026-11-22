@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 import json
+import re
 from urllib.parse import urlsplit
 
 from bs4 import ParserRejectedMarkup
@@ -17,6 +18,7 @@ from bs4 import ParserRejectedMarkup
 from . import (
     achievements, attendance, club_values, core, referees, representation, rumour_observations, rumours,
 )
+from .referee_capture import RefereeCaptureError, _next_directory_page
 
 
 # An empty outcome has no row to carry the lane's revisions, yet its receipt
@@ -174,6 +176,42 @@ def extract_representation_observations(
     return tuple(outcomes)
 
 
+_DIRECTORY_PAGE = re.compile(
+    r'/(?P<slug>[A-Za-z0-9_-]+)/schiedsrichter/(?P<route>wettbewerb|pokalwettbewerb)/'
+    r'(?P<competition_id>[A-Za-z0-9]+)/saison_id/(?P<edition_id>[0-9]{4})'
+    r'(?:/plus/1)?(?:/page/(?P<page>[0-9]+))?'
+)
+
+
+def _referee_walk_failure(captures):
+    """Find the page that breaks the supplied directory walk, if any.
+
+    The pages must be one contiguous walk from page 1 that only a terminal
+    page closes: a trailing next link means pages are missing and nothing of
+    the directory is certified. Returns that page's capture and the reason.
+    """
+    scope = None
+    for index, capture in enumerate(captures, 1):
+        match = _DIRECTORY_PAGE.fullmatch(urlsplit(capture.url).path)
+        if match is None:
+            return capture, 'directory_identity_invalid'
+        if scope is None:
+            scope = match.groupdict()
+        if int(match['page'] or '1') != index:
+            return capture, 'directory_pagination_incomplete'
+    del scope['page']
+    for index, capture in enumerate(captures, 1):
+        try:
+            has_next = _next_directory_page(capture.text, scope, index)
+        except RefereeCaptureError as exc:
+            return capture, exc.reason
+        except UnicodeDecodeError:
+            return capture, 'invalid_utf8'
+        if has_next != (index < len(captures)):
+            return capture, 'directory_pagination_incomplete'
+    return None
+
+
 def extract_referee_directory_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *,
     extracted_at: str, universe_version: str,
@@ -192,6 +230,13 @@ def extract_referee_directory_observations(
 
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
+    failure = _referee_walk_failure(captures)
+    if failure is not None:
+        # The walk is not certified whole: the directory keeps no partial rows
+        # and the failing page itself backs the error.
+        broken, reason = failure
+        return (_outcome(entity, 'error', 'referees:' + reason,
+                         **core._context(broken, scope, extracted_at, universe_version)),)
     first_page = {}
     try:
         pages = [capture.text for capture in captures]
@@ -199,6 +244,7 @@ def extract_referee_directory_observations(
             page = referees.parse_referee_directory_page(html, **directory)
             for aggregate in page.aggregates:
                 first_page.setdefault(aggregate.natural_key, index)
+        # Every supplied page is accounted for by the validated walk above.
         result = referees.reconcile_referee_directory_pages(
             pages, expected_page_count=len(pages), **directory,
         )
