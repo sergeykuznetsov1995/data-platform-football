@@ -1240,6 +1240,38 @@ def test_failed_targets_of_one_scope_stay_distinct_in_dq():
         '{"player_id":"1"}', '{"player_id":"2"}'}
 
 
+def test_failed_representation_packets_stay_distinct_in_dq():
+    class _BrokenPacket:
+        """Both packets of the run answer with a body that is not JSON."""
+        body = b'{"success": "nope"'
+
+        def __init__(self):
+            self.urls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            self.urls.append(url)
+            digest = hashlib.sha256(self.body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, raw_capture_id=digest, raw_body_hash=digest,
+                raw_fetched_at=CLUB_CAPTURED, cache_hit=False, status_code=200)
+
+        def raw_loader(self, capture_id):
+            return self.body, _JsonRecord(self.urls[-1], capture_id, CLUB_CAPTURED)
+
+    players = tuple(str(number) for number in range(1, 102))  # packets of 100 and 1
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t2', cycle_id='tm-cycle-t2',
+        representation_player_ids=players)
+    replay = _BrokenPacket()
+    report = CoreRun(replay.fetch, raw_loader=replay.raw_loader, universe_version=UNIVERSE,
+                     extracted_at=EXTRACTED_AT).run(plan)
+    assert [item['status'] for item in report.outcomes] == ['error', 'error']
+    assert report.dq['passed'] is True
+    assert {item['subject'] for item in report.outcomes} == {
+        core.canonical_json({'player_ids': list(players[:100])}).decode(),
+        core.canonical_json({'player_ids': ['101']}).decode()}
+
+
 def _rumour_feed_html(active: int, last: int, numbers, *, last_control=None) -> bytes:
     """One feed page whose pager evidences exactly the listed page numbers."""
     if last_control is None:
