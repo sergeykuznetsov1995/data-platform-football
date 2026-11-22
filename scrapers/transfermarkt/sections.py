@@ -269,7 +269,9 @@ def extract_rumour_observations(
 
     A merge plan owns exactly one capture, so each page's rows become their own
     outcome inside the one validated feed; the feed itself is the completeness
-    boundary (an incomplete plan yields a single error outcome, no rows).
+    boundary (an incomplete plan yields a single error outcome, no rows). A
+    confirmed empty page is one proof-bearing outcome: its capture stays in the
+    evidence bundle instead of vanishing between its populated neighbours.
     """
     entity = 'rumour_observations'
     if not captures or any(capture.endpoint != 'rumours' for capture in captures):
@@ -281,6 +283,14 @@ def extract_rumour_observations(
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
     try:
+        # The supplied pages must form the complete plan their pagers evidence
+        # before any page of the feed is interpreted.
+        paginations = tuple(
+            rumours.parse_rumour_pagination(
+                capture.text, competition=competition, page_url=capture.url)
+            for capture in captures)
+        if [capture.url for capture in captures] != list(rumours.build_rumour_page_plan(paginations)):
+            raise rumours.RumourParseError('incomplete_page_plan')
         pages = tuple(
             rumour_observations.extract_rumour_page(
                 capture.body, competition=competition, page_number=number,
@@ -298,12 +308,15 @@ def extract_rumour_observations(
         return (_outcome(entity, 'error', 'rumours:invalid_source_data', **context),)
 
     by_id = {capture.capture_id: capture for capture in captures}
-    if all(page.capture.status == 'observed_empty' for page in feed.pages):
-        return (_outcome(entity, 'observed_empty', 'rumours:empty_grid',
-                                 proof='rumours:confirmed_empty_grid', **context),)
     outcomes = []
-    for page in feed.pages:
-        if page.capture.status != 'observed_present':
+    # The feed sorts its pages by page number, which is the capture position.
+    for page, capture in zip(feed.pages, captures, strict=True):
+        page_context = core._context(capture, scope, extracted_at, universe_version)
+        if page.capture.status == 'observed_empty':
+            grid = rumours._confirmed_empty_grid(rumours._soup(capture.text))
+            proof = 'rumours:confirmed_empty_grid' if grid else 'rumours:no_entries_row'
+            reason = 'rumours:empty_grid' if grid else proof
+            outcomes.append(_outcome(entity, 'observed_empty', reason, proof=proof, **page_context))
             continue
         rows = []
         for row in page.rows:
@@ -319,11 +332,7 @@ def extract_rumour_observations(
                 observation_status='observed_present', status_reason='rumours:row',
                 parser_revision=rumours.PARSER_VERSION, schema_revision=rumours.SCHEMA_VERSION,
             ))
-        outcomes.append(_outcome(
-            entity, 'observed_present', 'rumours:page', tuple(rows),
-            **core._context(by_id[page.raw_capture_id], scope, extracted_at, universe_version)))
-    if not outcomes:
-        return (_outcome(entity, 'unknown', 'rumours:unresolved', **context),)
+        outcomes.append(_outcome(entity, 'observed_present', 'rumours:page', tuple(rows), **page_context))
     return tuple(outcomes)
 
 

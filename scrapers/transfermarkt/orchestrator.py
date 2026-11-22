@@ -244,8 +244,11 @@ def _requests(plan: CoreScopePlan):
     for request in _base_requests(plan):
         yield request, None
     for target in plan.rumour_competitions:
+        # The donor's canonical route: Transfermarkt serves the rumour grid
+        # under the generic "-" slug and every pager link carries it. A
+        # competition slug fails the donor's page navigation check instead.
         slug = target.slug or '-'
-        request = _Request("rumours", rumours_url(slug, target.competition_id),
+        request = _Request("rumours", rumours_url('-', target.competition_id),
                            competition_id=target.competition_id)
         yield request, rumours_competition(slug, target.competition_id, target.name)
     for target in plan.referee_directories:
@@ -447,6 +450,57 @@ def _outcome_scope_values(outcome, request, plan):
     return values
 
 
+class _RumourWalk:
+    """Union planning of one rumour feed.
+
+    Every fetched page contributes the page links it evidences: a first pager
+    may omit middle pages that a later page supplies. The combined plan is
+    validated by extraction before any page of the feed is written.
+    """
+
+    def __init__(self, competition):
+        self.competition = competition
+        self.links = {}       # page number -> evidenced canonical URL
+        self.last_page = None
+        self.captures = []    # canonical plan pages in page order
+        self.aliases = set()  # visited URLs that are no plan page
+
+    def add(self, capture):
+        """Register one fetched page and return the next page URL, if any."""
+        # The page stays in the walk even when its pager is unreadable, so
+        # extraction reports the donor error from the page that caused it.
+        self.captures.append(capture)
+        pagination = rumours.parse_rumour_pagination(
+            capture.text, competition=self.competition, page_url=capture.url)
+        if pagination.last_page > 100:
+            raise CoreRunError('rumours:pagination_limit')
+        if self.last_page is None:
+            self.last_page = pagination.last_page
+        elif pagination.last_page != self.last_page:
+            raise rumours.RumourParseError('conflicting_page_ref')
+        links = dict(pagination.links)
+        if not self.links and links.get(1) != capture.url:
+            # Every row binds to its CANONICAL plan URL; a listing that names
+            # another page 1 was only the discovery response.
+            self.captures.pop()
+            self.aliases.add(capture.url)
+        for number, url in links.items():
+            if self.links.setdefault(number, url) != url:
+                if url in self.aliases:
+                    # Two pages naming each other canonical would re-enter
+                    # discovery forever; the discovery URL never comes back.
+                    raise CoreRunError('rumours:discovery_cycle')
+                raise rumours.RumourParseError('conflicting_page_ref')
+        fetched = {page.url for page in self.captures}
+        for number in sorted(self.links):
+            url = self.links[number]
+            if url in self.aliases:
+                raise CoreRunError('rumours:discovery_cycle')
+            if url not in fetched:
+                return url
+        return None
+
+
 class CoreRun:
     def __init__(
         self,
@@ -475,8 +529,7 @@ class CoreRun:
             as_json = request.as_json
             page = request
             captures = []
-            remaining_urls = iter(())
-            rumour_discovery_urls = set()
+            walk = _RumourWalk(competition) if request.label == "rumours" else None
             while True:
                 result = self._fetch(
                     page.url, label=request.label, as_json=as_json, context=context,
@@ -488,6 +541,16 @@ class CoreRun:
                         or not result.raw_capture_id):
                     break
                 capture = _capture(page, result, self._raw_loader)
+                if walk is not None:
+                    try:
+                        next_url = walk.add(capture)
+                    except ValueError:
+                        # Extraction reports the donor error from these same pages.
+                        break
+                    if next_url is None:
+                        break
+                    page = replace(request, url=next_url)
+                    continue
                 captures.append(capture)
                 if request.label == "referee_directory":
                     number = len(captures)
@@ -501,37 +564,6 @@ class CoreRun:
                     if number >= 100:
                         raise CoreRunError('referee_directory:pagination_limit')
                     page = replace(request, url=referee_directory_url(request.directory_scope, page=number + 1))
-                    continue
-                if request.label == "rumours":
-                    if len(captures) == 1:
-                        try:
-                            pagination = rumours.parse_rumour_pagination(
-                                capture.text, competition=competition, page_url=page.url,
-                            )
-                            page_plan = rumours.build_rumour_page_plan((pagination,))
-                        except ValueError:
-                            # Extraction reports the donor error with the listing capture.
-                            break
-                        if len(page_plan) > 100:
-                            raise CoreRunError('rumours:pagination_limit')
-                        # Every row binds to its CANONICAL plan URL (page 1 is
-                        # .../page/1, not the suffixless listing); only the
-                        # table-free empty grid plans to the listing itself.
-                        if page_plan[0] != page.url:
-                            captures = []
-                            remaining_urls = iter(page_plan)
-                            # Two pages naming each other canonical would
-                            # re-enter discovery forever; the discovery URL
-                            # must never come back.
-                            rumour_discovery_urls = {request.url, page.url}
-                        else:
-                            remaining_urls = iter(page_plan[1:])
-                    next_url = next(remaining_urls, None)
-                    if next_url is None:
-                        break
-                    if next_url in rumour_discovery_urls:
-                        raise CoreRunError('rumours:discovery_cycle')
-                    page = replace(request, url=next_url)
                     continue
                 try:
                     next_url = attendance.next_attendance_url(capture.body, page.url)
@@ -550,6 +582,8 @@ class CoreRun:
                 if len(captures) >= 100:
                     raise CoreRunError('attendance:pagination_limit')
                 page = replace(request, url=next_url)
+            if walk is not None:
+                captures = walk.captures
             if extracted_at is None:
                 extracted_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
             unit, captured_at = _observations(

@@ -762,9 +762,14 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
             raise CoreParseError('row_scope_mismatch')
         return
     if entity == 'rumour_observations':
-        match = re.fullmatch(r'/[A-Za-z0-9_-]+/geruechte/wettbewerb/([A-Za-z0-9_-]+)(?:/page/[0-9]+)?/?', path)
-        if match is None or match[1] != scope_values['competition_id']:
-            raise CoreParseError('row_scope_mismatch')
+        # The donor's page-identity parser accepts exactly the forms its walk
+        # can produce (trailing slash, /plus/1, ?page=N) on Transfermarkt hosts.
+        from scrapers.transfermarkt import rumours
+
+        try:
+            rumours._page_ref(capture.url, scope_values['competition_id'])
+        except rumours.RumourParseError as exc:
+            raise CoreParseError('row_scope_mismatch') from exc
         return
     if entity == 'achievement_observations':
         recipient_type = scope_values['recipient_type']

@@ -1240,15 +1240,18 @@ def test_failed_targets_of_one_scope_stay_distinct_in_dq():
         '{"player_id":"1"}', '{"player_id":"2"}'}
 
 
-def _rumour_feed_html(active: int, last: int, numbers, *, last_control=True) -> bytes:
+def _rumour_feed_html(active: int, last: int, numbers, *, last_control=None) -> bytes:
     """One feed page whose pager evidences exactly the listed page numbers."""
+    if last_control is None:
+        # The donor infers the last page only from a control or a complete tail.
+        last_control = active != last
     items = []
     for number in numbers:
         active_class = ' tm-pagination__list-item--active' if number == active else ''
         items.append(
             f'<li class="tm-pagination__list-item{active_class}">'
             f'<a class="tm-pagination__link" href="{RUMOUR_LISTING}/page/{number}">{number}</a></li>')
-    if last_control and active != last:
+    if last_control:
         items.append(
             f'<li class="tm-pagination__list-item--icon-last-page">'
             f'<a class="tm-pagination__link" href="{RUMOUR_LISTING}/page/{last}"></a></li>')
@@ -1315,7 +1318,8 @@ def test_rumour_walk_unions_the_links_of_every_fetched_page():
 def test_rumour_feed_no_fetched_page_completes_is_not_certified():
     # Every fetched pager omits page 3 of four: no complete feed, no rows.
     pages = {RUMOUR_LISTING: _rumour_feed_html(1, 4, (1, 2, 4))}
-    pages.update({_rumour_page_url(n): _rumour_feed_html(n, 4, (1, 2, 4)) for n in (1, 2, 4)})
+    pages.update({_rumour_page_url(n): _rumour_feed_html(n, 4, (1, 2, 4), last_control=True)
+                  for n in (1, 2, 4)})
     fetcher = _FeedFetch(pages)
     report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
                      extracted_at=RUMOUR_EXTRACTED_AT).run(_rumour_run_plan())
