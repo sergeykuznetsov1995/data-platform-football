@@ -854,10 +854,57 @@ def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
             scopes.add(scope)
 
 
+def _ddl_columns(ddl: str) -> set[str]:
+    """Column names declared by a plan's CREATE TABLE statement."""
+    head = ddl.split('WITH', 1)[0]
+    body = head[head.index('(') + 1:head.rindex(')')]
+    parts, current, depth = [], '', 0
+    for char in body:
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+        if char == ',' and depth == 0:
+            parts.append(current)
+            current = ''
+        else:
+            current += char
+    parts.append(current)
+    return {part.split()[0].strip('"`[]') for part in parts if part.strip()}
+
+
+def _guard_table_schema(connection, plan: NativeWritePlan) -> None:
+    """A write never lands on a table of another schema.
+
+    Section lanes reuse the names of tables the retired donor stack left
+    behind, and CREATE TABLE IF NOT EXISTS does not recreate those. Refuse
+    before any mutation: a column the plan's DDL declares is missing, or the
+    table carries a column that belongs neither to that DDL nor to the plan.
+    """
+    if not plan.rows:
+        return
+    cursor = connection.cursor()
+    try:
+        try:
+            _query_rows(cursor, f'SELECT * FROM {plan.full_table} WHERE 1 = 0')
+        except Exception as exc:
+            if write_journal._table_not_found(exc):
+                return
+            raise
+        existing = {column[0] for column in cursor.description or []}
+    finally:
+        cursor.close()
+    declared = _ddl_columns(plan.ddl)
+    carried = {column for row in plan.rows for column in row}
+    if existing and (not declared <= existing or existing - declared - carried):
+        raise RuntimeError('core table schema differs from the plan: ' + plan.table)
+
+
 def _commit_plans(connection, writer, plans) -> list[dict]:
     execute_statement(connection.cursor(), core_receipts_ddl())
     for plan in plans:
         execute_statement(connection.cursor(), plan.ddl)
+        _guard_table_schema(connection, plan)
     states = [(plan, _replay_state(connection, plan)) for plan in plans]
     for plan, state in states:
         # A lineage-only refresh rewrites the run identity of rows that are

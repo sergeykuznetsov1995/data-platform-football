@@ -2086,7 +2086,7 @@ def test_first_write_refuses_a_table_of_another_schema_before_mutation():
     packet = _representation_capture()
     assigned, = [outcome for outcome in sections.extract_representation_observations(
         packet, _representation_scope(), expected_ids=('7', '9'), extracted_at=EXTRACTED_AT,
-        universe_version=UNIVERSE) if outcome.rows]
+        universe_version=UNIVERSE) if outcome.status == 'observed_present']
     columns = ', '.join(f'{column} TEXT' for column in (*assigned.rows[0], 'assessment_manifest_id'))
     db.sql.execute(f'CREATE TABLE transfermarkt_player_representation_observations ({columns})')
     plan = core.plan_for_outcome(assigned, captured_at=CLUB_CAPTURED, scope_values={'player_id': '7'})
