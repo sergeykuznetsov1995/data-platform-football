@@ -915,6 +915,22 @@ def _snapshot_document():
                 "unique_tournament_id": 54,
                 "capture_key": "SS-54",
                 "metadata_status": "ready",
+                "classification": {
+                    "sport": "football",
+                    "gender": "male",
+                    "status": "review_required",
+                    "exclusion_reasons": [],
+                },
+                "eligibility_review": {
+                    "status": "approved",
+                    "confirmed": {
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "professional": True,
+                    },
+                    "reviewed_by": "unit-owner",
+                    "reviewed_at": "2026-08-21",
+                },
                 "seasons": [
                     {
                         "source_season_id": 616,
@@ -947,6 +963,22 @@ def _snapshot_document():
                 "unique_tournament_id": 17,
                 "capture_key": "SS-17",
                 "metadata_status": "ready",
+                "classification": {
+                    "sport": "football",
+                    "gender": "male",
+                    "status": "review_required",
+                    "exclusion_reasons": [],
+                },
+                "eligibility_review": {
+                    "status": "approved",
+                    "confirmed": {
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "professional": True,
+                    },
+                    "reviewed_by": "unit-owner",
+                    "reviewed_at": "2026-08-21",
+                },
                 "seasons": [
                     {
                         "source_season_id": 70000,

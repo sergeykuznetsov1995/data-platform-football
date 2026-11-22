@@ -79,7 +79,17 @@ def _campaign_snapshot_for_planning() -> "tuple[dict[str, Any] | None, str]":
         return None, ""
     if not isinstance(document, dict):
         return None, ""
-    return document, str(document.get("campaign_id") or "")
+    campaign_id = str(document.get("campaign_id") or "").strip()
+    if not campaign_id:
+        # Review r1: a snapshot without a stable campaign identity must
+        # not contribute pairs — the worker refuses an unpinned fallback.
+        logger.warning(
+            "SofaScore raw replay: campaign snapshot %s has no campaign_id; "
+            "registry-only scope set applies",
+            path,
+        )
+        return None, ""
+    return document, campaign_id
 
 
 def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:

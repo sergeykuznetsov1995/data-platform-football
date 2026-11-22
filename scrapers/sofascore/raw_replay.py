@@ -530,6 +530,50 @@ def registry_tournament_ids(
     )
 
 
+def _snapshot_tournament_admitted(row: Mapping[str, object]) -> bool:
+    """Mirror load_exact_scope's tournament-level eligibility cheaply.
+
+    The worker still runs the FULL load_exact_scope validation (digest,
+    campaign identity, team-count evidence); this keeps planner queue
+    slots away from tournaments the worker is guaranteed to refuse
+    (review r1: a ready season under a non-ready or excluded tournament
+    must not consume a capped slot).  The denominator exclusion is part
+    of the same guarantee: a campaign row outside the denominator queues
+    (esoccer/student, #1353) is refused there and here alike.
+    """
+    if row.get("metadata_status") != "ready":
+        return False
+    classification = row.get("classification")
+    if not isinstance(classification, Mapping):
+        return False
+    if (
+        classification.get("sport") != "football"
+        or classification.get("gender") != "male"
+        or classification.get("status") in {None, "unknown", "excluded"}
+        or classification.get("exclusion_reasons")
+    ):
+        return False
+    review = row.get("eligibility_review")
+    confirmed = review.get("confirmed") if isinstance(review, Mapping) else None
+    if (
+        not isinstance(review, Mapping)
+        or review.get("status") != "approved"
+        or not isinstance(confirmed, Mapping)
+        or confirmed.get("age_group") != "adult"
+        or confirmed.get("team_level") != "first_team"
+        or confirmed.get("professional") is not True
+        or not str(review.get("reviewed_by") or "").strip()
+    ):
+        return False
+    from .all_mens_campaign import load_denominator
+
+    try:
+        source_id = int(row.get("unique_tournament_id"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return load_denominator().queue_priority(source_id) != 0
+
+
 def snapshot_replay_scope_pairs(
     document: Mapping[str, object],
     registry_ids: "frozenset[str] | set[str]",
@@ -561,6 +605,8 @@ def snapshot_replay_scope_pairs(
             continue
         capture_key = row.get("capture_key")
         if not isinstance(capture_key, str) or capture_key != f"SS-{source_id}":
+            continue
+        if not _snapshot_tournament_admitted(row):
             continue
         seasons = row.get("seasons")
         if not isinstance(seasons, list):
@@ -604,6 +650,11 @@ def _validate_snapshot_pair(
         capture_key = row.get("capture_key")
         if not isinstance(capture_key, str) or capture_key != f"SS-{wanted[0]}":
             return None
+        if not _snapshot_tournament_admitted(row):
+            raise ReplayPlanningError(
+                f"{prefix} is not replay-eligible: campaign tournament is "
+                "not admitted (metadata/review/denominator)"
+            )
         seasons = row.get("seasons")
         if not isinstance(seasons, list):
             return None

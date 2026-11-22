@@ -185,7 +185,16 @@ def _resolve_snapshot_scope(
             "registry and no campaign snapshot is configured "
             f"({_SNAPSHOT_ENV})"
         )
-    expected_campaign = os.environ.get(_REPLAY_CAMPAIGN_ID_ENV, "").strip() or None
+    # Review r1: the campaign pin is REQUIRED for the snapshot lane —
+    # without it a different, internally valid campaign containing the
+    # same pair could execute.
+    expected_campaign = os.environ.get(_REPLAY_CAMPAIGN_ID_ENV, "").strip()
+    if not expected_campaign:
+        raise ReplayScopeError(
+            f"replay scope {scope.source_tournament_id!r} needs the snapshot "
+            f"lane but {_REPLAY_CAMPAIGN_ID_ENV} is not pinned by the "
+            "planner"
+        )
     try:
         scope_row = load_exact_scope(
             snapshot_path,
@@ -263,8 +272,11 @@ def _load_scope(
         try:
             resolved, season_format, scope_row = _resolve_snapshot_scope(scope)
             overlay_source = ("snapshot", scope_row)
-        except ReplayScopeError:
-            raise unresolved from exc
+        except ReplayScopeError as snapshot_exc:
+            # The snapshot failure is the actionable reason (campaign
+            # mismatch, digest, eligibility); chain the registry error as
+            # its cause instead of masking it (review r1).
+            raise ReplayScopeError(str(snapshot_exc)) from unresolved
     if records is None:
         records = load_replay_scope_records(
             _replay_manager(getattr(capture_runtime, "manifest_store", None)),
@@ -954,43 +966,6 @@ def _player_universe_freshness_key(
 
     store = getattr(capture_runtime, "manifest_store", None)
     scope_key = resolved.freshness_key
-    listing = getattr(store, "list_for_scope", None)
-    squads_by_key: dict[str, list[object]] = {}
-    if callable(listing):
-        for record in listing(
-            resolved.source_tournament_id, resolved.source_season_id
-        ):
-            if getattr(record.key, "endpoint", None) != "squads":
-                continue
-            squads_by_key.setdefault(record.key.freshness_key, []).append(
-                record
-            )
-    terminal = {
-        key: (
-            sum(
-                1
-                for record in records
-                if getattr(record, "status", None) is not None
-                and record.status.terminal
-            ),
-            max(
-                (
-                    getattr(record, "updated_at", "")
-                    for record in records
-                ),
-                default="",
-            ),
-        )
-        for key, records in squads_by_key.items()
-    }
-    alternatives = sorted(
-        (key for key, (count, _) in terminal.items() if count > 0),
-        key=lambda key: (terminal[key][0], terminal[key][1]),
-    )
-    alternatives.reverse()  # most terminal squads first; freshest update wins ties
-    candidates = [scope_key] + [
-        key for key in alternatives if key != scope_key
-    ][:4]
 
     def universe_ready(key: str) -> bool:
         try:
@@ -1007,10 +982,56 @@ def _player_universe_freshness_key(
             return False
         return bool(getattr(plan, "player_universe_ready", False))
 
-    for candidate in candidates:
+    # The scope's own key is tested BEFORE any listing (review r1): a
+    # discovery failure must never preempt a working scope key, and a
+    # working scope key is never displaced.
+    tried = [scope_key]
+    if universe_ready(scope_key):
+        return scope_key, tried
+    listing = getattr(store, "list_for_scope", None)
+    squads_by_key: dict[str, list[object]] = {}
+    if callable(listing):
+        try:
+            for record in listing(
+                resolved.source_tournament_id, resolved.source_season_id
+            ):
+                if getattr(record.key, "endpoint", None) != "squads":
+                    continue
+                squads_by_key.setdefault(record.key.freshness_key, []).append(
+                    record
+                )
+        except Exception:
+            squads_by_key = {}
+    terminal = {
+        key: (
+            sum(
+                1
+                for record in records
+                if getattr(record, "status", None) is not None
+                and record.status.terminal
+            ),
+            max(
+                (getattr(record, "updated_at", "") for record in records),
+                default="",
+            ),
+        )
+        for key, records in squads_by_key.items()
+    }
+    alternatives = sorted(
+        (key for key, (count, _) in terminal.items() if count > 0),
+        key=lambda key: (terminal[key][0], terminal[key][1]),
+    )
+    alternatives.reverse()  # most terminal squads first; freshest update wins ties
+    # No cap (review r1): continue in rank order until a plan passes or
+    # the candidates are exhausted — a capped prefix could hide the one
+    # ready key behind four incomplete ones.
+    for candidate in alternatives:
+        if candidate == scope_key:
+            continue
+        tried.append(candidate)
         if universe_ready(candidate):
-            return candidate, candidates
-    return scope_key, candidates
+            return candidate, tried
+    return scope_key, tried
 
 
 def _players_phase(

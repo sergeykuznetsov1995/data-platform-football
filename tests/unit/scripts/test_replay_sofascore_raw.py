@@ -1536,8 +1536,14 @@ def test_scope_overlay_rejects_scope_outside_registry():
 # --- stage 3: campaign-snapshot resolution for non-registry tournaments ------
 
 
-def _campaign_snapshot_fixture(tmp_path, *, campaign_id="unit-campaign"):
-    """Digest-valid campaign snapshot with one NON-registry tournament."""
+def _campaign_snapshot_fixture(
+    tmp_path, *, campaign_id="unit-campaign", include_registry_pair=False
+):
+    """Digest-valid campaign snapshot with one NON-registry tournament.
+
+    ``include_registry_pair`` adds tournament 17 with season 99999 — a
+    pair the (real) registry refuses — for the authority test.
+    """
     document = {
         "schema_version": 1,
         "candidate_count": 1,
@@ -1599,6 +1605,30 @@ def _campaign_snapshot_fixture(tmp_path, *, campaign_id="unit-campaign"):
             }
         ],
     }
+    if include_registry_pair:
+        import copy
+
+        registry_row = copy.deepcopy(document["tournaments"][0])
+        registry_row["unique_tournament_id"] = 17
+        registry_row["capture_key"] = "SS-17"
+        registry_row["seasons"] = [
+            {
+                "source_season_id": 99999,
+                "source_name": "Ghost 25/26",
+                "canonical_season": "2526",
+                "season_format": "split_year",
+                "start_year": 2025,
+                "team_count": 20,
+                "metadata_status": "ready",
+                "team_count_evidence": {
+                    "type": "source_team_ids",
+                    "endpoint": "/unique-tournament/17/season/99999/teams",
+                    "count": 20,
+                    "team_ids_sha256": "c" * 64,
+                },
+            }
+        ]
+        document["tournaments"].append(registry_row)
     raw = json.dumps(
         document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()
@@ -1631,13 +1661,22 @@ def test_snapshot_resolution_covers_registry_absent_tournament(tmp_path, monkeyp
 
 
 def test_registry_authority_is_never_displaced_by_snapshot(tmp_path, monkeypatch):
-    """A tournament the registry KNOWS keeps registry errors (adjudication)."""
+    """A tournament the registry KNOWS keeps registry errors (adjudication).
+
+    Review r1 hardening: the snapshot ALSO carries the very pair
+    (17/99999) the registry refuses — the fallback must still not run.
+    """
     from dags.scripts.replay_sofascore_raw import _load_scope
 
-    snapshot = _campaign_snapshot_fixture(tmp_path)
+    snapshot = _campaign_snapshot_fixture(
+        tmp_path, include_registry_pair=True
+    )
     monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "unit-campaign")
 
-    runtime = _FakeRuntime(_FakeCatalog(), _FakeManager())
+    catalog = _FakeCatalog()
+    catalog.tournaments = (SimpleNamespace(unique_tournament_id=int(TOURNAMENT)),)
+    runtime = _FakeRuntime(catalog, _FakeManager())
     with pytest.raises(ReplayPlanningError, match="unknown for source"):
         _load_scope(
             # 17 is in the fake registry; the season is not.
@@ -1677,6 +1716,7 @@ def test_snapshot_overlay_renders_and_binds(tmp_path, monkeypatch):
 
     snapshot = _campaign_snapshot_fixture(tmp_path)
     monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "unit-campaign")
 
     resolved, season_format, scope_row = _resolve_snapshot_scope(
         ReplayScopeKey("54", "616", "final")
@@ -1777,10 +1817,10 @@ def test_universe_key_falls_back_to_terminal_squads_key(monkeypatch):
         freshness_key="week-2026-W30",
     )
 
-    key, candidates = _player_universe_freshness_key(runtime, resolved)
+    key, tried = _player_universe_freshness_key(runtime, resolved)
 
     assert key == "day-2026-07-18"
-    assert candidates[0] == "week-2026-W30"
+    assert tried == ["week-2026-W30", "day-2026-07-18"]
 
 
 def test_universe_key_keeps_scope_key_when_nothing_passes(monkeypatch):
@@ -1804,7 +1844,7 @@ def test_universe_key_keeps_scope_key_when_nothing_passes(monkeypatch):
         freshness_key="week-2026-W30",
     )
 
-    key, candidates = _player_universe_freshness_key(runtime, resolved)
+    key, tried = _player_universe_freshness_key(runtime, resolved)
 
     assert key == "week-2026-W30"
-    assert len(candidates) == 2
+    assert tried == ["week-2026-W30", "day-2026-07-17"]
