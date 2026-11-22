@@ -141,6 +141,10 @@ class CliTrino:
 
     def __init__(self, trino_sh: str) -> None:
         self._trino_sh = trino_sh
+        # The base64 queue page is ~140 k chars on one CSV field; the csv module
+        # would cap it at 131072 and fail (Astra r3). sys.maxsize is fine here:
+        # fields come from the read-only Trino CLI, never from untrusted input.
+        csv.field_size_limit(sys.maxsize)
 
     def execute_query(self, sql: str) -> List[Tuple[Optional[str], ...]]:
         result = subprocess.run(

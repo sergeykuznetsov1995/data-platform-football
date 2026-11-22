@@ -265,3 +265,14 @@ def test_main_invalid_today_prints_unavailable(monkeypatch, capsys):
     lines = capsys.readouterr().out.strip().splitlines()
     assert lines[0].startswith("история: не посчитана — некорректная дата --today")
     assert json.loads(lines[1])["status"] == "unavailable"
+
+
+def test_cli_trino_accepts_large_base64_fields(monkeypatch):
+    from scrapers.clubelo.history_coverage import CliTrino
+
+    # Astra r3: живая страница /Ranking даёт ~140 k символов base64 в одном поле;
+    # дефолтный csv-лимит 131072 ломал бы чтение очереди
+    big = "a" * 140_000
+    monkeypatch.setattr("scrapers.clubelo.history_coverage.subprocess.run",
+                        _fake_run(f'"{big}","{SHA}"\n'))
+    assert CliTrino("trino-ro.sh").execute_query("SELECT 1") == [(big, SHA)]
