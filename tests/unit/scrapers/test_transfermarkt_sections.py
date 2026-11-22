@@ -894,6 +894,8 @@ def test_representation_scope_run_batches_players_into_one_packet():
     assert report.fetched == 1
     assert {item['status'] for item in report.outcomes} == {'observed_present', 'unknown'}
     assert report.dq['passed'] is True
+    # Only the conclusive (assigned) player writes; the unknown one waits for
+    # a later conclusive capture — stage-B conclusive-only write policy.
     assert db.sql.execute(
         'SELECT COUNT(*) FROM transfermarkt_player_representation_observations'
-    ).fetchone()[0] == 2
+    ).fetchone()[0] == 1

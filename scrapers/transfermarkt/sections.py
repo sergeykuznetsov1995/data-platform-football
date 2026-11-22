@@ -7,13 +7,16 @@ and bind each observation to the capture and run that produced it.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 import json
 from urllib.parse import urlsplit
 
 from bs4 import ParserRejectedMarkup
 
-from . import achievements, attendance, club_values, core, referees, rumour_observations, rumours
+from . import (
+    achievements, attendance, club_values, core, referees, representation, rumour_observations, rumours,
+)
 
 
 def extract_attendance_observations(
@@ -69,6 +72,59 @@ def extract_attendance_observations(
             schema_revision=attendance.ATTENDANCE_SCHEMA_REVISION,
         ))
     return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)
+
+
+def extract_representation_observations(
+    capture: core.SourceCapture, scope: core.ScopeContext, *, expected_ids: Sequence[str],
+    extracted_at: str, universe_version: str,
+) -> tuple[core.LaneOutcome, ...]:
+    entity = 'player_representation_observations'
+    if capture.endpoint != 'representation':
+        raise core.CoreParseError('representation:invalid_endpoint')
+    context = core._context(capture, scope, extracted_at, universe_version)
+    try:
+        try:
+            payload = json.loads(capture.text)
+        except (ValueError, RecursionError) as exc:
+            raise representation.RepresentationParseError('invalid_json') from exc
+        assertions = representation.parse_representation_packet(payload, expected_ids=expected_ids)
+    except representation.RepresentationParseError as exc:
+        return (core.captureless_outcome(
+            entity, scope, status='error', reason='representation:' + exc.reason,
+            extracted_at=extracted_at, run_id=context['run_id'], universe_version=universe_version,
+        ),)
+
+    outcomes = []
+    for player_id in sorted(assertions, key=int):
+        assertion = assertions[player_id]
+        core._check_scope_against_capture(entity, {'player_id': player_id}, capture)
+        player_context = context | {'scope': replace(scope, player_id=player_id)}
+        status = assertion.observation_status
+        row_reason = 'representation:' + assertion.status_reason
+        if status == 'error':
+            outcomes.append(core.LaneOutcome(entity, status, row_reason, **player_context))
+            continue
+        if status == 'assigned':
+            status = 'observed_present'
+            reason = 'representation:assigned'
+            representative_key = f'agency:{assertion.representative_id}'
+        else:
+            reason = row_reason
+            representative_key = f'status:{status}'
+        values = {
+            'player_id': player_id, 'relation_type': representation.RELATION_TYPE,
+            'representative_key': representative_key, 'representative_id': assertion.representative_id,
+            'observation_status': status, 'status_reason': row_reason,
+            'evidence_type': assertion.evidence_type, 'evidence_locator': assertion.evidence_locator,
+            'observed_at': capture.captured_at,
+        }
+        row = core._render(
+            entity, values, observation_status=status, status_reason=row_reason,
+            parser_revision=representation.REPRESENTATION_PARSER_REVISION,
+            schema_revision=representation.REPRESENTATION_SCHEMA_REVISION, **player_context,
+        )
+        outcomes.append(core.LaneOutcome(entity, status, reason, (row,), **player_context))
+    return tuple(outcomes)
 
 
 def extract_referee_directory_observations(

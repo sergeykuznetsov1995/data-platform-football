@@ -9,10 +9,11 @@ signature, so live transport and offline capture replay run the same code.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+from itertools import batched
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -28,6 +29,7 @@ class CoreRunError(RuntimeError):
 Fetch = Callable[..., FetchOutcome]
 TM_BASE = "https://www.transfermarkt.com"
 TM_API_BASE = "https://tmapi.transfermarkt.technology"
+_REPRESENTATION_PACKET_LIMIT = 100
 
 
 def squad_url(club_slug: str, club_id: str, saison_year: int) -> str:
@@ -48,6 +50,13 @@ def mv_history_url(player_id: str) -> str:
 
 def transfers_url(player_id: str) -> str:
     return f"{TM_BASE}/ceapi/transferHistory/list/{player_id}"
+
+
+def representation_url(player_ids: Sequence[str]) -> str:
+    if not 1 <= len(player_ids) <= _REPRESENTATION_PACKET_LIMIT:
+        raise CoreRunError('representation:batch_invalid')
+    query = '&'.join(f'ids[]={player_id}' for player_id in player_ids)
+    return f"{TM_API_BASE}/players?{query}"
 
 
 def attendance_url(slug: str, competition_id: str, saison_year: int) -> str:
@@ -136,6 +145,7 @@ class CoreScopePlan:
     rumour_competitions: tuple[RumourCompetitionTarget, ...] = ()
     referee_directories: tuple[RefereeDirectoryTarget, ...] = ()
     referee_profile_ids: tuple[str, ...] = ()
+    representation_player_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,10 +181,13 @@ class _Request:
     recipient_type: str = ""
     directory_scope: Mapping[str, str] | None = None
     referee_id: str = ""
+    player_ids: tuple[str, ...] = ()
 
     @property
     def as_json(self) -> bool:
-        return bool(self.player_id) or self.label in ("player_achievement", "club_achievement")
+        return bool(self.player_id) or self.label in (
+            "player_achievement", "club_achievement", "representation",
+        )
 
     def scope_values(self, plan):
         # The replacement scope follows the entity's own scope columns:
@@ -245,6 +258,8 @@ def _requests(plan: CoreScopePlan):
                        directory_scope=directory), None
     for referee_id in plan.referee_profile_ids:
         yield _Request("referee_profile", referee_profile_url(referee_id), referee_id=referee_id), None
+    for batch in batched(plan.representation_player_ids, _REPRESENTATION_PACKET_LIMIT):
+        yield _Request("representation", representation_url(batch), player_ids=batch), None
 
 
 def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
@@ -304,6 +319,7 @@ _ENTITIES = {
     "rumours": ("rumour_observations",),
     "referee_directory": ("referee_aggregate_observations",),
     "referee_profile": ("referee_profiles",),
+    "representation": ("player_representation_observations",),
 }
 _PAGINATED_ENDPOINTS = frozenset({"attendance", "rumours", "referee_directory"})
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
@@ -320,6 +336,15 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
     paginated = request.label in _PAGINATED_ENDPOINTS
+    if request.label == "representation" and (
+        result.status in (FetchStatus.NOT_APPLICABLE, FetchStatus.SCHEMA_ERROR)
+        or (result.status in _SUCCESS and not result.raw_capture_id)
+    ):
+        reason = result.status.value if result.status is not FetchStatus.OK else "no_capture"
+        return (core.captureless_outcome(
+            _ENTITIES[request.label][0], scope, status="error", reason=f"representation:{reason}",
+            run_id=run_id, **metadata,
+        ),), None
     if result.status is FetchStatus.NOT_APPLICABLE and not paginated:
         return tuple(
             core.captureless_outcome(
@@ -367,6 +392,10 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         unit = core.extract_career_observations(capture, scope, **metadata)
     elif request.label == "club_values":
         unit = sections.extract_club_value_observations(capture, scope, **metadata)
+    elif request.label == "representation":
+        unit = sections.extract_representation_observations(
+            capture, scope, expected_ids=request.player_ids, **metadata,
+        )
     elif request.label == "referee_profile":
         unit = sections.extract_referee_profile_observations(
             capture, scope, referee_id=request.referee_id, **metadata,

@@ -14,7 +14,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from scrapers.transfermarkt import parsing
 
@@ -39,7 +39,7 @@ _ENDPOINTS = frozenset({
     'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history',
     # stage C sections (#2405)
     'attendance', 'club_values', 'player_achievement', 'club_achievement', 'coach_achievement',
-    'rumours', 'referee_directory', 'referee_profile',
+    'rumours', 'referee_directory', 'referee_profile', 'representation',
 })
 _OUTCOMES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
 _PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
@@ -53,6 +53,7 @@ _ENTITY_ROW_STATUSES = {
     'attendance_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
     'club_value_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
     'referee_aggregate_observations': frozenset({'observed_present', 'observed_empty', 'explicit_none'}),
+    'player_representation_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
 }
 
 LINEAGE_COLUMNS = (
@@ -69,6 +70,7 @@ CORE_ENTITIES = (
     # stage C sections (#2405)
     'attendance_observations', 'club_value_observations', 'achievement_observations',
     'rumour_observations', 'referee_aggregate_observations', 'referee_profiles',
+    'player_representation_observations',
 )
 CORE_TABLES = {entity: f'transfermarkt_{entity}' for entity in CORE_ENTITIES}
 CORE_NATURAL_KEYS = {
@@ -86,6 +88,9 @@ CORE_NATURAL_KEYS = {
     'rumour_observations': ('rumour_identity', 'subject_id', 'observed_at', 'correction_identity'),
     'referee_aggregate_observations': ('referee_id', 'competition_id', 'edition_id', 'metric', 'observed_at'),
     'referee_profiles': ('referee_id', 'observed_at'),
+    'player_representation_observations': (
+        'player_id', 'relation_type', 'representative_key', 'source_capture_id',
+    ),
 }
 CORE_SCOPE_COLUMNS = {
     'squad_memberships': ('league', 'season', 'club_id'),
@@ -102,6 +107,7 @@ CORE_SCOPE_COLUMNS = {
     'rumour_observations': ('competition_id',),
     'referee_aggregate_observations': ('competition_id', 'edition_id'),
     'referee_profiles': ('referee_id',),
+    'player_representation_observations': ('player_id',),
 }
 CORE_WRITE_MODES = {
     'squad_memberships': 'replace',
@@ -118,6 +124,7 @@ CORE_WRITE_MODES = {
     'rumour_observations': 'merge',
     'referee_aggregate_observations': 'merge',
     'referee_profiles': 'merge',
+    'player_representation_observations': 'merge',
 }
 
 SQUAD_MEMBERSHIP_BUSINESS = (
@@ -182,6 +189,10 @@ REFEREE_AGGREGATE_BUSINESS = (
     'status_reason', 'raw_value', 'source_row', 'source_column', 'observed_at',
 )
 REFEREE_PROFILE_BUSINESS = ('referee_id', 'name', 'nationality', 'birth_date', 'observed_at')
+REPRESENTATION_BUSINESS = (
+    'player_id', 'relation_type', 'representative_key', 'representative_id', 'observation_status',
+    'status_reason', 'evidence_type', 'evidence_locator', 'observed_at',
+)
 _BUSINESS_COLUMNS = {
     'squad_memberships': SQUAD_MEMBERSHIP_BUSINESS,
     'player_attribute_observations': ATTRIBUTE_BUSINESS,
@@ -197,6 +208,7 @@ _BUSINESS_COLUMNS = {
     'rumour_observations': RUMOUR_BUSINESS,
     'referee_aggregate_observations': REFEREE_AGGREGATE_BUSINESS,
     'referee_profiles': REFEREE_PROFILE_BUSINESS,
+    'player_representation_observations': REPRESENTATION_BUSINESS,
 }
 # observed_at serves both roles in the squad and coach tables.
 CORE_COLUMNS = {
@@ -700,6 +712,11 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         return
     url = urlsplit(capture.url)
     path = url.path
+    if entity == 'player_representation_observations':
+        if (url.hostname != 'tmapi.transfermarkt.technology' or path != '/players'
+                or scope_values['player_id'] not in parse_qs(url.query).get('ids[]', ())):
+            raise CoreParseError('row_scope_mismatch')
+        return
     if entity == 'referee_aggregate_observations':
         if _referee_directory_identity(path) != (scope_values['competition_id'], scope_values['edition_id']):
             raise CoreParseError('row_scope_mismatch')
@@ -784,6 +801,8 @@ def build_core_dq(
         )
         if entity == 'club_value_observations' and outcome.rows:
             identity += (outcome.rows[0].get('club_id'),)
+        if entity == 'player_representation_observations' and outcome.scope:
+            identity += (outcome.scope.player_id,)
         if identity in seen_outcomes:
             errors.add('duplicate_outcome')
         seen_outcomes.add(identity)
