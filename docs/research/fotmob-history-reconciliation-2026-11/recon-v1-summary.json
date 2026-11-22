@@ -1,0 +1,110 @@
+{
+  "actionable_gap_matches_total": 8829,
+  "denominator": {
+    "required_pairs": 5540,
+    "tournaments": 452
+  },
+  "gap_pairs_top": [
+    [
+      439,
+      "9138",
+      "2021/2022"
+    ],
+    [
+      339,
+      "9066",
+      "2018/2019"
+    ],
+    [
+      326,
+      "134",
+      "2016/2017"
+    ],
+    [
+      304,
+      "10626",
+      "2016/2017"
+    ],
+    [
+      255,
+      "112",
+      "2026 - Apertura"
+    ],
+    [
+      255,
+      "112",
+      "2025 - Clausura"
+    ],
+    [
+      255,
+      "112",
+      "2025 - Apertura"
+    ],
+    [
+      240,
+      "522",
+      "2015"
+    ],
+    [
+      240,
+      "522",
+      "2012/2013"
+    ],
+    [
+      239,
+      "522",
+      "2013/2014"
+    ],
+    [
+      216,
+      "10448",
+      "2025/2026"
+    ],
+    [
+      195,
+      "112",
+      "2026 - Clausura"
+    ],
+    [
+      194,
+      "9066",
+      "2016/2017"
+    ],
+    [
+      190,
+      "9039",
+      "2015/2016"
+    ],
+    [
+      190,
+      "9039",
+      "2014/2015"
+    ]
+  ],
+  "inputs": {
+    "/root/data-platform-football/.local/tasks/2301-division-cards/cross-scope-audit.json": "56bec3ce9e86fa7c689f583c77c7fa090a11eefd94c42b1b210a9111231cd830",
+    "/root/data-platform-football/.local/tasks/2302-audit-recount/report/historical-1294-results.csv": "6d9f612f48718346dbcaa77f91c6b5079e5326af81dcd6b54cacfcd272a4c6f0",
+    "/root/data-platform-football/.local/tasks/2302-audit-recount/report/marker-results.csv": "d7aebea44bc36dae40f8d5f2fcd2c94be9fd5461c34ed79570cfe900bcde2e95",
+    "/root/data-platform-football/.local/tasks/2302-audit-recount/report/scope-summary.csv": "c63c79963304908cfafd0d0670e9cf3a93bb1e31d0582541bc55b2d845db452a",
+    "/root/data-platform-football/docs/research/fotmob-scope-2026-11-14/scope-registry.csv": "0296c2f79c42dc8258b2917baaec7d8efe4f25478c68f4cb7ae782813242a449"
+  },
+  "insufficient_known0": 1788,
+  "multi_generation_conflicts": 0,
+  "notes": [
+    "Классификация — домен matches/season; leaderboards/stages/standings/",
+    "teams/players/transfers требуют live read-only проверки фактических ID.",
+    "outcome=insufficient_evidence (known=0) — главная цель live-шага."
+  ],
+  "pairs_by_calendar_state": {
+    "current": 3752,
+    "unknown": 1788
+  },
+  "pairs_by_outcome": {
+    "confirmed": 3551,
+    "confirmed_empty": 30,
+    "confirmed_gap": 146,
+    "insufficient_evidence": 1813
+  },
+  "rules_version": "fotmob-2255-recon-v1-rules-astra-2c78bf26",
+  "schema": "fotmob.2255-reconciliation.v1"
+}
