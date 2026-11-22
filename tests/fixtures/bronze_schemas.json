@@ -1423,7 +1423,7 @@
         "match_facts_json": "varchar",
         "match_id": "bigint",
         "missing_expected_sections_json": "varchar",
-        "momentum_json": "boolean",
+        "momentum_json": "varchar",
         "page_url": "varchar",
         "payload_json": "varchar",
         "player_stats_json": "varchar",
