@@ -3463,6 +3463,19 @@ def test_xg_policy_replaces_legacy_families_and_cleans_only_displaced_scope():
     assert len(storage.deletes) == 1
 
 
+@pytest.mark.unit
+def test_published_stage_xg_counts_returns_only_requested_stages():
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("a", 1), _xg_row("b", 1), _xg_row("c", 2)])
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+
+    counts = repository.published_stage_xg_counts("L", "S", stage_ids=[1, 3])
+
+    # #1899: only requested stages are reported; the count matches what the
+    # completeness guard would compare against for stage 1.
+    assert counts == {(1, "xg-stats"): 2}
+
+
 def test_xg_completeness_rejects_stage_shrink_hidden_by_another_stage_growth():
     storage = _StageFeedStorage()
     storage.seed(rows=[_xg_row("a", 1), _xg_row("b", 1), _xg_row("c", 2)])

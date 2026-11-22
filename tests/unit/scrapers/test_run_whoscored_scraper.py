@@ -2115,3 +2115,27 @@ def test_weekly_redirect_count_visible_in_run_summary(tmp_path, caplog):
         rc = runner._finish(report, str(tmp_path / "summary.json"))
     assert rc == 0 and report["status"] == "success"
     assert "stage_xg_redirected=2" in caplog.text
+
+
+@pytest.mark.unit
+def test_weekly_shrink_retained_count_visible_in_run_summary(tmp_path, caplog):
+    import logging
+
+    scope = runner.RunnerScope.parse("ENG-Premier League=2526")
+    report = runner._new_report("weekly", [scope])
+    result = _result("stages", scope=scope.spec, metadata={
+        "stage_xg_shrink_retained": [{
+            "stage_id": 700,
+            "counts": {
+                "xg-teamstats": {"old": 2, "new": 1},
+                "xg-stats": {"old": 1, "new": 1},
+            },
+        }],
+    })
+    runner._merge_result(report, result, scope_record=report["scopes"][0])
+
+    with caplog.at_level(logging.INFO):
+        rc = runner._finish(report, str(tmp_path / "shrink-summary.json"))
+
+    assert rc == 0 and report["status"] == "success"
+    assert "stage_xg_shrink_retained=1" in caplog.text
