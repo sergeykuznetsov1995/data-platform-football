@@ -1078,3 +1078,94 @@ def test_reobserved_multi_page_merge_refreshes_lineage_beside_a_newer_sibling_pa
         'SELECT run_id, page_number FROM transfermarkt_rumour_observations ORDER BY page_number'
     ).fetchall()
     assert rows == [(later_run, 1), (later_run, 2)]  # lineage refreshed, no duplicate rows
+
+
+def _outcome_context(entity='attendance_observations'):
+    return dict(
+        capture=_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
+        scope=_attendance_scope(), extracted_at=EXTRACTED_AT, run_id='tm-core-x',
+        universe_version=UNIVERSE)
+
+
+def test_proof_statuses_carry_rows_in_no_lane():
+    context = _outcome_context()
+    # A proof certifies an absence; the referee lane allows observed_empty as a
+    # metric verdict, which must not let a populated page hide behind a proof.
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('referee_aggregate_observations', 'observed_empty', 'referees:empty',
+                    ({'observation_status': 'observed_present'},),
+                    proof='referees:confirmed_empty', **context)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('attendance_observations', 'not_applicable', 'attendance:x',
+                    ({'observation_status': 'explicit_none'}), proof='p', **context)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('player_contract_observations', 'not_applicable', 'x',
+                    ({'observation_status': 'not_applicable', 'contract_status': 'not_rendered'}),
+                    proof='p', **context)
+
+
+@pytest.mark.parametrize('entity, status, reason, verdicts', [
+    # explicit_none aggregates only explicit_none rows (donor summarise rule)
+    ('attendance_observations', 'explicit_none', 'attendance:all_rows_explicit_none',
+     ['observed_present']),
+    ('attendance_observations', 'explicit_none', 'attendance:all_rows_explicit_none',
+     ['explicit_none', 'unknown']),
+    ('club_value_observations', 'explicit_none', 'club_values:club_rows_explicit_none', ['unknown']),
+    ('player_representation_observations', 'explicit_none', 'representation:explicit_none',
+     ['unknown']),
+    # observed_present needs a present row in the presence lanes
+    ('attendance_observations', 'observed_present', 'attendance:ok', ['unknown']),
+    ('attendance_observations', 'observed_present', 'attendance:ok',
+     ['explicit_none', 'unknown']),
+    ('club_value_observations', 'observed_present', 'club_values:club_rows_present',
+     ['explicit_none']),
+    ('player_representation_observations', 'observed_present', 'representation:assigned',
+     ['explicit_none']),
+    # unknown cannot hide a present row
+    ('attendance_observations', 'unknown', 'attendance:rows_unresolved',
+     ['observed_present', 'unknown']),
+    ('club_value_observations', 'unknown', 'club_values:club_rows_unresolved',
+     ['observed_present', 'unknown']),
+    ('player_representation_observations', 'unknown', 'representation:unknown',
+     ['observed_present']),
+])
+def test_aggregate_verdict_must_agree_with_its_row_verdicts(entity, status, reason, verdicts):
+    rows = tuple({'observation_status': verdict} for verdict in verdicts)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome(entity, status, reason, rows, **_outcome_context())
+
+
+@pytest.mark.parametrize('entity, status, reason, verdicts', [
+    ('attendance_observations', 'observed_present', 'attendance:ok',
+     ['observed_present', 'explicit_none', 'unknown']),
+    ('attendance_observations', 'unknown', 'attendance:rows_unresolved',
+     ['unknown', 'explicit_none']),
+    ('attendance_observations', 'explicit_none', 'attendance:all_rows_explicit_none',
+     ['explicit_none']),
+    ('club_value_observations', 'unknown', 'club_values:club_rows_unresolved', ['unknown']),
+    # The referee page outcome certifies the page's entries; its rows carry
+    # metric-level verdicts, including a page whose every cell is a dash.
+    ('referee_aggregate_observations', 'observed_present', 'referees:page',
+     ['explicit_none', 'observed_empty', 'observed_present']),
+    ('referee_aggregate_observations', 'observed_present', 'referees:page', ['explicit_none']),
+])
+def test_consistent_aggregates_and_metric_pages_stay_valid(entity, status, reason, verdicts):
+    rows = tuple({'observation_status': verdict} for verdict in verdicts)
+    assert LaneOutcome(entity, status, reason, rows, **_outcome_context()).status == status
+
+
+def test_populated_squad_page_keeps_its_contract_cell_exception():
+    context = _outcome_context('player_contract_observations')
+    rows = tuple({'observation_status': verdict, 'contract_status': contract} for verdict, contract in (
+        ('observed_present', 'ok'), ('unknown', 'unknown'), ('not_applicable', 'not_rendered')))
+    outcome = LaneOutcome('player_contract_observations', 'observed_present', 'squad_page',
+                          rows, **context)
+    assert len(outcome.rows) == 3
+    # A contract cell still has to agree with its own mapped verdict.
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('player_contract_observations', 'observed_present', 'squad_page',
+                    ({'observation_status': 'unknown', 'contract_status': 'ok'},), **context)
+    # Core lanes keep the strict outcome == row rule.
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('rumour_observations', 'observed_present', 'rumours:page',
+                    ({'observation_status': 'explicit_none'},), **context)
