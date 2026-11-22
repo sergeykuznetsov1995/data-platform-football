@@ -219,10 +219,39 @@ def test_main_unavailable_report_still_prints_two_lines(monkeypatch, capsys):
 
 
 def test_read_report_rejects_malformed_page_digest():
-    trino = _client([[("2026-10-01",)], [("aGk=", "x")], []])
+    # Astra r2: валидное тело очереди — недоступность вызывает ТОЛЬКО дайджест,
+    # не побочное падение gzip на мусорном теле
+    trino = _client([[("2026-10-01",)], [(_page_response()[0][0], "x")], []])
     report = read_report(trino, today=TODAY)
     assert report["status"] == "unavailable"
     assert report["reason"].startswith("очередь не читается: ")
+
+
+def test_cli_trino_keeps_quotes_that_belong_to_the_value(monkeypatch):
+    from scrapers.clubelo.history_coverage import CliTrino
+
+    # CSV удваивает кавычки значения: дайджест из 64 «a» с литеральными кавычками
+    # не должен превращаться в валидный hex после обрезки краёв (Astra r2)
+    csv_line = '"x","""' + "a" * 64 + '"""'
+    monkeypatch.setattr("scrapers.clubelo.history_coverage.subprocess.run",
+                        _fake_run(csv_line + "\n"))
+    rows = CliTrino("trino-ro.sh").execute_query("SELECT 1")
+    assert rows == [("x", '"' + "a" * 64 + '"')]
+    assert not re.fullmatch("[0-9a-f]{64}", rows[0][1])
+
+
+def test_main_invalid_today_reason_is_one_line(monkeypatch, capsys):
+    import json
+
+    from scrapers.clubelo.history_coverage import main
+
+    monkeypatch.setattr("scrapers.clubelo.history_coverage.subprocess.run",
+                        _fake_run("", returncode=0))
+    assert main(["--trino", "trino-ro.sh", "--today", "2026-02-30\nUTC"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0] == "история: не посчитана — некорректная дата --today: '2026-02-30\\nUTC'"
+    assert json.loads(lines[1])["status"] == "unavailable"
 
 
 def test_main_invalid_today_prints_unavailable(monkeypatch, capsys):

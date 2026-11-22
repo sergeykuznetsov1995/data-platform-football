@@ -8,6 +8,7 @@ one status bucket, and only done and no_page count as covered. Nothing is writte
 from __future__ import annotations
 
 import base64
+import csv
 import gzip
 import re
 import subprocess
@@ -133,8 +134,9 @@ class CliTrino:
     The morning summary's cron python has no lxml and never imports this
     module; it runs ``main()`` with the platform test venv python (the same
     interpreter ``trino-ro.sh`` uses) and reads the two printed lines back.
-    Rows come back exactly as ``_trino_rows`` in the summary parses them:
-    quoted CSV fields, one row per line, NULL as an empty field.
+    Rows come back as quoted CSV fields, one row per line, NULL as an empty
+    field. ``csv.reader`` keeps quotes that belong to a value, so a corrupted
+    digest cannot masquerade as valid hex after edge trimming (Astra r2).
     """
 
     def __init__(self, trino_sh: str) -> None:
@@ -151,7 +153,7 @@ class CliTrino:
         for line in result.stdout.splitlines():
             if not line.strip():
                 continue
-            cells = [cell.strip('"') for cell in line.split('","')]
+            cells = next(csv.reader([line]))
             rows.append(tuple(cell if cell != "" else None for cell in cells))
         return rows
 
@@ -173,7 +175,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         today = None
     report = (read_report(CliTrino(args.trino), today=today)
               if today is not None
-              else _unavailable(f"некорректная дата --today: {args.today}"))
+              else _unavailable(f"некорректная дата --today: {args.today.strip()[:64]!r}"))
     print(format_line(report))
     print(json.dumps(report, ensure_ascii=False, default=str))
     return 0
