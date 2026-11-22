@@ -3,6 +3,7 @@ import hashlib
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timezone
 import json
+import re
 
 import pytest
 
@@ -40,6 +41,10 @@ def isolated_paths(monkeypatch, tmp_path):
     monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
 
 
+_COLUMN_PROBE = re.compile(
+    r'^\s*SELECT \* FROM (?:iceberg\.bronze\.)?(transfermarkt_\w+) WHERE 1 = 0\s*$', re.I)
+
+
 class CoreCursor(MemoryCursor):
     def execute(self, sql, params=()):
         if 'MERGE INTO iceberg.ops.transfermarkt_core_receipts_v1' in sql:
@@ -51,7 +56,15 @@ class CoreCursor(MemoryCursor):
             cur.execute(f'INSERT INTO {RECEIPTS} ({columns}) VALUES ({marks})', bound)
             self.description = None
             return
-        return super().execute(sql, params)
+        super().execute(sql, params)
+        # sqlite reports no column types: the schema preflight's probe gets the
+        # declared ones, as Trino reports them.
+        probe = _COLUMN_PROBE.match(sql)
+        if probe and self.description:
+            declared = {row[1]: (row[2] or '').lower() for row in self.db.sql.execute(
+                f'PRAGMA table_info({probe[1]})')}
+            self.description = [(column[0], declared.get(column[0])) for column in self.description]
+        return self.description
 
 
 class CoreDB(MemoryDB):

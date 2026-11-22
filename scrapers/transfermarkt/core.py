@@ -489,6 +489,8 @@ def _render(
     )
     if any(value is not None and not isinstance(value, (str, int, bool)) for value in row.values()):
         raise CoreParseError('row_value_not_json_safe')
+    if any(type(value) is int and not -2 ** 63 <= value < 2 ** 63 for value in row.values()):
+        raise CoreParseError('row_value_exceeds_bigint')
     return row
 
 
@@ -721,11 +723,21 @@ def plan_for_outcome(
         raise CoreParseError('row_scope_mismatch')
     if not _rows_match_revisions(outcome):
         raise CoreParseError('revision_differs_from_rows')
+    # Rows are mutable after construction: the verdict policy is applied to
+    # the rows as they are now, not as they were when the outcome was built.
+    if not _status_matches_rows(entity, outcome.status, outcome.rows):
+        raise CoreParseError('status_rows_mismatch')
 
     from scrapers.transfermarkt.native_writer import NativeWritePlan
 
-    _check_scope_against_capture(entity, scope_values, outcome.capture)
     capture = outcome.capture
+    # The plan's clock is evidence, not a caller's choice: the newest walked
+    # page of a snapshot, otherwise the capture itself.
+    evidence_clock = (max(page[2] for page in outcome.pages) if outcome.pages
+                      else capture.captured_at if capture is not None else None)
+    if evidence_clock is not None and captured_at != evidence_clock:
+        raise CoreParseError('captured_at_differs_from_evidence')
+    _check_scope_against_capture(entity, scope_values, capture)
     evidence = ()
     if capture is not None:
         row = outcome.rows[0] if outcome.rows else {}

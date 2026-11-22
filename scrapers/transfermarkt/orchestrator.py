@@ -291,6 +291,11 @@ def _capture(request, result, raw_loader):
     )
 
 
+def _freshness_clock(outcome):
+    """The newest walked page of the outcome, or its own capture."""
+    return max((page[2] for page in outcome.pages), default=outcome.capture.captured_at)
+
+
 def _summary(outcome):
     return {
         "entity": outcome.entity,
@@ -617,7 +622,7 @@ class CoreRun:
             if captured_at is not None and writer is not None and connection_factory is not None:
                 # A multi-page merge writes one plan per contributing page capture.
                 entries = [
-                    (item, item.capture.captured_at, _outcome_scope_values(item, request, plan))
+                    (item, _freshness_clock(item), _outcome_scope_values(item, request, plan))
                     for item in unit
                     if item.status in core.CONCLUSIVE_CORE_STATUSES and item.capture is not None
                 ]

@@ -306,13 +306,20 @@ class NativeWritePlan:
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
+        # The plan keeps the rows it validated: the caller's dictionaries stay
+        # mutable, hashing and writing must see the validated content.
+        object.__setattr__(self, 'rows', tuple(dict(row) for row in self.rows))
         self._check_pages()
         clock = _timestamp(self.captured_at)
+        if self.pages:
+            # The snapshot is as fresh as its newest walked page, rowless or not.
+            if clock != max(_timestamp(page[2]) for page in self.pages):
+                raise ValueError('core captured_at must equal the newest walked page')
         if self.rows:
             newest_at, capture_id = max(
                 (_timestamp(row['captured_at']), row['source_capture_id']) for row in self.rows
             )
-            if clock != newest_at:
+            if clock < newest_at or (clock != newest_at and not self.pages):
                 raise ValueError('core captured_at must equal the newest row capture')
             if self.capture_id and self.capture_id != capture_id:
                 raise ValueError('core capture_id must equal the newest row capture id')
@@ -369,6 +376,13 @@ class NativeWritePlan:
                 raise ValueError(f'core plan row is missing columns: {sorted(missing)}')
             if any(value is not None and not isinstance(value, (int, str)) for value in row.values()):
                 raise ValueError('core plan row values must be strings, integers or null')
+            if any(type(value) is int and not -2 ** 63 <= value < 2 ** 63 for value in row.values()):
+                # Such a row fails only inside the insertion, after a
+                # replacement has already deleted the scope.
+                raise ValueError('core plan row integer exceeds the bigint range')
+            if ('observed_at' in self.natural_keys and row.get('observed_at') is not None
+                    and _timestamp(row['observed_at']) != _timestamp(row['captured_at'])):
+                raise ValueError('core observation clock must equal its capture clock')
             if any(row[col] in ('', None) for col in required):
                 raise ValueError('core plan row has empty lineage, key or capture columns')
             if any(str(row[col]) != str(value) for col, value in zip(self.scope_columns, self.scope_values)):
@@ -444,8 +458,20 @@ def _committed_clock(connection, table_sql: str, params: tuple) -> object:
 # decided per capture, never against the sibling's clock. What keeps such a
 # plan honest is that no other capture may already own one of its keys.
 _MULTI_CAPTURE_MERGE_ENTITIES = frozenset({
-    'rumour_observations', 'referee_aggregate_observations',
+    'rumour_observations', 'referee_aggregate_observations', 'club_value_observations',
 })
+# Pages of the referee directory re-own rows between walks: the donor keeps
+# the first page that lists a referee, and a later walk may list it earlier.
+# Every other capture is exactly its committed rows, rumours included.
+_PAGE_OWNED_ROWS_ENTITIES = frozenset({'referee_aggregate_observations'})
+# Varchar key columns that narrow the ownership lookup of a large scope; a
+# lane without an entry is read scope-wide (date and timestamp key columns
+# are never bound as parameters).
+_KEY_PREFILTER_COLUMNS = {
+    'rumour_observations': ('rumour_identity', 'subject_id', 'correction_identity'),
+    'referee_aggregate_observations': (
+        'referee_id', 'competition_id', 'edition_id', 'metric'),
+}
 _CAPTURE_KEY_COLUMNS = frozenset({'observed_at', 'source_capture_id'})
 # The attendance edition is the one replacement snapshot that spans several
 # walked pages; every other replacement is one captured page.
@@ -466,26 +492,29 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
     snapshot is then checked page by page, rowless pages included: its newest
     clock says nothing about a stale page riding along on a fresh sibling.
     """
-    if plan.write_mode == 'merge' and plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES and _capture_pinned(plan):
+    if plan.write_mode == 'merge' and _capture_pinned(plan):
         _guard_key_owners(connection, plan)
-        return
+        if plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES:
+            return
     committed = _committed_clock(
         connection,
         f'SELECT MAX(captured_at) FROM {plan.full_table} WHERE {plan.scope_sql()}',
         tuple(plan.scope_values),
     )
-    if committed is None:
-        scope_json = write_journal._canonical(
-            list(zip(plan.scope_columns, plan.scope_values))).decode()
-        committed = _committed_clock(
-            connection,
-            f'SELECT MAX(captured_at) FROM {CORE_RECEIPTS_TABLE} '
-            'WHERE target_table = ? AND scope_values_json = ?',
-            (plan.full_table, scope_json),
-        )
-    if committed is None:
+    scope_json = write_journal._canonical(
+        list(zip(plan.scope_columns, plan.scope_values))).decode()
+    acknowledged = _committed_clock(
+        connection,
+        f'SELECT MAX(captured_at) FROM {CORE_RECEIPTS_TABLE} '
+        'WHERE target_table = ? AND scope_values_json = ?',
+        (plan.full_table, scope_json),
+    )
+    # A rowless page leaves no row: the receipt is the only proof of how
+    # fresh the committed scope really is.
+    clocks = [_timestamp(value) for value in (committed, acknowledged) if value is not None]
+    if not clocks:
         return
-    if _timestamp(committed) > _timestamp(plan.captured_at):
+    if max(clocks) > _timestamp(plan.captured_at):
         raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
     if plan.write_mode == 'replace' and (plan.rows or plan.pages):
         _guard_source_pages(connection, plan)
@@ -513,36 +542,41 @@ def _guard_source_pages(connection, plan: NativeWritePlan) -> None:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
+def _key_cells(values) -> tuple:
+    return tuple(_canonical_cell(value) for value in values)
+
+
 def _guard_key_owners(connection, plan: NativeWritePlan) -> None:
     """A natural key that names its capture belongs to exactly one capture.
 
     Two captures can share a clock (a replayed page, a re-stored body): the
-    merge would replace the other capture's observation row by row. Only the
-    varchar part of the key is bound to the query; the clock is compared here.
+    merge would replace the other capture's observation row by row. The
+    lookup binds only varchar key columns; dates, clocks and the rest of the
+    key are compared here against the incoming row.
     """
-    if not plan.rows:
+    if not plan.rows or 'source_capture_id' in plan.natural_keys:
         return
-    keys = [column for column in plan.natural_keys if column not in _CAPTURE_KEY_COLUMNS]
-    planned = {tuple(str(row[column]) for column in keys) for row in plan.rows}
+    keys = [column for column in plan.natural_keys if column != 'source_capture_id']
+    prefilter = _KEY_PREFILTER_COLUMNS.get(plan.entity, ())
+    planned = {_key_cells(row[column] for column in keys) for row in plan.rows}
     matches = ' OR '.join(
-        '(' + ' AND '.join(f'{column} = ?' for column in keys) + ')' for _ in plan.rows) if keys else '1 = 1'
+        '(' + ' AND '.join(f'{column} = ?' for column in prefilter) + ')' for _ in plan.rows
+    ) if prefilter else '1 = 1'
     params = [*plan.scope_values, plan.capture_id]
     for row in plan.rows:
-        params.extend(row[column] for column in keys)
+        params.extend(row[column] for column in prefilter)
     cursor = connection.cursor()
     try:
         rows = _query_rows(
             cursor,
-            f"SELECT {', '.join([*keys, 'source_capture_id', 'observed_at'])} FROM {plan.full_table} "
+            f"SELECT {', '.join(keys)}, source_capture_id FROM {plan.full_table} "
             f"WHERE {plan.scope_sql()} AND source_capture_id <> ? AND ({matches})",
             tuple(params),
         )
     finally:
         cursor.close()
-    for row in rows:
-        if (tuple(str(cell) for cell in row[:len(keys)]) in planned
-                and _timestamp(row[len(keys) + 1]) == _timestamp(plan.captured_at)):
-            raise RuntimeError('core natural key is owned by another capture: ' + plan.table)
+    if any(_key_cells(row[:len(keys)]) in planned for row in rows):
+        raise RuntimeError('core natural key is owned by another capture: ' + plan.table)
 
 
 def _canonical_cell(value) -> Any:
@@ -635,8 +669,11 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
     existing = _read_plan_rows(connection, plan)
     if plan.write_mode == 'replace':
         # A refreshed snapshot reuses the pages it still shares with the
-        # committed one: each of those captures keeps its own integrity.
+        # committed one: each of those captures keeps its own integrity, the
+        # rowless ones included.
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
+        for _url, capture_id, _clock in plan.pages:
+            planned.setdefault(capture_id, [])
         for capture_id, rows in planned.items():
             shared = committed.get(capture_id)
             if shared is not None and (len(shared) != len(rows)
@@ -649,20 +686,21 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
         return 'refresh' if refreshed else 'written'
     if not existing:
         return 'pending'
-    partner = plan.rows
-    if plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES:
-        # Pages of one unit re-own rows between walks (the donor keeps the
-        # first page that lists a referee): only the keys this plan still
-        # holds are compared; the other committed rows stay the observations
-        # they were. Every other merge lane keeps the exact same-capture rule.
+    partner, complete = plan.rows, True
+    if plan.entity in _PAGE_OWNED_ROWS_ENTITIES:
+        # Only the keys this plan still holds are compared; the other
+        # committed rows of the capture stay the observations they were.
         held = {_plan_key(plan, row) for row in plan.rows}
         existing = [row for row in existing if _plan_key(plan, row) in held]
         committed_keys = {_plan_key(plan, row) for row in existing}
         partner = [row for row in plan.rows if _plan_key(plan, row) in committed_keys]
+        complete = len(existing) == len(plan.rows)
     if existing and not _rows_equal(existing, partner):
         if not _rows_equal_ignoring_lineage(existing, partner):
             raise RuntimeError('core replay differs from committed capture: ' + plan.table)
-        return 'refresh'
+        # A lineage-only refresh may skip the guards only when every incoming
+        # key is already committed under this very capture.
+        return 'refresh' if complete else 'pending'
     return 'written' if existing and len(existing) == len(plan.rows) else 'pending'
 
 
@@ -720,7 +758,7 @@ def _physical_proof(connection, plan: NativeWritePlan) -> dict:
             'physical_hash': _digest([]), 'expected_rows': 0, 'status_counts': {},
         }
     persisted = _read_plan_rows(connection, plan)
-    if _uses_merge(plan) and plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES:
+    if _uses_merge(plan) and plan.entity in _PAGE_OWNED_ROWS_ENTITIES:
         # An earlier walk may have left rows of this capture that another
         # page owns now: this plan verifies the rows it still holds.
         held = {_plan_key(plan, row) for row in plan.rows}
@@ -855,8 +893,8 @@ def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
             scopes.add(scope)
 
 
-def _ddl_columns(ddl: str) -> set[str]:
-    """Column names declared by a plan's CREATE TABLE statement."""
+def _ddl_columns(ddl: str) -> dict[str, str]:
+    """Column names and types declared by a plan's CREATE TABLE statement."""
     head = ddl.split('WITH', 1)[0]
     body = head[head.index('(') + 1:head.rindex(')')]
     parts, current, depth = [], '', 0
@@ -871,7 +909,12 @@ def _ddl_columns(ddl: str) -> set[str]:
         else:
             current += char
     parts.append(current)
-    return {part.split()[0].strip('"`[]') for part in parts if part.strip()}
+    columns = {}
+    for part in parts:
+        declared = fullmatch(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*', part, re.S)
+        if declared:
+            columns[declared[1]] = declared[2].replace(' ', '').lower()
+    return columns
 
 
 def _guard_table_schema(connection, plan: NativeWritePlan) -> None:
@@ -879,11 +922,11 @@ def _guard_table_schema(connection, plan: NativeWritePlan) -> None:
 
     Section lanes reuse the names of tables the retired donor stack left
     behind, and CREATE TABLE IF NOT EXISTS does not recreate those. Refuse
-    before any mutation: a column the plan's DDL declares is missing, or the
-    table carries a column that belongs neither to that DDL nor to the plan.
+    before any mutation: a column the plan's DDL declares is missing or has
+    another type, or the table carries a column that belongs neither to that
+    DDL nor to the plan. A rowless replacement deletes the scope, so it is
+    checked as well.
     """
-    if not plan.rows:
-        return
     cursor = connection.cursor()
     try:
         try:
@@ -892,12 +935,22 @@ def _guard_table_schema(connection, plan: NativeWritePlan) -> None:
             if write_journal._table_not_found(exc):
                 return
             raise
-        existing = {column[0] for column in cursor.description or []}
+        existing = {column[0]: str(column[1] or '').replace(' ', '').lower()
+                    for column in cursor.description or []}
     finally:
         cursor.close()
+    if not existing:
+        return
     declared = _ddl_columns(plan.ddl)
     carried = {column for row in plan.rows for column in row}
-    if existing and (not declared <= existing or existing - declared - carried):
+    # An engine that reports no type for a column leaves it to the names.
+    mistyped = [name for name, kind in declared.items()
+                if name in existing and existing[name] not in ('', 'none', 'null')
+                and existing[name] != kind]
+    # A rowless replacement only deletes: what it declares must be there; a
+    # column it would fill must not be foreign to the table as well.
+    foreign = set(existing) - set(declared) - carried if plan.rows else set()
+    if set(declared) - set(existing) or foreign or mistyped:
         raise RuntimeError('core table schema differs from the plan: ' + plan.table)
 
 
@@ -1020,9 +1073,17 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
             descriptor['scope_values'] = tuple(descriptor['scope_values'])
             plans.append(NativeWritePlan(**descriptor))
         run = body['identity']['run_id']
-        receipts.append(write_core_bundle(
+        receipt = write_core_bundle(
             connection_factory, writer, plans, run_id=run,
             universe_version=body['evidence'].get('universe_version', 'core-universe-v1'),
             committed_at=body['evidence'].get('committed_at', ''),
-        ))
+        )
+        saved = body['identity'].get('digest')
+        if saved != _digest({'plans': [plan.plan_sha256() for plan in plans], 'run_id': run}):
+            # The intent predates the current plan digest. Its identity is
+            # migrated so that the verified recovery neither repeats nor
+            # leaves the original intent pending.
+            write_journal.record_receipt(saved, {**receipt, 'plan_sha256': saved})
+            write_journal.finish_intent(path)
+        receipts.append(receipt)
     return receipts

@@ -1005,9 +1005,9 @@ def _attendance_plan(captures, extracted_at=EXTRACTED_AT):
     outcome = sections.extract_attendance_observations(
         captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
-    # The plan clock is the outcome's capture: the newest page WITH rows.
+    # The plan clock is the snapshot's freshness: its newest walked page.
     return core.plan_for_outcome(
-        outcome, captured_at=outcome.capture.captured_at,
+        outcome, captured_at=max(page[2] for page in outcome.pages),
         scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
 
 
@@ -2253,9 +2253,9 @@ def test_observation_clock_must_equal_its_capture_clock():
     outcome, = _referee_directory((other,))
     outcome = _replace(outcome, rows=tuple(
         {**row, 'observed_at': REFEREE_CAPTURED} for row in outcome.rows))
-    plan = core.plan_for_outcome(outcome, captured_at=later,
-                                 scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
     with pytest.raises((ValueError, RuntimeError)):
+        plan = core.plan_for_outcome(outcome, captured_at=later,
+                                     scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
         _bundle(db, [plan], later)
     assert db.sql.execute(
         "SELECT value FROM transfermarkt_referee_aggregate_observations "
