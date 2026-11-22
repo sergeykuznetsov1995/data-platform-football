@@ -897,6 +897,8 @@ def test_player_runner_offline_replay_writes_both_tables_without_network(
     assert receipts["sofascore_player_universe"]["rows"] == result[
         "universe_players"
     ]
+    assert "sofascore_player_profile" in receipts
+    assert "sofascore_player_season_stats" in receipts
 
 
 def _player_records_for(player_id: str, *, broken: bool = False) -> dict:

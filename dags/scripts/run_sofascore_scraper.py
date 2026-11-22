@@ -2635,7 +2635,11 @@ def _run_player_capture(
                     ).require()
 
             with bronze_writer_lock():
-                ppath = scraper.save_to_iceberg(
+                # #1367: publication receipts for every published table —
+                # the replay validator fails closed on a receipt-less one.
+                ppath = _save_publication(
+                    scraper,
+                    results,
                     df=profile_df,
                     table_name="sofascore_player_profile",
                     partition_cols=["league", "season"],
@@ -2645,7 +2649,9 @@ def _run_player_capture(
                 results["rows"] = len(profile_df)
                 results["profile_players"] = profile_df["player_id"].nunique()
                 if not season_df.empty:
-                    spath = scraper.save_to_iceberg(
+                    spath = _save_publication(
+                        scraper,
+                        results,
                         df=season_df,
                         table_name="sofascore_player_season_stats",
                         partition_cols=["league", "season"],
