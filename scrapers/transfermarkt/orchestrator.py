@@ -26,6 +26,7 @@ class CoreRunError(RuntimeError):
 
 Fetch = Callable[..., FetchOutcome]
 TM_BASE = "https://www.transfermarkt.com"
+TM_API_BASE = "https://tmapi.transfermarkt.technology"
 
 
 def squad_url(club_slug: str, club_id: str, saison_year: int) -> str:
@@ -57,6 +58,12 @@ def club_values_url(slug: str, competition_id: str, stichtag: str = '') -> str:
     return f"{url}/stichtag/{stichtag}" if stichtag else url
 
 
+def achievements_url(recipient_type: str, recipient_id: str, slug: str = '') -> str:
+    if recipient_type == 'coach':
+        return f"{TM_BASE}/{slug}/erfolge/trainer/{recipient_id}"
+    return f"{TM_API_BASE}/{recipient_type}/{recipient_id}/achievement"
+
+
 @dataclass(frozen=True)
 class ClubTarget:
     club_id: str
@@ -81,6 +88,13 @@ class ClubValueTarget:
 
 
 @dataclass(frozen=True)
+class AchievementHolderTarget:
+    recipient_type: str
+    recipient_id: str
+    slug: str = ''
+
+
+@dataclass(frozen=True)
 class CoreScopePlan:
     league: str
     season: str
@@ -93,6 +107,7 @@ class CoreScopePlan:
     coach_profile_ids: tuple[tuple[str, str], ...] = ()
     attendance_editions: tuple[AttendanceEditionTarget, ...] = ()
     club_value_targets: tuple[ClubValueTarget, ...] = ()
+    achievement_holders: tuple[AchievementHolderTarget, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -124,6 +139,12 @@ class _Request:
     coach_id: str = ""
     competition_id: str = ""
     edition_id: str = ""
+    recipient_id: str = ""
+    recipient_type: str = ""
+
+    @property
+    def as_json(self) -> bool:
+        return bool(self.player_id) or self.label in ("player_achievement", "club_achievement")
 
     def scope_values(self, plan):
         # The replacement scope follows the entity's own scope columns:
@@ -141,6 +162,8 @@ class _Request:
             return {"competition_id": self.competition_id, "edition_id": self.edition_id}
         if self.label == "club_values":
             return {"competition_id": self.competition_id}
+        if self.label.endswith("_achievement"):
+            return {"recipient_type": self.recipient_type, "recipient_id": self.recipient_id}
         raise CoreRunError(f"{self.label} request has no replacement scope")
 
 
@@ -162,6 +185,14 @@ def _requests(plan: CoreScopePlan):
     for target in plan.club_value_targets:
         url = club_values_url(target.slug or target.competition_id, target.competition_id, target.stichtag)
         yield _Request("club_values", url, competition_id=target.competition_id)
+    for holder in plan.achievement_holders:
+        if holder.recipient_type not in ("player", "club", "coach"):
+            raise CoreRunError("achievements:invalid_recipient_type")
+        if holder.recipient_type == "coach" and not holder.slug:
+            raise CoreRunError("achievements:coach_slug_missing")
+        url = achievements_url(holder.recipient_type, holder.recipient_id, holder.slug)
+        yield _Request(f"{holder.recipient_type}_achievement", url,
+                       recipient_type=holder.recipient_type, recipient_id=holder.recipient_id)
 
 
 def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
@@ -174,7 +205,7 @@ def _capture(request, result, raw_loader):
         if record.content_hash != result.raw_body_hash or record.url != request.url:
             raise CoreRunError(f"{request.label} raw capture does not match its outcome")
         captured_at = _normalise_ts(record.fetched_at)
-    elif request.player_id:
+    elif request.as_json:
         # A JSON payload cannot be re-serialised to its exact source bytes.
         raise CoreRunError(f"{request.label} capture requires its raw body loader")
     else:
@@ -215,6 +246,9 @@ _ENTITIES = {
     "coach_profile": ("coach_profiles",),
     "attendance": ("attendance_observations",),
     "club_values": ("club_value_observations",),
+    "player_achievement": ("achievement_observations",),
+    "club_achievement": ("achievement_observations",),
+    "coach_achievement": ("achievement_observations",),
 }
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
 
@@ -268,6 +302,11 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         unit = core.extract_career_observations(capture, scope, **metadata)
     elif request.label == "club_values":
         unit = sections.extract_club_value_observations(capture, scope, **metadata)
+    elif request.label.endswith("_achievement"):
+        unit = sections.extract_achievement_observations(
+            capture, scope, recipient_type=request.recipient_type,
+            recipient_id=request.recipient_id, **metadata,
+        )
     else:
         unit = core.extract_coach_profile(capture, scope, **metadata)
     return (unit if isinstance(unit, (tuple, list)) else (unit,)), capture.captured_at
@@ -307,7 +346,7 @@ class CoreRun:
         captured_units = []
         fetched = cache_hits = 0
         for request in _requests(plan):
-            as_json = bool(request.player_id)
+            as_json = request.as_json
             page = request
             captures = []
             while True:

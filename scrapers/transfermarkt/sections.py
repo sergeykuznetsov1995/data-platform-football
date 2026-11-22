@@ -8,8 +8,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+import json
 
-from . import attendance, club_values, core
+from bs4 import ParserRejectedMarkup
+
+from . import achievements, attendance, club_values, core
 
 
 def extract_attendance_observations(
@@ -109,3 +112,44 @@ def extract_club_value_observations(
             status, reason = 'unknown', 'club_rows_unresolved'
         outcomes.append(core.LaneOutcome(entity, status, 'club_values:' + reason, tuple(rows), **context))
     return tuple(outcomes)
+
+
+def extract_achievement_observations(
+    capture: core.SourceCapture, scope: core.ScopeContext, *, recipient_type: str, recipient_id: str,
+    extracted_at: str, universe_version: str,
+) -> core.LaneOutcome:
+    entity = 'achievement_observations'
+    if capture.endpoint != f'{recipient_type}_achievement':
+        raise core.CoreParseError('achievements:invalid_endpoint')
+    core._check_scope_against_capture(
+        entity, {'recipient_type': recipient_type, 'recipient_id': recipient_id}, capture,
+    )
+    context = core._context(capture, scope, extracted_at, universe_version)
+    try:
+        source = capture.text if recipient_type == 'coach' else json.loads(capture.text)
+    except (ValueError, RecursionError):
+        reason = 'achievements:invalid_utf8' if recipient_type == 'coach' else 'achievements:invalid_json'
+        return core.LaneOutcome(entity, 'error', reason, **context)
+    try:
+        result = achievements.parse_achievements(source, recipient_type=recipient_type, recipient_id=recipient_id)
+    except achievements.AchievementParseError as exc:
+        return core.LaneOutcome(entity, 'error', 'achievements:' + exc.reason, **context)
+    except (ParserRejectedMarkup, ValueError, RecursionError):
+        return core.LaneOutcome(entity, 'error', 'achievements:invalid_source_data', **context)
+
+    if result.status == 'observed_empty':
+        return core.LaneOutcome(entity, result.status, 'achievements:empty_collection',
+                                proof=f'achievements:empty_collection:{recipient_type}', **context)
+
+    reason = 'achievements:row'
+    rows = []
+    for achievement in result.rows:
+        values = achievement.as_dict()
+        if values['recipient_id'] != recipient_id or values['recipient_type'] != recipient_type:
+            raise core.CoreParseError('row_scope_mismatch')
+        rows.append(core._render(
+            entity, values, observation_status='observed_present', status_reason=reason,
+            parser_revision=achievements.ACHIEVEMENT_PARSER_REVISION,
+            schema_revision=str(achievements.ACHIEVEMENT_SCHEMA_REVISION), **context,
+        ))
+    return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)

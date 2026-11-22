@@ -34,7 +34,7 @@ _CAPTURE_RE = re.compile(r'^[0-9a-f]{64}$')
 _ENDPOINTS = frozenset({
     'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history',
     # stage C sections (#2405)
-    'attendance', 'club_values',
+    'attendance', 'club_values', 'player_achievement', 'club_achievement', 'coach_achievement',
 })
 _OUTCOMES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
 _PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
@@ -61,7 +61,7 @@ CORE_ENTITIES = (
     'squad_memberships', 'player_attribute_observations', 'player_contract_observations',
     'market_value_points', 'transfer_events', 'coach_profiles', 'coach_stints',
     # stage C sections (#2405)
-    'attendance_observations', 'club_value_observations',
+    'attendance_observations', 'club_value_observations', 'achievement_observations',
 )
 CORE_TABLES = {entity: f'transfermarkt_{entity}' for entity in CORE_ENTITIES}
 CORE_NATURAL_KEYS = {
@@ -75,6 +75,7 @@ CORE_NATURAL_KEYS = {
     # stage C sections (#2405)
     'attendance_observations': ('competition_id', 'edition_id', 'club_id', 'observed_at'),
     'club_value_observations': ('club_id', 'value_date', 'observed_at', 'source_point_id'),
+    'achievement_observations': ('recipient_type', 'recipient_id', 'source_capture_id', 'source_row_id'),
 }
 CORE_SCOPE_COLUMNS = {
     'squad_memberships': ('league', 'season', 'club_id'),
@@ -87,6 +88,7 @@ CORE_SCOPE_COLUMNS = {
     # stage C sections (#2405)
     'attendance_observations': ('competition_id', 'edition_id'),
     'club_value_observations': ('club_id',),
+    'achievement_observations': ('recipient_type', 'recipient_id'),
 }
 CORE_WRITE_MODES = {
     'squad_memberships': 'replace',
@@ -99,6 +101,7 @@ CORE_WRITE_MODES = {
     # stage C sections (#2405)
     'attendance_observations': 'replace',
     'club_value_observations': 'merge',
+    'achievement_observations': 'merge',
 }
 
 SQUAD_MEMBERSHIP_BUSINESS = (
@@ -144,6 +147,10 @@ CLUB_VALUE_BUSINESS = (
     'value_amount', 'source_point_id', 'source_point_kind', 'source_value_raw',
     'reconciliation_status', 'observed_at',
 )
+ACHIEVEMENT_BUSINESS = (
+    'recipient_type', 'recipient_id', 'title', 'award_id', 'trophy_id', 'season_id',
+    'season', 'result', 'club_id', 'club_name', 'competition_id', 'source_row_id',
+)
 _BUSINESS_COLUMNS = {
     'squad_memberships': SQUAD_MEMBERSHIP_BUSINESS,
     'player_attribute_observations': ATTRIBUTE_BUSINESS,
@@ -155,6 +162,7 @@ _BUSINESS_COLUMNS = {
     # stage C sections (#2405)
     'attendance_observations': ATTENDANCE_BUSINESS,
     'club_value_observations': CLUB_VALUE_BUSINESS,
+    'achievement_observations': ACHIEVEMENT_BUSINESS,
 }
 # observed_at serves both roles in the squad and coach tables.
 CORE_COLUMNS = {
@@ -648,7 +656,23 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
     the entity it belongs to, so a swapped club/player scope fails here."""
     if capture is None:
         return
-    path = urlsplit(capture.url).path
+    url = urlsplit(capture.url)
+    path = url.path
+    if entity == 'achievement_observations':
+        recipient_type = scope_values['recipient_type']
+        recipient_id = scope_values['recipient_id']
+        if capture.endpoint != f'{recipient_type}_achievement':
+            raise CoreParseError('row_scope_mismatch')
+        if recipient_type == 'coach':
+            match = re.fullmatch(r'/[A-Za-z0-9-]+/erfolge/trainer/([1-9][0-9]*)', path)
+            if url.hostname != 'www.transfermarkt.com' or match is None or match[1] != recipient_id:
+                raise CoreParseError('row_scope_mismatch')
+        else:
+            match = re.fullmatch(r'/(player|club)/([1-9][0-9]*)/achievement', path)
+            if (url.hostname != 'tmapi.transfermarkt.technology' or match is None
+                    or match.groups() != (recipient_type, recipient_id)):
+                raise CoreParseError('row_scope_mismatch')
+        return
     if entity == 'attendance_observations' and {'competition_id', 'edition_id'} <= scope_values.keys():
         match = re.fullmatch(
             r'/[A-Za-z0-9_-]+/besucherzahlen/wettbewerb/([A-Za-z0-9_-]+)/saison_id/([0-9]+)',

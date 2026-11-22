@@ -1,5 +1,6 @@
-"""Stage-C section lanes: attendance (T10) and club values (T11) observations (#2405)."""
+"""Stage-C section lanes: attendance (T10), club values (T11), achievements (T8) (#2405)."""
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from scrapers.transfermarkt.orchestrator import (
     AttendanceEditionTarget,
     ClubValueTarget,
     CoreRun,
+    CoreRunError,
     CoreScopePlan,
     attendance_url,
     club_values_url,
@@ -347,3 +349,155 @@ def test_planned_urls_cover_the_section_targets():
     assert attendance_url('premier-league', 'GB1', 2025) == ATTENDANCE_START
     assert club_values_url('v-league-1', 'VIE1', '2024-06-01') == \
         CLUB_VALUE_URL + '/stichtag/2024-06-01'
+
+
+# --------------------------------------------------------------------------- T8
+ACHIEVEMENTS_URL = 'https://tmapi.transfermarkt.technology/player/7/achievement'
+ACHIEVEMENTS_PACKET = {
+    'success': True, 'message': 'ok',
+    'data': {
+        'aggregated': [{'id': 17, 'name': 'Copa É', 'count': 2}],
+        'achievements': [
+            {
+                'id': '0017', 'trophyId': 31, 'seasonId': '02022',
+                'season': {'id': 2022, 'name': ' 2022 '},
+                'club': {'name': ' Example   XI ', 'id': 61},
+                'competition': {'id': 'Q1'}, 'result': ' Runner-up ',
+                'details': {'playerId': '007', 'clubId': 61, 'competitionId': 'Q1'},
+            },
+            {
+                'id': 17, 'name': 'Detail title', 'seasonId': 2025,
+                'season': {'id': 2025, 'name': '25/26'}, 'trophyId': 0,
+                'club': {'id': '', 'name': 'National XI'}, 'competition': {'id': ''},
+                'details': {'playerId': 0, 'competitionId': 0, 'clubId': 0},
+                'sourceRowId': '0041',
+            },
+        ],
+    },
+}
+ACHIEVEMENTS_EMPTY = {
+    'success': True, 'message': 'ok', 'data': {'aggregated': [], 'achievements': []},
+}
+
+
+def _achievement_capture(payload: dict) -> SourceCapture:
+    body = json.dumps(payload).encode('utf-8')
+    digest = hashlib.sha256(body).hexdigest()
+    return SourceCapture(
+        url=ACHIEVEMENTS_URL, endpoint='player_achievement', body=body,
+        capture_id=digest, body_hash=digest, captured_at=CLUB_CAPTURED,
+    )
+
+
+def _achievement_scope() -> ScopeContext:
+    return ScopeContext(
+        league='GB1', season='2526', scope_id='tm-scope-t8', cycle_id='tm-cycle-t8',
+    )
+
+
+def test_achievement_lane_maps_tmapi_packet_rows():
+    outcome = sections.extract_achievement_observations(
+        _achievement_capture(ACHIEVEMENTS_PACKET), _achievement_scope(),
+        recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE,
+    )
+    assert outcome.entity == 'achievement_observations'
+    assert outcome.status == 'observed_present'
+    assert outcome.status_reason == 'achievements:row'
+    assert len(outcome.rows) == 2
+    first, second = outcome.rows
+    assert (first['title'], first['club_name'], first['result']) == (
+        'Copa É', 'Example XI', 'Runner-up')
+    assert first['recipient_id'] == '7'
+    assert first['parser_revision'] == 'achievements-v1'
+    assert first['source_capture_id'] == outcome.capture.capture_id
+    assert second['source_row_id'] == 'source:41'
+    keys = [tuple(row[column] for column in core.CORE_NATURAL_KEYS['achievement_observations'])
+            for row in outcome.rows]
+    assert len(set(keys)) == 2
+    assert core.build_core_dq([outcome])['passed'] is True
+
+
+def test_achievement_lane_marks_empty_collection_with_proof():
+    outcome = sections.extract_achievement_observations(
+        _achievement_capture(ACHIEVEMENTS_EMPTY), _achievement_scope(),
+        recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE,
+    )
+    assert outcome.status == 'observed_empty'
+    assert outcome.proof == 'achievements:empty_collection:player'
+    assert outcome.rows == ()
+
+
+def test_achievement_lane_maps_broken_packet_to_error():
+    broken = SourceCapture(
+        url=ACHIEVEMENTS_URL, endpoint='player_achievement', body=b'{"success": false}',
+        capture_id=hashlib.sha256(b'{"success": false}').hexdigest(),
+        body_hash=hashlib.sha256(b'{"success": false}').hexdigest(),
+        captured_at=CLUB_CAPTURED,
+    )
+    outcome = sections.extract_achievement_observations(
+        broken, _achievement_scope(), recipient_type='player', recipient_id='7',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
+    )
+    assert outcome.status == 'error'
+    assert outcome.status_reason.startswith('achievements:')
+
+
+class _JsonFetch:
+    """Serve one JSON fixture through the client fetch contract."""
+
+    def __init__(self, url, payload, status_code=200):
+        self.url, self.payload, self.status_code = url, payload, status_code
+
+    def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+        assert url == self.url
+        body = json.dumps(self.payload).encode('utf-8')
+        return FetchOutcome(
+            status=FetchStatus.OK, value=self.payload,
+            raw_capture_id=hashlib.sha256(body).hexdigest(),
+            raw_body_hash=hashlib.sha256(body).hexdigest(),
+            raw_fetched_at=CLUB_CAPTURED, cache_hit=False, status_code=self.status_code,
+        )
+
+    def raw_loader(self, capture_id):
+        body = json.dumps(self.payload).encode('utf-8')
+        assert capture_id == hashlib.sha256(body).hexdigest()
+        return body, _JsonRecord(self.url, hashlib.sha256(body).hexdigest(), CLUB_CAPTURED)
+
+
+class _JsonRecord:
+    def __init__(self, url, content_hash, fetched_at):
+        self.url, self.content_hash, self.fetched_at = url, content_hash, fetched_at
+
+
+def test_achievement_holder_scope_run_writes_one_merge_bundle():
+    from scrapers.transfermarkt.orchestrator import AchievementHolderTarget, achievements_url
+    assert achievements_url('player', '7') == ACHIEVEMENTS_URL
+    replay = _JsonFetch(ACHIEVEMENTS_URL, ACHIEVEMENTS_PACKET)
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t8', cycle_id='tm-cycle-t8',
+        achievement_holders=(AchievementHolderTarget('player', '7'),),
+    )
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader,
+                  universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert [item['entity'] for item in report.outcomes] == ['achievement_observations']
+    assert report.outcomes[0]['status'] == 'observed_present'
+    assert report.outcomes[0]['rows'] == 2
+    assert report.dq['passed'] is True and report.dq['verified_write_coverage'] == 1.0
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_achievement_observations').fetchone()[0] == 2
+
+
+def test_achievement_json_capture_fails_closed_without_raw_loader():
+    from scrapers.transfermarkt.orchestrator import AchievementHolderTarget
+    replay = _JsonFetch(ACHIEVEMENTS_URL, ACHIEVEMENTS_PACKET)
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t8', cycle_id='tm-cycle-t8',
+        achievement_holders=(AchievementHolderTarget('player', '7'),),
+    )
+    run = CoreRun(replay.fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    with pytest.raises(CoreRunError, match='raw body loader'):
+        run.run(plan)
