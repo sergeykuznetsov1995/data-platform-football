@@ -46,6 +46,7 @@ from .manifest import EndpointManifest, ManifestStatus
 from .partition_keys import canonical_league
 
 __all__ = [
+    "FIELDS_BLOCKING_ENDPOINTS",
     "FIELDS_ENDPOINTS",
     "MODES",
     "MODE_DRAIN",
@@ -60,8 +61,10 @@ __all__ = [
     "ResolvedReplayScope",
     "list_replay_scope_keys",
     "load_replay_scope_records",
+    "replay_eligible_scope_pairs",
     "resolve_replay_scope",
     "select_replay_scope_plans",
+    "validate_replay_scope_pair",
 ]
 
 MODE_FIELDS = "fields"
@@ -78,6 +81,24 @@ FIELDS_ENDPOINTS = frozenset(
         "referee_profile",
     }
 )
+
+# Fields-mode endpoints whose stored ``schema_error`` blocks the scope's
+# season materialization (#1367): the deployed parser deterministically
+# re-rejects the same raw bytes, so ``materialize_season_partition`` can
+# never complete for that (tournament, season, freshness) triple.
+# ``lineups`` never enters the season plan and ``referee_profile`` has an
+# explicit rejected-profile carve-out, so a stored schema_error on either
+# does NOT block the scope (Astra design adjudication 2026-11-22).
+FIELDS_BLOCKING_ENDPOINTS = (
+    "cup_trees",
+    "participants",
+    "rounds",
+    "standings_total",
+)
+
+# Registry season formats that can name a Bronze ``season`` partition label
+# through the replay overlay; ``unknown`` cannot (review r1 F1).
+_REPLAYABLE_SEASON_FORMATS = ("single_year", "split_year")
 
 SKIP_NON_2XX = "non_2xx"
 SKIP_MISSING_LINEAGE = "missing_lineage"
@@ -274,7 +295,8 @@ _RAW_LINEAGE_SQL = (
     "COALESCE(TRIM(\"raw_blob_key\"), '') <> ''",
 )
 _SCOPE_ORDER_SQL = (
-    'ORDER BY "source_tournament_id", "source_season_id", "freshness_key"'
+    'ORDER BY m."source_tournament_id", m."source_season_id", '
+    'm."freshness_key"'
 )
 _RECORD_ORDER_SQL = (
     'ORDER BY "target_type", "target_id", "endpoint", '
@@ -284,6 +306,40 @@ _FIELDS_ENDPOINTS_SQL = '"endpoint" IN ({})'.format(
     ", ".join(f"'{endpoint}'" for endpoint in sorted(FIELDS_ENDPOINTS))
 )
 _DRAIN_STATUS_SQL = "\"status\" = 'retryable_failure'"
+
+# Suppression subquery for fields mode (#1367): a scope whose stored
+# ``schema_error`` on a blocking season endpoint cannot complete
+# materialization — the deployed parser deterministically re-rejects the
+# same committed raw.  Correlated on the full scope triple so one blocked
+# freshness key never suppresses its sibling captures of the same
+# (tournament, season).
+_FIELDS_BLOCKED_SQL = (
+    "NOT EXISTS (SELECT 1 FROM {table} b WHERE {correlation} "
+    "b.\"endpoint\" IN ({endpoints}) "
+    "AND b.\"status\" = 'schema_error' AND {replayable})"
+).format(
+    table=REPLAY_MANIFEST_TABLE,
+    correlation=" ".join(
+        f'b."{column}" = m."{column}" AND'
+        for column in (
+            "source_tournament_id",
+            "source_season_id",
+            "freshness_key",
+        )
+    ),
+    endpoints=", ".join(
+        f"'{endpoint}'" for endpoint in FIELDS_BLOCKING_ENDPOINTS
+    ),
+    replayable=" AND ".join(
+        (
+            'b."http_status" >= 200',
+            'b."http_status" < 300',
+            'b."http_status" <> 204',
+            "COALESCE(TRIM(b.\"raw_content_hash\"), '') <> ''",
+            "COALESCE(TRIM(b.\"raw_blob_key\"), '') <> ''",
+        )
+    ),
+)
 
 
 class ReplayManagerProtocol(Protocol):
@@ -309,6 +365,9 @@ ResolvedReplayScope = NamedTuple(
     league=str,
     canonical_season=str,
 )
+# The five-field shape is the module's public contract (review r1/r2 F4):
+# registry metadata the phases need beyond it — the season's format — is
+# carried alongside the scope by the worker, never inside it.
 
 
 def _mode_filter_sql(mode: str) -> str:
@@ -362,12 +421,148 @@ def _scope_int_id(value: str, name: str) -> int:
         ) from exc
 
 
+def _season_slug(canonical_season: object) -> Optional[int]:
+    """The canonical season as a partition slug, or None.
+
+    Conversion — not ``str.isdigit()`` — decides (review r2 F5): digits
+    like superscript two pass ``isdigit()`` but cannot become the overlay's
+    integer season id or a partition label.
+    """
+    if not isinstance(canonical_season, str):
+        return None
+    try:
+        return int(canonical_season)
+    except ValueError:
+        return None
+
+
+def _replayable_registry_season(season: object) -> bool:
+    """True when a registry season can resolve AND enter a scope overlay.
+
+    One predicate shared by resolution, pair enumeration and exact-scope
+    validation (review r1 F1): a replayable season needs a canonical season
+    convertible to a numeric slug (the overlay medallion entry and the
+    Bronze ``season`` partition are numeric), and a season format that
+    names a partition label (``single_year``/``split_year``).
+    """
+    if _season_slug(getattr(season, "canonical_season", None)) is None:
+        return False
+    return getattr(season, "season_format", None) in _REPLAYABLE_SEASON_FORMATS
+
+
+def replay_eligible_scope_pairs(
+    catalog: ReplayCatalogProtocol,
+) -> tuple[tuple[str, str], ...]:
+    """(source_tournament_id, source_season_id) pairs the registry resolves.
+
+    Enumeration mirrors :func:`resolve_replay_scope` exactly: only
+    capture-allowed tournaments with a canonical id, and only seasons whose
+    canonical season and replayable season format are present
+    (:func:`_replayable_registry_season`).  A ``season_id`` named by more
+    than one season of its tournament is refused by the resolver as
+    ambiguous, so only THOSE ids are skipped — uniquely named sibling
+    seasons of the same tournament stay eligible (review r2 F1).
+    The pair set is the SQL-side resolvability filter for automatic
+    planning — scopes outside it (unknown tournaments such as EURO with no
+    registry seasons, disabled tournaments) can never resolve in a worker.
+    """
+    tournaments = getattr(catalog, "tournaments", None)
+    if tournaments is None:
+        raise ReplayPlanningError(
+            "catalog does not expose a tournaments sequence for replay "
+            "scope enumeration"
+        )
+    pairs: set[tuple[str, str]] = set()
+    for tournament in tournaments:
+        if not getattr(tournament, "capture_allowed", False):
+            continue
+        canonical_id = getattr(tournament, "canonical_id", None)
+        if not isinstance(canonical_id, str) or not canonical_id.strip():
+            continue
+        source_id = getattr(tournament, "unique_tournament_id", None)
+        if isinstance(source_id, bool) or not isinstance(source_id, int):
+            continue
+        seasons = tuple(getattr(tournament, "seasons", ()) or ())
+        id_counts: dict[object, int] = {}
+        for season in seasons:
+            season_id = getattr(season, "season_id", None)
+            id_counts[season_id] = id_counts.get(season_id, 0) + 1
+        for season in seasons:
+            season_id = getattr(season, "season_id", None)
+            if isinstance(season_id, bool) or not isinstance(season_id, int):
+                continue
+            if id_counts[season_id] > 1:
+                continue
+            if not _replayable_registry_season(season):
+                continue
+            pairs.add((str(source_id), str(season_id)))
+    return tuple(sorted(pairs))
+
+
+def validate_replay_scope_pair(
+    exact_scope: Sequence[object], catalog: ReplayCatalogProtocol
+) -> tuple[str, str]:
+    """Validate an operator-supplied exact scope pair loudly.
+
+    Raises :class:`ReplayPlanningError` naming the exact reason (unknown
+    tournament, unknown season, missing canonical metadata, ineligible
+    season format, or registry-disabled tournament) so an exact replay
+    request fails in the planner instead of dying in a worker with a
+    generic resolution error.
+    """
+    wanted = _normalize_exact_scope(exact_scope)
+    tournament_id = _scope_int_id(wanted[0], "source_tournament_id")
+    season_id = _scope_int_id(wanted[1], "source_season_id")
+    prefix = f"exact replay scope ({wanted[0]!r}, {wanted[1]!r})"
+    try:
+        tournament = catalog.tournament(tournament_id)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ReplayPlanningError(
+            f"{prefix} is not replay-eligible: unknown tournament: {exc}"
+        ) from exc
+    matches = [
+        season for season in tournament.seasons if season.season_id == season_id
+    ]
+    if not matches:
+        raise ReplayPlanningError(
+            f"{prefix} is not replay-eligible: season {wanted[1]!r} is "
+            "unknown for the source tournament"
+        )
+    if len(matches) > 1:
+        raise ReplayPlanningError(
+            f"{prefix} is not replay-eligible: season {wanted[1]!r} is "
+            "ambiguous for the source tournament"
+        )
+    if not _replayable_registry_season(matches[0]):
+        canonical_season = getattr(matches[0], "canonical_season", None)
+        reason = (
+            "season has no numeric canonical season"
+            if _season_slug(canonical_season) is None
+            else "season has no replayable season format"
+        )
+        raise ReplayPlanningError(f"{prefix} is not replay-eligible: {reason}")
+    canonical_id = getattr(tournament, "canonical_id", None)
+    if not isinstance(canonical_id, str) or not canonical_id.strip():
+        raise ReplayPlanningError(
+            f"{prefix} is not replay-eligible: tournament has no canonical id"
+        )
+    if not getattr(tournament, "capture_allowed", False):
+        raise ReplayPlanningError(
+            f"{prefix} is not replay-eligible: tournament is not "
+            "capture-allowed by the registry"
+        )
+    return wanted
+
+
 def list_replay_scope_keys(
     manager: ReplayManagerProtocol,
     *,
     mode: str,
     exact_scope: Optional[Sequence[object]] = None,
     limit: int = 1,
+    catalog: Optional[ReplayCatalogProtocol] = None,
+    include_blocked: bool = False,
+    blocked_only: bool = False,
 ) -> tuple[ReplayScopeKey, ...]:
     """List replayable scope keys from the fixed manifest table.
 
@@ -379,22 +574,75 @@ def list_replay_scope_keys(
     freshness_key)`` capped by the SQL ``LIMIT``.  ``exact_scope`` values are
     bound as SQL parameters; the table identifier is the fixed module
     constant and never caller input.
+
+    ``catalog`` filters to scopes the registry can resolve.  Automatic
+    planning passes it to admit only capture-allowed
+    ``(source_tournament_id, source_season_id)`` pairs (bound as two ``?``
+    parameters per pair, decimal strings); an empty pair set short-circuits
+    to no candidates without touching the manifest.  An ``exact_scope``
+    under a catalog is validated eagerly and loudly instead of receiving the
+    pair filter.  In ``fields`` mode a scope triple with a stored
+    ``schema_error`` on a blocking season endpoint is suppressed unless
+    ``include_blocked`` opts in (the retry path after a parser fix); the
+    deployed parser deterministically re-rejects that committed raw, so its
+    season materialization can never complete (#1367).  ``blocked_only``
+    (fields mode, review r1 F3) inverts the same predicate to list exactly
+    the blocked triples — the planner's skip diagnostic — instead of every
+    candidate a second unrestricted query could sweep in.
     """
     if mode not in MODES:
         raise ReplayPlanningError(f"mode must be one of {MODES}, got {mode!r}")
     limit = _validate_positive_int(limit, "limit")
+    if blocked_only and include_blocked:
+        raise ReplayPlanningError(
+            "blocked_only and include_blocked are mutually exclusive"
+        )
+    if blocked_only and mode != MODE_FIELDS:
+        raise ReplayPlanningError(
+            "blocked_only is only meaningful for the fields mode"
+        )
     wanted_scope = _normalize_exact_scope(exact_scope)
-    clauses = [*_HTTP_REPLAYABLE_SQL, *_RAW_LINEAGE_SQL, _mode_filter_sql(mode)]
+    pair_filter = False
+    if catalog is not None:
+        if wanted_scope is None:
+            pair_filter = True
+        else:
+            wanted_scope = validate_replay_scope_pair(wanted_scope, catalog)
+    clauses = [
+        *_HTTP_REPLAYABLE_SQL,
+        *_RAW_LINEAGE_SQL,
+        _mode_filter_sql(mode),
+    ]
     params: list[str] = []
     if wanted_scope is not None:
         clauses.extend(
-            ['"source_tournament_id" = ?', '"source_season_id" = ?']
+            [
+                'm."source_tournament_id" = ?',
+                'm."source_season_id" = ?',
+            ]
         )
         params.extend(wanted_scope)
+    elif pair_filter:
+        pairs = replay_eligible_scope_pairs(catalog)
+        if not pairs:
+            return ()
+        clauses.append(
+            '(m."source_tournament_id", m."source_season_id") IN ({})'.format(
+                ", ".join("(?, ?)" for _ in pairs)
+            )
+        )
+        params.extend(
+            value for pair in pairs for value in pair
+        )
+    if mode == MODE_FIELDS and (blocked_only or not include_blocked):
+        predicate = _FIELDS_BLOCKED_SQL
+        if blocked_only:
+            predicate = predicate.replace("NOT EXISTS", "EXISTS", 1)
+        clauses.append(predicate)
     sql = (
-        'SELECT DISTINCT "source_tournament_id", "source_season_id", '
-        '"freshness_key" '
-        f"FROM {REPLAY_MANIFEST_TABLE} "
+        'SELECT DISTINCT m."source_tournament_id", m."source_season_id", '
+        'm."freshness_key" '
+        f"FROM {REPLAY_MANIFEST_TABLE} m "
         f"WHERE {' AND '.join(clauses)} "
         f"{_SCOPE_ORDER_SQL} "
         f"LIMIT {limit}"
@@ -451,8 +699,11 @@ def resolve_replay_scope(
     The tournament is looked up by ``int(source_tournament_id)`` and the
     season by exact ``season_id`` membership in ``tournament.seasons`` —
     never by date and never by the first alias.  Unknown tournaments, unknown
-    or ambiguous seasons, missing ``canonical_id``/``canonical_season`` and
-    unknown legacy league keys all raise :class:`ReplayPlanningError`.
+    or ambiguous seasons, missing ``canonical_id``/``canonical_season``,
+    a season format that cannot name a Bronze season label
+    (``single_year``/``split_year``), a canonical season the overlay cannot
+    convert to a partition slug and unknown legacy league keys all raise
+    :class:`ReplayPlanningError`.
     """
     scope = _normalize_scope_key(key)
     tournament_id = _scope_int_id(
@@ -482,6 +733,20 @@ def resolve_replay_scope(
     if not isinstance(canonical_season, str) or not canonical_season.strip():
         raise ReplayPlanningError(
             f"season {scope.source_season_id!r} has no canonical season"
+        )
+    season_format = getattr(matches[0], "season_format", None)
+    if season_format not in _REPLAYABLE_SEASON_FORMATS:
+        raise ReplayPlanningError(
+            f"season {scope.source_season_id!r} of source tournament "
+            f"{scope.source_tournament_id!r} has no replayable season format "
+            f"(got {season_format!r})"
+        )
+    if _season_slug(canonical_season) is None:
+        raise ReplayPlanningError(
+            f"season {scope.source_season_id!r} of source tournament "
+            f"{scope.source_tournament_id!r} has a non-numeric canonical "
+            f"season {canonical_season!r}; the replay overlay and the Bronze "
+            "season partition need a numeric slug"
         )
     canonical_id = getattr(tournament, "canonical_id", None)
     if not isinstance(canonical_id, str) or not canonical_id.strip():

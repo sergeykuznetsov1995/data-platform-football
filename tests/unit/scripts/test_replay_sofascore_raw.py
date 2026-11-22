@@ -1,5 +1,9 @@
 """Focused unit tests for the SofaScore raw-replay worker helpers (#1367)."""
 
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from dags.scripts.replay_sofascore_raw import (
@@ -55,9 +59,10 @@ def _record(
 
 
 class _FakeSeason:
-    def __init__(self, season_id, canonical_season):
+    def __init__(self, season_id, canonical_season, season_format="split_year"):
         self.season_id = season_id
         self.canonical_season = canonical_season
+        self.season_format = season_format
 
 
 class _FakeTournament:
@@ -69,7 +74,7 @@ class _FakeTournament:
 class _FakeCatalog:
     def __init__(self):
         self._tournament = _FakeTournament(
-            "england/premier-league", [_FakeSeason(int(SEASON), "25/26")]
+            "england/premier-league", [_FakeSeason(int(SEASON), "2526")]
         )
 
     def tournament(self, unique_tournament_id):
@@ -254,7 +259,7 @@ def test_load_scope_prefilters_exact_triple_without_sql():
     foreign_tournament = _record(
         "rounds", "season", SEASON, tournament="18"
     )
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -266,7 +271,7 @@ def test_load_scope_prefilters_exact_triple_without_sql():
         resolved.source_season_id,
         resolved.freshness_key,
     ) == (TOURNAMENT, SEASON, FRESHNESS)
-    assert resolved.canonical_season == "25/26"
+    assert resolved.canonical_season == "2526"
     assert isinstance(resolved.league, str) and resolved.league
     assert plan is not None
     assert plan.scope == ReplayScopeKey(TOURNAMENT, SEASON, FRESHNESS)
@@ -287,7 +292,7 @@ def test_load_scope_returns_none_plan_without_replayable_records():
         raw_content_hash=None,
         raw_blob_key=None,
     )
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -299,7 +304,7 @@ def test_load_scope_returns_none_plan_without_replayable_records():
 
 def test_load_scope_empty_records_yield_none_plan():
     runtime = _FakeRuntime(_FakeCatalog(), _FakeManager())
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -332,17 +337,88 @@ def test_load_scope_without_records_requires_trino_manager():
 
 # End-to-end replay contracts use the existing synthetic payload helpers. The
 # replay engine is fresh after fixture ingestion so its traffic measures only
-# the replay, never the synthetic seed.
+# the replay, never the synthetic seed.  The catalog is a REAL registry-grade
+# SofaScoreCatalog: the #1367 per-scope overlay renders from the resolved
+# tournament row, so a SimpleNamespace stand-in can no longer carry it.
 def _catalog_76986():
-    from types import SimpleNamespace
+    from scrapers.sofascore.catalog import SofaScoreCatalog
 
-    season = SimpleNamespace(season_id=76986, canonical_season="2526")
-    tournament = SimpleNamespace(
-        canonical_id="england/premier-league", seasons=[season]
-    )
-    return SimpleNamespace(
-        tournament=lambda _tournament_id: tournament,
-        tournament_map=lambda: {"england/premier-league": 17},
+    return SofaScoreCatalog.from_mapping(
+        {
+            "schema_version": 2,
+            "generated_at": "2026-11-22T00:00:00Z",
+            "tournaments": [
+                {
+                    "unique_tournament_id": 17,
+                    "name": "Premier League",
+                    "slug": "premier-league",
+                    "category": {
+                        "id": 1,
+                        "name": "England",
+                        "slug": "england",
+                    },
+                    "sport_slug": "football",
+                    "page_path": "football/england/premier-league",
+                    "canonical_id": "england/premier-league",
+                    "enabled": True,
+                    "classification": {
+                        "sport": "football",
+                        "gender": "male",
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "status": "source_confirmed_adult_men",
+                        "exclusion_reasons": [],
+                        "evidence": [
+                            {
+                                "type": "source_field",
+                                "endpoint": "/unique-tournament/17",
+                                "field": "gender",
+                                "value": "M",
+                            }
+                        ],
+                    },
+                    "review": {
+                        "status": "approved",
+                        "confirmed": {
+                            "sport": "football",
+                            "gender": "male",
+                            "age_group": "adult",
+                            "team_level": "first_team",
+                        },
+                        "evidence": [
+                            {
+                                "type": "owner_review",
+                                "reference": "#1367 fixture",
+                                "note": "offline replay fixture registry",
+                            }
+                        ],
+                        "reviewed_by": "fixture",
+                        "reviewed_at": "2026-11-22T00:00:00Z",
+                    },
+                    "seasons": [
+                        {
+                            "season_id": 76986,
+                            "name": "Premier League 25/26",
+                            "source_name": "Premier League 25/26",
+                            "year": "25/26",
+                            "format": "split_year",
+                            "season_format": "split_year",
+                            "canonical_season": "2526",
+                            "start_date": None,
+                            "end_date": None,
+                            "aliases": ["2526", "25/26"],
+                            "evidence": [
+                                {
+                                    "type": "source_field",
+                                    "endpoint": "/unique-tournament/17/seasons",
+                                    "value": "76986",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
     )
 
 
@@ -909,7 +985,9 @@ def test_players_phase_uses_and_restores_exact_season_freshness(
     resolved = SimpleNamespace(
         league="SS-17", canonical_season="2526", freshness_key="final"
     )
-    result = _players_phase(resolved, records, object(), mode="drain")
+    result = _players_phase(
+        resolved, records, object(), mode="drain", season_format="split_year"
+    )
     assert observed == {"season": "final", "player": "final", "offline": True}
     assert os.environ.get("SOFASCORE_SEASON_FRESHNESS_KEY") == outer_freshness
     assert os.environ.get("SOFASCORE_PLAYER_FRESHNESS_KEY") == outer_freshness
@@ -1129,3 +1207,275 @@ def test_cli_json_manifest_replays_local_raw_without_sql(
     assert result["selected"]["records"] == 6
     assert result["status_counts"]["deferred"] == 0
     assert result["source_request_count"] == 0
+
+
+# --- #1367 per-scope overlay contracts -------------------------------------
+
+
+def _single_year_catalog():
+    """Registry-grade catalog for the measured SS-16/58210 scope."""
+    from scrapers.sofascore.catalog import SofaScoreCatalog
+
+    return SofaScoreCatalog.from_mapping(
+        {
+            "schema_version": 2,
+            "generated_at": "2026-11-22T00:00:00Z",
+            "tournaments": [
+                {
+                    "unique_tournament_id": 16,
+                    "name": "FIFA World Cup",
+                    "slug": "world-championship",
+                    "category": {"id": 1468, "name": "World", "slug": "world"},
+                    "sport_slug": "football",
+                    "page_path": "football/world/world-championship",
+                    "canonical_id": "INT-World Cup",
+                    "enabled": True,
+                    "classification": {
+                        "sport": "football",
+                        "gender": "male",
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "status": "source_confirmed_adult_men",
+                        "exclusion_reasons": [],
+                        "evidence": [
+                            {
+                                "type": "source_field",
+                                "endpoint": "/unique-tournament/16",
+                                "field": "gender",
+                                "value": "M",
+                            }
+                        ],
+                    },
+                    "review": {
+                        "status": "approved",
+                        "confirmed": {
+                            "sport": "football",
+                            "gender": "male",
+                            "age_group": "adult",
+                            "team_level": "first_team",
+                        },
+                        "evidence": [
+                            {
+                                "type": "owner_review",
+                                "reference": "#1367 fixture",
+                                "note": "offline replay fixture registry",
+                            }
+                        ],
+                        "reviewed_by": "fixture",
+                        "reviewed_at": "2026-11-22T00:00:00Z",
+                    },
+                    "seasons": [
+                        {
+                            "season_id": 58210,
+                            "name": "World Cup 2026",
+                            "source_name": "World Cup 2026",
+                            "year": "2026",
+                            "format": "calendar_year",
+                            "season_format": "single_year",
+                            "canonical_season": "2026",
+                            "start_date": None,
+                            "end_date": None,
+                            "aliases": ["2026", "World Cup 2026"],
+                            "evidence": [
+                                {
+                                    "type": "source_field",
+                                    "endpoint": "/unique-tournament/16/seasons",
+                                    "value": "58210",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+
+def test_scope_overlay_rekeys_registry_row_and_preserves_eligibility():
+    import json
+
+    from dags.scripts.replay_sofascore_raw import _scope_overlay
+    from scrapers.sofascore.raw_replay import ReplayScopeKey, resolve_replay_scope
+
+    catalog = _single_year_catalog()
+    resolved = resolve_replay_scope(
+        ReplayScopeKey("16", "58210", "2026"), catalog
+    )
+    assert (resolved.league, resolved.canonical_season) == ("SS-16", "2026")
+
+    with _scope_overlay(resolved, catalog) as (registry_path, medallion_dir):
+        document = json.loads(
+            Path(registry_path).read_text(encoding="utf-8")
+        )
+        row = document["tournaments"][0]
+        assert row["canonical_id"] == "SS-16"
+        source = catalog.tournament(16)
+        assert row["enabled"] is source.enabled
+        assert row["classification"] == dict(source.classification)
+        assert row["review"] == dict(source.review)
+        assert row["seasons"][0]["canonical_season"] == "2026"
+        assert row["seasons"][0]["season_format"] == "single_year"
+        import yaml
+
+        competitions = yaml.safe_load(
+            (Path(medallion_dir) / "competitions.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["competitions"]
+        assert competitions[0]["id"] == "SS-16"
+        assert competitions[0]["seasons"][0]["season_format"] == "single_year"
+        assert competitions[0]["seasons"][0]["id"] == 2026
+
+
+@pytest.mark.parametrize("outer_env", [None, "preset"])
+def test_scope_overlay_binds_and_restores_both_configurations(outer_env):
+    import dags.utils.medallion_config as medallion_config
+    from dags.scripts.replay_sofascore_raw import _scope_overlay
+    from scrapers.sofascore import scraper as scraper_module
+    from scrapers.sofascore.raw_replay import ReplayScopeKey, resolve_replay_scope
+
+    catalog = _single_year_catalog()
+    resolved = resolve_replay_scope(
+        ReplayScopeKey("16", "58210", "2026"), catalog
+    )
+    previous_config_dir = medallion_config.CONFIG_DIR
+    previous_module_catalog = scraper_module._SOFASCORE_CATALOG
+    previous_env = {
+        name: os.environ.get(name)
+        for name in ("SOFASCORE_REGISTRY_PATH", "MEDALLION_CONFIG_DIR")
+    }
+    if outer_env is None:
+        # Review r2 F6: the absent case must not inherit values some other
+        # test left behind; clearing here makes the post-overlay absence
+        # assertions meaningful while ``finally`` still restores the
+        # process's original values.
+        for name in previous_env:
+            os.environ.pop(name, None)
+    else:
+        os.environ["SOFASCORE_REGISTRY_PATH"] = outer_env
+        os.environ["MEDALLION_CONFIG_DIR"] = outer_env
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            with _scope_overlay(resolved, catalog) as (registry_path, medallion_dir):
+                assert os.environ["SOFASCORE_REGISTRY_PATH"] == registry_path
+                assert os.environ["MEDALLION_CONFIG_DIR"] == medallion_dir
+                assert Path(medallion_config.CONFIG_DIR) == Path(medallion_dir)
+                overlay_entry = scraper_module._SOFASCORE_CATALOG.competition("SS-16")
+                assert overlay_entry.unique_tournament_id == 16
+                assert overlay_entry.capture_allowed is True
+                assert any(
+                    item["id"] == "SS-16"
+                    for item in medallion_config.load_competitions()["competitions"]
+                )
+                raise RuntimeError("boom")
+        # Restoration also covers the exceptional exit (review r1).
+        assert os.environ.get("SOFASCORE_REGISTRY_PATH") == outer_env
+        assert os.environ.get("MEDALLION_CONFIG_DIR") == outer_env
+        assert medallion_config.CONFIG_DIR is previous_config_dir
+        assert scraper_module._SOFASCORE_CATALOG is previous_module_catalog
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        medallion_config.CONFIG_DIR = previous_config_dir
+        scraper_module._SOFASCORE_CATALOG = previous_module_catalog
+
+
+def test_scope_overlay_refuses_unreplayable_registry_season_format():
+    from dags.scripts.replay_sofascore_raw import _scope_overlay
+    from scrapers.sofascore.raw_replay import ResolvedReplayScope
+
+    catalog = _single_year_catalog()
+    # A registry row whose matched season carries an unreplayable format
+    # must fail the overlay loudly instead of producing a broken partition.
+    source = catalog.tournament(16)
+    seasons = tuple(
+        SimpleNamespace(
+            season_id=season.season_id,
+            canonical_season=season.canonical_season,
+            season_format="unknown",
+        )
+        for season in source.seasons
+    )
+    patched = SimpleNamespace(
+        unique_tournament_id=source.unique_tournament_id,
+        name=source.name,
+        slug=source.slug,
+        category_id=source.category_id,
+        category_name=source.category_name,
+        category_slug=source.category_slug,
+        sport_slug=source.sport_slug,
+        page_path=source.page_path,
+        enabled=source.enabled,
+        classification=source.classification,
+        review=source.review,
+        seasons=seasons,
+    )
+    patched_catalog = SimpleNamespace(tournament=lambda _tid: patched)
+
+    with pytest.raises(ReplayScopeError, match="no replayable season format"):
+        with _scope_overlay(
+            ResolvedReplayScope("16", "58210", "2026", "SS-16", "2026"),
+            patched_catalog,
+        ):
+            pass
+
+
+def test_replay_season_label_guard_uses_overlay_format():
+    from dags.scripts.replay_sofascore_raw import (
+        _assert_replay_season_label,
+        _scope_overlay,
+    )
+    from scrapers.sofascore.raw_replay import ReplayScopeKey, resolve_replay_scope
+    from scrapers.sofascore.scraper import _season_label
+
+    catalog = _single_year_catalog()
+    resolved = resolve_replay_scope(
+        ReplayScopeKey("16", "58210", "2026"), catalog
+    )
+    with _scope_overlay(resolved, catalog):
+        assert _season_label("SS-16", "2026") == "2026"
+        _assert_replay_season_label(resolved, "single_year")
+    # Outside the overlay the capture key has no medallion entry, so the
+    # club fallback would silently produce a WRONG partition label — the
+    # guard must fail loud exactly there.
+    with pytest.raises(ReplayScopeError, match="label drift"):
+        _assert_replay_season_label(resolved, "single_year")
+
+
+def test_replay_season_label_guard_accepts_split_year():
+    from dags.scripts.replay_sofascore_raw import (
+        _assert_replay_season_label,
+        _scope_overlay,
+    )
+    from scrapers.sofascore.raw_replay import ReplayScopeKey, resolve_replay_scope
+
+    catalog = _catalog_76986()
+    resolved = resolve_replay_scope(
+        ReplayScopeKey("17", "76986", "final"), catalog
+    )
+    with _scope_overlay(resolved, catalog):
+        _assert_replay_season_label(resolved, "split_year")
+    # The split-year short form needs no overlay entry, so the guard must
+    # not reject it even when the binding is the plain repo configuration.
+    _assert_replay_season_label(resolved, "split_year")
+    with pytest.raises(ReplayScopeError, match="no registry season format"):
+        _assert_replay_season_label(resolved, "")
+
+
+def test_scope_overlay_rejects_scope_outside_registry():
+    from dags.scripts.replay_sofascore_raw import _scope_overlay
+    from scrapers.sofascore.raw_replay import ResolvedReplayScope
+
+    resolved = ResolvedReplayScope(
+        source_tournament_id="16",
+        source_season_id="99999",
+        freshness_key="2026",
+        league="SS-16",
+        canonical_season="2026",
+    )
+    with pytest.raises(ReplayScopeError, match="unknown for source tournament"):
+        with _scope_overlay(resolved, _single_year_catalog()):
+            pass

@@ -95,10 +95,38 @@ def test_dag_identity_topology_and_worker_bounds(replay):
         assert timedelta(0) < timeout <= timedelta(minutes=30)
 
 
+def _assert_planner_call(scopes, **expected):
+    """Assert the planner's list call(s); the catalog is compared by type.
+
+    An empty fields plan also triggers the blocked-candidates probe with
+    ``include_blocked=True`` (a skipped scope must never read as drained).
+    """
+    from scrapers.sofascore.catalog import SofaScoreCatalog
+
+    expected_calls = 2 if expected.get("expect_drained_probe") else 1
+    assert scopes.call_count == expected_calls
+    first = scopes.call_args_list[0]
+    assert first.args == (sentinel.manager,)
+    kwargs = first.kwargs
+    assert kwargs == {
+        "mode": expected["mode"],
+        "exact_scope": expected["exact_scope"],
+        "limit": expected["limit"],
+        "catalog": kwargs["catalog"],
+        "include_blocked": False,
+    }
+    assert isinstance(kwargs["catalog"], SofaScoreCatalog)
+    if expected_calls == 2:
+        probe = scopes.call_args_list[1]
+        assert probe.kwargs["blocked_only"] is True
+        assert probe.kwargs.get("include_blocked", False) is False
+
+
 def test_params_and_default_planner_arguments(replay, runtime):
     params = replay.PARAMS
     assert set(params) == {
-        "mode", "scope_cap", "target_cap", "source_tournament_id", "source_season_id"
+        "mode", "scope_cap", "target_cap", "source_tournament_id",
+        "source_season_id", "include_blocked",
     }
     assert params["mode"].value == "fields"
     assert params["mode"]._kw["enum"] == ["fields", "drain"]
@@ -110,6 +138,8 @@ def test_params_and_default_planner_arguments(replay, runtime):
     for name in ("source_tournament_id", "source_season_id"):
         assert params[name].value is None
         assert set(params[name]._kw["type"]) == {"null", "string"}
+    assert params["include_blocked"].value is False
+    assert params["include_blocked"]._kw["type"] == "boolean"
     runtime.scopes.return_value = [
         SimpleNamespace(source_tournament_id="7", source_season_id="42", freshness_key="v1")
     ]
@@ -119,8 +149,11 @@ def test_params_and_default_planner_arguments(replay, runtime):
     assert environments[0]["SOFASCORE_REPLAY_TARGET_CAP"] == "25"
     runtime.build.assert_called_once_with(run_id="manual", task_id="planner")
     runtime.manager.assert_called_once_with(sentinel.manifest)
-    runtime.scopes.assert_called_once_with(
-        sentinel.manager, mode="fields", exact_scope=None, limit=3
+    _assert_planner_call(
+        runtime.scopes,
+        mode="fields",
+        exact_scope=None,
+        limit=3,
     )
 
 
@@ -136,8 +169,11 @@ def test_planner_deterministic_exact_scopes_and_safe_unique_paths(replay, runtim
     environments = replay.plan_replay_scopes(params=params, run_id=run_id)
     runtime.build.assert_called_once_with(run_id=run_id, task_id="planner")
     runtime.manager.assert_called_once_with(sentinel.manifest)
-    runtime.scopes.assert_called_once_with(
-        sentinel.manager, mode=mode, exact_scope=None, limit=4
+    _assert_planner_call(
+        runtime.scopes,
+        mode=mode,
+        exact_scope=None,
+        limit=4,
     )
     assert len(environments) == 3
     outputs = set()
@@ -169,8 +205,12 @@ def test_exact_tournament_season_pair_is_trimmed(replay, runtime, mode):
     assert replay.plan_replay_scopes(params={
         "mode": mode, "source_tournament_id": " 7 ", "source_season_id": " 42 "
     }) == []
-    runtime.scopes.assert_called_once_with(
-        sentinel.manager, mode=mode, exact_scope=("7", "42"), limit=3
+    _assert_planner_call(
+        runtime.scopes,
+        mode=mode,
+        exact_scope=("7", "42"),
+        limit=3,
+        expect_drained_probe=(mode == "fields"),
     )
 
 
@@ -178,6 +218,7 @@ def test_exact_tournament_season_pair_is_trimmed(replay, runtime, mode):
     *({"mode": value} for value in ("live", "", None, 1)),
     *({name: value} for name in ("scope_cap", "target_cap")
       for value in (0, -1, True, False, 1.5, "3", None)),
+    *({"include_blocked": value} for value in (0, 1, "true", None)),
     *({"source_tournament_id": tournament, "source_season_id": season}
       for tournament, season in (("7", None), (None, "42"), ("", "42"),
                                  ("7", " "), (7, "42"), ("7", 42))),
@@ -314,3 +355,59 @@ def test_summary_fails_closed_on_invalid_worker_report(replay, tmp_path, path, v
 def test_summary_rejects_invalid_plan_entries(replay, environment):
     with pytest.raises(replay.AirflowException, match="misses a SOFASCORE_REPLAY_OUTPUT string"):
         _summarize(replay, [environment])
+
+
+# --- #1367 planner resolvability/terminality wiring -------------------------
+
+
+def test_planner_lazy_imports_resolve_against_real_modules():
+    """PR #2418 lesson: a fixture that fakes the worker module hides a wrong
+    import until the DAG runs in production.  Import every lazily imported
+    name of the planner against the REAL modules."""
+    from dags.scripts import replay_sofascore_raw as worker
+    from scrapers.sofascore import pipeline
+    from scrapers.sofascore import raw_replay
+
+    assert callable(worker._replay_manager)
+    assert callable(raw_replay.list_replay_scope_keys)
+    assert callable(raw_replay.replay_eligible_scope_pairs)
+    assert callable(raw_replay.validate_replay_scope_pair)
+    assert callable(pipeline.build_capture_runtime)
+    from scrapers.sofascore.catalog import SofaScoreCatalog
+
+    assert callable(SofaScoreCatalog.load)
+
+
+def test_planner_empty_fields_plan_distinguishes_blocked_from_drained(
+    replay, runtime, caplog
+):
+    import logging
+
+    blocked = SimpleNamespace(
+        source_tournament_id="16", source_season_id="58210", freshness_key="2026"
+    )
+    runtime.scopes.side_effect = [[], [blocked]]
+    with caplog.at_level(logging.WARNING):
+        assert replay.plan_replay_scopes() == []
+    assert runtime.scopes.call_count == 2
+    # Review r1 F3: the probe must query exactly the blocked triples, not
+    # every candidate an unrestricted second query could sweep in.
+    assert runtime.scopes.call_args.kwargs["blocked_only"] is True
+    assert runtime.scopes.call_args.kwargs.get("include_blocked", False) is False
+    assert any("schema_error season blockers" in message for message in caplog.messages)
+
+
+def test_planner_empty_drained_plan_runs_no_second_query(replay, runtime):
+    runtime.scopes.return_value = []
+    assert replay.plan_replay_scopes(params={"mode": "drain"}) == []
+    assert runtime.scopes.call_count == 1
+
+
+def test_planner_passes_include_blocked_through(replay, runtime):
+    runtime.scopes.return_value = []
+    assert (
+        replay.plan_replay_scopes(params={"mode": "fields", "include_blocked": True})
+        == []
+    )
+    assert runtime.scopes.call_count == 1
+    assert runtime.scopes.call_args.kwargs["include_blocked"] is True
