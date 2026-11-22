@@ -692,3 +692,208 @@ def test_rumour_pagination_failure_is_unavailable_without_partial_rows():
     assert [item['status'] for item in report.outcomes] == ['unavailable']
     assert report.receipts == ()
     assert report.dq['passed'] is True
+
+
+# --------------------------------------------------------------------------- T12
+REFEREE_FIXTURES = Path('tests/fixtures/transfermarkt/referees')
+REFEREE_DIRECTORY_URL = (
+    'https://www.transfermarkt.com/example-league/schiedsrichter/wettbewerb/XY1'
+    '/saison_id/2025/plus/1')
+REFEREE_PROFILE_URL = 'https://www.transfermarkt.com/-/profil/schiedsrichter/101'
+REFEREE_CAPTURED = '2026-11-20T15:00:00.000000+00:00'
+REFEREE_EXTRACTED_AT = '2026-11-20T15:10:00.000000+00:00'
+
+
+def _referee_directory_capture(captured_at: str = REFEREE_CAPTURED,
+                               name: str = 'directory_compact.html') -> SourceCapture:
+    body = (REFEREE_FIXTURES / name).read_bytes()
+    digest = hashlib.sha256(body).hexdigest()
+    return SourceCapture(
+        url=REFEREE_DIRECTORY_URL, endpoint='referee_directory', body=body,
+        capture_id=digest, body_hash=digest, captured_at=captured_at,
+    )
+
+
+def _referee_profile_capture() -> SourceCapture:
+    body = (REFEREE_FIXTURES / 'profile.html').read_bytes()
+    digest = hashlib.sha256(body).hexdigest()
+    return SourceCapture(
+        url=REFEREE_PROFILE_URL, endpoint='referee_profile', body=body,
+        capture_id=digest, body_hash=digest, captured_at=REFEREE_CAPTURED,
+    )
+
+
+def _referee_scope() -> ScopeContext:
+    return ScopeContext(
+        league='XY1', season='2526', scope_id='tm-scope-t12', cycle_id='tm-cycle-t12',
+    )
+
+
+def test_referee_directory_lane_maps_aggregates_per_page():
+    outcomes = sections.extract_referee_directory_observations(
+        (_referee_directory_capture(),), _referee_scope(),
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE,
+    )
+    outcome, = outcomes
+    assert outcome.entity == 'referee_aggregate_observations'
+    assert outcome.status == 'observed_present'
+    assert len(outcome.rows) == 10
+    by_referee = {}
+    for row in outcome.rows:
+        by_referee.setdefault(row['referee_id'], []).append(row)
+    assert sorted(by_referee) == ['101', '202']
+    sample = by_referee['101'][0]
+    assert sample['competition_id'] == 'XY1' and sample['edition_id'] == '2025'
+    assert sample['observation_status'] == 'observed_present'
+    assert sample['source_capture_id'] == outcome.capture.capture_id
+    assert core.build_core_dq(outcomes)['passed'] is True
+    values = {row['metric']: row['value'] for row in by_referee['101']}
+    assert values['matches_officiated'] == '14'
+    assert values['penalties_awarded'] == '4'
+
+
+def test_referee_profile_lane_maps_identity_fields():
+    outcome = sections.extract_referee_profile_observations(
+        _referee_profile_capture(), _referee_scope(), referee_id='101',
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE,
+    )
+    assert outcome.entity == 'referee_profiles'
+    assert outcome.status == 'observed_present'
+    row, = outcome.rows
+    assert (row['referee_id'], row['name']) == ('101', 'Ada Example')
+    assert row['nationality'] == 'Imaginaria'
+    assert row['birth_date'] == '1990-03-10'
+    assert row['observed_at'] == REFEREE_CAPTURED
+
+
+def test_referee_directory_scope_run_writes_one_bundle_per_page():
+    from scrapers.transfermarkt.orchestrator import RefereeDirectoryTarget
+
+    class _Fetch:
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            self.calls.append(url)
+            body = (REFEREE_FIXTURES / 'directory_compact.html').read_bytes()
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=REFEREE_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    fetcher = _Fetch()
+    plan = CoreScopePlan(
+        league='XY1', season='2526', scope_id='tm-scope-t12', cycle_id='tm-cycle-t12',
+        referee_directories=(RefereeDirectoryTarget('XY1', '2025', 'example-league'),),
+    )
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=REFEREE_EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [REFEREE_DIRECTORY_URL]
+    assert [item['entity'] for item in report.outcomes] == ['referee_aggregate_observations']
+    assert report.outcomes[0]['rows'] == 10
+    assert report.dq['passed'] is True
+    assert len(report.receipts) == 1 and report.receipts[0]['verified'] is True
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_referee_aggregate_observations').fetchone()[0] == 10
+
+
+def test_referee_profile_scope_run_writes_the_profile_row():
+    class _Fetch:
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            assert url == REFEREE_PROFILE_URL
+            body = (REFEREE_FIXTURES / 'profile.html').read_bytes()
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=REFEREE_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    plan = CoreScopePlan(
+        league='XY1', season='2526', scope_id='tm-scope-t12', cycle_id='tm-cycle-t12',
+        referee_profile_ids=('101',),
+    )
+    run = CoreRun(_Fetch().fetch, universe_version=UNIVERSE, extracted_at=REFEREE_EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert [item['entity'] for item in report.outcomes] == ['referee_profiles']
+    assert report.outcomes[0]['rows'] == 1
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_referee_profiles').fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------- T2
+REPRESENTATION_URL = (
+    'https://tmapi.transfermarkt.technology/players?ids[]=7&ids[]=9')
+REPRESENTATION_PACKET = {
+    'success': True,
+    'data': [
+        {
+            'id': '7',
+            'attributes': {'consultantAgencyId': 55},
+            'clubAssignments': [{'clubId': 11, 'type': 'current'}],
+        },
+        {
+            'id': '9',
+            'attributes': {},
+            'clubAssignments': [{'clubId': 631, 'type': 'current'}],
+        },
+    ],
+}
+
+
+def _representation_capture(payload: dict | None = None) -> SourceCapture:
+    body = json.dumps(payload or REPRESENTATION_PACKET).encode('utf-8')
+    digest = hashlib.sha256(body).hexdigest()
+    return SourceCapture(
+        url=REPRESENTATION_URL, endpoint='representation', body=body,
+        capture_id=digest, body_hash=digest, captured_at=CLUB_CAPTURED,
+    )
+
+
+def _representation_scope() -> ScopeContext:
+    return ScopeContext(
+        league='GB1', season='2526', scope_id='tm-scope-t2', cycle_id='tm-cycle-t2',
+    )
+
+
+def test_representation_lane_maps_packet_assertions_per_player():
+    outcomes = sections.extract_representation_observations(
+        _representation_capture(), _representation_scope(), expected_ids=('7', '9'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
+    )
+    assert [outcome.rows[0]['player_id'] if outcome.rows else outcome.scope.player_id
+            for outcome in outcomes] == ['7', '9']
+    assigned, unknown = outcomes
+    assert assigned.entity == 'player_representation_observations'
+    assert assigned.status == 'observed_present'
+    row, = assigned.rows
+    assert row['relation_type'] == 'consultant_agency'
+    assert row['representative_key'] == 'agency:55'
+    assert row['representative_id'] == '55'
+    assert row['observation_status'] == 'observed_present'
+    assert unknown.status == 'unknown'
+    assert unknown.rows[0]['representative_key'] == 'status:unknown'
+    assert unknown.rows[0]['representative_id'] is None
+    assert core.build_core_dq(outcomes)['passed'] is True
+
+
+def test_representation_scope_run_batches_players_into_one_packet():
+    from scrapers.transfermarkt.orchestrator import representation_url
+    assert representation_url(('7', '9')) == REPRESENTATION_URL
+    replay = _JsonFetch(REPRESENTATION_URL, REPRESENTATION_PACKET)
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t2', cycle_id='tm-cycle-t2',
+        representation_player_ids=('7', '9'),
+    )
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader,
+                  universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert report.fetched == 1
+    assert {item['status'] for item in report.outcomes} == {'observed_present', 'unknown'}
+    assert report.dq['passed'] is True
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_player_representation_observations'
+    ).fetchone()[0] == 2

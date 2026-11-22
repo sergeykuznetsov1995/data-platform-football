@@ -9,10 +9,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 import json
+from urllib.parse import urlsplit
 
 from bs4 import ParserRejectedMarkup
 
-from . import achievements, attendance, club_values, core, rumour_observations, rumours
+from . import achievements, attendance, club_values, core, referees, rumour_observations, rumours
 
 
 def extract_attendance_observations(
@@ -68,6 +69,86 @@ def extract_attendance_observations(
             schema_revision=attendance.ATTENDANCE_SCHEMA_REVISION,
         ))
     return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)
+
+
+def extract_referee_directory_observations(
+    captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *,
+    extracted_at: str, universe_version: str,
+) -> tuple[core.LaneOutcome, ...]:
+    entity = 'referee_aggregate_observations'
+    if not captures or any(capture.endpoint != 'referee_directory' for capture in captures):
+        raise core.CoreParseError('referees:invalid_captures')
+    competition_id, edition_id = core._referee_directory_identity(urlsplit(captures[0].url).path)
+    directory = {'competition_id': competition_id, 'edition_id': edition_id}
+    for capture in captures[1:]:
+        core._check_scope_against_capture(entity, directory, capture)
+
+    newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
+    context = core._context(newest, scope, extracted_at, universe_version)
+    first_page = {}
+    try:
+        pages = [capture.text for capture in captures]
+        for index, html in enumerate(pages):
+            page = referees.parse_referee_directory_page(html, **directory)
+            for aggregate in page.aggregates:
+                first_page.setdefault(aggregate.natural_key, index)
+        result = referees.reconcile_referee_directory_pages(
+            pages, expected_page_count=len(pages), **directory,
+        )
+    except referees.RefereeParseError as exc:
+        return (core.LaneOutcome(entity, 'error', 'referees:' + exc.reason, **context),)
+    except ValueError as exc:
+        return (core.LaneOutcome(entity, 'error', 'referees:' + (str(exc) or 'invalid_source_data'), **context),)
+
+    if not result.aggregates:
+        if result.completeness_proof:
+            proof = 'referees:' + result.completeness_proof
+            return (core.LaneOutcome(entity, 'observed_empty', proof, proof=proof, **context),)
+        return (core.LaneOutcome(entity, 'error', 'referees:completeness_proof_missing', **context),)
+
+    rows_by_page = [[] for _ in captures]
+    for aggregate in result.aggregates:
+        index = first_page[aggregate.natural_key]
+        capture = captures[index]
+        values = aggregate.as_dict()
+        values['observed_at'] = capture.captured_at
+        rows_by_page[index].append(core._render(
+            entity, values, scope, capture, extracted_at, context['run_id'], universe_version,
+            observation_status=aggregate.observation_status, status_reason='referees:' + aggregate.status_reason,
+            parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
+        ))
+    return tuple(
+        core.LaneOutcome(entity, 'observed_present', 'referees:page', tuple(rows),
+                         **core._context(capture, scope, extracted_at, universe_version))
+        for capture, rows in zip(captures, rows_by_page) if rows
+    )
+
+
+def extract_referee_profile_observations(
+    capture: core.SourceCapture, scope: core.ScopeContext, *, referee_id: str,
+    extracted_at: str, universe_version: str,
+) -> core.LaneOutcome:
+    entity = 'referee_profiles'
+    if capture.endpoint != 'referee_profile':
+        raise core.CoreParseError('referees:invalid_endpoint')
+    core._check_scope_against_capture(entity, {'referee_id': referee_id}, capture)
+    context = core._context(capture, scope, extracted_at, universe_version)
+    try:
+        profile = referees.parse_referee_profile(capture.text, referee_id=referee_id)
+    except referees.RefereeParseError as exc:
+        return core.LaneOutcome(entity, 'error', 'referees:' + exc.reason, **context)
+    except UnicodeDecodeError:
+        return core.LaneOutcome(entity, 'error', 'referees:invalid_utf8', **context)
+
+    reason = 'referees:profile'
+    values = profile.as_dict()
+    values['observed_at'] = capture.captured_at
+    row = core._render(
+        entity, values, observation_status='observed_present', status_reason=reason,
+        parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
+        **context,
+    )
+    return core.LaneOutcome(entity, 'observed_present', reason, (row,), **context)
 
 
 def extract_rumour_observations(

@@ -31,11 +31,15 @@ CONCLUSIVE_CORE_STATUSES = frozenset({
 _SEASON_RE = re.compile(r'^\d{4}$')
 _ID_RE = re.compile(r'^[1-9][0-9]*$')
 _CAPTURE_RE = re.compile(r'^[0-9a-f]{64}$')
+_REFEREE_DIRECTORY_PATH = re.compile(
+    r'/[A-Za-z0-9_-]+/schiedsrichter/(?:wettbewerb|pokalwettbewerb)/'
+    r'([A-Za-z0-9]+)/saison_id/([0-9]{4})(?:/plus/1)?(?:/page/[0-9]+)?'
+)
 _ENDPOINTS = frozenset({
     'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history',
     # stage C sections (#2405)
     'attendance', 'club_values', 'player_achievement', 'club_achievement', 'coach_achievement',
-    'rumours',
+    'rumours', 'referee_directory', 'referee_profile',
 })
 _OUTCOMES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
 _PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
@@ -48,6 +52,7 @@ _ENTITY_ROW_STATUSES = {
     'player_contract_observations': frozenset(_CONTRACT_STATUSES.values()),
     'attendance_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
     'club_value_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
+    'referee_aggregate_observations': frozenset({'observed_present', 'observed_empty', 'explicit_none'}),
 }
 
 LINEAGE_COLUMNS = (
@@ -63,7 +68,7 @@ CORE_ENTITIES = (
     'market_value_points', 'transfer_events', 'coach_profiles', 'coach_stints',
     # stage C sections (#2405)
     'attendance_observations', 'club_value_observations', 'achievement_observations',
-    'rumour_observations',
+    'rumour_observations', 'referee_aggregate_observations', 'referee_profiles',
 )
 CORE_TABLES = {entity: f'transfermarkt_{entity}' for entity in CORE_ENTITIES}
 CORE_NATURAL_KEYS = {
@@ -79,6 +84,8 @@ CORE_NATURAL_KEYS = {
     'club_value_observations': ('club_id', 'value_date', 'observed_at', 'source_point_id'),
     'achievement_observations': ('recipient_type', 'recipient_id', 'source_capture_id', 'source_row_id'),
     'rumour_observations': ('rumour_identity', 'subject_id', 'observed_at', 'correction_identity'),
+    'referee_aggregate_observations': ('referee_id', 'competition_id', 'edition_id', 'metric', 'observed_at'),
+    'referee_profiles': ('referee_id', 'observed_at'),
 }
 CORE_SCOPE_COLUMNS = {
     'squad_memberships': ('league', 'season', 'club_id'),
@@ -93,6 +100,8 @@ CORE_SCOPE_COLUMNS = {
     'club_value_observations': ('club_id',),
     'achievement_observations': ('recipient_type', 'recipient_id'),
     'rumour_observations': ('competition_id',),
+    'referee_aggregate_observations': ('competition_id', 'edition_id'),
+    'referee_profiles': ('referee_id',),
 }
 CORE_WRITE_MODES = {
     'squad_memberships': 'replace',
@@ -107,6 +116,8 @@ CORE_WRITE_MODES = {
     'club_value_observations': 'merge',
     'achievement_observations': 'merge',
     'rumour_observations': 'merge',
+    'referee_aggregate_observations': 'merge',
+    'referee_profiles': 'merge',
 }
 
 SQUAD_MEMBERSHIP_BUSINESS = (
@@ -166,6 +177,11 @@ RUMOUR_BUSINESS = (
     'content_hash', 'correction_identity', 'observation_key', 'assertion_json',
     'source_page_url', 'observed_at',
 )
+REFEREE_AGGREGATE_BUSINESS = (
+    'referee_id', 'competition_id', 'edition_id', 'metric', 'value', 'observation_status',
+    'status_reason', 'raw_value', 'source_row', 'source_column', 'observed_at',
+)
+REFEREE_PROFILE_BUSINESS = ('referee_id', 'name', 'nationality', 'birth_date', 'observed_at')
 _BUSINESS_COLUMNS = {
     'squad_memberships': SQUAD_MEMBERSHIP_BUSINESS,
     'player_attribute_observations': ATTRIBUTE_BUSINESS,
@@ -179,6 +195,8 @@ _BUSINESS_COLUMNS = {
     'club_value_observations': CLUB_VALUE_BUSINESS,
     'achievement_observations': ACHIEVEMENT_BUSINESS,
     'rumour_observations': RUMOUR_BUSINESS,
+    'referee_aggregate_observations': REFEREE_AGGREGATE_BUSINESS,
+    'referee_profiles': REFEREE_PROFILE_BUSINESS,
 }
 # observed_at serves both roles in the squad and coach tables.
 CORE_COLUMNS = {
@@ -190,13 +208,13 @@ COLUMN_TYPES: Mapping[str, str] = {
     **dict.fromkeys(('observed_at', 'captured_at', 'extracted_at', '_ingested_at'), 'timestamp'),
     **dict.fromkeys((
         'dob', 'joined_at', 'loan_until', 'injury_return_date', 'contract_until', 'mv_date',
-        'mv_last_change', 'transfer_date', 'appointed_date', 'left_date', 'value_date',
+        'mv_last_change', 'transfer_date', 'appointed_date', 'left_date', 'value_date', 'birth_date',
     ), 'date'),
     **dict.fromkeys((
         'age', 'height_cm', 'market_value_eur', 'shirt_number', 'signed_from_fee_eur',
         'value_eur', 'fee_eur', 'from_country_id', 'to_country_id',
         'capacity', 'spectators_total', 'spectators_average', 'matches', 'sold_out', 'value_amount',
-        'page_number',
+        'page_number', 'source_row',
     ), 'bigint'),
     **dict.fromkeys((
         'is_on_loan', 'is_captain', 'is_value_removed', 'is_upcoming',
@@ -668,6 +686,13 @@ def plan_for_outcome(
     )
 
 
+def _referee_directory_identity(path: str) -> tuple[str, str]:
+    match = _REFEREE_DIRECTORY_PATH.fullmatch(path)
+    if match is None:
+        raise CoreParseError('row_scope_mismatch')
+    return match[1], match[2]
+
+
 def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
     """Empty outcomes have no rows to cross-check; the capture URL still names
     the entity it belongs to, so a swapped club/player scope fails here."""
@@ -675,6 +700,15 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         return
     url = urlsplit(capture.url)
     path = url.path
+    if entity == 'referee_aggregate_observations':
+        if _referee_directory_identity(path) != (scope_values['competition_id'], scope_values['edition_id']):
+            raise CoreParseError('row_scope_mismatch')
+        return
+    if entity == 'referee_profiles':
+        match = re.fullmatch(r'/-/profil/schiedsrichter/([1-9][0-9]*)', path)
+        if match is None or match[1] != scope_values['referee_id']:
+            raise CoreParseError('row_scope_mismatch')
+        return
     if entity == 'rumour_observations':
         match = re.fullmatch(r'/[A-Za-z0-9_-]+/geruechte/wettbewerb/([A-Za-z0-9_-]+)(?:/page/[0-9]+)?', path)
         if match is None or match[1] != scope_values['competition_id']:

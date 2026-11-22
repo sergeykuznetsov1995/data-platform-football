@@ -9,7 +9,7 @@ signature, so live transport and offline capture replay run the same code.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from . import attendance, core, native_writer, parsing, rumours, sections
 from .models import FetchOutcome, FetchStatus
+from .referee_capture import _next_directory_page, referee_directory_url, referee_profile_url
 
 
 class CoreRunError(RuntimeError):
@@ -111,6 +112,14 @@ class RumourCompetitionTarget:
 
 
 @dataclass(frozen=True)
+class RefereeDirectoryTarget:
+    competition_id: str
+    edition_id: str
+    slug: str = ''
+    route: str = 'wettbewerb'
+
+
+@dataclass(frozen=True)
 class CoreScopePlan:
     league: str
     season: str
@@ -125,6 +134,8 @@ class CoreScopePlan:
     club_value_targets: tuple[ClubValueTarget, ...] = ()
     achievement_holders: tuple[AchievementHolderTarget, ...] = ()
     rumour_competitions: tuple[RumourCompetitionTarget, ...] = ()
+    referee_directories: tuple[RefereeDirectoryTarget, ...] = ()
+    referee_profile_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,6 +169,8 @@ class _Request:
     edition_id: str = ""
     recipient_id: str = ""
     recipient_type: str = ""
+    directory_scope: Mapping[str, str] | None = None
+    referee_id: str = ""
 
     @property
     def as_json(self) -> bool:
@@ -175,7 +188,9 @@ class _Request:
             return {"player_id": self.player_id}
         if self.coach_id:
             return {"coach_id": self.coach_id}
-        if self.label == "attendance":
+        if self.label == "referee_profile":
+            return {"referee_id": self.referee_id}
+        if self.label in ("attendance", "referee_directory"):
             return {"competition_id": self.competition_id, "edition_id": self.edition_id}
         if self.label in ("club_values", "rumours"):
             return {"competition_id": self.competition_id}
@@ -220,6 +235,16 @@ def _requests(plan: CoreScopePlan):
         request = _Request("rumours", rumours_url(slug, target.competition_id),
                            competition_id=target.competition_id)
         yield request, rumours_competition(slug, target.competition_id, target.name)
+    for target in plan.referee_directories:
+        directory = {
+            "competition_id": target.competition_id, "edition_id": target.edition_id,
+            "slug": target.slug or target.competition_id, "route": target.route,
+        }
+        yield _Request("referee_directory", referee_directory_url(directory),
+                       competition_id=target.competition_id, edition_id=target.edition_id,
+                       directory_scope=directory), None
+    for referee_id in plan.referee_profile_ids:
+        yield _Request("referee_profile", referee_profile_url(referee_id), referee_id=referee_id), None
 
 
 def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
@@ -277,7 +302,10 @@ _ENTITIES = {
     "club_achievement": ("achievement_observations",),
     "coach_achievement": ("achievement_observations",),
     "rumours": ("rumour_observations",),
+    "referee_directory": ("referee_aggregate_observations",),
+    "referee_profile": ("referee_profiles",),
 }
+_PAGINATED_ENDPOINTS = frozenset({"attendance", "rumours", "referee_directory"})
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
 
 
@@ -291,7 +319,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     )
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
-    paginated = request.label in ("attendance", "rumours")
+    paginated = request.label in _PAGINATED_ENDPOINTS
     if result.status is FetchStatus.NOT_APPLICABLE and not paginated:
         return tuple(
             core.captureless_outcome(
@@ -316,6 +344,9 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
             for entity in _ENTITIES[request.label]
         ), None
 
+    if request.label == "referee_directory":
+        unit = sections.extract_referee_directory_observations(captures, scope, **metadata)
+        return unit, max(page.captured_at for page in captures)
     if request.label == "rumours":
         unit = sections.extract_rumour_observations(
             captures, scope, competition=competition, **metadata)
@@ -336,6 +367,10 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         unit = core.extract_career_observations(capture, scope, **metadata)
     elif request.label == "club_values":
         unit = sections.extract_club_value_observations(capture, scope, **metadata)
+    elif request.label == "referee_profile":
+        unit = sections.extract_referee_profile_observations(
+            capture, scope, referee_id=request.referee_id, **metadata,
+        )
     elif request.label.endswith("_achievement"):
         unit = sections.extract_achievement_observations(
             capture, scope, recipient_type=request.recipient_type,
@@ -391,11 +426,24 @@ class CoreRun:
                 )
                 fetched += 1
                 cache_hits += int(result.cache_hit)
-                if (request.label not in ("attendance", "rumours") or result.status is not FetchStatus.OK
+                if (request.label not in _PAGINATED_ENDPOINTS or result.status is not FetchStatus.OK
                         or not result.raw_capture_id):
                     break
                 capture = _capture(page, result, self._raw_loader)
                 captures.append(capture)
+                if request.label == "referee_directory":
+                    number = len(captures)
+                    try:
+                        has_next = _next_directory_page(capture.text, request.directory_scope, number)
+                    except UnicodeDecodeError:
+                        # Extraction reports the invalid source text with the capture evidence.
+                        break
+                    if not has_next:
+                        break
+                    if number >= 100:
+                        raise CoreRunError('referee_directory:pagination_limit')
+                    page = replace(request, url=referee_directory_url(request.directory_scope, page=number + 1))
+                    continue
                 if request.label == "rumours":
                     if len(captures) == 1:
                         try:
@@ -443,8 +491,7 @@ class CoreRun:
                 captures, competition=competition)
             outcomes.extend(unit)
             if captured_at is not None and writer is not None and connection_factory is not None:
-                # Each outcome plans against ITS OWN capture clock: a multi-page
-                # unit (rumours) writes one plan per page capture.
+                # A multi-page merge writes one plan per contributing page capture.
                 entries = [
                     (item, item.capture.captured_at, _outcome_scope_values(item, request, plan))
                     for item in unit
