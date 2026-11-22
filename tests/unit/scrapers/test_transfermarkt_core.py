@@ -345,3 +345,18 @@ def test_lane_outcome_validates_status_rows_and_proof_rules():
                     run_id='r', universe_version=UNIVERSE)
     with pytest.raises(CoreParseError):
         LaneOutcome('nope', 'observed_empty', 'r', proof='p')
+
+
+def test_numeric_id_strings_render_as_their_bigint_column_type():
+    capture = _load('transfer_events')
+    player_id = capture.url.rsplit('/', 1)[-1].split('.')[0]
+    outcome = core.extract_career_observations(
+        capture, _scope(player_id=player_id, club_id=None),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    if outcome.rows:
+        for row in outcome.rows:
+            for column in ('from_country_id', 'to_country_id'):
+                if row[column] is not None:
+                    assert isinstance(row[column], int), column
+        return
+    pytest.skip('sample fixture has no transfer rows')

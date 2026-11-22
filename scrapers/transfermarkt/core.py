@@ -315,6 +315,11 @@ def _render(
         value = values[col]
         if COLUMN_TYPES[col] == 'date' and isinstance(value, date):
             value = _iso_date(value)
+        elif COLUMN_TYPES[col] == 'bigint' and isinstance(value, str) and value.isdigit():
+            # Parser helpers sometimes hand numeric ids as strings; the
+            # warehouse column is bigint and the physical read-back returns
+            # an int, so the plan must carry the int form.
+            value = int(value)
         row[col] = value
     row.update(
         source_url=capture.url, source_endpoint=capture.endpoint,
