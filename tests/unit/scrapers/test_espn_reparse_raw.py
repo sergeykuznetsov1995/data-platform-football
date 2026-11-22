@@ -267,6 +267,174 @@ def test_resume_after_child_commit(tmp_path):
     assert len(bronze.tables[MATCH_TABLE]) == 1
 
 
+class Interrupted(Bronze):
+    """Stop the ``stop_at``-th match commit, as a killed writer would."""
+
+    def __init__(self, stop_at):
+        super().__init__()
+        self.stop_at, self.commits = stop_at, 0
+
+    def insert_dataframe_atomic(self, schema, table, df, **kwargs):
+        if table == MATCH_TABLE:
+            self.commits += 1
+            if self.commits == self.stop_at:
+                raise RuntimeError("writer stopped before match")
+        return super().insert_dataframe_atomic(schema, table, df, **kwargs)
+
+
+def _three_matches(data, add):
+    """Two more matches of the same edition; they sort before the fixture."""
+    for number in (1, 2):
+        body = json.loads(json.dumps(data))
+        body["header"]["id"] = str(101 + number)
+        add(body, f"2026-08-0{number + 1} 00:00:00", event_id=101 + number)
+
+
+def test_checkpoint_skips_batches_an_earlier_segment_committed(tmp_path):
+    data, manifest, editions, store, add = corpus(tmp_path)
+    _three_matches(data, add)
+    state = tmp_path / "resume.jsonl"
+    bronze = Interrupted(stop_at=2)
+    with pytest.raises(RuntimeError, match="stopped"):
+        replay.run(
+            manifest, editions, store=store, trino=bronze, batch_size=1,
+            resume_state=state,
+        )
+    # Only the first batch is durable evidence: it is complete in all four
+    # tables.  The second lost its match, its children are left behind.
+    first = [json.loads(line) for line in state.read_text().splitlines()]
+    assert len(first) == 1
+    assert {r["event_id"] for r in bronze.tables[MATCH_TABLE]} == {102}
+    assert all({r["event_id"] for r in rows} == {102, 103} for table, rows in bronze.tables.items() if table != MATCH_TABLE)
+    calls = len(bronze.calls)
+
+    result = replay.run(
+        manifest, editions, store=store, trino=bronze, batch_size=1,
+        resume_state=state,
+    )
+    assert result["corpus"]["outcomes"] == {"written": 3}
+    # One report equal to a full run: every match parsed, the batch not rewritten.
+    assert all("selected_sha256" in r for r in result["matches"])
+    assert [r["event_id"] for r in result["matches"] if "resumed_from" in r] == [102]
+    assert result["matches"][0]["resumed_from"] == first[0]["batch_id"]
+    assert result["corpus"]["selected_matches"] == 3
+    assert result["resume"]["resumed_events"] == 1
+    assert result["resume"]["resumed_batches"] == 1
+    assert result["resume"]["prior_receipts"] == [first[0]["receipt"]]
+    assert len(result["receipts"]) == 2
+    written = bronze.calls[calls:]
+    assert len(written) == 8   # two batches x four tables
+    assert not any("IN (102)" in c["delete_filter"] for c in written)
+    assert len(state.read_text().splitlines()) == 3
+    for table, rows in bronze.tables.items():
+        keys = [tuple(r[k] for k in NATURAL_KEYS[table]) for r in rows]
+        assert len(keys) == len(set(keys))
+        assert {r["event_id"] for r in rows} == {102, 103, int(data["header"]["id"])}
+
+
+def test_resume_without_checkpoint_file_writes_everything(tmp_path):
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    state = tmp_path / "resume.jsonl"
+    bronze = Bronze()
+    result = replay.run(
+        manifest, editions, store=store, trino=bronze, resume_state=state
+    )
+    assert result["matches"][0]["outcome"] == "written"
+    assert "resumed_from" not in result["matches"][0]
+    assert result["resume"]["resumed_events"] == result["resume"]["resumed_batches"] == 0
+    assert len(state.read_text().splitlines()) == 1
+    assert "resume" not in replay.run(manifest, editions, store=store)
+
+
+@pytest.mark.parametrize("changed", ["batch_size", "manifest"])
+def test_checkpoint_of_another_replay_is_refused(tmp_path, changed):
+    data, manifest, editions, store, add = corpus(tmp_path)
+    state = tmp_path / "resume.jsonl"
+    bronze = Bronze()
+    replay.run(manifest, editions, store=store, trino=bronze, resume_state=state)
+    batch_size = 2 if changed == "batch_size" else 100
+    if changed == "manifest":
+        add(data, "2026-08-13 00:00:00")
+    calls = len(bronze.calls)
+    with pytest.raises(ValueError, match="another replay"):
+        replay.run(
+            manifest, editions, store=store, trino=bronze,
+            batch_size=batch_size, resume_state=state,
+        )
+    assert len(bronze.calls) == calls
+
+
+def test_checkpoint_event_outside_manifest_is_refused(tmp_path):
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    state = tmp_path / "resume.jsonl"
+    replay.run(manifest, editions, store=store, trino=Bronze(), resume_state=state)
+    entry = json.loads(state.read_text())
+    entry["event_ids"] = [999]
+    state.write_text(json.dumps(entry) + "\n")
+    with pytest.raises(ValueError, match="outside the manifest"):
+        replay.run(manifest, editions, store=store, trino=Bronze(), resume_state=state)
+
+
+def test_torn_checkpoint_tail_is_not_evidence(tmp_path):
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    state = tmp_path / "resume.jsonl"
+    bronze = Bronze()
+    replay.run(manifest, editions, store=store, trino=bronze, resume_state=state)
+    good = state.read_text()
+    torn = good + good[: len(good) // 2]
+    state.write_text(torn)
+    calls = len(bronze.calls)
+    result = replay.run(
+        manifest, editions, store=store, trino=bronze, resume_state=state
+    )
+    # The complete line counts, the interrupted one does not block the run.
+    assert result["resume"]["resumed_events"] == 1
+    assert len(bronze.calls) == calls and state.read_text() == torn
+    # Damage that is not a tail cannot be trusted, and one match cannot be
+    # recorded by two batches.
+    for damaged, reason in (
+        ('{"batch_id": "x"\n' + good, "unusable checkpoint"),
+        (good + good, "unusable checkpoint"),
+        (good + "{}", "another replay"),
+    ):
+        state.write_text(damaged)
+        with pytest.raises(ValueError, match=reason):
+            replay.run(
+                manifest, editions, store=store, trino=bronze, resume_state=state
+            )
+
+
+def test_checkpoint_held_by_another_writer_is_refused(tmp_path):
+    import fcntl
+
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    state = tmp_path / "resume.jsonl"
+    bronze = Bronze()
+    with state.open("a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match="held by another writer"):
+            replay.run(
+                manifest, editions, store=store, trino=bronze, resume_state=state
+            )
+        assert not bronze.calls and not state.read_text()
+    # The refused run released its own descriptor: the file is usable again.
+    # (A run failing inside the write releases it too: the interrupted run of
+    # test_checkpoint_skips_batches_an_earlier_segment_committed is resumed
+    # in the same process.)
+    result = replay.run(
+        manifest, editions, store=store, trino=bronze, resume_state=state
+    )
+    assert result["matches"][0]["outcome"] == "written"
+
+
+def test_resume_state_requires_write(tmp_path):
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    with pytest.raises(ValueError, match="requires --write"):
+        replay.run(
+            manifest, editions, store=store, resume_state=tmp_path / "resume.jsonl"
+        )
+
+
 @pytest.mark.parametrize("broken", ["missing", "gzip", "hash"])
 @pytest.mark.parametrize("write", [False, True])
 def test_bad_blob_never_downloads(tmp_path, broken, write):

@@ -2,6 +2,8 @@
 
 Run with --dry-run first. Writes require exclusive ownership of the selected
 matches: the four child-to-match commits are not a cross-table transaction.
+``--resume-state FILE`` records each committed batch so that a ``--write``
+stopped by a restart continues with the first batch that is not in the file.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from collections import defaultdict
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -317,6 +320,78 @@ def _code_sha(value):
     return value
 
 
+def _open_checkpoint(path):
+    """The checkpoint belongs to one writer for the whole run.
+
+    The lock lives on the open file: a second ``--write`` naming the same
+    state, say a restart while the old writer is still alive, is refused
+    instead of interleaving its lines with another writer's.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise ValueError(f"resume state is held by another writer: {path}") from exc
+    return fd
+
+
+def _append_checkpoint(fd, entry):
+    """One durable line per committed batch of a ``--resume-state`` run.
+
+    The line is written only after the batch receipt exists: a crash before
+    it reaches the disk just writes that batch again.  A crash inside the
+    append leaves a torn last line, which the loader ignores.
+    """
+    os.write(fd, (json.dumps(entry, sort_keys=True, default=str) + "\n").encode())
+    os.fsync(fd)
+
+
+def _load_checkpoint(fd, identity):
+    """Batches an earlier segment committed: ``{event_id: batch_id}`` and receipts.
+
+    ``identity`` holds what every line must share with this run, so a
+    checkpoint of another manifest, editions snapshot, parser or batch size
+    is refused instead of silently skipped.  A torn last line is not durable
+    evidence and is ignored; damage anywhere else cannot be trusted.
+    """
+    done = {}
+    receipts = []
+    text = os.pread(fd, os.fstat(fd).st_size, 0).decode("utf-8")
+    # Every complete line ends with a newline; a tail without one is torn.
+    torn_tail = bool(text) and not text.endswith("\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for index, raw in enumerate(lines):
+        try:
+            entry = json.loads(raw)
+        except ValueError as exc:
+            if index == len(lines) - 1 and torn_tail:
+                break
+            raise ValueError(f"unusable checkpoint: line {index + 1}") from exc
+        if not isinstance(entry, dict) or any(
+            entry.get(name) != value for name, value in identity.items()
+        ):
+            raise ValueError("checkpoint belongs to another replay")
+        try:
+            event_ids = entry["event_ids"]
+            batch_id = entry["receipt"]["batch_id"]
+            if (
+                not isinstance(event_ids, list)
+                or not event_ids
+                or any(type(i) is not int or i < 1 for i in event_ids)
+                or batch_id != entry["batch_id"]
+                or any(i in done for i in event_ids)
+            ):
+                raise ValueError("malformed checkpoint entry")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError(f"unusable checkpoint: line {index + 1}") from exc
+        receipts.append(entry["receipt"])
+        done.update((event_id, batch_id) for event_id in event_ids)
+    return done, receipts
+
+
 def run(
     manifest,
     editions,
@@ -328,10 +403,19 @@ def run(
     code_sha=None,
     require_complete_editions=False,
     state_dir=None,
+    resume_state=None,
 ):
-    """Only the injected raw reader and (in write mode) Bronze manager do IO."""
+    """Only the injected raw reader and (in write mode) Bronze manager do IO.
+
+    ``resume_state`` is an append-only checkpoint of committed batches: a
+    restarted write parses every match again, for one report equal to a
+    single full run, but does not write the batches an earlier segment
+    committed (#2108).
+    """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if resume_state is not None and trino is None:
+        raise ValueError("resume state requires --write")
     manifest_bytes = Path(manifest).read_bytes()
     edition_bytes = Path(editions).read_bytes()
     snapshot = load_editions(Path(editions))
@@ -408,10 +492,44 @@ def run(
         "matches": [],
         "receipts": [],
     }
+    done, prior_receipts, checkpoint = {}, [], None
+    if resume_state is not None:
+        try:
+            checkpoint = _open_checkpoint(resume_state)
+            done, prior_receipts = _load_checkpoint(
+                checkpoint,
+                {
+                    "manifest_sha256": report["manifest_sha256"],
+                    "editions_sha256": report["editions_sha256"],
+                    "parser_version": PARSER_VERSION,
+                    "batch_size": batch_size,
+                },
+            )
+            unknown = set(done) - {key[2] for key in grouped}
+            if unknown:
+                raise ValueError(
+                    f"checkpoint names {len(unknown)} events outside the manifest"
+                )
+            report["resume"] = {
+                "state": str(resume_state),
+                "prior_receipts": prior_receipts,
+            }
+        except BaseException:
+            if checkpoint is not None:
+                os.close(checkpoint)
+            raise
     batches = defaultdict(list)
 
     def flush(key):
         pending = batches[key]
+        if not pending:
+            return
+        # A batch an earlier segment committed is parsed, never written again.
+        resumed = [item for item in pending if item[0].schedule.event_id in done]
+        pending[:] = [item for item in pending if item[0].schedule.event_id not in done]
+        for chosen, record, _, _ in resumed:
+            record["outcome"] = "written"
+            record["resumed_from"] = done[chosen.schedule.event_id]
         if not pending:
             return
         slug, year = key
@@ -459,82 +577,103 @@ def run(
         report["receipts"].append(asdict(receipt))
         for _, record in ready:
             record["outcome"] = "written"
+        if checkpoint is not None:
+            # Only a committed batch with its duplicates marked reaches the file.
+            _append_checkpoint(
+                checkpoint,
+                {
+                    "manifest_sha256": report["manifest_sha256"],
+                    "editions_sha256": report["editions_sha256"],
+                    "parser_version": PARSER_VERSION,
+                    "batch_size": batch_size,
+                    "edition": [slug, year],
+                    "code_sha": report["code_sha"],
+                    "event_ids": sorted(p.schedule.event_id for p, _ in ready),
+                    "batch_id": receipt.batch_id,
+                    "receipt": asdict(receipt),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
         pending.clear()
 
-    for (cid, year, event_id), variants in sorted(grouped.items()):
-        context = contexts.get((cid, year))
-        slug = target_rows[cid].slug if cid in target_rows else None
-        if competition is not None and slug != competition:
-            continue
-        record = {
-            "event_id": event_id,
-            "competition_id": cid,
-            "season_year": year,
-            "competition": slug,
-            "variants": len(variants),
-            "errors": [],
-            "raw_any": dict.fromkeys(PARTS, False),
-        }
-        report["matches"].append(record)
-        if slug is None:
-            record["outcome"] = "outside_registry"
-            continue
-        if context is not None:
-            comp, edition = context
-        chosen = None
-        for fetched, sha, uri in sorted(variants.values(), reverse=True):
-            try:
-                body = store.load_exact(uri, sha)
+    try:
+        for (cid, year, event_id), variants in sorted(grouped.items()):
+            context = contexts.get((cid, year))
+            slug = target_rows[cid].slug if cid in target_rows else None
+            if competition is not None and slug != competition:
+                continue
+            record = {
+                "event_id": event_id,
+                "competition_id": cid,
+                "season_year": year,
+                "competition": slug,
+                "variants": len(variants),
+                "errors": [],
+                "raw_any": dict.fromkeys(PARTS, False),
+            }
+            report["matches"].append(record)
+            if slug is None:
+                record["outcome"] = "outside_registry"
+                continue
+            if context is not None:
+                comp, edition = context
+            chosen = None
+            for fetched, sha, uri in sorted(variants.values(), reverse=True):
                 try:
-                    presence = raw_parts(body)
-                    for part in PARTS:
-                        record["raw_any"][part] |= presence[part]
-                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-                    presence = dict.fromkeys(PARTS, False)
-                if context is None:
-                    continue
-                event = schedule_row_from_header(
-                    body, competition=comp, edition=edition
-                )
-                if event.event_id != event_id:
-                    raise ValueError("manifest event identity mismatch")
-                parsed = parse_summary(
-                    body, competition=comp, edition=edition, event=event
-                )
-                if parsed.disposition is SummaryDisposition.SOURCE_MALFORMED:
-                    record["errors"].append(
-                        {
-                            "sha256": sha,
-                            "reason": parsed.reason,
-                            "disposition": parsed.disposition.value,
-                        }
+                    body = store.load_exact(uri, sha)
+                    try:
+                        presence = raw_parts(body)
+                        for part in PARTS:
+                            record["raw_any"][part] |= presence[part]
+                    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                        presence = dict.fromkeys(PARTS, False)
+                    if context is None:
+                        continue
+                    event = schedule_row_from_header(
+                        body, competition=comp, edition=edition
                     )
-                    continue
-                if chosen is None:
-                    chosen = MatchPayload(event, parsed, RawRef(uri, sha, fetched))
-                    record.update(
-                        selected_sha256=sha,
-                        raw=presence,
-                        parsed=parsed_parts(parsed),
-                        anomalies=list(parsed.anomalies),
-                        disposition=parsed.disposition.value,
+                    if event.event_id != event_id:
+                        raise ValueError("manifest event identity mismatch")
+                    parsed = parse_summary(
+                        body, competition=comp, edition=edition, event=event
                     )
-            except (RawStoreError, OSError, EspnParseError, ValueError) as exc:
-                record["errors"].append({"sha256": sha, "reason": str(exc)})
-        record["other_variants"] = len(variants) - (chosen is not None)
-        if context is None:
-            record["outcome"] = "missing_edition"
-        elif chosen is None:
-            record["outcome"] = "no_valid_summary"
-        elif trino is None:
-            record["outcome"] = "parsed"
-        else:
-            key = (slug, year)
-            batches[key].append((chosen, record, comp, edition))
-            if len(batches[key]) >= batch_size:
-                flush(key)
-    for key in sorted(batches):
-        flush(key)
+                    if parsed.disposition is SummaryDisposition.SOURCE_MALFORMED:
+                        record["errors"].append(
+                            {
+                                "sha256": sha,
+                                "reason": parsed.reason,
+                                "disposition": parsed.disposition.value,
+                            }
+                        )
+                        continue
+                    if chosen is None:
+                        chosen = MatchPayload(event, parsed, RawRef(uri, sha, fetched))
+                        record.update(
+                            selected_sha256=sha,
+                            raw=presence,
+                            parsed=parsed_parts(parsed),
+                            anomalies=list(parsed.anomalies),
+                            disposition=parsed.disposition.value,
+                        )
+                except (RawStoreError, OSError, EspnParseError, ValueError) as exc:
+                    record["errors"].append({"sha256": sha, "reason": str(exc)})
+            record["other_variants"] = len(variants) - (chosen is not None)
+            if context is None:
+                record["outcome"] = "missing_edition"
+            elif chosen is None:
+                record["outcome"] = "no_valid_summary"
+            elif trino is None:
+                record["outcome"] = "parsed"
+            else:
+                key = (slug, year)
+                batches[key].append((chosen, record, comp, edition))
+                if len(batches[key]) >= batch_size:
+                    flush(key)
+        for key in sorted(batches):
+            flush(key)
+    finally:
+        if checkpoint is not None:
+            os.close(checkpoint)
     report["corpus"] = _aggregate(report["matches"])
     report["competitions"] = {
         slug: _aggregate([r for r in report["matches"] if r["competition"] == slug])
@@ -542,6 +681,14 @@ def run(
             {r["competition"] for r in report["matches"] if r["competition"]}
         )
     }
+    if resume_state is not None:
+        resumed = [r["resumed_from"] for r in report["matches"] if "resumed_from" in r]
+        report["resume"].update(
+            resumed_events=len(resumed),
+            # Batches this run skipped: a --competition selection leaves the
+            # rest of the checkpoint in report["resume"]["prior_receipts"].
+            resumed_batches=len(set(resumed)),
+        )
     return report
 
 
@@ -561,6 +708,11 @@ def main(argv=None):
     from .gate import default_state_path
 
     parser.add_argument("--state-dir", type=Path, default=default_state_path().parent)
+    parser.add_argument(
+        "--resume-state", type=Path,
+        help="append-only checkpoint of committed batches; a restarted --write "
+             "skips the batches recorded there",
+    )
     parser.add_argument("--report", type=Path)
     parser.add_argument("--code-sha", help="release commit in containers without .git")
     args = parser.parse_args(argv)
@@ -579,6 +731,7 @@ def main(argv=None):
         code_sha=args.code_sha,
         require_complete_editions=args.require_complete_editions,
         state_dir=args.state_dir,
+        resume_state=args.resume_state,
     )
     output = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
     if args.report:
