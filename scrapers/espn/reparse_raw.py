@@ -13,6 +13,7 @@ from collections import defaultdict
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -319,20 +320,34 @@ def _code_sha(value):
     return value
 
 
-def _append_checkpoint(path, entry):
+def _open_checkpoint(path):
+    """The checkpoint belongs to one writer for the whole run.
+
+    The lock lives on the open file: a second ``--write`` naming the same
+    state, say a restart while the old writer is still alive, is refused
+    instead of interleaving its lines with another writer's.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise ValueError(f"resume state is held by another writer: {path}") from exc
+    return fd
+
+
+def _append_checkpoint(fd, entry):
     """One durable line per committed batch of a ``--resume-state`` run.
 
     The line is written only after the batch receipt exists: a crash before
     it reaches the disk just writes that batch again.  A crash inside the
     append leaves a torn last line, which the loader ignores.
     """
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    os.write(fd, (json.dumps(entry, sort_keys=True, default=str) + "\n").encode())
+    os.fsync(fd)
 
 
-def _load_checkpoint(path, identity):
+def _load_checkpoint(fd, identity):
     """Batches an earlier segment committed: ``{event_id: batch_id}`` and receipts.
 
     ``identity`` holds what every line must share with this run, so a
@@ -342,10 +357,7 @@ def _load_checkpoint(path, identity):
     """
     done = {}
     receipts = []
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return done, receipts
+    text = os.pread(fd, os.fstat(fd).st_size, 0).decode("utf-8")
     # Every complete line ends with a newline; a tail without one is torn.
     torn_tail = bool(text) and not text.endswith("\n")
     lines = text.split("\n")
@@ -357,7 +369,7 @@ def _load_checkpoint(path, identity):
         except ValueError as exc:
             if index == len(lines) - 1 and torn_tail:
                 break
-            raise ValueError(f"unusable checkpoint {path}: line {index + 1}") from exc
+            raise ValueError(f"unusable checkpoint: line {index + 1}") from exc
         if not isinstance(entry, dict) or any(
             entry.get(name) != value for name, value in identity.items()
         ):
@@ -374,7 +386,7 @@ def _load_checkpoint(path, identity):
             ):
                 raise ValueError("malformed checkpoint entry")
         except (ValueError, TypeError, KeyError) as exc:
-            raise ValueError(f"unusable checkpoint {path}: line {index + 1}") from exc
+            raise ValueError(f"unusable checkpoint: line {index + 1}") from exc
         receipts.append(entry["receipt"])
         done.update((event_id, batch_id) for event_id in event_ids)
     return done, receipts
@@ -480,26 +492,32 @@ def run(
         "matches": [],
         "receipts": [],
     }
-    done, prior_receipts = {}, []
+    done, prior_receipts, checkpoint = {}, [], None
     if resume_state is not None:
-        done, prior_receipts = _load_checkpoint(
-            resume_state,
-            {
-                "manifest_sha256": report["manifest_sha256"],
-                "editions_sha256": report["editions_sha256"],
-                "parser_version": PARSER_VERSION,
-                "batch_size": batch_size,
-            },
-        )
-        unknown = set(done) - {key[2] for key in grouped}
-        if unknown:
-            raise ValueError(
-                f"checkpoint names {len(unknown)} events outside the manifest"
+        try:
+            checkpoint = _open_checkpoint(resume_state)
+            done, prior_receipts = _load_checkpoint(
+                checkpoint,
+                {
+                    "manifest_sha256": report["manifest_sha256"],
+                    "editions_sha256": report["editions_sha256"],
+                    "parser_version": PARSER_VERSION,
+                    "batch_size": batch_size,
+                },
             )
-        report["resume"] = {
-            "state": str(resume_state),
-            "prior_receipts": prior_receipts,
-        }
+            unknown = set(done) - {key[2] for key in grouped}
+            if unknown:
+                raise ValueError(
+                    f"checkpoint names {len(unknown)} events outside the manifest"
+                )
+            report["resume"] = {
+                "state": str(resume_state),
+                "prior_receipts": prior_receipts,
+            }
+        except BaseException:
+            if checkpoint is not None:
+                os.close(checkpoint)
+            raise
     batches = defaultdict(list)
 
     def flush(key):
@@ -559,10 +577,10 @@ def run(
         report["receipts"].append(asdict(receipt))
         for _, record in ready:
             record["outcome"] = "written"
-        if resume_state is not None:
+        if checkpoint is not None:
             # Only a committed batch with its duplicates marked reaches the file.
             _append_checkpoint(
-                resume_state,
+                checkpoint,
                 {
                     "manifest_sha256": report["manifest_sha256"],
                     "editions_sha256": report["editions_sha256"],
@@ -578,80 +596,84 @@ def run(
             )
         pending.clear()
 
-    for (cid, year, event_id), variants in sorted(grouped.items()):
-        context = contexts.get((cid, year))
-        slug = target_rows[cid].slug if cid in target_rows else None
-        if competition is not None and slug != competition:
-            continue
-        record = {
-            "event_id": event_id,
-            "competition_id": cid,
-            "season_year": year,
-            "competition": slug,
-            "variants": len(variants),
-            "errors": [],
-            "raw_any": dict.fromkeys(PARTS, False),
-        }
-        report["matches"].append(record)
-        if slug is None:
-            record["outcome"] = "outside_registry"
-            continue
-        if context is not None:
-            comp, edition = context
-        chosen = None
-        for fetched, sha, uri in sorted(variants.values(), reverse=True):
-            try:
-                body = store.load_exact(uri, sha)
+    try:
+        for (cid, year, event_id), variants in sorted(grouped.items()):
+            context = contexts.get((cid, year))
+            slug = target_rows[cid].slug if cid in target_rows else None
+            if competition is not None and slug != competition:
+                continue
+            record = {
+                "event_id": event_id,
+                "competition_id": cid,
+                "season_year": year,
+                "competition": slug,
+                "variants": len(variants),
+                "errors": [],
+                "raw_any": dict.fromkeys(PARTS, False),
+            }
+            report["matches"].append(record)
+            if slug is None:
+                record["outcome"] = "outside_registry"
+                continue
+            if context is not None:
+                comp, edition = context
+            chosen = None
+            for fetched, sha, uri in sorted(variants.values(), reverse=True):
                 try:
-                    presence = raw_parts(body)
-                    for part in PARTS:
-                        record["raw_any"][part] |= presence[part]
-                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-                    presence = dict.fromkeys(PARTS, False)
-                if context is None:
-                    continue
-                event = schedule_row_from_header(
-                    body, competition=comp, edition=edition
-                )
-                if event.event_id != event_id:
-                    raise ValueError("manifest event identity mismatch")
-                parsed = parse_summary(
-                    body, competition=comp, edition=edition, event=event
-                )
-                if parsed.disposition is SummaryDisposition.SOURCE_MALFORMED:
-                    record["errors"].append(
-                        {
-                            "sha256": sha,
-                            "reason": parsed.reason,
-                            "disposition": parsed.disposition.value,
-                        }
+                    body = store.load_exact(uri, sha)
+                    try:
+                        presence = raw_parts(body)
+                        for part in PARTS:
+                            record["raw_any"][part] |= presence[part]
+                    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                        presence = dict.fromkeys(PARTS, False)
+                    if context is None:
+                        continue
+                    event = schedule_row_from_header(
+                        body, competition=comp, edition=edition
                     )
-                    continue
-                if chosen is None:
-                    chosen = MatchPayload(event, parsed, RawRef(uri, sha, fetched))
-                    record.update(
-                        selected_sha256=sha,
-                        raw=presence,
-                        parsed=parsed_parts(parsed),
-                        anomalies=list(parsed.anomalies),
-                        disposition=parsed.disposition.value,
+                    if event.event_id != event_id:
+                        raise ValueError("manifest event identity mismatch")
+                    parsed = parse_summary(
+                        body, competition=comp, edition=edition, event=event
                     )
-            except (RawStoreError, OSError, EspnParseError, ValueError) as exc:
-                record["errors"].append({"sha256": sha, "reason": str(exc)})
-        record["other_variants"] = len(variants) - (chosen is not None)
-        if context is None:
-            record["outcome"] = "missing_edition"
-        elif chosen is None:
-            record["outcome"] = "no_valid_summary"
-        elif trino is None:
-            record["outcome"] = "parsed"
-        else:
-            key = (slug, year)
-            batches[key].append((chosen, record, comp, edition))
-            if len(batches[key]) >= batch_size:
-                flush(key)
-    for key in sorted(batches):
-        flush(key)
+                    if parsed.disposition is SummaryDisposition.SOURCE_MALFORMED:
+                        record["errors"].append(
+                            {
+                                "sha256": sha,
+                                "reason": parsed.reason,
+                                "disposition": parsed.disposition.value,
+                            }
+                        )
+                        continue
+                    if chosen is None:
+                        chosen = MatchPayload(event, parsed, RawRef(uri, sha, fetched))
+                        record.update(
+                            selected_sha256=sha,
+                            raw=presence,
+                            parsed=parsed_parts(parsed),
+                            anomalies=list(parsed.anomalies),
+                            disposition=parsed.disposition.value,
+                        )
+                except (RawStoreError, OSError, EspnParseError, ValueError) as exc:
+                    record["errors"].append({"sha256": sha, "reason": str(exc)})
+            record["other_variants"] = len(variants) - (chosen is not None)
+            if context is None:
+                record["outcome"] = "missing_edition"
+            elif chosen is None:
+                record["outcome"] = "no_valid_summary"
+            elif trino is None:
+                record["outcome"] = "parsed"
+            else:
+                key = (slug, year)
+                batches[key].append((chosen, record, comp, edition))
+                if len(batches[key]) >= batch_size:
+                    flush(key)
+        for key in sorted(batches):
+            flush(key)
+    finally:
+        if checkpoint is not None:
+            os.close(checkpoint)
     report["corpus"] = _aggregate(report["matches"])
     report["competitions"] = {
         slug: _aggregate([r for r in report["matches"] if r["competition"] == slug])
@@ -660,9 +682,12 @@ def run(
         )
     }
     if resume_state is not None:
+        resumed = [r["resumed_from"] for r in report["matches"] if "resumed_from" in r]
         report["resume"].update(
-            resumed_events=sum("resumed_from" in r for r in report["matches"]),
-            resumed_batches=len(prior_receipts),
+            resumed_events=len(resumed),
+            # Batches this run skipped: a --competition selection leaves the
+            # rest of the checkpoint in report["resume"]["prior_receipts"].
+            resumed_batches=len(set(resumed)),
         )
     return report
 

@@ -300,10 +300,12 @@ def test_checkpoint_skips_batches_an_earlier_segment_committed(tmp_path):
             manifest, editions, store=store, trino=bronze, batch_size=1,
             resume_state=state,
         )
-    # Only the first batch is durable evidence; the second lost its match.
+    # Only the first batch is durable evidence: it is complete in all four
+    # tables.  The second lost its match, its children are left behind.
     first = [json.loads(line) for line in state.read_text().splitlines()]
     assert len(first) == 1
-    assert [row["event_id"] for row in bronze.tables[MATCH_TABLE]] == [102]
+    assert {r["event_id"] for r in bronze.tables[MATCH_TABLE]} == {102}
+    assert all({r["event_id"] for r in rows} == {102, 103} for table, rows in bronze.tables.items() if table != MATCH_TABLE)
     calls = len(bronze.calls)
 
     result = replay.run(
@@ -388,10 +390,41 @@ def test_torn_checkpoint_tail_is_not_evidence(tmp_path):
     # The complete line counts, the interrupted one does not block the run.
     assert result["resume"]["resumed_events"] == 1
     assert len(bronze.calls) == calls and state.read_text() == torn
-    # Damage that is not a tail cannot be trusted.
-    state.write_text('{"batch_id": "x"\n' + good)
-    with pytest.raises(ValueError, match="unusable checkpoint"):
-        replay.run(manifest, editions, store=store, trino=bronze, resume_state=state)
+    # Damage that is not a tail cannot be trusted, and one match cannot be
+    # recorded by two batches.
+    for damaged, reason in (
+        ('{"batch_id": "x"\n' + good, "unusable checkpoint"),
+        (good + good, "unusable checkpoint"),
+        (good + "{}", "another replay"),
+    ):
+        state.write_text(damaged)
+        with pytest.raises(ValueError, match=reason):
+            replay.run(
+                manifest, editions, store=store, trino=bronze, resume_state=state
+            )
+
+
+def test_checkpoint_held_by_another_writer_is_refused(tmp_path):
+    import fcntl
+
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    state = tmp_path / "resume.jsonl"
+    bronze = Bronze()
+    with state.open("a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match="held by another writer"):
+            replay.run(
+                manifest, editions, store=store, trino=bronze, resume_state=state
+            )
+        assert not bronze.calls and not state.read_text()
+    # The refused run released its own descriptor: the file is usable again.
+    # (A run failing inside the write releases it too: the interrupted run of
+    # test_checkpoint_skips_batches_an_earlier_segment_committed is resumed
+    # in the same process.)
+    result = replay.run(
+        manifest, editions, store=store, trino=bronze, resume_state=state
+    )
+    assert result["matches"][0]["outcome"] == "written"
 
 
 def test_resume_state_requires_write(tmp_path):
