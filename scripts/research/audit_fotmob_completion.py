@@ -515,10 +515,6 @@ def section_results(payload, finished, history=()):
             category, reason = "writer_failed", "raw_present_typed_absent"
         elif typed and not raw:
             category, reason = "unknown", "typed_present_raw_absent"
-        elif not mask_valid:
-            category, reason = "unknown", "invalid_available_mask"
-        elif available != bool(typed):
-            category, reason = "unknown", "available_mask_disagrees"
         elif not raw and not typed:
             observed = timestamp(payload.get("_observed_at"))
             schema_evidence = any(parse_failure(row) and (
@@ -527,7 +523,19 @@ def section_results(payload, finished, history=()):
             if section == "matchFacts" and finished and schema_evidence:
                 category, reason = "parse_failed", "matchFacts_schema_drift"
             else:
-                category, reason = "source_unavailable", "stored_source_omission"
+                # The raw bytes prove the source served no section content.
+                # The stored mask may still claim presence: pre-#2302 batches
+                # recorded the source's JSON false sentinel as an available
+                # section (fixed in e46256b5). Raw evidence wins over the
+                # stale mask, so this is a definite source omission, not an
+                # unknown mask disagreement.
+                category = "source_unavailable"
+                reason = ("stored_source_omission_mask_stale"
+                          if available is True else "stored_source_omission")
+        elif not mask_valid:
+            category, reason = "unknown", "invalid_available_mask"
+        elif available != bool(typed):
+            category, reason = "unknown", "available_mask_disagrees"
         else:
             category, reason = "confirmed_content", "raw_typed_mask_agree"
         result.append({"section": section, "available": available, "typed": typed,

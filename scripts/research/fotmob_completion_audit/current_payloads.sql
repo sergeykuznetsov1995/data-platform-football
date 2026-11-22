@@ -18,33 +18,34 @@ SELECT competition_id, source_season_key, match_id, parser_version,
        _observed_at, _ingested_at, _target_batch_id, available_sections, payload_json_valid,
        CASE WHEN match_facts_json IS NOT NULL AND TRY(json_parse(match_facts_json)) IS NULL THEN CAST(NULL AS boolean)
             ELSE CASE WHEN TRY(json_parse(match_facts_json)) IS NULL THEN false
-            WHEN json_format(TRY(json_parse(match_facts_json))) IN ('null', '{{}}', '[]') THEN false ELSE true END END AS "typed_matchFacts",
+            WHEN json_format(TRY(json_parse(match_facts_json))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END END AS "typed_matchFacts",
        CASE WHEN stats_json IS NOT NULL AND TRY(json_parse(stats_json)) IS NULL THEN CAST(NULL AS boolean)
             ELSE CASE WHEN TRY(json_parse(stats_json)) IS NULL THEN false
-            WHEN json_format(TRY(json_parse(stats_json))) IN ('null', '{{}}', '[]') THEN false ELSE true END END AS "typed_stats",
+            WHEN json_format(TRY(json_parse(stats_json))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END END AS "typed_stats",
        CASE WHEN player_stats_json IS NOT NULL AND TRY(json_parse(player_stats_json)) IS NULL THEN CAST(NULL AS boolean)
             ELSE CASE WHEN TRY(json_parse(player_stats_json)) IS NULL THEN false
-            WHEN json_format(TRY(json_parse(player_stats_json))) IN ('null', '{{}}', '[]') THEN false ELSE true END END AS "typed_playerStats",
+            WHEN json_format(TRY(json_parse(player_stats_json))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END END AS "typed_playerStats",
        CASE WHEN lineup_json IS NOT NULL AND TRY(json_parse(lineup_json)) IS NULL THEN CAST(NULL AS boolean)
             ELSE CASE WHEN TRY(json_parse(lineup_json)) IS NULL THEN false
-            WHEN json_format(TRY(json_parse(lineup_json))) IN ('null', '{{}}', '[]') THEN false ELSE true END END AS "typed_lineup",
+            WHEN json_format(TRY(json_parse(lineup_json))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END END AS "typed_lineup",
        CASE WHEN shotmap_json IS NOT NULL AND TRY(json_parse(shotmap_json)) IS NULL THEN CAST(NULL AS boolean)
             ELSE CASE WHEN TRY(json_parse(shotmap_json)) IS NULL THEN false
-            WHEN json_format(TRY(json_parse(shotmap_json))) IN ('null', '{{}}', '[]') THEN false ELSE true END END AS "typed_shotmap",
-       CASE WHEN momentum_json IS NOT NULL AND TRY(json_parse(momentum_json)) IS NULL THEN CAST(NULL AS boolean)
-            ELSE CASE WHEN TRY(json_parse(momentum_json)) IS NULL THEN false
-            WHEN json_format(TRY(json_parse(momentum_json))) IN ('null', '{{}}', '[]') THEN false ELSE true END END AS "typed_momentum",
+            WHEN json_format(TRY(json_parse(shotmap_json))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END END AS "typed_shotmap",
+       CASE WHEN momentum_json IS NULL THEN false
+            WHEN lower(trim(CAST(momentum_json AS VARCHAR))) = 'false' THEN false
+            WHEN TRY(json_parse(CAST(momentum_json AS VARCHAR))) IS NULL THEN CAST(NULL AS boolean)
+            WHEN json_format(TRY(json_parse(CAST(momentum_json AS VARCHAR)))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "typed_momentum",
        CASE WHEN TRY(json_extract(raw_root, '$.matchFacts')) IS NULL THEN false
-            WHEN json_format(TRY(json_extract(raw_root, '$.matchFacts'))) IN ('null', '{{}}', '[]') THEN false ELSE true END AS "raw_matchFacts",
+            WHEN json_format(TRY(json_extract(raw_root, '$.matchFacts'))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "raw_matchFacts",
        CASE WHEN TRY(json_extract(raw_root, '$.stats')) IS NULL THEN false
-            WHEN json_format(TRY(json_extract(raw_root, '$.stats'))) IN ('null', '{{}}', '[]') THEN false ELSE true END AS "raw_stats",
+            WHEN json_format(TRY(json_extract(raw_root, '$.stats'))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "raw_stats",
        CASE WHEN TRY(json_extract(raw_root, '$.playerStats')) IS NULL THEN false
-            WHEN json_format(TRY(json_extract(raw_root, '$.playerStats'))) IN ('null', '{{}}', '[]') THEN false ELSE true END AS "raw_playerStats",
+            WHEN json_format(TRY(json_extract(raw_root, '$.playerStats'))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "raw_playerStats",
        CASE WHEN TRY(json_extract(raw_root, '$.lineup')) IS NULL THEN false
-            WHEN json_format(TRY(json_extract(raw_root, '$.lineup'))) IN ('null', '{{}}', '[]') THEN false ELSE true END AS "raw_lineup",
+            WHEN json_format(TRY(json_extract(raw_root, '$.lineup'))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "raw_lineup",
        CASE WHEN TRY(json_extract(raw_root, '$.shotmap')) IS NULL THEN false
-            WHEN json_format(TRY(json_extract(raw_root, '$.shotmap'))) IN ('null', '{{}}', '[]') THEN false ELSE true END AS "raw_shotmap",
+            WHEN json_format(TRY(json_extract(raw_root, '$.shotmap'))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "raw_shotmap",
        CASE WHEN TRY(json_extract(raw_root, '$.momentum')) IS NULL THEN false
-            WHEN json_format(TRY(json_extract(raw_root, '$.momentum'))) IN ('null', '{{}}', '[]') THEN false ELSE true END AS "raw_momentum"
+            WHEN json_format(TRY(json_extract(raw_root, '$.momentum'))) IN ('null', 'false', '{{}}', '[]') THEN false ELSE true END AS "raw_momentum"
 FROM rooted
 ORDER BY competition_id, source_season_key, match_id, _target_batch_id, _observed_at, _ingested_at
