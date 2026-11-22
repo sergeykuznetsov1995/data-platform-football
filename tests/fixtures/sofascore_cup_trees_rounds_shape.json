@@ -1,0 +1,99 @@
+{
+  "cupTrees": [
+    {
+      "id": 10560975,
+      "name": "World Cup 2026",
+      "tournament": {"id": 16, "name": "FIFA World Cup", "slug": "world-championship"},
+      "currentRound": 5,
+      "type": 1,
+      "rounds": [
+        {
+          "id": 56001,
+          "order": 4,
+          "type": 16,
+          "description": "Semifinal",
+          "blocks": [
+            {
+              "id": 2585779,
+              "blockId": 2218759,
+              "order": 1,
+              "finished": true,
+              "matchesInRound": 1,
+              "result": "1:1",
+              "homeTeamScore": "1 (3)",
+              "awayTeamScore": "1 (4)",
+              "eventInProgress": false,
+              "hasNextRoundLink": true,
+              "automaticProgression": false,
+              "seriesStartDateTimestamp": "2026-07-14T18:00:00Z",
+              "venue": {"id": 1022, "name": "MetLife Stadium", "city": {"name": "East Rutherford"}},
+              "participants": [
+                {"team": {"id": 4711, "name": "Germany", "nameCode": "GER", "national": true}, "winner": false, "order": 1, "id": 5716751},
+                {"team": {"id": 4699, "name": "Paraguay", "nameCode": "PAR", "national": true}, "winner": true, "order": 2, "id": 5716752, "sourceBlockId": 2218740}
+              ],
+              "events": [12813014]
+            },
+            {
+              "id": 2585780,
+              "blockId": 2218760,
+              "order": 2,
+              "finished": false,
+              "matchesInRound": 1,
+              "eventInProgress": false,
+              "automaticProgression": false,
+              "participants": [],
+              "events": []
+            }
+          ]
+        },
+        {
+          "id": 56005,
+          "order": 5,
+          "type": 1,
+          "description": "Final",
+          "blocks": [
+            {
+              "id": 2585775,
+              "blockId": 2218819,
+              "order": 1,
+              "finished": false,
+              "matchesInRound": 1,
+              "eventInProgress": false,
+              "automaticProgression": false,
+              "participants": [
+                {"team": {"id": 4698, "name": "Spain", "nameCode": "ESP", "national": true}, "winner": false, "order": 1, "id": 5716760, "sourceBlockId": 2218815}
+              ],
+              "events": [12813005]
+            }
+          ]
+        }
+      ],
+      "finalMatchCupBlock": {
+        "id": 2585775,
+        "blockId": 2218819,
+        "order": 1,
+        "finished": false,
+        "matchesInRound": 1,
+        "eventInProgress": false,
+        "automaticProgression": false,
+        "participants": [
+          {"team": {"id": 4698, "name": "Spain", "nameCode": "ESP", "national": true}, "winner": false, "order": 1, "id": 5716760, "sourceBlockId": 2218815}
+        ],
+        "events": [12813005]
+      },
+      "thirdPlaceMatchCupBlock": {
+        "id": 2585806,
+        "blockId": 2218821,
+        "order": 1,
+        "finished": false,
+        "matchesInRound": 1,
+        "eventInProgress": false,
+        "automaticProgression": false,
+        "participants": [],
+        "events": []
+      },
+      "showSingleParticipantByeBlocks": false,
+      "hideRoundsWithoutParticipants": false
+    }
+  ]
+}

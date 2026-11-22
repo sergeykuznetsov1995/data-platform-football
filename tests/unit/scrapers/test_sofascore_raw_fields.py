@@ -765,3 +765,146 @@ class TestSeasonFieldDuplicateGuards:
         ]
         with pytest.raises(SeasonMaterializationError, match="natural key check failed"):
             _materialize(specs, results)
+
+
+# --- #1367: the rounds/blocks cup-trees payload shape (World Cup 2026) -------
+
+CUP_TREES_ROUNDS_FIXTURE = "sofascore_cup_trees_rounds_shape.json"
+
+
+def _rounds_fixture() -> dict:
+    return _load_fixture(CUP_TREES_ROUNDS_FIXTURE)
+
+
+class TestParseCupTreesRoundsShape:
+    def test_fixture_rows_one_per_block_with_round_context(self):
+        rows = parse_cup_trees(
+            _rounds_fixture(), source_tournament_id=16, source_season_id=58210
+        )
+        assert [(row["node_id"], row["block_kind"]) for row in rows] == [
+            ("2585779", "round"),
+            ("2585780", "round"),
+            ("2585775", "final"),
+            ("2585806", "third_place"),
+        ]
+        for row in rows:
+            assert row["cup_tree_id"] == "10560975"
+            assert row["source_tournament_id"] == "16"
+            assert row["source_season_id"] == "58210"
+            assert row["parent_node_id"] is None
+            assert row["children_json"] == "[]"
+        semifinal = rows[0]
+        assert semifinal["round_description"] == "Semifinal"
+        assert semifinal["round_order"] == 4
+        assert semifinal["round_type"] == 16
+        assert semifinal["result"] == "1:1"
+        assert semifinal["home_team_score"] == "1 (3)"
+        assert semifinal["away_team_score"] == "1 (4)"
+        assert semifinal["finished"] is True
+        assert semifinal["venue_name"] == "MetLife Stadium"
+        assert semifinal["venue_city_name"] == "East Rutherford"
+        assert semifinal["events_json"] == "[12813014]"
+        participants = json.loads(semifinal["participants_json"])
+        assert [p["team"]["nameCode"] for p in participants] == ["GER", "PAR"]
+        assert participants[1]["sourceBlockId"] == 2218740
+
+    def test_standalone_role_merges_into_repeated_round_block(self):
+        # finalMatchCupBlock repeats the Final round block's id 2585775: one
+        # row keeps BOTH the round context and the explicit final role
+        # (review adjudication — first-seen dedupe must not drop the role).
+        rows = parse_cup_trees(
+            _rounds_fixture(), source_tournament_id=16, source_season_id=58210
+        )
+        final_rows = [row for row in rows if row["node_id"] == "2585775"]
+        assert len(final_rows) == 1
+        assert final_rows[0]["block_kind"] == "final"
+        assert final_rows[0]["round_description"] == "Final"
+        # review r1: the merged row keeps the round identity, not just the label
+        assert final_rows[0]["round_id"] == "56005"
+        ids = [row["node_id"] for row in rows]
+        assert len(ids) == len(set(ids))
+
+    def test_repeated_standalone_block_still_validates_list_fields(self):
+        # review r1: a malformed non-list on the repeated standalone block
+        # must raise — the duplicate branch is not a validation bypass.
+        payload = _rounds_fixture()
+        payload["cupTrees"][0]["finalMatchCupBlock"]["events"] = 12813005
+        with pytest.raises(
+            ValueError, match=r"finalMatchCupBlock: field 'events' must be a list"
+        ):
+            parse_cup_trees(payload, source_tournament_id=16, source_season_id=58210)
+
+    def test_empty_block_fields_encode_empty_lists(self):
+        rows = parse_cup_trees(
+            _rounds_fixture(), source_tournament_id=16, source_season_id=58210
+        )
+        bye = next(row for row in rows if row["node_id"] == "2585780")
+        assert bye["participants_json"] == "[]"
+        assert bye["events_json"] == "[]"
+
+    def test_absent_standalone_blocks_are_skipped(self):
+        payload = _rounds_fixture()
+        tree = payload["cupTrees"][0]
+        tree["finalMatchCupBlock"] = None
+        del tree["thirdPlaceMatchCupBlock"]
+        rows = parse_cup_trees(payload, source_tournament_id=1, source_season_id=2)
+        assert [row["block_kind"] for row in rows] == ["round", "round", "round"]
+
+    def test_nonempty_nodes_still_win_over_rounds(self):
+        payload = _rounds_fixture()
+        payload["cupTrees"][0]["nodes"] = [{"id": 7}]
+        rows = parse_cup_trees(payload, source_tournament_id=1, source_season_id=2)
+        assert [row["node_id"] for row in rows] == ["7"]
+
+    def test_malformed_items_raise(self):
+        with pytest.raises(
+            ValueError, match=r"cup_trees\[0\].rounds\[0\]: missing required field 'id'"
+        ):
+            parse_cup_trees(
+                {"cupTrees": [{"id": 1, "rounds": [{"blocks": []}]}]},
+                source_tournament_id=1,
+                source_season_id=2,
+            )
+        with pytest.raises(
+            ValueError,
+            match=r"cup_trees\[0\].rounds\[0\].blocks\[0\]: missing required field 'id'",
+        ):
+            parse_cup_trees(
+                {"cupTrees": [{"id": 1, "rounds": [{"id": 2, "blocks": [{}]}]}]},
+                source_tournament_id=1,
+                source_season_id=2,
+            )
+        with pytest.raises(
+            ValueError, match=r"field 'blocks' must be a list, got dict"
+        ):
+            parse_cup_trees(
+                {"cupTrees": [{"id": 1, "rounds": [{"id": 2, "blocks": {}}]}]},
+                source_tournament_id=1,
+                source_season_id=2,
+            )
+        with pytest.raises(
+            ValueError, match=r"field 'rounds' must be a list, got dict"
+        ):
+            parse_cup_trees(
+                {"cupTrees": [{"id": 1, "rounds": {}}]},
+                source_tournament_id=1,
+                source_season_id=2,
+            )
+
+    @pytest.mark.parametrize("field", ["participants", "events"])
+    def test_non_list_block_fields_raise(self, field):
+        block = {"id": 3}
+        block[field] = {} if field == "participants" else 12813014
+        payload = {"cupTrees": [{"id": 1, "rounds": [{"id": 2, "blocks": [block]}]}]}
+        with pytest.raises(
+            ValueError, match=rf"field '{field}' must be a list"
+        ):
+            parse_cup_trees(payload, source_tournament_id=1, source_season_id=2)
+
+    def test_malformed_standalone_block_raises(self):
+        payload = _rounds_fixture()
+        payload["cupTrees"][0]["finalMatchCupBlock"] = "nope"
+        with pytest.raises(
+            ValueError, match=r"cup_trees\[0\].finalMatchCupBlock: expected an object"
+        ):
+            parse_cup_trees(payload, source_tournament_id=1, source_season_id=2)
