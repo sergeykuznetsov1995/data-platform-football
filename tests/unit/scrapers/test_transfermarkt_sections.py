@@ -1,5 +1,5 @@
 """Stage-C section lanes: attendance (T10), club values (T11), achievements (T8) (#2405)."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +17,7 @@ from scrapers.transfermarkt.orchestrator import (
     CoreRun,
     CoreRunError,
     CoreScopePlan,
+    RumourCompetitionTarget,
     attendance_url,
     club_values_url,
     planned_urls,
@@ -1856,3 +1857,208 @@ def test_cached_directory_page_survives_a_first_page_ownership_shift():
         "SELECT source_capture_id, COUNT(*) FROM transfermarkt_referee_aggregate_observations "
         "WHERE referee_id = '303' GROUP BY 1 ORDER BY 1").fetchall()
     assert rows == sorted([(page_2.capture_id, 5), ('d' * 64, 5)])
+
+
+# --------------------------------- review round-2 pins (findings 8-19)
+def test_auto_extraction_clock_postdates_every_target_of_the_run():
+    # Round 2 finding 8: the clock used to be fixed after the first target,
+    # so the second target's own capture was newer than its extraction clock.
+    bodies = dict(_attendance_pages())
+    bodies[RUMOUR_LISTING] = (b'<div id="yw1"><span class="empty">No information available.</span>'
+                              b'<div class="keys"></div></div>')
+
+    class _Fetch:
+        """Every capture is stamped with the wall clock of its own fetch."""
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            self.calls.append(url)
+            body = bodies[url]
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=datetime.now(timezone.utc).isoformat(),
+                cache_hit=False, status_code=200)
+
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c', edition_id='2025',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+        rumour_competitions=(RumourCompetitionTarget('GB1', 'Premier League'),),
+    )
+    report = CoreRun(_Fetch().fetch, universe_version=UNIVERSE).run(plan)
+    assert [(item['entity'], item['status']) for item in report.outcomes] == [
+        ('attendance_observations', 'observed_present'), ('rumour_observations', 'observed_empty')]
+    # One extraction clock and run identity per target, each sampled after
+    # that target's last fetch.
+    assert len({item['run_id'] for item in report.outcomes}) == 2
+    assert [datetime.fromisoformat(item['extracted_at']) for item in report.outcomes] == sorted(
+        datetime.fromisoformat(item['extracted_at']) for item in report.outcomes)
+
+
+def test_conflicting_discovery_evidence_is_an_error_not_a_feed():
+    # Round 2 finding 9: the listing advertises page 2, canonical page 1 only
+    # itself. The walk sees the conflict; page 1 alone is not the feed.
+    pages = {RUMOUR_LISTING: _rumour_feed_html(1, 2, (1, 2)),
+             _rumour_page_url(1): _rumour_feed_html(1, 1, (1,))}
+    fetcher = _FeedFetch(pages)
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
+                     extracted_at=RUMOUR_EXTRACTED_AT).run(_rumour_run_plan())
+    assert fetcher.calls == [RUMOUR_LISTING, _rumour_page_url(1)]
+    outcome, = report.outcomes
+    assert (outcome['status'], outcome['status_reason'], outcome['rows']) == (
+        'error', 'rumours:conflicting_page_ref', 0)
+    assert report.receipts == ()
+
+
+def test_rumour_pages_are_assembled_in_plan_order():
+    # Round 2 finding 10: page 3 reveals the link to page 2, so page 2 is
+    # fetched after page 3 but is still the second page of the feed.
+    evidences = {1: (1, 3, 4), 3: (1, 2, 3, 4), 2: (1, 2, 3, 4), 4: (1, 2, 3, 4)}
+    pages = {RUMOUR_LISTING: _rumour_feed_html(1, 4, evidences[1])}
+    pages.update({_rumour_page_url(n): _rumour_feed_html(n, 4, numbers)
+                  for n, numbers in evidences.items()})
+    fetcher = _FeedFetch(pages)
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=RUMOUR_EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(_rumour_run_plan(), writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [RUMOUR_LISTING] + [_rumour_page_url(n) for n in (1, 3, 2, 4)]
+    assert [item['status'] for item in report.outcomes] == ['observed_present'] * 4
+    assert report.dq['passed'] is True and report.receipts[0]['verified'] is True
+    assert [row[0] for row in db.sql.execute(
+        'SELECT page_number FROM transfermarkt_rumour_observations ORDER BY page_number')] == [1, 2, 3, 4]
+
+
+def test_failed_club_value_requests_stay_distinct_by_stichtag():
+    # Round 2 finding 18: two stichtag targets of one competition.
+    class _Blocked:
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error='waf challenge')
+
+    plan = CoreScopePlan(
+        league='VIE1', season='2526', scope_id='s', cycle_id='c',
+        club_value_targets=(ClubValueTarget('VIE1', 'v-league-1', '2013-04-15'),
+                            ClubValueTarget('VIE1', 'v-league-1', '2024-06-01')))
+    report = CoreRun(_Blocked().fetch, universe_version=UNIVERSE,
+                     extracted_at=EXTRACTED_AT).run(plan)
+    assert report.dq['passed'] is True
+    assert {item['subject'] for item in report.outcomes} == {
+        '{"competition_id":"VIE1","stichtag":"2013-04-15"}',
+        '{"competition_id":"VIE1","stichtag":"2024-06-01"}'}
+
+
+def test_referee_walk_follows_the_exact_pages_the_links_name():
+    # Round 2 finding 11: page 1 names a Wettbewerb page 2; a Pokalwettbewerb
+    # page 2 with the same number is not the page the walk evidenced.
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_PAGE_2)
+    elsewhere = _referee_page(REFEREE_DIRECTORY_URL.replace('/wettbewerb/', '/pokalwettbewerb/')
+                              + '/page/2', _referee_second_page_body())
+    outcome = _directory_error((page_1, elsewhere))
+    assert outcome.status_reason == 'referees:directory_pagination_incomplete'
+
+
+def test_unparsable_referee_next_link_is_contained():
+    # Round 2 finding 12: the donor probe raises a plain ValueError here.
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url='https://[bad')
+    outcome = _directory_error((page_1,))
+    assert (outcome.status_reason, outcome.capture.capture_id) == (
+        'referees:pagination_link_invalid', page_1.capture_id)
+    assert sections.extract_referee_profile_observations(
+        _referee_profile_capture(), _referee_scope(), referee_id='101',
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE).status == 'observed_present'
+
+
+def test_attendance_scope_check_follows_the_donor_page_identity():
+    # Round 2 finding 13: the donor accepts a trailing slash before ?page=.
+    page_1_body = (ATTENDANCE_FIXTURES / 'page_1.html').read_bytes().replace(
+        b'saison_id/2025?page=2', b'saison_id/2025/?page=2')
+    page_2_url = ATTENDANCE_START + '/?page=2'
+    bodies = {ATTENDANCE_START: page_1_body, page_2_url: _attendance_pages()[ATTENDANCE_PAGE_2]}
+    fetcher = _SectionFetch(bodies)
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t10', cycle_id='tm-cycle-t10',
+        edition_id='2025',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+    )
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [ATTENDANCE_START, page_2_url]
+    assert (report.outcomes[0]['status'], report.outcomes[0]['rows']) == ('observed_present', 2)
+    assert report.receipts[0]['verified'] is True
+    for foreign in ('https://www.transfermarkt.com/premier-league/besucherzahlen/wettbewerb/ES1/saison_id/2025',
+                    'https://www.transfermarkt.com/premier-league/besucherzahlen/wettbewerb/GB1/saison_id/2024',
+                    'https://user@www.transfermarkt.com/premier-league/besucherzahlen/wettbewerb/GB1/saison_id/2025'):
+        with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+            core._check_scope_against_capture(
+                'attendance_observations', {'competition_id': 'GB1', 'edition_id': '2025'},
+                _capture(foreign, b'<html></html>', PAGE_1_CAPTURED))
+
+
+def test_empty_rumour_proof_names_the_layout_that_was_seen():
+    # Round 2 finding 14: headers over an empty body carry no "no entries" row.
+    header_only = ('<table class="items"><thead><tr><th>Player</th><th>Interested club</th>'
+                   '<th>Most recent source from</th><th>Assessment</th></tr></thead>'
+                   '<tbody></tbody></table><div class="pager"><ul>'
+                   '<li class="tm-pagination__list-item tm-pagination__list-item--active">'
+                   f'<a class="tm-pagination__link" href="{RUMOUR_LISTING}">1</a></li></ul></div>')
+    capture = _capture(RUMOUR_LISTING, f'<div id="yw1">{header_only}</div>'.encode(),
+                       RUMOUR_PAGE_1_CAPTURED, endpoint='rumours')
+    outcome, = sections.extract_rumour_observations(
+        (capture,), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.proof) == ('observed_empty', 'rumours:empty_table_body')
+    # The explicit donor marker keeps its own proof.
+    marker = _capture(RUMOUR_PAGE[2], _no_entries_html(2, 2), RUMOUR_PAGE_2_CAPTURED, endpoint='rumours')
+    first = _capture(RUMOUR_PAGE[1], _rumour_page_html(1), RUMOUR_PAGE_1_CAPTURED, endpoint='rumours')
+    _, empty = sections.extract_rumour_observations(
+        (first, marker), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert empty.proof == 'rumours:no_entries_row'
+
+
+def test_unknown_presence_outcome_needs_an_unresolved_row():
+    # Round 2 finding 17: every row explicit_none is the donor's explicit_none.
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('attendance_observations', 'unknown', 'attendance:rows_unresolved',
+                    ({'observation_status': 'explicit_none'},), **_outcome_context())
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('club_value_observations', 'unknown', 'club_values:club_rows_unresolved',
+                    ({'observation_status': 'explicit_none'},), **_outcome_context())
+
+
+@pytest.mark.parametrize('lane, endpoint, url', [
+    ('representation', 'representation', REPRESENTATION_URL),
+    ('club_values', 'club_values', CLUB_VALUE_URL)])
+def test_replay_adapters_keep_their_tuple_contract_on_http_failure(lane, endpoint, url):
+    # Round 2 finding 19: a 404 capture answered a bare outcome, not a tuple.
+    body = b'{"success": false}'
+    failed = _capture(url, body, CLUB_CAPTURED, endpoint=endpoint)
+    failed = _replace(failed, status_code=404)
+    if lane == 'representation':
+        outcomes = sections.extract_representation_observations(
+            failed, _representation_scope(), expected_ids=('7',), extracted_at=EXTRACTED_AT,
+            universe_version=UNIVERSE)
+    else:
+        outcomes = sections.extract_club_value_observations(
+            failed, _club_value_scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert isinstance(outcomes, tuple) and len(outcomes) == 1
+    assert (outcomes[0].status, outcomes[0].rows) == ('unavailable', ())
+    assert core.build_core_dq(outcomes)['passed'] is True
+
+
+def test_revisions_are_rechecked_when_rows_change_after_construction():
+    # Round 2 finding 16: the frozen outcome holds mutable row dictionaries.
+    pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
+             _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
+    outcome = sections.extract_attendance_observations(
+        pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert core.build_core_dq([outcome])['passed'] is True
+    outcome.rows[0]['parser_revision'] = 'wrong'
+    assert 'revision_mismatch' in core.build_core_dq([outcome])['errors']
+    with pytest.raises(CoreParseError, match='revision'):
+        core.plan_for_outcome(outcome, captured_at=outcome.capture.captured_at,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
