@@ -2483,7 +2483,13 @@ def _run_player_capture(
             from scrapers.sofascore.writer_lock import bronze_writer_lock
 
             with bronze_writer_lock():
-                upath = scraper.save_to_iceberg(
+                # #1367: every published table carries a publication receipt
+                # (the replay validator fails closed on a table without one);
+                # the universe write is the only _save_publication-shaped
+                # call that used the bare writer path.
+                upath = _save_publication(
+                    scraper,
+                    results,
                     df=universe_df,
                     table_name="sofascore_player_universe",
                     partition_cols=["league", "season"],

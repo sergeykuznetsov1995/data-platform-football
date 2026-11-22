@@ -888,6 +888,15 @@ def test_player_runner_offline_replay_writes_both_tables_without_network(
     assert result["traffic"]["request_count"] == 0
     assert result["profile_players"] == 1
     assert result["season_stats_players"] == 1
+    # #1367: every published table carries a publication receipt — the
+    # replay validator fails closed on a receipt-less table location.
+    receipts = {
+        receipt["table"]: receipt for receipt in result["publication_receipts"]
+    }
+    assert "sofascore_player_universe" in receipts
+    assert receipts["sofascore_player_universe"]["rows"] == result[
+        "universe_players"
+    ]
 
 
 def _player_records_for(player_id: str, *, broken: bool = False) -> dict:
