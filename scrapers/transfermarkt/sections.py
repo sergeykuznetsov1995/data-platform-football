@@ -141,6 +141,7 @@ def extract_representation_observations(
         return (core.captureless_outcome(
             entity, scope, status='error', reason='representation:' + exc.reason,
             extracted_at=extracted_at, run_id=context['run_id'], universe_version=universe_version,
+            subject=core.canonical_json({'player_ids': list(expected_ids)}).decode(),
         ),)
 
     outcomes = []
