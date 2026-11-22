@@ -202,11 +202,12 @@ def test_stream_pause_rotates_expiring_lease_before_http(expires_at):
     assert provider.closed == ['lease-1', 'lease-2']
 
 
-def test_history_stream_pause_still_does_not_sleep(monkeypatch):
-    monkeypatch.setattr('scrapers.transfermarkt.history_portion.enabled', lambda: True)
+def test_stream_pause_without_deadline_raises_without_sleeping():
+    # The history-portion admission hooks are gone (#2404): a paused stream
+    # only ever waits inside a bounded current portion.
     clock = Clock()
     provider = PausingProvider(clock, [10])
-    instance, _ = client(clock, [], provider=provider)
+    instance, _ = client(clock, [], provider=provider, deadline=None)
     with pytest.raises(SourceStreamPaused):
         instance._consume_source_request_permit(url=URL, label='listing', context={})
     assert clock.sleeps == []

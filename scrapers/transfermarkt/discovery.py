@@ -1232,7 +1232,13 @@ def _html_current(
 
 
 class TransfermarktCompetitionDiscovery:
-    """Discover the complete competition registry (full or daily mode)."""
+    """Discover the complete competition registry (full or daily mode).
+
+    With ``raw_store`` the page bodies are committed to the content-addressed
+    raw store and the checkpoint keeps only capture references (#2181: no
+    HTML bodies in the persisted checkpoint). Without a store the legacy
+    body-in-checkpoint mode remains for the donor stack.
+    """
 
     def __init__(
         self,
@@ -1248,6 +1254,7 @@ class TransfermarktCompetitionDiscovery:
         extra_competitions: Iterable[ExtraCompetition] = (),
         can_spend: Optional[Callable[[int], bool]] = None,
         report: Optional[MutableMapping[str, Any]] = None,
+        raw_store: Optional[Any] = None,
     ) -> None:
         if traffic_ledger is None:
             raise TypeError("traffic_ledger is required")
@@ -1267,6 +1274,7 @@ class TransfermarktCompetitionDiscovery:
         self._countries = {item.url: item for item in countries}
         self._extras = tuple(extra_competitions)
         self._can_spend = can_spend
+        self._raw_store = raw_store
         self._documents: dict[str, _Document] = {}
         self.report: MutableMapping[str, Any] = report if report is not None else {}
 
@@ -1279,6 +1287,10 @@ class TransfermarktCompetitionDiscovery:
                 f"checkpoint entry is not an object: {key}"
             )
         body = cached.get("body")
+        if body is None and "raw_capture_id" in cached:
+            body = self._cached_body_from_store(key, cached)
+        elif isinstance(body, str) and self._raw_store is not None and "raw_capture_id" not in cached:
+            body = self._migrate_body_entry(key, cached, body)
         expected_hash = cached.get("payload_hash")
         if cached.get("status") != FetchStatus.OK.value or not isinstance(body, str):
             raise DiscoveryCheckpointError(
@@ -1295,6 +1307,36 @@ class TransfermarktCompetitionDiscovery:
         document = _Document(key, body, actual_hash)
         self._documents[key] = document
         return document
+
+    def _migrate_body_entry(self, key: str, cached: Mapping[str, Any], body: str) -> str:
+        """Convert a legacy body-bearing entry to its raw-store reference.
+
+        Legacy entries never recorded a fetch time; the store stamps the
+        migration moment, and the body itself is byte-identical.
+        """
+        from scrapers.transfermarkt.models import FetchOutcome
+
+        placeholder = FetchOutcome(status=FetchStatus.OK)
+        self._checkpoint[key] = self._store_page(key, body, placeholder)
+        return body
+
+    def _cached_body_from_store(self, key: str, cached: Mapping[str, Any]) -> str:
+        """Reload a stored registry page body from its raw capture (#2181)."""
+        if self._raw_store is None:
+            raise DiscoveryCheckpointError(
+                f"checkpoint entry needs its raw store: {key}"
+            )
+        body_bytes, record = self._raw_store.load_capture(cached["raw_capture_id"])
+        if (
+            record.content_hash != cached.get("raw_content_hash")
+            or record.url != key
+            or record.endpoint != "competition_registry"
+            or record.status_code != 200
+        ):
+            raise DiscoveryCheckpointError(
+                f"checkpoint raw capture drift: {key}"
+            )
+        return body_bytes.decode("utf-8")
 
     def _get(self, url: str) -> _Document:
         canonical = _canonical_url(url)
@@ -1323,17 +1365,37 @@ class TransfermarktCompetitionDiscovery:
         body_hash = _payload_hash(outcome.value)
         if outcome.payload_hash is not None and outcome.payload_hash != body_hash:
             raise DiscoveryFetchError(f"transport payload hash mismatch: {canonical}")
-        self._checkpoint[canonical] = {
-            "attempts": outcome.attempts,
-            "body": outcome.value,
-            "decoded_body_bytes": outcome.decoded_body_bytes,
-            "payload_hash": body_hash,
-            "status": FetchStatus.OK.value,
-            "status_code": 200,
-        }
+        self._checkpoint[canonical] = self._store_page(canonical, outcome.value, outcome)
         document = _Document(canonical, outcome.value, body_hash)
         self._documents[canonical] = document
         return document
+
+    def _store_page(self, url: str, text: str, outcome: FetchOutcome) -> dict:
+        """Commit one registry page body, to the raw store when configured."""
+        entry = {
+            "attempts": outcome.attempts,
+            "decoded_body_bytes": outcome.decoded_body_bytes,
+            "payload_hash": _payload_hash(text),
+            "status": FetchStatus.OK.value,
+            "status_code": 200,
+        }
+        if self._raw_store is None:
+            return {**entry, "body": text}
+        # A listing URL outside the store's allowlisted contract must stop
+        # discovery here instead of silently bypassing the raw evidence.
+        record = self._raw_store.store_attempt(
+            url=url,
+            body=text.encode("utf-8"),
+            status_code=200,
+            headers=None,
+            fetched_at=outcome.raw_fetched_at,
+            cycle_id="discovery",
+            scope_id="competition_registry",
+            endpoint="competition_registry",
+            attempt=0,
+        )
+        return {**entry, "raw_capture_id": record.capture_id,
+                "raw_content_hash": record.content_hash}
 
     def _regulation(self, competition_id: str) -> Optional[_Regulation]:
         """The competition's tmapi regulation; ``None`` = not proven.
@@ -1376,14 +1438,7 @@ class TransfermarktCompetitionDiscovery:
                     competition_id
                 ] = f"schema: {exc}"
                 return None
-            self._checkpoint[url] = {
-                "attempts": outcome.attempts,
-                "body": body,
-                "decoded_body_bytes": outcome.decoded_body_bytes,
-                "payload_hash": document.payload_hash,
-                "status": FetchStatus.OK.value,
-                "status_code": 200,
-            }
+            self._checkpoint[url] = self._store_page(url, body, outcome)
             self._documents[url] = document
             return _Regulation(options=options, document=document)
         try:
