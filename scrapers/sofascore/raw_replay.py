@@ -357,21 +357,17 @@ class ReplayCatalogProtocol(Protocol):
     def tournament_map(self) -> Mapping[str, int]: ...
 
 
-class ResolvedReplayScope(NamedTuple):
-    """One resolved replay scope; ``league`` is the Bronze capture key.
-
-    ``canonical_id``/``season_format`` default to empty so pre-#1367
-    five-field constructions keep working (review r1 F4); the replay
-    worker refuses to run phases for a scope without them.
-    """
-
-    source_tournament_id: str
-    source_season_id: str
-    freshness_key: str
-    league: str
-    canonical_season: str
-    canonical_id: str = ""
-    season_format: str = ""
+ResolvedReplayScope = NamedTuple(
+    "ResolvedReplayScope",
+    source_tournament_id=str,
+    source_season_id=str,
+    freshness_key=str,
+    league=str,
+    canonical_season=str,
+)
+# The five-field shape is the module's public contract (review r1/r2 F4):
+# registry metadata the phases need beyond it — the season's format — is
+# carried alongside the scope by the worker, never inside it.
 
 
 def _mode_filter_sql(mode: str) -> str:
@@ -425,17 +421,31 @@ def _scope_int_id(value: str, name: str) -> int:
         ) from exc
 
 
+def _season_slug(canonical_season: object) -> Optional[int]:
+    """The canonical season as a partition slug, or None.
+
+    Conversion — not ``str.isdigit()`` — decides (review r2 F5): digits
+    like superscript two pass ``isdigit()`` but cannot become the overlay's
+    integer season id or a partition label.
+    """
+    if not isinstance(canonical_season, str):
+        return None
+    try:
+        return int(canonical_season)
+    except ValueError:
+        return None
+
+
 def _replayable_registry_season(season: object) -> bool:
     """True when a registry season can resolve AND enter a scope overlay.
 
     One predicate shared by resolution, pair enumeration and exact-scope
-    validation (review r1 F1): a replayable season needs a nonblank
-    canonical season that is a numeric slug (the overlay medallion entry and
-    the Bronze ``season`` partition are numeric), and a season format that
+    validation (review r1 F1): a replayable season needs a canonical season
+    convertible to a numeric slug (the overlay medallion entry and the
+    Bronze ``season`` partition are numeric), and a season format that
     names a partition label (``single_year``/``split_year``).
     """
-    canonical_season = getattr(season, "canonical_season", None)
-    if not isinstance(canonical_season, str) or not canonical_season.isdigit():
+    if _season_slug(getattr(season, "canonical_season", None)) is None:
         return False
     return getattr(season, "season_format", None) in _REPLAYABLE_SEASON_FORMATS
 
@@ -448,9 +458,10 @@ def replay_eligible_scope_pairs(
     Enumeration mirrors :func:`resolve_replay_scope` exactly: only
     capture-allowed tournaments with a canonical id, and only seasons whose
     canonical season and replayable season format are present
-    (:func:`_replayable_registry_season`).  A tournament whose seasons name
-    one ``season_id`` twice is skipped whole — ``resolve_replay_scope``
-    refuses to guess an ambiguous season, so its pairs can never resolve.
+    (:func:`_replayable_registry_season`).  A ``season_id`` named by more
+    than one season of its tournament is refused by the resolver as
+    ambiguous, so only THOSE ids are skipped — uniquely named sibling
+    seasons of the same tournament stay eligible (review r2 F1).
     The pair set is the SQL-side resolvability filter for automatic
     planning — scopes outside it (unknown tournaments such as EURO with no
     registry seasons, disabled tournaments) can never resolve in a worker.
@@ -472,14 +483,15 @@ def replay_eligible_scope_pairs(
         if isinstance(source_id, bool) or not isinstance(source_id, int):
             continue
         seasons = tuple(getattr(tournament, "seasons", ()) or ())
-        season_ids = [
-            getattr(season, "season_id", None) for season in seasons
-        ]
-        if len(season_ids) != len(set(season_ids)):
-            continue
+        id_counts: dict[object, int] = {}
+        for season in seasons:
+            season_id = getattr(season, "season_id", None)
+            id_counts[season_id] = id_counts.get(season_id, 0) + 1
         for season in seasons:
             season_id = getattr(season, "season_id", None)
             if isinstance(season_id, bool) or not isinstance(season_id, int):
+                continue
+            if id_counts[season_id] > 1:
                 continue
             if not _replayable_registry_season(season):
                 continue
@@ -525,8 +537,7 @@ def validate_replay_scope_pair(
         canonical_season = getattr(matches[0], "canonical_season", None)
         reason = (
             "season has no numeric canonical season"
-            if not isinstance(canonical_season, str)
-            or not canonical_season.isdigit()
+            if _season_slug(canonical_season) is None
             else "season has no replayable season format"
         )
         raise ReplayPlanningError(f"{prefix} is not replay-eligible: {reason}")
@@ -690,8 +701,9 @@ def resolve_replay_scope(
     never by date and never by the first alias.  Unknown tournaments, unknown
     or ambiguous seasons, missing ``canonical_id``/``canonical_season``,
     a season format that cannot name a Bronze season label
-    (``single_year``/``split_year``) and unknown legacy league keys all
-    raise :class:`ReplayPlanningError`.
+    (``single_year``/``split_year``), a canonical season the overlay cannot
+    convert to a partition slug and unknown legacy league keys all raise
+    :class:`ReplayPlanningError`.
     """
     scope = _normalize_scope_key(key)
     tournament_id = _scope_int_id(
@@ -729,7 +741,7 @@ def resolve_replay_scope(
             f"{scope.source_tournament_id!r} has no replayable season format "
             f"(got {season_format!r})"
         )
-    if not canonical_season.isdigit():
+    if _season_slug(canonical_season) is None:
         raise ReplayPlanningError(
             f"season {scope.source_season_id!r} of source tournament "
             f"{scope.source_tournament_id!r} has a non-numeric canonical "
@@ -757,6 +769,4 @@ def resolve_replay_scope(
         freshness_key=scope.freshness_key,
         league=league,
         canonical_season=canonical_season.strip(),
-        canonical_id=canonical_id.strip(),
-        season_format=season_format,
     )

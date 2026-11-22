@@ -679,10 +679,11 @@ def test_resolve_replay_scope_maps_canonical_league_and_season():
         freshness_key=FRESHNESS,
         league="SS-17",
         canonical_season="2526",
-        canonical_id="ENG-Premier League",
-        season_format="split_year",
     )
     assert isinstance(resolved, tuple)
+    # Review r2 F4: the five-field tuple is the module's public contract.
+    first, second = resolved[:2]
+    assert (first, second) == ("17", "76986")
 
 
 def test_resolve_replay_scope_unknown_season_fails():
@@ -780,8 +781,10 @@ def test_replay_eligible_scope_pairs_skips_incomplete_seasons():
     assert replay_eligible_scope_pairs(catalog) == ()
 
 
-def test_replay_eligible_scope_pairs_skips_ambiguous_tournament():
+def test_replay_eligible_scope_pairs_skips_only_ambiguous_season_ids():
     catalog = _fake_catalog()
+    # Review r2 F1: a duplicate season id must not drop the uniquely named
+    # sibling seasons of the same tournament.
     catalog.tournament(17).seasons = (
         SimpleNamespace(
             season_id=76986, canonical_season="2526", season_format="split_year"
@@ -789,9 +792,12 @@ def test_replay_eligible_scope_pairs_skips_ambiguous_tournament():
         SimpleNamespace(
             season_id=76986, canonical_season="2627", season_format="split_year"
         ),
+        SimpleNamespace(
+            season_id=76987, canonical_season="2627", season_format="split_year"
+        ),
     )
 
-    assert replay_eligible_scope_pairs(catalog) == ()
+    assert replay_eligible_scope_pairs(catalog) == (("17", "76987"),)
 
 
 def test_resolve_replay_scope_rejects_non_numeric_canonical_season():
@@ -833,11 +839,18 @@ def test_validate_replay_scope_pair_rejects_non_numeric_canonical_season():
         validate_replay_scope_pair(("17", "76986"), catalog)
 
 
-def test_resolved_scope_keeps_five_field_construction():
-    legacy = ResolvedReplayScope("17", "76986", FRESHNESS, "SS-17", "2526")
+def test_resolved_scope_stays_a_five_field_tuple():
+    resolved = ResolvedReplayScope("17", "76986", FRESHNESS, "SS-17", "2526")
 
-    assert legacy.canonical_id == ""
-    assert legacy.season_format == ""
+    assert len(resolved) == 5
+    one, two, three, four, five = resolved
+    assert (one, two, three, four, five) == (
+        "17",
+        "76986",
+        FRESHNESS,
+        "SS-17",
+        "2526",
+    )
 
 
 def test_list_replay_scope_keys_blocked_only_queries_exact_blockers():

@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -258,7 +259,7 @@ def test_load_scope_prefilters_exact_triple_without_sql():
     foreign_tournament = _record(
         "rounds", "season", SEASON, tournament="18"
     )
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -291,7 +292,7 @@ def test_load_scope_returns_none_plan_without_replayable_records():
         raw_content_hash=None,
         raw_blob_key=None,
     )
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -303,7 +304,7 @@ def test_load_scope_returns_none_plan_without_replayable_records():
 
 def test_load_scope_empty_records_yield_none_plan():
     runtime = _FakeRuntime(_FakeCatalog(), _FakeManager())
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -982,12 +983,11 @@ def test_players_phase_uses_and_restores_exact_season_freshness(
             monkeypatch.setenv(key, outer_freshness)
     records = [_record("player_profile", "player", "11111")]
     resolved = SimpleNamespace(
-        league="SS-17",
-        canonical_season="2526",
-        freshness_key="final",
-        season_format="split_year",
+        league="SS-17", canonical_season="2526", freshness_key="final"
     )
-    result = _players_phase(resolved, records, object(), mode="drain")
+    result = _players_phase(
+        resolved, records, object(), mode="drain", season_format="split_year"
+    )
     assert observed == {"season": "final", "player": "final", "offline": True}
     assert os.environ.get("SOFASCORE_SEASON_FRESHNESS_KEY") == outer_freshness
     assert os.environ.get("SOFASCORE_PLAYER_FRESHNESS_KEY") == outer_freshness
@@ -1344,7 +1344,14 @@ def test_scope_overlay_binds_and_restores_both_configurations(outer_env):
         name: os.environ.get(name)
         for name in ("SOFASCORE_REGISTRY_PATH", "MEDALLION_CONFIG_DIR")
     }
-    if outer_env is not None:
+    if outer_env is None:
+        # Review r2 F6: the absent case must not inherit values some other
+        # test left behind; clearing here makes the post-overlay absence
+        # assertions meaningful while ``finally`` still restores the
+        # process's original values.
+        for name in previous_env:
+            os.environ.pop(name, None)
+    else:
         os.environ["SOFASCORE_REGISTRY_PATH"] = outer_env
         os.environ["MEDALLION_CONFIG_DIR"] = outer_env
     try:
@@ -1376,14 +1383,43 @@ def test_scope_overlay_binds_and_restores_both_configurations(outer_env):
         scraper_module._SOFASCORE_CATALOG = previous_module_catalog
 
 
-def test_scope_overlay_refuses_legacy_five_field_scope():
+def test_scope_overlay_refuses_unreplayable_registry_season_format():
     from dags.scripts.replay_sofascore_raw import _scope_overlay
     from scrapers.sofascore.raw_replay import ResolvedReplayScope
 
-    legacy = ResolvedReplayScope("16", "58210", "2026", "SS-16", "2026")
+    catalog = _single_year_catalog()
+    # A registry row whose matched season carries an unreplayable format
+    # must fail the overlay loudly instead of producing a broken partition.
+    source = catalog.tournament(16)
+    seasons = tuple(
+        SimpleNamespace(
+            season_id=season.season_id,
+            canonical_season=season.canonical_season,
+            season_format="unknown",
+        )
+        for season in source.seasons
+    )
+    patched = SimpleNamespace(
+        unique_tournament_id=source.unique_tournament_id,
+        name=source.name,
+        slug=source.slug,
+        category_id=source.category_id,
+        category_name=source.category_name,
+        category_slug=source.category_slug,
+        sport_slug=source.sport_slug,
+        page_path=source.page_path,
+        enabled=source.enabled,
+        classification=source.classification,
+        review=source.review,
+        seasons=seasons,
+    )
+    patched_catalog = SimpleNamespace(tournament=lambda _tid: patched)
 
-    with pytest.raises(ReplayScopeError, match="no registry identity"):
-        with _scope_overlay(legacy, _single_year_catalog()):
+    with pytest.raises(ReplayScopeError, match="no replayable season format"):
+        with _scope_overlay(
+            ResolvedReplayScope("16", "58210", "2026", "SS-16", "2026"),
+            patched_catalog,
+        ):
             pass
 
 
@@ -1401,12 +1437,12 @@ def test_replay_season_label_guard_uses_overlay_format():
     )
     with _scope_overlay(resolved, catalog):
         assert _season_label("SS-16", "2026") == "2026"
-        _assert_replay_season_label(resolved)
+        _assert_replay_season_label(resolved, "single_year")
     # Outside the overlay the capture key has no medallion entry, so the
     # club fallback would silently produce a WRONG partition label — the
     # guard must fail loud exactly there.
     with pytest.raises(ReplayScopeError, match="label drift"):
-        _assert_replay_season_label(resolved)
+        _assert_replay_season_label(resolved, "single_year")
 
 
 def test_replay_season_label_guard_accepts_split_year():
@@ -1420,12 +1456,13 @@ def test_replay_season_label_guard_accepts_split_year():
     resolved = resolve_replay_scope(
         ReplayScopeKey("17", "76986", "final"), catalog
     )
-    assert resolved.season_format == "split_year"
     with _scope_overlay(resolved, catalog):
-        _assert_replay_season_label(resolved)
+        _assert_replay_season_label(resolved, "split_year")
     # The split-year short form needs no overlay entry, so the guard must
     # not reject it even when the binding is the plain repo configuration.
-    _assert_replay_season_label(resolved)
+    _assert_replay_season_label(resolved, "split_year")
+    with pytest.raises(ReplayScopeError, match="no registry season format"):
+        _assert_replay_season_label(resolved, "")
 
 
 def test_scope_overlay_rejects_scope_outside_registry():
@@ -1438,8 +1475,6 @@ def test_scope_overlay_rejects_scope_outside_registry():
         freshness_key="2026",
         league="SS-16",
         canonical_season="2026",
-        canonical_id="INT-World Cup",
-        season_format="single_year",
     )
     with pytest.raises(ReplayScopeError, match="unknown for source tournament"):
         with _scope_overlay(resolved, _single_year_catalog()):

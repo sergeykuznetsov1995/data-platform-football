@@ -165,16 +165,18 @@ def _load_scope(
     capture_runtime: object,
     records: Optional[Sequence[EndpointManifest]] = None,
     target_cap: int = 25,
-) -> tuple[ResolvedReplayScope, Optional[ReplayScopePlan]]:
+) -> tuple[ResolvedReplayScope, Optional[ReplayScopePlan], str]:
     """Resolve one exact replay scope and select its raw-replay plan.
 
     The catalog comes from the runtime when it carries one and otherwise from
     ``SofaScoreCatalog.load``.  Records already in memory are prefiltered to
     the exact scope triple; when absent they are loaded through the manifest
     store's trino manager with the planner's mode filters.  Returns the
-    catalog-resolved scope and the single selected plan — selected with the
+    catalog-resolved scope, the single selected plan — selected with the
     caller's ``target_cap`` (default 25) — or ``None`` when nothing is
-    replayable.
+    replayable, and the matched registry season's format (review r2 F4: the
+    five-field scope tuple stays the library contract; the format travels
+    alongside it).
     """
     if mode not in MODES:
         raise ReplayScopeError(f"mode must be one of {MODES}, got {mode!r}")
@@ -216,7 +218,13 @@ def _load_scope(
             scope.source_season_id,
         ),
     )
-    return resolved, (selection[0] if selection else None)
+    tournament = catalog.tournament(int(scope.source_tournament_id))
+    season = next(
+        item
+        for item in tournament.seasons
+        if str(item.season_id) == scope.source_season_id
+    )
+    return resolved, (selection[0] if selection else None), season.season_format
 
 
 def _target_ids(
@@ -473,16 +481,18 @@ def _overlay_competitions_document(
     reads them.
     """
     canonical_season = resolved.canonical_season
-    if not canonical_season.isdigit():
+    try:
+        season_slug = int(canonical_season)
+    except (TypeError, ValueError) as exc:
         raise ReplayScopeError(
             "cannot overlay medallion competitions for replay scope "
             f"{resolved.source_tournament_id!r}: canonical season "
             f"{canonical_season!r} is not a numeric slug"
-        )
+        ) from exc
     team_count = getattr(season, "team_count", None)
     season_config: dict[str, object] = {
-        "id": int(canonical_season),
-        "season_format": resolved.season_format,
+        "id": season_slug,
+        "season_format": season.season_format,
         "format": "league_round_robin",
         "team_count": team_count if team_count is not None else 1,
     }
@@ -527,16 +537,6 @@ def _scope_overlay(
     import yaml
     from scrapers.sofascore.catalog import SofaScoreCatalog
 
-    if not resolved.canonical_id.strip() or resolved.season_format not in (
-        "single_year",
-        "split_year",
-    ):
-        raise ReplayScopeError(
-            "replay scope carries no registry identity (canonical_id="
-            f"{resolved.canonical_id!r}, season_format="
-            f"{resolved.season_format!r}); resolve it through "
-            "resolve_replay_scope before replaying"
-        )
     capture_key = resolved.league
     try:
         tournament = catalog.tournament(int(resolved.source_tournament_id))
@@ -558,6 +558,16 @@ def _scope_overlay(
             f"cannot render replay overlay: season "
             f"{resolved.source_season_id!r} is unknown for source "
             f"tournament {resolved.source_tournament_id!r}"
+        )
+    if getattr(season, "season_format", None) not in (
+        "single_year",
+        "split_year",
+    ):
+        raise ReplayScopeError(
+            f"cannot render replay overlay: season "
+            f"{resolved.source_season_id!r} of source tournament "
+            f"{resolved.source_tournament_id!r} has no replayable season "
+            f"format (got {getattr(season, 'season_format', None)!r})"
         )
     registry_document = _overlay_registry_document(
         tournament, season, capture_key
@@ -637,26 +647,28 @@ def _scope_overlay(
             scraper_module._SOFASCORE_CATALOG = previous_module_catalog
 
 
-def _assert_replay_season_label(resolved: ResolvedReplayScope) -> None:
+def _assert_replay_season_label(
+    resolved: ResolvedReplayScope, season_format: str
+) -> None:
     """Fail loud when the Bronze season label drifted from the registry.
 
     The overlay binds ``season_format`` for the capture key; if the binding
     did not take effect, ``_season_label`` silently falls back to the club
     short form and the replay would read/write the WRONG partition
     ('2526' instead of the refresh lane's '2026').  The expected label is
-    derived independently from the resolved registry season's format, so
+    derived independently from the matched registry season's format, so
     this guard never rejects a valid split-year partition (design
     adjudication Q2).
     """
     from scrapers.sofascore.scraper import _season_label, _season_to_short
 
-    if resolved.season_format not in ("single_year", "split_year"):
+    if season_format not in ("single_year", "split_year"):
         raise ReplayScopeError(
-            "replay scope carries no registry season format "
-            f"({resolved.season_format!r}); resolve it through "
+            f"replay scope {resolved.league!r} carries no registry season "
+            f"format ({season_format!r}); resolve it through "
             "resolve_replay_scope before replaying"
         )
-    if resolved.season_format == "single_year":
+    if season_format == "single_year":
         # The single-year label formula is exactly the partition writer's
         # own (``_season_label`` returns ``str(int(season))``, the rule the
         # refresh lane used for the existing partition); a literal compare
@@ -681,6 +693,7 @@ def _matches_phase(
     capture_runtime: object,
     *,
     mode: Optional[str] = None,
+    season_format: str = "",
 ) -> dict[str, Any]:
     """Run the offline match phase for one exact replay scope.
 
@@ -728,7 +741,7 @@ def _matches_phase(
             "targets": [],
             "errors": [],
         }
-    _assert_replay_season_label(resolved)
+    _assert_replay_season_label(resolved, season_format)
     from dags.scripts import run_sofascore_scraper as runner
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -790,6 +803,7 @@ def _players_phase(
     capture_runtime: object,
     *,
     mode: Optional[str] = None,
+    season_format: str = "",
 ) -> dict[str, Any]:
     """Run the offline player phase for one exact replay scope.
 
@@ -829,7 +843,7 @@ def _players_phase(
         )
     if freshness is None and records:
         freshness = records[0].key.freshness_key
-    _assert_replay_season_label(resolved)
+    _assert_replay_season_label(resolved, season_format)
     from dags.scripts import run_sofascore_scraper as runner
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1117,7 +1131,7 @@ def run_replay_scope(
     and traffic comes from a single final engine metrics snapshot.
     """
     scope_key = _normalize_scope(scope)
-    resolved, plan = _load_scope(
+    resolved, plan, season_format = _load_scope(
         scope_key,
         mode=mode,
         capture_runtime=capture_runtime,
@@ -1184,13 +1198,21 @@ def run_replay_scope(
             (
                 "matches",
                 lambda: _matches_phase(
-                    resolved, plan_records, capture_runtime, mode=mode
+                    resolved,
+                    plan_records,
+                    capture_runtime,
+                    mode=mode,
+                    season_format=season_format,
                 ),
             ),
             (
                 "players",
                 lambda: _players_phase(
-                    resolved, plan_records, capture_runtime, mode=mode
+                    resolved,
+                    plan_records,
+                    capture_runtime,
+                    mode=mode,
+                    season_format=season_format,
                 ),
             ),
         )
