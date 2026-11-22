@@ -13,7 +13,11 @@ import pytest
 
 import scrapers.base.trino_manager as base
 from scrapers.whoscored.trino_budget import WRITE_TIMEOUT
-from scrapers.espn.trino_manager import EspnIcebergWriter, EspnTrinoTableManager
+from scrapers.espn.trino_manager import (
+    REQUEST_TIMEOUT,
+    EspnIcebergWriter,
+    EspnTrinoTableManager,
+)
 
 
 def _fake_trino(monkeypatch, calls: list[dict]) -> None:
@@ -51,6 +55,8 @@ def test_connection_pins_identity_and_bounds_query_lifetime(monkeypatch):
     assert calls[-1]["auth"] == ("src_espn", "synthetic-dedicated")
     assert calls[-1]["verify"] is False
     assert calls[-1]["max_attempts"] == 1
+    # Literal replay INSERTs must outrun the driver's 30s default (#2108).
+    assert calls[-1]["request_timeout"] == REQUEST_TIMEOUT == 300
 
 
 @pytest.mark.unit
