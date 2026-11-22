@@ -1,4 +1,5 @@
 """Stage-C section lanes: attendance (T10), club values (T11), achievements (T8) (#2405)."""
+from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -1237,3 +1238,172 @@ def test_failed_targets_of_one_scope_stay_distinct_in_dq():
     assert report.dq['passed'] is True
     assert {item['subject'] for item in report.outcomes} == {
         '{"player_id":"1"}', '{"player_id":"2"}'}
+
+
+def _rumour_feed_html(active: int, last: int, numbers, *, last_control=True) -> bytes:
+    """One feed page whose pager evidences exactly the listed page numbers."""
+    items = []
+    for number in numbers:
+        active_class = ' tm-pagination__list-item--active' if number == active else ''
+        items.append(
+            f'<li class="tm-pagination__list-item{active_class}">'
+            f'<a class="tm-pagination__link" href="{RUMOUR_LISTING}/page/{number}">{number}</a></li>')
+    if last_control and active != last:
+        items.append(
+            f'<li class="tm-pagination__list-item--icon-last-page">'
+            f'<a class="tm-pagination__link" href="{RUMOUR_LISTING}/page/{last}"></a></li>')
+    return f'<div id="yw1">{_GRID_TABLE}<div class="pager"><ul>{"".join(items)}</ul></div></div>'.encode()
+
+
+_NO_ENTRIES_TABLE = (
+    '<table class="items"><thead><tr><th>Player</th><th>Interested club</th>'
+    '<th>Most recent source from</th><th>Assessment</th></tr></thead><tbody><tr>'
+    '<td colspan="4" class="no-entries">No entries available</td></tr></tbody></table>')
+
+
+def _no_entries_html(active: int, last: int) -> bytes:
+    """A donor-valid empty feed page: the table rendered its no-entries row."""
+    return f'<div id="yw1">{_NO_ENTRIES_TABLE}{_rumour_pager(active, last)}</div>'.encode()
+
+
+def _rumour_page_url(number: int) -> str:
+    return f'{RUMOUR_LISTING}/page/{number}'
+
+
+class _FeedFetch:
+    """Serve rumour feed pages with a rising capture clock per fetch."""
+
+    def __init__(self, pages: dict[str, bytes]):
+        self.pages, self.calls = pages, []
+
+    def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+        self.calls.append(url)
+        body = self.pages[url]
+        digest = hashlib.sha256(body).hexdigest()
+        clock = datetime.fromisoformat(RUMOUR_PAGE_1_CAPTURED) + timedelta(seconds=len(self.calls))
+        return FetchOutcome(
+            status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+            raw_body_hash=digest, raw_fetched_at=clock.isoformat(), cache_hit=False,
+            status_code=200)
+
+
+def _rumour_run_plan(**targets):
+    from scrapers.transfermarkt.orchestrator import RumourCompetitionTarget
+    return CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t13', cycle_id='tm-cycle-t13',
+        rumour_competitions=(RumourCompetitionTarget('GB1', 'Premier League', **targets),))
+
+
+def test_rumour_walk_unions_the_links_of_every_fetched_page():
+    # The first pager skips page 3; page 2 supplies that link.
+    evidences = {1: (1, 2, 4), 2: (1, 2, 3, 4), 3: (1, 2, 3, 4), 4: (1, 2, 3, 4)}
+    pages = {RUMOUR_LISTING: _rumour_feed_html(1, 4, evidences[1])}
+    pages.update({_rumour_page_url(n): _rumour_feed_html(n, 4, numbers)
+                  for n, numbers in evidences.items()})
+    fetcher = _FeedFetch(pages)
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=RUMOUR_EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(_rumour_run_plan(), writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [RUMOUR_LISTING] + [_rumour_page_url(n) for n in (1, 2, 3, 4)]
+    assert [item['status'] for item in report.outcomes] == ['observed_present'] * 4
+    assert sum(item['rows'] for item in report.outcomes) == 4
+    assert report.dq['passed'] is True and report.receipts[0]['verified'] is True
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_rumour_observations').fetchone()[0] == 4
+
+
+def test_rumour_feed_no_fetched_page_completes_is_not_certified():
+    # Every fetched pager omits page 3 of four: no complete feed, no rows.
+    pages = {RUMOUR_LISTING: _rumour_feed_html(1, 4, (1, 2, 4))}
+    pages.update({_rumour_page_url(n): _rumour_feed_html(n, 4, (1, 2, 4)) for n in (1, 2, 4)})
+    fetcher = _FeedFetch(pages)
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
+                     extracted_at=RUMOUR_EXTRACTED_AT).run(_rumour_run_plan())
+    assert fetcher.calls == [RUMOUR_LISTING] + [_rumour_page_url(n) for n in (1, 2, 4)]
+    outcome, = report.outcomes
+    assert (outcome['status'], outcome['status_reason'], outcome['rows']) == (
+        'error', 'rumours:incomplete_page_plan', 0)
+    assert report.receipts == ()
+
+
+def test_empty_rumour_pages_keep_their_capture_in_the_bundle():
+    from scrapers.transfermarkt import rumours
+    page_1 = _rumour_capture(1, RUMOUR_PAGE_1_CAPTURED)
+    page_2 = _rumour_capture(2, RUMOUR_PAGE_2_CAPTURED, body=_no_entries_html(2, 2))
+    outcomes = sections.extract_rumour_observations(
+        (page_1, page_2), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    # One proof-bearing outcome per confirmed empty page: its capture joins
+    # the bundle digest and the physical read-back instead of disappearing.
+    assert [(outcome.status, outcome.capture.capture_id) for outcome in outcomes] == [
+        ('observed_present', page_1.capture_id), ('observed_empty', page_2.capture_id)]
+    assert (outcomes[1].proof, outcomes[1].rows) == ('rumours:no_entries_row', ())
+    assert outcomes[1].parser_revision == rumours.PARSER_VERSION
+    assert core.build_core_dq(outcomes)['passed'] is True
+
+    db = CoreDB()
+    plans = [core.plan_for_outcome(
+        outcome, captured_at=outcome.capture.captured_at,
+        scope_values={'competition_id': 'GB1'}) for outcome in outcomes]
+    receipt = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), plans, run_id=outcomes[0].run_id,
+        universe_version=UNIVERSE, committed_at=RUMOUR_EXTRACTED_AT)
+    assert receipt['verified'] is True
+    assert [proof['rows'] for proof in receipt['plans']] == [1, 0]
+    assert db.sql.execute(
+        'SELECT source_capture_id, row_count, observation_status, parser_revision, schema_revision '
+        'FROM transfermarkt_core_receipts_v1 ORDER BY rowid').fetchall() == [
+        (page_1.capture_id, 1, 'observed_present', rumours.PARSER_VERSION, rumours.SCHEMA_VERSION),
+        (page_2.capture_id, 0, 'observed_empty', rumours.PARSER_VERSION, rumours.SCHEMA_VERSION)]
+
+
+def test_all_empty_rumour_feed_reports_each_page():
+    empty_pages = (
+        SourceCapture(url=_rumour_page_url(1), endpoint='rumours', body=_no_entries_html(1, 2),
+                      capture_id='1' * 64, body_hash=hashlib.sha256(_no_entries_html(1, 2)).hexdigest(),
+                      captured_at=RUMOUR_PAGE_1_CAPTURED),
+        SourceCapture(url=_rumour_page_url(2), endpoint='rumours', body=_no_entries_html(2, 2),
+                      capture_id='2' * 64, body_hash=hashlib.sha256(_no_entries_html(2, 2)).hexdigest(),
+                      captured_at=RUMOUR_PAGE_2_CAPTURED),
+    )
+    outcomes = sections.extract_rumour_observations(
+        empty_pages, _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert [(outcome.status, outcome.capture.capture_id) for outcome in outcomes] == [
+        ('observed_empty', empty_pages[0].capture_id),
+        ('observed_empty', empty_pages[1].capture_id)]
+    assert core.build_core_dq(outcomes)['passed'] is True
+
+
+def test_rumour_discovery_always_takes_the_canonical_route():
+    from scrapers.transfermarkt.orchestrator import planned_urls
+    # Transfermarkt serves the grid under the generic "-" slug and its pager
+    # links carry it; a competition slug fails the donor's navigation check.
+    plan = _rumour_run_plan(slug='premier-league')
+    assert planned_urls(plan) == (RUMOUR_LISTING,)
+    empty_grid = (b'<div id="yw1"><span class="empty">No information available.</span>'
+                  b'<div class="keys"></div></div>')
+    report = CoreRun(_FeedFetch({RUMOUR_LISTING: empty_grid}).fetch, universe_version=UNIVERSE,
+                     extracted_at=RUMOUR_EXTRACTED_AT).run(plan)
+    outcome, = report.outcomes
+    assert (outcome['status'], outcome['status_reason']) == ('observed_empty', 'rumours:empty_grid')
+
+
+def test_rumour_scope_check_uses_the_donors_page_identity():
+    def capture(url):
+        body = _rumour_page_html(2)
+        return SourceCapture(url=url, endpoint='rumours', body=body,
+                             capture_id=hashlib.sha256(body).hexdigest(),
+                             body_hash=hashlib.sha256(body).hexdigest(),
+                             captured_at=RUMOUR_PAGE_2_CAPTURED)
+
+    scope = {'competition_id': 'GB1'}
+    for url in (RUMOUR_PAGE[2], RUMOUR_PAGE[2] + '/', RUMOUR_LISTING + '/plus/1/page/2',
+                RUMOUR_LISTING + '?page=2', RUMOUR_LISTING):
+        core._check_scope_against_capture('rumour_observations', scope, capture(url))
+    for url in ('https://www.transfermarkt.com/-/geruechte/wettbewerb/ES1/page/2',
+                'https://www.transfermarkt.com/-/tabelle/wettbewerb/GB1/page/2',
+                'https://transfermarkt.example.com/-/geruechte/wettbewerb/GB1/page/2',
+                RUMOUR_PAGE[2] + '#top'):
+        with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+            core._check_scope_against_capture('rumour_observations', scope, capture(url))
