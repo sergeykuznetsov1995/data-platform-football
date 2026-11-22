@@ -14,6 +14,7 @@ from scrapers.sofascore.manifest import (
 )
 from scrapers.sofascore.partition_keys import canonical_league
 from scrapers.sofascore.raw_replay import (
+    FIELDS_BLOCKING_ENDPOINTS,
     FIELDS_ENDPOINTS,
     MODE_DRAIN,
     MODE_FIELDS,
@@ -24,8 +25,10 @@ from scrapers.sofascore.raw_replay import (
     ResolvedReplayScope,
     list_replay_scope_keys,
     load_replay_scope_records,
+    replay_eligible_scope_pairs,
     resolve_replay_scope,
     select_replay_scope_plans,
+    validate_replay_scope_pair,
 )
 
 TOURNAMENT = "17"
@@ -378,23 +381,45 @@ def _manifest_row(record: EndpointManifest) -> tuple:
     return tuple(row[column] for column in MANIFEST_COLUMNS)
 
 
-def _fake_catalog():
+def _fake_catalog(*, enabled=True, season_format="split_year"):
     tournament = SimpleNamespace(
+        unique_tournament_id=17,
         canonical_id="ENG-Premier League",
-        seasons=(SimpleNamespace(season_id=76986, canonical_season="2526"),),
+        enabled=enabled,
+        capture_allowed=enabled,
+        seasons=(
+            SimpleNamespace(
+                season_id=76986,
+                canonical_season="2526",
+                season_format=season_format,
+            ),
+        ),
+    )
+    disabled = SimpleNamespace(
+        unique_tournament_id=1,
+        canonical_id="INT-European Championship",
+        enabled=False,
+        capture_allowed=False,
+        seasons=(),
     )
 
     class Catalog:
         def tournament(self, unique_tournament_id):
-            if int(unique_tournament_id) != 17:
-                raise ValueError(
-                    f"unknown unique_tournament_id {unique_tournament_id!r}"
-                )
-            return tournament
+            if int(unique_tournament_id) == 17:
+                return tournament
+            if int(unique_tournament_id) == 1:
+                return disabled
+            raise ValueError(
+                f"unknown unique_tournament_id {unique_tournament_id!r}"
+            )
 
         def tournament_map(self):
-            return {"ENG-Premier League": 17}
+            return {
+                "ENG-Premier League": 17,
+                "INT-European Championship": 1,
+            }
 
+    Catalog.tournaments = (tournament, disabled)
     return Catalog()
 
 
@@ -406,7 +431,7 @@ def test_list_replay_scope_keys_fields_sql_filters_and_params():
     call = manager.calls[0]
     assert call["fetch"] is True
     sql = call["sql"]
-    assert f"FROM {REPLAY_MANIFEST_TABLE}" in sql
+    assert f"FROM {REPLAY_MANIFEST_TABLE} m" in sql
     assert "SELECT DISTINCT" in sql
     assert '"http_status" >= 200' in sql
     assert '"http_status" < 300' in sql
@@ -418,8 +443,8 @@ def test_list_replay_scope_keys_fields_sql_filters_and_params():
         assert f"'{endpoint}'" in sql
     assert "retryable_failure" not in sql
     assert (
-        'ORDER BY "source_tournament_id", "source_season_id", "freshness_key"'
-        in sql
+        'ORDER BY m."source_tournament_id", m."source_season_id", '
+        'm."freshness_key"' in sql
     )
     assert "LIMIT 1" in sql
     assert call["params"] == ()
@@ -427,6 +452,110 @@ def test_list_replay_scope_keys_fields_sql_filters_and_params():
         ReplayScopeKey("23", "9", "f2"),
         ReplayScopeKey("10", "9", "f1"),
     )
+
+
+def test_list_replay_scope_keys_fields_suppresses_schema_error_blockers():
+    manager = FakeManager()
+
+    list_replay_scope_keys(manager, mode=MODE_FIELDS)
+
+    sql = manager.calls[0]["sql"]
+    assert "NOT EXISTS" in sql
+    assert "schema_error" in sql
+    suppression = sql.split("NOT EXISTS", 1)[1]
+    for endpoint in FIELDS_BLOCKING_ENDPOINTS:
+        assert f"'{endpoint}'" in suppression
+    assert "'lineups'" not in suppression
+    assert "'referee_profile'" not in suppression
+    for column in (
+        "source_tournament_id",
+        "source_season_id",
+        "freshness_key",
+    ):
+        assert f'b."{column}" = m."{column}"' in sql
+    assert "COALESCE(TRIM(b.\"raw_blob_key\"), '') <> ''" in sql
+
+
+def test_list_replay_scope_keys_include_blocked_drops_suppression():
+    manager = FakeManager()
+
+    list_replay_scope_keys(manager, mode=MODE_FIELDS, include_blocked=True)
+
+    assert "NOT EXISTS" not in manager.calls[0]["sql"]
+
+
+def test_list_replay_scope_keys_catalog_binds_resolvable_pairs():
+    manager = FakeManager([("17", "76986", "f1")])
+    catalog = _fake_catalog()
+
+    keys = list_replay_scope_keys(
+        manager, mode=MODE_FIELDS, limit=2, catalog=catalog
+    )
+
+    sql = manager.calls[0]["sql"]
+    params = manager.calls[0]["params"]
+    assert (
+        '(m."source_tournament_id", m."source_season_id") IN ((?, ?))' in sql
+    )
+    assert params == ("17", "76986")
+    assert keys == (ReplayScopeKey("17", "76986", "f1"),)
+
+
+def test_list_replay_scope_keys_empty_catalog_pairs_skip_sql():
+    manager = FakeManager()
+
+    class EmptyCatalog:
+        tournaments = ()
+
+    assert (
+        list_replay_scope_keys(
+            manager, mode=MODE_FIELDS, catalog=EmptyCatalog()
+        )
+        == ()
+    )
+    assert manager.calls == []
+
+
+def test_list_replay_scope_keys_exact_scope_validates_against_catalog():
+    manager = FakeManager([("17", "76986", FRESHNESS)])
+
+    keys = list_replay_scope_keys(
+        manager,
+        mode=MODE_FIELDS,
+        exact_scope=(TOURNAMENT, "76986"),
+        limit=2,
+        catalog=_fake_catalog(),
+    )
+
+    call = manager.calls[0]
+    sql, params = call["sql"], call["params"]
+    assert '(m."source_tournament_id", m."source_season_id") IN (' not in sql
+    assert 'm."source_tournament_id" = ?' in sql
+    assert 'm."source_season_id" = ?' in sql
+    assert params == (TOURNAMENT, "76986")
+    assert keys == (ReplayScopeKey(TOURNAMENT, "76986", FRESHNESS),)
+
+
+@pytest.mark.parametrize(
+    "pair,message",
+    [
+        (("8", "76986"), "unknown tournament"),
+        (("17", "99999"), "unknown for the source tournament"),
+        (("1", "76986"), "unknown for the source tournament"),
+    ],
+)
+def test_list_replay_scope_keys_exact_scope_rejects_unresolvable(pair, message):
+    manager = FakeManager()
+
+    with pytest.raises(ReplayPlanningError, match=message):
+        list_replay_scope_keys(
+            manager,
+            mode=MODE_FIELDS,
+            exact_scope=pair,
+            catalog=_fake_catalog(),
+        )
+
+    assert manager.calls == []
 
 
 def test_list_replay_scope_keys_drain_sql_filters_and_params():
@@ -438,6 +567,7 @@ def test_list_replay_scope_keys_drain_sql_filters_and_params():
     sql = call["sql"]
     assert "\"status\" = 'retryable_failure'" in sql
     assert '"endpoint" IN (' not in sql
+    assert "NOT EXISTS" not in sql
     assert '"http_status" <> 204' in sql
     assert "COALESCE(TRIM(\"raw_blob_key\"), '') <> ''" in sql
     assert "LIMIT 3" in sql
@@ -454,8 +584,8 @@ def test_list_replay_scope_keys_binds_exact_scope_params():
 
     call = manager.calls[0]
     assert call["params"] == (TOURNAMENT, SEASON)
-    assert '"source_tournament_id" = ?' in call["sql"]
-    assert '"source_season_id" = ?' in call["sql"]
+    assert 'm."source_tournament_id" = ?' in call["sql"]
+    assert 'm."source_season_id" = ?' in call["sql"]
     assert keys == (ReplayScopeKey(TOURNAMENT, SEASON, FRESHNESS),)
 
 
@@ -549,6 +679,8 @@ def test_resolve_replay_scope_maps_canonical_league_and_season():
         freshness_key=FRESHNESS,
         league="SS-17",
         canonical_season="2526",
+        canonical_id="ENG-Premier League",
+        season_format="split_year",
     )
     assert isinstance(resolved, tuple)
 
@@ -571,12 +703,31 @@ def test_resolve_replay_scope_requires_canonical_season():
     catalog = _fake_catalog()
     tournament = catalog.tournament(17)
     tournament.seasons = (
-        SimpleNamespace(season_id=11111, canonical_season=None),
+        SimpleNamespace(
+            season_id=11111, canonical_season=None, season_format="split_year"
+        ),
     )
 
     with pytest.raises(ReplayPlanningError):
         resolve_replay_scope(
             ReplayScopeKey("17", "11111", FRESHNESS), catalog
+        )
+
+
+@pytest.mark.parametrize("season_format", [None, "", "unknown", "split-year"])
+def test_resolve_replay_scope_requires_replayable_season_format(season_format):
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = (
+        SimpleNamespace(
+            season_id=76986,
+            canonical_season="2526",
+            season_format=season_format,
+        ),
+    )
+
+    with pytest.raises(ReplayPlanningError, match="season format"):
+        resolve_replay_scope(
+            ReplayScopeKey("17", "76986", FRESHNESS), catalog
         )
 
 
@@ -587,3 +738,60 @@ def test_resolve_replay_scope_requires_canonical_season():
 def test_resolve_replay_scope_rejects_bad_scope(scope):
     with pytest.raises(ReplayPlanningError):
         resolve_replay_scope(scope, _fake_catalog())
+
+
+def test_replay_eligible_scope_pairs_filters_and_sorts():
+    catalog = _fake_catalog()
+
+    pairs = replay_eligible_scope_pairs(catalog)
+
+    assert pairs == (("17", "76986"),)
+
+
+def test_replay_eligible_scope_pairs_requires_catalog_enumeration():
+    class BareCatalog:
+        def tournament(self, unique_tournament_id):
+            raise AssertionError("must not be called")
+
+        def tournament_map(self):
+            return {}
+
+    with pytest.raises(ReplayPlanningError, match="tournaments"):
+        replay_eligible_scope_pairs(BareCatalog())
+
+
+def test_replay_eligible_scope_pairs_skips_incomplete_seasons():
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = (
+        SimpleNamespace(season_id=1, canonical_season="2526"),
+        SimpleNamespace(
+            season_id=2, canonical_season=None, season_format="split_year"
+        ),
+        SimpleNamespace(
+            season_id=3, canonical_season="2526", season_format="unknown"
+        ),
+    )
+
+    assert replay_eligible_scope_pairs(catalog) == ()
+
+
+def test_validate_replay_scope_pair_accepts_eligible_pair():
+    assert validate_replay_scope_pair(("17", "76986"), _fake_catalog()) == (
+        "17",
+        "76986",
+    )
+
+
+def test_validate_replay_scope_pair_rejects_disabled_tournament():
+    catalog = _fake_catalog()
+    catalog.tournament(17).seasons = ()
+    catalog.tournament(1).seasons = (
+        SimpleNamespace(
+            season_id=76986,
+            canonical_season="2026",
+            season_format="single_year",
+        ),
+    )
+
+    with pytest.raises(ReplayPlanningError, match="capture-allowed"):
+        validate_replay_scope_pair(("1", "76986"), catalog)

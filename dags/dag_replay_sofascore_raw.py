@@ -46,6 +46,7 @@ PARAMS: dict[str, Any] = {
     "target_cap": Param(DEFAULT_TARGET_CAP, type="integer", minimum=1),
     "source_tournament_id": Param(None, type=["null", "string"]),
     "source_season_id": Param(None, type=["null", "string"]),
+    "include_blocked": Param(False, type="boolean"),
 }
 
 
@@ -62,6 +63,7 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
     target_cap = params.get("target_cap", DEFAULT_TARGET_CAP)
     source_tournament_id = params.get("source_tournament_id")
     source_season_id = params.get("source_season_id")
+    include_blocked = params.get("include_blocked", False)
 
     if mode not in REPLAY_MODES:
         raise ValueError(f"mode must be one of {REPLAY_MODES}, got {mode!r}")
@@ -70,6 +72,10 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
             raise ValueError(
                 f"{name} must be a positive integer, got {value!r}"
             )
+    if not isinstance(include_blocked, bool):
+        raise ValueError(
+            f"include_blocked must be a boolean, got {include_blocked!r}"
+        )
     exact_scope = None
     if source_tournament_id is not None or source_season_id is not None:
         if (
@@ -89,6 +95,7 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
         )
 
     from dags.scripts.replay_sofascore_raw import _replay_manager
+    from scrapers.sofascore.catalog import SofaScoreCatalog
     from scrapers.sofascore.pipeline import build_capture_runtime
     from scrapers.sofascore.raw_replay import list_replay_scope_keys
 
@@ -97,10 +104,47 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
     manager = _replay_manager(
         getattr(capture_runtime, "manifest_store", None)
     )
+    # #1367: only registry-resolvable, capture-allowed scopes may enter the
+    # bounded queue (EURO's manifest scopes without registry seasons used to
+    # die first in every worker); an exact scope is validated loudly here
+    # instead, and fields mode suppresses scopes with stored schema_error
+    # blockers that the deployed parser deterministically re-rejects.
+    catalog = SofaScoreCatalog.load()
     keys = list_replay_scope_keys(
-        manager, mode=mode, exact_scope=exact_scope, limit=scope_cap
+        manager,
+        mode=mode,
+        exact_scope=exact_scope,
+        limit=scope_cap,
+        catalog=catalog,
+        include_blocked=include_blocked,
     )
     if not keys:
+        if mode == "fields" and not include_blocked:
+            blocked = list_replay_scope_keys(
+                manager,
+                mode=mode,
+                exact_scope=exact_scope,
+                limit=scope_cap,
+                catalog=catalog,
+                include_blocked=True,
+            )
+            if blocked:
+                logger.warning(
+                    "SofaScore raw replay skipped %d scope(s) with stored "
+                    "schema_error season blockers (mode=%s): %s; re-run "
+                    "with include_blocked after a parser fix",
+                    len(blocked),
+                    mode,
+                    [
+                        (
+                            key.source_tournament_id,
+                            key.source_season_id,
+                            key.freshness_key,
+                        )
+                        for key in blocked
+                    ],
+                )
+                return []
         logger.info(
             "SofaScore raw replay drained: no replayable scope for mode=%s",
             mode,

@@ -17,6 +17,8 @@ import sys
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -377,6 +379,281 @@ def _env_overrides(values: Mapping[str, object]) -> Iterator[None]:
                 os.environ[name] = previous
 
 
+def _overlay_registry_season(season: object) -> dict[str, object]:
+    """Serialize one registry season row verbatim for the scope overlay.
+
+    The projected ``CatalogSeason`` does not retain the source row's
+    evidence list, so the overlay carries one synthesized entry naming the
+    replay overlay itself; every identity field is copied verbatim.
+    """
+    aliases = getattr(season, "aliases", ()) or ()
+    document: dict[str, object] = {
+        "season_id": season.season_id,
+        "name": season.name,
+        "source_name": season.source_name,
+        "year": season.year,
+        "format": season.format,
+        "season_format": season.season_format,
+        "source_canonical_season": getattr(
+            season, "source_canonical_season", None
+        ),
+        "canonical_season": season.canonical_season,
+        "start_date": getattr(season, "start_date", None),
+        "end_date": getattr(season, "end_date", None),
+        "aliases": list(aliases),
+        "evidence": [
+            {
+                "type": "replay_overlay",
+                "endpoint": "unique-tournament/seasons",
+                "value": str(season.season_id),
+                "note": (
+                    "#1367 offline raw replay per-scope overlay; identity "
+                    "fields copied verbatim from the source registry row"
+                ),
+            }
+        ],
+    }
+    team_count = getattr(season, "team_count", None)
+    if team_count is not None:
+        document["team_count"] = team_count
+        evidence = getattr(season, "team_count_evidence", None)
+        if evidence is not None:
+            document["team_count_evidence"] = dict(evidence)
+    return document
+
+
+def _overlay_registry_document(
+    tournament: object, season: object, capture_key: str
+) -> dict[str, object]:
+    """One-row registry overlay: the source row re-keyed to its capture key.
+
+    Identity, ``enabled``, ``classification`` and ``review`` are copied
+    VERBATIM from the resolved registry row, so the overlay preserves the
+    source tournament's eligibility exactly — the refresh lane's
+    ``render_scope_overlays`` contract (#1370) applied to the replay scope.
+    Only ``canonical_id`` is replaced by the Bronze capture key so every
+    catalog-keyed entry point (``competition()``) resolves the SS-* key.
+    """
+    return {
+        "schema_version": 2,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tournaments": [
+            {
+                "unique_tournament_id": tournament.unique_tournament_id,
+                "name": tournament.name,
+                "slug": tournament.slug,
+                "category": {
+                    "id": getattr(tournament, "category_id", None),
+                    "name": getattr(tournament, "category_name", None),
+                    "slug": getattr(tournament, "category_slug", None),
+                },
+                "sport_slug": tournament.sport_slug,
+                "page_path": tournament.page_path,
+                "canonical_id": capture_key,
+                "enabled": bool(tournament.enabled),
+                "classification": dict(tournament.classification),
+                "review": dict(tournament.review),
+                "seasons": [_overlay_registry_season(season)],
+            }
+        ],
+    }
+
+
+def _overlay_competitions_document(
+    tournament: object, season: object, resolved: ResolvedReplayScope
+) -> dict[str, object]:
+    """One-competition medallion overlay for the replay capture key.
+
+    The replay path consumes exactly one field from this overlay — the
+    season's ``season_format`` (via ``_season_label``) — so the Bronze
+    season partition label matches what the refresh lane wrote
+    ('2026' for single-year, not the club '2526' short form).  ``format``
+    and ``team_count`` are schema-completeness placeholders in the same
+    spirit as the refresh overlay's pending team counts: no replay DQ floor
+    reads them.
+    """
+    canonical_season = resolved.canonical_season
+    if not canonical_season.isdigit():
+        raise ReplayScopeError(
+            "cannot overlay medallion competitions for replay scope "
+            f"{resolved.source_tournament_id!r}: canonical season "
+            f"{canonical_season!r} is not a numeric slug"
+        )
+    team_count = getattr(season, "team_count", None)
+    season_config: dict[str, object] = {
+        "id": int(canonical_season),
+        "season_format": resolved.season_format,
+        "format": "league_round_robin",
+        "team_count": team_count if team_count is not None else 1,
+    }
+    if team_count is None:
+        season_config["team_count_pending"] = True
+    return {
+        "competitions": [
+            {
+                "id": resolved.league,
+                "name": tournament.name,
+                "country": (
+                    getattr(tournament, "category_name", None) or "World"
+                ),
+                "tier": 1,
+                "competition_format": None,
+                "seasons": [season_config],
+                "sources": {"primary": ["sofascore"], "fallback": []},
+                "in_scope": False,
+                "notes": (
+                    "#1367 offline raw replay overlay; season_format only"
+                ),
+            }
+        ]
+    }
+
+
+@contextmanager
+def _scope_overlay(
+    resolved: ResolvedReplayScope, catalog: object
+) -> Iterator[tuple[str, str]]:
+    """Render and bind the per-scope overlay for one replay run.
+
+    Writes the registry/medallion overlay pair into a temporary directory,
+    validates the overlay registry through the real loader and binds BOTH
+    import-time configurations to it for the enclosed phases: the env vars
+    plus an explicit rebind of the module-level singletons
+    (``scraper._SOFASCORE_CATALOG``, ``medallion_config.CONFIG_DIR``) so an
+    earlier import in the same process cannot freeze another path — the
+    startup-order guarantee required by the #1367 design adjudication.
+    Everything is restored on exit.
+    """
+    import yaml
+    from scrapers.sofascore.catalog import SofaScoreCatalog
+
+    capture_key = resolved.league
+    try:
+        tournament = catalog.tournament(int(resolved.source_tournament_id))
+    except Exception as exc:
+        raise ReplayScopeError(
+            f"cannot render replay overlay: unknown source tournament "
+            f"{resolved.source_tournament_id!r}: {exc}"
+        ) from exc
+    season = next(
+        (
+            item
+            for item in tournament.seasons
+            if str(item.season_id) == resolved.source_season_id
+        ),
+        None,
+    )
+    if season is None:
+        raise ReplayScopeError(
+            f"cannot render replay overlay: season "
+            f"{resolved.source_season_id!r} is unknown for source "
+            f"tournament {resolved.source_tournament_id!r}"
+        )
+    registry_document = _overlay_registry_document(
+        tournament, season, capture_key
+    )
+    competitions_document = _overlay_competitions_document(
+        tournament, season, resolved
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="sofascore-replay-overlay-"
+    ) as tmp:
+        registry_path = os.path.join(tmp, "tournaments.json")
+        medallion_dir = os.path.join(tmp, "medallion")
+        os.makedirs(medallion_dir, exist_ok=True)
+        with open(registry_path, "w", encoding="utf-8") as handle:
+            json.dump(registry_document, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        with open(
+            os.path.join(medallion_dir, "competitions.yaml"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            yaml.safe_dump(
+                competitions_document,
+                handle,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+        overlay_catalog = SofaScoreCatalog.from_file(registry_path)
+        overlay_tournament = overlay_catalog.competition(capture_key)
+        if str(overlay_tournament.unique_tournament_id) != str(
+            resolved.source_tournament_id
+        ):
+            raise ReplayScopeError(
+                "replay overlay registry resolved the wrong tournament for "
+                f"{capture_key!r}"
+            )
+        if bool(overlay_tournament.capture_allowed) is not bool(
+            getattr(tournament, "capture_allowed", False)
+        ):
+            raise ReplayScopeError(
+                "replay overlay changed capture eligibility for "
+                f"{capture_key!r}"
+            )
+
+        import dags.utils.medallion_config as medallion_config
+        from scrapers.sofascore import scraper as scraper_module
+
+        previous_registry = os.environ.get("SOFASCORE_REGISTRY_PATH")
+        previous_medallion = os.environ.get("MEDALLION_CONFIG_DIR")
+        previous_config_dir = medallion_config.CONFIG_DIR
+        previous_module_catalog = scraper_module._SOFASCORE_CATALOG
+        try:
+            os.environ["SOFASCORE_REGISTRY_PATH"] = registry_path
+            os.environ["MEDALLION_CONFIG_DIR"] = medallion_dir
+            medallion_config.CONFIG_DIR = Path(medallion_dir)
+            scraper_module._SOFASCORE_CATALOG = overlay_catalog
+            competitions = medallion_config.load_competitions()
+            if not any(
+                item.get("id") == capture_key
+                for item in competitions.get("competitions", [])
+            ):
+                raise ReplayScopeError(
+                    f"replay overlay competitions.yaml does not carry "
+                    f"{capture_key!r}"
+                )
+            yield registry_path, medallion_dir
+        finally:
+            if previous_registry is None:
+                os.environ.pop("SOFASCORE_REGISTRY_PATH", None)
+            else:
+                os.environ["SOFASCORE_REGISTRY_PATH"] = previous_registry
+            if previous_medallion is None:
+                os.environ.pop("MEDALLION_CONFIG_DIR", None)
+            else:
+                os.environ["MEDALLION_CONFIG_DIR"] = previous_medallion
+            medallion_config.CONFIG_DIR = previous_config_dir
+            scraper_module._SOFASCORE_CATALOG = previous_module_catalog
+
+
+def _assert_replay_season_label(resolved: ResolvedReplayScope) -> None:
+    """Fail loud when the Bronze season label drifted from the registry.
+
+    The overlay binds ``season_format`` for the capture key; if the binding
+    did not take effect, ``_season_label`` silently falls back to the club
+    short form and the replay would read/write the WRONG partition
+    ('2526' instead of the refresh lane's '2026').  The expected label is
+    derived independently from the resolved registry season's format, so
+    this guard never rejects a valid split-year partition (design
+    adjudication Q2).
+    """
+    from scrapers.sofascore.scraper import _season_label, _season_to_short
+
+    if resolved.season_format == "single_year":
+        expected = str(int(resolved.canonical_season))
+    else:
+        expected = _season_to_short(resolved.canonical_season)
+    computed = _season_label(resolved.league, resolved.canonical_season)
+    if computed != expected:
+        raise ReplayScopeError(
+            f"replay season label drift for {resolved.league!r}: partition "
+            f"label {computed!r} does not match the registry-derived label "
+            f"{expected!r}; the medallion overlay for the capture key is "
+            "not in effect"
+        )
+
+
 def _matches_phase(
     resolved: ResolvedReplayScope,
     records: Sequence[EndpointManifest],
@@ -430,6 +707,7 @@ def _matches_phase(
             "targets": [],
             "errors": [],
         }
+    _assert_replay_season_label(resolved)
     from dags.scripts import run_sofascore_scraper as runner
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -530,6 +808,7 @@ def _players_phase(
         )
     if freshness is None and records:
         freshness = records[0].key.freshness_key
+    _assert_replay_season_label(resolved)
     from dags.scripts import run_sofascore_scraper as runner
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -894,18 +1173,28 @@ def run_replay_scope(
                 ),
             ),
         )
-        for phase, run_phase in phases:
-            try:
-                phase_result = run_phase()
-            except Exception as exc:
-                phase_result = {
-                    "ran": False,
-                    "reason": "phase_error",
-                    "targets": [],
-                    "report": {},
-                    "errors": [f"{phase}: {exc}"],
-                }
-            _merge_phase_report(results, phase, phase_result)
+        # #1367: the capture key (league) is catalog/medallion-keyed only in a
+        # per-scope overlay registry (refresh-lane contract), so every phase
+        # runs inside one; a fresh worker process binds both configurations
+        # from the overlay env alone.
+        overlay_catalog = getattr(capture_runtime, "catalog", None)
+        if overlay_catalog is None:
+            overlay_catalog = SofaScoreCatalog.load(
+                getattr(capture_runtime, "registry_path", None)
+            )
+        with _scope_overlay(resolved, overlay_catalog):
+            for phase, run_phase in phases:
+                try:
+                    phase_result = run_phase()
+                except Exception as exc:
+                    phase_result = {
+                        "ran": False,
+                        "reason": "phase_error",
+                        "targets": [],
+                        "report": {},
+                        "errors": [f"{phase}: {exc}"],
+                    }
+                _merge_phase_report(results, phase, phase_result)
     results["status_counts"] = _selected_status_counts(
         capture_runtime, selected_records
     )
