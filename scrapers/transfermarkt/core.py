@@ -33,12 +33,20 @@ _ID_RE = re.compile(r'^[1-9][0-9]*$')
 _CAPTURE_RE = re.compile(r'^[0-9a-f]{64}$')
 _ENDPOINTS = frozenset({
     'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history',
+    # stage C sections (#2405)
+    'attendance', 'club_values',
 })
-_ROW_STATUSES = frozenset({'observed_present', 'explicit_none'})
+_OUTCOMES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
 _PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
 _CONTRACT_STATUSES = {
     'ok': 'observed_present', 'unknown': 'unknown', 'parse_error': 'error',
     'not_rendered': 'not_applicable',
+}
+# Sections preserve the donor parser's verdict for each row.
+_ENTITY_ROW_STATUSES = {
+    'player_contract_observations': frozenset(_CONTRACT_STATUSES.values()),
+    'attendance_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
+    'club_value_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
 }
 
 LINEAGE_COLUMNS = (
@@ -52,6 +60,8 @@ META_COLUMNS = ('_source', '_entity_type', '_batch_id', '_ingested_at')
 CORE_ENTITIES = (
     'squad_memberships', 'player_attribute_observations', 'player_contract_observations',
     'market_value_points', 'transfer_events', 'coach_profiles', 'coach_stints',
+    # stage C sections (#2405)
+    'attendance_observations', 'club_value_observations',
 )
 CORE_TABLES = {entity: f'transfermarkt_{entity}' for entity in CORE_ENTITIES}
 CORE_NATURAL_KEYS = {
@@ -62,6 +72,9 @@ CORE_NATURAL_KEYS = {
     'transfer_events': ('transfer_id',),
     'coach_profiles': ('coach_id', 'observed_at'),
     'coach_stints': ('stint_id',),
+    # stage C sections (#2405)
+    'attendance_observations': ('competition_id', 'edition_id', 'club_id', 'observed_at'),
+    'club_value_observations': ('club_id', 'value_date', 'observed_at', 'source_point_id'),
 }
 CORE_SCOPE_COLUMNS = {
     'squad_memberships': ('league', 'season', 'club_id'),
@@ -71,6 +84,9 @@ CORE_SCOPE_COLUMNS = {
     'transfer_events': ('player_id',),
     'coach_profiles': ('coach_id',),
     'coach_stints': ('club_id',),
+    # stage C sections (#2405)
+    'attendance_observations': ('competition_id', 'edition_id'),
+    'club_value_observations': ('club_id',),
 }
 CORE_WRITE_MODES = {
     'squad_memberships': 'replace',
@@ -80,6 +96,9 @@ CORE_WRITE_MODES = {
     'transfer_events': 'merge',
     'coach_profiles': 'merge',
     'coach_stints': 'replace',
+    # stage C sections (#2405)
+    'attendance_observations': 'replace',
+    'club_value_observations': 'merge',
 }
 
 SQUAD_MEMBERSHIP_BUSINESS = (
@@ -113,6 +132,18 @@ COACH_STINT_BUSINESS = (
     'stint_id', 'club_id', 'coach_id', 'coach_slug', 'name', 'role',
     'appointed_date', 'left_date', 'observed_at',
 )
+ATTENDANCE_BUSINESS = (
+    'competition_id', 'edition_id', 'club_id', 'observed_at', 'club_name',
+    'stadium_name', 'stadium_url', 'capacity', 'capacity_raw', 'spectators_total',
+    'spectators_total_raw', 'spectators_average', 'spectators_average_raw',
+    'matches', 'matches_raw', 'sold_out', 'sold_out_raw', 'capacity_filled_raw',
+    'final_season', 'final_season_proof',
+)
+CLUB_VALUE_BUSINESS = (
+    'competition_id', 'club_id', 'club_slug', 'club_name', 'value_date', 'currency',
+    'value_amount', 'source_point_id', 'source_point_kind', 'source_value_raw',
+    'reconciliation_status', 'observed_at',
+)
 _BUSINESS_COLUMNS = {
     'squad_memberships': SQUAD_MEMBERSHIP_BUSINESS,
     'player_attribute_observations': ATTRIBUTE_BUSINESS,
@@ -121,6 +152,9 @@ _BUSINESS_COLUMNS = {
     'transfer_events': TRANSFER_EVENT_BUSINESS,
     'coach_profiles': COACH_PROFILE_BUSINESS,
     'coach_stints': COACH_STINT_BUSINESS,
+    # stage C sections (#2405)
+    'attendance_observations': ATTENDANCE_BUSINESS,
+    'club_value_observations': CLUB_VALUE_BUSINESS,
 }
 # observed_at serves both roles in the squad and coach tables.
 CORE_COLUMNS = {
@@ -132,15 +166,16 @@ COLUMN_TYPES: Mapping[str, str] = {
     **dict.fromkeys(('observed_at', 'captured_at', 'extracted_at', '_ingested_at'), 'timestamp'),
     **dict.fromkeys((
         'dob', 'joined_at', 'loan_until', 'injury_return_date', 'contract_until', 'mv_date',
-        'mv_last_change', 'transfer_date', 'appointed_date', 'left_date',
+        'mv_last_change', 'transfer_date', 'appointed_date', 'left_date', 'value_date',
     ), 'date'),
     **dict.fromkeys((
         'age', 'height_cm', 'market_value_eur', 'shirt_number', 'signed_from_fee_eur',
         'value_eur', 'fee_eur', 'from_country_id', 'to_country_id',
+        'capacity', 'spectators_total', 'spectators_average', 'matches', 'sold_out', 'value_amount',
     ), 'bigint'),
     **dict.fromkeys((
         'is_on_loan', 'is_captain', 'is_value_removed', 'is_upcoming',
-        'from_is_special', 'to_is_special', 'is_loan_end',
+        'from_is_special', 'to_is_special', 'is_loan_end', 'final_season',
     ), 'boolean'),
 }
 
@@ -261,6 +296,25 @@ def _batch_id(run_id: str) -> str:
     return 'tm-core-batch-' + hashlib.sha256(run_id.encode('utf-8')).hexdigest()[:32]
 
 
+def _status_matches_rows(entity, status, rows) -> bool:
+    if not rows:
+        return status not in _OUTCOMES_WITH_ROWS
+    allowed = _ENTITY_ROW_STATUSES.get(entity)
+    contract = entity == 'player_contract_observations'
+    if status not in _OUTCOMES_WITH_ROWS and (contract or allowed is None or status not in allowed):
+        return False
+    if allowed is None:
+        return all(row.get('observation_status') == status for row in rows)
+    for row in rows:
+        verdict = row.get('observation_status')
+        if not isinstance(verdict, str) or verdict not in allowed:
+            return False
+        if contract and status == 'observed_present' and verdict != status:
+            if verdict != _CONTRACT_STATUSES.get(row.get('contract_status')):
+                return False
+    return True
+
+
 @dataclass(frozen=True)
 class LaneOutcome:
     entity: str
@@ -286,17 +340,8 @@ class LaneOutcome:
                 raise CoreParseError('missing_proof')
         elif self.proof is not None:
             raise CoreParseError('unexpected_proof')
-        if bool(self.rows) != (self.status in _ROW_STATUSES):
+        if not _status_matches_rows(self.entity, self.status, self.rows):
             raise CoreParseError('status_rows_mismatch')
-        if self.status == 'observed_present':
-            for row in self.rows:
-                row_status = row.get('observation_status')
-                if self.entity == 'player_contract_observations':
-                    # The page proves the player was seen even when the cell has no date.
-                    if row_status == _CONTRACT_STATUSES.get(row.get('contract_status')) and row_status:
-                        continue
-                if row_status != self.status:
-                    raise CoreParseError('status_rows_mismatch')
         if self.capture is not None and (
             not isinstance(self.scope, ScopeContext) or not all(map(_nonempty, (
                 self.extracted_at, self.run_id, self.universe_version,
@@ -308,7 +353,8 @@ class LaneOutcome:
 def _render(
     entity: str, values: Mapping, scope: ScopeContext, capture: SourceCapture,
     extracted_at: str, run_id: str, universe_version: str, observation_status: str,
-    status_reason: str,
+    status_reason: str, *, parser_revision: str = CORE_PARSER_REVISION,
+    schema_revision: str = CORE_SCHEMA_REVISION,
 ) -> dict:
     row = {}
     for col in _BUSINESS_COLUMNS[entity]:
@@ -328,7 +374,7 @@ def _render(
         scope_id=scope.scope_id, cycle_id=scope.cycle_id, run_id=run_id,
         universe_version=universe_version, captured_at=capture.captured_at,
         observed_at=capture.captured_at, extracted_at=extracted_at,
-        parser_revision=CORE_PARSER_REVISION, schema_revision=CORE_SCHEMA_REVISION,
+        parser_revision=parser_revision, schema_revision=schema_revision,
         observation_status=observation_status, status_reason=status_reason,
         _source='transfermarkt', _entity_type=entity, _batch_id=_batch_id(run_id),
         _ingested_at=extracted_at,
@@ -572,6 +618,7 @@ def plan_for_outcome(
     capture = outcome.capture
     evidence = ()
     if capture is not None:
+        row = outcome.rows[0] if outcome.rows else {}
         evidence = (
             ('source_url', capture.url),
             ('source_endpoint', capture.endpoint),
@@ -580,8 +627,8 @@ def plan_for_outcome(
             ('source_body_hash', capture.body_hash),
             ('scope_id', outcome.scope.scope_id),
             ('cycle_id', outcome.scope.cycle_id),
-            ('parser_revision', CORE_PARSER_REVISION),
-            ('schema_revision', CORE_SCHEMA_REVISION),
+            ('parser_revision', row.get('parser_revision', CORE_PARSER_REVISION)),
+            ('schema_revision', row.get('schema_revision', CORE_SCHEMA_REVISION)),
         )
     return NativeWritePlan(
         entity=entity, table=CORE_TABLES[entity], ddl=core_ddl(entity),
@@ -602,6 +649,13 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
     if capture is None:
         return
     path = urlsplit(capture.url).path
+    if entity == 'attendance_observations' and {'competition_id', 'edition_id'} <= scope_values.keys():
+        match = re.fullmatch(
+            r'/[A-Za-z0-9_-]+/besucherzahlen/wettbewerb/([A-Za-z0-9_-]+)/saison_id/([0-9]+)',
+            path,
+        )
+        if match is None or match.groups() != (scope_values['competition_id'], scope_values['edition_id']):
+            raise CoreParseError('row_scope_mismatch')
     for column, pattern in (
         ('club_id', r'/(?:kader|mitarbeiterhistorie)/verein/([1-9][0-9]*)'),
         ('player_id', r'/ceapi/(?:marketValueDevelopment/graph|transferHistory/list)/([1-9][0-9]*)'),
@@ -648,12 +702,14 @@ def build_core_dq(
             outcome.scope.cycle_id if outcome.scope else None,
             outcome.capture.capture_id if outcome.capture else None,
         )
+        if entity == 'club_value_observations' and outcome.rows:
+            identity += (outcome.rows[0].get('club_id'),)
         if identity in seen_outcomes:
             errors.add('duplicate_outcome')
         seen_outcomes.add(identity)
         if status not in CORE_STATUSES:
             errors.add('invalid_status')
-        elif bool(outcome.rows) != (status in _ROW_STATUSES):
+        elif not _status_matches_rows(entity, status, outcome.rows):
             errors.add('status_rows_mismatch')
         if entity not in CORE_ENTITIES:
             errors.add('invalid_entity')

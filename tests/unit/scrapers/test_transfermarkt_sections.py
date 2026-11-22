@@ -27,9 +27,9 @@ CLUB_VALUE_FIXTURES = Path('tests/fixtures/transfermarkt/club_values')
 ATTENDANCE_START = 'https://www.transfermarkt.com/premier-league/besucherzahlen/wettbewerb/GB1/saison_id/2025'
 ATTENDANCE_PAGE_2 = ATTENDANCE_START + '?page=2'
 CLUB_VALUE_URL = 'https://www.transfermarkt.com/v-league-1/marktwerteverein/wettbewerb/VIE1'
-PAGE_1_CAPTURED = '2026-11-20T12:00:00+00:00'
-PAGE_2_CAPTURED = '2026-11-20T12:05:00+00:00'
-CLUB_CAPTURED = '2026-11-20T10:00:00+00:00'
+PAGE_1_CAPTURED = '2026-11-20T12:00:00.000000+00:00'
+PAGE_2_CAPTURED = '2026-11-20T12:05:00.000000+00:00'
+CLUB_CAPTURED = '2026-11-20T10:00:00.000000+00:00'
 EXTRACTED_AT = '2026-11-20T12:10:00.000000+00:00'
 UNIVERSE = 'core-universe-v1'
 
@@ -195,7 +195,7 @@ def test_lane_outcome_row_status_policy_for_section_entities():
     )
     # unknown outcome may carry the donor's unresolved rows
     accepted = LaneOutcome('attendance_observations', 'unknown', 'attendance:rows_unresolved',
-                           ({'observation_status': 'unknown'}), **context)
+                           ({'observation_status': 'unknown'},), **context)
     assert accepted.status == 'unknown'
     # mixed per-row statuses stay valid under an observed_present outcome
     mixed = LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
@@ -205,7 +205,7 @@ def test_lane_outcome_row_status_policy_for_section_entities():
     # a row status outside the section policy is still rejected
     with pytest.raises(CoreParseError):
         LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
-                    ({'observation_status': 'observed_empty'}), **context)
+                    ({'observation_status': 'observed_empty'},), **context)
     # the pre-existing core entities keep the strict outcome == row rule
     squad_row = {'observation_status': 'unknown'}
     with pytest.raises(CoreParseError):
@@ -259,9 +259,10 @@ class _SectionFetch:
             return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error='waf challenge')
         body = self.pages[url]
         digest = hashlib.sha256(body).hexdigest()
+        fetched_at = PAGE_2_CAPTURED if url.endswith('?page=2') else PAGE_1_CAPTURED
         return FetchOutcome(
             status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
-            raw_body_hash=digest, raw_fetched_at=PAGE_1_CAPTURED, cache_hit=False,
+            raw_body_hash=digest, raw_fetched_at=fetched_at, cache_hit=False,
             status_code=200,
         )
 

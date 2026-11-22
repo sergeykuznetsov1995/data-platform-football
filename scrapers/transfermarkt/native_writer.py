@@ -298,19 +298,23 @@ class NativeWritePlan:
                 raise ValueError('core empty plan evidence values must be non-empty')
             if not _nonempty(self.capture_id):
                 raise ValueError('core empty plan lacks its capture id')
-        evidence_map = dict(self.evidence)
-        for column in ('raw_capture_id', 'source_capture_id'):
-            if evidence_map.get(column, self.capture_id) != self.capture_id:
-                raise ValueError('core plan evidence names a different capture')
-        # Populated plans keep deriving the capture from their rows.
-        if not self.capture_id and self.rows:
-            object.__setattr__(self, 'capture_id', self.rows[0]['source_capture_id'])
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
         clock = _timestamp(self.captured_at)
-        if self.rows and clock != max(_timestamp(row['captured_at']) for row in self.rows):
-            raise ValueError('core captured_at must equal the newest row capture')
+        if self.rows:
+            newest_at, capture_id = max(
+                (_timestamp(row['captured_at']), row['source_capture_id']) for row in self.rows
+            )
+            if clock != newest_at:
+                raise ValueError('core captured_at must equal the newest row capture')
+            if self.capture_id and self.capture_id != capture_id:
+                raise ValueError('core capture_id must equal the newest row capture id')
+            object.__setattr__(self, 'capture_id', capture_id)
+        evidence_map = dict(self.evidence)
+        for column in ('raw_capture_id', 'source_capture_id'):
+            if evidence_map.get(column, self.capture_id) != self.capture_id:
+                raise ValueError('core plan evidence names a different capture')
 
     def readback_sql(self) -> tuple[str, tuple]:
         """Parameterised physical read-back predicate for this plan.
@@ -344,7 +348,9 @@ class NativeWritePlan:
                 raise ValueError('core plan row has empty lineage, key or capture columns')
             if any(str(row[col]) != str(value) for col, value in zip(self.scope_columns, self.scope_values)):
                 raise ValueError('core plan row is outside its replacement scope')
-            if row['source_capture_id'] != self.rows[0]['source_capture_id']:
+            if not _nonempty(row['source_capture_id']):
+                raise ValueError('core plan row has invalid source_capture_id')
+            if self.write_mode == 'merge' and row['source_capture_id'] != self.rows[0]['source_capture_id']:
                 raise ValueError('core plan rows must share one source_capture_id')
             key = tuple(row[col] for col in self.natural_keys)
             if key in seen:
@@ -493,8 +499,13 @@ def _already_written(connection, plan: NativeWritePlan) -> bool:
     existing = _read_plan_rows(connection, plan)
     if not plan.rows:
         return False
-    capture = plan.rows[0]['source_capture_id']
-    matching = [row for row in existing if row.get('source_capture_id') == capture]
+    if plan.write_mode == 'replace':
+        # A refreshed snapshot can reuse cached pages from the preceding walk.
+        if {row.get('source_capture_id') for row in existing} != {row['source_capture_id'] for row in plan.rows}:
+            return False
+        matching = existing
+    else:
+        matching = [row for row in existing if row.get('source_capture_id') == plan.capture_id]
     if matching and not _rows_equal(matching, plan.rows):
         if _rows_equal_ignoring_lineage(matching, plan.rows):
             # Same source bytes observed under a new run: rewrite the
@@ -585,7 +596,7 @@ def _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
                   batch, committed_at) -> dict:
     first = {**dict(plan.evidence)}
     if plan.rows:
-        first.update(plan.rows[0])
+        first.update(next(row for row in plan.rows if row['source_capture_id'] == plan.capture_id))
     evidence = {
         col: first.get(col, '') for col in (
             'scope_id', 'cycle_id', 'source_capture_id', 'source_body_hash',

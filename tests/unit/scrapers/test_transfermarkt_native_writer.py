@@ -256,8 +256,14 @@ def test_plan_validation_rejects_broken_contracts():
         NativeWritePlan(**{**base, 'captured_at': EARLIER})
     with pytest.raises(ValueError, match='duplicate core natural key'):
         NativeWritePlan(**{**base, 'rows': base['rows'] + base['rows']})
-    with pytest.raises(ValueError, match='share one source_capture_id'):
+    # Stage C (#2405): a replace plan may span pages, but its declared capture
+    # must be the snapshot's newest one; merges still own exactly one capture.
+    with pytest.raises(ValueError, match='newest row capture id'):
         NativeWritePlan(**{**base, 'rows': (
+            base['rows'][0],
+            {**base['rows'][0], 'player_id': '2', 'source_capture_id': 'other'})})
+    with pytest.raises(ValueError, match='share one source_capture_id'):
+        NativeWritePlan(**{**base, 'write_mode': 'merge', 'rows': (
             base['rows'][0],
             {**base['rows'][0], 'player_id': '2', 'source_capture_id': 'other'})})
 
