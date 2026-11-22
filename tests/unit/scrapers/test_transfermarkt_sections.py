@@ -2316,3 +2316,208 @@ def test_schema_preflight_checks_column_types_before_replacing():
         _bundle(db, [_attendance_plan((newer_1, page_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
     assert db.sql.execute(
         'SELECT club_id FROM transfermarkt_attendance_observations').fetchall() == [('11',)]
+
+
+def test_edition_replacement_needs_the_whole_walk_from_its_first_page():
+    # Round 3 finding 3: a terminal page offered as the start of the walk is
+    # not an edition, and neither are captures the walk never visits.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+
+    def extract(captures, start_url):
+        return sections.extract_attendance_observations(
+            captures, _attendance_scope(), start_url=start_url, competition_id='GB1',
+            edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+
+    outcome = extract((page_2,), ATTENDANCE_PAGE_2)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'attendance:pagination_start_not_first_page', ())
+    stray = _page(ATTENDANCE_PAGE_2.replace('?page=2', '?page=3'), page_2.body, PAGE_2_CAPTURED, 'stray')
+    outcome = extract((page_1, page_2, stray), ATTENDANCE_START)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'attendance:pagination_captures_differ', ())
+    assert extract((page_1, page_2), ATTENDANCE_START).status == 'observed_present'
+
+
+def test_duplicate_replacement_targets_are_rejected_before_any_fetch():
+    # Round 3 finding 14: two replacements of one scope inside a run.
+    from scrapers.transfermarkt.orchestrator import ClubTarget
+    class _Never:
+        calls = []
+
+        def fetch(self, url, **kwargs):
+            self.calls.append(url)
+            raise AssertionError('no fetch expected')
+
+    editions = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c', edition_id='2025',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),
+                             AttendanceEditionTarget('GB1', 2025, 'premier-league')))
+    clubs = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        clubs=(ClubTarget('11', 'arsenal', squad_url='https://www.transfermarkt.com/x/kader/verein/11'),
+               ClubTarget('11', 'arsenal', squad_url='https://www.transfermarkt.com/x/kader/verein/11')))
+    for plan in (editions, clubs):
+        with pytest.raises(CoreRunError, match='duplicate'):
+            CoreRun(_Never().fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT).run(plan)
+    assert _Never.calls == []
+
+
+def test_club_value_lane_uses_the_target_competition_not_the_enclosing_league():
+    # Round 3 finding 15: a GB1 scope may request a VIE1 stichtag page.
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        club_value_targets=(ClubValueTarget('VIE1', 'v-league-1'),))
+    fetcher = _SectionFetch({CLUB_VALUE_URL: (CLUB_VALUE_FIXTURES / 'vie1-current.html').read_bytes()})
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
+                     extracted_at=EXTRACTED_AT).run(plan)
+    assert report.outcomes and {item['status'] for item in report.outcomes} == {'observed_present'}
+
+
+def test_section_captures_must_come_from_transfermarkt():
+    # Round 3 finding 16: the path alone does not identify the source.
+    elsewhere = 'https://example.invalid'
+    profile = _replace(_referee_profile_capture(), url=REFEREE_PROFILE_URL.replace(
+        'https://www.transfermarkt.com', elsewhere))
+    outcome = sections.extract_referee_profile_observations(
+        profile, _referee_scope(), referee_id='101', extracted_at=REFEREE_EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    assert (outcome.status, outcome.rows) == ('error', ())
+    assert outcome.status_reason == 'referees:row_scope_mismatch'
+    directory = _replace(
+        _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body()),
+        url=REFEREE_DIRECTORY_URL.replace('https://www.transfermarkt.com', elsewhere))
+    outcome = _directory_error((directory,))
+    assert outcome.status_reason == 'referees:directory_identity_invalid'
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    moved = tuple(_replace(page, url=page.url.replace('https://www.transfermarkt.com', elsewhere))
+                  for page in (page_1, page_2))
+    outcome = sections.extract_attendance_observations(
+        moved, _attendance_scope(), start_url=moved[0].url, competition_id='GB1', edition_id='2025',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.rows) == ('error', ())
+    assert outcome.status_reason == 'attendance:pagination_identity_invalid'
+
+
+def test_representation_packet_must_answer_the_whole_request():
+    # Round 3 finding 17: the capture asked for 7, 9 and 10; the caller
+    # narrowed the expectation to the two players the body happened to hold.
+    from scrapers.transfermarkt.orchestrator import representation_url
+    body = json.dumps(REPRESENTATION_PACKET).encode('utf-8')
+    digest = hashlib.sha256(body).hexdigest()
+    capture = SourceCapture(url=representation_url(('7', '9', '10')), endpoint='representation',
+                            body=body, capture_id=digest, body_hash=digest, captured_at=CLUB_CAPTURED)
+    outcomes = sections.extract_representation_observations(
+        capture, _representation_scope(), expected_ids=('7', '9'), extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    assert [outcome.status for outcome in outcomes] == ['error']
+    assert outcomes[0].status_reason == 'representation:requested_ids_differ'
+    assert outcomes[0].rows == ()
+
+
+def test_contract_cell_mapping_and_page_verdicts_are_checked_both_ways():
+    # Round 3 finding 18: a parsed-error contract cell is never "present",
+    # and a populated directory page is an observed page, not an absence.
+    context = _outcome_context('player_contract_observations')
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('player_contract_observations', 'observed_present', 'squad_page',
+                    ({'observation_status': 'observed_present', 'contract_status': 'parse_error'},),
+                    **context)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        LaneOutcome('referee_aggregate_observations', 'explicit_none', 'referees:dashes',
+                    ({'observation_status': 'explicit_none'},), **_outcome_context())
+
+
+def test_failed_rumour_walk_cites_the_page_that_failed():
+    # Round 3 finding 19: the error outcome names the unreadable page.
+    broken = b'<html><body>not a grid</body></html>'
+    pages = {RUMOUR_LISTING: _rumour_feed_html(1, 2, (1, 2)),
+             _rumour_page_url(1): _rumour_feed_html(1, 2, (1, 2)),
+             _rumour_page_url(2): broken}
+    report = CoreRun(_FeedFetch(pages).fetch, universe_version=UNIVERSE,
+                     extracted_at=RUMOUR_EXTRACTED_AT).run(_rumour_run_plan())
+    outcome, = report.outcomes
+    assert (outcome['status'], outcome['status_reason']) == ('error', 'rumours:missing_table')
+    assert outcome['source_capture_id'] == hashlib.sha256(broken).hexdigest()
+
+
+def test_empty_rumour_proof_ignores_a_marker_outside_the_rumour_table():
+    # Round 3 finding 20: another table on the page is not the rumour grid.
+    unrelated = ('<div id="yw1"><table class="items"><thead><tr><th>Player</th>'
+                 '<th>Interested club</th><th>Most recent source from</th><th>Assessment</th></tr>'
+                 '</thead><tbody></tbody></table><table class="other"><tr>'
+                 '<td class="no-entries">No entries available</td></tr></table></div>'
+                 '<div class="pager"><ul><li class="tm-pagination__list-item '
+                 'tm-pagination__list-item--active"><a class="tm-pagination__link" '
+                 f'href="{RUMOUR_LISTING}">1</a></li></ul></div>')
+    capture = _capture(RUMOUR_LISTING, unrelated.encode(), RUMOUR_PAGE_1_CAPTURED, endpoint='rumours')
+    outcome, = sections.extract_rumour_observations(
+        (capture,), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert outcome.proof == 'rumours:empty_table_body'
+
+
+def test_directory_continuation_of_another_competition_is_a_directory_error():
+    # Round 3 finding 21: the offending capture backs the error instead of
+    # an exception leaving the adapter.
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_PAGE_2)
+    elsewhere = REFEREE_DIRECTORY_PAGE_2.replace('/XY1/', '/ZZ1/')
+    page_2 = _referee_page(elsewhere, _referee_second_page_body())
+    outcome = _directory_error((page_1, page_2))
+    assert (outcome.status_reason, outcome.capture.capture_id) == (
+        'referees:directory_identity_invalid', page_2.capture_id)
+
+
+def test_report_run_id_names_the_target_of_its_receipt():
+    # Round 3 finding 22: the first outcome was a failed target.
+    empty_grid = (b'<div id="yw1"><span class="empty">No information available.</span>'
+                  b'<div class="keys"></div></div>')
+
+    class _Fetch:
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            if url != RUMOUR_LISTING:
+                return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error='waf challenge')
+            digest = hashlib.sha256(empty_grid).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=empty_grid.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=RUMOUR_PAGE_1_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c', edition_id='2025',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+        rumour_competitions=(RumourCompetitionTarget('GB1', 'Premier League'),))
+    db = CoreDB()
+    report = CoreRun(_Fetch().fetch, universe_version=UNIVERSE).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert [item['status'] for item in report.outcomes] == ['unavailable', 'observed_empty']
+    assert report.run_id == report.receipt['run_id'] == report.outcomes[1]['run_id']
+
+
+@pytest.mark.parametrize('lane', ['attendance', 'referee_profile', 'achievement'])
+def test_single_outcome_adapters_answer_one_outcome_on_http_failure_too(lane):
+    # Round 3 finding 23: these adapters declare one LaneOutcome, not a tuple.
+    body = b'<html></html>'
+    digest = hashlib.sha256(body).hexdigest()
+    if lane == 'attendance':
+        capture = _replace(_capture(ATTENDANCE_START, body, PAGE_1_CAPTURED), status_code=404)
+        outcome = sections.extract_attendance_observations(
+            (capture,), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+            edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    elif lane == 'referee_profile':
+        capture = _replace(
+            _capture(REFEREE_PROFILE_URL, body, REFEREE_CAPTURED, endpoint='referee_profile'),
+            status_code=404)
+        outcome = sections.extract_referee_profile_observations(
+            capture, _referee_scope(), referee_id='101', extracted_at=REFEREE_EXTRACTED_AT,
+            universe_version=UNIVERSE)
+    else:
+        capture = _replace(_achievement_capture(ACHIEVEMENTS_EMPTY), status_code=404)
+        outcome = sections.extract_achievement_observations(
+            capture, _achievement_scope(), recipient_type='player', recipient_id='7',
+            extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert isinstance(outcome, core.LaneOutcome)
+    assert (outcome.status, outcome.rows) == ('unavailable', ())
+    assert core.build_core_dq([outcome])['passed'] is True
