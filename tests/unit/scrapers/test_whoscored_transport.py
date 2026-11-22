@@ -3153,6 +3153,231 @@ def test_jsonl_request_ledger_fsync_contract_uses_private_append_only_file(tmp_p
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.fixture
+def request_ledger_clock(monkeypatch):
+    from datetime import datetime, timezone
+
+    current = [datetime(2026, 11, 22, 12, tzinfo=timezone.utc)]
+
+    class LedgerDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current[0].astimezone(tz)
+
+    monkeypatch.setattr("scrapers.whoscored.transport.datetime", LedgerDatetime)
+    return current
+
+
+@pytest.mark.unit
+def test_request_ledger_daily_files_record_pool_and_host_egress(
+    tmp_path, monkeypatch, request_ledger_clock
+):
+    import hashlib
+
+    path = tmp_path / "requests.jsonl"
+    proxy = "http://test:secret@pool.invalid:10002"
+    monkeypatch.setenv("WHOSCORED_REQUEST_LEDGER_PATH", str(path))
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
+    for index, pool_url in enumerate((proxy, ""), start=1):
+        transport = WhoScoredTransport(
+            direct_http_session=FakeHTTPSession(
+                FakeHTTPResponse(content=b"source", wire_bytes=777)
+            ),
+            direct_fs_client=FakeFSClient(),
+            context=TransportContext.from_env(),
+        )
+        assert transport.request_ledger.daily_files is True
+        transport._pool_proxy_url = pool_url
+        transport.fetch(f"https://www.whoscored.com/Matches/{index}/Live")
+
+    utc_date = request_ledger_clock[0].date().isoformat()
+    daily_path = tmp_path / f"requests.{utc_date}.jsonl"
+    events = [json.loads(line) for line in daily_path.read_text().splitlines()]
+    assert len(events) == 2
+    assert [event["egress"] for event in events] == [
+        "pool:" + hashlib.sha256(proxy.encode()).hexdigest()[:8],
+        "host",
+    ]
+    for event in events:
+        assert event["lane"] == "current"
+        assert isinstance(event["elapsed_ms"], int)
+        assert event["elapsed_ms"] >= 0
+        assert proxy not in event["egress"]
+        assert "secret" not in event["egress"]
+        assert "pool.invalid" not in event["egress"]
+    day_content = path.with_suffix(".day.json").read_text()
+    assert proxy not in day_content
+    assert "secret" not in day_content
+    assert "pool.invalid" not in day_content
+    assert daily_path.stat().st_mode & 0o777 == 0o600
+    assert not path.exists()
+
+
+@pytest.mark.unit
+def test_request_ledger_daily_counter_accumulates_lanes_and_prunes(
+    tmp_path, monkeypatch, request_ledger_clock
+):
+    from datetime import timedelta
+
+    path = tmp_path / "requests.jsonl"
+    day_path = path.with_suffix(".day.json")
+    today = request_ledger_clock[0].date()
+    old = {
+        (today - timedelta(days=offset)).isoformat(): {"service": offset}
+        for offset in range(1, 41)
+    }
+    day_path.write_text(json.dumps(old))
+    ledger = JsonlRequestLedger(str(path))
+    for index, (dag_id, sent, received) in enumerate(
+        (
+            ("dag_ingest_whoscored", 11, 101),
+            ("dag_backfill_whoscored", 29, 202),
+            ("dag_ingest_whoscored", 17, 303),
+        ),
+        start=1,
+    ):
+        monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag_id)
+        response = FakeHTTPResponse(content=b"source", wire_bytes=received)
+        response.request_size = sent
+        response.response_size = received
+        transport = WhoScoredTransport(
+            direct_http_session=FakeHTTPSession(response),
+            direct_fs_client=FakeFSClient(),
+            context=TransportContext.from_env(),
+            request_ledger=ledger,
+        )
+        transport.fetch(f"https://www.whoscored.com/Matches/{index}/Live")
+
+    totals = json.loads(day_path.read_text())
+    assert totals[today.isoformat()] == {"current": 432, "history": 231}
+    assert len(totals) == 35
+    assert set(totals) == set(sorted(old)[-34:]) | {today.isoformat()}
+    for date in sorted(old)[-34:]:
+        assert totals[date] == old[date]
+    assert day_path.stat().st_mode & 0o777 == 0o600
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    for lane in ("current", "history"):
+        assert totals[today.isoformat()][lane] == sum(
+            event["request_bytes"] + event["response_bytes"]
+            for event in events
+            if event["lane"] == lane
+        )
+
+
+@pytest.mark.unit
+def test_request_ledger_daily_counter_io_failure_keeps_event(
+    tmp_path, caplog, request_ledger_clock
+):
+    path = tmp_path / "requests.jsonl"
+    path.with_suffix(".day.json").mkdir()
+    transport = WhoScoredTransport(
+        direct_http_session=FakeHTTPSession(
+            FakeHTTPResponse(content=b"source", wire_bytes=777)
+        ),
+        direct_fs_client=FakeFSClient(),
+        request_ledger=JsonlRequestLedger(str(path), daily_files=True),
+    )
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    utc_date = request_ledger_clock[0].date().isoformat()
+    events = [
+        json.loads(line)
+        for line in (tmp_path / f"requests.{utc_date}.jsonl").read_text().splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["raw_sha256"] == result.sha256
+    assert "daily byte counter update failed (#1479)" in caplog.text
+
+
+@pytest.mark.unit
+def test_jsonl_request_ledger_default_keeps_original_path(tmp_path, request_ledger_clock):
+    path = tmp_path / "requests.jsonl"
+    ledger = JsonlRequestLedger(str(path))
+
+    ledger.append({"event_id": "original"})
+
+    assert json.loads(path.read_text()) == {"event_id": "original"}
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.unit
+def test_jsonl_request_ledger_daily_rotation_uses_append_date(
+    tmp_path, request_ledger_clock
+):
+    from datetime import timedelta
+
+    path = tmp_path / "requests.jsonl"
+    ledger = JsonlRequestLedger(str(path), daily_files=True)
+    first_date = request_ledger_clock[0].date().isoformat()
+    ledger.append({"event_id": "first", "occurred_at": "2000-01-01T00:00:00+00:00"})
+    request_ledger_clock[0] += timedelta(days=1)
+    second_date = request_ledger_clock[0].date().isoformat()
+    ledger.append({"event_id": "second"})
+
+    assert json.loads((tmp_path / f"requests.{first_date}.jsonl").read_text())[
+        "event_id"
+    ] == "first"
+    assert json.loads((tmp_path / f"requests.{second_date}.jsonl").read_text()) == {
+        "event_id": "second"
+    }
+    assert not path.exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("initial", ["", "broken json", "null"])
+def test_request_ledger_daily_counter_recovers_corrupt_content(tmp_path, initial):
+    path = tmp_path / "requests.jsonl"
+    day_path = path.with_suffix(".day.json")
+    day_path.write_text(initial)
+    ledger = JsonlRequestLedger(str(path))
+
+    ledger.daily_counter.update("2026-11-22", "service", 123)
+    ledger.daily_counter.update("2026-11-22", "service", -10)
+
+    assert json.loads(day_path.read_text()) == {"2026-11-22": {"service": 123}}
+
+
+@pytest.mark.unit
+def test_request_ledger_elapsed_ms_uses_activation_and_missing_start(monkeypatch):
+    from scrapers.whoscored.transport import TransportRoute
+
+    ledger = MemoryLedger()
+    transport = WhoScoredTransport(
+        direct_http_session=FakeHTTPSession(
+            FakeHTTPResponse(content=b"source", wire_bytes=777)
+        ),
+        direct_fs_client=FakeFSClient(),
+        context=TransportContext(dag_id="unknown_dag"),
+        request_ledger=ledger,
+    )
+    clock = [10.0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    transport._activate_request(cache_key="match:1", scope=None, entity=None)
+    clock[0] = 10.125
+    transport._record_ledger(
+        url="https://www.whoscored.com/Matches/1/Live",
+        route=TransportRoute.DIRECT_HTTP,
+        status="success",
+    )
+    transport._activate_request(cache_key="match:2", scope=None, entity=None)
+    clock[0] = 10.375
+    transport._record_ledger(
+        url="https://www.whoscored.com/Matches/2/Live",
+        route=TransportRoute.DIRECT_HTTP,
+        status="success",
+    )
+    del transport._request_started
+    transport._record_ledger(
+        url="https://www.whoscored.com/Matches/2/Live",
+        route=TransportRoute.DIRECT_HTTP,
+        status="success",
+    )
+
+    assert [event["elapsed_ms"] for event in ledger.events] == [125, 250, 0]
+    assert all(event["lane"] == "service" for event in ledger.events)
+
+
 class SimpleControlSession:
     def __init__(self, response):
         self.response = response

@@ -328,6 +328,81 @@ class TransportContext:
         }
 
 
+class DailyByteCounter:
+    """Best-effort per-lane daily byte totals (#1479)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def update(self, date: str, lane: str, wire_bytes: int) -> None:
+        import logging
+        import tempfile
+
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            with self._lock:
+                while True:
+                    descriptor = os.open(self.path, flags, 0o600)
+                    try:
+                        metadata = os.fstat(descriptor)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise OSError("daily byte counter is not a regular file")
+                        os.fchmod(descriptor, 0o600)
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                        current = os.stat(self.path, follow_symlinks=False)
+                        # Replacement can leave a waiter on the old inode (#1479).
+                        if (metadata.st_dev, metadata.st_ino) != (
+                            current.st_dev,
+                            current.st_ino,
+                        ):
+                            continue
+                        with os.fdopen(os.dup(descriptor), encoding="utf-8") as stream:
+                            try:
+                                data = json.load(stream)
+                            except ValueError:
+                                data = {}
+                        if not isinstance(data, dict):
+                            data = {}
+                        if not isinstance(data.get(date, {}), dict):
+                            data[date] = {}
+                        totals = data.setdefault(date, {})
+                        totals.setdefault(lane, 0)
+                        totals[lane] += max(0, wire_bytes)
+                        data = {key: data[key] for key in sorted(data)[-35:]}
+                        temporary_path = None
+                        try:
+                            temporary_fd, temporary_path = tempfile.mkstemp(
+                                dir=self.path.parent, prefix=self.path.name + "."
+                            )
+                            with os.fdopen(
+                                temporary_fd, "w", encoding="utf-8"
+                            ) as stream:
+                                os.fchmod(stream.fileno(), 0o600)
+                                json.dump(data, stream, sort_keys=True)
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                            os.replace(temporary_path, self.path)
+                            temporary_path = None
+                        finally:
+                            if temporary_path is not None:
+                                os.unlink(temporary_path)
+                        return
+                    finally:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        os.close(descriptor)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "WhoScored daily byte counter update failed (#1479)"
+            )
+
+
 @runtime_checkable
 class RequestLedger(Protocol):
     """Append-only sink; implementations must make one append durable."""
@@ -339,10 +414,12 @@ class RequestLedger(Protocol):
 class JsonlRequestLedger:
     """Process-safe append-only JSONL request ledger with an fsync commit."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, daily_files: bool = False) -> None:
         if not path:
             raise ValueError("request ledger path must not be empty")
         self.path = Path(path)
+        self.daily_files = daily_files
+        self.daily_counter = DailyByteCounter(self.path.with_suffix(".day.json"))
         self._lock = threading.Lock()
 
     def append(self, event: Mapping[str, Any]) -> None:
@@ -352,7 +429,14 @@ class JsonlRequestLedger:
             ).encode("utf-8")
             + b"\n"
         )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        path = self.path
+        if self.daily_files:
+            utc_date = datetime.now(timezone.utc).date().isoformat()
+            path = self.path.with_name(self.path.stem + "." + utc_date + ".jsonl")
+        self._append(path, rendered)
+
+    def _append(self, path: Path, rendered: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         flags = (
             os.O_APPEND
             | os.O_CREAT
@@ -361,7 +445,7 @@ class JsonlRequestLedger:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         with self._lock:
-            descriptor = os.open(self.path, flags, 0o600)
+            descriptor = os.open(path, flags, 0o600)
             try:
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):
@@ -1072,7 +1156,7 @@ class WhoScoredTransport:
         self.impersonate = impersonate
         ledger_path = os.environ.get("WHOSCORED_REQUEST_LEDGER_PATH", "").strip()
         self.request_ledger = request_ledger or (
-            JsonlRequestLedger(ledger_path) if ledger_path else None
+            JsonlRequestLedger(ledger_path, daily_files=True) if ledger_path else None
         )
         self.browser_session_ttl_seconds = max(1, browser_session_ttl_seconds)
         self.browser_session_max_requests = max(1, browser_session_max_requests)
@@ -1649,6 +1733,9 @@ class WhoScoredTransport:
     ) -> None:
         """Select the exact URL identity used by ledger writes below."""
 
+        import time
+
+        self._request_started = time.monotonic()
         self._active_cache_key = cache_key
         self._active_request_id = request_id or uuid.uuid4().hex
         self._active_context = self.context.request_context(
@@ -3418,12 +3505,31 @@ class WhoScoredTransport:
     ) -> None:
         if self.request_ledger is None:
             return
+        import hashlib
+        import time
+
+        started = getattr(self, "_request_started", None)
+        lane = {
+            "dag_ingest_whoscored": "current",
+            "dag_backfill_whoscored": "history",
+        }.get(self._active_context.dag_id, "service")
         event: dict[str, Any] = {
             "event_version": "whoscored-request-v1",
             "event_id": uuid.uuid4().hex,
             "occurred_at": datetime.now(timezone.utc).isoformat(),
             "request_id": self._active_request_id,
             **self._active_context.as_dict(),
+            "lane": lane,
+            "egress": (
+                "pool:" + hashlib.sha256(self._pool_proxy_url.encode()).hexdigest()[:8]
+                if self._pool_proxy_url
+                else "host"
+            ),
+            "elapsed_ms": (
+                max(0, int((time.monotonic() - started) * 1000))
+                if started is not None
+                else 0
+            ),
             "cache_key": self._active_cache_key,
             "url": _canonical_url_key(url),
             "route": route.value,
@@ -3450,6 +3556,14 @@ class WhoScoredTransport:
                 route=route,
                 retryable=True,
             ) from exc
+
+        # Count exactly the durable request event, excluding resource totals (#1479).
+        if isinstance(self.request_ledger, JsonlRequestLedger):
+            self.request_ledger.daily_counter.update(
+                event["occurred_at"][:10],
+                event["lane"],
+                event["request_bytes"] + event["response_bytes"],
+            )
 
     def get_traffic_stats(self) -> dict[str, Any]:
         return self.stats.as_dict()
