@@ -55,6 +55,14 @@ _ENTITY_ROW_STATUSES = {
     'referee_aggregate_observations': frozenset({'observed_present', 'observed_empty', 'explicit_none'}),
     'player_representation_observations': frozenset({'observed_present', 'explicit_none', 'unknown'}),
 }
+# Lanes whose outcome verdict summarises row PRESENCE (the donors' summarise
+# rule). The other row-bearing section lanes are page containers: a referee
+# page outcome certifies the page's entries while its rows carry metric
+# verdicts, so a page of dashes is still an observed page.
+_PRESENCE_ENTITIES = frozenset({
+    'attendance_observations', 'club_value_observations',
+    'player_representation_observations',
+})
 
 LINEAGE_COLUMNS = (
     'source_url', 'source_endpoint', 'raw_capture_id', 'source_capture_id',
@@ -352,6 +360,9 @@ def _batch_id(run_id: str) -> str:
 
 
 def _status_matches_rows(entity, status, rows) -> bool:
+    if status in _PROOF_STATUSES:
+        # A proof certifies an absence; no lane carries rows under it.
+        return not rows
     if not rows:
         return status not in _OUTCOMES_WITH_ROWS
     allowed = _ENTITY_ROW_STATUSES.get(entity)
@@ -360,14 +371,24 @@ def _status_matches_rows(entity, status, rows) -> bool:
         return False
     if allowed is None:
         return all(row.get('observation_status') == status for row in rows)
+    verdicts = []
     for row in rows:
         verdict = row.get('observation_status')
         if not isinstance(verdict, str) or verdict not in allowed:
             return False
-        if contract and status == 'observed_present' and verdict != status:
-            if verdict != _CONTRACT_STATUSES.get(row.get('contract_status')):
-                return False
-    return True
+        verdicts.append(verdict)
+        if (contract and status == 'observed_present' and verdict != status
+                and verdict != _CONTRACT_STATUSES.get(row.get('contract_status'))):
+            return False
+    # A populated squad page carries each contract cell's own verdict.
+    if contract and status == 'observed_present':
+        return True
+    # The donors' summarise rule for the aggregate verdict.
+    if status == 'explicit_none':
+        return all(verdict == 'explicit_none' for verdict in verdicts)
+    if status == 'observed_present':
+        return entity not in _PRESENCE_ENTITIES or 'observed_present' in verdicts
+    return 'observed_present' not in verdicts
 
 
 @dataclass(frozen=True)
