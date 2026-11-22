@@ -35,6 +35,7 @@ _ENDPOINTS = frozenset({
     'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history',
     # stage C sections (#2405)
     'attendance', 'club_values', 'player_achievement', 'club_achievement', 'coach_achievement',
+    'rumours',
 })
 _OUTCOMES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
 _PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
@@ -62,6 +63,7 @@ CORE_ENTITIES = (
     'market_value_points', 'transfer_events', 'coach_profiles', 'coach_stints',
     # stage C sections (#2405)
     'attendance_observations', 'club_value_observations', 'achievement_observations',
+    'rumour_observations',
 )
 CORE_TABLES = {entity: f'transfermarkt_{entity}' for entity in CORE_ENTITIES}
 CORE_NATURAL_KEYS = {
@@ -76,6 +78,7 @@ CORE_NATURAL_KEYS = {
     'attendance_observations': ('competition_id', 'edition_id', 'club_id', 'observed_at'),
     'club_value_observations': ('club_id', 'value_date', 'observed_at', 'source_point_id'),
     'achievement_observations': ('recipient_type', 'recipient_id', 'source_capture_id', 'source_row_id'),
+    'rumour_observations': ('rumour_identity', 'subject_id', 'observed_at', 'correction_identity'),
 }
 CORE_SCOPE_COLUMNS = {
     'squad_memberships': ('league', 'season', 'club_id'),
@@ -89,6 +92,7 @@ CORE_SCOPE_COLUMNS = {
     'attendance_observations': ('competition_id', 'edition_id'),
     'club_value_observations': ('club_id',),
     'achievement_observations': ('recipient_type', 'recipient_id'),
+    'rumour_observations': ('competition_id',),
 }
 CORE_WRITE_MODES = {
     'squad_memberships': 'replace',
@@ -102,6 +106,7 @@ CORE_WRITE_MODES = {
     'attendance_observations': 'replace',
     'club_value_observations': 'merge',
     'achievement_observations': 'merge',
+    'rumour_observations': 'merge',
 }
 
 SQUAD_MEMBERSHIP_BUSINESS = (
@@ -151,6 +156,16 @@ ACHIEVEMENT_BUSINESS = (
     'recipient_type', 'recipient_id', 'title', 'award_id', 'trophy_id', 'season_id',
     'season', 'result', 'club_id', 'club_name', 'competition_id', 'source_row_id',
 )
+RUMOUR_BUSINESS = (
+    'competition_id', 'page_number', 'player_id', 'player_name', 'player_url', 'subject_id',
+    'interested_club_id', 'interested_club_name', 'interested_club_url',
+    'interested_club_competition_id', 'interested_club_competition_name',
+    'interested_club_competition_url', 'current_club_id', 'current_club_name',
+    'current_club_url', 'position', 'nationalities_json', 'age', 'last_source_date',
+    'last_reply_date', 'probability_percent', 'thread_link', 'rumour_identity',
+    'content_hash', 'correction_identity', 'observation_key', 'assertion_json',
+    'source_page_url', 'observed_at',
+)
 _BUSINESS_COLUMNS = {
     'squad_memberships': SQUAD_MEMBERSHIP_BUSINESS,
     'player_attribute_observations': ATTRIBUTE_BUSINESS,
@@ -163,6 +178,7 @@ _BUSINESS_COLUMNS = {
     'attendance_observations': ATTENDANCE_BUSINESS,
     'club_value_observations': CLUB_VALUE_BUSINESS,
     'achievement_observations': ACHIEVEMENT_BUSINESS,
+    'rumour_observations': RUMOUR_BUSINESS,
 }
 # observed_at serves both roles in the squad and coach tables.
 CORE_COLUMNS = {
@@ -180,6 +196,7 @@ COLUMN_TYPES: Mapping[str, str] = {
         'age', 'height_cm', 'market_value_eur', 'shirt_number', 'signed_from_fee_eur',
         'value_eur', 'fee_eur', 'from_country_id', 'to_country_id',
         'capacity', 'spectators_total', 'spectators_average', 'matches', 'sold_out', 'value_amount',
+        'page_number',
     ), 'bigint'),
     **dict.fromkeys((
         'is_on_loan', 'is_captain', 'is_value_removed', 'is_upcoming',
@@ -658,6 +675,11 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         return
     url = urlsplit(capture.url)
     path = url.path
+    if entity == 'rumour_observations':
+        match = re.fullmatch(r'/[A-Za-z0-9_-]+/geruechte/wettbewerb/([A-Za-z0-9_-]+)(?:/page/[0-9]+)?', path)
+        if match is None or match[1] != scope_values['competition_id']:
+            raise CoreParseError('row_scope_mismatch')
+        return
     if entity == 'achievement_observations':
         recipient_type = scope_values['recipient_type']
         recipient_id = scope_values['recipient_id']

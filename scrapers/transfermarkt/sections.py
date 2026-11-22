@@ -12,7 +12,7 @@ import json
 
 from bs4 import ParserRejectedMarkup
 
-from . import achievements, attendance, club_values, core
+from . import achievements, attendance, club_values, core, rumour_observations, rumours
 
 
 def extract_attendance_observations(
@@ -68,6 +68,68 @@ def extract_attendance_observations(
             schema_revision=attendance.ATTENDANCE_SCHEMA_REVISION,
         ))
     return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)
+
+
+def extract_rumour_observations(
+    captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *,
+    competition: rumours.CompetitionContext, extracted_at: str, universe_version: str,
+) -> tuple[core.LaneOutcome, ...]:
+    """Observe one COMPLETE rumour feed, one write-plan outcome per page.
+
+    A merge plan owns exactly one capture, so each page's rows become their own
+    outcome inside the one validated feed; the feed itself is the completeness
+    boundary (an incomplete plan yields a single error outcome, no rows).
+    """
+    entity = 'rumour_observations'
+    if not captures or any(capture.endpoint != 'rumours' for capture in captures):
+        raise core.CoreParseError('rumours:invalid_captures')
+    newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
+    context = core._context(newest, scope, extracted_at, universe_version)
+    try:
+        pages = tuple(
+            rumour_observations.extract_rumour_page(
+                capture.body, competition=competition, page_number=number,
+                source_page_url=capture.url, raw_capture_id=capture.capture_id,
+                source_body_hash=capture.body_hash, captured_at=capture.captured_at,
+                extracted_at=extracted_at, scope_id=scope.scope_id, run_id=context['run_id'],
+                cycle_id=scope.cycle_id, universe_version=universe_version,
+            )
+            for number, capture in enumerate(captures, 1)
+        )
+        feed = rumour_observations.RumourFeedExtraction(pages)
+    except rumours.RumourParseError as exc:
+        return (core.LaneOutcome(entity, 'error', 'rumours:' + exc.reason, **context),)
+    except ValueError:
+        return (core.LaneOutcome(entity, 'error', 'rumours:invalid_source_data', **context),)
+
+    by_id = {capture.capture_id: capture for capture in captures}
+    if all(page.capture.status == 'observed_empty' for page in feed.pages):
+        return (core.LaneOutcome(entity, 'observed_empty', 'rumours:empty_grid',
+                                 proof='rumours:confirmed_empty_grid', **context),)
+    outcomes = []
+    for page in feed.pages:
+        if page.capture.status != 'observed_present':
+            continue
+        rows = []
+        for row in page.rows:
+            try:
+                row_capture = by_id[row['raw_capture_id']]
+            except KeyError as exc:
+                raise core.CoreParseError('rumours:row_capture_missing') from exc
+            values = dict(row)
+            if values['probability_percent'] is not None:
+                values['probability_percent'] = repr(values['probability_percent'])
+            rows.append(core._render(
+                entity, values, scope, row_capture, extracted_at, context['run_id'], universe_version,
+                observation_status='observed_present', status_reason='rumours:row',
+                parser_revision=rumours.PARSER_VERSION, schema_revision=rumours.SCHEMA_VERSION,
+            ))
+        outcomes.append(core.LaneOutcome(
+            entity, 'observed_present', 'rumours:page', tuple(rows),
+            **core._context(by_id[page.raw_capture_id], scope, extracted_at, universe_version)))
+    if not outcomes:
+        return (core.LaneOutcome(entity, 'unknown', 'rumours:unresolved', **context),)
+    return tuple(outcomes)
 
 
 def extract_club_value_observations(

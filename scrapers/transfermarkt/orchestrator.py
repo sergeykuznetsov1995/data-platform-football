@@ -16,7 +16,7 @@ import hashlib
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import attendance, core, native_writer, parsing, sections
+from . import attendance, core, native_writer, parsing, rumours, sections
 from .models import FetchOutcome, FetchStatus
 
 
@@ -64,6 +64,15 @@ def achievements_url(recipient_type: str, recipient_id: str, slug: str = '') -> 
     return f"{TM_API_BASE}/{recipient_type}/{recipient_id}/achievement"
 
 
+def rumours_url(slug: str, competition_id: str) -> str:
+    return f"{TM_BASE}/{slug}/geruechte/wettbewerb/{competition_id}"
+
+
+def rumours_competition(slug: str, competition_id: str, name: str) -> rumours.CompetitionContext:
+    url = f"{TM_BASE}/{slug}/startseite/wettbewerb/{competition_id}"
+    return rumours.CompetitionContext(competition_id, name, url)
+
+
 @dataclass(frozen=True)
 class ClubTarget:
     club_id: str
@@ -95,6 +104,13 @@ class AchievementHolderTarget:
 
 
 @dataclass(frozen=True)
+class RumourCompetitionTarget:
+    competition_id: str
+    name: str
+    slug: str = ''
+
+
+@dataclass(frozen=True)
 class CoreScopePlan:
     league: str
     season: str
@@ -108,6 +124,7 @@ class CoreScopePlan:
     attendance_editions: tuple[AttendanceEditionTarget, ...] = ()
     club_value_targets: tuple[ClubValueTarget, ...] = ()
     achievement_holders: tuple[AchievementHolderTarget, ...] = ()
+    rumour_competitions: tuple[RumourCompetitionTarget, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,14 +177,14 @@ class _Request:
             return {"coach_id": self.coach_id}
         if self.label == "attendance":
             return {"competition_id": self.competition_id, "edition_id": self.edition_id}
-        if self.label == "club_values":
+        if self.label in ("club_values", "rumours"):
             return {"competition_id": self.competition_id}
         if self.label.endswith("_achievement"):
             return {"recipient_type": self.recipient_type, "recipient_id": self.recipient_id}
         raise CoreRunError(f"{self.label} request has no replacement scope")
 
 
-def _requests(plan: CoreScopePlan):
+def _base_requests(plan: CoreScopePlan):
     for club in plan.clubs:
         if club.squad_url:
             yield _Request("squad", club.squad_url, club=club)
@@ -195,8 +212,18 @@ def _requests(plan: CoreScopePlan):
                        recipient_type=holder.recipient_type, recipient_id=holder.recipient_id)
 
 
+def _requests(plan: CoreScopePlan):
+    for request in _base_requests(plan):
+        yield request, None
+    for target in plan.rumour_competitions:
+        slug = target.slug or '-'
+        request = _Request("rumours", rumours_url(slug, target.competition_id),
+                           competition_id=target.competition_id)
+        yield request, rumours_competition(slug, target.competition_id, target.name)
+
+
 def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
-    return tuple(request.url for request in _requests(plan))
+    return tuple(request.url for request, _ in _requests(plan))
 
 
 def _capture(request, result, raw_loader):
@@ -249,11 +276,13 @@ _ENTITIES = {
     "player_achievement": ("achievement_observations",),
     "club_achievement": ("achievement_observations",),
     "coach_achievement": ("achievement_observations",),
+    "rumours": ("rumour_observations",),
 }
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
 
 
-def _observations(request, result, plan, extracted_at, universe_version, raw_loader, captures=()):
+def _observations(request, result, plan, extracted_at, universe_version, raw_loader, captures=(),
+                  competition=None):
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
         edition_id=request.edition_id or plan.edition_id or None, player_id=request.player_id or None,
@@ -262,7 +291,8 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     )
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
-    if result.status is FetchStatus.NOT_APPLICABLE and request.label != "attendance":
+    paginated = request.label in ("attendance", "rumours")
+    if result.status is FetchStatus.NOT_APPLICABLE and not paginated:
         return tuple(
             core.captureless_outcome(
                 entity, scope, status="not_applicable",
@@ -272,7 +302,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
             for entity in _ENTITIES[request.label]
         ), None
     if (result.status not in _SUCCESS or not result.raw_capture_id
-            or (request.label == "attendance" and result.status is not FetchStatus.OK)):
+            or (paginated and result.status is not FetchStatus.OK)):
         status = "unavailable"
         reason = f"{request.label}:{result.status.value}"
         if request.player_id:
@@ -286,6 +316,10 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
             for entity in _ENTITIES[request.label]
         ), None
 
+    if request.label == "rumours":
+        unit = sections.extract_rumour_observations(
+            captures, scope, competition=competition, **metadata)
+        return tuple(unit), max(capture.captured_at for capture in captures)
     if request.label == "attendance":
         outcome = sections.extract_attendance_observations(
             captures, scope, start_url=request.url, competition_id=request.competition_id,
@@ -345,10 +379,11 @@ class CoreRun:
         outcomes = []
         captured_units = []
         fetched = cache_hits = 0
-        for request in _requests(plan):
+        for request, competition in _requests(plan):
             as_json = request.as_json
             page = request
             captures = []
+            remaining_urls = iter(())
             while True:
                 result = self._fetch(
                     page.url, label=request.label, as_json=as_json, context=context,
@@ -356,11 +391,36 @@ class CoreRun:
                 )
                 fetched += 1
                 cache_hits += int(result.cache_hit)
-                if (request.label != "attendance" or result.status is not FetchStatus.OK
+                if (request.label not in ("attendance", "rumours") or result.status is not FetchStatus.OK
                         or not result.raw_capture_id):
                     break
                 capture = _capture(page, result, self._raw_loader)
                 captures.append(capture)
+                if request.label == "rumours":
+                    if len(captures) == 1:
+                        try:
+                            pagination = rumours.parse_rumour_pagination(
+                                capture.text, competition=competition, page_url=page.url,
+                            )
+                            page_plan = rumours.build_rumour_page_plan((pagination,))
+                        except ValueError:
+                            # Extraction reports the donor error with the listing capture.
+                            break
+                        if len(page_plan) > 100:
+                            raise CoreRunError('rumours:pagination_limit')
+                        # Every row binds to its CANONICAL plan URL (page 1 is
+                        # .../page/1, not the suffixless listing); only the
+                        # table-free empty grid plans to the listing itself.
+                        if page_plan[0] != page.url:
+                            captures = []
+                            remaining_urls = iter(page_plan)
+                        else:
+                            remaining_urls = iter(page_plan[1:])
+                    next_url = next(remaining_urls, None)
+                    if next_url is None:
+                        break
+                    page = replace(request, url=next_url)
+                    continue
                 try:
                     next_url = attendance.next_attendance_url(capture.body, page.url)
                     if next_url is None:
@@ -379,12 +439,16 @@ class CoreRun:
                     raise CoreRunError('attendance:pagination_limit')
                 page = replace(request, url=next_url)
             unit, captured_at = _observations(
-                request, result, plan, extracted_at, self._universe_version, self._raw_loader, captures)
+                request, result, plan, extracted_at, self._universe_version, self._raw_loader,
+                captures, competition=competition)
             outcomes.extend(unit)
             if captured_at is not None and writer is not None and connection_factory is not None:
+                # Each outcome plans against ITS OWN capture clock: a multi-page
+                # unit (rumours) writes one plan per page capture.
                 entries = [
-                    (item, captured_at, _outcome_scope_values(item, request, plan))
-                    for item in unit if item.status in core.CONCLUSIVE_CORE_STATUSES
+                    (item, item.capture.captured_at, _outcome_scope_values(item, request, plan))
+                    for item in unit
+                    if item.status in core.CONCLUSIVE_CORE_STATUSES and item.capture is not None
                 ]
                 if entries:
                     captured_units.append((unit[0].run_id, entries))
