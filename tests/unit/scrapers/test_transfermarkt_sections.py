@@ -2062,3 +2062,35 @@ def test_revisions_are_rechecked_when_rows_change_after_construction():
     with pytest.raises(CoreParseError, match='revision'):
         core.plan_for_outcome(outcome, captured_at=outcome.capture.captured_at,
                               scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+
+
+def test_first_write_refuses_a_table_of_another_schema_before_mutation():
+    # Round 2 finding 15: section lanes reuse the names of tables that the
+    # retired donor stack left behind with its own columns.
+    from scrapers.transfermarkt import referee_capture
+    donor_columns = ', '.join(f'{column} TEXT' for column in referee_capture.REFEREE_PROFILE_COLUMNS)
+    db = CoreDB()
+    db.sql.execute(f'CREATE TABLE transfermarkt_referee_profiles ({donor_columns})')
+    db.sql.execute("INSERT INTO transfermarkt_referee_profiles (referee_id, name) VALUES ('999', 'Old Row')")
+    profile = sections.extract_referee_profile_observations(
+        _referee_profile_capture(), _referee_scope(), referee_id='101',
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
+    plan = core.plan_for_outcome(profile, captured_at=REFEREE_CAPTURED, scope_values={'referee_id': '101'})
+    assert 'source_capture_id' not in referee_capture.REFEREE_PROFILE_COLUMNS
+    with pytest.raises(RuntimeError, match='schema differs'):
+        _write(db, [plan], profile.run_id, REFEREE_EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT referee_id, name FROM transfermarkt_referee_profiles').fetchall() == [('999', 'Old Row')]
+
+    # A table that merely carries one more column is refused just the same.
+    packet = _representation_capture()
+    assigned, = [outcome for outcome in sections.extract_representation_observations(
+        packet, _representation_scope(), expected_ids=('7', '9'), extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE) if outcome.rows]
+    columns = ', '.join(f'{column} TEXT' for column in (*assigned.rows[0], 'assessment_manifest_id'))
+    db.sql.execute(f'CREATE TABLE transfermarkt_player_representation_observations ({columns})')
+    plan = core.plan_for_outcome(assigned, captured_at=CLUB_CAPTURED, scope_values={'player_id': '7'})
+    with pytest.raises(RuntimeError, match='schema differs'):
+        _write(db, [plan], assigned.run_id, EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_player_representation_observations').fetchone()[0] == 0
