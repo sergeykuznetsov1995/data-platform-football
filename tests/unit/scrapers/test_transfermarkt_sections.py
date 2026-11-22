@@ -1411,3 +1411,183 @@ def test_rumour_scope_check_uses_the_donors_page_identity():
                 RUMOUR_PAGE[2] + '#top'):
         with pytest.raises(CoreParseError, match='row_scope_mismatch'):
             core._check_scope_against_capture('rumour_observations', scope, capture(url))
+
+
+# ------------------------------------------------ referee walk pins (r2 cycle)
+REFEREE_DIRECTORY_PAGE_2 = REFEREE_DIRECTORY_URL + '/page/2'
+
+
+def _referee_next_link(url: str) -> bytes:
+    return f'<ul class="naechste-seite"><li><a href="{url}">Next</a></li></ul>'.encode()
+
+
+def _referee_second_page_body() -> bytes:
+    """The compact directory layout with two other referees on record."""
+    body = _referee_first_page_body()
+    return (body.replace(b'schiedsrichter/101', b'schiedsrichter/303')
+                .replace(b'Ada Example', b'Cara Third')
+                .replace(b'schiedsrichter/202', b'schiedsrichter/404')
+                .replace(b'Boris Sample', b'Dan Fourth'))
+
+
+def _referee_first_page_body() -> bytes:
+    return (REFEREE_FIXTURES / 'directory_compact.html').read_bytes()
+
+
+def _referee_page(url: str, body: bytes, *, next_url: str | None = None) -> SourceCapture:
+    if next_url is not None:
+        body += _referee_next_link(next_url)
+    digest = hashlib.sha256(body).hexdigest()
+    return SourceCapture(
+        url=url, endpoint='referee_directory', body=body, capture_id=digest,
+        body_hash=digest, captured_at=REFEREE_CAPTURED)
+
+
+def _referee_directory(captures) -> tuple[LaneOutcome, ...]:
+    return sections.extract_referee_directory_observations(
+        captures, _referee_scope(), extracted_at=REFEREE_EXTRACTED_AT,
+        universe_version=UNIVERSE)
+
+
+def _directory_error(captures) -> LaneOutcome:
+    outcome, = _referee_directory(captures)
+    assert (outcome.status, outcome.rows) == ('error', ())
+    return outcome
+
+
+def test_truncated_referee_directory_is_not_certified():
+    # Page 1 still links to page 2: page 1 alone is a truncation of the walk.
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_PAGE_2)
+    outcome = _directory_error((page_1,))
+    assert outcome.status_reason == 'referees:directory_pagination_incomplete'
+    assert outcome.capture.capture_id == page_1.capture_id  # capture-backed
+    assert core.build_core_dq([outcome])['passed'] is True
+
+
+def test_referee_pages_out_of_walk_order_are_not_certified():
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_PAGE_2)
+    page_2 = _referee_page(REFEREE_DIRECTORY_PAGE_2, _referee_second_page_body())
+    page_3 = _referee_page(REFEREE_DIRECTORY_URL + '/page/3', _referee_second_page_body())
+    # The supplied sequence must start at page 1 and stay contiguous.
+    assert _directory_error((page_1, page_3)).status_reason == 'referees:directory_pagination_incomplete'
+    assert _directory_error((page_2,)).status_reason == 'referees:directory_pagination_incomplete'
+    # A page without its next link cannot be followed by another page.
+    detached = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body())
+    assert _directory_error((detached, page_2)).status_reason == 'referees:directory_pagination_incomplete'
+
+
+def test_malformed_referee_next_link_is_a_directory_error_of_its_own_page():
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_URL + '?page=99')
+    outcome = _directory_error((page_1,))
+    assert outcome.status_reason == 'referees:pagination_link_invalid'
+    assert outcome.capture.capture_id == page_1.capture_id
+
+
+def test_complete_referee_directory_walk_maps_each_page():
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_PAGE_2)
+    page_2 = _referee_page(REFEREE_DIRECTORY_PAGE_2, _referee_second_page_body())
+    outcomes = _referee_directory((page_1, page_2))
+    assert [(outcome.status, len(outcome.rows)) for outcome in outcomes] == [
+        ('observed_present', 10), ('observed_present', 10)]
+    assert outcomes[1].capture.capture_id == page_2.capture_id
+    assert core.build_core_dq(outcomes)['passed'] is True
+
+
+def test_referee_directory_scope_run_writes_the_complete_walk():
+    from scrapers.transfermarkt.orchestrator import RefereeDirectoryTarget
+    bodies = {
+        REFEREE_DIRECTORY_URL: _referee_first_page_body()
+        + _referee_next_link(REFEREE_DIRECTORY_PAGE_2),
+        REFEREE_DIRECTORY_PAGE_2: _referee_second_page_body(),
+    }
+
+    class _Fetch:
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            self.calls.append(url)
+            body = bodies[url]
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=REFEREE_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    fetcher = _Fetch()
+    plan = CoreScopePlan(
+        league='XY1', season='2526', scope_id='tm-scope-t12', cycle_id='tm-cycle-t12',
+        referee_directories=(RefereeDirectoryTarget('XY1', '2025', 'example-league'),),
+    )
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=REFEREE_EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [REFEREE_DIRECTORY_URL, REFEREE_DIRECTORY_PAGE_2]
+    assert [item['rows'] for item in report.outcomes] == [10, 10]
+    assert report.dq['passed'] is True and len(report.receipts) == 1
+    assert report.receipts[0]['verified'] is True
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_referee_aggregate_observations').fetchone()[0] == 20
+
+
+def test_malformed_referee_next_link_fails_only_its_directory():
+    from scrapers.transfermarkt.orchestrator import (
+        AchievementHolderTarget, RefereeDirectoryTarget)
+    # One run, two independent targets: a JSON holder and a broken directory.
+    achievements_body = json.dumps(ACHIEVEMENTS_PACKET).encode('utf-8')
+    directory_body = _referee_first_page_body() + _referee_next_link(REFEREE_DIRECTORY_URL + '?page=99')
+    served = {
+        ACHIEVEMENTS_URL: ('player_achievement', achievements_body, CLUB_CAPTURED),
+        REFEREE_DIRECTORY_URL: ('referee_directory', directory_body, REFEREE_CAPTURED),
+    }
+
+    class _Fetch:
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            assert label == served[url][0]
+            if label != 'referee_directory':
+                return FetchOutcome(
+                    status=FetchStatus.OK, value=ACHIEVEMENTS_PACKET,
+                    raw_capture_id=hashlib.sha256(served[url][1]).hexdigest(),
+                    raw_body_hash=hashlib.sha256(served[url][1]).hexdigest(),
+                    raw_fetched_at=served[url][2], cache_hit=False, status_code=200)
+            self.calls.append(url)
+            body = served[url][1]
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'),
+                raw_capture_id=hashlib.sha256(body).hexdigest(),
+                raw_body_hash=hashlib.sha256(body).hexdigest(),
+                raw_fetched_at=served[url][2], cache_hit=False, status_code=200)
+
+        def raw_loader(self, capture_id):
+            url, = [url for url, item in served.items()
+                    if hashlib.sha256(item[1]).hexdigest() == capture_id]
+            return served[url][1], _JsonRecord(url, capture_id, served[url][2])
+
+    fetcher = _Fetch()
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        achievement_holders=(AchievementHolderTarget('player', '7'),),
+        referee_directories=(RefereeDirectoryTarget('XY1', '2025', 'example-league'),),
+    )
+    run = CoreRun(fetcher.fetch, raw_loader=fetcher.raw_loader, universe_version=UNIVERSE,
+                  extracted_at=REFEREE_EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    # The holder parsed before the broken directory keeps its write and receipt.
+    assert [(item['entity'], item['status'], item['rows']) for item in report.outcomes] == [
+        ('achievement_observations', 'observed_present', 2),
+        ('referee_aggregate_observations', 'error', 0)]
+    assert report.outcomes[1]['status_reason'] == 'referees:pagination_link_invalid'
+    assert len(report.receipts) == 1 and report.receipts[0]['verified'] is True
+    assert fetcher.calls == [REFEREE_DIRECTORY_URL]  # the broken link is not followed
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_achievement_observations').fetchone()[0] == 2
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_referee_aggregate_observations').fetchone()[0] == 0
