@@ -368,6 +368,7 @@ class NativeWritePlan:
         required = keys | _REQUIRED_ROW_COLUMNS
         seen = set()
         pages = {}
+        column_types = {}
         for row in self.rows:
             if not isinstance(row, dict):
                 raise ValueError('core plan row must be a dict')
@@ -383,6 +384,11 @@ class NativeWritePlan:
             if ('observed_at' in self.natural_keys and row.get('observed_at') is not None
                     and _timestamp(row['observed_at']) != _timestamp(row['captured_at'])):
                 raise ValueError('core observation clock must equal its capture clock')
+            for column, value in row.items():
+                kind = (None if value is None else 'bool' if isinstance(value, bool)
+                        else 'int' if isinstance(value, int) else 'str')
+                if kind and column_types.setdefault(column, kind) != kind:
+                    raise ValueError(f'core plan column mixes value types: {column}')
             if any(row[col] in ('', None) for col in required):
                 raise ValueError('core plan row has empty lineage, key or capture columns')
             if any(str(row[col]) != str(value) for col, value in zip(self.scope_columns, self.scope_values)):
