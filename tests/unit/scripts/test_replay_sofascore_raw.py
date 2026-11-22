@@ -1,5 +1,7 @@
 """Focused unit tests for the SofaScore raw-replay worker helpers (#1367)."""
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +21,11 @@ from scrapers.sofascore.manifest import (
     ManifestKey,
     ManifestStatus,
 )
-from scrapers.sofascore.raw_replay import MODE_FIELDS, ReplayScopeKey
+from scrapers.sofascore.raw_replay import (
+    MODE_FIELDS,
+    ReplayPlanningError,
+    ReplayScopeKey,
+)
 
 TOURNAMENT = "17"
 SEASON = "61627"
@@ -86,6 +92,8 @@ class _FakeCatalog:
 
     def tournament_map(self):
         return {"england/premier-league": int(TOURNAMENT)}
+
+    tournaments = ()
 
 
 class _FakeManager:
@@ -259,7 +267,7 @@ def test_load_scope_prefilters_exact_triple_without_sql():
     foreign_tournament = _record(
         "rounds", "season", SEASON, tournament="18"
     )
-    resolved, plan, season_format = _load_scope(
+    resolved, plan, season_format, overlay_source = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -292,7 +300,7 @@ def test_load_scope_returns_none_plan_without_replayable_records():
         raw_content_hash=None,
         raw_blob_key=None,
     )
-    resolved, plan, season_format = _load_scope(
+    resolved, plan, season_format, overlay_source = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -304,7 +312,7 @@ def test_load_scope_returns_none_plan_without_replayable_records():
 
 def test_load_scope_empty_records_yield_none_plan():
     runtime = _FakeRuntime(_FakeCatalog(), _FakeManager())
-    resolved, plan, season_format = _load_scope(
+    resolved, plan, season_format, overlay_source = _load_scope(
         (TOURNAMENT, SEASON, FRESHNESS),
         mode=MODE_FIELDS,
         capture_runtime=runtime,
@@ -1347,7 +1355,7 @@ def test_scope_overlay_rekeys_registry_row_and_preserves_eligibility():
     )
     assert (resolved.league, resolved.canonical_season) == ("SS-16", "2026")
 
-    with _scope_overlay(resolved, catalog) as (registry_path, medallion_dir):
+    with _scope_overlay(resolved, ("registry", catalog)) as (registry_path, medallion_dir):
         document = json.loads(
             Path(registry_path).read_text(encoding="utf-8")
         )
@@ -1400,7 +1408,7 @@ def test_scope_overlay_binds_and_restores_both_configurations(outer_env):
         os.environ["MEDALLION_CONFIG_DIR"] = outer_env
     try:
         with pytest.raises(RuntimeError, match="boom"):
-            with _scope_overlay(resolved, catalog) as (registry_path, medallion_dir):
+            with _scope_overlay(resolved, ("registry", catalog)) as (registry_path, medallion_dir):
                 assert os.environ["SOFASCORE_REGISTRY_PATH"] == registry_path
                 assert os.environ["MEDALLION_CONFIG_DIR"] == medallion_dir
                 assert Path(medallion_config.CONFIG_DIR) == Path(medallion_dir)
@@ -1462,7 +1470,7 @@ def test_scope_overlay_refuses_unreplayable_registry_season_format():
     with pytest.raises(ReplayScopeError, match="no replayable season format"):
         with _scope_overlay(
             ResolvedReplayScope("16", "58210", "2026", "SS-16", "2026"),
-            patched_catalog,
+            ("registry", patched_catalog),
         ):
             pass
 
@@ -1479,7 +1487,7 @@ def test_replay_season_label_guard_uses_overlay_format():
     resolved = resolve_replay_scope(
         ReplayScopeKey("16", "58210", "2026"), catalog
     )
-    with _scope_overlay(resolved, catalog):
+    with _scope_overlay(resolved, ("registry", catalog)):
         assert _season_label("SS-16", "2026") == "2026"
         _assert_replay_season_label(resolved, "single_year")
     # Outside the overlay the capture key has no medallion entry, so the
@@ -1500,7 +1508,7 @@ def test_replay_season_label_guard_accepts_split_year():
     resolved = resolve_replay_scope(
         ReplayScopeKey("17", "76986", "final"), catalog
     )
-    with _scope_overlay(resolved, catalog):
+    with _scope_overlay(resolved, ("registry", catalog)):
         _assert_replay_season_label(resolved, "split_year")
     # The split-year short form needs no overlay entry, so the guard must
     # not reject it even when the binding is the plain repo configuration.
@@ -1521,5 +1529,322 @@ def test_scope_overlay_rejects_scope_outside_registry():
         canonical_season="2026",
     )
     with pytest.raises(ReplayScopeError, match="unknown for source tournament"):
-        with _scope_overlay(resolved, _single_year_catalog()):
+        with _scope_overlay(resolved, ("registry", _single_year_catalog())):
             pass
+
+
+# --- stage 3: campaign-snapshot resolution for non-registry tournaments ------
+
+
+def _campaign_snapshot_fixture(
+    tmp_path, *, campaign_id="unit-campaign", include_registry_pair=False
+):
+    """Digest-valid campaign snapshot with one NON-registry tournament.
+
+    ``include_registry_pair`` adds tournament 17 with season 99999 — a
+    pair the (real) registry refuses — for the authority test.
+    """
+    document = {
+        "schema_version": 1,
+        "candidate_count": 1,
+        "policy_id": "unit-policy",
+        "campaign_id": campaign_id,
+        "tournaments": [
+            {
+                "unique_tournament_id": 54,
+                "capture_key": "SS-54",
+                "name": "Bundesliga (AUT)",
+                "slug": "bundesliga",
+                "page_path": "football/austria/bundesliga",
+                "category": {"id": 9, "name": "Austria", "slug": "austria"},
+                "kind": "league",
+                "metadata_status": "ready",
+                "classification": {
+                    "sport": "football",
+                    "gender": "male",
+                    "age_group": "unknown",
+                    "team_level": "unknown",
+                    "status": "review_required",
+                    "exclusion_reasons": [],
+                    "evidence": [
+                        {
+                            "type": "source_field",
+                            "endpoint": "/unique-tournament/54",
+                            "field": "gender",
+                            "value": "M",
+                        }
+                    ],
+                },
+                "eligibility_review": {
+                    "status": "approved",
+                    "confirmed": {
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "professional": True,
+                    },
+                    "reviewed_by": "unit-owner",
+                    "reviewed_at": "2026-08-21",
+                },
+                "seasons": [
+                    {
+                        "source_season_id": 616,
+                        "source_name": "Bundesliga 25/26",
+                        "canonical_season": "2526",
+                        "season_format": "split_year",
+                        "start_year": 2025,
+                        "team_count": 12,
+                        "metadata_status": "ready",
+                        "team_count_evidence": {
+                            "type": "source_team_ids",
+                            "endpoint": "/unique-tournament/54/season/616/teams",
+                            "count": 12,
+                            "team_ids_sha256": "b" * 64,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    if include_registry_pair:
+        import copy
+
+        registry_row = copy.deepcopy(document["tournaments"][0])
+        registry_row["unique_tournament_id"] = 17
+        registry_row["capture_key"] = "SS-17"
+        registry_row["seasons"] = [
+            {
+                "source_season_id": 99999,
+                "source_name": "Ghost 25/26",
+                "canonical_season": "2526",
+                "season_format": "split_year",
+                "start_year": 2025,
+                "team_count": 20,
+                "metadata_status": "ready",
+                "team_count_evidence": {
+                    "type": "source_team_ids",
+                    "endpoint": "/unique-tournament/17/season/99999/teams",
+                    "count": 20,
+                    "team_ids_sha256": "c" * 64,
+                },
+            }
+        ]
+        document["tournaments"].append(registry_row)
+    raw = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    document["snapshot_id"] = hashlib.sha256(raw).hexdigest()
+    path = tmp_path / "snapshot.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return str(path)
+
+
+def test_snapshot_resolution_covers_registry_absent_tournament(tmp_path, monkeypatch):
+    from dags.scripts.replay_sofascore_raw import _load_scope
+
+    snapshot = _campaign_snapshot_fixture(tmp_path)
+    monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "unit-campaign")
+
+    runtime = _FakeRuntime(_FakeCatalog(), _FakeManager())
+    resolved, plan, season_format, overlay_source = _load_scope(
+        ("54", "616", "final"),
+        mode=MODE_FIELDS,
+        capture_runtime=runtime,
+        records=(),
+    )
+
+    assert resolved.league == "SS-54"
+    assert resolved.canonical_season == "2526"
+    assert season_format == "split_year"
+    assert overlay_source[0] == "snapshot"
+    assert overlay_source[1]["capture_key"] == "SS-54"
+
+
+def test_registry_authority_is_never_displaced_by_snapshot(tmp_path, monkeypatch):
+    """A tournament the registry KNOWS keeps registry errors (adjudication).
+
+    Review r1 hardening: the snapshot ALSO carries the very pair
+    (17/99999) the registry refuses — the fallback must still not run.
+    """
+    from dags.scripts.replay_sofascore_raw import _load_scope
+
+    snapshot = _campaign_snapshot_fixture(
+        tmp_path, include_registry_pair=True
+    )
+    monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "unit-campaign")
+
+    catalog = _FakeCatalog()
+    catalog.tournaments = (SimpleNamespace(unique_tournament_id=int(TOURNAMENT)),)
+    runtime = _FakeRuntime(catalog, _FakeManager())
+    with pytest.raises(ReplayPlanningError, match="unknown for source"):
+        _load_scope(
+            # 17 is in the fake registry; the season is not.
+            (TOURNAMENT, "99999", "final"),
+            mode=MODE_FIELDS,
+            capture_runtime=runtime,
+            records=(),
+        )
+
+
+def test_snapshot_campaign_identity_is_pinned(tmp_path, monkeypatch):
+    from dags.scripts.replay_sofascore_raw import (
+        ReplayScopeError,
+        _resolve_snapshot_scope,
+    )
+
+    snapshot = _campaign_snapshot_fixture(tmp_path)
+    monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "other-campaign")
+
+    with pytest.raises(ReplayScopeError, match="campaign"):
+        _resolve_snapshot_scope(
+            __import__(
+                "scrapers.sofascore.raw_replay", fromlist=["ReplayScopeKey"]
+            ).ReplayScopeKey("54", "616", "final")
+        )
+
+
+def test_snapshot_overlay_renders_and_binds(tmp_path, monkeypatch):
+    import dags.utils.medallion_config as medallion_config
+    from dags.scripts.replay_sofascore_raw import (
+        _resolve_snapshot_scope,
+        _scope_overlay,
+    )
+    from scrapers.sofascore import scraper as scraper_module
+    from scrapers.sofascore.raw_replay import ReplayScopeKey
+
+    snapshot = _campaign_snapshot_fixture(tmp_path)
+    monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "unit-campaign")
+
+    resolved, season_format, scope_row = _resolve_snapshot_scope(
+        ReplayScopeKey("54", "616", "final")
+    )
+    previous_config_dir = medallion_config.CONFIG_DIR
+    previous_module_catalog = scraper_module._SOFASCORE_CATALOG
+    try:
+        with _scope_overlay(resolved, ("snapshot", scope_row)) as (
+            registry_path,
+            medallion_dir,
+        ):
+            entry = scraper_module._SOFASCORE_CATALOG.competition("SS-54")
+            assert entry.unique_tournament_id == 54
+            assert entry.capture_allowed is True
+            assert any(
+                item["id"] == "SS-54"
+                for item in medallion_config.load_competitions()["competitions"]
+            )
+        assert medallion_config.CONFIG_DIR is previous_config_dir
+        assert scraper_module._SOFASCORE_CATALOG is previous_module_catalog
+    finally:
+        medallion_config.CONFIG_DIR = previous_config_dir
+        scraper_module._SOFASCORE_CATALOG = previous_module_catalog
+
+
+# --- stage 4: player-universe freshness key -----------------------------------
+
+
+class _UniversePlan:
+    def __init__(self, ready):
+        self.player_universe_ready = ready
+
+
+def _squads_record(freshness, terminal, updated):
+    return SimpleNamespace(
+        key=SimpleNamespace(
+            endpoint="squads",
+            freshness_key=freshness,
+        ),
+        status=SimpleNamespace(terminal=terminal),
+        updated_at=updated,
+    )
+
+
+def test_universe_key_prefers_scope_key_when_ready(monkeypatch):
+    from dags.scripts.replay_sofascore_raw import _player_universe_freshness_key
+
+    planned = []
+
+    def fake_plan(raw_store, store, **kwargs):
+        planned.append(kwargs["freshness_key"])
+        return _UniversePlan(ready=True)
+
+    monkeypatch.setattr(
+        "scrapers.sofascore.season_pipeline.plan_season_partition", fake_plan
+    )
+    runtime = SimpleNamespace(
+        raw_store=object(),
+        manifest_store=SimpleNamespace(
+            list_for_scope=lambda tid, sid: [
+                _squads_record("day-2026-07-17", True, "2026-07-17")
+            ]
+        ),
+    )
+    resolved = SimpleNamespace(
+        source_tournament_id="16",
+        source_season_id="58210",
+        freshness_key="week-2026-W30",
+    )
+
+    key, candidates = _player_universe_freshness_key(runtime, resolved)
+
+    assert key == "week-2026-W30"
+    assert planned == ["week-2026-W30"]
+
+
+def test_universe_key_falls_back_to_terminal_squads_key(monkeypatch):
+    from dags.scripts.replay_sofascore_raw import _player_universe_freshness_key
+
+    def fake_plan(raw_store, store, **kwargs):
+        return _UniversePlan(ready=kwargs["freshness_key"].startswith("day-"))
+
+    monkeypatch.setattr(
+        "scrapers.sofascore.season_pipeline.plan_season_partition", fake_plan
+    )
+    runtime = SimpleNamespace(
+        raw_store=object(),
+        manifest_store=SimpleNamespace(
+            list_for_scope=lambda tid, sid: [
+                _squads_record("day-2026-07-17", True, "2026-07-17"),
+                _squads_record("day-2026-07-18", True, "2026-07-18"),
+            ]
+        ),
+    )
+    resolved = SimpleNamespace(
+        source_tournament_id="16",
+        source_season_id="58210",
+        freshness_key="week-2026-W30",
+    )
+
+    key, tried = _player_universe_freshness_key(runtime, resolved)
+
+    assert key == "day-2026-07-18"
+    assert tried == ["week-2026-W30", "day-2026-07-18"]
+
+
+def test_universe_key_keeps_scope_key_when_nothing_passes(monkeypatch):
+    from dags.scripts.replay_sofascore_raw import _player_universe_freshness_key
+
+    monkeypatch.setattr(
+        "scrapers.sofascore.season_pipeline.plan_season_partition",
+        lambda *args, **kwargs: _UniversePlan(ready=False),
+    )
+    runtime = SimpleNamespace(
+        raw_store=object(),
+        manifest_store=SimpleNamespace(
+            list_for_scope=lambda tid, sid: [
+                _squads_record("day-2026-07-17", True, "2026-07-17")
+            ]
+        ),
+    )
+    resolved = SimpleNamespace(
+        source_tournament_id="16",
+        source_season_id="58210",
+        freshness_key="week-2026-W30",
+    )
+
+    key, tried = _player_universe_freshness_key(runtime, resolved)
+
+    assert key == "week-2026-W30"
+    assert tried == ["week-2026-W30", "day-2026-07-17"]

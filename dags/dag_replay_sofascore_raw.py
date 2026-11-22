@@ -55,6 +55,43 @@ def _safe_path_component(value: object) -> str:
     return safe or "_"
 
 
+def _campaign_snapshot_for_planning() -> "tuple[dict[str, Any] | None, str]":
+    """Read the campaign snapshot for stage-3 pair planning (best effort).
+
+    Returns (document, campaign_id); (None, "") when the kontur does not
+    mount one — the registry-only queue then applies unchanged.  The
+    document feeds only pair LISTING; every worker re-validates through
+    load_exact_scope (digest + pinned campaign identity).
+    """
+    path = os.environ.get("SOFASCORE_ALL_MENS_SNAPSHOT", "").strip()
+    if not path or not os.path.isfile(path):
+        return None, ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "SofaScore raw replay: cannot read campaign snapshot %s: %s "
+            "(registry-only scope set applies)",
+            path,
+            exc,
+        )
+        return None, ""
+    if not isinstance(document, dict):
+        return None, ""
+    campaign_id = str(document.get("campaign_id") or "").strip()
+    if not campaign_id:
+        # Review r1: a snapshot without a stable campaign identity must
+        # not contribute pairs — the worker refuses an unpinned fallback.
+        logger.warning(
+            "SofaScore raw replay: campaign snapshot %s has no campaign_id; "
+            "registry-only scope set applies",
+            path,
+        )
+        return None, ""
+    return document, campaign_id
+
+
 def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
     """Return one mapped worker env per replayable scope, bounded by caps."""
     params = context.get("params") or {}
@@ -109,7 +146,12 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
     # die first in every worker); an exact scope is validated loudly here
     # instead, and fields mode suppresses scopes with stored schema_error
     # blockers that the deployed parser deterministically re-rejects.
+    # Stage 3: tournaments ABSENT from the registry resolve through the
+    # campaign snapshot (read-only env path; the worker re-validates digest
+    # and campaign identity), and the planner pins the campaign id into
+    # every worker env so a snapshot revision cannot swap the planned scope.
     catalog = SofaScoreCatalog.load()
+    snapshot_document, campaign_id = _campaign_snapshot_for_planning()
     keys = list_replay_scope_keys(
         manager,
         mode=mode,
@@ -117,6 +159,7 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
         limit=scope_cap,
         catalog=catalog,
         include_blocked=include_blocked,
+        snapshot_document=snapshot_document,
     )
     if not keys:
         if mode == "fields" and not include_blocked:
@@ -178,14 +221,15 @@ def plan_replay_scopes(**context: Any) -> list[dict[str, str]]:
             continue
         seen_outputs.add(output_path)
         logger.info("SofaScore raw replay selected scope: %s", scope_json)
-        environments.append(
-            {
-                "SOFASCORE_REPLAY_MODE": mode,
-                "SOFASCORE_REPLAY_SCOPE_JSON": scope_json,
-                "SOFASCORE_REPLAY_TARGET_CAP": str(target_cap),
-                "SOFASCORE_REPLAY_OUTPUT": output_path,
-            }
-        )
+        environment = {
+            "SOFASCORE_REPLAY_MODE": mode,
+            "SOFASCORE_REPLAY_SCOPE_JSON": scope_json,
+            "SOFASCORE_REPLAY_TARGET_CAP": str(target_cap),
+            "SOFASCORE_REPLAY_OUTPUT": output_path,
+        }
+        if campaign_id:
+            environment["SOFASCORE_REPLAY_CAMPAIGN_ID"] = campaign_id
+        environments.append(environment)
     return environments
 
 

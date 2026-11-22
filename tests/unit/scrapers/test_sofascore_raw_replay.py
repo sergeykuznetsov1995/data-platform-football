@@ -25,6 +25,7 @@ from scrapers.sofascore.raw_replay import (
     ResolvedReplayScope,
     list_replay_scope_keys,
     load_replay_scope_records,
+    registry_tournament_ids,
     replay_eligible_scope_pairs,
     resolve_replay_scope,
     select_replay_scope_plans,
@@ -492,8 +493,8 @@ def test_list_replay_scope_keys_catalog_binds_resolvable_pairs():
         manager, mode=MODE_FIELDS, limit=2, catalog=catalog
     )
 
-    sql = manager.calls[0]["sql"]
-    params = manager.calls[0]["params"]
+    sql = manager.calls[-1]["sql"]
+    params = manager.calls[-1]["params"]
     assert (
         '(m."source_tournament_id", m."source_season_id") IN ((?, ?))' in sql
     )
@@ -501,7 +502,7 @@ def test_list_replay_scope_keys_catalog_binds_resolvable_pairs():
     assert keys == (ReplayScopeKey("17", "76986", "f1"),)
 
 
-def test_list_replay_scope_keys_empty_catalog_pairs_skip_sql():
+def test_list_replay_scope_keys_empty_catalog_pairs_skip_main_query():
     manager = FakeManager()
 
     class EmptyCatalog:
@@ -513,7 +514,9 @@ def test_list_replay_scope_keys_empty_catalog_pairs_skip_sql():
         )
         == ()
     )
-    assert manager.calls == []
+    # Only the cheap DISTINCT probe ran; no main query, no IN-list.
+    assert len(manager.calls) == 1
+    assert "SELECT DISTINCT" in manager.calls[0]["sql"]
 
 
 def test_list_replay_scope_keys_exact_scope_validates_against_catalog():
@@ -898,3 +901,178 @@ def test_validate_replay_scope_pair_rejects_disabled_tournament():
 
     with pytest.raises(ReplayPlanningError, match="capture-allowed"):
         validate_replay_scope_pair(("1", "76986"), catalog)
+
+
+# --- stage 3: campaign-snapshot pairs beyond the registry ---------------------
+
+
+def _snapshot_document():
+    return {
+        "schema_version": 1,
+        "campaign_id": "unit-campaign",
+        "tournaments": [
+            {
+                "unique_tournament_id": 54,
+                "capture_key": "SS-54",
+                "metadata_status": "ready",
+                "classification": {
+                    "sport": "football",
+                    "gender": "male",
+                    "status": "review_required",
+                    "exclusion_reasons": [],
+                },
+                "eligibility_review": {
+                    "status": "approved",
+                    "confirmed": {
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "professional": True,
+                    },
+                    "reviewed_by": "unit-owner",
+                    "reviewed_at": "2026-08-21",
+                },
+                "seasons": [
+                    {
+                        "source_season_id": 616,
+                        "canonical_season": "2526",
+                        "season_format": "split_year",
+                        "metadata_status": "ready",
+                    },
+                    {
+                        "source_season_id": 617,
+                        "canonical_season": "2627",
+                        "season_format": "split_year",
+                        "metadata_status": "excluded",
+                    },
+                    {
+                        "source_season_id": 618,
+                        "canonical_season": "25/26",
+                        "season_format": "split_year",
+                        "metadata_status": "ready",
+                    },
+                    {
+                        "source_season_id": 619,
+                        "canonical_season": "2628",
+                        "season_format": "unknown",
+                        "metadata_status": "ready",
+                    },
+                ],
+            },
+            {
+                # registry-covered id: never contributes (adjudication)
+                "unique_tournament_id": 17,
+                "capture_key": "SS-17",
+                "metadata_status": "ready",
+                "classification": {
+                    "sport": "football",
+                    "gender": "male",
+                    "status": "review_required",
+                    "exclusion_reasons": [],
+                },
+                "eligibility_review": {
+                    "status": "approved",
+                    "confirmed": {
+                        "age_group": "adult",
+                        "team_level": "first_team",
+                        "professional": True,
+                    },
+                    "reviewed_by": "unit-owner",
+                    "reviewed_at": "2026-08-21",
+                },
+                "seasons": [
+                    {
+                        "source_season_id": 70000,
+                        "canonical_season": "2526",
+                        "season_format": "split_year",
+                        "metadata_status": "ready",
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def test_registry_tournament_ids_lists_presence_not_eligibility():
+    ids = registry_tournament_ids(_fake_catalog())
+
+    assert ids == frozenset({"17", "1"})
+
+
+def test_snapshot_pairs_cover_only_registry_absent_tournaments():
+    from scrapers.sofascore.raw_replay import snapshot_replay_scope_pairs
+
+    pairs = snapshot_replay_scope_pairs(
+        _snapshot_document(), registry_tournament_ids(_fake_catalog())
+    )
+
+    assert pairs == (("54", "616"),)
+
+
+def test_list_replay_scope_keys_unions_snapshot_pairs():
+    # the manifest carries one registry pair and one snapshot-only pair
+    manager = FakeManager([("17", "76986", "f0"), ("54", "616", "f1")])
+    catalog = _fake_catalog()
+
+    keys = list_replay_scope_keys(
+        manager,
+        mode=MODE_FIELDS,
+        limit=5,
+        catalog=catalog,
+        snapshot_document=_snapshot_document(),
+    )
+
+    sql, params = manager.calls[-1]["sql"], manager.calls[-1]["params"]
+    assert sql.count("(?, ?)") == 2  # registry pair + snapshot pair
+    bound = list(zip(params[0::2], params[1::2]))
+    assert ("54", "616") in bound and ("17", "76986") in bound
+    assert keys == (
+        ReplayScopeKey("17", "76986", "f0"),
+        ReplayScopeKey("54", "616", "f1"),
+    )
+
+
+def test_exact_scope_validates_through_snapshot_fallback():
+    manager = FakeManager([("54", "616", "f1")])
+
+    keys = list_replay_scope_keys(
+        manager,
+        mode=MODE_DRAIN,
+        exact_scope=("54", "616"),
+        limit=2,
+        catalog=_fake_catalog(),
+        snapshot_document=_snapshot_document(),
+    )
+
+    assert manager.calls[0]["params"] == ("54", "616")
+    assert keys == (ReplayScopeKey("54", "616", "f1"),)
+
+
+def test_exact_scope_registry_season_error_is_not_displaced():
+    manager = FakeManager()
+
+    with pytest.raises(ReplayPlanningError, match="unknown for the source"):
+        list_replay_scope_keys(
+            manager,
+            mode=MODE_DRAIN,
+            exact_scope=(TOURNAMENT, "99999"),
+            limit=1,
+            catalog=_fake_catalog(),
+            snapshot_document=_snapshot_document(),
+        )
+
+    assert manager.calls == []
+
+
+def test_snapshot_pairs_skip_malformed_classification_status():
+    """Review r2: a non-string classification.status must not abort the
+    bulk enumeration with a TypeError — the row is simply not admitted."""
+    from scrapers.sofascore.raw_replay import snapshot_replay_scope_pairs
+
+    document = _snapshot_document()
+    document["tournaments"][0]["classification"]["status"] = ["weird"]
+
+    pairs = snapshot_replay_scope_pairs(
+        document, registry_tournament_ids(_fake_catalog())
+    )
+
+    assert pairs == ()
