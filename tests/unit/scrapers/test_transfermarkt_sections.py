@@ -2094,3 +2094,225 @@ def test_first_write_refuses_a_table_of_another_schema_before_mutation():
         _write(db, [plan], assigned.run_id, EXTRACTED_AT)
     assert db.sql.execute(
         'SELECT COUNT(*) FROM transfermarkt_player_representation_observations').fetchone()[0] == 0
+
+
+# --------------------------------- review round-3 pins (findings 1-23)
+ROWLESS_TERMINAL_PAGE_2 = (
+    b'<!doctype html><html><body><table class="items"><thead><tr><th>#</th><th>Stadium</th>'
+    b'<th>Capacity</th><th>Spectators</th><th>Average</th><th>Matches</th><th>Sold out</th>'
+    b'<th>Capacity</th></tr></thead><tbody></tbody></table></body></html>')
+
+
+def _page(url, body, clock, name):
+    return _capture(url, body, clock, capture_id=hashlib.sha256(name.encode()).hexdigest())
+
+
+def test_replayed_snapshot_cannot_resurrect_a_page_a_newer_rowless_walk_removed():
+    # Round 3 finding 1: the 12:30 empty page leaves no row to prove itself.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    original = [_attendance_plan((page_1, page_2))]
+    db = CoreDB()
+    _bundle(db, original, EXTRACTED_AT)
+    # A newer walk saw an empty page 1: Arsenal legitimately leaves the edition.
+    rowless_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, NEWER_PAGE_CAPTURED, 'rowless 12:30')
+    _bundle(db, [_attendance_plan((rowless_1, page_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'631'}
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, original, EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'631'}
+
+
+def test_newer_rowless_page_keeps_the_snapshot_fresh():
+    # Round 3 finding 5: freshness is the newest WALKED page, rows or not.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    empty_chelsea = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 2')
+    plan = _attendance_plan((page_1, empty_chelsea), LATER_EXTRACTED_AT)
+    assert plan.captured_at == NEWER_PAGE_CAPTURED and plan.capture_id == page_1.capture_id
+    assert _bundle(db, [plan], LATER_EXTRACTED_AT)['verified'] is True
+    assert set(_stadiums(db)) == {'11'}
+
+
+def test_reused_page_cannot_lose_its_rows_silently():
+    # Round 3 finding 6: page 1 keeps its evidence but not its row.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    plan = _attendance_plan((page_1, page_2), LATER_EXTRACTED_AT)
+    plan = _replace(plan, rows=tuple(row for row in plan.rows if row['club_id'] != '11'))
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _bundle(db, [plan], LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11', '631'}
+
+
+def test_rowless_plan_cannot_invent_its_capture_clock():
+    # Round 3 finding 13: a rowless plan's clock is its capture's clock.
+    outcome = sections.extract_achievement_observations(
+        _achievement_capture(ACHIEVEMENTS_EMPTY), _achievement_scope(),
+        recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    with pytest.raises(CoreParseError, match='captured_at'):
+        core.plan_for_outcome(outcome, captured_at=LATER_EXTRACTED_AT,
+                              scope_values={'recipient_type': 'player', 'recipient_id': '7'})
+    plan = core.plan_for_outcome(outcome, captured_at=outcome.capture.captured_at,
+                                 scope_values={'recipient_type': 'player', 'recipient_id': '7'})
+    assert plan.captured_at == CLUB_CAPTURED
+
+
+def _referee_at(url, body, capture_id, clock=REFEREE_CAPTURED):
+    return SourceCapture(url=url, endpoint='referee_directory', body=body,
+                         capture_id=capture_id, body_hash=hashlib.sha256(body).hexdigest(),
+                         captured_at=clock)
+
+
+def test_cached_page_cannot_gain_keys_from_another_capture_on_refresh():
+    # Round 3 finding 2: both captures share a clock, so referee 101's keys
+    # under page 2 would replace page 1's observation of the same keys.
+    first_1 = _referee_at(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')],
+                                                                next_url=REFEREE_DIRECTORY_PAGE_2), 'a' * 64)
+    page_2 = _referee_at(REFEREE_DIRECTORY_PAGE_2, _referee_body(
+        [('101', 'Ada Example'), ('202', 'Boris Sample')]), 'b' * 64)
+    db = CoreDB()
+    first = _referee_directory((first_1, page_2))
+    assert [len(outcome.rows) for outcome in first] == [5, 5]
+    _bundle(db, _referee_plans(first, {'a' * 64: REFEREE_CAPTURED, 'b' * 64: REFEREE_CAPTURED}),
+            REFEREE_EXTRACTED_AT)
+    # Next walk: a fresh page 1 no longer lists referee 101; page 2 is cached.
+    fresh_1 = _referee_at(REFEREE_DIRECTORY_URL, _referee_body(
+        [('303', 'Cara Third')], next_url=REFEREE_DIRECTORY_PAGE_2), 'c' * 64)
+    second = sections.extract_referee_directory_observations(
+        (fresh_1, page_2), _referee_scope(), extracted_at=LATER_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert [len(outcome.rows) for outcome in second] == [5, 10]
+    with pytest.raises(RuntimeError, match='another capture'):
+        _bundle(db, _referee_plans(second, {'c' * 64: REFEREE_CAPTURED, 'b' * 64: REFEREE_CAPTURED}),
+                LATER_EXTRACTED_AT)
+    owners = db.sql.execute(
+        "SELECT source_capture_id, COUNT(*) FROM transfermarkt_referee_aggregate_observations "
+        "WHERE referee_id = '101' GROUP BY 1").fetchall()
+    assert owners == [('a' * 64, 5)]
+
+
+def test_equal_clock_club_value_captures_cannot_take_each_others_keys():
+    # Round 3 finding 7: two stichtag pages share clubs; at one clock their
+    # keys collide, and at different clocks neither supersedes the other.
+    early = _club_value_plans('vie1-2013-04-15.html', '2013-04-15', PAGE_1_CAPTURED, EXTRACTED_AT)
+    same_clock = _club_value_plans('vie1-2024-06-01.html', '2024-06-01', PAGE_1_CAPTURED, EXTRACTED_AT)
+    db = CoreDB()
+    _bundle(db, early, EXTRACTED_AT)
+    before = db.sql.execute('SELECT COUNT(*) FROM transfermarkt_club_value_observations').fetchone()[0]
+    with pytest.raises(RuntimeError, match='another capture'):
+        _bundle(db, same_clock, EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_club_value_observations').fetchone()[0] == before
+
+    later = _club_value_plans('vie1-2024-06-01.html', '2024-06-01', PAGE_2_CAPTURED, EXTRACTED_AT)
+    earlier = _club_value_plans('vie1-2013-04-15.html', '2013-04-15', PAGE_1_CAPTURED, EXTRACTED_AT)
+    db = CoreDB()
+    _bundle(db, later, EXTRACTED_AT)
+    assert _bundle(db, earlier, EXTRACTED_AT)['verified'] is True
+
+
+def test_rumour_capture_cannot_gain_rows_on_replay():
+    # Round 3 finding 8: the same capture replayed under another competition
+    # display name hashes into other assertions.
+    from scrapers.transfermarkt import rumours
+    pages = (_rumour_capture(1, RUMOUR_PAGE_1_CAPTURED), _rumour_capture(2, RUMOUR_PAGE_2_CAPTURED))
+    later = '2026-11-20T21:45:00.000000+00:00'
+
+    def plans(extracted_at, name):
+        outcomes = sections.extract_rumour_observations(
+            pages, _rumour_scope(), competition=rumours.CompetitionContext(
+                'GB1', name, 'https://www.transfermarkt.com/-/startseite/wettbewerb/GB1'),
+            extracted_at=extracted_at, universe_version=UNIVERSE)
+        return [core.plan_for_outcome(
+            outcome, captured_at=outcome.capture.captured_at,
+            scope_values={'competition_id': 'GB1'}) for outcome in outcomes]
+
+    db = CoreDB()
+    _bundle(db, plans(RUMOUR_EXTRACTED_AT, 'Premier League'), RUMOUR_EXTRACTED_AT)
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _bundle(db, plans(later, 'English Premier League'), later)
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_rumour_observations').fetchone()[0] == 2
+
+
+def test_observation_clock_must_equal_its_capture_clock():
+    # Round 3 finding 12: a row cannot claim an older observation clock than
+    # the capture that carries it.
+    first = _referee_page(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')]))
+    db = CoreDB()
+    _bundle(db, _referee_plans(_referee_directory((first,)), {first.capture_id: REFEREE_CAPTURED}),
+            REFEREE_EXTRACTED_AT)
+    later = '2026-11-20T15:07:00.000000+00:00'
+    other = _referee_at(REFEREE_DIRECTORY_URL, _referee_body(
+        [('101', 'Ada Example')], matches_of={'101': '13'}), 'e' * 64, later)
+    outcome, = _referee_directory((other,))
+    outcome = _replace(outcome, rows=tuple(
+        {**row, 'observed_at': REFEREE_CAPTURED} for row in outcome.rows))
+    plan = core.plan_for_outcome(outcome, captured_at=later,
+                                 scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
+    with pytest.raises((ValueError, RuntimeError)):
+        _bundle(db, [plan], later)
+    assert db.sql.execute(
+        "SELECT value FROM transfermarkt_referee_aggregate_observations "
+        "WHERE referee_id = '101' AND metric = 'matches_officiated'").fetchall() == [('14',)]
+
+
+def test_plan_freezes_rows_and_rechecks_row_verdicts():
+    # Round 3 finding 11: the outcome holds mutable rows.
+    pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
+             _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
+    outcome = sections.extract_attendance_observations(
+        pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    for row in outcome.rows:
+        row['observation_status'] = 'unknown'
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+    # A plan keeps the rows it validated.
+    frozen = _attendance_plan(pages)
+    outcome = sections.extract_attendance_observations(
+        pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    plan = core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED,
+                                 scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+    outcome.rows[0]['parser_revision'] = 'wrong'
+    assert {row['parser_revision'] for row in plan.rows} == {frozen.rows[0]['parser_revision']}
+    assert plan.plan_sha256() == frozen.plan_sha256()
+
+
+def test_unrepresentable_count_never_reaches_mutation():
+    # Round 3 finding 4: a bigint column cannot hold this capacity; the
+    # replacement must stop before it deletes the committed edition.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    overflow = page_1.body.replace(b'60.704', b'9223372036854775808')
+    newer_1 = _page(ATTENDANCE_START, overflow, NEWER_PAGE_CAPTURED, 'overflow')
+    with pytest.raises(ValueError, match='bigint'):
+        _attendance_plan((newer_1, page_2), LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11', '631'}
+
+
+def test_schema_preflight_checks_column_types_before_replacing():
+    # Round 3 finding 9: same column names, another type.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    db.sql.execute('DROP TABLE transfermarkt_attendance_observations')
+    # The fake warehouse is sqlite: the Iceberg DDL without its catalog prefix and format.
+    db.sql.execute(core.core_ddl('attendance_observations').split(' WITH ')[0].replace(
+        'iceberg.bronze.', '').replace('capacity bigint', 'capacity varchar'))
+    db.sql.execute("INSERT INTO transfermarkt_attendance_observations (club_id) VALUES ('11')")
+    newer_1 = _page(ATTENDANCE_START, page_1.body, NEWER_PAGE_CAPTURED, 'newer 1')
+    with pytest.raises(RuntimeError, match='schema differs'):
+        _bundle(db, [_attendance_plan((newer_1, page_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT club_id FROM transfermarkt_attendance_observations').fetchall() == [('11',)]

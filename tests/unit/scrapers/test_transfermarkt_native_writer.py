@@ -710,3 +710,50 @@ def test_same_capture_merge_keeps_its_exact_rule_outside_multi_capture_lanes():
     with pytest.raises(RuntimeError, match='replay differs'):
         write(db, [mv_plan([('2025-01-01', 10), ('2025-02-01', 20)], capture='cap-mv')],
               run_id='run-2', clock=LATER)
+
+
+# ---------------------------------------------------------------- stage-C review round 3
+def _empty_roster_plan(clock=CLOCK, capture='cap-empty'):
+    return NativeWritePlan(
+        entity='squad_memberships', table='transfermarkt_squad_memberships',
+        ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
+        scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
+        rows=(), captured_at=clock, status='observed_empty', status_reason='empty_roster',
+        proof='empty_roster:no_data_rows', capture_id=capture,
+        evidence=(
+            ('source_url', 'u'), ('source_endpoint', 'squad'),
+            ('raw_capture_id', capture), ('source_capture_id', capture),
+            ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
+            ('parser_revision', 'p'), ('schema_revision', 's'),
+        ),
+    )
+
+
+def test_schema_preflight_also_guards_a_rowless_replacement():
+    # Round 3 finding 9: a proven-empty replacement deletes the scope, so the
+    # table must be this plan's before that delete runs.
+    db = CoreDB()
+    db.sql.execute('CREATE TABLE transfermarkt_squad_memberships (league TEXT, season TEXT, '
+                   'club_id TEXT, donor_extra TEXT)')
+    db.sql.execute("INSERT INTO transfermarkt_squad_memberships VALUES ('GB1', '2526', '11', 'x')")
+    with pytest.raises(RuntimeError, match='schema differs'):
+        write(db, [_empty_roster_plan()], run_id='run-2')
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
+
+
+def test_pre_upgrade_intent_is_finished_after_verified_recovery():
+    # Round 3 finding 10: an intent saved under an earlier plan digest must
+    # not stay pending after its verified recovery.
+    db = CoreDB()
+    plan = _empty_roster_plan()
+    descriptor = dataclasses_replace(plan). __dict__.copy()
+    descriptor['rows'] = []
+    old_digest = 'f' * 64
+    write_journal.save_intent(
+        {'run_id': 'run-old', 'digest': old_digest}, {'plans': [descriptor]},
+        run_id='run-old', universe_version='u', committed_at=CLOCK)
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert write_journal.pending_intents({'run_id': 'run-old'}) == []
+    assert write_journal.read_receipt(old_digest)['verified'] is True
+    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == []
