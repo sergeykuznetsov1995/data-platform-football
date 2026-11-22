@@ -211,6 +211,11 @@ def _collect_cup_tree_block(
     """
     _required_mapping(block, where)
     node_id = _required_id(block, "id", where)
+    # Validate the list fields on EVERY observation — including a repeated
+    # standalone block whose row is already collected: the duplicate branch
+    # must not become a validation bypass (review r1).
+    participants_json = _canonical_list(block, "participants", where)
+    events_json = _canonical_list(block, "events", where)
     if (cup_tree_id, node_id) in visited:
         existing = rows_by_node.get(node_id)
         if existing is not None and block_kind in ("final", "third_place"):
@@ -229,8 +234,8 @@ def _collect_cup_tree_block(
     _auto_flatten(block, row)
     row["parent_node_id"] = None
     row["children_json"] = "[]"
-    row["participants_json"] = _canonical_list(block, "participants", where)
-    row["events_json"] = _canonical_list(block, "events", where)
+    row["participants_json"] = participants_json
+    row["events_json"] = events_json
     rows.append(row)
     rows_by_node[node_id] = row
     return None

@@ -819,8 +819,20 @@ class TestParseCupTreesRoundsShape:
         assert len(final_rows) == 1
         assert final_rows[0]["block_kind"] == "final"
         assert final_rows[0]["round_description"] == "Final"
+        # review r1: the merged row keeps the round identity, not just the label
+        assert final_rows[0]["round_id"] == "56005"
         ids = [row["node_id"] for row in rows]
         assert len(ids) == len(set(ids))
+
+    def test_repeated_standalone_block_still_validates_list_fields(self):
+        # review r1: a malformed non-list on the repeated standalone block
+        # must raise — the duplicate branch is not a validation bypass.
+        payload = _rounds_fixture()
+        payload["cupTrees"][0]["finalMatchCupBlock"]["events"] = 12813005
+        with pytest.raises(
+            ValueError, match=r"finalMatchCupBlock: field 'events' must be a list"
+        ):
+            parse_cup_trees(payload, source_tournament_id=16, source_season_id=58210)
 
     def test_empty_block_fields_encode_empty_lists(self):
         rows = parse_cup_trees(
