@@ -879,6 +879,76 @@ def test_fixtures_new_variants_still_fail_closed(old, new, check):
         parse_fixtures(html.replace(old, new, 1))
 
 
+LIVE_FIXTURES_1109 = LIVE_FIXTURES.parents[1] / "20261109" / "Fixtures.html.gz"
+
+
+def _fixtures_1109_html() -> str:
+    with gzip.open(LIVE_FIXTURES_1109, "rt", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_saved_1109_fixtures_with_upper_bound_parse_every_match():
+    from datetime import datetime
+    from scrapers.clubelo.parse import parse_fixtures
+
+    page = parse_fixtures(_fixtures_1109_html())
+    assert page.rating_date == date(2026, 11, 8)
+    assert page.page_created_at == datetime(2026, 11, 9, 17, 42, 33)
+    assert len(page.rows) == 50
+    game = next(r for r in page.rows if r["game_id"] == 1700437)
+    assert (game["home_stake"], game["home_stake_chance"], game["home_stake_if_win"],
+            game["home_stake_if_draw"], game["home_stake_if_loss"]) == (
+        "Relegation", ">99.9", "99.9", "100", "100")
+    shown = {r[f"{side}_stake_{field}"] for r in page.rows for side in ("home", "away")
+             for field in ("chance", "if_win", "if_draw", "if_loss")}
+    bounds = {value for value in shown if value and value.startswith(("<", ">"))}
+    assert bounds == {"<0.1", ">99.9"}
+    assert not any(value and value.endswith("%") for value in shown)
+
+
+def _home_row_1109(html: str) -> str:
+    start = html.rfind("<tr", 0, html.find('data-live-status-game-id="1700437"'))
+    end = html.find("</tr>", start)
+    return html[start:end + 5]
+
+
+@pytest.mark.parametrize("field, nth100", [
+    ("home_stake_if_win", None),
+    ("home_stake_if_draw", 1),
+    ("home_stake_if_loss", 2),
+])
+def test_fixtures_upper_bound_in_win_draw_loss_positions_parses(field, nth100):
+    from scrapers.clubelo.parse import parse_fixtures
+
+    html = _fixtures_1109_html()
+    upper = '<span class="min1081">&gt;99.9</span>'
+    if nth100 is None:
+        win = '<span class="min1081">99.9</span>'
+        assert html.count(win) == 1
+        html = html.replace(win, upper, 1)
+    else:
+        row = _home_row_1109(html)
+        hundred = '<span class="min1081">100%</span>'
+        assert row.count(hundred) == 2
+        start = row.index(hundred) if nth100 == 1 else row.rindex(hundred)
+        changed = row[:start] + upper + row[start + len(hundred):]
+        html = html.replace(row, changed, 1)
+    page = parse_fixtures(html)
+    game = next(r for r in page.rows if r["game_id"] == 1700437)
+    assert game[field] == ">99.9"
+    assert game["home_stake_chance"] == ">99.9"
+
+
+def test_fixtures_unknown_bound_marker_still_fails_closed():
+    from scrapers.clubelo.parse import parse_fixtures
+
+    html = _fixtures_1109_html()
+    upper = '<span class="min1081">&gt;99.9</span>'
+    assert upper in html
+    with pytest.raises(LayoutChanged, match="F3 chance"):
+        parse_fixtures(html.replace(upper, '<span class="min1081">≥99.9</span>', 1))
+
+
 def test_empty_fixtures_page_is_data_truth():
     from scrapers.clubelo.parse import parse_fixtures
 

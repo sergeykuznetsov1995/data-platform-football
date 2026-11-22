@@ -151,3 +151,77 @@ def test_provisional_pair_gaining_slug_is_a_change():
     day = dq.analyze_snapshots(rows, today=TODAY)["days"][-1]
     assert day["slug_changes"] == [
         {"name": "Stable", "country": "ENG", "before": [], "after": ["stable"]}]
+
+
+def test_fixtures_gap_lists_raw_dates_without_parsed_rows():
+    raw = [(date(2026, 11, 4), "1"), (date(2026, 11, 8), "6"),
+           (date(2026, 11, 10), "2"), (date(2026, 11, 9), "1")]
+    parsed = [(date(2026, 11, 9), "50")]
+    trino = Mock(execute_query=Mock(side_effect=[raw, parsed]))
+
+    report = dq.read_fixtures_gap(trino, today=date(2026, 11, 22))
+    assert report["status"] == "ok"
+    assert report["window_from"] == date(2026, 10, 23)
+    assert report["window_to_exclusive"] == date(2026, 11, 22)
+    assert report["raw_dates"] == 4
+    assert report["parsed_dates"] == 1
+    assert report["gaps"] == [
+        {"rating_date": date(2026, 11, 4), "raw_pages": 1},
+        {"rating_date": date(2026, 11, 8), "raw_pages": 6},
+        {"rating_date": date(2026, 11, 10), "raw_pages": 2},
+    ]
+
+
+def test_fixtures_gap_window_binds_completed_days_only():
+    trino = Mock(execute_query=Mock(side_effect=[[], []]))
+    dq.read_fixtures_gap(trino, today=date(2026, 11, 22))
+    raw, parsed = [call.args[0] for call in trino.execute_query.call_args_list]
+    for query in (raw, parsed):
+        assert "rating_date >= DATE '2026-10-23'" in query
+        assert "rating_date < DATE '2026-11-22'" in query
+    assert "page = '/Fixtures'" in raw
+    assert dq.RAW_PAGE_TABLE in raw
+    assert dq.FIXTURES_TABLE in parsed
+
+
+def test_fixtures_gap_accepts_iso_dates_and_int_counts():
+    trino = Mock(execute_query=Mock(side_effect=[[("2026-11-04", 2)], []]))
+    report = dq.read_fixtures_gap(trino, today=date(2026, 11, 22))
+    assert report["gaps"] == [{"rating_date": date(2026, 11, 4), "raw_pages": 2}]
+
+
+@pytest.mark.parametrize("responses, reason", [
+    ([RuntimeError("query failed")], "ошибка чтения Bronze"),
+    ([[("2026-11-04", "x")], []], "не разобран ответ Bronze"),
+    ([[("2026-11-04",)], []], "не разобран ответ Bronze"),
+    ([[("2026-11-04", "0")], []], "не разобран ответ Bronze"),
+    ([[("2026-11-04", "-1")], []], "не разобран ответ Bronze"),
+])
+def test_fixtures_gap_failures_never_raise(responses, reason):
+    trino = Mock(execute_query=Mock(side_effect=responses))
+    report = dq.read_fixtures_gap(trino, today=date(2026, 11, 22))
+    assert report["status"] == "unavailable"
+    assert report["reason"] == reason
+
+
+def test_fixtures_gap_window_without_raw_pages_is_not_green():
+    # месяц без единой raw-страницы — не «дыр нет ✅», а видимое «не посчитано» (Astra r1)
+    trino = Mock(execute_query=Mock(side_effect=[[], []]))
+    report = dq.read_fixtures_gap(trino, today=date(2026, 11, 22))
+    assert report["status"] == "unavailable"
+    assert report["reason"] == "нет raw /Fixtures за окно"
+
+
+@pytest.mark.parametrize("report, expected", [
+    ({"status": "ok", "raw_dates": 4, "gaps": [
+        {"rating_date": date(2026, 11, 4), "raw_pages": 1},
+        {"rating_date": date(2026, 11, 8), "raw_pages": 6},
+        {"rating_date": date(2026, 11, 10), "raw_pages": 2},
+    ]}, "fixtures: raw-без-parsed 3 дат — 04.11 (1), 08.11 (6), 10.11 (2)"),
+    ({"status": "ok", "raw_dates": 5, "gaps": []},
+     "fixtures: raw-без-parsed нет (5 дат с raw за 30 дн)"),
+    ({"status": "unavailable", "reason": "ошибка чтения Bronze", "gaps": []},
+     "fixtures: raw-без-parsed не посчитано — ошибка чтения Bronze"),
+])
+def test_format_fixtures_gap(report, expected):
+    assert dq.format_fixtures_gap(report) == expected

@@ -2,6 +2,7 @@
 
 No identity mapping or ingestion changes. A rating date is one observation,
 regardless of the number of four-hourly replacements of its partition.
+The same read-only approach detects /Fixtures gaps by anti-joining raw and parsed dates (#2279).
 """
 from __future__ import annotations
 
@@ -14,6 +15,12 @@ COLUMNS = (
 )
 MAX_ROWS = 20000
 TABLE = "iceberg.bronze.clubelo_rank_snapshot"
+# 30 days keeps a nonfatal parse gap visible for a month: parsed rows for a
+# missed date appear only when a later run reparse succeeds, and 04.11 was
+# already 18 days old when #2279 landed — a shorter window would hide it.
+FIXTURES_GAP_LOOKBACK_DAYS = 30
+RAW_PAGE_TABLE = "iceberg.bronze.clubelo_raw_page"
+FIXTURES_TABLE = "iceberg.bronze.clubelo_fixture"
 
 
 def analyze_snapshots(rows, *, today: date, max_age_days: int = 3):
@@ -133,3 +140,63 @@ def format_summary(report):
                      f"({format(share, '.2%') if share is not None else 'нет знаменателя'})")
         lines.append(f"  elo_delta_1d_raw: {day['delta_raw']!r}")
     return lines
+
+
+def _counts_by_date(rows):
+    """Per-date counts; a GROUP BY count(*) answer is malformed below 1 (Astra r1)."""
+    counts = Counter()
+    for day, count in rows:
+        value = int(str(count))
+        if value < 1:
+            raise ValueError(count)
+        counts[date.fromisoformat(str(day))] += value
+    return counts
+
+
+def read_fixtures_gap(trino, *, today: date) -> dict:
+    """Find completed days with a raw /Fixtures page and no parsed fixture rows."""
+    try:
+        first = today - timedelta(days=FIXTURES_GAP_LOOKBACK_DAYS)
+        window = (f"rating_date >= DATE '{first.isoformat()}' "
+                  f"AND rating_date < DATE '{today.isoformat()}'")
+        raw_rows = trino.execute_query(
+            f"SELECT cast(rating_date AS varchar), count(*) FROM {RAW_PAGE_TABLE} "
+            f"WHERE page = '/Fixtures' AND {window} GROUP BY 1"
+        )
+        parsed_rows = trino.execute_query(
+            f"SELECT cast(rating_date AS varchar), count(*) FROM {FIXTURES_TABLE} "
+            f"WHERE {window} GROUP BY 1"
+        )
+    except Exception:
+        return {"status": "unavailable", "reason": "ошибка чтения Bronze", "gaps": []}
+
+    # No raw page in the whole window is not "no gaps" (a month without a single
+    # /Fixtures fetch must stay visible), and an empty raw answer cannot be told
+    # apart from a lost one — both fail closed (Astra r1).
+    if not raw_rows:
+        return {"status": "unavailable", "reason": "нет raw /Fixtures за окно", "gaps": []}
+
+    try:
+        raw = _counts_by_date(raw_rows)
+        parsed = _counts_by_date(parsed_rows)
+    except Exception:
+        return {"status": "unavailable", "reason": "не разобран ответ Bronze", "gaps": []}
+
+    return {
+        "status": "ok", "window_from": first, "window_to_exclusive": today,
+        "raw_dates": len(raw), "parsed_dates": sum(count > 0 for count in parsed.values()),
+        "gaps": [{"rating_date": day, "raw_pages": raw[day]}
+                 for day in sorted(raw) if not parsed.get(day)],
+    }
+
+
+def format_fixtures_gap(report: dict) -> str:
+    """Format the /Fixtures gap report for the morning summary."""
+    if report["status"] != "ok":
+        return f"fixtures: raw-без-parsed не посчитано — {report['reason']}"
+    gaps = report["gaps"]
+    if not gaps:
+        return (f"fixtures: raw-без-parsed нет ({report['raw_dates']} дат с raw "
+                f"за {FIXTURES_GAP_LOOKBACK_DAYS} дн)")
+    dates = ", ".join(f"{gap['rating_date']:%d.%m} ({gap['raw_pages']})" for gap in gaps)
+    return f"fixtures: raw-без-parsed {len(gaps)} дат — {dates}"
