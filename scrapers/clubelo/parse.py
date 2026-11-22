@@ -905,9 +905,10 @@ _UTC_KICKOFF = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})Z$")
 # 02.11: a game already played when the page was built shows its status and
 # score ("FT<br/>3-1") in the date cell instead of the kick-off.
 _GAME_STATUS = re.compile(r"^(?:[A-Za-z]{1,4}|\d{1,3}(?:\+\d{1,2})?') ?\d{1,3}-\d{1,3}$")
-# Stake cells show a bound below the display precision ("<0.1") and an
-# impossible outcome as "0%" (narrow layout "⨉"): kept as text without "%".
-_STAKE_PCT = re.compile(r"^(<?\d+(?:\.\d+)?)%?$")
+# Stake cells show a bound outside the display precision — "<0.1" below it
+# and ">99.9" above it (04/08/10.11: |loss/chance; #2279) — and an impossible
+# outcome as "0%" (narrow layout "⨉"): kept as text without "%".
+_STAKE_PCT = re.compile(r"^([<>]?\d+(?:\.\d+)?)%?$")
 
 
 @dataclass
