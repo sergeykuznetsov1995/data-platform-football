@@ -250,6 +250,9 @@ class NativeWritePlan:
     roster lanes REPLACE their club-season scope (departed players leave with
     the old rows); accumulating observation and career lanes MERGE by natural
     key (a later capture adds or updates rows and never deletes the rest).
+    ``pages`` is the evidence of a multi-page replacement snapshot: every
+    walked page as (source_url, source_capture_id, captured_at), rowless ones
+    included, because a page that contributes no row still has a clock.
     """
 
     entity: str
@@ -266,6 +269,7 @@ class NativeWritePlan:
     proof: str = ''
     capture_id: str = ''
     evidence: tuple[tuple[str, str], ...] = ()
+    pages: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.table, str) or not fullmatch(r'transfermarkt_[a-z0-9_]+', self.table):
@@ -298,9 +302,11 @@ class NativeWritePlan:
                 raise ValueError('core empty plan evidence values must be non-empty')
             if not _nonempty(self.capture_id):
                 raise ValueError('core empty plan lacks its capture id')
+        object.__setattr__(self, 'pages', tuple(tuple(page) for page in self.pages))
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
+        self._check_pages()
         clock = _timestamp(self.captured_at)
         if self.rows:
             newest_at, capture_id = max(
@@ -315,6 +321,24 @@ class NativeWritePlan:
         for column in ('raw_capture_id', 'source_capture_id'):
             if evidence_map.get(column, self.capture_id) != self.capture_id:
                 raise ValueError('core plan evidence names a different capture')
+
+    def _multi_page(self) -> bool:
+        return self.write_mode == 'replace' and self.entity in _MULTI_PAGE_REPLACE_ENTITIES
+
+    def _check_pages(self) -> None:
+        if not self.pages:
+            return
+        if not self._multi_page():
+            raise ValueError('core page evidence belongs to a multi-page replacement snapshot')
+        seen = set()
+        for url, capture_id, clock in self.pages:
+            if not all(map(_nonempty, (url, capture_id, clock))) or url in seen:
+                raise ValueError('core page evidence needs distinct pages with url, capture and clock')
+            _timestamp(clock)
+            seen.add(url)
+        if any((row['source_url'], row['source_capture_id'], row['captured_at']) not in self.pages
+               for row in self.rows):
+            raise ValueError('core rows must come from a page of the snapshot evidence')
 
     def readback_sql(self) -> tuple[str, tuple]:
         """Parameterised physical read-back predicate for this plan.
@@ -336,6 +360,7 @@ class NativeWritePlan:
         keys = set(self.natural_keys) | set(self.scope_columns)
         required = keys | _REQUIRED_ROW_COLUMNS
         seen = set()
+        pages = {}
         for row in self.rows:
             if not isinstance(row, dict):
                 raise ValueError('core plan row must be a dict')
@@ -350,8 +375,12 @@ class NativeWritePlan:
                 raise ValueError('core plan row is outside its replacement scope')
             if not _nonempty(row['source_capture_id']):
                 raise ValueError('core plan row has invalid source_capture_id')
-            if self.write_mode == 'merge' and row['source_capture_id'] != self.rows[0]['source_capture_id']:
+            if not self._multi_page() and row['source_capture_id'] != self.rows[0]['source_capture_id']:
                 raise ValueError('core plan rows must share one source_capture_id')
+            if self._multi_page():
+                page = (row['source_capture_id'], row['captured_at'])
+                if pages.setdefault(row['source_url'], page) != page:
+                    raise ValueError('core snapshot allows one capture per source page')
             key = tuple(row[col] for col in self.natural_keys)
             if key in seen:
                 raise ValueError('duplicate core natural key')
@@ -371,15 +400,21 @@ class NativeWritePlan:
 
         The capture clock, write mode and observation status belong to the
         identity: two empty captures of one scope at different times are
-        different plans, not one reusable acknowledgement.
+        different plans, not one reusable acknowledgement. So is the capture
+        of a rowless plan, which has no row to name it.
         """
-        return _digest({
+        plan = {
             'entity': self.entity, 'table': self.table, 'natural_keys': self.natural_keys,
             'scope': list(zip(self.scope_columns, self.scope_values)),
             'write_mode': self.write_mode, 'captured_at': self.captured_at,
             'status': self.status, 'status_reason': self.status_reason, 'proof': self.proof,
             'rows': _sorted_rows(self.rows, self.natural_keys),
-        })
+        }
+        if self.pages:
+            plan['pages'] = self.pages
+        if not self.rows:
+            plan['capture'] = {'capture_id': self.capture_id, 'evidence': self.evidence}
+        return _digest(plan)
 
 
 def _query_rows(cursor, sql, params=None):
@@ -404,13 +439,22 @@ def _committed_clock(connection, table_sql: str, params: tuple) -> object:
 
 
 # Section lanes that observe ONE scope through several page captures per run
-# (a feed, a paged directory). Their natural key names the capture, so a merge
-# plan can only add its own capture's rows: freshness is decided per capture
-# by the same-capture replay check, never against a sibling page's newer clock.
+# (a feed, a paged directory). Their natural key names the capture clock, so
+# an older capture owns other rows than a newer sibling page: freshness is
+# decided per capture, never against the sibling's clock. What keeps such a
+# plan honest is that no other capture may already own one of its keys.
 _MULTI_CAPTURE_MERGE_ENTITIES = frozenset({
     'rumour_observations', 'referee_aggregate_observations',
 })
 _CAPTURE_KEY_COLUMNS = frozenset({'observed_at', 'source_capture_id'})
+# The attendance edition is the one replacement snapshot that spans several
+# walked pages; every other replacement is one captured page.
+_MULTI_PAGE_REPLACE_ENTITIES = frozenset({'attendance_observations'})
+
+
+def _capture_pinned(plan: NativeWritePlan) -> bool:
+    """A merge lane whose natural key names its own capture."""
+    return plan.write_mode == 'merge' and bool(_CAPTURE_KEY_COLUMNS.intersection(plan.natural_keys))
 
 
 def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
@@ -419,11 +463,11 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
     The data table proves freshness while rows exist; a proven-empty
     replacement leaves none, so the per-scope warehouse receipts carry the
     newest committed capture clock for empty scopes too. A replacement
-    snapshot is then checked page by page: its newest clock says nothing
-    about a stale page riding along on a fresh sibling.
+    snapshot is then checked page by page, rowless pages included: its newest
+    clock says nothing about a stale page riding along on a fresh sibling.
     """
-    if (plan.write_mode == 'merge' and plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES
-            and _CAPTURE_KEY_COLUMNS.intersection(plan.natural_keys)):
+    if plan.write_mode == 'merge' and plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES and _capture_pinned(plan):
+        _guard_key_owners(connection, plan)
         return
     committed = _committed_clock(
         connection,
@@ -443,13 +487,13 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
         return
     if _timestamp(committed) > _timestamp(plan.captured_at):
         raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
-    if plan.write_mode == 'replace' and plan.rows:
+    if plan.write_mode == 'replace' and (plan.rows or plan.pages):
         _guard_source_pages(connection, plan)
 
 
 def _guard_source_pages(connection, plan: NativeWritePlan) -> None:
     """Each source page the snapshot shares with the scope must not regress."""
-    planned = {}
+    planned = {url: _timestamp(clock) for url, _capture_id, clock in plan.pages}
     for row in plan.rows:
         clock, url = _timestamp(row['captured_at']), row['source_url']
         if url not in planned or planned[url] < clock:
@@ -467,6 +511,38 @@ def _guard_source_pages(connection, plan: NativeWritePlan) -> None:
     for url, clock in committed:
         if url in planned and _timestamp(clock) > planned[url]:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
+
+
+def _guard_key_owners(connection, plan: NativeWritePlan) -> None:
+    """A natural key that names its capture belongs to exactly one capture.
+
+    Two captures can share a clock (a replayed page, a re-stored body): the
+    merge would replace the other capture's observation row by row. Only the
+    varchar part of the key is bound to the query; the clock is compared here.
+    """
+    if not plan.rows:
+        return
+    keys = [column for column in plan.natural_keys if column not in _CAPTURE_KEY_COLUMNS]
+    planned = {tuple(str(row[column]) for column in keys) for row in plan.rows}
+    matches = ' OR '.join(
+        '(' + ' AND '.join(f'{column} = ?' for column in keys) + ')' for _ in plan.rows) if keys else '1 = 1'
+    params = [*plan.scope_values, plan.capture_id]
+    for row in plan.rows:
+        params.extend(row[column] for column in keys)
+    cursor = connection.cursor()
+    try:
+        rows = _query_rows(
+            cursor,
+            f"SELECT {', '.join([*keys, 'source_capture_id', 'observed_at'])} FROM {plan.full_table} "
+            f"WHERE {plan.scope_sql()} AND source_capture_id <> ? AND ({matches})",
+            tuple(params),
+        )
+    finally:
+        cursor.close()
+    for row in rows:
+        if (tuple(str(cell) for cell in row[:len(keys)]) in planned
+                and _timestamp(row[len(keys) + 1]) == _timestamp(plan.captured_at)):
+            raise RuntimeError('core natural key is owned by another capture: ' + plan.table)
 
 
 def _canonical_cell(value) -> Any:
@@ -536,24 +612,57 @@ def _rows_equal_ignoring_lineage(left, right) -> bool:
     return _rows_equal(_strip_run_lineage(left), _strip_run_lineage(right))
 
 
-def _already_written(connection, plan: NativeWritePlan) -> bool:
-    existing = _read_plan_rows(connection, plan)
+def _plan_key(plan: NativeWritePlan, row: Mapping) -> tuple:
+    return tuple(str(row[column]) for column in plan.natural_keys)
+
+
+def _by_capture(rows) -> dict:
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row['source_capture_id'], []).append(row)
+    return grouped
+
+
+def _replay_state(connection, plan: NativeWritePlan) -> str:
+    """Classify a plan against what the scope already holds.
+
+    ``written`` needs nothing, ``refresh`` is the same capture observed under
+    a new run (only lineage differs), ``pending`` still has to be written. A
+    capture that is committed with other business rows is never rewritten.
+    """
     if not plan.rows:
-        return False
+        return 'pending'
+    existing = _read_plan_rows(connection, plan)
     if plan.write_mode == 'replace':
-        # A refreshed snapshot can reuse cached pages from the preceding walk.
-        if {row.get('source_capture_id') for row in existing} != {row['source_capture_id'] for row in plan.rows}:
-            return False
-        matching = existing
-    else:
-        matching = [row for row in existing if row.get('source_capture_id') == plan.capture_id]
-    if matching and not _rows_equal(matching, plan.rows):
-        if _rows_equal_ignoring_lineage(matching, plan.rows):
-            # Same source bytes observed under a new run: rewrite the
-            # lineage instead of failing the whole bundle.
-            return False
-        raise RuntimeError('core replay differs from committed capture: ' + plan.table)
-    return bool(matching)
+        # A refreshed snapshot reuses the pages it still shares with the
+        # committed one: each of those captures keeps its own integrity.
+        committed, planned = _by_capture(existing), _by_capture(plan.rows)
+        for capture_id, rows in planned.items():
+            shared = committed.get(capture_id)
+            if shared is not None and (len(shared) != len(rows)
+                                       or not _rows_equal_ignoring_lineage(shared, rows)):
+                raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+        if committed.keys() != planned.keys():
+            return 'pending'
+        refreshed = any(not _rows_equal(committed[capture_id], planned[capture_id])
+                        for capture_id in planned)
+        return 'refresh' if refreshed else 'written'
+    if not existing:
+        return 'pending'
+    if plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES:
+        # Pages of one unit re-own rows between walks (the donor keeps the
+        # first page that lists a referee): only the keys this plan still
+        # holds are compared; the other committed rows stay the observations
+        # they were.
+        held = {_plan_key(plan, row) for row in plan.rows}
+        existing = [row for row in existing if _plan_key(plan, row) in held]
+    committed_keys = {_plan_key(plan, row) for row in existing}
+    partner = [row for row in plan.rows if _plan_key(plan, row) in committed_keys]
+    if existing and not _rows_equal(existing, partner):
+        if not _rows_equal_ignoring_lineage(existing, partner):
+            raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+        return 'refresh'
+    return 'written' if existing and len(existing) == len(plan.rows) else 'pending'
 
 
 def _uses_merge(plan: NativeWritePlan) -> bool:
@@ -610,6 +719,11 @@ def _physical_proof(connection, plan: NativeWritePlan) -> dict:
             'physical_hash': _digest([]), 'expected_rows': 0, 'status_counts': {},
         }
     persisted = _read_plan_rows(connection, plan)
+    if _uses_merge(plan) and plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES:
+        # An earlier walk may have left rows of this capture that another
+        # page owns now: this plan verifies the rows it still holds.
+        held = {_plan_key(plan, row) for row in plan.rows}
+        persisted = [row for row in persisted if _plan_key(plan, row) in held]
     if not _rows_equal(persisted, plan.rows):
         raise RuntimeError('core physical readback differs: ' + plan.table)
     if not _uses_merge(plan):
@@ -744,11 +858,16 @@ def _commit_plans(connection, writer, plans) -> list[dict]:
     execute_statement(connection.cursor(), core_receipts_ddl())
     for plan in plans:
         execute_statement(connection.cursor(), plan.ddl)
-    pending = [plan for plan in plans if not _already_written(connection, plan)]
-    for plan in pending:
-        guard_native_bundle(connection, plan)
-    for plan in pending:
-        _mutate_plan(connection, writer, plan)
+    states = [(plan, _replay_state(connection, plan)) for plan in plans]
+    for plan, state in states:
+        # A lineage-only refresh rewrites the run identity of rows that are
+        # already committed under this very capture: nothing can regress,
+        # whatever clock a sibling capture of the scope carries.
+        if state == 'pending' or (state == 'refresh' and not _capture_pinned(plan)):
+            guard_native_bundle(connection, plan)
+    for plan, state in states:
+        if state != 'written':
+            _mutate_plan(connection, writer, plan)
     return [_physical_proof(connection, plan) for plan in plans]
 
 
@@ -775,6 +894,9 @@ def write_core_bundle(
     with writer_deadline(deadline), writer_lock():
         _validate_bundle(plans, run_id, universe_version, committed_at)
         plan_hashes = [plan.plan_sha256() for plan in plans]
+        if len(set(plan_hashes)) != len(plan_hashes):
+            # One acknowledgement never stands for two plans of a bundle.
+            raise ValueError('duplicate core receipt identity across plans')
         digest = _digest({'plans': plan_hashes, 'run_id': run_id})
         batch = _batch_id_for_run(run_id)
         stored = write_journal.read_receipt(digest)

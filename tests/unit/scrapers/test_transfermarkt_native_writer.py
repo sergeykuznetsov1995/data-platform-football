@@ -1,4 +1,5 @@
 """Unit tests for the stage-B mono-native writer commit path (#2404)."""
+import hashlib
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timezone
 import json
@@ -259,10 +260,14 @@ def test_plan_validation_rejects_broken_contracts():
         NativeWritePlan(**{**base, 'rows': base['rows'] + base['rows']})
     # Stage C (#2405): a replace plan may span pages, but its declared capture
     # must be the snapshot's newest one; merges still own exactly one capture.
-    with pytest.raises(ValueError, match='newest row capture id'):
+    # Only the attendance edition snapshot spans pages (review r2 finding 3):
+    # a roster lane rejects two captures outright, merge still owns one.
+    with pytest.raises(ValueError, match='share one source_capture_id'):
         NativeWritePlan(**{**base, 'rows': (
             base['rows'][0],
             {**base['rows'][0], 'player_id': '2', 'source_capture_id': 'other'})})
+    with pytest.raises(ValueError, match='page evidence belongs to a multi-page'):
+        NativeWritePlan(**{**base, 'pages': (('u', 'c', CLOCK),)})
     with pytest.raises(ValueError, match='share one source_capture_id'):
         NativeWritePlan(**{**base, 'write_mode': 'merge', 'rows': (
             base['rows'][0],
@@ -315,29 +320,33 @@ def test_guard_refuses_older_bundle_and_accepts_equal_or_missing():
 
 # ---------------------------------------------------------------- stage-C review (#2405)
 
-ATTENDANCE_PAGE_1 = 'https://www.transfermarkt.com/x/besucherzahlen/wettbewerb/GB1/saison_id/2025'
-ATTENDANCE_PAGE_2 = ATTENDANCE_PAGE_1 + '?page=2'
-SIBLING_CLOCK = datetime(2026, 11, 21, 12, 30, 0, tzinfo=timezone.utc).isoformat()
-NEWEST = datetime(2026, 11, 21, 14, 0, 0, tzinfo=timezone.utc).isoformat()
+# SourceCapture only accepts the core's canonical microsecond clocks.
+PAGE_EARLIER = EARLIER.replace('+00:00', '.000000+00:00')
+PAGE_CLOCK = CLOCK.replace('+00:00', '.000000+00:00')
+SIBLING_CLOCK = datetime(2026, 11, 21, 12, 30, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
+NEWEST = datetime(2026, 11, 21, 14, 0, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
 
 
-def _page_snapshot(first_clock, first_capture):
-    """A replace snapshot of two source pages captured at different clocks."""
-    template = membership_plan(['1'], clock=first_clock, capture=first_capture).rows[0]
-    first = {**template, 'source_url': ATTENDANCE_PAGE_1}
-    second = {**template, 'player_id': '2', 'captured_at': SIBLING_CLOCK,
-              'source_capture_id': 'cap-2', 'raw_capture_id': 'cap-2',
-              'source_url': ATTENDANCE_PAGE_2}
-    plan = membership_plan(['1', '2'], clock=SIBLING_CLOCK, capture='cap-2')
-    return dataclasses_replace(
-        plan, rows=(first, second), capture_id='',
-        captured_at=max(first_clock, SIBLING_CLOCK))
+def _snapshot(first_clock, first_capture):
+    """An attendance edition snapshot of two pages captured at different clocks."""
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        ATTENDANCE_FIXTURES, ATTENDANCE_PAGE_2, ATTENDANCE_START, EXTRACTED_AT, _attendance_plan,
+        _capture,
+    )
+    def page(url, fixture, clock, name):
+        # A later capture of the same page has its own 64-hex capture identity.
+        return _capture(url, (ATTENDANCE_FIXTURES / fixture).read_bytes(), clock,
+                        capture_id=hashlib.sha256(name.encode()).hexdigest())
+    page_1 = page(ATTENDANCE_START, 'page_1.html', first_clock, first_capture)
+    page_2 = page(ATTENDANCE_PAGE_2, 'page_2.html', SIBLING_CLOCK, 'cap-2')
+    return _attendance_plan((page_1, page_2), EXTRACTED_AT)
 
 
 def test_guard_refuses_a_stale_page_hidden_behind_a_fresh_sibling_page():
-    plan = _page_snapshot(EARLIER, 'cap-old')
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
+    plan = _snapshot(PAGE_EARLIER, 'cap-old')
     cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
-                         pages=[(ATTENDANCE_PAGE_1, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+                         pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
     # The scope maximum equals the plan's own clock: only the per-page
     # comparison sees that page 1 would regress a fresher committed page.
@@ -346,15 +355,33 @@ def test_guard_refuses_a_stale_page_hidden_behind_a_fresh_sibling_page():
 
 
 def test_guard_accepts_equal_newer_and_unrelated_pages_of_a_snapshot():
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
     # A committed page the snapshot no longer contains is replaced by design.
     cursor = GuardCursor(
         rows=[(SIBLING_CLOCK,)],
-        pages=[(ATTENDANCE_PAGE_1, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK),
-               (ATTENDANCE_PAGE_1 + '?page=3', SIBLING_CLOCK)])
+        pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK),
+               (ATTENDANCE_START + '?page=3', SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
-    native_writer.guard_native_bundle(connection, _page_snapshot(CLOCK, 'cap-1'))
+    native_writer.guard_native_bundle(connection, _snapshot(PAGE_CLOCK, 'cap-1'))
     # A newer page 1 beside the unchanged page 2 is a legitimate refresh.
-    native_writer.guard_native_bundle(connection, _page_snapshot(NEWEST, 'cap-new'))
+    native_writer.guard_native_bundle(connection, _snapshot(NEWEST, 'cap-new'))
+
+
+def test_guard_counts_a_page_that_contributed_no_row():
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
+    plan = _snapshot(NEWEST, 'cap-new')
+    # Page 1 of the new walk is an older capture that rendered no row.
+    rowless_older = dataclasses_replace(
+        plan, rows=tuple(row for row in plan.rows if row['source_url'] == ATTENDANCE_PAGE_2),
+        captured_at=SIBLING_CLOCK, capture_id='', evidence=(),
+        pages=((ATTENDANCE_START, 'cap-rowless', PAGE_EARLIER),
+               (ATTENDANCE_PAGE_2, hashlib.sha256(b'cap-2').hexdigest(), SIBLING_CLOCK)))
+    cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
+                         pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+    connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
+    # The rows alone are fresh; the walked page 1 evidence is not.
+    with pytest.raises(StaleTransfermarktWrite):
+        native_writer.guard_native_bundle(connection, rowless_older)
 
 
 def test_guard_keeps_scope_freshness_for_clockless_merge_lanes():

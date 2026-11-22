@@ -1004,8 +1004,9 @@ def _attendance_plan(captures, extracted_at=EXTRACTED_AT):
     outcome = sections.extract_attendance_observations(
         captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
+    # The plan clock is the outcome's capture: the newest page WITH rows.
     return core.plan_for_outcome(
-        outcome, captured_at=max(capture.captured_at for capture in captures),
+        outcome, captured_at=outcome.capture.captured_at,
         scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
 
 
@@ -1696,8 +1697,11 @@ def test_snapshot_pages_come_from_one_capture_each():
     with pytest.raises(ValueError, match='one capture per source page'):
         _replace(plan, rows=(borrowed, plan.rows[1]))
     # The walk's page evidence names every page the rows came from.
-    with pytest.raises(ValueError, match='page evidence'):
+    with pytest.raises(ValueError, match='snapshot evidence'):
         _replace(plan, pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED),))
+    # A multi-page plan names the newest page's capture, or none at all.
+    with pytest.raises(ValueError, match='newest row capture id'):
+        _replace(plan, capture_id=page_1.capture_id)
 
 
 def _empty_rumour_plans(captured_at):
@@ -1742,7 +1746,8 @@ def test_bundle_rejects_two_plans_with_one_receipt_identity_before_mutation():
     with pytest.raises(ValueError, match='duplicate core receipt'):
         _write(db, [plans[0], plans[0]], run_id, RUMOUR_EXTRACTED_AT)
     assert db.sql.execute(
-        'SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 0
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'transfermarkt_core_receipts_v1'").fetchone()[0] == 0
 
 
 def _club_value_plans(fixture, stichtag, captured_at, extracted_at):

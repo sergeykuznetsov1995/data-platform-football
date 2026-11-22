@@ -117,7 +117,9 @@ def extract_attendance_observations(
         context['capture'] = max(
             (capture for capture in captures if capture.capture_id in contributing),
             key=lambda capture: (capture.captured_at, capture.capture_id))
-    return _outcome(entity, result.status, reason, tuple(rows), **context)
+    # Every walked page keeps its own clock, the rowless ones included.
+    pages = tuple((capture.url, capture.capture_id, capture.captured_at) for capture in captures)
+    return _outcome(entity, result.status, reason, tuple(rows), pages=pages, **context)
 
 
 def extract_representation_observations(

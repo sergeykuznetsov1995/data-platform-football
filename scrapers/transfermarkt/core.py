@@ -409,6 +409,9 @@ class LaneOutcome:
     # The requested target inside a scope that may hold several; a failed
     # request keeps no capture to tell its targets apart in DQ.
     subject: str = ''
+    # Every walked page of a multi-page snapshot as (source_url, capture_id,
+    # captured_at): a page that contributes no row still has a clock.
+    pages: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.entity not in CORE_ENTITIES:
@@ -426,6 +429,17 @@ class LaneOutcome:
             raise CoreParseError('unexpected_proof')
         if not _status_matches_rows(self.entity, self.status, self.rows):
             raise CoreParseError('status_rows_mismatch')
+        pages = tuple(tuple(page) for page in self.pages)
+        object.__setattr__(self, 'pages', pages)
+        if (any(not all(map(_nonempty, page)) for page in pages)
+                or len({page[0] for page in pages}) != len(pages)):
+            raise CoreParseError('invalid_page_evidence')
+        for page in pages:
+            canonical_timestamp(page[2])
+        if self.capture is not None and pages and not any(
+                page[1] == self.capture.capture_id and page[2] == self.capture.captured_at
+                and page[0] == self.capture.url for page in pages):
+            raise CoreParseError('capture_outside_page_evidence')
         if any(
             row.get('parser_revision', self.parser_revision) != self.parser_revision
             or row.get('schema_revision', self.schema_revision) != self.schema_revision
@@ -729,7 +743,7 @@ def plan_for_outcome(
         status=outcome.status, status_reason=outcome.status_reason,
         proof=outcome.proof or '',
         capture_id=capture.capture_id if capture is not None else '',
-        evidence=evidence,
+        evidence=evidence, pages=outcome.pages,
     )
 
 
