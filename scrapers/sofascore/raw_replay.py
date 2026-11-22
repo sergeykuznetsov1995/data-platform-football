@@ -546,10 +546,12 @@ def _snapshot_tournament_admitted(row: Mapping[str, object]) -> bool:
     classification = row.get("classification")
     if not isinstance(classification, Mapping):
         return False
+    status = classification.get("status")
     if (
         classification.get("sport") != "football"
         or classification.get("gender") != "male"
-        or classification.get("status") in {None, "unknown", "excluded"}
+        or not isinstance(status, str)
+        or status in {"unknown", "excluded"}
         or classification.get("exclusion_reasons")
     ):
         return False

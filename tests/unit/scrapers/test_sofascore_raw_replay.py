@@ -1061,3 +1061,18 @@ def test_exact_scope_registry_season_error_is_not_displaced():
         )
 
     assert manager.calls == []
+
+
+def test_snapshot_pairs_skip_malformed_classification_status():
+    """Review r2: a non-string classification.status must not abort the
+    bulk enumeration with a TypeError — the row is simply not admitted."""
+    from scrapers.sofascore.raw_replay import snapshot_replay_scope_pairs
+
+    document = _snapshot_document()
+    document["tournaments"][0]["classification"]["status"] = ["weird"]
+
+    pairs = snapshot_replay_scope_pairs(
+        document, registry_tournament_ids(_fake_catalog())
+    )
+
+    assert pairs == ()
