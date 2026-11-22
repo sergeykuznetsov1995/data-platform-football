@@ -649,6 +649,50 @@ def test_fields_replay_end_to_end_is_zero_source_and_idempotent(
             assert call["df"].equals(previous), table
 
 
+def test_fields_replay_publishes_rounds_shaped_cup_trees(tmp_path, monkeypatch):
+    """#1367: the World Cup rounds/blocks payload replays into the table.
+
+    The block rows carry round context and the merged standalone roles —
+    the exact shape the WC-2026 partition needs after the parser gap fix.
+    """
+    from dags.scripts.replay_sofascore_raw import run_replay_scope
+
+    rounds_body = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "sofascore_cup_trees_rounds_shape.json"
+    ).read_bytes()
+    seed, records = _seed_replay_scope(
+        tmp_path,
+        mode="fields",
+        payload_overrides={"cup_trees": rounds_body},
+    )
+    runtime, transport = _fresh_replay_runtime(seed, tmp_path)
+    scraper, saved = _patch_replay_writers(monkeypatch)
+
+    result = run_replay_scope(
+        ("17", "76986", "final"),
+        mode="fields",
+        capture_runtime=runtime,
+        records=records,
+    )
+
+    assert result["errors"] == []
+    assert transport.calls == 0
+    assert result["phases"]["season"]["report"]["cup_trees_rows"] == 4
+    cup = saved["sofascore_cup_trees"][0]["df"]
+    assert list(cup["node_id"]) == [
+        "2585779",
+        "2585780",
+        "2585775",
+        "2585806",
+    ]
+    assert list(cup["block_kind"]) == ["round", "round", "final", "third_place"]
+    final_row = cup[cup["node_id"] == "2585775"].iloc[0]
+    assert final_row["round_description"] == "Final"
+    assert final_row["participants_json"] != "[]"
+
+
 def test_drain_replays_match_players_and_season_without_squads_table(
     tmp_path, monkeypatch
 ):

@@ -167,13 +167,162 @@ def _collect_cup_tree_node(
     return None
 
 
+def _canonical_list(
+    block: Mapping[str, Any], field: str, where: str
+) -> str:
+    """Canonical JSON of an optional list field; ``[]`` only for null/absent.
+
+    A malformed non-list value (object, scalar) raises instead of silently
+    encoding as a JSON object/number — a scalar ``events`` id must not
+    masquerade as an empty list (#1367 review adjudication).
+    """
+    value = block.get(field)
+    if value is None:
+        return "[]"
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{where}: field {field!r} must be a list, "
+            f"got {type(value).__name__}"
+        )
+    return _canonical_json(value)
+
+
+def _collect_cup_tree_block(
+    rows: list[dict[str, Any]],
+    visited: set[tuple[str, str]],
+    rows_by_node: dict[str, dict[str, Any]],
+    block: Any,
+    *,
+    cup_tree_id: str,
+    source_tournament_id: str,
+    source_season_id: str,
+    where: str,
+    block_kind: str,
+    round_context: Mapping[str, Any] | None = None,
+) -> None:
+    """Append one row per bracket block of a rounds-shaped cup tree.
+
+    ``node_id`` is the block id — blocks ARE the bracket nodes in the
+    rounds/blocks payload shape (World Cup 2026).  A standalone match block
+    (``finalMatchCupBlock``/``thirdPlaceMatchCupBlock``) repeating a round
+    block's id does NOT drop its explicit role onto the floor: the existing
+    round row keeps its round context and takes the standalone
+    ``block_kind`` (#1367 review adjudication).
+    """
+    _required_mapping(block, where)
+    node_id = _required_id(block, "id", where)
+    if (cup_tree_id, node_id) in visited:
+        existing = rows_by_node.get(node_id)
+        if existing is not None and block_kind in ("final", "third_place"):
+            existing["block_kind"] = block_kind
+        return
+    visited.add((cup_tree_id, node_id))
+    row = {
+        "cup_tree_id": cup_tree_id,
+        "node_id": node_id,
+        "source_tournament_id": source_tournament_id,
+        "source_season_id": source_season_id,
+        "block_kind": block_kind,
+    }
+    if round_context is not None:
+        row.update(round_context)
+    _auto_flatten(block, row)
+    row["parent_node_id"] = None
+    row["children_json"] = "[]"
+    row["participants_json"] = _canonical_list(block, "participants", where)
+    row["events_json"] = _canonical_list(block, "events", where)
+    rows.append(row)
+    rows_by_node[node_id] = row
+    return None
+
+
+def _collect_rounds_shaped_tree(
+    tree: Mapping[str, Any],
+    rows: list[dict[str, Any]],
+    visited: set[tuple[str, str]],
+    rows_by_node: dict[str, dict[str, Any]],
+    *,
+    cup_tree_id: str,
+    source_tournament_id: str,
+    source_season_id: str,
+    tree_where: str,
+) -> None:
+    rounds = tree.get("rounds")
+    if rounds is None:
+        rounds = []
+    if not isinstance(rounds, list):
+        raise ValueError(
+            f"{tree_where}: field 'rounds' must be a list, "
+            f"got {type(rounds).__name__}"
+        )
+    for round_index, round_item in enumerate(rounds):
+        round_where = f"{tree_where}.rounds[{round_index}]"
+        _required_mapping(round_item, round_where)
+        round_id = _required_id(round_item, "id", round_where)
+        round_context = {
+            "round_id": round_id,
+            "round_order": round_item.get("order"),
+            "round_description": round_item.get("description"),
+            "round_type": round_item.get("type"),
+        }
+        blocks = round_item.get("blocks")
+        if blocks is None:
+            blocks = []
+        if not isinstance(blocks, list):
+            raise ValueError(
+                f"{round_where}: field 'blocks' must be a list, "
+                f"got {type(blocks).__name__}"
+            )
+        for block_index, block in enumerate(blocks):
+            _collect_cup_tree_block(
+                rows,
+                visited,
+                rows_by_node,
+                block,
+                cup_tree_id=cup_tree_id,
+                source_tournament_id=source_tournament_id,
+                source_season_id=source_season_id,
+                where=f"{round_where}.blocks[{block_index}]",
+                block_kind="round",
+                round_context=round_context,
+            )
+    for field, kind in (
+        ("finalMatchCupBlock", "final"),
+        ("thirdPlaceMatchCupBlock", "third_place"),
+    ):
+        block = tree.get(field)
+        if block is None:
+            continue
+        _collect_cup_tree_block(
+            rows,
+            visited,
+            rows_by_node,
+            block,
+            cup_tree_id=cup_tree_id,
+            source_tournament_id=source_tournament_id,
+            source_season_id=source_season_id,
+            where=f"{tree_where}.{field}",
+            block_kind=kind,
+        )
+    return None
+
+
 def parse_cup_trees(
     payload: Mapping[str, Any],
     *,
     source_tournament_id: Any,
     source_season_id: Any,
 ) -> list[dict[str, Any]]:
-    """Parse the season ``cup-trees`` payload into one row per bracket node."""
+    """Parse the season ``cup-trees`` payload into one row per bracket node.
+
+    Two payload shapes (#1367): the ``nodes`` tree (league cups; nested
+    nodes with ``children``) and the ``rounds``/blocks tree (World Cup
+    2026; one block per match plus standalone final/third-place blocks —
+    the blocks are the bracket nodes, so each becomes one row under the
+    same ``(cup_tree_id, node_id)`` natural key).  A tree carrying a
+    non-empty ``nodes`` list keeps the nodes branch byte-for-byte; the
+    blocks branch only runs when ``nodes`` is absent or empty.
+    """
     endpoint = "cup_trees"
     data = _payload_object(payload, endpoint)
     source_tournament = str(source_tournament_id)
@@ -189,17 +338,29 @@ def parse_cup_trees(
             nodes = []
         if not isinstance(nodes, list):
             raise ValueError(f"{tree_where}: field 'nodes' must be a list, got {type(nodes).__name__}")
-        for node_index, node in enumerate(nodes):
-            _collect_cup_tree_node(
-                rows,
-                visited,
-                node,
-                cup_tree_id=cup_tree_id,
-                parent_node_id=None,
-                source_tournament_id=source_tournament,
-                source_season_id=source_season,
-                where=f"{tree_where}.nodes[{node_index}]",
-            )
+        if nodes:
+            for node_index, node in enumerate(nodes):
+                _collect_cup_tree_node(
+                    rows,
+                    visited,
+                    node,
+                    cup_tree_id=cup_tree_id,
+                    parent_node_id=None,
+                    source_tournament_id=source_tournament,
+                    source_season_id=source_season,
+                    where=f"{tree_where}.nodes[{node_index}]",
+                )
+            continue
+        _collect_rounds_shaped_tree(
+            tree,
+            rows,
+            visited,
+            {},
+            cup_tree_id=cup_tree_id,
+            source_tournament_id=source_tournament,
+            source_season_id=source_season,
+            tree_where=tree_where,
+        )
     assert_natural_keys(rows, ("cup_tree_id", "node_id"))
     return rows
 
