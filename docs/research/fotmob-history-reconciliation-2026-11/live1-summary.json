@@ -1,0 +1,12 @@
+{
+  "pairs": 1813,
+  "by_outcome": {
+    "confirmed_empty": 27,
+    "advertised_not_started": 11,
+    "insufficient_evidence": 14,
+    "no_observation_in_verified_slice": 1761
+  },
+  "manifest_watermark_max_observed_at": "2026-11-22 01:12:31.292000",
+  "manifest_pairs": 52,
+  "source_gap_pairs": 0
+}

@@ -1,0 +1,26 @@
+{
+  "domains": {
+    "leaderboard_categories": {
+      "declared_absent": 200,
+      "not_declared": 1560,
+      "present": 2019
+    },
+    "playoff_brackets": {
+      "not_declared": 2558,
+      "present": 1221
+    },
+    "season_stages": {
+      "not_declared": 3779
+    },
+    "season_teams": {
+      "not_declared": 26,
+      "present": 3753
+    },
+    "standings": {
+      "not_declared": 1760,
+      "present": 2019
+    }
+  },
+  "manifest_pairs": 3779,
+  "observed_pairs": 3779
+}

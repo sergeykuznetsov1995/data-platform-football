@@ -1,0 +1,184 @@
+{
+  "astra_rounds": [
+    {
+      "defects_accepted": [
+        "интерпретация never_requested",
+        "правило advertised_not_started по max kickoff"
+      ],
+      "round": 1,
+      "run": "2255-astra-verify-v1/runs/1a3f7f5e70c84776bd271058ff889658",
+      "status": "gate: failed (mcp_tool_call запрещён); вердикт использован как advisory"
+    },
+    {
+      "round": 2,
+      "run": "2255-astra-verify-v2/runs/f1a9fdd1ce074b6fac90a9d10dad1755",
+      "status": "completed (гейт чистый)",
+      "verdicts": {
+        "1_arithmetic": "CONFIRMED",
+        "2_fixes": "CONFIRMED",
+        "3_spotcheck": "DEFECT — 47/2023/2024 принят и исправлен (r3)",
+        "4_repair_list": "DEFECT — per-match декомпозиция 8829 = следующий шаг",
+        "5_domains": "UNVERIFIABLE — приоритет: leaderboards/stages/standings/playoffs offline, затем teams/players, transfers",
+        "6_publication": "DEFECT — реестр доказательств добавлен в паспорт (r3)"
+      }
+    }
+  ],
+  "boundaries": [
+    "1761 gap_candidate_no_observation — кандидаты в проверенном срезе; полнота журнала v1-эры и retention манифеста не проверены; в repair не включаются",
+    "домены leaderboards/stages/standings/playoffs/teams/players/transfers и критерий daily-долга не проверены — отдельные шаги",
+    "advertised_not_started (11): остаточный риск неполных/устаревших календарей и NULL kickoff",
+    "8829 actionable — агрегат по 146 парам; per-match_id адресный список — до любого repair"
+  ],
+  "denominator": {
+    "formula": "первые 10 source_order ∪ start>=2010 (policy fotmob-owner-scope-2026-11-14-v2-friendlies-included)",
+    "required_pairs": 5540,
+    "sha256": "0296c2f79c42dc8258b2917baaec7d8efe4f25478c68f4cb7ae782813242a449",
+    "source": "docs/research/fotmob-scope-2026-11-14/scope-registry.csv",
+    "tournaments": 452
+  },
+  "evidence_generations": [
+    {
+      "made_current_at": "2026-11-21 19:08..20:53 UTC",
+      "name": "#2302 recount (scope-summary + marker-results)",
+      "paths": [
+        ".local/tasks/2302-audit-recount/report/scope-summary.csv",
+        ".local/tasks/2302-audit-recount/report/marker-results.csv"
+      ],
+      "snapshots": {
+        "c1": "3677059621392830669",
+        "manifest": "6392235734914281821",
+        "matches": "7096738123652429000",
+        "payloads": "5610187574808996316"
+      }
+    },
+    {
+      "name": "#2301 cross-scope edition mapping",
+      "path": ".local/tasks/2301-division-cards/cross-scope-audit.json"
+    },
+    {
+      "name": "старая очередь #1294 (хвост)",
+      "path": ".local/tasks/2302-audit-recount/report/historical-1294-results.csv"
+    }
+  ],
+  "final_outcomes_r3": {
+    "advertised_not_started": 11,
+    "confirmed": 3551,
+    "confirmed_empty": 57,
+    "confirmed_gap": 146,
+    "gap_candidate_no_observation": 1761,
+    "insufficient_evidence": 14,
+    "proven_not_applicable": 0
+  },
+  "live_step": {
+    "comparison_now": "2026-11-22 07:18:16.050000+00:00",
+    "kickoff_comparison_now": "2026-11-22 07:25:53.088 UTC (авторитетный, последний прогон)",
+    "manifest_watermark_max_observed_at": "2026-11-22 01:12:31.292000",
+    "now_observations_all_runs": [
+      "2026-11-22 07:18:16.050 UTC (r1, отвергнут)",
+      "2026-11-22 07:22:28.331 UTC (r2)",
+      "2026-11-22 07:25:53.088 UTC (r3, итоговый)"
+    ],
+    "query_count": 61,
+    "query_ids": [
+      "20261122_071816_21132_3qvg9",
+      "20261122_071817_21135_3qvg9",
+      "20261122_071819_21138_3qvg9",
+      "20261122_071821_21141_3qvg9",
+      "20261122_071823_21145_3qvg9",
+      "20261122_071825_21148_3qvg9",
+      "20261122_071827_21151_3qvg9",
+      "20261122_071829_21154_3qvg9",
+      "20261122_071831_21157_3qvg9",
+      "20261122_071833_21160_3qvg9",
+      "20261122_071835_21164_3qvg9",
+      "20261122_071837_21167_3qvg9",
+      "20261122_071839_21170_3qvg9",
+      "20261122_071841_21176_3qvg9",
+      "20261122_071843_21180_3qvg9",
+      "20261122_071845_21183_3qvg9",
+      "20261122_071847_21186_3qvg9",
+      "20261122_071849_21189_3qvg9",
+      "20261122_071851_21192_3qvg9",
+      "20261122_071853_21196_3qvg9",
+      "20261122_071855_21199_3qvg9",
+      "20261122_071857_21202_3qvg9",
+      "20261122_071859_21207_3qvg9",
+      "20261122_071900_21210_3qvg9",
+      "20261122_071902_21217_3qvg9",
+      "20261122_071904_21222_3qvg9",
+      "20261122_071906_21227_3qvg9",
+      "20261122_071908_21232_3qvg9",
+      "20261122_071911_21235_3qvg9",
+      "20261122_071912_21239_3qvg9",
+      "20261122_071914_21242_3qvg9",
+      "query_id",
+      "20261122_072228_21350_3qvg9",
+      "20261122_072230_21351_3qvg9",
+      "20261122_072231_21352_3qvg9",
+      "20261122_072233_21353_3qvg9",
+      "20261122_072235_21354_3qvg9",
+      "20261122_072237_21355_3qvg9",
+      "20261122_072239_21356_3qvg9",
+      "20261122_072241_21357_3qvg9",
+      "20261122_072243_21358_3qvg9",
+      "20261122_072244_21359_3qvg9",
+      "20261122_072246_21360_3qvg9",
+      "20261122_072248_21361_3qvg9",
+      "20261122_072250_21362_3qvg9",
+      "20261122_072251_21363_3qvg9",
+      "20261122_072253_21364_3qvg9",
+      "20261122_072254_21365_3qvg9",
+      "20261122_072256_21366_3qvg9",
+      "20261122_072258_21367_3qvg9",
+      "20261122_072300_21368_3qvg9",
+      "20261122_072302_21374_3qvg9",
+      "20261122_072305_21376_3qvg9",
+      "20261122_072307_21377_3qvg9",
+      "20261122_072309_21378_3qvg9",
+      "20261122_072310_21380_3qvg9",
+      "20261122_072312_21381_3qvg9",
+      "20261122_072314_21382_3qvg9",
+      "20261122_072316_21384_3qvg9",
+      "20261122_072318_21388_3qvg9",
+      "20261122_072320_21394_3qvg9",
+      "20261122_072322_21396_3qvg9",
+      "20261122_072324_21397_3qvg9"
+    ],
+    "run_tag": "fotmob:2255:live1",
+    "sql_and_scripts": {
+      "build_recon_v1.py": "7bc54860ccf07f05c301a8db834e932bd055c6c2bb6af3a3cc56f6c3419ce759",
+      "live_classify.py": "b18efee3c73fcaf171c80c773c547a5a976edd3ef8e86bd4b001dfc5a5e1da2e",
+      "merge_v1.py": "0e577e9e9bd8b4677ecf564691e19a65ef5526310f3b24b2a0002bf91561bbb7"
+    },
+    "transport": "docker exec airflow-scheduler, src_fotmob, SELECT-only, query_max_run_time 25s"
+  },
+  "next_steps": [
+    "per-match_id декомпозиция 8829 из current-id-evidence.csv (#2302 pass1) с воспроизведением суммы до дедупа",
+    "offline сверка leaderboards/stages/standings/playoffs по срезам #2302",
+    "teams/players terminal outcomes, transfers — offline по сохранённым наблюдениям",
+    "daily-долг: параллельно при разборе 8829",
+    "публикация отчёта v1 в docs/research после per-match декомпозиции"
+  ],
+  "outputs": {
+    "by_competition": "recon-draft-by-competition.csv (452)",
+    "pairs": "recon-draft-pairs.csv (5540 строк)",
+    "summary": "recon-draft-summary.json"
+  },
+  "pending_domains": [
+    "leaderboards",
+    "stages/standings/playoffs applicability",
+    "teams/players terminal outcomes",
+    "transfers",
+    "daily-debt control walk"
+  ],
+  "reconciliation_version": "fotmob-2255-recon-v1+live1-r3",
+  "rules": {
+    "advertised_not_started": "MIN(utc_time) > now() AND n_finished=0",
+    "confirmed_empty": "expected_matches=0 при success/not_modified, либо offline sentinel-исходы",
+    "confirmed_gap": "actionable_gap>0 (offline) или expected>0 при нулевом сборе (live)",
+    "mixed_window_insufficient": "MIN(utc_time) <= now() AND n_finished=0 (прошедший матч без финального статуса не исключён)",
+    "no_observation": "нет league_season-наблюдения и строк матчей в проверенном срезе; кандидат, не доказанный долг",
+    "rules_version": "fotmob-2255-recon-v1-rules-astra-2c78bf26 (поправки r2: first_kickoff, no_observation)"
+  },
+  "schema": "fotmob.2255-reconciliation.passport.v1"
+}

@@ -1,0 +1,22 @@
+{
+  "team_snapshots": {
+    "query_id": "20261122_120059_28668_3qvg9",
+    "distinct_or_count": 9104,
+    "max_observed_at": "2026-11-22 11:26:13.264819"
+  },
+  "player_snapshots": {
+    "query_id": "20261122_120106_28675_3qvg9",
+    "distinct_or_count": 88082,
+    "max_observed_at": "2026-11-01 18:55:28.798445"
+  },
+  "squad_snapshots": {
+    "query_id": "20261122_120110_28679_3qvg9",
+    "distinct_or_count": 3406,
+    "max_observed_at": "2026-11-22 11:19:35.084263"
+  },
+  "transfer_events": {
+    "query_id": "20261122_120115_28681_3qvg9",
+    "distinct_or_count": 975148,
+    "max_observed_at": "2026-11-21 00:18:32.592880"
+  }
+}
