@@ -19,11 +19,36 @@ from . import (
 )
 
 
+# An empty outcome has no row to carry the lane's revisions, yet its receipt
+# must stay attributable: every lane outcome names them itself.
+_REVISIONS = {
+    'attendance_observations': (
+        attendance.ATTENDANCE_PARSER_REVISION, attendance.ATTENDANCE_SCHEMA_REVISION),
+    'club_value_observations': (
+        club_values.CLUB_VALUE_PARSER_REVISION, club_values.CLUB_VALUE_SCHEMA_REVISION),
+    'achievement_observations': (
+        achievements.ACHIEVEMENT_PARSER_REVISION, str(achievements.ACHIEVEMENT_SCHEMA_REVISION)),
+    'rumour_observations': (rumours.PARSER_VERSION, rumours.SCHEMA_VERSION),
+    'referee_aggregate_observations': (
+        referees.REFEREE_PARSER_REVISION, referees.REFEREE_SCHEMA_REVISION),
+    'referee_profiles': (referees.REFEREE_PARSER_REVISION, referees.REFEREE_SCHEMA_REVISION),
+    'player_representation_observations': (
+        representation.REPRESENTATION_PARSER_REVISION, representation.REPRESENTATION_SCHEMA_REVISION),
+}
+
+
+def _outcome(entity, status, reason, rows=(), proof=None, **context) -> core.LaneOutcome:
+    parser_revision, schema_revision = _REVISIONS[entity]
+    return core.LaneOutcome(
+        entity, status, reason, rows, proof=proof, parser_revision=parser_revision,
+        schema_revision=schema_revision, **context)
+
+
 def _unavailable_capture(section: str, entity: str, capture: core.SourceCapture,
                          scope: core.ScopeContext, extracted_at: str, universe_version: str):
     """A non-200 body is transport evidence, never section content."""
     context = core._context(capture, scope, extracted_at, universe_version)
-    return core.LaneOutcome(entity, 'unavailable', f'{section}:http_{capture.status_code}', **context)
+    return _outcome(entity, 'unavailable', f'{section}:http_{capture.status_code}', **context)
 
 
 def extract_attendance_observations(
@@ -58,9 +83,9 @@ def extract_attendance_observations(
             pages, start_url=start_url, competition_id=competition_id, edition_id=edition_id,
         )
     except attendance.AttendanceParseError as exc:
-        return core.LaneOutcome(entity, 'error', 'attendance:' + exc.reason, **context)
+        return _outcome(entity, 'error', 'attendance:' + exc.reason, **context)
     except (ValueError, OverflowError):
-        return core.LaneOutcome(entity, 'error', 'attendance:invalid_source_data', **context)
+        return _outcome(entity, 'error', 'attendance:invalid_source_data', **context)
 
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context['capture'] = newest
@@ -90,7 +115,7 @@ def extract_attendance_observations(
         context['capture'] = max(
             (capture for capture in captures if capture.capture_id in contributing),
             key=lambda capture: (capture.captured_at, capture.capture_id))
-    return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)
+    return _outcome(entity, result.status, reason, tuple(rows), **context)
 
 
 def extract_representation_observations(
@@ -124,7 +149,7 @@ def extract_representation_observations(
         status = assertion.observation_status
         row_reason = 'representation:' + assertion.status_reason
         if status == 'error':
-            outcomes.append(core.LaneOutcome(entity, status, row_reason, **player_context))
+            outcomes.append(_outcome(entity, status, row_reason, **player_context))
             continue
         if status == 'assigned':
             status = 'observed_present'
@@ -145,7 +170,7 @@ def extract_representation_observations(
             parser_revision=representation.REPRESENTATION_PARSER_REVISION,
             schema_revision=representation.REPRESENTATION_SCHEMA_REVISION, **player_context,
         )
-        outcomes.append(core.LaneOutcome(entity, status, reason, (row,), **player_context))
+        outcomes.append(_outcome(entity, status, reason, (row,), **player_context))
     return tuple(outcomes)
 
 
@@ -178,15 +203,15 @@ def extract_referee_directory_observations(
             pages, expected_page_count=len(pages), **directory,
         )
     except referees.RefereeParseError as exc:
-        return (core.LaneOutcome(entity, 'error', 'referees:' + exc.reason, **context),)
+        return (_outcome(entity, 'error', 'referees:' + exc.reason, **context),)
     except ValueError as exc:
-        return (core.LaneOutcome(entity, 'error', 'referees:' + (str(exc) or 'invalid_source_data'), **context),)
+        return (_outcome(entity, 'error', 'referees:' + (str(exc) or 'invalid_source_data'), **context),)
 
     if not result.aggregates:
         if result.completeness_proof:
             proof = 'referees:' + result.completeness_proof
-            return (core.LaneOutcome(entity, 'observed_empty', proof, proof=proof, **context),)
-        return (core.LaneOutcome(entity, 'error', 'referees:completeness_proof_missing', **context),)
+            return (_outcome(entity, 'observed_empty', proof, proof=proof, **context),)
+        return (_outcome(entity, 'error', 'referees:completeness_proof_missing', **context),)
 
     rows_by_page = [[] for _ in captures]
     for aggregate in result.aggregates:
@@ -200,7 +225,7 @@ def extract_referee_directory_observations(
             parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
         ))
     return tuple(
-        core.LaneOutcome(entity, 'observed_present', 'referees:page', tuple(rows),
+        _outcome(entity, 'observed_present', 'referees:page', tuple(rows),
                          **core._context(capture, scope, extracted_at, universe_version))
         for capture, rows in zip(captures, rows_by_page) if rows
     )
@@ -221,9 +246,9 @@ def extract_referee_profile_observations(
     try:
         profile = referees.parse_referee_profile(capture.text, referee_id=referee_id)
     except referees.RefereeParseError as exc:
-        return core.LaneOutcome(entity, 'error', 'referees:' + exc.reason, **context)
+        return _outcome(entity, 'error', 'referees:' + exc.reason, **context)
     except UnicodeDecodeError:
-        return core.LaneOutcome(entity, 'error', 'referees:invalid_utf8', **context)
+        return _outcome(entity, 'error', 'referees:invalid_utf8', **context)
 
     reason = 'referees:profile'
     values = profile.as_dict()
@@ -233,7 +258,7 @@ def extract_referee_profile_observations(
         parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
         **context,
     )
-    return core.LaneOutcome(entity, 'observed_present', reason, (row,), **context)
+    return _outcome(entity, 'observed_present', reason, (row,), **context)
 
 
 def extract_rumour_observations(
@@ -268,13 +293,13 @@ def extract_rumour_observations(
         )
         feed = rumour_observations.RumourFeedExtraction(pages)
     except rumours.RumourParseError as exc:
-        return (core.LaneOutcome(entity, 'error', 'rumours:' + exc.reason, **context),)
+        return (_outcome(entity, 'error', 'rumours:' + exc.reason, **context),)
     except ValueError:
-        return (core.LaneOutcome(entity, 'error', 'rumours:invalid_source_data', **context),)
+        return (_outcome(entity, 'error', 'rumours:invalid_source_data', **context),)
 
     by_id = {capture.capture_id: capture for capture in captures}
     if all(page.capture.status == 'observed_empty' for page in feed.pages):
-        return (core.LaneOutcome(entity, 'observed_empty', 'rumours:empty_grid',
+        return (_outcome(entity, 'observed_empty', 'rumours:empty_grid',
                                  proof='rumours:confirmed_empty_grid', **context),)
     outcomes = []
     for page in feed.pages:
@@ -294,11 +319,11 @@ def extract_rumour_observations(
                 observation_status='observed_present', status_reason='rumours:row',
                 parser_revision=rumours.PARSER_VERSION, schema_revision=rumours.SCHEMA_VERSION,
             ))
-        outcomes.append(core.LaneOutcome(
+        outcomes.append(_outcome(
             entity, 'observed_present', 'rumours:page', tuple(rows),
             **core._context(by_id[page.raw_capture_id], scope, extracted_at, universe_version)))
     if not outcomes:
-        return (core.LaneOutcome(entity, 'unknown', 'rumours:unresolved', **context),)
+        return (_outcome(entity, 'unknown', 'rumours:unresolved', **context),)
     return tuple(outcomes)
 
 
@@ -321,11 +346,11 @@ def extract_club_value_observations(
         )
         extraction = club_values.parse_club_values(capture.text, club_capture)
     except club_values.ClubValueParseError as exc:
-        return (core.LaneOutcome(entity, 'error', 'club_values:' + exc.reason, **context),)
+        return (_outcome(entity, 'error', 'club_values:' + exc.reason, **context),)
     except UnicodeDecodeError:
-        return (core.LaneOutcome(entity, 'error', 'club_values:invalid_utf8', **context),)
+        return (_outcome(entity, 'error', 'club_values:invalid_utf8', **context),)
     except (ValueError, TypeError, ArithmeticError, RecursionError):
-        return (core.LaneOutcome(entity, 'error', 'club_values:invalid_source_data', **context),)
+        return (_outcome(entity, 'error', 'club_values:invalid_source_data', **context),)
 
     by_club = {}
     for point in extraction.rows:
@@ -345,7 +370,7 @@ def extract_club_value_observations(
             status, reason = 'explicit_none', 'club_rows_explicit_none'
         else:
             status, reason = 'unknown', 'club_rows_unresolved'
-        outcomes.append(core.LaneOutcome(entity, status, 'club_values:' + reason, tuple(rows), **context))
+        outcomes.append(_outcome(entity, status, 'club_values:' + reason, tuple(rows), **context))
     return tuple(outcomes)
 
 
@@ -367,16 +392,16 @@ def extract_achievement_observations(
         source = capture.text if recipient_type == 'coach' else json.loads(capture.text)
     except (ValueError, RecursionError):
         reason = 'achievements:invalid_utf8' if recipient_type == 'coach' else 'achievements:invalid_json'
-        return core.LaneOutcome(entity, 'error', reason, **context)
+        return _outcome(entity, 'error', reason, **context)
     try:
         result = achievements.parse_achievements(source, recipient_type=recipient_type, recipient_id=recipient_id)
     except achievements.AchievementParseError as exc:
-        return core.LaneOutcome(entity, 'error', 'achievements:' + exc.reason, **context)
+        return _outcome(entity, 'error', 'achievements:' + exc.reason, **context)
     except (ParserRejectedMarkup, ValueError, RecursionError):
-        return core.LaneOutcome(entity, 'error', 'achievements:invalid_source_data', **context)
+        return _outcome(entity, 'error', 'achievements:invalid_source_data', **context)
 
     if result.status == 'observed_empty':
-        return core.LaneOutcome(entity, result.status, 'achievements:empty_collection',
+        return _outcome(entity, result.status, 'achievements:empty_collection',
                                 proof=f'achievements:empty_collection:{recipient_type}', **context)
 
     reason = 'achievements:row'
@@ -390,4 +415,4 @@ def extract_achievement_observations(
             parser_revision=achievements.ACHIEVEMENT_PARSER_REVISION,
             schema_revision=str(achievements.ACHIEVEMENT_SCHEMA_REVISION), **context,
         ))
-    return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)
+    return _outcome(entity, result.status, reason, tuple(rows), **context)

@@ -1204,7 +1204,7 @@ def test_populated_outcome_names_the_revision_of_its_rows():
     # An outcome cannot claim a revision its rows do not carry.
     with pytest.raises(CoreParseError, match='revision'):
         LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
-                    ({'observation_status': 'observed_present', 'parser_revision': 'other-v9'}),
+                    ({'observation_status': 'observed_present', 'parser_revision': 'other-v9'},),
                     parser_revision=attendance.ATTENDANCE_PARSER_REVISION,
                     **_outcome_context())
 

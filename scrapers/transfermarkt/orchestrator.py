@@ -301,6 +301,7 @@ def _summary(outcome):
         )),
         "run_id": outcome.run_id,
         "extracted_at": outcome.extracted_at,
+        "subject": outcome.subject,
     }
 
 
@@ -325,6 +326,18 @@ _PAGINATED_ENDPOINTS = frozenset({"attendance", "rumours", "referee_directory"})
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
 
 
+def _request_subject(request, plan) -> str:
+    """Name the requested target inside a scope that may hold several.
+
+    A failed request keeps no capture to tell its targets apart in DQ.
+    """
+    try:
+        values = request.scope_values(plan)
+    except CoreRunError:
+        values = {"player_ids": request.player_ids}
+    return core.canonical_json(values).decode()
+
+
 def _observations(request, result, plan, extracted_at, universe_version, raw_loader, captures=(),
                   competition=None):
     scope = core.ScopeContext(
@@ -335,6 +348,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     )
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
+    subject = _request_subject(request, plan)
     paginated = request.label in _PAGINATED_ENDPOINTS
     if request.label == "representation" and (
         result.status in (FetchStatus.NOT_APPLICABLE, FetchStatus.SCHEMA_ERROR)
@@ -343,7 +357,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         reason = result.status.value if result.status is not FetchStatus.OK else "no_capture"
         return (core.captureless_outcome(
             _ENTITIES[request.label][0], scope, status="error", reason=f"representation:{reason}",
-            run_id=run_id, **metadata,
+            run_id=run_id, subject=subject, **metadata,
         ),), None
     if result.status is FetchStatus.NOT_APPLICABLE and not paginated:
         return tuple(
@@ -351,7 +365,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
                 entity, scope, status="not_applicable",
                 reason=f"{request.label}:transport_not_applicable",
                 proof=f"transport:not_applicable:{request.label}",
-                run_id=run_id, **metadata)
+                run_id=run_id, subject=subject, **metadata)
             for entity in _ENTITIES[request.label]
         ), None
     if (result.status not in _SUCCESS or not result.raw_capture_id
@@ -365,7 +379,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
                 reason = f"career:{request.label}:no_capture"
         return tuple(
             core.captureless_outcome(entity, scope, status=status, reason=reason,
-                                     run_id=run_id, **metadata)
+                                     run_id=run_id, subject=subject, **metadata)
             for entity in _ENTITIES[request.label]
         ), None
 

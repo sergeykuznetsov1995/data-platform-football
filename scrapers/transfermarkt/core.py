@@ -403,6 +403,12 @@ class LaneOutcome:
     run_id: str = ''
     universe_version: str = ''
     proof: str | None = None
+    # An empty outcome has no row to name the lane's revisions.
+    parser_revision: str = CORE_PARSER_REVISION
+    schema_revision: str = CORE_SCHEMA_REVISION
+    # The requested target inside a scope that may hold several; a failed
+    # request keeps no capture to tell its targets apart in DQ.
+    subject: str = ''
 
     def __post_init__(self) -> None:
         if self.entity not in CORE_ENTITIES:
@@ -411,6 +417,8 @@ class LaneOutcome:
             raise CoreParseError('invalid_status')
         if not _nonempty(self.status_reason):
             raise CoreParseError('invalid_status_reason')
+        if not _nonempty(self.parser_revision) or not _nonempty(self.schema_revision):
+            raise CoreParseError('invalid_revision')
         if self.status in _PROOF_STATUSES:
             if not _nonempty(self.proof):
                 raise CoreParseError('missing_proof')
@@ -418,6 +426,12 @@ class LaneOutcome:
             raise CoreParseError('unexpected_proof')
         if not _status_matches_rows(self.entity, self.status, self.rows):
             raise CoreParseError('status_rows_mismatch')
+        if any(
+            row.get('parser_revision', self.parser_revision) != self.parser_revision
+            or row.get('schema_revision', self.schema_revision) != self.schema_revision
+            for row in self.rows
+        ):
+            raise CoreParseError('revision_differs_from_rows')
         if self.capture is not None and (
             not isinstance(self.scope, ScopeContext) or not all(map(_nonempty, (
                 self.extracted_at, self.run_id, self.universe_version,
@@ -649,7 +663,7 @@ def extract_coach_stints(
 
 def captureless_outcome(
     entity: str, scope: ScopeContext, *, status: str, reason: str, extracted_at: str,
-    run_id: str, universe_version: str, proof: str | None = None,
+    run_id: str, universe_version: str, proof: str | None = None, subject: str = '',
 ) -> LaneOutcome:
     if status not in {'unknown', 'unavailable', 'error', 'not_applicable'}:
         raise CoreParseError('invalid_captureless_status')
@@ -658,7 +672,7 @@ def captureless_outcome(
         raise CoreParseError('incomplete_lineage')
     return LaneOutcome(entity, status, reason, proof=proof, scope=scope,
                        extracted_at=extracted_at, run_id=run_id,
-                       universe_version=universe_version)
+                       universe_version=universe_version, subject=subject)
 
 
 def core_ddl(entity: str) -> str:
@@ -703,8 +717,8 @@ def plan_for_outcome(
             ('source_body_hash', capture.body_hash),
             ('scope_id', outcome.scope.scope_id),
             ('cycle_id', outcome.scope.cycle_id),
-            ('parser_revision', row.get('parser_revision', CORE_PARSER_REVISION)),
-            ('schema_revision', row.get('schema_revision', CORE_SCHEMA_REVISION)),
+            ('parser_revision', row.get('parser_revision', outcome.parser_revision)),
+            ('schema_revision', row.get('schema_revision', outcome.schema_revision)),
         )
     return NativeWritePlan(
         entity=entity, table=CORE_TABLES[entity], ddl=core_ddl(entity),
@@ -819,6 +833,7 @@ def build_core_dq(
             entity, outcome.scope.scope_id if outcome.scope else None,
             outcome.scope.cycle_id if outcome.scope else None,
             outcome.capture.capture_id if outcome.capture else None,
+            outcome.subject,
         )
         if entity == 'club_value_observations' and outcome.rows:
             identity += (outcome.rows[0].get('club_id'),)
