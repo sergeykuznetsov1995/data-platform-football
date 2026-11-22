@@ -19,9 +19,7 @@ from urllib.parse import urlsplit
 
 from . import attendance, core, native_writer, parsing, rumours, sections
 from .models import FetchOutcome, FetchStatus
-from .referee_capture import (
-    RefereeCaptureError, _next_directory_page, referee_directory_url, referee_profile_url,
-)
+from .referee_capture import _next_directory_page, referee_directory_url, referee_profile_url
 
 
 class CoreRunError(RuntimeError):
@@ -183,6 +181,7 @@ class _Request:
     recipient_type: str = ""
     directory_scope: Mapping[str, str] | None = None
     referee_id: str = ""
+    stichtag: str = ""
     player_ids: tuple[str, ...] = ()
 
     @property
@@ -231,7 +230,7 @@ def _base_requests(plan: CoreScopePlan):
         yield _Request("attendance", url, competition_id=target.competition_id, edition_id=str(target.saison_year))
     for target in plan.club_value_targets:
         url = club_values_url(target.slug or target.competition_id, target.competition_id, target.stichtag)
-        yield _Request("club_values", url, competition_id=target.competition_id)
+        yield _Request("club_values", url, competition_id=target.competition_id, stichtag=target.stichtag)
     for holder in plan.achievement_holders:
         if holder.recipient_type not in ("player", "club", "coach"):
             raise CoreRunError("achievements:invalid_recipient_type")
@@ -340,11 +339,14 @@ def _request_subject(request, plan) -> str:
         values = request.scope_values(plan)
     except CoreRunError:
         values = {"player_ids": request.player_ids}
+    if request.label == "club_values":
+        # Stichtag targets of one competition share their scope values.
+        values = {**values, "stichtag": request.stichtag}
     return core.canonical_json(values).decode()
 
 
 def _observations(request, result, plan, extracted_at, universe_version, raw_loader, captures=(),
-                  competition=None):
+                  competition=None, walk_failure=None):
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
         edition_id=request.edition_id or plan.edition_id or None, player_id=request.player_id or None,
@@ -392,8 +394,12 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         unit = sections.extract_referee_directory_observations(captures, scope, **metadata)
         return unit, max(page.captured_at for page in captures)
     if request.label == "rumours":
+        if walk_failure is not None and not captures:
+            return (core.captureless_outcome(
+                "rumour_observations", scope, status="error",
+                reason=f"rumours:{walk_failure}", run_id=run_id, subject=subject, **metadata),), None
         unit = sections.extract_rumour_observations(
-            captures, scope, competition=competition, **metadata)
+            captures, scope, competition=competition, failure=walk_failure, **metadata)
         return tuple(unit), max(capture.captured_at for capture in captures)
     if request.label == "attendance":
         outcome = sections.extract_attendance_observations(
@@ -464,8 +470,17 @@ class _RumourWalk:
         self.competition = competition
         self.links = {}       # page number -> evidenced canonical URL
         self.last_page = None
-        self.captures = []    # canonical plan pages in page order
+        self.pages = {}       # validated page number -> its capture
+        self.captures = []    # every page handed to extraction, failures included
         self.aliases = set()  # visited URLs that are no plan page
+
+    def ordered(self):
+        """The plan pages in page order.
+
+        A later page may reveal an earlier page number, so fetch order and
+        page order differ; extraction numbers the pages by position.
+        """
+        return [self.pages[number] for number in sorted(self.pages)] or list(self.captures)
 
     def add(self, capture):
         """Register one fetched page and return the next page URL, if any."""
@@ -486,6 +501,8 @@ class _RumourWalk:
             # another page 1 was only the discovery response.
             self.captures.pop()
             self.aliases.add(capture.url)
+        else:
+            self.pages[pagination.current_page] = capture
         for number, url in links.items():
             if self.links.setdefault(number, url) != url:
                 if url in self.aliases:
@@ -518,11 +535,12 @@ class CoreRun:
         self._extracted_at = extracted_at
 
     def run(self, plan: CoreScopePlan, *, writer=None, connection_factory=None) -> CoreRunReport:
-        # An auto-sampled extraction clock must postdate every capture of the
-        # run (donor contracts reject extracted_at < captured_at); sample it
-        # lazily after the first successful fetch. Explicit stamps are used
-        # verbatim — offline replays pin their own clocks.
-        extracted_at = None if self._extracted_at is None else _normalise_ts(self._extracted_at)
+        # An auto-sampled extraction clock must postdate every capture of its
+        # own target (donor contracts reject extracted_at < captured_at), so
+        # it is sampled after each target's walk: one clock and run identity
+        # per target. An explicit stamp is used verbatim for the whole run —
+        # offline replays pin their own clocks.
+        pinned = None if self._extracted_at is None else _normalise_ts(self._extracted_at)
         context = {"scope_id": plan.scope_id, "cycle_id": plan.cycle_id}
         outcomes = []
         captured_units = []
@@ -532,6 +550,7 @@ class CoreRun:
             page = request
             captures = []
             walk = _RumourWalk(competition) if request.label == "rumours" else None
+            walk_failure = None
             while True:
                 result = self._fetch(
                     page.url, label=request.label, as_json=as_json, context=context,
@@ -546,8 +565,10 @@ class CoreRun:
                 if walk is not None:
                     try:
                         next_url = walk.add(capture)
-                    except ValueError:
-                        # Extraction reports the donor error from these same pages.
+                    except ValueError as exc:
+                        # The walk's own evidence conflicts or is unreadable:
+                        # the feed is reported from it, never certified in part.
+                        walk_failure = getattr(exc, "reason", None) or "invalid_source_data"
                         break
                     if next_url is None:
                         break
@@ -558,9 +579,10 @@ class CoreRun:
                     number = len(captures)
                     try:
                         has_next = _next_directory_page(capture.text, request.directory_scope, number)
-                    except (UnicodeDecodeError, RefereeCaptureError):
-                        # The adapter checks the same links against the whole
-                        # walk and reports the failing page with its capture.
+                    except ValueError:
+                        # Any probe failure (a malformed link URL included) is
+                        # contained: the adapter checks the same links against
+                        # the whole walk and reports the failing page.
                         break
                     if not has_next:
                         break
@@ -586,12 +608,11 @@ class CoreRun:
                     raise CoreRunError('attendance:pagination_limit')
                 page = replace(request, url=next_url)
             if walk is not None:
-                captures = walk.captures
-            if extracted_at is None:
-                extracted_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                captures = walk.ordered()
+            extracted_at = pinned or datetime.now(timezone.utc).isoformat(timespec="microseconds")
             unit, captured_at = _observations(
                 request, result, plan, extracted_at, self._universe_version, self._raw_loader,
-                captures, competition=competition)
+                captures, competition=competition, walk_failure=walk_failure)
             outcomes.extend(unit)
             if captured_at is not None and writer is not None and connection_factory is not None:
                 # A multi-page merge writes one plan per contributing page capture.
@@ -601,18 +622,18 @@ class CoreRun:
                     if item.status in core.CONCLUSIVE_CORE_STATUSES and item.capture is not None
                 ]
                 if entries:
-                    captured_units.append((unit[0].run_id, entries))
+                    captured_units.append((unit[0].run_id, extracted_at, entries))
 
         bundles = []
-        for run_id, entries in captured_units:
+        for run_id, committed_at, entries in captured_units:
             plans = [core.plan_for_outcome(item, captured_at=captured_at, scope_values=values)
                      for item, captured_at, values in entries]
-            bundles.append((run_id, plans))
+            bundles.append((run_id, committed_at, plans))
         receipts = []
-        for run_id, plans in bundles:
+        for run_id, committed_at, plans in bundles:
             receipt = native_writer.write_core_bundle(
                 connection_factory, writer, plans, run_id=run_id,
-                universe_version=self._universe_version, committed_at=extracted_at,
+                universe_version=self._universe_version, committed_at=committed_at,
             )
             if not isinstance(receipt, dict):
                 raise CoreRunError(f"Missing receipt for capture run {run_id}")

@@ -388,7 +388,11 @@ def _status_matches_rows(entity, status, rows) -> bool:
         return all(verdict == 'explicit_none' for verdict in verdicts)
     if status == 'observed_present':
         return entity not in _PRESENCE_ENTITIES or 'observed_present' in verdicts
-    return 'observed_present' not in verdicts
+    # unknown never hides a present row, and in a presence lane it needs a row
+    # that is itself unresolved: rows that are all explicit_none are the
+    # donor's explicit_none.
+    return 'observed_present' not in verdicts and (
+        entity not in _PRESENCE_ENTITIES or 'unknown' in verdicts)
 
 
 @dataclass(frozen=True)
@@ -715,6 +719,8 @@ def plan_for_outcome(
         raise CoreParseError('invalid_scope_values')
     if any(row.get(col) != scope_values[col] for row in outcome.rows for col in scope_columns):
         raise CoreParseError('row_scope_mismatch')
+    if not _rows_match_revisions(outcome):
+        raise CoreParseError('revision_differs_from_rows')
 
     from scrapers.transfermarkt.native_writer import NativeWritePlan
 
@@ -752,6 +758,15 @@ def _referee_directory_identity(path: str) -> tuple[str, str]:
     if match is None:
         raise CoreParseError('row_scope_mismatch')
     return match[1], match[2]
+
+
+def _rows_match_revisions(outcome: LaneOutcome) -> bool:
+    """Rows stay mutable after construction: every consumer rechecks them."""
+    return all(
+        row.get('parser_revision', outcome.parser_revision) == outcome.parser_revision
+        and row.get('schema_revision', outcome.schema_revision) == outcome.schema_revision
+        for row in outcome.rows
+    )
 
 
 def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
@@ -801,12 +816,16 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
                 raise CoreParseError('row_scope_mismatch')
         return
     if entity == 'attendance_observations' and {'competition_id', 'edition_id'} <= scope_values.keys():
-        match = re.fullmatch(
-            r'/[A-Za-z0-9_-]+/besucherzahlen/wettbewerb/([A-Za-z0-9_-]+)/saison_id/([0-9]+)',
-            path,
-        )
-        if match is None or match.groups() != (scope_values['competition_id'], scope_values['edition_id']):
-            raise CoreParseError('row_scope_mismatch')
+        # The donor's own page validation: it accepts every form its walk can
+        # produce (a trailing slash before ?page=N included) and nothing else.
+        from scrapers.transfermarkt import attendance
+
+        try:
+            attendance._validate_attendance_url(
+                capture.url, host=url.netloc, path=path,
+                competition=scope_values['competition_id'], edition=scope_values['edition_id'])
+        except attendance.AttendanceParseError as exc:
+            raise CoreParseError('row_scope_mismatch') from exc
     for column, pattern in (
         ('club_id', r'/(?:kader|mitarbeiterhistorie)/verein/([1-9][0-9]*)'),
         ('player_id', r'/ceapi/(?:marketValueDevelopment/graph|transferHistory/list)/([1-9][0-9]*)'),
@@ -865,6 +884,8 @@ def build_core_dq(
             errors.add('invalid_status')
         elif not _status_matches_rows(entity, status, outcome.rows):
             errors.add('status_rows_mismatch')
+        if not _rows_match_revisions(outcome):
+            errors.add('revision_mismatch')
         if entity not in CORE_ENTITIES:
             errors.add('invalid_entity')
             continue

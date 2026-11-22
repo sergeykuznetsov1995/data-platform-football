@@ -18,7 +18,7 @@ from bs4 import ParserRejectedMarkup
 from . import (
     achievements, attendance, club_values, core, referees, representation, rumour_observations, rumours,
 )
-from .referee_capture import RefereeCaptureError, _next_directory_page
+from .referee_capture import _next_directory_page, referee_directory_url
 
 
 # An empty outcome has no row to carry the lane's revisions, yet its receipt
@@ -130,8 +130,8 @@ def extract_representation_observations(
     if capture.endpoint != 'representation':
         raise core.CoreParseError('representation:invalid_endpoint')
     if capture.status_code != 200:
-        return _unavailable_capture('representation', 'player_representation_observations', capture, scope,
-                                    extracted_at, universe_version)
+        return (_unavailable_capture('representation', 'player_representation_observations', capture, scope,
+                                     extracted_at, universe_version),)
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
         try:
@@ -206,12 +206,17 @@ def _referee_walk_failure(captures):
     for index, capture in enumerate(captures, 1):
         try:
             has_next = _next_directory_page(capture.text, scope, index)
-        except RefereeCaptureError as exc:
-            return capture, exc.reason
         except UnicodeDecodeError:
             return capture, 'invalid_utf8'
+        except ValueError as exc:
+            # RefereeCaptureError carries its reason; the URL parser of a
+            # malformed link raises a plain ValueError.
+            return capture, getattr(exc, 'reason', None) or 'pagination_link_invalid'
         if has_next != (index < len(captures)):
             return capture, 'directory_pagination_incomplete'
+        if has_next and captures[index].url != referee_directory_url(scope, page=index + 1):
+            # The next capture must be the very page this link names.
+            return captures[index], 'directory_pagination_incomplete'
     return None
 
 
@@ -313,6 +318,7 @@ def extract_referee_profile_observations(
 def extract_rumour_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *,
     competition: rumours.CompetitionContext, extracted_at: str, universe_version: str,
+    failure: str | None = None,
 ) -> tuple[core.LaneOutcome, ...]:
     """Observe one COMPLETE rumour feed, one write-plan outcome per page.
 
@@ -331,6 +337,10 @@ def extract_rumour_observations(
                                      extracted_at, universe_version),)
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
+    if failure is not None:
+        # The walk stopped on conflicting or unreadable evidence of its own:
+        # the pages it did fetch are not the feed.
+        return (_outcome(entity, 'error', 'rumours:' + failure, **context),)
     try:
         # The supplied pages must form the complete plan their pagers evidence
         # before any page of the feed is interpreted.
@@ -362,9 +372,13 @@ def extract_rumour_observations(
     for page, capture in zip(feed.pages, captures, strict=True):
         page_context = core._context(capture, scope, extracted_at, universe_version)
         if page.capture.status == 'observed_empty':
-            grid = rumours._confirmed_empty_grid(rumours._soup(capture.text))
-            proof = 'rumours:confirmed_empty_grid' if grid else 'rumours:no_entries_row'
-            reason = 'rumours:empty_grid' if grid else proof
+            soup = rumours._soup(capture.text)
+            if rumours._confirmed_empty_grid(soup):
+                proof, reason = 'rumours:confirmed_empty_grid', 'rumours:empty_grid'
+            elif soup.select('td.no-entries'):
+                proof = reason = 'rumours:no_entries_row'
+            else:
+                proof = reason = 'rumours:empty_table_body'
             outcomes.append(_outcome(entity, 'observed_empty', reason, proof=proof, **page_context))
             continue
         rows = []
@@ -392,8 +406,8 @@ def extract_club_value_observations(
     if capture.endpoint != 'club_values':
         raise core.CoreParseError('club_values:invalid_endpoint')
     if capture.status_code != 200:
-        return _unavailable_capture('club_values', 'club_value_observations', capture, scope,
-                                    extracted_at, universe_version)
+        return (_unavailable_capture('club_values', 'club_value_observations', capture, scope,
+                                     extracted_at, universe_version),)
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
         club_capture = club_values.ClubValueCapture(
