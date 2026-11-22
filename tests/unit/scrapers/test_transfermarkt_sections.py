@@ -1169,3 +1169,71 @@ def test_populated_squad_page_keeps_its_contract_cell_exception():
     with pytest.raises(CoreParseError, match='status_rows_mismatch'):
         LaneOutcome('rumour_observations', 'observed_present', 'rumours:page',
                     ({'observation_status': 'explicit_none'},), **context)
+
+
+def test_empty_outcomes_carry_their_section_revisions_into_receipts():
+    from scrapers.transfermarkt import achievements
+    outcome = sections.extract_achievement_observations(
+        _achievement_capture(ACHIEVEMENTS_EMPTY), _achievement_scope(),
+        recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    plan = core.plan_for_outcome(outcome, captured_at=CLUB_CAPTURED,
+                                 scope_values={'recipient_type': 'player', 'recipient_id': '7'})
+    # With no row to speak for the lane, the outcome names its own revisions.
+    assert dict(plan.evidence)['parser_revision'] == achievements.ACHIEVEMENT_PARSER_REVISION
+    assert dict(plan.evidence)['schema_revision'] == str(achievements.ACHIEVEMENT_SCHEMA_REVISION)
+    db = CoreDB()
+    native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [plan], run_id=outcome.run_id,
+        universe_version=UNIVERSE, committed_at=EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT parser_revision, schema_revision, row_count, observation_status '
+        'FROM transfermarkt_core_receipts_v1').fetchone() == (
+        'achievements-v1', '1', 0, 'observed_empty')
+    assert core.build_core_dq([outcome])['passed'] is True
+
+
+def test_populated_outcome_names_the_revision_of_its_rows():
+    from scrapers.transfermarkt import attendance
+    outcome = sections.extract_attendance_observations(
+        (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),),
+        _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert outcome.parser_revision == attendance.ATTENDANCE_PARSER_REVISION
+    assert outcome.schema_revision == attendance.ATTENDANCE_SCHEMA_REVISION
+    # An outcome cannot claim a revision its rows do not carry.
+    with pytest.raises(CoreParseError, match='revision'):
+        LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
+                    ({'observation_status': 'observed_present', 'parser_revision': 'other-v9'}),
+                    parser_revision=attendance.ATTENDANCE_PARSER_REVISION,
+                    **_outcome_context())
+
+
+def test_failed_targets_of_one_scope_stay_distinct_in_dq():
+    from scrapers.transfermarkt.orchestrator import AchievementHolderTarget
+
+    class _Blocked:
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error='waf challenge')
+
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t8', cycle_id='tm-cycle-t8',
+        achievement_holders=(AchievementHolderTarget('player', '7'), AchievementHolderTarget('club', '13')),
+    )
+    report = CoreRun(_Blocked().fetch, universe_version=UNIVERSE,
+                     extracted_at=EXTRACTED_AT).run(plan)
+    # Two failed holders of one scope: neither a duplicate nor anonymous.
+    assert report.dq['passed'] is True
+    assert report.dq['outcome_status_counts'] == {'unavailable': 2}
+    assert {item['subject'] for item in report.outcomes} == {
+        '{"recipient_id":"7","recipient_type":"player"}',
+        '{"recipient_id":"13","recipient_type":"club"}'}
+
+    careers = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        market_value_player_ids=('1', '2'), transfer_player_ids=('1',))
+    report = CoreRun(_Blocked().fetch, universe_version=UNIVERSE,
+                     extracted_at=EXTRACTED_AT).run(careers)
+    assert report.dq['passed'] is True
+    assert {item['subject'] for item in report.outcomes} == {
+        '{"player_id":"1"}', '{"player_id":"2"}'}
