@@ -24,6 +24,14 @@ from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB, CoreWri
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.fixture(autouse=True)
+def isolated_paths(monkeypatch, tmp_path):
+    """Keep the journaled writer out of the host's shared Airflow logs volume."""
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+
 ATTENDANCE_FIXTURES = Path('tests/fixtures/transfermarkt/attendance')
 CLUB_VALUE_FIXTURES = Path('tests/fixtures/transfermarkt/club_values')
 ATTENDANCE_START = 'https://www.transfermarkt.com/premier-league/besucherzahlen/wettbewerb/GB1/saison_id/2025'
@@ -899,3 +907,86 @@ def test_representation_scope_run_batches_players_into_one_packet():
     assert db.sql.execute(
         'SELECT COUNT(*) FROM transfermarkt_player_representation_observations'
     ).fetchone()[0] == 1
+
+
+# --------------------------------------------------- review r1 regression pins
+def test_outcome_scope_cannot_override_the_requested_target():
+    from scrapers.transfermarkt.orchestrator import _outcome_scope_values
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        coach_profile_ids=(('202', 'x'),),
+    )
+    request = next(r for r, _ in _iter_requests(plan) if r.label == 'coach_profile')
+    outcome = core.LaneOutcome(
+        'coach_profiles', 'observed_present', 'coach_profile',
+        ({'coach_id': '101', 'observation_status': 'observed_present'},),
+        **core._context(_coach_capture('101'), core.ScopeContext(
+            league='GB1', season='2627', scope_id='s', cycle_id='c'), EXTRACTED_AT, UNIVERSE))
+    with pytest.raises(CoreRunError, match='escape the requested scope'):
+        _outcome_scope_values(outcome, request, plan)
+
+
+def _coach_capture(coach_id: str) -> SourceCapture:
+    body = b'<html></html>'
+    return SourceCapture(
+        url=f'https://www.transfermarkt.com/x/profil/trainer/{coach_id}',
+        endpoint='coach_profile', body=body, capture_id=hashlib.sha256(body).hexdigest(),
+        body_hash=hashlib.sha256(body).hexdigest(), captured_at=CLUB_CAPTURED)
+
+
+def _iter_requests(plan):
+    from scrapers.transfermarkt import orchestrator
+    return orchestrator._requests(plan)
+
+
+def test_rumour_discovery_cycle_fails_closed():
+    from scrapers.transfermarkt.orchestrator import RumourCompetitionTarget
+
+    def pager(href_for_one: str) -> str:
+        return ('<div class="pager"><ul>'
+                '<li class="tm-pagination__list-item tm-pagination__list-item--active">'
+                f'<a class="tm-pagination__link" href="{href_for_one}">1</a></li>'
+                '</ul></div>')
+
+    class _Fetch:
+        """Listing names /page/1 canonical; /page/1 names the listing back."""
+
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            self.calls.append(url)
+            href = RUMOUR_PAGE[1] if url == RUMOUR_LISTING else RUMOUR_LISTING
+            body = f'<div id="yw1">{_GRID_TABLE}{pager(href)}</div>'.encode()
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=RUMOUR_PAGE_1_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    fetcher = _Fetch()
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='tm-scope-t13', cycle_id='tm-cycle-t13',
+        rumour_competitions=(RumourCompetitionTarget('GB1', 'Premier League', '-'),),
+    )
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=RUMOUR_EXTRACTED_AT)
+    with pytest.raises(CoreRunError, match='discovery_cycle'):
+        run.run(plan)
+    # The guard rejects the conflicting re-entry BEFORE fetching it again.
+    assert fetcher.calls == [RUMOUR_LISTING, RUMOUR_PAGE[1]]
+
+
+def test_achievement_adapter_treats_http_failure_as_unavailable():
+    body = json.dumps(ACHIEVEMENTS_EMPTY).encode('utf-8')
+    digest = hashlib.sha256(body).hexdigest()
+    failed = SourceCapture(
+        url=ACHIEVEMENTS_URL, endpoint='player_achievement', body=body,
+        capture_id=digest, body_hash=digest, captured_at=CLUB_CAPTURED, status_code=404,
+    )
+    outcome = sections.extract_achievement_observations(
+        failed, _achievement_scope(), recipient_type='player', recipient_id='7',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
+    )
+    assert outcome.status == 'unavailable'
+    assert outcome.status_reason == 'achievements:http_404'
+    assert outcome.rows == ()

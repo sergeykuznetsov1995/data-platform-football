@@ -727,7 +727,7 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
             raise CoreParseError('row_scope_mismatch')
         return
     if entity == 'rumour_observations':
-        match = re.fullmatch(r'/[A-Za-z0-9_-]+/geruechte/wettbewerb/([A-Za-z0-9_-]+)(?:/page/[0-9]+)?', path)
+        match = re.fullmatch(r'/[A-Za-z0-9_-]+/geruechte/wettbewerb/([A-Za-z0-9_-]+)(?:/page/[0-9]+)?/?', path)
         if match is None or match[1] != scope_values['competition_id']:
             raise CoreParseError('row_scope_mismatch')
         return

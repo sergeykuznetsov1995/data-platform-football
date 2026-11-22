@@ -19,6 +19,13 @@ from . import (
 )
 
 
+def _unavailable_capture(section: str, entity: str, capture: core.SourceCapture,
+                         scope: core.ScopeContext, extracted_at: str, universe_version: str):
+    """A non-200 body is transport evidence, never section content."""
+    context = core._context(capture, scope, extracted_at, universe_version)
+    return core.LaneOutcome(entity, 'unavailable', f'{section}:http_{capture.status_code}', **context)
+
+
 def extract_attendance_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *, start_url: str,
     competition_id: str, edition_id: str, extracted_at: str, universe_version: str,
@@ -27,6 +34,10 @@ def extract_attendance_observations(
     entity = 'attendance_observations'
     if not captures or any(capture.endpoint != 'attendance' for capture in captures):
         raise core.CoreParseError('attendance:invalid_captures')
+    failed = next((c for c in captures if c.status_code != 200), None)
+    if failed is not None:
+        return _unavailable_capture('attendance', 'attendance_observations', failed, scope,
+                                    extracted_at, universe_version)
     if not isinstance(final_season, bool):
         raise core.CoreParseError('attendance:final_season_invalid')
     if final_season and not core._nonempty(final_season_proof):
@@ -67,10 +78,18 @@ def extract_attendance_observations(
         rows.append(core._render(
             entity, values, scope, capture=row_capture, run_id=context['run_id'],
             extracted_at=extracted_at, universe_version=universe_version,
-            observation_status=row.observation_status, status_reason=reason,
+            observation_status=row.observation_status,
+            status_reason='attendance:' + row.status_reason,
             parser_revision=attendance.ATTENDANCE_PARSER_REVISION,
             schema_revision=attendance.ATTENDANCE_SCHEMA_REVISION,
         ))
+    if rows:
+        # The outcome's capture is the newest page that CONTRIBUTED a row: a
+        # newer but rowless trailing page must not shift the plan's clock.
+        contributing = {row['source_capture_id'] for row in rows}
+        context['capture'] = max(
+            (capture for capture in captures if capture.capture_id in contributing),
+            key=lambda capture: (capture.captured_at, capture.capture_id))
     return core.LaneOutcome(entity, result.status, reason, tuple(rows), **context)
 
 
@@ -81,6 +100,9 @@ def extract_representation_observations(
     entity = 'player_representation_observations'
     if capture.endpoint != 'representation':
         raise core.CoreParseError('representation:invalid_endpoint')
+    if capture.status_code != 200:
+        return _unavailable_capture('representation', 'player_representation_observations', capture, scope,
+                                    extracted_at, universe_version)
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
         try:
@@ -134,6 +156,10 @@ def extract_referee_directory_observations(
     entity = 'referee_aggregate_observations'
     if not captures or any(capture.endpoint != 'referee_directory' for capture in captures):
         raise core.CoreParseError('referees:invalid_captures')
+    failed = next((c for c in captures if c.status_code != 200), None)
+    if failed is not None:
+        return (_unavailable_capture('referees', 'referee_aggregate_observations', failed, scope,
+                                     extracted_at, universe_version),)
     competition_id, edition_id = core._referee_directory_identity(urlsplit(captures[0].url).path)
     directory = {'competition_id': competition_id, 'edition_id': edition_id}
     for capture in captures[1:]:
@@ -187,6 +213,9 @@ def extract_referee_profile_observations(
     entity = 'referee_profiles'
     if capture.endpoint != 'referee_profile':
         raise core.CoreParseError('referees:invalid_endpoint')
+    if capture.status_code != 200:
+        return _unavailable_capture('referees', 'referee_profiles', capture, scope,
+                                    extracted_at, universe_version)
     core._check_scope_against_capture(entity, {'referee_id': referee_id}, capture)
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
@@ -220,6 +249,10 @@ def extract_rumour_observations(
     entity = 'rumour_observations'
     if not captures or any(capture.endpoint != 'rumours' for capture in captures):
         raise core.CoreParseError('rumours:invalid_captures')
+    failed = next((c for c in captures if c.status_code != 200), None)
+    if failed is not None:
+        return (_unavailable_capture('rumours', 'rumour_observations', failed, scope,
+                                     extracted_at, universe_version),)
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
     try:
@@ -275,6 +308,9 @@ def extract_club_value_observations(
     entity = 'club_value_observations'
     if capture.endpoint != 'club_values':
         raise core.CoreParseError('club_values:invalid_endpoint')
+    if capture.status_code != 200:
+        return _unavailable_capture('club_values', 'club_value_observations', capture, scope,
+                                    extracted_at, universe_version)
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
         club_capture = club_values.ClubValueCapture(
@@ -320,6 +356,9 @@ def extract_achievement_observations(
     entity = 'achievement_observations'
     if capture.endpoint != f'{recipient_type}_achievement':
         raise core.CoreParseError('achievements:invalid_endpoint')
+    if capture.status_code != 200:
+        return _unavailable_capture('achievements', 'achievement_observations', capture, scope,
+                                    extracted_at, universe_version)
     core._check_scope_against_capture(
         entity, {'recipient_type': recipient_type, 'recipient_id': recipient_id}, capture,
     )

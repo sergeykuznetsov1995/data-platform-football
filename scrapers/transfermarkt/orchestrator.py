@@ -411,9 +411,22 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
 
 
 def _outcome_scope_values(outcome, request, plan):
+    # Single-target lanes keep their REQUESTED scope: rows are cross-checked
+    # against it, so a wrong-holder page can never be written under another
+    # identity. Only explicit fan-out sections (one capture, many row scopes)
+    # derive the scope from their rows.
+    requested = None
+    try:
+        requested = request.scope_values(plan)
+    except CoreRunError:
+        requested = None
+    columns = core.CORE_SCOPE_COLUMNS[outcome.entity]
+    if requested is not None and set(requested) == set(columns):
+        if any(row[column] != requested[column] for row in outcome.rows for column in columns):
+            raise CoreRunError(f"{outcome.entity} rows escape the requested scope")
+        return dict(requested)
     if not outcome.rows:
         return request.scope_values(plan)
-    columns = core.CORE_SCOPE_COLUMNS[outcome.entity]
     values = {column: outcome.rows[0][column] for column in columns}
     if any(row[column] != values[column] for row in outcome.rows for column in columns):
         raise CoreRunError(f"{outcome.entity} rows span multiple scopes")
@@ -435,10 +448,11 @@ class CoreRun:
         self._extracted_at = extracted_at
 
     def run(self, plan: CoreScopePlan, *, writer=None, connection_factory=None) -> CoreRunReport:
-        extracted_at = (
-            datetime.now(timezone.utc).isoformat(timespec="microseconds")
-            if self._extracted_at is None else _normalise_ts(self._extracted_at)
-        )
+        # An auto-sampled extraction clock must postdate every capture of the
+        # run (donor contracts reject extracted_at < captured_at); sample it
+        # lazily after the first successful fetch. Explicit stamps are used
+        # verbatim — offline replays pin their own clocks.
+        extracted_at = None if self._extracted_at is None else _normalise_ts(self._extracted_at)
         context = {"scope_id": plan.scope_id, "cycle_id": plan.cycle_id}
         outcomes = []
         captured_units = []
@@ -448,6 +462,7 @@ class CoreRun:
             page = request
             captures = []
             remaining_urls = iter(())
+            rumour_discovery_urls = set()
             while True:
                 result = self._fetch(
                     page.url, label=request.label, as_json=as_json, context=context,
@@ -491,11 +506,17 @@ class CoreRun:
                         if page_plan[0] != page.url:
                             captures = []
                             remaining_urls = iter(page_plan)
+                            # Two pages naming each other canonical would
+                            # re-enter discovery forever; the discovery URL
+                            # must never come back.
+                            rumour_discovery_urls = {request.url, page.url}
                         else:
                             remaining_urls = iter(page_plan[1:])
                     next_url = next(remaining_urls, None)
                     if next_url is None:
                         break
+                    if next_url in rumour_discovery_urls:
+                        raise CoreRunError('rumours:discovery_cycle')
                     page = replace(request, url=next_url)
                     continue
                 try:
@@ -515,6 +536,8 @@ class CoreRun:
                 if len(captures) >= 100:
                     raise CoreRunError('attendance:pagination_limit')
                 page = replace(request, url=next_url)
+            if extracted_at is None:
+                extracted_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
             unit, captured_at = _observations(
                 request, result, plan, extracted_at, self._universe_version, self._raw_loader,
                 captures, competition=competition)
