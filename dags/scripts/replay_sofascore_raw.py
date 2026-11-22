@@ -40,6 +40,7 @@ from scrapers.sofascore.manifest import (
 from scrapers.sofascore.raw_replay import (
     MODES,
     ReplayManagerProtocol,
+    ReplayPlanningError,
     ReplayScopeKey,
     ReplayScopePlan,
     ResolvedReplayScope,
@@ -158,6 +159,62 @@ def _replay_manager(manifest_store: object) -> ReplayManagerProtocol:
     return manager
 
 
+_SNAPSHOT_ENV = "SOFASCORE_ALL_MENS_SNAPSHOT"
+_REPLAY_CAMPAIGN_ID_ENV = "SOFASCORE_REPLAY_CAMPAIGN_ID"
+
+
+def _resolve_snapshot_scope(
+    scope: ReplayScopeKey,
+) -> "tuple[ResolvedReplayScope, str, Mapping[str, object]]":
+    """Resolve a scope through the campaign snapshot overlay lane.
+
+    Used ONLY for tournaments absent from the registry (stage-3
+    adjudication): the campaign snapshot supplies the owner-approved scope
+    row and ``load_exact_scope`` re-validates the snapshot digest, the
+    campaign identity (``SOFASCORE_REPLAY_CAMPAIGN_ID`` pinned by the
+    planner) and the eligibility rules, so a revised or different campaign
+    can never silently swap the planned scope.  The resolved league is the
+    campaign capture key (``SS-<tournament_id>``).
+    """
+    from scrapers.sofascore.all_mens_campaign import CampaignScopeError, load_exact_scope
+
+    snapshot_path = os.environ.get(_SNAPSHOT_ENV, "").strip()
+    if not snapshot_path:
+        raise ReplayScopeError(
+            f"replay scope {scope.source_tournament_id!r} is outside the "
+            "registry and no campaign snapshot is configured "
+            f"({_SNAPSHOT_ENV})"
+        )
+    expected_campaign = os.environ.get(_REPLAY_CAMPAIGN_ID_ENV, "").strip() or None
+    try:
+        scope_row = load_exact_scope(
+            snapshot_path,
+            tournament_id=int(scope.source_tournament_id),
+            source_season_id=int(scope.source_season_id),
+            expected_campaign_id=expected_campaign,
+            allow_pending_season=True,
+        )
+    except CampaignScopeError as exc:
+        raise ReplayScopeError(
+            f"cannot resolve replay scope {scope.source_tournament_id!r}/"
+            f"{scope.source_season_id!r} from the campaign snapshot: {exc}"
+        ) from exc
+    capture_key = str(scope_row["capture_key"])
+    if capture_key != f"SS-{scope.source_tournament_id}":
+        raise ReplayScopeError(
+            f"campaign snapshot capture key {capture_key!r} does not match "
+            f"the scope tournament {scope.source_tournament_id!r}"
+        )
+    resolved = ResolvedReplayScope(
+        source_tournament_id=scope.source_tournament_id,
+        source_season_id=scope.source_season_id,
+        freshness_key=scope.freshness_key,
+        league=capture_key,
+        canonical_season=str(scope_row["canonical_season"]),
+    )
+    return resolved, str(scope_row["season_format"]), scope_row
+
+
 def _load_scope(
     scope: object,
     *,
@@ -165,18 +222,19 @@ def _load_scope(
     capture_runtime: object,
     records: Optional[Sequence[EndpointManifest]] = None,
     target_cap: int = 25,
-) -> tuple[ResolvedReplayScope, Optional[ReplayScopePlan], str]:
+) -> "tuple[ResolvedReplayScope, Optional[ReplayScopePlan], str, tuple]":
     """Resolve one exact replay scope and select its raw-replay plan.
 
     The catalog comes from the runtime when it carries one and otherwise from
-    ``SofaScoreCatalog.load``.  Records already in memory are prefiltered to
-    the exact scope triple; when absent they are loaded through the manifest
-    store's trino manager with the planner's mode filters.  Returns the
-    catalog-resolved scope, the single selected plan — selected with the
-    caller's ``target_cap`` (default 25) — or ``None`` when nothing is
-    replayable, and the matched registry season's format (review r2 F4: the
-    five-field scope tuple stays the library contract; the format travels
-    alongside it).
+    ``SofaScoreCatalog.load``.  A tournament ABSENT from the registry falls
+    back to the campaign snapshot lane (stage 3); a tournament the registry
+    knows keeps registry authority — its resolution errors propagate.
+    Records already in memory are prefiltered to the exact scope triple;
+    when absent they are loaded through the manifest store's trino manager
+    with the planner's mode filters.  Returns the resolved scope, the single
+    selected plan — or ``None`` when nothing is replayable — the matched
+    season's format, and the overlay source (``("registry", catalog)`` or
+    ``("snapshot", scope_row)``) the phase overlay renders from.
     """
     if mode not in MODES:
         raise ReplayScopeError(f"mode must be one of {MODES}, got {mode!r}")
@@ -186,7 +244,27 @@ def _load_scope(
         catalog = SofaScoreCatalog.load(
             getattr(capture_runtime, "registry_path", None)
         )
-    resolved = resolve_replay_scope(scope, catalog)
+    overlay_source: tuple = ("registry", catalog)
+    try:
+        resolved = resolve_replay_scope(scope, catalog)
+        season_format = ""
+    except ReplayPlanningError as exc:
+        from scrapers.sofascore.raw_replay import registry_tournament_ids
+
+        try:
+            registry_ids = registry_tournament_ids(catalog)
+        except ReplayPlanningError:
+            # Membership cannot be established — registry authority stays
+            # and its resolution error propagates (no silent fallback).
+            raise exc
+        if str(scope.source_tournament_id) in registry_ids:
+            raise
+        unresolved = exc
+        try:
+            resolved, season_format, scope_row = _resolve_snapshot_scope(scope)
+            overlay_source = ("snapshot", scope_row)
+        except ReplayScopeError:
+            raise unresolved from exc
     if records is None:
         records = load_replay_scope_records(
             _replay_manager(getattr(capture_runtime, "manifest_store", None)),
@@ -218,13 +296,20 @@ def _load_scope(
             scope.source_season_id,
         ),
     )
-    tournament = catalog.tournament(int(scope.source_tournament_id))
-    season = next(
-        item
-        for item in tournament.seasons
-        if str(item.season_id) == scope.source_season_id
+    if overlay_source[0] == "registry":
+        tournament = catalog.tournament(int(scope.source_tournament_id))
+        season = next(
+            item
+            for item in tournament.seasons
+            if str(item.season_id) == scope.source_season_id
+        )
+        season_format = season.season_format
+    return (
+        resolved,
+        (selection[0] if selection else None),
+        season_format,
+        overlay_source,
     )
-    return resolved, (selection[0] if selection else None), season.season_format
 
 
 def _target_ids(
@@ -521,23 +606,129 @@ def _overlay_competitions_document(
 
 @contextmanager
 def _scope_overlay(
-    resolved: ResolvedReplayScope, catalog: object
+    resolved: ResolvedReplayScope, overlay_source: tuple
 ) -> Iterator[tuple[str, str]]:
     """Render and bind the per-scope overlay for one replay run.
 
-    Writes the registry/medallion overlay pair into a temporary directory,
-    validates the overlay registry through the real loader and binds BOTH
-    import-time configurations to it for the enclosed phases: the env vars
-    plus an explicit rebind of the module-level singletons
+    ``overlay_source`` is ``("registry", catalog)`` — render the resolved
+    registry row re-keyed to its capture key — or ``("snapshot", scope_row)``
+    — render the campaign overlay through the refresh lane's own
+    ``render_scope_overlays`` (stage 3; the scope row is the
+    ``load_exact_scope``-validated mapping).  Both write the
+    registry/medallion overlay pair into a temporary directory, validate
+    the overlay registry through the real loader and bind BOTH import-time
+    configurations to it for the enclosed phases: the env vars plus an
+    explicit rebind of the module-level singletons
     (``scraper._SOFASCORE_CATALOG``, ``medallion_config.CONFIG_DIR``) so an
     earlier import in the same process cannot freeze another path — the
     startup-order guarantee required by the #1367 design adjudication.
     Everything is restored on exit.
     """
-    import yaml
     from scrapers.sofascore.catalog import SofaScoreCatalog
 
     capture_key = resolved.league
+    source_kind, source_payload = overlay_source
+    with tempfile.TemporaryDirectory(
+        prefix="sofascore-replay-overlay-"
+    ) as tmp:
+        if source_kind == "snapshot":
+            from scrapers.sofascore.all_mens_campaign import (
+                render_scope_overlays,
+            )
+
+            paths = render_scope_overlays(source_payload, tmp)
+            registry_path = str(paths.registry_path)
+            medallion_dir = str(paths.competitions_path.parent)
+        else:
+            catalog = source_payload
+            registry_path, medallion_dir = _render_registry_overlay(
+                resolved, catalog, capture_key, tmp
+            )
+        overlay_catalog = SofaScoreCatalog.from_file(registry_path)
+        overlay_tournament = overlay_catalog.competition(capture_key)
+        if str(overlay_tournament.unique_tournament_id) != str(
+            resolved.source_tournament_id
+        ):
+            raise ReplayScopeError(
+                "replay overlay registry resolved the wrong tournament for "
+                f"{capture_key!r}"
+            )
+        if bool(overlay_tournament.capture_allowed) is not (
+            _source_capture_allowed(source_kind, source_payload, resolved)
+        ):
+            raise ReplayScopeError(
+                "replay overlay changed capture eligibility for "
+                f"{capture_key!r}"
+            )
+        with _bind_scope_overlay(
+            resolved, capture_key, registry_path, medallion_dir, overlay_catalog
+        ) as bound:
+            yield bound
+
+
+def _source_capture_allowed(
+    source_kind: str, source_payload: object, resolved: ResolvedReplayScope
+) -> bool:
+    """The overlay must preserve the SOURCE row's capture decision."""
+    if source_kind == "snapshot":
+        return True  # load_exact_scope admits only campaign-approved scopes
+    tournament = source_payload.tournament(int(resolved.source_tournament_id))
+    return bool(getattr(tournament, "capture_allowed", False))
+
+
+@contextmanager
+def _bind_scope_overlay(
+    resolved: ResolvedReplayScope,
+    capture_key: str,
+    registry_path: str,
+    medallion_dir: str,
+    overlay_catalog: object,
+) -> Iterator[tuple[str, str]]:
+    """Bind both import-time configurations to the rendered overlay."""
+    import dags.utils.medallion_config as medallion_config
+    from scrapers.sofascore import scraper as scraper_module
+
+    previous_registry = os.environ.get("SOFASCORE_REGISTRY_PATH")
+    previous_medallion = os.environ.get("MEDALLION_CONFIG_DIR")
+    previous_config_dir = medallion_config.CONFIG_DIR
+    previous_module_catalog = scraper_module._SOFASCORE_CATALOG
+    try:
+        os.environ["SOFASCORE_REGISTRY_PATH"] = registry_path
+        os.environ["MEDALLION_CONFIG_DIR"] = medallion_dir
+        medallion_config.CONFIG_DIR = Path(medallion_dir)
+        scraper_module._SOFASCORE_CATALOG = overlay_catalog
+        competitions = medallion_config.load_competitions()
+        if not any(
+            item.get("id") == capture_key
+            for item in competitions.get("competitions", [])
+        ):
+            raise ReplayScopeError(
+                f"replay overlay competitions.yaml does not carry "
+                f"{capture_key!r}"
+            )
+        yield registry_path, medallion_dir
+    finally:
+        if previous_registry is None:
+            os.environ.pop("SOFASCORE_REGISTRY_PATH", None)
+        else:
+            os.environ["SOFASCORE_REGISTRY_PATH"] = previous_registry
+        if previous_medallion is None:
+            os.environ.pop("MEDALLION_CONFIG_DIR", None)
+        else:
+            os.environ["MEDALLION_CONFIG_DIR"] = previous_medallion
+        medallion_config.CONFIG_DIR = previous_config_dir
+        scraper_module._SOFASCORE_CATALOG = previous_module_catalog
+
+
+def _render_registry_overlay(
+    resolved: ResolvedReplayScope,
+    catalog: object,
+    capture_key: str,
+    tmp: str,
+) -> tuple[str, str]:
+    """Render the registry-row overlay pair; returns (registry, medallion)."""
+    import yaml
+
     try:
         tournament = catalog.tournament(int(resolved.source_tournament_id))
     except Exception as exc:
@@ -575,76 +766,24 @@ def _scope_overlay(
     competitions_document = _overlay_competitions_document(
         tournament, season, resolved
     )
-    with tempfile.TemporaryDirectory(
-        prefix="sofascore-replay-overlay-"
-    ) as tmp:
-        registry_path = os.path.join(tmp, "tournaments.json")
-        medallion_dir = os.path.join(tmp, "medallion")
-        os.makedirs(medallion_dir, exist_ok=True)
-        with open(registry_path, "w", encoding="utf-8") as handle:
-            json.dump(registry_document, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        with open(
-            os.path.join(medallion_dir, "competitions.yaml"),
-            "w",
-            encoding="utf-8",
-        ) as handle:
-            yaml.safe_dump(
-                competitions_document,
-                handle,
-                allow_unicode=True,
-                sort_keys=False,
-            )
-        overlay_catalog = SofaScoreCatalog.from_file(registry_path)
-        overlay_tournament = overlay_catalog.competition(capture_key)
-        if str(overlay_tournament.unique_tournament_id) != str(
-            resolved.source_tournament_id
-        ):
-            raise ReplayScopeError(
-                "replay overlay registry resolved the wrong tournament for "
-                f"{capture_key!r}"
-            )
-        if bool(overlay_tournament.capture_allowed) is not bool(
-            getattr(tournament, "capture_allowed", False)
-        ):
-            raise ReplayScopeError(
-                "replay overlay changed capture eligibility for "
-                f"{capture_key!r}"
-            )
-
-        import dags.utils.medallion_config as medallion_config
-        from scrapers.sofascore import scraper as scraper_module
-
-        previous_registry = os.environ.get("SOFASCORE_REGISTRY_PATH")
-        previous_medallion = os.environ.get("MEDALLION_CONFIG_DIR")
-        previous_config_dir = medallion_config.CONFIG_DIR
-        previous_module_catalog = scraper_module._SOFASCORE_CATALOG
-        try:
-            os.environ["SOFASCORE_REGISTRY_PATH"] = registry_path
-            os.environ["MEDALLION_CONFIG_DIR"] = medallion_dir
-            medallion_config.CONFIG_DIR = Path(medallion_dir)
-            scraper_module._SOFASCORE_CATALOG = overlay_catalog
-            competitions = medallion_config.load_competitions()
-            if not any(
-                item.get("id") == capture_key
-                for item in competitions.get("competitions", [])
-            ):
-                raise ReplayScopeError(
-                    f"replay overlay competitions.yaml does not carry "
-                    f"{capture_key!r}"
-                )
-            yield registry_path, medallion_dir
-        finally:
-            if previous_registry is None:
-                os.environ.pop("SOFASCORE_REGISTRY_PATH", None)
-            else:
-                os.environ["SOFASCORE_REGISTRY_PATH"] = previous_registry
-            if previous_medallion is None:
-                os.environ.pop("MEDALLION_CONFIG_DIR", None)
-            else:
-                os.environ["MEDALLION_CONFIG_DIR"] = previous_medallion
-            medallion_config.CONFIG_DIR = previous_config_dir
-            scraper_module._SOFASCORE_CATALOG = previous_module_catalog
+    registry_path = os.path.join(tmp, "tournaments.json")
+    medallion_dir = os.path.join(tmp, "medallion")
+    os.makedirs(medallion_dir, exist_ok=True)
+    with open(registry_path, "w", encoding="utf-8") as handle:
+        json.dump(registry_document, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    with open(
+        os.path.join(medallion_dir, "competitions.yaml"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        yaml.safe_dump(
+            competitions_document,
+            handle,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    return registry_path, medallion_dir
 
 
 def _assert_replay_season_label(
@@ -797,6 +936,83 @@ def _matches_phase(
     }
 
 
+def _player_universe_freshness_key(
+    capture_runtime: object, resolved: ResolvedReplayScope
+) -> "tuple[str, list[str]]":
+    """Pick the season freshness key whose plan satisfies the universe guard.
+
+    The scope's OWN key gets first chance (stage-4 adjudication: never
+    displace a working key); only when its plan is not
+    ``player_universe_ready`` do ranked alternatives compete — most
+    terminal squads records first, freshest update breaking ties — and the
+    first alternative whose own offline plan passes the guard wins.  When
+    nothing passes, the scope key is returned unchanged and the runner's
+    refusal stays the honest outcome.  Returns the chosen key and the
+    candidates tried (for the phase report).
+    """
+    from scrapers.sofascore.season_pipeline import plan_season_partition
+
+    store = getattr(capture_runtime, "manifest_store", None)
+    scope_key = resolved.freshness_key
+    listing = getattr(store, "list_for_scope", None)
+    squads_by_key: dict[str, list[object]] = {}
+    if callable(listing):
+        for record in listing(
+            resolved.source_tournament_id, resolved.source_season_id
+        ):
+            if getattr(record.key, "endpoint", None) != "squads":
+                continue
+            squads_by_key.setdefault(record.key.freshness_key, []).append(
+                record
+            )
+    terminal = {
+        key: (
+            sum(
+                1
+                for record in records
+                if getattr(record, "status", None) is not None
+                and record.status.terminal
+            ),
+            max(
+                (
+                    getattr(record, "updated_at", "")
+                    for record in records
+                ),
+                default="",
+            ),
+        )
+        for key, records in squads_by_key.items()
+    }
+    alternatives = sorted(
+        (key for key, (count, _) in terminal.items() if count > 0),
+        key=lambda key: (terminal[key][0], terminal[key][1]),
+    )
+    alternatives.reverse()  # most terminal squads first; freshest update wins ties
+    candidates = [scope_key] + [
+        key for key in alternatives if key != scope_key
+    ][:4]
+
+    def universe_ready(key: str) -> bool:
+        try:
+            plan = plan_season_partition(
+                capture_runtime.raw_store,
+                store,
+                source_tournament_id=int(resolved.source_tournament_id),
+                source_season_id=int(resolved.source_season_id),
+                freshness_key=key,
+                event_freshness_key="final",
+                paid_proxy=True,
+            )
+        except Exception:
+            return False
+        return bool(getattr(plan, "player_universe_ready", False))
+
+    for candidate in candidates:
+        if universe_ready(candidate):
+            return candidate, candidates
+    return scope_key, candidates
+
+
 def _players_phase(
     resolved: ResolvedReplayScope,
     records: Sequence[EndpointManifest],
@@ -846,6 +1062,9 @@ def _players_phase(
     _assert_replay_season_label(resolved, season_format)
     from dags.scripts import run_sofascore_scraper as runner
 
+    universe_key, universe_candidates = _player_universe_freshness_key(
+        capture_runtime, resolved
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         report_path = os.path.join(tmpdir, "players_report.json")
         with _env_overrides(
@@ -854,7 +1073,7 @@ def _players_phase(
                     list(ids), ensure_ascii=False
                 ),
                 _REPLAY_PLAYER_FRESHNESS_ENV: freshness,
-                _REPLAY_SEASON_FRESHNESS_ENV: freshness,
+                _REPLAY_SEASON_FRESHNESS_ENV: universe_key,
             }
         ):
             exit_code = runner._run_player_capture(
@@ -895,6 +1114,9 @@ def _players_phase(
         "exit_code": exit_code,
         "targets": list(ids),
         "report": report,
+        "player_freshness_key": freshness,
+        "universe_freshness_key": universe_key,
+        "universe_candidates": universe_candidates,
         "errors": report.get("errors", []),
     }
 
@@ -1131,7 +1353,7 @@ def run_replay_scope(
     and traffic comes from a single final engine metrics snapshot.
     """
     scope_key = _normalize_scope(scope)
-    resolved, plan, season_format = _load_scope(
+    resolved, plan, season_format, overlay_source = _load_scope(
         scope_key,
         mode=mode,
         capture_runtime=capture_runtime,
@@ -1219,13 +1441,9 @@ def run_replay_scope(
         # #1367: the capture key (league) is catalog/medallion-keyed only in a
         # per-scope overlay registry (refresh-lane contract), so every phase
         # runs inside one; a fresh worker process binds both configurations
-        # from the overlay env alone.
-        overlay_catalog = getattr(capture_runtime, "catalog", None)
-        if overlay_catalog is None:
-            overlay_catalog = SofaScoreCatalog.load(
-                getattr(capture_runtime, "registry_path", None)
-            )
-        with _scope_overlay(resolved, overlay_catalog):
+        # from the overlay env alone.  Registry scopes render from the
+        # registry row; campaign scopes from the snapshot overlay lane.
+        with _scope_overlay(resolved, overlay_source):
             for phase, run_phase in phases:
                 try:
                     phase_result = run_phase()

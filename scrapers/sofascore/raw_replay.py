@@ -61,8 +61,10 @@ __all__ = [
     "ResolvedReplayScope",
     "list_replay_scope_keys",
     "load_replay_scope_records",
+    "registry_tournament_ids",
     "replay_eligible_scope_pairs",
     "resolve_replay_scope",
+    "snapshot_replay_scope_pairs",
     "select_replay_scope_plans",
     "validate_replay_scope_pair",
 ]
@@ -499,8 +501,142 @@ def replay_eligible_scope_pairs(
     return tuple(sorted(pairs))
 
 
+def registry_tournament_ids(
+    catalog: ReplayCatalogProtocol,
+) -> frozenset[str]:
+    """Tournament ids present in the registry, eligible or not.
+
+    Presence — not resolvability — decides the snapshot-fallback boundary
+    (stage-3 adjudication): a tournament the registry KNOWS stays under
+    registry authority even when its particular season fails to resolve,
+    so its errors propagate instead of silently re-resolving through the
+    campaign snapshot.
+    """
+    tournaments = getattr(catalog, "tournaments", None)
+    if tournaments is None:
+        raise ReplayPlanningError(
+            "catalog does not expose a tournaments sequence for replay "
+            "scope enumeration"
+        )
+    return frozenset(
+        str(tournament.unique_tournament_id)
+        for tournament in tournaments
+        if isinstance(
+            getattr(tournament, "unique_tournament_id", None), int
+        )
+        and not isinstance(
+            getattr(tournament, "unique_tournament_id", None), bool
+        )
+    )
+
+
+def snapshot_replay_scope_pairs(
+    document: Mapping[str, object],
+    registry_ids: "frozenset[str] | set[str]",
+) -> tuple[tuple[str, str], ...]:
+    """Replay pairs the CAMPAIGN snapshot adds beyond the registry.
+
+    Only tournaments ABSENT from the registry contribute (stage-3
+    adjudication: the snapshot never wins a registry-covered pair).  A
+    season qualifies when its canonical season is a numeric slug, its
+    format names a partition label, and its metadata is ready or pending
+    (``excluded`` seasons are refused, mirroring ``load_exact_scope``).
+    The worker still re-validates through ``load_exact_scope`` (digest +
+    campaign identity), so this listing is a planning filter, not the
+    trust boundary.
+    """
+    rows = document.get("tournaments")
+    if not isinstance(rows, list):
+        raise ReplayPlanningError(
+            "campaign snapshot does not contain a tournaments list"
+        )
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        source_id = row.get("unique_tournament_id")
+        if isinstance(source_id, bool) or not isinstance(source_id, int):
+            continue
+        if str(source_id) in registry_ids:
+            continue
+        capture_key = row.get("capture_key")
+        if not isinstance(capture_key, str) or capture_key != f"SS-{source_id}":
+            continue
+        seasons = row.get("seasons")
+        if not isinstance(seasons, list):
+            continue
+        for season in seasons:
+            if not isinstance(season, Mapping):
+                continue
+            season_id = season.get("source_season_id")
+            if isinstance(season_id, bool) or not isinstance(season_id, int):
+                continue
+            if season.get("metadata_status") == "excluded":
+                continue
+            canonical = season.get("canonical_season")
+            if not isinstance(canonical, str) or _season_slug(canonical) is None:
+                continue
+            if season.get("season_format") not in _REPLAYABLE_SEASON_FORMATS:
+                continue
+            pairs.add((str(source_id), str(season_id)))
+    return tuple(sorted(pairs))
+
+
+def _validate_snapshot_pair(
+    wanted: tuple[str, str],
+    document: Mapping[str, object],
+    prefix: str,
+) -> "tuple[str, str] | None":
+    """Exact-pair validation against the campaign snapshot, or None.
+
+    Mirrors the season half of :func:`snapshot_replay_scope_pairs` for one
+    pair; the worker re-validates the full scope (digest, campaign
+    identity, eligibility) through ``load_exact_scope``.
+    """
+    rows = document.get("tournaments")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("unique_tournament_id")) != wanted[0]:
+            continue
+        capture_key = row.get("capture_key")
+        if not isinstance(capture_key, str) or capture_key != f"SS-{wanted[0]}":
+            return None
+        seasons = row.get("seasons")
+        if not isinstance(seasons, list):
+            return None
+        for season in seasons:
+            if not isinstance(season, Mapping):
+                continue
+            if str(season.get("source_season_id")) != wanted[1]:
+                continue
+            if season.get("metadata_status") == "excluded":
+                raise ReplayPlanningError(
+                    f"{prefix} is not replay-eligible: campaign season is "
+                    "excluded"
+                )
+            canonical = season.get("canonical_season")
+            if not isinstance(canonical, str) or _season_slug(canonical) is None:
+                raise ReplayPlanningError(
+                    f"{prefix} is not replay-eligible: season has no numeric "
+                    "canonical season"
+                )
+            if season.get("season_format") not in _REPLAYABLE_SEASON_FORMATS:
+                raise ReplayPlanningError(
+                    f"{prefix} is not replay-eligible: season has no "
+                    "replayable season format"
+                )
+            return wanted
+    return None
+
+
 def validate_replay_scope_pair(
-    exact_scope: Sequence[object], catalog: ReplayCatalogProtocol
+    exact_scope: Sequence[object],
+    catalog: ReplayCatalogProtocol,
+    *,
+    snapshot_document: Optional[Mapping[str, object]] = None,
 ) -> tuple[str, str]:
     """Validate an operator-supplied exact scope pair loudly.
 
@@ -517,6 +653,14 @@ def validate_replay_scope_pair(
     try:
         tournament = catalog.tournament(tournament_id)
     except (ValueError, KeyError, TypeError) as exc:
+        if snapshot_document is not None and str(tournament_id) not in (
+            registry_tournament_ids(catalog)
+        ):
+            snapshot_pair = _validate_snapshot_pair(
+                wanted, snapshot_document, prefix
+            )
+            if snapshot_pair is not None:
+                return snapshot_pair
         raise ReplayPlanningError(
             f"{prefix} is not replay-eligible: unknown tournament: {exc}"
         ) from exc
@@ -554,6 +698,41 @@ def validate_replay_scope_pair(
     return wanted
 
 
+def _resolvable_manifest_pairs(
+    manager: ReplayManagerProtocol,
+    mode: str,
+    catalog: ReplayCatalogProtocol,
+    *,
+    snapshot_document: Optional[Mapping[str, object]] = None,
+) -> tuple[tuple[str, str], ...]:
+    """Resolvable (tid, sid) pairs that actually exist in the manifest.
+
+    Two-step filter (stage 3): the campaign pair set is ~10k, too large for
+    a single SQL IN-list; the manifest itself only ever holds ~1k pairs.
+    One cheap DISTINCT query returns the manifest pairs, the resolvable set
+    (registry ∪ campaign snapshot beyond the registry) is intersected in
+    Python, and the main scope-keys query receives the compact result.
+    """
+    manifest_pairs = manager._execute(
+        f"SELECT DISTINCT m.\"source_tournament_id\", "
+        f"m.\"source_season_id\" "
+        f"FROM {REPLAY_MANIFEST_TABLE} m "
+        f"WHERE {' AND '.join([*_HTTP_REPLAYABLE_SQL, *_RAW_LINEAGE_SQL, _mode_filter_sql(mode)])}",
+        fetch=True,
+    )
+    present = {
+        (str(row[0]), str(row[1])) for row in (manifest_pairs or [])
+    }
+    resolvable = set(replay_eligible_scope_pairs(catalog))
+    if snapshot_document is not None:
+        resolvable |= set(
+            snapshot_replay_scope_pairs(
+                snapshot_document, registry_tournament_ids(catalog)
+            )
+        )
+    return tuple(sorted(present & resolvable))
+
+
 def list_replay_scope_keys(
     manager: ReplayManagerProtocol,
     *,
@@ -563,6 +742,7 @@ def list_replay_scope_keys(
     catalog: Optional[ReplayCatalogProtocol] = None,
     include_blocked: bool = False,
     blocked_only: bool = False,
+    snapshot_document: Optional[Mapping[str, object]] = None,
 ) -> tuple[ReplayScopeKey, ...]:
     """List replayable scope keys from the fixed manifest table.
 
@@ -607,7 +787,11 @@ def list_replay_scope_keys(
         if wanted_scope is None:
             pair_filter = True
         else:
-            wanted_scope = validate_replay_scope_pair(wanted_scope, catalog)
+            wanted_scope = validate_replay_scope_pair(
+                wanted_scope,
+                catalog,
+                snapshot_document=snapshot_document,
+            )
     clauses = [
         *_HTTP_REPLAYABLE_SQL,
         *_RAW_LINEAGE_SQL,
@@ -623,7 +807,12 @@ def list_replay_scope_keys(
         )
         params.extend(wanted_scope)
     elif pair_filter:
-        pairs = replay_eligible_scope_pairs(catalog)
+        pairs = _resolvable_manifest_pairs(
+            manager,
+            mode,
+            catalog,
+            snapshot_document=snapshot_document,
+        )
         if not pairs:
             return ()
         clauses.append(

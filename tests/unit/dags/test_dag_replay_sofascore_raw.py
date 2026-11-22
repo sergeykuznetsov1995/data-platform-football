@@ -114,6 +114,7 @@ def _assert_planner_call(scopes, **expected):
         "limit": expected["limit"],
         "catalog": kwargs["catalog"],
         "include_blocked": False,
+        "snapshot_document": kwargs.get("snapshot_document"),
     }
     assert isinstance(kwargs["catalog"], SofaScoreCatalog)
     if expected_calls == 2:
