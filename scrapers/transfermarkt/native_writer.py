@@ -403,13 +403,28 @@ def _committed_clock(connection, table_sql: str, params: tuple) -> object:
     return rows[0][0] if rows else None
 
 
+# Section lanes that observe ONE scope through several page captures per run
+# (a feed, a paged directory). Their natural key names the capture, so a merge
+# plan can only add its own capture's rows: freshness is decided per capture
+# by the same-capture replay check, never against a sibling page's newer clock.
+_MULTI_CAPTURE_MERGE_ENTITIES = frozenset({
+    'rumour_observations', 'referee_aggregate_observations',
+})
+_CAPTURE_KEY_COLUMNS = frozenset({'observed_at', 'source_capture_id'})
+
+
 def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
     """An older bundle must not overwrite a fresher committed capture.
 
     The data table proves freshness while rows exist; a proven-empty
     replacement leaves none, so the per-scope warehouse receipts carry the
-    newest committed capture clock for empty scopes too.
+    newest committed capture clock for empty scopes too. A replacement
+    snapshot is then checked page by page: its newest clock says nothing
+    about a stale page riding along on a fresh sibling.
     """
+    if (plan.write_mode == 'merge' and plan.entity in _MULTI_CAPTURE_MERGE_ENTITIES
+            and _CAPTURE_KEY_COLUMNS.intersection(plan.natural_keys)):
+        return
     committed = _committed_clock(
         connection,
         f'SELECT MAX(captured_at) FROM {plan.full_table} WHERE {plan.scope_sql()}',
@@ -424,8 +439,34 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
             'WHERE target_table = ? AND scope_values_json = ?',
             (plan.full_table, scope_json),
         )
-    if committed is not None and _timestamp(committed) > _timestamp(plan.captured_at):
+    if committed is None:
+        return
+    if _timestamp(committed) > _timestamp(plan.captured_at):
         raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
+    if plan.write_mode == 'replace' and plan.rows:
+        _guard_source_pages(connection, plan)
+
+
+def _guard_source_pages(connection, plan: NativeWritePlan) -> None:
+    """Each source page the snapshot shares with the scope must not regress."""
+    planned = {}
+    for row in plan.rows:
+        clock, url = _timestamp(row['captured_at']), row['source_url']
+        if url not in planned or planned[url] < clock:
+            planned[url] = clock
+    cursor = connection.cursor()
+    try:
+        committed = _query_rows(
+            cursor,
+            f'SELECT source_url, MAX(captured_at) FROM {plan.full_table} '
+            f'WHERE {plan.scope_sql()} GROUP BY source_url',
+            tuple(plan.scope_values),
+        )
+    finally:
+        cursor.close()
+    for url, clock in committed:
+        if url in planned and _timestamp(clock) > planned[url]:
+            raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
 def _canonical_cell(value) -> Any:
