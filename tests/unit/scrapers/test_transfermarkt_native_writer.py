@@ -1048,3 +1048,24 @@ def test_unrecognised_intent_digest_is_refused_before_mutation():
     assert not db.sql.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transfermarkt_core_receipts_v1'"
     ).fetchall()
+
+
+# ---------------------------------------------------------------- stage-C review round 5
+
+def test_page_evidence_is_validated_field_by_field():
+    # Round 5 finding 11: the page-tuple checks sat inside all(...), where the
+    # truthy map object short-circuited them, and the journal rebuilds plans
+    # through the same constructor.
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_START
+    plan = _snapshot(CLOCK, 'cap-1')
+    first = plan.pages[0]
+    with pytest.raises(ValueError, match='page evidence'):
+        dataclasses_replace(plan, pages=plan.pages + (first,))
+    with pytest.raises(ValueError, match='page evidence'):
+        dataclasses_replace(plan, pages=(
+            *plan.pages, (ATTENDANCE_START + '?page=9', first[1], first[2], 'invalid')))
+    with pytest.raises(ValueError, match='page evidence'):
+        dataclasses_replace(plan, pages=(
+            *plan.pages, (ATTENDANCE_START + '?page=9', first[1], first[2], 'f' * 64)))
+    with pytest.raises(ValueError, match='page evidence'):
+        dataclasses_replace(plan, pages=(*plan.pages[:-1], (*plan.pages[-1][:2], '', plan.pages[-1][3])))
