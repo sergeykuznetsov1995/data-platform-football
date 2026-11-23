@@ -643,14 +643,15 @@ def _scope_json(plan: NativeWritePlan) -> str:
         list(zip(plan.scope_columns, plan.scope_values))).decode()
 
 
-def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
-    """The accepted page evidence of the scope, (url, capture_id, clock, hash).
+def _read_manifest(connection, plan: NativeWritePlan) -> dict[str, tuple]:
+    """The accepted evidence of every page of the scope.
 
-    Only a multi-page replacement snapshot keeps a manifest: the pages of
-    every other lane are exactly the captures of its committed rows.
+    ``url -> (capture id, clock, body hash)``. Two rows naming one page are
+    not a manifest. Only a multi-page replacement snapshot keeps one: the
+    pages of every other lane are exactly the captures of its committed rows.
     """
     if not plan._multi_page():
-        return []
+        return {}
     cursor = connection.cursor()
     try:
         rows = _query_rows(
@@ -661,11 +662,29 @@ def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
         )
     except Exception as exc:
         if write_journal._table_not_found(exc):
-            return []
+            return {}
         raise
     finally:
         cursor.close()
-    return [tuple(row) for row in rows]
+    accepted = {}
+    for url, capture_id, clock, body_hash in rows:
+        if url in accepted:
+            raise RuntimeError('core page manifest differs: two rows name one page of ' + plan.table)
+        accepted[url] = (capture_id, _timestamp(clock), body_hash)
+    return accepted
+
+
+def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
+    """The accepted page evidence of the scope, (url, capture_id, clock, hash)."""
+    return [(url, *evidence) for url, evidence in _read_manifest(connection, plan).items()]
+
+
+def _verify_pages(connection, plan: NativeWritePlan) -> None:
+    """The recorded manifest reads back as the snapshot's pages, one row each."""
+    accepted = _read_manifest(connection, plan)
+    for url, capture_id, clock, body_hash, _next in plan.pages:
+        if accepted.get(url) != (capture_id, _timestamp(clock), body_hash):
+            raise RuntimeError('core page manifest differs: ' + plan.table)
 
 
 def _record_pages(cursor, plan: NativeWritePlan) -> None:
@@ -701,8 +720,9 @@ def _same_pages(manifest, pages) -> bool:
     The evidence of other pages the scope once accepted stays beside it; it
     says nothing about this snapshot.
     """
-    accepted = {(url, capture_id, _timestamp(clock)) for url, capture_id, clock, _body_hash in manifest}
-    return all((page[0], page[1], _timestamp(page[2])) in accepted for page in pages)
+    accepted = {(url, capture_id, _timestamp(clock), body_hash)
+                for url, capture_id, clock, body_hash in manifest}
+    return all((page[0], page[1], _timestamp(page[2]), page[3]) in accepted for page in pages)
 
 
 def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
@@ -1226,6 +1246,11 @@ def _commit_plans(connection, writer, plans) -> list[dict]:
                 _record_pages(cursor, plan)
             finally:
                 cursor.close()
+    # Like the receipts, the manifest is acknowledged only once it reads
+    # back: a snapshot whose pages did not reach the warehouse is not written.
+    for plan in plans:
+        if plan.pages:
+            _verify_pages(connection, plan)
     return [_physical_proof(connection, plan) for plan in plans]
 
 
