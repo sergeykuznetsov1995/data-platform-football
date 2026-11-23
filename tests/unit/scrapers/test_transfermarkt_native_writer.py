@@ -1582,3 +1582,66 @@ def test_a_receipt_repair_is_bound_to_the_acknowledged_universe():
     assert _receipt_count(db) == 0
     assert commit('u')['verified'] is True
     assert _receipt_count(db) == 1
+
+
+def _warehouse_receipt(db, plan, run_id, clock):
+    native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+    plan_hashes, digest = native_writer._bundle_identity([plan], run_id)
+    native_writer._merge_receipts(db, [native_writer._plan_receipt(
+        plan, {**_EMPTY_PROOF, 'physical_hash': native_writer._digest([])}, plan_hashes[0],
+        digest, run_id, 'u', native_writer._batch_id_for_run(run_id), clock)])
+
+
+def test_a_displaced_capture_cannot_return_as_empty():
+    # Round 6 finding 6: a roster capture that a newer capture displaced came
+    # back as a proven-empty roster and erased its successor; one capture id
+    # was also acknowledged twice with different bodies and clocks.
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-a')])
+    write(db, [membership_plan(['2'], capture='cap-b')], run_id='run-2')
+    assert _players(db) == ['2']
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [_empty_roster_plan(capture='cap-a')], run_id='run-3')
+    assert _players(db) == ['2']
+    _warehouse_receipt(db, _empty_roster_plan(capture='cap-x'), 'run-old', CLOCK)
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [_empty_roster_plan(clock=LATER, capture='cap-x')], run_id='run-4', clock=LATER)
+    assert _receipt_count(db) == 3  # cap-a, cap-b and one cap-x
+
+
+def test_an_acknowledged_empty_merge_capture_cannot_acquire_rows():
+    # Round 6 finding 7: a merge lane answered "pending" as soon as its data
+    # read was empty, without looking at the capture's zero-row receipt.
+    db = CoreDB()
+    write(db, [_empty_merge_plan()])
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [mv_plan([('2025-01-01', 10)], capture='cap-mv2', clock=LATER)],
+              run_id='run-2', clock=LATER)
+    assert db.sql.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transfermarkt_market_value_points'"
+    ).fetchall() == []
+
+
+def test_run_preflight_refuses_capture_contradictions_between_valid_plans():
+    # Round 6 finding 21: two plans that are valid on their own contradicted
+    # each other about one capture: populated and proven-empty, or one capture
+    # id naming two different responses.
+    with pytest.raises(ValueError, match='duplicate core capture'):
+        native_writer.validate_run_plans(
+            [mv_plan([('2025-01-01', 10)], capture='cap-mv2'), _empty_merge_plan()])
+    first = mv_plan([('2025-01-01', 10)], capture='cap-1')
+    second = dataclasses_replace(mv_plan([('2025-02-01', 20)], capture='cap-1'), rows=tuple(
+        {**row, 'source_body_hash': 'e' * 64} for row in
+        mv_plan([('2025-02-01', 20)], capture='cap-1').rows))
+    with pytest.raises(ValueError, match='duplicate core capture'):
+        native_writer.validate_run_plans([first, second])
+    # Packet fan-out stays legitimate while every plan names the same response.
+    from tests.unit.scrapers import test_transfermarkt_sections as lanes
+    packet = lanes.sections.extract_representation_observations(
+        lanes._representation_capture(), lanes._representation_scope(), expected_ids=('7', '9'),
+        extracted_at=lanes.EXTRACTED_AT, universe_version=lanes.UNIVERSE)
+    plans = [core.plan_for_outcome(
+        outcome, captured_at=lanes.CLUB_CAPTURED,
+        scope_values={'player_id': outcome.scope.player_id}) for outcome in packet]
+    assert len(plans) == 2
+    native_writer.validate_run_plans(plans)
