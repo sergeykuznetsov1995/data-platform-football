@@ -3453,3 +3453,45 @@ def test_a_contradictory_empty_merge_is_refused_before_its_siblings_mutate():
             achievements.run_id, LATER_EXTRACTED_AT)
     assert dict(db.sql.execute(
         'SELECT club_id, captured_at FROM transfermarkt_attendance_observations').fetchall()) == before
+
+
+def test_every_source_is_checked_by_its_complete_origin_and_route():
+    # Round 5 finding 22: achievement sources were compared by hostname only
+    # and their query and fragment were never read, so another port of the
+    # API host and a coach page with a query were verified.
+    body = json.dumps(ACHIEVEMENTS_PACKET).encode('utf-8')
+    digest = hashlib.sha256(body).hexdigest()
+    for url in ('https://tmapi.transfermarkt.technology:444/player/7/achievement',
+                'https://tmapi.transfermarkt.technology/player/7/achievement?x=1',
+                'https://tmapi.transfermarkt.technology/player/7/achievement#more',
+                'https://user@tmapi.transfermarkt.technology/player/7/achievement'):
+        capture = SourceCapture(url=url, endpoint='player_achievement', body=body,
+                                capture_id=digest, body_hash=digest, captured_at=CLUB_CAPTURED)
+        with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+            sections.extract_achievement_observations(
+                capture, _achievement_scope(), recipient_type='player', recipient_id='7',
+                extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    coach = {'recipient_type': 'coach', 'recipient_id': '7'}
+    page = _capture('https://www.transfermarkt.com/x/erfolge/trainer/7', b'<html></html>',
+                    CLUB_CAPTURED, endpoint='coach_achievement')
+    for url in ('https://www.transfermarkt.com:444/x/erfolge/trainer/7',
+                'https://www.transfermarkt.com/x/erfolge/trainer/7?page=2#more',
+                'https://www.transfermarkt.com/x/erfolge/trainer/7?page=2',
+                'https://www.transfermarkt.com/x/erfolge/trainer/7#more'):
+        with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+            core._check_scope_against_capture('achievement_observations', coach, _replace(page, url=url))
+    core._check_scope_against_capture('achievement_observations', coach, page)
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core._check_scope_against_capture(
+            'player_representation_observations', {'player_id': '7'},
+            _replace(_representation_capture(), url=REPRESENTATION_URL.replace('.technology/', '.technology:444/')))
+    core._check_scope_against_capture(
+        'player_representation_observations', {'player_id': '7'}, _representation_capture())
+    # A stage-B lane keeps the same rule for its own origin.
+    from tests.unit.scrapers.test_transfermarkt_core import _load
+    squad = _load('squad')
+    scope_values = {'league': 'GB1', 'season': '2526', 'club_id': squad.url.split('/verein/')[1].split('/')[0]}
+    core._check_scope_against_capture('squad_memberships', scope_values, squad)
+    for url in (squad.url.replace('.com/', '.com:444/'), squad.url + '?page=2', squad.url + '#x'):
+        with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+            core._check_scope_against_capture('squad_memberships', scope_values, _replace(squad, url=url))
