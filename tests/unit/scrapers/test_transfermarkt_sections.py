@@ -2688,3 +2688,95 @@ def test_snapshot_receipt_keeps_the_clock_of_the_capture_it_names():
     older_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, PAGE_2_CAPTURED, 'empty 12:05')
     with pytest.raises(StaleTransfermarktWrite):
         _bundle(db, [_attendance_plan((page_1, older_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
+
+
+def _rowless_tail_snapshot(extracted_at=EXTRACTED_AT):
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, PAGE_2_CAPTURED, 'empty tail')
+    return [_attendance_plan((page_1, empty_2), extracted_at)], page_1, empty_2
+
+
+def _manifest(db):
+    return db.sql.execute(
+        'SELECT source_url, source_capture_id FROM transfermarkt_core_pages_v1 ORDER BY source_url'
+    ).fetchall()
+
+
+def test_recovery_after_a_crash_before_the_manifest_records_it(monkeypatch):
+    # The manifest follows the snapshot it belongs to. A crash in between
+    # leaves the intent pending; the replay rewrites the snapshot and records it.
+    plans, page_1, empty_2 = _rowless_tail_snapshot()
+    db = CoreDB()
+    writer = CoreWriter(db)
+    run_id = plans[0].rows[0]['run_id']
+    original = native_writer._replace_pages
+
+    def crash(*args):
+        raise RuntimeError('crash before the manifest')
+
+    monkeypatch.setattr(native_writer, '_replace_pages', crash)
+    with pytest.raises(RuntimeError, match='crash before the manifest'):
+        _write(db, plans, run_id, EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11'}  # the snapshot's rows are already committed
+    assert native_writer.write_journal.pending_intents({'run_id': run_id})
+    monkeypatch.setattr(native_writer, '_replace_pages', original)
+    receipts = native_writer.replay_pending_intents(lambda: db, writer)
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert native_writer.write_journal.pending_intents({'run_id': run_id}) == []
+    assert _manifest(db) == [(ATTENDANCE_START, page_1.capture_id), (ATTENDANCE_PAGE_2, empty_2.capture_id)]
+    assert set(_stadiums(db)) == {'11'}
+
+
+def test_snapshot_committed_without_its_manifest_is_recorded_on_replay():
+    # A snapshot the warehouse holds without a manifest is written once more
+    # and recorded; from then on its replay is a pure acknowledgement.
+    plans, page_1, empty_2 = _rowless_tail_snapshot()
+    db = CoreDB()
+    writer = CoreWriter(db)
+    run_id = plans[0].rows[0]['run_id']
+
+    def commit():
+        return native_writer.write_core_bundle(
+            lambda: db, writer, plans, run_id=run_id, universe_version=UNIVERSE,
+            committed_at=EXTRACTED_AT)
+
+    commit()
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
+    assert commit()['verified'] is True
+    assert _manifest(db) == [(ATTENDANCE_START, page_1.capture_id), (ATTENDANCE_PAGE_2, empty_2.capture_id)]
+    writes, events = len(writer.writes), len(db.events)
+    assert commit()['verified'] is True
+    assert len(writer.writes) == writes
+    assert not [sql for sql in db.events[events:] if sql.lstrip().startswith('DELETE')]
+
+
+def test_wholly_rowless_snapshot_is_proven_by_its_manifest():
+    # No row at all: the accepted pages and their clocks live in the manifest.
+    # (The donor proves an empty edition only through a recognised layout;
+    # this is the plan the writer then receives.)
+    early = ('2026-11-20T11:00:00.000000+00:00', '2026-11-20T11:05:00.000000+00:00')
+    late = (PAGE_1_CAPTURED, PAGE_2_CAPTURED)
+
+    def proven_empty(clocks, extracted_at):
+        pages = (_page(ATTENDANCE_START, ROWLESS_PAGE_1, clocks[0], 'empty 1'),
+                 _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, clocks[1], 'empty 2'))
+        outcome = sections.extract_attendance_observations(
+            pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+            edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
+        plan = core.plan_for_outcome(
+            _replace(outcome, status='observed_empty', status_reason='attendance:proven',
+                     proof='attendance:proven', rows=()),
+            captured_at=clocks[1], scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+        return plan, outcome.run_id
+
+    older, older_run = proven_empty(early, EXTRACTED_AT)
+    newer, newer_run = proven_empty(late, LATER_EXTRACTED_AT)
+    db = CoreDB()
+    _write(db, [older], older_run, EXTRACTED_AT)
+    _write(db, [newer], newer_run, LATER_EXTRACTED_AT)
+    accepted = [(ATTENDANCE_START, newer.pages[0][1]), (ATTENDANCE_PAGE_2, newer.pages[1][1])]
+    assert _manifest(db) == accepted
+    # The acknowledged older emptiness cannot be acknowledged over the newer one.
+    with pytest.raises(StaleTransfermarktWrite):
+        _write(db, [older], older_run, EXTRACTED_AT)
+    assert _manifest(db) == accepted

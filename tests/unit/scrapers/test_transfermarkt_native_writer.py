@@ -311,9 +311,10 @@ def test_merge_and_replace_readbacks_use_different_predicates():
 
 
 class GuardCursor:
-    def __init__(self, rows=None, pages=None, fail=False):
+    def __init__(self, rows=None, pages=None, fail=False, manifest=None):
         self.rows = rows
         self.pages = pages or []
+        self.manifest = manifest or []  # accepted page evidence of the scope
         self.fail = fail
         self.description = None
     def execute(self, sql, params=None):
@@ -321,6 +322,8 @@ class GuardCursor:
             raise RuntimeError('TABLE_NOT_FOUND: nope')
         self.sql = sql
     def fetchall(self):
+        if 'transfermarkt_core_pages_v1' in self.sql:
+            return self.manifest
         return self.pages if 'GROUP BY source_url' in self.sql else self.rows
     def close(self):
         pass
@@ -837,3 +840,22 @@ def test_empty_replacement_cannot_erase_its_own_capture():
     with pytest.raises(RuntimeError, match='replay differs'):
         write(db, [_empty_roster_plan(clock=LATER, capture='cap-1')], run_id='run-2', clock=LATER)
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 2
+
+def test_guard_reads_the_page_manifest_of_a_rowless_committed_page():
+    # Round 4 finding 1: a page the last walk left without rows exists only
+    # in the manifest; the data rows cannot prove its clock.
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
+    plan = _snapshot(PAGE_EARLIER, 'cap-old')
+    manifest = [(ATTENDANCE_START, 'empty', SIBLING_CLOCK), (ATTENDANCE_PAGE_2, 'cap-2', SIBLING_CLOCK)]
+
+    def guard(pages):
+        cursor = GuardCursor(rows=[(SIBLING_CLOCK,)], pages=pages, manifest=manifest)
+        connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
+        native_writer.guard_native_bundle(connection, plan)
+
+    with pytest.raises(StaleTransfermarktWrite):
+        guard([(ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+    # Without the manifest the rows alone would let the stale page through.
+    cursor = GuardCursor(rows=[(SIBLING_CLOCK,)], pages=[(ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+    native_writer.guard_native_bundle(
+        type('C', (), {'cursor': lambda self, c=cursor: c})(), plan)
