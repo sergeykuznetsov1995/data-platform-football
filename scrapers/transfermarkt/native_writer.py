@@ -439,6 +439,8 @@ class NativeWritePlan:
         seen = set()
         pages = {}
         column_types = {}
+        timestamps = [column for column, kind in _ddl_columns(self.ddl).items()
+                      if kind.startswith('timestamp')]
         for row in self.rows:
             if not isinstance(row, dict):
                 raise ValueError('core plan row must be a dict')
@@ -448,9 +450,16 @@ class NativeWritePlan:
             if any(value is not None and not isinstance(value, (int, str)) for value in row.values()):
                 raise ValueError('core plan row values must be strings, integers or null')
             if any(type(value) is int and not -2 ** 63 <= value < 2 ** 63 for value in row.values()):
-                # Such a row fails only inside the insertion, after a
-                # replacement has already deleted the scope.
+                # The bigint column cannot hold it; refuse it before anything
+                # is staged.
                 raise ValueError('core plan row integer exceeds the bigint range')
+            for column in timestamps:
+                value = row.get(column)
+                # The engine reads several spellings of one moment. A key
+                # cell is compared as text, so a plan states it one way only.
+                if value is not None and (not isinstance(value, str)
+                                          or value != _canonical_clock(value)):
+                    raise ValueError(f'core plan row timestamp is not canonical: {column}')
             if ('observed_at' in self.natural_keys and row.get('observed_at') is not None
                     and _timestamp(row['observed_at']) != _timestamp(row['captured_at'])):
                 raise ValueError('core observation clock must equal its capture clock')
@@ -698,8 +707,27 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
-def _key_cells(values) -> tuple:
-    return tuple(_canonical_cell(value) for value in values)
+def _canonical_clock(value) -> str:
+    """The one spelling of a moment: UTC ISO text with microseconds.
+
+    Anything the text does not parse as (a non-string, a broken timestamp)
+    is returned unchanged, so the caller's own comparison refuses it.
+    """
+    try:
+        return _timestamp(value).isoformat(timespec='microseconds')
+    except (TypeError, ValueError):
+        return value
+
+
+def _key_cells(values, columns=()) -> tuple:
+    cells = []
+    for index, value in enumerate(values):
+        # An engine returns a clock as a datetime, a plan holds it as text;
+        # both are compared as the moment they name, never as spelling.
+        if index < len(columns) and columns[index].endswith('_at'):
+            value = _canonical_clock(value) if isinstance(value, str) else value
+        cells.append(_canonical_cell(value))
+    return tuple(cells)
 
 
 def _guard_key_owners(connection, plan: NativeWritePlan) -> None:
@@ -714,7 +742,7 @@ def _guard_key_owners(connection, plan: NativeWritePlan) -> None:
         return
     keys = [column for column in plan.natural_keys if column != 'source_capture_id']
     prefilter = _KEY_PREFILTER_COLUMNS.get(plan.entity, ())
-    planned = {_key_cells(row[column] for column in keys) for row in plan.rows}
+    planned = {_key_cells((row[column] for column in keys), keys) for row in plan.rows}
     matches = ' OR '.join(
         '(' + ' AND '.join(f'{column} = ?' for column in prefilter) + ')' for _ in plan.rows
     ) if prefilter else '1 = 1'
@@ -731,7 +759,7 @@ def _guard_key_owners(connection, plan: NativeWritePlan) -> None:
         )
     finally:
         cursor.close()
-    if any(_key_cells(row[:len(keys)]) in planned for row in rows):
+    if any(_key_cells(row[:len(keys)], keys) in planned for row in rows):
         raise RuntimeError('core natural key is owned by another capture: ' + plan.table)
 
 

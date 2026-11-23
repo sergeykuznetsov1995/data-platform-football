@@ -17,9 +17,10 @@ pytestmark = pytest.mark.unit
 
 RECEIPTS = 'transfermarkt_core_receipts_v1'
 UTC = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
-CLOCK = UTC.isoformat()
-LATER = datetime(2026, 11, 21, 13, 0, 0, tzinfo=timezone.utc).isoformat()
-EARLIER = datetime(2026, 11, 21, 11, 0, 0, tzinfo=timezone.utc).isoformat()
+# Plan rows state a clock in its one canonical spelling (UTC, microseconds).
+CLOCK = UTC.isoformat(timespec='microseconds')
+LATER = datetime(2026, 11, 21, 13, 0, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
+EARLIER = datetime(2026, 11, 21, 11, 0, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
 
 # A plan's DDL declares every column its rows carry (production builds both
 # from CORE_COLUMNS): the schema preflight reads the table against the DDL.
@@ -351,9 +352,6 @@ def test_guard_refuses_older_bundle_and_accepts_equal_or_missing():
 
 # ---------------------------------------------------------------- stage-C review (#2405)
 
-# SourceCapture only accepts the core's canonical microsecond clocks.
-PAGE_EARLIER = EARLIER.replace('+00:00', '.000000+00:00')
-PAGE_CLOCK = CLOCK.replace('+00:00', '.000000+00:00')
 SIBLING_CLOCK = datetime(2026, 11, 21, 12, 30, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
 NEWEST = datetime(2026, 11, 21, 14, 0, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
 
@@ -375,9 +373,9 @@ def _snapshot(first_clock, first_capture):
 
 def test_guard_refuses_a_stale_page_hidden_behind_a_fresh_sibling_page():
     from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
-    plan = _snapshot(PAGE_EARLIER, 'cap-old')
+    plan = _snapshot(EARLIER, 'cap-old')
     cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
-                         pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+                         pages=[(ATTENDANCE_START, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
     # The scope maximum equals the plan's own clock: only the per-page
     # comparison sees that page 1 would regress a fresher committed page.
@@ -390,10 +388,10 @@ def test_guard_accepts_equal_newer_and_unrelated_pages_of_a_snapshot():
     # A committed page the snapshot no longer contains is replaced by design.
     cursor = GuardCursor(
         rows=[(SIBLING_CLOCK,)],
-        pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK),
+        pages=[(ATTENDANCE_START, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK),
                (ATTENDANCE_START + '?page=3', SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
-    native_writer.guard_native_bundle(connection, _snapshot(PAGE_CLOCK, 'cap-1'))
+    native_writer.guard_native_bundle(connection, _snapshot(CLOCK, 'cap-1'))
     # A newer page 1 beside the unchanged page 2 is a legitimate refresh.
     native_writer.guard_native_bundle(connection, _snapshot(NEWEST, 'cap-new'))
 
@@ -405,11 +403,11 @@ def test_guard_counts_a_page_that_contributed_no_row():
     rowless_older = dataclasses_replace(
         plan, rows=tuple(row for row in plan.rows if row['source_url'] == ATTENDANCE_PAGE_2),
         captured_at=SIBLING_CLOCK, capture_id='', evidence=(),
-        pages=((ATTENDANCE_START, 'cap-rowless', PAGE_EARLIER, hashlib.sha256(b'rowless').hexdigest()),
+        pages=((ATTENDANCE_START, 'cap-rowless', EARLIER, hashlib.sha256(b'rowless').hexdigest()),
                (ATTENDANCE_PAGE_2, hashlib.sha256(b'cap-2').hexdigest(), SIBLING_CLOCK,
                 plan.rows[1]['source_body_hash'])))
     cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
-                         pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
+                         pages=[(ATTENDANCE_START, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
     # The rows alone are fresh; the walked page 1 evidence is not.
     with pytest.raises(StaleTransfermarktWrite):
@@ -851,7 +849,7 @@ def test_guard_reads_the_page_manifest_of_a_rowless_committed_page():
     # Round 4 finding 1: a page the last walk left without rows exists only
     # in the manifest; the data rows cannot prove its clock.
     from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
-    plan = _snapshot(PAGE_EARLIER, 'cap-old')
+    plan = _snapshot(EARLIER, 'cap-old')
     manifest = [(ATTENDANCE_START, 'empty', SIBLING_CLOCK), (ATTENDANCE_PAGE_2, 'cap-2', SIBLING_CLOCK)]
 
     def guard(pages):
@@ -912,7 +910,7 @@ def test_failed_insertion_keeps_the_committed_scope():
 def test_plan_rows_are_read_only_after_validation():
     # Round 4 finding 7: a plan's rows stayed writable through plan.rows, so
     # the writer could verify content the plan never validated.
-    plan = _snapshot(PAGE_CLOCK, 'cap-1')
+    plan = _snapshot(CLOCK, 'cap-1')
     digest = plan.plan_sha256()
     row = plan.rows[0]
     with pytest.raises(TypeError):
