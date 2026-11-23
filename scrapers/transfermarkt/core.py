@@ -818,12 +818,16 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
             raise CoreParseError('row_scope_mismatch')
         return
     if entity == 'referee_aggregate_observations':
-        if _referee_directory_identity(path) != (scope_values['competition_id'], scope_values['edition_id']):
+        # The donor's directory URL carries its page in the path; a query or
+        # fragment is not part of the supported route.
+        if (url.query or url.fragment or _referee_directory_identity(path)
+                != (scope_values['competition_id'], scope_values['edition_id'])):
             raise CoreParseError('row_scope_mismatch')
         return
     if entity == 'referee_profiles':
         match = re.fullmatch(r'/-/profil/schiedsrichter/([1-9][0-9]*)', path)
-        if url.hostname != TRANSFERMARKT_HOST:
+        # The whole origin: another port of the right host is another source.
+        if url.netloc != TRANSFERMARKT_HOST or url.query or url.fragment:
             raise CoreParseError('row_scope_mismatch')
         if match is None or match[1] != scope_values['referee_id']:
             raise CoreParseError('row_scope_mismatch')
@@ -845,7 +849,7 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
             raise CoreParseError('row_scope_mismatch')
         if recipient_type == 'coach':
             match = re.fullmatch(r'/[A-Za-z0-9-]+/erfolge/trainer/([1-9][0-9]*)', path)
-            if url.hostname != 'www.transfermarkt.com' or match is None or match[1] != recipient_id:
+            if url.netloc != TRANSFERMARKT_HOST or match is None or match[1] != recipient_id:
                 raise CoreParseError('row_scope_mismatch')
         else:
             match = re.fullmatch(r'/(player|club)/([1-9][0-9]*)/achievement', path)

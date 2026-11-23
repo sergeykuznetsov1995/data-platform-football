@@ -255,13 +255,16 @@ def _referee_walk_failure(captures):
 
     The pages must be one contiguous walk from page 1 that only a terminal
     page closes: a trailing next link means pages are missing and nothing of
-    the directory is certified. Returns that page's capture and the reason.
+    the directory is certified. Every page URL is the donor's route, with
+    its page in the path: a query or fragment is not part of it. Returns the
+    page that breaks the walk, its capture and the reason.
     """
     scope = identity = None
     for index, capture in enumerate(captures, 1):
         url = urlsplit(capture.url)
         match = _DIRECTORY_PAGE.fullmatch(url.path)
-        if match is None or url.netloc != core.TRANSFERMARKT_HOST:
+        if (match is None or url.netloc != core.TRANSFERMARKT_HOST
+                or url.query or url.fragment):
             return capture, 'directory_identity_invalid'
         if scope is None:
             scope = match.groupdict()
@@ -300,18 +303,19 @@ def extract_referee_directory_observations(
     if failed is not None:
         return (_unavailable_capture('referees', 'referee_aggregate_observations', failed, scope,
                                      extracted_at, universe_version),)
+    failure = _referee_walk_failure(captures)
+    if failure is not None:
+        # The walk is not certified whole: the directory keeps no partial rows
+        # and the failing page itself backs the error. The identity of the
+        # directory is read only once its first page proved well-formed.
+        broken, reason = failure
+        return (_outcome(entity, 'error', 'referees:' + reason,
+                         **core._context(broken, scope, extracted_at, universe_version)),)
     competition_id, edition_id = core._referee_directory_identity(urlsplit(captures[0].url).path)
     directory = {'competition_id': competition_id, 'edition_id': edition_id}
 
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
-    failure = _referee_walk_failure(captures)
-    if failure is not None:
-        # The walk is not certified whole: the directory keeps no partial rows
-        # and the failing page itself backs the error.
-        broken, reason = failure
-        return (_outcome(entity, 'error', 'referees:' + reason,
-                         **core._context(broken, scope, extracted_at, universe_version)),)
     first_page = {}
     try:
         pages = [capture.text for capture in captures]
