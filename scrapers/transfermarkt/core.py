@@ -361,6 +361,39 @@ def _batch_id(run_id: str) -> str:
     return 'tm-core-batch-' + hashlib.sha256(run_id.encode('utf-8')).hexdigest()[:32]
 
 
+def _row_facts_match_verdict(entity: str, row) -> bool:
+    """Whether a row's verdict agrees with the facts the row itself carries.
+
+    Each section's donor states these invariants for its own rows. They are
+    repeated here because DQ and planning read the rows after the donor is
+    gone, and the rows have stayed mutable.
+    """
+    verdict = row.get('observation_status')
+    if entity == 'attendance_observations':
+        # The donor: a club is observed exactly when a crowd figure is published.
+        published = row.get('spectators_total') is not None or row.get('spectators_average') is not None
+        return published == (verdict == 'observed_present')
+    if entity == 'player_representation_observations':
+        # The donor: only an assigned player names a representative, and an
+        # explicit absence carries its own evidence.
+        if verdict == 'observed_present':
+            return (_nonempty(row.get('representative_id'))
+                    and row.get('representative_key') == f"agency:{row.get('representative_id')}")
+        if row.get('representative_id') is not None or row.get('representative_key') != f'status:{verdict}':
+            return False
+        return verdict != 'explicit_none' or row.get('evidence_type') == 'player_profile_explicit_none'
+    if entity == 'referee_aggregate_observations':
+        # The donor: a metric has a value exactly when it is observed present.
+        return (row.get('value') is not None) == (verdict == 'observed_present')
+    if entity == 'club_value_observations':
+        # The donor: a value is present exactly when it has a non-negative amount.
+        amount = row.get('value_amount')
+        if (amount is not None) != (verdict == 'observed_present'):
+            return False
+        return amount is None or (type(amount) is int and amount >= 0)
+    return True
+
+
 def _status_matches_rows(entity, status, rows) -> bool:
     if status in _PROOF_STATUSES:
         # A proof certifies an absence; no lane carries rows under it.
@@ -382,10 +415,8 @@ def _status_matches_rows(entity, status, rows) -> bool:
         if not isinstance(verdict, str) or verdict not in allowed:
             return False
         verdicts.append(verdict)
-        # The donor's amount/status invariant: a club value is present
-        # exactly when the row carries its amount.
-        if (entity == 'club_value_observations'
-                and (verdict == 'observed_present') != (row.get('value_amount') is not None)):
+        # The row's own facts must agree with its verdict.
+        if not _row_facts_match_verdict(entity, row):
             return False
         # Each contract cell carries its own verdict, in both directions.
         if contract and verdict != _CONTRACT_STATUSES.get(row.get('contract_status')):

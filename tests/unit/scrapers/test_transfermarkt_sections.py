@@ -212,7 +212,7 @@ def test_lane_outcome_row_status_policy_for_section_entities():
     assert accepted.status == 'unknown'
     # mixed per-row statuses stay valid under an observed_present outcome
     mixed = LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
-                        ({'observation_status': 'observed_present'},
+                        ({'observation_status': 'observed_present', 'spectators_total': 1},
                          {'observation_status': 'explicit_none'}), **context)
     assert len(mixed.rows) == 2
     # a row status outside the section policy is still rejected
@@ -1138,6 +1138,13 @@ def test_aggregate_verdict_must_agree_with_its_row_verdicts(entity, status, reas
         LaneOutcome(entity, status, reason, rows, **_outcome_context())
 
 
+def _stub_row(entity, verdict):
+    """A row stub that carries the facts its verdict claims (round 5)."""
+    facts = {('attendance_observations', 'observed_present'): {'spectators_total': 1},
+             ('referee_aggregate_observations', 'observed_present'): {'value': '1'}}
+    return {'observation_status': verdict, **facts.get((entity, verdict), {})}
+
+
 @pytest.mark.parametrize('entity, status, reason, verdicts', [
     ('attendance_observations', 'observed_present', 'attendance:ok',
      ['observed_present', 'explicit_none', 'unknown']),
@@ -1153,7 +1160,7 @@ def test_aggregate_verdict_must_agree_with_its_row_verdicts(entity, status, reas
     ('referee_aggregate_observations', 'observed_present', 'referees:page', ['explicit_none']),
 ])
 def test_consistent_aggregates_and_metric_pages_stay_valid(entity, status, reason, verdicts):
-    rows = tuple({'observation_status': verdict} for verdict in verdicts)
+    rows = tuple(_stub_row(entity, verdict) for verdict in verdicts)
     assert LaneOutcome(entity, status, reason, rows, **_outcome_context()).status == status
 
 
@@ -1207,7 +1214,8 @@ def test_populated_outcome_names_the_revision_of_its_rows():
     # An outcome cannot claim a revision its rows do not carry.
     with pytest.raises(CoreParseError, match='revision'):
         LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
-                    ({'observation_status': 'observed_present', 'parser_revision': 'other-v9'},),
+                    ({'observation_status': 'observed_present', 'spectators_total': 1,
+                      'parser_revision': 'other-v9'},),
                     parser_revision=attendance.ATTENDANCE_PARSER_REVISION,
                     **_outcome_context())
 
