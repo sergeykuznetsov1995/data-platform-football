@@ -3661,3 +3661,55 @@ def test_an_unrenderable_row_is_its_sections_error(monkeypatch, lane):
         assert outcome.status_reason.endswith(':row_value_exceeds_bigint')
         assert outcome.capture is not None
     assert core.build_core_dq(outcomes)['passed'] is True
+
+
+def test_a_rows_verdict_must_agree_with_the_facts_the_row_carries():
+    # Round 5 finding 19: a row kept its donor's facts (a crowd figure, an
+    # agency, a metric value) under a verdict that denies them, and DQ and
+    # planning certified it.
+    page_1, page_2 = _two_pages()
+    outcome, = sections.extract_attendance_observations(
+        (page_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert all(row['spectators_total'] for row in outcome.rows)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        _replace(outcome, status='explicit_none',
+                 rows=tuple({**row, 'observation_status': 'explicit_none'} for row in outcome.rows))
+    for row in outcome.rows:
+        row['observation_status'] = 'explicit_none'
+    assert 'status_rows_mismatch' in core.build_core_dq([outcome])['errors']
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+
+    assigned = next(item for item in sections.extract_representation_observations(
+        _representation_capture(), _representation_scope(), expected_ids=('7', '9'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE) if item.status == 'observed_present')
+    assert assigned.rows[0]['representative_key'] == 'agency:55'
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        _replace(assigned, status='explicit_none',
+                 rows=({**assigned.rows[0], 'observation_status': 'explicit_none'},))
+    assigned.rows[0]['observation_status'] = 'explicit_none'
+    assert 'status_rows_mismatch' in core.build_core_dq([assigned])['errors']
+
+    first = _referee_page(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')]))
+    directory, = _referee_directory((first,))
+    published = [row for row in directory.rows if row['observation_status'] == 'observed_present']
+    assert any(row['metric'] == 'matches_officiated' and row['value'] == '14' for row in published)
+    absent = tuple({**row, 'observation_status': 'explicit_none'} for row in directory.rows)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        _replace(directory, rows=absent)
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        _replace(directory, rows=tuple(
+            {**row, 'value': None} if row['observation_status'] == 'observed_present' else row
+            for row in directory.rows))
+
+    values = sections.extract_club_value_observations(
+        _club_value_capture(), _club_value_scope(), competition_id='VIE1',
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    club = next(item for item in values if all(row['value_amount'] is not None for row in item.rows))
+    club.rows[0]['value_amount'] = -1
+    assert 'status_rows_mismatch' in core.build_core_dq([club])['errors']
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        core.plan_for_outcome(club, captured_at=CLUB_CAPTURED,
+                              scope_values={'club_id': club.rows[0]['club_id']})
