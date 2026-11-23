@@ -1406,7 +1406,7 @@ def _insert_receipt(connection, sql, bound, receipt_id, expected) -> None:
                 cursor.fetchall()
             return
         except Exception as exc:
-            ambiguous = _ambiguous_commit(exc)
+            failure = exc
         finally:
             cursor.close()
         stored = _stored_receipts(connection, [receipt_id]).get(receipt_id)
@@ -1414,8 +1414,8 @@ def _insert_receipt(connection, sql, bound, receipt_id, expected) -> None:
             if stored != expected:
                 raise RuntimeError('core receipt contradicts its earlier acknowledgement')
             return
-        if attempt or not ambiguous:
-            raise
+        if attempt or not _ambiguous_commit(failure):
+            raise failure
 
 
 def _merge_receipts(connection, receipts) -> None:
