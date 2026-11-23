@@ -1434,3 +1434,151 @@ def test_an_ambiguous_receipt_insert_is_resolved_by_reading_the_id_back():
         universe_version='u', committed_at=CLOCK)
     assert receipt['verified'] is True
     assert _receipt_count(db) == 1
+
+
+# ---------------------------------------------------------------- round 6: journal and identity
+
+def _stored_clocks(db):
+    import datetime as _datetime
+    return sorted(native_writer._timestamp(value[0]).isoformat() for value in db.sql.execute(
+        'SELECT committed_at FROM transfermarkt_core_receipts_v1'))
+
+
+def test_a_receipt_only_repair_leaves_a_recoverable_intent():
+    # Round 6 finding 8: with every data plan already written, a repair that
+    # only re-inserts deleted receipts saved no intent, so an interrupted
+    # repair had nothing left to replay.
+    class RepairDB(CoreDB):
+        flaky = False
+        inserts = 0
+
+        def cursor(self):
+            if not self.flaky:
+                return CoreCursor(self)
+
+            class FlakyCursor(CoreCursor):
+                def execute(self, sql, params=()):
+                    if sql.startswith('INSERT INTO iceberg.ops.transfermarkt_core_receipts_v1'):
+                        RepairDB.inserts += 1
+                        if RepairDB.inserts == 2:
+                            raise RuntimeError('crash during receipt repair')
+                    return super().execute(sql, params)
+            return FlakyCursor(self)
+
+    db = RepairDB()
+    plans = [membership_plan(['1'], capture='cap-1'), mv_plan([('2025-01-01', 10)])]
+
+    def commit():
+        return native_writer.write_core_bundle(
+            lambda: db, CoreWriter(db), plans, run_id='r', universe_version='u', committed_at=CLOCK)
+
+    assert commit()['verified'] is True
+    db.sql.execute('DELETE FROM transfermarkt_core_receipts_v1')
+    db.flaky = True
+    with pytest.raises(RuntimeError, match='crash during receipt repair'):
+        commit()
+    assert write_journal.pending_intents({'run_id': 'r'})
+    db.flaky = False
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert _receipt_count(db) == 2 and not write_journal.pending_intents({'run_id': 'r'})
+
+
+def test_an_interrupted_migration_never_leaves_an_intent_the_reader_rejects(monkeypatch):
+    # Round 6 finding 9: the migration saved a second intent under the legacy
+    # digest with a current-format descriptor; an interruption left it behind,
+    # and every later recovery stopped at "digest is not recognised".
+    db = CoreDB()
+    plan = _empty_roster_plan()
+    _plan_hash, legacy_digest = _stage_b_identity(plan, 'run-old')
+    _legacy_intent(plan, legacy_digest)
+    real = native_writer._commit_plans
+
+    def crash(*args, **kwargs):
+        raise RuntimeError('crash during migration')
+
+    monkeypatch.setattr(native_writer, '_commit_plans', crash)
+    with pytest.raises(RuntimeError, match='crash during migration'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    monkeypatch.setattr(native_writer, '_commit_plans', real)
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert write_journal.pending_intents({'run_id': 'run-old'}) == []
+
+
+def test_an_ordinary_retry_reuses_a_completed_stage_b_acknowledgement():
+    # Round 6 findings 10 and 11: a unit the stage-B writer acknowledged
+    # completely (journal receipt and warehouse receipt under the old digest,
+    # no pending intent, no alias) was committed a second time under today's
+    # identity by the ordinary retry; an alias published later carried the
+    # post-write anchors instead of the acknowledged ones.
+    db = CoreDB()
+    plan = _empty_roster_plan()
+    plan_hash, legacy_digest = _stage_b_identity(plan, 'run-old')
+    _current, current_digest = native_writer._bundle_identity([plan], 'run-old')
+    batch = native_writer._batch_id_for_run('run-old')
+    write_journal.snapshot_anchors(legacy_digest, db, {'transfermarkt_squad_memberships', 'ops.transfermarkt_core_receipts_v1'})
+    acknowledged = write_journal.read_snapshot_anchors(legacy_digest)
+    native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+    native_writer._merge_receipts(db, [native_writer._plan_receipt(
+        plan, {**_EMPTY_PROOF, 'physical_hash': native_writer._digest([])}, plan_hash,
+        legacy_digest, 'run-old', 'u', batch, CLOCK)])
+    write_journal.record_receipt(legacy_digest, {
+        'verified': True, 'receipt_readback': True, 'run_id': 'run-old', 'universe_version': 'u',
+        'committed_at': CLOCK, 'plan_sha256': legacy_digest, 'committed_batch': batch,
+        'plans': [], 'manifests': []})
+    again = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [plan], run_id='run-old', universe_version='u',
+        committed_at=LATER)
+    assert again['verified'] is True
+    assert _receipt_count(db) == 1
+    assert db.sql.execute('SELECT plan_sha256 FROM transfermarkt_core_receipts_v1').fetchall() == [
+        (plan_hash,)]
+    assert write_journal.read_receipt(current_digest)['verified'] is True
+    assert write_journal.read_snapshot_anchors(current_digest) == acknowledged != {}
+
+
+def test_a_retry_reuses_the_commit_clock_of_its_pending_intent(monkeypatch):
+    # Round 6 finding 12: a retry that named a later commit clock saved a
+    # second intent for the same digest; its receipt contradicted the one the
+    # interrupted write had already stored, and the replay stopped there.
+    db = CoreDB()
+    plans = [membership_plan(['1'], capture='cap-1')]
+    real = write_journal.record_receipt
+
+    def crash(*args, **kwargs):
+        raise RuntimeError('crash before the local acknowledgement')
+
+    monkeypatch.setattr(write_journal, 'record_receipt', crash)
+    with pytest.raises(RuntimeError, match='crash before'):
+        native_writer.write_core_bundle(
+            lambda: db, CoreWriter(db), plans, run_id='r', universe_version='u', committed_at=CLOCK)
+    monkeypatch.setattr(write_journal, 'record_receipt', real)
+    assert _stored_clocks(db) == [native_writer._timestamp(CLOCK).isoformat()]
+    again = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), plans, run_id='r', universe_version='u', committed_at=LATER)
+    assert again['verified'] is True
+    assert _receipt_count(db) == 1
+    assert _stored_clocks(db) == [native_writer._timestamp(CLOCK).isoformat()]
+    assert not write_journal.pending_intents({'run_id': 'r'})
+
+
+def test_a_receipt_repair_is_bound_to_the_acknowledged_universe():
+    # Round 6 finding 13: a retry under another universe repaired the deleted
+    # warehouse receipt with that universe and still returned the original
+    # acknowledgement.
+    db = CoreDB()
+    plans = [membership_plan(['1'], capture='cap-1')]
+
+    def commit(universe):
+        return native_writer.write_core_bundle(
+            lambda: db, CoreWriter(db), plans, run_id='r', universe_version=universe,
+            committed_at=CLOCK)
+
+    assert commit('u')['verified'] is True
+    db.sql.execute('DELETE FROM transfermarkt_core_receipts_v1')
+    with pytest.raises(RuntimeError, match='universe'):
+        commit('different')
+    assert _receipt_count(db) == 0
+    assert commit('u')['verified'] is True
+    assert _receipt_count(db) == 1
