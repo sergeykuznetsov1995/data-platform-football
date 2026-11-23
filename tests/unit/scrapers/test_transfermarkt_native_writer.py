@@ -316,13 +316,15 @@ def test_plan_validation_rejects_broken_contracts():
     with pytest.raises(ValueError, match='share one source_capture_id'):
         NativeWritePlan(**{**base, 'rows': (
             base['rows'][0],
-            {**base['rows'][0], 'player_id': '2', 'source_capture_id': 'other'})})
+            {**base['rows'][0], 'player_id': '2',
+             'source_capture_id': 'other', 'raw_capture_id': 'other'})})
     with pytest.raises(ValueError, match='page evidence belongs to a multi-page'):
         NativeWritePlan(**{**base, 'pages': (('u', 'c', CLOCK),)})
     with pytest.raises(ValueError, match='share one source_capture_id'):
         NativeWritePlan(**{**base, 'write_mode': 'merge', 'rows': (
             base['rows'][0],
-            {**base['rows'][0], 'player_id': '2', 'source_capture_id': 'other'})})
+            {**base['rows'][0], 'player_id': '2',
+             'source_capture_id': 'other', 'raw_capture_id': 'other'})})
 
 
 def test_merge_and_replace_readbacks_use_different_predicates():

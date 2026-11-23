@@ -2585,7 +2585,7 @@ def test_row_lineage_must_match_its_own_page():
         {**row, 'raw_capture_id': arsenal['raw_capture_id'],
          'source_body_hash': arsenal['source_body_hash']}
         if row['club_id'] == '631' else row for row in outcome.rows)
-    with pytest.raises(ValueError, match='lineage differs'):
+    with pytest.raises(ValueError, match='lineage differs|names two captures'):
         core.plan_for_outcome(
             _replace(outcome, rows=borrowed), captured_at=PAGE_2_CAPTURED,
             scope_values={'competition_id': 'GB1', 'edition_id': '2025'})

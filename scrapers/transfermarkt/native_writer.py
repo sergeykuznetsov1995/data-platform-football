@@ -446,13 +446,21 @@ class NativeWritePlan:
                 'core row lineage differs: rows must come from a page of the snapshot evidence')
 
     def _check_row_evidence(self) -> None:
-        """Without a page manifest the plan's evidence stands for every row."""
-        if self.pages or not self.rows:
+        """A row carries the evidence its plan names.
+
+        Without a page manifest the plan's evidence is the one response
+        behind every row; a snapshot's evidence describes the run its rows
+        share, each page being compared with the manifest instead.
+        """
+        if not self.rows:
             return
         evidence = dict(self.evidence)
-        for column in ('source_url', 'source_body_hash'):
+        columns = ['source_endpoint', 'scope_id', 'cycle_id']
+        if not self.pages:
+            columns += ['source_url', 'source_body_hash']
+        for column in columns:
             if evidence.get(column) is not None and any(
-                    row[column] != evidence[column] for row in self.rows):
+                    column in row and row[column] != evidence[column] for row in self.rows):
                 raise ValueError('core row lineage differs from the plan evidence')
 
     def readback_sql(self) -> tuple[str, tuple]:
@@ -476,7 +484,9 @@ class NativeWritePlan:
         required = keys | _REQUIRED_ROW_COLUMNS
         seen = set()
         pages = {}
+        first = None
         column_types = {}
+        shared = _RUN_COLUMNS if self._multi_page() else _RESPONSE_COLUMNS
         declared = _ddl_columns(self.ddl)
         timestamps = [column for column, kind in declared.items() if kind.startswith('timestamp')]
         for row in self.rows:
@@ -515,6 +525,15 @@ class NativeWritePlan:
                 raise ValueError('core plan row is outside its replacement scope')
             if not _nonempty(row['source_capture_id']):
                 raise ValueError('core plan row has invalid source_capture_id')
+            if row['raw_capture_id'] != row['source_capture_id']:
+                # One response has one identity: a row never names two captures.
+                raise ValueError('core row names two captures: raw_capture_id differs from source_capture_id')
+            if first is None:
+                first = row
+            # Every row carries the lineage of the response (the run, for a
+            # snapshot) alike: the receipt names one capture for them all.
+            elif any(column in first and row.get(column) != first[column] for column in shared):
+                raise ValueError('core plan rows must share one source response')
             if not self._multi_page() and row['source_capture_id'] != self.rows[0]['source_capture_id']:
                 raise ValueError('core plan rows must share one source_capture_id')
             if self._multi_page():
@@ -612,6 +631,11 @@ _KEY_PREFILTER_COLUMNS = {
         'referee_id', 'competition_id', 'edition_id', 'metric'),
 }
 _CAPTURE_KEY_COLUMNS = frozenset({'observed_at', 'source_capture_id'})
+# The lineage every row of one plan carries alike: the run it belongs to.
+# A plan of one captured page is one response, and its rows carry that
+# response's whole lineage; a snapshot holds one response per page.
+_RUN_COLUMNS = ('source_endpoint', 'scope_id', 'cycle_id', 'run_id', 'universe_version')
+_RESPONSE_COLUMNS = ('captured_at', 'source_url', 'source_body_hash', *_RUN_COLUMNS)
 # The attendance edition is the one replacement snapshot that spans several
 # walked pages; every other replacement is one captured page.
 _MULTI_PAGE_REPLACE_ENTITIES = frozenset({'attendance_observations'})
