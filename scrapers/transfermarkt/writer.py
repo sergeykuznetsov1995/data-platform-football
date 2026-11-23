@@ -25,6 +25,7 @@ from scrapers.transfermarkt.native_writer import (  # noqa: F401 — donor facad
     is_mutation,
     locked_write,
     shared_writer_lock_ready,
+    write_is_journalled,
     writer_deadline,
     writer_lock,
 )
@@ -72,14 +73,28 @@ class TransfermarktTrinoManager(TrinoTableManager):
                 types[column] = 'DATE'
         return types
 
-    def _execute(self, sql, fetch=False, params=None):
+    def _execute(self, sql, fetch=False, params=None, *, replay_safe=True):
         parent = super()._execute
         if fetch or not _MUTATION.match(sql):
             return parent(sql, fetch=fetch, params=params)
+        if not replay_safe:
+            return parent(sql, fetch=fetch, params=params, replay_safe=False)
         return _execute_committing(lambda: parent(sql, fetch=fetch, params=params))
-    def _execute_committing(self, sql):
+    def _execute_committing(self, sql, *, replay_safe=True):
         # Avoid the common manager's independent retry loop and nested jitter.
+        if not replay_safe:
+            # The strict ladder retries a definite rejected commit only.
+            return super()._execute_committing(sql, replay_safe=False)
         return self._execute(sql)
+    def _execute_replacement(self, sql):
+        # A replacement MERGE inserts its staged rows on every execution:
+        # replayed after an uncertain commit it adds them a second time. A
+        # journalled core write stops at the uncertainty instead, since its
+        # replay reads the scope back before it writes again. The donor stack
+        # has no journal and keeps the replay-safe default.
+        if write_is_journalled():
+            return self._execute_committing(sql, replay_safe=False)
+        return super()._execute_replacement(sql)
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         with writer_lock():
             if kwargs.get('delete_filter'):

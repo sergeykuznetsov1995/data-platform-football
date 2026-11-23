@@ -1705,3 +1705,33 @@ def test_an_uncertain_snapshot_is_replaced_once_more_and_acknowledged():
     assert native_writer._rows_equal(native_writer._read_plan_rows(db, snapshot), snapshot.rows)
     native_writer._verify_pages(db, snapshot)
     assert write_journal.pending_intents({'run_id': 'run-b'}) == []
+
+
+def test_the_production_writer_never_replays_the_replacement_of_a_core_write(monkeypatch):
+    # Round 6 finding 2, the wiring. The commit boundary marks the thread, the
+    # production writer hands the scope to its manager, and the manager runs
+    # the replacement MERGE it generates once.
+    from scrapers.transfermarkt import writer as transfermarkt_writer
+    from tests.unit.scrapers.test_transfermarkt_writer_safety import (
+        _TombstoneWarehouse, _scripted,
+    )
+
+    plan = membership_plan(['B'], capture='cap-b')
+    warehouse = _TombstoneWarehouse(
+        plan.table, [dict(membership_plan(['A'], capture='cap-a').rows[0])])
+    production = transfermarkt_writer.TransfermarktIcebergWriter(
+        trino_host='trino.invalid', trino_port=8080)
+    production._trino_manager = _scripted(warehouse)
+    # The core writer created the table and checked its columns itself.
+    monkeypatch.setattr(production._trino_manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(IcebergWriter, '_evolve_schema', lambda *args: None)
+
+    with pytest.raises(TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(
+            lambda: CoreDB(), production, [plan], run_id='run-1',
+            universe_version='core-universe-v1', committed_at=CLOCK)
+
+    assert len(warehouse.merges) == 1
+    assert warehouse.players() == ['B']
+    assert write_journal.pending_intents({'run_id': 'run-1'})
+    assert not native_writer.write_is_journalled()  # the boundary closed with the failure

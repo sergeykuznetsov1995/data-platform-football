@@ -101,6 +101,26 @@ def writer_deadline(deadline):
         _LOCAL.deadline = previous
 
 
+@contextmanager
+def journalled_write():
+    """Mark the statements of this thread as belonging to a journalled unit.
+
+    The journal replays the unit and reads the warehouse back before anything
+    is written again, so no statement of the unit is replayed blindly after an
+    uncertain outcome: the one that would duplicate its rows stops instead.
+    """
+    previous = getattr(_LOCAL, 'journalled', False)
+    _LOCAL.journalled = True
+    try:
+        yield
+    finally:
+        _LOCAL.journalled = previous
+
+
+def write_is_journalled() -> bool:
+    return bool(getattr(_LOCAL, 'journalled', False))
+
+
 def _execute_committing(operation, *, attempts=4):
     """Retry only explicit Iceberg commit conflicts; drain inside operation."""
     for attempt in range(attempts):
@@ -1787,7 +1807,7 @@ def _commit_bundle(
     ``journaled`` says the caller already holds the pending intent of this
     unit and finishes it: no second intent is published.
     """
-    with writer_deadline(deadline), writer_lock():
+    with writer_deadline(deadline), journalled_write(), writer_lock():
         _validate_bundle(plans, run_id, universe_version, committed_at)
         if len(set(plan_hashes)) != len(plan_hashes):
             # One acknowledgement never stands for two plans of a bundle.

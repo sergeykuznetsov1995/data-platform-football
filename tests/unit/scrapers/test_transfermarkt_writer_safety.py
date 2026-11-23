@@ -348,12 +348,18 @@ def test_base_trino_manager_still_receives_no_session_properties(monkeypatch):
 class _TombstoneWarehouse:
     """A scripted Trino whose statements land in DuckDB as Trino would run them."""
 
-    def __init__(self, players):
+    def __init__(self, table, rows):
         import duckdb
 
+        kinds = {str: 'VARCHAR', int: 'BIGINT', bool: 'BOOLEAN', type(None): 'VARCHAR'}
+        self.table = table
         self.engine = duckdb.connect(':memory:')
-        self.engine.execute('CREATE TABLE roster (club_id VARCHAR, player_id VARCHAR)')
-        self.engine.executemany('INSERT INTO roster VALUES (?, ?)', [('11', player) for player in players])
+        columns = list(rows[0])
+        self.engine.execute(f'CREATE TABLE {table} (' + ', '.join(
+            f'{column} {kinds[type(rows[0][column])]}' for column in columns) + ')')
+        self.engine.executemany(
+            f'INSERT INTO {table} VALUES ({", ".join("?" for _ in columns)})',
+            [tuple(row[column] for column in columns) for row in rows])
         self.executed = []
         self.lost = False
 
@@ -367,11 +373,16 @@ class _TombstoneWarehouse:
         return _TombstoneConnection(self)
 
     def players(self):
-        return sorted(row[0] for row in self.engine.execute('SELECT player_id FROM roster').fetchall())
+        rows = self.engine.execute(f'SELECT player_id FROM {self.table}').fetchall()
+        return sorted(row[0] for row in rows)
 
     @property
     def merges(self):
         return [sql for sql in self.executed if sql.startswith('MERGE INTO')]
+
+
+def _roster(players):
+    return _TombstoneWarehouse('roster', [{'club_id': '11', 'player_id': player} for player in players])
 
 
 class _TombstoneCursor:
@@ -407,26 +418,26 @@ class _TombstoneConnection:
 
 
 def _scripted(warehouse):
+    """The production manager on the scripted server, its slow stage insert done."""
     manager = writer.TransfermarktTrinoManager()
     manager._conn = warehouse.connection()
     manager._create_connection = warehouse.connection  # a reset reaches the same server
+
+    def staged(schema, table, df, *args, **kwargs):
+        warehouse.engine.executemany(
+            f'INSERT INTO {table} VALUES ({", ".join("?" for _ in df.columns)})',
+            [tuple(row) for row in df.itertuples(index=False, name=None)])
+        return len(df)
+
+    manager.insert_dataframe = staged
     return manager
 
 
 def _replace_roster(warehouse, players):
     """One replacement of the roster through the production staged path."""
-    manager = _scripted(warehouse)
     frame = pd.DataFrame({'club_id': ['11'] * len(players), 'player_id': list(players)})
-
-    def staged(schema, table, df, *args, **kwargs):
-        warehouse.engine.executemany(
-            f'INSERT INTO {table} VALUES (?, ?, ?)',
-            [tuple(row) for row in df.itertuples(index=False, name=None)])
-        return len(df)
-
-    with patch.object(manager, 'insert_dataframe', side_effect=staged):
-        return manager.insert_dataframe_atomic(
-            'bronze', 'roster', frame, delete_filter="club_id = '11'")
+    return _scripted(warehouse).insert_dataframe_atomic(
+        'bronze', 'roster', frame, delete_filter="club_id = '11'")
 
 
 def test_a_replayed_replacement_merge_inserts_its_rows_a_second_time():
@@ -435,7 +446,7 @@ def test_a_replayed_replacement_merge_inserts_its_rows_a_second_time():
     # on every execution. Replayed after the response to a committed MERGE was
     # lost, it reports one row and leaves two. The replay-safe default is what
     # the donor stack keeps; a journalled core write must not use it.
-    warehouse = _TombstoneWarehouse(['A'])
+    warehouse = _roster(['A'])
 
     assert _replace_roster(warehouse, ['B']) == 1
 
@@ -447,7 +458,7 @@ def test_a_journalled_replacement_stops_at_a_lost_response_and_is_never_replayed
     # Round 6 finding 2, the fix. Inside the core writer's commit boundary the
     # replacement MERGE runs once: an uncertain outcome is raised for the
     # journal, whose replay reads the scope back before it writes again.
-    warehouse = _TombstoneWarehouse(['A'])
+    warehouse = _roster(['A'])
 
     with native_writer.journalled_write(), pytest.raises(TrinoAmbiguousWriteError):
         _replace_roster(warehouse, ['B'])
