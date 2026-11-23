@@ -1172,3 +1172,103 @@ def test_validated_rows_cannot_be_reinitialised():
         lambda: db, CoreWriter(db), [plan], run_id='run-14', universe_version='u',
         committed_at=plan.captured_at)
     assert receipt['plans'][0]['status_counts'] == {'observed_present': 2}
+
+
+# ---------------------------------------------------------------- round 5: journal and receipts
+
+_EMPTY_PROOF = {'entity': 'squad_memberships', 'table': 'transfermarkt_squad_memberships',
+                'rows': 0, 'physical_hash': None, 'expected_rows': 0, 'status_counts': {}}
+
+
+def _receipt_count(db):
+    return db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0]
+
+
+def test_an_existing_receipt_is_never_overwritten_with_another_capture():
+    # Round 5 finding 8: stage B digests a rowless plan without its capture,
+    # so two captures of one scope at one clock share a receipt id. Recovery
+    # of the second overwrote the first one's evidence through MERGE UPDATE.
+    db = CoreDB()
+    native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+    first = _empty_roster_plan(capture='cap-a')
+    second = _empty_roster_plan(capture='cap-b')
+    plan_hash, legacy_digest = _stage_b_identity(first, 'run-old')
+    assert _stage_b_identity(second, 'run-old') == (plan_hash, legacy_digest)
+    seeded = native_writer._plan_receipt(
+        first, {**_EMPTY_PROOF, 'physical_hash': native_writer._digest([])}, plan_hash,
+        legacy_digest, 'run-old', 'u', native_writer._batch_id_for_run('run-old'), CLOCK)
+    native_writer._merge_receipts(db, [seeded])
+    _legacy_intent(second, legacy_digest)
+    with pytest.raises(RuntimeError, match='receipt'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert db.sql.execute(
+        'SELECT source_capture_id FROM transfermarkt_core_receipts_v1').fetchall() == [('cap-a',)]
+
+
+def test_an_identical_acknowledgement_rewrites_no_receipt(monkeypatch):
+    # Round 5 finding 8: every acknowledged replay issued a receipt MERGE
+    # ... UPDATE, an overwrite in principle.
+    db = CoreDB()
+    plans = [membership_plan(['1'], capture='cap-1')]
+    issued = []
+    real = native_writer.execute_statement
+
+    def spy(cursor, sql, params=None):
+        # The SQL the writer would send for the receipts table, reads aside.
+        if 'transfermarkt_core_receipts_v1' in sql and not sql.lstrip().startswith(('SELECT', 'CREATE')):
+            issued.append(sql.split('(')[0].strip())
+        return real(cursor, sql, params)
+
+    monkeypatch.setattr(native_writer, 'execute_statement', spy)
+
+    def commit():
+        return native_writer.write_core_bundle(
+            lambda: db, CoreWriter(db), plans, run_id='r', universe_version='u', committed_at=CLOCK)
+
+    first = commit()
+    assert issued and 'MERGE' not in issued[0]
+    issued.clear()
+    assert commit() == first
+    assert issued == []
+    assert _receipt_count(db) == 1
+
+
+def test_the_legacy_identity_serves_only_what_stage_b_could_journal():
+    # Round 5 finding 9: a stage-C snapshot journalled with its page evidence
+    # was accepted under the stage-B digest of a plan without that evidence.
+    plan = _snapshot(CLOCK, 'cap-1')
+    descriptor = asdict(plan)
+    descriptor['rows'] = native_writer._sorted_rows(plan.rows, plan.natural_keys)
+    digest = native_writer._digest({
+        'plans': [native_writer._stage_b_plan_sha256(plan)], 'run_id': 'run-old'})
+    path = write_journal.save_intent(
+        {'run_id': 'run-old', 'digest': digest}, {'plans': [descriptor]},
+        run_id='run-old', universe_version='u', committed_at=plan.captured_at)
+    db = CoreDB()
+    with pytest.raises(RuntimeError, match='not recognised'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert path.exists()
+    assert not db.sql.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transfermarkt_core_receipts_v1'"
+    ).fetchall()
+
+
+def test_a_retry_after_a_migrated_recovery_reuses_its_acknowledgement():
+    # Round 5 finding 10: the migration was acknowledged under the legacy
+    # digest only, so the ordinary writer retry of the same plan committed
+    # again under the current digest and wrote a second warehouse receipt.
+    db = CoreDB()
+    plan = _empty_roster_plan()
+    plan_hash, legacy_digest = _stage_b_identity(plan, 'run-old')
+    _legacy_intent(plan, legacy_digest)
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    events = len(db.events)
+    again = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [plan], run_id='run-old', universe_version='u',
+        committed_at=CLOCK)
+    assert again['verified'] is True
+    assert _receipt_count(db) == 1
+    assert db.sql.execute(
+        'SELECT plan_sha256 FROM transfermarkt_core_receipts_v1').fetchall() == [(plan_hash,)]
+    assert not [sql for sql in db.events[events:] if sql.lstrip().startswith('DELETE')]
