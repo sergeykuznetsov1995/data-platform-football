@@ -1422,8 +1422,14 @@ def _commit_plans(connection, writer, plans, repair=None) -> list[dict]:
     if repair is not None and any(state != 'written' for _plan, state in states):
         repair()
     for plan, state in states:
-        if state != 'written':
-            _mutate_plan(connection, writer, plan)
+        if state == 'written':
+            continue
+        if not plan.rows and not plan.pages and not _read_plan_rows(connection, plan):
+            # A proven-empty single page has nothing else to empty: the scope
+            # already holds no row. Its acknowledgement is verified, and an
+            # acknowledged replay of it issues no statement on the data.
+            continue
+        _mutate_plan(connection, writer, plan)
     for plan, state in states:
         # The manifest follows the snapshot it belongs to; a snapshot that
         # was already written has its manifest already.
@@ -1539,6 +1545,11 @@ def _commit_bundle(
         if stored is not None:
             if stored.get('plan_sha256') != digest:
                 raise RuntimeError('core journal receipt plan_sha256 differs')
+            # The acknowledgement names the identity its warehouse receipts
+            # were written under. A unit migrated from an earlier writer keeps
+            # that one, so a retry under today's identity reuses them.
+            identity = stored.get('identity') or {'plan_hashes': plan_hashes, 'digest': digest}
+            receipt_hashes, receipt_digest = list(identity['plan_hashes']), identity['digest']
             # An acknowledgement re-verifies the whole physical tail: drifted
             # rows fail closed, a deleted receipt row is rewritten and
             # re-read, and a leftover intent is finally finished.
@@ -1556,9 +1567,9 @@ def _commit_bundle(
                 write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
                 proofs = _commit_plans(connection, writer, plans, repair=repair)
                 plan_receipts = [
-                    _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
-                                  batch, stored['committed_at'])
-                    for plan, proof, plan_hash in zip(plans, proofs, plan_hashes, strict=True)
+                    _plan_receipt(plan, proof, plan_hash, receipt_digest, run_id,
+                                  universe_version, batch, stored['committed_at'])
+                    for plan, proof, plan_hash in zip(plans, proofs, receipt_hashes, strict=True)
                 ]
                 _merge_receipts(connection, plan_receipts)
                 _verify_receipts(connection, plan_receipts)
@@ -1588,6 +1599,8 @@ def _commit_bundle(
             'verified': True, 'receipt_readback': True, 'run_id': run_id,
             'universe_version': universe_version, 'committed_at': committed_at,
             'plan_sha256': digest, 'committed_batch': batch, 'plans': proofs, 'manifests': [],
+            # The plan hashes and digest the warehouse receipts were written under.
+            'identity': {'plan_hashes': list(plan_hashes), 'digest': digest},
         }
         write_journal.record_receipt(digest, receipt)
         write_journal.finish_intent(intent_path)
@@ -1616,6 +1629,7 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
             plans.append(NativeWritePlan(**descriptor))
         run = body['identity']['run_id']
         plan_hashes, digest = _bundle_identity(plans, run)
+        current = digest
         saved = body['identity'].get('digest')
         if saved != digest and not _journalled_by_stage_b(body['payload']['plans']):
             # Not this writer's digest and not a stage-B unit: nothing is
@@ -1631,6 +1645,14 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
             run_id=run,
             universe_version=body['evidence'].get('universe_version', 'core-universe-v1'),
             committed_at=body['evidence'].get('committed_at', ''))
+        if digest != current and write_journal.read_receipt(current) is None:
+            # A migrated acknowledgement is journalled under the identity this
+            # writer computes for the same plans as well, still bound to the
+            # warehouse receipts written under the earlier one: an ordinary
+            # retry of the unit reuses them instead of committing a second time.
+            write_journal.record_receipt(
+                current, {**receipt, 'plan_sha256': current, 'identity': {
+                    'plan_hashes': list(plan_hashes), 'digest': digest}})
         if path.exists():
             # The verified recovery finishes the very file that was replayed,
             # whatever format this writer would save the unit in.
