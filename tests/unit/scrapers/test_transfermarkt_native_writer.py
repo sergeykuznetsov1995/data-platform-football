@@ -22,27 +22,46 @@ CLOCK = UTC.isoformat(timespec='microseconds')
 LATER = datetime(2026, 11, 21, 13, 0, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
 EARLIER = datetime(2026, 11, 21, 11, 0, 0, tzinfo=timezone.utc).isoformat(timespec='microseconds')
 
-# A plan's DDL declares every column its rows carry (production builds both
-# from CORE_COLUMNS): the schema preflight reads the table against the DDL.
-_LINEAGE_DDL = (
-    'source_url varchar, source_endpoint varchar, raw_capture_id varchar, '
-    'source_capture_id varchar, source_body_hash varchar, run_id varchar, '
-    'universe_version varchar, parser_revision varchar, schema_revision varchar, '
-    'captured_at timestamp(6), _batch_id varchar, _ingested_at timestamp(6)'
-)
+# A plan carries its entity's registered DDL and exactly its column set.
+MEMBERSHIPS_DDL = core.core_ddl('squad_memberships')
+MV_DDL = core.core_ddl('market_value_points')
 
-MEMBERSHIPS_DDL = (
-    'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_squad_memberships '
-    '(league varchar, season varchar, club_id varchar, player_id varchar, '
-    f'player_name varchar, {_LINEAGE_DDL}) '
-    "WITH (format = 'PARQUET')"
-)
+_SQUAD_URL = 'https://www.transfermarkt.com/x/kader/verein/11/saison_id/2025/plus/1'
+_MV_URL = 'https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/1'
 
-MV_DDL = (
-    'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_market_value_points '
-    f'(player_id varchar, mv_date varchar, value_eur bigint, {_LINEAGE_DDL}) '
-    "WITH (format = 'PARQUET')"
-)
+
+def _placeholder(column):
+    """A value of the declared type for a business column the test does not name."""
+    kind = core.COLUMN_TYPES[column]
+    if kind == 'bigint':
+        return 1
+    if kind == 'boolean':
+        return False
+    if kind == 'date':
+        return None
+    return 'x'
+
+
+def _contract_row(entity, endpoint, url, *, capture, clock, run, ingested, **business):
+    """A row shaped exactly as the entity's contract says, like core._render.
+
+    The lineage is the capture's and the run's: the writer refuses a row
+    that disagrees with either.
+    """
+    values = {column: _placeholder(column) for column in core._BUSINESS_COLUMNS[entity]}
+    values.update(business)
+    row = {column: values[column] for column in core._BUSINESS_COLUMNS[entity]}
+    row.update(
+        source_url=url, source_endpoint=endpoint, raw_capture_id=capture,
+        source_capture_id=capture, source_body_hash='b' * 64,
+        scope_id='tm-scope', cycle_id='tm-cycle', run_id=run, universe_version='u',
+        captured_at=clock, observed_at=clock, extracted_at=ingested,
+        parser_revision='core-v1', schema_revision='1',
+        observation_status='observed_present', status_reason='squad_page',
+        _source='transfermarkt', _entity_type=entity,
+        _batch_id=native_writer._batch_id_for_run(run), _ingested_at=ingested,
+    )
+    return row
 
 
 @pytest.fixture(autouse=True)
@@ -133,16 +152,10 @@ class CoreWriter(IcebergWriter):
 
 def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
                     status='observed_present', proof='', run='run-1', ingested=None):
-    rows = [{
-        'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': pid,
-        'player_name': 'Player ' + pid, 'captured_at': clock,
-        'source_capture_id': capture,
-        'source_url': 'https://www.transfermarkt.com/x/kader/verein/11/saison_id/2025/plus/1',
-        'source_endpoint': 'squad', 'raw_capture_id': capture,
-        'source_body_hash': 'b' * 64, 'run_id': run, 'universe_version': 'u',
-        'parser_revision': 'core-v1', 'schema_revision': '1',
-        '_batch_id': native_writer._batch_id_for_run(run), '_ingested_at': ingested or clock,
-    } for pid in players]
+    rows = tuple(_contract_row(
+        'squad_memberships', 'squad', _SQUAD_URL, capture=capture, clock=clock, run=run,
+        ingested=ingested or clock, league='GB1', season='2526', club_id='11',
+        player_id=pid, player_name='Player ' + pid) for pid in players)
     return NativeWritePlan(
         entity='squad_memberships', table='transfermarkt_squad_memberships',
         ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
@@ -151,7 +164,7 @@ def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
         status=status, status_reason='squad_page' if status == 'observed_present'
         else 'empty_roster', proof=proof, capture_id=capture,
         evidence=(
-            ('source_url', 'https://www.transfermarkt.com/x/kader/verein/11/saison_id/2025/plus/1'),
+            ('source_url', _SQUAD_URL),
             ('source_endpoint', 'squad'), ('raw_capture_id', capture),
             ('source_capture_id', capture), ('source_body_hash', 'b' * 64),
             ('scope_id', 'tm-scope'), ('cycle_id', 'tm-cycle'),
@@ -161,15 +174,10 @@ def membership_plan(players, *, clock=CLOCK, capture='cap-1', mode='replace',
 
 
 def mv_plan(points, *, clock=CLOCK, capture='cap-mv'):
-    rows = [{
-        'player_id': '1', 'mv_date': day, 'value_eur': value,
-        'captured_at': clock, 'source_capture_id': capture,
-        'source_url': 'https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/1',
-        'source_endpoint': 'market_value_points', 'raw_capture_id': capture,
-        'source_body_hash': 'c' * 64, 'run_id': 'run-1', 'universe_version': 'u',
-        'parser_revision': 'core-v1', 'schema_revision': '1',
-        '_batch_id': 'tm-core-batch-1', '_ingested_at': clock,
-    } for day, value in points]
+    rows = tuple(_contract_row(
+        'market_value_points', 'market_value_points', _MV_URL, capture=capture, clock=clock,
+        run='run-1', ingested=clock, player_id='1', mv_date=day, value_eur=value)
+        for day, value in points)
     return NativeWritePlan(
         entity='market_value_points', table='transfermarkt_market_value_points',
         ddl=MV_DDL, natural_keys=('player_id', 'mv_date'),
@@ -269,24 +277,12 @@ def test_receipt_requires_verified_flag_and_round_trips():
 
 
 def test_plan_validation_rejects_broken_contracts():
-    base = dict(entity='squad_memberships', table='transfermarkt_squad_memberships',
-                ddl=MEMBERSHIPS_DDL, natural_keys=('league', 'season', 'club_id', 'player_id'),
-                scope_columns=('league', 'season', 'club_id'), scope_values=('GB1', '2526', '11'),
-                rows=({'league': 'GB1', 'season': '2526', 'club_id': '11', 'player_id': '1',
-                       'captured_at': CLOCK, 'source_capture_id': 'c',
-                       'source_url': 'u', 'source_endpoint': 'squad', 'raw_capture_id': 'c',
-                       'source_body_hash': 'b', 'run_id': 'r', 'universe_version': 'u',
-                       'parser_revision': 'p', 'schema_revision': 's',
-                       '_batch_id': 'b1', '_ingested_at': CLOCK},),
-                captured_at=CLOCK, status_reason='squad_page',
-                capture_id='c',
-                evidence=(
-                    ('source_url', 'u'), ('source_endpoint', 'squad'),
-                    ('raw_capture_id', 'c'), ('source_capture_id', 'c'),
-                    ('source_body_hash', 'b'), ('scope_id', 's'),
-                    ('cycle_id', 'c'), ('parser_revision', 'p'),
-                    ('schema_revision', 's'),
-                ))
+    plan = membership_plan(['1'], capture='c')
+    base = dict(
+        entity=plan.entity, table=plan.table, ddl=plan.ddl, natural_keys=plan.natural_keys,
+        scope_columns=plan.scope_columns, scope_values=plan.scope_values, rows=plan.rows,
+        captured_at=plan.captured_at, status_reason='squad_page', capture_id='c',
+        evidence=plan.evidence)
     NativeWritePlan(**base)
     with pytest.raises(ValueError, match='table name'):
         NativeWritePlan(**{**base, 'table': 'transfermarkt_squad_memberships; DROP TABLE x'})
@@ -300,22 +296,17 @@ def test_plan_validation_rejects_broken_contracts():
         NativeWritePlan(**{**base, 'captured_at': EARLIER})
     with pytest.raises(ValueError, match='duplicate core natural key'):
         NativeWritePlan(**{**base, 'rows': base['rows'] + base['rows']})
-    # Stage C (#2405): a replace plan may span pages, but its declared capture
-    # must be the snapshot's newest one; merges still own exactly one capture.
-    # Only the attendance edition snapshot spans pages (review r2 finding 3):
-    # a roster lane rejects two captures outright, merge still owns one.
+    # A roster lane holds exactly one capture, and is never written as a merge:
+    # only the attendance edition snapshot spans pages (review r2 finding 3).
     with pytest.raises(ValueError, match='share one source_capture_id'):
         NativeWritePlan(**{**base, 'rows': (
             base['rows'][0],
             {**base['rows'][0], 'player_id': '2',
              'source_capture_id': 'other', 'raw_capture_id': 'other'})})
     with pytest.raises(ValueError, match='page evidence belongs to a multi-page'):
-        NativeWritePlan(**{**base, 'pages': (('u', 'c', CLOCK),)})
-    with pytest.raises(ValueError, match='share one source_capture_id'):
-        NativeWritePlan(**{**base, 'write_mode': 'merge', 'rows': (
-            base['rows'][0],
-            {**base['rows'][0], 'player_id': '2',
-             'source_capture_id': 'other', 'raw_capture_id': 'other'})})
+        NativeWritePlan(**{**base, 'pages': (('u', 'c', CLOCK, 'h' * 64, ''),)})
+    with pytest.raises(ValueError, match='entity contract'):
+        NativeWritePlan(**{**base, 'write_mode': 'merge'})
 
 
 def test_merge_and_replace_readbacks_use_different_predicates():
@@ -1306,8 +1297,8 @@ def test_a_plan_is_bound_to_its_entity_contract():
     from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2
     plan = membership_plan(['1'])
     for change in ({'write_mode': 'merge'}, {'natural_keys': ('league', 'season', 'club_id')},
-                   {'scope_columns': ('league', 'season')},
-                   {'ddl': plan.ddl.replace('player_name varchar, ', '')}):
+                   {'scope_columns': ('league', 'season', 'player_id')},
+                   {'ddl': plan.ddl.replace('    player_name varchar,\n', '')}):
         with pytest.raises(ValueError, match='entity contract'):
             dataclasses_replace(plan, **change)
     with pytest.raises(ValueError, match='entity contract'):

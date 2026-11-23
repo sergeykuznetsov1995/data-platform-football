@@ -1709,8 +1709,9 @@ def test_snapshot_pages_come_from_one_capture_each():
     with pytest.raises(ValueError, match='snapshot evidence'):
         _replace(plan, pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED,
                                page_2.body_hash, ''),))
-    # A multi-page plan names the newest page's capture, or none at all.
-    with pytest.raises(ValueError, match='newest row capture id'):
+    # A multi-page plan names the newest page's capture, or none at all (its
+    # evidence may not describe another page than the one it names: round 6).
+    with pytest.raises(ValueError, match='newest row capture id|evidence differs from its page'):
         _replace(plan, capture_id=page_1.capture_id)
 
 

@@ -14,7 +14,7 @@ from contextlib import contextmanager
 import fcntl
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from re import fullmatch
@@ -374,7 +374,7 @@ class NativeWritePlan:
             raise ValueError('core scope values must be non-empty strings')
         if not self.captured_at:
             raise ValueError('core captured_at must be non-empty')
-        if _canonical_clock(self.captured_at) is None:
+        if self.captured_at != _canonical_clock(self.captured_at):
             raise ValueError('core captured_at must be a timestamp in its canonical spelling')
         if self.write_mode not in ('replace', 'merge'):
             raise ValueError('core write_mode must be replace or merge')
@@ -386,6 +386,7 @@ class NativeWritePlan:
                 'rows, and an absence has none')
         if self.status in _PROOF_STATUSES and not _nonempty(self.proof):
             raise ValueError('core plan proof is required for empty observations')
+        self._check_entity_shape()
         # An empty plan has no row to carry its capture lineage; the evidence
         # mapping stands in for it so the receipt stays fully attributable.
         if not self.rows:
@@ -406,6 +407,7 @@ class NativeWritePlan:
         object.__setattr__(self, 'rows', tuple(_Row(row) for row in self.rows))
         self._check_pages()
         self._check_row_evidence()
+        self._check_entity_rows()
         clock = _timestamp(self.captured_at)
         if self.pages:
             # The snapshot is as fresh as its newest walked page, rowless or not.
@@ -424,7 +426,10 @@ class NativeWritePlan:
             # A snapshot without rows carries the clock of its newest page
             # and names that page: its receipt pairs a capture with its own
             # clock.
-            if self.capture_id != max(self.pages, key=lambda page: _timestamp(page[2]))[1]:
+            # The same tie-break as the adapter: the newest clock, then the
+            # highest capture id.
+            if self.capture_id != max(
+                    self.pages, key=lambda page: (_timestamp(page[2]), page[1]))[1]:
                 raise ValueError('core rowless snapshot must name its newest page')
         evidence_map = dict(self.evidence)
         for column in ('raw_capture_id', 'source_capture_id'):
@@ -433,6 +438,40 @@ class NativeWritePlan:
 
     def _multi_page(self) -> bool:
         return self.write_mode == 'replace' and self.entity in _MULTI_PAGE_REPLACE_ENTITIES
+
+    def _check_entity_shape(self) -> None:
+        """The plan is the registered entity's, in its registered shape.
+
+        A plan reaches the writer from ``plan_for_outcome`` or from a journal
+        descriptor. Neither may decide the table, the mode, the keys, the
+        scope or the DDL of an entity on its own: that is what lets a
+        reconstructed descriptor turn a merge lane into a replacement.
+        """
+        contract = _entity_registry(self.entity)
+        if (self.table != contract['table'] or self.write_mode != contract['write_mode']
+                or self.natural_keys != contract['natural_keys']
+                or self.scope_columns != contract['scope_columns'] or self.ddl != contract['ddl']):
+            raise ValueError('core plan departs from the entity contract: ' + self.entity)
+
+    def _check_entity_rows(self) -> None:
+        """Rows, verdicts and page evidence follow the entity's contract.
+
+        The same policy that certifies an outcome certifies a plan: rows are
+        exactly the entity's columns, the verdict agrees with the rows, a
+        proof belongs to an absence only, and a snapshot is a walk from the
+        scope's first page.
+        """
+        from scrapers.transfermarkt import core
+
+        columns = set(core.CORE_COLUMNS[self.entity])
+        if any(row.keys() != columns for row in self.rows):
+            raise ValueError("core plan rows are not the entity's column set: " + self.entity)
+        if not core._status_matches_rows(self.entity, self.status, self.rows):
+            raise ValueError('core plan status contradicts its rows: ' + self.entity)
+        if self.proof and self.status not in _PROOF_STATUSES:
+            raise ValueError('core plan proof is unexpected beside rows')
+        core._check_pages_against_scope(
+            self.entity, dict(zip(self.scope_columns, self.scope_values)), self.pages)
 
     def _check_pages(self) -> None:
         if not self.pages:
@@ -486,6 +525,15 @@ class NativeWritePlan:
         columns = ['source_endpoint', 'scope_id', 'cycle_id']
         if not self.pages:
             columns += ['source_url', 'source_body_hash']
+        else:
+            # A snapshot's evidence describes the capture the plan names:
+            # the receipt may not state another page's URL or body.
+            named = next((page for page in self.pages if page[1] == self.capture_id), None)
+            for column, index in (('source_url', 0), ('raw_capture_id', 1),
+                                  ('source_capture_id', 1), ('source_body_hash', 3)):
+                if (named is not None and evidence.get(column) is not None
+                        and evidence[column] != named[index]):
+                    raise ValueError('core plan evidence differs from its page evidence')
         for column in columns:
             if evidence.get(column) is not None and any(
                     column in row and row[column] != evidence[column] for row in self.rows):
@@ -553,6 +601,12 @@ class NativeWritePlan:
                 raise ValueError('core plan row is outside its replacement scope')
             if not _nonempty(row['source_capture_id']):
                 raise ValueError('core plan row has invalid source_capture_id')
+            # The batch is derived from the run and the ingestion clock is
+            # the extraction clock: a row cannot carry another run's.
+            if (row['_batch_id'] != _batch_id_for_run(row['run_id'])
+                    or row['_ingested_at'] != row['extracted_at']
+                    or row['extracted_at'] != _canonical_clock(row['extracted_at'])):
+                raise ValueError('core plan row disagrees with its run')
             if row['raw_capture_id'] != row['source_capture_id']:
                 # One response has one identity: a row never names two captures.
                 raise ValueError('core row names two captures: raw_capture_id differs from source_capture_id')
@@ -662,7 +716,9 @@ _CAPTURE_KEY_COLUMNS = frozenset({'observed_at', 'source_capture_id'})
 # The lineage every row of one plan carries alike: the run it belongs to.
 # A plan of one captured page is one response, and its rows carry that
 # response's whole lineage; a snapshot holds one response per page.
-_RUN_COLUMNS = ('source_endpoint', 'scope_id', 'cycle_id', 'run_id', 'universe_version')
+_RUN_COLUMNS = (
+    'source_endpoint', 'scope_id', 'cycle_id', 'run_id', 'universe_version', 'extracted_at',
+)
 _RESPONSE_COLUMNS = ('captured_at', 'source_url', 'source_body_hash', *_RUN_COLUMNS)
 # The attendance edition is the one replacement snapshot that spans several
 # walked pages; every other replacement is one captured page.
@@ -866,6 +922,22 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
+def _entity_registry(entity: str) -> dict:
+    """The registered contract of one core entity.
+
+    ``core`` loads this module lazily when it plans an outcome, and a plan
+    loads ``core`` lazily when it is validated: neither imports the other at
+    module load.
+    """
+    from scrapers.transfermarkt import core
+
+    if entity not in core.CORE_ENTITIES:
+        raise ValueError('invalid core entity: ' + str(entity))
+    return {'table': core.CORE_TABLES[entity], 'write_mode': core.CORE_WRITE_MODES[entity],
+            'natural_keys': core.CORE_NATURAL_KEYS[entity],
+            'scope_columns': core.CORE_SCOPE_COLUMNS[entity], 'ddl': core.core_ddl(entity)}
+
+
 def _value_has_type(kind: str, value) -> bool:
     """Whether a row value has the Python form of its declared SQL column.
 
@@ -880,6 +952,14 @@ def _value_has_type(kind: str, value) -> bool:
     if kind.startswith(('double', 'real', 'decimal', 'float')):
         # Exact decimal text is kept in a varchar column instead.
         return False
+    if kind.startswith('date'):
+        # The engine casts the text to a calendar date: it has to be one.
+        if not isinstance(value, str):
+            return False
+        try:
+            return date.fromisoformat(value).isoformat() == value
+        except ValueError:
+            return False
     return isinstance(value, str)
 
 
