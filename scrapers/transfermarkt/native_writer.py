@@ -245,6 +245,15 @@ _REQUIRED_ROW_COLUMNS = frozenset({
     'raw_capture_id', 'source_body_hash', 'run_id', 'universe_version',
     'parser_revision', 'schema_revision', '_batch_id', '_ingested_at',
 })
+# Only what a page conclusively established is written. An unknown,
+# unavailable or failed observation replaces nothing, whatever calls the
+# writer with it. Rows exist under the two statuses that carry rows; an
+# absence exists only as a proof.
+_CONCLUSIVE_STATUSES = frozenset({
+    'observed_present', 'observed_empty', 'explicit_none', 'not_applicable',
+})
+_STATUSES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
+_PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
 
 
 def _nonempty(value) -> bool:
@@ -340,9 +349,13 @@ class NativeWritePlan:
             raise ValueError('core captured_at must be non-empty')
         if self.write_mode not in ('replace', 'merge'):
             raise ValueError('core write_mode must be replace or merge')
-        if not _nonempty(self.status) or not _nonempty(self.status_reason):
-            raise ValueError('core plan needs its observation status and reason')
-        if self.status in ('observed_empty', 'not_applicable') and not _nonempty(self.proof):
+        if self.status not in _CONCLUSIVE_STATUSES or not _nonempty(self.status_reason):
+            raise ValueError('core plan status must be conclusive, with its reason')
+        if bool(self.rows) != (self.status in _STATUSES_WITH_ROWS):
+            raise ValueError(
+                'core plan status and rows disagree: rows need a status that carries '
+                'rows, and an absence has none')
+        if self.status in _PROOF_STATUSES and not _nonempty(self.proof):
             raise ValueError('core plan proof is required for empty observations')
         # An empty plan has no row to carry its capture lineage; the evidence
         # mapping stands in for it so the receipt stays fully attributable.
