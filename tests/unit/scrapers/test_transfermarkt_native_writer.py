@@ -813,6 +813,7 @@ def _legacy_intent(plan, digest):
     """Save a plan the way stage B journalled it: no page evidence field."""
     descriptor = asdict(plan)
     del descriptor['pages']
+    descriptor['rows'] = native_writer._sorted_rows(plan.rows, plan.natural_keys)
     return write_journal.save_intent(
         {'run_id': 'run-old', 'digest': digest}, {'plans': [descriptor]},
         run_id='run-old', universe_version='u', committed_at=CLOCK)
@@ -968,24 +969,26 @@ def test_plan_rows_are_read_only_after_validation():
         row['observation_status'] = 'unknown'
     with pytest.raises(TypeError):
         row['parser_revision'] = 'wrong'
-    with pytest.raises(TypeError):
-        row.update(stadium_name='Ashburton Grove')
+    # A mapping with no mutating method at all (round 5 finding 14): there is
+    # no initialiser or update left to refill a validated row through.
+    for attempt in (lambda: row.update(stadium_name='Ashburton Grove'),
+                    lambda: row.pop('club_name'), lambda: row.setdefault('club_name', 'x'),
+                    lambda: row.clear()):
+        with pytest.raises(AttributeError):
+            attempt()
     with pytest.raises(TypeError):
         del row['club_name']
     with pytest.raises(TypeError):
-        row.pop('club_name')
-    with pytest.raises(TypeError):
-        row.setdefault('club_name', 'x')
-    with pytest.raises(TypeError):
-        row.clear()
-    with pytest.raises(TypeError):
         row |= {'club_name': 'x'}
     assert plan.plan_sha256() == digest
-    # Still a mapping for every consumer: copyable and serialisable.
-    assert isinstance(row, dict) and row['observation_status'] == 'observed_present'
+    # Still a mapping for every consumer: copyable and serialisable as dicts.
+    from collections.abc import Mapping
+    assert isinstance(row, Mapping) and not isinstance(row, dict)
+    assert row['observation_status'] == 'observed_present'
     assert {**row, 'club_name': 'x'}['club_name'] == 'x'
-    assert json.loads(json.dumps(plan.rows)) == json.loads(json.dumps(
-        [dict(item) for item in plan.rows]))
+    assert {json.dumps(item, sort_keys=True)
+            for item in native_writer._sorted_rows(plan.rows, plan.natural_keys)} == {
+        json.dumps(dict(item), sort_keys=True) for item in plan.rows}
     assert [dict(item) for item in asdict(plan)['rows']] == [dict(item) for item in plan.rows]
     # Another plan is the way to change rows.
     changed = dataclasses_replace(plan, rows=tuple({**item, 'stadium_name': 'x'} for item in plan.rows))
@@ -1156,6 +1159,8 @@ def test_validated_rows_cannot_be_reinitialised():
     row = plan.rows[0]
     with pytest.raises(TypeError):
         row.__init__(observation_status='unknown', parser_revision='wrong')
+    with pytest.raises(TypeError):
+        row.__init__({'observation_status': 'unknown'})
     with pytest.raises((TypeError, AttributeError)):
         row._values['observation_status'] = 'unknown'
     with pytest.raises((TypeError, AttributeError)):

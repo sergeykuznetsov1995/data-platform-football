@@ -9,6 +9,7 @@ Airflow logs volume).
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import contextmanager
 import fcntl
 import os
@@ -24,6 +25,7 @@ import random
 import re
 import threading
 import time
+from types import MappingProxyType
 
 from scrapers.base.trino_manager import _is_iceberg_commit_conflict
 
@@ -266,27 +268,52 @@ def _check_columns(columns) -> None:
             raise ValueError(f'invalid core column name: {name!r}')
 
 
-class _Row(dict):
-    """A validated plan row: readable as a mapping, never written again.
+class _Row(Mapping):
+    """A validated plan row: an immutable mapping of its values.
 
     Hashing, journalling, writing and read-back must all see the content the
-    plan validated. Staying a dict keeps every consumer (JSON, dataclasses,
-    frames) working unchanged; another plan is the way to other rows.
+    plan validated. The values live in a mapping proxy no other code holds a
+    reference to, and the row has neither a writable initialiser nor any
+    mutating method: another plan is the way to other rows.
     """
 
-    __slots__ = ()
+    __slots__ = ('_values',)
 
-    @staticmethod
-    def _read_only(*args, **kwargs):
+    def __init__(self, values):
+        # A row is filled once. The initialiser a copy or a pickle starts is
+        # that of a new instance; calling it again on a built row refills
+        # nothing.
+        if hasattr(self, '_values'):
+            raise TypeError('core plan rows are read-only: build another plan')
+        object.__setattr__(self, '_values', MappingProxyType(dict(values)))
+
+    def __setattr__(self, name, value):
         raise TypeError('core plan rows are read-only: build another plan')
+
+    def __delattr__(self, name):
+        raise TypeError('core plan rows are read-only: build another plan')
+
+    def __getitem__(self, column):
+        return self._values[column]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __repr__(self):
+        return f'_Row({dict(self._values)!r})'
 
     def __reduce__(self):
         # copy and pickle rebuild a row through its constructor, never by
         # assigning into it.
-        return _Row, (dict(self),)
+        return _Row, (dict(self._values),)
 
-    __setitem__ = __delitem__ = __ior__ = _read_only
-    clear = update = pop = popitem = setdefault = _read_only
+
+def _plain_rows(rows) -> list[dict]:
+    """Plan rows as plain dictionaries: for hashing, journalling and frames."""
+    return [dict(row) for row in rows]
 
 
 def _sorted_rows(rows, natural_keys) -> list[dict]:
@@ -294,7 +321,7 @@ def _sorted_rows(rows, natural_keys) -> list[dict]:
     def key(row):
         return tuple((isinstance(row[col], str), row[col]) for col in natural_keys)
 
-    return sorted(rows, key=key)
+    return sorted(_plain_rows(rows), key=key)
 
 
 @dataclass(frozen=True)
@@ -490,8 +517,8 @@ class NativeWritePlan:
         declared = _ddl_columns(self.ddl)
         timestamps = [column for column, kind in declared.items() if kind.startswith('timestamp')]
         for row in self.rows:
-            if not isinstance(row, dict):
-                raise ValueError('core plan row must be a dict')
+            if not isinstance(row, Mapping):
+                raise ValueError('core plan row must be a mapping')
             _check_columns(row)
             if missing := required.difference(row):
                 raise ValueError(f'core plan row is missing columns: {sorted(missing)}')
@@ -1079,7 +1106,7 @@ def _mutate_plan(connection, writer, plan: NativeWritePlan) -> None:
         import pandas as pd
 
         columns = list(dict.fromkeys(col for row in plan.rows for col in row))
-        frame = pd.DataFrame(list(plan.rows), columns=columns, dtype=object)
+        frame = pd.DataFrame(_plain_rows(plan.rows), columns=columns, dtype=object)
         writer.write_dataframe(
             df=frame, database='bronze', table=plan.table, add_metadata=False,
             merge_keys=list(plan.natural_keys),
@@ -1099,7 +1126,7 @@ def _mutate_plan(connection, writer, plan: NativeWritePlan) -> None:
     import pandas as pd
 
     columns = list(dict.fromkeys(col for row in plan.rows for col in row))
-    frame = pd.DataFrame(list(plan.rows), columns=columns, dtype=object)
+    frame = pd.DataFrame(_plain_rows(plan.rows), columns=columns, dtype=object)
     # The scope is handed to the writer as its delete filter: the
     # Transfermarkt writer stages the rows and replaces the scope with one
     # statement, so a failed insertion leaves the committed rows in place.
