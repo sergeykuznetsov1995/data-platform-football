@@ -1308,7 +1308,14 @@ def validate_run_plans(plans) -> None:
     """
     seen = set()
     scopes = set()
+    identities = set()
     for plan in plans:
+        # The same plan twice is one acknowledgement asked for twice, a
+        # rowless one included: it has no key and no scope to compare.
+        identity = plan.plan_sha256()
+        if identity in identities:
+            raise ValueError('duplicate core receipt identity across plans')
+        identities.add(identity)
         for row in plan.rows:
             key = (plan.table, tuple(row[col] for col in plan.natural_keys))
             if key in seen:
