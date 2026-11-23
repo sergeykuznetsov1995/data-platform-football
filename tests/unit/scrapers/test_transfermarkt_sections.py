@@ -2915,3 +2915,30 @@ def test_club_value_rows_carry_an_amount_exactly_when_present():
     core.LaneOutcome('club_value_observations', 'explicit_none',
                      'club_values:club_rows_explicit_none',
                      ({'observation_status': 'explicit_none', 'value_amount': None},), **context)
+
+
+def test_a_value_the_row_cannot_hold_is_the_sections_error_not_the_runs():
+    # Round 4 finding 15: an oversized count raised out of the attendance
+    # adapter, and the referee profile queued after it was never fetched.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    overflow = _page(ATTENDANCE_START, page_1.body.replace(b'60.704', b'9223372036854775808'),
+                     NEWER_PAGE_CAPTURED, 'overflow')
+    fetcher = _SectionFetch({
+        ATTENDANCE_START: overflow.body, ATTENDANCE_PAGE_2: page_2.body,
+        REFEREE_PROFILE_URL: (REFEREE_FIXTURES / 'profile.html').read_bytes()})
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c', edition_id='2025',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+        referee_profile_ids=('101',))
+    db = CoreDB()
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
+                     extracted_at=REFEREE_EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [ATTENDANCE_START, ATTENDANCE_PAGE_2, REFEREE_PROFILE_URL]
+    assert [(item['entity'], item['status'], item['status_reason'], item['rows'])
+            for item in report.outcomes] == [
+        ('attendance_observations', 'error', 'attendance:row_value_exceeds_bigint', 0),
+        ('referee_profiles', 'observed_present', 'referees:profile', 1)]
+    assert [item['entity'] for item in report.receipts[0]['plans']] == ['referee_profiles']
+    assert report.dq['passed'] is True
