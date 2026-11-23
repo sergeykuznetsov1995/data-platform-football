@@ -452,9 +452,10 @@ class NativeWritePlan:
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
             if url in seen or capture_id in captures:
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
-            if not fullmatch(r'[0-9a-f]{64}', body_hash) or not isinstance(next_url, str):
+            # A page clock is stated one way only, like the clock of a row.
+            if (not fullmatch(r'[0-9a-f]{64}', body_hash) or not isinstance(next_url, str)
+                    or clock != _canonical_clock(clock)):
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
-            _timestamp(clock)
             seen.add(url)
             captures.add(capture_id)
         # The manifest is the walk. A page that leads on to a page the

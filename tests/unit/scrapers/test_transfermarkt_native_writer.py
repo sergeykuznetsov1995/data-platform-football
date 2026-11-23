@@ -1090,6 +1090,11 @@ def test_page_evidence_is_validated_field_by_field():
     with pytest.raises(ValueError, match='page evidence'):
         dataclasses_replace(plan, pages=(
             *plan.pages[:-1], (*plan.pages[-1][:2], '', plan.pages[-1][3], '')))
+    # A page clock is stated one way only, like the clock of a row.
+    with pytest.raises(ValueError, match='page evidence'):
+        dataclasses_replace(plan, pages=(
+            (*plan.pages[0][:2], plan.pages[0][2].replace('+00:00', 'Z'), *plan.pages[0][3:]),
+            plan.pages[1]))
 
 
 def test_a_plan_rebuilt_at_the_write_boundary_must_be_one_whole_walk():
