@@ -3309,3 +3309,60 @@ def test_a_capture_committed_as_rowless_cannot_acquire_rows():
     with pytest.raises(RuntimeError, match='replay differs'):
         _write(db, [acquired_plan], plan.rows[0]['run_id'], LATER_EXTRACTED_AT)
     assert set(_stadiums(db)) == {'11'}
+
+
+def test_a_rowless_snapshot_names_its_newest_page():
+    # Round 5 finding 13: a wholly rowless snapshot named its first page
+    # while its receipt stored the clock of the last one.
+    empty_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, PAGE_1_CAPTURED, 'empty 12:00')
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, PAGE_2_CAPTURED, 'empty 12:05')
+    outcome, = sections.extract_attendance_observations(
+        (empty_1, empty_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    proven = _replace(outcome, status='observed_empty', status_reason='attendance:proven',
+                      proof='attendance:proven', rows=())
+    scope_values = {'competition_id': 'GB1', 'edition_id': '2025'}
+    with pytest.raises((ValueError, CoreParseError)):
+        core.plan_for_outcome(_replace(proven, capture=empty_1), captured_at=PAGE_2_CAPTURED,
+                              scope_values=scope_values)
+    plan = core.plan_for_outcome(proven, captured_at=PAGE_2_CAPTURED, scope_values=scope_values)
+    assert plan.capture_id == empty_2.capture_id
+    db = CoreDB()
+    _write(db, [plan], proven.run_id, EXTRACTED_AT)
+    receipt = db.sql.execute(
+        'SELECT source_capture_id, captured_at FROM transfermarkt_core_receipts_v1').fetchone()
+    assert (receipt[0], _moment(receipt[1])) == (empty_2.capture_id, _moment(PAGE_2_CAPTURED))
+
+
+def test_a_repair_of_an_acknowledged_snapshot_leaves_a_recoverable_intent(monkeypatch):
+    # Round 5 finding 7: an acknowledged snapshot that has to be written
+    # again was mutated without an intent, so an interrupted repair had
+    # nothing left to replay.
+    plans, page_1, empty_2 = _rowless_tail_snapshot()
+    db = CoreDB()
+    writer = CoreWriter(db)
+    run_id = plans[0].rows[0]['run_id']
+
+    def commit():
+        return native_writer.write_core_bundle(
+            lambda: db, writer, plans, run_id=run_id, universe_version=UNIVERSE,
+            committed_at=EXTRACTED_AT)
+
+    assert commit()['verified'] is True
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
+
+    def crash(cursor, plan):
+        raise RuntimeError('crash during repair')
+
+    monkeypatch.setattr(native_writer, '_record_pages', crash)
+    with pytest.raises(RuntimeError, match='crash during repair'):
+        commit()
+    # The repair is journalled before it mutates, like any other write.
+    assert native_writer.write_journal.pending_intents({'run_id': run_id})
+    real = native_writer._record_pages
+    monkeypatch.setattr(native_writer, '_record_pages', real)
+    receipts = native_writer.replay_pending_intents(lambda: db, writer)
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert native_writer.write_journal.pending_intents({'run_id': run_id}) == []
+    assert _manifest(db) == [(ATTENDANCE_START, page_1.capture_id), (ATTENDANCE_PAGE_2, empty_2.capture_id)]
+    assert set(_stadiums(db)) == {'11'}
