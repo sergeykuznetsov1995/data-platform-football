@@ -1233,17 +1233,49 @@ def _receipt_cell(col, value):
     return str(value)
 
 
-def _merge_receipts(connection, receipts) -> None:
+def _receipt_cells(receipt) -> tuple:
+    return tuple(_receipt_cell(col, receipt[col]) for col in RECEIPT_COLUMNS)
+
+
+def _stored_receipts(connection, ids) -> dict[str, tuple]:
+    """The receipts the warehouse holds under these ids, cell by cell."""
+    if not ids:
+        return {}
     names = ', '.join(RECEIPT_COLUMNS)
-    params = ', '.join('?' for _ in RECEIPT_COLUMNS)
-    assignments = ', '.join(f'{col} = s.{col}' for col in RECEIPT_COLUMNS if col != 'receipt_id')
-    values = ', '.join(f's.{col}' for col in RECEIPT_COLUMNS)
-    sql = (
-        f'MERGE INTO {CORE_RECEIPTS_TABLE} t USING (VALUES ({params})) s({names}) '
-        f'ON t.receipt_id = s.receipt_id WHEN MATCHED THEN UPDATE SET {assignments} '
-        f'WHEN NOT MATCHED THEN INSERT ({names}) VALUES ({values})'
-    )
+    placeholders = ', '.join('?' for _ in ids)
+    rows = _query_rows(
+        connection.cursor(),
+        f'SELECT {names} FROM {CORE_RECEIPTS_TABLE} WHERE receipt_id IN ({placeholders})', ids)
+    stored = {}
+    try:
+        for row in rows:
+            cells = tuple(_receipt_cell(col, value)
+                          for col, value in zip(RECEIPT_COLUMNS, row, strict=True))
+            if not cells or cells[0] in stored:
+                raise RuntimeError('core receipt readback differs')
+            stored[cells[0]] = cells
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError('core receipt readback differs') from exc
+    return stored
+
+
+def _merge_receipts(connection, receipts) -> None:
+    """Acknowledge the receipts the warehouse does not hold yet.
+
+    A receipt is immutable: one already stored under the same id must equal
+    the receipt about to be acknowledged. Anything else contradicts the
+    earlier acknowledgement and is refused before anything is written.
+    """
+    stored = _stored_receipts(connection, [receipt['receipt_id'] for receipt in receipts])
+    names = ', '.join(RECEIPT_COLUMNS)
+    marks = ', '.join('?' for _ in RECEIPT_COLUMNS)
     for receipt in receipts:
+        expected = _receipt_cells(receipt)
+        earlier = stored.get(expected[0])
+        if earlier is not None:
+            if earlier != expected:
+                raise RuntimeError('core receipt contradicts its earlier acknowledgement')
+            continue
         bound = []
         for col in RECEIPT_COLUMNS:
             value = _receipt_cell(col, receipt[col])
@@ -1251,28 +1283,18 @@ def _merge_receipts(connection, receipts) -> None:
                 # Trino timestamp(6) stores UTC wall time without an offset.
                 value = _timestamp(value).replace(tzinfo=None)
             bound.append(value)
-        execute_statement(connection.cursor(), sql, bound)
+        execute_statement(
+            connection.cursor(),
+            f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})', bound)
 
 
 def _verify_receipts(connection, receipts) -> None:
-    names = ', '.join(RECEIPT_COLUMNS)
-    ids = [receipt['receipt_id'] for receipt in receipts]
-    placeholders = ', '.join('?' for _ in ids)
-    sql = f'SELECT {names} FROM {CORE_RECEIPTS_TABLE} WHERE receipt_id IN ({placeholders})'
-    rows = _query_rows(connection.cursor(), sql, ids)
-    expected = {
-        receipt['receipt_id']: tuple(_receipt_cell(col, receipt[col]) for col in RECEIPT_COLUMNS)
-        for receipt in receipts
-    }
-    try:
-        for row in rows:
-            actual = tuple(_receipt_cell(col, value) for col, value in zip(RECEIPT_COLUMNS, row, strict=True))
-            if not actual or actual != expected.pop(actual[0], None):
-                raise RuntimeError('core receipt readback differs')
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError('core receipt readback differs') from exc
-    if expected:
-        raise RuntimeError('core receipt readback differs')
+    """Read back every receipt of the bundle exactly as acknowledged."""
+    expected = {receipt['receipt_id']: _receipt_cells(receipt) for receipt in receipts}
+    stored = _stored_receipts(connection, list(expected))
+    for receipt_id, cells in expected.items():
+        if stored.get(receipt_id) != cells:
+            raise RuntimeError('core receipt readback differs')
 
 
 def validate_run_plans(plans) -> None:

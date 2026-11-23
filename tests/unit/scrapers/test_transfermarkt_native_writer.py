@@ -80,15 +80,6 @@ class CoreCursor(MemoryCursor):
                     (*bound[3:], *bound[:3]))
             self.description = None
             return
-        if 'MERGE INTO iceberg.ops.transfermarkt_core_receipts_v1' in sql:
-            bound = tuple(params)
-            cur = self.db.sql.cursor()
-            cur.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id = ?', (bound[0],))
-            columns = ', '.join(native_writer.RECEIPT_COLUMNS)
-            marks = ', '.join('?' for _ in native_writer.RECEIPT_COLUMNS)
-            cur.execute(f'INSERT INTO {RECEIPTS} ({columns}) VALUES ({marks})', bound)
-            self.description = None
-            return
         super().execute(sql, params)
         # sqlite reports no column types: the schema preflight's probe gets the
         # declared ones, as Trino reports them.
