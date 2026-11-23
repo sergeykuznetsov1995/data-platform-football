@@ -393,8 +393,13 @@ class NativeWritePlan:
         seen = set()
         captures = set()
         for url, capture_id, clock, body_hash in self.pages:
-            if (not all(map(_nonempty, (url, capture_id, clock, body_hash)) or url in seen
-                    or capture_id in captures or not fullmatch(r'[0-9a-f]{64}', body_hash))):
+            # Each predicate on its own: inside all(...) a truthy map object
+            # would stand in for the checks after it.
+            if not all(map(_nonempty, (url, capture_id, clock, body_hash))):
+                raise ValueError('core page evidence needs distinct pages with url, capture and clock')
+            if url in seen or capture_id in captures:
+                raise ValueError('core page evidence needs distinct pages with url, capture and clock')
+            if not fullmatch(r'[0-9a-f]{64}', body_hash):
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
             _timestamp(clock)
             seen.add(url)
