@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from scrapers.transfermarkt import core, native_writer, sections
-from scrapers.transfermarkt.attendance import AttendancePage
 from scrapers.transfermarkt.core import CoreParseError, LaneOutcome, ScopeContext, SourceCapture
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from scrapers.transfermarkt.native_writer import StaleTransfermarktWrite

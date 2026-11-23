@@ -1297,7 +1297,6 @@ def test_a_plan_is_bound_to_its_entity_contract():
     # Round 6 finding 15: the public constructor accepted a plan that
     # departed from the registered entity: a business column missing from
     # every row, or a merge lane switched to replace.
-    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2
     plan = membership_plan(['1'])
     for change in ({'write_mode': 'merge'}, {'natural_keys': ('league', 'season', 'club_id')},
                    {'scope_columns': ('league', 'season', 'player_id')},
@@ -1440,7 +1439,6 @@ def test_an_ambiguous_receipt_insert_is_resolved_by_reading_the_id_back():
 # ---------------------------------------------------------------- round 6: journal and identity
 
 def _stored_clocks(db):
-    import datetime as _datetime
     return sorted(native_writer._timestamp(value[0]).isoformat() for value in db.sql.execute(
         'SELECT committed_at FROM transfermarkt_core_receipts_v1'))
 
