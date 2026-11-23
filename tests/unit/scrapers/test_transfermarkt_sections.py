@@ -2739,9 +2739,9 @@ def _rowless_tail_snapshot(extracted_at=EXTRACTED_AT):
 
 
 def _manifest(db):
-    return db.sql.execute(
-        'SELECT source_url, source_capture_id FROM transfermarkt_core_pages_v1 ORDER BY source_url'
-    ).fetchall()
+    """The pages of the scope's newest walk: (url, capture id), by url."""
+    evidence = _manifest_evidence(db)
+    return sorted((url, item[0]) for url, item in evidence.items())
 
 
 def test_recovery_after_a_crash_before_the_manifest_records_it(monkeypatch):
@@ -3169,11 +3169,16 @@ T1245 = '2026-11-20T12:45:00.000000+00:00'
 
 
 def _manifest_evidence(db):
-    """Accepted page evidence of the scope: URL -> (capture id, moment, body hash)."""
-    return {
-        url: (capture_id, _moment(clock), body_hash) for url, capture_id, clock, body_hash in db.sql.execute(
-            'SELECT source_url, source_capture_id, captured_at, source_body_hash '
-            'FROM transfermarkt_core_pages_v1')}
+    """Newest accepted page evidence of the scope: URL -> (capture id, moment, body hash).
+
+    Every acknowledgement logs its walk; a later log row of a page supersedes an earlier one.
+    """
+    newest = {}
+    for url, capture_id, clock, body_hash, _acknowledged_at in db.sql.execute(
+            'SELECT source_url, source_capture_id, captured_at, source_body_hash, acknowledged_at '
+            'FROM transfermarkt_core_pages_v1 ORDER BY captured_at, acknowledged_at'):
+        newest[url] = (capture_id, _moment(clock), body_hash)
+    return newest
 
 
 def _two_pages(first_clock=PAGE_1_CAPTURED, second_clock=PAGE_2_CAPTURED):
@@ -3197,19 +3202,18 @@ def test_an_interrupted_manifest_update_keeps_the_last_accepted_page(monkeypatch
     # A later walk refreshes the empty page; its manifest update is interrupted.
     refreshed = _page(ATTENDANCE_START, ROWLESS_PAGE_1, T1235, 'empty 12:35')
     pending = [_attendance_plan((refreshed, page_2), LATER_EXTRACTED_AT)]
-    real = native_writer.execute_statement
+    real = native_writer._record_pages
     armed = {'on': True}
 
-    def flaky(cursor, sql, params=None):
-        # The scope's manifest rows are written, and the first write of a
-        # page is lost. Reading the manifest keeps working.
-        if (armed['on'] and 'transfermarkt_core_pages_v1' in sql
-                and sql.lstrip().startswith(('INSERT', 'MERGE'))):
+    def interrupted(*args):
+        # The one statement that logs the later walk is lost. Reading the
+        # log keeps working.
+        if armed['on']:
             armed['on'] = False
             raise RuntimeError('interrupted manifest')
-        return real(cursor, sql, params)
+        return real(*args)
 
-    monkeypatch.setattr(native_writer, 'execute_statement', flaky)
+    monkeypatch.setattr(native_writer, '_record_pages', interrupted)
     with pytest.raises(RuntimeError, match='interrupted manifest'):
         _write(db, pending, pending[0].rows[0]['run_id'], LATER_EXTRACTED_AT)
     assert not armed['on'] and set(_stadiums(db)) == {'631'}
@@ -3290,14 +3294,7 @@ def test_a_snapshot_whose_manifest_was_not_persisted_is_not_acknowledged(monkeyp
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
     db = CoreDB()
     plans = [_attendance_plan((rowless_1, page_2))]
-    real = native_writer.execute_statement
-
-    def without_manifest(cursor, sql, params=None):
-        if 'transfermarkt_core_pages_v1' in sql and not sql.lstrip().startswith(('SELECT', 'CREATE')):
-            return None
-        return real(cursor, sql, params)
-
-    monkeypatch.setattr(native_writer, 'execute_statement', without_manifest)
+    monkeypatch.setattr(native_writer, '_record_pages', lambda *args: None)
     with pytest.raises(RuntimeError, match='manifest'):
         _bundle(db, plans, EXTRACTED_AT)
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 0
@@ -3365,7 +3362,7 @@ def test_a_repair_of_an_acknowledged_snapshot_leaves_a_recoverable_intent(monkey
     assert commit()['verified'] is True
     db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
 
-    def crash(cursor, plan):
+    def crash(*args):
         raise RuntimeError('crash during repair')
 
     real = native_writer._record_pages
@@ -3988,3 +3985,66 @@ def test_a_page_returns_with_the_rows_it_was_acknowledged_with():
     assert _manifest_evidence(db) == {
         ATTENDANCE_START: (late_1.capture_id, _moment(T1245), late_1.body_hash),
         ATTENDANCE_PAGE_2: (page_2.capture_id, _moment(PAGE_2_CAPTURED), page_2.body_hash)}
+
+
+def test_each_acknowledgement_logs_its_walk_once():
+    plans, page_1, empty_2 = _rowless_tail_snapshot()
+    plan, = plans
+    db = CoreDB()
+    first = _write(db, plans, plan.rows[0]['run_id'], EXTRACTED_AT)
+    # A row per page, stating the length of its walk and the rows the page
+    # contributed: none for the page that left no row.
+    assert db.sql.execute(
+        'SELECT page_number, pages_count, source_capture_id, row_count '
+        'FROM transfermarkt_core_pages_v1 ORDER BY page_number').fetchall() == [
+        (1, 2, page_1.capture_id, 1), (2, 2, empty_2.capture_id, 0)]
+    # The acknowledgement keeps its walk in the journal as well: each page
+    # as planned, with the rows it contributed and their digest.
+    walk, = first['walks']
+    assert walk['table'] == plan.full_table and walk['scope_values_json'] == (
+        '[["competition_id","GB1"],["edition_id","2025"]]')
+    assert [[*page[:5], page[5], len(page[6])] for page in walk['pages']] == [
+        [*plan.pages[0], 1, 64], [*plan.pages[1], 0, 64]]
+    # An acknowledged replay neither writes nor logs anything again.
+    assert _write(db, plans, plan.rows[0]['run_id'], EXTRACTED_AT) == first
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (2,)
+
+
+def test_a_walk_with_a_page_missing_is_not_evidence():
+    # The clock of a page without rows lives only in the walk that
+    # acknowledged it. A walk that lost one of its pages, the rowless tail
+    # included, says nothing trustworthy: the scope refuses until it is whole.
+    page_1, cached_2 = _two_pages()
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 12:30')
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, empty_2))], EXTRACTED_AT)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE page_number = 2')
+    stale = [_attendance_plan((page_1, cached_2), LATER_EXTRACTED_AT)]
+    with pytest.raises(RuntimeError, match='manifest differs'):
+        _bundle(db, stale, LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11'}
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone() == (1,)
+
+
+def test_an_acknowledgement_cannot_repair_the_evidence_another_one_lost():
+    # Only the acknowledgement that lost its pages may write while evidence
+    # is missing: it restores its own. Another one's retry waits, because
+    # nothing proves it would not regress the walk whose evidence is gone.
+    page_1, page_2 = _two_pages()
+    db = CoreDB()
+    older = [_attendance_plan((page_1, page_2))]
+    _bundle(db, older, EXTRACTED_AT)
+    late_1 = _page(ATTENDANCE_START, page_1.body, T1215, 'late 12:15')
+    newer = [_attendance_plan((late_1, page_2), LATER_EXTRACTED_AT)]
+    _bundle(db, newer, LATER_EXTRACTED_AT)
+    lost, = db.sql.execute(
+        'SELECT receipt_id FROM transfermarkt_core_receipts_v1 ORDER BY committed_at').fetchall()[1:]
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id = ?', lost)
+    with pytest.raises(RuntimeError, match='manifest lost'):
+        _bundle(db, older, EXTRACTED_AT)
+    # The walk that lost its evidence repairs it on its own retry; from then
+    # on the older snapshot is stale, as it was before the loss.
+    assert _bundle(db, newer, LATER_EXTRACTED_AT)['verified'] is True
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (4,)
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, older, EXTRACTED_AT)

@@ -78,28 +78,6 @@ _COLUMN_PROBE = re.compile(
 
 class CoreCursor(MemoryCursor):
     def execute(self, sql, params=()):
-        if sql.startswith('MERGE INTO iceberg.ops.transfermarkt_core_pages_v1 '):
-            # One statement per page: insert the page, or replace its
-            # evidence when the snapshot's clock is not older.
-            bound = tuple(params)
-            columns = ', '.join(native_writer.PAGES_COLUMNS)
-            marks = ', '.join('?' for _ in native_writer.PAGES_COLUMNS)
-            cur = self.db.sql.cursor()
-            accepted = cur.execute(
-                'SELECT captured_at FROM transfermarkt_core_pages_v1 '
-                'WHERE target_table = ? AND scope_values_json = ? AND source_url = ?',
-                bound[:3]).fetchone()
-            if accepted is None:
-                cur.execute(
-                    f'INSERT INTO transfermarkt_core_pages_v1 ({columns}) VALUES ({marks})', bound)
-            elif native_writer._timestamp(bound[4]) >= native_writer._timestamp(accepted[0]):
-                cur.execute(
-                    'UPDATE transfermarkt_core_pages_v1 SET source_capture_id = ?, '
-                    'captured_at = ?, source_body_hash = ? '
-                    'WHERE target_table = ? AND scope_values_json = ? AND source_url = ?',
-                    (*bound[3:], *bound[:3]))
-            self.description = None
-            return
         super().execute(sql, params)
         # sqlite reports no column types: the schema preflight's probe gets the
         # declared ones, as Trino reports them.
@@ -328,7 +306,9 @@ class GuardCursor:
     def __init__(self, rows=None, pages=None, fail=False, manifest=None):
         self.rows = rows
         self.pages = pages or []
-        self.manifest = manifest or []  # accepted page evidence of the scope
+        # Accepted page evidence of the scope, (url, capture id, clock, hash):
+        # one acknowledged walk, logged under its receipt.
+        self.manifest = manifest or []
         self.fail = fail
         self.description = None
     def execute(self, sql, params=None):
@@ -337,7 +317,12 @@ class GuardCursor:
         self.sql = sql
     def fetchall(self):
         if 'transfermarkt_core_pages_v1' in self.sql:
-            return self.manifest
+            return [('receipt-walk', '', '', number, len(self.manifest), url, capture_id, clock,
+                     body_hash, 0, '', CLOCK)
+                    for number, (url, capture_id, clock, body_hash)
+                    in enumerate(self.manifest, start=1)]
+        if 'SELECT receipt_id FROM' in self.sql:
+            return [('receipt-walk',)] if self.manifest else []
         return self.pages if 'GROUP BY source_url' in self.sql else self.rows
     def close(self):
         pass
@@ -1701,7 +1686,11 @@ def test_an_uncertain_snapshot_is_replaced_once_more_and_acknowledged():
     assert receipt['verified'] is True
     assert settled.writes == [(snapshot.table, len(snapshot.rows), ())]
     assert native_writer._rows_equal(native_writer._read_plan_rows(db, snapshot), snapshot.rows)
-    native_writer._verify_pages(db, snapshot)
+    # Its walk is logged once, under the receipt that acknowledges it.
+    plan_hashes, digest = native_writer._bundle_identity([snapshot], 'run-b')
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_core_pages_v1 WHERE receipt_id = ?',
+        (native_writer._receipt_id(plan_hashes[0], 'run-b', digest),)).fetchone() == (len(snapshot.pages),)
     assert write_journal.pending_intents({'run_id': 'run-b'}) == []
 
 
