@@ -1699,7 +1699,8 @@ def test_snapshot_pages_come_from_one_capture_each():
         _replace(plan, rows=(borrowed, plan.rows[1]))
     # The walk's page evidence names every page the rows came from.
     with pytest.raises(ValueError, match='snapshot evidence'):
-        _replace(plan, pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED),))
+        _replace(plan, pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED,
+                               page_2.body_hash),))
     # A multi-page plan names the newest page's capture, or none at all.
     with pytest.raises(ValueError, match='newest row capture id'):
         _replace(plan, capture_id=page_1.capture_id)

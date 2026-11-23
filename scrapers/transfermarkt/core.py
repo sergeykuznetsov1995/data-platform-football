@@ -417,8 +417,9 @@ class LaneOutcome:
     # request keeps no capture to tell its targets apart in DQ.
     subject: str = ''
     # Every walked page of a multi-page snapshot as (source_url, capture_id,
-    # captured_at): a page that contributes no row still has a clock.
-    pages: tuple[tuple[str, str, str], ...] = ()
+    # captured_at, source_body_hash): the full lineage of a page, including
+    # one that contributes no row but still has a clock.
+    pages: tuple[tuple[str, str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.entity not in CORE_ENTITIES:
@@ -438,14 +439,19 @@ class LaneOutcome:
             raise CoreParseError('status_rows_mismatch')
         pages = tuple(tuple(page) for page in self.pages)
         object.__setattr__(self, 'pages', pages)
-        if (any(not all(map(_nonempty, page)) for page in pages)
-                or len({page[0] for page in pages}) != len(pages)):
+        # A page is one capture, and a capture id names exactly one response.
+        if (any(len(page) != 4 or not all(map(_nonempty, page)) for page in pages)
+                or len({page[0] for page in pages}) != len(pages)
+                or len({page[1] for page in pages}) != len(pages)):
             raise CoreParseError('invalid_page_evidence')
         for page in pages:
             canonical_timestamp(page[2])
+            if not _CAPTURE_RE.fullmatch(page[3]):
+                raise CoreParseError('invalid_page_evidence')
         if self.capture is not None and pages and not any(
-                page[1] == self.capture.capture_id and page[2] == self.capture.captured_at
-                and page[0] == self.capture.url for page in pages):
+                page[0] == self.capture.url and page[1] == self.capture.capture_id
+                and page[2] == self.capture.captured_at
+                and page[3] == self.capture.body_hash for page in pages):
             raise CoreParseError('capture_outside_page_evidence')
         if any(
             row.get('parser_revision', self.parser_revision) != self.parser_revision

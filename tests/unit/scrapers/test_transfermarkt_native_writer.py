@@ -396,8 +396,9 @@ def test_guard_counts_a_page_that_contributed_no_row():
     rowless_older = dataclasses_replace(
         plan, rows=tuple(row for row in plan.rows if row['source_url'] == ATTENDANCE_PAGE_2),
         captured_at=SIBLING_CLOCK, capture_id='', evidence=(),
-        pages=((ATTENDANCE_START, 'cap-rowless', PAGE_EARLIER),
-               (ATTENDANCE_PAGE_2, hashlib.sha256(b'cap-2').hexdigest(), SIBLING_CLOCK)))
+        pages=((ATTENDANCE_START, 'cap-rowless', PAGE_EARLIER, hashlib.sha256(b'rowless').hexdigest()),
+               (ATTENDANCE_PAGE_2, hashlib.sha256(b'cap-2').hexdigest(), SIBLING_CLOCK,
+                plan.rows[1]['source_body_hash'])))
     cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
                          pages=[(ATTENDANCE_START, PAGE_CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()

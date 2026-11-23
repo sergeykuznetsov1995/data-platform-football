@@ -251,8 +251,9 @@ class NativeWritePlan:
     the old rows); accumulating observation and career lanes MERGE by natural
     key (a later capture adds or updates rows and never deletes the rest).
     ``pages`` is the evidence of a multi-page replacement snapshot: every
-    walked page as (source_url, source_capture_id, captured_at), rowless ones
-    included, because a page that contributes no row still has a clock.
+    walked page as (source_url, source_capture_id, captured_at,
+    source_body_hash), rowless ones included, because a page that contributes
+    no row still has a clock and a body.
     """
 
     entity: str
@@ -269,7 +270,7 @@ class NativeWritePlan:
     proof: str = ''
     capture_id: str = ''
     evidence: tuple[tuple[str, str], ...] = ()
-    pages: tuple[tuple[str, str, str], ...] = ()
+    pages: tuple[tuple[str, str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.table, str) or not fullmatch(r'transfermarkt_[a-z0-9_]+', self.table):
@@ -310,6 +311,7 @@ class NativeWritePlan:
         # mutable, hashing and writing must see the validated content.
         object.__setattr__(self, 'rows', tuple(dict(row) for row in self.rows))
         self._check_pages()
+        self._check_row_evidence()
         clock = _timestamp(self.captured_at)
         if self.pages:
             # The snapshot is as fresh as its newest walked page, rowless or not.
@@ -338,14 +340,31 @@ class NativeWritePlan:
         if not self._multi_page():
             raise ValueError('core page evidence belongs to a multi-page replacement snapshot')
         seen = set()
-        for url, capture_id, clock in self.pages:
-            if not all(map(_nonempty, (url, capture_id, clock))) or url in seen:
+        captures = set()
+        for url, capture_id, clock, body_hash in self.pages:
+            if (not all(map(_nonempty, (url, capture_id, clock, body_hash)) or url in seen
+                    or capture_id in captures or not fullmatch(r'[0-9a-f]{64}', body_hash))):
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
             _timestamp(clock)
             seen.add(url)
-        if any((row['source_url'], row['source_capture_id'], row['captured_at']) not in self.pages
-               for row in self.rows):
-            raise ValueError('core rows must come from a page of the snapshot evidence')
+            captures.add(capture_id)
+        # A row carries the whole lineage of one page of the snapshot: URL,
+        # capture, clock and body hash.
+        if any((row['source_url'], row['source_capture_id'], row['captured_at'],
+                row['source_body_hash']) not in self.pages
+               or row['raw_capture_id'] != row['source_capture_id'] for row in self.rows):
+            raise ValueError(
+                'core row lineage differs: rows must come from a page of the snapshot evidence')
+
+    def _check_row_evidence(self) -> None:
+        """Without a page manifest the plan's evidence stands for every row."""
+        if self.pages or not self.rows:
+            return
+        evidence = dict(self.evidence)
+        for column in ('source_url', 'source_body_hash'):
+            if evidence.get(column) is not None and any(
+                    row[column] != evidence[column] for row in self.rows):
+                raise ValueError('core row lineage differs from the plan evidence')
 
     def readback_sql(self) -> tuple[str, tuple]:
         """Parameterised physical read-back predicate for this plan.
@@ -528,7 +547,7 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
 
 def _guard_source_pages(connection, plan: NativeWritePlan) -> None:
     """Each source page the snapshot shares with the scope must not regress."""
-    planned = {url: _timestamp(clock) for url, _capture_id, clock in plan.pages}
+    planned = {url: _timestamp(clock) for url, _capture_id, clock, _body_hash in plan.pages}
     for row in plan.rows:
         clock, url = _timestamp(row['captured_at']), row['source_url']
         if url not in planned or planned[url] < clock:
@@ -678,7 +697,7 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
         # committed one: each of those captures keeps its own integrity, the
         # rowless ones included.
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
-        for _url, capture_id, _clock in plan.pages:
+        for _url, capture_id, _clock, _body_hash in plan.pages:
             planned.setdefault(capture_id, [])
         for capture_id, rows in planned.items():
             shared = committed.get(capture_id)
@@ -796,7 +815,10 @@ def _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
                   batch, committed_at) -> dict:
     first = {**dict(plan.evidence)}
     if plan.rows:
-        first.update(next(row for row in plan.rows if row['source_capture_id'] == plan.capture_id))
+        row = next(row for row in plan.rows if row['source_capture_id'] == plan.capture_id)
+        # The validated evidence is what the receipt names; a row only
+        # supplies what the evidence does not carry.
+        first.update({column: value for column, value in row.items() if column not in first})
     evidence = {
         col: first.get(col, '') for col in (
             'scope_id', 'cycle_id', 'source_capture_id', 'source_body_hash',

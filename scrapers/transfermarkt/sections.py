@@ -53,6 +53,19 @@ def _unavailable_capture(section: str, entity: str, capture: core.SourceCapture,
     return _outcome(entity, 'unavailable', f'{section}:http_{capture.status_code}', **context)
 
 
+def _distinct_captures(captures, section: str) -> None:
+    """A capture id names exactly one response: URL, body and clock.
+
+    Two pages sharing an id would let a row take the lineage of whichever
+    page a lookup saw last, so contradictory evidence is refused outright.
+    """
+    seen = {}
+    for capture in captures:
+        evidence = (capture.url, capture.body_hash, capture.captured_at)
+        if seen.setdefault(capture.capture_id, evidence) != evidence:
+            raise core.CoreParseError(f'{section}:capture_conflict')
+
+
 def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_id: str):
     """Why the supplied pages are not exactly one walk from the edition's first page.
 
@@ -103,6 +116,7 @@ def extract_attendance_observations(
         raise core.CoreParseError('attendance:final_season_proof_missing')
 
     context = core._context(captures[-1], scope, extracted_at, universe_version)
+    _distinct_captures(captures, 'attendance')
     walk = _attendance_walk(captures, start_url, competition_id=competition_id, edition_id=edition_id)
     if walk is not None:
         # A terminal page offered as the start, or captures the walk never
@@ -154,8 +168,10 @@ def extract_attendance_observations(
         context['capture'] = max(
             (capture for capture in captures if capture.capture_id in contributing),
             key=lambda capture: (capture.captured_at, capture.capture_id))
-    # Every walked page keeps its own clock, the rowless ones included.
-    pages = tuple((capture.url, capture.capture_id, capture.captured_at) for capture in captures)
+    # Every walked page keeps its own lineage, the rowless ones included.
+    pages = tuple(
+        (capture.url, capture.capture_id, capture.captured_at, capture.body_hash)
+        for capture in captures)
     return _outcome(entity, result.status, reason, tuple(rows), pages=pages, **context)
 
 
@@ -385,6 +401,7 @@ def extract_rumour_observations(
                                      extracted_at, universe_version),)
     newest = broken or max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
+    _distinct_captures(captures, 'rumours')
     if failure is not None:
         # The walk stopped on conflicting or unreadable evidence of its own:
         # the pages it did fetch are not the feed. The page that broke it,
@@ -415,9 +432,9 @@ def extract_rumour_observations(
     except ValueError:
         return (_outcome(entity, 'error', 'rumours:invalid_source_data', **context),)
 
-    by_id = {capture.capture_id: capture for capture in captures}
     outcomes = []
     # The feed sorts its pages by page number, which is the capture position.
+    # Every row of a page binds to that page's own capture.
     for page, capture in zip(feed.pages, captures, strict=True):
         page_context = core._context(capture, scope, extracted_at, universe_version)
         if page.capture.status == 'observed_empty':
@@ -433,15 +450,13 @@ def extract_rumour_observations(
             continue
         rows = []
         for row in page.rows:
-            try:
-                row_capture = by_id[row['raw_capture_id']]
-            except KeyError as exc:
-                raise core.CoreParseError('rumours:row_capture_missing') from exc
+            if row['raw_capture_id'] != capture.capture_id:
+                raise core.CoreParseError('rumours:row_capture_missing')
             values = dict(row)
             if values['probability_percent'] is not None:
                 values['probability_percent'] = repr(values['probability_percent'])
             rows.append(core._render(
-                entity, values, scope, row_capture, extracted_at, context['run_id'], universe_version,
+                entity, values, scope, capture, extracted_at, context['run_id'], universe_version,
                 observation_status='observed_present', status_reason='rumours:row',
                 parser_revision=rumours.PARSER_VERSION, schema_revision=rumours.SCHEMA_VERSION,
             ))
