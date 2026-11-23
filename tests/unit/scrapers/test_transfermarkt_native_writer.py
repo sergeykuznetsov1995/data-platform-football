@@ -1121,3 +1121,25 @@ def test_a_capture_committed_as_empty_cannot_acquire_rows():
     with pytest.raises(RuntimeError, match='replay differs'):
         write(db, [membership_plan(['1'], capture='cap-x')], run_id='run-2', clock=CLOCK)
     assert _players(db) == []
+
+
+def test_the_writer_accepts_only_a_conclusive_plan():
+    # Round 5 finding 5: a rowless plan with an inconclusive status reached
+    # the public writer, deleted the committed scope and was acknowledged.
+    db = CoreDB()
+    write(db, [membership_plan(['1', '2'], capture='cap-1')])
+    for status in ('unknown', 'unavailable', 'error', 'explicit_none'):
+        with pytest.raises(ValueError, match='status'):
+            dataclasses_replace(_empty_roster_plan(clock=LATER), status=status, proof='x')
+    # Rows need a status that carries rows; an absence needs a proof.
+    for status in ('observed_empty', 'not_applicable'):
+        with pytest.raises(ValueError, match='proof'):
+            dataclasses_replace(_empty_roster_plan(clock=LATER), status=status, proof='')
+    with pytest.raises(ValueError, match='status'):
+        dataclasses_replace(membership_plan(['1']), status='observed_empty', proof='empty_roster:x')
+    with pytest.raises(ValueError, match='status'):
+        dataclasses_replace(membership_plan(['1']), status='not_applicable', proof='x')
+    assert _players(db) == ['1', '2']
+    # The conclusive combinations stay accepted.
+    dataclasses_replace(_empty_roster_plan(clock=LATER), status='not_applicable')
+    assert membership_plan(['1']).status == 'observed_present'

@@ -3366,3 +3366,90 @@ def test_a_repair_of_an_acknowledged_snapshot_leaves_a_recoverable_intent(monkey
     assert native_writer.write_journal.pending_intents({'run_id': run_id}) == []
     assert _manifest(db) == [(ATTENDANCE_START, page_1.capture_id), (ATTENDANCE_PAGE_2, empty_2.capture_id)]
     assert set(_stadiums(db)) == {'11'}
+
+
+def test_a_timestamp_that_does_not_parse_is_refused_before_the_bundle():
+    # Round 5 finding 15: the canonical check compared a cell with itself
+    # whenever it could not be parsed, so any text passed for a clock.
+    first = _referee_page(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')]))
+    outcome, = _referee_directory((first,))
+    for column in ('extracted_at', 'captured_at', 'observed_at'):
+        broken = _replace(outcome, rows=tuple({**row, column: 'yesterday'} for row in outcome.rows))
+        with pytest.raises((ValueError, CoreParseError)):
+            core.plan_for_outcome(broken, captured_at=REFEREE_CAPTURED,
+                                  scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
+    with pytest.raises(ValueError, match='timestamp'):
+        _replace(_attendance_plan(_two_pages()), captured_at='later that day')
+
+
+def test_row_values_match_their_declared_column_types():
+    # Round 5 finding 16: two capacities given as text were one consistent
+    # type for their column; the replacement committed the text over the
+    # committed numbers and only the read-back failed.
+    page_1, page_2 = _two_pages()
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    plan = _attendance_plan((page_1, page_2), LATER_EXTRACTED_AT)
+    with pytest.raises(ValueError, match='column type'):
+        as_text = _replace(plan, rows=tuple({**row, 'capacity': str(row['capacity'])} for row in plan.rows))
+    with pytest.raises(ValueError, match='column type'):
+        as_number = _replace(plan, rows=tuple({**row, 'club_id': int(row['club_id'])} for row in plan.rows))
+    with pytest.raises(ValueError, match='column type'):
+        as_flag = _replace(plan, rows=tuple({**row, 'final_season': 'yes'} for row in plan.rows))
+    assert set(_stadiums(db)) == {'11', '631'}
+
+
+def test_rows_of_one_capture_share_their_whole_lineage():
+    # Round 5 finding 12: a row could name another raw capture, another
+    # endpoint or another scope than its receipt, and rows of one capture
+    # could carry different clocks.
+    profile, = sections.extract_referee_profile_observations(
+        _referee_profile_capture(), _referee_scope(), referee_id='101',
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
+    row = profile.rows[0]
+    for change in ({'raw_capture_id': 'f' * 64}, {'source_endpoint': 'rumours'},
+                   {'scope_id': 'another-scope'}, {'cycle_id': 'another-cycle'}):
+        with pytest.raises((ValueError, CoreParseError)):
+            core.plan_for_outcome(_replace(profile, rows=({**row, **change},)),
+                                  captured_at=REFEREE_CAPTURED, scope_values={'referee_id': '101'})
+    achievements, = sections.extract_achievement_observations(
+        _achievement_capture(ACHIEVEMENTS_PACKET), _achievement_scope(), recipient_type='player',
+        recipient_id='7', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert len(achievements.rows) == 2
+    first, second = achievements.rows
+    for change in ({'captured_at': '2026-11-20T09:00:00.000000+00:00'},
+                   {'source_url': ACHIEVEMENTS_URL + '/other'}, {'run_id': 'another-run'},
+                   {'universe_version': 'another-universe'}):
+        with pytest.raises((ValueError, CoreParseError)):
+            core.plan_for_outcome(
+                _replace(achievements, rows=({**first, **change}, second)),
+                captured_at=CLUB_CAPTURED,
+                scope_values={'recipient_type': 'player', 'recipient_id': '7'})
+
+
+def test_a_contradictory_empty_merge_is_refused_before_its_siblings_mutate():
+    # Round 5 finding 17: an empty merge plan whose capture is committed
+    # with rows was only rejected by its read-back, after the replacement
+    # sharing its bundle had already been written.
+    achievements, = sections.extract_achievement_observations(
+        _achievement_capture(ACHIEVEMENTS_PACKET), _achievement_scope(), recipient_type='player',
+        recipient_id='7', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    populated = core.plan_for_outcome(achievements, captured_at=CLUB_CAPTURED,
+                                      scope_values={'recipient_type': 'player', 'recipient_id': '7'})
+    db = CoreDB()
+    _write(db, [populated], achievements.run_id, EXTRACTED_AT)
+    page_1, page_2 = _two_pages()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    newer_1 = _page(ATTENDANCE_START, page_1.body, NEWER_PAGE_CAPTURED, 'newer page 1')
+    replacement = _attendance_plan((newer_1, page_2), LATER_EXTRACTED_AT)
+    empty = _replace(achievements, status='observed_empty', status_reason='achievements:empty_collection',
+                     proof='achievements:empty_collection:player', rows=())
+    before = dict(db.sql.execute(
+        'SELECT club_id, captured_at FROM transfermarkt_attendance_observations').fetchall())
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _write(db, [replacement, core.plan_for_outcome(
+            empty, captured_at=CLUB_CAPTURED,
+            scope_values={'recipient_type': 'player', 'recipient_id': '7'})],
+            achievements.run_id, LATER_EXTRACTED_AT)
+    assert dict(db.sql.execute(
+        'SELECT club_id, captured_at FROM transfermarkt_attendance_observations').fetchall()) == before
