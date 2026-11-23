@@ -3580,3 +3580,84 @@ def test_a_referee_profile_target_is_canonicalised_once():
         ('referee_profiles', 'observed_present')]
     assert report.receipts[0]['verified'] is True
     assert db.sql.execute('SELECT referee_id FROM transfermarkt_referee_profiles').fetchall() == [('101',)]
+
+
+def test_a_value_a_row_cannot_hold_fails_only_its_own_target_in_every_lane():
+    # Round 5 finding 21: rendering sat outside the source-error handler of
+    # every lane but attendance, so one oversized source amount aborted the
+    # run and the target queued after it was never fetched.
+    body = (CLUB_VALUE_FIXTURES / 'vie1-current.html').read_bytes()
+    chart_value = b"'y':1275000"
+    assert chart_value in body
+    fetcher = _SectionFetch({
+        CLUB_VALUE_URL: body.replace(chart_value, b"'y':9223372036854775808", 1),
+        REFEREE_PROFILE_URL: (REFEREE_FIXTURES / 'profile.html').read_bytes()})
+    plan = CoreScopePlan(
+        league='VIE1', season='2526', scope_id='s', cycle_id='c',
+        club_value_targets=(ClubValueTarget('VIE1', 'v-league-1'),),
+        referee_profile_ids=('101',))
+    db = CoreDB()
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
+                     extracted_at=REFEREE_EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [CLUB_VALUE_URL, REFEREE_PROFILE_URL]
+    assert [(item['entity'], item['status'], item['status_reason'], item['rows'])
+            for item in report.outcomes] == [
+        ('club_value_observations', 'error', 'club_values:row_value_exceeds_bigint', 0),
+        ('referee_profiles', 'observed_present', 'referees:profile', 1)]
+    assert report.dq['passed'] is True
+
+
+@pytest.mark.parametrize('lane', [
+    'club_values', 'referee_directory', 'referee_profile', 'achievement', 'representation',
+    'rumours'])
+def test_an_unrenderable_row_is_its_sections_error(monkeypatch, lane):
+    # Round 5 finding 21: rendering sat outside the handler of every adapter
+    # but attendance. A row the core cannot render (forced here; the donors
+    # type most of their values themselves) is the section's error outcome,
+    # never an exception out of the adapter.
+    real = core._render
+    entity = {
+        'club_values': 'club_value_observations',
+        'referee_directory': 'referee_aggregate_observations',
+        'referee_profile': 'referee_profiles',
+        'achievement': 'achievement_observations',
+        'representation': 'player_representation_observations',
+        'rumours': 'rumour_observations',
+    }[lane]
+
+    def refusing(target, *args, **kwargs):
+        if target == entity:
+            raise core.CoreParseError('row_value_exceeds_bigint')
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(core, '_render', refusing)
+    directory = (_referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                               next_url=REFEREE_DIRECTORY_PAGE_2),
+                 _referee_page(REFEREE_DIRECTORY_PAGE_2, _referee_second_page_body()))
+    feed = (_rumour_capture(1, RUMOUR_PAGE_1_CAPTURED), _rumour_capture(2, RUMOUR_PAGE_2_CAPTURED))
+    outcomes = {
+        'club_values': lambda: sections.extract_club_value_observations(
+            _club_value_capture(), _club_value_scope(), competition_id='VIE1',
+            extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),
+        'referee_directory': lambda: _referee_directory(directory),
+        'referee_profile': lambda: sections.extract_referee_profile_observations(
+            _referee_profile_capture(), _referee_scope(), referee_id='101',
+            extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE),
+        'achievement': lambda: sections.extract_achievement_observations(
+            _achievement_capture(ACHIEVEMENTS_PACKET), _achievement_scope(),
+            recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
+            universe_version=UNIVERSE),
+        'representation': lambda: sections.extract_representation_observations(
+            _representation_capture(), _representation_scope(), expected_ids=('7', '9'),
+            extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),
+        'rumours': lambda: sections.extract_rumour_observations(
+            feed, _rumour_scope(), competition=_rumour_competition(),
+            extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE),
+    }[lane]()
+    assert outcomes
+    for outcome in outcomes:
+        assert (outcome.status, outcome.rows) == ('error', ())
+        assert outcome.status_reason.endswith(':row_value_exceeds_bigint')
+        assert outcome.capture is not None
+    assert core.build_core_dq(outcomes)['passed'] is True

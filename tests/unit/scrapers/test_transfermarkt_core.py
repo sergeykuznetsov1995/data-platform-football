@@ -360,3 +360,72 @@ def test_numeric_id_strings_render_as_their_bigint_column_type():
                     assert isinstance(row[column], int), column
         return
     pytest.skip('sample fixture has no transfer rows')
+
+
+# ---------------------------------------------------------------- stage-C review round 5
+
+
+def test_a_career_row_that_cannot_hold_its_value_is_an_error_of_its_capture():
+    # Round 5 finding 21 (stage-B lane): a source amount beyond bigint
+    # raised out of extraction instead of becoming the capture's error.
+    import re
+
+    for index in range(4):
+        capture = _load('market_value_points', index)
+        patched, count = re.subn(rb'"y":\s*\d+', b'"y":9223372036854775808', capture.body, count=1)
+        if count:
+            break
+    else:
+        pytest.skip('no recorded market-value fixture carries a chart value')
+    digest = hashlib.sha256(patched).hexdigest()
+    player_id = capture.url.rsplit('/', 1)[-1]
+    broken = SourceCapture(
+        url=capture.url, endpoint='market_value_points', body=patched, capture_id=digest,
+        body_hash=digest, captured_at=capture.captured_at, status_code=capture.status_code)
+    outcome = core.extract_career_observations(
+        broken, _scope(player_id=player_id, club_id=None),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'row_value_exceeds_bigint', ())
+    assert outcome.capture.capture_id == digest
+
+
+@pytest.mark.parametrize('endpoint', [
+    'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history'])
+def test_a_core_row_that_cannot_be_rendered_is_its_captures_error(monkeypatch, endpoint):
+    # Round 5 finding 21 (stage-B lanes): rendering a row is part of reading
+    # the capture; a row the core cannot render is the capture's error.
+    capture = _load(endpoint)
+
+    def scope():
+        if endpoint in ('market_value_points', 'transfer_events'):
+            return _scope(player_id=capture.url.rsplit('/', 1)[-1], club_id=None)
+        if endpoint == 'coach_profile':
+            return _scope()
+        return _scope(club_id=capture.url.split('/verein/')[1].split('/')[0])
+
+    def extract():
+        if endpoint == 'squad':
+            return core.extract_squad_observations(
+                capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        if endpoint in ('market_value_points', 'transfer_events'):
+            return (core.extract_career_observations(
+                capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),)
+        if endpoint == 'coach_profile':
+            return (core.extract_coach_profile(
+                capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),)
+        return (core.extract_coach_stints(
+            capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),)
+
+    if not any(outcome.rows for outcome in extract()):
+        pytest.skip('the recorded capture of this lane renders no row')
+    real = core._render
+
+    def refusing(*args, **kwargs):
+        raise core.CoreParseError('row_value_exceeds_bigint')
+
+    monkeypatch.setattr(core, '_render', refusing)
+    for outcome in extract():
+        assert (outcome.status, outcome.status_reason, outcome.rows) == (
+            'error', 'row_value_exceeds_bigint', ())
+        assert outcome.capture.capture_id == capture.capture_id
