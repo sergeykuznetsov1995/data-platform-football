@@ -2955,3 +2955,23 @@ def test_a_value_the_row_cannot_hold_is_the_sections_error_not_the_runs():
         ('referee_profiles', 'observed_present', 'referees:profile', 1)]
     assert [item['entity'] for item in report.receipts[0]['plans']] == ['referee_profiles']
     assert report.dq['passed'] is True
+
+
+def test_club_value_competition_ids_keep_the_donors_grammar():
+    # Round 4 finding 16: the donor accepts competition ids like U-21; the
+    # run pushed the target through the league grammar of its own scope.
+    body = (CLUB_VALUE_FIXTURES / 'vie1-current.html').read_bytes().replace(b'VIE1', b'U-21')
+    url = CLUB_VALUE_URL.replace('/VIE1', '/U-21')
+    fetcher = _SectionFetch({url: body})
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        club_value_targets=(ClubValueTarget('U-21', 'v-league-1'),))
+    db = CoreDB()
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE,
+                     extracted_at=EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert [item['status'] for item in report.outcomes] == ['observed_present'] * 14
+    assert report.dq['passed'] is True and report.receipts[0]['verified'] is True
+    assert db.sql.execute(
+        'SELECT DISTINCT competition_id FROM transfermarkt_club_value_observations').fetchall() == [
+        ('U-21',)]
