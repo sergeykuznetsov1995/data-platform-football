@@ -3540,7 +3540,9 @@ def test_a_parse_error_cites_the_page_that_failed():
         edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, outcome.rows) == ('error', ())
     assert outcome.capture.capture_id == broken_1.capture_id
-    broken_2 = _page(ATTENDANCE_PAGE_2, page_2.body.replace(b'60.704', b'x'), PAGE_2_CAPTURED, 'x')
+    broken_2 = _page(ATTENDANCE_PAGE_2, page_2.body.replace(b'40,173', b'not-a-number'),
+                     PAGE_2_CAPTURED, 'broken page 2')
+    assert broken_2.body != page_2.body
     page_1_again = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
     outcome, = sections.extract_attendance_observations(
         (page_1_again, broken_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',

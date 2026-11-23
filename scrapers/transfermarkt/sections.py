@@ -105,6 +105,22 @@ def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_i
     return walked
 
 
+def _failing_attendance_page(walk, competition_id: str, edition_id: str):
+    """The capture of the first page the donor cannot parse on its own.
+
+    The donor reports one error for the whole walk. The page that caused it
+    is the first one that fails when read alone; a page that only fails
+    together with the others leaves the newest page as the evidence.
+    """
+    pages = list(walk)
+    for page, (capture, _following) in pages:
+        try:
+            attendance._parse_page(page, competition=competition_id, edition=edition_id)
+        except attendance.AttendanceParseError:
+            return capture
+    return pages[-1][1][0]
+
+
 def extract_attendance_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *, start_url: str,
     competition_id: str, edition_id: str, extracted_at: str, universe_version: str,
@@ -132,21 +148,28 @@ def extract_attendance_observations(
             # visits, must not become a replacement of the whole edition.
             return (_outcome(entity, 'error', 'attendance:' + walk, **context),)
         walk = [(capture, None) for capture in captures]  # the donor reports its own walk
-    try:
-        pages = [
-            attendance.AttendancePage(
+    pages = []
+    for capture, _following in walk:
+        try:
+            pages.append(attendance.AttendancePage(
                 url=capture.url, body=capture.body, capture_id=capture.capture_id,
                 body_hash=capture.body_hash, status_code=capture.status_code,
                 # The donor's ISO format omits zero microseconds. Row lineage uses the original.
                 captured_at=datetime.fromisoformat(capture.captured_at).isoformat(),
-            )
-            for capture, _following in walk
-        ]
+            ))
+        except attendance.AttendanceParseError as exc:
+            # The page the donor's own contract refuses is known here.
+            return (_outcome(entity, 'error', 'attendance:' + exc.reason,
+                             **core._context(capture, scope, extracted_at, universe_version)),)
+    try:
         result = attendance.parse_attendance(
             pages, start_url=start_url, competition_id=competition_id, edition_id=edition_id,
         )
     except attendance.AttendanceParseError as exc:
-        return (_outcome(entity, 'error', 'attendance:' + exc.reason, **context),)
+        # The page that cannot be parsed backs the error, not a valid sibling.
+        broken = _failing_attendance_page(zip(pages, walk, strict=True), competition_id, edition_id)
+        return (_outcome(entity, 'error', 'attendance:' + exc.reason,
+                         **core._context(broken, scope, extracted_at, universe_version)),)
     except (ValueError, OverflowError):
         return (_outcome(entity, 'error', 'attendance:invalid_source_data', **context),)
 
@@ -332,20 +355,31 @@ def extract_referee_directory_observations(
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context = core._context(newest, scope, extracted_at, universe_version)
     first_page = {}
+    reading = None  # the capture whose page the donor is reading
+
+    def failed(reason: str):
+        # The page being read when the donor failed backs the error; a
+        # failure of the reconciled directory is backed by its newest page.
+        backing = newest if reading is None else reading
+        return _outcome(entity, 'error', 'referees:' + reason,
+                        **core._context(backing, scope, extracted_at, universe_version))
+
     try:
         pages = [capture.text for capture in captures]
         for index, html in enumerate(pages):
+            reading = captures[index]
             page = referees.parse_referee_directory_page(html, **directory)
             for aggregate in page.aggregates:
                 first_page.setdefault(aggregate.natural_key, index)
+        reading = None
         # Every supplied page is accounted for by the validated walk above.
         result = referees.reconcile_referee_directory_pages(
             pages, expected_page_count=len(pages), **directory,
         )
     except referees.RefereeParseError as exc:
-        return (_outcome(entity, 'error', 'referees:' + exc.reason, **context),)
+        return (failed(exc.reason),)
     except ValueError as exc:
-        return (_outcome(entity, 'error', 'referees:' + (str(exc) or 'invalid_source_data'), **context),)
+        return (failed(str(exc) or 'invalid_source_data'),)
 
     if not result.aggregates:
         if result.completeness_proof:
