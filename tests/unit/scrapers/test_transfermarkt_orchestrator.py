@@ -1,6 +1,8 @@
 """Offline orchestration tests for the stage-B core run (#2404)."""
 import gzip
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -302,6 +304,128 @@ def _write_replay_manifest(root, captures):
         (root / blob_file).write_bytes(gzip.compress(capture.body))
         fixtures.append({'capture_id': capture.capture_id, 'endpoint': capture.endpoint, 'blob_file': blob_file})
     (root / 'manifest.json').write_text(json.dumps({'fixtures': fixtures}))
+
+
+@pytest.mark.parametrize('malformed_first', [False, True])
+def test_offline_malformed_transfer_cannot_hide_capture_conflict(malformed_first, tmp_path, monkeypatch, capsys):
+    # Round 9 finding 8
+    from dags.scripts import run_transfermarkt_core as cli
+
+    squad = _load('squad')
+    body = b'{"transfers":'
+    transfer = replace(_load('transfer_events'), capture_id=squad.capture_id,
+                       body=body, body_hash=hashlib.sha256(body).hexdigest())
+    _write_replay_manifest(tmp_path, [transfer, squad])
+    # Give the two endpoint records separate blobs, even though they claim one ID.
+    (tmp_path / 'transfer.gz').write_bytes(gzip.compress(body))
+    path = tmp_path / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest['fixtures'][0]['blob_file'] = 'transfer.gz'
+    path.write_text(json.dumps({'fixtures': manifest['fixtures'][:1]}))
+    fetch = cli._fixture_fetch(cli._load_records(tmp_path))
+    malformed = fetch(transfer.url, as_json=True, label='transfer_events')
+    assert (malformed.status, malformed.error, malformed.raw_capture_id, malformed.raw_body_hash) == (
+        FetchStatus.SCHEMA_ERROR, 'invalid_json', transfer.capture_id, transfer.body_hash)
+    assert fetch.requested == fetch.reached == {transfer.url}
+    if not malformed_first:
+        manifest['fixtures'].reverse()
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(cli, '_write_options', lambda args: pytest.fail('unexpected writer setup'))
+    with pytest.raises(SystemExit) as caught:
+        cli.main(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+                  '--season', '2627', '--write'])
+    assert caught.value.code == 2
+    assert capsys.readouterr().err.rstrip().endswith(': capture_evidence_conflict')
+
+
+@pytest.mark.parametrize('edition', ['2026', '2025', None])
+def test_offline_attendance_respects_explicit_edition(edition, tmp_path, monkeypatch, capsys):
+    # Round 9 finding 10
+    from dags.scripts import run_transfermarkt_core as cli
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        ATTENDANCE_PAGE_2, ATTENDANCE_START, PAGE_1_CAPTURED, PAGE_2_CAPTURED, _attendance_capture,
+    )
+
+    captures = [_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
+                _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)]
+    if edition != '2025':
+        captures.insert(0, _load('squad'))  # 2026 squad and 2025 attendance
+    _write_replay_manifest(tmp_path, captures)
+    path = tmp_path / 'report.json'
+    args = ['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+            '--season', '2526' if edition == '2025' else '2627', '--report-out', str(path)]
+    if edition is not None:
+        args.extend(['--edition-id', edition])
+    if edition == '2026':
+        monkeypatch.setattr(cli, '_fixture_fetch', lambda *a: pytest.fail('unexpected fetch setup'))
+        monkeypatch.setattr(cli, '_write_options', lambda *a: pytest.fail('unexpected writer setup'))
+        with pytest.raises(SystemExit) as caught:
+            cli.main([*args, '--write'])
+        assert caught.value.code == 2
+        assert capsys.readouterr().err.rstrip().endswith(': attendance_edition_mismatch')
+        return
+    assert cli.main(args) == 0
+    report = json.loads(path.read_text())
+    assert report['fetched'] == len(captures)
+    attendance, = [item for item in report['outcomes'] if item['entity'] == 'attendance_observations']
+    assert (attendance['status'], attendance['rows']) == ('observed_present', 2)
+
+
+def test_live_cli_refuses_foreign_attendance_before_transport(monkeypatch, capsys):
+    # Round 9 finding 10
+    from dags.scripts import run_transfermarkt_core as cli
+    from scrapers.transfermarkt import client
+
+    plan = _plan(attendance_editions=(orchestrator.AttendanceEditionTarget('GB1', 2026),
+                                      orchestrator.AttendanceEditionTarget('GB1', 2025)))
+    monkeypatch.setattr(cli, '_live_plan', lambda args: plan)
+    monkeypatch.setattr(client, 'TransfermarktHttpClient', lambda: pytest.fail('unexpected transport setup'))
+    with pytest.raises(SystemExit) as caught:
+        cli.main(['live', '--league', 'GB1', '--season', '2627', '--edition-id', '2026',
+                  '--scope-id', 's', '--cycle-id', 'c', '--club', '11:arsenal',
+                  '--i-have-transport-permission'])
+    assert caught.value.code == 2
+    assert capsys.readouterr().err.rstrip().endswith(': attendance_edition_mismatch')
+
+
+@pytest.mark.parametrize('different_body', [False, True], ids=['aliases', 'conflict'])
+def test_shared_empty_squad_capture_keeps_each_requested_club(different_body):
+    # Round 9 finding 12
+    from scrapers.transfermarkt.native_writer import _timestamp
+
+    empty = _load('squad', 3)
+    clubs = tuple(ClubTarget(club_id, slug, squad_url=squad_url(slug, club_id, YEAR))
+                  for club_id, slug in [('11', 'first'), ('12', 'second')])
+    second_body = empty.body + b' ' if different_body else empty.body
+    second_clock = '2026-11-21T11:00:00.000000+00:00'
+    assert second_clock != empty.captured_at
+    responses = {clubs[0].squad_url: (empty.body, empty.captured_at),
+                 clubs[1].squad_url: (second_body, second_clock)}
+
+    def fetch(url, **kwargs):
+        body, clock = responses[url]
+        return FetchOutcome(status=FetchStatus.OK, value=body.decode(), status_code=200,
+                            raw_capture_id=empty.capture_id, raw_body_hash=hashlib.sha256(body).hexdigest(),
+                            raw_fetched_at=clock)
+
+    plan = _plan(clubs=clubs)
+    run = CoreRun(fetch, extracted_at=EXTRACTED_AT)
+    if different_body:
+        with pytest.raises(CoreRunError, match='^capture_evidence_conflict$'):
+            run.run(plan, writer=object(), connection_factory=lambda: pytest.fail('unexpected connection'))
+        return
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert report.dq['errors'] == []
+    assert report.dq['outcome_status_counts'] == {'observed_empty': 6}
+    assert len(report.receipts) == 2 and all(r['verified'] is True for r in report.receipts)
+    rows = db.sql.execute(
+        "SELECT scope_values_json, captured_at, source_capture_id, source_body_hash "
+        "FROM transfermarkt_core_receipts_v1 WHERE entity = 'squad_memberships'")
+    assert {(dict(json.loads(scope))['club_id'], _timestamp(clock), capture_id, body_hash)
+            for scope, clock, capture_id, body_hash in rows} == {
+        (club.club_id, _timestamp(responses[club.squad_url][1]), empty.capture_id, empty.body_hash)
+        for club in clubs}
 
 
 @pytest.mark.parametrize('case', ['complete', 'club_values', 'unreached', 'missing_start', 'duplicate_start'])

@@ -394,6 +394,8 @@ class _TombstoneCursor:
 
     def execute(self, sql, params=None):
         self.sql = sql
+        if sql.startswith('MERGE INTO'):
+            self.query_id = 'q_target_merge'
         self.rows = self.warehouse.run(sql)
 
     def fetchall(self):

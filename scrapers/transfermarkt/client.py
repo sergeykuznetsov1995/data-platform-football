@@ -1401,7 +1401,9 @@ class TransfermarktHttpClient:
         """Parse only bytes that have passed raw-store verification."""
 
         if as_json:
-            return json.loads(body.decode("utf-8-sig", errors="strict"))
+            from scrapers.transfermarkt.sections import parse_json_integer
+
+            return json.loads(body.decode("utf-8-sig", errors="strict"), parse_int=parse_json_integer)
         return body.decode("utf-8", errors="replace")
 
     def _capture_attempt_ordinal(self) -> int:

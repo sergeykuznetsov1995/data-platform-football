@@ -1088,22 +1088,29 @@ def build_core_dq(
         errors.add('empty_universe')
     seen_outcomes = set()
     seen_keys = set()
+    hashes_by_capture = {}
     counts = {entity: Counter() for entity in CORE_ENTITIES}
     row_counts = dict.fromkeys(CORE_ENTITIES, 0)
     outcome_status_counts = Counter()
     for outcome in outcomes:
         entity, status = outcome.entity, outcome.status
         outcome_status_counts[status] += 1
+        scope = outcome.scope
+        capture = outcome.capture
+        evidence = [(page[1], page[3]) for page in outcome.pages]
+        if capture is not None:
+            evidence.append((capture.capture_id, capture.body_hash))
+        for capture_id, body_hash in evidence:
+            if hashes_by_capture.setdefault(capture_id, body_hash) != body_hash:
+                errors.add('capture_evidence_conflict')
         identity = (
-            entity, outcome.scope.scope_id if outcome.scope else None,
-            outcome.scope.cycle_id if outcome.scope else None,
-            outcome.capture.capture_id if outcome.capture else None,
+            entity, scope.scope_id if scope else None, scope.cycle_id if scope else None,
+            tuple(getattr(scope, column, None) for column in CORE_SCOPE_COLUMNS.get(entity, ())),
+            capture.capture_id if capture else None,
             outcome.subject,
         )
         if entity == 'club_value_observations' and outcome.rows:
             identity += (outcome.rows[0].get('club_id'),)
-        if entity == 'player_representation_observations' and outcome.scope:
-            identity += (outcome.scope.player_id,)
         if identity in seen_outcomes:
             errors.add('duplicate_outcome')
         seen_outcomes.add(identity)

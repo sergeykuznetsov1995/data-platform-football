@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import gzip
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -42,6 +43,7 @@ def _parser():
 def _load_records(root):
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     records = {}
+    hashes_by_capture = {}
     for fixture in manifest["fixtures"]:
         capture_id = fixture["capture_id"]
         path = root / "captures" / fixture["endpoint"] / f"{capture_id}.json"
@@ -50,6 +52,9 @@ def _load_records(root):
             raise ValueError(f"Capture ID mismatch in {path}")
         if record["endpoint"] != fixture["endpoint"]:
             raise ValueError(f"Fixture endpoint mismatch in {path}")
+        body_hash = record["content_hash"]
+        if hashes_by_capture.setdefault(capture_id, body_hash) != body_hash:
+            raise ValueError("capture_evidence_conflict")
         blob = root / fixture["blob_file"]
         url = record["url"]
         if url in records:
@@ -77,26 +82,24 @@ def _fixture_fetch(records):
                 status=FetchStatus.RETRY_EXHAUSTED, error=f"http_{record['status_code']}",
                 status_code=record["status_code"],
             )
-        text = gzip.decompress(blob.read_bytes()).decode("utf-8")
+        body = gzip.decompress(blob.read_bytes())
+        if hashlib.sha256(body).hexdigest() != record["content_hash"]:
+            raise ValueError("body_hash_mismatch")
+        evidence = {
+            "raw_capture_id": record["capture_id"], "raw_body_hash": record["content_hash"],
+            "raw_fetched_at": record["fetched_at"], "status_code": record["status_code"],
+        }
+        text = body.decode("utf-8")
         if as_json:
             try:
                 value = json.loads(text, parse_int=parse_json_integer)
             except ValueError:
                 return FetchOutcome(
-                    status=FetchStatus.SCHEMA_ERROR, error="invalid_json",
-                    status_code=record["status_code"],
+                    status=FetchStatus.SCHEMA_ERROR, error="invalid_json", **evidence,
                 )
         else:
             value = text
-        return FetchOutcome(
-            status=FetchStatus.OK,
-            value=value,
-            raw_capture_id=record["capture_id"],
-            raw_body_hash=record["content_hash"],
-            raw_fetched_at=record["fetched_at"],
-            cache_hit=False,
-            status_code=record["status_code"],
-        )
+        return FetchOutcome(status=FetchStatus.OK, value=value, **evidence)
 
     fetch.requested = requested
     fetch.reached = reached
@@ -316,9 +319,13 @@ def main(argv=None):
     from scrapers.transfermarkt.orchestrator import CoreRun, CoreRunError, planned_urls
 
     try:
-        if args.mode == "offline":
-            records = _load_records(args.fixtures_root)
-            plan = _offline_plan(args, records)
+        records = _load_records(args.fixtures_root) if args.mode == "offline" else None
+        plan = _offline_plan(args, records) if records is not None else _live_plan(args)
+        if args.edition_id is not None and any(
+            str(target.saison_year) != args.edition_id for target in plan.attendance_editions
+        ):
+            raise ValueError("attendance_edition_mismatch")
+        if records is not None:
             missing = [url for url in planned_urls(plan) if url not in records]
             if missing:
                 raise ValueError("Missing planned fixture: " + ", ".join(missing))
@@ -327,7 +334,6 @@ def main(argv=None):
         else:
             from scrapers.transfermarkt.client import TransfermarktHttpClient
 
-            plan = _live_plan(args)
             client = TransfermarktHttpClient()
             fetch = client.fetch
             raw_loader = getattr(client, "_raw_store", None)

@@ -162,7 +162,7 @@ def _index_entry(line: bytes) -> dict:
         entry = json.loads(line, parse_constant=_invalid_json_number)
         if not isinstance(entry, dict) or not re.fullmatch(r'[0-9a-f]{64}', entry['digest']):
             raise ValueError('invalid digest')
-        if entry['status'] == 'finished':
+        if entry['status'] == 'finished' and isinstance(entry.get('identity', {}), dict):
             return entry
         if entry['status'] == 'pending' and isinstance(entry['identity'], dict):
             return entry
@@ -178,6 +178,14 @@ def _load_index_entries() -> list[dict]:
             for line in stream:
                 if line.endswith(b'\n'):
                     entry = _index_entry(line)
+                    if entry['status'] == 'finished' and entry['digest'] in entries:
+                        # Older finish records contain only the file hash. Keep
+                        # the preceding pending identity for upgrade discovery.
+                        previous = entries[entry['digest']]
+                        if ('identity' in previous and 'identity' in entry
+                                and previous['identity'] != entry['identity']):
+                            raise RuntimeError('core write intent identity differs')
+                        entry = {**previous, **entry}
                     entries[entry['digest']] = entry
     except FileNotFoundError:
         pass
@@ -232,8 +240,8 @@ def adopt_intent(path):
 
 def finish_intent(path: Path) -> None:
     """Publish completion before removing the verified intent file."""
-    _intent_body(path, 'core write intent checksum differs')
-    _append_index({'digest': path.stem, 'status': 'finished'})
+    body = _intent_body(path, 'core write intent checksum differs')
+    _append_index({'digest': path.stem, 'status': 'finished', 'identity': body['identity']})
     path.unlink()
 
 
@@ -257,10 +265,12 @@ def pending_statement(key):
     return statement
 
 
-def begin_statement(key, expected, *, observable=True):
+def begin_statement(key, expected, *, observable=True, target_preimage=False):
     """Fence one dispatch under the shared writer lock, before it can reach Trino."""
     statement = {'key': list(key), 'expected': expected, 'observable': observable,
                  'attempt': uuid4().hex}
+    if target_preimage:
+        statement['target_preimage'] = True
     _immutable_record(_statement_path(key), statement)
     return statement
 
@@ -284,6 +294,45 @@ def finish_statement(statement):
     path.unlink()
     _fsync_directory(path.parent)
     _record_path('statement-queries', statement['attempt']).unlink(missing_ok=True)
+
+
+def _scope_owner_path(scope):
+    return _record_path('scope-owners', hashlib.sha256(_canonical(scope)).hexdigest())
+
+
+def scope_owner(scope):
+    path = _scope_owner_path(scope)
+    if path.exists():
+        record = _read_record(path)
+        if record['scope'] != list(scope):
+            raise RuntimeError('core scope guard differs')
+        return record['owner']
+    return None
+
+
+def hold_scope(scope, owner):
+    _immutable_record(_scope_owner_path(scope), {'scope': list(scope), 'owner': owner})
+
+
+def release_scope(scope, owner):
+    if scope_owner(scope) == owner:
+        path = _scope_owner_path(scope)
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
+def stage_record(receipt_id, stage):
+    return _record_path('stages/' + receipt_id, stage)
+
+
+def retained_stages(receipt_id):
+    for path in sorted((_root() / 'stages' / receipt_id).glob('*.json')):
+        yield path, _read_record(path)
+
+
+def forget_stage(path):
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def read_snapshot_anchors(digest: str) -> dict[str, int | None]:
@@ -363,7 +412,10 @@ def record_receipt(digest: str, receipt: Mapping) -> None:
     """Persist immutable evidence of a physically verified commit."""
     if receipt.get('verified') is not True:
         raise RuntimeError('core journal receipt is unverified')
-    _immutable_record(_record_path('receipts', digest), dict(receipt))
+    path = _record_path('receipts', digest)
+    _immutable_record(path, dict(receipt))
+    if _canonical(_read_record(path)) != _canonical(dict(receipt)):
+        raise RuntimeError('core journal receipt readback differs')
 
 
 def acknowledgements():

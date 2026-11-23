@@ -294,6 +294,24 @@ def test_core_dq_passes_the_recorded_sample_and_flags_duplicates():
     assert 'empty_universe' in core.build_core_dq(())['errors']
 
 
+def test_dq_compares_club_scopes_and_capture_bodies_independently():
+    # Round 9 finding 12
+    capture = _load('squad', 3)
+    club_id = capture.url.split('/verein/')[1].split('/')[0]
+    original, *_ = core.extract_squad_observations(
+        capture, _scope(club_id=club_id, season='2627', edition_id='2026'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    alias = replace(capture, url=capture.url.replace(f'/verein/{club_id}/', '/verein/12/'),
+                    captured_at='2026-11-21T11:00:00.000000+00:00')
+    other_club = replace(original, scope=replace(original.scope, club_id='12'), capture=alias)
+    assert core.build_core_dq([original, other_club])['errors'] == []
+    assert core.build_core_dq([other_club, other_club])['errors'] == ['duplicate_outcome']
+    different = alias.body + b' '
+    conflict = replace(alias, body=different, body_hash=hashlib.sha256(different).hexdigest())
+    assert core.build_core_dq([original, replace(other_club, capture=conflict)])['errors'] == [
+        'capture_evidence_conflict']
+
+
 def test_plan_for_outcome_builds_the_native_write_contract():
     outcomes = _squad_outcomes()
     club_id = outcomes[0].rows[0]['club_id']

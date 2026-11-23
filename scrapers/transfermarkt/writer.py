@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import time  # noqa: F401 — donor tests patch the shared time module through here
 from contextlib import suppress
+from uuid import uuid4
 
 from scrapers.base import trino_manager as base_trino
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
+from scrapers.transfermarkt import write_journal
 from scrapers.transfermarkt.native_writer import (  # noqa: F401 — donor facade
     CommittingConnection,
     CommittingCursor,
@@ -143,15 +145,37 @@ class TransfermarktTrinoManager(TrinoTableManager):
 
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         with writer_lock():
+            stage_record = None
             if write_is_journalled():
                 kwargs.pop('staging_id', None)  # a delayed insert belongs only to its original stage
+                target = getattr(_LOCAL, 'target', None)
+                if target is not None:
+                    scope, receipt_id, _, _ = target
+                    if scope[0] != f'{self.catalog}.{schema}.{table}':
+                        raise RuntimeError('core staging target differs')
+                    suffix = 'tm_' + uuid4().hex
+                    stage = table + '__stg_' + suffix
+                    stage_record = write_journal.stage_record(receipt_id, stage)
+                    write_journal._immutable_record(stage_record, {
+                        'receipt_id': receipt_id, 'table': scope[0], 'stage': stage})
+                    kwargs['staging_id'] = suffix
             if kwargs.get('delete_filter'):
                 kwargs['single_statement_replace'] = True
-            return super().insert_dataframe_atomic(schema, table, df, **kwargs)
+            count = super().insert_dataframe_atomic(schema, table, df, **kwargs)
+            if stage_record is not None:
+                write_journal.forget_stage(stage_record)
+            return count
 
 
 class TransfermarktIcebergWriter(IcebergWriter):
     dispatches_journalled_target = True
+
+    def drop_journalled_stage(self, stage):
+        manager = self._get_trino_manager()
+        if manager.catalog != 'iceberg':
+            raise RuntimeError('core retained stage catalog differs')
+        with base_trino._COMMIT_LOCK:
+            manager.drop_table('bronze', stage, if_exists=True)
 
     def _get_trino_manager(self):
         if self._trino_manager is None:
