@@ -1722,3 +1722,222 @@ def test_the_production_writer_never_replays_the_replacement_of_a_core_write(mon
     assert warehouse.players() == ['B']
     assert write_journal.pending_intents({'run_id': 'run-1'})
     assert not native_writer.write_is_journalled()  # the boundary closed with the failure
+
+
+# ---------------------------------------------------------------- round 7: writer pins
+
+
+def _walk_pages():
+    """Page captures of the attendance edition at this file's clocks."""
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        ATTENDANCE_FIXTURES, ATTENDANCE_PAGE_2, ATTENDANCE_START, _capture,
+    )
+
+    def page(url, fixture, clock, name):
+        return _capture(url, (ATTENDANCE_FIXTURES / fixture).read_bytes(), clock,
+                        capture_id=hashlib.sha256(name.encode()).hexdigest())
+    return ATTENDANCE_START, ATTENDANCE_PAGE_2, page
+
+
+class _UnknownOpsCursor(CoreCursor):
+    """Every INSERT into an ops table answers "commit state unknown" and lands nothing."""
+
+    inserts = 0
+
+    def execute(self, sql, params=()):
+        if sql.startswith('INSERT INTO iceberg.ops.'):
+            type(self).inserts += 1
+            raise RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown')
+        return super().execute(sql, params)
+
+
+class _UnknownOpsDB(CoreDB):
+    healthy = False
+
+    def cursor(self):
+        return CoreCursor(self) if self.healthy else _UnknownOpsCursor(self)
+
+
+def test_an_ops_insert_with_an_unknown_outcome_is_never_repeated_at_once():
+    # Round 7 finding 2 (in-process part): an INSERT whose commit was unknown
+    # was repeated at once because the read-back saw no row. The first
+    # statement can still land after that read: a receipt twice under one id,
+    # or a walk logged twice. Only the replay, later, writes an absent row.
+    for plans in ([membership_plan(['1'], capture='cap-1')], [_snapshot(CLOCK, 'cap-1')]):
+        db = _UnknownOpsDB()
+        _UnknownOpsCursor.inserts = 0
+        run_id = plans[0].rows[0]['run_id']
+        with pytest.raises(RuntimeError, match='commit state unknown'):
+            native_writer.write_core_bundle(
+                lambda: db, CoreWriter(db), plans, run_id=run_id,
+                universe_version='core-universe-v1', committed_at=plans[0].captured_at)
+        assert _UnknownOpsCursor.inserts == 1 and _receipt_count(db) == 0
+        assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (0,)
+        assert write_journal.pending_intents({'run_id': run_id})
+        db.healthy = True
+        settled = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+        assert len(settled) == 1 and settled[0]['verified'] is True and _receipt_count(db) == 1
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (2,)
+
+
+def _directory_plans(referee, capture_id):
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        REFEREE_CAPTURED, REFEREE_DIRECTORY_URL, _referee_body, _referee_directory, _referee_page,
+        _referee_plans,
+    )
+    page = dataclasses_replace(
+        _referee_page(REFEREE_DIRECTORY_URL, _referee_body([(referee, 'Ref ' + referee)])),
+        capture_id=capture_id)
+    return _referee_plans(_referee_directory((page,)), {capture_id: REFEREE_CAPTURED})
+
+
+def test_a_capture_cannot_be_two_responses_in_the_referee_directory():
+    # Round 7 finding 11: the same directory URL and capture clock answered
+    # twice with different bodies under one capture id. The rows of the first
+    # response were already there, so the capture's receipt evidence was never
+    # compared and both responses were acknowledged.
+    from tests.unit.scrapers.test_transfermarkt_sections import REFEREE_EXTRACTED_AT
+    db = CoreDB()
+    first, second = _directory_plans('101', 'a' * 64), _directory_plans('303', 'a' * 64)
+    assert first[0].capture_id == second[0].capture_id and first[0].rows != second[0].rows
+    write(db, first, run_id=first[0].rows[0]['run_id'], clock=REFEREE_EXTRACTED_AT)
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, second, run_id=second[0].rows[0]['run_id'], clock=REFEREE_EXTRACTED_AT)
+    assert db.sql.execute(
+        'SELECT COUNT(DISTINCT source_body_hash) FROM transfermarkt_core_receipts_v1 '
+        'WHERE source_capture_id = ?', ('a' * 64,)).fetchone() == (1,)
+    assert db.sql.execute(
+        'SELECT COUNT(*) FROM transfermarkt_referee_aggregate_observations WHERE referee_id = ?',
+        ('303',)).fetchone() == (0,)
+
+
+def _other_cycle(plan, cycle):
+    return dataclasses_replace(plan, rows=tuple({**row, 'cycle_id': cycle} for row in plan.rows))
+
+
+def test_a_cached_capture_observed_in_another_cycle_is_a_lineage_refresh():
+    # Round 7 finding 13: the cycle names the run that observed a capture, as
+    # its run id does. Compared as a business fact, a cached page could never
+    # return in a later cycle.
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        LATER_EXTRACTED_AT, _attendance_plan,
+    )
+    start, page_2_url, page = _walk_pages()
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-1')])
+    refreshed = _other_cycle(
+        membership_plan(['1'], capture='cap-1', run='run-2', ingested=LATER), 'tm-cycle-2')
+    assert write(db, [refreshed], run_id='run-2', clock=LATER)['verified'] is True
+    assert db.sql.execute('SELECT DISTINCT cycle_id FROM transfermarkt_squad_memberships').fetchall() \
+        == [('tm-cycle-2',)]
+    older = _snapshot(EARLIER, 'cap-old')
+    write(db, [older], run_id='run-a', clock=older.captured_at)
+    # A later cycle walks a fresher first page and the very capture of page 2
+    # the earlier cycle acknowledged: the cache served it again.
+    later = _other_cycle(_attendance_plan(
+        (page(start, 'page_1.html', NEWEST, 'cap-late'),
+         page(page_2_url, 'page_2.html', SIBLING_CLOCK, 'cap-2')), LATER_EXTRACTED_AT), 'tm-cycle-2')
+    assert write(db, [later], run_id=later.rows[0]['run_id'], clock=later.captured_at)['verified'] is True
+    assert db.sql.execute('SELECT DISTINCT cycle_id FROM transfermarkt_attendance_observations').fetchall() \
+        == [('tm-cycle-2',)]
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 3
+
+
+def test_an_acknowledgement_superseded_at_an_equal_clock_cannot_be_retried():
+    # Round 7 finding 5: two different captures of one page at one clock are
+    # ordered by their acknowledgement. The retry of the earlier one restored
+    # the rows the later one had left out, and returned verified.
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        EXTRACTED_AT, LATER_EXTRACTED_AT, ROWLESS_TERMINAL_PAGE_2, _attendance_plan, _capture,
+    )
+    start, page_2_url, page = _walk_pages()
+    page_1 = page(start, 'page_1.html', CLOCK, 'cap-1')
+    empty_2 = _capture(page_2_url, ROWLESS_TERMINAL_PAGE_2, SIBLING_CLOCK,
+                       capture_id=hashlib.sha256(b'empty').hexdigest())
+    first = _attendance_plan(
+        (page_1, page(page_2_url, 'page_2.html', SIBLING_CLOCK, 'cap-2')), EXTRACTED_AT)
+    second = _attendance_plan((page_1, empty_2), LATER_EXTRACTED_AT)
+    db = CoreDB()
+
+    def clubs():
+        return sorted(row[0] for row in db.sql.execute(
+            'SELECT club_id FROM transfermarkt_attendance_observations'))
+
+    write(db, [first], run_id=first.rows[0]['run_id'], clock=first.captured_at)
+    assert write(db, [second], run_id=second.rows[0]['run_id'], clock=LATER)['verified'] is True
+    assert clubs() == ['11']
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [first], run_id=first.rows[0]['run_id'], clock=first.captured_at)
+    assert clubs() == ['11']
+    # The later acknowledgement is still the one in force.
+    assert write(db, [second], run_id=second.rows[0]['run_id'], clock=LATER)['verified'] is True
+    assert clubs() == ['11']
+
+
+def test_an_acknowledgement_restores_its_own_partly_lost_walk():
+    # Round 7 finding 6 (own walk): a walk that lost one of its rows was
+    # refused as corrupt even to the acknowledgement that logged it, so
+    # nothing could ever make it whole again.
+    plan = _snapshot(CLOCK, 'cap-1')
+    db = CoreDB()
+    first = write(db, [plan], run_id=plan.rows[0]['run_id'], clock=plan.captured_at)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE page_number = 2')
+    again = write(db, [plan], run_id=plan.rows[0]['run_id'], clock=plan.captured_at)
+    assert again['plan_sha256'] == first['plan_sha256'] and again['verified'] is True
+    assert db.sql.execute(
+        'SELECT page_number, pages_count FROM transfermarkt_core_pages_v1 ORDER BY page_number'
+    ).fetchall() == [(1, 2), (2, 2)]
+
+
+def test_the_whole_retried_unit_may_restore_its_evidence():
+    # Round 7 finding 6, the unit: a retried unit is one acknowledgement. The
+    # plans of the unit being retried may all restore what they lost; an
+    # acknowledgement outside the unit still waits.
+    older, newer = _snapshot(EARLIER, 'cap-old'), _snapshot(CLOCK, 'cap-1')
+
+    def receipt_of(plan, run_id):
+        plan_hashes, digest = native_writer._bundle_identity([plan], run_id)
+        return native_writer._receipt_id(plan_hashes[0], run_id, digest)
+
+    db = CoreDB()
+    write(db, [older], run_id='run-a', clock=older.captured_at)
+    write(db, [newer], run_id='run-b', clock=newer.captured_at)
+    lost, kept = receipt_of(older, 'run-a'), receipt_of(newer, 'run-b')
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id = ?', (lost,))
+    with pytest.raises(RuntimeError, match='manifest lost'):
+        native_writer._replay_state(db, newer, kept, newer.captured_at)
+    assert native_writer._replay_state(db, newer, kept, newer.captured_at, own={kept, lost}) \
+        == 'pending'
+
+
+def test_an_alias_carries_the_anchors_of_the_acknowledgement_it_aliases(monkeypatch):
+    # Round 7 finding 9: the alias receipt became durable before its anchors
+    # were copied. The interrupted copy was never completed, and the next
+    # retry anchored the alias to the warehouse as it was after the write.
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-old')], run_id='run-0')
+    plan = _empty_roster_plan(clock=LATER, capture='cap-empty')
+    _legacy_digest = _stage_b_identity(plan, 'run-old')[1]
+    _legacy_intent(plan, _legacy_digest)
+    # The warehouse moves on after the legacy acknowledgement was anchored.
+    db.snapshots['transfermarkt_core_receipts_v1'] = [(34, None, '2026-11-21 10:00:00')]
+    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db))[0]['verified'] is True
+    db.snapshots['transfermarkt_core_receipts_v1'] = [(86, 34, '2026-11-21 13:00:00')]
+    original = write_journal.read_snapshot_anchors(_legacy_digest)
+    current = native_writer._bundle_identity([plan], 'run-old')[1]
+
+    def interrupted(*args):
+        raise RuntimeError('crash between alias and anchor')
+
+    with monkeypatch.context() as patched:
+        patched.setattr(write_journal, 'copy_snapshot_anchors', interrupted)
+        with pytest.raises(RuntimeError, match='crash between alias and anchor'):
+            native_writer.write_core_bundle(
+                lambda: db, CoreWriter(db), [plan], run_id='run-old', universe_version='u',
+                committed_at=CLOCK)
+    again = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [plan], run_id='run-old', universe_version='u',
+        committed_at=CLOCK)
+    assert again['verified'] is True
+    # The alias is anchored where the acknowledgement it stands for was: before its write emptied the roster.
+    assert write_journal.read_snapshot_anchors(current) == original
