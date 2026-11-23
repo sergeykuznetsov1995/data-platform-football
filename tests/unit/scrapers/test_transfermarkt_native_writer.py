@@ -88,21 +88,26 @@ class CoreWriter(IcebergWriter):
         super().__init__()
         self.db = db
         self.writes = []
+        self.replacements = []  # (table, delete_filter) of every write
 
     def _write_to_iceberg(self, df, database, table, partition_spec, mode='append',
                           delete_filter=None, merge_keys=None, bulk_arrow=False):
         df = self._pandas_to_arrow(df).to_pandas()
         self.writes.append((table, len(df), tuple(merge_keys or ())))
+        self.replacements.append((table, delete_filter))
         cur = self.db.sql.cursor()
         columns = list(df.columns)
         cur.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(col + " TEXT" for col in columns)})')
         existing = {row[1] for row in cur.execute(f'PRAGMA table_info({table})')}
         for column in set(columns) - existing:
             cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} TEXT')
+        staged = list(df.itertuples(index=False, name=None))
         if delete_filter:
+            # Like the Transfermarkt writer's single-statement replacement:
+            # the scope's live rows leave only once the new rows are staged.
             cur.execute(f'DELETE FROM {table} WHERE {delete_filter}')
         marks = ', '.join('?' for _ in columns)
-        for row in df.itertuples(index=False, name=None):
+        for row in staged:
             if merge_keys:
                 idx = [columns.index(key) for key in merge_keys]
                 cur.execute('DELETE FROM ' + table + ' WHERE ' + ' AND '.join(key + ' = ?' for key in merge_keys),
@@ -859,3 +864,45 @@ def test_guard_reads_the_page_manifest_of_a_rowless_committed_page():
     cursor = GuardCursor(rows=[(SIBLING_CLOCK,)], pages=[(ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
     native_writer.guard_native_bundle(
         type('C', (), {'cursor': lambda self, c=cursor: c})(), plan)
+
+
+def _players(db):
+    return sorted(row[0] for row in db.sql.execute(
+        'SELECT player_id FROM transfermarkt_squad_memberships'))
+
+
+def test_failed_insertion_keeps_the_committed_scope():
+    # Round 4 finding 2: the writer committed its own DELETE before calling
+    # the insertion, so a failed insertion left the committed scope empty.
+    db = CoreDB()
+    write(db, [membership_plan(['1', '2'], capture='cap-1')])
+
+    class TimedOut(CoreWriter):
+        def _write_to_iceberg(self, *args, **kwargs):
+            raise TimeoutError('insertion timeout')
+
+    with pytest.raises(TimeoutError, match='insertion timeout'):
+        native_writer.write_core_bundle(
+            lambda: db, TimedOut(db), [membership_plan(['1', '9'], capture='cap-2', clock=LATER)],
+            run_id='run-2', universe_version='core-universe-v1', committed_at=LATER)
+    assert _players(db) == ['1', '2']
+
+    # A populated replacement hands its scope to the writer's staged
+    # replacement and issues no DELETE of its own.
+    events, writer = len(db.events), CoreWriter(db)
+    receipt = native_writer.write_core_bundle(
+        lambda: db, writer, [membership_plan(['1', '9'], capture='cap-3', clock=LATER)],
+        run_id='run-3', universe_version='core-universe-v1', committed_at=LATER)
+    assert receipt['verified'] is True
+    assert writer.replacements == [
+        ('transfermarkt_squad_memberships', "league = 'GB1' AND season = '2526' AND club_id = '11'")]
+    assert not [sql for sql in db.events[events:]
+                if sql.startswith('DELETE FROM iceberg.bronze.transfermarkt_squad_memberships')]
+    assert _players(db) == ['1', '9']
+    # A proven-empty replacement has nothing to stage: it stays one DELETE.
+    events = len(db.events)
+    write(db, [_empty_roster_plan(clock=NEWEST, capture='cap-empty')], run_id='run-4', clock=NEWEST)
+    assert [sql for sql in db.events[events:] if sql.startswith('DELETE')] == [
+        'DELETE FROM iceberg.bronze.transfermarkt_squad_memberships '
+        'WHERE league = ? AND season = ? AND club_id = ?']
+    assert _players(db) == []
