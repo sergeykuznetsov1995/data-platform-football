@@ -304,8 +304,11 @@ MAX_DEFERRED_SESSION_FAILURES_PER_RUN = 25
 # fresh clearances outright must still fail the wave rather than launch
 # browsers in a loop. A productive warm session resets this streak: later
 # expiry is independent transport churn, not evidence that the source rejects
-# every fresh clearance.
-MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
+# every fresh clearance.  Since 19.11 the residential exits come in mixed
+# reputation: one drawn exit may hold a Cloudflare loop that only the next
+# exit breaks, so a target gets four consecutive draws before it counts as
+# exhausted (was 2; owner-approved transport tolerance 23.11).
+MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 4
 # Exhausting the refreshes above says the *page* did not come back on a fresh
 # clearance -- it does not say the source rejects clearances, because the very
 # next target usually fetches on that same fresh session (82% of 403s recovered
@@ -313,8 +316,9 @@ MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
 # exhausted target is deferred with backoff and the wave moves on; only a streak
 # of them, with no page fetched in between, is source-wide evidence that ends
 # the wave.  The streak bounds the browser solves such a wave can burn at
-# MAX_CONSECUTIVE_CLEARANCE_REFRESHES x this many (#1188).
-MAX_CLEARANCE_EXHAUSTED_TARGETS = 3
+# MAX_CONSECUTIVE_CLEARANCE_REFRESHES x this many (#1188); at the 23.11 values
+# that ceiling is 4 x 5 = 20 solves per dying wave, still a bounded burn.
+MAX_CLEARANCE_EXHAUSTED_TARGETS = 5
 # A deferred target is returned with ``requeue=True``, which store.fail_fetch
 # defines as "the failure was ours, the page was never judged": it clears
 # retry_after and marks this run's target 'skipped'.  So the deferral is exact
@@ -891,7 +895,13 @@ _STAGE_FIELDS = (
     "trino_typed_ms",
 )
 
-_FAILURE_MATRIX_SLOTS = ("initial", "re_solve_1", "re_solve_2")
+_FAILURE_MATRIX_SLOTS = (
+    "initial",
+    *(
+        f"re_solve_{index}"
+        for index in range(1, MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1)
+    ),
+)
 
 
 def _not_attempted_cell() -> dict:
@@ -906,9 +916,7 @@ def _new_failure_matrix_row(lease) -> dict:
     return {
         "target_id": lease.target_id,
         "logical_refresh_id": lease.logical_refresh_id,
-        "initial": _not_attempted_cell(),
-        "re_solve_1": _not_attempted_cell(),
-        "re_solve_2": _not_attempted_cell(),
+        **{slot: _not_attempted_cell() for slot in _FAILURE_MATRIX_SLOTS},
     }
 
 
