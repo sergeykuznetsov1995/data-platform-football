@@ -260,8 +260,11 @@ def _requests(plan: CoreScopePlan):
         yield _Request("referee_directory", referee_directory_url(directory),
                        competition_id=target.competition_id, edition_id=target.edition_id,
                        directory_scope=directory), None
-    for referee_id in plan.referee_profile_ids:
-        yield _Request("referee_profile", referee_profile_url(referee_id), referee_id=referee_id), None
+    for target in plan.referee_profile_ids:
+        # One canonical id serves the URL and the requested scope alike; the
+        # donor's URL builder is what validates and normalises it.
+        url = referee_profile_url(target)
+        yield _Request("referee_profile", url, referee_id=url.rsplit('/', 1)[-1]), None
     for batch in batched(plan.representation_player_ids, _REPRESENTATION_PACKET_LIMIT):
         yield _Request("representation", representation_url(batch), player_ids=batch), None
 
