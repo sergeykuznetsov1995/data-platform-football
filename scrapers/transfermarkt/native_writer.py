@@ -1470,6 +1470,30 @@ def _bundle_identity(plans, run_id: str) -> tuple[list[str], str]:
     return plan_hashes, _digest({'plans': plan_hashes, 'run_id': run_id})
 
 
+# What the stage-B writer (#2404) could journal: the core entities of that
+# stage, each described in the format of its plan, which had no page evidence.
+_STAGE_B_ENTITIES = frozenset({
+    'squad_memberships', 'player_attribute_observations', 'player_contract_observations',
+    'market_value_points', 'transfer_events', 'coach_profiles', 'coach_stints',
+})
+_STAGE_B_PLAN_FIELDS = frozenset({
+    'entity', 'table', 'ddl', 'natural_keys', 'scope_columns', 'scope_values', 'rows',
+    'captured_at', 'write_mode', 'status', 'status_reason', 'proof', 'capture_id', 'evidence',
+})
+
+
+def _journalled_by_stage_b(descriptors) -> bool:
+    """Whether a unit is exactly what the stage-B writer journalled.
+
+    Read from the descriptors as saved, before a rebuilt plan applies the
+    defaults of today: a snapshot with page evidence never was a stage-B
+    unit, whatever digest it is filed under.
+    """
+    return bool(descriptors) and all(
+        set(descriptor) == _STAGE_B_PLAN_FIELDS and descriptor['entity'] in _STAGE_B_ENTITIES
+        for descriptor in descriptors)
+
+
 def _stage_b_plan_sha256(plan: NativeWritePlan) -> str:
     """The plan digest of the stage-B writer (#2404).
 
@@ -1593,6 +1617,10 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
         run = body['identity']['run_id']
         plan_hashes, digest = _bundle_identity(plans, run)
         saved = body['identity'].get('digest')
+        if saved != digest and not _journalled_by_stage_b(body['payload']['plans']):
+            # Not this writer's digest and not a stage-B unit: nothing is
+            # known about what it committed.
+            raise RuntimeError('core journal intent digest is not recognised: ' + str(saved))
         if saved != digest:
             plan_hashes = [_stage_b_plan_sha256(plan) for plan in plans]
             digest = _digest({'plans': plan_hashes, 'run_id': run})
