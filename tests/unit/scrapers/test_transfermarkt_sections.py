@@ -2804,3 +2804,42 @@ def test_timestamp_spellings_cannot_take_another_captures_keys():
         "SELECT value FROM transfermarkt_referee_aggregate_observations "
         "WHERE referee_id = '101' AND metric = 'matches_officiated'").fetchall()
     assert rows == [('14',)]
+
+
+def test_one_run_validates_every_bundle_before_its_first_mutation():
+    # Round 4 finding 9: two targets of one run claimed the same natural keys
+    # (one capture clock); the second failed only after the first had
+    # committed its rows and warehouse receipts.
+    bodies = {
+        f'{CLUB_VALUE_URL}/stichtag/{day}': (CLUB_VALUE_FIXTURES / f'vie1-{day}.html').read_bytes()
+        for day in ('2013-04-15', '2024-06-01')}
+
+    class _OneClock:
+        """Both pages answer with one capture clock."""
+
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            self.calls.append(url)
+            body = bodies[url]
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=PAGE_1_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    plan = CoreScopePlan(
+        league='VIE1', season='2526', scope_id='s', cycle_id='c',
+        club_value_targets=(ClubValueTarget('VIE1', 'v-league-1', '2013-04-15'),
+                            ClubValueTarget('VIE1', 'v-league-1', '2024-06-01')))
+    fetcher = _OneClock()
+    db = CoreDB()
+    run = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    with pytest.raises(ValueError, match='duplicate core natural key'):
+        run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    # Nothing was written: neither a data table nor a receipt.
+    assert db.sql.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'transfermarkt_%'"
+    ).fetchone()[0] == 0
+    assert fetcher.calls == list(bodies)
