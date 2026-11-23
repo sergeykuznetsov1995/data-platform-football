@@ -727,6 +727,22 @@ def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
     return [(url, *evidence) for url, evidence in _read_manifest(connection, plan).items()]
 
 
+def _refuse_committed_rows(connection, plan: NativeWritePlan) -> None:
+    """Refuse an empty plan whose capture the scope holds with rows."""
+    cursor = connection.cursor()
+    try:
+        counts = _query_rows(
+            cursor,
+            f'SELECT COUNT(*) FROM {plan.full_table} WHERE {plan.scope_sql()} '
+            'AND source_capture_id = ?',
+            (*plan.scope_values, plan.capture_id),
+        )
+    finally:
+        cursor.close()
+    if len(counts) != 1 or counts[0][0]:
+        raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+
+
 def _accepted_without_rows(connection, plan: NativeWritePlan) -> bool:
     """Whether the scope acknowledged this plan's capture as a page without rows.
 
@@ -1024,6 +1040,10 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
                         for capture_id in carrying)
         return 'refresh' if refreshed else 'written'
     if not plan.rows:
+        # An empty merge writes nothing. A capture the scope holds with rows
+        # is never replayed as empty: the contradiction is found while the
+        # bundle is classified, before any plan of it mutates.
+        _refuse_committed_rows(connection, plan)
         return 'pending'
     existing = _read_plan_rows(connection, plan)
     if not existing:
