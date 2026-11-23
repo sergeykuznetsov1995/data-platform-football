@@ -1268,3 +1268,106 @@ def test_a_retry_after_a_migrated_recovery_reuses_its_acknowledgement():
     assert db.sql.execute(
         'SELECT plan_sha256 FROM transfermarkt_core_receipts_v1').fetchall() == [(plan_hash,)]
     assert not [sql for sql in db.events[events:] if sql.lstrip().startswith('DELETE')]
+
+
+# ---------------------------------------------------------------- stage-C review round 6
+
+def _empty_merge_plan():
+    """A proven-empty market-value plan: a merge lane with no row."""
+    return NativeWritePlan(
+        entity='market_value_points', table='transfermarkt_market_value_points',
+        ddl=MV_DDL, natural_keys=('player_id', 'mv_date'),
+        scope_columns=('player_id',), scope_values=('1',),
+        rows=(), captured_at=LATER, write_mode='merge',
+        status='observed_empty', status_reason='empty_collection',
+        proof='empty_collection:market_value_points', capture_id='cap-mv2',
+        evidence=(
+            ('source_url', 'u'), ('source_endpoint', 'market_value_points'),
+            ('raw_capture_id', 'cap-mv2'), ('source_capture_id', 'cap-mv2'),
+            ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
+            ('parser_revision', 'p'), ('schema_revision', 's'),
+        ),
+    )
+
+
+def _referee_profile_plan():
+    from tests.unit.scrapers import test_transfermarkt_sections as lanes
+    profile, = lanes.sections.extract_referee_profile_observations(
+        lanes._referee_profile_capture(), lanes._referee_scope(), referee_id='101',
+        extracted_at=lanes.REFEREE_EXTRACTED_AT, universe_version=lanes.UNIVERSE)
+    return core.plan_for_outcome(profile, captured_at=lanes.REFEREE_CAPTURED,
+                                 scope_values={'referee_id': '101'})
+
+
+def test_a_plan_is_bound_to_its_entity_contract():
+    # Round 6 finding 15: the public constructor accepted a plan that
+    # departed from the registered entity: a business column missing from
+    # every row, or a merge lane switched to replace.
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2
+    plan = membership_plan(['1'])
+    for change in ({'write_mode': 'merge'}, {'natural_keys': ('league', 'season', 'club_id')},
+                   {'scope_columns': ('league', 'season')},
+                   {'ddl': plan.ddl.replace('player_name varchar, ', '')}):
+        with pytest.raises(ValueError, match='entity contract'):
+            dataclasses_replace(plan, **change)
+    with pytest.raises(ValueError, match='entity contract'):
+        dataclasses_replace(_empty_merge_plan(), write_mode='replace')
+    with pytest.raises(ValueError, match='column set'):
+        dataclasses_replace(plan, rows=tuple(
+            {column: value for column, value in row.items() if column != 'player_name'}
+            for row in plan.rows))
+    snapshot = _snapshot(CLOCK, 'cap-1')
+    with pytest.raises(ValueError, match='column set'):
+        dataclasses_replace(snapshot, rows=tuple(
+            {column: value for column, value in row.items() if column != 'capacity'}
+            for row in snapshot.rows))
+
+
+def test_a_direct_plan_cannot_contradict_the_row_verdict_policy():
+    # Round 6 finding 16: a plan reconstructed by hand carried rows marked
+    # unknown under an observed_present status with a proof on top.
+    plan = _snapshot(CLOCK, 'cap-1')
+    with pytest.raises(ValueError, match='status'):
+        dataclasses_replace(plan, rows=tuple(
+            {**row, 'observation_status': 'unknown'} for row in plan.rows))
+    with pytest.raises(ValueError, match='proof'):
+        dataclasses_replace(plan, proof='no rows')
+
+
+def test_a_snapshot_offered_to_the_writer_starts_on_its_first_page():
+    # Round 6 finding 14: only the terminal tuple and its row reached the
+    # writer, which replaced the whole edition with them.
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2
+    plan = _snapshot(CLOCK, 'cap-1')
+    with pytest.raises(ValueError, match='first_page'):
+        dataclasses_replace(
+            plan, rows=tuple(row for row in plan.rows if row['source_url'] == ATTENDANCE_PAGE_2),
+            pages=plan.pages[1:], captured_at=plan.pages[1][2],
+            capture_id=plan.pages[1][1], evidence=())
+
+
+def test_named_capture_evidence_comes_from_the_manifest_and_rows_agree_with_the_run():
+    # Round 6 finding 17: the receipt took a forged body hash from the plan's
+    # evidence, and rows carrying another batch or extraction clock verified.
+    plan = _snapshot(CLOCK, 'cap-1')
+    forged = tuple(
+        ('source_body_hash', 'e' * 64) if column == 'source_body_hash' else (column, value)
+        for column, value in plan.evidence)
+    with pytest.raises(ValueError, match='evidence'):
+        dataclasses_replace(plan, evidence=forged)
+    with pytest.raises(ValueError, match='run'):
+        dataclasses_replace(plan, rows=tuple(
+            {**row, '_batch_id': 'wrong'} if row is plan.rows[0] else row for row in plan.rows))
+    with pytest.raises(ValueError, match='run'):
+        dataclasses_replace(plan, rows=tuple(
+            {**row, 'extracted_at': EARLIER} if row is plan.rows[0] else row for row in plan.rows))
+
+
+def test_plan_clocks_and_dates_are_canonical():
+    # Round 6 finding 18: a date-only plan clock verified, and a DATE column
+    # accepted any text.
+    with pytest.raises(ValueError, match='canonical'):
+        dataclasses_replace(_empty_roster_plan(), captured_at='2026-11-21')
+    profile = _referee_profile_plan()
+    with pytest.raises(ValueError, match='date'):
+        dataclasses_replace(profile, rows=({**profile.rows[0], 'birth_date': 'yesterday'},))
