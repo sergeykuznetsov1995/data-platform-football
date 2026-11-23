@@ -2843,3 +2843,75 @@ def test_one_run_validates_every_bundle_before_its_first_mutation():
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'transfermarkt_%'"
     ).fetchone()[0] == 0
     assert fetcher.calls == list(bodies)
+
+
+def test_plan_rows_carry_exactly_the_entity_columns():
+    # Round 4 finding 12: a row that lost a business column used to be
+    # written with a null over the committed value; only the physical
+    # read-back noticed, after the replacement.
+    pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
+             _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
+    outcome = sections.extract_attendance_observations(
+        pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert all(row['capacity'] is not None for row in outcome.rows)
+    stripped = _replace(outcome, rows=tuple(
+        {column: value for column, value in row.items() if column != 'capacity'}
+        for row in outcome.rows))
+    assert 'row_column_mismatch' in core.build_core_dq([stripped])['errors']
+    db = CoreDB()
+    _bundle(db, [_attendance_plan(pages)], EXTRACTED_AT)
+    with pytest.raises(CoreParseError, match='row_column_mismatch'):
+        core.plan_for_outcome(stripped, captured_at=PAGE_2_CAPTURED,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+    # A column the entity does not have is refused just the same.
+    extra = _replace(outcome, rows=tuple({**row, 'donor_extra': 'x'} for row in outcome.rows))
+    with pytest.raises(CoreParseError, match='row_column_mismatch'):
+        core.plan_for_outcome(extra, captured_at=PAGE_2_CAPTURED,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+
+
+def test_a_populated_page_verdict_cannot_be_an_absence():
+    # Round 4 finding 14: a populated referee profile and its row were both
+    # marked explicit_none and still passed DQ and write verification.
+    profile = sections.extract_referee_profile_observations(
+        _referee_profile_capture(), _referee_scope(), referee_id='101',
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert core.build_core_dq([profile])['passed'] is True
+    # A populated page is an observed page, whatever verdict its rows claim.
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        _replace(profile, status='explicit_none',
+                 rows=({**profile.rows[0], 'observation_status': 'explicit_none'},))
+    for status in ('unknown', 'error', 'unavailable'):
+        with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+            _replace(profile, status=status)
+
+
+def test_club_value_rows_carry_an_amount_exactly_when_present():
+    # Round 4 finding 14: rows marked explicit_none kept their amounts.
+    outcomes = sections.extract_club_value_observations(
+        _club_value_capture(), _club_value_scope(), extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    club = next(outcome for outcome in outcomes
+                if all(row['value_amount'] is not None for row in outcome.rows))
+    assert core.build_core_dq([club])['passed'] is True
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        _replace(club, status='explicit_none', status_reason='club_values:club_rows_explicit_none',
+                 rows=tuple({**row, 'observation_status': 'explicit_none'} for row in club.rows))
+    # Rows stay mutable after construction: DQ and planning recheck it.
+    club.rows[0]['value_amount'] = None
+    assert 'status_rows_mismatch' in core.build_core_dq([club])['errors']
+    with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+        core.plan_for_outcome(club, captured_at=CLUB_CAPTURED,
+                              scope_values={'club_id': club.rows[0]['club_id']})
+    context = _outcome_context('club_value_observations')
+    for verdict, amount in (('observed_present', None), ('explicit_none', 1275000),
+                            ('unknown', 1275000)):
+        with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+            core.LaneOutcome('club_value_observations', 'observed_present',
+                             'club_values:club_rows_present',
+                             ({'observation_status': verdict, 'value_amount': amount},), **context)
+    # An explicit absence without an amount stays valid.
+    core.LaneOutcome('club_value_observations', 'explicit_none',
+                     'club_values:club_rows_explicit_none',
+                     ({'observation_status': 'explicit_none', 'value_amount': None},), **context)
