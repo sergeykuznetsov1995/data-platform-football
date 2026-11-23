@@ -2780,3 +2780,27 @@ def test_wholly_rowless_snapshot_is_proven_by_its_manifest():
     with pytest.raises(StaleTransfermarktWrite):
         _write(db, [older], older_run, EXTRACTED_AT)
     assert _manifest(db) == accepted
+
+
+def test_timestamp_spellings_cannot_take_another_captures_keys():
+    # Round 4 finding 8: the engine reads '15:00:00Z' and '15:00:00+00:00'
+    # as one TIMESTAMP, so a respelled key reached the ownership guard as a
+    # different key and then merged over the committed owner's rows.
+    first = _referee_page(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')]))
+    db = CoreDB()
+    _bundle(db, _referee_plans(_referee_directory((first,)), {first.capture_id: REFEREE_CAPTURED}),
+            REFEREE_EXTRACTED_AT)
+    other = _referee_at(REFEREE_DIRECTORY_URL, _referee_body(
+        [('101', 'Ada Example')], matches_of={'101': '13'}), 'e' * 64, REFEREE_CAPTURED)
+    outcome, = _referee_directory((other,))
+    respelled = _replace(outcome, rows=tuple(
+        {**row, 'observed_at': REFEREE_CAPTURED.replace('+00:00', 'Z')} for row in outcome.rows))
+    with pytest.raises((ValueError, RuntimeError)):
+        plan = core.plan_for_outcome(
+            respelled, captured_at=REFEREE_CAPTURED,
+            scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
+        _bundle(db, [plan], REFEREE_EXTRACTED_AT)
+    rows = db.sql.execute(
+        "SELECT value FROM transfermarkt_referee_aggregate_observations "
+        "WHERE referee_id = '101' AND metric = 'matches_officiated'").fetchall()
+    assert rows == [('14',)]

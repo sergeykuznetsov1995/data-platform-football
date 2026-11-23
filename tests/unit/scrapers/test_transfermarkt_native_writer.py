@@ -941,3 +941,16 @@ def test_plan_rows_are_read_only_after_validation():
     # Another plan is the way to change rows.
     changed = dataclasses_replace(plan, rows=tuple({**item, 'stadium_name': 'x'} for item in plan.rows))
     assert changed.plan_sha256() != digest and plan.plan_sha256() == digest
+
+
+def test_key_cells_compare_the_moment_not_its_spelling():
+    # Round 4 finding 8: an engine returns a clock as a datetime, a plan
+    # holds it as text; both spellings of one moment are one key.
+    columns = ('referee_id', 'observed_at')
+    engine = native_writer._key_cells(('101', datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)), columns)
+    assert engine == native_writer._key_cells(('101', '2026-11-20T15:00:00.000000+00:00'), columns)
+    assert engine == native_writer._key_cells(('101', '2026-11-20T15:00:00Z'), columns)
+    assert engine != native_writer._key_cells(('101', '2026-11-20T15:00:01.000000+00:00'), columns)
+    # Only clock columns are read as moments; text stays text.
+    assert native_writer._key_cells(('2026-11-20T15:00:00Z', 'x'), ('note', 'x')) == (
+        '2026-11-20T15:00:00Z', 'x')
