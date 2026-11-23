@@ -78,6 +78,8 @@ _COLUMN_PROBE = re.compile(
 
 class CoreCursor(MemoryCursor):
     def execute(self, sql, params=()):
+        if 'FROM system.runtime.queries' in sql:
+            sql = sql.replace('system.runtime.queries', 'test_query_history')
         super().execute(sql, params)
         # sqlite reports no column types: the schema preflight's probe gets the
         # declared ones, as Trino reports them.
@@ -90,6 +92,20 @@ class CoreCursor(MemoryCursor):
 
 
 class CoreDB(MemoryDB):
+    def __init__(self):
+        super().__init__()
+        self.sql.execute('CREATE TABLE test_query_history (query_id TEXT, state TEXT, error_code TEXT)')
+
+    def rejected(self, client_error):
+        # The client lost its response. A separate coordinator read can prove
+        # that this particular simulated submission was rejected before execution.
+        row = self.sql.execute("INSERT INTO test_query_history (state, error_code) "
+                               "VALUES ('FAILED', 'QUERY_QUEUE_FULL')").lastrowid
+        client_error.query_id = f'query-{row}'
+        self.sql.execute('UPDATE test_query_history SET query_id = ? WHERE rowid = ?',
+                         (client_error.query_id, row))
+        return client_error
+
     def cursor(self):
         return CoreCursor(self)
 
@@ -574,7 +590,7 @@ def test_pending_intent_replays_after_a_crash_without_another_request():
     writer = CoreWriter(db)
     plans = [membership_plan(['1'], capture='cap-1')]
     broken = CoreWriter(db)
-    broken._write_to_iceberg = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('crash mid-write'))
+    broken._write_to_iceberg = lambda *a, **k: (_ for _ in ()).throw(db.rejected(RuntimeError('crash mid-write')))
     with pytest.raises(RuntimeError, match='crash mid-write'):
         native_writer.write_core_bundle(
             lambda: db, broken, plans, run_id='r', universe_version='u', committed_at=CLOCK)
@@ -877,7 +893,7 @@ def test_failed_insertion_keeps_the_committed_scope():
 
     class TimedOut(CoreWriter):
         def _write_to_iceberg(self, *args, **kwargs):
-            raise TimeoutError('insertion timeout')
+            raise db.rejected(TimeoutError('insertion timeout'))
 
     with pytest.raises(TimeoutError, match='insertion timeout'):
         native_writer.write_core_bundle(
@@ -1445,7 +1461,7 @@ def test_a_receipt_only_repair_leaves_a_recoverable_intent():
                     if sql.startswith('INSERT INTO iceberg.ops.transfermarkt_core_receipts_v1'):
                         RepairDB.inserts += 1
                         if RepairDB.inserts == 2:
-                            raise RuntimeError('crash during receipt repair')
+                            raise self.db.rejected(RuntimeError('crash during receipt repair'))
                     return super().execute(sql, params)
             return FlakyCursor(self)
 
@@ -1747,7 +1763,7 @@ class _UnknownOpsCursor(CoreCursor):
     def execute(self, sql, params=()):
         if sql.startswith('INSERT INTO iceberg.ops.'):
             type(self).inserts += 1
-            raise RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown')
+            raise self.db.rejected(RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown'))
         return super().execute(sql, params)
 
 
@@ -1762,7 +1778,7 @@ def test_an_ops_insert_with_an_unknown_outcome_is_never_repeated_at_once():
     # Round 7 finding 2 (in-process part): an INSERT whose commit was unknown
     # was repeated at once because the read-back saw no row. The first
     # statement can still land after that read: a receipt twice under one id,
-    # or a walk logged twice. Only the replay, later, writes an absent row.
+    # or a walk logged twice. Replay learns the rejection from the coordinator.
     for plans in ([membership_plan(['1'], capture='cap-1')], [_snapshot(CLOCK, 'cap-1')]):
         db = _UnknownOpsDB()
         _UnknownOpsCursor.inserts = 0
@@ -1948,3 +1964,317 @@ def test_an_alias_carries_the_anchors_of_the_acknowledgement_it_aliases(monkeypa
     assert again['verified'] is True
     # The alias is anchored where the acknowledgement it stands for was: before its write emptied the roster.
     assert write_journal.read_snapshot_anchors(current) == original
+
+
+def test_a_lost_historical_walk_is_restored_from_its_acknowledgement():
+    # Round 7 finding 6 (historical walk): the walk of an older
+    # acknowledgement was deleted. Nothing could restore it: its own retry is
+    # stale, the current acknowledgement and every fresh walk were refused.
+    # The journal keeps the acknowledged walk: it is logged again under its
+    # own receipt, the data is not touched, and the scope goes on.
+    from tests.unit.scrapers.test_transfermarkt_sections import _attendance_plan
+    start, _page_2_url, page = _walk_pages()
+
+    def single(clock, name):
+        return _attendance_plan((page(start, 'single_page.html', clock, name),))
+
+    def receipt_of(plan, run_id):
+        plan_hashes, digest = native_writer._bundle_identity([plan], run_id)
+        return native_writer._receipt_id(plan_hashes[0], run_id, digest)
+
+    older, newer, fresh = single(EARLIER, 'cap-old'), single(CLOCK, 'cap-1'), single(NEWEST, 'cap-new')
+    db = CoreDB()
+    write(db, [older], run_id='run-a', clock=older.captured_at)
+    write(db, [newer], run_id='run-b', clock=newer.captured_at)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id = ?', (receipt_of(older, 'run-a'),))
+    events = len(db.events)
+    assert write(db, [fresh], run_id='run-c', clock=fresh.captured_at)['verified'] is True
+    assert db.sql.execute(
+        'SELECT receipt_id, source_capture_id FROM transfermarkt_core_pages_v1 ORDER BY captured_at'
+    ).fetchall() == [(receipt_of(older, 'run-a'), older.pages[0][1]),
+                     (receipt_of(newer, 'run-b'), newer.pages[0][1]),
+                     (receipt_of(fresh, 'run-c'), fresh.pages[0][1])]
+    # The repair logged the lost walk and nothing else: two walk INSERTs in
+    # all, the restored one and that of the fresh snapshot, and no write to
+    # the data beyond the fresh snapshot's own.
+    inserts = [sql for sql in db.events[events:]
+               if sql.startswith('INSERT INTO iceberg.ops.transfermarkt_core_pages_v1')]
+    assert len(inserts) == 2
+    # A receipt this journal never acknowledged stays lost evidence.
+    db.sql.execute('INSERT INTO transfermarkt_core_receipts_v1 SELECT * FROM '
+                   'transfermarkt_core_receipts_v1 WHERE receipt_id = ?', (receipt_of(older, 'run-a'),))
+    db.sql.execute("UPDATE transfermarkt_core_receipts_v1 SET receipt_id = 'tm-core-receipt-unknown' "
+                   'WHERE rowid = (SELECT MAX(rowid) FROM transfermarkt_core_receipts_v1)')
+    with pytest.raises(RuntimeError, match='manifest lost'):
+        write(db, [single(LATER, 'cap-later')], run_id='run-d', clock=LATER)
+
+
+def test_the_journal_finds_the_walk_an_acknowledgement_logged():
+    walk = {'table': 'iceberg.bronze.transfermarkt_attendance_observations', 'receipt_id': 'tm-core-receipt-1',
+            'scope_values_json': '[]', 'pages': [['u', 'c', CLOCK, 'h', '', 0, 'd']]}
+    write_journal.record_receipt('d' * 64, {'verified': True, 'plan_sha256': 'x', 'committed_at': CLOCK,
+                                            'walks': [walk]})
+    write_journal.record_receipt('e' * 64, {'verified': True, 'plan_sha256': 'y', 'committed_at': LATER})
+    assert write_journal.acknowledged_walk('tm-core-receipt-1') == (walk, CLOCK)
+    assert write_journal.acknowledged_walk('tm-core-receipt-2') is None
+
+
+def _empty_squad_plans(clock=LATER):
+    roster = _empty_roster_plan(clock=clock)
+    return [roster, *(dataclasses_replace(
+        roster, entity=entity, table=core.CORE_TABLES[entity], ddl=core.core_ddl(entity),
+        natural_keys=core.CORE_NATURAL_KEYS[entity], write_mode=core.CORE_WRITE_MODES[entity])
+        for entity in ('player_attribute_observations', 'player_contract_observations'))]
+
+
+def _stage_b_squad_intent(plans):
+    hashes = [native_writer._stage_b_plan_sha256(plan) for plan in plans]
+    digest = native_writer._digest({'plans': hashes, 'run_id': 'run-old'})
+    descriptors = native_writer._descriptors(plans)
+    for descriptor in descriptors:
+        del descriptor['pages']
+    path = write_journal.save_intent(
+        {'run_id': 'run-old', 'digest': digest}, {'plans': descriptors},
+        run_id='run-old', committed_at=CLOCK, universe_version='u')
+    return digest, path
+
+
+def test_lost_empty_squad_receipt_cannot_reopen_the_roster():
+    # Round 7 finding 4: the two surviving squad receipts belong to other data tables.
+    db = CoreDB()
+    populated = membership_plan(['1', '2'])
+    write(db, [populated])
+    write(db, _empty_squad_plans(), run_id='empty', clock=LATER)
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE run_id = ? AND entity = ?',
+                   ('empty', populated.entity))
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [populated])
+    assert _players(db) == [] and _receipt_count(db) == 3
+
+
+def test_recovered_walk_evidence_participates_in_capture_checks():
+    # Round 7 finding 6: a displaced page with its original ID cannot return with other rows.
+    from tests.unit.scrapers.test_transfermarkt_sections import _attendance_plan
+    db = CoreDB()
+    original = _snapshot(CLOCK, 'cap-1')
+    start, _, page = _walk_pages()
+    shorter = _attendance_plan((page(start, 'single_page.html', LATER, 'shorter'),))
+    write(db, [original], run_id='first')
+    write(db, [shorter], run_id='shorter', clock=LATER)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE pages_count = 2')
+    fresh = _snapshot(NEWEST, 'fresh')
+    changed = dataclasses_replace(fresh, rows=tuple(
+        {**row, 'spectators_total': row['spectators_total'] + 1}
+        if row['club_id'] == '631' else row for row in fresh.rows))
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [changed], run_id='changed', clock=NEWEST)
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, shorter), shorter.rows)
+    assert _receipt_count(db) == 2
+
+
+@pytest.mark.parametrize('anchored_stage_b', [True, False])
+def test_ordinary_retry_settles_the_pending_stage_b_squad(monkeypatch, anchored_stage_b):
+    # Round 7 finding 7: all three receipts landed before the legacy intent was finished.
+    db, plans = CoreDB(), _empty_squad_plans()
+    legacy, path = _stage_b_squad_intent(plans)
+
+    def crash(*args):
+        raise RuntimeError('lost local acknowledgement')
+
+    if anchored_stage_b:
+        # This handover predates dispatch fences. Only complete physical
+        # evidence can settle it, through the read-only recovery path.
+        write_journal.snapshot_anchors(legacy, db, native_writer._anchored_tables(plans))
+        native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+        for plan in plans:
+            native_writer.execute_statement(db.cursor(), plan.ddl)
+        native_writer._merge_receipts(db, [native_writer._plan_receipt(
+            plan, native_writer._physical_proof(db, plan), native_writer._stage_b_plan_sha256(plan),
+            legacy, 'run-old', 'u', native_writer._batch_id_for_run('run-old'), CLOCK)
+            for plan in plans])
+    else:
+        with monkeypatch.context() as patch:
+            patch.setattr(write_journal, 'record_receipt', crash)
+            with pytest.raises(RuntimeError, match='lost local acknowledgement'):
+                native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    before = db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall()
+    assert len(before) == 3 and path.exists()
+    receipt = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), plans, run_id='run-old', universe_version='u', committed_at=NEWEST)
+    assert receipt['verified'] and receipt['identity']['digest'] == legacy
+    assert receipt['committed_at'] == CLOCK
+    assert db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall() == before
+    assert not path.exists() and write_journal.pending_intents({}) == []
+
+
+def test_interrupted_legacy_squad_repair_uses_replayable_descriptors(monkeypatch):
+    # Round 7 finding 8: descriptor identity and the original warehouse identity survive repair.
+    db, plans = CoreDB(), _empty_squad_plans()
+    legacy, _ = _stage_b_squad_intent(plans)
+    original, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    current = native_writer._bundle_identity(plans, 'run-old')[1]
+    anchors = write_journal.read_snapshot_anchors(legacy)
+    assert anchors and write_journal.read_receipt(current) is None
+    before = db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall()
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE entity = ?', (plans[0].entity,))
+
+    def interrupt(*args, **kwargs):
+        raise RuntimeError('interrupted before INSERT')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native_writer, '_insert_once', interrupt)
+        with pytest.raises(RuntimeError, match='interrupted before INSERT'):
+            native_writer.write_core_bundle(lambda: db, CoreWriter(db), plans, run_id='run-old',
+                                            universe_version='u', committed_at=NEWEST)
+    (_, body), = write_journal.pending_intents({})
+    assert body['identity']['digest'] == current
+    assert body['payload']['warehouse_identity'] == original['identity']
+    replayed, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert replayed['verified'] and replayed['identity'] == original['identity']
+    assert db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall() == before
+    assert write_journal.read_snapshot_anchors(current) == write_journal.read_snapshot_anchors(legacy) == anchors
+    assert write_journal.pending_intents({}) == []
+
+
+@pytest.mark.parametrize('has_binding', [True, False])
+def test_missing_legacy_market_value_receipt_cannot_change_body(monkeypatch, has_binding):
+    # Round 7 finding 10: whitespace changes the response evidence even though both parses are empty.
+    def empty(body):
+        body_hash = hashlib.sha256(body).hexdigest()
+        plan = _empty_merge_plan()
+        evidence = {**dict(plan.evidence), 'raw_capture_id': body_hash,
+                    'source_capture_id': body_hash, 'source_body_hash': body_hash}
+        return dataclasses_replace(plan, capture_id=body_hash, evidence=tuple(evidence.items()))
+
+    first, other = empty(b'{"list":[]}'), empty(b'{"list": []}')
+    db = CoreDB()
+    _, legacy = _stage_b_identity(first, 'run-old')
+    assert _stage_b_identity(other, 'run-old')[1] == legacy
+    _legacy_intent(first, legacy)
+    with monkeypatch.context() as patch:
+        if not has_binding:
+            # An acknowledgement written by the previous version, before it
+            # recorded the descriptor digest. Publish it once in that format.
+            record = write_journal.record_receipt
+            patch.setattr(write_journal, 'record_receipt', lambda digest, receipt: record(
+                digest, {k: v for k, v in receipt.items() if k != 'descriptor_digest'}))
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    original = write_journal.read_receipt(legacy)
+    before = db.sql.execute(f'SELECT * FROM {RECEIPTS}').fetchall()
+    db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    start = len(db.events)
+    with pytest.raises(RuntimeError, match='capture evidence'):
+        native_writer.write_core_bundle(lambda: db, CoreWriter(db), [other], run_id='run-old',
+                                        universe_version='u', committed_at=CLOCK)
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert _receipt_count(db) == 0 and write_journal.read_receipt(legacy) == original
+    assert write_journal.read_receipt(native_writer._bundle_identity([other], 'run-old')[1]) is None
+    def retry_original():
+        return native_writer.write_core_bundle(lambda: db, CoreWriter(db), [first], run_id='run-old',
+                                               universe_version='u', committed_at=CLOCK)
+
+    if has_binding:
+        assert retry_original()['verified']
+        assert db.sql.execute(f'SELECT * FROM {RECEIPTS}').fetchall() == before
+    else:
+        with pytest.raises(RuntimeError, match='independent capture evidence'):
+            retry_original()
+        assert _receipt_count(db) == 0
+
+
+def test_queued_attendance_merge_fences_replay_and_newer_capture():
+    # Round 7 finding 1: execute the original from its retained stage after replay returns.
+    db = CoreDB()
+    older = _other_cycle(_snapshot(EARLIER, 'old'), 'older-cycle')
+    write(db, [older], run_id='old', clock=older.captured_at)
+    pending = _snapshot(CLOCK, 'pending')
+    newest = _snapshot(NEWEST, 'newest')
+
+    class QueuedReplacement(CoreWriter):
+        def _write_to_iceberg(self, df, database, table, partition_spec, mode='append',
+                              delete_filter=None, merge_keys=None, bulk_arrow=False):
+            columns = list(df.columns)
+            tombstones = db.sql.execute(
+                f'SELECT {", ".join(columns)} FROM {table} WHERE {delete_filter}').fetchall()
+            staged = df.copy()
+
+            def land():
+                # The retained stage deletes only its original row images.
+                # Each staged insert takes the unconditional insert branch.
+                predicate = ' AND '.join(f'{col} IS ?' for col in columns)
+                db.sql.executemany(f'DELETE FROM {table} WHERE {predicate}', tombstones)
+                CoreWriter._write_to_iceberg(self, staged, database, table, partition_spec)
+
+            self.land = land
+            raise TrinoAmbiguousWriteError('queued replacement')
+
+    delayed, retry = QueuedReplacement(db), CoreWriter(db)
+    with pytest.raises(TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(lambda: db, delayed, [pending], run_id='pending',
+                                        universe_version='u', committed_at=pending.captured_at)
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, older), older.rows)
+    try:
+        early = native_writer.replay_pending_intents(lambda: db, retry, run_id='pending')
+    except RuntimeError as exc:
+        assert 'still pending' in str(exc)
+        with pytest.raises(RuntimeError, match='still pending'):
+            write(db, [newest], run_id='newest', clock=NEWEST)
+        early = []
+    finally:
+        delayed.land()
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, pending), pending.rows)
+    assert not early
+    assert not retry.writes and _receipt_count(db) == 1
+    assert write_journal.pending_intents({'run_id': 'pending'})
+    settled, = native_writer.replay_pending_intents(lambda: db, retry, run_id='pending')
+    assert settled['verified'] and _receipt_count(db) == 2
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, pending), pending.rows)
+    assert write(db, [newest], run_id='newest', clock=NEWEST)['verified']
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, newest), newest.rows)
+
+
+@pytest.mark.parametrize('target', [RECEIPTS, 'transfermarkt_core_pages_v1'])
+def test_queued_ops_insert_lands_after_the_replay_attempt(target):
+    # Round 7 finding 2: one accepted INSERT may remain queued across a new connection.
+    plan = _snapshot(CLOCK, 'pending')
+
+    class QueuedCursor(CoreCursor):
+        def execute(self, sql, params=()):
+            if sql.startswith(f'INSERT INTO iceberg.ops.{target}') and self.db.queued is None:
+                self.db.queued = (sql, tuple(params))
+                error = RuntimeError('commit state unknown')
+                if target == RECEIPTS:
+                    error.query_id = 'queued-receipt'
+                    self.db.sql.execute('INSERT INTO test_query_history VALUES (?, ?, ?)',
+                                        (error.query_id, 'QUEUED', None))
+                raise error
+            return super().execute(sql, params)
+
+    class QueuedDB(CoreDB):
+        queued = None
+
+        def cursor(self):
+            return QueuedCursor(self)
+
+    db = QueuedDB()
+    with pytest.raises(RuntimeError, match='commit state unknown'):
+        write(db, [plan], run_id='queued', clock=plan.captured_at)
+    assert db.sql.execute(f'SELECT count(*) FROM {target}').fetchone() == (0,)
+    try:
+        early = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    except RuntimeError as exc:
+        assert 'still pending' in str(exc)
+        early = []
+    finally:
+        # Even a replay that erroneously returns verified is followed by
+        # the original, exactly as accepted, including its bound rows.
+        CoreCursor(db).execute(*db.queued)
+    expected_count = 1 if target == RECEIPTS else len(plan.pages)
+    assert db.sql.execute(f'SELECT count(*) FROM {target}').fetchone() == (expected_count,)
+    assert not early
+    assert write_journal.pending_intents({'run_id': 'queued'})
+    settled, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert settled['verified'] and write_journal.pending_intents({}) == []
+    assert _receipt_count(db) == 1
+    assert db.sql.execute('SELECT page_number FROM transfermarkt_core_pages_v1 '
+                          'ORDER BY page_number').fetchall() == [(1,), (2,)]

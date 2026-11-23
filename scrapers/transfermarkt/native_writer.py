@@ -27,7 +27,9 @@ import threading
 import time
 from types import MappingProxyType
 
-from scrapers.base.trino_manager import _is_iceberg_commit_conflict
+from scrapers.base.trino_manager import (
+    TrinoAmbiguousWriteError, TrinoError, _is_definite_iceberg_commit_conflict, _is_iceberg_commit_conflict,
+)
 
 
 _MUTEX = threading.RLock()
@@ -105,9 +107,8 @@ def writer_deadline(deadline):
 def journalled_write():
     """Mark the statements of this thread as belonging to a journalled unit.
 
-    The journal replays the unit and reads the warehouse back before anything
-    is written again, so no statement of the unit is replayed blindly after an
-    uncertain outcome: the one that would duplicate its rows stops instead.
+    The manager submits the final replacement in strict mode. The native
+    writer tracks that submission across calls under the shared writer lock.
     """
     previous = getattr(_LOCAL, 'journalled', False)
     _LOCAL.journalled = True
@@ -780,7 +781,65 @@ def _capture_pinned(plan: NativeWritePlan) -> bool:
     return plan.write_mode == 'merge' and bool(_CAPTURE_KEY_COLUMNS.intersection(plan.natural_keys))
 
 
-def guard_native_bundle(connection, plan: NativeWritePlan, *, own=(), acknowledged_at=None) -> None:
+def _stage_b_empty_clocks(connection, plan, receipt, proofs, own):
+    """A stage-B acknowledgement can predate the journal's list of plan hashes."""
+    cursor = connection.cursor()
+    try:
+        rows = _query_rows(
+            cursor, f'SELECT receipt_id, plan_sha256, scope_values_json, captured_at, row_count '
+            f'FROM {CORE_RECEIPTS_TABLE} WHERE target_table = ? AND run_id = ?',
+            (plan.full_table, receipt['run_id']))
+    finally:
+        cursor.close()
+    digest, run = receipt['plan_sha256'], receipt['run_id']
+    members = [(key, scope, clock, count) for key, plan_hash, scope, clock, count in rows
+               if key == _receipt_id(plan_hash, run, digest)]
+    keys = {key for key, *_ in members}
+    if len(keys) != len(members):
+        raise RuntimeError('core empty replacement receipt differs: ' + plan.table)
+    key = _receipt_id(_stage_b_plan_sha256(plan), run, digest)
+    if key in own and key not in keys and not plan.rows:
+        members.append((key, _scope_json(plan), plan.captured_at, 0))
+    if Counter(row[3] for row in members) != Counter(proof['rows'] for proof in proofs):
+        raise RuntimeError('core empty replacement receipt lost: ' + plan.table)
+    return [_timestamp(clock) for _, scope, clock, count in members
+            if count == 0 and scope == _scope_json(plan)]
+
+
+def _empty_replacement_clocks(connection, plan, own):
+    """An empty scope may have lost even the receipt that carried its clock."""
+    for receipt in write_journal.acknowledgements():
+        proofs = receipt.get('plans', ())
+        identity = receipt.get('identity')
+        if identity is None:
+            table_proofs = [proof for proof in proofs if proof['table'] == plan.table]
+            if any(proof['rows'] == 0 for proof in table_proofs):
+                yield from _stage_b_empty_clocks(connection, plan, receipt, table_proofs, own)
+            continue
+        for index, proof in enumerate(proofs):
+            if proof['table'] != plan.table or proof['rows'] != 0:
+                continue
+            if 'scope_values_json' in proof:
+                if proof['scope_values_json'] == _scope_json(plan):
+                    yield _timestamp(proof['captured_at'])
+                continue
+            # Older proofs identify the table only. The warehouse row must
+            # supply its scope and clock before a replacement can proceed.
+            key = _receipt_id(identity['plan_hashes'][index], receipt['run_id'], identity['digest'])
+            held = _stored_receipts(connection, [key]).get(key)
+            if held is None:
+                if key in own and not plan.rows:
+                    yield _timestamp(plan.captured_at)
+                    continue
+                raise RuntimeError('core empty replacement receipt lost: ' + plan.table)
+            cells = dict(zip(RECEIPT_COLUMNS, held, strict=True))
+            if cells['target_table'] != plan.full_table or cells['row_count'] != 0:
+                raise RuntimeError('core empty replacement receipt differs: ' + plan.table)
+            if cells['scope_values_json'] == _scope_json(plan):
+                yield _timestamp(cells['captured_at'])
+
+
+def guard_native_bundle(connection, plan: NativeWritePlan, *, own=(), acknowledged_at=None, accepted=None) -> None:
     """An older bundle must not overwrite a fresher committed capture.
 
     The data table proves freshness while rows exist; a proven-empty
@@ -791,8 +850,8 @@ def guard_native_bundle(connection, plan: NativeWritePlan, *, own=(), acknowledg
     freshness and its per-page check are read. The snapshot's newest clock
     says nothing about a stale page riding along on a fresh sibling.
 
-    ``own`` names the receipts of the acknowledgement being retried: it is
-    the one write allowed to restore evidence it lost itself.
+    ``own`` names receipts of the unit being retried. The commit boundary
+    supplies the checked walks, including evidence recovered from the journal.
     ``acknowledged_at`` is the commit clock of the unit being written: two
     different captures of one page at one clock are ordered by it, and the
     later acknowledgement is the one in force.
@@ -815,8 +874,11 @@ def guard_native_bundle(connection, plan: NativeWritePlan, *, own=(), acknowledg
     )
     # A rowless page leaves no row: the receipt and the logged walks are the
     # only proof of how fresh the committed scope really is.
-    accepted = _accepted_pages(connection, plan, own=own)
+    if accepted is None:
+        accepted = _accepted_pages(connection, plan, own=own)
     clocks = [_timestamp(value) for value in (committed, acknowledged) if value is not None]
+    if committed is None and plan.write_mode == 'replace' and not plan._multi_page():
+        clocks.extend(_empty_replacement_clocks(connection, plan, own))
     clocks.extend(_timestamp(evidence[1]) for _order, evidence in accepted.pages.values())
     if not clocks:
         return
@@ -844,10 +906,10 @@ class _AcceptedPages(NamedTuple):
 
     pages: dict
     captures: dict
-    logged: frozenset
+    walks: dict
 
 
-_NO_PAGES = _AcceptedPages({}, {}, frozenset())
+_NO_PAGES = _AcceptedPages({}, {}, {})
 
 
 def _page_cell(column: str, value):
@@ -863,8 +925,7 @@ def _walk_cells(row) -> tuple:
         _page_cell(column, value) for column, value in zip(PAGES_COLUMNS, row, strict=True))
 
 
-def _refuse_lost_pages(connection, plan: NativeWritePlan, logged, own) -> None:
-    """Every receipt of the scope must still hold the pages it acknowledged."""
+def _scope_walk_receipts(connection, plan: NativeWritePlan) -> set[str]:
     cursor = connection.cursor()
     try:
         receipts = _query_rows(
@@ -875,25 +936,14 @@ def _refuse_lost_pages(connection, plan: NativeWritePlan, logged, own) -> None:
     except Exception as exc:
         if not write_journal._table_not_found(exc):
             raise
-        return  # nothing was ever acknowledged
+        return set()
     finally:
         cursor.close()
-    lost = {row[0] for row in receipts} - set(logged) - set(own)
-    if lost:
-        raise RuntimeError('core page manifest lost: ' + plan.table)
+    return {row[0] for row in receipts}
 
 
-def _accepted_pages(connection, plan: NativeWritePlan, *, own=()) -> _AcceptedPages:
-    """The page evidence the scope ever acknowledged, checked to be all there.
-
-    Every acknowledgement of a multi-page scope logged the walk it stands for.
-    A receipt without its rows lost that evidence, and with it the clocks of
-    the pages that left no row: the scope then refuses every walk but the
-    retry of the acknowledgement that lost them (``own``, the receipts of the
-    whole retried unit). Only a multi-page replacement snapshot keeps a log:
-    the pages of every other lane are exactly the captures of its committed
-    rows.
-    """
+def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None) -> _AcceptedPages:
+    """Read the scope's complete walks. Only a commit may supply a repair callback."""
     if not plan._multi_page():
         return _NO_PAGES
     cursor = connection.cursor()
@@ -917,17 +967,27 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=()) -> _AcceptedPa
     except (TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError('core page manifest differs: ' + plan.table) from exc
     pages, captures = {}, {}
-    for receipt_id, walk in walks.items():
-        # A walk is whole or it is not a walk: as many pages as each of its
-        # rows says, numbered 1..n, each once. What is left of the walk of an
-        # acknowledgement being retried says nothing until that retry made it
-        # whole again.
+    for receipt_id in sorted(walks.keys() | _scope_walk_receipts(connection, plan)):
+        walk = walks.get(receipt_id, ())
         numbers = sorted(cells[3] for cells in walk)
-        if numbers != list(range(1, len(walk) + 1)) or len(walk) != walk[0][4] \
-                or len({cells[5] for cells in walk}) != len(walk):
-            if receipt_id not in own:
-                raise RuntimeError('core page manifest differs: ' + plan.table)
-            continue
+        complete = (bool(walk) and numbers == list(range(1, len(walk) + 1))
+                    and all(cells[4] == len(walk) for cells in walk)
+                    and len({cells[5] for cells in walk}) == len(walk))
+        if not complete:
+            if restore is None:
+                if receipt_id in own:
+                    if walk:
+                        original = _journal_walk_rows(plan, receipt_id)
+                        if original:
+                            _held_page_numbers(walk, tuple(map(_walk_cells, original)), plan.table)
+                        del walks[receipt_id]
+                    continue  # a member of the retried unit may still supply this walk
+                reason = 'differs' if walk else 'lost'
+                raise RuntimeError(f'core page manifest {reason}: ' + plan.table)
+            walk = restore(plan, receipt_id, walk)
+            if not walk:
+                raise RuntimeError('core page manifest lost: ' + plan.table)
+        walks[receipt_id] = tuple(sorted(walk, key=lambda cells: cells[3]))
         for cells in walk:
             url, capture_id, clock, body_hash, count, digest, acknowledged_at = cells[5:]
             evidence = (capture_id, clock, body_hash, count, digest)
@@ -937,8 +997,7 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=()) -> _AcceptedPa
             newest = pages.get(url)
             if newest is None or (clock, acknowledged_at) >= newest[0]:
                 pages[url] = ((clock, acknowledged_at), evidence)
-    _refuse_lost_pages(connection, plan, walks, own)
-    return _AcceptedPages(pages, captures, frozenset(walks))
+    return _AcceptedPages(pages, captures, walks)
 
 
 def _refuse_committed_rows(connection, plan: NativeWritePlan) -> None:
@@ -1077,39 +1136,69 @@ def _stored_walk(connection, receipt_id: str):
 
 
 def _record_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_at: str) -> None:
-    """Log the walk the acknowledgement stands for, once and as a whole.
+    """Log the walk the acknowledgement stands for, once and as a whole."""
+    _log_walk(connection, plan.table, receipt_id, _walk_rows(plan, receipt_id, committed_at))
 
-    One statement carries every page of the walk: it lands whole or not at
-    all, and nothing is ever updated. An interrupted acknowledgement leaves
-    the evidence of every page exactly as the earlier ones accepted it. A
-    walk of this acknowledgement that reached the warehouse in part is
-    completed with the pages it lacks.
+
+def _held_page_numbers(stored, expected, table):
+    by_number = {cells[3]: cells for cells in expected}
+    kept = {cells[3] for cells in stored}
+    if len(kept) != len(stored) or any(by_number.get(cells[3]) != cells for cells in stored):
+        raise RuntimeError('core page manifest differs: ' + table)
+    return kept
+
+
+def _log_walk(connection, table: str, receipt_id: str, rows) -> None:
+    """Log the pages of a walk its receipt still lacks.
+
+    One statement carries every page the receipt lacks: they land whole or
+    not at all, and nothing is ever updated. An interrupted acknowledgement
+    leaves the evidence of every page exactly as the earlier ones accepted
+    it. Pages the receipt already holds must read back exactly as intended,
+    and are left as they are.
     """
-    rows = _walk_rows(plan, receipt_id, committed_at)
     expected = tuple(_walk_cells(row) for row in rows)
+    key = (CORE_PAGES_TABLE, receipt_id)
     stored = _stored_walk(connection, receipt_id)
     if stored is not None:
-        by_number = dict(zip((cells[3] for cells in expected), expected, strict=True))
-        if any(by_number.get(cells[3]) != cells for cells in stored):
-            raise RuntimeError('core page manifest differs: ' + plan.table)
-        kept = {cells[3] for cells in stored}
+        kept = _held_page_numbers(stored, expected, table)
         if len(kept) == len(expected):
+            _settle_statement(connection, key, _digest(expected), lambda: stored == expected)
             return
-        # The walk lost pages: they are logged again under the receipt that
-        # acknowledged them, and the pages it still holds are left as they are.
         rows = tuple(row for row, cells in zip(rows, expected, strict=True) if cells[3] not in kept)
     names = ', '.join(PAGES_COLUMNS)
     marks = '(' + ', '.join('?' for _ in PAGES_COLUMNS) + ')'
     sql = f'INSERT INTO {CORE_PAGES_TABLE} ({names}) VALUES ' + ', '.join([marks] * len(rows))
     _insert_once(
-        connection, sql, tuple(value for row in rows for value in row),
+        connection, key, sql, tuple(value for row in rows for value in row),
         lambda: _stored_walk(connection, receipt_id), expected)
+
+
+def _journal_walk_rows(plan: NativeWritePlan, receipt_id: str):
+    """Recover the original bound values of a lost walk from its immutable acknowledgement."""
+    kept = write_journal.acknowledged_walk(receipt_id)
+    if kept is None:
+        return None
+    walk, acknowledged_at = kept
+    if walk.get('table') != plan.full_table or walk.get('scope_values_json') != _scope_json(plan) \
+            or not isinstance(walk.get('pages'), list) or not walk['pages']:
+        raise RuntimeError('core page manifest differs: ' + plan.table)
+    rows = []
+    for number, page in enumerate(walk['pages'], start=1):
+        url, capture_id, clock, body_hash, _next, count, digest = page
+        rows.append((
+            receipt_id, plan.full_table, _scope_json(plan), number, len(walk['pages']), url,
+            capture_id, _timestamp(clock).replace(tzinfo=None), body_hash, count, digest,
+            _timestamp(acknowledged_at).replace(tzinfo=None)))
+    return tuple(rows)
 
 
 def _verify_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_at: str) -> None:
     """The logged walk reads back exactly as the acknowledgement states it."""
-    if _stored_walk(connection, receipt_id) != _expected_walk(plan, receipt_id, committed_at):
+    expected = _expected_walk(plan, receipt_id, committed_at)
+    if _stored_walk(connection, receipt_id) != expected:
         raise RuntimeError('core page manifest differs: ' + plan.table)
+    _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id), _digest(expected), lambda: True)
 
 
 def _guard_source_pages(connection, plan: NativeWritePlan, manifest=(), acknowledged_at=None) -> None:
@@ -1320,7 +1409,7 @@ def _by_capture(rows) -> dict:
 
 
 def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
-                  committed_at: str = '', own=None) -> str:
+                  committed_at: str = '', own=None, accepted=None) -> str:
     """Classify a plan against what the scope already holds.
 
     ``written`` needs nothing, ``refresh`` is the same capture observed under
@@ -1338,7 +1427,8 @@ def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
         # never acquires rows, and it never changes its evidence.
         existing = _read_plan_rows(connection, plan)
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
-        accepted = _accepted_pages(connection, plan, own=(receipt_id,) if own is None else own)
+        if accepted is None:
+            accepted = _accepted_pages(connection, plan, own=(receipt_id,) if own is None else own)
         for url, capture_id, clock, body_hash, _next in plan.pages:
             rows = planned.setdefault(capture_id, [])
             was_accepted = accepted.captures.get(capture_id)
@@ -1372,12 +1462,14 @@ def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
         carrying = [capture for capture, rows in planned.items() if rows]
         logged = True
         if plan.pages:
+            own_walk = accepted.walks.get(receipt_id)
+            if own_walk is not None and own_walk != _expected_walk(plan, receipt_id, committed_at):
+                raise RuntimeError('core page manifest differs: ' + plan.table)
             newest = {(url, *evidence[:3])
                       for url, (_order, evidence) in accepted.pages.items()}
             logged = all(
                 (page[0], page[1], _page_cell('captured_at', page[2]), page[3]) in newest
-                for page in plan.pages) and _stored_walk(connection, receipt_id) == _expected_walk(
-                    plan, receipt_id, committed_at)
+                for page in plan.pages) and own_walk is not None
         if {capture for capture, rows in committed.items() if rows} != set(carrying) or not logged:
             return 'pending'
         refreshed = any(not _rows_equal(committed[capture_id], planned[capture_id])
@@ -1440,9 +1532,8 @@ def _mutate_plan(connection, writer, plan: NativeWritePlan) -> None:
         # scope is the one statement of its own.
         cursor = connection.cursor()
         try:
-            execute_statement(
-                cursor, f'DELETE FROM {plan.full_table} WHERE {plan.scope_sql()}',
-                plan.scope_values)
+            _execute_once(cursor, f'DELETE FROM {plan.full_table} WHERE {plan.scope_sql()}',
+                          plan.scope_values)
         finally:
             cursor.close()
         return
@@ -1499,11 +1590,14 @@ def _physical_proof(connection, plan: NativeWritePlan) -> dict:
         if 'observation_status' in row:
             status = row['observation_status']
             status_counts['null' if status is None else str(status)] += 1
-    return {
+    proof = {
         'entity': plan.entity, 'table': plan.table, 'rows': len(persisted),
         'physical_hash': _digest(_sorted_rows(persisted, plan.natural_keys)),
         'expected_rows': len(plan.rows), 'status_counts': dict(status_counts),
     }
+    if plan.write_mode == 'replace' and not persisted:
+        proof.update(scope_values_json=_scope_json(plan), captured_at=plan.captured_at)
+    return proof
 
 
 def _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
@@ -1588,7 +1682,7 @@ def _stored_receipts(connection, ids) -> dict[str, tuple]:
 
 
 def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_id,
-                                 universe_version, batch, committed_at) -> None:
+                                 universe_version, batch, committed_at, *, require_rowless=False) -> None:
     """A receipt the warehouse holds under one of this bundle's ids must agree with it.
 
     Everything a receipt states but its physical proof is known before the
@@ -1602,9 +1696,11 @@ def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_i
         for plan, plan_hash in zip(plans, plan_hashes, strict=True)
     ]
     stored = _stored_receipts(connection, [receipt['receipt_id'] for receipt in expected])
-    for receipt in expected:
+    for plan, receipt in zip(plans, expected, strict=True):
         earlier = stored.get(receipt['receipt_id'])
         if earlier is None:
+            if require_rowless and not plan.rows:
+                raise RuntimeError('core legacy receipt lacks independent capture evidence')
             continue
         cells = _receipt_cells(receipt)
         if any(earlier[index] != cells[index]
@@ -1613,33 +1709,73 @@ def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_i
             raise RuntimeError('core receipt contradicts its earlier acknowledgement')
 
 
-def _insert_once(connection, sql, bound, read, expected) -> None:
-    """Run one INSERT exactly once per call.
-
-    The commit may be unknown after a failure. What the statement was to
-    write is read back once: rows that read back exactly as intended landed,
-    and the failure is answered. An absent row proves only what was visible
-    at that read, so the statement is never repeated at once: the replay of
-    the unit, later, writes a row that is still missing. What is already
-    stored under the rows' key is the caller's to compare before the INSERT.
-    """
+def _query_rejected(connection, statement):
+    query_id = write_journal.statement_query(statement)
+    if not query_id:
+        return False
     cursor = connection.cursor()
     try:
-        # A committing cursor retries ambiguous commits on its own.
-        run = getattr(cursor, 'execute_once', cursor.execute)
-        run(sql, bound)
-        if not isinstance(cursor, CommittingCursor):
-            cursor.fetchall()
-    except Exception:
-        try:
-            landed = read() == expected
-        except Exception:
-            # The read back failed as well: nothing proves the statement landed.
-            landed = False
-        if not landed:
+        rows = _query_rows(cursor, 'SELECT state, error_code FROM system.runtime.queries '
+                           'WHERE query_id = ?', (query_id,))
+    finally:
+        cursor.close()
+    # FAILED alone can mean a lost commit response. These two coordinator
+    # errors occur during admission or parsing, before any write can start.
+    return len(rows) == 1 and tuple(rows[0]) in {
+        ('FAILED', 'QUERY_QUEUE_FULL'), ('FAILED', 'SYNTAX_ERROR')}
+
+
+def _statement_failure(statement, exc, cursor=None):
+    if not isinstance(exc, TrinoAmbiguousWriteError) and _is_definite_iceberg_commit_conflict(exc):
+        write_journal.finish_statement(statement)
+        return True
+    # Use only the failing operation's cursor or its explicit exception
+    # chain. A disconnected submission can have no known coordinator ID.
+    query_id = None
+    while not query_id and exc is not None:
+        query_id = getattr(exc, 'query_id', None)
+        exc = exc.__cause__
+    write_journal.remember_query(statement, query_id or getattr(cursor, 'query_id', None))
+    return False
+
+
+def _settle_statement(connection, key, expected, landed):
+    statement = write_journal.pending_statement(key)
+    if statement is None:
+        return
+    observed = (statement['observable'] and statement['expected'] == expected and landed())
+    if not observed and not _query_rejected(connection, statement):
+        raise RuntimeError('core statement outcome is still pending: ' + key[0])
+    write_journal.finish_statement(statement)
+
+
+def _execute_once(cursor, sql, bound):
+    if isinstance(cursor, CommittingCursor):
+        cursor.execute_once(sql, bound)
+    else:
+        cursor.execute(sql, bound)
+        cursor.fetchall()
+
+
+def _insert_once(connection, key, sql, bound, read, expected) -> None:
+    """Fence one physical INSERT until its previously missing cells land or Trino rejects it."""
+    fingerprint = _digest(expected)
+    _settle_statement(connection, key, fingerprint, lambda: read() == expected)
+    if read() == expected:
+        return
+    cursor = connection.cursor()
+    statement = None
+    try:
+        statement = write_journal.begin_statement(key, fingerprint)
+        _execute_once(cursor, sql, bound)
+    except Exception as exc:
+        if statement is None:
+            raise
+        if _statement_failure(statement, exc, cursor) or read() != expected:
             raise
     finally:
         cursor.close()
+    write_journal.finish_statement(statement)
 
 
 def _merge_receipts(connection, receipts) -> None:
@@ -1654,10 +1790,12 @@ def _merge_receipts(connection, receipts) -> None:
     marks = ', '.join('?' for _ in RECEIPT_COLUMNS)
     for receipt in receipts:
         expected = _receipt_cells(receipt)
+        key = (CORE_RECEIPTS_TABLE, expected[0])
         earlier = stored.get(expected[0])
         if earlier is not None:
             if earlier != expected:
                 raise RuntimeError('core receipt contradicts its earlier acknowledgement')
+            _settle_statement(connection, key, _digest(expected), lambda: True)
             continue
         bound = []
         for col in RECEIPT_COLUMNS:
@@ -1667,7 +1805,7 @@ def _merge_receipts(connection, receipts) -> None:
                 value = _timestamp(value).replace(tzinfo=None)
             bound.append(value)
         _insert_once(
-            connection, f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})',
+            connection, key, f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})',
             bound, lambda: _stored_receipts(connection, [expected[0]]).get(expected[0]), expected)
 
 
@@ -1801,7 +1939,46 @@ def _descriptors(plans) -> list[dict]:
     return descriptors
 
 
-def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), committed_at='') -> list[dict]:
+def _settle_plan_statements(connection, plan, receipt_id, committed_at):
+    if plan.write_mode == 'replace':
+        # Only the fenced writer could have changed a differing preimage to
+        # this exact nonempty scope. Equal preimages and empty reads prove
+        # nothing about a still-queued replacement.
+        _settle_statement(connection, (plan.full_table, _scope_json(plan)), receipt_id,
+                          lambda: _rows_equal(_read_plan_rows(connection, plan), plan.rows))
+    page_key = (CORE_PAGES_TABLE, receipt_id)
+    if plan.pages and write_journal.pending_statement(page_key) is not None:
+        expected = _expected_walk(plan, receipt_id, committed_at)
+        _settle_statement(connection, page_key, _digest(expected),
+                          lambda: _stored_walk(connection, receipt_id) == expected)
+    key = (CORE_RECEIPTS_TABLE, receipt_id)
+    statement = write_journal.pending_statement(key)
+    if statement is not None:
+        expected = statement['expected']
+        _settle_statement(connection, key, expected, lambda: _digest(
+            _stored_receipts(connection, [receipt_id]).get(receipt_id)) == expected)
+
+
+def _write_plan(connection, writer, plan, receipt_id):
+    if plan.write_mode != 'replace':
+        _mutate_plan(connection, writer, plan)
+        return
+    before = _read_plan_rows(connection, plan)
+    if not before and not plan.rows:
+        return
+    statement = write_journal.begin_statement(
+        (plan.full_table, _scope_json(plan)), receipt_id,
+        observable=bool(plan.rows) and not _rows_equal(before, plan.rows))
+    try:
+        _mutate_plan(connection, writer, plan)
+    except (TrinoError, RuntimeError, OSError) as exc:
+        _statement_failure(statement, exc)
+        raise
+    write_journal.finish_statement(statement)
+
+
+def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), committed_at='',
+                  verify_only=False) -> list[dict]:
     """Guard, mutate and prove the plans against the warehouse.
 
     ``repair`` is called when the plans are about to mutate although their
@@ -1809,37 +1986,74 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
     intent behind to replay. ``receipt_ids`` names, per plan, the warehouse
     receipt about to acknowledge it: a snapshot's walk is logged under it.
     """
-    execute_statement(connection.cursor(), core_receipts_ddl())
-    if any(plan.pages for plan in plans):
-        execute_statement(connection.cursor(), core_pages_ddl())
-    for plan in plans:
-        execute_statement(connection.cursor(), plan.ddl)
-        _guard_table_schema(connection, plan)
     receipt_ids = tuple(receipt_ids) or ('',) * len(plans)
-    # The acknowledgement being retried is the one write allowed to restore
-    # the page evidence it lost itself.
-    own = frozenset(receipt_id for plan, receipt_id in zip(plans, receipt_ids, strict=True)
-                    if plan.pages)
-    states = [(plan, _replay_state(connection, plan, receipt_id, committed_at, own=own))
-              for plan, receipt_id in zip(plans, receipt_ids, strict=True)]
-    for plan, state in states:
+    for plan, receipt_id in zip(plans, receipt_ids, strict=True):
+        _settle_plan_statements(connection, plan, receipt_id, committed_at)
+    if not verify_only:
+        execute_statement(connection.cursor(), core_receipts_ddl())
+        if any(plan.pages for plan in plans):
+            execute_statement(connection.cursor(), core_pages_ddl())
+    for plan in plans:
+        if not verify_only:
+            execute_statement(connection.cursor(), plan.ddl)
+        _guard_table_schema(connection, plan)
+    unit = dict(zip(receipt_ids, plans, strict=True))
+    restorations = {}
+
+    def recover_walk(plan, receipt_id, surviving):
+        member = unit.get(receipt_id)
+        if member is None and repair is not None:
+            return None  # an acknowledged retry may repair only its unit
+        rows = _journal_walk_rows(plan, receipt_id)
+        if member is not None:
+            if member.full_table != plan.full_table or _scope_json(member) != _scope_json(plan):
+                raise RuntimeError('core page manifest differs: ' + plan.table)
+            expected = _walk_rows(member, receipt_id, committed_at)
+            if rows is not None and rows != expected:
+                raise RuntimeError('core page manifest differs: ' + plan.table)
+            rows = expected
+        if not rows:
+            return None
+        expected = tuple(_walk_cells(row) for row in rows)
+        _held_page_numbers(_stored_walk(connection, receipt_id) or (), expected, plan.table)
+        restorations[receipt_id] = (plan.table, rows, 'differs' if surviving else 'lost')
+        return expected
+
+    recover = None if verify_only else recover_walk
+    evidence = [_accepted_pages(connection, plan, restore=recover) for plan in plans]
+    states = [(plan, _replay_state(connection, plan, receipt_id, committed_at, accepted=accepted))
+              for plan, receipt_id, accepted in zip(plans, receipt_ids, evidence, strict=True)]
+    for (plan, state), accepted, receipt_id in zip(states, evidence, receipt_ids, strict=True):
         # A lineage-only refresh rewrites the run identity of rows that are
         # already committed under this very capture: nothing can regress,
         # whatever clock a sibling capture of the scope carries.
         if state == 'pending' or (state == 'refresh' and not _capture_pinned(plan)):
-            guard_native_bundle(
-                connection, plan, own=own, acknowledged_at=_timestamp(committed_at))
-    if repair is not None and any(state != 'written' for _plan, state in states):
+            try:
+                guard_native_bundle(connection, plan, accepted=accepted, own=(receipt_id,),
+                                    acknowledged_at=_timestamp(committed_at))
+            except StaleTransfermarktWrite as exc:
+                for table, _, reason in restorations.values():
+                    if table == plan.table:
+                        raise StaleTransfermarktWrite(f'{exc} (core page manifest {reason})') from exc
+                raise
+    if verify_only:
+        for plan, receipt_id in zip(plans, receipt_ids, strict=True):
+            if plan.pages:
+                _verify_pages(connection, plan, receipt_id, committed_at)
+        return [_physical_proof(connection, plan) for plan in plans]
+    if repair is not None and (restorations or any(state != 'written' for _plan, state in states)):
         repair()
-    for plan, state in states:
+    for key, (table, rows, _reason) in restorations.items():
+        if key in unit:
+            _record_pages(connection, unit[key], key, committed_at)
+        else:
+            _log_walk(connection, table, key, rows)
+        if _stored_walk(connection, key) != tuple(_walk_cells(row) for row in rows):
+            raise RuntimeError('core page manifest differs: ' + table)
+    for (plan, state), receipt_id in zip(states, receipt_ids, strict=True):
         if state == 'written':
             continue
-        if not plan.rows and not plan.pages and not _read_plan_rows(connection, plan):
-            # A proven-empty single page has nothing else to empty: the scope
-            # already holds no row. Its acknowledgement is verified, and an
-            # acknowledged replay of it issues no statement on the data.
-            continue
-        _mutate_plan(connection, writer, plan)
+        _write_plan(connection, writer, plan, receipt_id)
     for plan, receipt_id, (_plan, state) in zip(plans, receipt_ids, states, strict=True):
         # The logged walk follows the snapshot it belongs to; a snapshot that
         # is written is logged under its own acknowledgement.
@@ -1864,16 +2078,6 @@ def _anchored_tables(plans) -> set[str]:
     if any(plan.pages for plan in plans):
         tables.add(_PAGES_ANCHOR_NAME)
     return tables
-
-
-def _finish_leftover_intent(digest: str, run_id: str) -> None:
-    """A crash between record_receipt and finish_intent must not strand it.
-
-    Journal files are named by their own body checksum, not the bundle
-    digest, so the leftover unit is found through the identity index.
-    """
-    for path, _body in write_journal.pending_intents({'run_id': run_id, 'digest': digest}):
-        write_journal.finish_intent(path)
 
 
 def _bundle_identity(plans, run_id: str) -> tuple[list[str], str]:
@@ -1936,18 +2140,15 @@ def write_core_bundle(
 
 
 def _earlier_acknowledgement(plans, run_id: str) -> tuple[list[str], str] | None:
-    """The identity under which the previous writer acknowledged this unit.
-
-    A unit of the stage-B core entities that the stage-B writer acknowledged
-    completely carries a journal receipt under its stage-B digest and no
-    acknowledgement under today's identity. The ordinary retry must reuse
-    that acknowledgement instead of committing the unit a second time.
-    """
+    """Find the earlier writer's pending or acknowledged unit."""
     if not all(plan.entity in _STAGE_B_ENTITIES and not plan.pages for plan in plans):
         return None
     plan_hashes = [_stage_b_plan_sha256(plan) for plan in plans]
     digest = _digest({'plans': plan_hashes, 'run_id': run_id})
-    return (plan_hashes, digest) if write_journal.read_receipt(digest) is not None else None
+    if write_journal.read_receipt(digest) is not None or write_journal.pending_intents(
+            {'run_id': run_id, 'digest': digest}):
+        return plan_hashes, digest
+    return None
 
 
 def _publish_alias(current: str, receipt: dict, plan_hashes, digest: str) -> None:
@@ -1956,14 +2157,19 @@ def _publish_alias(current: str, receipt: dict, plan_hashes, digest: str) -> Non
     Bound to the warehouse receipts already written and to the anchors
     recorded before that write: an ordinary retry of the unit reuses both.
     """
-    if current == digest or write_journal.read_receipt(current) is not None:
+    if current == digest:
         return
     # The anchors first: an alias is never visible without the pre-write
     # anchors of the acknowledgement it stands for, and an interrupted
     # publication leaves nothing for a retry to complete.
     write_journal.copy_snapshot_anchors(digest, current)
+    original = write_journal.read_snapshot_anchors(digest)
+    if not original or write_journal.read_snapshot_anchors(current) != original:
+        raise RuntimeError('core alias snapshot anchors differ')
+    if write_journal.read_receipt(current) is not None:
+        return
     write_journal.record_receipt(current, {
-        **receipt, 'plan_sha256': current,
+        **receipt, 'plan_sha256': current, 'descriptor_digest': current,
         'identity': {'plan_hashes': list(plan_hashes), 'digest': digest}})
 
 
@@ -1986,10 +2192,34 @@ def _journal_walks(plans, receipt_ids) -> list[dict]:
     return walks
 
 
+def _pre_upgrade_pending(plans, paths, stored):
+    """An old anchored intent may have dispatched DML without a statement fence.
+
+    Its stage-B recovery may verify an already complete warehouse unit. A
+    missing result cannot be resubmitted, and other captures of the same
+    scope must wait. Without pre-write anchors the old writer had not yet
+    reached DML, so it is safe to adopt that exact intent before submission.
+    """
+    scopes = {(plan.table, plan.scope_values) for plan in plans}
+    verify_only = False
+    for path, body in write_journal.pending_intents({}, untracked_only=True):
+        descriptors = body['payload']['plans']
+        if not any((item['table'], tuple(item['scope_values'])) in scopes for item in descriptors):
+            continue
+        if not write_journal.read_snapshot_anchors(body['identity']['digest']):
+            if path in paths:
+                write_journal.adopt_intent(path)
+            continue
+        if path not in paths or stored is not None or not _journalled_by_stage_b(descriptors):
+            raise RuntimeError('pre-upgrade core statement outcome is still pending')
+        verify_only = True
+    return verify_only
+
+
 def _commit_bundle(
     connection_factory, writer, plans, *, plan_hashes, digest, run_id: str,
     universe_version: str, committed_at: str, deadline: float | None = None,
-    journaled: bool = False,
+    journaled: bool = False, repair_identity=None,
 ) -> dict:
     """Commit a bundle under a given identity: its own, or the one it was
     journalled under by an earlier writer.
@@ -2004,11 +2234,29 @@ def _commit_bundle(
             raise ValueError('duplicate core receipt identity across plans')
         batch = _batch_id_for_run(run_id)
         current = digest
+        descriptor_digest = _bundle_identity(plans, run_id)[1]
         if write_journal.read_receipt(digest) is None:
             earlier = _earlier_acknowledgement(plans, run_id)
             if earlier is not None:
                 plan_hashes, digest = earlier
         stored = write_journal.read_receipt(digest)
+        identity = (stored or {}).get('identity') or {'plan_hashes': plan_hashes, 'digest': digest}
+        keys = {descriptor_digest, digest, identity['digest']}
+        pending = [entry for key in sorted(keys) for entry in
+                   write_journal.pending_intents({'run_id': run_id, 'digest': key})]
+        paths = [path for path, _ in pending]
+        if journaled and not paths and stored is None:
+            raise RuntimeError('core replay lost its pending intent')
+        for _path, body in pending:
+            saved_plans, _, _ = _intent_unit(body)
+            if _bundle_identity(saved_plans, run_id)[1] != descriptor_digest:
+                raise RuntimeError('core pending intent capture evidence differs')
+            warehouse = body['payload'].get('warehouse_identity')
+            if warehouse is not None and (stored is None or warehouse != identity):
+                raise RuntimeError('core repair warehouse identity differs')
+        if repair_identity is not None and stored is None:
+            raise RuntimeError('core repair lacks its original acknowledgement')
+        verify_only = _pre_upgrade_pending(plans, paths, stored)
         if stored is not None:
             if stored.get('plan_sha256') != digest:
                 raise RuntimeError('core journal receipt plan_sha256 differs')
@@ -2019,26 +2267,36 @@ def _commit_bundle(
             # The acknowledgement names the identity its warehouse receipts
             # were written under. A unit migrated from an earlier writer keeps
             # that one, so a retry under today's identity reuses them.
-            identity = stored.get('identity') or {'plan_hashes': plan_hashes, 'digest': digest}
+            if repair_identity is not None and repair_identity != identity:
+                raise RuntimeError('core repair warehouse identity differs')
+            binding = stored.get('descriptor_digest')
+            if binding is not None and binding != descriptor_digest:
+                raise RuntimeError('core legacy acknowledgement capture evidence differs')
             receipt_hashes, receipt_digest = list(identity['plan_hashes']), identity['digest']
+            has_descriptor_evidence = binding is not None or any(
+                body['identity']['digest'] == receipt_digest
+                or body['payload'].get('warehouse_identity') == identity for _, body in pending)
             receipt_ids = [_receipt_id(plan_hash, run_id, receipt_digest)
                            for plan_hash in receipt_hashes]
-            repaired = []
 
             def repair():
                 # The acknowledged bundle has to change again (drifted rows, a
                 # lost manifest, a deleted receipt): journal it first.
-                repaired.append(write_journal.save_intent(
-                    {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
-                    run_id=run_id, universe_version=universe_version,
-                    committed_at=stored['committed_at']))
+                if not paths:
+                    paths.append(write_journal.save_intent(
+                        {'run_id': run_id, 'digest': descriptor_digest, 'statement_protocol': 1},
+                        {'plans': _descriptors(plans), 'warehouse_identity': identity},
+                        run_id=run_id, universe_version=universe_version,
+                        committed_at=stored['committed_at']))
 
             connection = connection_factory()
             try:
                 _refuse_receipt_contradictions(
                     connection, plans, receipt_hashes, receipt_digest, run_id,
-                    universe_version, batch, stored['committed_at'])
-                write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
+                    universe_version, batch, stored['committed_at'],
+                    require_rowless=(receipt_digest != descriptor_digest and not has_descriptor_evidence))
+                if write_journal.read_snapshot_anchors(receipt_digest).keys() != _anchored_tables(plans):
+                    raise RuntimeError('core acknowledged snapshot anchors differ')
                 proofs = _commit_plans(
                     connection, writer, plans, repair=repair, receipt_ids=receipt_ids,
                     committed_at=stored['committed_at'])
@@ -2049,7 +2307,7 @@ def _commit_bundle(
                 ]
                 held = _stored_receipts(
                     connection, [receipt['receipt_id'] for receipt in plan_receipts])
-                if len(held) < len(plan_receipts) and not repaired:
+                if len(held) < len(plan_receipts):
                     # Only receipts are missing: their repair is journalled
                     # before the first one is inserted.
                     repair()
@@ -2057,23 +2315,26 @@ def _commit_bundle(
                 _verify_receipts(connection, plan_receipts)
             finally:
                 connection.close()
-            _finish_leftover_intent(digest, run_id)
-            _publish_alias(current, stored, plan_hashes, digest)
+            _publish_alias(current, stored, receipt_hashes, receipt_digest)
+            for path in paths:
+                write_journal.finish_intent(path)
             return stored
 
         # An interrupted write of this very unit left its intent behind: the
         # unit is committed with the metadata that intent names, and no second
         # intent is published for an identity that is already in flight.
-        pending = write_journal.pending_intents({'run_id': run_id, 'digest': digest})
         if pending:
             evidence = pending[0][1]['evidence']
+            if any(body['evidence'] != evidence for _, body in pending):
+                raise RuntimeError('core pending intent metadata differs')
             committed_at = evidence.get('committed_at', committed_at)
             universe_version = evidence.get('universe_version', universe_version)
         elif not journaled:
-            write_journal.save_intent(
-                {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
+            paths.append(write_journal.save_intent(
+                {'run_id': run_id, 'digest': digest, 'statement_protocol': 1},
+                {'plans': _descriptors(plans)},
                 run_id=run_id, universe_version=universe_version, committed_at=committed_at,
-            )
+            ))
         connection = connection_factory()
         try:
             _refuse_receipt_contradictions(
@@ -2082,30 +2343,55 @@ def _commit_bundle(
             write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
             receipt_ids = [_receipt_id(plan_hash, run_id, digest) for plan_hash in plan_hashes]
             proofs = _commit_plans(
-                connection, writer, plans, receipt_ids=receipt_ids, committed_at=committed_at)
+                connection, writer, plans, receipt_ids=receipt_ids, committed_at=committed_at,
+                verify_only=verify_only)
             plan_receipts = [
                 _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
                               batch, committed_at)
                 for plan, proof, plan_hash in zip(plans, proofs, plan_hashes, strict=True)
             ]
-            _merge_receipts(connection, plan_receipts)
+            if not verify_only:
+                _merge_receipts(connection, plan_receipts)
             _verify_receipts(connection, plan_receipts)
         finally:
             connection.close()
+        if verify_only:
+            for path in paths:
+                write_journal.adopt_intent(path)
         receipt = {
             'verified': True, 'receipt_readback': True, 'run_id': run_id,
             'universe_version': universe_version, 'committed_at': committed_at,
             'plan_sha256': digest, 'committed_batch': batch, 'plans': proofs, 'manifests': [],
             # The plan hashes and digest the warehouse receipts were written under.
             'identity': {'plan_hashes': list(plan_hashes), 'digest': digest},
+            'descriptor_digest': descriptor_digest,
             'walks': _journal_walks(plans, receipt_ids),
         }
         write_journal.record_receipt(digest, receipt)
         _publish_alias(current, receipt, plan_hashes, digest)
         # The unit is acknowledged: the intent published here and any one an
         # interrupted write left behind are finished.
-        _finish_leftover_intent(digest, run_id)
+        for path in paths:
+            write_journal.finish_intent(path)
         return receipt
+
+
+def _intent_unit(body):
+    descriptors = body['payload']['plans']
+    plans = [NativeWritePlan(
+        **{**descriptor, 'natural_keys': tuple(descriptor['natural_keys']),
+           'scope_columns': tuple(descriptor['scope_columns']),
+           'scope_values': tuple(descriptor['scope_values'])})
+        for descriptor in descriptors]
+    run = body['identity']['run_id']
+    hashes, digest = _bundle_identity(plans, run)
+    saved = body['identity'].get('digest')
+    if saved != digest and _journalled_by_stage_b(descriptors):
+        hashes = [_stage_b_plan_sha256(plan) for plan in plans]
+        digest = _digest({'plans': hashes, 'run_id': run})
+    if saved != digest:
+        raise RuntimeError('core journal intent digest is not recognised: ' + str(saved))
+    return plans, hashes, digest
 
 
 def replay_pending_intents(connection_factory, writer, *, run_id: str | None = None) -> list[dict]:
@@ -2119,35 +2405,18 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
     neither says nothing about what the intent committed and is refused.
     """
     receipts = []
-    for path, body in write_journal.pending_intents({'run_id': run_id} if run_id else {}):
-        plans = []
-        for descriptor in body['payload']['plans']:
-            descriptor = dict(descriptor)
-            descriptor['rows'] = [dict(row) for row in descriptor['rows']]
-            descriptor['natural_keys'] = tuple(descriptor['natural_keys'])
-            descriptor['scope_columns'] = tuple(descriptor['scope_columns'])
-            descriptor['scope_values'] = tuple(descriptor['scope_values'])
-            plans.append(NativeWritePlan(**descriptor))
-        run = body['identity']['run_id']
-        plan_hashes, digest = _bundle_identity(plans, run)
-        saved = body['identity'].get('digest')
-        if saved != digest and not _journalled_by_stage_b(body['payload']['plans']):
-            # Not this writer's digest and not a stage-B unit: nothing is
-            # known about what it committed.
-            raise RuntimeError('core journal intent digest is not recognised: ' + str(saved))
-        if saved != digest:
-            plan_hashes = [_stage_b_plan_sha256(plan) for plan in plans]
-            digest = _digest({'plans': plan_hashes, 'run_id': run})
-            if saved != digest:
-                raise RuntimeError('core journal intent digest is not recognised: ' + str(saved))
-        receipt = _commit_bundle(
-            connection_factory, writer, plans, plan_hashes=plan_hashes, digest=digest,
-            run_id=run, journaled=True,
-            universe_version=body['evidence'].get('universe_version', 'core-universe-v1'),
-            committed_at=body['evidence'].get('committed_at', ''))
-        if path.exists():
-            # The verified recovery finishes the very file that was replayed,
-            # whatever format this writer would save the unit in.
-            write_journal.finish_intent(path)
-        receipts.append(receipt)
+    with writer_lock():
+        pending = write_journal.pending_intents({'run_id': run_id} if run_id else {})
+    for path, body in pending:
+        with writer_lock():
+            if not path.exists():
+                continue  # another recovery finished this exact intent
+            plans, plan_hashes, digest = _intent_unit(body)
+            receipt = _commit_bundle(
+                connection_factory, writer, plans, plan_hashes=plan_hashes, digest=digest,
+                run_id=body['identity']['run_id'], journaled=True,
+                repair_identity=body['payload'].get('warehouse_identity'),
+                universe_version=body['evidence'].get('universe_version', 'core-universe-v1'),
+                committed_at=body['evidence'].get('committed_at', ''))
+            receipts.append(receipt)
     return receipts

@@ -98,6 +98,17 @@ class AttendanceEditionTarget:
     competition_id: str
     saison_year: int
     slug: str = ''
+    start_url: str = ''
+
+    def __post_init__(self):
+        if self.start_url:
+            if not sections._attendance_source_valid(self.start_url):
+                raise CoreRunError('attendance:pagination_identity_invalid')
+            attendance._validate_attendance_url(
+                self.start_url, host=core.TRANSFERMARKT_HOST, path=urlsplit(self.start_url).path,
+                competition=self.competition_id, edition=str(self.saison_year))
+            if sections._attendance_page_number(self.start_url) != 1:
+                raise CoreRunError('attendance:pagination_start_not_first_page')
 
 
 @dataclass(frozen=True)
@@ -239,7 +250,8 @@ def _base_requests(plan: CoreScopePlan):
     for coach_id, slug in plan.coach_profile_ids:
         yield _Request("coach_profile", coach_profile_url(slug, coach_id), coach_id=coach_id)
     for target in plan.attendance_editions:
-        url = attendance_url(target.slug or target.competition_id, target.competition_id, target.saison_year)
+        url = target.start_url or attendance_url(
+            target.slug or target.competition_id, target.competition_id, target.saison_year)
         yield _Request("attendance", url, competition_id=target.competition_id, edition_id=str(target.saison_year))
     for target in plan.club_value_targets:
         url = club_values_url(target.slug or target.competition_id, target.competition_id, target.stichtag)
@@ -309,6 +321,8 @@ def _run_requests(plan: CoreScopePlan):
 def _capture(request, result, raw_loader):
     if raw_loader is not None:
         body, record = raw_loader(result.raw_capture_id)
+        if getattr(record, "endpoint", request.label) != request.label:
+            raise CoreRunError(f"{request.label} raw capture endpoint differs")
         if record.content_hash != result.raw_body_hash or record.url != request.url:
             raise CoreRunError(f"{request.label} raw capture does not match its outcome")
         captured_at = _normalise_ts(record.fetched_at)
@@ -444,6 +458,11 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
             **metadata)
         return tuple(unit), max(capture.captured_at for capture in captures)
     if request.label == "attendance":
+        if walk_failure is not None:
+            return (sections._outcome(
+                "attendance_observations", "error", f"attendance:{walk_failure}",
+                **core._context(walk_failed, scope, extracted_at, universe_version),
+            ),), walk_failed.captured_at
         unit = sections.extract_attendance_observations(
             captures, scope, start_url=request.url, competition_id=request.competition_id,
             edition_id=request.edition_id, **metadata,
@@ -646,6 +665,9 @@ class CoreRun:
                         next_url, host=start.netloc, path=start.path,
                         competition=request.competition_id, edition=request.edition_id,
                     )
+                    if sections._attendance_page_number(next_url) != len(captures) + 1:
+                        walk_failure, walk_failed = 'pagination_not_sequential', capture
+                        break
                 except ValueError:
                     # The donor parser reports the precise error from these same pages.
                     break
@@ -671,6 +693,14 @@ class CoreRun:
                 ]
                 if entries:
                     captured_units.append((unit[0].run_id, extracted_at, entries))
+
+        evidence_by_id = {}
+        for outcome in outcomes:
+            capture = outcome.capture
+            if capture is not None:
+                evidence = (capture.url, capture.body_hash, capture.captured_at)
+                if evidence_by_id.setdefault(capture.capture_id, evidence) != evidence:
+                    raise CoreRunError('capture_evidence_conflict')
 
         bundles = []
         for run_id, committed_at, entries in captured_units:

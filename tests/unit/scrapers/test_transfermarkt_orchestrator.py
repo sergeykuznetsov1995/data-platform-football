@@ -264,3 +264,103 @@ def test_live_cli_refuses_without_explicit_transport_permission(capsys):
         cli.main(['live', '--league', 'GB1', '--season', '2627',
                   '--scope-id', 's', '--cycle-id', 'c', '--club', '11:arsenal'])
     assert caught.value.code == 2
+
+
+def test_finding_16_offline_squad_record_cannot_be_relabelled_as_coach_history():
+    # Round 7 finding 16: both dispatch and raw loading bind a recorded endpoint to its route.
+    from dags.scripts import run_transfermarkt_core as cli
+
+    capture = _load('squad')
+    args = cli._parser().parse_args(['offline', '--fixtures-root', str(FIXTURES),
+                                     '--league', 'GB1', '--season', '2627'])
+    record, blob = cli._load_records(FIXTURES)[capture.url]
+    records = {capture.url: ({**record, 'endpoint': 'coach_history'}, blob)}
+    with pytest.raises(ValueError) as refused:
+        cli._offline_plan(args, records)
+    assert str(refused.value) == f"Fixture endpoint 'coach_history' does not match its URL {capture.url!r}"
+
+    replay = _ReplayFetch({'squad'})
+    request = orchestrator._Request('squad', capture.url)
+    result = replay.fetch(capture.url, as_json=False, label=request.label)
+    with pytest.raises(CoreRunError, match='^squad raw capture endpoint differs$'):
+        orchestrator._capture(request, result, cli._fixture_raw_loader(records))
+    assert orchestrator._capture(request, result, replay.raw_loader) == capture
+
+
+def _write_replay_manifest(root, captures):
+    fixtures = []
+    for capture in captures:
+        folder = root / 'captures' / capture.endpoint
+        folder.mkdir(parents=True, exist_ok=True)
+        record = {
+            'endpoint': capture.endpoint, 'url': capture.url, 'capture_id': capture.capture_id,
+            'content_hash': capture.body_hash, 'fetched_at': capture.captured_at,
+            'status_code': capture.status_code, 'scope_id': 's', 'cycle_id': 'c',
+        }
+        (folder / f'{capture.capture_id}.json').write_text(json.dumps(record))
+        blob_file = f'{capture.capture_id}.gz'
+        (root / blob_file).write_bytes(gzip.compress(capture.body))
+        fixtures.append({'capture_id': capture.capture_id, 'endpoint': capture.endpoint, 'blob_file': blob_file})
+    (root / 'manifest.json').write_text(json.dumps({'fixtures': fixtures}))
+
+
+@pytest.mark.parametrize('case', ['complete', 'club_values', 'unreached', 'missing_start', 'duplicate_start'])
+def test_finding_17_offline_cli_accounts_for_every_manifest_record(case, tmp_path, monkeypatch, capsys):
+    # Round 7 finding 17: success requires a representable edition and every fixture to be reached.
+    from dataclasses import replace
+
+    from dags.scripts import run_transfermarkt_core as cli
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        ATTENDANCE_PAGE_2, ATTENDANCE_START, PAGE_1_CAPTURED, PAGE_2_CAPTURED,
+        _attendance_capture, _club_value_capture,
+    )
+
+    first = _attendance_capture('page_1.html', ATTENDANCE_START + '?page=01', PAGE_1_CAPTURED)
+    second = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    captures = [_load('squad'), second]
+    if case != 'missing_start':
+        captures.append(first)
+    if case == 'duplicate_start':
+        captures.append(replace(first, url=ATTENDANCE_START, capture_id='a' * 64))
+    if case == 'club_values':
+        captures.append(_club_value_capture())
+    _write_replay_manifest(tmp_path, captures)
+    report_path = tmp_path / 'report.json'
+    args = ['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1', '--season', '2627',
+            '--write', '--report-out', str(report_path)]
+
+    db = CoreDB()
+    writer = CoreWriter(db)
+    monkeypatch.setattr(cli, '_write_options', lambda args: {'writer': writer, 'connection_factory': lambda: db})
+    plan_errors = {
+        'club_values': "The offline replay plan cannot represent 'club_values' fixtures yet",
+        'missing_start': 'attendance_first_page_missing',
+        'duplicate_start': 'attendance_duplicate_first_page',
+    }
+    if case in plan_errors:
+        with pytest.raises(SystemExit) as caught:
+            cli.main(args)
+        assert caught.value.code == 2
+        assert plan_errors[case] in capsys.readouterr().err
+        assert writer.writes == []
+        return
+
+    if case == 'unreached':
+        fixture_fetch = cli._fixture_fetch
+
+        def without_second_page(records):
+            return fixture_fetch({url: entry for url, entry in records.items() if url != second.url})
+
+        monkeypatch.setattr(cli, '_fixture_fetch', without_second_page)
+        assert cli.main(args) == 2
+        assert capsys.readouterr().err.splitlines() == ['Unreached fixture records:', second.url]
+        report = json.loads(report_path.read_text())
+        assert len(report['receipts']) == 1 and report['receipts'][0]['verified'] is True
+        return
+
+    assert cli.main(args) == 0
+    report = json.loads(report_path.read_text())
+    assert report['fetched'] == 3
+    assert len(report['receipts']) == 2 and all(item['verified'] for item in report['receipts'])
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone() == (38,)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_attendance_observations').fetchone() == (2,)

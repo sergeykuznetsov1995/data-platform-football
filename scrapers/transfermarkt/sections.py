@@ -6,7 +6,7 @@ and bind each observation to the capture and run that produced it.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 import json
@@ -71,6 +71,11 @@ def _attendance_source_valid(url: str) -> bool:
     return parts.scheme == 'https' and parts.netloc == core.TRANSFERMARKT_HOST and not parts.fragment
 
 
+def _attendance_page_number(url: str) -> int:
+    """Page number of a donor-validated attendance URL."""
+    return int(parse_qs(urlsplit(url).query).get('page', ['1'])[0])
+
+
 def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_id: str):
     """Check that the supplied pages are exactly one walk from the first page.
 
@@ -109,6 +114,8 @@ def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_i
             capture = by_url.get(current)
             if capture is None:
                 return None
+            if _attendance_page_number(current) != len(walked) + 1:
+                return 'pagination_not_sequential', capture
             following = attendance.next_attendance_url(capture.body, capture.url)
             walked.append((capture, following))
             if following is not None and not _attendance_source_valid(following):
@@ -238,6 +245,25 @@ def extract_attendance_observations(
     return (_outcome(entity, result.status, reason, tuple(rows), pages=pages, **context),)
 
 
+def _representation_packet_rows(payload, expected_ids):
+    if not isinstance(payload, Mapping) or payload.get('success') is not True:
+        raise ValueError('invalid_packet')
+    data = payload.get('data')
+    if not isinstance(data, list) or not 1 <= len(data) <= 100 or len(data) != len(expected_ids):
+        raise ValueError('invalid_packet')
+    rows = {}
+    for row in data:
+        if not isinstance(row, Mapping):
+            raise ValueError('invalid_packet')
+        player_id = representation.canonical_player_id(row.get('id'))
+        if player_id in rows:
+            raise ValueError('invalid_packet')
+        rows[player_id] = row
+    if rows.keys() != set(expected_ids):
+        raise ValueError('invalid_packet')
+    return rows
+
+
 def extract_representation_observations(
     capture: core.SourceCapture, scope: core.ScopeContext, *, expected_ids: Sequence[str],
     extracted_at: str, universe_version: str,
@@ -254,24 +280,34 @@ def extract_representation_observations(
         # The packet must answer the whole request its URL made: a narrowed
         # expectation would certify a capture that never asked for the rest.
         return (_outcome(entity, 'error', 'representation:requested_ids_differ', **context),)
-    try:
-        try:
-            payload = json.loads(capture.text)
-        except (ValueError, RecursionError) as exc:
-            raise representation.RepresentationParseError('invalid_json') from exc
-        assertions = representation.parse_representation_packet(payload, expected_ids=expected_ids)
-    except ValueError as exc:
+
+    def packet_error(reason):
         return (core.captureless_outcome(
-            entity, scope, status='error', reason='representation:' + getattr(exc, 'reason', 'invalid_packet'),
+            entity, scope, status='error', reason='representation:' + reason,
             extracted_at=extracted_at, run_id=context['run_id'], universe_version=universe_version,
             subject=core.canonical_json({'player_ids': list(expected_ids)}).decode(),
         ),)
 
+    try:
+        payload = json.loads(capture.text)
+    except (ValueError, RecursionError):
+        return packet_error('invalid_json')
+    try:
+        rows = _representation_packet_rows(payload, expected_ids)
+    except ValueError:
+        return packet_error('invalid_packet')
+
     outcomes = []
-    for player_id in sorted(assertions, key=int):
-        assertion = assertions[player_id]
+    for player_id in sorted(rows, key=int):
         core._check_scope_against_capture(entity, {'player_id': player_id}, capture)
         player_context = context | {'scope': replace(scope, player_id=player_id)}
+        try:
+            assertion = representation.parse_representation_packet(
+                {**payload, 'data': [rows[player_id]]}, expected_ids=(player_id,))[player_id]
+        except ValueError as exc:
+            reason = 'representation:' + getattr(exc, 'reason', 'invalid_packet')
+            outcomes.append(_outcome(entity, 'error', reason, **player_context))
+            continue
         status = assertion.observation_status
         row_reason = 'representation:' + assertion.status_reason
         if status == 'error':

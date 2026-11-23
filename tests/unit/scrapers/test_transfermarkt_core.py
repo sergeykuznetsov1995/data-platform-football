@@ -65,11 +65,12 @@ def test_plan_scope_is_cross_checked_against_the_capture_url():
     capture = _load('squad')
     club_id = capture.url.split('/verein/')[1].split('/')[0]
     outcomes = core.extract_squad_observations(
-        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        capture, _scope(club_id=club_id, season='2627', edition_id='2026'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     with pytest.raises(CoreParseError, match='row_scope_mismatch'):
         core.plan_for_outcome(
             outcomes[0], captured_at=capture.captured_at,
-            scope_values={'league': 'GB1', 'season': '2526', 'club_id': '999'})
+            scope_values={'league': 'GB1', 'season': '2627', 'club_id': '999'})
 
 
 def test_source_capture_verifies_body_hash_and_lineage():
@@ -265,7 +266,8 @@ def _squad_outcomes():
     capture = _load('squad')
     club_id = capture.url.split('/verein/')[1].split('/')[0]
     return core.extract_squad_observations(
-        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        capture, _scope(club_id=club_id, season='2627', edition_id='2026'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
 
 
 def test_captureless_outcomes_cover_transport_failures():
@@ -297,17 +299,17 @@ def test_plan_for_outcome_builds_the_native_write_contract():
     club_id = outcomes[0].rows[0]['club_id']
     plan = core.plan_for_outcome(
         outcomes[0], captured_at=outcomes[0].capture.captured_at,
-        scope_values={'league': 'GB1', 'season': '2526', 'club_id': club_id})
+        scope_values={'league': 'GB1', 'season': '2627', 'club_id': club_id})
     assert plan.table == 'transfermarkt_squad_memberships'
     assert plan.write_mode == 'replace'
-    assert plan.scope_values == ('GB1', '2526', club_id)
+    assert plan.scope_values == ('GB1', '2627', club_id)
     assert plan.natural_keys == ('league', 'season', 'club_id', 'player_id')
     assert plan.ddl.startswith('CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_squad_memberships')
     from scrapers.transfermarkt.native_writer import NativeWritePlan
     assert isinstance(plan, NativeWritePlan)
     merged = core.plan_for_outcome(
         outcomes[1], captured_at=outcomes[1].capture.captured_at,
-        scope_values={'league': 'GB1', 'season': '2526', 'club_id': club_id})
+        scope_values={'league': 'GB1', 'season': '2627', 'club_id': club_id})
     assert merged.write_mode == 'merge'
 
 
@@ -318,10 +320,10 @@ def test_plan_for_outcome_refuses_non_conclusive_and_scope_drift():
         extracted_at=EXTRACTED_AT, run_id='r', universe_version=UNIVERSE)
     with pytest.raises(ValueError, match='non-conclusive'):
         core.plan_for_outcome(unavailable, captured_at=EXTRACTED_AT, scope_values={})
-    with pytest.raises(Exception):
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
         core.plan_for_outcome(
             outcomes[0], captured_at=outcomes[0].capture.captured_at,
-            scope_values={'league': 'GB1', 'season': '2526', 'club_id': '999'})
+            scope_values={'league': 'GB1', 'season': '2627', 'club_id': '999'})
 
 
 def test_core_ddl_types_follow_the_column_contract():
@@ -435,7 +437,7 @@ def test_finding_22a_stage_b_routes_bind_the_endpoint_and_scope():
     # Round 6 finding 22: a recorded body only plans on its own endpoint, route and id.
     squad = _load('squad')
     club_id = squad.url.split('/verein/')[1].split('/')[0]
-    scope = _scope(club_id=club_id)
+    scope = _scope(club_id=club_id, season='2627', edition_id='2026')
     outcomes = core.extract_squad_observations(
         squad, scope, extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     values = {'club_id': club_id, 'league': scope.league, 'season': scope.season}
@@ -481,3 +483,49 @@ def test_finding_24a_numeric_club_name_is_a_market_value_capture_error():
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, outcome.status_reason, outcome.rows) == ('error', 'row_value_not_text', ())
     assert outcome.capture == broken
+
+
+def test_finding_3_empty_squad_from_another_season_cannot_replace_memberships(tmp_path, monkeypatch):
+    # Round 7 finding 3: even a proven empty squad must name the season it replaces.
+    from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+    from scrapers.transfermarkt.orchestrator import ClubTarget, CoreRun, CoreScopePlan
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB, CoreWriter
+
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+    current = _load('squad')
+    club_id = current.url.split('/verein/')[1].split('/')[0]
+    empty = replace(_load('squad', 3), url=current.url.replace('/saison_id/2026/', '/saison_id/2025/'))
+    captures = {page.url: page for page in (current, empty)}
+
+    def fetch(url, **kwargs):
+        capture = captures[url]
+        return FetchOutcome(status=FetchStatus.OK, value=capture.text, raw_capture_id=capture.capture_id,
+                            raw_body_hash=capture.body_hash, raw_fetched_at=capture.captured_at)
+
+    db = CoreDB()
+    writer = CoreWriter(db)
+    target = ClubTarget(club_id, 'club', squad_url=current.url)
+    plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                         edition_id='2026', clubs=(target,))
+    run = CoreRun(fetch, extracted_at=EXTRACTED_AT)
+    report = run.run(plan, writer=writer, connection_factory=lambda: db)
+    receipt, = report.receipts
+    assert receipt['verified'] is True
+    count = 'SELECT COUNT(*) FROM transfermarkt_squad_memberships WHERE season = ? AND club_id = ?'
+    assert db.sql.execute(count, ('2627', club_id)).fetchone() == (38,)
+    receipts = 'SELECT receipt_id FROM transfermarkt_core_receipts_v1 ORDER BY receipt_id'
+    before = db.sql.execute(receipts).fetchall()
+    writes = list(writer.writes)
+
+    wrong = replace(plan, clubs=(replace(target, squad_url=empty.url),))
+    with pytest.raises(CoreParseError, match='^row_scope_mismatch$'):
+        run.run(wrong, writer=writer, connection_factory=lambda: db)
+    assert writer.writes == writes
+    assert db.sql.execute(receipts).fetchall() == before
+    assert db.sql.execute(count, ('2627', club_id)).fetchone() == (38,)
+    unreadable = {'league': 'GB1', 'season': 'bad', 'club_id': club_id}
+    for entity in ('squad_memberships', 'player_attribute_observations', 'player_contract_observations'):
+        with pytest.raises(CoreParseError, match='^row_scope_mismatch$'):
+            core._check_scope_against_capture(entity, unreadable, empty)

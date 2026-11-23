@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
-from datetime import date
 import gzip
 import json
 from pathlib import Path
@@ -60,10 +59,13 @@ def _load_records(root):
 def _fixture_fetch(records):
     from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 
+    reached = set()
+
     def fetch(url, *, as_json, label, context=None, validator=None):
         entry = records.get(url)
         if entry is None:
             return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error="fixture_missing")
+        reached.add(url)
         record, blob = entry
         if record["status_code"] != 200:
             return FetchOutcome(
@@ -91,6 +93,7 @@ def _fixture_fetch(records):
             status_code=record["status_code"],
         )
 
+    fetch.reached = reached
     return fetch
 
 
@@ -107,6 +110,7 @@ def _fixture_raw_loader(records):
 
 class _RawRecord:
     def __init__(self, record):
+        self.endpoint = record["endpoint"]
         self.content_hash = record["content_hash"]
         self.url = record["url"]
         self.fetched_at = record["fetched_at"]
@@ -128,13 +132,9 @@ def _report(report, plan, path):
 
 def _season_year(season):
     """The saison year of a slug, with the century window of season.py."""
-    if len(season) != 4 or not season.isdecimal():
-        raise ValueError(f"Cannot infer a saison year from {season!r}; supply --edition-id")
-    first, second = int(season[:2]), int(season[2:])
-    if second == (first + 1) % 100:
-        candidate = 2000 + first
-        return candidate if candidate <= date.today().year + 1 else 1900 + first
-    return int(season) - 1
+    from scrapers.transfermarkt import core
+
+    return core.saison_year(season)
 
 
 def _squad_season_matches(url, season):
@@ -179,7 +179,39 @@ def _live_plan(args):
     )
 
 
+# Endpoints of the stage-B core lanes. Their records of another season are on
+# file by design (the sample mixes seasons): a run owns exactly one of them.
+_CORE_ENDPOINTS = frozenset({"squad", "coach_history", "market_value_points", "transfer_events", "coach_profile"})
+
+
+def _offline_attendance_targets(urls):
+    from scrapers.transfermarkt import attendance, core, sections
+    from scrapers.transfermarkt.orchestrator import AttendanceEditionTarget
+
+    starts = {}
+    for url in urls:
+        parts = urlsplit(url)
+        match = attendance._ATTENDANCE_PATH_RE.fullmatch(parts.path)
+        if match is None or not sections._attendance_source_valid(url):
+            raise ValueError(f"Fixture endpoint 'attendance' does not match its URL {url!r}")
+        competition, edition = match.groups()
+        attendance._validate_attendance_url(
+            url, host=core.TRANSFERMARKT_HOST, path=parts.path,
+            competition=competition, edition=edition)
+        key = (competition, edition)
+        starts.setdefault(key, None)
+        if sections._attendance_page_number(url) == 1:
+            if starts[key] is not None:
+                raise ValueError("attendance_duplicate_first_page")
+            starts[key] = AttendanceEditionTarget(
+                competition, int(edition), parts.path.split("/")[1], start_url=url)
+    if None in starts.values():
+        raise ValueError("attendance_first_page_missing")
+    return tuple(starts.values())
+
+
 def _offline_plan(args, records):
+    from scrapers.transfermarkt import core
     from scrapers.transfermarkt.orchestrator import ClubTarget, CoreScopePlan
 
     if not records:
@@ -190,28 +222,34 @@ def _offline_plan(args, records):
     mv_players = []
     transfer_players = []
     coaches = {}
+    attendance_urls = []
     squad_year = None
-    core_endpoints = {"squad", "coach_history", "market_value_points", "transfer_events", "coach_profile"}
     for url, (record, _blob) in records.items():
-        if record["endpoint"] not in core_endpoints:
+        endpoint = record["endpoint"]
+        if endpoint == "attendance":
+            attendance_urls.append(url)
+            continue
+        if endpoint not in _CORE_ENDPOINTS:
+            if endpoint in core._ENDPOINTS:
+                raise ValueError(f"The offline replay plan cannot represent {endpoint!r} fixtures yet")
             continue
         parts = urlsplit(url).path.strip("/").split("/")
-        match parts:
-            case [slug, "kader", "verein", club_id, "saison_id", year, "plus", "1"]:
+        match endpoint, parts:
+            case "squad", [slug, "kader", "verein", club_id, "saison_id", year, "plus", "1"]:
                 # The sample mixes seasons; a run owns exactly one of them.
                 if _squad_season_matches(url, season):
                     squad_year = int(year)
                     clubs.setdefault(club_id, {"club_slug": slug})["squad_url"] = url
-            case [slug, "mitarbeiterhistorie", "verein", club_id, "plus", "1"]:
+            case "coach_history", [slug, "mitarbeiterhistorie", "verein", club_id, "plus", "1"]:
                 clubs.setdefault(club_id, {"club_slug": slug})["coach_history_url"] = url
-            case ["ceapi", "marketValueDevelopment", "graph", player_id]:
+            case "market_value_points", ["ceapi", "marketValueDevelopment", "graph", player_id]:
                 mv_players.append(player_id)
-            case ["ceapi", "transferHistory", "list", player_id]:
+            case "transfer_events", ["ceapi", "transferHistory", "list", player_id]:
                 transfer_players.append(player_id)
-            case [slug, "profil", "trainer", coach_id]:
+            case "coach_profile", [slug, "profil", "trainer", coach_id]:
                 coaches[coach_id] = slug
             case _:
-                raise ValueError(f"Unrecognised {record['endpoint']} fixture URL {url!r}")
+                raise ValueError(f"Fixture endpoint {endpoint!r} does not match its URL {url!r}")
 
     edition = args.edition_id or first.get("edition_id") or squad_year
     year = squad_year or (int(edition) if edition else _season_year(season))
@@ -223,6 +261,7 @@ def _offline_plan(args, records):
         market_value_player_ids=tuple(sorted(set(mv_players))),
         transfer_player_ids=tuple(sorted(set(transfer_players))),
         coach_profile_ids=tuple(sorted(coaches.items())),
+        attendance_editions=_offline_attendance_targets(attendance_urls),
     )
 
 
@@ -265,6 +304,7 @@ def main(argv=None):
     try:
         if args.mode == "offline":
             records = _load_records(args.fixtures_root)
+            fixture_urls = set(records)
             plan = _offline_plan(args, records)
             missing = [url for url in planned_urls(plan) if url not in records]
             if missing:
@@ -282,6 +322,19 @@ def main(argv=None):
         write_args = _write_options(args) if args.write else {}
         report = CoreRun(fetch, raw_loader=raw_loader).run(plan, **write_args)
         _report(report, plan, args.report_out)
+        if args.mode == "offline":
+            # A record of a section the core replay plans for that the run
+            # never reached is a plan that skipped it in silence: nothing may
+            # report success over it. Records of other seasons and of donors
+            # the replay does not plan for are on file by design.
+            from scrapers.transfermarkt import core
+
+            sections = core._ENDPOINTS - _CORE_ENDPOINTS
+            unreached = {url for url in fixture_urls
+                         if records[url][0]["endpoint"] in sections} - fetch.reached
+            if unreached:
+                print("Unreached fixture records:", *sorted(unreached), sep="\n", file=sys.stderr)
+                return 2
     except (ValueError, KeyError, OSError, CoreRunError) as exc:
         parser.exit(2, f"{parser.prog}: {exc}\n")
     verified = bool(report.receipts) and all(r.get("verified") is True for r in report.receipts)

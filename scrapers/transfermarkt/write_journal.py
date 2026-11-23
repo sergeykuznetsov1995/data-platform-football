@@ -17,6 +17,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from uuid import uuid4
 
 
 def _root() -> Path:
@@ -202,18 +203,31 @@ def _load_index() -> list[dict]:
     return list(entries.values())
 
 
-def pending_intents(identity: Mapping) -> list[tuple[Path, dict]]:
+def pending_intents(identity: Mapping, *, untracked_only=False) -> list[tuple[Path, dict]]:
     """Read indexed and orphaned pending units that match the requested identity."""
     pending = []
     for entry in _load_index():
         if entry['status'] != 'pending' or not identity.items() <= entry['identity'].items():
             continue
+        if untracked_only:
+            if entry['identity'].get('statement_protocol') == 1:
+                continue
+            marker = _record_path('adopted-intents', entry['digest'])
+            if marker.exists():
+                if _read_record(marker) != {'intent': entry['digest']}:
+                    raise RuntimeError('core adopted intent differs')
+                continue
         path = _root() / (entry['digest'] + '.json')
         body = _intent_body(path, 'core write intent checksum differs')
         if body['identity'] != entry['identity']:
             raise RuntimeError('core write intent identity differs')
         pending.append((path, body))
     return sorted(pending, key=lambda pair: pair[0].name)
+
+
+def adopt_intent(path):
+    """Record a handover proven before first dispatch or after complete readback."""
+    _immutable_record(_record_path('adopted-intents', path.stem), {'intent': path.stem})
 
 
 def finish_intent(path: Path) -> None:
@@ -227,6 +241,49 @@ def _record_path(directory: str, digest: str) -> Path:
     if not digest or Path(digest).name != digest:
         raise ValueError('invalid core journal digest')
     return _root() / directory / (digest + '.json')
+
+
+def _statement_path(key):
+    return _record_path('pending-statements', hashlib.sha256(_canonical(key)).hexdigest())
+
+
+def pending_statement(key):
+    path = _statement_path(key)
+    if not path.exists():
+        return None
+    statement = _read_record(path)
+    if statement['key'] != list(key):
+        raise RuntimeError('core pending statement key differs')
+    return statement
+
+
+def begin_statement(key, expected, *, observable=True):
+    """Fence one dispatch under the shared writer lock, before it can reach Trino."""
+    statement = {'key': list(key), 'expected': expected, 'observable': observable,
+                 'attempt': uuid4().hex}
+    _immutable_record(_statement_path(key), statement)
+    return statement
+
+
+def remember_query(statement, query_id):
+    if isinstance(query_id, str) and query_id:
+        _immutable_record(_record_path('statement-queries', statement['attempt']),
+                          {'query_id': query_id})
+
+
+def statement_query(statement):
+    path = _record_path('statement-queries', statement['attempt'])
+    return _read_record(path)['query_id'] if path.exists() else None
+
+
+def finish_statement(statement):
+    """Release the fence only after the attempt is settled, including across a crash."""
+    path = _statement_path(statement['key'])
+    if _read_record(path) != statement:
+        raise RuntimeError('core pending statement changed')
+    path.unlink()
+    _fsync_directory(path.parent)
+    _record_path('statement-queries', statement['attempt']).unlink(missing_ok=True)
 
 
 def read_snapshot_anchors(digest: str) -> dict[str, int | None]:
@@ -307,6 +364,33 @@ def record_receipt(digest: str, receipt: Mapping) -> None:
     if receipt.get('verified') is not True:
         raise RuntimeError('core journal receipt is unverified')
     _immutable_record(_record_path('receipts', digest), dict(receipt))
+
+
+def acknowledgements():
+    """Read the verified, immutable acknowledgements, including pre-upgrade records."""
+    for path in sorted((_root() / 'receipts').glob('*.json')):
+        receipt = _read_record(path)
+        if receipt.get('verified') is not True:
+            raise RuntimeError('core journal receipt is unverified')
+        yield receipt
+
+
+def acknowledged_walk(receipt_id: str) -> tuple[Mapping, object] | None:
+    """The walk an acknowledgement logged in the warehouse under one receipt.
+
+    Read back for a warehouse that lost it, from the receipts of this journal
+    and nowhere else. Every receipt is read: this is the exceptional path of
+    lost evidence, never taken by a write that lost nothing.
+    """
+    result = None
+    for receipt in acknowledgements():
+        for walk in receipt.get('walks') or ():
+            if isinstance(walk, Mapping) and walk.get('receipt_id') == receipt_id:
+                candidate = (walk, receipt.get('committed_at'))
+                if result is not None and result != candidate:
+                    raise RuntimeError('core journal walk differs')
+                result = candidate
+    return result
 
 
 def read_receipt(digest: str) -> dict | None:

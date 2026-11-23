@@ -34,7 +34,7 @@ _SEASON_RE = re.compile(r'^\d{4}$')
 _ID_RE = re.compile(r'^[1-9][0-9]*$')
 _CAPTURE_RE = re.compile(r'^[0-9a-f]{64}$')
 _SQUAD_ROUTE = (
-    'squad', 'club_id', r'/[A-Za-z0-9_-]+/kader/verein/([1-9][0-9]*)/saison_id/[0-9]{4}(?:/plus/1)?/?',
+    'squad', 'club_id', r'/[A-Za-z0-9_-]+/kader/verein/([1-9][0-9]*)/saison_id/([0-9]{4})(?:/plus/1)?/?',
 )
 _STAGE_B_ROUTES = {
     'squad_memberships': _SQUAD_ROUTE,
@@ -946,6 +946,18 @@ def _source_origin(entity: str, scope_values: Mapping[str, str]) -> str:
     return TRANSFERMARKT_HOST
 
 
+def saison_year(season: str) -> int:
+    """Map a season slug or ending year to its Transfermarkt starting year."""
+    if not isinstance(season, str) or not season.isdecimal():
+        raise ValueError(f"Cannot infer a saison year from {season!r}; supply --edition-id")
+    if len(season) == 4:
+        first, second = int(season[:2]), int(season[2:])
+        if second == (first + 1) % 100:
+            candidate = 2000 + first
+            return candidate if candidate <= date.today().year + 1 else 1900 + first
+    return int(season) - 1
+
+
 def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
     """Empty outcomes have no rows to cross-check; the capture URL still names
     the entity it belongs to, so a swapped club/player scope fails here."""
@@ -1019,6 +1031,13 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         match = re.fullmatch(pattern, path)
         if capture.endpoint != endpoint or match is None or match[1] != scope_values[column]:
             raise CoreParseError('row_scope_mismatch')
+        if endpoint == 'squad':
+            try:
+                year = saison_year(scope_values['season'])
+            except (KeyError, ValueError) as exc:
+                raise CoreParseError('row_scope_mismatch') from exc
+            if int(match[2]) != year:
+                raise CoreParseError('row_scope_mismatch')
 
 
 def _check_pages_against_scope(entity: str, scope_values: Mapping[str, str], pages) -> None:

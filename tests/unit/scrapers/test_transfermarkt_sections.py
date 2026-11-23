@@ -3501,7 +3501,7 @@ def test_every_source_is_checked_by_its_complete_origin_and_route():
     # A stage-B lane keeps the same rule for its own origin.
     from tests.unit.scrapers.test_transfermarkt_core import _load
     squad = _load('squad')
-    scope_values = {'league': 'GB1', 'season': '2526', 'club_id': squad.url.split('/verein/')[1].split('/')[0]}
+    scope_values = {'league': 'GB1', 'season': '2627', 'club_id': squad.url.split('/verein/')[1].split('/')[0]}
     core._check_scope_against_capture('squad_memberships', scope_values, squad)
     for url in (squad.url.replace('.com/', '.com:444/'), squad.url + '?page=2', squad.url + '#x'):
         with pytest.raises(CoreParseError, match='row_scope_mismatch'):
@@ -3822,15 +3822,17 @@ def test_finding_23_saved_attendance_page_with_a_fragment_cannot_write():
                               scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
 
 
-def test_finding_24b_unconvertible_agency_id_is_a_packet_error():
-    # Round 6 finding 24: the donor's integer conversion error belongs to its packet.
+def test_finding_24b_unconvertible_agency_id_is_a_player_error():
+    # Round 6 finding 24: the donor's integer conversion error stays inside extraction.
     payload = json.loads(_representation_capture().body)
     payload['data'][0]['attributes']['consultantAgencyId'] = '9' * 4301
-    outcome, = sections.extract_representation_observations(
-        _representation_capture(payload), _representation_scope(), expected_ids=('7', '9'),
+    capture = _representation_capture(payload)
+    failed, sibling = sections.extract_representation_observations(
+        capture, _representation_scope(), expected_ids=('7', '9'),
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
-    assert (outcome.status, outcome.status_reason, outcome.rows, outcome.capture) == (
-        'error', 'representation:invalid_packet', (), None)
+    assert (failed.status, failed.status_reason, failed.rows, failed.capture, failed.scope.player_id) == (
+        'error', 'representation:invalid_packet', (), capture, '7')
+    assert (sibling.status, sibling.scope.player_id) == ('unknown', '9')
 
 
 def test_finding_25_donor_verdicts_are_rechecked_at_construction_dq_and_planning():
@@ -3923,11 +3925,10 @@ def test_finding_27_invalid_attendance_link_cites_its_own_page():
 # ---------------------------------------------------------------- round 6: the acknowledged walk
 
 
-def test_a_lost_manifest_refuses_another_walk_until_it_is_repaired():
-    # Round 6 finding 4: the manifest was the only place that held the 12:30
-    # clock of a page without rows. Once it was lost, a walk with the same
-    # first page and a cached 12:05 second page verified and restored rows
-    # the 12:30 walk had left out.
+def test_a_lost_manifest_is_restored_before_a_stale_walk_is_refused():
+    # Round 7 finding 6: the journal restores the lost 12:30 evidence before
+    # the cached 12:05 page is classified; repairing evidence never admits
+    # the stale rows that the 12:30 walk had left out.
     page_1, cached_2 = _two_pages()
     empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 12:30')
     plans = [_attendance_plan((page_1, empty_2))]
@@ -3937,12 +3938,14 @@ def test_a_lost_manifest_refuses_another_walk_until_it_is_repaired():
     db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
 
     stale = [_attendance_plan((page_1, cached_2), LATER_EXTRACTED_AT)]
-    with pytest.raises(RuntimeError, match='manifest lost'):
+    with pytest.raises(StaleTransfermarktWrite):
         _bundle(db, stale, LATER_EXTRACTED_AT)
     assert set(_stadiums(db)) == {'11'}
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1
-    # The acknowledgement that lost its pages repairs them on its own retry:
-    # the walk it names is logged again from its plan.
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone()[0] == 0
+    # The rejected stale write changed nothing, including the ops tables.
+    # The acknowledgement's own retry reads the same restored evidence and
+    # neither logs another walk nor changes the business rows.
     writer = CoreWriter(db)
     repaired = native_writer.write_core_bundle(
         lambda: db, writer, plans, run_id=plans[0].rows[0]['run_id'], universe_version=UNIVERSE,
@@ -4010,26 +4013,31 @@ def test_each_acknowledgement_logs_its_walk_once():
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (2,)
 
 
-def test_a_walk_with_a_page_missing_is_not_evidence():
-    # The clock of a page without rows lives only in the walk that
-    # acknowledged it. A walk that lost one of its pages, the rowless tail
-    # included, says nothing trustworthy: the scope refuses until it is whole.
+def test_a_walk_with_a_page_missing_is_restored_before_freshness_is_checked():
+    # A partial walk is not evidence. The immutable acknowledgement restores
+    # its missing page, and only the restored whole walk participates in the
+    # freshness decision.
     page_1, cached_2 = _two_pages()
     empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 12:30')
     db = CoreDB()
     _bundle(db, [_attendance_plan((page_1, empty_2))], EXTRACTED_AT)
     db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE page_number = 2')
     stale = [_attendance_plan((page_1, cached_2), LATER_EXTRACTED_AT)]
-    with pytest.raises(RuntimeError, match='manifest differs'):
+    with pytest.raises(StaleTransfermarktWrite):
         _bundle(db, stale, LATER_EXTRACTED_AT)
     assert set(_stadiums(db)) == {'11'}
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone() == (1,)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (1,)
+    # The rejected write did not persist the repair. Its owner performs it
+    # without another data replacement or a second receipt.
+    assert _bundle(db, [_attendance_plan((page_1, empty_2))], EXTRACTED_AT)['verified'] is True
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (2,)
 
 
 def test_an_acknowledgement_cannot_repair_the_evidence_another_one_lost():
-    # Only the acknowledgement that lost its pages may write while evidence
-    # is missing: it restores its own. Another one's retry waits, because
-    # nothing proves it would not regress the walk whose evidence is gone.
+    # Only the acknowledgement that lost its pages may repair them on retry.
+    # Another acknowledged unit still waits; a genuinely fresh write has a
+    # separate restoration path and never repairs through this retry.
     page_1, page_2 = _two_pages()
     db = CoreDB()
     older = [_attendance_plan((page_1, page_2))]
@@ -4042,9 +4050,86 @@ def test_an_acknowledgement_cannot_repair_the_evidence_another_one_lost():
     db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id = ?', lost)
     with pytest.raises(RuntimeError, match='manifest lost'):
         _bundle(db, older, EXTRACTED_AT)
-    # The walk that lost its evidence repairs it on its own retry; from then
-    # on the older snapshot is stale, as it was before the loss.
+    # The newer acknowledgement's retry restores its own walk.
     assert _bundle(db, newer, LATER_EXTRACTED_AT)['verified'] is True
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (4,)
     with pytest.raises(StaleTransfermarktWrite):
         _bundle(db, older, EXTRACTED_AT)
+
+
+# --------------------------------- review round-7 pins
+
+
+def test_finding_12_capture_conflict_with_an_error_profile_prevents_all_writes():
+    # Round 7 finding 12: a failed profile still binds its capture ID before any bundle writes.
+    profile = _referee_profile_capture()
+    other_url = REFEREE_PROFILE_URL.replace('/101', '/102')
+    replay = _SectionFetch({profile.url: profile.body, other_url: b'<html></html>'})
+
+    def fetch(url, **kwargs):
+        return _replace(replay.fetch(url, **kwargs), raw_capture_id=profile.capture_id)
+
+    plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                         referee_profile_ids=('101', '102'))
+    db = CoreDB()
+    writer = CoreWriter(db)
+    with pytest.raises(CoreRunError, match='^capture_evidence_conflict$'):
+        CoreRun(fetch, extracted_at=EXTRACTED_AT).run(plan, writer=writer, connection_factory=lambda: db)
+    assert replay.calls == [profile.url, other_url]
+    assert writer.writes == []
+    assert db.sql.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'transfermarkt_%'"
+    ).fetchall() == []
+
+
+def test_finding_14_invalid_agency_id_only_withholds_its_players_receipt():
+    # Round 7 finding 14: a bad agency value preserves its capture and a valid sibling's receipt.
+    payload = json.loads(_representation_capture().body)
+    payload['data'][0]['attributes']['consultantAgencyId'] = '9' * 4301
+    payload['data'][1]['attributes']['consultantAgencyId'] = '56'
+    replay = _JsonFetch(REPRESENTATION_URL, payload)
+    plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                         representation_player_ids=('7', '9'))
+    db = CoreDB()
+    report = CoreRun(replay.fetch, raw_loader=replay.raw_loader, extracted_at=EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    failed, assigned = report.outcomes
+    assert (failed['status'], failed['status_reason'], failed['rows'], failed['source_capture_id']) == (
+        'error', 'representation:invalid_packet', 0, _representation_capture(payload).capture_id)
+    assert (assigned['status'], assigned['rows']) == ('observed_present', 1)
+    assert db.sql.execute(
+        'SELECT player_id, representative_id FROM transfermarkt_player_representation_observations'
+    ).fetchall() == [('9', '56')]
+    receipt, = report.receipts
+    assert receipt['verified'] is True
+    (scope_json,), = db.sql.execute('SELECT scope_values_json FROM transfermarkt_core_receipts_v1')
+    assert json.loads(scope_json) == [['player_id', '9']]
+
+
+def test_finding_15_skipped_attendance_page_is_contained_and_referee_verifies():
+    # Round 7 finding 15: navigation cites the bad link, and replay rejects the out-of-order page.
+    pages = _attendance_pages()
+    first = _capture(ATTENDANCE_START, pages[ATTENDANCE_START].replace(b'?page=2', b'?page=3'), PAGE_1_CAPTURED)
+    third = _capture(ATTENDANCE_START + '?page=3', pages[ATTENDANCE_PAGE_2], PAGE_2_CAPTURED)
+    outcome = _attendance_outcome((first, third))
+    assert (outcome.status, outcome.status_reason, outcome.rows, outcome.capture) == (
+        'error', 'attendance:pagination_not_sequential', (), third)
+
+    profile = _referee_profile_capture()
+    replay = _SectionFetch({page.url: page.body for page in (first, third, profile)})
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+        referee_profile_ids=('101',))
+    db = CoreDB()
+    report = CoreRun(replay.fetch, extracted_at=EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert replay.calls == [first.url, profile.url]
+    failed, written = report.outcomes
+    assert (failed['entity'], failed['status'], failed['status_reason'], failed['rows'],
+            failed['source_capture_id']) == (
+        'attendance_observations', 'error', 'attendance:pagination_not_sequential', 0, first.capture_id)
+    assert (written['entity'], written['status']) == ('referee_profiles', 'observed_present')
+    receipt, = report.receipts
+    assert receipt['verified'] is True
+    assert db.sql.execute('SELECT referee_id FROM transfermarkt_referee_profiles').fetchall() == [('101',)]
