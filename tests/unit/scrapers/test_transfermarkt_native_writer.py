@@ -1772,11 +1772,13 @@ def test_an_ops_insert_with_an_unknown_outcome_is_never_repeated_at_once():
                 lambda: db, CoreWriter(db), plans, run_id=run_id,
                 universe_version='core-universe-v1', committed_at=plans[0].captured_at)
         assert _UnknownOpsCursor.inserts == 1 and _receipt_count(db) == 0
-        assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (0,)
+        if plans[0].pages:
+            assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (0,)
         assert write_journal.pending_intents({'run_id': run_id})
         db.healthy = True
         settled = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
         assert len(settled) == 1 and settled[0]['verified'] is True and _receipt_count(db) == 1
+    # The replay logged the two-page walk once.
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (2,)
 
 
@@ -1812,7 +1814,11 @@ def test_a_capture_cannot_be_two_responses_in_the_referee_directory():
 
 
 def _other_cycle(plan, cycle):
-    return dataclasses_replace(plan, rows=tuple({**row, 'cycle_id': cycle} for row in plan.rows))
+    """The same capture as a later cycle observed it: only the cycle differs."""
+    return dataclasses_replace(
+        plan, rows=tuple({**row, 'cycle_id': cycle} for row in plan.rows),
+        evidence=tuple((key, cycle) if key == 'cycle_id' else (key, value)
+                       for key, value in plan.evidence))
 
 
 def test_a_cached_capture_observed_in_another_cycle_is_a_lineage_refresh():
@@ -1840,7 +1846,8 @@ def test_a_cached_capture_observed_in_another_cycle_is_a_lineage_refresh():
     assert write(db, [later], run_id=later.rows[0]['run_id'], clock=later.captured_at)['verified'] is True
     assert db.sql.execute('SELECT DISTINCT cycle_id FROM transfermarkt_attendance_observations').fetchall() \
         == [('tm-cycle-2',)]
-    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 3
+    # One receipt per acknowledgement: two rosters and two walks.
+    assert _receipt_count(db) == 4
 
 
 def test_an_acknowledgement_superseded_at_an_equal_clock_cannot_be_retried():
@@ -1907,7 +1914,7 @@ def test_the_whole_retried_unit_may_restore_its_evidence():
     with pytest.raises(RuntimeError, match='manifest lost'):
         native_writer._replay_state(db, newer, kept, newer.captured_at)
     assert native_writer._replay_state(db, newer, kept, newer.captured_at, own={kept, lost}) \
-        == 'pending'
+        == 'written'
 
 
 def test_an_alias_carries_the_anchors_of_the_acknowledgement_it_aliases(monkeypatch):

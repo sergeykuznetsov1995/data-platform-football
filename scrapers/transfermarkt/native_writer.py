@@ -780,7 +780,7 @@ def _capture_pinned(plan: NativeWritePlan) -> bool:
     return plan.write_mode == 'merge' and bool(_CAPTURE_KEY_COLUMNS.intersection(plan.natural_keys))
 
 
-def guard_native_bundle(connection, plan: NativeWritePlan, *, own=()) -> None:
+def guard_native_bundle(connection, plan: NativeWritePlan, *, own=(), acknowledged_at=None) -> None:
     """An older bundle must not overwrite a fresher committed capture.
 
     The data table proves freshness while rows exist; a proven-empty
@@ -793,6 +793,9 @@ def guard_native_bundle(connection, plan: NativeWritePlan, *, own=()) -> None:
 
     ``own`` names the receipts of the acknowledgement being retried: it is
     the one write allowed to restore evidence it lost itself.
+    ``acknowledged_at`` is the commit clock of the unit being written: two
+    different captures of one page at one clock are ordered by it, and the
+    later acknowledgement is the one in force.
     """
     if plan.write_mode == 'merge' and _capture_pinned(plan):
         _guard_key_owners(connection, plan)
@@ -821,7 +824,8 @@ def guard_native_bundle(connection, plan: NativeWritePlan, *, own=()) -> None:
         raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
     if plan.write_mode == 'replace' and (plan.rows or plan.pages):
         _guard_source_pages(connection, plan, [
-            (url, evidence[1]) for url, (_order, evidence) in accepted.pages.items()])
+            (url, evidence[1], order[1], evidence[0], evidence[2])
+            for url, (order, evidence) in accepted.pages.items()], acknowledged_at)
 
 
 def _scope_json(plan: NativeWritePlan) -> str:
@@ -885,9 +889,10 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=()) -> _AcceptedPa
     Every acknowledgement of a multi-page scope logged the walk it stands for.
     A receipt without its rows lost that evidence, and with it the clocks of
     the pages that left no row: the scope then refuses every walk but the
-    retry of the acknowledgement that lost them (``own``). Only a multi-page
-    replacement snapshot keeps a log: the pages of every other lane are
-    exactly the captures of its committed rows.
+    retry of the acknowledgement that lost them (``own``, the receipts of the
+    whole retried unit). Only a multi-page replacement snapshot keeps a log:
+    the pages of every other lane are exactly the captures of its committed
+    rows.
     """
     if not plan._multi_page():
         return _NO_PAGES
@@ -912,13 +917,17 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=()) -> _AcceptedPa
     except (TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError('core page manifest differs: ' + plan.table) from exc
     pages, captures = {}, {}
-    for walk in walks.values():
+    for receipt_id, walk in walks.items():
         # A walk is whole or it is not a walk: as many pages as each of its
-        # rows says, numbered 1..n, each once.
+        # rows says, numbered 1..n, each once. What is left of the walk of an
+        # acknowledgement being retried says nothing until that retry made it
+        # whole again.
         numbers = sorted(cells[3] for cells in walk)
         if numbers != list(range(1, len(walk) + 1)) or len(walk) != walk[0][4] \
                 or len({cells[5] for cells in walk}) != len(walk):
-            raise RuntimeError('core page manifest differs: ' + plan.table)
+            if receipt_id not in own:
+                raise RuntimeError('core page manifest differs: ' + plan.table)
+            continue
         for cells in walk:
             url, capture_id, clock, body_hash, count, digest, acknowledged_at = cells[5:]
             evidence = (capture_id, clock, body_hash, count, digest)
@@ -993,8 +1002,9 @@ def _receipt_id(plan_hash: str, run_id: str, digest: str) -> str:
         (plan_hash + run_id + digest).encode('utf-8')).hexdigest()[:32]
 
 
-# A re-observation of the same capture regenerates run identity only.
-_LINEAGE_ONLY_COLUMNS = frozenset({'run_id', '_batch_id', '_ingested_at', 'extracted_at'})
+# A re-observation of the same capture regenerates run identity only: the run
+# that observed it, when it was extracted, and the cycle it belonged to.
+_LINEAGE_ONLY_COLUMNS = frozenset({'run_id', '_batch_id', '_ingested_at', 'extracted_at', 'cycle_id'})
 
 
 def _strip_run_lineage(rows) -> list[dict]:
@@ -1071,22 +1081,29 @@ def _record_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_
 
     One statement carries every page of the walk: it lands whole or not at
     all, and nothing is ever updated. An interrupted acknowledgement leaves
-    the evidence of every page exactly as the earlier ones accepted it.
+    the evidence of every page exactly as the earlier ones accepted it. A
+    walk of this acknowledgement that reached the warehouse in part is
+    completed with the pages it lacks.
     """
     rows = _walk_rows(plan, receipt_id, committed_at)
     expected = tuple(_walk_cells(row) for row in rows)
     stored = _stored_walk(connection, receipt_id)
     if stored is not None:
-        if stored != expected:
+        by_number = dict(zip((cells[3] for cells in expected), expected, strict=True))
+        if any(by_number.get(cells[3]) != cells for cells in stored):
             raise RuntimeError('core page manifest differs: ' + plan.table)
-        return
+        kept = {cells[3] for cells in stored}
+        if len(kept) == len(expected):
+            return
+        # The walk lost pages: they are logged again under the receipt that
+        # acknowledged them, and the pages it still holds are left as they are.
+        rows = tuple(row for row, cells in zip(rows, expected, strict=True) if cells[3] not in kept)
     names = ', '.join(PAGES_COLUMNS)
     marks = '(' + ', '.join('?' for _ in PAGES_COLUMNS) + ')'
     sql = f'INSERT INTO {CORE_PAGES_TABLE} ({names}) VALUES ' + ', '.join([marks] * len(rows))
     _insert_once(
         connection, sql, tuple(value for row in rows for value in row),
-        lambda: _stored_walk(connection, receipt_id), expected,
-        'core page manifest differs: ' + plan.table)
+        lambda: _stored_walk(connection, receipt_id), expected)
 
 
 def _verify_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_at: str) -> None:
@@ -1095,17 +1112,22 @@ def _verify_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_
         raise RuntimeError('core page manifest differs: ' + plan.table)
 
 
-def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
+def _guard_source_pages(connection, plan: NativeWritePlan, manifest=(), acknowledged_at=None) -> None:
     """Each source page the snapshot shares with the scope must not regress.
 
     The data rows prove the pages that still contribute one; the logged
-    walks prove the pages a newer walk left without rows.
+    walks prove the pages a newer walk left without rows. ``manifest`` holds,
+    per page, ``(url, clock, acknowledged at, capture id, body hash)``: a
+    page accepted at the same clock with another capture by a later
+    acknowledgement (``acknowledged_at`` is this unit's own clock) has
+    superseded this one.
     """
-    planned = {url: _timestamp(clock) for url, _capture_id, clock, _body_hash, _next in plan.pages}
+    planned = {url: (_timestamp(clock), capture_id, body_hash)
+               for url, capture_id, clock, body_hash, _next in plan.pages}
     for row in plan.rows:
         clock, url = _timestamp(row['captured_at']), row['source_url']
-        if url not in planned or planned[url] < clock:
-            planned[url] = clock
+        if url not in planned or planned[url][0] < clock:
+            planned[url] = (clock, row['source_capture_id'], row['source_body_hash'])
     cursor = connection.cursor()
     try:
         committed = _query_rows(
@@ -1116,8 +1138,17 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
         )
     finally:
         cursor.close()
-    for url, clock in [*committed, *manifest]:
-        if url in planned and _timestamp(clock) > planned[url]:
+    for url, clock in committed:
+        if url in planned and _timestamp(clock) > planned[url][0]:
+            raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
+    for url, clock, logged_at, capture_id, body_hash in manifest:
+        if url not in planned:
+            continue
+        superseded = (
+            _timestamp(clock) == planned[url][0]
+            and (capture_id, body_hash) != planned[url][1:]
+            and acknowledged_at is not None and _timestamp(logged_at) > acknowledged_at)
+        if _timestamp(clock) > planned[url][0] or superseded:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
@@ -1289,7 +1320,7 @@ def _by_capture(rows) -> dict:
 
 
 def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
-                  committed_at: str = '') -> str:
+                  committed_at: str = '', own=None) -> str:
     """Classify a plan against what the scope already holds.
 
     ``written`` needs nothing, ``refresh`` is the same capture observed under
@@ -1307,7 +1338,7 @@ def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
         # never acquires rows, and it never changes its evidence.
         existing = _read_plan_rows(connection, plan)
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
-        accepted = _accepted_pages(connection, plan, own=(receipt_id,))
+        accepted = _accepted_pages(connection, plan, own=(receipt_id,) if own is None else own)
         for url, capture_id, clock, body_hash, _next in plan.pages:
             rows = planned.setdefault(capture_id, [])
             was_accepted = accepted.captures.get(capture_id)
@@ -1360,10 +1391,12 @@ def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
         _refuse_committed_rows(connection, plan)
         _refuse_capture_contradiction(connection, plan, empty=True)
         return 'pending'
+    # One response per capture id, whoever's rows are already there: its
+    # receipts carry the plan's own body and clock, and a capture that was
+    # acknowledged without rows never acquires them.
+    _refuse_capture_contradiction(connection, plan, empty=False)
     existing = _read_plan_rows(connection, plan)
     if not existing:
-        # A capture acknowledged without rows never acquires them.
-        _refuse_capture_contradiction(connection, plan, empty=False)
         return 'pending'
     partner, complete = plan.rows, True
     if plan.entity in _PAGE_OWNED_ROWS_ENTITIES:
@@ -1580,40 +1613,33 @@ def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_i
             raise RuntimeError('core receipt contradicts its earlier acknowledgement')
 
 
-def _ambiguous_commit(exc: Exception) -> bool:
-    """A failure that may mean the statement committed: the same reading the
-    commit-conflict retry ladder gives."""
-    return bool(_is_iceberg_commit_conflict(exc) or 'ICEBERG_COMMIT_ERROR' in str(exc))
+def _insert_once(connection, sql, bound, read, expected) -> None:
+    """Run one INSERT exactly once per call.
 
-
-def _insert_once(connection, sql, bound, read, expected, differs: str) -> None:
-    """Run one INSERT without ever repeating it blindly.
-
-    The commit may be unknown after a failure. What the statement writes is
-    read back first: rows that landed and agree are done, ones that differ
-    contradict what is already stored, and only rows that are absent are
-    inserted again.
+    The commit may be unknown after a failure. What the statement was to
+    write is read back once: rows that read back exactly as intended landed,
+    and the failure is answered. An absent row proves only what was visible
+    at that read, so the statement is never repeated at once: the replay of
+    the unit, later, writes a row that is still missing. What is already
+    stored under the rows' key is the caller's to compare before the INSERT.
     """
-    for attempt in range(2):
-        cursor = connection.cursor()
+    cursor = connection.cursor()
+    try:
+        # A committing cursor retries ambiguous commits on its own.
+        run = getattr(cursor, 'execute_once', cursor.execute)
+        run(sql, bound)
+        if not isinstance(cursor, CommittingCursor):
+            cursor.fetchall()
+    except Exception:
         try:
-            # A committing cursor retries ambiguous commits on its own.
-            run = getattr(cursor, 'execute_once', cursor.execute)
-            run(sql, bound)
-            if not isinstance(cursor, CommittingCursor):
-                cursor.fetchall()
-            return
-        except Exception as exc:
-            failure = exc
-        finally:
-            cursor.close()
-        stored = read()
-        if stored is not None:
-            if stored != expected:
-                raise RuntimeError(differs)
-            return
-        if attempt or not _ambiguous_commit(failure):
-            raise failure
+            landed = read() == expected
+        except Exception:
+            # The read back failed as well: nothing proves the statement landed.
+            landed = False
+        if not landed:
+            raise
+    finally:
+        cursor.close()
 
 
 def _merge_receipts(connection, receipts) -> None:
@@ -1642,8 +1668,7 @@ def _merge_receipts(connection, receipts) -> None:
             bound.append(value)
         _insert_once(
             connection, f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})',
-            bound, lambda: _stored_receipts(connection, [expected[0]]).get(expected[0]), expected,
-            'core receipt contradicts its earlier acknowledgement')
+            bound, lambda: _stored_receipts(connection, [expected[0]]).get(expected[0]), expected)
 
 
 def _verify_receipts(connection, receipts) -> None:
@@ -1795,14 +1820,15 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
     # the page evidence it lost itself.
     own = frozenset(receipt_id for plan, receipt_id in zip(plans, receipt_ids, strict=True)
                     if plan.pages)
-    states = [(plan, _replay_state(connection, plan, receipt_id, committed_at))
+    states = [(plan, _replay_state(connection, plan, receipt_id, committed_at, own=own))
               for plan, receipt_id in zip(plans, receipt_ids, strict=True)]
     for plan, state in states:
         # A lineage-only refresh rewrites the run identity of rows that are
         # already committed under this very capture: nothing can regress,
         # whatever clock a sibling capture of the scope carries.
         if state == 'pending' or (state == 'refresh' and not _capture_pinned(plan)):
-            guard_native_bundle(connection, plan, own=own)
+            guard_native_bundle(
+                connection, plan, own=own, acknowledged_at=_timestamp(committed_at))
     if repair is not None and any(state != 'written' for _plan, state in states):
         repair()
     for plan, state in states:
@@ -1932,10 +1958,13 @@ def _publish_alias(current: str, receipt: dict, plan_hashes, digest: str) -> Non
     """
     if current == digest or write_journal.read_receipt(current) is not None:
         return
+    # The anchors first: an alias is never visible without the pre-write
+    # anchors of the acknowledgement it stands for, and an interrupted
+    # publication leaves nothing for a retry to complete.
+    write_journal.copy_snapshot_anchors(digest, current)
     write_journal.record_receipt(current, {
         **receipt, 'plan_sha256': current,
         'identity': {'plan_hashes': list(plan_hashes), 'digest': digest}})
-    write_journal.copy_snapshot_anchors(digest, current)
 
 
 def _journal_walks(plans, receipt_ids) -> list[dict]:
