@@ -2513,30 +2513,41 @@ def test_report_run_id_names_the_target_of_its_receipt():
 
 
 @pytest.mark.parametrize('lane', ['attendance', 'referee_profile', 'achievement'])
-def test_single_outcome_adapters_answer_one_outcome_on_http_failure_too(lane):
-    # Round 3 finding 23: these adapters declare one LaneOutcome, not a tuple.
+def _scalar_adapter(lane, failed):
+    """Call the adapter of a single-outcome section; ``failed`` answers 404."""
     body = b'<html></html>'
-    digest = hashlib.sha256(body).hexdigest()
     if lane == 'attendance':
-        capture = _replace(_capture(ATTENDANCE_START, body, PAGE_1_CAPTURED), status_code=404)
-        outcome = sections.extract_attendance_observations(
-            (capture,), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
-            edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
-    elif lane == 'referee_profile':
-        capture = _replace(
-            _capture(REFEREE_PROFILE_URL, body, REFEREE_CAPTURED, endpoint='referee_profile'),
-            status_code=404)
-        outcome = sections.extract_referee_profile_observations(
-            capture, _referee_scope(), referee_id='101', extracted_at=REFEREE_EXTRACTED_AT,
-            universe_version=UNIVERSE)
-    else:
-        capture = _replace(_achievement_capture(ACHIEVEMENTS_EMPTY), status_code=404)
-        outcome = sections.extract_achievement_observations(
-            capture, _achievement_scope(), recipient_type='player', recipient_id='7',
+        capture = _capture(ATTENDANCE_START, body if failed else (
+            ATTENDANCE_FIXTURES / 'page_1.html').read_bytes(), PAGE_1_CAPTURED)
+        return sections.extract_attendance_observations(
+            (_replace(capture, status_code=404) if failed else capture,), _attendance_scope(),
+            start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
             extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
-    assert isinstance(outcome, core.LaneOutcome)
-    assert (outcome.status, outcome.rows) == ('unavailable', ())
-    assert core.build_core_dq([outcome])['passed'] is True
+    if lane == 'referee_profile':
+        capture = _capture(REFEREE_PROFILE_URL, body if failed else (
+            REFEREE_FIXTURES / 'profile.html').read_bytes(), REFEREE_CAPTURED,
+            endpoint='referee_profile')
+        return sections.extract_referee_profile_observations(
+            _replace(capture, status_code=404) if failed else capture, _referee_scope(),
+            referee_id='101', extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
+    capture = _achievement_capture(b'<html></html>' if failed else ACHIEVEMENTS_PACKET)
+    return sections.extract_achievement_observations(
+        _replace(capture, status_code=404) if failed else capture, _achievement_scope(),
+        recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
+
+
+@pytest.mark.parametrize('lane', ['attendance', 'referee_profile', 'achievement'])
+def test_single_outcome_adapters_answer_a_one_element_tuple_on_every_path(lane):
+    # Round 4 finding 21 (revises the round-3 pin): these adapters used to
+    # answer a bare outcome, which does not compose with DQ.
+    for failed in (False, True):
+        outcomes = _scalar_adapter(lane, failed)
+        assert isinstance(outcomes, tuple) and len(outcomes) == 1
+        assert isinstance(outcomes[0], core.LaneOutcome)
+        # The direct call the contract promises.
+        assert core.build_core_dq(outcomes)['passed'] is True
+        assert outcomes[0].status == ('unavailable' if failed else 'observed_present')
 
 
 # --------------------------------- review round-4 pins (findings 1-21)
@@ -3018,3 +3029,63 @@ def test_referee_directory_urls_carry_no_query_and_validate_their_first_page():
     core._check_scope_against_capture(
         'referee_aggregate_observations', {'competition_id': 'XY1', 'edition_id': '2025'},
         _referee_page(REFEREE_DIRECTORY_URL, body))
+
+
+
+def test_rumour_row_parse_failure_cites_the_page_that_failed():
+    # Round 4 finding 18: a row of page 1 could not be parsed, and the error
+    # outcome named page 2, the newest one, as its evidence.
+    broken = _rumour_feed_html(1, 2, (1, 2)).replace(
+        b'<a href="/p/profil/spieler/17">Player P</a>', b'Player P')
+    page_1 = _rumour_capture(1, RUMOUR_PAGE_1_CAPTURED, body=broken)
+    page_2 = _rumour_capture(2, RUMOUR_PAGE_2_CAPTURED)
+    outcome, = sections.extract_rumour_observations(
+        (page_1, page_2), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason) == ('error', 'rumours:invalid_player')
+    assert outcome.capture.capture_id == page_1.capture_id
+    assert outcome.rows == ()
+
+
+def test_empty_rumour_proof_ignores_a_marker_in_the_header():
+    # Round 4 finding 19: the marker selector searched the whole table, so a
+    # marked header cell over an empty body passed for the donor's marker row.
+    header_marker = ('<table class="items"><thead><tr><td class="no-entries">Player</td>'
+                     '<th>Interested club</th><th>Most recent source from</th>'
+                     '<th>Assessment</th></tr></thead><tbody></tbody></table>')
+    pager = _rumour_pager(1, 1)
+    capture = _capture(RUMOUR_LISTING, f'<div id="yw1">{header_marker}{pager}</div>'.encode(),
+                       RUMOUR_PAGE_1_CAPTURED, endpoint='rumours')
+    outcome, = sections.extract_rumour_observations(
+        (capture,), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.proof) == ('observed_empty', 'rumours:empty_table_body')
+    # The donor's marker row keeps its own proof.
+    marker = _capture(RUMOUR_PAGE[1], _no_entries_html(1, 1), RUMOUR_PAGE_1_CAPTURED,
+                      endpoint='rumours')
+    outcome, = sections.extract_rumour_observations(
+        (marker,), _rumour_scope(), competition=_rumour_competition(),
+        extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert outcome.proof == 'rumours:no_entries_row'
+
+
+def test_attendance_first_page_number_is_compared_numerically():
+    # Round 4 finding 20: the donor reads ?page=01 as page 1; the adapter
+    # compared the query as text and refused a donor-valid walk.
+    start = ATTENDANCE_START + '?page=01'
+    page_1 = _attendance_capture('page_1.html', start, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    outcome = sections.extract_attendance_observations(
+        (page_1, page_2), _attendance_scope(), start_url=start, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, len(outcome.rows)) == ('observed_present', 2)
+    plan = core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED,
+                                 scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+    assert plan.pages[0][0] == start
+    # A later page is still not a start, however it is spelled.
+    later = _replace(page_1, url=ATTENDANCE_START + '?page=02')
+    outcome = sections.extract_attendance_observations(
+        (later, page_2), _attendance_scope(), start_url=later.url, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason) == (
+        'error', 'attendance:pagination_start_not_first_page')
