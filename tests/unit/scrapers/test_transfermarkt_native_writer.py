@@ -828,3 +828,12 @@ def test_plan_rows_carry_the_evidence_the_plan_names():
         (column, row['source_body_hash'] if column == 'source_body_hash' else value)
         for column, value in evidenced)
     assert dataclasses_replace(plan, evidence=own).evidence == own
+
+def test_empty_replacement_cannot_erase_its_own_capture():
+    # Round 4 finding 3, single-page lane: a capture is never both populated
+    # and empty; the same-capture integrity check used to be skipped.
+    db = CoreDB()
+    write(db, [membership_plan(['1', '2'], capture='cap-1')])
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [_empty_roster_plan(clock=LATER, capture='cap-1')], run_id='run-2', clock=LATER)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 2

@@ -2563,3 +2563,63 @@ def test_row_lineage_must_match_its_own_page():
         core.plan_for_outcome(
             _replace(outcome, rows=borrowed), captured_at=PAGE_2_CAPTURED,
             scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+
+
+def test_edition_replacement_requires_the_whole_page_manifest():
+    # Round 4 finding 4: a terminal page's row without page evidence used to
+    # replace the whole edition; a manifest may not start past the first page.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    scope_values = {'competition_id': 'GB1', 'edition_id': '2025'}
+
+    def extract(captures):
+        return sections.extract_attendance_observations(
+            captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+            edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+
+    outcome = extract((page_1, page_2))
+
+    def terminal_only(**changes):
+        terminal = _replace(
+            outcome, rows=tuple(row for row in outcome.rows if row['club_id'] == '631'),
+            capture=_replace(page_2, url=ATTENDANCE_PAGE_2), **changes)
+        return core.plan_for_outcome(terminal, captured_at=PAGE_2_CAPTURED, scope_values=scope_values)
+
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    with pytest.raises(ValueError, match='page manifest'):
+        terminal_only(pages=())
+    with pytest.raises(CoreParseError, match='first page'):
+        terminal_only(pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED,
+                              page_2.body_hash),))
+    assert set(_stadiums(db)) == {'11', '631'}
+    # A one-page edition carries its own one-page manifest.
+    single = _attendance_capture('single_page.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    plan = _attendance_plan((single,))
+    assert plan.pages == ((ATTENDANCE_START, single.capture_id, PAGE_1_CAPTURED, single.body_hash),)
+    # A page of another edition inside the manifest is not this scope's walk.
+    elsewhere = ATTENDANCE_START.replace('/2025', '/2024')
+    with pytest.raises(CoreParseError, match='page_scope_mismatch'):
+        core.plan_for_outcome(
+            _replace(outcome, pages=((elsewhere, page_1.capture_id, PAGE_1_CAPTURED, page_1.body_hash),
+                                     *outcome.pages[1:])),
+            captured_at=PAGE_2_CAPTURED, scope_values=scope_values)
+
+
+def test_rowless_replacement_cannot_erase_a_capture_committed_with_rows():
+    # Round 4 finding 3: a rowless plan returned "pending" before any capture
+    # was compared, so it deleted a populated edition under the same capture.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    outcome = sections.extract_attendance_observations(
+        (page_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=LATER_EXTRACTED_AT, universe_version=UNIVERSE)
+    rowless = _replace(outcome, status='observed_empty', status_reason='attendance:empty',
+                       proof='attendance:empty', rows=())
+    plan = core.plan_for_outcome(rowless, captured_at=PAGE_2_CAPTURED,
+                                 scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _write(db, [plan], outcome.run_id, LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11', '631'}
