@@ -968,6 +968,9 @@ def test_pre_upgrade_intent_is_finished_after_verified_recovery():
     assert len(receipts) == 1 and receipts[0]['verified'] is True
     assert write_journal.pending_intents({'run_id': 'run-old'}) == []
     assert write_journal.read_receipt(old_digest)['verified'] is True
+    # The receipt the stage-B writer never reached is completed under its identity.
+    assert db.sql.execute(
+        'SELECT plan_sha256 FROM transfermarkt_core_receipts_v1').fetchall() == [(plan_hash,)]
     assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == []
 
 
@@ -1003,9 +1006,10 @@ def test_legacy_recovery_keeps_the_identity_of_its_warehouse_receipt():
     native_writer._merge_receipts(db, [legacy_receipt])
     receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
     assert len(receipts) == 1 and receipts[0]['verified'] is True
+    # One warehouse receipt for the run, scope and capture: the legacy one.
     assert db.sql.execute(
         'SELECT receipt_id, plan_sha256 FROM transfermarkt_core_receipts_v1').fetchall() == [
-        (legacy_receipt['receipt_id'], legacy_digest)]
+        (legacy_receipt['receipt_id'], legacy_receipt['plan_sha256'])]
     assert write_journal.read_receipt(legacy_digest)['plan_sha256'] == legacy_digest
     assert not path.exists() and write_journal.pending_intents({'run_id': 'run-old'}) == []
 
