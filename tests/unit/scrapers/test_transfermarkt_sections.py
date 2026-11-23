@@ -3495,3 +3495,86 @@ def test_every_source_is_checked_by_its_complete_origin_and_route():
     for url in (squad.url.replace('.com/', '.com:444/'), squad.url + '?page=2', squad.url + '#x'):
         with pytest.raises(CoreParseError, match='row_scope_mismatch'):
             core._check_scope_against_capture('squad_memberships', scope_values, _replace(squad, url=url))
+
+
+def test_a_referee_directory_cannot_bind_two_responses_to_one_capture():
+    # Round 5 finding 20: the capture-conflict check covered attendance and
+    # rumours only, so two directory pages under one capture id verified
+    # rows with two body hashes under that id.
+    page_1 = _referee_page(REFEREE_DIRECTORY_URL, _referee_first_page_body(),
+                           next_url=REFEREE_DIRECTORY_PAGE_2)
+    page_2 = _referee_page(REFEREE_DIRECTORY_PAGE_2, _referee_second_page_body())
+    with pytest.raises(CoreParseError, match='referees:capture_conflict'):
+        _referee_directory((page_1, _replace(page_2, capture_id=page_1.capture_id)))
+
+
+def test_duplicate_targets_of_one_run_are_refused_before_any_write():
+    # Round 5 finding 23: one empty packet requested twice planned the same
+    # rowless merge twice. Empty plans have neither rows nor a replacement
+    # scope, so the run-level check did not compare them.
+    from scrapers.transfermarkt.orchestrator import AchievementHolderTarget
+    replay = _JsonFetch(ACHIEVEMENTS_URL, ACHIEVEMENTS_EMPTY)
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        achievement_holders=(AchievementHolderTarget('player', '7'), AchievementHolderTarget('player', '7')))
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader, universe_version=UNIVERSE,
+                  extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    with pytest.raises(ValueError, match='duplicate'):
+        run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert not db.sql.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name LIKE 'transfermarkt_%'"
+    ).fetchall()
+
+
+def test_a_parse_error_cites_the_page_that_failed():
+    # Round 5 finding 24: a donor error over the whole walk was backed by the
+    # newest page, which was a valid one.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    broken_1 = _page(ATTENDANCE_START, page_1.body.replace(b'60.704', b'not-a-number'),
+                     PAGE_1_CAPTURED, 'broken page 1')
+    assert broken_1.body != page_1.body
+    outcome, = sections.extract_attendance_observations(
+        (broken_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.rows) == ('error', ())
+    assert outcome.capture.capture_id == broken_1.capture_id
+    broken_2 = _page(ATTENDANCE_PAGE_2, page_2.body.replace(b'60.704', b'x'), PAGE_2_CAPTURED, 'x')
+    page_1_again = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    outcome, = sections.extract_attendance_observations(
+        (page_1_again, broken_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.capture.capture_id) == ('error', broken_2.capture_id)
+    # The same for a directory page the donor cannot read.
+    first = _referee_page(REFEREE_DIRECTORY_URL, b'<html><body>no table here</body></html>',
+                          next_url=REFEREE_DIRECTORY_PAGE_2)
+    second = _referee_page(REFEREE_DIRECTORY_PAGE_2, _referee_second_page_body())
+    outcome = _directory_error((first, second))
+    assert outcome.capture.capture_id == first.capture_id
+
+
+def test_a_referee_profile_target_is_canonicalised_once():
+    # Round 5 finding 25: the request URL normalised '0101' to referee 101
+    # while the requested scope kept '0101'.
+    body = (REFEREE_FIXTURES / 'profile.html').read_bytes()
+
+    class _Fetch:
+        def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
+            assert url == REFEREE_PROFILE_URL
+            digest = hashlib.sha256(body).hexdigest()
+            return FetchOutcome(
+                status=FetchStatus.OK, value=body.decode('utf-8'), raw_capture_id=digest,
+                raw_body_hash=digest, raw_fetched_at=REFEREE_CAPTURED, cache_hit=False,
+                status_code=200)
+
+    plan = CoreScopePlan(league='XY1', season='2526', scope_id='s', cycle_id='c',
+                         referee_profile_ids=('0101',))
+    db = CoreDB()
+    report = CoreRun(_Fetch().fetch, universe_version=UNIVERSE,
+                     extracted_at=REFEREE_EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert [(item['entity'], item['status']) for item in report.outcomes] == [
+        ('referee_profiles', 'observed_present')]
+    assert report.receipts[0]['verified'] is True
+    assert db.sql.execute('SELECT referee_id FROM transfermarkt_referee_profiles').fetchall() == [('101',)]
