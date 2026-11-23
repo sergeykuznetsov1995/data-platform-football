@@ -295,8 +295,10 @@ class NativeWritePlan:
     key (a later capture adds or updates rows and never deletes the rest).
     ``pages`` is the evidence of a multi-page replacement snapshot: every
     walked page as (source_url, source_capture_id, captured_at,
-    source_body_hash), rowless ones included, because a page that contributes
-    no row still has a clock and a body.
+    source_body_hash, next_url), rowless ones included, because a page that
+    contributes no row still has a clock and a body. The manifest is the
+    walk: each page names the page its own link leads to and the last one
+    names none, so a prefix of a walk is never mistaken for the whole.
     """
 
     entity: str
@@ -313,7 +315,7 @@ class NativeWritePlan:
     proof: str = ''
     capture_id: str = ''
     evidence: tuple[tuple[str, str], ...] = ()
-    pages: tuple[tuple[str, str, str, str], ...] = ()
+    pages: tuple[tuple[str, str, str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.table, str) or not fullmatch(r'transfermarkt_[a-z0-9_]+', self.table):
@@ -392,22 +394,29 @@ class NativeWritePlan:
             raise ValueError('core page evidence belongs to a multi-page replacement snapshot')
         seen = set()
         captures = set()
-        for url, capture_id, clock, body_hash in self.pages:
+        for url, capture_id, clock, body_hash, next_url in self.pages:
             # Each predicate on its own: inside all(...) a truthy map object
             # would stand in for the checks after it.
             if not all(map(_nonempty, (url, capture_id, clock, body_hash))):
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
             if url in seen or capture_id in captures:
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
-            if not fullmatch(r'[0-9a-f]{64}', body_hash):
+            if not fullmatch(r'[0-9a-f]{64}', body_hash) or not isinstance(next_url, str):
                 raise ValueError('core page evidence needs distinct pages with url, capture and clock')
             _timestamp(clock)
             seen.add(url)
             captures.add(capture_id)
+        # The manifest is the walk. A page that leads on to a page the
+        # manifest does not hold, or a last page that still leads somewhere,
+        # is a part of a walk offered as the whole edition.
+        if any(page[4] != (self.pages[index + 1][0] if index + 1 < len(self.pages) else '')
+               for index, page in enumerate(self.pages)):
+            raise ValueError('core page evidence is not one walk from its first to its last page')
         # A row carries the whole lineage of one page of the snapshot: URL,
         # capture, clock and body hash.
+        lineage = {page[:4] for page in self.pages}
         if any((row['source_url'], row['source_capture_id'], row['captured_at'],
-                row['source_body_hash']) not in self.pages
+                row['source_body_hash']) not in lineage
                or row['raw_capture_id'] != row['source_capture_id'] for row in self.rows):
             raise ValueError(
                 'core row lineage differs: rows must come from a page of the snapshot evidence')
@@ -667,7 +676,7 @@ def _replace_pages(connection, plan: NativeWritePlan) -> None:
             cursor,
             f'DELETE FROM {CORE_PAGES_TABLE} WHERE target_table = ? AND scope_values_json = ?',
             scope)
-        for url, capture_id, clock, body_hash in plan.pages:
+        for url, capture_id, clock, body_hash, _next in plan.pages:
             # Trino timestamp(6) stores UTC wall time without an offset.
             execute_statement(
                 cursor, f'INSERT INTO {CORE_PAGES_TABLE} ({columns}) VALUES ({marks})',
@@ -681,8 +690,7 @@ def _same_pages(manifest, pages) -> bool:
     if not pages:
         return True
     accepted = {(url, capture_id, _timestamp(clock)) for url, capture_id, clock in manifest}
-    return accepted == {
-        (url, capture_id, _timestamp(clock)) for url, capture_id, clock, _body_hash in pages}
+    return accepted == {(page[0], page[1], _timestamp(page[2])) for page in pages}
 
 
 def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
@@ -691,7 +699,7 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
     The data rows prove the pages that still contribute one; the manifest
     proves the pages a newer walk left without rows.
     """
-    planned = {url: _timestamp(clock) for url, _capture_id, clock, _body_hash in plan.pages}
+    planned = {url: _timestamp(clock) for url, _capture_id, clock, _body_hash, _next in plan.pages}
     for row in plan.rows:
         clock, url = _timestamp(row['captured_at']), row['source_url']
         if url not in planned or planned[url] < clock:
@@ -859,7 +867,7 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
         # with rows, it is a contradiction, never a deletion.
         existing = _read_plan_rows(connection, plan)
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
-        for _url, capture_id, _clock, _body_hash in plan.pages:
+        for _url, capture_id, _clock, _body_hash, _next in plan.pages:
             planned.setdefault(capture_id, [])
         if not plan.pages:
             planned.setdefault(plan.capture_id, [])

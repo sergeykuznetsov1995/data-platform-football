@@ -67,9 +67,12 @@ def _distinct_captures(captures, section: str) -> None:
 
 
 def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_id: str):
-    """Why the supplied pages are not exactly one walk from the edition's first page.
+    """Check that the supplied pages are exactly one walk from the first page.
 
-    Returns the reason, or None when the donor's own walk is the one to report.
+    Returns the walk: every capture in the order the pages' own links visit
+    it, each with the link its page gives to the next. Returns the reason
+    when the pages cannot be that walk, and None when the donor's own walk
+    is the one to report.
     """
     parts = urlsplit(start_url)
     if parts.netloc != core.TRANSFERMARKT_HOST:
@@ -84,7 +87,7 @@ def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_i
             url, host=parts.netloc, path=parts.path, competition=competition_id, edition=edition_id)
 
     by_url = {attendance._canonical_url(capture.url): capture for capture in captures}
-    visited = []
+    walked, visited = [], []
     try:
         current = validate(start_url)
         while current is not None and current not in visited:
@@ -92,12 +95,14 @@ def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_i
             capture = by_url.get(current)
             if capture is None:
                 return None
-            current = attendance.next_attendance_url(capture.body, current)
-            if current is not None:
-                current = validate(current)
+            following = attendance.next_attendance_url(capture.body, capture.url)
+            walked.append((capture, following))
+            current = validate(following) if following is not None else None
     except ValueError:
         return None
-    return None if set(visited) == set(by_url) else 'pagination_captures_differ'
+    if {attendance._canonical_url(capture.url) for capture, _following in walked} != set(by_url):
+        return 'pagination_captures_differ'
+    return walked
 
 
 def extract_attendance_observations(
@@ -121,10 +126,12 @@ def extract_attendance_observations(
     context = core._context(captures[-1], scope, extracted_at, universe_version)
     _distinct_captures(captures, 'attendance')
     walk = _attendance_walk(captures, start_url, competition_id=competition_id, edition_id=edition_id)
-    if walk is not None:
-        # A terminal page offered as the start, or captures the walk never
-        # visits, must not become a replacement of the whole edition.
-        return (_outcome(entity, 'error', 'attendance:' + walk, **context),)
+    if not isinstance(walk, list):
+        if walk is not None:
+            # A terminal page offered as the start, or captures the walk never
+            # visits, must not become a replacement of the whole edition.
+            return (_outcome(entity, 'error', 'attendance:' + walk, **context),)
+        walk = [(capture, None) for capture in captures]  # the donor reports its own walk
     try:
         pages = [
             attendance.AttendancePage(
@@ -133,7 +140,7 @@ def extract_attendance_observations(
                 # The donor's ISO format omits zero microseconds. Row lineage uses the original.
                 captured_at=datetime.fromisoformat(capture.captured_at).isoformat(),
             )
-            for capture in captures
+            for capture, _following in walk
         ]
         result = attendance.parse_attendance(
             pages, start_url=start_url, competition_id=competition_id, edition_id=edition_id,
@@ -177,10 +184,14 @@ def extract_attendance_observations(
         context['capture'] = max(
             (capture for capture in captures if capture.capture_id in contributing),
             key=lambda capture: (capture.captured_at, capture.capture_id))
-    # Every walked page keeps its own lineage, the rowless ones included.
+    # Every walked page keeps its own lineage, the rowless ones included, in
+    # the order the walk visits it, each naming the page its own link leads
+    # to: the manifest is the walk, not only its start.
     pages = tuple(
-        (capture.url, capture.capture_id, capture.captured_at, capture.body_hash)
-        for capture in captures)
+        (capture.url, capture.capture_id, capture.captured_at, capture.body_hash,
+         walk[index + 1][0].url if index + 1 < len(walk)
+         else '' if following is None else attendance._canonical_url(following))
+        for index, (capture, following) in enumerate(walk))
     return (_outcome(entity, result.status, reason, tuple(rows), pages=pages, **context),)
 
 

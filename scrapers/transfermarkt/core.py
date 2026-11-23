@@ -425,9 +425,11 @@ class LaneOutcome:
     # request keeps no capture to tell its targets apart in DQ.
     subject: str = ''
     # Every walked page of a multi-page snapshot as (source_url, capture_id,
-    # captured_at, source_body_hash): the full lineage of a page, including
-    # one that contributes no row but still has a clock.
-    pages: tuple[tuple[str, str, str, str], ...] = ()
+    # captured_at, source_body_hash, next_url): the full lineage of a page,
+    # including one that contributes no row but still has a clock, and the
+    # link its own page gives to the next ('' for the terminal page). The
+    # manifest is the walk: each page names the next one.
+    pages: tuple[tuple[str, str, str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.entity not in CORE_ENTITIES:
@@ -448,7 +450,8 @@ class LaneOutcome:
         pages = tuple(tuple(page) for page in self.pages)
         object.__setattr__(self, 'pages', pages)
         # A page is one capture, and a capture id names exactly one response.
-        if (any(len(page) != 4 or not all(map(_nonempty, page)) for page in pages)
+        if (any(len(page) != 5 or not all(map(_nonempty, page[:4]))
+                or not isinstance(page[4], str) for page in pages)
                 or len({page[0] for page in pages}) != len(pages)
                 or len({page[1] for page in pages}) != len(pages)):
             raise CoreParseError('invalid_page_evidence')
@@ -461,6 +464,9 @@ class LaneOutcome:
                 and page[2] == self.capture.captured_at
                 and page[3] == self.capture.body_hash for page in pages):
             raise CoreParseError('capture_outside_page_evidence')
+        if pages and any(page[4] != (pages[index + 1][0] if index + 1 < len(pages) else '')
+                         for index, page in enumerate(pages)):
+            raise CoreParseError('page_chain_broken')
         if any(
             row.get('parser_revision', self.parser_revision) != self.parser_revision
             or row.get('schema_revision', self.schema_revision) != self.schema_revision
