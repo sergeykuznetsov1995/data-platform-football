@@ -771,22 +771,26 @@ def test_schema_preflight_also_guards_a_rowless_replacement():
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
 
 
-def test_pre_upgrade_intent_is_finished_after_verified_recovery():
-    # Round 3 finding 10: an intent saved under an earlier plan digest must
-    # not stay pending after its verified recovery.
-    db = CoreDB()
-    plan = _empty_roster_plan()
-    descriptor = dataclasses_replace(plan). __dict__.copy()
-    descriptor['rows'] = []
-    old_digest = 'f' * 64
-    write_journal.save_intent(
-        {'run_id': 'run-old', 'digest': old_digest}, {'plans': [descriptor]},
+def _stage_b_identity(plan, run_id):
+    """The bundle identity of the stage-B writer (#2404), before page evidence
+    and rowless capture evidence entered the plan digest."""
+    plan_hash = native_writer._digest({
+        'entity': plan.entity, 'table': plan.table, 'natural_keys': plan.natural_keys,
+        'scope': list(zip(plan.scope_columns, plan.scope_values)),
+        'write_mode': plan.write_mode, 'captured_at': plan.captured_at,
+        'status': plan.status, 'status_reason': plan.status_reason, 'proof': plan.proof,
+        'rows': [],
+    })
+    return plan_hash, native_writer._digest({'plans': [plan_hash], 'run_id': run_id})
+
+
+def _legacy_intent(plan, digest):
+    """Save a plan the way stage B journalled it: no page evidence field."""
+    descriptor = asdict(plan)
+    del descriptor['pages']
+    return write_journal.save_intent(
+        {'run_id': 'run-old', 'digest': digest}, {'plans': [descriptor]},
         run_id='run-old', universe_version='u', committed_at=CLOCK)
-    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
-    assert len(receipts) == 1 and receipts[0]['verified'] is True
-    assert write_journal.pending_intents({'run_id': 'run-old'}) == []
-    assert write_journal.read_receipt(old_digest)['verified'] is True
-    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == []
 
 
 def test_plan_rejects_a_column_of_mixed_value_types_before_mutation():
@@ -952,3 +956,70 @@ def test_key_cells_compare_the_moment_not_its_spelling():
     # Only clock columns are read as moments; text stays text.
     assert native_writer._key_cells(('2026-11-20T15:00:00Z', 'x'), ('note', 'x')) == (
         '2026-11-20T15:00:00Z', 'x')
+
+
+def test_pre_upgrade_intent_is_finished_after_verified_recovery():
+    # Round 3 finding 10: an intent saved under an earlier plan digest must
+    # not stay pending after its verified recovery.
+    db = CoreDB()
+    plan_hash, old_digest = _stage_b_identity(_empty_roster_plan(), 'run-old')
+    path = _legacy_intent(_empty_roster_plan(), old_digest)
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert write_journal.pending_intents({'run_id': 'run-old'}) == []
+    assert write_journal.read_receipt(old_digest)['verified'] is True
+    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == []
+
+
+def test_recovery_finishes_the_exact_intent_file_it_replayed():
+    # Round 4 finding 11: a populated stage-B intent kept its digest, was
+    # re-saved in the current format, and only that copy was finished.
+    db = CoreDB()
+    plan = membership_plan(['1'], capture='cap-1')
+    digest = native_writer._digest({'plans': [plan.plan_sha256()], 'run_id': 'run-old'})
+    path = _legacy_intent(plan, digest)
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert not path.exists()
+    assert write_journal.pending_intents({'run_id': 'run-old'}) == []
+    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == []
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
+
+
+def test_legacy_recovery_keeps_the_identity_of_its_warehouse_receipt():
+    # Round 4 finding 10: recovery committed under the new digest before it
+    # looked at the saved identity, so a legacy write that had already
+    # produced its warehouse receipt was acknowledged a second time.
+    db = CoreDB()
+    plan = _empty_roster_plan()
+    plan_hash, legacy_digest = _stage_b_identity(plan, 'run-old')
+    path = _legacy_intent(plan, legacy_digest)
+    # The stage-B writer crashed after its warehouse receipt was verified.
+    native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+    legacy_receipt = native_writer._plan_receipt(
+        plan, {'entity': plan.entity, 'table': plan.table, 'rows': 0,
+               'physical_hash': native_writer._digest([]), 'expected_rows': 0, 'status_counts': {}},
+        plan_hash, legacy_digest, 'run-old', 'u', native_writer._batch_id_for_run('run-old'), CLOCK)
+    native_writer._merge_receipts(db, [legacy_receipt])
+    receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert db.sql.execute(
+        'SELECT receipt_id, plan_sha256 FROM transfermarkt_core_receipts_v1').fetchall() == [
+        (legacy_receipt['receipt_id'], legacy_digest)]
+    assert write_journal.read_receipt(legacy_digest)['plan_sha256'] == legacy_digest
+    assert not path.exists() and write_journal.pending_intents({'run_id': 'run-old'}) == []
+
+
+def test_unrecognised_intent_digest_is_refused_before_mutation():
+    # Round 4 finding 10: a digest that is neither this writer's nor the one
+    # before it says nothing about what the intent committed.
+    db = CoreDB()
+    plan = _empty_roster_plan()
+    path = _legacy_intent(plan, 'f' * 64)
+    with pytest.raises(RuntimeError, match='not recognised'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert path.exists() and len(write_journal.pending_intents({'run_id': 'run-old'})) == 1
+    assert write_journal.read_receipt('f' * 64) is None
+    assert not db.sql.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transfermarkt_core_receipts_v1'"
+    ).fetchall()
