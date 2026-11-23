@@ -2623,3 +2623,68 @@ def test_rowless_replacement_cannot_erase_a_capture_committed_with_rows():
     with pytest.raises(RuntimeError, match='replay differs'):
         _write(db, [plan], outcome.run_id, LATER_EXTRACTED_AT)
     assert set(_stadiums(db)) == {'11', '631'}
+
+
+def _moment(value) -> datetime:
+    # The fake warehouse stores Trino's naive UTC wall time.
+    return datetime.fromisoformat(str(value).replace(' ', 'T')).replace(tzinfo=timezone.utc)
+
+
+def test_acknowledged_snapshot_with_a_rowless_page_replays_without_a_write():
+    # Round 4 finding 5: the empty page left no committed row, so the replay
+    # saw a capture the scope "did not hold" and replaced the edition again.
+    rowless_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, PAGE_1_CAPTURED, 'rowless page 1')
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    writer = CoreWriter(db)
+    plans = [_attendance_plan((rowless_1, page_2))]
+
+    def commit():
+        return native_writer.write_core_bundle(
+            lambda: db, writer, plans, run_id=plans[0].rows[0]['run_id'],
+            universe_version=UNIVERSE, committed_at=EXTRACTED_AT)
+
+    first = commit()
+    assert first['verified'] is True and set(_stadiums(db)) == {'631'}
+    writes, events = len(writer.writes), len(db.events)
+    again = commit()
+    assert again == first
+    assert len(writer.writes) == writes
+    assert not [sql for sql in db.events[events:] if sql.lstrip().startswith('DELETE')]
+    assert set(_stadiums(db)) == {'631'}
+
+
+def test_acknowledged_replay_cannot_resurrect_a_page_a_rowless_walk_retired():
+    # Round 4 finding 1: both snapshots share the 12:30 maximum, and the
+    # retired page left no row for the per-URL guard to read.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, NEWER_PAGE_CAPTURED)
+    empty_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, '2026-11-20T12:15:00.000000+00:00',
+                    'empty 12:15')
+    original = [_attendance_plan((page_1, page_2))]
+    db = CoreDB()
+    first = _bundle(db, original, EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11', '631'}
+    later = _attendance_plan((empty_1, page_2), LATER_EXTRACTED_AT)
+    assert later.captured_at == original[0].captured_at == NEWER_PAGE_CAPTURED
+    assert _bundle(db, [later], LATER_EXTRACTED_AT)['verified'] is True
+    assert set(_stadiums(db)) == {'631'}
+    with pytest.raises(StaleTransfermarktWrite):
+        _write(db, original, first['run_id'], EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'631'}
+
+
+def test_snapshot_receipt_keeps_the_clock_of_the_capture_it_names():
+    # Round 4 finding 1: a receipt paired the 12:00 capture id with the
+    # 12:30 clock of a newer page that contributed no row.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 12:30')
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, empty_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
+    receipt = db.sql.execute(
+        'SELECT source_capture_id, captured_at FROM transfermarkt_core_receipts_v1').fetchone()
+    assert receipt[0] == page_1.capture_id and _moment(receipt[1]) == _moment(PAGE_1_CAPTURED)
+    # The scope is still acknowledged as fresh as its newest walked page.
+    older_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, PAGE_2_CAPTURED, 'empty 12:05')
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [_attendance_plan((page_1, older_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
