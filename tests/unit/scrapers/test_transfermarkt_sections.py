@@ -2297,8 +2297,21 @@ def test_unrepresentable_count_never_reaches_mutation():
     _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
     overflow = page_1.body.replace(b'60.704', b'9223372036854775808')
     newer_1 = _page(ATTENDANCE_START, overflow, NEWER_PAGE_CAPTURED, 'overflow')
+    # Round 4 finding 15: the adapter names the value the row cannot hold
+    # instead of raising, so no plan is built from it.
+    outcome = sections.extract_attendance_observations(
+        (newer_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=LATER_EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'attendance:row_value_exceeds_bigint', ())
+    with pytest.raises(ValueError, match='non-conclusive'):
+        core.plan_for_outcome(outcome, captured_at=NEWER_PAGE_CAPTURED,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+    # The plan boundary keeps its own check for a row built any other way.
+    plan = _attendance_plan((page_1, page_2), LATER_EXTRACTED_AT)
     with pytest.raises(ValueError, match='bigint'):
-        _attendance_plan((newer_1, page_2), LATER_EXTRACTED_AT)
+        _replace(plan, rows=tuple(
+            {**row, 'capacity': 2 ** 63} if row['club_id'] == '11' else row for row in plan.rows))
     assert set(_stadiums(db)) == {'11', '631'}
 
 

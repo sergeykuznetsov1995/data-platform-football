@@ -153,14 +153,20 @@ def extract_attendance_observations(
         values = row.semantic_dict()
         values.update(final_season=final_season,
                       final_season_proof=final_season_proof if final_season else '')
-        rows.append(core._render(
-            entity, values, scope, capture=row_capture, run_id=context['run_id'],
-            extracted_at=extracted_at, universe_version=universe_version,
-            observation_status=row.observation_status,
-            status_reason='attendance:' + row.status_reason,
-            parser_revision=attendance.ATTENDANCE_PARSER_REVISION,
-            schema_revision=attendance.ATTENDANCE_SCHEMA_REVISION,
-        ))
+        try:
+            rows.append(core._render(
+                entity, values, scope, capture=row_capture, run_id=context['run_id'],
+                extracted_at=extracted_at, universe_version=universe_version,
+                observation_status=row.observation_status,
+                status_reason='attendance:' + row.status_reason,
+                parser_revision=attendance.ATTENDANCE_PARSER_REVISION,
+                schema_revision=attendance.ATTENDANCE_SCHEMA_REVISION,
+            ))
+        except core.CoreParseError as exc:
+            # A source value the row cannot hold is this section's error,
+            # backed by the page that carries it: the run goes on.
+            return _outcome(entity, 'error', 'attendance:' + exc.reason,
+                            **core._context(row_capture, scope, extracted_at, universe_version))
     if rows:
         # The outcome's capture is the newest page that CONTRIBUTED a row: a
         # newer but rowless trailing page must not shift the plan's clock.
