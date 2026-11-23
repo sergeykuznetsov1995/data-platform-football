@@ -911,6 +911,27 @@ def test_failed_insertion_keeps_the_committed_scope():
     assert _players(db) == []
 
 
+def test_populated_replacement_reaches_the_transfermarkt_writer_as_its_delete_filter(monkeypatch):
+    # Round 4 finding 2, the wiring: the real writer class with only its
+    # storage replaced. The manager behind it turns a delete filter into the
+    # staged single-statement replacement (test_transfermarkt_writer_safety).
+    from scrapers.transfermarkt import writer as transfermarkt_writer
+    seen = {}
+
+    def storage(self, df, database, table, partition_spec, mode='append', **kwargs):
+        seen.update(database=database, table=table, mode=mode, **kwargs)
+        return 'iceberg.bronze.' + table
+
+    monkeypatch.setattr(IcebergWriter, '_write_to_iceberg', storage)
+    native_writer._mutate_plan(
+        CoreDB(), transfermarkt_writer.TransfermarktIcebergWriter(trino_host='trino.invalid', trino_port=8080),
+        membership_plan(['1']))
+    assert seen == {
+        'database': 'bronze', 'table': 'transfermarkt_squad_memberships', 'mode': 'append',
+        'delete_filter': "league = 'GB1' AND season = '2526' AND club_id = '11'",
+        'merge_keys': None, 'bulk_arrow': False}
+
+
 def test_plan_rows_are_read_only_after_validation():
     # Round 4 finding 7: a plan's rows stayed writable through plan.rows, so
     # the writer could verify content the plan never validated.
