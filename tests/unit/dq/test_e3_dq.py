@@ -62,6 +62,17 @@ class TestCheckCounts:
             f"{[c.name for c in checks]}"
         )
 
+    def test_sofascore_league_table_dq_uses_declared_natural_key(self):
+        checks = [
+            c for c in e3_dq.build_silver_e3_checks()
+            if c.params.get("table") == "iceberg.silver.sofascore_league_table"
+        ]
+        duplicate = next(c for c in checks if c.kind == "no_duplicates")
+        nulls = next(c for c in checks if c.kind == "no_nulls")
+        expected_key = ["league", "season", "standing_scope", "team_key"]
+        assert duplicate.params["pk"] == expected_key
+        assert nulls.params["cols"][:4] == expected_key
+
     def test_silver_whoscored_events_spadl_count(self):
         """whoscored_events_spadl has 8 registry checks; its scale-aware
         unknown coverage is a custom CheckResult appended by the DAG.

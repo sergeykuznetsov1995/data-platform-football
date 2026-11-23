@@ -35,6 +35,48 @@ def test_live_cli_rejects_local_json_manifest_before_any_side_effect():
 
 
 @pytest.mark.unit
+def test_complete_season_noop_reports_terminal_endpoint_accounting(tmp_path, monkeypatch):
+    runner = _runner_module()
+    output = tmp_path / "season.json"
+    plan = SimpleNamespace(
+        specs=tuple(range(33)),
+        pending_keys=(),
+        schedule_event_ids=tuple(range(324)),
+        team_ids=tuple(range(20)),
+        referee_ids=tuple(range(17)),
+        complete=True,
+        finished_event_ids=tuple(range(321)),
+        player_universe_evidence_gaps=(),
+    )
+    monkeypatch.setattr(
+        "scrapers.sofascore.season_pipeline.plan_season_partition",
+        lambda *args, **kwargs: plan,
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (38, 77040))
+    monkeypatch.setattr(runner, "_capture_identity", lambda *args: {})
+    monkeypatch.setattr("scrapers.sofascore.scraper._season_label", lambda _league, _season: "2526")
+    monkeypatch.setattr("utils.proxy_traffic.record_traffic_run", lambda **kwargs: None)
+
+    rc = runner._run_season_capture_engine(
+        ["SS-38"],
+        2025,
+        str(output),
+        force_replace=False,
+        entity="all",
+        capture_runtime=MagicMock(),
+        offline_replay=False,
+    )
+
+    assert rc == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["planned_endpoints"] == 33
+    assert result["terminal_endpoints"] == 33
+    assert result["rejected_endpoints"] == 0
+    assert result["full_complete"] is True
+    assert result["traffic"]["request_count"] == 0
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("entity", ["all", "match_capture", "player_capture"])
 def test_out_of_window_tournament_is_clean_noop_before_plan_or_runtime(
     tmp_path, monkeypatch, entity

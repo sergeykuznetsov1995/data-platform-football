@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import Mapping
+from copy import deepcopy
 
 import pytest
 
@@ -260,8 +261,11 @@ def test_missing_required_endpoint_evidence_is_a_violation():
 def scope_runner(monkeypatch):
     calls = []
 
-    def run(partition, connection, *, contract=None, require_complete=True):
-        calls.append((partition, connection, contract, require_complete))
+    def run(partition, connection, *, contract=None, require_complete=True,
+            require_player_universe=True):
+        calls.append((
+            partition, connection, contract, require_complete, require_player_universe
+        ))
         return {
             "status": "success", "league": "SS-17", "season": "2526",
             "source_tournament_id": 17, "source_season_id": 76986,
@@ -289,7 +293,7 @@ def test_scope_maps_identity_and_aggregates_rejected_separately(scope_runner):
     _assert_identity(report)
     assert report["status"] == "success"
     assert scope_runner == [
-        (ActiveRegistryPartition("SS-17", "2526", 17, 76986), connection, contract, True)
+        (ActiveRegistryPartition("SS-17", "2526", 17, 76986), connection, contract, True, False)
     ]
     assert report["planned_endpoints"] == 7
     assert report["terminal_endpoints"] == 6
@@ -315,3 +319,86 @@ def test_partial_scope_forwards_incomplete_mode_and_retains_counters(scope_runne
     assert report["planned_endpoints"] == 5
     assert report["terminal_endpoints"] == 4
     assert report["rejected_rows"] == {"schema_error": 2}
+
+
+def test_history_scope_defers_player_universe_gate_to_players_lane(scope_runner):
+    connection, contract = object(), object()
+    report = dq.run_scope_bronze_dq(
+        SCOPE, [_phase()], require_complete=True, connection=connection, contract=contract
+    )
+    assert scope_runner[0][4] is False
+    assert report["status"] == "success"
+
+
+def test_players_scope_keeps_player_universe_gate(scope_runner):
+    connection, contract = object(), object()
+    report = dq.run_scope_bronze_dq(
+        SCOPE, [{**_phase(), "phase": "players"}], require_complete=True,
+        connection=connection, contract=contract,
+    )
+    assert scope_runner[0][4] is True
+    assert report["status"] == "success"
+
+
+def test_query_builder_respects_player_universe_scope():
+    names = {query.name for query in dq.build_bronze_partition_dq_queries(
+        "SS-17", "2526", 17, 76986, require_player_universe=False
+    )}
+    assert "player_profile_expected_universe_nonempty" not in names
+    names = {query.name for query in dq.build_bronze_partition_dq_queries(
+        "SS-17", "2526", 17, 76986, require_player_universe=True
+    )}
+    assert "player_profile_expected_universe_nonempty" in names
+
+
+def test_league_table_natural_key_uses_source_id_with_legacy_fallback():
+    contract = deepcopy(dq.load_coverage_contract())
+    assert contract["bronze_compatibility_columns"]["sofascore_league_table"] == [
+        ["team_id", "team"]
+    ]
+    duplicate = _named(_queries(), "duplicate_natural_key[bronze.sofascore_league_table]")
+    assert '"group", COALESCE("team_id", "team")' in _sql(duplicate)
+    null = _named(_queries(), "null_natural_key[bronze.sofascore_league_table]")
+    assert 'COALESCE("team_id", "team") IS NULL' in _sql(null)
+
+
+@pytest.mark.parametrize("missing_section", [False, True], ids=["entry", "section"])
+def test_league_table_legacy_contract_without_fallback_uses_declared_key(missing_section):
+    contract = deepcopy(dq.load_coverage_contract())
+    if missing_section:
+        contract.pop("bronze_compatibility_columns")
+    else:
+        contract["bronze_compatibility_columns"].pop("sofascore_league_table")
+    duplicate = _named(
+        dq.build_partition_dq_queries("SS-17", "2526", 17, 76986, contract=contract),
+        "duplicate_natural_key[bronze.sofascore_league_table]",
+    )
+    assert "COALESCE" not in _sql(duplicate)
+    assert '"team_id"' in _sql(duplicate)
+
+
+def test_duplicate_key_uses_declared_compatibility_for_any_bronze_table():
+    contract = deepcopy(dq.load_coverage_contract())
+    table_name = "bronze.sofascore_example"
+    contract["tables"][table_name] = {
+        "natural_key": ["league", "season", "entity_id"],
+        "partition_columns": ["league", "season"],
+    }
+    contract["committed_state_dq"]["duplicate_tables"].append(table_name)
+    contract["bronze_compatibility_columns"]["sofascore_example"] = [
+        ["entity_id", "entity_name"]
+    ]
+    duplicate = _named(
+        dq.build_partition_dq_queries("SS-17", "2526", 17, 76986, contract=contract),
+        f"duplicate_natural_key[{table_name}]",
+    )
+    assert 'COALESCE("entity_id", "entity_name")' in _sql(duplicate)
+
+
+def test_natural_key_rejects_multiple_compatibility_fallbacks():
+    contract = deepcopy(dq.load_coverage_contract())
+    contract["bronze_compatibility_columns"]["sofascore_league_table"].append(
+        ["team_id", "team_name"]
+    )
+    with pytest.raises(dq.SofaScoreContractError, match="multiple compatibility fallbacks"):
+        dq.build_partition_dq_queries("SS-17", "2526", 17, 76986, contract=contract)

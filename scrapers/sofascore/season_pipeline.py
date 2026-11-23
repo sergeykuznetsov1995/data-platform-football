@@ -1752,9 +1752,9 @@ def materialize_season_partition(
 
     standings_keys: set[tuple[str, str, str, str]] = set()
     for row in standings_rows:
-        team = row.get("team")
+        team = row.get("team_id") if row.get("team_id") is not None else row.get("team")
         group = row.get("group")
-        if team in (None, ""):
+        if team is None or not str(team).strip():
             raise SeasonMaterializationError("standings natural key has no team")
         if group in (None, ""):
             raise SeasonMaterializationError("standings natural key has no group scope")

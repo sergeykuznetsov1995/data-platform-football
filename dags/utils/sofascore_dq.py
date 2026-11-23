@@ -1553,7 +1553,34 @@ def build_partition_dq_queries(
                 "committed-state duplicate table is not league/season "
                 f"partitioned: {table_name}"
             )
-        key_sql = ", ".join(f'"{column}"' for column in spec["natural_key"])
+        compatibility = doc.get("bronze_compatibility_columns", {})
+        if table_name.startswith("bronze."):
+            compatibility = compatibility.get(table_name.rsplit(".", 1)[-1], [])
+        else:
+            compatibility = []
+        fallbacks = [
+            pair for pair in compatibility
+            if len(pair) == 2 and pair[0] in spec["natural_key"]
+        ]
+        if len(fallbacks) > 1:
+            raise SofaScoreContractError(
+                "natural key has multiple compatibility fallbacks: "
+                f"{table_name}"
+            )
+        if fallbacks:
+            id_column, fallback_column = fallbacks[0]
+            coalesce = f'COALESCE("{id_column}", "{fallback_column}")'
+            key_sql = ", ".join(
+                coalesce if column == id_column else f'"{column}"'
+                for column in spec["natural_key"]
+            )
+            null_predicate = f"{coalesce} IS NULL OR trim({coalesce}) = ''"
+        else:
+            key_sql = ", ".join(f'"{column}"' for column in spec["natural_key"])
+            null_predicate = " OR ".join(
+                f'"{column}" IS NULL OR trim(CAST("{column}" AS varchar)) = \'\''
+                for column in spec["natural_key"]
+            )
         queries.append(
             DQQuery(
                 name=f"duplicate_natural_key[{table_name}]",
@@ -1564,10 +1591,6 @@ def build_partition_dq_queries(
                 ),
                 expected_value=0,
             )
-        )
-        null_predicate = " OR ".join(
-            f'"{column}" IS NULL OR trim(CAST("{column}" AS varchar)) = \'\''
-            for column in spec["natural_key"]
         )
         queries.append(
             DQQuery(
@@ -1808,6 +1831,7 @@ def build_bronze_partition_dq_queries(
     *,
     contract: Mapping[str, Any] | None = None,
     require_complete: bool = True,
+    require_player_universe: bool = True,
 ) -> list[DQQuery]:
     """Build the Bronze-readable committed-state gates for one partition.
 
@@ -1817,7 +1841,8 @@ def build_bronze_partition_dq_queries(
     completeness gate additionally accepts a ``schema_error`` manifest state
     only when a quarantined match in ``iceberg.bronze.sofascore_rejected_rows``
     proves the rejection.  ``require_complete=False`` omits the completeness
-    gate for partial refreshes.
+    gate for partial refreshes.  ``require_player_universe=False`` leaves the
+    player-universe gate to the separate players lane.
     """
 
     parts = _required_endpoint_completeness_parts(
@@ -1837,6 +1862,8 @@ def build_bronze_partition_dq_queries(
     ):
         lowered = query.sql.lower()
         if "iceberg.silver" in lowered or "iceberg.gold" in lowered:
+            continue
+        if query.name == "player_profile_expected_universe_nonempty" and not require_player_universe:
             continue
         if query.name == "required_endpoint_completeness":
             if require_complete:
@@ -1966,6 +1993,7 @@ def run_bronze_partition_dq(
     *,
     contract: Mapping[str, Any] | None = None,
     require_complete: bool = True,
+    require_player_universe: bool = True,
 ) -> dict[str, Any]:
     """Execute the Bronze-only gates for one partition and report, not raise.
 
@@ -1985,6 +2013,7 @@ def run_bronze_partition_dq(
         partition.source_season_id,
         contract=contract,
         require_complete=require_complete,
+        require_player_universe=require_player_universe,
     )
     results: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
@@ -2301,12 +2330,17 @@ def run_scope_bronze_dq(
 
     The partition report from ``run_bronze_partition_dq`` keeps its status,
     results, violations and errors; scope accounting violations are added on
-    top instead of masking SQL findings (nor being masked by them).  An
+    top instead of masking SQL findings (nor being masked by them).  The
+    player-universe gate runs only for the separate players phase.  An
     injected connection stays open, while a lazily created
     ``utils.data_quality._get_conn()`` connection is closed in ``finally``.
     """
 
     partition = _scope_active_registry_partition(scope)
+    require_player_universe = any(
+        _phase_label(phase, index) == "players"
+        for index, phase in enumerate(phases or ())
+    )
     counters, rejected_rows, counter_violations = _aggregate_scope_counters(
         phases, require_complete=require_complete
     )
@@ -2321,6 +2355,7 @@ def run_scope_bronze_dq(
             connection,
             contract=contract,
             require_complete=require_complete,
+            require_player_universe=require_player_universe,
         )
     finally:
         if owns_connection and connection is not None:
