@@ -375,10 +375,6 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         club_id=request.club.club_id if request.club else None,
         club_name=request.club.club_name if request.club else None,
     )
-    if request.label == "club_values":
-        # The stichtag page belongs to the target's competition, not to the
-        # league that happens to enclose the run.
-        scope = replace(scope, league=request.competition_id)
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
     subject = _request_subject(request, plan)
@@ -443,7 +439,8 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
     elif request.player_id:
         unit = core.extract_career_observations(capture, scope, **metadata)
     elif request.label == "club_values":
-        unit = sections.extract_club_value_observations(capture, scope, **metadata)
+        unit = sections.extract_club_value_observations(
+            capture, scope, competition_id=request.competition_id, **metadata)
     elif request.label == "representation":
         unit = sections.extract_representation_observations(
             capture, scope, expected_ids=request.player_ids, **metadata,

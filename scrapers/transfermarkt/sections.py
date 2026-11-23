@@ -471,8 +471,14 @@ def extract_rumour_observations(
 
 
 def extract_club_value_observations(
-    capture: core.SourceCapture, scope: core.ScopeContext, *, extracted_at: str, universe_version: str,
+    capture: core.SourceCapture, scope: core.ScopeContext, *, competition_id: str,
+    extracted_at: str, universe_version: str,
 ) -> tuple[core.LaneOutcome, ...]:
+    """Observe one club-values page of ``competition_id``.
+
+    The page belongs to the target's competition, which follows the donor's
+    own id grammar (``U-21`` is one); the enclosing scope keeps its league.
+    """
     entity = 'club_value_observations'
     if capture.endpoint != 'club_values':
         raise core.CoreParseError('club_values:invalid_endpoint')
@@ -482,7 +488,7 @@ def extract_club_value_observations(
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
         club_capture = club_values.ClubValueCapture(
-            competition_id=scope.league, source_url=capture.url, raw_capture_id=capture.capture_id,
+            competition_id=competition_id, source_url=capture.url, raw_capture_id=capture.capture_id,
             source_body_hash=capture.body_hash, captured_at=capture.captured_at,
             extracted_at=extracted_at, scope_id=scope.scope_id, run_id=context['run_id'],
             cycle_id=scope.cycle_id, universe_version=universe_version,

@@ -164,8 +164,8 @@ def test_attendance_lane_maps_parse_failure_to_error():
 def test_club_value_lane_splits_one_outcome_per_club():
     capture = _club_value_capture()
     outcomes = sections.extract_club_value_observations(
-        capture, _club_value_scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
-    )
+        capture, _club_value_scope(), competition_id='VIE1', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
     assert outcomes  # tuple of per-club outcomes
     club_ids = sorted(outcome.rows[0]['club_id'] for outcome in outcomes)
     assert club_ids == [
@@ -192,8 +192,8 @@ def test_club_value_lane_splits_one_outcome_per_club():
 def test_club_value_lane_maps_parse_error_to_error_outcome():
     capture = _club_value_capture(url=CLUB_VALUE_URL.replace('/VIE1', '/ES1'))
     outcomes = sections.extract_club_value_observations(
-        capture, _club_value_scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
-    )
+        capture, _club_value_scope(), competition_id='VIE1', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
     assert len(outcomes) == 1
     assert outcomes[0].status == 'error'
     assert outcomes[0].status_reason == 'club_values:source_url_competition_mismatch'
@@ -1757,7 +1757,8 @@ def _club_value_plans(fixture, stichtag, captured_at, extracted_at):
     capture = _capture(f'{CLUB_VALUE_URL}/stichtag/{stichtag}', body, captured_at,
                        endpoint='club_values')
     outcomes = sections.extract_club_value_observations(
-        capture, _club_value_scope(), extracted_at=extracted_at, universe_version=UNIVERSE)
+        capture, _club_value_scope(), competition_id='VIE1', extracted_at=extracted_at,
+        universe_version=UNIVERSE)
     return [core.plan_for_outcome(
         outcome, captured_at=captured_at, scope_values={'club_id': outcome.rows[0]['club_id']})
         for outcome in outcomes]
@@ -2045,7 +2046,7 @@ def test_replay_adapters_keep_their_tuple_contract_on_http_failure(lane, endpoin
             universe_version=UNIVERSE)
     else:
         outcomes = sections.extract_club_value_observations(
-            failed, _club_value_scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+            failed, _club_value_scope(), competition_id='VIE1', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert isinstance(outcomes, tuple) and len(outcomes) == 1
     assert (outcomes[0].status, outcomes[0].rows) == ('unavailable', ())
     assert core.build_core_dq(outcomes)['passed'] is True
@@ -2903,7 +2904,7 @@ def test_a_populated_page_verdict_cannot_be_an_absence():
 def test_club_value_rows_carry_an_amount_exactly_when_present():
     # Round 4 finding 14: rows marked explicit_none kept their amounts.
     outcomes = sections.extract_club_value_observations(
-        _club_value_capture(), _club_value_scope(), extracted_at=EXTRACTED_AT,
+        _club_value_capture(), _club_value_scope(), competition_id='VIE1', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE)
     club = next(outcome for outcome in outcomes
                 if all(row['value_amount'] is not None for row in outcome.rows))
