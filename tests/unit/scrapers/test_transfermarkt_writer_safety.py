@@ -8,8 +8,10 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from scrapers.transfermarkt import writer
+from scrapers.base.trino_manager import TrinoAmbiguousWriteError, TrinoError
+from scrapers.transfermarkt import native_writer, writer
 from scrapers.transfermarkt.write_intents import save_intent, pending_intents, unpack_frames, finish_intent
+from tests.unit.scrapers.test_trino_ambiguous_replace import FakeConflictError, FakeConnection
 from dags.scripts import run_transfermarkt_scraper as run
 from dags.utils import transfermarkt_bronze_dq as dq
 
@@ -338,3 +340,154 @@ def test_base_trino_manager_still_receives_no_session_properties(monkeypatch):
     writer.base_trino.TrinoTableManager(host='trino')._create_connection()
 
     assert 'session_properties' not in calls[-1]
+
+
+# ---------------------------------------------------------------- review round 6, finding 2
+
+
+class _TombstoneWarehouse:
+    """A scripted Trino whose statements land in DuckDB as Trino would run them."""
+
+    def __init__(self, players):
+        import duckdb
+
+        self.engine = duckdb.connect(':memory:')
+        self.engine.execute('CREATE TABLE roster (club_id VARCHAR, player_id VARCHAR)')
+        self.engine.executemany('INSERT INTO roster VALUES (?, ?)', [('11', player) for player in players])
+        self.executed = []
+        self.lost = False
+
+    def run(self, sql):
+        # Trino names a table by its catalog and schema; DuckDB has neither.
+        sql = sql.replace('iceberg.bronze.', '')
+        self.executed.append(sql)
+        return self.engine.execute(sql).fetchall()
+
+    def connection(self):
+        return _TombstoneConnection(self)
+
+    def players(self):
+        return sorted(row[0] for row in self.engine.execute('SELECT player_id FROM roster').fetchall())
+
+    @property
+    def merges(self):
+        return [sql for sql in self.executed if sql.startswith('MERGE INTO')]
+
+
+class _TombstoneCursor:
+    def __init__(self, warehouse):
+        self.warehouse = warehouse
+        self.sql = None
+        self.rows = None
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+        self.rows = self.warehouse.run(sql)
+
+    def fetchall(self):
+        if self.sql.startswith('MERGE INTO') and not self.warehouse.lost:
+            # The server committed the replacement; its response never came.
+            self.warehouse.lost = True
+            raise RuntimeError('Connection reset by peer')
+        return self.rows
+
+    def close(self):
+        pass
+
+
+class _TombstoneConnection:
+    def __init__(self, warehouse):
+        self.warehouse = warehouse
+
+    def cursor(self):
+        return _TombstoneCursor(self.warehouse)
+
+    def close(self):
+        pass
+
+
+def _scripted(warehouse):
+    manager = writer.TransfermarktTrinoManager()
+    manager._conn = warehouse.connection()
+    manager._create_connection = warehouse.connection  # a reset reaches the same server
+    return manager
+
+
+def _replace_roster(warehouse, players):
+    """One replacement of the roster through the production staged path."""
+    manager = _scripted(warehouse)
+    frame = pd.DataFrame({'club_id': ['11'] * len(players), 'player_id': list(players)})
+
+    def staged(schema, table, df, *args, **kwargs):
+        warehouse.engine.executemany(
+            f'INSERT INTO {table} VALUES (?, ?, ?)',
+            [tuple(row) for row in df.itertuples(index=False, name=None)])
+        return len(df)
+
+    with patch.object(manager, 'insert_dataframe', side_effect=staged):
+        return manager.insert_dataframe_atomic(
+            'bronze', 'roster', frame, delete_filter="club_id = '11'")
+
+
+def test_a_replayed_replacement_merge_inserts_its_rows_a_second_time():
+    # Round 6 finding 2, the hazard itself. The staged replacement deletes the
+    # rows the scope held when its stage was built and inserts the staged rows
+    # on every execution. Replayed after the response to a committed MERGE was
+    # lost, it reports one row and leaves two. The replay-safe default is what
+    # the donor stack keeps; a journalled core write must not use it.
+    warehouse = _TombstoneWarehouse(['A'])
+
+    assert _replace_roster(warehouse, ['B']) == 1
+
+    assert len(warehouse.merges) == 2
+    assert warehouse.players() == ['B', 'B']
+
+
+def test_a_journalled_replacement_stops_at_a_lost_response_and_is_never_replayed():
+    # Round 6 finding 2, the fix. Inside the core writer's commit boundary the
+    # replacement MERGE runs once: an uncertain outcome is raised for the
+    # journal, whose replay reads the scope back before it writes again.
+    warehouse = _TombstoneWarehouse(['A'])
+
+    with native_writer.journalled_write(), pytest.raises(TrinoAmbiguousWriteError):
+        _replace_roster(warehouse, ['B'])
+
+    assert len(warehouse.merges) == 1
+    assert warehouse.players() == ['B']  # committed once, before the response was lost
+    assert not [sql for sql in warehouse.executed if sql.startswith('DROP TABLE')]  # stage retained
+    # A replacement issued again builds its stage from the rows the scope holds
+    # now: it lands the same rows once more, and once only.
+    assert _replace_roster(warehouse, ['B']) == 1
+    assert warehouse.players() == ['B']
+
+
+def test_a_journalled_replacement_is_not_retried_while_its_commit_state_is_unknown():
+    # "Failed to commit the transaction" may stand for a commit that landed.
+    unknown = FakeConflictError('Failed to commit the transaction')
+    connection = FakeConnection(outcomes=[unknown])
+    manager = writer.TransfermarktTrinoManager()
+    manager._conn = connection
+    sql = 'MERGE INTO iceberg.bronze.roster t USING iceberg.bronze.roster__stg_x s'
+
+    with native_writer.journalled_write(), patch.object(writer.base_trino.time, 'sleep') as sleep:
+        with pytest.raises(TrinoError) as refused:
+            manager._execute_replacement(sql)
+
+    assert connection.executed == [sql]
+    assert not isinstance(refused.value, TrinoAmbiguousWriteError)
+    assert refused.value.__cause__ is unknown
+    sleep.assert_not_called()
+
+
+def test_a_journalled_replacement_still_retries_a_rejected_commit():
+    conflict = FakeConflictError('Found conflicting files')
+    connection = FakeConnection(outcomes=[conflict, []])
+    manager = writer.TransfermarktTrinoManager()
+    manager._conn = connection
+    sql = 'MERGE INTO iceberg.bronze.roster t USING iceberg.bronze.roster__stg_x s'
+
+    with native_writer.journalled_write(), patch.object(writer.base_trino.time, 'sleep') as sleep:
+        manager._execute_replacement(sql)
+
+    assert connection.executed == [sql, sql]
+    assert sleep.call_count == 1

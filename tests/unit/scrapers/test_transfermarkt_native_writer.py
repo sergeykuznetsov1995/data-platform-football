@@ -12,6 +12,7 @@ from scrapers.transfermarkt import core, native_writer, write_journal
 from scrapers.transfermarkt.native_writer import NativeWritePlan, StaleTransfermarktWrite
 from tests.unit.utils.test_transfermarkt_current_write import MemoryCursor, MemoryDB
 from scrapers.base.iceberg_writer import IcebergWriter
+from scrapers.base.trino_manager import TrinoAmbiguousWriteError
 
 pytestmark = pytest.mark.unit
 
@@ -1645,3 +1646,62 @@ def test_run_preflight_refuses_capture_contradictions_between_valid_plans():
         scope_values={'club_id': outcome.rows[0]['club_id']}) for outcome in outcomes[:2]]
     assert len(plans) == 2
     native_writer.validate_run_plans(plans)
+
+# ---------------------------------------------------------------- round 6: an uncertain replacement
+
+
+class _LostResponse(CoreWriter):
+    """A staged replacement that committed before the connection dropped."""
+
+    def _write_to_iceberg(self, *args, **kwargs):
+        super()._write_to_iceberg(*args, **kwargs)
+        raise TrinoAmbiguousWriteError('Connection lost while executing SQL')
+
+
+@pytest.mark.parametrize('entry', ['retry', 'replay'])
+def test_an_uncertain_replacement_is_settled_by_reading_the_scope_back(entry):
+    # Round 6 finding 2. The replacement MERGE may commit before its response
+    # is lost. The bundle is then neither acknowledged nor written again: the
+    # rows the journal's replay reads back are the plan's own.
+    db = CoreDB()
+    write(db, [membership_plan(['1'], capture='cap-1')])
+    plans = [membership_plan(['1', '2'], capture='cap-2', clock=LATER)]
+    with pytest.raises(TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(
+            lambda: db, _LostResponse(db), plans, run_id='run-2',
+            universe_version='core-universe-v1', committed_at=LATER)
+    assert _players(db) == ['1', '2']
+    assert write_journal.pending_intents({'run_id': 'run-2'})
+    assert _receipt_count(db) == 1  # nothing acknowledged the unverified write
+    settled = CoreWriter(db)
+    if entry == 'retry':
+        receipt = write(db, plans, run_id='run-2', clock=LATER)
+    else:
+        receipt = native_writer.replay_pending_intents(lambda: db, settled)[0]
+    assert receipt['verified'] is True and receipt['receipt_readback'] is True
+    assert settled.writes == []
+    assert _players(db) == ['1', '2'] and _receipt_count(db) == 2
+    assert write_journal.pending_intents({'run_id': 'run-2'}) == []
+
+
+def test_an_uncertain_snapshot_is_replaced_once_more_and_acknowledged():
+    # A snapshot's replay finds its rows but not its page manifest, which
+    # follows the data: the replacement is issued once more, from a stage built
+    # on the rows the scope holds now, and the unit is acknowledged.
+    db = CoreDB()
+    older = _snapshot(EARLIER, 'cap-old')
+    native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [older], run_id='run-a', universe_version='u',
+        committed_at=older.captured_at)
+    snapshot = _snapshot(CLOCK, 'cap-1')
+    with pytest.raises(TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(
+            lambda: db, _LostResponse(db), [snapshot], run_id='run-b', universe_version='u',
+            committed_at=snapshot.captured_at)
+    settled = CoreWriter(db)
+    receipt = native_writer.replay_pending_intents(lambda: db, settled)[0]
+    assert receipt['verified'] is True
+    assert settled.writes == [(snapshot.table, len(snapshot.rows), ())]
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, snapshot), snapshot.rows)
+    native_writer._verify_pages(db, snapshot)
+    assert write_journal.pending_intents({'run_id': 'run-b'}) == []
