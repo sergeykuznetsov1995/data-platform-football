@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from scrapers.transfermarkt import native_writer, write_journal
+from scrapers.transfermarkt import core, native_writer, write_journal
 from scrapers.transfermarkt.native_writer import NativeWritePlan, StaleTransfermarktWrite
 from tests.unit.utils.test_transfermarkt_current_write import MemoryCursor, MemoryDB
 from scrapers.base.iceberg_writer import IcebergWriter
@@ -783,3 +783,19 @@ def test_plan_rejects_a_column_of_mixed_value_types_before_mutation():
     with pytest.raises(ValueError, match='mixes value types'):
         write(db, [dataclasses_replace(plan, rows=tuple(mixed), capture_id='')], run_id='run-2', clock=LATER)
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 2
+
+
+# ---------------------------------------------------------------- stage-C review round 4
+
+def test_rowless_replacement_refuses_a_table_with_a_foreign_column():
+    # Round 4 finding 6: a table of this plan's own columns plus a donor
+    # column is not this plan's table; a proven-empty replacement must not
+    # delete from it.
+    db = CoreDB()
+    db.sql.execute(core.core_ddl('squad_memberships').split(' WITH ')[0].replace(
+        'iceberg.bronze.', '').rstrip(')') + ', donor_extra varchar)')
+    db.sql.execute("INSERT INTO transfermarkt_squad_memberships (league, season, club_id, donor_extra) "
+                   "VALUES ('GB1', '2526', '11', 'x')")
+    with pytest.raises(RuntimeError, match='schema differs'):
+        write(db, [_empty_roster_plan()], run_id='run-2')
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
