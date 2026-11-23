@@ -371,13 +371,21 @@ def _status_matches_rows(entity, status, rows) -> bool:
     if status not in _OUTCOMES_WITH_ROWS and (contract or allowed is None or status not in allowed):
         return False
     if allowed is None:
-        return all(row.get('observation_status') == status for row in rows)
+        # A populated page is an observed page: its rows carry that one
+        # verdict, never an absence the page itself contradicts.
+        return status == 'observed_present' and all(
+            row.get('observation_status') == status for row in rows)
     verdicts = []
     for row in rows:
         verdict = row.get('observation_status')
         if not isinstance(verdict, str) or verdict not in allowed:
             return False
         verdicts.append(verdict)
+        # The donor's amount/status invariant: a club value is present
+        # exactly when the row carries its amount.
+        if (entity == 'club_value_observations'
+                and (verdict == 'observed_present') != (row.get('value_amount') is not None)):
+            return False
         # Each contract cell carries its own verdict, in both directions.
         if contract and verdict != _CONTRACT_STATUSES.get(row.get('contract_status')):
             return False
@@ -732,6 +740,12 @@ def plan_for_outcome(
         raise CoreParseError('row_scope_mismatch')
     if not _rows_match_revisions(outcome):
         raise CoreParseError('revision_differs_from_rows')
+    # A writable row is exactly the entity's column set: a missing business
+    # column would be written as a null over the committed value, and only
+    # the physical read-back would notice, after the replacement.
+    columns = set(CORE_COLUMNS[entity])
+    if any(row.keys() != columns for row in outcome.rows):
+        raise CoreParseError('row_column_mismatch')
     # Rows are mutable after construction: the verdict policy is applied to
     # the rows as they are now, not as they were when the outcome was built.
     if not _status_matches_rows(entity, outcome.status, outcome.rows):
