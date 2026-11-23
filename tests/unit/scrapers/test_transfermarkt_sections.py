@@ -1700,7 +1700,7 @@ def test_snapshot_pages_come_from_one_capture_each():
     # The walk's page evidence names every page the rows came from.
     with pytest.raises(ValueError, match='snapshot evidence'):
         _replace(plan, pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED,
-                               page_2.body_hash),))
+                               page_2.body_hash, ''),))
     # A multi-page plan names the newest page's capture, or none at all.
     with pytest.raises(ValueError, match='newest row capture id'):
         _replace(plan, capture_id=page_1.capture_id)
@@ -2618,17 +2618,18 @@ def test_edition_replacement_requires_the_whole_page_manifest():
         terminal_only(pages=())
     with pytest.raises(CoreParseError, match='first_page'):
         terminal_only(pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED,
-                              page_2.body_hash),))
+                              page_2.body_hash, ''),))
     assert set(_stadiums(db)) == {'11', '631'}
     # A one-page edition carries its own one-page manifest.
     single = _attendance_capture('single_page.html', ATTENDANCE_START, PAGE_1_CAPTURED)
     plan = _attendance_plan((single,))
-    assert plan.pages == ((ATTENDANCE_START, single.capture_id, PAGE_1_CAPTURED, single.body_hash),)
+    assert plan.pages == ((ATTENDANCE_START, single.capture_id, PAGE_1_CAPTURED, single.body_hash, ''),)
     # A page of another edition inside the manifest is not this scope's walk.
     elsewhere = ATTENDANCE_START.replace('/2025', '/2024')
     with pytest.raises(CoreParseError, match='page_scope_mismatch'):
         core.plan_for_outcome(
-            _replace(outcome, pages=((elsewhere, page_1.capture_id, PAGE_1_CAPTURED, page_1.body_hash),
+            _replace(outcome, pages=((elsewhere, page_1.capture_id, PAGE_1_CAPTURED,
+                                      page_1.body_hash, outcome.pages[0][4]),
                                      *outcome.pages[1:])),
             captured_at=PAGE_2_CAPTURED, scope_values=scope_values)
 
@@ -3090,3 +3091,57 @@ def test_attendance_first_page_number_is_compared_numerically():
         edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, outcome.status_reason) == (
         'error', 'attendance:pagination_start_not_first_page')
+
+
+# --------------------------------- review round-5 pins (findings 1-25)
+
+def test_a_manifest_must_be_the_whole_walk_not_only_its_start():
+    # Round 5 finding 3: page 1 refreshed, its row and evidence retained
+    # alone, although the page's own HTML still links to page 2. One first
+    # page proves the start of a walk, not its end.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    # A later capture of the same page has its own identity.
+    refreshed = _page(ATTENDANCE_START, page_1.body, NEWER_PAGE_CAPTURED, 'refreshed 12:30')
+    scope_values = {'competition_id': 'GB1', 'edition_id': '2025'}
+
+    def extract(captures):
+        outcome, = sections.extract_attendance_observations(
+            captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+            edition_id='2025', extracted_at=LATER_EXTRACTED_AT, universe_version=UNIVERSE)
+        return outcome
+
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    outcome = extract((refreshed, page_2))
+    assert [page[0] for page in outcome.pages] == [ATTENDANCE_START, ATTENDANCE_PAGE_2]
+    assert outcome.pages[0][4] == ATTENDANCE_PAGE_2 and outcome.pages[1][4] == ''
+    with pytest.raises((ValueError, CoreParseError)):
+        prefix = _replace(outcome, capture=refreshed,
+                          rows=tuple(row for row in outcome.rows if row['club_id'] == '11'),
+                          pages=outcome.pages[:1])
+        _bundle(db, [core.plan_for_outcome(prefix, captured_at=NEWER_PAGE_CAPTURED,
+                                           scope_values=scope_values)], LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11', '631'}
+    # A page dropped from the middle or a reordered walk is not a walk either.
+    for pages in (outcome.pages[::-1], outcome.pages[1:]):
+        with pytest.raises((ValueError, CoreParseError)):
+            core.plan_for_outcome(_replace(outcome, pages=pages),
+                                  captured_at=NEWER_PAGE_CAPTURED, scope_values=scope_values)
+
+
+def test_reordered_captures_of_one_walk_do_not_make_a_second_snapshot():
+    # Round 5 finding 18: the adapter accepted either order of the same two
+    # saved pages, hashed the manifest as supplied, and acknowledged two
+    # different snapshots of one edition.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    forward = _attendance_plan((page_1, page_2))
+    backward = _attendance_plan((page_2, page_1))
+    assert [page[0] for page in backward.pages] == [ATTENDANCE_START, ATTENDANCE_PAGE_2]
+    assert backward.plan_sha256() == forward.plan_sha256()
+    db = CoreDB()
+    _bundle(db, [forward], EXTRACTED_AT)
+    again = _bundle(db, [backward], EXTRACTED_AT)
+    assert again == _bundle(db, [forward], EXTRACTED_AT)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1

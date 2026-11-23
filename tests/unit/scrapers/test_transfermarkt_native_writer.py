@@ -403,9 +403,10 @@ def test_guard_counts_a_page_that_contributed_no_row():
     rowless_older = dataclasses_replace(
         plan, rows=tuple(row for row in plan.rows if row['source_url'] == ATTENDANCE_PAGE_2),
         captured_at=SIBLING_CLOCK, capture_id='', evidence=(),
-        pages=((ATTENDANCE_START, 'cap-rowless', EARLIER, hashlib.sha256(b'rowless').hexdigest()),
+        pages=((ATTENDANCE_START, 'cap-rowless', EARLIER, hashlib.sha256(b'rowless').hexdigest(),
+                ATTENDANCE_PAGE_2),
                (ATTENDANCE_PAGE_2, hashlib.sha256(b'cap-2').hexdigest(), SIBLING_CLOCK,
-                plan.rows[1]['source_body_hash'])))
+                plan.rows[1]['source_body_hash'], '')))
     cursor = GuardCursor(rows=[(SIBLING_CLOCK,)],
                          pages=[(ATTENDANCE_START, CLOCK), (ATTENDANCE_PAGE_2, SIBLING_CLOCK)])
     connection = type('C', (), {'cursor': lambda self, c=cursor: c})()
@@ -1063,9 +1064,27 @@ def test_page_evidence_is_validated_field_by_field():
         dataclasses_replace(plan, pages=plan.pages + (first,))
     with pytest.raises(ValueError, match='page evidence'):
         dataclasses_replace(plan, pages=(
-            *plan.pages, (ATTENDANCE_START + '?page=9', first[1], first[2], 'invalid')))
+            *plan.pages, (ATTENDANCE_START + '?page=9', first[1], first[2], 'invalid', '')))
     with pytest.raises(ValueError, match='page evidence'):
         dataclasses_replace(plan, pages=(
-            *plan.pages, (ATTENDANCE_START + '?page=9', first[1], first[2], 'f' * 64)))
+            *plan.pages, (ATTENDANCE_START + '?page=9', first[1], first[2], 'f' * 64, '')))
     with pytest.raises(ValueError, match='page evidence'):
-        dataclasses_replace(plan, pages=(*plan.pages[:-1], (*plan.pages[-1][:2], '', plan.pages[-1][3])))
+        dataclasses_replace(plan, pages=(
+            *plan.pages[:-1], (*plan.pages[-1][:2], '', plan.pages[-1][3], '')))
+
+
+def test_a_plan_rebuilt_at_the_write_boundary_must_be_one_whole_walk():
+    # Round 5 finding 3, the write boundary: the journal rebuilds a plan
+    # without an outcome, so the walk is checked here as well.
+    from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
+    plan = _snapshot(CLOCK, 'cap-1')
+    assert [page[4] for page in plan.pages] == [ATTENDANCE_PAGE_2, '']
+    with pytest.raises(ValueError, match='one walk'):
+        dataclasses_replace(plan, pages=plan.pages[:1])
+    with pytest.raises(ValueError, match='one walk'):
+        dataclasses_replace(plan, pages=plan.pages[::-1])
+    with pytest.raises(ValueError, match='one walk'):
+        dataclasses_replace(plan, pages=(
+            (*plan.pages[0][:4], ATTENDANCE_START + '?page=3'), plan.pages[1]))
+    with pytest.raises(ValueError, match='one walk'):
+        dataclasses_replace(plan, pages=(plan.pages[0], (*plan.pages[1][:4], plan.pages[0][0])))
