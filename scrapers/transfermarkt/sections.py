@@ -317,6 +317,7 @@ def extract_referee_directory_observations(
     if failed is not None:
         return (_unavailable_capture('referees', 'referee_aggregate_observations', failed, scope,
                                      extracted_at, universe_version),)
+    _distinct_captures(captures, 'referees')
     failure = _referee_walk_failure(captures)
     if failure is not None:
         # The walk is not certified whole: the directory keeps no partial rows
