@@ -147,3 +147,44 @@ def test_run_refresh_rejects_conf_before_construction_or_lock(monkeypatch, conf)
 
     with pytest.raises(ValueError, match="C1 bootstrap is manual and requires an approved window"):
         c1.run_refresh(dag_run=SimpleNamespace(conf=conf))
+
+
+@pytest.mark.unit
+def test_run_refresh_retries_snapshot_invalidation(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("TRINO_SRC_FOTMOB_PASSWORD", raising=False)
+    monkeypatch.delenv("TRINO_PASSWORD", raising=False)
+    monkeypatch.delenv("TRINO_USER", raising=False)
+    monkeypatch.setenv("TRINO_PORT", "8080")
+    monkeypatch.setattr(base, "TRINO_AVAILABLE", True)
+    monkeypatch.setattr(base, "trino", SimpleNamespace(
+        dbapi=SimpleNamespace(connect=lambda **k: object()),
+        auth=SimpleNamespace(BasicAuthentication=lambda u, p: ("basic", u, p)),
+    ), raising=False)
+    monkeypatch.setattr(c1, "wait_for_wave", lambda: None)
+    calls = []
+
+    def refresh(manager, *, writer_lock):
+        calls.append(None)
+        if len(calls) < c1.C1_REFRESH_ATTEMPTS:
+            raise RuntimeError("C1 source snapshots changed during refresh")
+        return {"generation": "g", "seasons": 0, "rows": 1}
+
+    monkeypatch.setattr(c1, "refresh", refresh)
+    result = c1.run_refresh(dag_run=SimpleNamespace(conf={}))
+    assert result == {"generation": "g", "seasons": 0, "rows": 1}
+    assert len(calls) == c1.C1_REFRESH_ATTEMPTS
+
+    fatal = RuntimeError("C1 requires an approved bootstrap")
+    calls.clear()
+
+    def refresh_fatal(manager, *, writer_lock):
+        calls.append(None)
+        raise fatal
+
+    monkeypatch.setattr(c1, "refresh", refresh_fatal)
+    with pytest.raises(RuntimeError) as caught:
+        c1.run_refresh(dag_run=SimpleNamespace(conf={}))
+    assert caught.value is fatal
+    assert len(calls) == 1

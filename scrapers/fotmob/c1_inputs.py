@@ -34,6 +34,7 @@ C1_MAX_LOCK_HOLD_SECONDS = 300.0
 C1_WAVE_WAIT_SECONDS = 600.0
 C1_WAVE_POLL_SECONDS = 60.0
 C1_WAVE_PROBE_ATTEMPTS = 3
+C1_REFRESH_ATTEMPTS = 3
 _sleep = time.sleep
 COLUMNS = (
     "deadline_day", "competition_id", "source_season_key", "match_id", "kind",
@@ -833,4 +834,15 @@ def run_refresh(**context):
             "enable_dynamic_filtering": "false",
         },
     )
-    return refresh(manager, writer_lock=build_writer_lock())
+    # Saturated wave lanes can invalidate the pinned source snapshots while
+    # this refresh politely waits for the publication lease; the failed attempt
+    # publishes nothing, so retry from freshly pinned snapshots instead of
+    # burning the whole slot. The task deadline still bounds the loop.
+    attempts = C1_REFRESH_ATTEMPTS
+    while True:
+        attempts -= 1
+        try:
+            return refresh(manager, writer_lock=build_writer_lock())
+        except RuntimeError as error:
+            if attempts <= 0 or "snapshots changed" not in str(error):
+                raise
