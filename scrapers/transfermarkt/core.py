@@ -22,6 +22,7 @@ from scrapers.transfermarkt import parsing
 CORE_PARSER_REVISION = 'core-v1'
 CORE_SCHEMA_REVISION = '1'
 TRANSFERMARKT_HOST = 'www.transfermarkt.com'
+TRANSFERMARKT_API_HOST = 'tmapi.transfermarkt.technology'
 CORE_STATUSES = frozenset({
     'observed_present', 'observed_empty', 'explicit_none', 'not_applicable',
     'unknown', 'unavailable', 'error',
@@ -811,6 +812,21 @@ def _rows_match_revisions(outcome: LaneOutcome) -> bool:
     )
 
 
+# Lanes whose route carries a query. The lane validates it itself (the
+# players of a packet, the page of a walk); every other route has none.
+_ROUTES_WITH_QUERY = frozenset({
+    'player_representation_observations', 'attendance_observations', 'rumour_observations',
+})
+
+
+def _source_origin(entity: str, scope_values: Mapping[str, str]) -> str:
+    """The one authority a lane's captures come from."""
+    if entity == 'player_representation_observations' or (
+            entity == 'achievement_observations' and scope_values.get('recipient_type') != 'coach'):
+        return TRANSFERMARKT_API_HOST
+    return TRANSFERMARKT_HOST
+
+
 def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
     """Empty outcomes have no rows to cross-check; the capture URL still names
     the entity it belongs to, so a swapped club/player scope fails here."""
@@ -818,6 +834,12 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         return
     url = urlsplit(capture.url)
     path = url.path
+    # The complete origin and route of the lane: https from its own authority
+    # as a whole (another port or a user part is another source), no fragment,
+    # and a query only where the lane's route has one.
+    if (url.scheme != 'https' or url.netloc != _source_origin(entity, scope_values)
+            or url.fragment or (url.query and entity not in _ROUTES_WITH_QUERY)):
+        raise CoreParseError('row_scope_mismatch')
     if entity == 'player_representation_observations':
         if (url.hostname != 'tmapi.transfermarkt.technology' or path != '/players'
                 or scope_values['player_id'] not in parse_qs(url.query).get('ids[]', ())):
