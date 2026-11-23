@@ -2976,3 +2976,45 @@ def test_club_value_competition_ids_keep_the_donors_grammar():
     assert db.sql.execute(
         'SELECT DISTINCT competition_id FROM transfermarkt_club_value_observations').fetchall() == [
         ('U-21',)]
+
+
+def test_referee_and_coach_sources_are_checked_by_their_full_origin():
+    # Round 4 finding 17: the profile check compared only the hostname, so a
+    # capture served from another port of it received a verified receipt.
+    elsewhere = _replace(_referee_profile_capture(),
+                         url=REFEREE_PROFILE_URL.replace('.com/', '.com:444/'))
+    outcome = sections.extract_referee_profile_observations(
+        elsewhere, _referee_scope(), referee_id='101', extracted_at=REFEREE_EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'referees:row_scope_mismatch', ())
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core._check_scope_against_capture('referee_profiles', {'referee_id': '101'}, elsewhere)
+    # The coach achievement page follows the same origin rule.
+    coach = _capture('https://www.transfermarkt.com:444/x/erfolge/trainer/7', b'<html></html>',
+                     CLUB_CAPTURED, endpoint='coach_achievement')
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core._check_scope_against_capture(
+            'achievement_observations', {'recipient_type': 'coach', 'recipient_id': '7'}, coach)
+
+
+def test_referee_directory_urls_carry_no_query_and_validate_their_first_page():
+    # Round 4 finding 17: the query of a directory URL was ignored, so a
+    # terminal page offered as page 1 verified as a whole directory, and a
+    # malformed first path raised out of the adapter.
+    body = _referee_directory_capture().body
+    terminal = _referee_page(REFEREE_DIRECTORY_URL + '?page=2', body)
+    outcome = _directory_error((terminal,))
+    assert outcome.status_reason == 'referees:directory_identity_invalid'
+    malformed = _referee_page(REFEREE_DIRECTORY_URL + '/extra', body)
+    outcome = _directory_error((malformed,))
+    assert (outcome.status_reason, outcome.capture.capture_id) == (
+        'referees:directory_identity_invalid', malformed.capture_id)
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core._check_scope_against_capture(
+            'referee_aggregate_observations', {'competition_id': 'XY1', 'edition_id': '2025'},
+            terminal)
+    # The canonical directory URL of the scope is the one that is accepted.
+    core._check_scope_against_capture(
+        'referee_aggregate_observations', {'competition_id': 'XY1', 'edition_id': '2025'},
+        _referee_page(REFEREE_DIRECTORY_URL, body))
