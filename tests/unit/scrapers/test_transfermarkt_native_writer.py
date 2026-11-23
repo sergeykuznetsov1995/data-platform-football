@@ -1145,3 +1145,25 @@ def test_the_writer_accepts_only_a_conclusive_plan():
     # The conclusive combinations stay accepted.
     dataclasses_replace(_empty_roster_plan(clock=LATER), status='not_applicable')
     assert membership_plan(['1']).status == 'observed_present'
+
+
+def test_validated_rows_cannot_be_reinitialised():
+    # Round 5 finding 14: the read-only row was still a dictionary, and the
+    # initialiser it inherited refilled it in place; the writer then verified
+    # an observed_present receipt over rows marked unknown.
+    plan = _snapshot(CLOCK, 'cap-1')
+    digest = plan.plan_sha256()
+    row = plan.rows[0]
+    with pytest.raises(TypeError):
+        row.__init__(observation_status='unknown', parser_revision='wrong')
+    with pytest.raises((TypeError, AttributeError)):
+        row._values['observation_status'] = 'unknown'
+    with pytest.raises((TypeError, AttributeError)):
+        row._values = {'observation_status': 'unknown'}
+    assert plan.plan_sha256() == digest
+    assert row['observation_status'] == 'observed_present' and row['parser_revision'] == 'attendance-v1'
+    db = CoreDB()
+    receipt = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [plan], run_id='run-14', universe_version='u',
+        committed_at=plan.captured_at)
+    assert receipt['plans'][0]['status_counts'] == {'observed_present': 2}
