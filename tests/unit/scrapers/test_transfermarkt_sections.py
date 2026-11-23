@@ -3145,3 +3145,165 @@ def test_reordered_captures_of_one_walk_do_not_make_a_second_snapshot():
     again = _bundle(db, [backward], EXTRACTED_AT)
     assert again == _bundle(db, [forward], EXTRACTED_AT)
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1
+
+
+T1215 = '2026-11-20T12:15:00.000000+00:00'
+T1235 = '2026-11-20T12:35:00.000000+00:00'
+T1245 = '2026-11-20T12:45:00.000000+00:00'
+
+
+def _manifest_evidence(db):
+    """Accepted page evidence of the scope: URL -> (capture id, moment, body hash)."""
+    return {
+        url: (capture_id, _moment(clock), body_hash) for url, capture_id, clock, body_hash in db.sql.execute(
+            'SELECT source_url, source_capture_id, captured_at, source_body_hash '
+            'FROM transfermarkt_core_pages_v1')}
+
+
+def _two_pages(first_clock=PAGE_1_CAPTURED, second_clock=PAGE_2_CAPTURED):
+    return (_attendance_capture('page_1.html', ATTENDANCE_START, first_clock),
+            _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, second_clock))
+
+
+def test_an_interrupted_manifest_update_keeps_the_last_accepted_page(monkeypatch):
+    # Round 5 finding 1: the manifest scope was deleted before its rows were
+    # re-inserted; an interruption in between erased the accepted clock of a
+    # rowless page and let the acknowledged older snapshot through.
+    page_1, page_2 = _two_pages(second_clock=NEWER_PAGE_CAPTURED)
+    original = [_attendance_plan((page_1, page_2))]
+    db = CoreDB()
+    writer = CoreWriter(db)
+    first = _bundle(db, original, EXTRACTED_AT)
+    empty_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, T1215, 'empty 12:15')
+    _bundle(db, [_attendance_plan((empty_1, page_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'631'}
+    assert _manifest_evidence(db)[ATTENDANCE_START][:2] == (empty_1.capture_id, _moment(T1215))
+    # A later walk refreshes the empty page; its manifest update is interrupted.
+    refreshed = _page(ATTENDANCE_START, ROWLESS_PAGE_1, T1235, 'empty 12:35')
+    pending = [_attendance_plan((refreshed, page_2), LATER_EXTRACTED_AT)]
+    real = native_writer.execute_statement
+    armed = {'on': True}
+
+    def flaky(cursor, sql, params=None):
+        # The scope's manifest rows are written, and the first write of a
+        # page is lost. Reading the manifest keeps working.
+        if (armed['on'] and 'transfermarkt_core_pages_v1' in sql
+                and sql.lstrip().startswith(('INSERT', 'MERGE'))):
+            armed['on'] = False
+            raise RuntimeError('interrupted manifest')
+        return real(cursor, sql, params)
+
+    monkeypatch.setattr(native_writer, 'execute_statement', flaky)
+    with pytest.raises(RuntimeError, match='interrupted manifest'):
+        _write(db, pending, pending[0].rows[0]['run_id'], LATER_EXTRACTED_AT)
+    assert not armed['on'] and set(_stadiums(db)) == {'631'}
+    # Until the interrupted bundle is replayed, its damage must not reopen
+    # the acknowledged older snapshot.
+    with pytest.raises(StaleTransfermarktWrite):
+        _write(db, original, first['run_id'], EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'631'}
+    receipts = native_writer.replay_pending_intents(lambda: db, writer)
+    assert len(receipts) == 1 and receipts[0]['verified'] is True
+    assert _manifest_evidence(db)[ATTENDANCE_START][:2] == (refreshed.capture_id, _moment(T1235))
+    with pytest.raises(StaleTransfermarktWrite):
+        _write(db, original, first['run_id'], EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'631'}
+
+
+def test_a_page_that_left_the_walk_keeps_its_accepted_clock():
+    # Round 5 finding 2: a shorter walk replaced the whole manifest scope, and
+    # the page that had left it came back later with an older cached capture.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 12:30')
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, empty_2))], EXTRACTED_AT)
+    # The edition later fits on one page: page 2 is no longer walked.
+    single = _page(ATTENDANCE_START, (ATTENDANCE_FIXTURES / 'single_page.html').read_bytes(),
+                   T1235, 'single 12:35')
+    assert _bundle(db, [_attendance_plan((single,), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)['verified'] is True
+    assert _manifest_evidence(db) == {
+        ATTENDANCE_START: (single.capture_id, _moment(T1235), single.body_hash),
+        ATTENDANCE_PAGE_2: (empty_2.capture_id, _moment(NEWER_PAGE_CAPTURED), empty_2.body_hash)}
+    # A later page 1 links to a cached page 2 older than the accepted emptiness.
+    late_1 = _page(ATTENDANCE_START, page_1.body, T1245, 'late 12:45')
+    cached_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [_attendance_plan((late_1, cached_2), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)
+    # A genuinely newer page 2 joins the walk again.
+    fresh_2 = _page(ATTENDANCE_PAGE_2, cached_2.body, T1245, 'fresh 12:45')
+    assert _bundle(db, [_attendance_plan((late_1, fresh_2), LATER_EXTRACTED_AT)],
+                   LATER_EXTRACTED_AT)['verified'] is True
+
+
+def test_page_evidence_cannot_change_for_a_capture_the_scope_accepted():
+    # Round 5 finding 6: the committed manifest was compared without its
+    # body hashes, so a rowless capture replayed with another body was
+    # acknowledged a second time over the warehouse's original evidence.
+    rowless_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, PAGE_1_CAPTURED, 'rowless page 1')
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    plans = [_attendance_plan((rowless_1, page_2))]
+    _bundle(db, plans, EXTRACTED_AT)
+    plan = plans[0]
+    first = plan.pages[0]
+    rehashed = _replace(plan, pages=((first[0], first[1], first[2], 'e' * 64, first[4]), plan.pages[1]))
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _write(db, [rehashed], plan.rows[0]['run_id'], LATER_EXTRACTED_AT)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1
+    assert _manifest_evidence(db)[ATTENDANCE_START][2] == rowless_1.body_hash
+
+
+def test_a_duplicated_manifest_row_is_a_corrupt_manifest():
+    # Round 5 finding 6: two accepted rows for one page is not a manifest.
+    rowless_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, PAGE_1_CAPTURED, 'rowless page 1')
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    plans = [_attendance_plan((rowless_1, page_2))]
+    _bundle(db, plans, EXTRACTED_AT)
+    db.sql.execute(
+        'INSERT INTO transfermarkt_core_pages_v1 SELECT * FROM transfermarkt_core_pages_v1 '
+        'WHERE source_url = ?', (ATTENDANCE_START,))
+    with pytest.raises(RuntimeError, match='manifest'):
+        _bundle(db, plans, LATER_EXTRACTED_AT)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1
+
+
+def test_a_snapshot_whose_manifest_was_not_persisted_is_not_acknowledged(monkeypatch):
+    # Round 5 finding 6: the manifest was written but never read back.
+    rowless_1 = _page(ATTENDANCE_START, ROWLESS_PAGE_1, PAGE_1_CAPTURED, 'rowless page 1')
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    db = CoreDB()
+    plans = [_attendance_plan((rowless_1, page_2))]
+    real = native_writer.execute_statement
+
+    def without_manifest(cursor, sql, params=None):
+        if 'transfermarkt_core_pages_v1' in sql and not sql.lstrip().startswith(('SELECT', 'CREATE')):
+            return None
+        return real(cursor, sql, params)
+
+    monkeypatch.setattr(native_writer, 'execute_statement', without_manifest)
+    with pytest.raises(RuntimeError, match='manifest'):
+        _bundle(db, plans, EXTRACTED_AT)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 0
+
+
+def test_a_capture_committed_as_rowless_cannot_acquire_rows():
+    # Round 5 finding 4: a row appeared under a capture the scope had
+    # accepted as a page without rows, carrying that page's exact evidence.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, PAGE_2_CAPTURED, 'empty page 2')
+    db = CoreDB()
+    plans = [_attendance_plan((page_1, empty_2))]
+    _bundle(db, plans, EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11'}
+    plan = plans[0]
+    page_1_again, populated_2 = _two_pages()
+    chelsea = next(row for row in _attendance_plan((page_1_again, populated_2)).rows
+                   if row['club_id'] == '631')
+    _url, capture_id, _clock, body_hash, _next = plan.pages[1]
+    acquired = {**chelsea, 'raw_capture_id': capture_id, 'source_capture_id': capture_id,
+                'source_body_hash': body_hash}
+    acquired_plan = _replace(plan, rows=plan.rows + (acquired,), capture_id=capture_id, evidence=())
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _write(db, [acquired_plan], plan.rows[0]['run_id'], LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11'}

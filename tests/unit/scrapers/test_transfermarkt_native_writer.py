@@ -1088,3 +1088,13 @@ def test_a_plan_rebuilt_at_the_write_boundary_must_be_one_whole_walk():
             (*plan.pages[0][:4], ATTENDANCE_START + '?page=3'), plan.pages[1]))
     with pytest.raises(ValueError, match='one walk'):
         dataclasses_replace(plan, pages=(plan.pages[0], (*plan.pages[1][:4], plan.pages[0][0])))
+
+
+def test_a_capture_committed_as_empty_cannot_acquire_rows():
+    # Round 5 finding 4, single-page lane: the zero-row receipt of the scope
+    # names the capture that was accepted as empty.
+    db = CoreDB()
+    write(db, [_empty_roster_plan(capture='cap-x')])
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [membership_plan(['1'], capture='cap-x')], run_id='run-2', clock=CLOCK)
+    assert _players(db) == []
