@@ -2589,7 +2589,7 @@ def test_edition_replacement_requires_the_whole_page_manifest():
     _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
     with pytest.raises(ValueError, match='page manifest'):
         terminal_only(pages=())
-    with pytest.raises(CoreParseError, match='first page'):
+    with pytest.raises(CoreParseError, match='first_page'):
         terminal_only(pages=((ATTENDANCE_PAGE_2, page_2.capture_id, PAGE_2_CAPTURED,
                               page_2.body_hash),))
     assert set(_stadiums(db)) == {'11', '631'}

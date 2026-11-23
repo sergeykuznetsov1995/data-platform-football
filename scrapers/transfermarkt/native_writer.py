@@ -336,6 +336,10 @@ class NativeWritePlan:
 
     def _check_pages(self) -> None:
         if not self.pages:
+            # Without its page evidence a snapshot proves none of the pages
+            # it did not walk: a terminal page would replace the whole scope.
+            if self._multi_page():
+                raise ValueError('core multi-page replacement requires its page manifest')
             return
         if not self._multi_page():
             raise ValueError('core page evidence belongs to a multi-page replacement snapshot')
@@ -689,26 +693,32 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
     a new run (only lineage differs), ``pending`` still has to be written. A
     capture that is committed with other business rows is never rewritten.
     """
-    if not plan.rows:
-        return 'pending'
-    existing = _read_plan_rows(connection, plan)
     if plan.write_mode == 'replace':
-        # A refreshed snapshot reuses the pages it still shares with the
-        # committed one: each of those captures keeps its own integrity, the
-        # rowless ones included.
+        # A replacement is classified capture by capture. A page that
+        # contributes no row is a capture with an empty row set: committed
+        # with rows, it is a contradiction, never a deletion.
+        existing = _read_plan_rows(connection, plan)
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
         for _url, capture_id, _clock, _body_hash in plan.pages:
             planned.setdefault(capture_id, [])
+        if not plan.pages:
+            planned.setdefault(plan.capture_id, [])
         for capture_id, rows in planned.items():
             shared = committed.get(capture_id)
             if shared is not None and (len(shared) != len(rows)
                                        or not _rows_equal_ignoring_lineage(shared, rows)):
                 raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+        if not plan.rows and not plan.pages:
+            # One empty page proves itself only through its receipt.
+            return 'pending'
         if committed.keys() != planned.keys():
             return 'pending'
         refreshed = any(not _rows_equal(committed[capture_id], planned[capture_id])
                         for capture_id in planned)
         return 'refresh' if refreshed else 'written'
+    if not plan.rows:
+        return 'pending'
+    existing = _read_plan_rows(connection, plan)
     if not existing:
         return 'pending'
     partner, complete = plan.rows, True

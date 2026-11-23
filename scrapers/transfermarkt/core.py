@@ -747,6 +747,7 @@ def plan_for_outcome(
     if evidence_clock is not None and captured_at != evidence_clock:
         raise CoreParseError('captured_at_differs_from_evidence')
     _check_scope_against_capture(entity, scope_values, capture)
+    _check_pages_against_scope(entity, scope_values, outcome.pages)
     evidence = ()
     if capture is not None:
         row = outcome.rows[0] if outcome.rows else {}
@@ -859,6 +860,33 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         match = re.search(pattern, path)
         if match is not None and match.group(1) != scope_values[column]:
             raise CoreParseError('row_scope_mismatch')
+
+
+def _check_pages_against_scope(entity: str, scope_values: Mapping[str, str], pages) -> None:
+    """A replacement snapshot replaces its whole scope or nothing.
+
+    Every page of its manifest must belong to the requested scope, and the
+    manifest must be one walk from that scope's first page: a manifest that
+    starts later certifies pages it never saw.
+    """
+    if not pages:
+        return
+    if entity == 'attendance_observations':
+        from scrapers.transfermarkt import attendance
+
+        first_pages = 0
+        for url, *_ in pages:
+            parts = urlsplit(url)
+            try:
+                attendance._validate_attendance_url(
+                    url, host=TRANSFERMARKT_HOST, path=parts.path,
+                    competition=scope_values['competition_id'], edition=scope_values['edition_id'])
+            except attendance.AttendanceParseError as exc:
+                raise CoreParseError('page_scope_mismatch') from exc
+            # The donor validated the query: at most one positive page number.
+            first_pages += int(parse_qs(parts.query).get('page', ['1'])[0]) == 1
+        if first_pages != 1:
+            raise CoreParseError('page_manifest_does_not_start_on_the_first_page')
 
 
 def _receipt_diagnostics(receipt: Mapping | None) -> list[str]:
