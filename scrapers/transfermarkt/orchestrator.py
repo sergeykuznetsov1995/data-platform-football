@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 from itertools import batched
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -213,6 +214,18 @@ class _Request:
         raise CoreRunError(f"{self.label} request has no replacement scope")
 
 
+def _canonical_target_id(value: str, error: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value):
+        raise CoreRunError(error)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise CoreRunError(error) from exc
+    if number == 0:
+        raise CoreRunError(error)
+    return str(number)
+
+
 def _base_requests(plan: CoreScopePlan):
     for club in plan.clubs:
         if club.squad_url:
@@ -236,9 +249,10 @@ def _base_requests(plan: CoreScopePlan):
             raise CoreRunError("achievements:invalid_recipient_type")
         if holder.recipient_type == "coach" and not holder.slug:
             raise CoreRunError("achievements:coach_slug_missing")
-        url = achievements_url(holder.recipient_type, holder.recipient_id, holder.slug)
+        recipient_id = _canonical_target_id(holder.recipient_id, 'achievements:recipient_id_invalid')
+        url = achievements_url(holder.recipient_type, recipient_id, holder.slug)
         yield _Request(f"{holder.recipient_type}_achievement", url,
-                       recipient_type=holder.recipient_type, recipient_id=holder.recipient_id)
+                       recipient_type=holder.recipient_type, recipient_id=recipient_id)
 
 
 def _requests(plan: CoreScopePlan):
@@ -265,7 +279,9 @@ def _requests(plan: CoreScopePlan):
         # donor's URL builder is what validates and normalises it.
         url = referee_profile_url(target)
         yield _Request("referee_profile", url, referee_id=url.rsplit('/', 1)[-1]), None
-    for batch in batched(plan.representation_player_ids, _REPRESENTATION_PACKET_LIMIT):
+    player_ids = (_canonical_target_id(value, 'representation:player_id_invalid')
+                  for value in plan.representation_player_ids)
+    for batch in batched(player_ids, _REPRESENTATION_PACKET_LIMIT):
         yield _Request("representation", representation_url(batch), player_ids=batch), None
 
 
@@ -622,6 +638,8 @@ class CoreRun:
                 try:
                     next_url = attendance.next_attendance_url(capture.body, page.url)
                     if next_url is None:
+                        break
+                    if not sections._attendance_source_valid(next_url):
                         break
                     start = urlsplit(request.url)
                     next_url = attendance._validate_attendance_url(

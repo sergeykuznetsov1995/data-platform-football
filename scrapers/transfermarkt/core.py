@@ -33,6 +33,20 @@ CONCLUSIVE_CORE_STATUSES = frozenset({
 _SEASON_RE = re.compile(r'^\d{4}$')
 _ID_RE = re.compile(r'^[1-9][0-9]*$')
 _CAPTURE_RE = re.compile(r'^[0-9a-f]{64}$')
+_SQUAD_ROUTE = (
+    'squad', 'club_id', r'/[A-Za-z0-9_-]+/kader/verein/([1-9][0-9]*)/saison_id/[0-9]{4}(?:/plus/1)?/?',
+)
+_STAGE_B_ROUTES = {
+    'squad_memberships': _SQUAD_ROUTE,
+    'player_attribute_observations': _SQUAD_ROUTE,
+    'player_contract_observations': _SQUAD_ROUTE,
+    'coach_stints': ('coach_history', 'club_id',
+                     r'/[A-Za-z0-9_-]+/mitarbeiterhistorie/verein/([1-9][0-9]*)(?:/plus/1)?/?'),
+    'market_value_points': ('market_value_points', 'player_id',
+                            r'/ceapi/marketValueDevelopment/graph/([1-9][0-9]*)'),
+    'transfer_events': ('transfer_events', 'player_id', r'/ceapi/transferHistory/list/([1-9][0-9]*)'),
+    'coach_profiles': ('coach_profile', 'coach_id', r'/[A-Za-z0-9_-]+/profil/trainer/([1-9][0-9]*)/?'),
+}
 _REFEREE_DIRECTORY_PATH = re.compile(
     r'/[A-Za-z0-9_-]+/schiedsrichter/(?:wettbewerb|pokalwettbewerb)/'
     r'([A-Za-z0-9]+)/saison_id/([0-9]{4})(?:/plus/1)?(?:/page/[0-9]+)?'
@@ -372,19 +386,37 @@ def _row_facts_match_verdict(entity: str, row) -> bool:
     if entity == 'attendance_observations':
         # The donor: a club is observed exactly when a crowd figure is published.
         published = row.get('spectators_total') is not None or row.get('spectators_average') is not None
-        return published == (verdict == 'observed_present')
+        if published:
+            return verdict == 'observed_present'
+        raw_cells = (row.get('spectators_total_raw'), row.get('spectators_average_raw'))
+        unknown = any(isinstance(cell, str) and cell.strip().lower() in {'', '?', 'unknown'}
+                      for cell in raw_cells)
+        return verdict == ('unknown' if unknown else 'explicit_none')
     if entity == 'player_representation_observations':
         # The donor: only an assigned player names a representative, and an
         # explicit absence carries its own evidence.
         if verdict == 'observed_present':
-            return (_nonempty(row.get('representative_id'))
-                    and row.get('representative_key') == f"agency:{row.get('representative_id')}")
+            representative = row.get('representative_id')
+            return (isinstance(representative, str) and _ID_RE.fullmatch(representative) is not None
+                    and row.get('representative_key') == f'agency:{representative}')
         if row.get('representative_id') is not None or row.get('representative_key') != f'status:{verdict}':
             return False
-        return verdict != 'explicit_none' or row.get('evidence_type') == 'player_profile_explicit_none'
+        if verdict != 'explicit_none':
+            return True
+        if row.get('evidence_type') != 'player_profile_explicit_none' or not _nonempty(row.get('source_url')):
+            return False
+        try:
+            url = urlsplit(row['source_url'])
+        except ValueError:
+            return False
+        match = re.fullmatch(r'/[A-Za-z0-9_-]+/profil/spieler/([1-9][0-9]*)/?', url.path)
+        return url.netloc == TRANSFERMARKT_HOST and match is not None and match[1] == row.get('player_id')
     if entity == 'referee_aggregate_observations':
         # The donor: a metric has a value exactly when it is observed present.
-        return (row.get('value') is not None) == (verdict == 'observed_present')
+        value = row.get('value')
+        if verdict == 'observed_present':
+            return isinstance(value, str) and re.fullmatch(r'[0-9]+(?:[.,][0-9]+)?', value) is not None
+        return value is None and row.get('raw_value') == ('' if verdict == 'observed_empty' else '-')
     if entity == 'club_value_observations':
         # The donor: a value is present exactly when it has a non-negative amount.
         amount = row.get('value_amount')
@@ -522,13 +554,28 @@ def _render(
     row = {}
     for col in _BUSINESS_COLUMNS[entity]:
         value = values[col]
-        if COLUMN_TYPES[col] == 'date' and isinstance(value, date):
-            value = _iso_date(value)
-        elif COLUMN_TYPES[col] == 'bigint' and isinstance(value, str) and value.isdigit():
-            # Parser helpers sometimes hand numeric ids as strings; the
-            # warehouse column is bigint and the physical read-back returns
-            # an int, so the plan must carry the int form.
-            value = int(value)
+        if value is None:
+            row[col] = None
+            continue
+        kind = COLUMN_TYPES[col]
+        if kind == 'varchar' and not isinstance(value, str):
+            raise CoreParseError('row_value_not_text')
+        if kind == 'boolean' and not isinstance(value, bool):
+            raise CoreParseError('row_value_not_boolean')
+        if kind == 'bigint' and type(value) is not int:
+            if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value):
+                raise CoreParseError('row_value_not_integer')
+            digits = value.lstrip('0') or '0'
+            if len(digits) > 19:
+                raise CoreParseError('row_value_exceeds_bigint')
+            value = int(digits)
+        if kind == 'date':
+            if not isinstance(value, date):
+                try:
+                    value = date.fromisoformat(value)
+                except (TypeError, ValueError) as exc:
+                    raise CoreParseError('row_value_not_date') from exc
+            value = date.isoformat(value)
         row[col] = value
     row.update(
         source_url=capture.url, source_endpoint=capture.endpoint,
@@ -823,6 +870,10 @@ def plan_for_outcome(
     _check_pages_against_scope(entity, scope_values, outcome.pages)
     evidence = ()
     if capture is not None:
+        if entity == 'club_value_observations':
+            competition = _club_value_competition(capture.url)
+            if any(row['competition_id'] != competition for row in outcome.rows):
+                raise CoreParseError('row_scope_mismatch')
         row = outcome.rows[0] if outcome.rows else {}
         evidence = (
             ('source_url', capture.url),
@@ -846,6 +897,22 @@ def plan_for_outcome(
         capture_id=capture.capture_id if capture is not None else '',
         evidence=evidence, pages=outcome.pages,
     )
+
+
+def _club_value_competition(url: str) -> str:
+    match = re.fullmatch(
+        r'/[A-Za-z0-9_-]+/marktwerteverein/(?:wettbewerb|pokalwettbewerb)/'
+        r'([A-Za-z0-9_-]+)(?:/stichtag/[0-9]{4}-[0-9]{2}-[0-9]{2})?/?', urlsplit(url).path)
+    if match is None:
+        raise CoreParseError('row_scope_mismatch')
+    return match[1]
+
+
+def _representation_query_ids(query: str) -> list[str]:
+    params = parse_qs(query, keep_blank_values=True)
+    if params.keys() != {'ids[]'} or not all(_ID_RE.fullmatch(value) for value in params['ids[]']):
+        return []
+    return params['ids[]']
 
 
 def _referee_directory_identity(path: str) -> tuple[str, str]:
@@ -893,8 +960,7 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
             or url.fragment or (url.query and entity not in _ROUTES_WITH_QUERY)):
         raise CoreParseError('row_scope_mismatch')
     if entity == 'player_representation_observations':
-        if (url.hostname != 'tmapi.transfermarkt.technology' or path != '/players'
-                or scope_values['player_id'] not in parse_qs(url.query).get('ids[]', ())):
+        if path != '/players' or scope_values['player_id'] not in _representation_query_ids(url.query):
             raise CoreParseError('row_scope_mismatch')
         return
     if entity == 'referee_aggregate_observations':
@@ -948,15 +1014,10 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
                 competition=scope_values['competition_id'], edition=scope_values['edition_id'])
         except attendance.AttendanceParseError as exc:
             raise CoreParseError('row_scope_mismatch') from exc
-    for column, pattern in (
-        ('club_id', r'/(?:kader|mitarbeiterhistorie)/verein/([1-9][0-9]*)'),
-        ('player_id', r'/ceapi/(?:marketValueDevelopment/graph|transferHistory/list)/([1-9][0-9]*)'),
-        ('coach_id', r'/profil/trainer/([1-9][0-9]*)'),
-    ):
-        if column not in scope_values:
-            continue
-        match = re.search(pattern, path)
-        if match is not None and match.group(1) != scope_values[column]:
+    if entity in _STAGE_B_ROUTES:
+        endpoint, column, pattern = _STAGE_B_ROUTES[entity]
+        match = re.fullmatch(pattern, path)
+        if capture.endpoint != endpoint or match is None or match[1] != scope_values[column]:
             raise CoreParseError('row_scope_mismatch')
 
 
@@ -972,8 +1033,7 @@ def _check_pages_against_scope(entity: str, scope_values: Mapping[str, str], pag
     if entity == 'attendance_observations':
         from scrapers.transfermarkt import attendance
 
-        first_pages = 0
-        for url, *_ in pages:
+        for number, (url, *_) in enumerate(pages, start=1):
             parts = urlsplit(url)
             try:
                 attendance._validate_attendance_url(
@@ -982,9 +1042,8 @@ def _check_pages_against_scope(entity: str, scope_values: Mapping[str, str], pag
             except attendance.AttendanceParseError as exc:
                 raise CoreParseError('page_scope_mismatch') from exc
             # The donor validated the query: at most one positive page number.
-            first_pages += int(parse_qs(parts.query).get('page', ['1'])[0]) == 1
-        if first_pages != 1:
-            raise CoreParseError('page_manifest_does_not_start_on_the_first_page')
+            if int(parse_qs(parts.query).get('page', ['1'])[0]) != number:
+                raise CoreParseError('page_manifest_does_not_start_on_the_first_page')
 
 
 def _receipt_diagnostics(receipt: Mapping | None) -> list[str]:

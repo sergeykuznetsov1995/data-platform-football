@@ -66,42 +66,60 @@ def _distinct_captures(captures, section: str) -> None:
             raise core.CoreParseError(f'{section}:capture_conflict')
 
 
+def _attendance_source_valid(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme == 'https' and parts.netloc == core.TRANSFERMARKT_HOST and not parts.fragment
+
+
 def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_id: str):
     """Check that the supplied pages are exactly one walk from the first page.
 
     Returns the walk: every capture in the order the pages' own links visit
-    it, each with the link its page gives to the next. Returns the reason
+    it, each with the link its page gives to the next. Returns the reason and capture
     when the pages cannot be that walk, and None when the donor's own walk
     is the one to report.
     """
-    parts = urlsplit(start_url)
-    if parts.netloc != core.TRANSFERMARKT_HOST:
-        return 'pagination_identity_invalid'
-    # The donor reads the page number as a number: ?page=01 is its page 1.
-    page = parse_qs(parts.query).get('page', ['1'])
-    if len(page) != 1 or not page[0].isdigit() or int(page[0]) != 1:
-        return 'pagination_start_not_first_page'
+    by_url = {}
+    for capture in captures:
+        if not _attendance_source_valid(capture.url):
+            return 'pagination_identity_invalid', capture
+        url = attendance._canonical_url(capture.url)
+        if url in by_url:
+            return 'pagination_captures_differ', capture
+        by_url[url] = capture
 
-    def validate(url):
+    walked, visited = [], set()
+    capture = by_url.get(start_url, captures[0])
+
+    def validate(url, start_path):
         return attendance._validate_attendance_url(
-            url, host=parts.netloc, path=parts.path, competition=competition_id, edition=edition_id)
+            url, host=core.TRANSFERMARKT_HOST, path=start_path, competition=competition_id, edition=edition_id)
 
-    by_url = {attendance._canonical_url(capture.url): capture for capture in captures}
-    walked, visited = [], []
     try:
-        current = validate(start_url)
+        parts = urlsplit(start_url)
+        if not _attendance_source_valid(start_url):
+            return 'pagination_identity_invalid', capture
+        # The donor reads the page number as a number: ?page=01 is its page 1.
+        page = parse_qs(parts.query).get('page', ['1'])
+        if len(page) != 1 or not page[0].isdigit() or int(page[0]) != 1:
+            return 'pagination_start_not_first_page', capture
+        current = validate(start_url, parts.path)
         while current is not None and current not in visited:
-            visited.append(current)
+            visited.add(current)
             capture = by_url.get(current)
             if capture is None:
                 return None
             following = attendance.next_attendance_url(capture.body, capture.url)
             walked.append((capture, following))
-            current = validate(following) if following is not None else None
+            if following is not None and not _attendance_source_valid(following):
+                return 'pagination_identity_invalid', capture
+            current = validate(following, parts.path) if following is not None else None
+    except attendance.AttendanceParseError as exc:
+        return exc.reason, capture
     except ValueError:
-        return None
-    if {attendance._canonical_url(capture.url) for capture, _following in walked} != set(by_url):
-        return 'pagination_captures_differ'
+        return 'pagination_identity_invalid', capture
+    if visited != by_url.keys():
+        return 'pagination_captures_differ', captures[-1]
     return walked
 
 
@@ -146,7 +164,9 @@ def extract_attendance_observations(
         if walk is not None:
             # A terminal page offered as the start, or captures the walk never
             # visits, must not become a replacement of the whole edition.
-            return (_outcome(entity, 'error', 'attendance:' + walk, **context),)
+            reason, broken = walk
+            return (_outcome(entity, 'error', 'attendance:' + reason,
+                             **core._context(broken, scope, extracted_at, universe_version)),)
         walk = [(capture, None) for capture in captures]  # the donor reports its own walk
     pages = []
     for capture, _following in walk:
@@ -229,8 +249,8 @@ def extract_representation_observations(
         return (_unavailable_capture('representation', 'player_representation_observations', capture, scope,
                                      extracted_at, universe_version),)
     context = core._context(capture, scope, extracted_at, universe_version)
-    requested = parse_qs(urlsplit(capture.url).query).get('ids[]', [])
-    if len(requested) != len(expected_ids) or set(requested) != set(expected_ids):
+    requested = core._representation_query_ids(urlsplit(capture.url).query)
+    if not requested or sorted(requested) != sorted(expected_ids):
         # The packet must answer the whole request its URL made: a narrowed
         # expectation would certify a capture that never asked for the rest.
         return (_outcome(entity, 'error', 'representation:requested_ids_differ', **context),)
@@ -240,9 +260,9 @@ def extract_representation_observations(
         except (ValueError, RecursionError) as exc:
             raise representation.RepresentationParseError('invalid_json') from exc
         assertions = representation.parse_representation_packet(payload, expected_ids=expected_ids)
-    except representation.RepresentationParseError as exc:
+    except ValueError as exc:
         return (core.captureless_outcome(
-            entity, scope, status='error', reason='representation:' + exc.reason,
+            entity, scope, status='error', reason='representation:' + getattr(exc, 'reason', 'invalid_packet'),
             extracted_at=extracted_at, run_id=context['run_id'], universe_version=universe_version,
             subject=core.canonical_json({'player_ids': list(expected_ids)}).decode(),
         ),)
