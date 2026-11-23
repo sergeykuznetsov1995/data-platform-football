@@ -449,6 +449,22 @@ class NativeWritePlan:
     def _multi_page(self) -> bool:
         return self.write_mode == 'replace' and self.entity in _MULTI_PAGE_REPLACE_ENTITIES
 
+    def response_evidence(self) -> dict[str, tuple]:
+        """Every capture the plan rests on and the one response it names.
+
+        ``capture id -> (source_url, source_body_hash, captured_at)``.
+        """
+        if self.pages:
+            return {page[1]: (page[0], page[3], _timestamp(page[2])) for page in self.pages}
+        if self.rows:
+            row = self.rows[0]
+            return {row['source_capture_id']: (
+                row['source_url'], row['source_body_hash'], _timestamp(row['captured_at']))}
+        evidence = dict(self.evidence)
+        return {self.capture_id: (
+            evidence.get('source_url'), evidence.get('source_body_hash'),
+            _timestamp(self.captured_at))}
+
     def _check_entity_shape(self) -> None:
         """The plan is the registered entity's, in its registered shape.
 
@@ -837,26 +853,44 @@ def _refuse_committed_rows(connection, plan: NativeWritePlan) -> None:
         raise RuntimeError('core replay differs from committed capture: ' + plan.table)
 
 
-def _accepted_without_rows(connection, plan: NativeWritePlan) -> bool:
-    """Whether the scope acknowledged this plan's capture as a page without rows.
-
-    A single captured page leaves no manifest: its zero-row receipt is the
-    only evidence that its capture was accepted as empty.
-    """
+def _acknowledged_capture(connection, plan: NativeWritePlan) -> list[tuple]:
+    """How the scope acknowledged this plan's capture: (rows, body hash, clock) per receipt."""
     cursor = connection.cursor()
     try:
         rows = _query_rows(
             cursor,
-            f'SELECT row_count FROM {CORE_RECEIPTS_TABLE} WHERE target_table = ? '
-            'AND scope_values_json = ? AND source_capture_id = ?',
+            f'SELECT row_count, source_body_hash, captured_at FROM {CORE_RECEIPTS_TABLE} '
+            'WHERE target_table = ? AND scope_values_json = ? AND source_capture_id = ?',
             (plan.full_table, _scope_json(plan), plan.capture_id))
     except Exception as exc:
         if write_journal._table_not_found(exc):
-            return False
+            return []
         raise
     finally:
         cursor.close()
-    return any(row[0] == 0 for row in rows)
+    return [(row[0], row[1], _timestamp(row[2])) for row in rows]
+
+
+def _refuse_capture_contradiction(connection, plan: NativeWritePlan, *, empty: bool) -> bool:
+    """Refuse a plan that contradicts how its capture was acknowledged.
+
+    A capture id names one response: its receipts carry one body hash and
+    one clock, the plan's own. A capture acknowledged with rows never comes
+    back without them, and one acknowledged without rows never acquires
+    them. Returns whether the capture was acknowledged without rows.
+    """
+    acknowledged = _acknowledged_capture(connection, plan)
+    if plan.rows:
+        own = (plan.rows[0]['source_body_hash'], _timestamp(plan.rows[0]['captured_at']))
+    else:
+        own = (dict(plan.evidence).get('source_body_hash'), _timestamp(plan.captured_at))
+    if len({(body, clock) for _rows, body, clock in acknowledged} | {own}) > 1:
+        raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+    counts = {rows for rows, _body, _clock in acknowledged}
+    if (empty and any(count > 0 for count in counts)) \
+            or (not empty and any(count == 0 for count in counts)):
+        raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+    return counts == {0}
 
 
 def _verify_pages(connection, plan: NativeWritePlan) -> None:
@@ -1135,7 +1169,9 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
                 committed.setdefault(capture_id, [])
         if not plan.pages:
             planned.setdefault(plan.capture_id, [])
-            if _accepted_without_rows(connection, plan):
+            # Its receipt says whether the scope accepted this capture without
+            # rows, and whether the capture is still the response it was.
+            if _refuse_capture_contradiction(connection, plan, empty=not plan.rows):
                 committed.setdefault(plan.capture_id, [])
         for capture_id, rows in planned.items():
             shared = committed.get(capture_id)
@@ -1158,13 +1194,17 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
                         for capture_id in carrying)
         return 'refresh' if refreshed else 'written'
     if not plan.rows:
-        # An empty merge writes nothing. A capture the scope holds with rows
-        # is never replayed as empty: the contradiction is found while the
-        # bundle is classified, before any plan of it mutates.
+        # An empty merge writes nothing. A capture the scope holds with rows,
+        # or acknowledged with rows, is never replayed as empty: the
+        # contradiction is found while the bundle is classified, before any
+        # plan of it mutates.
         _refuse_committed_rows(connection, plan)
+        _refuse_capture_contradiction(connection, plan, empty=True)
         return 'pending'
     existing = _read_plan_rows(connection, plan)
     if not existing:
+        # A capture acknowledged without rows never acquires them.
+        _refuse_capture_contradiction(connection, plan, empty=False)
         return 'pending'
     partner, complete = plan.rows, True
     if plan.entity in _PAGE_OWNED_ROWS_ENTITIES:
@@ -1468,6 +1508,8 @@ def validate_run_plans(plans) -> None:
     seen = set()
     scopes = set()
     identities = set()
+    owners = set()
+    captures = {}
     for plan in plans:
         # The same plan twice is one acknowledgement asked for twice, a
         # rowless one included: it has no key and no scope to compare.
@@ -1485,6 +1527,16 @@ def validate_run_plans(plans) -> None:
             if scope in scopes:
                 raise ValueError('duplicate core replacement scope across plans')
             scopes.add(scope)
+        # One capture of one scope is owned by one plan, and a capture id
+        # names one response across the whole run: plans that are valid on
+        # their own may still contradict each other about a capture.
+        owner = (plan.table, plan.scope_values, plan.capture_id)
+        if owner in owners:
+            raise ValueError('duplicate core capture across plans')
+        owners.add(owner)
+        for capture_id, evidence in plan.response_evidence().items():
+            if captures.setdefault(capture_id, evidence) != evidence:
+                raise ValueError('duplicate core capture evidence across plans')
 
 
 def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:

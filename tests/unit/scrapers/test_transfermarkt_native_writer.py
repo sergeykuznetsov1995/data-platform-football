@@ -1617,9 +1617,7 @@ def test_an_acknowledged_empty_merge_capture_cannot_acquire_rows():
     with pytest.raises(RuntimeError, match='replay differs'):
         write(db, [mv_plan([('2025-01-01', 10)], capture='cap-mv2', clock=LATER)],
               run_id='run-2', clock=LATER)
-    assert db.sql.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transfermarkt_market_value_points'"
-    ).fetchall() == []
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_market_value_points').fetchone()[0] == 0
 
 
 def test_run_preflight_refuses_capture_contradictions_between_valid_plans():
@@ -1635,13 +1633,15 @@ def test_run_preflight_refuses_capture_contradictions_between_valid_plans():
         mv_plan([('2025-02-01', 20)], capture='cap-1').rows))
     with pytest.raises(ValueError, match='duplicate core capture'):
         native_writer.validate_run_plans([first, second])
-    # Packet fan-out stays legitimate while every plan names the same response.
+    # Fan-out of one capture over several scopes stays legitimate while every
+    # plan names the same response.
     from tests.unit.scrapers import test_transfermarkt_sections as lanes
-    packet = lanes.sections.extract_representation_observations(
-        lanes._representation_capture(), lanes._representation_scope(), expected_ids=('7', '9'),
+    capture = lanes._club_value_capture()
+    outcomes = lanes.sections.extract_club_value_observations(
+        capture, lanes._club_value_scope(), competition_id='VIE1',
         extracted_at=lanes.EXTRACTED_AT, universe_version=lanes.UNIVERSE)
     plans = [core.plan_for_outcome(
         outcome, captured_at=lanes.CLUB_CAPTURED,
-        scope_values={'player_id': outcome.scope.player_id}) for outcome in packet]
+        scope_values={'club_id': outcome.rows[0]['club_id']}) for outcome in outcomes[:2]]
     assert len(plans) == 2
     native_writer.validate_run_plans(plans)
