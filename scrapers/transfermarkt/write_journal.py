@@ -287,6 +287,21 @@ def snapshot_anchors(digest: str, connection, tables: Iterable[str]) -> dict[str
     return anchors
 
 
+def copy_snapshot_anchors(source: str, target: str) -> bool:
+    """Publish a unit's pre-write anchors under another identity of that unit.
+
+    An acknowledgement written under one identity and journalled under
+    another keeps the anchors recorded before its write; the new identity
+    never anchors a later state. Nothing changes when the source has no
+    anchors or the target already has its own.
+    """
+    source_path, target_path = _record_path('anchors', source), _record_path('anchors', target)
+    if not source_path.exists() or target_path.exists():
+        return False
+    _immutable_record(target_path, {**_read_record(source_path), 'intent_sha256': target})
+    return True
+
+
 def record_receipt(digest: str, receipt: Mapping) -> None:
     """Persist immutable evidence of a physically verified commit."""
     if receipt.get('verified') is not True:

@@ -1695,38 +1695,79 @@ def write_core_bundle(
         deadline=deadline)
 
 
+def _earlier_acknowledgement(plans, run_id: str) -> tuple[list[str], str] | None:
+    """The identity under which the previous writer acknowledged this unit.
+
+    A unit of the stage-B core entities that the stage-B writer acknowledged
+    completely carries a journal receipt under its stage-B digest and no
+    acknowledgement under today's identity. The ordinary retry must reuse
+    that acknowledgement instead of committing the unit a second time.
+    """
+    if not all(plan.entity in _STAGE_B_ENTITIES and not plan.pages for plan in plans):
+        return None
+    plan_hashes = [_stage_b_plan_sha256(plan) for plan in plans]
+    digest = _digest({'plans': plan_hashes, 'run_id': run_id})
+    return (plan_hashes, digest) if write_journal.read_receipt(digest) is not None else None
+
+
+def _publish_alias(current: str, receipt: dict, plan_hashes, digest: str) -> None:
+    """Journal under today's identity an acknowledgement written under an earlier writer's.
+
+    Bound to the warehouse receipts already written and to the anchors
+    recorded before that write: an ordinary retry of the unit reuses both.
+    """
+    if current == digest or write_journal.read_receipt(current) is not None:
+        return
+    write_journal.record_receipt(current, {
+        **receipt, 'plan_sha256': current,
+        'identity': {'plan_hashes': list(plan_hashes), 'digest': digest}})
+    write_journal.copy_snapshot_anchors(digest, current)
+
+
 def _commit_bundle(
     connection_factory, writer, plans, *, plan_hashes, digest, run_id: str,
     universe_version: str, committed_at: str, deadline: float | None = None,
+    journaled: bool = False,
 ) -> dict:
     """Commit a bundle under a given identity: its own, or the one it was
-    journalled under by an earlier writer."""
+    journalled under by an earlier writer.
+
+    ``journaled`` says the caller already holds the pending intent of this
+    unit and finishes it: no second intent is published.
+    """
     with writer_deadline(deadline), writer_lock():
         _validate_bundle(plans, run_id, universe_version, committed_at)
         if len(set(plan_hashes)) != len(plan_hashes):
             # One acknowledgement never stands for two plans of a bundle.
             raise ValueError('duplicate core receipt identity across plans')
         batch = _batch_id_for_run(run_id)
+        current = digest
+        if write_journal.read_receipt(digest) is None:
+            earlier = _earlier_acknowledgement(plans, run_id)
+            if earlier is not None:
+                plan_hashes, digest = earlier
         stored = write_journal.read_receipt(digest)
         if stored is not None:
             if stored.get('plan_sha256') != digest:
                 raise RuntimeError('core journal receipt plan_sha256 differs')
+            if stored.get('universe_version', universe_version) != universe_version:
+                # The acknowledgement names its universe; a retry under
+                # another one is another unit.
+                raise RuntimeError('core journal receipt belongs to another universe')
             # The acknowledgement names the identity its warehouse receipts
             # were written under. A unit migrated from an earlier writer keeps
             # that one, so a retry under today's identity reuses them.
             identity = stored.get('identity') or {'plan_hashes': plan_hashes, 'digest': digest}
             receipt_hashes, receipt_digest = list(identity['plan_hashes']), identity['digest']
-            # An acknowledgement re-verifies the whole physical tail: drifted
-            # rows fail closed, a deleted receipt row is rewritten and
-            # re-read, and a leftover intent is finally finished.
+            repaired = []
 
             def repair():
-                # The acknowledged bundle has to mutate again (drifted rows,
-                # a missing manifest, a deleted receipt): journal it first.
-                write_journal.save_intent(
+                # The acknowledged bundle has to change again (drifted rows, a
+                # lost manifest, a deleted receipt): journal it first.
+                repaired.append(write_journal.save_intent(
                     {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
                     run_id=run_id, universe_version=universe_version,
-                    committed_at=stored['committed_at'])
+                    committed_at=stored['committed_at']))
 
             connection = connection_factory()
             try:
@@ -1740,17 +1781,33 @@ def _commit_bundle(
                                   universe_version, batch, stored['committed_at'])
                     for plan, proof, plan_hash in zip(plans, proofs, receipt_hashes, strict=True)
                 ]
+                held = _stored_receipts(
+                    connection, [receipt['receipt_id'] for receipt in plan_receipts])
+                if len(held) < len(plan_receipts) and not repaired:
+                    # Only receipts are missing: their repair is journalled
+                    # before the first one is inserted.
+                    repair()
                 _merge_receipts(connection, plan_receipts)
                 _verify_receipts(connection, plan_receipts)
             finally:
                 connection.close()
             _finish_leftover_intent(digest, run_id)
+            _publish_alias(current, stored, plan_hashes, digest)
             return stored
 
-        intent_path = write_journal.save_intent(
-            {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
-            run_id=run_id, universe_version=universe_version, committed_at=committed_at,
-        )
+        # An interrupted write of this very unit left its intent behind: the
+        # unit is committed with the metadata that intent names, and no second
+        # intent is published for an identity that is already in flight.
+        pending = write_journal.pending_intents({'run_id': run_id, 'digest': digest})
+        if pending:
+            evidence = pending[0][1]['evidence']
+            committed_at = evidence.get('committed_at', committed_at)
+            universe_version = evidence.get('universe_version', universe_version)
+        elif not journaled:
+            write_journal.save_intent(
+                {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
+                run_id=run_id, universe_version=universe_version, committed_at=committed_at,
+            )
         connection = connection_factory()
         try:
             _refuse_receipt_contradictions(
@@ -1775,7 +1832,10 @@ def _commit_bundle(
             'identity': {'plan_hashes': list(plan_hashes), 'digest': digest},
         }
         write_journal.record_receipt(digest, receipt)
-        write_journal.finish_intent(intent_path)
+        _publish_alias(current, receipt, plan_hashes, digest)
+        # The unit is acknowledged: the intent published here and any one an
+        # interrupted write left behind are finished.
+        _finish_leftover_intent(digest, run_id)
         return receipt
 
 
@@ -1801,7 +1861,6 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
             plans.append(NativeWritePlan(**descriptor))
         run = body['identity']['run_id']
         plan_hashes, digest = _bundle_identity(plans, run)
-        current = digest
         saved = body['identity'].get('digest')
         if saved != digest and not _journalled_by_stage_b(body['payload']['plans']):
             # Not this writer's digest and not a stage-B unit: nothing is
@@ -1814,17 +1873,9 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
                 raise RuntimeError('core journal intent digest is not recognised: ' + str(saved))
         receipt = _commit_bundle(
             connection_factory, writer, plans, plan_hashes=plan_hashes, digest=digest,
-            run_id=run,
+            run_id=run, journaled=True,
             universe_version=body['evidence'].get('universe_version', 'core-universe-v1'),
             committed_at=body['evidence'].get('committed_at', ''))
-        if digest != current and write_journal.read_receipt(current) is None:
-            # A migrated acknowledgement is journalled under the identity this
-            # writer computes for the same plans as well, still bound to the
-            # warehouse receipts written under the earlier one: an ordinary
-            # retry of the unit reuses them instead of committing a second time.
-            write_journal.record_receipt(
-                current, {**receipt, 'plan_sha256': current, 'identity': {
-                    'plan_hashes': list(plan_hashes), 'digest': digest}})
         if path.exists():
             # The verified recovery finishes the very file that was replayed,
             # whatever format this writer would save the unit in.
