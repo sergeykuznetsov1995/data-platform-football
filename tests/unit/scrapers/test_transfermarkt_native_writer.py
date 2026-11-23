@@ -20,17 +20,26 @@ CLOCK = UTC.isoformat()
 LATER = datetime(2026, 11, 21, 13, 0, 0, tzinfo=timezone.utc).isoformat()
 EARLIER = datetime(2026, 11, 21, 11, 0, 0, tzinfo=timezone.utc).isoformat()
 
+# A plan's DDL declares every column its rows carry (production builds both
+# from CORE_COLUMNS): the schema preflight reads the table against the DDL.
+_LINEAGE_DDL = (
+    'source_url varchar, source_endpoint varchar, raw_capture_id varchar, '
+    'source_capture_id varchar, source_body_hash varchar, run_id varchar, '
+    'universe_version varchar, parser_revision varchar, schema_revision varchar, '
+    'captured_at timestamp(6), _batch_id varchar, _ingested_at timestamp(6)'
+)
+
 MEMBERSHIPS_DDL = (
     'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_squad_memberships '
     '(league varchar, season varchar, club_id varchar, player_id varchar, '
-    'player_name varchar, captured_at timestamp(6), source_capture_id varchar) '
+    f'player_name varchar, {_LINEAGE_DDL}) '
     "WITH (format = 'PARQUET')"
 )
 
 MV_DDL = (
     'CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_market_value_points '
-    '(player_id varchar, mv_date varchar, value_eur bigint, captured_at timestamp(6), '
-    'source_capture_id varchar) WITH (format = \'PARQUET\')'
+    f'(player_id varchar, mv_date varchar, value_eur bigint, {_LINEAGE_DDL}) '
+    "WITH (format = 'PARQUET')"
 )
 
 

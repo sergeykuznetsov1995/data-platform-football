@@ -953,9 +953,9 @@ def _guard_table_schema(connection, plan: NativeWritePlan) -> None:
     mistyped = [name for name, kind in declared.items()
                 if name in existing and existing[name] not in ('', 'none', 'null')
                 and existing[name] != kind]
-    # A rowless replacement only deletes: what it declares must be there; a
-    # column it would fill must not be foreign to the table as well.
-    foreign = set(existing) - set(declared) - carried if plan.rows else set()
+    # A rowless replacement deletes live rows of the scope: the table must be
+    # exactly the plan's, with no donor column beside the declared ones.
+    foreign = set(existing) - set(declared) - carried
     if set(declared) - set(existing) or foreign or mistyped:
         raise RuntimeError('core table schema differs from the plan: ' + plan.table)
 
