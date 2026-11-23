@@ -208,7 +208,7 @@ def test_lane_outcome_row_status_policy_for_section_entities():
     )
     # unknown outcome may carry the donor's unresolved rows
     accepted = LaneOutcome('attendance_observations', 'unknown', 'attendance:rows_unresolved',
-                           ({'observation_status': 'unknown'},), **context)
+                           (_stub_row('attendance_observations', 'unknown'),), **context)
     assert accepted.status == 'unknown'
     # mixed per-row statuses stay valid under an observed_present outcome
     mixed = LaneOutcome('attendance_observations', 'observed_present', 'attendance:ok',
@@ -1139,9 +1139,15 @@ def test_aggregate_verdict_must_agree_with_its_row_verdicts(entity, status, reas
 
 
 def _stub_row(entity, verdict):
-    """A row stub that carries the facts its verdict claims (round 5)."""
-    facts = {('attendance_observations', 'observed_present'): {'spectators_total': 1},
-             ('referee_aggregate_observations', 'observed_present'): {'value': '1'}}
+    """A row stub that carries the facts its verdict claims."""
+    facts = {
+        ('attendance_observations', 'observed_present'): {'spectators_total': 1},
+        ('attendance_observations', 'unknown'): {'spectators_total_raw': '?'},
+        ('referee_aggregate_observations', 'observed_present'): {
+            'value': '14', 'raw_value': '14', 'status_reason': 'referees:numeric'},
+        ('referee_aggregate_observations', 'observed_empty'): {'raw_value': ''},
+        ('referee_aggregate_observations', 'explicit_none'): {'raw_value': '-'},
+    }
     return {'observation_status': verdict, **facts.get((entity, verdict), {})}
 
 
@@ -3722,3 +3728,197 @@ def test_a_rows_verdict_must_agree_with_the_facts_the_row_carries():
     with pytest.raises(CoreParseError, match='status_rows_mismatch'):
         core.plan_for_outcome(club, captured_at=CLUB_CAPTURED,
                               scope_values={'club_id': club.rows[0]['club_id']})
+
+
+# --------------------------------- review round-6 pins
+
+
+def _attendance_outcome(captures, start_url=ATTENDANCE_START):
+    outcome, = sections.extract_attendance_observations(
+        captures, _attendance_scope(), start_url=start_url, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    return outcome
+
+
+def test_finding_14_attendance_manifest_is_numbered_in_walk_order():
+    # Round 6 finding 14: even a self-consistent chain must visit page 1 before page 2.
+    outcome = _attendance_outcome(_two_pages())
+    values = {'competition_id': 'GB1', 'edition_id': '2025'}
+    plan = core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED, scope_values=values)
+    assert plan.pages == outcome.pages
+    second, first = outcome.pages[::-1]
+    reversed_walk = (second[:4] + (first[0],), first[:4] + ('',))
+    broken = _replace(outcome, pages=reversed_walk)
+    with pytest.raises(CoreParseError, match='page_manifest_does_not_start_on_the_first_page'):
+        core.plan_for_outcome(broken, captured_at=PAGE_2_CAPTURED, scope_values=values)
+
+
+def test_finding_20_duplicate_attendance_url_is_refused_in_either_order():
+    # Round 6 finding 20: a populated and a rowless capture cannot both own page 1.
+    first, second = _two_pages()
+    rowless = _capture(ATTENDANCE_START, ROWLESS_PAGE_1, PAGE_1_CAPTURED)
+    assert first.capture_id != rowless.capture_id
+    for captures in ((first, rowless, second), (rowless, first, second)):
+        outcome = _attendance_outcome(captures)
+        assert (outcome.status, outcome.status_reason, outcome.rows) == (
+            'error', 'attendance:pagination_captures_differ', ())
+
+
+def test_finding_22b_club_values_bind_every_row_to_the_url_competition():
+    # Round 6 finding 22: the club scope alone cannot certify the page's competition.
+    capture = _club_value_capture()
+    clubs = sections.extract_club_value_observations(
+        capture, _club_value_scope(), competition_id='VIE1', extracted_at=EXTRACTED_AT,
+        universe_version=UNIVERSE)
+    club = next(item for item in clubs if item.status == 'observed_present')
+    values = {'club_id': club.rows[0]['club_id']}
+    assert core.plan_for_outcome(club, captured_at=capture.captured_at, scope_values=values)
+    wrong = _replace(capture, url=capture.url.replace('/VIE1', '/GB1'))
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core.plan_for_outcome(_replace(club, capture=wrong), captured_at=capture.captured_at,
+                              scope_values=values)
+
+
+@pytest.mark.parametrize('extra', ['&other=yes', '&ids[]=', '&ids[]=09'])
+def test_finding_22c_representation_query_validates_every_key_and_id(extra):
+    # Round 6 finding 22: a valid player in the query cannot hide an invalid parameter.
+    capture = _representation_capture()
+    wrong = _replace(capture, url=capture.url + extra)
+    args = dict(expected_ids=('7', '9'), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    error, = sections.extract_representation_observations(wrong, _representation_scope(), **args)
+    assert (error.status, error.status_reason, error.rows) == (
+        'error', 'representation:requested_ids_differ', ())
+    assigned, _ = sections.extract_representation_observations(capture, _representation_scope(), **args)
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core.plan_for_outcome(_replace(assigned, capture=wrong), captured_at=capture.captured_at,
+                              scope_values={'player_id': '7'})
+
+
+def test_finding_23_http_attendance_continuation_is_never_fetched():
+    # Round 6 finding 23: an HTTP next link fails attendance and the next target still verifies.
+    body = ROWLESS_PAGE_1.replace(b'href="/', b'href="http://www.transfermarkt.com/')
+    assert ATTENDANCE_PAGE_2.replace('https:', 'http:').encode() in body
+    fetcher = _SectionFetch({ATTENDANCE_START: body, REFEREE_PROFILE_URL: _referee_profile_capture().body})
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+        referee_profile_ids=('101',))
+    db = CoreDB()
+    report = CoreRun(fetcher.fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert fetcher.calls == [ATTENDANCE_START, REFEREE_PROFILE_URL]
+    attendance, profile = report.outcomes
+    assert (attendance['status'], attendance['status_reason'], attendance['rows']) == (
+        'error', 'attendance:pagination_identity_invalid', 0)
+    assert (profile['entity'], profile['status']) == ('referee_profiles', 'observed_present')
+    receipt, = report.receipts
+    assert receipt['verified'] is True
+
+
+def test_finding_23_saved_attendance_page_with_a_fragment_cannot_write():
+    # Round 6 finding 23: canonicalisation cannot strip a fragment from saved evidence.
+    first, second = _two_pages()
+    outcome = _attendance_outcome((_replace(first, url=first.url + '#different'), second))
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'attendance:pagination_identity_invalid', ())
+    with pytest.raises(ValueError, match='non-conclusive'):
+        core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED,
+                              scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
+
+
+def test_finding_24b_unconvertible_agency_id_is_a_packet_error():
+    # Round 6 finding 24: the donor's integer conversion error belongs to its packet.
+    payload = json.loads(_representation_capture().body)
+    payload['data'][0]['attributes']['consultantAgencyId'] = '9' * 4301
+    outcome, = sections.extract_representation_observations(
+        _representation_capture(payload), _representation_scope(), expected_ids=('7', '9'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows, outcome.capture) == (
+        'error', 'representation:invalid_packet', (), None)
+
+
+def test_finding_25_donor_verdicts_are_rechecked_at_construction_dq_and_planning():
+    # Round 6 finding 25: raw crowd cells, metric cells and representation evidence justify their verdicts.
+    def refused(outcome, row, **changes):
+        # Give each case a fresh row so it can change after LaneOutcome construction.
+        rows = tuple(dict(original) for original in outcome.rows)
+        index = outcome.rows.index(row)
+        copied = _replace(outcome, rows=rows)
+        rows[index].update(changes)
+        with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+            _replace(copied)
+        assert 'status_rows_mismatch' in core.build_core_dq([copied])['errors']
+        values = {column: row[column] for column in core.CORE_SCOPE_COLUMNS[copied.entity]}
+        with pytest.raises(CoreParseError, match='status_rows_mismatch'):
+            core.plan_for_outcome(copied, captured_at=copied.capture.captured_at, scope_values=values)
+
+    attendance = _attendance_outcome(_two_pages())
+    for raw in ('?', ' UnKnOwN ', ''):
+        refused(attendance, attendance.rows[0], spectators_total=None, spectators_average=None,
+                spectators_total_raw='-', spectators_average_raw=raw, observation_status='explicit_none')
+    refused(attendance, attendance.rows[0], spectators_total=None, spectators_average=None,
+            spectators_total_raw='-', spectators_average_raw='-', observation_status='unknown')
+
+    directory, = _referee_directory((_referee_directory_capture(),))
+    metric = next(row for row in directory.rows if row['observation_status'] == 'observed_present')
+    refused(directory, metric, value='14x')
+    refused(directory, metric, observation_status='observed_empty', value=None, raw_value='-')
+    refused(directory, metric, observation_status='explicit_none', value=None, raw_value='')
+
+    assigned, _ = sections.extract_representation_observations(
+        _representation_capture(), _representation_scope(), expected_ids=('7', '9'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    refused(assigned, assigned.rows[0], representative_id='055', representative_key='agency:055')
+    profile = 'https://www.transfermarkt.com/example/profil/spieler/7'
+    absence = _replace(assigned, status='explicit_none', rows=({
+        **assigned.rows[0], 'observation_status': 'explicit_none', 'representative_id': None,
+        'representative_key': 'status:explicit_none', 'evidence_type': 'player_profile_explicit_none',
+        'source_url': profile},))
+    refused(absence, absence.rows[0], source_url=REPRESENTATION_URL)
+    refused(absence, absence.rows[0], source_url=profile.replace('/7', '/9'))
+
+
+def test_finding_26_representation_and_achievement_targets_use_canonical_ids():
+    # Round 6 finding 26: the request, donor and write scope use the same positive decimal id.
+    from scrapers.transfermarkt.orchestrator import AchievementHolderTarget
+
+    plan = CoreScopePlan(league='GB1', season='2526', scope_id='s', cycle_id='c',
+                         representation_player_ids=('7', '9'))
+    replay = _JsonFetch(REPRESENTATION_URL, REPRESENTATION_PACKET)
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader, universe_version=UNIVERSE,
+                  extracted_at=EXTRACTED_AT)
+    expected = run.run(plan)
+    db = CoreDB()
+    report = run.run(_replace(plan, representation_player_ids=('007', '9')),
+                     writer=CoreWriter(db), connection_factory=lambda: db)
+    assert report.outcomes == expected.outcomes
+    assert [item['status'] for item in report.outcomes] == ['observed_present', 'unknown']
+    assert report.receipts[0]['verified'] is True
+
+    replay = _JsonFetch(ACHIEVEMENTS_URL, ACHIEVEMENTS_PACKET)
+    plan = _replace(plan, representation_player_ids=(),
+                    achievement_holders=(AchievementHolderTarget('player', '007'),))
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader, universe_version=UNIVERSE,
+                  extracted_at=EXTRACTED_AT)
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert report.outcomes[0]['status'] == 'observed_present'
+    assert report.receipts[0]['verified'] is True
+    assert db.sql.execute(
+        'SELECT DISTINCT recipient_id FROM transfermarkt_achievement_observations').fetchall() == [('7',)]
+
+    for value in ('', '000', '-1', '９'):
+        with pytest.raises(CoreRunError, match='representation:player_id_invalid'):
+            planned_urls(_replace(plan, achievement_holders=(), representation_player_ids=(value,)))
+        with pytest.raises(CoreRunError, match='achievements:recipient_id_invalid'):
+            planned_urls(_replace(plan, achievement_holders=(AchievementHolderTarget('player', value),)))
+
+
+def test_finding_27_invalid_attendance_link_cites_its_own_page():
+    # Round 6 finding 27: the source of a wrong-edition continuation backs the error.
+    first, second = _two_pages()
+    body = first.body.replace(b'saison_id/2025?page=2', b'saison_id/2023?page=2')
+    assert body != first.body
+    broken = _capture(first.url, body, first.captured_at)
+    outcome = _attendance_outcome((broken, second))
+    assert (outcome.status, outcome.status_reason, outcome.rows, outcome.capture) == (
+        'error', 'attendance:pagination_identity_invalid', (), broken)

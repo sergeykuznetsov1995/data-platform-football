@@ -1,4 +1,5 @@
 """Offline core-lane tests on the recorded stage-A capture sample (#2404)."""
+from dataclasses import replace
 import gzip
 import hashlib
 import json
@@ -428,3 +429,55 @@ def test_a_core_row_that_cannot_be_rendered_is_its_captures_error(monkeypatch, e
         assert (outcome.status, outcome.status_reason, outcome.rows) == (
             'error', 'row_value_exceeds_bigint', ())
         assert outcome.capture.capture_id == capture.capture_id
+
+
+def test_finding_22a_stage_b_routes_bind_the_endpoint_and_scope():
+    # Round 6 finding 22: a recorded body only plans on its own endpoint, route and id.
+    squad = _load('squad')
+    club_id = squad.url.split('/verein/')[1].split('/')[0]
+    scope = _scope(club_id=club_id)
+    outcomes = core.extract_squad_observations(
+        squad, scope, extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    values = {'club_id': club_id, 'league': scope.league, 'season': scope.season}
+    for outcome in outcomes:
+        assert core.plan_for_outcome(outcome, captured_at=squad.captured_at, scope_values=values)
+        for wrong in (
+            replace(squad, url='https://www.transfermarkt.com/unrelated'),
+            replace(squad, url=squad.url.replace(f'/verein/{club_id}/', f'/verein/{club_id}1/')),
+            replace(squad, endpoint='coach_history'),
+        ):
+            with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+                core.plan_for_outcome(replace(outcome, capture=wrong),
+                                      captured_at=squad.captured_at, scope_values=values)
+
+    career = _load('market_value_points')
+    player_id = career.url.rsplit('/', 1)[-1]
+    outcome = core.extract_career_observations(
+        career, _scope(player_id=player_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    values = {'player_id': player_id}
+    assert core.plan_for_outcome(outcome, captured_at=career.captured_at, scope_values=values)
+    wrong = replace(career, url=f'https://www.transfermarkt.com/ceapi/transferHistory/list/{player_id}')
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core.plan_for_outcome(replace(outcome, capture=wrong), captured_at=career.captured_at,
+                              scope_values=values)
+
+
+def test_finding_24a_numeric_club_name_is_a_market_value_capture_error():
+    # Round 6 finding 24: a JSON number for a text column fails inside extraction.
+    for index in range(4):
+        capture = _load('market_value_points', index)
+        payload = json.loads(capture.body)
+        point = next((row for row in payload.get('list', []) if isinstance(row.get('verein'), str)), None)
+        if point is not None:
+            point['verein'] = 42
+            break
+    else:
+        pytest.fail('recorded market-value fixtures lack a club name')
+    body = json.dumps(payload).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    broken = replace(capture, body=body, capture_id=digest, body_hash=digest)
+    outcome = core.extract_career_observations(
+        broken, _scope(player_id=capture.url.rsplit('/', 1)[-1]),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == ('error', 'row_value_not_text', ())
+    assert outcome.capture == broken
