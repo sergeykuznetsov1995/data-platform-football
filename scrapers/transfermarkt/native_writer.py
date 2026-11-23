@@ -200,9 +200,12 @@ def core_receipts_ddl() -> str:
 
 
 # The accepted page evidence of every committed multi-page replacement
-# snapshot, one row per walked page. A page that contributes no row leaves
-# nothing in the data table: without this manifest its capture id and clock
-# are known only while the write runs.
+# snapshot: one row per source page a scope ever accepted, holding the
+# newest evidence of that page. A page that contributes no row leaves
+# nothing in the data table, and a page that later leaves the walk would
+# leave nothing either: without this manifest its capture id and clock are
+# known only while the write runs, and it could come back with an older
+# capture. Rows are never deleted; each page is kept by one statement.
 CORE_PAGES_TABLE = 'iceberg.ops.transfermarkt_core_pages_v1'
 _PAGES_ANCHOR_NAME = 'ops.transfermarkt_core_pages_v1'
 PAGES_COLUMNS = (
@@ -626,7 +629,7 @@ def guard_native_bundle(connection, plan: NativeWritePlan) -> None:
     # only proof of how fresh the committed scope really is.
     manifest = _committed_pages(connection, plan)
     clocks = [_timestamp(value) for value in (committed, acknowledged) if value is not None]
-    clocks.extend(_timestamp(clock) for _url, _capture_id, clock in manifest)
+    clocks.extend(_timestamp(clock) for _url, _capture_id, clock, _body_hash in manifest)
     if not clocks:
         return
     if max(clocks) > _timestamp(plan.captured_at):
@@ -641,7 +644,7 @@ def _scope_json(plan: NativeWritePlan) -> str:
 
 
 def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
-    """The accepted page evidence of the scope, (url, capture_id, clock) each.
+    """The accepted page evidence of the scope, (url, capture_id, clock, hash).
 
     Only a multi-page replacement snapshot keeps a manifest: the pages of
     every other lane are exactly the captures of its committed rows.
@@ -652,8 +655,8 @@ def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
     try:
         rows = _query_rows(
             cursor,
-            f'SELECT source_url, source_capture_id, captured_at FROM {CORE_PAGES_TABLE} '
-            'WHERE target_table = ? AND scope_values_json = ?',
+            f'SELECT source_url, source_capture_id, captured_at, source_body_hash '
+            f'FROM {CORE_PAGES_TABLE} WHERE target_table = ? AND scope_values_json = ?',
             (plan.full_table, _scope_json(plan)),
         )
     except Exception as exc:
@@ -665,32 +668,41 @@ def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
     return [tuple(row) for row in rows]
 
 
-def _replace_pages(connection, plan: NativeWritePlan) -> None:
-    """The snapshot's own pages become the whole manifest of its scope."""
+def _record_pages(cursor, plan: NativeWritePlan) -> None:
+    """Keep the newest accepted evidence of every page the snapshot walked.
+
+    One statement per page, upserting that page's row: nothing is deleted,
+    so an interrupted update leaves the previous evidence of the page it
+    was updating, and every other page, exactly as accepted.
+    """
     columns = ', '.join(PAGES_COLUMNS)
     marks = ', '.join('?' for _ in PAGES_COLUMNS)
+    inserted = ', '.join('s.' + column for column in PAGES_COLUMNS)
+    sql = (
+        f'MERGE INTO {CORE_PAGES_TABLE} t USING (VALUES ({marks})) s({columns}) '
+        'ON t.target_table = s.target_table AND t.scope_values_json = s.scope_values_json '
+        'AND t.source_url = s.source_url '
+        'WHEN MATCHED AND s.captured_at >= t.captured_at THEN UPDATE SET '
+        'source_capture_id = s.source_capture_id, captured_at = s.captured_at, '
+        'source_body_hash = s.source_body_hash '
+        f'WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ({inserted})'
+    )
     scope = (plan.full_table, _scope_json(plan))
-    cursor = connection.cursor()
-    try:
+    for url, capture_id, clock, body_hash, _next in plan.pages:
+        # Trino timestamp(6) stores UTC wall time without an offset.
         execute_statement(
-            cursor,
-            f'DELETE FROM {CORE_PAGES_TABLE} WHERE target_table = ? AND scope_values_json = ?',
-            scope)
-        for url, capture_id, clock, body_hash, _next in plan.pages:
-            # Trino timestamp(6) stores UTC wall time without an offset.
-            execute_statement(
-                cursor, f'INSERT INTO {CORE_PAGES_TABLE} ({columns}) VALUES ({marks})',
-                (*scope, url, capture_id, _timestamp(clock).replace(tzinfo=None), body_hash))
-    finally:
-        cursor.close()
+            cursor, sql,
+            (*scope, url, capture_id, _timestamp(clock).replace(tzinfo=None), body_hash))
 
 
 def _same_pages(manifest, pages) -> bool:
-    """Whether the committed manifest is exactly the planned page evidence."""
-    if not pages:
-        return True
-    accepted = {(url, capture_id, _timestamp(clock)) for url, capture_id, clock in manifest}
-    return accepted == {(page[0], page[1], _timestamp(page[2])) for page in pages}
+    """Whether every page the snapshot walks is accepted exactly as planned.
+
+    The evidence of other pages the scope once accepted stays beside it; it
+    says nothing about this snapshot.
+    """
+    accepted = {(url, capture_id, _timestamp(clock)) for url, capture_id, clock, _body_hash in manifest}
+    return all((page[0], page[1], _timestamp(page[2])) in accepted for page in pages)
 
 
 def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
@@ -714,7 +726,7 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
         )
     finally:
         cursor.close()
-    accepted = [(url, clock) for url, _capture_id, clock in manifest]
+    accepted = [(url, clock) for url, _capture_id, clock, _body_hash in manifest]
     for url, clock in [*committed, *accepted]:
         if url in planned and _timestamp(clock) > planned[url]:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
@@ -1209,7 +1221,11 @@ def _commit_plans(connection, writer, plans) -> list[dict]:
         # The manifest follows the snapshot it belongs to; a snapshot that
         # was already written has its manifest already.
         if plan.pages and state != 'written':
-            _replace_pages(connection, plan)
+            cursor = connection.cursor()
+            try:
+                _record_pages(cursor, plan)
+            finally:
+                cursor.close()
     return [_physical_proof(connection, plan) for plan in plans]
 
 

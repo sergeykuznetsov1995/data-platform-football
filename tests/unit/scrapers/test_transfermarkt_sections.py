@@ -2737,17 +2737,17 @@ def test_recovery_after_a_crash_before_the_manifest_records_it(monkeypatch):
     db = CoreDB()
     writer = CoreWriter(db)
     run_id = plans[0].rows[0]['run_id']
-    original = native_writer._replace_pages
+    original = native_writer._record_pages
 
     def crash(*args):
         raise RuntimeError('crash before the manifest')
 
-    monkeypatch.setattr(native_writer, '_replace_pages', crash)
+    monkeypatch.setattr(native_writer, '_record_pages', crash)
     with pytest.raises(RuntimeError, match='crash before the manifest'):
         _write(db, plans, run_id, EXTRACTED_AT)
     assert set(_stadiums(db)) == {'11'}  # the snapshot's rows are already committed
     assert native_writer.write_journal.pending_intents({'run_id': run_id})
-    monkeypatch.setattr(native_writer, '_replace_pages', original)
+    monkeypatch.setattr(native_writer, '_record_pages', original)
     receipts = native_writer.replay_pending_intents(lambda: db, writer)
     assert len(receipts) == 1 and receipts[0]['verified'] is True
     assert native_writer.write_journal.pending_intents({'run_id': run_id}) == []

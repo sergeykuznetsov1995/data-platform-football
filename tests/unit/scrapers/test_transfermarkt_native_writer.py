@@ -58,6 +58,28 @@ _COLUMN_PROBE = re.compile(
 
 class CoreCursor(MemoryCursor):
     def execute(self, sql, params=()):
+        if sql.startswith('MERGE INTO iceberg.ops.transfermarkt_core_pages_v1 '):
+            # One statement per page: insert the page, or replace its
+            # evidence when the snapshot's clock is not older.
+            bound = tuple(params)
+            columns = ', '.join(native_writer.PAGES_COLUMNS)
+            marks = ', '.join('?' for _ in native_writer.PAGES_COLUMNS)
+            cur = self.db.sql.cursor()
+            accepted = cur.execute(
+                'SELECT captured_at FROM transfermarkt_core_pages_v1 '
+                'WHERE target_table = ? AND scope_values_json = ? AND source_url = ?',
+                bound[:3]).fetchone()
+            if accepted is None:
+                cur.execute(
+                    f'INSERT INTO transfermarkt_core_pages_v1 ({columns}) VALUES ({marks})', bound)
+            elif native_writer._timestamp(bound[4]) >= native_writer._timestamp(accepted[0]):
+                cur.execute(
+                    'UPDATE transfermarkt_core_pages_v1 SET source_capture_id = ?, '
+                    'captured_at = ?, source_body_hash = ? '
+                    'WHERE target_table = ? AND scope_values_json = ? AND source_url = ?',
+                    (*bound[3:], *bound[:3]))
+            self.description = None
+            return
         if 'MERGE INTO iceberg.ops.transfermarkt_core_receipts_v1' in sql:
             bound = tuple(params)
             cur = self.db.sql.cursor()
@@ -855,7 +877,8 @@ def test_guard_reads_the_page_manifest_of_a_rowless_committed_page():
     # in the manifest; the data rows cannot prove its clock.
     from tests.unit.scrapers.test_transfermarkt_sections import ATTENDANCE_PAGE_2, ATTENDANCE_START
     plan = _snapshot(EARLIER, 'cap-old')
-    manifest = [(ATTENDANCE_START, 'empty', SIBLING_CLOCK), (ATTENDANCE_PAGE_2, 'cap-2', SIBLING_CLOCK)]
+    manifest = [(ATTENDANCE_START, 'empty', SIBLING_CLOCK, 'a' * 64),
+               (ATTENDANCE_PAGE_2, 'cap-2', SIBLING_CLOCK, 'b' * 64)]
 
     def guard(pages):
         cursor = GuardCursor(rows=[(SIBLING_CLOCK,)], pages=pages, manifest=manifest)
