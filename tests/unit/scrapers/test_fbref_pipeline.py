@@ -11276,8 +11276,8 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
     raw = _raw_store(tmp_path)
     control = BudgetAwareFakeControl(raw)
     control.run.update(
-        request_limit=400,
-        byte_limit=100 * 1024 * 1024,
+        request_limit=1600,
+        byte_limit=400 * 1024 * 1024,
     )
     run_id = str(uuid.UUID(int=1))
 
@@ -11299,7 +11299,10 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             lease_expires_at=NOW + timedelta(minutes=10),
         )
 
-    rejected = [make_lease(number) for number in (9, 12, 13)]
+    rejected = [
+        make_lease(number)
+        for number in (9, 12, 13, 15, 16)
+    ]
     untouched = make_lease(14)
     first = rejected[0]
     claims = iter(
@@ -11307,8 +11310,10 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             [*rejected, untouched],
             *(
                 [make_lease(number, epoch)]
-                for number in (9, 12, 13)
-                for epoch in (2, 3)
+                for number in (9, 12, 13, 15, 16)
+                for epoch in range(
+                    2, MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 2
+                )
             ),
         )
     )
@@ -11334,7 +11339,10 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
 
     with pytest.raises(
         FetchWaveError,
-        match="clearance_session_refreshes_exhausted=2",
+        match=(
+            "clearance_session_refreshes_exhausted="
+            f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
+        ),
     ):
         pipeline.fetch_wave(
             run_id,
@@ -11342,25 +11350,28 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             page_kinds=["competition"],
             settings=PipelineSettings(
                 run_type="current",
-                request_limit=400,
-                byte_limit=100 * 1024 * 1024,
+                request_limit=1600,
+                byte_limit=400 * 1024 * 1024,
                 shard_size=4,
                 request_reservation_bytes=4 * 1024 * 1024,
                 domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
             ),
         )
 
-    # Two re-solves per exhausted target, and the wave stops at the third such
-    # target -- 9 rejected attempts, never a browser per remaining page.
+    # Every re-solve per exhausted target, and the wave stops only at the
+    # MAX_CLEARANCE_EXHAUSTED_TARGETS-th such target -- the rejected attempts
+    # scale with the tolerance, never a browser per remaining page.
     assert control.run["requests_reserved"] == 0
-    assert len(control.failed) == 3 * (MAX_CLEARANCE_EXHAUSTED_TARGETS)
+    assert len(control.failed) == (MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1) * (
+        MAX_CLEARANCE_EXHAUSTED_TARGETS
+    )
     assert (
         sum(
             1
             for lease, _ in control.failed
             if lease.logical_refresh_id == first.logical_refresh_id
         )
-        == 3
+        == MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1
     )
     assert control.events.count(f"requeue:{untouched.target_id}") == 1
     assert not any(
@@ -11409,8 +11420,12 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
     claims = iter(
         (
             [stubborn, make_lease(12), make_lease(13)],
-            [make_lease(9, 2)],
-            [make_lease(9, 3)],
+            *(
+                [make_lease(9, epoch)]
+                for epoch in range(
+                    2, MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 2
+                )
+            ),
         )
     )
     control.claim_targets = lambda *args, **kwargs: next(claims)
@@ -11511,15 +11526,11 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
         if lease.target_id == stubborn.target_id
     ]
     assert len(stubborn_failures) == MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1
-    # The first two keep the target in this run; the last returns it with
-    # backoff instead of buying it another paid session here.
+    # Every refresh before the last keeps the target in this run; the last
+    # returns it with backoff instead of buying it another paid session here.
     assert [
         kwargs.get("session_retry", False) for kwargs in stubborn_failures
-    ] == [
-        True,
-        True,
-        False,
-    ]
+    ] == [True] * MAX_CONSECUTIVE_CLEARANCE_REFRESHES + [False]
     # requeue=True is what drops the target from this run: it closes the run
     # target as 'skipped', which claim_targets will not take again.  It also
     # clears retry_after, so no delay may be claimed here -- pinned by
@@ -11537,6 +11548,137 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
     assert not any(
         lease.target_id != stubborn.target_id for lease, _ in control.failed
     )
+
+
+def test_recovery_on_third_refresh_keeps_the_wave_productive(tmp_path):
+    """Since 19.11 the residential exits mix clean and Cloudflare-looped IPs:
+    one drawn exit may reject a clearance that only the next exit accepts.
+    A target that needs a third re-solve (past the old limit of two) must
+    still fetch, and a cohort of such targets must publish, not die."""
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=1600,
+        byte_limit=400 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(number, epoch=1):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=7600 + number * 10 + epoch)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=8600 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=9600 + number * 10 + epoch)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    numbers = (9, 12, 13)
+    claims = iter(
+        (
+            [make_lease(number) for number in numbers],
+            *(
+                [make_lease(number, epoch)]
+                for number in numbers
+                for epoch in (2, 3, 4)
+            ),
+        )
+    )
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+
+    class ThirdRefreshRecoversFetcher:
+        """Clearance fails twice per URL, then the page is served."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def ensure_clearance(self):
+            return True
+
+        def reset_clearance(self):
+            return None
+
+        def __init__(self):
+            self.attempts = {}
+
+        def fetch(self, url, **kwargs):
+            count = self.attempts.get(url, 0)
+            self.attempts[url] = count + 1
+            if count < 3:
+                raise FetchError(
+                    "FBref clearance was not granted",
+                    error_class="clearance_failed",
+                    wire_bytes=200,
+                    browser_document_bytes=500,
+                    browser_asset_bytes=100,
+                    browser_requests=20,
+                    browser_bootstrap_attempts=1,
+                    target_requests=1,
+                    latency_ms=100,
+                )
+            body = b"<html>ok</html>"
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=1,
+                http_status_history=(200,),
+                browser_document_bytes=0,
+                browser_asset_bytes=0,
+                browser_requests=0,
+                browser_bootstrap_attempts=0,
+            )
+
+    fetcher = ThirdRefreshRecoversFetcher()
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *args: fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=1600,
+            byte_limit=400 * 1024 * 1024,
+            shard_size=4,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
+    )
+
+    # Every target exhausted the old two-refresh limit and recovered on the
+    # third; on the previous constants this cohort died with
+    # clearance_session_refreshes_exhausted and fetched nothing.
+    assert result.fetched == 3
+    assert result.failures == []
+    assert result.deferred_session_failures == 0
+    assert result.requeued_session_exhaustion == 0
+    # Only the intermediate failed attempts are recorded (three per target);
+    # no target ends the wave failed or deferred.
+    assert len(control.failed) == 3 * 3
 
 
 @pytest.mark.parametrize("request_limit", [100, 119])
@@ -15228,15 +15370,17 @@ def test_session_abort_defers_once_and_continues_wave(tmp_path, reason):
     )
 
 
-def test_three_consecutive_session_aborts_stop_before_next_target(tmp_path):
-    execute, control, leases, calls = _session_failure_wave(tmp_path, {0, 1, 2})
+def test_max_consecutive_session_aborts_stop_before_next_target(tmp_path):
+    exhausted = set(range(MAX_CLEARANCE_EXHAUSTED_TARGETS))
+    execute, control, leases, calls = _session_failure_wave(tmp_path, exhausted)
     with pytest.raises(FetchWaveError, match="clearance_session_refreshes_exhausted"):
         execute()
-    assert len(calls) == 3
-    assert len(control.failed) == 3
+    assert len(calls) == MAX_CLEARANCE_EXHAUSTED_TARGETS
+    assert len(control.failed) == MAX_CLEARANCE_EXHAUSTED_TARGETS
     assert all(kwargs["requeue"] for _, kwargs in control.failed)
     assert [e for e in control.events if e.startswith("requeue:")] == [
-        f"requeue:{lease.target_id}" for lease in leases[3:]
+        f"requeue:{lease.target_id}"
+        for lease in leases[MAX_CLEARANCE_EXHAUSTED_TARGETS:]
     ]
 
 
@@ -15269,10 +15413,16 @@ def test_session_abort_streak_survives_wave_boundary(tmp_path):
         tmp_path / "a", {0, 1}, size=2, live=live
     )
     assert execute().deferred_session_failures == 2
-    execute, _, _, calls = _session_failure_wave(tmp_path / "b", {0}, size=2, live=live)
+    remaining = MAX_CLEARANCE_EXHAUSTED_TARGETS - 2
+    execute, _, _, calls = _session_failure_wave(
+        tmp_path / "b",
+        set(range(remaining)),
+        size=remaining + 1,
+        live=live,
+    )
     with pytest.raises(FetchWaveError, match="clearance_session_refreshes_exhausted"):
         execute()
-    assert len(calls) == 1
+    assert len(calls) == remaining
     live.close(control, status="failed")
 
 
@@ -16822,16 +16972,20 @@ def _failure_matrix_row(
     lease,
     *,
     initial=None,
-    re_solve_1=None,
-    re_solve_2=None,
+    **re_solves,
 ):
-    return {
+    row = {
         "target_id": lease.target_id,
         "logical_refresh_id": lease.logical_refresh_id,
         "initial": initial or _failure_matrix_cell("not_attempted"),
-        "re_solve_1": re_solve_1 or _failure_matrix_cell("not_attempted"),
-        "re_solve_2": re_solve_2 or _failure_matrix_cell("not_attempted"),
     }
+    for index in range(1, MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1):
+        slot = f"re_solve_{index}"
+        row[slot] = re_solves.pop(
+            slot, None
+        ) or _failure_matrix_cell("not_attempted")
+    assert not re_solves, f"unknown re-solve slots: {sorted(re_solves)}"
+    return row
 
 
 def _failure_matrix_streak(event, lease, before, after):
@@ -16906,8 +17060,8 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
     raw = _raw_store(tmp_path)
     control = BudgetAwareFakeControl(raw)
     control.run.update(
-        request_limit=400,
-        byte_limit=100 * 1024 * 1024,
+        request_limit=1600,
+        byte_limit=400 * 1024 * 1024,
     )
     run_id = str(uuid.UUID(int=1))
 
@@ -16929,20 +17083,24 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
             lease_expires_at=NOW + timedelta(minutes=10),
         )
 
-    initial = [make_lease(number) for number in (5, 9, 12, 13, 14)]
-    five, nine, twelve, thirteen, fourteen = initial
-    nine_e2, nine_e3 = make_lease(9, 2), make_lease(9, 3)
-    twelve_e2, twelve_e3 = make_lease(12, 2), make_lease(12, 3)
-    thirteen_e2, thirteen_e3 = make_lease(13, 2), make_lease(13, 3)
+    initial = [make_lease(number) for number in (5, 9, 12, 13, 15, 16, 14)]
+    five, nine, twelve, thirteen, fifteen, sixteen, fourteen = initial
+    exhausted_numbers = (9, 12, 13, 15, 16)
+    exhausted_epochs = {
+        number: [
+            make_lease(number, epoch)
+            for epoch in range(2, MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 2)
+        ]
+        for number in exhausted_numbers
+    }
     claims = iter(
         (
             initial,
-            [nine_e2],
-            [nine_e3],
-            [twelve_e2],
-            [twelve_e3],
-            [thirteen_e2],
-            [thirteen_e3],
+            *(
+                [lease]
+                for number in exhausted_numbers
+                for lease in exhausted_epochs[number]
+            ),
         )
     )
     control.claim_targets = lambda *args, **kwargs: next(claims)
@@ -16967,7 +17125,7 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
                         "diagnostic_class": "geo-ip-transport",
                     }
                 ]
-                * 3
+                * (MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1)
             ),
             *(
                 [
@@ -16980,14 +17138,31 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
                         "latency_ms": 100,
                     }
                 ]
-                * 2
+                * MAX_CONSECUTIVE_CLEARANCE_REFRESHES
             ),
             {
                 "error_class": "hard_transport_policy",
                 "session_failure_reason": "unrouted_websocket_upgrade",
             },
-            *([{"error_class": "warm_session_connection"}] * 2),
-            {"error_class": "clearance_failed"},
+            *(
+                [{"error_class": "warm_session_connection"}] * 2
+                + [{"error_class": "clearance_failed"}]
+                * (MAX_CONSECUTIVE_CLEARANCE_REFRESHES - 1)
+            ),
+            *([{"error_class": "clearance_failed"}] * 5),
+            *(
+                [
+                    {
+                        "error_class": "http_status",
+                        "http_status": 403,
+                        "wire_bytes": 200,
+                        "target_requests": 1,
+                        "http_status_history": (403,),
+                        "latency_ms": 100,
+                    }
+                ]
+                * 5
+            ),
         ]
     )
 
@@ -17004,7 +17179,10 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
 
     with pytest.raises(
         FetchWaveError,
-        match="clearance_session_refreshes_exhausted=2",
+        match=(
+            "clearance_session_refreshes_exhausted="
+            f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
+        ),
     ) as excinfo:
         pipeline.fetch_wave(
             run_id,
@@ -17013,7 +17191,7 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
             settings=PipelineSettings(
                 run_type="current",
                 request_limit=400,
-                byte_limit=100 * 1024 * 1024,
+                byte_limit=400 * 1024 * 1024,
                 shard_size=5,
                 request_reservation_bytes=4 * 1024 * 1024,
                 domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
@@ -17023,73 +17201,78 @@ def test_red_wave_failure_matrix_covers_every_claimed_target_and_class(
     wave = excinfo.value.result
     assert wave is not None
     assert wave.fetched == 0
-    assert wave.requeued_dead_clearance == 9
-    assert wave.deferred_session_failures == 3
+    attempts_per_target = MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1
+    assert (
+        wave.requeued_dead_clearance
+        == attempts_per_target * MAX_CLEARANCE_EXHAUSTED_TARGETS
+    )
+    assert wave.deferred_session_failures == MAX_CLEARANCE_EXHAUSTED_TARGETS
     assert wave.deferred_target_failures == ["fbref:competition:5:http_status"]
-    assert wave.failures == ["clearance_session_refreshes_exhausted=2"]
-    assert len(control.failed) == 10
+    assert wave.failures == [
+        "clearance_session_refreshes_exhausted="
+        f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
+    ]
+    assert (
+        len(control.failed)
+        == 1 + attempts_per_target * MAX_CLEARANCE_EXHAUSTED_TARGETS
+    )
+    exhausted_classes = {
+        9: ["geo-ip-transport"]
+        * (MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1),
+        12: ["http-403"] * MAX_CONSECUTIVE_CLEARANCE_REFRESHES
+        + ["unrouted-websocket-101"],
+        13: ["warm-session"] * 2
+        + ["clearance-failed"] * (MAX_CONSECUTIVE_CLEARANCE_REFRESHES - 1),
+        15: ["clearance-failed"]
+        * (MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1),
+        16: ["http-403"] * (MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1),
+    }
+
+    def _row(number, classes):
+        lease = make_lease(number)
+        attempts = [lease, *exhausted_epochs[number]]
+        cells = {}
+        for attempt, diagnostic in zip(attempts, classes):
+            slot = (
+                "initial"
+                if attempt is lease
+                else f"re_solve_{attempt.attempt_number - 1}"
+            )
+            cells[slot] = _failure_matrix_cell(
+                "failed", diagnostic, attempt.attempt_id
+            )
+        return _failure_matrix_row(lease, **cells)
+
     assert wave.failure_matrix == [
         _failure_matrix_row(
             five,
             initial=_failure_matrix_cell("failed", "other", five.attempt_id),
         ),
-        _failure_matrix_row(
-            nine,
-            initial=_failure_matrix_cell(
-                "failed", "geo-ip-transport", nine.attempt_id
-            ),
-            re_solve_1=_failure_matrix_cell(
-                "failed", "geo-ip-transport", nine_e2.attempt_id
-            ),
-            re_solve_2=_failure_matrix_cell(
-                "failed", "geo-ip-transport", nine_e3.attempt_id
-            ),
-        ),
-        _failure_matrix_row(
-            twelve,
-            initial=_failure_matrix_cell(
-                "failed", "http-403", twelve.attempt_id
-            ),
-            re_solve_1=_failure_matrix_cell(
-                "failed", "http-403", twelve_e2.attempt_id
-            ),
-            re_solve_2=_failure_matrix_cell(
-                "failed", "unrouted-websocket-101", twelve_e3.attempt_id
-            ),
-        ),
-        _failure_matrix_row(
-            thirteen,
-            initial=_failure_matrix_cell(
-                "failed", "warm-session", thirteen.attempt_id
-            ),
-            re_solve_1=_failure_matrix_cell(
-                "failed", "warm-session", thirteen_e2.attempt_id
-            ),
-            re_solve_2=_failure_matrix_cell(
-                "failed", "clearance-failed", thirteen_e3.attempt_id
-            ),
-        ),
+        *(_row(number, exhausted_classes[number]) for number in exhausted_numbers),
         _failure_matrix_row(fourteen),
     ]
     assert wave.streak_transitions == [
-        _failure_matrix_streak("session_failure", nine, (0, 0), (1, 0)),
-        _failure_matrix_streak("session_failure", nine_e2, (1, 0), (2, 0)),
-        _failure_matrix_streak("session_failure", nine_e3, (2, 0), (3, 0)),
-        _failure_matrix_streak("target_exhausted", nine_e3, (3, 0), (0, 1)),
-        _failure_matrix_streak("session_failure", twelve, (0, 1), (1, 1)),
-        _failure_matrix_streak("session_failure", twelve_e2, (1, 1), (2, 1)),
-        _failure_matrix_streak("session_failure", twelve_e3, (2, 1), (3, 1)),
-        _failure_matrix_streak("target_exhausted", twelve_e3, (3, 1), (0, 2)),
-        _failure_matrix_streak("session_failure", thirteen, (0, 2), (1, 2)),
-        _failure_matrix_streak(
-            "session_failure", thirteen_e2, (1, 2), (2, 2)
-        ),
-        _failure_matrix_streak(
-            "session_failure", thirteen_e3, (2, 2), (3, 2)
-        ),
-        _failure_matrix_streak(
-            "target_exhausted", thirteen_e3, (3, 2), (0, 3)
-        ),
+        transition
+        for index, number in enumerate(exhausted_numbers)
+        for transition in (
+            *(
+                _failure_matrix_streak(
+                    "session_failure",
+                    lease,
+                    (count, index),
+                    (count + 1, index),
+                )
+                for count, lease in enumerate(
+                    [make_lease(number), *exhausted_epochs[number]]
+                )
+            ),
+            _failure_matrix_streak(
+                "target_exhausted",
+                exhausted_epochs[number][-1],
+                (MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1, index),
+                (0, index + 1),
+            ),
+        )
     ]
     document = wave.as_dict()
     assert json.loads(json.dumps(document)) == document
