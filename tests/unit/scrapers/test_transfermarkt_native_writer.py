@@ -1,5 +1,6 @@
 """Unit tests for the stage-B mono-native writer commit path (#2404)."""
 import hashlib
+from dataclasses import asdict
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timezone
 import json
@@ -906,3 +907,37 @@ def test_failed_insertion_keeps_the_committed_scope():
         'DELETE FROM iceberg.bronze.transfermarkt_squad_memberships '
         'WHERE league = ? AND season = ? AND club_id = ?']
     assert _players(db) == []
+
+
+def test_plan_rows_are_read_only_after_validation():
+    # Round 4 finding 7: a plan's rows stayed writable through plan.rows, so
+    # the writer could verify content the plan never validated.
+    plan = _snapshot(PAGE_CLOCK, 'cap-1')
+    digest = plan.plan_sha256()
+    row = plan.rows[0]
+    with pytest.raises(TypeError):
+        row['observation_status'] = 'unknown'
+    with pytest.raises(TypeError):
+        row['parser_revision'] = 'wrong'
+    with pytest.raises(TypeError):
+        row.update(stadium_name='Ashburton Grove')
+    with pytest.raises(TypeError):
+        del row['club_name']
+    with pytest.raises(TypeError):
+        row.pop('club_name')
+    with pytest.raises(TypeError):
+        row.setdefault('club_name', 'x')
+    with pytest.raises(TypeError):
+        row.clear()
+    with pytest.raises(TypeError):
+        row |= {'club_name': 'x'}
+    assert plan.plan_sha256() == digest
+    # Still a mapping for every consumer: copyable and serialisable.
+    assert isinstance(row, dict) and row['observation_status'] == 'observed_present'
+    assert {**row, 'club_name': 'x'}['club_name'] == 'x'
+    assert json.loads(json.dumps(plan.rows)) == json.loads(json.dumps(
+        [dict(item) for item in plan.rows]))
+    assert [dict(item) for item in asdict(plan)['rows']] == [dict(item) for item in plan.rows]
+    # Another plan is the way to change rows.
+    changed = dataclasses_replace(plan, rows=tuple({**item, 'stadium_name': 'x'} for item in plan.rows))
+    assert changed.plan_sha256() != digest and plan.plan_sha256() == digest
