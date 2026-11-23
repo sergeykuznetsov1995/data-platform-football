@@ -1261,7 +1261,21 @@ def _guard_table_schema(connection, plan: NativeWritePlan) -> None:
         raise RuntimeError('core table schema differs from the plan: ' + plan.table)
 
 
-def _commit_plans(connection, writer, plans) -> list[dict]:
+def _descriptors(plans) -> list[dict]:
+    """The plans as the journal stores them: rows sorted by natural key."""
+    descriptors = [asdict(plan) for plan in plans]
+    for descriptor, plan in zip(descriptors, plans):
+        descriptor['rows'] = _sorted_rows(plan.rows, plan.natural_keys)
+    return descriptors
+
+
+def _commit_plans(connection, writer, plans, repair=None) -> list[dict]:
+    """Guard, mutate and prove the plans against the warehouse.
+
+    ``repair`` is called when the plans are about to mutate although their
+    bundle is already acknowledged: an interrupted repair must leave an
+    intent behind to replay.
+    """
     execute_statement(connection.cursor(), core_receipts_ddl())
     if any(plan.pages for plan in plans):
         execute_statement(connection.cursor(), core_pages_ddl())
@@ -1275,6 +1289,8 @@ def _commit_plans(connection, writer, plans) -> list[dict]:
         # whatever clock a sibling capture of the scope carries.
         if state == 'pending' or (state == 'refresh' and not _capture_pinned(plan)):
             guard_native_bundle(connection, plan)
+    if repair is not None and any(state != 'written' for _plan, state in states):
+        repair()
     for plan, state in states:
         if state != 'written':
             _mutate_plan(connection, writer, plan)
@@ -1372,10 +1388,19 @@ def _commit_bundle(
             # An acknowledgement re-verifies the whole physical tail: drifted
             # rows fail closed, a deleted receipt row is rewritten and
             # re-read, and a leftover intent is finally finished.
+
+            def repair():
+                # The acknowledged bundle has to mutate again (drifted rows,
+                # a missing manifest, a deleted receipt): journal it first.
+                write_journal.save_intent(
+                    {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
+                    run_id=run_id, universe_version=universe_version,
+                    committed_at=stored['committed_at'])
+
             connection = connection_factory()
             try:
                 write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
-                proofs = _commit_plans(connection, writer, plans)
+                proofs = _commit_plans(connection, writer, plans, repair=repair)
                 plan_receipts = [
                     _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
                                   batch, stored['committed_at'])
@@ -1388,11 +1413,8 @@ def _commit_bundle(
             _finish_leftover_intent(digest, run_id)
             return stored
 
-        descriptors = [asdict(plan) for plan in plans]
-        for descriptor, plan in zip(descriptors, plans):
-            descriptor['rows'] = _sorted_rows(plan.rows, plan.natural_keys)
         intent_path = write_journal.save_intent(
-            {'run_id': run_id, 'digest': digest}, {'plans': descriptors},
+            {'run_id': run_id, 'digest': digest}, {'plans': _descriptors(plans)},
             run_id=run_id, universe_version=universe_version, committed_at=committed_at,
         )
         connection = connection_factory()

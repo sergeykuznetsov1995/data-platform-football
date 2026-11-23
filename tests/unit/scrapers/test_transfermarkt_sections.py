@@ -3354,12 +3354,12 @@ def test_a_repair_of_an_acknowledged_snapshot_leaves_a_recoverable_intent(monkey
     def crash(cursor, plan):
         raise RuntimeError('crash during repair')
 
+    real = native_writer._record_pages
     monkeypatch.setattr(native_writer, '_record_pages', crash)
     with pytest.raises(RuntimeError, match='crash during repair'):
         commit()
     # The repair is journalled before it mutates, like any other write.
     assert native_writer.write_journal.pending_intents({'run_id': run_id})
-    real = native_writer._record_pages
     monkeypatch.setattr(native_writer, '_record_pages', real)
     receipts = native_writer.replay_pending_intents(lambda: db, writer)
     assert len(receipts) == 1 and receipts[0]['verified'] is True
