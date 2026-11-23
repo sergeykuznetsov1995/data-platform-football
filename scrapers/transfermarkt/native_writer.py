@@ -305,6 +305,9 @@ class NativeWritePlan:
             raise ValueError('core natural_keys must be non-empty')
         if not self.scope_columns or len(self.scope_columns) != len(self.scope_values):
             raise ValueError('core scope_columns and scope_values must have equal non-zero length')
+        if any(not _nonempty(value) for value in self.scope_values):
+            # The writer's staged replacement receives the scope as SQL text.
+            raise ValueError('core scope values must be non-empty strings')
         if not self.captured_at:
             raise ValueError('core captured_at must be non-empty')
         if self.write_mode not in ('replace', 'merge'):
@@ -457,6 +460,19 @@ class NativeWritePlan:
     def scope_sql(self) -> str:
         """Return the predicate bound by scope_values in order."""
         return ' AND '.join(f'{col} = ?' for col in self.scope_columns)
+
+    def scope_filter_sql(self) -> str:
+        """Return the scope predicate as inline SQL for the writer's filter.
+
+        The base writer takes a delete filter as SQL text. Column names are
+        validated identifiers and scope values non-empty strings, quoted the
+        way the donor renders its partition filters.
+        """
+        if any(not _nonempty(value) for value in self.scope_values):
+            raise ValueError('core scope values must be non-empty strings')
+        return ' AND '.join(
+            f"{col} = '{value.replace(chr(39), chr(39) * 2)}'"
+            for col, value in zip(self.scope_columns, self.scope_values))
 
     def plan_sha256(self) -> str:
         """Hash the logical plan independently of row order.
@@ -850,20 +866,28 @@ def _mutate_plan(connection, writer, plan: NativeWritePlan) -> None:
             merge_keys=list(plan.natural_keys),
         )
         return
-    cursor = connection.cursor()
-    sql = f'DELETE FROM {plan.full_table} WHERE {plan.scope_sql()}'
-    try:
-        execute_statement(cursor, sql, plan.scope_values)
-    finally:
-        cursor.close()
-    if plan.rows:
-        import pandas as pd
+    if not plan.rows:
+        # A proven-empty replacement has nothing to stage: emptying the
+        # scope is the one statement of its own.
+        cursor = connection.cursor()
+        try:
+            execute_statement(
+                cursor, f'DELETE FROM {plan.full_table} WHERE {plan.scope_sql()}',
+                plan.scope_values)
+        finally:
+            cursor.close()
+        return
+    import pandas as pd
 
-        columns = list(dict.fromkeys(col for row in plan.rows for col in row))
-        frame = pd.DataFrame(list(plan.rows), columns=columns, dtype=object)
-        writer.write_dataframe(
-            df=frame, database='bronze', table=plan.table, add_metadata=False
-        )
+    columns = list(dict.fromkeys(col for row in plan.rows for col in row))
+    frame = pd.DataFrame(list(plan.rows), columns=columns, dtype=object)
+    # The scope is handed to the writer as its delete filter: the
+    # Transfermarkt writer stages the rows and replaces the scope with one
+    # statement, so a failed insertion leaves the committed rows in place.
+    writer.write_dataframe(
+        df=frame, database='bronze', table=plan.table, add_metadata=False,
+        delete_filter=plan.scope_filter_sql(),
+    )
 
 
 def _physical_proof(connection, plan: NativeWritePlan) -> dict:
