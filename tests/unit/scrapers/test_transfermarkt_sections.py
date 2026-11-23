@@ -2522,3 +2522,43 @@ def test_single_outcome_adapters_answer_one_outcome_on_http_failure_too(lane):
     assert isinstance(outcome, core.LaneOutcome)
     assert (outcome.status, outcome.rows) == ('unavailable', ())
     assert core.build_core_dq([outcome])['passed'] is True
+
+
+# --------------------------------- review round-4 pins (findings 1-21)
+
+def test_one_capture_id_cannot_name_two_responses():
+    # Round 4 finding 13: a by-id lookup used to attribute Arsenal to
+    # Chelsea's URL, body hash and clock when both pages shared a capture id.
+    page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    same_id = _replace(page_2, capture_id=page_1.capture_id)
+    with pytest.raises(CoreParseError, match='attendance:capture_conflict'):
+        sections.extract_attendance_observations(
+            (page_1, same_id), _attendance_scope(), start_url=ATTENDANCE_START,
+            competition_id='GB1', edition_id='2025', extracted_at=EXTRACTED_AT,
+            universe_version=UNIVERSE)
+    rumour_1 = _rumour_capture(1, RUMOUR_PAGE_1_CAPTURED)
+    rumour_2 = _replace(_rumour_capture(2, RUMOUR_PAGE_2_CAPTURED), capture_id=rumour_1.capture_id)
+    with pytest.raises(CoreParseError, match='rumours:capture_conflict'):
+        sections.extract_rumour_observations(
+            (rumour_1, rumour_2), _rumour_scope(), competition=_rumour_competition(),
+            extracted_at=RUMOUR_EXTRACTED_AT, universe_version=UNIVERSE)
+
+
+def test_row_lineage_must_match_its_own_page():
+    # Round 4 finding 13: a row edited to carry another page's capture
+    # evidence used to pass DQ and land in a verified receipt.
+    pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
+             _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
+    outcome = sections.extract_attendance_observations(
+        pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
+        edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    arsenal = next(row for row in outcome.rows if row['club_id'] == '11')
+    borrowed = tuple(
+        {**row, 'raw_capture_id': arsenal['raw_capture_id'],
+         'source_body_hash': arsenal['source_body_hash']}
+        if row['club_id'] == '631' else row for row in outcome.rows)
+    with pytest.raises(ValueError, match='lineage differs'):
+        core.plan_for_outcome(
+            _replace(outcome, rows=borrowed), captured_at=PAGE_2_CAPTURED,
+            scope_values={'competition_id': 'GB1', 'edition_id': '2025'})

@@ -808,3 +808,22 @@ def test_rowless_replacement_refuses_a_table_with_a_foreign_column():
     with pytest.raises(RuntimeError, match='schema differs'):
         write(db, [_empty_roster_plan()], run_id='run-2')
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone()[0] == 1
+
+def test_plan_rows_carry_the_evidence_the_plan_names():
+    # Round 4 finding 13: only the capture ids were compared, so a row's body
+    # hash could differ from the evidence and still reach the receipt.
+    plan = membership_plan(['1'], capture='cap-1')
+    row = plan.rows[0]
+    evidenced = (
+        ('source_url', row['source_url']), ('source_endpoint', 'squad'),
+        ('raw_capture_id', 'cap-1'), ('source_capture_id', 'cap-1'),
+        ('source_body_hash', 'e' * 64), ('scope_id', 'tm-scope'), ('cycle_id', 'tm-cycle'),
+        ('parser_revision', 'core-v1'), ('schema_revision', '1'),
+    )
+    with pytest.raises(ValueError, match='lineage differs'):
+        dataclasses_replace(plan, evidence=evidenced)
+    # The row's own evidence is accepted.
+    own = tuple(
+        (column, row['source_body_hash'] if column == 'source_body_hash' else value)
+        for column, value in evidenced)
+    assert dataclasses_replace(plan, evidence=own).evidence == own
