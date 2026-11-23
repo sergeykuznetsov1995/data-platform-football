@@ -3921,3 +3921,70 @@ def test_finding_27_invalid_attendance_link_cites_its_own_page():
     outcome = _attendance_outcome((broken, second))
     assert (outcome.status, outcome.status_reason, outcome.rows, outcome.capture) == (
         'error', 'attendance:pagination_identity_invalid', (), broken)
+
+
+# ---------------------------------------------------------------- round 6: the acknowledged walk
+
+
+def test_a_lost_manifest_refuses_another_walk_until_it_is_repaired():
+    # Round 6 finding 4: the manifest was the only place that held the 12:30
+    # clock of a page without rows. Once it was lost, a walk with the same
+    # first page and a cached 12:05 second page verified and restored rows
+    # the 12:30 walk had left out.
+    page_1, cached_2 = _two_pages()
+    empty_2 = _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty 12:30')
+    plans = [_attendance_plan((page_1, empty_2))]
+    db = CoreDB()
+    first = _bundle(db, plans, EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11'}
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
+
+    stale = [_attendance_plan((page_1, cached_2), LATER_EXTRACTED_AT)]
+    with pytest.raises(RuntimeError, match='manifest lost'):
+        _bundle(db, stale, LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11'}
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0] == 1
+    # The acknowledgement that lost its pages repairs them on its own retry:
+    # the walk it names is logged again from its plan.
+    writer = CoreWriter(db)
+    repaired = native_writer.write_core_bundle(
+        lambda: db, writer, plans, run_id=plans[0].rows[0]['run_id'], universe_version=UNIVERSE,
+        committed_at=EXTRACTED_AT)
+    assert repaired['verified'] is True and repaired['plan_sha256'] == first['plan_sha256']
+    assert _manifest_evidence(db) == {
+        ATTENDANCE_START: (page_1.capture_id, _moment(PAGE_1_CAPTURED), page_1.body_hash),
+        ATTENDANCE_PAGE_2: (empty_2.capture_id, _moment(NEWER_PAGE_CAPTURED), empty_2.body_hash)}
+    assert set(_stadiums(db)) == {'11'}
+    # The lost clock is back: the cached page is stale again.
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, stale, LATER_EXTRACTED_AT)
+
+
+def test_a_page_returns_with_the_rows_it_was_acknowledged_with():
+    # Round 6 finding 5: a page that had left the walk was compared with an
+    # empty row set when it returned, because the shorter walk that replaced
+    # the scope no longer held its rows.
+    page_1, page_2 = _two_pages()
+    db = CoreDB()
+    _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
+    single = _page(ATTENDANCE_START, (ATTENDANCE_FIXTURES / 'single_page.html').read_bytes(),
+                   T1235, 'single 12:35')
+    assert _bundle(db, [_attendance_plan((single,), LATER_EXTRACTED_AT)], LATER_EXTRACTED_AT)[
+        'verified'] is True
+    before = _stadiums(db)
+    late_1 = _page(ATTENDANCE_START, page_1.body, T1245, 'late 12:45')
+    returning = _attendance_plan((late_1, page_2), LATER_EXTRACTED_AT)
+    # The capture that returns is the one the scope acknowledged: other rows
+    # under its name are not that capture.
+    changed = _replace(returning, rows=tuple(
+        {**row, 'spectators_total': row['spectators_total'] + 1} if row['club_id'] == '631' else row
+        for row in returning.rows))
+    with pytest.raises(RuntimeError, match='replay differs'):
+        _bundle(db, [changed], LATER_EXTRACTED_AT)
+    assert _stadiums(db) == before
+
+    assert _bundle(db, [returning], LATER_EXTRACTED_AT)['verified'] is True
+    assert set(_stadiums(db)) == {'11', '631'}
+    assert _manifest_evidence(db) == {
+        ATTENDANCE_START: (late_1.capture_id, _moment(T1245), late_1.body_hash),
+        ATTENDANCE_PAGE_2: (page_2.capture_id, _moment(PAGE_2_CAPTURED), page_2.body_hash)}
