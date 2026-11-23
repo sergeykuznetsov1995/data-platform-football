@@ -140,6 +140,11 @@ class CommittingCursor:
             self._committed_rows = result
             return self
         return result
+    def execute_once(self, sql, params=None):
+        """Run a statement exactly once: the caller resolves an ambiguous commit."""
+        result = self._cursor.execute(sql, tuple(params)) if params is not None else self._cursor.execute(sql)
+        return list(self._cursor.fetchall()) if is_mutation(sql) else result
+
     def fetchall(self):
         if self._committed_rows is not None:
             rows, self._committed_rows = self._committed_rows, None
@@ -190,6 +195,11 @@ RECEIPT_COLUMNS = (
 )
 _RECEIPT_BIGINT_COLUMNS = frozenset({'expected_rows', 'row_count'})
 _RECEIPT_TIMESTAMPS = frozenset({'committed_at', 'captured_at'})
+# What a receipt states about the physical result of its write; every other
+# cell is known before anything is written.
+_RECEIPT_PROOF_COLUMNS = frozenset({'row_count', 'expected_rows', 'status_counts_json', 'physical_hash'})
+_UNWRITTEN_PROOF = {'entity': '', 'table': '', 'rows': None, 'physical_hash': None,
+                   'expected_rows': None, 'status_counts': None}
 
 
 def core_receipts_ddl() -> str:
@@ -1324,9 +1334,15 @@ def _stored_receipts(connection, ids) -> dict[str, tuple]:
         return {}
     names = ', '.join(RECEIPT_COLUMNS)
     placeholders = ', '.join('?' for _ in ids)
-    rows = _query_rows(
-        connection.cursor(),
-        f'SELECT {names} FROM {CORE_RECEIPTS_TABLE} WHERE receipt_id IN ({placeholders})', ids)
+    try:
+        rows = _query_rows(
+            connection.cursor(),
+            f'SELECT {names} FROM {CORE_RECEIPTS_TABLE} '
+            f'WHERE receipt_id IN ({placeholders})', ids)
+    except Exception as exc:
+        if write_journal._table_not_found(exc):
+            return {}  # nothing was ever acknowledged
+        raise
     stored = {}
     try:
         for row in rows:
@@ -1338,6 +1354,68 @@ def _stored_receipts(connection, ids) -> dict[str, tuple]:
     except (TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError('core receipt readback differs') from exc
     return stored
+
+
+def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_id,
+                                 universe_version, batch, committed_at) -> None:
+    """A receipt the warehouse holds under one of this bundle's ids must agree with it.
+
+    Everything a receipt states but its physical proof is known before the
+    bundle writes anything. A contradiction with an earlier acknowledgement is
+    therefore found before the first mutation, not by the receipts step after
+    the data has been replaced.
+    """
+    expected = [
+        _plan_receipt(plan, _UNWRITTEN_PROOF, plan_hash, digest, run_id, universe_version,
+                      batch, committed_at)
+        for plan, plan_hash in zip(plans, plan_hashes, strict=True)
+    ]
+    stored = _stored_receipts(connection, [receipt['receipt_id'] for receipt in expected])
+    for receipt in expected:
+        earlier = stored.get(receipt['receipt_id'])
+        if earlier is None:
+            continue
+        cells = _receipt_cells(receipt)
+        if any(earlier[index] != cells[index]
+               for index, column in enumerate(RECEIPT_COLUMNS)
+               if column not in _RECEIPT_PROOF_COLUMNS):
+            raise RuntimeError('core receipt contradicts its earlier acknowledgement')
+
+
+def _ambiguous_commit(exc: Exception) -> bool:
+    """A failure that may mean the statement committed: the same reading the
+    commit-conflict retry ladder gives."""
+    return bool(_is_iceberg_commit_conflict(exc) or 'ICEBERG_COMMIT_ERROR' in str(exc))
+
+
+def _insert_receipt(connection, sql, bound, receipt_id, expected) -> None:
+    """Insert one receipt without ever repeating the INSERT blindly.
+
+    The commit may be unknown after a failure. The receipt id is read back
+    first: a receipt that landed and agrees is done, one that differs
+    contradicts its acknowledgement, and only a receipt that is absent is
+    inserted again.
+    """
+    for attempt in range(2):
+        cursor = connection.cursor()
+        try:
+            # A committing cursor retries ambiguous commits on its own.
+            run = getattr(cursor, 'execute_once', cursor.execute)
+            run(sql, bound)
+            if not isinstance(cursor, CommittingCursor):
+                cursor.fetchall()
+            return
+        except Exception as exc:
+            ambiguous = _ambiguous_commit(exc)
+        finally:
+            cursor.close()
+        stored = _stored_receipts(connection, [receipt_id]).get(receipt_id)
+        if stored is not None:
+            if stored != expected:
+                raise RuntimeError('core receipt contradicts its earlier acknowledgement')
+            return
+        if attempt or not ambiguous:
+            raise
 
 
 def _merge_receipts(connection, receipts) -> None:
@@ -1364,9 +1442,9 @@ def _merge_receipts(connection, receipts) -> None:
                 # Trino timestamp(6) stores UTC wall time without an offset.
                 value = _timestamp(value).replace(tzinfo=None)
             bound.append(value)
-        execute_statement(
-            connection.cursor(),
-            f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})', bound)
+        _insert_receipt(
+            connection, f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})',
+            bound, expected[0], expected)
 
 
 def _verify_receipts(connection, receipts) -> None:
@@ -1652,6 +1730,9 @@ def _commit_bundle(
 
             connection = connection_factory()
             try:
+                _refuse_receipt_contradictions(
+                    connection, plans, receipt_hashes, receipt_digest, run_id,
+                    universe_version, batch, stored['committed_at'])
                 write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
                 proofs = _commit_plans(connection, writer, plans, repair=repair)
                 plan_receipts = [
@@ -1672,6 +1753,9 @@ def _commit_bundle(
         )
         connection = connection_factory()
         try:
+            _refuse_receipt_contradictions(
+                connection, plans, plan_hashes, digest, run_id, universe_version, batch,
+                committed_at)
             write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
             proofs = _commit_plans(connection, writer, plans)
             plan_receipts = [

@@ -1198,15 +1198,17 @@ def test_an_identical_acknowledgement_rewrites_no_receipt(monkeypatch):
     db = CoreDB()
     plans = [membership_plan(['1'], capture='cap-1')]
     issued = []
-    real = native_writer.execute_statement
+    real = CoreCursor.execute
 
-    def spy(cursor, sql, params=None):
-        # The SQL the writer would send for the receipts table, reads aside.
-        if 'transfermarkt_core_receipts_v1' in sql and not sql.lstrip().startswith(('SELECT', 'CREATE')):
+    def spy(self, sql, params=()):
+        # Every write the writer sends to the receipts table, whichever path
+        # issues it (round 6 moved the INSERT behind a read-back).
+        if ('transfermarkt_core_receipts_v1' in sql
+                and not sql.lstrip().startswith(('SELECT', 'CREATE'))):
             issued.append(sql.split('(')[0].strip())
-        return real(cursor, sql, params)
+        return real(self, sql, params)
 
-    monkeypatch.setattr(native_writer, 'execute_statement', spy)
+    monkeypatch.setattr(CoreCursor, 'execute', spy)
 
     def commit():
         return native_writer.write_core_bundle(
