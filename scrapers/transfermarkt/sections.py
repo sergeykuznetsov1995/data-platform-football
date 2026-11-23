@@ -271,11 +271,17 @@ def extract_representation_observations(
             'evidence_type': assertion.evidence_type, 'evidence_locator': assertion.evidence_locator,
             'observed_at': capture.captured_at,
         }
-        row = core._render(
-            entity, values, observation_status=status, status_reason=row_reason,
-            parser_revision=representation.REPRESENTATION_PARSER_REVISION,
-            schema_revision=representation.REPRESENTATION_SCHEMA_REVISION, **player_context,
-        )
+        try:
+            row = core._render(
+                entity, values, observation_status=status, status_reason=row_reason,
+                parser_revision=representation.REPRESENTATION_PARSER_REVISION,
+                schema_revision=representation.REPRESENTATION_SCHEMA_REVISION, **player_context,
+            )
+        except core.CoreParseError as exc:
+            # A row the core cannot render is this player's error; the other
+            # players of the packet are observed all the same.
+            outcomes.append(_outcome(entity, 'error', 'representation:' + exc.reason, **player_context))
+            continue
         outcomes.append(_outcome(entity, status, reason, (row,), **player_context))
     return tuple(outcomes)
 
@@ -388,16 +394,23 @@ def extract_referee_directory_observations(
         return (_outcome(entity, 'error', 'referees:completeness_proof_missing', **context),)
 
     rows_by_page = [[] for _ in captures]
-    for aggregate in result.aggregates:
-        index = first_page[aggregate.natural_key]
-        capture = captures[index]
-        values = aggregate.as_dict()
-        values['observed_at'] = capture.captured_at
-        rows_by_page[index].append(core._render(
-            entity, values, scope, capture, extracted_at, context['run_id'], universe_version,
-            observation_status=aggregate.observation_status, status_reason='referees:' + aggregate.status_reason,
-            parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
-        ))
+    try:
+        for aggregate in result.aggregates:
+            index = first_page[aggregate.natural_key]
+            capture = captures[index]
+            values = aggregate.as_dict()
+            values['observed_at'] = capture.captured_at
+            rows_by_page[index].append(core._render(
+                entity, values, scope, capture, extracted_at, context['run_id'], universe_version,
+                observation_status=aggregate.observation_status,
+                status_reason='referees:' + aggregate.status_reason,
+                parser_revision=referees.REFEREE_PARSER_REVISION,
+                schema_revision=referees.REFEREE_SCHEMA_REVISION,
+            ))
+    except core.CoreParseError as exc:
+        # The directory keeps no partial rows: the page of the row backs the error.
+        return (_outcome(entity, 'error', 'referees:' + exc.reason,
+                         **core._context(capture, scope, extracted_at, universe_version)),)
     return tuple(
         _outcome(entity, 'observed_present', 'referees:page', tuple(rows),
                          **core._context(capture, scope, extracted_at, universe_version))
@@ -431,11 +444,15 @@ def extract_referee_profile_observations(
     reason = 'referees:profile'
     values = profile.as_dict()
     values['observed_at'] = capture.captured_at
-    row = core._render(
-        entity, values, observation_status='observed_present', status_reason=reason,
-        parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
-        **context,
-    )
+    try:
+        row = core._render(
+            entity, values, observation_status='observed_present', status_reason=reason,
+            parser_revision=referees.REFEREE_PARSER_REVISION,
+            schema_revision=referees.REFEREE_SCHEMA_REVISION, **context,
+        )
+    except core.CoreParseError as exc:
+        # A row the core cannot render is this profile's error.
+        return (_outcome(entity, 'error', 'referees:' + exc.reason, **context),)
     return (_outcome(entity, 'observed_present', reason, (row,), **context),)
 
 
@@ -528,17 +545,22 @@ def extract_rumour_observations(
             outcomes.append(_outcome(entity, 'observed_empty', reason, proof=proof, **page_context))
             continue
         rows = []
-        for row in page.rows:
-            if row['raw_capture_id'] != capture.capture_id:
-                raise core.CoreParseError('rumours:row_capture_missing')
-            values = dict(row)
-            if values['probability_percent'] is not None:
-                values['probability_percent'] = repr(values['probability_percent'])
-            rows.append(core._render(
-                entity, values, scope, capture, extracted_at, context['run_id'], universe_version,
-                observation_status='observed_present', status_reason='rumours:row',
-                parser_revision=rumours.PARSER_VERSION, schema_revision=rumours.SCHEMA_VERSION,
-            ))
+        try:
+            for row in page.rows:
+                if row['raw_capture_id'] != capture.capture_id:
+                    raise core.CoreParseError('rumours:row_capture_missing')
+                values = dict(row)
+                if values['probability_percent'] is not None:
+                    values['probability_percent'] = repr(values['probability_percent'])
+                rows.append(core._render(
+                    entity, values, scope, capture, extracted_at, context['run_id'], universe_version,
+                    observation_status='observed_present', status_reason='rumours:row',
+                    parser_revision=rumours.PARSER_VERSION, schema_revision=rumours.SCHEMA_VERSION,
+                ))
+        except core.CoreParseError as exc:
+            # A row of the feed no page can hold is the feed's error, backed
+            # by the page it came from: no page of the feed is certified.
+            return (_outcome(entity, 'error', 'rumours:' + exc.reason, **page_context),)
         outcomes.append(_outcome(entity, 'observed_present', 'rumours:page', tuple(rows), **page_context))
     return tuple(outcomes)
 
@@ -575,13 +597,18 @@ def extract_club_value_observations(
         return (_outcome(entity, 'error', 'club_values:invalid_source_data', **context),)
 
     by_club = {}
-    for point in extraction.rows:
-        row = core._render(
-            entity, point, observation_status=point['observation_status'], status_reason='club_values:point',
-            parser_revision=club_values.CLUB_VALUE_PARSER_REVISION,
-            schema_revision=club_values.CLUB_VALUE_SCHEMA_REVISION, **context,
-        )
-        by_club.setdefault(point['club_id'], []).append(row)
+    try:
+        for point in extraction.rows:
+            row = core._render(
+                entity, point, observation_status=point['observation_status'],
+                status_reason='club_values:point',
+                parser_revision=club_values.CLUB_VALUE_PARSER_REVISION,
+                schema_revision=club_values.CLUB_VALUE_SCHEMA_REVISION, **context,
+            )
+            by_club.setdefault(point['club_id'], []).append(row)
+    except core.CoreParseError as exc:
+        # A value a row cannot hold is this section's error; the run goes on.
+        return (_outcome(entity, 'error', 'club_values:' + exc.reason, **context),)
 
     outcomes = []
     for rows in by_club.values():
@@ -629,13 +656,18 @@ def extract_achievement_observations(
 
     reason = 'achievements:row'
     rows = []
-    for achievement in result.rows:
-        values = achievement.as_dict()
-        if values['recipient_id'] != recipient_id or values['recipient_type'] != recipient_type:
-            raise core.CoreParseError('row_scope_mismatch')
-        rows.append(core._render(
-            entity, values, observation_status='observed_present', status_reason=reason,
-            parser_revision=achievements.ACHIEVEMENT_PARSER_REVISION,
-            schema_revision=str(achievements.ACHIEVEMENT_SCHEMA_REVISION), **context,
-        ))
+    try:
+        for achievement in result.rows:
+            values = achievement.as_dict()
+            if values['recipient_id'] != recipient_id or values['recipient_type'] != recipient_type:
+                raise core.CoreParseError('row_scope_mismatch')
+            rows.append(core._render(
+                entity, values, observation_status='observed_present', status_reason=reason,
+                parser_revision=achievements.ACHIEVEMENT_PARSER_REVISION,
+                schema_revision=str(achievements.ACHIEVEMENT_SCHEMA_REVISION), **context,
+            ))
+    except core.CoreParseError as exc:
+        # A row the core cannot render (or one that names another holder) is
+        # this holder's error; the run goes on.
+        return (_outcome(entity, 'error', 'achievements:' + exc.reason, **context),)
     return (_outcome(entity, result.status, reason, tuple(rows), **context),)

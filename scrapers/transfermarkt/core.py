@@ -567,29 +567,38 @@ def extract_squad_observations(
         return page_outcomes('observed_empty', 'empty_roster', proof)
 
     by_entity = {entity: [] for entity in entities}
-    for player in players:
-        contract = player['_contract_status']
-        values = {
-            **player,
-            'league': scope.league,
-            'season': scope.season,
-            'club_id': scope.club_id,
-            'club_name': scope.club_name if scope.club_name is not None else player.get('club_name'),
-            'player_id': _require_id(player.get('player_id'), 'player_id'),
-            'observed_at': capture.captured_at,
-            'contract_status': contract,
-            'player_name': player['name'],
-        }
-        for entity in entities:
-            if any(values[key] in (None, '') for key in CORE_NATURAL_KEYS[entity]):
-                continue
-            if entity == 'player_contract_observations':
-                status = _CONTRACT_STATUSES[contract]
-                reason = 'contract:' + contract
-            else:
-                status, reason = 'observed_present', 'squad_row'
-            row = _render(entity, values, observation_status=status, status_reason=reason, **context)
-            by_entity[entity].append(row)
+
+    def render(page_rows):
+        for player in page_rows:
+            contract = player['_contract_status']
+            values = {
+                **player,
+                'league': scope.league,
+                'season': scope.season,
+                'club_id': scope.club_id,
+                'club_name': scope.club_name if scope.club_name is not None else player.get('club_name'),
+                'player_id': _require_id(player.get('player_id'), 'player_id'),
+                'observed_at': capture.captured_at,
+                'contract_status': contract,
+                'player_name': player['name'],
+            }
+            for entity in entities:
+                if any(values[key] in (None, '') for key in CORE_NATURAL_KEYS[entity]):
+                    continue
+                if entity == 'player_contract_observations':
+                    status = _CONTRACT_STATUSES[contract]
+                    reason = 'contract:' + contract
+                else:
+                    status, reason = 'observed_present', 'squad_row'
+                row = _render(entity, values, observation_status=status, status_reason=reason, **context)
+                by_entity[entity].append(row)
+
+    try:
+        render(players)
+    except CoreParseError as exc:
+        # A row the page cannot hold (an id that is not one, a value beyond
+        # its column) is this capture's error, not the end of the run.
+        return page_outcomes('error', exc.reason)
     return tuple(
         LaneOutcome(entity, 'observed_present', 'squad_page', tuple(by_entity[entity]), **context)
         for entity in entities
@@ -625,11 +634,15 @@ def extract_career_observations(
     if not parsed:
         return LaneOutcome(entity, 'observed_empty', 'empty_collection',
                            proof='empty_collection:' + entity, **context)
-    rows = tuple(
-        _render(entity, row, observation_status='observed_present',
-                status_reason='career_page', **context)
-        for row in parsed
-    )
+    try:
+        rows = tuple(
+            _render(entity, row, observation_status='observed_present',
+                    status_reason='career_page', **context)
+            for row in parsed
+        )
+    except CoreParseError as exc:
+        # A value a row cannot hold is this capture's error, not the end of the run.
+        return LaneOutcome(entity, 'error', exc.reason, **context)
     return LaneOutcome(entity, 'observed_present', 'career_page', rows, **context)
 
 
@@ -655,8 +668,12 @@ def extract_coach_profile(
     if profile is None:
         return LaneOutcome(entity, 'error', 'profile_unrecognized', **context)
     values = {**profile, 'coach_id': coach_id, 'observed_at': capture.captured_at}
-    row = _render(entity, values, observation_status='observed_present',
-                  status_reason='coach_profile', **context)
+    try:
+        row = _render(entity, values, observation_status='observed_present',
+                      status_reason='coach_profile', **context)
+    except CoreParseError as exc:
+        # A value the row cannot hold is this capture's error, not the end of the run.
+        return LaneOutcome(entity, 'error', exc.reason, **context)
     return LaneOutcome(entity, 'observed_present', 'coach_profile', (row,), **context)
 
 
@@ -687,21 +704,25 @@ def extract_coach_stints(
         return LaneOutcome(entity, 'error', 'schema:invalid_coach_history', **context)
 
     rows = []
-    for stint in stints:
-        identity = {
-            'club_id': scope.club_id,
-            'coach_id': _require_id(stint['coach_id'], 'coach_id'),
-            'role': stint['role'],
-            'appointed_date': _iso_date(stint['appointed_date']),
-            'left_date': _iso_date(stint['left_date']),
-        }
-        values = {
-            **stint, **identity,
-            'stint_id': hashlib.sha256(canonical_json(identity)).hexdigest(),
-            'observed_at': capture.captured_at,
-        }
-        rows.append(_render(entity, values, observation_status='observed_present',
-                            status_reason='coach_history', **context))
+    try:
+        for stint in stints:
+            identity = {
+                'club_id': scope.club_id,
+                'coach_id': _require_id(stint['coach_id'], 'coach_id'),
+                'role': stint['role'],
+                'appointed_date': _iso_date(stint['appointed_date']),
+                'left_date': _iso_date(stint['left_date']),
+            }
+            values = {
+                **stint, **identity,
+                'stint_id': hashlib.sha256(canonical_json(identity)).hexdigest(),
+                'observed_at': capture.captured_at,
+            }
+            rows.append(_render(entity, values, observation_status='observed_present',
+                                status_reason='coach_history', **context))
+    except CoreParseError as exc:
+        # A row the page cannot hold is this capture's error, not the end of the run.
+        return LaneOutcome(entity, 'error', exc.reason, **context)
     return LaneOutcome(entity, 'observed_present', 'coach_history', tuple(rows), **context)
 
 
