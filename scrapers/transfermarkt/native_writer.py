@@ -254,6 +254,29 @@ def _check_columns(columns) -> None:
             raise ValueError(f'invalid core column name: {name!r}')
 
 
+class _Row(dict):
+    """A validated plan row: readable as a mapping, never written again.
+
+    Hashing, journalling, writing and read-back must all see the content the
+    plan validated. Staying a dict keeps every consumer (JSON, dataclasses,
+    frames) working unchanged; another plan is the way to other rows.
+    """
+
+    __slots__ = ()
+
+    @staticmethod
+    def _read_only(*args, **kwargs):
+        raise TypeError('core plan rows are read-only: build another plan')
+
+    def __reduce__(self):
+        # copy and pickle rebuild a row through its constructor, never by
+        # assigning into it.
+        return _Row, (dict(self),)
+
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = update = pop = popitem = setdefault = _read_only
+
+
 def _sorted_rows(rows, natural_keys) -> list[dict]:
     # Keep numeric key ordering even for a bundle containing both ints and strings.
     def key(row):
@@ -330,9 +353,10 @@ class NativeWritePlan:
         _check_columns(self.natural_keys)
         _check_columns(self.scope_columns)
         self._check_rows()
-        # The plan keeps the rows it validated: the caller's dictionaries stay
-        # mutable, hashing and writing must see the validated content.
-        object.__setattr__(self, 'rows', tuple(dict(row) for row in self.rows))
+        # The plan keeps the rows it validated, and keeps them as validated:
+        # the caller's dictionaries stay mutable, hashing and writing must see
+        # this content and nothing else.
+        object.__setattr__(self, 'rows', tuple(_Row(row) for row in self.rows))
         self._check_pages()
         self._check_row_evidence()
         clock = _timestamp(self.captured_at)
