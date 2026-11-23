@@ -48,6 +48,8 @@ def _load_records(root):
         record = json.loads(path.read_text(encoding="utf-8"))
         if record["capture_id"] != capture_id:
             raise ValueError(f"Capture ID mismatch in {path}")
+        if record["endpoint"] != fixture["endpoint"]:
+            raise ValueError(f"Fixture endpoint mismatch in {path}")
         blob = root / fixture["blob_file"]
         url = record["url"]
         if url in records:
@@ -58,10 +60,13 @@ def _load_records(root):
 
 def _fixture_fetch(records):
     from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+    from scrapers.transfermarkt.sections import parse_json_integer
 
+    requested = set()
     reached = set()
 
     def fetch(url, *, as_json, label, context=None, validator=None):
+        requested.add(url)
         entry = records.get(url)
         if entry is None:
             return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error="fixture_missing")
@@ -75,7 +80,7 @@ def _fixture_fetch(records):
         text = gzip.decompress(blob.read_bytes()).decode("utf-8")
         if as_json:
             try:
-                value = json.loads(text)
+                value = json.loads(text, parse_int=parse_json_integer)
             except ValueError:
                 return FetchOutcome(
                     status=FetchStatus.SCHEMA_ERROR, error="invalid_json",
@@ -93,6 +98,7 @@ def _fixture_fetch(records):
             status_code=record["status_code"],
         )
 
+    fetch.requested = requested
     fetch.reached = reached
     return fetch
 
@@ -164,7 +170,7 @@ def _live_plan(args):
         ClubTarget, CoreScopePlan, coach_history_url, squad_url,
     )
 
-    year = int(args.edition_id) if args.edition_id else _season_year(args.season)
+    year = _season_year(args.season)
     clubs = tuple(
         ClubTarget(club_id, slug, name, squad_url(slug, club_id, year),
                    coach_history_url(slug, club_id))
@@ -239,7 +245,11 @@ def _offline_plan(args, records):
                 # The sample mixes seasons; a run owns exactly one of them.
                 if _squad_season_matches(url, season):
                     squad_year = int(year)
-                    clubs.setdefault(club_id, {"club_slug": slug})["squad_url"] = url
+                    club = clubs.setdefault(club_id, {"club_slug": slug})
+                    if "squad_url" in club:
+                        raise ValueError(f"Conflicting squad fixture URLs for club {club_id}: "
+                                         f"{club['squad_url']}, {url}")
+                    club["squad_url"] = url
             case "coach_history", [slug, "mitarbeiterhistorie", "verein", club_id, "plus", "1"]:
                 clubs.setdefault(club_id, {"club_slug": slug})["coach_history_url"] = url
             case "market_value_points", ["ceapi", "marketValueDevelopment", "graph", player_id]:
@@ -251,12 +261,11 @@ def _offline_plan(args, records):
             case _:
                 raise ValueError(f"Fixture endpoint {endpoint!r} does not match its URL {url!r}")
 
-    edition = args.edition_id or first.get("edition_id") or squad_year
-    year = squad_year or (int(edition) if edition else _season_year(season))
+    edition = args.edition_id or squad_year or first.get("edition_id") or _season_year(season)
     return CoreScopePlan(
         league=args.league, season=season,
         scope_id=args.scope_id or first["scope_id"], cycle_id=args.cycle_id or first["cycle_id"],
-        edition_id=str(edition or year),
+        edition_id=str(edition),
         clubs=tuple(ClubTarget(club_id=key, **value) for key, value in clubs.items()),
         market_value_player_ids=tuple(sorted(set(mv_players))),
         transfer_player_ids=tuple(sorted(set(transfer_players))),
@@ -266,10 +275,11 @@ def _offline_plan(args, records):
 
 
 def _write_options(args):
+    from inspect import signature
     import os
 
     from trino.auth import BasicAuthentication
-    from trino.dbapi import connect
+    from trino.dbapi import Connection, connect
 
     from scrapers.transfermarkt.native_writer import CommittingConnection
     from scrapers.transfermarkt.writer import TransfermarktIcebergWriter
@@ -278,12 +288,16 @@ def _write_options(args):
     port = args.trino_port or int(os.getenv("TRINO_PORT", "8080"))
     user = args.trino_user or os.getenv("TRINO_USER", "airflow")
     password = os.getenv("TRINO_PASSWORD")
+    transport = {"max_attempts": 1}
+    if "legacy_prepared_statements" in signature(Connection).parameters:
+        transport["legacy_prepared_statements"] = False
 
     def connection_factory():
         connection = connect(
             host=host, port=port, user=user, catalog="iceberg", schema="bronze",
             http_scheme="https" if password else "http",
             auth=BasicAuthentication(user, password) if password else None,
+            **transport,
         )
         return CommittingConnection(connection)
 
@@ -304,7 +318,6 @@ def main(argv=None):
     try:
         if args.mode == "offline":
             records = _load_records(args.fixtures_root)
-            fixture_urls = set(records)
             plan = _offline_plan(args, records)
             missing = [url for url in planned_urls(plan) if url not in records]
             if missing:
@@ -329,11 +342,18 @@ def main(argv=None):
             # the replay does not plan for are on file by design.
             from scrapers.transfermarkt import core
 
-            sections = core._ENDPOINTS - _CORE_ENDPOINTS
-            unreached = {url for url in fixture_urls
-                         if records[url][0]["endpoint"] in sections} - fetch.reached
+            eligible = {
+                url for url, (record, _) in records.items()
+                if record["endpoint"] in core._ENDPOINTS
+                and (record["endpoint"] != "squad" or _squad_season_matches(url, plan.season))
+            }
+            missing = fetch.requested - fetch.reached
+            unreached = eligible - fetch.requested
+            if missing:
+                print("Missing fixture responses:", *sorted(missing), sep="\n", file=sys.stderr)
             if unreached:
                 print("Unreached fixture records:", *sorted(unreached), sep="\n", file=sys.stderr)
+            if missing or unreached:
                 return 2
     except (ValueError, KeyError, OSError, CoreRunError) as exc:
         parser.exit(2, f"{parser.prog}: {exc}\n")

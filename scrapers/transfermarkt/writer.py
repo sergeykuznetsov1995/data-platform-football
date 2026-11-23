@@ -10,6 +10,7 @@ shared Airflow logs volume).
 from __future__ import annotations
 
 import time  # noqa: F401 — donor tests patch the shared time module through here
+from contextlib import suppress
 
 from scrapers.base import trino_manager as base_trino
 from scrapers.base.iceberg_writer import IcebergWriter
@@ -18,9 +19,12 @@ from scrapers.transfermarkt.native_writer import (  # noqa: F401 — donor facad
     CommittingConnection,
     CommittingCursor,
     StaleTransfermarktWrite,
+    TrinoConnection,
     _LOCAL,
     _MUTATION,
     _execute_committing,
+    _execute_once,
+    _target_dispatch,
     execute_statement,
     is_mutation,
     locked_write,
@@ -37,7 +41,21 @@ CAREER_TABLES = frozenset({
 
 
 class TransfermarktTrinoManager(TrinoTableManager):
+    @property
+    def connection(self):
+        # The base manager caches a connection across calls. A donor read can
+        # warm it before a journalled write, and donor work can follow either.
+        with self._conn_lock:
+            if isinstance(self._conn, TrinoConnection):
+                strict = self._conn.max_attempts == 1 and self._conn.legacy_prepared_statements is False
+                if strict != write_is_journalled():
+                    self._reset_connection()
+            return super().connection
+
     def _create_connection(self):
+        transport = {}
+        if write_is_journalled():
+            transport.update(max_attempts=1, legacy_prepared_statements=False)
         if self._password:
             return base_trino.trino.dbapi.connect(
                 host=self.host,
@@ -48,6 +66,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
                 auth=base_trino.trino.auth.BasicAuthentication(self.user, self._password),
                 verify=False,
                 session_properties={'enable_dynamic_filtering': 'false'},
+                **transport,
             )
         return base_trino.trino.dbapi.connect(
             host=self.host,
@@ -55,6 +74,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
             user=self.user,
             catalog=self.catalog,
             session_properties={'enable_dynamic_filtering': 'false'},
+            **transport,
         )
 
     def arrow_schema_to_trino(self, arrow_schema):
@@ -75,34 +95,64 @@ class TransfermarktTrinoManager(TrinoTableManager):
 
     def _execute(self, sql, fetch=False, params=None, *, replay_safe=True):
         parent = super()._execute
-        if fetch or not _MUTATION.match(sql):
+        mutation = _MUTATION.match(sql)
+        if fetch or not mutation:
             return parent(sql, fetch=fetch, params=params)
+        if write_is_journalled():
+            verb = mutation[1].upper()
+            if verb == 'INSERT':
+                # Includes every VALUES batch and the replacement tombstones.
+                return parent(sql, fetch=fetch, params=params, replay_safe=False)
+            if verb == 'MERGE':
+                return self._execute_target(sql, params)
         if not replay_safe:
             return parent(sql, fetch=fetch, params=params, replay_safe=False)
         return _execute_committing(lambda: parent(sql, fetch=fetch, params=params))
+
+    def _execute_target(self, sql, params):
+        with self._conn_lock:
+            cursor = self.connection.cursor()
+            try:
+                with _target_dispatch() as statement:
+                    try:
+                        _execute_once(cursor, sql, params, statement)
+                    except Exception as exc:
+                        if any(message in str(exc) for message in self._CONNECTION_ERRORS):
+                            with suppress(Exception):
+                                self._reset_connection()
+                            raise base_trino.TrinoAmbiguousWriteError(
+                                f'Connection lost while executing SQL: {exc}') from exc
+                        raise base_trino.TrinoError(f'SQL execution failed: {exc}') from exc
+            finally:
+                with suppress(Exception):
+                    cursor.close()
+
     def _execute_committing(self, sql, *, replay_safe=True):
         # Avoid the common manager's independent retry loop and nested jitter.
-        if not replay_safe:
+        if write_is_journalled() or not replay_safe:
             # The strict ladder retries a definite rejected commit only.
             return super()._execute_committing(sql, replay_safe=False)
         return self._execute(sql)
-    def _execute_replacement(self, sql):
-        # A replacement MERGE inserts its staged rows on every execution:
-        # replayed after an uncertain commit it adds them a second time. A
-        # journalled core write stops at the uncertainty instead, since its
-        # replay reads the scope back before it writes again. The donor stack
-        # has no journal and keeps the replay-safe default.
+
+    def _fast_merge_column_types(self, schema, table, columns, provided):
+        # The base single-row fast path falls back to another MERGE on a
+        # TrinoError, including an ambiguous response to its first MERGE.
         if write_is_journalled():
-            return self._execute_committing(sql, replay_safe=False)
-        return super()._execute_replacement(sql)
+            return None
+        return super()._fast_merge_column_types(schema, table, columns, provided)
+
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         with writer_lock():
+            if write_is_journalled():
+                kwargs.pop('staging_id', None)  # a delayed insert belongs only to its original stage
             if kwargs.get('delete_filter'):
                 kwargs['single_statement_replace'] = True
             return super().insert_dataframe_atomic(schema, table, df, **kwargs)
 
 
 class TransfermarktIcebergWriter(IcebergWriter):
+    dispatches_journalled_target = True
+
     def _get_trino_manager(self):
         if self._trino_manager is None:
             self._trino_manager = TransfermarktTrinoManager(host=self.trino_host, port=self.trino_port, catalog=self.catalog)

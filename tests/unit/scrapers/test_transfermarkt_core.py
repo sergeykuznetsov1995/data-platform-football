@@ -529,3 +529,28 @@ def test_finding_3_empty_squad_from_another_season_cannot_replace_memberships(tm
     for entity in ('squad_memberships', 'player_attribute_observations', 'player_contract_observations'):
         with pytest.raises(CoreParseError, match='^row_scope_mismatch$'):
             core._check_scope_against_capture(entity, unreadable, empty)
+
+
+@pytest.mark.parametrize('mode', ['offline', 'live_plan'])
+def test_r8_explicit_edition_must_match_the_squad_season(mode, tmp_path, monkeypatch, capsys):
+    # Round 8 finding 18
+    from dags.scripts import run_transfermarkt_core as cli
+    from scrapers.transfermarkt.orchestrator import ClubTarget, CoreRun, CoreRunError, CoreScopePlan
+    from tests.unit.scrapers.test_transfermarkt_orchestrator import _write_replay_manifest
+
+    capture = _load('squad')
+    assert '/saison_id/2026/' in capture.url
+    if mode == 'offline':
+        _write_replay_manifest(tmp_path, [capture])
+        monkeypatch.setattr(cli, '_write_options', lambda args: pytest.fail('unexpected writer setup'))
+        with pytest.raises(SystemExit) as caught:
+            cli.main(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+                      '--season', '2627', '--edition-id', '2025', '--write'])
+        assert caught.value.code == 2
+        assert capsys.readouterr().err.rstrip().endswith(': season_edition_mismatch')
+    else:
+        club_id = capture.url.split('/verein/')[1].split('/')[0]
+        plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                             edition_id='2025', clubs=(ClubTarget(club_id, 'club', squad_url=capture.url),))
+        with pytest.raises(CoreRunError, match='^season_edition_mismatch$'):
+            CoreRun(lambda *a, **kw: pytest.fail('unexpected fetch')).run(plan)

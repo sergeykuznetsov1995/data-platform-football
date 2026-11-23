@@ -245,6 +245,14 @@ def extract_attendance_observations(
     return (_outcome(entity, result.status, reason, tuple(rows), pages=pages, **context),)
 
 
+def parse_json_integer(token: str) -> int | str:
+    """Keep an oversized integer token available for field-level validation."""
+    try:
+        return int(token)
+    except ValueError:
+        return token
+
+
 def _representation_packet_rows(payload, expected_ids):
     if not isinstance(payload, Mapping) or payload.get('success') is not True:
         raise ValueError('invalid_packet')
@@ -289,7 +297,7 @@ def extract_representation_observations(
         ),)
 
     try:
-        payload = json.loads(capture.text)
+        payload = json.loads(capture.text, parse_int=parse_json_integer)
     except (ValueError, RecursionError):
         return packet_error('invalid_json')
     try:

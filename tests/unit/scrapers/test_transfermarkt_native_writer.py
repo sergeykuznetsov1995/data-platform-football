@@ -96,18 +96,27 @@ class CoreDB(MemoryDB):
         super().__init__()
         self.sql.execute('CREATE TABLE test_query_history (query_id TEXT, state TEXT, error_code TEXT)')
 
-    def rejected(self, client_error):
+    def rejected(self, cursor, client_error):
         # The client lost its response. A separate coordinator read can prove
         # that this particular simulated submission was rejected before execution.
         row = self.sql.execute("INSERT INTO test_query_history (state, error_code) "
                                "VALUES ('FAILED', 'QUERY_QUEUE_FULL')").lastrowid
-        client_error.query_id = f'query-{row}'
+        cursor.query_id = f'query-{row}'
         self.sql.execute('UPDATE test_query_history SET query_id = ? WHERE rowid = ?',
-                         (client_error.query_id, row))
+                         (cursor.query_id, row))
         return client_error
 
     def cursor(self):
         return CoreCursor(self)
+
+
+def _rejected_target(db, error):
+    class RejectedCursor(CoreCursor):
+        def execute(self, sql, params=()):
+            raise db.rejected(self, error)
+
+    with native_writer._target_dispatch() as statement:
+        native_writer._execute_once(RejectedCursor(db), 'MERGE INTO target', None, statement)
 
 
 class CoreWriter(IcebergWriter):
@@ -492,7 +501,7 @@ def test_empty_replace_bundle_deletes_the_scope_and_receipts_zero_rows():
         rows=(), captured_at=LATER, status='observed_empty', status_reason='empty_roster',
         proof='empty_roster:no_data_rows', capture_id='cap-empty',
         evidence=(
-            ('source_url', 'u'), ('source_endpoint', 'squad'),
+            ('source_url', _SQUAD_URL), ('source_endpoint', 'squad'),
             ('raw_capture_id', 'cap-empty'), ('source_capture_id', 'cap-empty'),
             ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
             ('parser_revision', 'p'), ('schema_revision', 's'),
@@ -590,7 +599,8 @@ def test_pending_intent_replays_after_a_crash_without_another_request():
     writer = CoreWriter(db)
     plans = [membership_plan(['1'], capture='cap-1')]
     broken = CoreWriter(db)
-    broken._write_to_iceberg = lambda *a, **k: (_ for _ in ()).throw(db.rejected(RuntimeError('crash mid-write')))
+    broken.dispatches_journalled_target = True
+    broken._write_to_iceberg = lambda *a, **k: _rejected_target(db, RuntimeError('crash mid-write'))
     with pytest.raises(RuntimeError, match='crash mid-write'):
         native_writer.write_core_bundle(
             lambda: db, broken, plans, run_id='r', universe_version='u', committed_at=CLOCK)
@@ -658,7 +668,7 @@ def test_empty_merge_plan_after_populated_scope_keeps_earlier_rows():
         status='observed_empty', status_reason='empty_collection',
         proof='empty_collection:market_value_points', capture_id='cap-mv2',
         evidence=(
-            ('source_url', 'u'), ('source_endpoint', 'market_value_points'),
+            ('source_url', _MV_URL), ('source_endpoint', 'market_value_points'),
             ('raw_capture_id', 'cap-mv2'), ('source_capture_id', 'cap-mv2'),
             ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
             ('parser_revision', 'p'), ('schema_revision', 's'),
@@ -715,7 +725,7 @@ def test_plan_evidence_must_name_the_same_capture_and_carry_real_values():
             rows=(), captured_at=CLOCK, status='observed_empty', status_reason='empty_roster',
             proof='p', capture_id='cap-B',
             evidence=(
-                ('source_url', 'u'), ('source_endpoint', 'squad'),
+                ('source_url', _SQUAD_URL), ('source_endpoint', 'squad'),
                 ('raw_capture_id', 'cap-B'), ('source_capture_id', 'cap-B'),
                 ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
                 ('parser_revision', 'p'), ('schema_revision', 's'),
@@ -727,7 +737,7 @@ def test_plan_evidence_must_name_the_same_capture_and_carry_real_values():
     empty_plan()  # a consistent plan validates
     mismatched = (
         ('raw_capture_id', 'cap-A'), ('source_capture_id', 'cap-B'),
-        ('source_url', 'u'), ('source_endpoint', 'squad'),
+        ('source_url', _SQUAD_URL), ('source_endpoint', 'squad'),
         ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
         ('parser_revision', 'p'), ('schema_revision', 's'),
     )
@@ -760,7 +770,7 @@ def _empty_roster_plan(clock=CLOCK, capture='cap-empty'):
         rows=(), captured_at=clock, status='observed_empty', status_reason='empty_roster',
         proof='empty_roster:no_data_rows', capture_id=capture,
         evidence=(
-            ('source_url', 'u'), ('source_endpoint', 'squad'),
+            ('source_url', _SQUAD_URL), ('source_endpoint', 'squad'),
             ('raw_capture_id', capture), ('source_capture_id', capture),
             ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
             ('parser_revision', 'p'), ('schema_revision', 's'),
@@ -892,8 +902,10 @@ def test_failed_insertion_keeps_the_committed_scope():
     write(db, [membership_plan(['1', '2'], capture='cap-1')])
 
     class TimedOut(CoreWriter):
+        dispatches_journalled_target = True
+
         def _write_to_iceberg(self, *args, **kwargs):
-            raise db.rejected(TimeoutError('insertion timeout'))
+            _rejected_target(db, TimeoutError('insertion timeout'))
 
     with pytest.raises(TimeoutError, match='insertion timeout'):
         native_writer.write_core_bundle(
@@ -1277,7 +1289,7 @@ def _empty_merge_plan():
         status='observed_empty', status_reason='empty_collection',
         proof='empty_collection:market_value_points', capture_id='cap-mv2',
         evidence=(
-            ('source_url', 'u'), ('source_endpoint', 'market_value_points'),
+            ('source_url', _MV_URL), ('source_endpoint', 'market_value_points'),
             ('raw_capture_id', 'cap-mv2'), ('source_capture_id', 'cap-mv2'),
             ('source_body_hash', 'b'), ('scope_id', 's'), ('cycle_id', 'c'),
             ('parser_revision', 'p'), ('schema_revision', 's'),
@@ -1461,7 +1473,7 @@ def test_a_receipt_only_repair_leaves_a_recoverable_intent():
                     if sql.startswith('INSERT INTO iceberg.ops.transfermarkt_core_receipts_v1'):
                         RepairDB.inserts += 1
                         if RepairDB.inserts == 2:
-                            raise self.db.rejected(RuntimeError('crash during receipt repair'))
+                            raise self.db.rejected(self, RuntimeError('crash during receipt repair'))
                     return super().execute(sql, params)
             return FlakyCursor(self)
 
@@ -1598,7 +1610,7 @@ def test_a_displaced_capture_cannot_return_as_empty():
     # was also acknowledged twice with different bodies and clocks.
     db = CoreDB()
     write(db, [membership_plan(['1'], capture='cap-a')])
-    write(db, [membership_plan(['2'], capture='cap-b')], run_id='run-2')
+    write(db, [membership_plan(['2'], capture='cap-b')], run_id='run-2', clock=LATER)
     assert _players(db) == ['2']
     with pytest.raises(RuntimeError, match='replay differs'):
         write(db, [_empty_roster_plan(capture='cap-a')], run_id='run-3')
@@ -1696,7 +1708,7 @@ def test_an_uncertain_snapshot_is_replaced_once_more_and_acknowledged():
     with pytest.raises(TrinoAmbiguousWriteError):
         native_writer.write_core_bundle(
             lambda: db, _LostResponse(db), [snapshot], run_id='run-b', universe_version='u',
-            committed_at=snapshot.captured_at)
+            committed_at=LATER)
     settled = CoreWriter(db)
     receipt = native_writer.replay_pending_intents(lambda: db, settled)[0]
     assert receipt['verified'] is True
@@ -1763,7 +1775,7 @@ class _UnknownOpsCursor(CoreCursor):
     def execute(self, sql, params=()):
         if sql.startswith('INSERT INTO iceberg.ops.'):
             type(self).inserts += 1
-            raise self.db.rejected(RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown'))
+            raise self.db.rejected(self, RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown'))
         return super().execute(sql, params)
 
 
@@ -1924,12 +1936,12 @@ def test_the_whole_retried_unit_may_restore_its_evidence():
 
     db = CoreDB()
     write(db, [older], run_id='run-a', clock=older.captured_at)
-    write(db, [newer], run_id='run-b', clock=newer.captured_at)
+    write(db, [newer], run_id='run-b', clock=LATER)
     lost, kept = receipt_of(older, 'run-a'), receipt_of(newer, 'run-b')
     db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id = ?', (lost,))
     with pytest.raises(RuntimeError, match='manifest lost'):
-        native_writer._replay_state(db, newer, kept, newer.captured_at)
-    assert native_writer._replay_state(db, newer, kept, newer.captured_at, own={kept, lost}) \
+        native_writer._replay_state(db, newer, kept, LATER)
+    assert native_writer._replay_state(db, newer, kept, LATER, own={kept, lost}) \
         == 'written'
 
 
@@ -2104,7 +2116,10 @@ def test_ordinary_retry_settles_the_pending_stage_b_squad(monkeypatch, anchored_
     assert receipt['verified'] and receipt['identity']['digest'] == legacy
     assert receipt['committed_at'] == CLOCK
     assert db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall() == before
-    assert not path.exists() and write_journal.pending_intents({}) == []
+    if anchored_stage_b:
+        assert [pending for pending, _ in write_journal.pending_intents({})] == [path]
+    else:
+        assert not path.exists() and write_journal.pending_intents({}) == []
 
 
 def test_interrupted_legacy_squad_repair_uses_replayable_descriptors(monkeypatch):
@@ -2211,7 +2226,7 @@ def test_queued_attendance_merge_fences_replay_and_newer_capture():
     delayed, retry = QueuedReplacement(db), CoreWriter(db)
     with pytest.raises(TrinoAmbiguousWriteError):
         native_writer.write_core_bundle(lambda: db, delayed, [pending], run_id='pending',
-                                        universe_version='u', committed_at=pending.captured_at)
+                                        universe_version='u', committed_at=LATER)
     assert native_writer._rows_equal(native_writer._read_plan_rows(db, older), older.rows)
     try:
         early = native_writer.replay_pending_intents(lambda: db, retry, run_id='pending')
@@ -2244,9 +2259,9 @@ def test_queued_ops_insert_lands_after_the_replay_attempt(target):
                 self.db.queued = (sql, tuple(params))
                 error = RuntimeError('commit state unknown')
                 if target == RECEIPTS:
-                    error.query_id = 'queued-receipt'
+                    self.query_id = 'queued-receipt'
                     self.db.sql.execute('INSERT INTO test_query_history VALUES (?, ?, ?)',
-                                        (error.query_id, 'QUEUED', None))
+                                        (self.query_id, 'QUEUED', None))
                 raise error
             return super().execute(sql, params)
 
@@ -2278,3 +2293,381 @@ def test_queued_ops_insert_lands_after_the_replay_attempt(target):
     assert _receipt_count(db) == 1
     assert db.sql.execute('SELECT page_number FROM transfermarkt_core_pages_v1 '
                           'ORDER BY page_number').fetchall() == [(1,), (2,)]
+
+
+def _copy_warehouse_scope(warehouse, db, plan):
+    """Make the actual DuckDB MERGE result visible to the SQLite readback harness."""
+    columns = ', '.join(plan.rows[0])
+    rows = warehouse.engine.execute(f'SELECT {columns} FROM {plan.table} WHERE {plan.scope_sql()}',
+                                    plan.scope_values).fetchall()
+    db.sql.execute(f'DELETE FROM {plan.table} WHERE {plan.scope_sql()}', plan.scope_values)
+    marks = ', '.join('?' for _ in plan.rows[0])
+    db.sql.executemany(f'INSERT INTO {plan.table} ({columns}) VALUES ({marks})', rows)
+
+
+@pytest.mark.parametrize('fault', ['values', 'tombstones', 'count'])
+def test_stage_failure_leaves_target_undispatched_and_retry_uses_a_fresh_stage(monkeypatch, fault):
+    # Round 8 finding 3. A delayed stage INSERT lands after the retry's count.
+    # Round 8 finding 7. A failed count must leave the target free to replay.
+    from scrapers.base.trino_manager import TrinoError
+    from scrapers.transfermarkt import writer as tm_writer
+    from tests.unit.scrapers.test_transfermarkt_writer_safety import _TombstoneWarehouse
+
+    db = CoreDB()
+    old = membership_plan(['A'])
+    plan = membership_plan(['B'], capture='cap-b', clock=LATER, run='capture-b')
+    write(db, [old])
+    warehouse = _TombstoneWarehouse(plan.table, [dict(old.rows[0])])
+    warehouse.lost = True  # this test loses only the selected staging response
+    manager = tm_writer.TransfermarktTrinoManager()
+    manager._conn = warehouse.connection()
+    manager._create_connection = warehouse.connection
+    production = tm_writer.TransfermarktIcebergWriter()
+    production._trino_manager = manager
+    monkeypatch.setattr(manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(IcebergWriter, '_evolve_schema', lambda *args: None)
+    held, stages = [], []
+    run = warehouse.run
+
+    def stage_fault(sql):
+        if sql.startswith('CREATE TABLE ') and '__stg_' in sql:
+            stages.append(sql.split()[2])
+        if not held:
+            insert = sql.startswith('INSERT INTO ') and '__stg_' in sql
+            if ((fault == 'values' and insert and 'VALUES' in sql)
+                    or (fault == 'tombstones' and insert and 'SELECT DISTINCT' in sql)):
+                held.append(sql)
+                raise ConnectionResetError('Connection reset after accepted stage INSERT')
+            if fault == 'count' and sql.startswith('SELECT count(*)'):
+                held.append(None)
+                raise RuntimeError('stage count unavailable')
+        if held and sql.startswith('DROP TABLE') and stages[0] in sql:
+            return []  # keep the first stage available to its queued query
+        if held and sql.startswith('MERGE INTO') and held[0] is not None:
+            run(held.pop())
+            held.append(None)
+        result = run(sql)
+        if sql.startswith('MERGE INTO'):
+            _copy_warehouse_scope(warehouse, db, plan)
+        return result
+
+    monkeypatch.setattr(warehouse, 'run', stage_fault)
+    scope = (plan.full_table, native_writer._scope_json(plan))
+    with pytest.raises(TrinoError if fault == 'count' else TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(lambda: db, production, [plan], run_id='capture-b',
+                                        universe_version='u', committed_at=LATER)
+    assert len(stages) == 1 and not warehouse.merges and warehouse.players() == ['A']
+    assert write_journal.pending_statement(scope) is None
+    replayed, = native_writer.replay_pending_intents(lambda: db, production, run_id='capture-b')
+    assert replayed['verified'] and _players(db) == ['B']
+    assert len(stages) == len(set(stages)) == 2
+    assert len(warehouse.merges) == 1 and stages[1].split('.')[-1] in warehouse.merges[0]
+    assert held == [None] and warehouse.players() == ['B']
+    assert write_journal.pending_statement(scope) is None
+
+
+@pytest.mark.parametrize('local_ack', [False, True])
+def test_verified_legacy_empty_delete_still_fences_newer_rosters(local_ack):
+    # Round 8 finding 4. The physical receipts already exist while a repeated
+    # stage-B DELETE waits at the coordinator. Its empty postimage has no ID.
+    db, plans = CoreDB(), _empty_squad_plans()
+    digest, path = _stage_b_squad_intent(plans)
+    write_journal.snapshot_anchors(digest, db, native_writer._anchored_tables(plans))
+    native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+    hashes = [native_writer._stage_b_plan_sha256(plan) for plan in plans]
+    proofs = []
+    for plan in plans:
+        native_writer.execute_statement(db.cursor(), plan.ddl)
+        proofs.append(native_writer._physical_proof(db, plan))
+    batch = native_writer._batch_id_for_run('run-old')
+    native_writer._merge_receipts(db, [
+        native_writer._plan_receipt(plan, proof, plan_hash, digest, 'run-old', 'u', batch, CLOCK)
+        for plan, proof, plan_hash in zip(plans, proofs, hashes, strict=True)])
+    if local_ack:
+        # r7 could mark the legacy handover adopted after readback, before
+        # retiring the intent. That marker cannot prove a pre-DML handoff.
+        write_journal.adopt_intent(path)
+        write_journal.record_receipt(digest, {
+            'verified': True, 'receipt_readback': True, 'run_id': 'run-old', 'universe_version': 'u',
+            'plan_sha256': digest, 'committed_batch': batch, 'committed_at': CLOCK, 'plans': proofs,
+            'manifests': []})
+    roster = plans[0]
+    queued = (f'DELETE FROM {roster.full_table} WHERE {roster.scope_sql()}', roster.scope_values)
+    start = len(db.events)
+    verified, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-old')
+    assert verified['verified']
+    assert native_writer.write_core_bundle(lambda: db, CoreWriter(db), plans, run_id='run-old',
+                                          universe_version='u', committed_at=CLOCK)['verified']
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [membership_plan(['new'], clock=NEWEST, capture='fresh')], clock=NEWEST)
+    db.cursor().execute(*queued)
+    assert _players(db) == [] and _receipt_count(db) == len(plans)
+
+
+def _transfer_plan(player, name, clock):
+    entity = 'transfer_events'
+    row = _contract_row(entity, entity, 'https://www.transfermarkt.com/ceapi/transferHistory/list/' + player,
+                        capture=name, clock=clock, run=name, ingested=clock, player_id=player,
+                        transfer_id='transfer-' + player, to_club_name=name)
+    return NativeWritePlan(
+        entity=entity, table=core.CORE_TABLES[entity], ddl=core.core_ddl(entity),
+        natural_keys=core.CORE_NATURAL_KEYS[entity], scope_columns=('player_id',),
+        scope_values=(player,), rows=(row,), captured_at=clock, write_mode='merge',
+        status_reason='career_page', capture_id=name)
+
+
+def test_delayed_keyed_transfer_merge_serializes_only_its_player(monkeypatch):
+    # Round 8 finding 5. Queue the real single-row manager's target SQL and
+    # apply it later, after an overlapping corrected capture tries to publish.
+    from scrapers.transfermarkt import writer as tm_writer
+    from tests.unit.scrapers.test_transfermarkt_writer_safety import _TombstoneWarehouse, _scripted
+
+    db = CoreDB()
+    old, fresh = _transfer_plan('1', 'old', CLOCK), _transfer_plan('1', 'corrected', LATER)
+    initial = _transfer_plan('1', 'initial', EARLIER)
+    write(db, [initial], run_id='initial', clock=EARLIER)
+    warehouse = _TombstoneWarehouse(old.table, [dict(initial.rows[0])])
+    production = tm_writer.TransfermarktIcebergWriter()
+    production._trino_manager = _scripted(warehouse)
+    monkeypatch.setattr(production._trino_manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(IcebergWriter, '_evolve_schema', lambda *args: None)
+    held = []
+    run = warehouse.run
+
+    def queue(sql):
+        if sql.startswith('MERGE INTO'):
+            held.append(sql)
+            raise ConnectionResetError('Connection reset after accepted keyed MERGE')
+        return run(sql)
+
+    monkeypatch.setattr(warehouse, 'run', queue)
+    with pytest.raises(TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(lambda: db, production, [old], run_id='old',
+                                        universe_version='u', committed_at=CLOCK)
+    assert len(held) == 1 and 'WHEN MATCHED THEN UPDATE SET' in held[0]
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [fresh], run_id='corrected', clock=LATER)
+    other = _transfer_plan('2', 'unrelated', LATER)
+    assert write(db, [other], run_id='unrelated', clock=LATER)['verified']
+    with pytest.raises(RuntimeError, match='still pending'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='old')
+
+    run(held[0])
+    _copy_warehouse_scope(warehouse, db, old)
+    retry = CoreWriter(db)
+    receipt, = native_writer.replay_pending_intents(lambda: db, retry, run_id='old')
+    assert receipt['verified'] and not retry.writes
+    assert write(db, [fresh], run_id='corrected', clock=LATER)['verified']
+    assert db.sql.execute(f'SELECT player_id, to_club_name FROM {old.table} ORDER BY player_id').fetchall() == [
+        ('1', 'corrected'), ('2', 'unrelated')]
+
+
+def test_first_response_delete_rejection_requires_its_coordinator_record(monkeypatch):
+    # Round 8 finding 6. process() raises a real TrinoUserError before the
+    # cursor has assigned query_id. The admission response is from the DELETE.
+    import requests
+    from trino import dbapi
+    from trino.exceptions import TrinoUserError
+    from tests.unit.scrapers.test_transfermarkt_writer_safety import _trino_response
+
+    posts = []
+    class Admission(requests.Session):
+        def send(self, request, **kwargs):
+            assert request.method == 'POST'
+            posts.append(request.body.decode())
+            return _trino_response('q_delete', error={
+                'errorName': 'QUERY_QUEUE_FULL', 'message': 'queue full',
+                'errorCode': 1, 'errorType': 'USER_ERROR',
+            })
+
+    transport = native_writer._journal_connection(lambda: dbapi.connect(
+        host='offline.invalid', user='test', http_session=Admission()))
+    db = CoreDB()
+    write(db, [membership_plan(['1'])])
+    plan = _empty_roster_plan(clock=LATER)
+    execute = CoreCursor.execute
+    def reject_delete(self, sql, params=()):
+        if sql.startswith('DELETE FROM ' + plan.full_table):
+            return transport.cursor().execute(sql, params)
+        return execute(self, sql, params)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CoreCursor, 'execute', reject_delete)
+        with pytest.raises(TrinoUserError, match='q_delete'):
+            write(db, [plan], run_id='empty', clock=LATER)
+    assert len(posts) == 1 and posts[0].startswith("EXECUTE IMMEDIATE 'DELETE FROM ")
+    key = (plan.full_table, native_writer._scope_json(plan))
+    assert write_journal.statement_query(write_journal.pending_statement(key)) == 'q_delete'
+    with pytest.raises(RuntimeError, match='still pending'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='empty')
+    assert _players(db) == ['1']
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_delete', 'FAILED', 'QUERY_QUEUE_FULL')")
+    verified, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='empty')
+    assert verified['verified'] and _players(db) == [] and write_journal.pending_statement(key) is None
+
+
+@pytest.mark.parametrize('conflict', ['body', 'clock'])
+def test_referee_capture_evidence_survives_receipt_loss_on_another_key(conflict):
+    # Round 8 finding 17. Even rows no longer owned by the incoming page
+    # identify the response whose receipt disappeared.
+    from tests.unit.scrapers.test_transfermarkt_sections import REFEREE_EXTRACTED_AT
+    db = CoreDB()
+    first, = _directory_plans('101', 'a' * 64)
+    incoming, = _directory_plans('303', first.capture_id)
+    if conflict == 'clock':
+        body = first.rows[0]['source_body_hash']
+        incoming = dataclasses_replace(
+            incoming, captured_at=LATER,
+            evidence=tuple((col, body if col == 'source_body_hash' else value)
+                           for col, value in incoming.evidence),
+            rows=tuple({**row, 'captured_at': LATER, 'observed_at': LATER,
+                        'source_body_hash': body} for row in incoming.rows))
+    write(db, [first], run_id=first.rows[0]['run_id'], clock=REFEREE_EXTRACTED_AT)
+    db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    before = db.sql.execute(f'SELECT * FROM {first.table}').fetchall()
+    writer = CoreWriter(db)
+    with pytest.raises(RuntimeError, match='replay differs'):
+        native_writer.write_core_bundle(lambda: db, writer, [incoming], run_id=incoming.rows[0]['run_id'],
+                                        universe_version='u', committed_at=LATER)
+    assert not writer.writes and _receipt_count(db) == 0
+    assert db.sql.execute(f'SELECT * FROM {first.table}').fetchall() == before
+
+
+def test_queued_merge_from_before_single_submit_still_guards_its_scope():
+    # Round 8 finding 5. r7's protocol bit on an anchored keyed intent did
+    # not mean its target was fenced, even when no statement file survives.
+    db = CoreDB()
+    old = _transfer_plan('1', 'queued', CLOCK)
+    fresh = _transfer_plan('1', 'corrected', LATER)
+    _, digest = native_writer._bundle_identity([old], 'queued')
+    write_journal.save_intent(
+        {'run_id': 'queued', 'digest': digest, 'statement_protocol': 1},
+        {'plans': native_writer._descriptors([old])}, run_id='queued', universe_version='u',
+        committed_at=CLOCK)
+    write_journal.snapshot_anchors(digest, db, native_writer._anchored_tables([old]))
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [fresh], run_id='corrected', clock=LATER)
+    assert not any(native_writer.is_mutation(sql) for sql in db.events)
+
+
+def test_pre_upgrade_cleanup_id_cannot_release_an_insert():
+    # Round 8 finding 2. The ID saved on an earlier attempt can belong to
+    # DEALLOCATE. Even a definite rejection of that ID cannot authorize replay.
+    db = CoreDB()
+    key = (native_writer.CORE_RECEIPTS_TABLE, 'old-receipt')
+    expected = native_writer._digest(('old-receipt',))
+    old = write_journal.begin_statement(key, expected)
+    write_journal.remember_query(old, 'q_deallocate')
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_deallocate', 'FAILED', 'QUERY_QUEUE_FULL')")
+    with pytest.raises(RuntimeError, match='still pending'):
+        native_writer._settle_statement(db, key, expected, lambda: True)
+    assert write_journal.pending_statement(key) == old
+
+
+@pytest.mark.parametrize('mismatch', ['season', 'origin'])
+def test_adoption_rechecks_the_saved_route_before_any_mutation(mismatch):
+    # Round 8 finding 8
+    from tests.unit.scrapers.test_transfermarkt_core import _scope
+
+    body = (b'<html><body><h1 class="data-header__headline-wrapper">Empty FC</h1>'
+            b'<p>no squad here</p></body></html>')
+    digest = hashlib.sha256(body).hexdigest()
+    capture = core.SourceCapture(_SQUAD_URL, 'squad', body, digest, digest, CLOCK)
+    outcome, *_ = core.extract_squad_observations(capture, _scope(), extracted_at=LATER, universe_version='u')
+    plan = core.plan_for_outcome(outcome, captured_at=CLOCK, scope_values={
+        'league': 'GB1', 'season': '2526', 'club_id': '11'})
+    assert plan.status == 'observed_empty'
+    descriptor, = native_writer._descriptors([plan])
+    del descriptor['pages']
+    if mismatch == 'season':
+        descriptor['scope_values'] = ('GB1', '2627', '11')
+        # The old hash bound the scope but never validated it against the route.
+        valid_url = _SQUAD_URL.replace('/2025/', '/2026/')
+        plan = dataclasses_replace(plan, scope_values=descriptor['scope_values'], evidence=tuple(
+            (k, valid_url if k == 'source_url' else v) for k, v in plan.evidence))
+    else:
+        descriptor['evidence'] = [(k, v.replace('www.', 'other.') if k == 'source_url' else v)
+                                  for k, v in plan.evidence]
+    _, legacy = _stage_b_identity(plan, 'run-old')
+    path = write_journal.save_intent({'run_id': 'run-old', 'digest': legacy}, {'plans': [descriptor]},
+                                     run_id='run-old', universe_version='u', committed_at=LATER)
+    db = CoreDB()
+    with pytest.raises(core.CoreParseError, match='row_scope_mismatch'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    with pytest.raises(core.CoreParseError, match='row_scope_mismatch'):
+        native_writer.write_core_bundle(lambda: db, CoreWriter(db), [plan], run_id='run-old',
+                                        universe_version='u', committed_at=LATER)
+    assert path.exists() and not write_journal.read_snapshot_anchors(legacy)
+    assert not write_journal._record_path('single-submit-adoptions', path.stem).exists()
+    assert not db.events
+
+
+@pytest.mark.parametrize('damage', [None, 'receipt', 'target'])
+def test_completed_pre_fence_intent_only_verifies_its_original_ack(damage):
+    # Round 8 finding 9
+    db, plan = CoreDB(), _empty_roster_plan()
+    original = write(db, [plan])
+    path = write_journal.save_intent(
+        {'run_id': 'run-1', 'digest': original['plan_sha256'], 'statement_protocol': 1},
+        {'plans': native_writer._descriptors([plan])}, run_id='run-1',
+        universe_version=original['universe_version'], committed_at=CLOCK)
+    if damage == 'receipt':
+        db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    elif damage == 'target':
+        db.sql.execute(f"INSERT INTO {plan.table} (league, season, club_id) VALUES ('GB1','2526','11')")
+    start = len(db.events)
+    if damage:
+        with pytest.raises(RuntimeError, match='readback differs'):
+            native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    else:
+        assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db)) == [original]
+        assert write(db, [plan], clock=NEWEST) == original
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [membership_plan(['1'], clock=LATER)], run_id='later', clock=LATER)
+    assert path.exists() and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+
+
+def test_existing_capture_sensitive_alias_repairs_original_receipt(monkeypatch):
+    # Round 8 finding 10
+    db, plan = CoreDB(), _empty_merge_plan()
+    _, legacy = _stage_b_identity(plan, 'run-old')
+    _legacy_intent(plan, legacy)
+    record = write_journal.record_receipt
+    with monkeypatch.context() as patch:
+        # Published aliases originally had the current key and original warehouse
+        # identity, before the redundant descriptor_digest field was introduced.
+        patch.setattr(write_journal, 'record_receipt', lambda key, receipt: record(
+            key, {k: v for k, v in receipt.items() if k != 'descriptor_digest'}))
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+        native_writer.write_core_bundle(lambda: db, CoreWriter(db), [plan], run_id='run-old',
+                                        universe_version='u', committed_at=NEWEST)
+    current = native_writer._bundle_identity([plan], 'run-old')[1]
+    alias = write_journal.read_receipt(current)
+    assert alias['identity']['digest'] == legacy and write_journal.pending_intents({}) == []
+    assert write_journal.read_snapshot_anchors(current) == write_journal.read_snapshot_anchors(legacy)
+    before = db.sql.execute(f'SELECT * FROM {RECEIPTS}').fetchall()
+    db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    assert native_writer.write_core_bundle(lambda: db, CoreWriter(db), [plan], run_id='run-old',
+                                          universe_version='u', committed_at=NEWEST) == alias
+    assert db.sql.execute(f'SELECT * FROM {RECEIPTS}').fetchall() == before
+
+
+@pytest.mark.parametrize('empty_first', [True, False])
+def test_single_page_order_survives_receipt_loss_and_refuses_ties(empty_first):
+    # Round 8 finding 11
+    db = CoreDB()
+    empty, populated = _empty_roster_plan(), membership_plan(['1'])
+    first, later = (empty, populated) if empty_first else (populated, empty)
+    write(db, [first], run_id='first', clock=CLOCK)
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [later], run_id='collision', clock=CLOCK)
+    assert _players(db) == ([] if empty_first else ['1'])
+    newer = write(db, [later], run_id='later', clock=LATER)
+    assert newer['plans'][0]['committed_at'] == LATER
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE run_id = ?', ('later',))
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [first], run_id='first', clock=NEWEST)
+    assert _players(db) == (['1'] if empty_first else [])
+    assert _receipt_count(db) == 1
+    assert write(db, [later], run_id='later', clock=NEWEST) == newer

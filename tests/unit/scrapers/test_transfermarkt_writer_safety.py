@@ -1,5 +1,6 @@
 """Offline acceptance for TM committing boundaries and physical capture refs."""
 from datetime import date, datetime, timezone
+import json
 import multiprocessing
 import sqlite3
 from types import SimpleNamespace
@@ -502,3 +503,136 @@ def test_a_journalled_replacement_still_retries_a_rejected_commit():
 
     assert connection.executed == [sql, sql]
     assert sleep.call_count == 1
+
+
+def _trino_response(query_id, **fields):
+    from requests import Response
+
+    response = Response()
+    response.status_code = 200
+    response._content = json.dumps({
+        'id': query_id, 'stats': {}, 'infoUri': 'http://offline.invalid/query', **fields,
+    }).encode()
+    return response
+
+
+@pytest.mark.parametrize('boundary', ['manager', 'pages', 'receipt'])
+def test_one_accepted_post_per_journalled_dbapi_call(monkeypatch, tmp_path, boundary):
+    # Round 8 finding 1. Count accepted HTTP POSTs below the installed DBAPI.
+    import requests
+    from trino import dbapi
+    from trino.exceptions import TrinoConnectionError
+
+    submissions = []
+    sql = ('MERGE INTO target USING stage ON true WHEN MATCHED THEN DELETE'
+           if boundary == 'manager' else f'INSERT INTO {boundary} VALUES (?)')
+    params = None if boundary == 'manager' else ('capture',)
+
+    class LostResponses(requests.Session):
+        def send(self, request, **kwargs):
+            assert request.method == 'POST'
+            submissions.append(request.body)
+            raise requests.ConnectionError('Connection reset after accepted POST')
+
+    connect = dbapi.connect
+
+    def offline(**options):
+        return connect(http_session=LostResponses(), **options)
+
+    monkeypatch.setattr(dbapi, 'connect', offline)
+    monkeypatch.setattr(writer.time, 'sleep', lambda _: None)
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TRINO_PASSWORD', raising=False)
+    manager = writer.TransfermarktTrinoManager(host='offline.invalid')
+    # The same manager may have been warmed by the donor stack.
+    manager._conn = manager._create_connection()
+    donor = manager.connection
+    with pytest.raises(TrinoConnectionError):
+        donor.cursor().execute('DELETE FROM control')
+    assert len(submissions) == 3 and len(set(submissions)) == 1
+    submissions.clear()
+
+    with native_writer.journalled_write():
+        if boundary == 'manager':
+            # Skip only the connection health check (it would also lose its response).
+            monkeypatch.setattr(manager, '_connect_with_retry',
+                                lambda: setattr(manager, '_conn', manager._create_connection()))
+            with pytest.raises(TrinoAmbiguousWriteError):
+                manager._execute_replacement(sql)
+        else:
+            connection = native_writer._journal_connection(lambda: native_writer.CommittingConnection(
+                dbapi.connect(host='offline.invalid', user='test')))
+            key = ('ops', boundary)
+            landed = []
+
+            def insert():
+                native_writer._insert_once(connection, key, sql, params, lambda: tuple(landed), params)
+
+            with pytest.raises(TrinoConnectionError):
+                insert()
+            with pytest.raises(RuntimeError, match='still pending'):
+                insert()
+            landed.append('capture')  # the only accepted submission finally commits
+            insert()
+    assert len(submissions) == 1
+    assert sql.encode() in submissions[0]
+    if boundary == 'manager':
+        assert manager.connection.max_attempts == donor.max_attempts
+        assert manager.connection.legacy_prepared_statements is donor.legacy_prepared_statements
+
+
+def test_parameterized_insert_keeps_its_dml_id_across_a_lost_poll(monkeypatch, tmp_path):
+    # Round 8 finding 2. Legacy cleanup would return q_deallocate while the
+    # INSERT was still queued. Exercise execute() polling inside the DBAPI.
+    import requests
+    from trino import dbapi
+    from trino.exceptions import TrinoConnectionError, TrinoUserError
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    posts = []
+    rejected = dict(errorName='QUERY_QUEUE_FULL', errorCode=1, errorType='USER_ERROR',
+                    message='rejected at admission')
+
+    class Coordinator(requests.Session):
+        def send(self, request, **kwargs):
+            if request.method == 'GET':
+                raise requests.ConnectionError('poll response lost')
+            if request.method == 'DELETE':  # best effort cursor cleanup
+                response = _trino_response('q_insert')
+                response.status_code = 204
+                return response
+            assert request.method == 'POST'
+            sql = request.body.decode()
+            posts.append(sql)
+            if sql.startswith("EXECUTE IMMEDIATE 'SELECT 1'"):
+                return _trino_response('q_probe', error=rejected)
+            if sql.startswith('PREPARE '):
+                return _trino_response('q_prepare')
+            if sql.startswith('DEALLOCATE '):
+                return _trino_response('q_deallocate', error=rejected)
+            return _trino_response('q_insert', nextUri='http://offline.invalid/results/q_insert')
+
+    def connect():
+        return dbapi.connect(host='offline.invalid', user='test', http_session=Coordinator(),
+                             max_attempts=1, legacy_prepared_statements=True)
+
+    sql = 'INSERT INTO receipts VALUES (?)'
+    legacy = connect().cursor()
+    with pytest.raises(TrinoUserError) as cleanup:
+        legacy.execute(sql, ('capture',))
+    assert cleanup.value.query_id == 'q_deallocate' and legacy.query_id == 'q_insert'
+    assert [post.split()[0] for post in posts] == ['PREPARE', 'EXECUTE', 'DEALLOCATE']
+    posts.clear()
+    connection = native_writer._journal_connection(connect)
+    key = ('ops', 'receipt')
+    with pytest.raises(TrinoConnectionError):
+        native_writer._insert_once(connection, key, sql, ('capture',), lambda: None, ('capture',))
+    assert posts == ["EXECUTE IMMEDIATE 'INSERT INTO receipts VALUES (?)' USING 'capture'"]
+    journal = native_writer.write_journal
+    assert journal.statement_query(journal.pending_statement(key)) == 'q_insert'
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB
+    history = CoreDB()
+    history.sql.executemany('INSERT INTO test_query_history VALUES (?, ?, ?)', [
+        ('q_deallocate', 'FAILED', 'QUERY_QUEUE_FULL'), ('q_insert', 'QUEUED', None)])
+    with pytest.raises(RuntimeError, match='still pending'):
+        native_writer._settle_statement(history, key, native_writer._digest(('capture',)), lambda: False)

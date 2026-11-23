@@ -283,8 +283,8 @@ def test_finding_16_offline_squad_record_cannot_be_relabelled_as_coach_history()
     request = orchestrator._Request('squad', capture.url)
     result = replay.fetch(capture.url, as_json=False, label=request.label)
     with pytest.raises(CoreRunError, match='^squad raw capture endpoint differs$'):
-        orchestrator._capture(request, result, cli._fixture_raw_loader(records))
-    assert orchestrator._capture(request, result, replay.raw_loader) == capture
+        orchestrator._capture(request, result, cli._fixture_raw_loader(records), {})
+    assert orchestrator._capture(request, result, replay.raw_loader, {}) == capture
 
 
 def _write_replay_manifest(root, captures):
@@ -317,6 +317,9 @@ def test_finding_17_offline_cli_accounts_for_every_manifest_record(case, tmp_pat
 
     first = _attendance_capture('page_1.html', ATTENDANCE_START + '?page=01', PAGE_1_CAPTURED)
     second = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
+    if case == 'unreached':
+        # An unavailable first page leaves the saved second page unrequested.
+        first = replace(first, status_code=503)
     captures = [_load('squad'), second]
     if case != 'missing_start':
         captures.append(first)
@@ -346,12 +349,6 @@ def test_finding_17_offline_cli_accounts_for_every_manifest_record(case, tmp_pat
         return
 
     if case == 'unreached':
-        fixture_fetch = cli._fixture_fetch
-
-        def without_second_page(records):
-            return fixture_fetch({url: entry for url, entry in records.items() if url != second.url})
-
-        monkeypatch.setattr(cli, '_fixture_fetch', without_second_page)
         assert cli.main(args) == 2
         assert capsys.readouterr().err.splitlines() == ['Unreached fixture records:', second.url]
         report = json.loads(report_path.read_text())
@@ -364,3 +361,96 @@ def test_finding_17_offline_cli_accounts_for_every_manifest_record(case, tmp_pat
     assert len(report['receipts']) == 2 and all(item['verified'] for item in report['receipts'])
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone() == (38,)
     assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_attendance_observations').fetchone() == (2,)
+
+
+def test_r8_manifest_endpoint_must_match_the_record(tmp_path, monkeypatch, capsys):
+    # Round 8 finding 20
+    from dags.scripts import run_transfermarkt_core as cli
+
+    squad = _load('squad')
+    _write_replay_manifest(tmp_path, [squad])
+    path = tmp_path / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest['fixtures'][0]['endpoint'] = 'coach_history'
+    path.write_text(json.dumps(manifest))
+    (tmp_path / 'captures/squad').rename(tmp_path / 'captures/coach_history')
+    monkeypatch.setattr(cli, '_offline_plan', lambda *args: pytest.fail('unexpected dispatch'))
+    with pytest.raises(SystemExit) as caught:
+        cli.main(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1', '--season', '2627'])
+    assert caught.value.code == 2
+    record_path = tmp_path / 'captures/coach_history' / f'{squad.capture_id}.json'
+    assert capsys.readouterr().err.rstrip().endswith(f'Fixture endpoint mismatch in {record_path}')
+
+
+@pytest.mark.parametrize('case', ['conflicting_squad', 'missing_continuation', 'unreached_core'])
+def test_r8_offline_replay_requires_every_request_and_eligible_record(case, tmp_path, monkeypatch, capsys):
+    # Round 8 finding 21
+    from dataclasses import replace
+
+    from dags.scripts import run_transfermarkt_core as cli
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        ATTENDANCE_PAGE_2, ATTENDANCE_START, PAGE_1_CAPTURED, _attendance_capture,
+    )
+
+    squad = _load('squad')
+    club_id = squad.url.split('/verein/')[1].split('/')[0]
+    if case == 'conflicting_squad':
+        extra = replace(squad, url=squad_url('another-slug', club_id, YEAR), capture_id='a' * 64)
+    elif case == 'missing_continuation':
+        extra = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
+    else:
+        extra = _load('coach_profile')
+        offline_plan = cli._offline_plan
+
+        def skip_coach(*args):
+            return replace(offline_plan(*args), coach_profile_ids=())
+
+        monkeypatch.setattr(cli, '_offline_plan', skip_coach)
+    _write_replay_manifest(tmp_path, [squad, extra])
+    report_path = tmp_path / 'report.json'
+    args = ['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1', '--season', '2627',
+            '--write', '--report-out', str(report_path)]
+    db = CoreDB()
+    writer = CoreWriter(db)
+    monkeypatch.setattr(cli, '_write_options', lambda args: {'writer': writer, 'connection_factory': lambda: db})
+
+    if case == 'conflicting_squad':
+        with pytest.raises(SystemExit) as caught:
+            cli.main(args)
+        assert caught.value.code == 2
+        assert capsys.readouterr().err.rstrip().endswith(
+            f'Conflicting squad fixture URLs for club {club_id}: {squad.url}, {extra.url}')
+        assert writer.writes == []
+        return
+
+    assert cli.main(args) == 2
+    expected = (['Missing fixture responses:', ATTENDANCE_PAGE_2] if case == 'missing_continuation'
+                else ['Unreached fixture records:', extra.url])
+    assert capsys.readouterr().err.splitlines() == expected
+    receipt, = json.loads(report_path.read_text())['receipts']
+    assert receipt['verified'] is True
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_squad_memberships').fetchone() == (38,)
+
+
+def test_offline_native_connection_submits_once(tmp_path, monkeypatch):
+    from inspect import signature
+    from unittest.mock import Mock
+
+    import trino.dbapi
+
+    from dags.scripts import run_transfermarkt_core as cli
+    from scrapers.transfermarkt import writer
+
+    connect = Mock()
+    monkeypatch.setattr(trino.dbapi, 'connect', connect)
+    monkeypatch.setattr(writer, 'TransfermarktIcebergWriter', Mock())
+    monkeypatch.delenv('TRINO_PASSWORD', raising=False)
+    args = cli._parser().parse_args(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+                                     '--season', '2627', '--write', '--trino-host', 'offline.invalid',
+                                     '--trino-port', '8080', '--trino-user', 'replay'])
+    cli._write_options(args)['connection_factory']()
+    expected = dict(host='offline.invalid', port=8080, user='replay', catalog='iceberg', schema='bronze',
+                    http_scheme='http', auth=None, max_attempts=1)
+    if 'legacy_prepared_statements' in signature(trino.dbapi.Connection).parameters:
+        expected['legacy_prepared_statements'] = False
+    connect.assert_called_once_with(**expected)

@@ -378,9 +378,8 @@ def acknowledgements():
 def acknowledged_walk(receipt_id: str) -> tuple[Mapping, object] | None:
     """The walk an acknowledgement logged in the warehouse under one receipt.
 
-    Read back for a warehouse that lost it, from the receipts of this journal
-    and nowhere else. Every receipt is read: this is the exceptional path of
-    lost evidence, never taken by a write that lost nothing.
+    The original cells and acknowledgement clock also identify the digest
+    format to reproduce when verifying a walk written before an upgrade.
     """
     result = None
     for receipt in acknowledgements():
@@ -391,6 +390,38 @@ def acknowledged_walk(receipt_id: str) -> tuple[Mapping, object] | None:
                     raise RuntimeError('core journal walk differs')
                 result = candidate
     return result
+
+
+def scope_walks(table, scope):
+    """Find original walks and older plan proofs that still need a warehouse witness."""
+    from .native_writer import _receipt_id
+
+    walks, missing = {}, {}
+    for receipt in acknowledgements():
+        recorded = {}
+        for walk in receipt.get('walks') or ():
+            if walk['table'] != table:
+                continue
+            recorded[walk['receipt_id']] = walk['scope_values_json']
+            if walk['scope_values_json'] == scope:
+                candidate = (walk, receipt['committed_at'])
+                if walks.setdefault(walk['receipt_id'], candidate) != candidate:
+                    raise RuntimeError('core journal walk differs')
+        proofs = [(i, proof) for i, proof in enumerate(receipt.get('plans', ()))
+                  if proof['table'] == table.rsplit('.', 1)[-1]]
+        identity = receipt.get('identity')
+        if not identity:
+            if len(proofs) > len(recorded):
+                raise RuntimeError('core journal walk lacks warehouse identity')
+            continue
+        for index, proof in proofs:
+            key = _receipt_id(identity['plan_hashes'][index], receipt['run_id'], identity['digest'])
+            if key in recorded:
+                if proof.get('scope_values_json', recorded[key]) != recorded[key]:
+                    raise RuntimeError('core journal walk scope differs')
+            elif proof.get('scope_values_json', scope) == scope:
+                missing[key] = proof.get('scope_values_json')
+    return walks, missing
 
 
 def read_receipt(digest: str) -> dict | None:

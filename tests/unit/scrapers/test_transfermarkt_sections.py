@@ -4133,3 +4133,262 @@ def test_finding_15_skipped_attendance_page_is_contained_and_referee_verifies():
     receipt, = report.receipts
     assert receipt['verified'] is True
     assert db.sql.execute('SELECT referee_id FROM transfermarkt_referee_profiles').fetchall() == [('101',)]
+
+
+@pytest.mark.parametrize('conflict', [True, False])
+def test_r8_discarded_attendance_page_binds_its_capture_id(conflict):
+    # Round 8 finding 16
+    first, second = _two_pages()
+    broken = _capture(second.url, second.body.replace(b'40,173', b'not-a-number'), second.captured_at)
+    profile = _referee_profile_capture()
+    replay = _SectionFetch({page.url: page.body for page in (first, broken, profile)})
+
+    def fetch(url, **kwargs):
+        result = replay.fetch(url, **kwargs)
+        if conflict and url == profile.url:
+            return _replace(result, raw_capture_id=first.capture_id)
+        return result
+
+    plan = CoreScopePlan(
+        league='GB1', season='2526', scope_id='s', cycle_id='c',
+        attendance_editions=(AttendanceEditionTarget('GB1', 2025, 'premier-league'),),
+        referee_profile_ids=('101',))
+    db = CoreDB()
+    writer = CoreWriter(db)
+    run = CoreRun(fetch, extracted_at=EXTRACTED_AT)
+    if conflict:
+        with pytest.raises(CoreRunError, match='^capture_evidence_conflict$'):
+            run.run(plan, writer=writer, connection_factory=lambda: pytest.fail('unexpected connection'))
+        assert writer.writes == []
+    else:
+        report = run.run(plan, writer=writer, connection_factory=lambda: db)
+        failed, valid = report.outcomes
+        assert (failed['status'], failed['source_capture_id']) == ('error', broken.capture_id)
+        assert (valid['entity'], valid['status']) == ('referee_profiles', 'observed_present')
+        receipt, = report.receipts
+        assert receipt['verified'] is True
+    assert replay.calls == [first.url, broken.url, profile.url]
+
+
+def test_r8_unquoted_oversized_agency_preserves_the_sibling_receipt(tmp_path):
+    # Round 8 finding 19
+    from dags.scripts import run_transfermarkt_core as cli
+    from tests.unit.scrapers.test_transfermarkt_orchestrator import _write_replay_manifest
+
+    payload = json.loads(_representation_capture().body)
+    payload['data'][0]['attributes']['consultantAgencyId'] = 'oversized'
+    payload['data'][1]['attributes']['consultantAgencyId'] = 56
+    digits = '9' * 4301
+    body = json.dumps(payload).replace('"oversized"', digits).encode()
+    capture = _capture(REPRESENTATION_URL, body, CLUB_CAPTURED, endpoint='representation')
+    _write_replay_manifest(tmp_path, [capture])
+    records = cli._load_records(tmp_path)
+    fixture_fetch = cli._fixture_fetch(records)
+
+    def fetch(url, **kwargs):
+        result = fixture_fetch(url, **kwargs)
+        assert result.status is FetchStatus.OK
+        first, second = result.value['data']
+        assert first['attributes']['consultantAgencyId'] == digits
+        assert second['attributes']['consultantAgencyId'] == 56
+        return result
+
+    plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                         representation_player_ids=('7', '9'))
+    db = CoreDB()
+    report = CoreRun(fetch, raw_loader=cli._fixture_raw_loader(records), extracted_at=EXTRACTED_AT).run(
+        plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    failed, assigned = report.outcomes
+    assert (failed['status'], failed['status_reason'], failed['rows'], failed['source_capture_id']) == (
+        'error', 'representation:invalid_packet', 0, capture.capture_id)
+    assert (assigned['status'], assigned['rows']) == ('observed_present', 1)
+    receipt, = report.receipts
+    assert receipt['verified'] is True
+    assert db.sql.execute(
+        'SELECT player_id, representative_id FROM transfermarkt_player_representation_observations'
+    ).fetchall() == [('9', '56')]
+
+
+def test_walk_order_refuses_different_evidence_at_an_identical_pair_of_clocks():
+    # Round 8 finding 11
+    db = CoreDB()
+    first, second = _two_pages()
+    original = _attendance_plan((first, second))
+    changed = _page(first.url, first.body, first.captured_at, 'same clock, other capture')
+    collision = _attendance_plan((changed, second), LATER_EXTRACTED_AT)
+    receipt = _bundle(db, [original], EXTRACTED_AT)
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [collision], EXTRACTED_AT)
+    # Retrying the conflicting pending unit keeps its first acknowledgement clock.
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [collision], LATER_EXTRACTED_AT)
+    assert _bundle(db, [original], LATER_EXTRACTED_AT) == receipt
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone() == (1,)
+
+
+def test_journal_only_walk_still_guards_a_rowless_page_and_is_restored_on_commit():
+    # Round 8 finding 12
+    db = CoreDB()
+    first, cached = _two_pages()
+    empty = _page(cached.url, ROWLESS_TERMINAL_PAGE_2, NEWER_PAGE_CAPTURED, 'empty tail')
+    receipt = _bundle(db, [_attendance_plan((first, empty))], EXTRACTED_AT)
+    receipt_id = receipt['walks'][0]['receipt_id']
+    original = native_writer._stored_walk(db, receipt_id)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
+    db.sql.execute('DELETE FROM transfermarkt_core_receipts_v1')
+    fresh_first = _page(first.url, first.body, T1245, 'fresh head')
+    stale = _attendance_plan((fresh_first, cached), LATER_EXTRACTED_AT)
+    with pytest.raises(RuntimeError, match='manifest lost'):
+        native_writer._replay_state(db, stale)
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [stale], LATER_EXTRACTED_AT)
+    assert native_writer._stored_walk(db, receipt_id) is None
+    assert set(_stadiums(db)) == {'11'}
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone() == (0,)
+    fresh = _attendance_plan((fresh_first, empty), LATER_EXTRACTED_AT)
+    assert _bundle(db, [fresh], LATER_EXTRACTED_AT)['verified']
+    assert native_writer._stored_walk(db, receipt_id) == original
+    assert set(_stadiums(db)) == {'11'}
+
+
+@pytest.mark.parametrize('rowless', [False, True])
+def test_numeric_page_identity_guards_cached_padded_page_two(rowless):
+    # Round 8 finding 13
+    db = CoreDB()
+    first, cached = _two_pages()
+    tail_body = ROWLESS_TERMINAL_PAGE_2 if rowless else cached.body
+    tail = _page(cached.url, tail_body, NEWER_PAGE_CAPTURED, 'fresh tail')
+    original = _attendance_plan((first, tail))
+    _bundle(db, [original], EXTRACTED_AT)
+    padded_url = ATTENDANCE_START + '?page=02'
+    padded_head = _page(first.url, first.body.replace(b'page=2', b'page=02'), T1245, 'padded head')
+    stale = _attendance_plan((padded_head, _page(padded_url, cached.body, PAGE_2_CAPTURED, 'padded tail')),
+                             LATER_EXTRACTED_AT)
+    assert stale.pages[1][0] == padded_url
+    if not rowless:
+        with pytest.raises(StaleTransfermarktWrite):
+            native_writer._guard_source_pages(db, stale, {})
+    with pytest.raises(StaleTransfermarktWrite):
+        _bundle(db, [stale], LATER_EXTRACTED_AT)
+    fresh = _attendance_plan((padded_head, _page(padded_url, cached.body, T1245, 'refreshed padded tail')),
+                             LATER_EXTRACTED_AT)
+    accepted = _bundle(db, [fresh], LATER_EXTRACTED_AT)
+    assert accepted['walks'][0]['pages'][1][0] == padded_url
+    pages = native_writer._accepted_pages(db, fresh).pages
+    assert set(pages) == {('GB1', '2025', 1), ('GB1', '2025', 2)}
+    assert set(_stadiums(db)) == {'11', '631'}
+
+
+@pytest.mark.parametrize('version', [6, 7, 8])
+def test_walk_digest_keeps_original_cells_and_survives_a_new_scope_and_universe(monkeypatch, version):
+    # Round 8 finding 14
+    db = CoreDB()
+    pages = _two_pages()
+    first = _attendance_plan(pages)
+    with monkeypatch.context() as old:
+        if version < 8:
+            ignored = {'run_id', '_batch_id', '_ingested_at', 'extracted_at'}
+            if version == 7:
+                ignored.add('cycle_id')
+
+            def old_digest(plan, page, rows, *_):
+                return native_writer._digest([
+                    {k: v for k, v in row.items() if k not in ignored}
+                    for row in native_writer._sorted_rows(rows, plan.natural_keys)])
+
+            record_walks = native_writer._journal_walks
+
+            def old_walks(plans, ids):
+                walks = record_walks(plans, ids)
+                for walk in walks:
+                    del walk['digest_version']
+                return walks
+
+            old.setattr(native_writer, '_page_digest', old_digest)
+            old.setattr(native_writer, '_journal_walks', old_walks)
+        receipt = _bundle(db, [first], EXTRACTED_AT)
+
+    key = receipt['walks'][0]['receipt_id']
+    original = native_writer._stored_walk(db, key)
+    assert _bundle(db, [first], EXTRACTED_AT) == receipt
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE page_number = 2')
+    assert _bundle(db, [first], EXTRACTED_AT) == receipt
+    assert native_writer._stored_walk(db, key) == original
+
+    scope = _replace(_attendance_scope(), scope_id='another-scope', cycle_id='another-cycle')
+    outcome, = sections.extract_attendance_observations(
+        pages, scope, start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
+        extracted_at=LATER_EXTRACTED_AT, universe_version='another-universe')
+    cached = core.plan_for_outcome(outcome, captured_at=first.captured_at,
+                                   scope_values=dict(zip(first.scope_columns, first.scope_values)))
+
+    def commit(plan):
+        return native_writer.write_core_bundle(lambda: db, CoreWriter(db), [plan], run_id=outcome.run_id,
+                                              universe_version=outcome.universe_version, committed_at=LATER_EXTRACTED_AT)
+
+    changed = _replace(cached, rows=tuple({**row, 'capacity': row['capacity'] + 1} for row in cached.rows))
+    with pytest.raises(RuntimeError, match='replay differs'):
+        commit(changed)
+    fresh = commit(cached)
+    assert fresh['walks'][0]['digest_version'] == 8
+    assert fresh['universe_version'] == 'another-universe' and fresh['run_id'] == outcome.run_id
+    assert native_writer._stored_walk(db, key) == original
+    old_hashes = [page[6] for page in receipt['walks'][0]['pages']]
+    new_hashes = [page[6] for page in fresh['walks'][0]['pages']]
+    assert (old_hashes == new_hashes) == (version == 8)
+
+
+def test_a_fence_on_the_second_lost_walk_prevents_the_first_repair():
+    # Round 8 finding 15
+    journal = native_writer.write_journal
+    db = CoreDB()
+    body = (ATTENDANCE_FIXTURES / 'single_page.html').read_bytes()
+
+    def single(clock):
+        return _attendance_plan((_page(ATTENDANCE_START, body, clock, clock),))
+
+    keys = [_write(db, [single(clock)], clock, clock)['walks'][0]['receipt_id']
+            for clock in (PAGE_1_CAPTURED, NEWER_PAGE_CAPTURED)]
+    before = {key: native_writer._stored_walk(db, key) for key in keys}
+    receipt_rows = db.sql.execute('SELECT * FROM transfermarkt_core_receipts_v1 ORDER BY receipt_id').fetchall()
+    later_key = max(keys)
+    fence = journal.begin_statement((native_writer.CORE_PAGES_TABLE, later_key),
+                                    {'single_submit': native_writer._digest(before[later_key])})
+    journal.remember_query(fence, 'queued-walk')
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
+    business = db.sql.execute('SELECT * FROM transfermarkt_attendance_observations').fetchall()
+    cursor = len(db.events)
+    with pytest.raises(RuntimeError, match='still pending'):
+        _write(db, [single(T1245)], T1245, T1245)
+    assert not any(sql.startswith('INSERT') for sql in db.events[cursor:])
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (0,)
+    assert db.sql.execute('SELECT * FROM transfermarkt_attendance_observations').fetchall() == business
+    assert db.sql.execute('SELECT * FROM transfermarkt_core_receipts_v1 ORDER BY receipt_id').fetchall() == receipt_rows
+    db.sql.execute("INSERT INTO test_query_history VALUES ('queued-walk', 'FAILED', 'QUERY_QUEUE_FULL')")
+    assert _write(db, [single(T1245)], T1245, T1245)['verified']
+    assert all(native_writer._stored_walk(db, key) == rows for key, rows in before.items())
+
+
+def test_missing_unscoped_legacy_walk_cannot_be_skipped(monkeypatch):
+    # Round 8 finding 12
+    db = CoreDB()
+    original = _attendance_plan(_two_pages())
+    journal = native_writer.write_journal
+    record = journal.record_receipt
+
+    def old_ack(key, receipt):
+        proofs = [{k: v for k, v in proof.items() if k in (
+            'entity', 'table', 'rows', 'physical_hash', 'expected_rows', 'status_counts')}
+                  for proof in receipt['plans']]
+        record(key, {**receipt, 'plans': proofs, 'walks': []})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, 'record_receipt', old_ack)
+        _bundle(db, [original], EXTRACTED_AT)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1')
+    db.sql.execute('DELETE FROM transfermarkt_core_receipts_v1')
+    fresh = _attendance_plan((_attendance_capture('single_page.html', ATTENDANCE_START, T1245),))
+    with pytest.raises(RuntimeError, match='manifest lost'):
+        _bundle(db, [fresh], LATER_EXTRACTED_AT)
+    assert set(_stadiums(db)) == {'11', '631'}
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_pages_v1').fetchone() == (0,)

@@ -12,6 +12,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
 from itertools import batched
 import re
@@ -268,6 +269,8 @@ def _base_requests(plan: CoreScopePlan):
 
 
 def _requests(plan: CoreScopePlan):
+    if plan.edition_id and plan.edition_id != str(core.saison_year(plan.season)):
+        raise CoreRunError('season_edition_mismatch')
     for request in _base_requests(plan):
         yield request, None
     for target in plan.rumour_competitions:
@@ -318,7 +321,7 @@ def _run_requests(plan: CoreScopePlan):
     return requests
 
 
-def _capture(request, result, raw_loader):
+def _capture(request, result, raw_loader, evidence_by_id):
     if raw_loader is not None:
         body, record = raw_loader(result.raw_capture_id)
         if getattr(record, "endpoint", request.label) != request.label:
@@ -334,11 +337,17 @@ def _capture(request, result, raw_loader):
         if hashlib.sha256(body).hexdigest() != result.raw_body_hash:
             raise CoreRunError(f"{request.label} body does not match its hash")
         captured_at = _normalise_ts(result.raw_fetched_at)
-    return core.SourceCapture(
+    capture = core.SourceCapture(
         url=request.url, endpoint=request.label, body=body,
         capture_id=result.raw_capture_id, body_hash=result.raw_body_hash,
         captured_at=captured_at, status_code=result.status_code or 200,
     )
+    # Aliases of one response (a discovery URL and its canonical page) may be
+    # observed at different clocks; only another body is a contradiction.
+    evidence = capture.body_hash
+    if evidence_by_id.setdefault(capture.capture_id, evidence) != evidence:
+        raise CoreRunError('capture_evidence_conflict')
+    return capture
 
 
 def _freshness_clock(outcome):
@@ -400,7 +409,7 @@ def _request_subject(request, plan) -> str:
     return core.canonical_json(values).decode()
 
 
-def _observations(request, result, plan, extracted_at, universe_version, raw_loader, captures=(),
+def _observations(request, result, plan, extracted_at, universe_version, capture_response, captures=(),
                   competition=None, walk_failure=None, walk_failed=None):
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
@@ -469,7 +478,7 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
         )
         return unit, max(page.captured_at for page in captures)
 
-    capture = _capture(request, result, raw_loader)
+    capture = capture_response(request, result)
     if request.label == "squad":
         unit = core.extract_squad_observations(capture, scope, **metadata)
     elif request.label == "coach_history":
@@ -607,6 +616,7 @@ class CoreRun:
         context = {"scope_id": plan.scope_id, "cycle_id": plan.cycle_id}
         outcomes = []
         captured_units = []
+        capture_response = partial(_capture, raw_loader=self._raw_loader, evidence_by_id={})
         fetched = cache_hits = 0
         for request, competition in _run_requests(plan):
             as_json = request.as_json
@@ -624,7 +634,7 @@ class CoreRun:
                 if (request.label not in _PAGINATED_ENDPOINTS or result.status is not FetchStatus.OK
                         or not result.raw_capture_id):
                     break
-                capture = _capture(page, result, self._raw_loader)
+                capture = capture_response(page, result)
                 if walk is not None:
                     try:
                         next_url = walk.add(capture)
@@ -680,7 +690,7 @@ class CoreRun:
                 captures = walk.ordered()
             extracted_at = pinned or datetime.now(timezone.utc).isoformat(timespec="microseconds")
             unit, captured_at = _observations(
-                request, result, plan, extracted_at, self._universe_version, self._raw_loader,
+                request, result, plan, extracted_at, self._universe_version, capture_response,
                 captures, competition=competition, walk_failure=walk_failure,
                 walk_failed=walk_failed)
             outcomes.extend(unit)
@@ -693,14 +703,6 @@ class CoreRun:
                 ]
                 if entries:
                     captured_units.append((unit[0].run_id, extracted_at, entries))
-
-        evidence_by_id = {}
-        for outcome in outcomes:
-            capture = outcome.capture
-            if capture is not None:
-                evidence = (capture.url, capture.body_hash, capture.captured_at)
-                if evidence_by_id.setdefault(capture.capture_id, evidence) != evidence:
-                    raise CoreRunError('capture_evidence_conflict')
 
         bundles = []
         for run_id, committed_at, entries in captured_units:
