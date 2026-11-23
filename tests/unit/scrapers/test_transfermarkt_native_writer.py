@@ -1362,3 +1362,73 @@ def test_plan_clocks_and_dates_are_canonical():
     profile = _referee_profile_plan()
     with pytest.raises(ValueError, match='date'):
         dataclasses_replace(profile, rows=({**profile.rows[0], 'birth_date': 'yesterday'},))
+
+
+def _receipt_count(db):
+    return db.sql.execute('SELECT COUNT(*) FROM transfermarkt_core_receipts_v1').fetchone()[0]
+
+
+def test_a_receipt_contradiction_is_refused_before_any_mutation():
+    # Round 6 finding 1: the contradiction between a bundle's receipt and the
+    # one the warehouse already holds under that id was found by the receipts
+    # step, after the bundle had replaced live data and inserted the receipts
+    # of its other plans.
+    db = CoreDB()
+    write(db, [membership_plan(['1', '2'], capture='cap-pop')])
+    receipts_before = _receipt_count(db)
+    first, second = _empty_roster_plan(capture='cap-a'), _empty_roster_plan(capture='cap-b')
+    plan_hash, legacy_digest = _stage_b_identity(first, 'run-old')
+    seeded = native_writer._plan_receipt(
+        first, {**_EMPTY_PROOF, 'physical_hash': native_writer._digest([])}, plan_hash,
+        legacy_digest, 'run-old', 'u', native_writer._batch_id_for_run('run-old'), CLOCK)
+    native_writer._merge_receipts(db, [seeded])
+    _legacy_intent(second, legacy_digest)
+    with pytest.raises(RuntimeError, match='contradicts'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    assert _players(db) == ['1', '2']  # the roster was not deleted
+    assert _receipt_count(db) == receipts_before + 1
+
+    plans = [membership_plan(['9'], capture='cap-9'), mv_plan([('2025-01-01', 10)])]
+    plan_hashes, digest = native_writer._bundle_identity(plans, 'r')
+    forged = native_writer._plan_receipt(
+        plans[1], {'entity': plans[1].entity, 'table': plans[1].table, 'rows': 1,
+                   'physical_hash': 'h', 'expected_rows': 1, 'status_counts': {}},
+        plan_hashes[1], digest, 'r', 'u', native_writer._batch_id_for_run('r'), CLOCK)
+    native_writer._merge_receipts(db, [{**forged, 'source_body_hash': 'e' * 64}])
+    receipts_before = _receipt_count(db)
+    with pytest.raises(RuntimeError, match='contradicts'):
+        native_writer.write_core_bundle(
+            lambda: db, CoreWriter(db), plans, run_id='r', universe_version='u', committed_at=CLOCK)
+    # Neither the first plan's receipt nor any data was written.
+    assert _receipt_count(db) == receipts_before
+    assert '9' not in _players(db)
+    assert not db.sql.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transfermarkt_market_value_points'"
+    ).fetchall()
+
+
+def test_an_ambiguous_receipt_insert_is_resolved_by_reading_the_id_back():
+    # Round 6 finding 3: the commit-conflict retry ladder repeated the receipt
+    # INSERT after a commit whose outcome was unknown, and the read-back saw
+    # two physical rows for one receipt id.
+    class AmbiguousCursor(CoreCursor):
+        fired = False
+
+        def execute(self, sql, params=()):
+            insert = sql.startswith('INSERT INTO iceberg.ops.transfermarkt_core_receipts_v1')
+            if insert and not AmbiguousCursor.fired:
+                AmbiguousCursor.fired = True
+                super().execute(sql, params)
+                raise RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown')
+            return super().execute(sql, params)
+
+    class AmbiguousDB(CoreDB):
+        def cursor(self):
+            return AmbiguousCursor(self)
+
+    db = AmbiguousDB()
+    receipt = native_writer.write_core_bundle(
+        lambda: db, CoreWriter(db), [membership_plan(['1'], capture='cap-1')], run_id='r',
+        universe_version='u', committed_at=CLOCK)
+    assert receipt['verified'] is True
+    assert _receipt_count(db) == 1
