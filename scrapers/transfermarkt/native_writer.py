@@ -347,6 +347,8 @@ class NativeWritePlan:
             raise ValueError('core scope values must be non-empty strings')
         if not self.captured_at:
             raise ValueError('core captured_at must be non-empty')
+        if _canonical_clock(self.captured_at) is None:
+            raise ValueError('core captured_at must be a timestamp in its canonical spelling')
         if self.write_mode not in ('replace', 'merge'):
             raise ValueError('core write_mode must be replace or merge')
         if self.status not in _CONCLUSIVE_STATUSES or not _nonempty(self.status_reason):
@@ -491,10 +493,9 @@ class NativeWritePlan:
                 raise ValueError('core plan row integer exceeds the bigint range')
             for column in timestamps:
                 value = row.get(column)
-                # The engine reads several spellings of one moment. A key
-                # cell is compared as text, so a plan states it one way only.
-                if value is not None and (not isinstance(value, str)
-                                          or value != _canonical_clock(value)):
+                # A clock is stated one way only: the engine reads several
+                # spellings of one moment, and a key cell is compared as text.
+                if value is not None and value != _canonical_clock(value):
                     raise ValueError(f'core plan row timestamp is not canonical: {column}')
             if ('observed_at' in self.natural_keys and row.get('observed_at') is not None
                     and _timestamp(row['observed_at']) != _timestamp(row['captured_at'])):
@@ -793,16 +794,18 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
 
 
-def _canonical_clock(value) -> str:
+def _canonical_clock(value) -> str | None:
     """The one spelling of a moment: UTC ISO text with microseconds.
 
-    Anything the text does not parse as (a non-string, a broken timestamp)
-    is returned unchanged, so the caller's own comparison refuses it.
+    None for anything a plan may not carry as a clock: not text, or text
+    that is not a timestamp. The caller's own comparison refuses it.
     """
+    if not isinstance(value, str):
+        return None
     try:
         return _timestamp(value).isoformat(timespec='microseconds')
-    except (TypeError, ValueError):
-        return value
+    except ValueError:
+        return None
 
 
 def _key_cells(values, columns=()) -> tuple:
@@ -810,8 +813,8 @@ def _key_cells(values, columns=()) -> tuple:
     for index, value in enumerate(values):
         # An engine returns a clock as a datetime, a plan holds it as text;
         # both are compared as the moment they name, never as spelling.
-        if index < len(columns) and columns[index].endswith('_at'):
-            value = _canonical_clock(value) if isinstance(value, str) else value
+        if index < len(columns) and columns[index].endswith('_at') and isinstance(value, str):
+            value = _canonical_clock(value) or value
         cells.append(_canonical_cell(value))
     return tuple(cells)
 
