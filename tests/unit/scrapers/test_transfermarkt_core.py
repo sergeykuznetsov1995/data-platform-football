@@ -419,7 +419,6 @@ def test_a_core_row_that_cannot_be_rendered_is_its_captures_error(monkeypatch, e
 
     if not any(outcome.rows for outcome in extract()):
         pytest.skip('the recorded capture of this lane renders no row')
-    real = core._render
 
     def refusing(*args, **kwargs):
         raise core.CoreParseError('row_value_exceeds_bigint')

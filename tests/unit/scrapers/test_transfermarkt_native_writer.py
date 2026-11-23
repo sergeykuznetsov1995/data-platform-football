@@ -1004,7 +1004,7 @@ def test_pre_upgrade_intent_is_finished_after_verified_recovery():
     # not stay pending after its verified recovery.
     db = CoreDB()
     plan_hash, old_digest = _stage_b_identity(_empty_roster_plan(), 'run-old')
-    path = _legacy_intent(_empty_roster_plan(), old_digest)
+    _legacy_intent(_empty_roster_plan(), old_digest)
     receipts = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
     assert len(receipts) == 1 and receipts[0]['verified'] is True
     assert write_journal.pending_intents({'run_id': 'run-old'}) == []

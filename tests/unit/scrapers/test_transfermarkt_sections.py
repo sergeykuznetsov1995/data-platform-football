@@ -3399,11 +3399,11 @@ def test_row_values_match_their_declared_column_types():
     _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
     plan = _attendance_plan((page_1, page_2), LATER_EXTRACTED_AT)
     with pytest.raises(ValueError, match='column type'):
-        as_text = _replace(plan, rows=tuple({**row, 'capacity': str(row['capacity'])} for row in plan.rows))
+        _replace(plan, rows=tuple({**row, 'capacity': str(row['capacity'])} for row in plan.rows))
     with pytest.raises(ValueError, match='column type'):
-        as_number = _replace(plan, rows=tuple({**row, 'club_id': int(row['club_id'])} for row in plan.rows))
+        _replace(plan, rows=tuple({**row, 'club_id': int(row['club_id'])} for row in plan.rows))
     with pytest.raises(ValueError, match='column type'):
-        as_flag = _replace(plan, rows=tuple({**row, 'final_season': 'yes'} for row in plan.rows))
+        _replace(plan, rows=tuple({**row, 'final_season': 'yes'} for row in plan.rows))
     assert set(_stadiums(db)) == {'11', '631'}
 
 

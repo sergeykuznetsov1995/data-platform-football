@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from re import fullmatch
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 from . import write_journal
 import random
