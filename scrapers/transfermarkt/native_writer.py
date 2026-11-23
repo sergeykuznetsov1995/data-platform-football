@@ -1081,14 +1081,15 @@ def _verify_receipts(connection, receipts) -> None:
         raise RuntimeError('core receipt readback differs')
 
 
-def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
-    if not plans:
-        raise ValueError('core bundle requires at least one plan')
-    # One entity may appear in several plans (one club per memberships plan);
-    # natural-key uniqueness across plans is the real collision contract.
-    if not all((run_id, universe_version, committed_at)):
-        raise ValueError('core run_id, universe_version and committed_at must be non-empty')
-    _timestamp(committed_at)
+def validate_run_plans(plans) -> None:
+    """The cross-plan contract of a set of plans.
+
+    One entity may appear in several plans (one club per memberships plan);
+    a natural key and a replacement scope are each owned by one plan. It is
+    checked for a bundle before it is journalled, and for every bundle of a
+    run before the first of them mutates anything: a collision between two
+    targets must not surface after the first one has committed.
+    """
     seen = set()
     scopes = set()
     for plan in plans:
@@ -1102,6 +1103,15 @@ def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
             if scope in scopes:
                 raise ValueError('duplicate core replacement scope across plans')
             scopes.add(scope)
+
+
+def _validate_bundle(plans, run_id, universe_version, committed_at) -> None:
+    if not plans:
+        raise ValueError('core bundle requires at least one plan')
+    if not all((run_id, universe_version, committed_at)):
+        raise ValueError('core run_id, universe_version and committed_at must be non-empty')
+    _timestamp(committed_at)
+    validate_run_plans(plans)
 
 
 def _ddl_columns(ddl: str) -> dict[str, str]:

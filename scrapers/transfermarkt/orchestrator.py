@@ -659,6 +659,11 @@ class CoreRun:
             plans = [core.plan_for_outcome(item, captured_at=captured_at, scope_values=values)
                      for item, captured_at, values in entries]
             bundles.append((run_id, committed_at, plans))
+        # Every plan of the run is checked against every other before the
+        # first mutation: a collision between two targets must not surface
+        # after the first one has committed.
+        native_writer.validate_run_plans(
+            [plan for _run_id, _committed_at, plans in bundles for plan in plans])
         receipts = []
         for run_id, committed_at, plans in bundles:
             receipt = native_writer.write_core_bundle(
