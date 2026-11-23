@@ -378,6 +378,12 @@ class NativeWritePlan:
             if self.capture_id and self.capture_id != capture_id:
                 raise ValueError('core capture_id must equal the newest row capture id')
             object.__setattr__(self, 'capture_id', capture_id)
+        if not self.rows and self.pages:
+            # A snapshot without rows carries the clock of its newest page
+            # and names that page: its receipt pairs a capture with its own
+            # clock.
+            if self.capture_id != max(self.pages, key=lambda page: _timestamp(page[2]))[1]:
+                raise ValueError('core rowless snapshot must name its newest page')
         evidence_map = dict(self.evidence)
         for column in ('raw_capture_id', 'source_capture_id'):
             if evidence_map.get(column, self.capture_id) != self.capture_id:
