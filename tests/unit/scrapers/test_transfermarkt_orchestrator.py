@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from scrapers.transfermarkt import orchestrator
+from scrapers.transfermarkt.core import CoreParseError, SourceCapture
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from scrapers.transfermarkt.orchestrator import (
     ClubTarget,
@@ -280,13 +281,19 @@ def test_finding_16_offline_squad_record_cannot_be_relabelled_as_coach_history()
     with pytest.raises(ValueError) as refused:
         cli._offline_plan(args, records)
     assert str(refused.value) == f"Fixture endpoint 'coach_history' does not match its URL {capture.url!r}"
+    with pytest.raises(ValueError, match='^squad raw capture endpoint differs$'):
+        cli._fixture_fetch(records)(capture.url, as_json=False, label='squad')
 
     replay = _ReplayFetch({'squad'})
     request = orchestrator._Request('squad', capture.url)
     result = replay.fetch(capture.url, as_json=False, label=request.label)
     with pytest.raises(CoreRunError, match='^squad raw capture endpoint differs$'):
-        orchestrator._capture(request, result, cli._fixture_raw_loader(records), {})
-    assert orchestrator._capture(request, result, replay.raw_loader, {}) == capture
+        orchestrator._capture(request, result, cli._fixture_raw_loader(records))
+    loader = cli._fixture_raw_loader({capture.url: (record, blob)})
+    assert orchestrator._capture(request, result, loader) == capture
+    with pytest.raises(ValueError) as refused:
+        loader('0' * 64, capture.url)
+    assert str(refused.value) == f'Capture ID mismatch for {capture.url}'
 
 
 def _write_replay_manifest(root, captures):
@@ -341,6 +348,7 @@ def test_offline_malformed_transfer_cannot_hide_capture_conflict(malformed_first
 @pytest.mark.parametrize('edition', ['2026', '2025', None])
 def test_offline_attendance_respects_explicit_edition(edition, tmp_path, monkeypatch, capsys):
     # Round 9 finding 10
+    # Round 10 finding 10
     from dags.scripts import run_transfermarkt_core as cli
     from tests.unit.scrapers.test_transfermarkt_sections import (
         ATTENDANCE_PAGE_2, ATTENDANCE_START, PAGE_1_CAPTURED, PAGE_2_CAPTURED, _attendance_capture,
@@ -366,6 +374,8 @@ def test_offline_attendance_respects_explicit_edition(edition, tmp_path, monkeyp
         return
     assert cli.main(args) == 0
     report = json.loads(path.read_text())
+    assert report['plan']['edition_inferred'] is (edition is None)
+    assert report['plan']['edition_id'] == (edition or '2026')
     assert report['fetched'] == len(captures)
     attendance, = [item for item in report['outcomes'] if item['entity'] == 'attendance_observations']
     assert (attendance['status'], attendance['rows']) == ('observed_present', 2)
@@ -386,6 +396,82 @@ def test_live_cli_refuses_foreign_attendance_before_transport(monkeypatch, capsy
                   '--i-have-transport-permission'])
     assert caught.value.code == 2
     assert capsys.readouterr().err.rstrip().endswith(': attendance_edition_mismatch')
+
+
+@pytest.mark.parametrize('lane,exception,error', [
+    ('attendance', CoreRunError, 'attendance_edition_mismatch'),
+    ('referee_directory', CoreRunError, 'referee_directory_edition_mismatch'),
+    ('squad', CoreParseError, 'row_scope_mismatch'),
+])
+def test_direct_run_rejects_foreign_edition_before_fetch(lane, exception, error):
+    # Round 10 finding 10
+    plan = _plan()
+    if lane == 'attendance':
+        plan = replace(plan, attendance_editions=(orchestrator.AttendanceEditionTarget('GB1', 2025),))
+    elif lane == 'referee_directory':
+        plan = replace(plan, referee_directories=(orchestrator.RefereeDirectoryTarget('XY1', '2025'),))
+    else:
+        plan = replace(plan, clubs=(ClubTarget('11', 'arsenal', squad_url=squad_url('arsenal', '11', 2025)),))
+    run = CoreRun(lambda *a, **kw: pytest.fail('unexpected fetch'))
+    with pytest.raises(exception, match=f'^{error}$'):
+        run.run(plan, writer=object(), connection_factory=lambda: pytest.fail('unexpected connection'))
+
+
+@pytest.mark.parametrize('conflict', [True, False])
+def test_failed_json_fetch_binds_its_supplied_evidence_before_writes(conflict):
+    # Round 10 finding 11
+    squad = _load('squad')
+    replay = _ReplayFetch({'squad'})
+    club_id = squad.url.split('/verein/')[1].split('/')[0]
+    plan = _plan(clubs=(ClubTarget(club_id, 'club', squad_url=squad.url),), transfer_player_ids=('7',))
+
+    def fetch(url, **kwargs):
+        if url == squad.url:
+            return replay.fetch(url, **kwargs)
+        assert url == transfers_url('7')
+        digest = hashlib.sha256(b'{').hexdigest() if conflict else squad.body_hash
+        return FetchOutcome(status=FetchStatus.SCHEMA_ERROR, error='invalid_json',
+                            raw_capture_id=squad.capture_id, raw_body_hash=digest)
+
+    run = CoreRun(fetch, extracted_at=EXTRACTED_AT)
+    if conflict:
+        with pytest.raises(CoreRunError, match='^capture_evidence_conflict$'):
+            run.run(plan, writer=object(), connection_factory=lambda: pytest.fail('unexpected connection'))
+    else:
+        db = CoreDB()
+        report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+        failed = report.outcomes[-1]
+        assert (failed['status'], failed['source_capture_id']) == ('unavailable', None)
+        receipt, = report.receipts
+        assert receipt['verified'] is True
+
+
+def test_offline_career_capture_aliases_keep_both_request_records(tmp_path, monkeypatch):
+    # Round 10 finding 12
+    from dags.scripts import run_transfermarkt_core as cli
+    from scrapers.transfermarkt.native_writer import _timestamp
+
+    body = b'{"list":[],"transfers":[]}'
+    digest = hashlib.sha256(body).hexdigest()
+    mv = SourceCapture(url=mv_history_url('7'), endpoint='market_value_points', body=body,
+                       capture_id='a' * 64, body_hash=digest, captured_at='2026-01-01T09:00:00.000000+00:00')
+    transfer = replace(mv, endpoint='transfer_events', url=transfers_url('7'),
+                       captured_at='2026-01-01T10:00:00.000000+00:00')
+    _write_replay_manifest(tmp_path, [transfer, mv])
+    db = CoreDB()
+    options = {'writer': CoreWriter(db), 'connection_factory': lambda: db}
+    monkeypatch.setattr(cli, '_write_options', lambda args: options)
+    path = tmp_path / 'report.json'
+    assert cli.main(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1', '--season', '2627',
+                     '--write', '--report-out', str(path)]) == 0
+    report = json.loads(path.read_text())
+    assert report['dq']['errors'] == []
+    assert report['dq']['outcome_status_counts'] == {'observed_empty': 2}
+    assert len(report['receipts']) == 2 and all(receipt['verified'] for receipt in report['receipts'])
+    records = db.sql.execute('SELECT entity, captured_at, source_capture_id, source_body_hash '
+                             'FROM transfermarkt_core_receipts_v1')
+    assert {(entity, _timestamp(clock), cid, sha) for entity, clock, cid, sha in records} == {
+        (c.endpoint, _timestamp(c.captured_at), c.capture_id, c.body_hash) for c in (mv, transfer)}
 
 
 @pytest.mark.parametrize('different_body', [False, True], ids=['aliases', 'conflict'])

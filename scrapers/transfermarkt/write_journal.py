@@ -321,6 +321,73 @@ def release_scope(scope, owner):
         _fsync_directory(path.parent)
 
 
+def bundle_reservations():
+    for path in (_root() / 'reserving-bundles').glob('*.json'):
+        record = _read_record(path)
+        if record['owner'] != path.stem:
+            raise RuntimeError('core bundle reservation differs')
+        yield record
+
+
+def reserve_scopes(scopes, owner):
+    """Publish the entire reservation before materializing individual scope guards."""
+    scopes = sorted(set(scopes))
+    path = _record_path('reserving-bundles', owner)
+    if len(scopes) > 1:
+        _immutable_record(path, {'owner': owner, 'scopes': scopes})
+    for scope in scopes:
+        hold_scope(scope, owner)
+
+
+def finish_reservation(owner, scopes):
+    path = _record_path('reserving-bundles', owner)
+    if path.exists():
+        expected = {'owner': owner, 'scopes': [list(s) for s in sorted(set(scopes))]}
+        if _read_record(path) != expected:
+            raise RuntimeError('core bundle reservation differs')
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
+def completed_intent(intent):
+    path = _record_path('completed-intents', intent)
+    if path.exists():
+        record = _read_record(path)
+        if record['intent'] != intent:
+            raise RuntimeError('core completed intent differs')
+        return record
+
+
+def complete_intent(path, digest, owner, terminal):
+    _immutable_record(_record_path('completed-intents', path.stem), {
+        'intent': path.stem, 'digest': digest, 'owner': owner, 'terminal': terminal})
+
+
+def terminal_target(intent, receipt_id, statement=None):
+    directory = 'terminal-targets/' + intent + '/' + receipt_id
+    paths = ((_root() / directory).glob('*.json') if statement is None
+             else (_record_path(directory, statement['attempt']),))
+    for path in paths:
+        if path.exists():
+            record = _read_record(path)
+            if (record['intent'] != intent or record['receipt_id'] != receipt_id or not record['query_id']
+                    or record['attempt'] != path.stem
+                    or statement is not None and record['query_id'] != statement_query(statement)):
+                raise RuntimeError('core terminal target binding differs')
+            return True
+    return False
+
+
+def remember_terminal_target(intent, receipt_id, statement):
+    """Preserve the bound coordinator outcome before unlinking its statement."""
+    query_id = statement_query(statement)
+    if not query_id or statement['expected'] != {'single_submit': receipt_id}:
+        raise RuntimeError('core terminal target binding differs')
+    directory = 'terminal-targets/' + intent + '/' + receipt_id
+    _immutable_record(_record_path(directory, statement['attempt']), {
+        'intent': intent, 'receipt_id': receipt_id, 'attempt': statement['attempt'], 'query_id': query_id})
+
+
 def stage_record(receipt_id, stage):
     return _record_path('stages/' + receipt_id, stage)
 
@@ -472,7 +539,9 @@ def scope_walks(table, scope):
                 if proof.get('scope_values_json', recorded[key]) != recorded[key]:
                     raise RuntimeError('core journal walk scope differs')
             elif proof.get('scope_values_json', scope) == scope:
-                missing[key] = proof.get('scope_values_json')
+                evidence = (proof.get('scope_values_json'), receipt['committed_at'])
+                if missing.setdefault(key, evidence) != evidence:
+                    raise RuntimeError('core journal walk differs')
     return walks, missing
 
 

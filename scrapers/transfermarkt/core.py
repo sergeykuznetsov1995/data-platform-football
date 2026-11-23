@@ -347,6 +347,7 @@ class ScopeContext:
     club_name: str | None = None
     player_id: str | None = None
     edition_id: str | None = None
+    competition_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.league, str) or not re.fullmatch(r'[A-Z0-9]{2,6}', self.league):
@@ -961,9 +962,14 @@ def saison_year(season: str) -> int:
 def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
     """Empty outcomes have no rows to cross-check; the capture URL still names
     the entity it belongs to, so a swapped club/player scope fails here."""
-    if capture is None:
-        return
-    url = urlsplit(capture.url)
+    if capture is not None:
+        _check_scope_against_url(entity, scope_values, capture.url, capture.endpoint)
+
+
+def _check_scope_against_url(
+    entity: str, scope_values: Mapping[str, str], source_url: str, source_endpoint: str,
+) -> None:
+    url = urlsplit(source_url)
     path = url.path
     # The complete origin and route of the lane: https from its own authority
     # as a whole (another port or a user part is another source), no fragment,
@@ -996,14 +1002,14 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
         from scrapers.transfermarkt import rumours
 
         try:
-            rumours._page_ref(capture.url, scope_values['competition_id'])
+            rumours._page_ref(source_url, scope_values['competition_id'])
         except rumours.RumourParseError as exc:
             raise CoreParseError('row_scope_mismatch') from exc
         return
     if entity == 'achievement_observations':
         recipient_type = scope_values['recipient_type']
         recipient_id = scope_values['recipient_id']
-        if capture.endpoint != f'{recipient_type}_achievement':
+        if source_endpoint != f'{recipient_type}_achievement':
             raise CoreParseError('row_scope_mismatch')
         if recipient_type == 'coach':
             match = re.fullmatch(r'/[A-Za-z0-9-]+/erfolge/trainer/([1-9][0-9]*)', path)
@@ -1022,14 +1028,14 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
 
         try:
             attendance._validate_attendance_url(
-                capture.url, host=TRANSFERMARKT_HOST, path=path,
+                source_url, host=TRANSFERMARKT_HOST, path=path,
                 competition=scope_values['competition_id'], edition=scope_values['edition_id'])
         except attendance.AttendanceParseError as exc:
             raise CoreParseError('row_scope_mismatch') from exc
     if entity in _STAGE_B_ROUTES:
         endpoint, column, pattern = _STAGE_B_ROUTES[entity]
         match = re.fullmatch(pattern, path)
-        if capture.endpoint != endpoint or match is None or match[1] != scope_values[column]:
+        if source_endpoint != endpoint or match is None or match[1] != scope_values[column]:
             raise CoreParseError('row_scope_mismatch')
         if endpoint == 'squad':
             try:

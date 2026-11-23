@@ -348,6 +348,8 @@ class GuardCursor:
                     in enumerate(self.manifest, start=1)]
         if 'SELECT receipt_id FROM' in self.sql:
             return [('receipt-walk',)] if self.manifest else []
+        if 'SELECT receipt_id, committed_at FROM' in self.sql:
+            return [('receipt-walk', CLOCK)] if self.manifest else []
         return self.pages if 'GROUP BY source_url' in self.sql else self.rows
     def close(self):
         pass
@@ -3010,3 +3012,321 @@ def test_empty_club_capture_aliases_compare_body_only(different_body):
     else:
         assert write(db, [first, second])['verified']
         assert _receipt_count(db) == 2
+
+
+def _historical_single_submit(plan, run, clock, *, finished):
+    _, digest = native_writer._bundle_identity([plan], run)
+    path = write_journal.save_intent(
+        {'run_id': run, 'digest': digest, 'single_submit': True, 'statement_protocol': 1},
+        {'plans': native_writer._descriptors([plan])}, universe_version='core-universe-v1',
+        committed_at=clock)
+    if finished:
+        write_journal.finish_intent(path)
+    return path
+
+
+@pytest.mark.parametrize('scope_protocol', [False, True])
+def test_finished_single_submit_walk_migrates_its_guard(monkeypatch, scope_protocol):
+    # Round 10 finding 1
+    db, old = CoreDB(), _snapshot(CLOCK, 'old')
+    receipt = write(db, [old])
+    identity = {'run_id': 'run-1', 'digest': receipt['plan_sha256'], 'single_submit': True,
+                'statement_protocol': 1}
+    if scope_protocol:
+        identity['scope_protocol'] = 1
+    path = write_journal.save_intent(identity, {'plans': native_writer._descriptors([old])})
+    write_journal.finish_intent(path)
+    fresh = _snapshot(NEWEST, 'fresh')
+    persisted = write_journal._immutable_record
+    def interrupt(path, value):
+        persisted(path, value)
+        if 'legacy-scopes' in path.parts:
+            raise RuntimeError('after guard publication')
+    before = len(db.events)
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, '_immutable_record', interrupt)
+        with pytest.raises(RuntimeError, match='after guard publication'):
+            write(db, [fresh], clock=NEWEST)
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, [fresh], clock=NEWEST)
+    assert write(db, [old]) == receipt
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[before:])
+
+
+@pytest.mark.parametrize('local_ack', [True, False])
+def test_walk_order_uses_the_bound_receipt_clock(local_ack, monkeypatch):
+    # Round 10 finding 2
+    db, old = CoreDB(), _snapshot(CLOCK, 'first')
+    late = '2026-11-21T12:35:00.000000+00:00'
+    early = '2026-11-21T12:10:00.000000+00:00'
+    record = write_journal.record_receipt
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', lambda key, receipt: record(
+            key, {k: value for k, value in receipt.items() if k != 'walks'}))
+        receipt = write(db, [old], clock=late)
+    if local_ack:
+        # Isolate the clock still present in the old local proof.
+        db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    else:
+        write_journal._record_path('receipts', receipt['plan_sha256']).unlink()
+    db.sql.execute('UPDATE transfermarkt_core_pages_v1 SET acknowledged_at = ?', (early,))
+    with pytest.raises(RuntimeError, match='acknowledgement clock'):
+        write(db, [_snapshot(CLOCK, 'conflicting')], clock='2026-11-21T12:15:00.000000+00:00')
+    assert native_writer._rows_equal(native_writer._read_plan_rows(db, old), old.rows)
+
+
+@pytest.mark.parametrize('interrupt_settlement', [False, True])
+def test_bound_finished_delete_recovers_ahead_of_competing_anchored_intent(monkeypatch, interrupt_settlement):
+    # Round 10 finding 3
+    db = CoreDB()
+    write(db, [membership_plan(['1'])])
+    owner = _empty_roster_plan(clock=LATER)
+    path = _historical_single_submit(owner, 'delete', LATER, finished=False)
+    owner_hashes, owner_digest = native_writer._bundle_identity([owner], 'delete')
+    write_journal.snapshot_anchors(owner_digest, db, native_writer._anchored_tables([owner]))
+    execute = CoreCursor.execute
+    def lose(self, sql, params=()):
+        if sql.startswith('DELETE FROM ' + owner.full_table):
+            self.query_id = 'q_delete'
+            execute(self, sql, params)
+            raise TrinoAmbiguousWriteError('lost DELETE poll')
+        return execute(self, sql, params)
+    with monkeypatch.context() as patch:
+        patch.setattr(CoreCursor, 'execute', lose)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='delete')
+    other = membership_plan(['2'], clock=NEWEST, capture='competing')
+    competitor = _historical_single_submit(other, 'competing', NEWEST, finished=False)
+    hashes, digest = native_writer._bundle_identity([other], 'competing')
+    write_journal.snapshot_anchors(digest, db, native_writer._anchored_tables([other]))
+    other_id = native_writer._receipt_id(hashes[0], 'competing', digest)
+    unknown = write_journal.begin_statement((native_writer.CORE_RECEIPTS_TABLE, other_id),
+                                            {'single_submit': 'unknown-postimage'}, observable=False)
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_delete', 'FINISHED', NULL)")
+    before = len(db.events)
+    if interrupt_settlement:
+        remember = write_journal.remember_terminal_target
+        def interrupt(*args):
+            remember(*args)
+            raise RuntimeError('after terminal witness')
+        with monkeypatch.context() as patch:
+            patch.setattr(write_journal, 'remember_terminal_target', interrupt)
+            with pytest.raises(RuntimeError, match='after terminal witness'):
+                native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='delete')
+        db.sql.execute('DELETE FROM test_query_history')
+    with pytest.raises(RuntimeError, match='still pending') as unresolved:
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+    recovered, = unresolved.value.receipts
+    assert recovered['verified'] and not path.exists() and competitor.exists()
+    owner_id = native_writer._receipt_id(owner_hashes[0], 'delete', owner_digest)
+    assert write_journal.terminal_target(path.stem, owner_id)
+    assert unresolved.value.unresolved == (competitor.stem,)
+    assert write_journal.pending_statement(unknown['key']) == unknown
+    assert any('test_query_history' in sql for sql in db.events[before:])
+    assert not any(sql.startswith('DELETE FROM') for sql in db.events[before:])
+    assert _players(db) == []
+
+
+def test_latest_bound_walk_verifies_through_two_finished_guards():
+    # Round 10 finding 4
+    db = CoreDB()
+    first, latest = _snapshot(CLOCK, 'first'), _snapshot(NEWEST, 'latest')
+    write(db, [first], run_id='first')
+    receipt = write(db, [latest], run_id='latest', clock=NEWEST)
+    for plan, run, clock in ((first, 'first', CLOCK), (latest, 'latest', NEWEST)):
+        _historical_single_submit(plan, run, clock, finished=True)
+    start = len(db.events)
+    assert write(db, [latest], run_id='latest', clock=NEWEST) == receipt
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [first], run_id='first')
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [_snapshot(NEWEST, 'third')], run_id='third', clock=NEWEST)
+    assert len(list((write_journal._root() / 'legacy-scopes' / first.table).glob('*.json'))) == 2
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+
+
+@pytest.mark.parametrize('boundary', ['reserving', 'between_members'])
+def test_packet_reserves_both_players_before_dispatch(monkeypatch, boundary):
+    # Round 10 finding 5
+    db = CoreDB()
+    packet = [_transfer_plan(player, 'initial-' + player, CLOCK) for player in ('1', '2')]
+    calls = []
+    name = 'hold_scope' if boundary == 'reserving' else '_write_plan'
+    module = write_journal if boundary == 'reserving' else native_writer
+    original = getattr(module, name)
+    def interrupt(*args):
+        if calls:
+            raise RuntimeError('interrupted packet')
+        calls.append(args)
+        return original(*args)
+    with monkeypatch.context() as patch:
+        patch.setattr(module, name, interrupt)
+        with pytest.raises(RuntimeError, match='interrupted packet'):
+            write(db, packet)
+    newer = _transfer_plan('2', 'new-2', LATER)
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [newer], run_id='new', clock=LATER)
+    result, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+    assert result['verified'] and write(db, [newer], run_id='new', clock=LATER)['verified']
+    assert write(db, [_transfer_plan('1', 'new-1', LATER)], run_id='next', clock=LATER)['verified']
+    assert db.sql.execute(f'SELECT player_id, to_club_name FROM {newer.table} ORDER BY 1').fetchall() == [
+        ('1', 'new-1'), ('2', 'new-2')]
+    assert not write_journal.pending_intents({})
+
+
+def _club_plan(club, capture, clock):
+    plan = membership_plan([club], capture=capture, clock=clock)
+    return dataclasses_replace(plan, scope_values=('GB1', '2526', club), rows=tuple({
+        **r, 'club_id': club, 'source_url': r['source_url'].replace('/verein/11/', f'/verein/{club}/')
+    } for r in plan.rows))
+
+
+def test_recovery_finishes_partial_release_after_superseding_one_club(monkeypatch):
+    # Round 10 finding 6
+    db = CoreDB()
+    packet = [_club_plan(c, 'old-' + c, CLOCK) for c in ('11', '22')]
+    release = write_journal.release_scope
+    def interrupt(scope, owner):
+        release(scope, owner)
+        raise RuntimeError('after one release')
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'release_scope', interrupt)
+        with pytest.raises(RuntimeError, match='after one release'):
+            write(db, packet)
+    fresh = [_club_plan(c, 'new-' + c, LATER) for c in ('11', '22')]
+    assert write(db, fresh[:1], run_id='new-11', clock=LATER)['verified']
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, fresh[1:], run_id='new-22', clock=LATER)
+    before = list(db.events)
+    recovered, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+    assert recovered['verified'] and db.events == before
+    assert write(db, fresh[1:], run_id='new-22', clock=LATER)['verified']
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, packet)
+    assert not write_journal.pending_intents({})
+
+
+@pytest.mark.parametrize('rules', [(6, 6), (7, 7), (6, 7), (7, 6)])
+def test_foreign_bundle_requires_one_digest_rule_for_restored_walk(monkeypatch, rules):
+    # Round 10 finding 7
+    db, plan = CoreDB(), _snapshot(CLOCK, 'head')
+    digest, journal_walks = native_writer._page_digest, native_writer._journal_walks
+    def historical_digest(plan, page, rows, *args):
+        return digest(plan, page, rows, rules[plan.pages.index(page)])
+    def unversioned(plans, ids):
+        walks = journal_walks(plans, ids)
+        for walk in walks:
+            del walk['digest_version']
+        return walks
+    with monkeypatch.context() as patch:
+        patch.setattr(native_writer, '_page_digest', historical_digest)
+        patch.setattr(native_writer, '_journal_walks', unversioned)
+        old = write(db, [plan], run_id='historical')
+    key = old['walks'][0]['receipt_id']
+    cells = native_writer._stored_walk(db, key)
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE page_number = 2')
+    cached = _other_cycle(plan, 'another-cycle')
+    if rules[0] == rules[1]:
+        assert write(db, [cached], run_id='later', clock=LATER)['verified']
+        assert native_writer._stored_walk(db, key) == cells
+    else:
+        with pytest.raises(RuntimeError, match='replay differs'):
+            write(db, [cached], run_id='later', clock=LATER)
+        assert native_writer._stored_walk(db, key) == cells[:1]
+        assert _receipt_count(db) == 1
+
+
+def _referee_observation(plan, competition, clock):
+    url = plan.rows[0]['source_url'].replace('/XY1/', '/' + competition + '/')
+    return dataclasses_replace(plan, scope_values=(competition, '2025'), captured_at=clock,
+        rows=tuple({**r, 'competition_id': competition, 'source_url': url, 'observed_at': clock,
+                    'captured_at': clock} for r in plan.rows),
+        evidence=tuple((c, url if c == 'source_url' else v) for c, v in plan.evidence))
+
+
+@pytest.mark.parametrize('evidence', ['receipt', 'queued', 'lost_binding', 'historical_queue'])
+def test_referee_body_is_bound_across_scopes_before_target_dispatch(evidence):
+    # Round 10 finding 8
+    db = CoreDB()
+    first, = _directory_plans('101', 'a' * 64)
+    conflict, = _directory_plans('303', first.capture_id)
+    conflict = _referee_observation(conflict, 'GB1', LATER)
+    key = (first.full_table, first.capture_id)
+    if evidence == 'receipt':
+        write(db, [first])
+        db.sql.execute(f'DELETE FROM {first.table}')
+        # A historical writer left only the warehouse witness.
+        write_journal._record_path('capture-bodies', native_writer._digest(key)).unlink()
+    else:
+        class Queued(CoreWriter):
+            dispatches_journalled_target = True
+            def _write_to_iceberg(self, *args, **kwargs):
+                self.land = lambda: CoreWriter._write_to_iceberg(self, *args, **kwargs)
+                _submit_lost_merge(db)
+        queued = Queued(db)
+        if evidence == 'historical_queue':
+            _historical_single_submit(first, 'run-1', CLOCK, finished=False)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            native_writer.write_core_bundle(lambda: db, queued, [first], run_id='run-1',
+                                            universe_version='core-universe-v1', committed_at=CLOCK)
+        if evidence in ('historical_queue', 'lost_binding'):
+            write_journal._record_path('capture-bodies', native_writer._digest(key)).unlink()
+    rejected = CoreWriter(db)
+    with pytest.raises(RuntimeError, match='replay differs'):
+        native_writer.write_core_bundle(lambda: db, rejected, [conflict], run_id='conflicting',
+                                        universe_version='u', committed_at=LATER)
+    assert not rejected.writes
+    if evidence != 'receipt':
+        queued.land()
+        db.sql.execute("UPDATE test_query_history SET state = 'FINISHED' WHERE query_id = 'q_lost_merge'")
+        assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')[0]['verified']
+    assert write(db, [first])['verified']
+    assert db.sql.execute(f'SELECT DISTINCT source_body_hash FROM {first.table}').fetchall() == [
+        (first.rows[0]['source_body_hash'],)]
+    assert _receipt_count(db) == 1
+
+
+def _squad_observation(entity, clock, capture='squad-body'):
+    fields = {'contract_status': 'ok'} if entity == 'player_contract_observations' else {}
+    row = _contract_row(entity, 'squad', _SQUAD_URL, capture=capture, clock=clock, run='squad',
+                        ingested=LATER, league='GB1', season='2526', club_id='11', player_id='1', **fields)
+    return NativeWritePlan(entity=entity, table=core.CORE_TABLES[entity], ddl=core.core_ddl(entity),
+                           natural_keys=core.CORE_NATURAL_KEYS[entity], scope_columns=core.CORE_SCOPE_COLUMNS[entity],
+                           scope_values=('GB1', '2526', '11'), rows=(row,), captured_at=clock,
+                           write_mode='merge', status_reason='squad_page')
+
+
+def test_accumulating_bundle_verifies_distinct_clocks_and_competitions_together():
+    # Round 10 finding 14
+    db = CoreDB()
+    referee, = _directory_plans('101', 'a' * 64)
+    plans = [referee, _referee_observation(referee, 'XY1', LATER),
+             _referee_observation(referee, 'GB1', LATER)]
+    for entity in ('player_attribute_observations', 'player_contract_observations'):
+        plans.extend(_squad_observation(entity, clock) for clock in (CLOCK, LATER))
+    receipt = write(db, plans)
+    assert len(receipt['plans']) == _receipt_count(db) == 7
+    assert write(db, plans) == receipt
+    conflict = dataclasses_replace(plans[-1], rows=tuple({**row, 'source_body_hash': 'e' * 64}
+                                                         for row in plans[-1].rows))
+    with pytest.raises(ValueError, match='capture evidence'):
+        write(db, [plans[-2], conflict])
+    collision = _squad_observation(plans[-1].entity, LATER, capture='other')
+    with pytest.raises(ValueError, match='natural key'):
+        write(db, [plans[-1], collision])
+
+
+@pytest.mark.parametrize('entity', ['player_attribute_observations', 'player_contract_observations'])
+def test_newest_first_keeps_unseen_squad_observation_keys(entity):
+    # Round 10 finding 15
+    db = CoreDB()
+    newer = _squad_observation(entity, LATER, 'newer')
+    older = _squad_observation(entity, CLOCK, 'older')
+    latest = write(db, [newer], run_id='latest', clock=LATER)
+    historical = write(db, [older], run_id='history', clock=CLOCK)
+    assert write(db, [newer], run_id='latest') == latest
+    assert write(db, [older], run_id='history') == historical
+    assert db.sql.execute(f'SELECT source_capture_id FROM {older.table} ORDER BY observed_at').fetchall() == [
+        ('older',), ('newer',)]
+    with pytest.raises(RuntimeError, match='natural key'):
+        write(db, [_squad_observation(entity, CLOCK, 'collision')])

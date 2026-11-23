@@ -312,6 +312,22 @@ def test_dq_compares_club_scopes_and_capture_bodies_independently():
         'capture_evidence_conflict']
 
 
+def test_squad_adapter_preserves_attribute_and_contract_club_identity():
+    # Round 10 finding 13
+    capture = _load('squad', 3)
+    lanes = []
+    for club_id in ('11', '12'):
+        alias = replace(capture, url=f'https://www.transfermarkt.com/club/kader/verein/{club_id}/saison_id/2026')
+        _, attributes, contracts = core.extract_squad_observations(
+            alias, _scope(club_id=club_id, season='2627', edition_id='2026'),
+            extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        for outcome in (attributes, contracts):
+            assert outcome.status == 'observed_empty'
+            assert core.build_core_dq([outcome, outcome])['errors'] == ['duplicate_outcome']
+        lanes.extend((attributes, contracts))
+    assert core.build_core_dq(lanes)['errors'] == []
+
+
 def test_plan_for_outcome_builds_the_native_write_contract():
     outcomes = _squad_outcomes()
     club_id = outcomes[0].rows[0]['club_id']

@@ -809,6 +809,40 @@ def test_referee_directory_scope_run_writes_one_bundle_per_page():
         'SELECT COUNT(*) FROM transfermarkt_referee_aggregate_observations').fetchone()[0] == 10
 
 
+@pytest.mark.parametrize('case', ['aliases', 'same_competition', 'body_conflict'])
+def test_referee_capture_identity_includes_the_requested_competition(case):
+    # Round 10 finding 13
+    from scrapers.transfermarkt.orchestrator import RefereeDirectoryTarget
+
+    page = _referee_directory_capture()
+    competition_ids = ('XY1', 'XY1' if case == 'same_competition' else 'XY2')
+    plan = CoreScopePlan(
+        league='XY1', season='2526', scope_id='s', cycle_id='c', edition_id='2025',
+        referee_directories=tuple(RefereeDirectoryTarget(cid, '2025', 'example-league')
+                                  for cid in competition_ids),
+    )
+    first, second = planned_urls(plan)
+    replay = _SectionFetch({first: page.body, second: page.body + (b' ' if case == 'body_conflict' else b'')})
+
+    def fetch(url, **kwargs):
+        return _replace(replay.fetch(url, **kwargs), raw_capture_id=page.capture_id)
+
+    run = CoreRun(fetch, extracted_at=REFEREE_EXTRACTED_AT)
+    if case == 'body_conflict':
+        with pytest.raises(CoreRunError, match='^capture_evidence_conflict$'):
+            run.run(plan, writer=object(), connection_factory=lambda: pytest.fail('unexpected connection'))
+    elif case == 'same_competition':
+        assert run.run(plan).dq['errors'] == ['duplicate_natural_key', 'duplicate_outcome']
+    else:
+        db = CoreDB()
+        report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+        assert report.dq['errors'] == []
+        assert len(report.receipts) == 2 and all(receipt['verified'] for receipt in report.receipts)
+        receipts = db.sql.execute('SELECT scope_values_json, source_capture_id FROM transfermarkt_core_receipts_v1')
+        assert {(dict(json.loads(scope))['competition_id'], dict(json.loads(scope))['edition_id'], cid)
+                for scope, cid in receipts} == {(comp, '2025', page.capture_id) for comp in competition_ids}
+
+
 def test_referee_profile_scope_run_writes_the_profile_row():
     class _Fetch:
         def fetch(self, url, *, as_json, label, context=None, validator=None, **kwargs):
@@ -4196,7 +4230,7 @@ def test_r8_unquoted_oversized_agency_preserves_the_sibling_receipt(tmp_path):
     plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
                          representation_player_ids=('7', '9'))
     db = CoreDB()
-    report = CoreRun(fetch, raw_loader=cli._fixture_raw_loader(records), extracted_at=EXTRACTED_AT).run(
+    report = CoreRun(fetch, request_raw_loader=cli._fixture_raw_loader(records), extracted_at=EXTRACTED_AT).run(
         plan, writer=CoreWriter(db), connection_factory=lambda: db)
     failed, assigned = report.outcomes
     assert (failed['status'], failed['status_reason'], failed['rows'], failed['source_capture_id']) == (

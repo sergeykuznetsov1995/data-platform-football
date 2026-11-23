@@ -427,9 +427,9 @@ def _scripted(warehouse):
     manager._create_connection = warehouse.connection  # a reset reaches the same server
 
     def staged(schema, table, df, *args, **kwargs):
-        warehouse.engine.executemany(
-            f'INSERT INTO {table} VALUES ({", ".join("?" for _ in df.columns)})',
-            [tuple(row) for row in df.itertuples(index=False, name=None)])
+        kinds = {row[0]: row[1] for row in warehouse.engine.execute(f'DESCRIBE {table}').fetchall()}
+        columns = ', '.join(f'CAST("{column}" AS {kind})' for column, kind in kinds.items())
+        warehouse.engine.execute(f'INSERT INTO {table} SELECT {columns} FROM df')
         return len(df)
 
     manager.insert_dataframe = staged
@@ -638,3 +638,112 @@ def test_parameterized_insert_keeps_its_dml_id_across_a_lost_poll(monkeypatch, t
         ('q_deallocate', 'FAILED', 'QUERY_QUEUE_FULL'), ('q_insert', 'QUEUED', None)])
     with pytest.raises(RuntimeError, match='still pending'):
         native_writer._settle_statement(history, key, native_writer._digest(('capture',)), lambda: False)
+
+
+@pytest.fixture
+def staged_bundle(monkeypatch, tmp_path):
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'stage-journal'))
+    db = native.CoreDB()
+    old = native.membership_plan(['1'])
+    fresh = native.membership_plan(['2'], clock=native.LATER, capture='next', run='next')
+    native.write(db, [old])
+    warehouse = _TombstoneWarehouse(old.table, [dict(old.rows[0])])
+    warehouse.lost = True
+    manager = _scripted(warehouse)
+    production = writer.TransfermarktIcebergWriter()
+    production._trino_manager = manager
+    monkeypatch.setattr(manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(native.IcebergWriter, '_evolve_schema', lambda *args: None)
+
+    def commit():
+        return native_writer.write_core_bundle(lambda: db, production, [fresh], run_id='next',
+                                                universe_version='u', committed_at=native.LATER)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, production, run_id='next')
+
+    def land(sql):
+        result = warehouse.engine.execute(sql.replace('iceberg.bronze.', '')).fetchall()
+        if sql.startswith('MERGE INTO'):
+            native._copy_warehouse_scope(warehouse, db, fresh)
+        return result
+
+    return warehouse, db, fresh, commit, replay, land
+
+
+def test_fresh_stage_has_no_drop_that_can_land_behind_queued_merge(staged_bundle, monkeypatch):
+    # Round 10 finding 9
+    warehouse, db, plan, commit, replay, land = staged_bundle
+    drops, queued = [], []
+    run = warehouse.run
+    def delay(sql):
+        if sql.startswith('DROP TABLE'):
+            drops.append(sql)
+            return []
+        if sql.startswith('MERGE INTO'):
+            queued.append(sql)
+            raise ConnectionResetError('Connection reset after queued MERGE')
+        return run(sql)
+    with monkeypatch.context() as patch:
+        patch.setattr(warehouse, 'run', delay)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            commit()
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+    assert len(queued) == 1
+    assert drops == []
+    assert len(warehouse.engine.execute('SHOW TABLES').fetchall()) == 2
+    land(queued[0])
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_target_merge', 'FINISHED', NULL)")
+    assert replay()[0]['verified'] and warehouse.players() == ['2']
+    assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
+
+
+@pytest.mark.parametrize('query_history', [True, False])
+def test_late_stage_create_is_dropped_after_its_terminal_result(staged_bundle, monkeypatch, query_history):
+    # Round 10 finding 16
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreCursor
+
+    warehouse, db, plan, commit, replay, land = staged_bundle
+    queued, stages = [], []
+    execute = _TombstoneCursor.execute
+    read = CoreCursor.execute
+    def read_stage(self, sql, params=()):
+        if stages and sql == f'SELECT * FROM {stages[0]} WHERE 1 = 0':
+            if (stages[0].split('.')[-1],) in warehouse.engine.execute('SHOW TABLES').fetchall():
+                return land(sql)
+            raise RuntimeError('TABLE_NOT_FOUND: ' + stages[0])
+        return read(self, sql, params)
+
+    def delay(self, sql, params=None):
+        if sql.startswith('CREATE TABLE ') and '__stg_' in sql:
+            stages.append(sql.split()[2])
+            if not queued:
+                queued.append(sql)
+                if query_history:
+                    self.query_id = 'q_stage_create'
+                    db.sql.execute("INSERT INTO test_query_history VALUES ('q_stage_create', 'QUEUED', NULL)")
+                raise ConnectionResetError('Connection reset after queued CREATE')
+        if sql.startswith('MERGE INTO'):
+            self.sql = sql
+            self.query_id = 'q_target_merge'
+            self.rows = land(sql)
+            return
+        return execute(self, sql, params)
+    with monkeypatch.context() as patch:
+        patch.setattr(_TombstoneCursor, 'execute', delay)
+        patch.setattr(CoreCursor, 'execute', read_stage)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            commit()
+        with pytest.raises(RuntimeError, match='CREATE outcome is still pending'):
+            replay()
+        assert len(set(stages)) == len(stages) == 2
+        assert native_writer.write_journal.pending_intents({'run_id': 'next'})
+        assert warehouse.players() == ['2']
+        land(queued[0])
+        db.sql.execute("UPDATE test_query_history SET state = 'FINISHED' WHERE query_id = 'q_stage_create'")
+        assert replay()[0]['verified']
+    assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
+    assert not native_writer.write_journal.pending_intents({})

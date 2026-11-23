@@ -159,6 +159,9 @@ class CoreScopePlan:
     referee_directories: tuple[RefereeDirectoryTarget, ...] = ()
     referee_profile_ids: tuple[str, ...] = ()
     representation_player_ids: tuple[str, ...] = ()
+    # An inferred edition describes the season. Only an explicit edition
+    # constrains independently dated section targets in a mixed fixture.
+    edition_inferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -189,7 +192,7 @@ class _Request:
     player_id: str = ""
     coach_id: str = ""
     competition_id: str = ""
-    edition_id: str = ""
+    edition_id: str | None = None
     recipient_id: str = ""
     recipient_type: str = ""
     directory_scope: Mapping[str, str] | None = None
@@ -268,9 +271,7 @@ def _base_requests(plan: CoreScopePlan):
                        recipient_type=holder.recipient_type, recipient_id=recipient_id)
 
 
-def _requests(plan: CoreScopePlan):
-    if plan.edition_id and plan.edition_id != str(core.saison_year(plan.season)):
-        raise CoreRunError('season_edition_mismatch')
+def _target_requests(plan: CoreScopePlan):
     for request in _base_requests(plan):
         yield request, None
     for target in plan.rumour_competitions:
@@ -304,13 +305,15 @@ def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
     return tuple(request.url for request, _ in _requests(plan))
 
 
-def _run_requests(plan: CoreScopePlan):
+def _requests(plan: CoreScopePlan):
     """The run's requests: one scope is never replaced twice in a run.
 
     Two replacements of one scope are two verified deletions of each other,
     whichever of them is fetched first.
     """
-    requests = list(_requests(plan))
+    if plan.edition_id and plan.edition_id != str(core.saison_year(plan.season)):
+        raise CoreRunError('season_edition_mismatch')
+    requests = list(_target_requests(plan))
     seen = set()
     for request, _competition in requests:
         if any(core.CORE_WRITE_MODES[entity] == 'replace' for entity in _ENTITIES[request.label]):
@@ -318,12 +321,19 @@ def _run_requests(plan: CoreScopePlan):
             if target in seen:
                 raise CoreRunError(f"{request.label}:duplicate_target")
             seen.add(target)
+    for request, _ in requests:
+        if request.label == 'squad':
+            core._check_scope_against_url('squad_memberships', request.scope_values(plan),
+                                          request.url, request.label)
+        if (plan.edition_id and not plan.edition_inferred and request.edition_id is not None
+                and request.edition_id != plan.edition_id):
+            raise CoreRunError(f'{request.label}_edition_mismatch')
     return requests
 
 
-def _capture(request, result, raw_loader, evidence_by_id):
+def _capture(request, result, raw_loader):
     if raw_loader is not None:
-        body, record = raw_loader(result.raw_capture_id)
+        body, record = raw_loader(result.raw_capture_id, request.url)
         if getattr(record, "endpoint", request.label) != request.label:
             raise CoreRunError(f"{request.label} raw capture endpoint differs")
         if record.content_hash != result.raw_body_hash or record.url != request.url:
@@ -337,17 +347,11 @@ def _capture(request, result, raw_loader, evidence_by_id):
         if hashlib.sha256(body).hexdigest() != result.raw_body_hash:
             raise CoreRunError(f"{request.label} body does not match its hash")
         captured_at = _normalise_ts(result.raw_fetched_at)
-    capture = core.SourceCapture(
+    return core.SourceCapture(
         url=request.url, endpoint=request.label, body=body,
         capture_id=result.raw_capture_id, body_hash=result.raw_body_hash,
         captured_at=captured_at, status_code=result.status_code or 200,
     )
-    # Aliases of one response (a discovery URL and its canonical page) may be
-    # observed at different clocks; only another body is a contradiction.
-    evidence = capture.body_hash
-    if evidence_by_id.setdefault(capture.capture_id, evidence) != evidence:
-        raise CoreRunError('capture_evidence_conflict')
-    return capture
 
 
 def _freshness_clock(outcome):
@@ -414,6 +418,7 @@ def _observations(request, result, plan, extracted_at, universe_version, capture
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
         edition_id=request.edition_id or plan.edition_id or None, player_id=request.player_id or None,
+        competition_id=request.competition_id or None,
         club_id=request.club.club_id if request.club else None,
         club_name=request.club.club_name if request.club else None,
     )
@@ -593,16 +598,23 @@ class _RumourWalk:
 
 
 class CoreRun:
+    """Use an ID-only raw loader or resolve a replay record by (capture ID, request URL)."""
+
     def __init__(
         self,
         fetch: Fetch,
         *,
         raw_loader: Callable[[str], tuple[bytes, Any]] | None = None,
+        request_raw_loader: Callable[[str, str], tuple[bytes, Any]] | None = None,
         universe_version: str = "core-universe-v1",
         extracted_at: str | None = None,
     ):
         self._fetch = fetch
-        self._raw_loader = raw_loader
+        if raw_loader is not None and request_raw_loader is not None:
+            raise ValueError('supply only one raw loader')
+        self._raw_loader = request_raw_loader
+        if raw_loader is not None:
+            self._raw_loader = lambda capture_id, url: raw_loader(capture_id)
         self._universe_version = universe_version
         self._extracted_at = extracted_at
 
@@ -616,9 +628,10 @@ class CoreRun:
         context = {"scope_id": plan.scope_id, "cycle_id": plan.cycle_id}
         outcomes = []
         captured_units = []
-        capture_response = partial(_capture, raw_loader=self._raw_loader, evidence_by_id={})
+        capture_response = partial(_capture, raw_loader=self._raw_loader)
+        hashes_by_capture = {}
         fetched = cache_hits = 0
-        for request, competition in _run_requests(plan):
+        for request, competition in _requests(plan):
             as_json = request.as_json
             page = request
             captures = []
@@ -629,6 +642,11 @@ class CoreRun:
                     page.url, label=request.label, as_json=as_json, context=context,
                     validator=parsing.endpoint_validator(request.label, as_json=as_json),
                 )
+                # Even a transport/schema failure may identify the raw response.
+                # Its captureless lane outcome will no longer carry this evidence.
+                capture_id, body_hash = result.raw_capture_id, result.raw_body_hash
+                if capture_id and body_hash and hashes_by_capture.setdefault(capture_id, body_hash) != body_hash:
+                    raise CoreRunError('capture_evidence_conflict')
                 fetched += 1
                 cache_hits += int(result.cache_hit)
                 if (request.label not in _PAGINATED_ENDPOINTS or result.status is not FetchStatus.OK

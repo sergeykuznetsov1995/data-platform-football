@@ -75,8 +75,10 @@ def _fixture_fetch(records):
         entry = records.get(url)
         if entry is None:
             return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error="fixture_missing")
-        reached.add(url)
         record, blob = entry
+        if record["endpoint"] != label:
+            raise ValueError(f"{label} raw capture endpoint differs")
+        reached.add(url)
         if record["status_code"] != 200:
             return FetchOutcome(
                 status=FetchStatus.RETRY_EXHAUSTED, error=f"http_{record['status_code']}",
@@ -107,11 +109,10 @@ def _fixture_fetch(records):
 
 
 def _fixture_raw_loader(records):
-    by_capture = {record["capture_id"]: entry for entry in records.values()
-                  for record in (entry[0],)}
-
-    def load(capture_id):
-        record, blob = by_capture[capture_id]
+    def load(capture_id, url):
+        record, blob = records[url]
+        if record["capture_id"] != capture_id:
+            raise ValueError(f"Capture ID mismatch for {url}")
         return gzip.decompress(blob.read_bytes()), _RawRecord(record)
 
     return load
@@ -181,7 +182,7 @@ def _live_plan(args):
     )
     return CoreScopePlan(
         league=args.league, season=args.season, scope_id=args.scope_id, cycle_id=args.cycle_id,
-        edition_id=args.edition_id or str(year), clubs=clubs,
+        edition_id=args.edition_id or str(year), edition_inferred=args.edition_id is None, clubs=clubs,
         market_value_player_ids=tuple(args.player),
         transfer_player_ids=tuple(args.player),
         coach_profile_ids=tuple(map(_coach_parts, args.coach)),
@@ -268,7 +269,7 @@ def _offline_plan(args, records):
     return CoreScopePlan(
         league=args.league, season=season,
         scope_id=args.scope_id or first["scope_id"], cycle_id=args.cycle_id or first["cycle_id"],
-        edition_id=str(edition),
+        edition_id=str(edition), edition_inferred=args.edition_id is None,
         clubs=tuple(ClubTarget(club_id=key, **value) for key, value in clubs.items()),
         market_value_player_ids=tuple(sorted(set(mv_players))),
         transfer_player_ids=tuple(sorted(set(transfer_players))),
@@ -319,27 +320,26 @@ def main(argv=None):
     from scrapers.transfermarkt.orchestrator import CoreRun, CoreRunError, planned_urls
 
     try:
+        if args.edition_id == "":
+            raise ValueError("season_edition_mismatch")
         records = _load_records(args.fixtures_root) if args.mode == "offline" else None
         plan = _offline_plan(args, records) if records is not None else _live_plan(args)
-        if args.edition_id is not None and any(
-            str(target.saison_year) != args.edition_id for target in plan.attendance_editions
-        ):
-            raise ValueError("attendance_edition_mismatch")
+        urls = planned_urls(plan)
         if records is not None:
-            missing = [url for url in planned_urls(plan) if url not in records]
+            missing = [url for url in urls if url not in records]
             if missing:
                 raise ValueError("Missing planned fixture: " + ", ".join(missing))
             fetch = _fixture_fetch(records)
-            raw_loader = _fixture_raw_loader(records)
+            run = CoreRun(fetch, request_raw_loader=_fixture_raw_loader(records))
         else:
             from scrapers.transfermarkt.client import TransfermarktHttpClient
 
             client = TransfermarktHttpClient()
-            fetch = client.fetch
             raw_loader = getattr(client, "_raw_store", None)
             raw_loader = raw_loader.load_capture if raw_loader is not None else None
+            run = CoreRun(client.fetch, raw_loader=raw_loader)
         write_args = _write_options(args) if args.write else {}
-        report = CoreRun(fetch, raw_loader=raw_loader).run(plan, **write_args)
+        report = run.run(plan, **write_args)
         _report(report, plan, args.report_out)
         if args.mode == "offline":
             # A record of a section the core replay plans for that the run

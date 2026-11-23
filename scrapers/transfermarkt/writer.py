@@ -10,7 +10,7 @@ shared Airflow logs volume).
 from __future__ import annotations
 
 import time  # noqa: F401 — donor tests patch the shared time module through here
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from uuid import uuid4
 
 from scrapers.base import trino_manager as base_trino
@@ -24,6 +24,7 @@ from scrapers.transfermarkt.native_writer import (  # noqa: F401 — donor facad
     TrinoConnection,
     _LOCAL,
     _MUTATION,
+    _definite_rejection,
     _execute_committing,
     _execute_once,
     _target_dispatch,
@@ -40,6 +41,18 @@ CAREER_TABLES = frozenset({
     'transfermarkt_market_value_points', 'transfermarkt_transfer_events',
     'transfermarkt_market_value_history', 'transfermarkt_transfers',
 })
+
+
+@contextmanager
+def _stage_create(stage):
+    statement = write_journal.begin_statement(('stage-create', stage), {'single_submit': stage})
+    try:
+        yield statement
+    except Exception as exc:
+        if _definite_rejection(exc):
+            write_journal.finish_statement(statement)
+        raise
+    write_journal.finish_statement(statement)
 
 
 class TransfermarktTrinoManager(TrinoTableManager):
@@ -102,6 +115,14 @@ class TransfermarktTrinoManager(TrinoTableManager):
             return parent(sql, fetch=fetch, params=params)
         if write_is_journalled():
             verb = mutation[1].upper()
+            stage = getattr(_LOCAL, 'fresh_stage', None)
+            if stage and sql == 'DROP TABLE IF EXISTS ' + stage:
+                # The shared helper clears caller-supplied stable names. This
+                # name was allocated for a single attempt and has no predecessor.
+                return
+            if stage and sql.startswith('CREATE TABLE ' + stage + ' AS '):
+                _LOCAL.fresh_stage = None
+                return self._execute_target(sql, params, dispatch=_stage_create(stage))
             if verb == 'INSERT':
                 # Includes every VALUES batch and the replacement tombstones.
                 return parent(sql, fetch=fetch, params=params, replay_safe=False)
@@ -111,11 +132,11 @@ class TransfermarktTrinoManager(TrinoTableManager):
             return parent(sql, fetch=fetch, params=params, replay_safe=False)
         return _execute_committing(lambda: parent(sql, fetch=fetch, params=params))
 
-    def _execute_target(self, sql, params):
+    def _execute_target(self, sql, params, *, dispatch=None):
         with self._conn_lock:
             cursor = self.connection.cursor()
             try:
-                with _target_dispatch() as statement:
+                with (dispatch if dispatch is not None else _target_dispatch()) as statement:
                     try:
                         _execute_once(cursor, sql, params, statement)
                     except Exception as exc:
@@ -146,6 +167,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         with writer_lock():
             stage_record = None
+            previous_stage = getattr(_LOCAL, 'fresh_stage', None)
             if write_is_journalled():
                 kwargs.pop('staging_id', None)  # a delayed insert belongs only to its original stage
                 target = getattr(_LOCAL, 'target', None)
@@ -157,11 +179,15 @@ class TransfermarktTrinoManager(TrinoTableManager):
                     stage = table + '__stg_' + suffix
                     stage_record = write_journal.stage_record(receipt_id, stage)
                     write_journal._immutable_record(stage_record, {
-                        'receipt_id': receipt_id, 'table': scope[0], 'stage': stage})
+                        'receipt_id': receipt_id, 'table': scope[0], 'stage': stage, 'fenced_create': True})
                     kwargs['staging_id'] = suffix
             if kwargs.get('delete_filter'):
                 kwargs['single_statement_replace'] = True
-            count = super().insert_dataframe_atomic(schema, table, df, **kwargs)
+            try:
+                _LOCAL.fresh_stage = f'{self.catalog}.{schema}.{stage}' if stage_record else None
+                count = super().insert_dataframe_atomic(schema, table, df, **kwargs)
+            finally:
+                _LOCAL.fresh_stage = previous_stage
             if stage_record is not None:
                 write_journal.forget_stage(stage_record)
             return count
