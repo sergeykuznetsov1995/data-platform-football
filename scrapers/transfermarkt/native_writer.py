@@ -477,8 +477,8 @@ class NativeWritePlan:
         seen = set()
         pages = {}
         column_types = {}
-        timestamps = [column for column, kind in _ddl_columns(self.ddl).items()
-                      if kind.startswith('timestamp')]
+        declared = _ddl_columns(self.ddl)
+        timestamps = [column for column, kind in declared.items() if kind.startswith('timestamp')]
         for row in self.rows:
             if not isinstance(row, dict):
                 raise ValueError('core plan row must be a dict')
@@ -505,6 +505,10 @@ class NativeWritePlan:
                         else 'int' if isinstance(value, int) else 'str')
                 if kind and column_types.setdefault(column, kind) != kind:
                     raise ValueError(f'core plan column mixes value types: {column}')
+            for column, value in row.items():
+                if (value is not None and column in declared
+                        and not _value_has_type(declared[column], value)):
+                    raise ValueError(f'core plan value does not match its column type: {column}')
             if any(row[col] in ('', None) for col in required):
                 raise ValueError('core plan row has empty lineage, key or capture columns')
             if any(str(row[col]) != str(value) for col, value in zip(self.scope_columns, self.scope_values)):
@@ -792,6 +796,23 @@ def _guard_source_pages(connection, plan: NativeWritePlan, manifest=()) -> None:
     for url, clock in [*committed, *accepted]:
         if url in planned and _timestamp(clock) > planned[url]:
             raise StaleTransfermarktWrite('newer capture already committed to ' + plan.table)
+
+
+def _value_has_type(kind: str, value) -> bool:
+    """Whether a row value has the Python form of its declared SQL column.
+
+    A plan carries text, integers, booleans or null. The engine would store
+    something else than the plan states for any other combination: text in
+    a numeric column is cast on the way in and reads back as a number.
+    """
+    if kind.startswith(('bigint', 'integer', 'smallint', 'tinyint')):
+        return type(value) is int
+    if kind.startswith('boolean'):
+        return type(value) is bool
+    if kind.startswith(('double', 'real', 'decimal', 'float')):
+        # Exact decimal text is kept in a varchar column instead.
+        return False
+    return isinstance(value, str)
 
 
 def _canonical_clock(value) -> str | None:
