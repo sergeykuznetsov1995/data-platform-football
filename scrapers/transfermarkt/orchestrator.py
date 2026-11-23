@@ -425,11 +425,11 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
             **metadata)
         return tuple(unit), max(capture.captured_at for capture in captures)
     if request.label == "attendance":
-        outcome = sections.extract_attendance_observations(
+        unit = sections.extract_attendance_observations(
             captures, scope, start_url=request.url, competition_id=request.competition_id,
             edition_id=request.edition_id, **metadata,
         )
-        return (outcome,), max(page.captured_at for page in captures)
+        return unit, max(page.captured_at for page in captures)
 
     capture = _capture(request, result, raw_loader)
     if request.label == "squad":

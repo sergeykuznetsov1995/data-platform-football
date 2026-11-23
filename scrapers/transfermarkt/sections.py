@@ -74,7 +74,9 @@ def _attendance_walk(captures, start_url: str, *, competition_id: str, edition_i
     parts = urlsplit(start_url)
     if parts.netloc != core.TRANSFERMARKT_HOST:
         return 'pagination_identity_invalid'
-    if parse_qs(parts.query).get('page', ['1']) != ['1']:
+    # The donor reads the page number as a number: ?page=01 is its page 1.
+    page = parse_qs(parts.query).get('page', ['1'])
+    if len(page) != 1 or not page[0].isdigit() or int(page[0]) != 1:
         return 'pagination_start_not_first_page'
 
     def validate(url):
@@ -102,14 +104,15 @@ def extract_attendance_observations(
     captures: Sequence[core.SourceCapture], scope: core.ScopeContext, *, start_url: str,
     competition_id: str, edition_id: str, extracted_at: str, universe_version: str,
     final_season: bool = False, final_season_proof: str | None = None,
-) -> core.LaneOutcome:
+) -> tuple[core.LaneOutcome, ...]:
+    """Observe one edition walk; the answer is one outcome, on every path."""
     entity = 'attendance_observations'
     if not captures or any(capture.endpoint != 'attendance' for capture in captures):
         raise core.CoreParseError('attendance:invalid_captures')
     failed = next((c for c in captures if c.status_code != 200), None)
     if failed is not None:
-        return _unavailable_capture('attendance', 'attendance_observations', failed, scope,
-                                    extracted_at, universe_version)
+        return (_unavailable_capture('attendance', 'attendance_observations', failed, scope,
+                                     extracted_at, universe_version),)
     if not isinstance(final_season, bool):
         raise core.CoreParseError('attendance:final_season_invalid')
     if final_season and not core._nonempty(final_season_proof):
@@ -121,7 +124,7 @@ def extract_attendance_observations(
     if walk is not None:
         # A terminal page offered as the start, or captures the walk never
         # visits, must not become a replacement of the whole edition.
-        return _outcome(entity, 'error', 'attendance:' + walk, **context)
+        return (_outcome(entity, 'error', 'attendance:' + walk, **context),)
     try:
         pages = [
             attendance.AttendancePage(
@@ -136,9 +139,9 @@ def extract_attendance_observations(
             pages, start_url=start_url, competition_id=competition_id, edition_id=edition_id,
         )
     except attendance.AttendanceParseError as exc:
-        return _outcome(entity, 'error', 'attendance:' + exc.reason, **context)
+        return (_outcome(entity, 'error', 'attendance:' + exc.reason, **context),)
     except (ValueError, OverflowError):
-        return _outcome(entity, 'error', 'attendance:invalid_source_data', **context)
+        return (_outcome(entity, 'error', 'attendance:invalid_source_data', **context),)
 
     newest = max(captures, key=lambda capture: (capture.captured_at, capture.capture_id))
     context['capture'] = newest
@@ -165,8 +168,8 @@ def extract_attendance_observations(
         except core.CoreParseError as exc:
             # A source value the row cannot hold is this section's error,
             # backed by the page that carries it: the run goes on.
-            return _outcome(entity, 'error', 'attendance:' + exc.reason,
-                            **core._context(row_capture, scope, extracted_at, universe_version))
+            return (_outcome(entity, 'error', 'attendance:' + exc.reason,
+                             **core._context(row_capture, scope, extracted_at, universe_version)),)
     if rows:
         # The outcome's capture is the newest page that CONTRIBUTED a row: a
         # newer but rowless trailing page must not shift the plan's clock.
@@ -178,7 +181,7 @@ def extract_attendance_observations(
     pages = tuple(
         (capture.url, capture.capture_id, capture.captured_at, capture.body_hash)
         for capture in captures)
-    return _outcome(entity, result.status, reason, tuple(rows), pages=pages, **context)
+    return (_outcome(entity, result.status, reason, tuple(rows), pages=pages, **context),)
 
 
 def extract_representation_observations(
@@ -359,24 +362,25 @@ def extract_referee_directory_observations(
 def extract_referee_profile_observations(
     capture: core.SourceCapture, scope: core.ScopeContext, *, referee_id: str,
     extracted_at: str, universe_version: str,
-) -> core.LaneOutcome:
+) -> tuple[core.LaneOutcome, ...]:
+    """Observe one referee profile; the answer is one outcome, on every path."""
     entity = 'referee_profiles'
     if capture.endpoint != 'referee_profile':
         raise core.CoreParseError('referees:invalid_endpoint')
     if capture.status_code != 200:
-        return _unavailable_capture('referees', 'referee_profiles', capture, scope,
-                                    extracted_at, universe_version)
+        return (_unavailable_capture('referees', 'referee_profiles', capture, scope,
+                                     extracted_at, universe_version),)
     context = core._context(capture, scope, extracted_at, universe_version)
     try:
         core._check_scope_against_capture(entity, {'referee_id': referee_id}, capture)
     except core.CoreParseError as exc:
-        return _outcome(entity, 'error', 'referees:' + exc.reason, **context)
+        return (_outcome(entity, 'error', 'referees:' + exc.reason, **context),)
     try:
         profile = referees.parse_referee_profile(capture.text, referee_id=referee_id)
     except referees.RefereeParseError as exc:
-        return _outcome(entity, 'error', 'referees:' + exc.reason, **context)
+        return (_outcome(entity, 'error', 'referees:' + exc.reason, **context),)
     except UnicodeDecodeError:
-        return _outcome(entity, 'error', 'referees:invalid_utf8', **context)
+        return (_outcome(entity, 'error', 'referees:invalid_utf8', **context),)
 
     reason = 'referees:profile'
     values = profile.as_dict()
@@ -386,7 +390,22 @@ def extract_referee_profile_observations(
         parser_revision=referees.REFEREE_PARSER_REVISION, schema_revision=referees.REFEREE_SCHEMA_REVISION,
         **context,
     )
-    return _outcome(entity, 'observed_present', reason, (row,), **context)
+    return (_outcome(entity, 'observed_present', reason, (row,), **context),)
+
+
+def _body_marker_row(table) -> bool:
+    """The donor's "no entries" row: the body's only row, one marked cell.
+
+    A marked cell anywhere else, a header cell included, is not that row.
+    """
+    body = table.find('tbody', recursive=False)
+    if body is None:
+        return False
+    rows = body.find_all('tr', recursive=False)
+    if len(rows) != 1:
+        return False
+    cells = rows[0].find_all('td', recursive=False)
+    return len(cells) == 1 and 'no-entries' in cells[0].get('class', [])
 
 
 def extract_rumour_observations(
@@ -417,30 +436,34 @@ def extract_rumour_observations(
         # the pages it did fetch are not the feed. The page that broke it,
         # when there is one, backs the error.
         return (_outcome(entity, 'error', 'rumours:' + failure, **context),)
+    # The page being read backs an error: the newest page of the feed is
+    # not necessarily the one that could not be parsed.
+    current = newest
     try:
         # The supplied pages must form the complete plan their pagers evidence
         # before any page of the feed is interpreted.
-        paginations = tuple(
-            rumours.parse_rumour_pagination(
-                capture.text, competition=competition, page_url=capture.url)
-            for capture in captures)
+        paginations = []
+        for current in captures:
+            paginations.append(rumours.parse_rumour_pagination(
+                current.text, competition=competition, page_url=current.url))
         if [capture.url for capture in captures] != list(rumours.build_rumour_page_plan(paginations)):
             raise rumours.RumourParseError('incomplete_page_plan')
-        pages = tuple(
-            rumour_observations.extract_rumour_page(
-                capture.body, competition=competition, page_number=number,
-                source_page_url=capture.url, raw_capture_id=capture.capture_id,
-                source_body_hash=capture.body_hash, captured_at=capture.captured_at,
+        pages = []
+        for number, current in enumerate(captures, 1):
+            pages.append(rumour_observations.extract_rumour_page(
+                current.body, competition=competition, page_number=number,
+                source_page_url=current.url, raw_capture_id=current.capture_id,
+                source_body_hash=current.body_hash, captured_at=current.captured_at,
                 extracted_at=extracted_at, scope_id=scope.scope_id, run_id=context['run_id'],
                 cycle_id=scope.cycle_id, universe_version=universe_version,
-            )
-            for number, capture in enumerate(captures, 1)
-        )
+            ))
         feed = rumour_observations.RumourFeedExtraction(pages)
     except rumours.RumourParseError as exc:
-        return (_outcome(entity, 'error', 'rumours:' + exc.reason, **context),)
+        failed = core._context(current, scope, extracted_at, universe_version)
+        return (_outcome(entity, 'error', 'rumours:' + exc.reason, **failed),)
     except ValueError:
-        return (_outcome(entity, 'error', 'rumours:invalid_source_data', **context),)
+        failed = core._context(current, scope, extracted_at, universe_version)
+        return (_outcome(entity, 'error', 'rumours:invalid_source_data', **failed),)
 
     outcomes = []
     # The feed sorts its pages by page number, which is the capture position.
@@ -452,9 +475,9 @@ def extract_rumour_observations(
             if rumours._confirmed_empty_grid(soup):
                 proof, reason = 'rumours:confirmed_empty_grid', 'rumours:empty_grid'
             else:
-                # Only the rumour table itself can carry the donor's marker.
+                # Only the rumour table's body can carry the donor's marker row.
                 table = rumours._rumour_table(soup)
-                proof = reason = ('rumours:no_entries_row' if table.select('td.no-entries')
+                proof = reason = ('rumours:no_entries_row' if _body_marker_row(table)
                                   else 'rumours:empty_table_body')
             outcomes.append(_outcome(entity, 'observed_empty', reason, proof=proof, **page_context))
             continue
@@ -530,13 +553,14 @@ def extract_club_value_observations(
 def extract_achievement_observations(
     capture: core.SourceCapture, scope: core.ScopeContext, *, recipient_type: str, recipient_id: str,
     extracted_at: str, universe_version: str,
-) -> core.LaneOutcome:
+) -> tuple[core.LaneOutcome, ...]:
+    """Observe one holder's achievements; the answer is one outcome, on every path."""
     entity = 'achievement_observations'
     if capture.endpoint != f'{recipient_type}_achievement':
         raise core.CoreParseError('achievements:invalid_endpoint')
     if capture.status_code != 200:
-        return _unavailable_capture('achievements', 'achievement_observations', capture, scope,
-                                    extracted_at, universe_version)
+        return (_unavailable_capture('achievements', 'achievement_observations', capture, scope,
+                                     extracted_at, universe_version),)
     core._check_scope_against_capture(
         entity, {'recipient_type': recipient_type, 'recipient_id': recipient_id}, capture,
     )
@@ -545,17 +569,17 @@ def extract_achievement_observations(
         source = capture.text if recipient_type == 'coach' else json.loads(capture.text)
     except (ValueError, RecursionError):
         reason = 'achievements:invalid_utf8' if recipient_type == 'coach' else 'achievements:invalid_json'
-        return _outcome(entity, 'error', reason, **context)
+        return (_outcome(entity, 'error', reason, **context),)
     try:
         result = achievements.parse_achievements(source, recipient_type=recipient_type, recipient_id=recipient_id)
     except achievements.AchievementParseError as exc:
-        return _outcome(entity, 'error', 'achievements:' + exc.reason, **context)
+        return (_outcome(entity, 'error', 'achievements:' + exc.reason, **context),)
     except (ParserRejectedMarkup, ValueError, RecursionError):
-        return _outcome(entity, 'error', 'achievements:invalid_source_data', **context)
+        return (_outcome(entity, 'error', 'achievements:invalid_source_data', **context),)
 
     if result.status == 'observed_empty':
-        return _outcome(entity, result.status, 'achievements:empty_collection',
-                                proof=f'achievements:empty_collection:{recipient_type}', **context)
+        return (_outcome(entity, result.status, 'achievements:empty_collection',
+                         proof=f'achievements:empty_collection:{recipient_type}', **context),)
 
     reason = 'achievements:row'
     rows = []
@@ -568,4 +592,4 @@ def extract_achievement_observations(
             parser_revision=achievements.ACHIEVEMENT_PARSER_REVISION,
             schema_revision=str(achievements.ACHIEVEMENT_SCHEMA_REVISION), **context,
         ))
-    return _outcome(entity, result.status, reason, tuple(rows), **context)
+    return (_outcome(entity, result.status, reason, tuple(rows), **context),)

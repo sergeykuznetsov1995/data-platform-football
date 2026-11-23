@@ -99,7 +99,7 @@ def test_core_registries_cover_the_section_entities():
 def test_attendance_lane_maps_recorded_pages_to_observation_rows():
     page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (page_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START,
         competition_id='GB1', edition_id='2025', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE,
@@ -132,7 +132,7 @@ def test_attendance_lane_maps_recorded_pages_to_observation_rows():
 
 def test_attendance_lane_reports_unproven_empty_as_unknown_without_rows():
     empty = _attendance_capture('empty.html', ATTENDANCE_START, PAGE_1_CAPTURED)
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (empty,), _attendance_scope(), start_url=ATTENDANCE_START,
         competition_id='GB1', edition_id='2025', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE,
@@ -150,7 +150,7 @@ def test_attendance_lane_maps_parse_failure_to_error():
         body_hash=hashlib.sha256(b'<html>not a listing</html>').hexdigest(),
         captured_at=PAGE_1_CAPTURED,
     )
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (broken,), _attendance_scope(), start_url=ATTENDANCE_START,
         competition_id='GB1', edition_id='2025', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE,
@@ -229,7 +229,7 @@ def test_lane_outcome_row_status_policy_for_section_entities():
 def test_native_plan_allows_multi_capture_replace_but_not_merge():
     page_1 = _attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED)
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (page_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START,
         competition_id='GB1', edition_id='2025', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE,
@@ -407,7 +407,7 @@ def _achievement_scope() -> ScopeContext:
 
 
 def test_achievement_lane_maps_tmapi_packet_rows():
-    outcome = sections.extract_achievement_observations(
+    outcome, = sections.extract_achievement_observations(
         _achievement_capture(ACHIEVEMENTS_PACKET), _achievement_scope(),
         recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE,
@@ -430,7 +430,7 @@ def test_achievement_lane_maps_tmapi_packet_rows():
 
 
 def test_achievement_lane_marks_empty_collection_with_proof():
-    outcome = sections.extract_achievement_observations(
+    outcome, = sections.extract_achievement_observations(
         _achievement_capture(ACHIEVEMENTS_EMPTY), _achievement_scope(),
         recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE,
@@ -447,7 +447,7 @@ def test_achievement_lane_maps_broken_packet_to_error():
         body_hash=hashlib.sha256(b'{"success": false}').hexdigest(),
         captured_at=CLUB_CAPTURED,
     )
-    outcome = sections.extract_achievement_observations(
+    outcome, = sections.extract_achievement_observations(
         broken, _achievement_scope(), recipient_type='player', recipient_id='7',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
     )
@@ -764,7 +764,7 @@ def test_referee_directory_lane_maps_aggregates_per_page():
 
 
 def test_referee_profile_lane_maps_identity_fields():
-    outcome = sections.extract_referee_profile_observations(
+    outcome, = sections.extract_referee_profile_observations(
         _referee_profile_capture(), _referee_scope(), referee_id='101',
         extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE,
     )
@@ -986,7 +986,7 @@ def test_achievement_adapter_treats_http_failure_as_unavailable():
         url=ACHIEVEMENTS_URL, endpoint='player_achievement', body=body,
         capture_id=digest, body_hash=digest, captured_at=CLUB_CAPTURED, status_code=404,
     )
-    outcome = sections.extract_achievement_observations(
+    outcome, = sections.extract_achievement_observations(
         failed, _achievement_scope(), recipient_type='player', recipient_id='7',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE,
     )
@@ -1002,7 +1002,7 @@ LATER_EXTRACTED_AT = '2026-11-20T13:00:00.000000+00:00'
 
 
 def _attendance_plan(captures, extracted_at=EXTRACTED_AT):
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
     # The plan clock is the snapshot's freshness: its newest walked page.
@@ -1176,7 +1176,7 @@ def test_populated_squad_page_keeps_its_contract_cell_exception():
 
 def test_empty_outcomes_carry_their_section_revisions_into_receipts():
     from scrapers.transfermarkt import achievements
-    outcome = sections.extract_achievement_observations(
+    outcome, = sections.extract_achievement_observations(
         _achievement_capture(ACHIEVEMENTS_EMPTY), _achievement_scope(),
         recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE)
@@ -1198,7 +1198,7 @@ def test_empty_outcomes_carry_their_section_revisions_into_receipts():
 
 def test_populated_outcome_names_the_revision_of_its_rows():
     from scrapers.transfermarkt import attendance
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),),
         _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
@@ -1970,7 +1970,7 @@ def test_unparsable_referee_next_link_is_contained():
         'referees:pagination_link_invalid', page_1.capture_id)
     assert sections.extract_referee_profile_observations(
         _referee_profile_capture(), _referee_scope(), referee_id='101',
-        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE).status == 'observed_present'
+        extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)[0].status == 'observed_present'
 
 
 def test_attendance_scope_check_follows_the_donor_page_identity():
@@ -2056,7 +2056,7 @@ def test_revisions_are_rechecked_when_rows_change_after_construction():
     # Round 2 finding 16: the frozen outcome holds mutable row dictionaries.
     pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
              _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert core.build_core_dq([outcome])['passed'] is True
@@ -2075,7 +2075,7 @@ def test_first_write_refuses_a_table_of_another_schema_before_mutation():
     db = CoreDB()
     db.sql.execute(f'CREATE TABLE transfermarkt_referee_profiles ({donor_columns})')
     db.sql.execute("INSERT INTO transfermarkt_referee_profiles (referee_id, name) VALUES ('999', 'Old Row')")
-    profile = sections.extract_referee_profile_observations(
+    profile, = sections.extract_referee_profile_observations(
         _referee_profile_capture(), _referee_scope(), referee_id='101',
         extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
     plan = core.plan_for_outcome(profile, captured_at=REFEREE_CAPTURED, scope_values={'referee_id': '101'})
@@ -2154,7 +2154,7 @@ def test_reused_page_cannot_lose_its_rows_silently():
 
 def test_rowless_plan_cannot_invent_its_capture_clock():
     # Round 3 finding 13: a rowless plan's clock is its capture's clock.
-    outcome = sections.extract_achievement_observations(
+    outcome, = sections.extract_achievement_observations(
         _achievement_capture(ACHIEVEMENTS_EMPTY), _achievement_scope(),
         recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
         universe_version=UNIVERSE)
@@ -2269,7 +2269,7 @@ def test_plan_freezes_rows_and_rechecks_row_verdicts():
     # Round 3 finding 11: the outcome holds mutable rows.
     pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
              _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     for row in outcome.rows:
@@ -2279,7 +2279,7 @@ def test_plan_freezes_rows_and_rechecks_row_verdicts():
                               scope_values={'competition_id': 'GB1', 'edition_id': '2025'})
     # A plan keeps the rows it validated.
     frozen = _attendance_plan(pages)
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     plan = core.plan_for_outcome(outcome, captured_at=PAGE_2_CAPTURED,
@@ -2300,7 +2300,7 @@ def test_unrepresentable_count_never_reaches_mutation():
     newer_1 = _page(ATTENDANCE_START, overflow, NEWER_PAGE_CAPTURED, 'overflow')
     # Round 4 finding 15: the adapter names the value the row cannot hold
     # instead of raising, so no plan is built from it.
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (newer_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=LATER_EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, outcome.status_reason, outcome.rows) == (
@@ -2341,9 +2341,10 @@ def test_edition_replacement_needs_the_whole_walk_from_its_first_page():
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
 
     def extract(captures, start_url):
-        return sections.extract_attendance_observations(
+        outcome, = sections.extract_attendance_observations(
             captures, _attendance_scope(), start_url=start_url, competition_id='GB1',
             edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        return outcome
 
     outcome = extract((page_2,), ATTENDANCE_PAGE_2)
     assert (outcome.status, outcome.status_reason, outcome.rows) == (
@@ -2395,7 +2396,7 @@ def test_section_captures_must_come_from_transfermarkt():
     elsewhere = 'https://example.invalid'
     profile = _replace(_referee_profile_capture(), url=REFEREE_PROFILE_URL.replace(
         'https://www.transfermarkt.com', elsewhere))
-    outcome = sections.extract_referee_profile_observations(
+    outcome, = sections.extract_referee_profile_observations(
         profile, _referee_scope(), referee_id='101', extracted_at=REFEREE_EXTRACTED_AT,
         universe_version=UNIVERSE)
     assert (outcome.status, outcome.rows) == ('error', ())
@@ -2409,7 +2410,7 @@ def test_section_captures_must_come_from_transfermarkt():
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
     moved = tuple(_replace(page, url=page.url.replace('https://www.transfermarkt.com', elsewhere))
                   for page in (page_1, page_2))
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         moved, _attendance_scope(), start_url=moved[0].url, competition_id='GB1', edition_id='2025',
         extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, outcome.rows) == ('error', ())
@@ -2518,7 +2519,7 @@ def _scalar_adapter(lane, failed):
     body = b'<html></html>'
     if lane == 'attendance':
         capture = _capture(ATTENDANCE_START, body if failed else (
-            ATTENDANCE_FIXTURES / 'page_1.html').read_bytes(), PAGE_1_CAPTURED)
+            ATTENDANCE_FIXTURES / 'single_page.html').read_bytes(), PAGE_1_CAPTURED)
         return sections.extract_attendance_observations(
             (_replace(capture, status_code=404) if failed else capture,), _attendance_scope(),
             start_url=ATTENDANCE_START, competition_id='GB1', edition_id='2025',
@@ -2530,7 +2531,7 @@ def _scalar_adapter(lane, failed):
         return sections.extract_referee_profile_observations(
             _replace(capture, status_code=404) if failed else capture, _referee_scope(),
             referee_id='101', extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
-    capture = _achievement_capture(b'<html></html>' if failed else ACHIEVEMENTS_PACKET)
+    capture = _achievement_capture(ACHIEVEMENTS_EMPTY if failed else ACHIEVEMENTS_PACKET)
     return sections.extract_achievement_observations(
         _replace(capture, status_code=404) if failed else capture, _achievement_scope(),
         recipient_type='player', recipient_id='7', extracted_at=EXTRACTED_AT,
@@ -2576,7 +2577,7 @@ def test_row_lineage_must_match_its_own_page():
     # evidence used to pass DQ and land in a verified receipt.
     pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
              _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     arsenal = next(row for row in outcome.rows if row['club_id'] == '11')
@@ -2598,9 +2599,10 @@ def test_edition_replacement_requires_the_whole_page_manifest():
     scope_values = {'competition_id': 'GB1', 'edition_id': '2025'}
 
     def extract(captures):
-        return sections.extract_attendance_observations(
+        outcome, = sections.extract_attendance_observations(
             captures, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
             edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        return outcome
 
     outcome = extract((page_1, page_2))
 
@@ -2638,7 +2640,7 @@ def test_rowless_replacement_cannot_erase_a_capture_committed_with_rows():
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
     db = CoreDB()
     _bundle(db, [_attendance_plan((page_1, page_2))], EXTRACTED_AT)
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (page_1, page_2), _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=LATER_EXTRACTED_AT, universe_version=UNIVERSE)
     rowless = _replace(outcome, status='observed_empty', status_reason='attendance:empty',
@@ -2785,7 +2787,7 @@ def test_wholly_rowless_snapshot_is_proven_by_its_manifest():
     def proven_empty(clocks, extracted_at):
         pages = (_page(ATTENDANCE_START, ROWLESS_PAGE_1, clocks[0], 'empty 1'),
                  _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, clocks[1], 'empty 2'))
-        outcome = sections.extract_attendance_observations(
+        outcome, = sections.extract_attendance_observations(
             pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
             edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
         plan = core.plan_for_outcome(
@@ -2876,7 +2878,7 @@ def test_plan_rows_carry_exactly_the_entity_columns():
     # read-back noticed, after the replacement.
     pages = (_attendance_capture('page_1.html', ATTENDANCE_START, PAGE_1_CAPTURED),
              _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED))
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
         edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert all(row['capacity'] is not None for row in outcome.rows)
@@ -2899,7 +2901,7 @@ def test_plan_rows_carry_exactly_the_entity_columns():
 def test_a_populated_page_verdict_cannot_be_an_absence():
     # Round 4 finding 14: a populated referee profile and its row were both
     # marked explicit_none and still passed DQ and write verification.
-    profile = sections.extract_referee_profile_observations(
+    profile, = sections.extract_referee_profile_observations(
         _referee_profile_capture(), _referee_scope(), referee_id='101',
         extracted_at=REFEREE_EXTRACTED_AT, universe_version=UNIVERSE)
     assert core.build_core_dq([profile])['passed'] is True
@@ -2994,7 +2996,7 @@ def test_referee_and_coach_sources_are_checked_by_their_full_origin():
     # capture served from another port of it received a verified receipt.
     elsewhere = _replace(_referee_profile_capture(),
                          url=REFEREE_PROFILE_URL.replace('.com/', '.com:444/'))
-    outcome = sections.extract_referee_profile_observations(
+    outcome, = sections.extract_referee_profile_observations(
         elsewhere, _referee_scope(), referee_id='101', extracted_at=REFEREE_EXTRACTED_AT,
         universe_version=UNIVERSE)
     assert (outcome.status, outcome.status_reason, outcome.rows) == (
@@ -3053,8 +3055,7 @@ def test_empty_rumour_proof_ignores_a_marker_in_the_header():
     header_marker = ('<table class="items"><thead><tr><td class="no-entries">Player</td>'
                      '<th>Interested club</th><th>Most recent source from</th>'
                      '<th>Assessment</th></tr></thead><tbody></tbody></table>')
-    pager = _rumour_pager(1, 1)
-    capture = _capture(RUMOUR_LISTING, f'<div id="yw1">{header_marker}{pager}</div>'.encode(),
+    capture = _capture(RUMOUR_PAGE[1], f'<div id="yw1">{header_marker}{_rumour_pager(1, 1)}</div>'.encode(),
                        RUMOUR_PAGE_1_CAPTURED, endpoint='rumours')
     outcome, = sections.extract_rumour_observations(
         (capture,), _rumour_scope(), competition=_rumour_competition(),
@@ -3075,7 +3076,7 @@ def test_attendance_first_page_number_is_compared_numerically():
     start = ATTENDANCE_START + '?page=01'
     page_1 = _attendance_capture('page_1.html', start, PAGE_1_CAPTURED)
     page_2 = _attendance_capture('page_2.html', ATTENDANCE_PAGE_2, PAGE_2_CAPTURED)
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (page_1, page_2), _attendance_scope(), start_url=start, competition_id='GB1',
         edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, len(outcome.rows)) == ('observed_present', 2)
@@ -3084,7 +3085,7 @@ def test_attendance_first_page_number_is_compared_numerically():
     assert plan.pages[0][0] == start
     # A later page is still not a start, however it is spelled.
     later = _replace(page_1, url=ATTENDANCE_START + '?page=02')
-    outcome = sections.extract_attendance_observations(
+    outcome, = sections.extract_attendance_observations(
         (later, page_2), _attendance_scope(), start_url=later.url, competition_id='GB1',
         edition_id='2025', extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     assert (outcome.status, outcome.status_reason) == (
