@@ -679,6 +679,28 @@ def _committed_pages(connection, plan: NativeWritePlan) -> list[tuple]:
     return [(url, *evidence) for url, evidence in _read_manifest(connection, plan).items()]
 
 
+def _accepted_without_rows(connection, plan: NativeWritePlan) -> bool:
+    """Whether the scope acknowledged this plan's capture as a page without rows.
+
+    A single captured page leaves no manifest: its zero-row receipt is the
+    only evidence that its capture was accepted as empty.
+    """
+    cursor = connection.cursor()
+    try:
+        rows = _query_rows(
+            cursor,
+            f'SELECT row_count FROM {CORE_RECEIPTS_TABLE} WHERE target_table = ? '
+            'AND scope_values_json = ? AND source_capture_id = ?',
+            (plan.full_table, _scope_json(plan), plan.capture_id))
+    except Exception as exc:
+        if write_journal._table_not_found(exc):
+            return False
+        raise
+    finally:
+        cursor.close()
+    return any(row[0] == 0 for row in rows)
+
+
 def _verify_pages(connection, plan: NativeWritePlan) -> None:
     """The recorded manifest reads back as the snapshot's pages, one row each."""
     accepted = _read_manifest(connection, plan)
@@ -894,15 +916,26 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
     capture that is committed with other business rows is never rewritten.
     """
     if plan.write_mode == 'replace':
-        # A replacement is classified capture by capture. A page that
-        # contributes no row is a capture with an empty row set: committed
-        # with rows, it is a contradiction, never a deletion.
+        # A replacement is classified capture by capture against everything
+        # the scope accepted: its rows, and for a snapshot its manifest. A
+        # page without rows is a capture with an empty row set: committed
+        # with rows it is never replayed as empty, accepted without rows it
+        # never acquires rows, and it never changes its evidence.
         existing = _read_plan_rows(connection, plan)
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
-        for _url, capture_id, _clock, _body_hash, _next in plan.pages:
+        accepted = _read_manifest(connection, plan)
+        accepted_by_capture = {evidence[0]: (url, *evidence[1:]) for url, evidence in accepted.items()}
+        for url, capture_id, clock, body_hash, _next in plan.pages:
             planned.setdefault(capture_id, [])
+            was_accepted = accepted_by_capture.get(capture_id)
+            if was_accepted is not None:
+                if was_accepted != (url, _timestamp(clock), body_hash):
+                    raise RuntimeError('core replay differs from committed capture: ' + plan.table)
+                committed.setdefault(capture_id, [])
         if not plan.pages:
             planned.setdefault(plan.capture_id, [])
+            if _accepted_without_rows(connection, plan):
+                committed.setdefault(plan.capture_id, [])
         for capture_id, rows in planned.items():
             shared = committed.get(capture_id)
             if shared is not None and (len(shared) != len(rows)
@@ -914,9 +947,11 @@ def _replay_state(connection, plan: NativeWritePlan) -> str:
         # A refreshed snapshot reuses the pages it still shares with the
         # committed one. Its rowless pages hold no row to compare: the
         # committed manifest is what makes an identical snapshot "written".
-        manifest = _committed_pages(connection, plan)
-        carrying = _by_capture(plan.rows).keys()
-        if committed.keys() != carrying or not _same_pages(manifest, plan.pages):
+        # Only captures that carry rows live in the data table; rowless ones
+        # are proven by the manifest above.
+        carrying = [capture for capture, rows in planned.items() if rows]
+        if {capture for capture, rows in committed.items() if rows} != set(carrying) \
+                or not _same_pages(_committed_pages(connection, plan), plan.pages):
             return 'pending'
         refreshed = any(not _rows_equal(committed[capture_id], planned[capture_id])
                         for capture_id in carrying)

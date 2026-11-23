@@ -2786,8 +2786,10 @@ def test_wholly_rowless_snapshot_is_proven_by_its_manifest():
     late = (PAGE_1_CAPTURED, PAGE_2_CAPTURED)
 
     def proven_empty(clocks, extracted_at):
-        pages = (_page(ATTENDANCE_START, ROWLESS_PAGE_1, clocks[0], 'empty 1'),
-                 _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, clocks[1], 'empty 2'))
+        # A capture is one response at one clock: each page of each snapshot
+        # has its own capture identity.
+        pages = (_page(ATTENDANCE_START, ROWLESS_PAGE_1, clocks[0], 'empty 1 at ' + clocks[0]),
+                 _page(ATTENDANCE_PAGE_2, ROWLESS_TERMINAL_PAGE_2, clocks[1], 'empty 2 at ' + clocks[1]))
         outcome, = sections.extract_attendance_observations(
             pages, _attendance_scope(), start_url=ATTENDANCE_START, competition_id='GB1',
             edition_id='2025', extracted_at=extracted_at, universe_version=UNIVERSE)
