@@ -1133,6 +1133,126 @@ def test_extract_tournament_standings_same_name_blocks_differ_by_id():
     assert "group_id" not in normalize_standing(rows[0])
 
 
+def test_extract_tournament_standings_same_name_distinct_team_ids_get_suffix():
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"] = [{
+        "type": "total", "id": 38003, "name": "National League",
+        "rows": [
+            {"team": {"id": 86406, "name": "Hapoel Jerusalem"}},
+            {"team": {"id": 36272, "name": "Hapoel Jerusalem"}},
+        ],
+    }]
+
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+
+    rows = extract_tournament_standings(buffer, 291, 84027)
+    assert [row["team"]["id"] for row in rows] == [86406, 36272]
+    teams = [normalize_standing(row)["team"] for row in rows]
+    assert teams == ["Hapoel Jerusalem", "Hapoel Jerusalem #36272"]
+    assert len(set(teams)) == 2
+
+
+def test_extract_tournament_standings_same_name_across_blocks_gets_suffix():
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"] = [
+        {"type": "total", "id": 1001, "name": "Group G",
+         "rows": [{"team": {"id": 1, "name": "Club A"}}]},
+        {"type": "total", "id": 1002, "name": "Group G",
+         "rows": [{"team": {"id": 2, "name": "Club A"}}]},
+    ]
+
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+
+    rows = extract_tournament_standings(buffer, 291, 84027)
+    assert [normalize_standing(row)["team"] for row in rows] == [
+        "Club A", "Club A #2"]
+
+
+def test_extract_tournament_standings_explicit_distinct_groups_keep_names():
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"] = [{
+        "type": "total", "id": 1001, "name": "Group G",
+        "rows": [
+            {"group": "G", "team": {"id": 1, "name": "Club A"}},
+            {"group": "H", "team": {"id": 2, "name": "Club A"}},
+        ],
+    }]
+
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+
+    rows = extract_tournament_standings(buffer, 291, 84027)
+    assert [normalize_standing(row)["team"] for row in rows] == ["Club A", "Club A"]
+    assert [normalize_standing(row)["group"] for row in rows] == ["G", "H"]
+
+
+def test_standings_repeated_team_id_still_fails_strict_guard():
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"] = [{
+        "type": "total", "id": 1001, "name": "Group G",
+        "rows": [
+            {"team": {"id": 1, "name": "Club A"}},
+            {"team": {"id": 2, "name": "Club A"}},
+            {"team": {"id": 2, "name": "Club A"}},
+        ],
+    }]
+
+    from scrapers.sofascore.capture_engine import SchemaValidationError
+    from scrapers.sofascore.season_pipeline import _standings_parser
+
+    with pytest.raises(SchemaValidationError, match="duplicate standings row"):
+        _standings_parser(source_tournament_id="291", source_season_id="84027")(
+            buffer[path]["json"]
+        )
+
+
+def test_standings_repeated_team_id_with_different_names_still_fails():
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"] = [{
+        "type": "total", "id": 1001, "name": "Group G",
+        "rows": [
+            {"team": {"id": 1, "name": "Club A"}},
+            {"team": {"id": 2, "name": "Club A"}},
+            {"team": {"id": 2, "name": "Club B"}},
+        ],
+    }]
+
+    from scrapers.sofascore.capture_engine import SchemaValidationError
+    from scrapers.sofascore.season_pipeline import _standings_parser
+
+    with pytest.raises(SchemaValidationError, match="duplicate standings row"):
+        _standings_parser(source_tournament_id="291", source_season_id="84027")(
+            buffer[path]["json"]
+        )
+
+
+def test_extract_tournament_standings_suffix_avoids_original_name_collision():
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"] = [{
+        "type": "total", "id": 1001, "name": "Group G",
+        "rows": [
+            {"team": {"id": 1, "name": "Club A"}},
+            {"team": {"id": 2, "name": "Club A"}},
+            {"team": {"id": 3, "name": "Club A #2"}},
+        ],
+    }]
+
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+
+    rows = extract_tournament_standings(buffer, 291, 84027)
+    assert [normalize_standing(row)["team"] for row in rows] == [
+        "Club A", "Club A #2-2", "Club A #2"]
+
+
 def test_same_name_blocks_without_shared_team_keep_the_published_group():
     """#1351 (Astra r1): such a season already published under the plain name
     (no duplicate, no schema_error); renaming it would leave the old Bronze

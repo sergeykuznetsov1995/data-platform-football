@@ -327,7 +327,9 @@ def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> l
     # only keys the parser's duplicate check (never a Bronze column). Only a
     # LATER same-name block that repeats a team already seen under that name
     # gets `` #<id>`` appended, so Bronze rows differ — every season that could
-    # publish before (no repeated team) keeps its group key unchanged.
+    # publish before (no repeated team) keeps its group key unchanged. Distinct
+    # team ids may also share a display name; only a duplicate final
+    # ``(group, team)`` key gets a unique id suffix, preserving existing keys.
     teams_by_name: dict = {}
     rows: list = []
     for block in blocks:
@@ -350,6 +352,39 @@ def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> l
             if multi_group and isinstance(row, dict) and not row.get("group"):
                 row = {**row, "group": group_name, "group_id": group_id}
             rows.append(row)
+    reserved_keys = {
+        (
+            str(row.get("group") or "__total__"),
+            str((row.get("team") or {}).get("name") or ""),
+        )
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("team"), dict)
+    }
+    used_keys: dict = {}
+    seen_identities: set = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or not isinstance(row.get("team"), dict):
+            continue
+        team = row["team"]
+        team_name = str(team.get("name") or "")
+        team_id = team.get("id")
+        group = str(row.get("group") or "__total__")
+        identity = (group, team_id)
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        key = (group, team_name)
+        if used_keys.get(key) != team_id and team_id is not None:
+            base = f"{team_name} #{team_id}"
+            candidate = base
+            suffix = 2
+            while (group, candidate) in reserved_keys or (group, candidate) in used_keys:
+                candidate = f"{base}-{suffix}"
+                suffix += 1
+            if key in used_keys:
+                rows[index] = {**row, "team": {**team, "name": candidate}}
+                key = (group, candidate)
+        used_keys[key] = team_id
     return rows
 
 
