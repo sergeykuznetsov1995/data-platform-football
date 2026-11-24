@@ -1384,7 +1384,8 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
     assert not list(journal.retained_stages(operation['operation']['member']))
 
 
-@pytest.mark.parametrize('boundary', ['original', 'repair', 'before-reservation', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup', 'linked-worklist'])
+@pytest.mark.parametrize('boundary', ['original', 'repair', 'before-reservation', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup',
+                                      'linked-worklist', 'linked-general', 'linked-original'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1424,9 +1425,10 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
             assert body['payload']['predecessor_head'] == native_writer._digest(head)
         else:
             assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
-    elif boundary == 'linked-worklist':
+    elif boundary.startswith('linked-'):
+        # Round 29 finding 9
         # Round 28 finding 7
-        native._r28_overlapping_worklists(tmp_path, monkeypatch, db, plans)
+        native._r28_overlapping_worklists(tmp_path, monkeypatch, db, plans, boundary.removeprefix('linked-'))
     elif boundary.startswith('rejected-'):
         # Round 22 finding 3
         native._restore_rejected_tail_mapping(monkeypatch, db, plans, members[-1], cleanup=boundary == 'rejected-cleanup')

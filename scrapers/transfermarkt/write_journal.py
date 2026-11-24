@@ -989,7 +989,12 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         targets = previous.get('target_attempts', {})
         if list(key) == operation['scope']:
             targets = {**targets, operation['member']: statement['attempt']}
+        pages = previous.get('page_attempts', {})
+        from .native_writer import CORE_PAGES_TABLE
+        if list(key) == [CORE_PAGES_TABLE, operation['member']]:
+            pages = {**pages, operation['member']: statement['attempt']}
         _replace_submission({'owner': owner, 'statement': statement, 'members': members,
+                             **({'page_attempts': pages} if pages else {}),
                              **({'target_attempts': targets} if targets else {}),
                             **({'receipt_repair': repair} if repair and repair['intent'] == operation['intent'] else {}),
                             'scopes': previous.get('scopes') or [operation['scope']]})
