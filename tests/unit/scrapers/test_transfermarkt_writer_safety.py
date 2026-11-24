@@ -1387,7 +1387,8 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
 @pytest.mark.parametrize('boundary', ['original', 'repair', 'before-reservation', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup',
                                       'linked-worklist', 'linked-general', 'linked-original', 'general-with-original',
                                       'general-before-receipt-reservation', 'exact-step-predecessor',
-                                      'retired-receipt-predecessor', 'reserved-general-predecessor'])
+                                      'retired-receipt-predecessor', 'reserved-general-predecessor',
+                                      'reserved-worklist-predecessor', 'reserved-step-predecessor'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1427,6 +1428,22 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
             assert body['payload']['predecessor_head'] == native_writer._digest(head)
         else:
             assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
+    elif boundary == 'reserved-worklist-predecessor':
+        # Round 35 finding 5
+        _, plans, _, _, record, attempts = native._r32_repaired_packet_missing_receipt(monkeypatch, db=db)
+        native._r28_interrupt(monkeypatch, native_writer, '_merge_receipts', lambda: native.write(db, plans))
+        record.write_bytes(attempts[1])
+    elif boundary == 'reserved-step-predecessor':
+        # Round 35 finding 6
+        _, record = native._r33_restore_step_predecessor(db, plans, monkeypatch, unreserved=False)
+        previous = record.read_bytes()
+        record.unlink()
+        table = plans[0].table
+        db.sql.execute(f"CREATE TABLE seven AS SELECT * FROM {table} WHERE player_id='7'")
+        db.sql.execute(f"DELETE FROM {table} WHERE player_id='7'")
+        native._r28_interrupt(monkeypatch, native.write_journal, 'reserve_scopes', lambda: native.write(db, plans))
+        db.sql.execute(f'INSERT INTO {table} SELECT * FROM seven')
+        record.write_bytes(previous)
     elif boundary == 'reserved-general-predecessor':
         # Round 34 finding 1
         _, plans, _, _, record, attempts = native._r32_repaired_packet_missing_receipt(monkeypatch, db=db)

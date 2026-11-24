@@ -460,7 +460,10 @@ def reserve_submission(scopes, owner, intent, *, missing_receipts=None, publicat
         return
     if statement and _read_record(_packet_watermark(owner)).get('retired') == statement['attempt']:
         # Start a new reservation, keeping the ordering across publication.
-        head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {})}
+        head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {}),
+                'retired_steps': {'intent': previous_intent,
+                                  'target_attempts': head.get('target_attempts', {}),
+                                  'page_attempts': head.get('page_attempts', {})}}
     if missing_receipts is not None:
         # The per-member heads survive publication. Freeze the repair's ordered
         # worklist and pre-submit attempts before the first receipt can be sent.
@@ -832,7 +835,7 @@ def _unlink_record(path):
         _fsync_directory(path.parent)
 
 
-def _check_settled(marker, statement):
+def _check_settled(marker, statement, *, dispatched_rejection=False):
     """Validate the cleanup marker and report a mapped rejection that must stay pending."""
     # Older markers held just the statement. A marker is cleanup evidence
     # only after its own operation crossed the durable settlement boundary.
@@ -844,7 +847,7 @@ def _check_settled(marker, statement):
     if operation is not None:
         current = latest_operation(operation['scope'], statement['key'], operation['member'])
         if (not current or current.get('statement') != statement or current['operation'] != operation
-                or current['state'] == 'dispatched'
+                or current['state'] == 'dispatched' and not (dispatched_rejection and mapped)
                 or current.get('query_id') and query_id not in (None, current['query_id'])):
             raise RuntimeError('core settled operation binding differs')
         query_id = current.get('query_id', query_id)
@@ -940,6 +943,9 @@ def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None, retry_statem
         if (decision and current['state'] == 'dispatched'
                 and current['statement'] == statement == decision['statement']
                 and mapping['query_id'] == decision['query_id']):
+            continue
+        if (current and current['state'] == 'dispatched' and current['statement'] in rejections
+                and current['statement'] == statement):
             continue
         rejected_retry = (current and current['state'] == 'rejected'
                           and (statement == retry_statement or current['statement'] in rejections))
@@ -1042,20 +1048,38 @@ def statement_query(statement):
         return record['query_id']
 
 
+def rejection_dispatch(statement):
+    """Inspect the files left by this independently verified coordinator rejection."""
+    key = statement['key']
+    pending = read_statement(key)
+    if pending is not None and pending != statement:
+        raise RuntimeError('core rejected statement binding differs')
+    marker = _record_path('settled-statements', _statement_path(key).stem)
+    if marker.exists():
+        _check_settled(_read_record(marker), statement, dispatched_rejection=True)
+    return pending
+
+
 def finish_rejection(statement):
     """Finish a verified rejection, including cleanup after both dispatch files were removed."""
     key = statement['key']
-    if read_statement(key) is not None:
-        finish_statement(statement, outcome='rejected')
-        return
     op = statement['operation']
     record = latest_operation(op['scope'], key, op['member'])
+    pending = rejection_dispatch(statement)
+    if record and record['state'] == 'dispatched':
+        # Whole-packet readback and the mapped rejection have passed. Persist
+        # that outcome while the original query mapping still exists.
+        if record['statement'] != statement or not statement_query(statement):
+            raise RuntimeError('core rejected statement binding differs')
+        _operation_transition(statement, 'rejected')
+        record = latest_operation(op['scope'], key, op['member'])
+    if pending is not None:
+        finish_statement(statement, outcome='rejected')
+        return
     if (not record or record['state'] != 'rejected' or record['statement'] != statement
             or not record.get('query_id') or statement_query(statement) not in (None, record['query_id'])):
         raise RuntimeError('core rejected statement binding differs')
     settled = _record_path('settled-statements', _statement_path(key).stem)
-    if settled.exists():
-        _check_settled(_read_record(settled), statement)
     _unlink_record(_record_path('statement-queries', statement['attempt']))
     _unlink_record(settled)
 
@@ -1156,8 +1180,9 @@ def finish_reservation(owner, scopes):
         _fsync_directory(path.parent)
 
 
-def start_obsolete_release(intent, head_digest, *, terminal_generation=None):
-    completion = completed_intent(intent)
+def start_obsolete_release(intent, head_digest, *, terminal_generation=None, completion=None):
+    if completion is None:
+        completion = completed_intent(intent)
     if completion.get('obsolete_release_head') != head_digest:
         completion.pop('terminal_guard_generation', None)
     if terminal_generation is not None:
@@ -1217,7 +1242,7 @@ def completed_intent(intent):
         return record
 
 
-def complete_intent(path, digest, owner, terminal, publication_reservation=None):
+def complete_intent(path, digest, owner, terminal, publication_reservation=None, obsolete_release_head=None):
     from .native_writer import _bundle_identity, _intent_unit
 
     body = _intent_body(path, 'core write intent checksum differs')
@@ -1245,7 +1270,12 @@ def complete_intent(path, digest, owner, terminal, publication_reservation=None)
             or completion.get('descriptor_digest', descriptor_digest) != descriptor_digest
             or not acknowledgement_bound(digest, receipt, run, completion)):
         raise RuntimeError('core completed intent acknowledgement differs')
-    _store_record(_record_path('completed-intents', path.stem), completion, replace=associate)
+    if obsolete_release_head is not None:
+        # A completion alone cannot distinguish this verified obsolete intent
+        # from a completed reservation whose independent head was replaced.
+        start_obsolete_release(path.stem, obsolete_release_head, completion=completion)
+    else:
+        _store_record(_record_path('completed-intents', path.stem), completion, replace=associate)
 
 
 def terminal_target(intent, receipt_id, statement=None, *, scope=None):
