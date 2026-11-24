@@ -463,11 +463,11 @@ def reserve_submission(scopes, owner, intent):
     _replace_submission({**head, 'owner': owner, 'scopes': scopes, 'reservation': intent})
 
 
-def overlapping_submission(scopes, owner, descriptors):
+def overlapping_submission(scopes, owner, descriptors, disjoint_packets):
     """Route a missing descriptor or a rewound packet by its independent scopes."""
     directory = _submission_path(owner).parent
     bindings = _packet_watermark(owner).parent
-    for packet in {p.stem for d in (directory, bindings) for p in d.glob('*.json')} - {owner}:
+    for packet in {p.stem for d in (directory, bindings) for p in d.glob('*.json')} - {owner} - disjoint_packets:
         binding = _packet_watermark(packet)
         try:
             head = submission_head(packet)
@@ -488,7 +488,7 @@ def overlapping_submission(scopes, owner, descriptors):
             return packet
         if packet not in descriptors and statement and watermark.get('retired') != statement['attempt']:
             return packet
-        if packet not in descriptors and head.get('reservation') and not statement and not watermark.get('released'):
+        if head.get('reservation') and not statement and not watermark.get('released'):
             return packet
 
 

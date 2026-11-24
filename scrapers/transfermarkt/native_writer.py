@@ -2564,9 +2564,19 @@ def _check_scope_owners(plans, receipt_ids):
     # Older writers materialized the members separately. One bound member
     # proves the entire pending descriptor crossed the reservation boundary.
     descriptors_present = set()
+    disjoint_packets = set()
     for path, body in write_journal.pending_intents({}):
         descriptors = body['payload']['plans']
         if not any((d['table'], tuple(d['scope_values'])) in requested for d in descriptors):
+            # The initial submission has no scopes yet. Its content-addressed
+            # descriptor routes it even when the independent watermark is torn.
+            if body['identity'].get('submission_protocol') and 'warehouse_identity' not in body['payload']:
+                try:
+                    _, hashes, digest = _intent_unit(body)
+                except (ValueError, TypeError, KeyError, RuntimeError):
+                    # An unrecognised descriptor cannot exempt any packet head.
+                    continue
+                disjoint_packets.add(_receipt_id(hashes[0], body['identity']['run_id'], digest))
             continue
         if body['payload'].get('receipt_only') and write_journal.read_receipt(body['identity']['digest']):
             continue
@@ -2627,7 +2637,7 @@ def _check_scope_owners(plans, receipt_ids):
             # After the final unlink, keep fencing the archived replacements.
             # A replay with its own bound member must reach statement settlement.
             raise _ScopePending('core packet scope acknowledgement is still pending', keys[0])
-    conflict = write_journal.overlapping_submission(scopes, bundle_owner, descriptors_present)
+    conflict = write_journal.overlapping_submission(scopes, bundle_owner, descriptors_present, disjoint_packets)
     if conflict:
         raise _ScopePending('core overlapping packet submission history is still pending', conflict)
     for plan in plans:
@@ -3607,13 +3617,49 @@ def _check_submission_head(path, identity, owner, *, reviewing=False):
     return head
 
 
-def _guard_prepublication(connection, path, identity, plans, receipt_ids):
+def _unsubmitted_receipts(head, intent, plans, receipt_ids):
+    """Identify the untouched tail of the original ordered receipt INSERTs."""
+    last = (head or {}).get('statement')
+    if (not last or last['key'][0] != CORE_RECEIPTS_TABLE or last['operation']['intent'] != intent
+            or 'sequence' not in last or 'members' not in head):
+        return ()
+    member = last['operation']['member']
+    if member not in receipt_ids[:-1] or last['key'] != [CORE_RECEIPTS_TABLE, member]:
+        return ()
+    boundary = receipt_ids.index(member) + 1
+    for index, (plan, key) in enumerate(zip(plans, receipt_ids, strict=True)):
+        scope = _target_scope(plan)
+        receipt_key = (CORE_RECEIPTS_TABLE, key)
+        receipt = write_journal.latest_operation(scope, receipt_key, key)
+        member_attempt = head['members'].get(key)
+        if index < boundary:
+            if (not receipt or receipt['state'] not in ('returned', 'FINISHED')
+                    or receipt['operation'] != _operation(scope, key)
+                    or receipt['statement']['attempt'] != member_attempt):
+                return ()
+        else:
+            if receipt or write_journal.pending_statement(receipt_key):
+                return ()
+            # A missing receipt file alone cannot prove that this member has
+            # never submitted its INSERT. Authenticate its last packet attempt.
+            earlier = [r for r in write_journal.scope_operations(scope)
+                       if r['operation']['member'] == key and r.get('statement')]
+            if earlier:
+                previous = max(earlier, key=lambda r: r['statement'].get('sequence', 0))
+                statement = previous['statement']
+                if (statement['key'] not in (list(scope), [CORE_PAGES_TABLE, key])
+                        or previous['operation'] != _operation(scope, key)
+                        or statement['attempt'] != member_attempt
+                        or not 0 < statement.get('sequence', 0) < last['sequence']):
+                    return ()
+            elif member_attempt is not None:
+                return ()
+    return receipt_ids[boundary:]
+
+
+def _guard_prepublication(connection, path, identity, plans, receipt_ids, head, unsubmitted):
     """Return whether a surviving post-publication repair needs target readback."""
     owner = receipt_ids[0]
-    if any(write_journal._record_path('operator-reconciliations/' + path.stem, member).exists()
-           for member in receipt_ids):
-        raise _ScopePending('core explicit reconciliation is still pending', owner)
-    head = _check_submission_head(path, identity, owner)
     submission = head and head.get('statement')
     if submission and submission['operation']['intent'] == path.stem:
         # A settled original receipt in an unpublished journal is also the
@@ -3622,7 +3668,7 @@ def _guard_prepublication(connection, path, identity, plans, receipt_ids):
         op = submission['operation']
         latest = write_journal.latest_operation(op['scope'], submission['key'], op['member'])
         if (latest and submission['key'][0] == CORE_RECEIPTS_TABLE and latest['state'] == 'returned'
-                and write_journal.statement_query(submission) is None):
+                and write_journal.statement_query(submission) is None and not unsubmitted):
             write_journal._immutable_record(write_journal._review_required_path(owner, path.stem),
                                             {'owner': owner, 'intent': path.stem})
             raise _ScopePending('core pre-publication operator reconciliation is still pending', owner)
@@ -3654,26 +3700,33 @@ def _guard_prepublication(connection, path, identity, plans, receipt_ids):
     return later_repair
 
 
-def _verify_returned_receipts(connection, plans, receipt_ids, hashes, digest, run, universe, batch, clock):
-    """A restored receipt query file can only finish an already exact packet."""
+def _verify_returned_receipts(connection, plans, receipt_ids, hashes, digest, run, universe, batch, clock,
+                              *, unsubmitted=()):
+    """Verify the packet targets and every submitted receipt before continuing."""
     returned = []
     for plan, member in zip(plans, receipt_ids, strict=True):
         record = write_journal.latest_operation(_target_scope(plan), (CORE_RECEIPTS_TABLE, member), member)
         if record and record['state'] == 'returned':
             statement = record['statement']
             query = write_journal.statement_query(statement)
-            if query is not None:
-                if query != record.get('query_id') or _query_outcome(connection, statement, query_id=query) != 'finished':
+            if query is not None or unsubmitted:
+                if query is None:
+                    query = record.get('query_id')
+                if (not query or query != record.get('query_id')
+                        or _query_outcome(connection, statement, query_id=query) != 'finished'):
                     raise RuntimeError('core returned receipt outcome is still pending')
                 returned.append((statement, query))
-    if not returned:
+    if not returned and not unsubmitted:
         return
     receipts = []
     for plan, member, plan_hash in zip(plans, receipt_ids, hashes, strict=True):
         if plan.pages:
             _verify_pages(connection, plan, member, clock, settle=False)
         proof = _physical_proof(connection, plan, clock)
-        receipts.append(_plan_receipt(plan, proof, plan_hash, digest, run, universe, batch, clock))
+        if member not in unsubmitted:
+            receipts.append(_plan_receipt(plan, proof, plan_hash, digest, run, universe, batch, clock))
+    if _stored_receipts(connection, unsubmitted):
+        raise RuntimeError('core unsubmitted receipt readback differs')
     _verify_receipts(connection, receipts)
     expected = {r['receipt_id']: _digest(_receipt_cells(r)) for r in receipts}
     for statement, query in returned:
@@ -3794,8 +3847,10 @@ def _commit_bundle(
         publications = []
         _LOCAL.packet = (receipt_ids[0], paths, dict(zip(receipt_ids, descriptor_hashes, strict=True)), publications)
         scopes = {_target_scope(plan) for plan in plans}
-        for hold in write_journal.restored_packet_hold(scopes):
-            if reviews is None or hold['owner'] != receipt_ids[0] or hold['digest'] != digest:
+        restore_holds = list(write_journal.restored_packet_hold(scopes))
+        for hold in restore_holds:
+            if (reviews is None or hold['owner'] != receipt_ids[0] or hold['digest'] != digest
+                    or set(map(tuple, hold['scopes'])) != scopes):
                 raise _ScopePending('core restored packet operator reconciliation is still pending', hold['owner'])
         active_operations = _check_operation_history(plans, receipt_ids[0])
         historical_receipts = any(not body['identity'].get('packet_attempt') for _, body in pending) or (
@@ -3809,8 +3864,20 @@ def _commit_bundle(
                         write_journal.read_receipt(completion['digest']), run_id, completion)):
                 raise RuntimeError('core completed intent acknowledgement differs')
         if stored is not None:
-            if reviews is not None and (len(pending) != 1 or pending[0][1]['payload'].get('warehouse_identity') != identity):
-                raise RuntimeError('core reconciliation requires the exact pending repair intent')
+            if reviews is not None:
+                if len(pending) != 1:
+                    raise RuntimeError('core reconciliation requires the exact pending intent')
+                path, body = pending[0]
+                if body['payload'].get('warehouse_identity') != identity:
+                    # Publication can precede completion of the original intent.
+                    # Only its own held packet and reviewed submissions can release it.
+                    if (not restore_holds or 'warehouse_identity' in body['payload']
+                            or body['identity']['digest'] != digest
+                            or body['evidence'].get('committed_at') != stored['committed_at']
+                            or identity != {'digest': digest, 'plan_hashes': list(plan_hashes)}
+                            or any(d.get('statement', {}).get('operation', {}).get('intent') != path.stem
+                                   for d in reviews.values())):
+                        raise RuntimeError('core reconciliation requires the exact held publication intent')
             head = write_journal.submission_head(receipt_ids[0])
             missing = head is None and (write_journal._packet_watermark(receipt_ids[0]).exists()
                                         or write_journal.packet_used_submissions(keys, run_id))
@@ -3965,6 +4032,16 @@ def _commit_bundle(
                 run_id=run_id, universe_version=universe_version, committed_at=committed_at,
             ))
             _check_scope_owners(plans, receipt_ids)
+        head = None
+        unsubmitted = ()
+        if reviews is None:
+            for path, body in pending:
+                if any(write_journal._record_path('operator-reconciliations/' + path.stem, member).exists()
+                       for member in receipt_ids):
+                    raise _ScopePending('core explicit reconciliation is still pending', receipt_ids[0])
+                head = _check_submission_head(path, body['identity'], receipt_ids[0])
+            if len(pending) == 1:
+                unsubmitted = _unsubmitted_receipts(head, pending[0][0].stem, plans, receipt_ids)
         connection = _journal_connection(connection_factory)
         try:
             later_repair = False
@@ -3975,7 +4052,8 @@ def _commit_bundle(
                 _verify_operator_reviews(connection, path, body['identity'], plans, receipt_ids, reviews)
             else:
                 for path, body in pending:
-                    later_repair |= _guard_prepublication(connection, path, body['identity'], plans, receipt_ids)
+                    later_repair |= _guard_prepublication(connection, path, body['identity'], plans, receipt_ids,
+                                                          head, unsubmitted)
             if (historical_receipts and historical_intent and len({_target_scope(p) for p in plans}) > 1
                     and write_journal.read_snapshot_anchors(digest)
                     and not any(write_journal.scope_owner(_target_scope(p))
@@ -3997,10 +4075,10 @@ def _commit_bundle(
                                                     {'intent': path.stem})
             write_journal.snapshot_anchors(digest, connection, _anchored_tables(plans))
             _verify_returned_receipts(connection, plans, receipt_ids, plan_hashes, digest, run_id,
-                                      universe_version, batch, committed_at)
+                                      universe_version, batch, committed_at, unsubmitted=unsubmitted)
             proofs = _commit_plans(
                 connection, writer, plans, receipt_ids=receipt_ids, committed_at=committed_at,
-                verify_only=verify_only or later_repair or reviews is not None, contested=contested,
+                verify_only=verify_only or later_repair or reviews is not None or bool(unsubmitted), contested=contested,
                 historical_intent=historical_intent, run_id=run_id, held_receipts=held_receipts,
                 defer_cleanup=reviews is not None)
             plan_receipts = [
