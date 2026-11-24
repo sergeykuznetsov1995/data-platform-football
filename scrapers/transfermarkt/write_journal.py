@@ -849,11 +849,10 @@ def _check_settled(marker, statement):
     if 'statement' in marker and (query_id is not None or operation) and marker['query_id'] != query_id:
         raise RuntimeError('core settled query binding differs')
 
-    # The writer authenticates a restored rejected receipt against the current
-    # submission and coordinator before allowing its cleanup to finish.
+    # A surviving query mapping still needs coordinator authentication in the writer.
     if operation is not None and current['state'] == 'rejected' and mapped is not None:
         from .native_writer import CORE_RECEIPTS_TABLE
-        return statement['key'] == [CORE_RECEIPTS_TABLE, operation['member']]
+        return statement['key'] in (operation['scope'], [CORE_RECEIPTS_TABLE, operation['member']])
     return False
 
 
@@ -990,6 +989,9 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         # including when a single-scope repair starts without reserve_submission.
         previous_intent = previous.get('statement', {}).get('operation', {}).get('intent')
         steps = previous if previous_intent == operation['intent'] else {}
+        # Freeze the member heads at the first dispatch that tracks target history.
+        # A sibling added after an upgrade cannot certify earlier target no-ops.
+        before_tracking = steps.get('before_target_tracking', steps.get('members') if steps else {})
         targets = steps.get('target_attempts', {})
         if list(key) == operation['scope']:
             targets = {**targets, operation['member']: statement['attempt']}
@@ -1000,6 +1002,7 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         _replace_submission({'owner': owner, 'statement': statement, 'members': members,
                              **({'page_attempts': pages} if pages else {}),
                              **({'target_attempts': targets} if targets else {}),
+                             **({'before_target_tracking': before_tracking} if before_tracking is not None else {}),
                             **({'receipt_repair': repair} if repair and repair['intent'] == operation['intent'] else {}),
                             'scopes': previous.get('scopes') or [operation['scope']]})
     _immutable_record(_attempt_path(key), statement)
