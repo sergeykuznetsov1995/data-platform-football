@@ -508,6 +508,14 @@ def overlapping_submission(scopes, owner, descriptors, disjoint_packets):
             return packet
 
 
+def submission_retired(head):
+    """Read the retirement marker of an already authenticated head."""
+    statement = (head or {}).get('statement')
+    if statement:
+        return _read_record(_packet_watermark(head['owner'])).get('retired') == statement['attempt']
+    return False
+
+
 def submission_is_current(head):
     if head.get('superseded'):
         return False
@@ -886,9 +894,10 @@ def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None):
                     current and current['operation']) if op}
         if affected and scopes is not None and affected.isdisjoint(scopes):
             continue
-        if (reviewed_dispatch and current and current['state'] == 'dispatched'
-                and current['statement'] == statement == reviewed_dispatch['statement']
-                and mapping['query_id'] == reviewed_dispatch['query_id']):
+        decision = (reviewed_dispatch or {}).get(current['operation']['member']) if current else None
+        if (decision and current['state'] == 'dispatched'
+                and current['statement'] == statement == decision['statement']
+                and mapping['query_id'] == decision['query_id']):
             continue
         if (not current or current['state'] not in ('FINISHED', 'returned')
                 or not current.get('query_id') or current['query_id'] != mapping['query_id']

@@ -1193,7 +1193,18 @@ def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, le
                               f'WHERE {roster.scope_sql()}', roster.scope_values).fetchone()
 
     scope = native_writer._target_scope(roster)
+    # Round 20 finding 1. Today's writer sees the retired original sequence.
+    start = len(db.events)
+    with pytest.raises(RuntimeError, match='physical readback differs'):
+        replay()
+    assert not warehouse.merges and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
     with monkeypatch.context() as patch:
+        # Model the already submitted MERGE from r19 for the late-landing checks below.
+        def retired_prefix(head, intent, plans, members):
+            assert journal.submission_retired(head) and head['statement']['operation']['intent'] == intent
+            return None
+
+        patch.setattr(native_writer, '_receipt_prefix', retired_prefix)
         patch.setattr(warehouse, 'run', delay)
         if legacy_observable:
             begin = journal.begin_statement

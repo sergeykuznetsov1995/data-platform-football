@@ -2314,8 +2314,8 @@ def _merge_receipts(connection, receipts, *, read_only=False, prefix=None) -> No
             _settle_statement(connection, key, _digest(expected), lambda: read_receipt() == expected,
                               require_finished=True)
             continue
-        if read_only:
-            raise RuntimeError('core reviewed receipt readback differs')
+        if read_only or prefix and prefix.retired:
+            raise RuntimeError('core read-only receipt readback differs')
         operation = _operation((receipt['target_table'], receipt['scope_values_json']), receipt_id)
         if prefix is not None and receipt_id not in prefix.untouched:
             # A definite rejection can use its existing retry path. No other
@@ -2501,7 +2501,8 @@ def _check_operation_history(plans, owner, reviewed_dispatch=None):
             pending = write_journal.pending_statement(record['key'])
             same_member = pending and (pending['key'] != list(scope)
                                        or _statement_expected(pending) == operation['member'])
-            reviewed = reviewed_dispatch and reviewed_dispatch['statement'] == latest and pending is None
+            decision = (reviewed_dispatch or {}).get(operation['member'])
+            reviewed = decision and decision['statement'] == latest and pending is None
             if (record['state'] == 'dispatched' or same_member) and pending != latest and not reviewed:
                 raise _ScopePending('core local dispatch history differs and the outcome is still pending',
                                     operation['owner'])
@@ -3635,6 +3636,7 @@ class _ReceiptPrefix(NamedTuple):
     untouched: tuple
     # Attempts whose own coordinator result is needed for this continuation.
     submitted: tuple = ()
+    retired: bool = False
 
 
 def _receipt_prefix(head, intent, plans, receipt_ids):
@@ -3644,6 +3646,9 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
     with no untouched members permits settlement and definite-rejection retries.
     """
     last = (head or {}).get('statement')
+    if last and last['operation']['intent'] == intent and write_journal.submission_retired(head):
+        # The completed sequence can be verified after its operations were unlinked.
+        return _ReceiptPrefix((), retired=True)
     repair = (head or {}).get('receipt_repair')
     if repair and repair['intent'] == intent:
         ordered = repair['missing']
@@ -3661,13 +3666,6 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
     if receipt_head:
         op = last['operation']
         member = op['member']
-        if not write_journal.latest_operation(op['scope'], last['key'], member):
-            # submission_is_current accepts an absent last operation only after
-            # retirement. An old descriptor can outlive the entire publication.
-            if any(write_journal.latest_operation(_target_scope(plan), (CORE_RECEIPTS_TABLE, key), key)
-                   for plan, key in zip(plans, receipt_ids, strict=True)):
-                return _ReceiptPrefix(())
-            return None
         if (member not in ordered or last['key'] != [CORE_RECEIPTS_TABLE, member]
                 or 'sequence' not in last or 'members' not in head):
             return _ReceiptPrefix(())
@@ -3680,7 +3678,11 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
     prefix_members = set(ordered[:boundary])
     tail = tuple(ordered[boundary:])
     if not tail and not repair:
-        return _ReceiptPrefix(())
+        # A final rejected POST is still a submitted member. Include it when
+        # checking restored mappings so its absent row can be classified.
+        record = write_journal.latest_operation(op['scope'], last['key'], member)
+        if not record or record['state'] not in ('dispatched', 'rejected'):
+            return _ReceiptPrefix(())
     submitted = []
     previous_sequence = 0
     for plan, key in zip(plans, receipt_ids, strict=True):
@@ -3689,6 +3691,10 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
         record = write_journal.latest_operation(scope, receipt_key, key)
         attempt = head.get('members', {}).get(key)
         if key in prefix_members:
+            if not record and not tail and not repair and key != member:
+                # An original packet can reuse a previously stored receipt.
+                # Whole-packet readback below still requires its exact row.
+                continue
             operation = _operation(scope, key)
             if (not record or record['state'] not in ('returned', 'FINISHED', 'dispatched', 'rejected')
                     or any(record['operation'][k] != operation[k]
@@ -3726,6 +3732,50 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
             elif attempt is not None:
                 raise RuntimeError('core receipt tail submission is still pending')
     return _ReceiptPrefix(tail, tuple(submitted))
+
+
+def _repair_prefix(head, path, payload, plans, receipt_ids):
+    """Recover a receipt-only worklist on either side of its reservation."""
+    repair = (head or {}).get('receipt_repair', {})
+    work = payload.get('receipt_worklist')
+    if work is not None:
+        missing = work['missing']
+        if (not payload.get('receipt_only') or not missing
+                or missing != [member for member in receipt_ids if member in missing]):
+            raise RuntimeError('core receipt repair members differ')
+        if repair.get('intent') == path.stem:
+            if repair != {'intent': path.stem, **work}:
+                raise RuntimeError('core receipt repair reservation differs')
+        else:
+            if work['before'] != (head or {}).get('members', {}):
+                raise RuntimeError('core receipt repair prior attempts differ')
+            return _ReceiptPrefix(tuple(missing))
+    elif payload.get('receipt_only') and repair.get('intent') != path.stem:
+        # A pre-worklist descriptor alone cannot identify the authorized rows.
+        raise RuntimeError('core receipt repair reservation is still pending')
+    return _receipt_prefix(head, path.stem, plans, receipt_ids)
+
+
+def _check_retiring_receipts(head, paths, plans, receipts):
+    """Completion covers removed records. Surviving receipts must still agree."""
+    intents = {path.stem for path in paths}
+    last = (head or {}).get('statement')
+    if not last or last['operation']['intent'] not in intents:
+        raise RuntimeError('core completed submission binding differs')
+    for plan, receipt in zip(plans, receipts, strict=True):
+        member = receipt['receipt_id']
+        key = (CORE_RECEIPTS_TABLE, member)
+        record = write_journal.latest_operation(_target_scope(plan), key, member)
+        if write_journal.pending_statement(key):
+            raise RuntimeError('core completed receipt outcome is still pending')
+        if record is None:
+            continue
+        statement = record['statement']
+        if (record['operation']['owner'] != head['owner'] or record['operation']['intent'] not in intents
+                or record['state'] not in ('returned', 'FINISHED', 'observed')
+                or statement['attempt'] != head.get('members', {}).get(member)
+                or _statement_expected(statement) != _digest(_receipt_cells(receipt))):
+            raise RuntimeError('core completed receipt binding differs')
 
 
 def _guard_prepublication(connection, path, identity, plans, receipt_ids, head, prefix):
@@ -3774,7 +3824,8 @@ def _guard_prepublication(connection, path, identity, plans, receipt_ids, head, 
 def _verify_receipt_prefix(connection, plans, receipt_ids, hashes, digest, run, universe, batch, clock,
                            *, prefix):
     """Verify all target cells before promoting any recovered receipt attempt."""
-    untouched, submitted = prefix or _ReceiptPrefix(())
+    prefix = prefix or _ReceiptPrefix(())
+    untouched, submitted = prefix.untouched, prefix.submitted
     verified = []
     rejected = set()
     for plan, member in zip(plans, receipt_ids, strict=True):
@@ -3830,20 +3881,24 @@ def _reviewed_publication_dispatch(path, plans, receipt_ids, reviews):
     last = (head or {}).get('statement')
     if not last or last['key'][0] != CORE_RECEIPTS_TABLE:
         return
-    member = last['operation']['member']
-    if member not in receipt_ids:
+    if last['operation']['member'] not in receipt_ids:
         raise RuntimeError('core operator reconciliation attempt differs')
-    scope = _target_scope(plans[receipt_ids.index(member)])
-    record = write_journal.latest_operation(scope, (CORE_RECEIPTS_TABLE, member), member)
-    if not record or record['state'] != 'dispatched' or write_journal.pending_statement(record['key']):
-        return
-    decision = reviews[member]
-    if (not write_journal.submission_is_current(head) or head.get('members', {}).get(member) != last['attempt']
-            or last['operation']['intent'] != path.stem or last['key'] != [CORE_RECEIPTS_TABLE, member]
-            or write_journal.check_reconciliation(path.stem, _operation(scope, member), decision) != last
-            or write_journal.statement_query(last) != decision['query_id']):
-        raise RuntimeError('core reviewed dispatch binding differs')
-    return decision
+    authenticated = {}
+    for plan, member in zip(plans, receipt_ids, strict=True):
+        scope = _target_scope(plan)
+        key = [CORE_RECEIPTS_TABLE, member]
+        record = write_journal.latest_operation(scope, key, member)
+        if not record or record['state'] != 'dispatched' or write_journal.pending_statement(key):
+            continue
+        decision = reviews[member]
+        statement = write_journal.check_reconciliation(path.stem, _operation(scope, member), decision)
+        if (not write_journal.submission_is_current(head)
+                or head.get('members', {}).get(member) != statement['attempt']
+                or statement['operation']['intent'] != path.stem or statement['key'] != key
+                or write_journal.statement_query(statement) != decision['query_id']):
+            raise RuntimeError('core reviewed dispatch binding differs')
+        authenticated[member] = decision
+    return authenticated
 
 
 def _verify_operator_reviews(connection, path, identity, plans, receipt_ids, reviews):
@@ -3932,6 +3987,9 @@ def _commit_bundle(
                     break
         paths = [path for path, _ in pending]
         receipt_repairs = {path for path, body in pending if body['payload'].get('receipt_only') is True}
+        # Guarded receipt-only repairs never owned the historical target guards.
+        guarded_repairs = {path for path, body in pending
+                           if path in receipt_repairs and not body['payload'].get('reserve_scopes')}
         if receipt_repairs and stored is None:
             raise RuntimeError('core receipt repair lacks its original acknowledgement')
         historical_intent = None
@@ -3999,6 +4057,10 @@ def _commit_bundle(
             if reviews is None and (missing or (head and not write_journal.submission_is_current(head))):
                 write_journal.hold_restored_packet(receipt_ids[0], digest, scopes)
                 raise _ScopePending('core packet submission history is still pending', receipt_ids[0])
+            head_repair = (head or {}).get('receipt_repair', {})
+            if (reviews is None and head_repair and head_repair['intent'] not in {path.stem for path in paths}
+                    and (active_operations or not write_journal.submission_retired(head))):
+                raise _ScopePending('core receipt repair descriptor is still pending', receipt_ids[0])
             # The acknowledgement names the identity its warehouse receipts
             # were written under. A unit migrated from an earlier writer keeps
             # that one, so a retry under today's identity reuses them.
@@ -4024,7 +4086,7 @@ def _commit_bundle(
                     return stored
                 paths.clear()
             if reviews is None and completed and all(completed) and not active_operations:
-                if set(paths) == receipt_repairs:
+                if set(paths) == guarded_repairs:
                     for path in paths:
                         write_journal.finish_intent(path)
                 else:
@@ -4033,28 +4095,34 @@ def _commit_bundle(
                     return stored
                 paths.clear()  # an ordinary retry still verifies live data
                 receipt_repairs.clear()
+                guarded_repairs.clear()
             verify_only, contested = _pre_upgrade_pending(
                 plans, paths, descriptor_digest, acknowledged=True, receipt_ids=receipt_ids, run_id=run_id)
-            verify_only |= bool(receipt_repairs) or reviews is not None
+            retiring = bool(active_operations and completed and all(
+                c and c.get('acknowledgement') and c.get('descriptor_digest') == descriptor_digest for c in completed))
+            verify_only |= bool(guarded_repairs) or reviews is not None or retiring
             has_descriptor_evidence = alias or binding is not None or any(
                 body['identity']['digest'] == receipt_digest
                 or body['payload'].get('warehouse_identity') == identity for _, body in pending)
 
-            def repair(*, receipt_only=False):
+            def repair(*, missing=()):
                 # The acknowledged bundle has to change again (drifted rows, a
                 # lost manifest, a deleted receipt): journal it first.
                 if not publications:
                     publications.extend(write_journal.published_intents(digest, stored, descriptor_digest))
                 if not paths:
+                    payload = {'plans': _descriptors(plans), 'warehouse_identity': identity}
+                    if missing:
+                        payload.update(receipt_only=True, reserve_scopes=not verify_only, receipt_worklist={
+                            'missing': list(missing), 'before': (head or {}).get('members', {})})
                     paths.append(write_journal.save_intent(
                         {'run_id': run_id, 'digest': descriptor_digest, 'statement_protocol': 1,
                          'single_submit': True, 'scope_protocol': 1, 'packet_attempt': uuid4().hex},
-                        {'plans': _descriptors(plans), 'warehouse_identity': identity,
-                         **({'receipt_only': True} if receipt_only else {})},
+                        payload,
                         run_id=run_id, universe_version=universe_version,
                         committed_at=stored['committed_at']))
-                    if receipt_only:
-                        receipt_repairs.add(paths[-1])
+                    if missing and verify_only:
+                        guarded_repairs.add(paths[-1])
 
             _check_scope_owners(plans, receipt_ids)
             connection = _journal_connection(connection_factory)
@@ -4068,11 +4136,13 @@ def _commit_bundle(
                     universe_version, batch, stored['committed_at'],
                     require_rowless=(receipt_digest != descriptor_digest and not has_descriptor_evidence))
                 prefix = None
-                if reviews is None:
-                    repair_intent = (head or {}).get('receipt_repair', {}).get('intent')
+                if reviews is None and not retiring:
+                    retired_intent = (head['statement']['operation']['intent']
+                                      if write_journal.submission_retired(head) else None)
                     for path, body in pending:
-                        if path in paths and (repair_intent == path.stem or 'warehouse_identity' in body['payload']):
-                            candidate = _receipt_prefix(head, path.stem, plans, receipt_ids)
+                        if path in paths and (path.stem in (retired_intent, head_repair.get('intent'))
+                                              or 'warehouse_identity' in body['payload']):
+                            candidate = _repair_prefix(head, path, body['payload'], plans, receipt_ids)
                             if candidate is not None:
                                 if path != paths[-1]:
                                     raise RuntimeError('core receipt repair intent binding differs')
@@ -4098,27 +4168,31 @@ def _commit_bundle(
                                   universe_version, batch, stored['committed_at'])
                     for plan, proof, plan_hash in zip(plans, proofs, receipt_hashes, strict=True)
                 ]
+                if retiring:
+                    _check_retiring_receipts(head, paths, plans, plan_receipts)
                 held = _stored_receipts(connection, receipt_ids)
                 if verify_only and not stored['plans']:
                     _verify_receipts(connection, plan_receipts)
                 if len(held) < len(plan_receipts):
-                    if reviews is not None:
-                        raise RuntimeError('core reviewed receipt readback differs')
-                    repair(receipt_only=verify_only)
+                    if reviews is not None or retiring or prefix and prefix.retired:
+                        raise RuntimeError('core completed or reviewed receipt readback differs')
+                    missing = tuple(member for member in receipt_ids if member not in held)
+                    repair(missing=missing)
                     if prefix is None:
-                        missing = tuple(member for member in receipt_ids if member not in held)
-                        write_journal.reserve_submission(scopes, receipt_ids[0], paths[-1].stem,
-                                                         missing_receipts=missing)
                         prefix = _ReceiptPrefix(missing)
+                    if head_repair.get('intent') != paths[-1].stem:
+                        write_journal.reserve_submission(scopes, receipt_ids[0], paths[-1].stem,
+                                                         missing_receipts=prefix.untouched)
                     if not verify_only:
                         write_journal.reserve_scopes(scopes, receipt_ids[0])
                 _merge_receipts(connection, plan_receipts, read_only=reviews is not None, prefix=prefix)
                 _verify_receipts(connection, plan_receipts)
-                if reviewed_dispatch:
-                    write_journal.verified_operation(reviewed_dispatch['statement'], reviewed_dispatch['query_id'])
+                for decision in (reviewed_dispatch or {}).values():
+                    write_journal.verified_operation(decision['statement'], decision['query_id'])
                 _verify_packet_operations(connection, plans, receipt_ids)
-                settled = reviews is not None or not verify_only or _terminal_packet(historical_intent, plans, receipt_ids)
-                if not settled and paths and not receipt_repairs:
+                settled = (reviews is not None or not verify_only or retiring and not guarded_repairs
+                           or _terminal_packet(historical_intent, plans, receipt_ids))
+                if not settled and paths and not guarded_repairs:
                     write_journal.finish_guarded_receipt_repair(receipt_ids[0], paths[-1].stem)
                 if settled:
                     _clean_stages(connection, writer, plans, receipt_ids, run_id, defer=reviews is not None)
@@ -4131,7 +4205,7 @@ def _commit_bundle(
             # only after its bound warehouse identity has verified in full.
             if settled or not paths:
                 _publish_alias(current, stored, receipt_hashes, receipt_digest)
-            for path in receipt_repairs:
+            for path in guarded_repairs:
                 write_journal.complete_intent(path, descriptor_digest, receipt_ids[0], terminal=True)
                 write_journal.retire_operations({_target_scope(plan) for plan in plans}, receipt_ids[0])
                 write_journal.finish_intent(path)
