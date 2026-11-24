@@ -142,20 +142,26 @@ def test_reader_covers_week_even_with_short_lookback():
         assert f"{alias}.completed_at <= '{{cutoff}}'" in READINESS_SQL
 
 
-def test_offline_cli_json_markdown_and_adapter_keep_entire_week(tmp_path, capsys, monkeypatch):
-    data = snapshot()
-    data["competitions"].append(dict(data["competitions"][0], competition_id="10", name="Unknown"))
+def run_offline_report(tmp_path, data, competition_map):
     source = tmp_path / "snapshot.json"
     source.write_text(json.dumps(data))
     mapping = tmp_path / "map.json"
-    mapping.write_text(json.dumps({"competitions": MAP}))
+    mapping.write_text(json.dumps({"competitions": competition_map}))
     output = tmp_path / "output"
     assert main(["--input", str(source), "--map", str(mapping), "--as-of", AS_OF.isoformat(),
                  "--lookback", "1", "--output-dir", str(output)]) == 0
+    report_path, = (p for p in output.glob("*.json") if not p.name.endswith("-snapshot.json"))
+    return report_path
+
+
+def test_offline_cli_json_markdown_and_adapter_keep_entire_week(tmp_path, capsys, monkeypatch):
+    data = snapshot()
+    data["competitions"].append(dict(data["competitions"][0], competition_id="10", name="Unknown"))
+    report_path = run_offline_report(tmp_path, data, MAP)
     lines = capsys.readouterr().out.splitlines()
-    bundle = json.loads(next(p for p in output.glob("*.json") if "snapshot" not in p.name).read_text())
+    bundle = json.loads(report_path.read_text())
     assert bundle["weekly"]["competitions"][1]["difference"] == -1
-    markdown = next(output.glob("*.md")).read_text()
+    markdown = report_path.with_suffix(".md").read_text()
     assert all(line in markdown for line in lines[4:])
     root = Path(__file__).resolve().parents[3]
     spec = importlib.util.spec_from_file_location("weekly_adapter", root / "deploy/fbref/morning_report_adapter.py")
@@ -166,6 +172,45 @@ def test_offline_cli_json_markdown_and_adapter_keep_entire_week(tmp_path, capsys
     assert adapter.fbref_daily_report() == ["• " + line for line in lines]
     lines.pop()
     assert "недоступен" in adapter.fbref_daily_report()[0]
+
+
+@pytest.mark.parametrize("read_failed", [True, False], ids=["read_failed", "successful_empty"])
+@pytest.mark.parametrize("source,dependent_reason,independent_reason", [
+    pytest.param("fotmob_season_manifest", "missing_fotmob_season",
+                 "missing_or_incomplete_fotmob_phase_catalog", id="manifest"),
+    pytest.param("fotmob_phase_catalog", "missing_or_incomplete_fotmob_phase_catalog",
+                 "missing_fotmob_season", id="catalog"),
+])
+def test_weekly_fotmob_read_state(tmp_path, capsys, source, dependent_reason, independent_reason, read_failed):
+    data = snapshot()
+    for key in ("schedules", "observations", "readiness", "fotmob_matches",
+                "fotmob_seasons", "fotmob_phase_catalog"):
+        data[key] = []
+    # An explicit phase requires evidence from both the catalog and the season manifest.
+    mapping = {"9": {"fotmob_ids": ["47"], "season_keys": {
+        "2026-2027": {"47": ["2026/2027 - Regular Season"]}}}}
+    data["errors"] = [{"source": source, "reason": "read_failed"}] if read_failed else []
+
+    report_path = run_offline_report(tmp_path, data, mapping)
+    row, = json.loads(report_path.read_text())["weekly"]["competitions"]
+    line, = (line for line in capsys.readouterr().out.splitlines() if line.startswith(f"| {row['name']} |"))
+    assert line in report_path.with_suffix(".md").read_text().splitlines()
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    assert row["difference"] is None
+    assert cells[4] == "н/д"
+    reasons = {p["reason"] for p in row["evidence"]}
+    assert independent_reason in reasons
+    assert independent_reason in cells[5]
+    if read_failed:
+        assert {p.get("source") for p in row["evidence"] if p["reason"] == "read_failed"} == {source}
+        assert dependent_reason not in reasons
+        assert dependent_reason not in cells[5]
+        assert source in cells[5] and "read_failed" in cells[5]
+    else:
+        assert dependent_reason in reasons
+        assert dependent_reason in cells[5]
+        assert "read_failed" not in reasons
+        assert "read_failed" not in cells[5]
 
 
 def test_duplicate_reference_identity_on_different_days_is_not_two_matches():
