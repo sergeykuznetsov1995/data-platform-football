@@ -857,27 +857,39 @@ def _check_settled(marker, statement):
     return False
 
 
-def pending_statement(key):
+def read_statement(key):
+    """Inspect either surviving dispatch file without repairing or settling it."""
     path = _statement_path(key)
     binding = _attempt_path(key)
-    settled = _record_path('settled-statements', path.stem)
-    marker = _read_record(settled) if settled.exists() else None
     if not path.exists() and not binding.exists():
-        if marker is not None:
-            statement = marker.get('statement', marker)
-            if statement['key'] != list(key):
-                raise RuntimeError('core settled statement key differs')
-            if not _check_settled(marker, statement):
-                _unlink_record(settled)
         return None
     statement = _read_record(path if path.exists() else binding)
     if statement['key'] != list(key):
         raise RuntimeError('core pending statement key differs')
+    if path.exists() and binding.exists() and _read_record(binding) != statement:
+        raise RuntimeError('core pending statement binding differs')
+    return statement
+
+
+def pending_statement(key, *, inspect_only=False):
+    """Route a pending attempt, optionally leaving torn dispatch files untouched."""
+    path = _statement_path(key)
+    binding = _attempt_path(key)
+    settled = _record_path('settled-statements', path.stem)
+    marker = _read_record(settled) if settled.exists() else None
+    statement = read_statement(key)
+    if statement is None:
+        if marker is not None:
+            statement = marker.get('statement', marker)
+            if statement['key'] != list(key):
+                raise RuntimeError('core settled statement key differs')
+            if not _check_settled(marker, statement) and not inspect_only:
+                _unlink_record(settled)
+        return None
     keep_mapping = marker is not None and _check_settled(marker, statement)
-    if binding.exists():
-        if _read_record(binding) != statement:
-            raise RuntimeError('core pending statement binding differs')
-    else:
+    if inspect_only:
+        return statement if marker is None or keep_mapping else None
+    if not binding.exists():
         _immutable_record(binding, statement)
     if not path.exists():
         _immutable_record(path, statement)

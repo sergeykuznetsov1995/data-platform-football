@@ -1083,9 +1083,17 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, 
         journal._immutable_record(stage_path, stage_record)
     with pytest.raises(RuntimeError, match='still pending'):
         replay_b()
-    assert journal.pending_statement(scope) == statement and stage_path.exists()
-    assert journal._read_record(stage_path) == stage_record
+    assert journal.read_statement(scope) == statement
+    assert stage_path.exists() == (not restore_stage)
     db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
+    if lost_receipt:
+        # Round 27 finding 3
+        files = native._r27_dispatch_files(statement)
+        before = native._r26_file_bytes(files)
+        with pytest.raises(RuntimeError, match='receipt readback differs'):
+            replay_b()
+        assert native._r26_file_bytes(files) == before and not journal.terminal_target(intent.stem, key)
+        db.sql.execute(f'INSERT INTO {native.RECEIPTS} SELECT * FROM saved_receipt')
     # Round 15 finding 5
     finish = journal.finish_statement
 
@@ -1099,6 +1107,7 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, 
         with pytest.raises(RuntimeError, match='after verified target unlink'):
             replay_b()
     assert journal.pending_statement(scope) is None and intent.exists()
+    assert journal._read_record(stage_path) == stage_record
     db.sql.execute("DELETE FROM test_query_history WHERE query_id='q_target_merge'")
     assert journal.terminal_target(intent.stem, key, statement)
     if restore_owner:
@@ -1133,6 +1142,7 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, 
     if lost_receipt:
         # Round 25 finding 2
         # The later FINISHED target binds this repair to an existing publication.
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (key,))
         start = len(db.events)
         with pytest.raises(RuntimeError, match='receipt readback differs'):
             replay_b()

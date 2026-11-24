@@ -2727,7 +2727,7 @@ def _released_after_ack(body, plans, receipt_ids):
 
 
 def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bundle_owner, contested,
-                            historical_intent, *, repair, held_receipts):
+                            historical_intent, *, repair, held_receipts, acquire_guard=True):
     settled_targets = set()
     scope = _target_scope(plan)
     target = write_journal.pending_statement(scope)
@@ -2765,15 +2765,15 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
             if 'outcome' not in witness:
                 write_journal.remember_terminal_target(historical_intent.stem, expected, target)
             write_journal.verified_operation(target, query_id)
-            write_journal.hold_scope(scope, bundle_owner)
             settled_targets.add(expected)
         elif _settle_statement(connection, scope, expected, lambda: _target_matches(connection, owner),
                                release=False, target=True, require_finished=scope in contested,
                                on_finished=record_finished, independent_postimage=independent_postimage,
                                operation=_operation(scope, expected)):
-            write_journal.hold_scope(scope, bundle_owner)
             settled_targets.add(expected)
         if expected in settled_targets:
+            if acquire_guard:
+                write_journal.hold_scope(scope, bundle_owner)
             write_journal.finish_statement(target)
         else:
             write_journal.finish_statement(target, outcome='rejected')
@@ -2856,7 +2856,8 @@ def _write_plan(connection, writer, plan, receipt_id, bundle_owner, repair=False
 
 
 def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), committed_at='',
-                  verify_only=False, contested=(), historical_intent=None, run_id=None, held_receipts=(), defer_cleanup=False) -> list[dict]:
+                  verify_only=False, contested=(), historical_intent=None, run_id=None, held_receipts=(), defer_cleanup=False,
+                  acquire_guard=True) -> list[dict]:
     """Guard, mutate and prove the plans against the warehouse.
 
     ``repair`` is called when the plans are about to mutate although their
@@ -2886,10 +2887,10 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
         required = {scope} if verify_only and target else contested
         settled_targets.update(_settle_plan_statements(
             connection, plan, receipt_id, committed_at, unit, receipt_ids[0], required,
-            historical_intent, repair=repair is not None, held_receipts=held_receipts))
+            historical_intent, repair=repair is not None, held_receipts=held_receipts, acquire_guard=acquire_guard))
     for plan, receipt_id in zip(plans, receipt_ids, strict=True):
         scope = _target_scope(plan)
-        if plan.pages and receipt_id in settled_targets and write_journal.scope_owner(scope) is None:
+        if acquire_guard and plan.pages and receipt_id in settled_targets and write_journal.scope_owner(scope) is None:
             head = write_journal.latest_operation(scope, scope, receipt_id)
             if head and head['state'] == 'FINISHED' and head['operation']['owner'] == receipt_ids[0]:
                 # Reservation/owner checks and exact target settlement ran under
@@ -3639,26 +3640,29 @@ def _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, war
 
 
 def _verify_member_cells(connection_factory, plans, receipt_ids, stored, warehouse, universe_version,
-                         scopes, *, check_statements=False):
+                         scopes, *, check_statements=False, linked_head=None):
     owned = [(plan, member, plan_hash) for plan, member, plan_hash in
              zip(plans, receipt_ids, warehouse['plan_hashes'], strict=True) if _target_scope(plan) in scopes]
     if not owned:
         return
     connection = _journal_connection(connection_factory)
     try:
+        if linked_head is not None:
+            _check_linked_operations(connection, linked_head, plans, receipt_ids)
         receipts = []
         clock = stored['committed_at']
         for plan, member, plan_hash in owned:
-            scope = _target_scope(plan)
-            if check_statements and any(write_journal.pending_statement(key)
-                                        for key in (scope, (CORE_PAGES_TABLE, member), (CORE_RECEIPTS_TABLE, member))):
-                raise RuntimeError('core releasing statement outcome is still pending')
             if plan.pages:
                 _verify_pages(connection, plan, member, clock, settle=False)
             proof = _physical_proof(connection, plan, clock)
             receipts.append(_plan_receipt(plan, proof, plan_hash, warehouse['digest'], stored['run_id'],
                                           universe_version, stored['committed_batch'], clock))
         _verify_receipts(connection, receipts)
+        if check_statements:
+            for plan, member, _ in owned:
+                keys = (_target_scope(plan), (CORE_PAGES_TABLE, member), (CORE_RECEIPTS_TABLE, member))
+                if any(write_journal.pending_statement(key) for key in keys):
+                    raise RuntimeError('core releasing statement outcome is still pending')
     finally:
         connection.close()
 
@@ -3679,26 +3683,60 @@ def _record_completion(path, plans, receipt_ids, publication_reservation=None):
     write_journal.complete_intent(path, identity['digest'], receipt_ids[0], terminal, publication_reservation)
 
 
-def _check_linked_targets(head, plans, receipt_ids, *, retired):
-    """Authenticate surviving target attempts before inspecting their dispatch files."""
-    scopes = {_target_scope(plan) for plan in plans}
+def _check_linked_operations(connection, head, plans, receipt_ids):
+    """A restored descriptor can retire only attempts authenticated by the later head."""
     members = dict(zip(receipt_ids, plans, strict=True))
-    for scope in scopes:
+    retired = write_journal.submission_retired(head)
+    for scope in {_target_scope(plan) for plan in plans}:
         for record in write_journal.scope_operations(scope):
             op = record['operation']
             if op['owner'] != head['owner']:
                 continue
-            if record['state'] not in ('returned', 'FINISHED') and (
-                    retired or record['state'] not in ('dispatched', 'observed')):
-                raise _ScopePending('core retiring target outcome is still pending', op['owner'])
-            statement = record.get('statement')
             member = op['member']
+            statement = record.get('statement')
+            target = record['key'] == list(scope)
             if (member not in members or _target_scope(members[member]) != scope
-                    or record['key'] != list(scope)
                     or op['intent'] != head['statement']['operation']['intent']
-                    or not statement or statement.get('operation') != op or _statement_expected(statement) != member
+                    or op['plan_sha256'] != members[member].plan_sha256()
+                    or not statement or statement.get('operation') != op
                     or statement['attempt'] != head['members'].get(member)):
                 raise RuntimeError('core retiring target operation binding differs')
+            state = record['state']
+            pending = write_journal.read_statement(record['key'])
+            same_member = pending and (not target or _statement_expected(pending) == member)
+            if (state == 'dispatched' or same_member) and pending != statement:
+                raise _ScopePending('core local dispatch history differs and the outcome is still pending', op['owner'])
+            if target and statement.get('stage'):
+                _registered_stage(member, members[member].full_table, statement['stage'])
+                if state == 'FINISHED' and not _target_matches(connection, members[member]):
+                    raise _ScopePending('core staged target outcome is still pending', op['owner'])
+            query = record.get('query_id')
+            mapped = write_journal.statement_query(statement)
+            if mapped and state != 'dispatched' and mapped != query:
+                raise RuntimeError('core retiring operation query binding differs')
+            if target and state == 'rejected':
+                terminal = query and _query_outcome(connection, statement, query_id=query) == 'rejected'
+            elif state == 'FINISHED' or state == 'returned' and not query:
+                terminal = True
+            else:
+                terminal = (state == 'returned' or not retired and state in ('dispatched', 'observed')) and (
+                    _query_outcome(connection, statement, query_id=query or mapped) == 'finished')
+            if not terminal:
+                raise _ScopePending('core retiring target outcome is still pending', op['owner'])
+
+            if target:
+                expected = member
+            elif record['key'] == [CORE_RECEIPTS_TABLE, member]:
+                cells = _stored_receipts(connection, [member]).get(member)
+                if cells is None:
+                    raise RuntimeError('core receipt readback differs')
+                expected = _digest(cells)
+            elif record['key'] == [CORE_PAGES_TABLE, member] and members[member].pages:
+                expected = _digest(_stored_walk(connection, member))
+            else:
+                raise RuntimeError('core retiring operation key differs')
+            if _statement_expected(statement) != expected:
+                raise RuntimeError('core retiring operation postimage differs')
 
 
 def _finish_obsolete_descriptors(plans, receipt_ids, paths, release_head):
@@ -3817,7 +3855,7 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
             if tail or key == member or record.get('query_id'):
                 submitted.append(key)
         elif repair:
-            if (attempt != repair['before'].get(key) or write_journal.pending_statement(receipt_key)
+            if (attempt != repair['before'].get(key) or write_journal.pending_statement(receipt_key, inspect_only=True)
                     or record and record['statement']['attempt'] != attempt):
                 raise RuntimeError('core receipt repair submission is still pending')
         else:
@@ -3931,13 +3969,12 @@ def _linked_publications(head, pending, plans, receipt_ids, descriptor_hashes, *
         if path.stem == operation['intent']:
             continue
         linked = path.stem in operation.get('after_publication', ())
-        payload = body['payload']
-        if 'warehouse_identity' in payload and not (
-                linked and (retired or statement['key'] == operation['scope'])
-                and payload.get('receipt_only') and payload.get('receipt_worklist')):
+        if 'warehouse_identity' in body['payload'] and not linked:
             continue
         if not linked and not (retired and body['identity'].get('submission_protocol')):
             continue  # a pre-fence guard can coexist with a different publication
+        if linked and member not in receipt_ids and statement['key'] == [CORE_PAGES_TABLE, member]:
+            raise _ScopePending('core historical page repair descriptor is still pending', head['owner'])
         if not linked or member not in receipt_ids or head.get('members', {}).get(member) != statement['attempt']:
             raise RuntimeError('core submission publication binding differs')
         index = receipt_ids.index(member)
@@ -3990,7 +4027,7 @@ def _guard_prepublication(connection, path, identity, plans, receipt_ids, head, 
 
 
 def _verify_receipt_prefix(connection, plans, receipt_ids, hashes, digest, run, universe, batch, clock,
-                           *, prefix):
+                           *, prefix, inspect_only=False):
     """Verify all target cells before promoting any recovered receipt attempt."""
     prefix = prefix or _ReceiptPrefix(())
     untouched, submitted = prefix.untouched, prefix.submitted
@@ -4020,7 +4057,7 @@ def _verify_receipt_prefix(connection, plans, receipt_ids, hashes, digest, run, 
             verified.append((statement, query))
         else:
             raise RuntimeError('core receipt outcome is still pending')
-    if not verified and not untouched and not rejected:
+    if not inspect_only and not verified and not untouched and not rejected:
         return
     receipts = []
     absent = rejected.union(untouched)
@@ -4037,8 +4074,9 @@ def _verify_receipt_prefix(connection, plans, receipt_ids, hashes, digest, run, 
     for statement, query in verified:
         if _statement_expected(statement) != expected[statement['operation']['member']]:
             raise RuntimeError('core receipt postimage differs')
-    for statement, query in verified:
-        write_journal.verified_operation(statement, query)
+    if not inspect_only:
+        for statement, query in verified:
+            write_journal.verified_operation(statement, query)
 
 
 def _reviewed_publication_dispatch(path, plans, receipt_ids, reviews):
@@ -4152,7 +4190,7 @@ def _commit_bundle(
         # Completed packets use their acknowledgement when routing partial release.
         if pending and identity != descriptor_identity and not all(completed):
             for plan, plan_hash in zip(plans, descriptor_hashes, strict=True):
-                target = write_journal.pending_statement(_target_scope(plan))
+                target = write_journal.pending_statement(_target_scope(plan), inspect_only=True)
                 if target and _statement_expected(target) == _receipt_id(plan_hash, run_id, descriptor_digest):
                     identity = descriptor_identity
                     break
@@ -4217,28 +4255,28 @@ def _commit_bundle(
         }
         retired_head = bool(current_head and write_journal.submission_retired(head))
         linked = set()
-        # Before the first local acknowledgement, live operations go through
-        # coordinator and historical-walk checks in _guard_prepublication.
-        target_head = bool(current_head and last and last['key'] == last['operation']['scope'])
-        if current_head and last and (stored is not None or retired_head or target_head) and reviews is None:
+        # An active statement authorizes writes only under its dispatching
+        # descriptor. An authenticated reference to an earlier publication
+        # permits whole-packet verification and retirement.
+        if current_head and last and reviews is None:
             linked = set(_linked_publications(head, pending, plans, receipt_ids, descriptor_hashes,
                                               retired=retired_head))
             if retired_head:
                 stale_descriptors.update(linked)
             else:
                 stale_descriptors.update(linked & receipt_repairs)
-            if target_head and not retired_head and not linked and (not paths or paths[-1].stem != head_intent):
-                raise _ScopePending('core target repair descriptor is still pending', receipt_ids[0])
+            if not retired_head and not linked and (not paths or paths[-1].stem != head_intent):
+                raise _ScopePending('core repair descriptor is still pending', receipt_ids[0])
         no_post = bool(current_head and head.get('reservation') and not last)
         released_reservation = no_post and write_journal.reservation_release_started(head)
-        if released_reservation and reviews is None:
+        if no_post and reviews is None:
             for path, body in pending:
                 if (path in receipt_repairs and body['payload'].get('receipt_worklist')
                         and path.stem != head_intent and path.stem in head.get('after_publication', ())):
                     linked.add(path)
                     stale_descriptors.add(path)
         closing_reservation = (no_post and bool(completed) and all(completed)
-                               and not (released_reservation and stale_descriptors))
+                               and not (linked & receipt_repairs or released_reservation and stale_descriptors))
         publication_reservation = None
         if (no_post and len(pending) == 1 and 'warehouse_identity' not in pending[0][1]['payload']
                 and pending[0][0].stem != head['reservation']):
@@ -4273,21 +4311,31 @@ def _commit_bundle(
             # A linked completion predating this reservation still needs full
             # readback before it can record the association and begin release.
             foreign_owner = _check_undispatched_reservation(head, plans, receipt_ids, checked_scopes)
-        elif released_reservation and stale_descriptors:
+        elif no_post and (linked or released_reservation and stale_descriptors):
             _check_undispatched_reservation(head, plans, receipt_ids, scopes)
         elif closing_statement:
             checked_scopes = write_journal.remaining_reservation_scopes(head)
             foreign_owner = _check_release_statements(head, plans, receipt_ids, checked_scopes)
-        if target_head and linked & stale_descriptors and not obsolete_release:
-            _check_linked_targets(head, plans, receipt_ids, retired=retired_head)
-        # A single unpublished member can still need coordinator settlement of
-        # its staged target before the historical walk/receipt can be verified.
-        if target_head and linked and (stored is not None or len(plans) > 1) and not obsolete_release:
-            # pending_statement can itself finish a torn cleanup. Prove every
-            # member before inspecting dispatch files or materializing guards.
+        if linked and not obsolete_release:
+            # pending_statement may finish a torn unlink, and scope routing may
+            # materialize a reservation. Both must follow whole-packet readback.
             publication = stored or {'run_id': run_id, 'committed_batch': batch,
                                      'committed_at': pending[0][1]['evidence']['committed_at']}
-            _verify_member_cells(connection_factory, plans, receipt_ids, publication, identity, universe_version, scopes)
+            _verify_member_cells(connection_factory, plans, receipt_ids, publication, identity, universe_version,
+                                 scopes, linked_head=head if last else None)
+        elif (stored and retry_statement and not retired_head and not any(completed)
+              and head_repair.get('intent') == paths[-1].stem == head_intent
+              and last['attempt'] != head_repair['before'].get(last['operation']['member'])):
+            # A live worklist can also have stopped mid-unlink. Its untouched
+            # tail must still be absent, and every other receipt must be exact.
+            prefix = _repair_prefix(head, paths[-1], pending[-1][1]['payload'], plans, receipt_ids)
+            connection = _journal_connection(connection_factory)
+            try:
+                _verify_receipt_prefix(connection, plans, receipt_ids, identity['plan_hashes'], identity['digest'],
+                                       run_id, universe_version, batch, stored['committed_at'],
+                                       prefix=prefix, inspect_only=True)
+            finally:
+                connection.close()
         write_journal.check_dispatch_bindings(checked_scopes, reviewed_dispatch=reviewed_dispatch,
                                               retry_statement=retry_statement)
         active_operations = _check_operation_history(
@@ -4481,7 +4529,7 @@ def _commit_bundle(
                     connection, writer, plans, repair=repair, receipt_ids=receipt_ids,
                     committed_at=stored['committed_at'], verify_only=verify_postimages,
                     contested=contested, historical_intent=historical_intent, run_id=run_id, held_receipts=held_receipts,
-                    defer_cleanup=read_only_publication)
+                    defer_cleanup=read_only_publication, acquire_guard=not (stale_descriptors or linked))
                 if verify_postimages:
                     original = stored['plans']
                     if stored.get('receipt_readback') is not True:
@@ -4548,7 +4596,7 @@ def _commit_bundle(
                 # A historical target guard still needs its own terminal proof.
                 obsolete = stale_descriptors if settled else stale_descriptors & guarded_repairs
                 release_head = head if retired_head or released_reservation else None
-                if target_head and obsolete & linked and active_operations:
+                if obsolete & linked and (active_operations or no_post and not released_reservation):
                     write_journal.retire_operations(scopes, receipt_ids[0])
                     release_head = head
                 _finish_obsolete_descriptors(plans, receipt_ids, obsolete, release_head)
@@ -4628,7 +4676,7 @@ def _commit_bundle(
                 connection, writer, plans, receipt_ids=receipt_ids, committed_at=committed_at,
                 verify_only=verify_only or read_only_publication or prefix is not None, contested=contested,
                 historical_intent=historical_intent, run_id=run_id, held_receipts=held_receipts,
-                defer_cleanup=read_only_publication)
+                defer_cleanup=read_only_publication, acquire_guard=not stale_descriptors)
             plan_receipts = [
                 _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version,
                               batch, committed_at)
@@ -4664,7 +4712,7 @@ def _commit_bundle(
         _publish_alias(current, receipt, plan_hashes, digest)
         # A pre-fence intent still guards the scope after read-only verification.
         if stale_descriptors:
-            if target_head and linked and active_operations:
+            if linked and active_operations:
                 write_journal.retire_operations(scopes, receipt_ids[0])
             _finish_obsolete_descriptors(plans, receipt_ids, stale_descriptors,
                                          head if retired_head or released_reservation else None)
