@@ -1428,7 +1428,7 @@ def test_a_receipt_contradiction_is_refused_before_any_mutation():
     ).fetchall()
 
 
-def test_an_ambiguous_receipt_insert_is_resolved_by_reading_the_id_back():
+def test_an_ambiguous_receipt_insert_is_resolved_by_its_finished_query_and_readback():
     # Round 6 finding 3: the commit-conflict retry ladder repeated the receipt
     # INSERT after a commit whose outcome was unknown, and the read-back saw
     # two physical rows for one receipt id.
@@ -1440,6 +1440,7 @@ def test_an_ambiguous_receipt_insert_is_resolved_by_reading_the_id_back():
             if insert and not AmbiguousCursor.fired:
                 AmbiguousCursor.fired = True
                 super().execute(sql, params)
+                self.query_id = 'q_ambiguous_receipt'
                 raise RuntimeError('ICEBERG_COMMIT_ERROR: commit state unknown')
             return super().execute(sql, params)
 
@@ -1448,9 +1449,14 @@ def test_an_ambiguous_receipt_insert_is_resolved_by_reading_the_id_back():
             return AmbiguousCursor(self)
 
     db = AmbiguousDB()
-    receipt = native_writer.write_core_bundle(
-        lambda: db, CoreWriter(db), [membership_plan(['1'], capture='cap-1')], run_id='r',
-        universe_version='u', committed_at=CLOCK)
+    with pytest.raises(RuntimeError, match='commit state unknown'):
+        native_writer.write_core_bundle(
+            lambda: db, CoreWriter(db), [membership_plan(['1'], capture='cap-1')], run_id='r',
+            universe_version='u', committed_at=CLOCK)
+    with pytest.raises(RuntimeError, match='still pending'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='r')
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_ambiguous_receipt','FINISHED',NULL)")
+    receipt, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='r')
     assert receipt['verified'] is True
     assert _receipt_count(db) == 1
 
@@ -2320,6 +2326,10 @@ def test_queued_ops_insert_lands_after_the_replay_attempt(target):
     assert db.sql.execute(f'SELECT count(*) FROM {target}').fetchone() == (expected_count,)
     assert not early
     assert write_journal.pending_intents({'run_id': 'queued'})
+    if target == RECEIPTS:
+        with pytest.raises(RuntimeError, match='still pending'):
+            native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
+        db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='queued-receipt'")
     settled, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
     assert settled['verified'] and write_journal.pending_intents({}) == []
     assert _receipt_count(db) == 1
@@ -2821,6 +2831,9 @@ def test_target_remains_fenced_until_its_ops_insert_lands(monkeypatch, interrupt
     def queue(self, sql, params=()):
         if sql.startswith('INSERT INTO ' + table):
             held.append((sql, tuple(params)))
+            if interruption == 'receipt':
+                self.query_id = 'q_ops_receipt'
+                db.sql.execute("INSERT INTO test_query_history VALUES ('q_ops_receipt','QUEUED',NULL)")
             raise RuntimeError('queued ops insert')
         return execute(self, sql, params)
     with monkeypatch.context() as patch:
@@ -2831,6 +2844,8 @@ def test_target_remains_fenced_until_its_ops_insert_lands(monkeypatch, interrupt
         write(db, [competitor], run_id='competitor', clock=LATER if interruption == 'walk-tie' else NEWEST)
     assert len(held) == 1
     db.cursor().execute(*held[0])
+    if interruption == 'receipt':
+        db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_ops_receipt'")
     receipt, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='queued')
     assert receipt['verified']
     if interruption == 'walk':
@@ -3996,6 +4011,85 @@ def test_historical_receipt_repair_requires_finished_before_first_publication(mo
     db.cursor().execute(*submission)
     assert replay()[0]['verified'] and not path.exists() and _receipt_count(db) == 6
     assert write_journal.pending_statement(key) is None
+
+
+@pytest.mark.parametrize('old_observable_fence', [False, True])
+def test_current_packet_receipt_needs_finished_and_exact_cells_before_publication(monkeypatch, old_observable_fence):
+    # Round 14 finding 2
+    db = CoreDB()
+    plans = [membership_plan(['1']), _club_plan('42', 'sibling', CLOCK)]
+
+    def interrupt(*args):
+        raise RuntimeError('before local publication')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', interrupt)
+        with pytest.raises(RuntimeError, match='before local publication'):
+            write(db, plans)
+    (path, body), = write_journal.pending_intents({'run_id': 'run-1'})
+    digest = body['identity']['digest']
+    assert body['identity']['packet_attempt'] and write_journal.read_receipt(digest) is None
+    key = native_writer._receipt_id(plans[0].plan_sha256(), 'run-1', digest)
+    fence = (native_writer.CORE_RECEIPTS_TABLE, key)
+    assert not write_journal.terminal_target(path.stem, key)
+    expected = db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall()
+    assert len(expected) == 2
+    db.sql.execute(f'CREATE TABLE saved_receipt AS SELECT * FROM {RECEIPTS} WHERE receipt_id=?', (key,))
+    delete = f'DELETE FROM {RECEIPTS} WHERE receipt_id=?'
+    db.sql.execute(delete, (key,))
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+
+    execute, submissions = CoreCursor.execute, []
+
+    def queue(cursor, sql, params=()):
+        if sql.startswith('INSERT INTO ' + native_writer.CORE_RECEIPTS_TABLE):
+            submissions.append((sql, tuple(params)))
+            cursor.query_id = 'q_current_receipt'
+            db.sql.execute("INSERT INTO test_query_history VALUES ('q_current_receipt','QUEUED',NULL)")
+            raise TrinoAmbiguousWriteError('lost receipt INSERT response')
+        return execute(cursor, sql, params)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CoreCursor, 'execute', queue)
+        if old_observable_fence:
+            # The deployed writer marked current-packet INSERTs observable.
+            begin = write_journal.begin_statement
+
+            def begin_prior_statement(statement_key, expected, **options):
+                if statement_key == fence:
+                    options['observable'] = True
+                return begin(statement_key, expected, **options)
+
+            patch.setattr(write_journal, 'begin_statement', begin_prior_statement)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            replay()
+        statement = write_journal.pending_statement(fence)
+        assert statement['observable'] is old_observable_fence
+        assert write_journal.statement_query(statement) == 'q_current_receipt'
+        db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM saved_receipt')
+        assert db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall() == expected
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        db.sql.execute(delete, (key,))
+        db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_current_receipt'")
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        assert write_journal.pending_statement(fence) == statement
+        assert path.exists() and write_journal.read_receipt(digest) is None
+    submission, = submissions
+    restored = db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM saved_receipt').lastrowid
+    db.cursor().execute(*submission)
+    assert db.sql.execute(f'SELECT COUNT(*) FROM {RECEIPTS} WHERE receipt_id=?', (key,)).fetchone() == (2,)
+    with pytest.raises(RuntimeError, match='receipt readback differs'):
+        replay()
+    assert write_journal.pending_statement(fence) == statement and write_journal.read_receipt(digest) is None
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE rowid=?', (restored,))
+    ack, = replay()
+    assert ack['verified'] and write_journal.read_receipt(digest) == ack
+    assert not path.exists() and write_journal.pending_statement(fence) is None
+    assert db.sql.execute(f'SELECT * FROM {RECEIPTS} ORDER BY receipt_id').fetchall() == expected
 
 
 @pytest.mark.parametrize('conflict', [False, True])

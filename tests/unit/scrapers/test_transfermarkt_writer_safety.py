@@ -936,3 +936,108 @@ def test_pre_binding_stage_survives_loss_of_target_statement(staged_bundle, monk
         db.sql.execute("INSERT INTO test_query_history VALUES ('q_original','FINISHED',NULL)")
         assert replay()[0]['verified'] and len(queued) == 1
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
+
+
+def test_pre_walk_backup_with_scope_owner_cannot_repeat_single_page_repair(tmp_path, monkeypatch):
+    # Round 14 finding 1
+    import shutil
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+    from tests.unit.scrapers import test_transfermarkt_sections as lanes
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    db = native.CoreDB()
+    journal = native_writer.write_journal
+    body = (lanes.ATTENDANCE_FIXTURES / 'single_page.html').read_bytes()
+
+    def snapshot(name, clock):
+        page = lanes._page(lanes.ATTENDANCE_START, body + name.encode(), clock, name)
+        return lanes._attendance_plan((page,), extracted_at=clock)
+
+    a, b, c = snapshot('A', native.EARLIER), snapshot('B', native.CLOCK), snapshot('C', native.NEWEST)
+    assert lanes._bundle(db, [a], native.EARLIER)['verified']
+    root = journal._root()
+    backup = tmp_path / 'before-walk-b'
+    record_pages = native_writer._record_pages
+
+    def backup_before_walk(*args, **kwargs):
+        shutil.copytree(root, backup)
+        record_pages(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native_writer, '_record_pages', backup_before_walk)
+        ack = lanes._bundle(db, [b], native.CLOCK)
+    key = ack['walks'][0]['receipt_id']
+    scope = native_writer._target_scope(b)
+    warehouse = _TombstoneWarehouse(b.table, [dict(row) for row in a.rows])
+    warehouse.lost = True
+    native._copy_warehouse_scope(warehouse, db, a)
+    assert native_writer._target_matches(db, a)
+    assert native_writer._stored_receipts(db, [key]) and native_writer._stored_walk(db, key)
+    production = writer.TransfermarktIcebergWriter()
+    production._trino_manager = _scripted(warehouse)
+    monkeypatch.setattr(production._trino_manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(native.IcebergWriter, '_evolve_schema', lambda *args: None)
+    run_sql, submissions = warehouse.run, []
+
+    def dispatch(sql):
+        if sql.startswith('MERGE INTO'):
+            submissions.append(sql)
+            if len(submissions) == 1:
+                db.sql.execute("INSERT INTO test_query_history VALUES ('q_target_merge','QUEUED',NULL)")
+                raise ConnectionResetError('Connection reset after accepted repair MERGE')
+            result = run_sql(sql)
+            native._copy_warehouse_scope(warehouse, db, b)
+            return result
+        return run_sql(sql)
+
+    monkeypatch.setattr(warehouse, 'run', dispatch)
+
+    def commit(plan):
+        return native_writer.write_core_bundle(lambda: db, production, [plan], run_id=plan.rows[0]['run_id'],
+                                               universe_version=lanes.UNIVERSE, committed_at=plan.captured_at)
+
+    def replay_b():
+        return native_writer.replay_pending_intents(lambda: db, production, run_id=ack['run_id'])
+
+    with pytest.raises(TrinoAmbiguousWriteError):
+        commit(b)
+    statement = journal.pending_statement(scope)
+    assert journal.statement_query(statement) == 'q_target_merge'
+    stage = statement['stage']
+    stage_path = journal.stage_record(key, stage)
+    stage_record = journal._read_record(stage_path)
+    root.rename(tmp_path / 'in-flight')
+    shutil.copytree(backup, root)
+    (intent, _), = journal.pending_intents({'run_id': ack['run_id']})
+    assert journal.read_receipt(ack['plan_sha256']) is None
+    assert journal.scope_owner(scope) == key and journal.pending_statement(scope) is None
+    try:
+        with pytest.raises(native.StaleTransfermarktWrite, match='local dispatch history'):
+            replay_b()
+        with pytest.raises(native.StaleTransfermarktWrite):
+            commit(c)
+        assert intent.exists() and journal.read_receipt(ack['plan_sha256']) is None
+        assert journal.scope_owner(scope) == key and native_writer._target_matches(db, a)
+        assert (stage,) in warehouse.engine.execute('SHOW TABLES').fetchall()
+        assert native.write(db, [native._attendance_edition(c, '2024')], run_id='disjoint',
+                            clock=native.NEWEST)['verified']
+    finally:
+        run_sql(submissions[0])
+        native._copy_warehouse_scope(warehouse, db, b)
+    assert len(submissions) == 1 and native_writer._target_matches(db, b)
+    assert warehouse.engine.execute(f'SELECT club_id, COUNT(*) FROM {b.table} GROUP BY club_id '
+                                    'ORDER BY club_id').fetchall() == [('11', 1), ('631', 1)]
+    # Exact Bronze cells still cannot settle the orphan. Recover just the
+    # bound attempt, its coordinator ID and its retained stage from the backup.
+    with pytest.raises(native.StaleTransfermarktWrite, match='local dispatch history'):
+        replay_b()
+    journal._immutable_record(journal._attempt_path(scope), statement)
+    journal.remember_query(statement, 'q_target_merge')
+    journal._immutable_record(stage_path, stage_record)
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay_b()
+    assert journal.pending_statement(scope) == statement and stage_path.exists()
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
+    assert replay_b() == [ack]
+    assert len(submissions) == 1 and not intent.exists()
+    assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(b.table,)]
