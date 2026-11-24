@@ -2034,18 +2034,18 @@ def _split_phase_run_id(run_id: str) -> tuple[str, str]:
     value = str(run_id or "").strip()
     if value.count("::") != 1:
         raise ParentEnvelopeError(
-            "production SofaScore run_id must end in ::season, ::targets or ::players"
+            "production SofaScore run_id must end in ::season, ::season_fields, ::targets or ::players"
         )
     base_run_id, phase = value.rsplit("::", 1)
-    if not base_run_id or phase not in {"season", "targets", "players"}:
+    if not base_run_id or phase not in {"season", "season_fields", "targets", "players"}:
         raise ParentEnvelopeError(
-            "production SofaScore run_id must end in ::season, ::targets or ::players"
+            "production SofaScore run_id must end in ::season, ::season_fields, ::targets or ::players"
         )
     return base_run_id, phase
 
 
 class ParentRunEnvelopeLedger:
-    """Atomic parent cap shared by immutable season/targets/players plans.
+    """Atomic parent cap shared by immutable season/season_fields/targets/players plans.
 
     #1350: single writer, document kept in memory.  ``register`` (envelope
     opening) persists immediately; per-chunk ``consume`` only marks the
@@ -2055,7 +2055,7 @@ class ParentRunEnvelopeLedger:
     """
 
     SCHEMA_VERSION = 1
-    PHASE_ORDER = {"season": 0, "targets": 1, "players": 2}
+    PHASE_ORDER = {"season": 0, "season_fields": 0, "targets": 1, "players": 2}
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -2250,9 +2250,9 @@ class ParentRunEnvelopeLedger:
     def register(self, plan: SignedDagRunPlan) -> ParentRunEnvelope:
         base_run_id, phase = _split_phase_run_id(plan.run_id)
         allocation_scopes = {allocation.scope for allocation in plan.allocations}
-        if phase == "season" and allocation_scopes not in (set(), {"season"}):
+        if phase in {"season", "season_fields"} and allocation_scopes not in (set(), {"season"}):
             raise ParentEnvelopeError(
-                "season phase plan may contain only season allocations"
+                "season/season_fields phase plan may contain only season allocations"
             )
         if phase == "targets" and not allocation_scopes.issubset({"match"}):
             raise ParentEnvelopeError(

@@ -213,18 +213,18 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             if self.workload_plan.run_id.count("::") != 1:
                 raise ValueError(
                     "production workload run_id must end in "
-                    "::season, ::targets or ::players"
+                    "::season, ::season_fields, ::targets or ::players"
                 )
             self.base_run_id, self.workload_phase = (
                 self.workload_plan.run_id.rsplit("::", 1)
             )
             if (
                 not self.base_run_id
-                or self.workload_phase not in {"season", "targets", "players"}
+                or self.workload_phase not in {"season", "season_fields", "targets", "players"}
             ):
                 raise ValueError(
                     "production workload run_id must end in "
-                    "::season, ::targets or ::players"
+                    "::season, ::season_fields, ::targets or ::players"
                 )
             try:
                 self.allocation = next(

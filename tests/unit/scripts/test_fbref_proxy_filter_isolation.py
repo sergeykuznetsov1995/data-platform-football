@@ -32,7 +32,8 @@ SHARED_FILTER_SHA256 = (
     # #2145: manual TM registry uses the existing source/stream; FBref unchanged.
     # #2163: owned compaction scratch accounting; dedicated FBref bytes unchanged.
     # #2167: compact SofaScore state and retired parent markers; FBref unchanged.
-    "f1e1f5763b9f1780faf85f73b90fcfc079d05b46702c913df3a52e345fc9f220"
+    # #1368: signed season_fields phase across the shared transport; FBref unchanged.
+    "620615aee11e9b6bb58cda5f543858039a7ee9e775ca6773e1ffbb1b2f9201cb"
 )
 
 

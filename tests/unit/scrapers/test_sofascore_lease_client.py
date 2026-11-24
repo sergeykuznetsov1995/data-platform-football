@@ -82,6 +82,13 @@ def test_player_phase_uses_same_parent_run_identity():
     )
 
 
+def test_season_fields_phase_uses_same_parent_run_identity():
+    assert _phase_run_id("scheduled__2026-07-11::season_fields") == (
+        "scheduled__2026-07-11",
+        "season_fields",
+    )
+
+
 def _lease_payload(*, token="unsafe/token+", plan=None, allocation=None):
     if plan is None or allocation is None:
         plan, allocation = _plan()

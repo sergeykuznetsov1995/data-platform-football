@@ -883,6 +883,58 @@ def test_signed_players_phase_is_accepted_by_production_transport(tmp_path):
     assert client.acquire_calls[0]["run_id"].endswith("::players")
 
 
+def test_signed_season_fields_phase_is_accepted_by_production_transport(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    runtime.engine.run_id = "scheduled__signed-run::season_fields"
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "6" * 32,
+        task_id="capture",
+        scope="season",
+        workload_class="season_test",
+        batch_index=0,
+        units=("1",),
+        budget_bytes=10_000,
+    )
+    other_allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "5" * 32,
+        task_id="capture_other",
+        scope="season",
+        workload_class="season_test",
+        batch_index=1,
+        units=("2",),
+        budget_bytes=10_000,
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_refresh_sofascore_all_mens",
+        run_id=runtime.engine.run_id,
+        player_universe_ids=(),
+        allocations=(other_allocation, allocation),
+        control_token="c" * 32,
+    )
+    client = _LeaseClient([0, 0, 100], final_total=100)
+    factory = _TransportFactory(
+        client,
+        _Capture([_record(b'{"items":[{"id":1}]}')]),
+    )
+
+    results, _ = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="SS-22758:2627",
+        entity="season_fields",
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="1",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert client.acquire_calls[0]["run_id"].endswith("::season_fields")
+    assert client.acquire_calls[0]["allocation_id"] == allocation.allocation_id
+
+
 def test_challenge_rewarms_same_browser_and_engine_retry_is_accounted(tmp_path):
     runtime, limiter = _runtime(tmp_path)
     client = _LeaseClient([0, 0, 40, 40, 90], final_total=90)
