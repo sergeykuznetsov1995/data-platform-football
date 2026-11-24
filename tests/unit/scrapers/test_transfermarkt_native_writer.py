@@ -10263,7 +10263,7 @@ def test_r36_noop_across_reservation(monkeypatch, replay, window, legacy):
 @pytest.mark.parametrize('released', [False, True])
 @pytest.mark.parametrize(('completed', 'receipt_only', 'restore_receipt'), [
     (completed, receipt_only, False) for completed in (False, True) for receipt_only in (False, True)
-] + [(True, True, 'returned'), (True, True, 'promotion'), (False, True, 'returned')])
+] + [(completed, True, state) for completed in (False, True) for state in ('returned', 'promotion')])
 def test_r36_obsolete_retired_generation(tmp_path, monkeypatch, replay, released, completed, receipt_only, restore_receipt):
     # Round 39 finding 10
     # Round 39 finding 11
@@ -10271,6 +10271,8 @@ def test_r36_obsolete_retired_generation(tmp_path, monkeypatch, replay, released
     # Round 37 finding 9
     # Round 36 finding 9
     db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
+    if restore_receipt == 'promotion':
+        write(db, [plans[0]], run_id='earlier-sibling')
     ack = write(db, plans)
     owner, _ = _r26_members(ack)
     root = write_journal._root()
@@ -10322,8 +10324,26 @@ def test_r36_obsolete_retired_generation(tmp_path, monkeypatch, replay, released
         assert _r26_file_bytes(evidence) == evidence
         db.sql.execute(f'UPDATE {RECEIPTS} SET physical_hash=? WHERE receipt_id=?', (ack['plans'][0]['physical_hash'], owner))
     if restore_receipt == 'promotion':
+        # Round 40 finding 6
         _, pending, attempt, marker, mapping = saved
+        mapping.parent.mkdir(exist_ok=True)
         for path in (pending, attempt, mapping):
+            path.write_bytes(saved[path])
+        db.sql.execute(f"UPDATE {RECEIPTS} SET row_count=0 WHERE run_id='earlier-sibling'")
+        for window in ('before-marker', 'marker', 'mapping-unlink'):
+            if window == 'marker':
+                marker.write_bytes(saved[marker])
+            if window == 'mapping-unlink':
+                pending.unlink()
+                attempt.unlink()
+            evidence = _r26_file_bytes([descriptor, *saved, *_r27_guards(plans, owner)])
+            with pytest.raises(RuntimeError, match='differs from committed capture'):
+                _r20_recover(db, writer, plans, replay)
+            assert _r26_file_bytes(evidence) == evidence
+            _r28_no_dml(db, writer, start)
+        db.sql.execute(f"UPDATE {RECEIPTS} SET row_count=1 WHERE run_id='earlier-sibling'")
+        marker.unlink()
+        for path in (pending, attempt):
             path.write_bytes(saved[path])
         promote = write_journal.verified_operation
 
@@ -10879,6 +10899,7 @@ def test_r39_dispatched_repair_freshness(monkeypatch, tmp_path, replay):
 @pytest.mark.parametrize('replay', [False, True])
 @pytest.mark.parametrize('completed', [False, True])
 def test_r39_missing_merge_target_receipt(tmp_path, monkeypatch, replay, completed):
+    # Round 40 finding 1
     # Round 39 finding 2
     db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
     prior = write(db, [plans[0]], run_id='older')
@@ -10905,7 +10926,10 @@ def test_r39_missing_merge_target_receipt(tmp_path, monkeypatch, replay, complet
     db.sql.execute(f'ALTER TABLE {table} RENAME TO held_table')
     writer, start = CoreWriter(db), len(db.events)
     for column, wrong, exact in [('source_body_hash', 'a' * 64, plans[0].rows[0]['source_body_hash']),
-                                 ('row_count', 0, 1)]:
+                                 ('row_count', 0, 1), ('row_count', 2, 1), ('expected_rows', 2, 1)]:
+        if column == 'expected_rows':
+            # Even internally consistent counts must agree with this exact plan SHA.
+            db.sql.execute(f'UPDATE {RECEIPTS} SET row_count=2 WHERE receipt_id=?', (historical,))
         db.sql.execute(f'UPDATE {RECEIPTS} SET {column}=? WHERE receipt_id=?', (wrong, historical))
         with pytest.raises(RuntimeError, match='differs from committed capture'):
             _r20_recover(db, writer, plans, replay)
@@ -10913,6 +10937,7 @@ def test_r39_missing_merge_target_receipt(tmp_path, monkeypatch, replay, complet
         assert _r26_file_bytes(evidence) == evidence
         assert not db.sql.execute('SELECT name FROM sqlite_master WHERE name=?', (table,)).fetchone()
         db.sql.execute(f'UPDATE {RECEIPTS} SET {column}=? WHERE receipt_id=?', (exact, historical))
+    db.sql.execute(f'UPDATE {RECEIPTS} SET row_count=1 WHERE receipt_id=?', (historical,))
     db.sql.execute(f'ALTER TABLE held_table RENAME TO {table}')
     assert _r20_recover(db, writer, plans, replay) == ack
     assert not record.exists() and not write_journal.pending_intents({})
@@ -10920,7 +10945,10 @@ def test_r39_missing_merge_target_receipt(tmp_path, monkeypatch, replay, complet
 
 
 @pytest.mark.parametrize('replay', [False, True])
-def test_r39_publication_historical_marker(monkeypatch, replay):
+@pytest.mark.parametrize('window', ['orphan', 'legacy-precompletion', 'modern-precompletion', 'released', 'held'])
+def test_r39_publication_historical_marker(monkeypatch, replay, window):
+    # Round 40 finding 4
+    # Round 40 finding 8
     # Round 39 finding 4
     from tests.unit.scrapers.test_transfermarkt_sections import _attendance_plan
 
@@ -10930,6 +10958,10 @@ def test_r39_publication_historical_marker(monkeypatch, replay):
     historical = write(db, [older], run_id='early', clock=EARLIER)['walks'][0]['receipt_id']
     db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id=?', (historical,))
     plans = [_attendance_plan((page(url, 'single_page.html', CLOCK, 'current'),)), *_representation_packet(('7',), CLOCK)]
+    if window == 'legacy-precompletion':
+        _historical_packet(plans)
+    if window == 'held':
+        plans.reverse()
     release = write_journal.release_scope
 
     def stop_after_release(scope, owner):
@@ -10937,35 +10969,65 @@ def test_r39_publication_historical_marker(monkeypatch, replay):
         _r22_stop()
 
     with monkeypatch.context() as patch:
+        _capture_returned_queries(patch, db, [native_writer.CORE_PAGES_TABLE])
         saved = _r37_capture_settlement(patch, 'settled-statements',
                                          lambda key: key == [native_writer.CORE_PAGES_TABLE, historical])
         patch.setattr(write_journal, 'release_scope', stop_after_release)
         with pytest.raises(OSError):
             write(db, plans)
-    _, _, _, marker, _ = saved
+    record, _, _, marker, _ = saved
     marker.write_bytes(saved[marker])
     (descriptor, body), = write_journal.pending_intents({})
+    if window.endswith('precompletion'):
+        write_journal._record_path('completed-intents', descriptor.stem).unlink()
     guard = write_journal._scope_owner_path(native_writer._target_scope(plans[-1]))
     assert guard.exists()
-    evidence = _r26_file_bytes([marker, descriptor, guard])
     writer, start = CoreWriter(db), len(db.events)
+    if window in ('released', 'held'):
+        exact = write_journal._decode_record(saved[record])
+        statement = {**exact['statement'], 'attempt': 'other'}
+        write_journal._store_record(record, {**exact, 'statement': statement})
+        write_journal._store_record(marker, {'statement': statement, 'query_id': exact['query_id']}, replace=True)
+    evidence = _r26_file_bytes([marker, descriptor, guard, record])
     with pytest.raises(RuntimeError):
         _r20_recover(db, writer, plans, replay)
     assert _r26_file_bytes(evidence) == evidence
     _r28_no_dml(db, writer, start)
-    marker.unlink()
+    if window in ('released', 'held'):
+        for path in (record, marker):
+            path.write_bytes(saved[path])
+        evidence = _r26_file_bytes(evidence)
+        query = exact['query_id']
+        db.sql.execute("UPDATE test_query_history SET state='QUEUED' WHERE query_id=?", (query,))
+        with pytest.raises(RuntimeError):
+            _r20_recover(db, writer, plans, replay)
+        assert _r26_file_bytes(evidence) == evidence
+        db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id=?", (query,))
+        db.sql.execute("UPDATE transfermarkt_core_pages_v1 SET source_body_hash='wrong' WHERE receipt_id=?", (historical,))
+        with pytest.raises(RuntimeError):
+            _r20_recover(db, writer, plans, replay)
+        assert _r26_file_bytes(evidence) == evidence
+        _r28_no_dml(db, writer, start)
+        db.sql.execute('UPDATE transfermarkt_core_pages_v1 SET source_body_hash=? WHERE receipt_id=?',
+                       (older.pages[0][3], historical))
+    else:
+        marker.unlink()
     assert _r20_recover(db, writer, plans, replay) == write_journal.read_receipt(body['identity']['digest'])
-    assert not descriptor.exists() and not guard.exists() and not writer.writes
+    assert not any(path.exists() for path in evidence) and not writer.writes
     assert not _r33_data_mutations(db, start, plans)
 
 
 @pytest.mark.parametrize('replay', [False, True])
-def test_r39_obsolete_release_capture_readback(tmp_path, monkeypatch, replay):
+@pytest.mark.parametrize('damage', ['other-target', 'held-receipt', 'released-receipt', 'released-body'])
+def test_r39_obsolete_release_capture_readback(tmp_path, monkeypatch, replay, damage):
+    # Round 40 finding 5
     # Round 39 finding 5
     db = CoreDB()
     seven, nine, other = _representation_packet(('7', '9', '23'), CLOCK)
     plans = [seven, nine]
     write(db, [other], run_id='third')
+    for index, plan in enumerate(plans):
+        write(db, [plan], run_id=f'prior-{index}')
     ack = write(db, plans)
     backup = tmp_path / 'obsolete'
     db.sql.execute(f"DELETE FROM {nine.table} WHERE player_id='9'")
@@ -10986,16 +11048,35 @@ def test_r39_obsolete_release_capture_readback(tmp_path, monkeypatch, replay):
         with pytest.raises(OSError):
             _r20_recover(db, CoreWriter(db), plans, True)
     assert sum(p.exists() for p in guards) == 1
-    db.sql.execute(f"UPDATE {nine.table} SET source_body_hash=? WHERE player_id='23'", ('a' * 64,))
     writer, start = CoreWriter(db), len(db.events)
-    if replay:
-        assert _r20_recover(db, writer, plans, True) == ack
+    if damage == 'other-target':
+        db.sql.execute(f"UPDATE {nine.table} SET source_body_hash=? WHERE player_id='23'", ('a' * 64,))
+    else:
+        index = next(i for i, g in enumerate(guards) if g.exists() == (damage == 'held-receipt'))
+        if damage == 'released-body':
+            assert seven.capture_id == nine.capture_id
+            db.sql.execute(f'UPDATE {RECEIPTS} SET source_body_hash=? WHERE run_id=?', ('a' * 64, f'prior-{index}'))
+        else:
+            db.sql.execute(f'UPDATE {RECEIPTS} SET row_count=0 WHERE run_id=?', (f'prior-{index}',))
+        if damage == 'held-receipt':
+            evidence = _r26_file_bytes([*guards, *(p for p, _ in write_journal.pending_intents({}))])
+            with pytest.raises(RuntimeError, match='differs from committed capture'):
+                _r20_recover(db, writer, plans, replay)
+            assert _r26_file_bytes(evidence) == evidence
+            db.sql.execute(f'UPDATE {RECEIPTS} SET row_count=1 WHERE run_id=?', (f'prior-{index}',))
+    if replay or damage == 'held-receipt':
+        assert _r20_recover(db, writer, plans, replay) == ack
     else:
         with pytest.raises(RuntimeError, match='differs from committed capture'):
             _r20_recover(db, writer, plans, False)
     _r28_no_dml(db, writer, start)
     assert not any(path.exists() for path in guards)
     db.sql.execute(f"UPDATE {nine.table} SET source_body_hash=? WHERE player_id='23'", (other.rows[0]['source_body_hash'],))
+    if damage == 'released-receipt':
+        db.sql.execute(f'UPDATE {RECEIPTS} SET row_count=1 WHERE run_id=?', (f'prior-{index}',))
+    if damage == 'released-body':
+        db.sql.execute(f'UPDATE {RECEIPTS} SET source_body_hash=? WHERE run_id=?',
+                       (plans[index].rows[0]['source_body_hash'], f'prior-{index}'))
     assert _r20_recover(db, writer, plans, False) == ack
 
 
@@ -11032,4 +11113,107 @@ def test_r39_foreign_marker_on_released_target(monkeypatch, replay):
             _r20_recover(db, writer, plans, False)
     assert write_journal.scope_owner(nine) is None and not write_journal.pending_intents({})
     assert _r26_file_bytes(saved) == evidence
+    _r28_no_dml(db, writer, start)
+
+
+@pytest.mark.parametrize('replay', [False, True])
+@pytest.mark.parametrize('damage', ['landed-merge', 'publisher-marker'])
+def test_r40_dispatched_repair_before_table_creation(monkeypatch, replay, damage):
+    # Round 40 finding 2
+    # Round 40 finding 3
+    from tests.unit.scrapers.test_transfermarkt_sections import _attendance_plan
+
+    db = CoreDB()
+    url, _, page = _walk_pages()
+    earlier = _attendance_plan((page(url, 'single_page.html', EARLIER, 'earlier'),))
+    with monkeypatch.context() as patch:
+        saved = _r37_capture_settlement(patch, 'settled-statements', lambda key: key[0] == native_writer.CORE_PAGES_TABLE)
+        historical = write(db, [earlier], run_id='early', clock=EARLIER)['walks'][0]['receipt_id']
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id=?', (historical,))
+    att = _attendance_plan((page(url, 'single_page.html', CLOCK, 'current'),))
+    rep, = _representation_packet(('7',), CLOCK)
+    plans = [att, rep]
+    write(db, [rep], run_id='prior')
+    ack = write(db, plans)
+    db.sql.execute(f'DELETE FROM {rep.table}')
+    if damage == 'landed-merge':
+        with pytest.raises(TrinoAmbiguousWriteError):
+            _r20_recover(db, _LostResponse(db), plans, False)
+        pending = write_journal.read_statement(native_writer._target_scope(rep))
+        assert write_journal.statement_query(pending) == 'q_lost_merge'
+        op = pending['operation']
+        files = [*_r27_dispatch_files(pending), write_journal._operation_path(op['scope'], pending['key'], op['member'])]
+        db.sql.execute(f"UPDATE {RECEIPTS} SET row_count=0 WHERE run_id='prior'")
+    else:
+        _r28_interrupt(monkeypatch, native_writer, '_merge_receipts', lambda: write(db, plans))
+        record, _, _, marker, _ = saved
+        marker.write_bytes(saved[marker])
+        assert not record.exists()
+        files = list(saved)
+    db.sql.execute(f'ALTER TABLE {att.table} RENAME TO held_attendance')
+    (descriptor, _), = write_journal.pending_intents({})
+    owner = _r26_members(ack)[0]
+    evidence = _r26_file_bytes([*files, descriptor, *_r27_guards(plans, owner)])
+    writer, start = CoreWriter(db), len(db.events)
+    with pytest.raises(RuntimeError):
+        _r20_recover(db, writer, plans, replay)
+    assert not db.sql.execute('SELECT name FROM sqlite_master WHERE name=?', (att.table,)).fetchone()
+    assert _r26_file_bytes(evidence) == evidence
+    _r28_no_dml(db, writer, start)
+    db.sql.execute(f'ALTER TABLE held_attendance RENAME TO {att.table}')
+    if damage == 'landed-merge':
+        db.sql.execute(f"UPDATE {RECEIPTS} SET row_count=1 WHERE run_id='prior'")
+    else:
+        marker.unlink()
+    assert _r20_recover(db, writer, plans, replay) == ack
+    assert not descriptor.exists() and not writer.writes and not _r33_data_mutations(db, start, plans)
+
+
+@pytest.mark.parametrize('replay', [False, True])
+@pytest.mark.parametrize('queued', [False, True])
+def test_r40_foreign_historical_marker_after_release(monkeypatch, replay, queued):
+    # Round 40 finding 7
+    from tests.unit.scrapers.test_transfermarkt_sections import _attendance_plan
+
+    db = CoreDB()
+    url, _, page = _walk_pages()
+
+    def attendance(clock, tag):
+        return _attendance_plan((page(url, 'single_page.html', clock, tag),))
+
+    old = write(db, [attendance(EARLIER, 'initial')], run_id='original', clock=EARLIER)
+    historical = old['walks'][0]['receipt_id']
+    key = [native_writer.CORE_PAGES_TABLE, historical]
+    remove_walk = 'DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id=?'
+    db.sql.execute(remove_walk, (historical,))
+    plans = [attendance(CLOCK, 'current'), *_representation_packet(('9',), CLOCK)]
+    ack = write(db, plans)
+    released, held = _r38_partial_release(monkeypatch, db, plans, ack)
+    db.sql.execute(remove_walk, (historical,))
+    with monkeypatch.context() as patch:
+        saved = _r37_capture_settlement(patch, 'settled-statements', lambda k: k == key)
+        write(db, [attendance(LATER, 'later')], run_id='later', clock=LATER)
+    record, _, _, marker, _ = saved
+    assert not record.exists()
+    files = [*saved, write_journal._scope_owner_path(released)]
+    if queued:
+        clock = '2026-11-21T14:00:00.000000+00:00'
+        db.sql.execute(remove_walk, (historical,))
+        with monkeypatch.context() as patch:
+            _interrupt_ops_insert(patch, db, native_writer.CORE_PAGES_TABLE, 'queued-walk', landed=False)
+            with pytest.raises(TrinoAmbiguousWriteError):
+                write(db, [attendance(clock, 'next')], run_id='next', clock=clock)
+        pending = write_journal.read_statement(key)
+        assert pending['operation']['owner'] == write_journal.scope_owner(released)
+        files.extend(_r27_dispatch_files(pending))
+    marker.write_bytes(saved[marker])
+    evidence = _r26_file_bytes(files)
+    writer, start = CoreWriter(db), len(db.events)
+    if replay:
+        assert _r20_recover(db, writer, plans, True) == ack
+    else:
+        with pytest.raises(StaleTransfermarktWrite, match='released target'):
+            _r20_recover(db, writer, plans, False)
+    assert _r26_file_bytes(evidence) == evidence
+    assert write_journal.scope_owner(held) is None and not write_journal.pending_intents({'run_id': 'run-1'})
     _r28_no_dml(db, writer, start)
