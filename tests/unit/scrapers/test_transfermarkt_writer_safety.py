@@ -1388,7 +1388,7 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
                                       'linked-worklist', 'linked-general', 'linked-original', 'general-with-original',
                                       'general-before-receipt-reservation', 'exact-step-predecessor',
                                       'retired-receipt-predecessor', 'reserved-general-predecessor',
-                                      'reserved-worklist-predecessor', 'reserved-step-predecessor'])
+                                      'reserved-worklist-predecessor', 'reserved-step-predecessor', 'completed-worklist-predecessor'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1428,6 +1428,15 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
             assert body['payload']['predecessor_head'] == native_writer._digest(head)
         else:
             assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
+    elif boundary == 'completed-worklist-predecessor':
+        # Round 36 finding 1
+        _, plans, _, _, record, attempts = native._r32_repaired_packet_missing_receipt(monkeypatch, db=db)
+        native._r32_stop_before_receipt_reservation(monkeypatch, lambda: native.write(db, plans))
+        db.sql.execute(f'INSERT INTO {native.RECEIPTS} SELECT * FROM nine')
+        native._r28_interrupt(monkeypatch, native.write_journal, 'release_obsolete_guards', lambda: native.write(db, plans))
+        (completed, _), = native.write_journal.pending_intents({})
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (members[-1],))
+        record.write_bytes(attempts[1])
     elif boundary == 'reserved-worklist-predecessor':
         # Round 35 finding 5
         _, plans, _, _, record, attempts = native._r32_repaired_packet_missing_receipt(monkeypatch, db=db)
@@ -1500,4 +1509,6 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
     assert len(inserts) == 1 and inserts[0].startswith('INSERT INTO ' + native_writer.CORE_RECEIPTS_TABLE)
     assert native._receipt_count(db) == 2 and native_writer._stored_receipts(db, members).keys() == set(members)
     assert not native.write_journal.pending_intents({})
+    if boundary == 'completed-worklist-predecessor':
+        assert native.write_journal.submission_head(members[0])['statement']['operation']['intent'] != completed.stem
     db.sql.close()

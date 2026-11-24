@@ -1013,7 +1013,8 @@ def _scope_receipt_ids(connection, plan: NativeWritePlan) -> set[str]:
     return {row[0] for row in receipts}
 
 
-def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, settled_targets=()) -> _AcceptedPages:
+def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, settled_targets=(),
+                    inspect_only=False) -> _AcceptedPages:
     """Read the scope's complete walks. Only a commit may supply a repair callback."""
     if not plan._multi_page():
         return _NO_PAGES
@@ -1127,7 +1128,7 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, 
                 raise StaleTransfermarktWrite('core page manifest lacks independent page clocks: ' + plan.table)
             ordered = walks[receipt_id]
             _expected_walk(member, receipt_id, ordered[0][-1], held=ordered)
-        if complete and receipt_id not in own and original:
+        if complete and receipt_id not in own and original and not inspect_only:
             _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id), _digest(walks[receipt_id]),
                               lambda: True, release=restore is not None, independent_postimage=True,
                               operation=_operation(_target_scope(plan), receipt_id))
@@ -2566,7 +2567,6 @@ def _verify_packet_operations(connection, plans, receipt_ids, *, publication=Non
     Include it even if a restored journal no longer lists that walk.
     """
     head = write_journal.submission_head(receipt_ids[0]) or {}
-    legacy_members = head.get('before_target_tracking', head.get('members', {}))
     prove_noops = False
     for scope in {_target_scope(plan) for plan in plans}:
         for record in write_journal.scope_operations(scope):
@@ -2576,7 +2576,7 @@ def _verify_packet_operations(connection, plans, receipt_ids, *, publication=Non
             if record['state'] == 'dispatched':
                 raise RuntimeError('core packet operation outcome is still pending')
             member = operation['member']
-            if (publication and record['state'] == 'unchanged' and member in legacy_members
+            if (publication and record['state'] == 'unchanged' and 'members' in head
                     and operation['intent'] == publication == head.get('statement', {}).get('operation', {}).get('intent')):
                 prove_noops = True
             if member not in receipt_ids and record['state'] != 'rejected':
@@ -3882,7 +3882,9 @@ def _check_retiring_operations(connection, head, plans, receipt_ids, *, bindings
                          and write_journal._read_record(witness) == binding)
             _check_member_attempt(connection, head, scope, plan, record,
                                   original_publication=original_publication, complete_sequence=complete or witnessed)
-            if witness_noops and complete:
+            before_tracking = head.get('before_target_tracking')
+            tracked = before_tracking is not None and record['operation']['member'] not in before_tracking
+            if witness_noops and (complete or tracked):
                 write_journal._immutable_record(witness, binding)
     return rejections
 
@@ -4058,9 +4060,15 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
 
 def _witnessed_predecessor_noop(head, record):
     op = record['operation']
-    if op['intent'] != head.get('statement', {}).get('operation', {}).get('intent') or record['key'] != op['scope']:
+    if 'statement' in head:
+        intent = head['statement']['operation']['intent']
+        digest = _digest(head)
+    else:
+        retired = head.get('retired_steps', {})
+        intent, digest = retired.get('intent'), retired.get('head')
+    if not digest or op['intent'] != intent or record['key'] != op['scope']:
         return False
-    binding = {'head': _digest(head), 'operation': record}
+    binding = {'head': digest, 'operation': record}
     witness = write_journal._record_path('verified-noops', _digest(binding))
     completion = write_journal.completed_intent(op['intent'])
     return (witness.exists() and write_journal._read_record(witness) == binding
@@ -4122,25 +4130,60 @@ def _predecessor_operations(connection, head, plans, receipt_ids, *, reserved=Fa
                     raise RuntimeError(mismatch)
             records[write_journal._operation_path(scope, key, member)] = record
     if records:
-        # Inspect the whole packet before consuming even one predecessor. A
-        # sibling dispatch may have survived without its operation record.
-        for member, plan in members.items():
-            scope = _target_scope(plan)
-            for key in (scope, (CORE_PAGES_TABLE, member), (CORE_RECEIPTS_TABLE, member)):
-                if write_journal.read_statement(key):
-                    raise RuntimeError('core receipt repair predecessor operation outcome is still pending')
-                marker = write_journal._record_path('settled-statements', write_journal._statement_path(key).stem)
-                if marker.exists():
-                    settled = write_journal._read_record(marker)
-                    statement = settled.get('statement', settled)
-                    op = write_journal._statement_operation(statement)
-                    if not op:
-                        raise RuntimeError('core settled operation binding differs')
-                    record = records.get(write_journal._operation_path(scope, key, op['member']))
-                    if not record or record.get('statement') != statement:
-                        raise RuntimeError('core settled operation binding differs')
-                    write_journal._check_settled(settled, statement)
+        _check_predecessor_dispatch(members, head, records)
     return records
+
+
+def _check_predecessor_dispatch(members, head, records):
+    scopes = {_target_scope(plan) for plan in members.values()}
+    keys = set(scopes)
+    keys.update((table, member) for member in members for table in (CORE_PAGES_TABLE, CORE_RECEIPTS_TABLE))
+    # A publication can also dispatch a walk for a historical receipt. Its
+    # statement files survive independently of the operation and warehouse row.
+    keys.update((CORE_PAGES_TABLE, member) for member in head.get('members', {}) if member not in members)
+    for statement in write_journal._dispatch_records():
+        if statement['key'][0] != CORE_PAGES_TABLE:
+            continue
+        op = write_journal._statement_operation(statement)
+        if op and op['owner'] == head['owner'] and tuple(op['scope']) in scopes:
+            keys.add(tuple(statement['key']))
+    for key in keys:
+        pending = write_journal.read_statement(key)
+        marker = write_journal._record_path('settled-statements', write_journal._statement_path(key).stem)
+        if not marker.exists():
+            if pending:
+                raise RuntimeError('core receipt repair predecessor operation outcome is still pending')
+            continue
+        settled = write_journal._read_record(marker)
+        statement = settled.get('statement', settled)
+        op = write_journal._statement_operation(statement)
+        if not op or statement['key'] != list(key) or pending is not None and pending != statement:
+            raise RuntimeError('core settled statement binding differs')
+        record = records.get(write_journal._operation_path(op['scope'], key, op['member']))
+        if not record or record.get('statement') != statement:
+            raise RuntimeError('core settled operation binding differs')
+        write_journal._check_settled(settled, statement)
+
+
+def _preflight_predecessor_warehouse(connection, plans, receipt_ids, clock):
+    members = dict(zip(receipt_ids, plans, strict=True))
+    for member, plan in members.items():
+        _guard_table_schema(connection, plan)
+        if plan.pages:
+            _accepted_pages(connection, plan, own=members, inspect_only=True)
+            held = _stored_walk(connection, member)
+            complete = held if held and len(held) == len(plan.pages) else None
+            expected = _expected_walk(plan, member, clock, held=complete)
+            _held_page_numbers(held or (), expected, plan.table)
+
+
+def _retire_predecessors(records):
+    for path, record in records.items():
+        # Finish a verified torn settlement while its operation still exists.
+        write_journal.pending_statement(record['key'])
+        if statement := record.get('statement'):
+            write_journal._unlink_record(write_journal._record_path('statement-queries', statement['attempt']))
+        write_journal._unlink_record(path)
 
 
 def _repair_prefix(head, path, payload, plans, receipt_ids):
@@ -4178,6 +4221,7 @@ def _check_undispatched_reservation(head, plans, receipt_ids, owned_scopes, *, p
 
 def _check_release_statements(head, plans, receipt_ids, owned_scopes, *, undispatched=False, predecessors=()):
     foreign_owner = None
+    settled_keys = {tuple(predecessors[path]['key']) for path in predecessors if predecessors[path].get('statement')}
     # No target, page or receipt operation belongs to a receipt reservation
     # which has never dispatched a statement, including a restored no-op.
     no_post_worklist = 'receipt_repair' in head and 'statement' not in head
@@ -4188,7 +4232,7 @@ def _check_release_statements(head, plans, receipt_ids, owned_scopes, *, undispa
         keys = [(CORE_RECEIPTS_TABLE, member), (CORE_PAGES_TABLE, member)]
         if scope in owned_scopes:
             keys.append(scope)
-        else:
+        elif scope not in settled_keys:
             # A released target key can now fence another packet. Its bound
             # operation and statement stay with that packet.
             for path in (write_journal._statement_path(scope), write_journal._attempt_path(scope)):
@@ -4199,7 +4243,7 @@ def _check_release_statements(head, plans, receipt_ids, owned_scopes, *, undispa
                         raise RuntimeError('core reserved operation outcome is still pending')
                     foreign_owner = statement.get('operation', {}).get('owner') or _statement_expected(statement)
         if (any(write_journal._statement_path(key).exists() or write_journal._attempt_path(key).exists()
-                for key in keys)
+                for key in keys if key not in settled_keys)
                 or any(no_post_worklist or record.get('statement') for record in write_journal.scope_operations(scope)
                        if (scope in owned_scopes or record['operation']['owner'] == head['owner'])
                        and write_journal._operation_path(scope, record['key'], record['operation']['member']) not in predecessors)):
@@ -4613,12 +4657,16 @@ def _commit_bundle(
                       and path not in linked and path not in stale_descriptors}
         for path in general_repairs | (receipt_repairs - guarded_repairs - stale_descriptors - linked):
             write_journal.check_guard_generations(scopes, receipt_ids[0], {path.stem})
+        retired_guards = False
         if stored and not paths and reviews is None:
-            write_journal.check_guard_generations(scopes, receipt_ids[0], {head_intent} if head_intent else set())
+            held = write_journal.check_guard_generations(scopes, receipt_ids[0], {head_intent} if head_intent else set())
+            retired_guards = held and retired_head
         if (retired_head or no_post) and not linked and stale_descriptors - guarded_repairs:
             write_journal.check_guard_generations(scopes, receipt_ids[0], {p.stem for p in stale_descriptors})
         closing_reservation = (no_post and bool(completed) and all(completed)
-                               and not (linked & stale_descriptors or released_reservation and stale_descriptors))
+                               and not (linked & stale_descriptors or released_reservation and stale_descriptors
+                                        or any(p.stem == head.get('retired_steps', {}).get('intent')
+                                               for p in stale_descriptors)))
         publication_reservation = None
         if (no_post and len(pending) == 1 and 'warehouse_identity' not in pending[0][1]['payload']
                 and pending[0][0].stem != head['reservation']):
@@ -4660,8 +4708,8 @@ def _commit_bundle(
                            for scope in scopes for r in write_journal.scope_operations(scope)))
             else:
                 obsolete_release = False
-        reserved_worklist = (no_post and head_repair and head_intent in current_intents and stored
-                             and reviews is None and not released_reservation)
+        reserved_worklist = (no_post and head_repair and head_intent in current_intents and stored and reviews is None)
+        releasing_worklist = reserved_worklist and released_reservation
         if obsolete_release:
             checked_scopes = set().union(*(write_journal.obsolete_guard_scopes(scopes, receipt_ids[0], intent)
                                            for intent in release_intents))
@@ -4712,7 +4760,7 @@ def _commit_bundle(
                             and any(p.stem == head_intent for p in general_repairs))
         reserved_predecessor = reserved_general or reserved_worklist
         predecessor_records = {}
-        if (stored and reviews is None and active_operations and (
+        if (stored and reviews is None and (active_operations or releasing_worklist) and (
                 unreserved or reserved_predecessor or not paths and retired_head)):
             connection = _journal_connection(connection_factory)
             try:
@@ -4725,7 +4773,8 @@ def _commit_bundle(
             # to the predecessor. None can establish current retirement.
             active_operations = False
         if reserved_predecessor:
-            _check_undispatched_reservation(head, plans, receipt_ids, scopes, predecessors=predecessor_records)
+            foreign_owner = _check_undispatched_reservation(head, plans, receipt_ids, checked_scopes,
+                                                            predecessors=predecessor_records)
         missing_repair = False
         if head_repair and head_repair['intent'] not in current_intents and not closing_reservation:
             missing_repair = (not current_head or active_operations
@@ -4793,6 +4842,23 @@ def _commit_bundle(
                     _verify_member_cells(connection_factory, plans, receipt_ids, stored, identity, universe_version,
                                          scopes - checked_scopes, check_statements=True)
                 return stored
+            completed_worklist = (retired_head and not read_only_publication and len(paths) == 1
+                                  and completed[0] and paths[0] in (unreserved & receipt_repairs))
+            if predecessor_records and (completed_worklist or releasing_worklist and closing_reservation):
+                # A completed descriptor has only cleanup authority. Validate the
+                # surviving evidence before handing an ordinary retry a fresh intent.
+                if completed_worklist:
+                    _check_scope_owners(plans, receipt_ids, read_only_paths=paths)
+                connection = _journal_connection(connection_factory)
+                try:
+                    _preflight_predecessor_warehouse(connection, plans, receipt_ids, stored['committed_at'])
+                    _refuse_receipt_contradictions(connection, plans, receipt_hashes, receipt_digest, run_id,
+                                                   universe_version, batch, stored['committed_at'], proofs=stored['plans'])
+                    _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, identity, universe_version)
+                    _retire_predecessors(predecessor_records)
+                    predecessor_records.clear()
+                finally:
+                    connection.close()
             if (not no_post and not read_only_publication and not active_operations
                     and len(pending) == 1 and not any(completed) and _released_after_ack(pending[0][1], plans, receipt_ids)):
                 _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, identity, universe_version)
@@ -4810,8 +4876,16 @@ def _commit_bundle(
                     or all(write_journal.scope_owner(scope) == receipt_ids[0] for scope in scopes))))
             if closing_reservation and checked_scopes == scopes:
                 retiring = True  # the independent head still owns the entire packet
-            if not read_only_publication and completed and all(completed) and not (active_operations or retiring or predecessor_records):
-                if set(paths) == guarded_repairs:
+            if completed_worklist or (not read_only_publication and completed and all(completed)
+                                      and not (active_operations or retiring or predecessor_records)):
+                if completed_worklist:
+                    path = paths[0]
+                    if path not in guarded_repairs:
+                        _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, identity, universe_version)
+                        write_journal.release_obsolete_guards(scopes, receipt_ids[0], path.stem)
+                    write_journal.finish_intent(path)
+                    retiring = False
+                elif set(paths) == guarded_repairs:
                     for path in paths:
                         write_journal.finish_intent(path)
                 else:
@@ -4912,15 +4986,16 @@ def _commit_bundle(
                 prefix = _verify_receipt_prefix(connection, plans, receipt_ids, receipt_hashes, receipt_digest,
                                                 run_id, universe_version, batch, stored['committed_at'],
                                                 prefix=prefix, predecessors=predecessor_records)
-                # These statements retired before the current repair. Only retire the
-                # authenticated files, after checking scope ownership and every held receipt.
-                for path, record in predecessor_records.items():
-                    # The marker is meaningful only while its operation exists.
-                    write_journal.pending_statement(record['key'])
-                    if statement := record.get('statement'):
-                        write_journal._unlink_record(write_journal._record_path('statement-queries', statement['attempt']))
-                    write_journal._unlink_record(path)
                 verify_postimages = verify_only or read_only_publication or prefix is not None
+                if predecessor_records or retired_guards or (not verify_postimages and (unreserved or not paths and retired_head)):
+                    _preflight_predecessor_warehouse(connection, plans, receipt_ids, stored['committed_at'])
+                if retired_guards and not predecessor_records:
+                    _check_predecessor_dispatch(dict(zip(receipt_ids, plans, strict=True)), head, {})
+                _retire_predecessors(predecessor_records)
+                if retired_guards:
+                    # The retired head's exact guards can survive its descriptor.
+                    # Release them under this lock before admitting a fresh repair.
+                    write_journal.release_obsolete_guards(scopes, receipt_ids[0], head_intent)
                 for statement in rejections:
                     write_journal.finish_rejection(statement)
                 proofs = _commit_plans(

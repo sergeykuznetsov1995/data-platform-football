@@ -461,7 +461,7 @@ def reserve_submission(scopes, owner, intent, *, missing_receipts=None, publicat
     if statement and _read_record(_packet_watermark(owner)).get('retired') == statement['attempt']:
         # Start a new reservation, keeping the ordering across publication.
         head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {}),
-                'retired_steps': {'intent': previous_intent,
+                'retired_steps': {'intent': previous_intent, 'head': hashlib.sha256(_canonical(head)).hexdigest(),
                                   'target_attempts': head.get('target_attempts', {}),
                                   'page_attempts': head.get('page_attempts', {})}}
     if missing_receipts is not None:
