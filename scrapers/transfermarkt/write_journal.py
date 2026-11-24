@@ -986,10 +986,14 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         members = dict(previous.get('members', {}))
         members[operation['member']] = statement['attempt']
         repair = previous.get('receipt_repair')
-        targets = previous.get('target_attempts', {})
+        # Members span reservations. Step attempts describe only this intent,
+        # including when a single-scope repair starts without reserve_submission.
+        previous_intent = previous.get('statement', {}).get('operation', {}).get('intent')
+        steps = previous if previous_intent == operation['intent'] else {}
+        targets = steps.get('target_attempts', {})
         if list(key) == operation['scope']:
             targets = {**targets, operation['member']: statement['attempt']}
-        pages = previous.get('page_attempts', {})
+        pages = steps.get('page_attempts', {})
         from .native_writer import CORE_PAGES_TABLE
         if list(key) == [CORE_PAGES_TABLE, operation['member']]:
             pages = {**pages, operation['member']: statement['attempt']}
