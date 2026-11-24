@@ -2,6 +2,7 @@
 Tests for SofaScoreScraper.
 """
 
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -47,6 +48,43 @@ class TestSofaScoreScraper:
     def test_rate_limit(self, scraper):
         """Test SofaScore rate limit."""
         assert scraper.DEFAULT_RATE_LIMIT == 20
+
+    @pytest.mark.unit
+    def test_scope_overlay_registry_is_used_after_planner_import(
+        self, tmp_path, monkeypatch, mock_dependencies
+    ):
+        from scrapers.sofascore.all_mens_campaign import (
+            load_exact_scope,
+            render_scope_overlays,
+        )
+        from tests.unit.scrapers.test_sofascore_all_mens_campaign import _snapshot
+
+        document = _snapshot()
+        tournament = document["tournaments"][0]
+        tournament.update({"unique_tournament_id": 33495, "capture_key": "SS-33495"})
+        tournament["seasons"][0].update({
+            "source_season_id": 91673,
+            "canonical_season": "2026",
+            "season_format": "single_year",
+        })
+        document.pop("snapshot_id", None)
+        document["snapshot_id"] = hashlib.sha256(json.dumps(
+            document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        snapshot = tmp_path / "snapshot.json"
+        snapshot.write_text(json.dumps(document), encoding="utf-8")
+        scope = load_exact_scope(snapshot, tournament_id=33495, source_season_id=91673)
+        paths = render_scope_overlays(scope, tmp_path / "scope")
+
+        from scrapers.sofascore.catalog import CatalogError
+        from scrapers.sofascore.scraper import _SOFASCORE_CATALOG, SofaScoreScraper
+
+        with pytest.raises(CatalogError, match="SS-33495"):
+            _SOFASCORE_CATALOG.competition("SS-33495")
+        monkeypatch.setenv("SOFASCORE_REGISTRY_PATH", str(paths.registry_path))
+        with patch("scrapers.sofascore.iceberg_writer.SofaScoreIcebergWriter", MagicMock()):
+            scraper = SofaScoreScraper(leagues=["SS-33495"], seasons=[2026])
+        assert scraper.leagues == ["SS-33495"]
 
     @pytest.mark.parametrize(
         "proxy_kwargs",

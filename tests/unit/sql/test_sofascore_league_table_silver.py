@@ -2,10 +2,12 @@
 Unit tests for Silver ``sofascore_league_table`` SQL logic (#702).
 
 Conform-only projection of ``bronze.sofascore_league_table`` (APPEND-mode
-snapshots): dedup to the latest ``_ingested_at`` per (league, season, group, team),
-cast numerics to INTEGER, rename ``team`` → ``team_name`` and ``_ingested_at``
-→ ``_bronze_ingested_at``, emit the season slug as-is (#404). The dedup logic
-moved here from gold.fct_standings (#702 — Gold one-hop from Silver).
+snapshots): dedup to the latest ``_ingested_at`` per (league, season, group,
+COALESCE(team_id, team) as team_key), suppressing a name-only legacy row when
+an identified row exists for the same team and scope. Cast numerics to INTEGER,
+rename ``team`` → ``team_name`` and ``_ingested_at`` → ``_bronze_ingested_at``,
+emit the season slug as-is (#404). The dedup logic moved here from
+gold.fct_standings (#702 — Gold one-hop from Silver).
 
 Trino → DuckDB transpile via sqlglot; fixture rows in-memory.
 """
@@ -36,27 +38,30 @@ def _bootstrap(con) -> None:
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
     con.execute("""
         CREATE TABLE bronze.sofascore_league_table (
-            league VARCHAR, season VARCHAR, team VARCHAR, "group" VARCHAR,
+            league VARCHAR, season VARCHAR, team VARCHAR, team_id VARCHAR, "group" VARCHAR,
             mp BIGINT, w BIGINT, d BIGINT, l BIGINT,
             gf BIGINT, ga BIGINT, gd BIGINT, pts BIGINT,
             _ingested_at TIMESTAMP
         )
     """)
-    # 2 teams × 2 snapshots + one blank-name row (must be filtered out).
+    # Identified snapshots outrank a newer name-only alias of the same team.
     con.execute("""
         INSERT INTO bronze.sofascore_league_table VALUES
         -- older snapshots (discarded)
-        ('ENG-Premier League', '2425', 'Manchester City', '__total__', 10, 8, 1, 1, 30, 10, 20, 25,
+        ('ENG-Premier League', '2425', 'Manchester City', '524211', '__total__', 10, 8, 1, 1, 30, 10, 20, 25,
          TIMESTAMP '2026-04-26 06:00:00'),
-        ('ENG-Premier League', '2425', 'Liverpool',       '__total__', 10, 7, 2, 1, 25, 12, 13, 23,
+        ('ENG-Premier League', '2425', 'Liverpool',       '524205', '__total__', 10, 7, 2, 1, 25, 12, 13, 23,
          TIMESTAMP '2026-04-26 06:00:00'),
-        -- latest snapshots (win)
-        ('ENG-Premier League', '2425', 'Manchester City', '__total__', 12, 10, 1, 1, 35, 11, 24, 31,
+        -- newer legacy alias must not duplicate the identified team
+        ('ENG-Premier League', '2425', 'Manchester City', NULL, '__total__', 13, 11, 1, 1, 38, 11, 27, 34,
+         TIMESTAMP '2026-04-28 06:00:00'),
+        -- latest identified snapshots (win)
+        ('ENG-Premier League', '2425', 'Manchester City', '524211', '__total__', 12, 10, 1, 1, 35, 11, 24, 31,
          TIMESTAMP '2026-04-27 06:00:00'),
-        ('ENG-Premier League', '2425', 'Liverpool',       '__total__', 12, 8, 2, 2, 28, 14, 14, 26,
+        ('ENG-Premier League', '2425', 'Liverpool',       '524205', '__total__', 12, 8, 2, 2, 28, 14, 14, 26,
          TIMESTAMP '2026-04-27 06:00:00'),
         -- blank team name -> filtered
-        ('ENG-Premier League', '2425', '   ',             '__total__', 12, 0, 0, 12, 0, 50, -50, 0,
+        ('ENG-Premier League', '2425', '   ',             NULL, '__total__', 12, 0, 0, 12, 0, 50, -50, 0,
          TIMESTAMP '2026-04-27 06:00:00')
     """)
 
@@ -83,9 +88,10 @@ def silver_rows():
 @pytest.mark.unit
 class TestSofascoreLeagueTableSilver:
     def test_dedup_and_blank_filter(self, silver_rows):
-        """5 input rows → 2 (latest per team; blank name dropped)."""
+        """Six rows become two teams; legacy aliases and blank names are dropped."""
         assert len(silver_rows) == 2
         assert {r["team_name"] for r in silver_rows} == {"Manchester City", "Liverpool"}
+        assert all(r["team_id"] is not None for r in silver_rows)
 
     def test_latest_snapshot_wins(self, silver_rows):
         mci = next(r for r in silver_rows if r["team_name"] == "Manchester City")
@@ -98,6 +104,39 @@ class TestSofascoreLeagueTableSilver:
         assert "team" not in mci and "_ingested_at" not in mci
         # cast to int
         assert isinstance(mci["points"], int)
+        assert mci["team_key"] == "524211"
+        assert mci["team_id"] == "524211"
+
+    def test_same_team_name_different_source_ids(self):
+        sql_text = SQL_PATH.read_text(encoding="utf-8")
+        translated = _translate(sql_text)
+        con = duckdb.connect(":memory:")
+        con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
+        con.execute("""
+            CREATE TABLE bronze.sofascore_league_table (
+                league VARCHAR, season VARCHAR, team VARCHAR, team_id VARCHAR, "group" VARCHAR,
+                mp BIGINT, w BIGINT, d BIGINT, l BIGINT,
+                gf BIGINT, ga BIGINT, gd BIGINT, pts BIGINT,
+                _ingested_at TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO bronze.sofascore_league_table VALUES
+            ('SS-22307', '2024', 'Planet Futsal FC', '524211', '__total__', 10, 8, 1, 1, 30, 10, 20, 25,
+             TIMESTAMP '2026-04-26 06:00:00'),
+            ('SS-22307', '2024', 'Planet Futsal FC', '524205', '__total__', 10, 7, 2, 1, 25, 12, 13, 23,
+             TIMESTAMP '2026-04-26 06:00:00'),
+            ('SS-22307', '2024', 'Planet Futsal FC', NULL, '__total__', 11, 8, 2, 1, 27, 12, 15, 26,
+             TIMESTAMP '2026-04-27 06:00:00'),
+            ('SS-999', '2024', 'Legacy FC', NULL, '__total__', 10, 7, 2, 1, 25, 12, 13, 23,
+             TIMESTAMP '2026-04-26 06:00:00')
+        """)
+        rows = con.execute(translated).fetchall()
+        assert len(rows) == 3
+        assert {row[0] for row in rows} == {"524211", "524205", "Legacy FC"}
+        assert {row[1] for row in rows} == {"524211", "524205", None}
+        assert {row[2] for row in rows} == {"Planet Futsal FC", "Legacy FC"}
+        con.close()
 
     def test_season_slug_as_is(self, silver_rows):
         """#404: SofaScore bronze season is already slug — emitted unchanged."""

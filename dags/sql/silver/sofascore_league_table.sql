@@ -2,7 +2,7 @@
 -- Silver: sofascore_league_table   (from bronze.sofascore_league_table)
 -- =============================================================================
 --
--- One row per (league, season, team_name) — conform-only проекция турнирной
+-- One row per (league, season, standing_scope, team_key) — conform-only проекция турнирной
 -- таблицы из SofaScore. Итоговые показатели сезона (игры / победы / голы / очки).
 -- Это season-grain SNAPSHOT, который SofaScore отдаёт напрямую, НЕ rollup из
 -- match-grain — поэтому conform, а не Gold-факт (ср. charter §2 и
@@ -14,8 +14,11 @@
 --   APPEND-mode → dedup ROW_NUMBER здесь (перенесён из gold.fct_standings).
 --
 -- Notes:
---   * SofaScore НЕ отдаёт numeric team_id и position в этой выдаче — храним только
---     team_name; canonical-резолв и расчёт position отложены в Gold (charter §5).
+--   * team_key is the dedup key from COALESCE(team_id, team). team_id stays the
+--     nullable source identifier, so legacy fallback never impersonates a source ID.
+--     A name-only legacy alias is kept only without an identified row for the
+--     same team and scope; distinct IDs with one name remain distinct rows.
+--     Canonical-резолв и расчёт position отложены в Gold (charter §5).
 --     Gold джойнит silver.xref_team по имени (source='sofascore').
 --   * Season НЕ конвертируем — в bronze SofaScore уже slug '2526' (#404), в отличие
 --     от FotMob (там year-start bigint → LPAD/MOD). Эмитим as-is.
@@ -28,18 +31,24 @@ WITH bronze_dedup AS (
         SELECT
             s.*,
             ROW_NUMBER() OVER (
-                PARTITION BY league, season, "group", team
+                PARTITION BY league, season, "group", COALESCE(team_id, team)
                 ORDER BY _ingested_at DESC
-            ) AS rn
+            ) AS rn,
+            MAX(team_id) OVER (
+                PARTITION BY league, season, "group", team
+            ) AS identified_team_id
         FROM iceberg.bronze.sofascore_league_table s
         WHERE team IS NOT NULL
           AND trim(team) <> ''
     )
     WHERE rn = 1
+      AND (team_id IS NOT NULL OR identified_team_id IS NULL)
 )
 
 SELECT
     -- ===== Identity =====
+    COALESCE(b.team_id, b.team)                           AS team_key,
+    b.team_id                                             AS team_id,
     b.team                                                AS team_name,
 
     -- ===== Standings =====

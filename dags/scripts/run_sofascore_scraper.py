@@ -3051,6 +3051,7 @@ def _run_season_capture_engine(
                 }
             results["match_phase_ready"] = True
             results["full_complete"] = True
+            results.update(_endpoint_closure(len(plan.specs), 0))
             results["endpoint_completeness"] = 1.0
             results["traffic"] = {
                 "paid_proxy_bytes": 0,
@@ -3234,7 +3235,7 @@ def _run_season_capture_engine(
                     df=standings_df,
                     table_name="sofascore_league_table",
                     partition_cols=["league", "season"],
-                    natural_keys=["league", "season", "group", "team"],
+                    natural_keys=["league", "season", "group", "team_id"],
                 )
                 results["tables"].append(path)
                 results["league_table_rows"] = len(standings_df)

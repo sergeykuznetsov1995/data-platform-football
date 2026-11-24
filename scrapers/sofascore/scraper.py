@@ -123,11 +123,12 @@ class SofaScoreScraper(SoccerdataScraper):
         from scrapers.sofascore.iceberg_writer import SofaScoreIcebergWriter
 
         self._iceberg_writer = SofaScoreIcebergWriter()
+        catalog = SofaScoreCatalog.load()
         # Every network-capable entrypoint, including direct library use, is
         # activation-gated.  Discovery may catalog women/youth/reserve rows,
         # but an unreviewed or disabled tournament can never reach a browser.
         for league in self.leagues:
-            tournament = _SOFASCORE_CATALOG.competition(league)
+            tournament = catalog.competition(league)
             if not tournament.capture_allowed:
                 reasons = '; '.join(tournament.activation_eligibility.reasons)
                 raise ValueError(

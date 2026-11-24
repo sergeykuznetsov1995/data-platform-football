@@ -2713,6 +2713,61 @@ def _replayed_complete_partition(tmp_path):
 
 
 @pytest.mark.unit
+def test_partition_materializer_distinguishes_teams_by_source_id(tmp_path):
+    plan, results = _replayed_complete_partition(tmp_path)
+    index = next(
+        i for i, result in enumerate(results)
+        if result.manifest.key.endpoint == "standings_total"
+    )
+    result = results[index]
+    rows = list(result.datasets["league_table"].rows)
+    first = dict(rows[0])
+    rows.append({**first, "team_id": str(int(first["team_id"]) + 1)})
+    results[index] = replace(
+        result,
+        manifest=replace(result.manifest, row_count=len(rows)),
+        datasets={"league_table": ParsedDataset("league_table", rows)},
+    )
+
+    materialized = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    assert rows[0]["team"] == rows[-1]["team"]
+    assert {row["team_id"] for row in materialized.standings_rows} == {
+        row["team_id"] for row in rows
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("team_id", ["", "  "])
+def test_partition_materializer_rejects_empty_team_id_without_name_fallback(tmp_path, team_id):
+    plan, results = _replayed_complete_partition(tmp_path)
+    index = next(
+        i for i, result in enumerate(results)
+        if result.manifest.key.endpoint == "standings_total"
+    )
+    result = results[index]
+    rows = list(result.datasets["league_table"].rows)
+    rows[0]["team_id"] = team_id
+    results[index] = replace(
+        result,
+        manifest=replace(result.manifest, row_count=len(rows)),
+        datasets={"league_table": ParsedDataset("league_table", rows)},
+    )
+
+    with pytest.raises(SeasonMaterializationError, match="standings natural key has no team"):
+        materialize_season_partition(
+            plan,
+            results,
+            canonical_league="ENG-Premier League",
+            canonical_season="2025/26",
+        )
+
+
+@pytest.mark.unit
 def test_partition_materializer_rejects_duplicate_schedule_natural_key(tmp_path):
     plan, results = _replayed_complete_partition(tmp_path)
     index = next(

@@ -140,10 +140,12 @@ committed_state_dq:
   later_stage_duplicate_tables:
     - silver.sofascore_player_ratings
 
-# Static Silver SQL references both legacy and source-key Bronze columns. The
-# writers create this nullable superset so a fresh Iceberg catalog plans the
-# COALESCE expressions successfully.
+# Silver SQL and committed-state DQ reference both legacy and source-key Bronze
+# columns. The writers create this nullable superset so a fresh Iceberg catalog
+# plans the COALESCE expressions successfully.
 bronze_compatibility_columns:
+  sofascore_league_table:
+    - [team_id, team]
   sofascore_schedule:
     - [home_team, home_team_name]
     - [away_team, away_team_name]
@@ -194,8 +196,8 @@ tables:
 
   bronze.sofascore_league_table:
     grain: one team in one total standings block
-    natural_key: [league, season, group, team]
-    required_columns: [team, position, mp, w, d, l, gf, ga, gd, pts, promotion, promotion_json, group, league, season, _ingested_at]
+    natural_key: [league, season, group, team_id]
+    required_columns: [team, team_id, position, mp, w, d, l, gf, ga, gd, pts, promotion, promotion_json, group, league, season, _ingested_at]
     partition_columns: [league, season]
     materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
     production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
@@ -540,8 +542,8 @@ tables:
 
   silver.sofascore_league_table:
     grain: one team in one legacy total standings snapshot
-    natural_key: [league, season, standing_scope, team_name]
-    required_columns: [team_name, played, wins, draws, losses, goals_for, goals_against, goal_diff, points, group_id, standing_scope, league, season]
+    natural_key: [league, season, standing_scope, team_key]
+    required_columns: [team_key, team_id, team_name, played, wins, draws, losses, goals_for, goals_against, goal_diff, points, group_id, standing_scope, league, season]
     partition_columns: [league, season]
     materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
     production_write_status: transform active over existing Bronze
