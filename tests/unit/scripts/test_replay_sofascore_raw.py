@@ -1660,12 +1660,7 @@ def test_snapshot_resolution_covers_registry_absent_tournament(tmp_path, monkeyp
     assert overlay_source[1]["capture_key"] == "SS-54"
 
 
-def test_registry_authority_is_never_displaced_by_snapshot(tmp_path, monkeypatch):
-    """A tournament the registry KNOWS keeps registry errors (adjudication).
-
-    Review r1 hardening: the snapshot ALSO carries the very pair
-    (17/99999) the registry refuses — the fallback must still not run.
-    """
+def test_snapshot_supplies_missing_registry_season(tmp_path, monkeypatch):
     from dags.scripts.replay_sofascore_raw import _load_scope
 
     snapshot = _campaign_snapshot_fixture(
@@ -1676,10 +1671,37 @@ def test_registry_authority_is_never_displaced_by_snapshot(tmp_path, monkeypatch
 
     catalog = _FakeCatalog()
     catalog.tournaments = (SimpleNamespace(unique_tournament_id=int(TOURNAMENT)),)
+    catalog._tournament.capture_allowed = True
+    runtime = _FakeRuntime(catalog, _FakeManager())
+    resolved, plan, season_format, overlay_source = _load_scope(
+        (TOURNAMENT, "99999", "final"),
+        mode=MODE_FIELDS,
+        capture_runtime=runtime,
+        records=(),
+    )
+
+    assert resolved.league == "SS-17"
+    assert resolved.canonical_season == "2526"
+    assert season_format == "split_year"
+    assert overlay_source[0] == "snapshot"
+    assert overlay_source[1]["capture_key"] == "SS-17"
+
+
+def test_snapshot_does_not_override_disabled_registry_tournament(tmp_path, monkeypatch):
+    from dags.scripts.replay_sofascore_raw import _load_scope
+
+    snapshot = _campaign_snapshot_fixture(
+        tmp_path, include_registry_pair=True
+    )
+    monkeypatch.setenv("SOFASCORE_ALL_MENS_SNAPSHOT", snapshot)
+    monkeypatch.setenv("SOFASCORE_REPLAY_CAMPAIGN_ID", "unit-campaign")
+
+    catalog = _FakeCatalog()
+    catalog.tournaments = (SimpleNamespace(unique_tournament_id=int(TOURNAMENT)),)
+    catalog._tournament.capture_allowed = False
     runtime = _FakeRuntime(catalog, _FakeManager())
     with pytest.raises(ReplayPlanningError, match="unknown for source"):
         _load_scope(
-            # 17 is in the fake registry; the season is not.
             (TOURNAMENT, "99999", "final"),
             mode=MODE_FIELDS,
             capture_runtime=runtime,

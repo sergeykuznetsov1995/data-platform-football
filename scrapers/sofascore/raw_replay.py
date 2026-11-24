@@ -721,6 +721,12 @@ def validate_replay_scope_pair(
         season for season in tournament.seasons if season.season_id == season_id
     ]
     if not matches:
+        if snapshot_document is not None:
+            snapshot_pair = _validate_snapshot_pair(
+                wanted, snapshot_document, prefix
+            )
+            if snapshot_pair is not None:
+                return snapshot_pair
         raise ReplayPlanningError(
             f"{prefix} is not replay-eligible: season {wanted[1]!r} is "
             "unknown for the source tournament"

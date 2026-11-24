@@ -1047,6 +1047,22 @@ def test_exact_scope_validates_through_snapshot_fallback():
     assert keys == (ReplayScopeKey("54", "616", "f1"),)
 
 
+def test_exact_scope_snapshot_supplies_missing_registry_season():
+    manager = FakeManager([("17", "70000", "f0")])
+
+    keys = list_replay_scope_keys(
+        manager,
+        mode=MODE_DRAIN,
+        exact_scope=(TOURNAMENT, "70000"),
+        limit=1,
+        catalog=_fake_catalog(),
+        snapshot_document=_snapshot_document(),
+    )
+
+    assert manager.calls[0]["params"] == (TOURNAMENT, "70000")
+    assert keys == (ReplayScopeKey(TOURNAMENT, "70000", "f0"),)
+
+
 def test_exact_scope_registry_season_error_is_not_displaced():
     manager = FakeManager()
 
