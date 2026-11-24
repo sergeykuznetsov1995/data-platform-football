@@ -120,11 +120,14 @@ def journalled_write():
     own dispatch across calls under the shared writer lock.
     """
     previous = getattr(_LOCAL, 'journalled', False)
+    previous_packet = getattr(_LOCAL, 'packet', None)
     _LOCAL.journalled = True
+    _LOCAL.packet = None
     try:
         yield
     finally:
         _LOCAL.journalled = previous
+        _LOCAL.packet = previous_packet
 
 
 def write_is_journalled() -> bool:
@@ -1010,7 +1013,7 @@ def _scope_receipt_ids(connection, plan: NativeWritePlan) -> set[str]:
     return {row[0] for row in receipts}
 
 
-def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, finished_members=()) -> _AcceptedPages:
+def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, settled_targets=()) -> _AcceptedPages:
     """Read the scope's complete walks. Only a commit may supply a repair callback."""
     if not plan._multi_page():
         return _NO_PAGES
@@ -1074,6 +1077,15 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, 
         walk = walks.get(receipt_id, ())
         saved = journal.get(receipt_id)
         original = _journal_walk_rows(plan, receipt_id, saved) if saved else None
+        if not original and receipt_id not in missing:
+            # Neither the walk nor an ops receipt proves which target attempt
+            # produced the current Bronze rows. This includes partial walks.
+            if not isinstance(own, dict) or receipt_id not in own:
+                raise StaleTransfermarktWrite('core page manifest lost: ' + plan.table)
+            if (receipt_id not in settled_targets
+                    or write_journal.scope_owner(_target_scope(plan)) != next(iter(own))
+                    or not _target_matches(connection, own[receipt_id])):
+                raise StaleTransfermarktWrite('core page manifest lacks local dispatch history: ' + plan.table)
         expected_clocks = set()
         if saved or receipt_id in missing:
             local_clock = saved[1] if saved else missing[receipt_id][1]
@@ -1107,15 +1119,7 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, 
         elif not original and receipt_id not in own:
             raise RuntimeError('core page manifest lacks original capture evidence: ' + plan.table)
         walks[receipt_id] = tuple(sorted(walk, key=lambda cells: cells[3]))
-        if len(walk) == 1 and receipt_id in clocks and not original and receipt_id not in missing:
-            # A restored owner can predate both the walk and a later repair.
-            # Use the orphan only to verify an exact, independently settled member.
-            if (receipt_id not in finished_members or not isinstance(own, dict) or receipt_id not in own
-                    or write_journal.scope_owner(_target_scope(plan)) != next(iter(own))
-                    or not _target_matches(connection, own[receipt_id])):
-                raise StaleTransfermarktWrite('core page manifest lacks local dispatch history: ' + plan.table)
-            _expected_walk(own[receipt_id], receipt_id, walks[receipt_id][0][-1], held=walks[receipt_id])
-        if not original and len(walk) > 1:
+        if not original and (len(walk) > 1 or receipt_id not in missing):
             # The receipt names just one response. The other clocks must
             # match the independently bound descriptor or immutable walk.
             member = own.get(receipt_id) if isinstance(own, dict) else None
@@ -1125,7 +1129,8 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None, 
             _expected_walk(member, receipt_id, ordered[0][-1], held=ordered)
         if complete and receipt_id not in own and original:
             _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id), _digest(walks[receipt_id]),
-                              lambda: True, release=restore is not None, independent_postimage=True)
+                              lambda: True, release=restore is not None, independent_postimage=True,
+                              operation=_operation(_target_scope(plan), receipt_id))
         versions = rules[receipt_id] = _walk_versions(saved[0]) if saved else (8, 7, 6)
         for cells in walk:
             url, capture_id, clock, body_hash, count, digest, acknowledged_at = cells[5:]
@@ -1420,6 +1425,8 @@ def _log_walk(connection, table: str, receipt_id: str, rows, *, stored=_UNREAD_W
     """
     expected = tuple(_walk_cells(row) for row in rows)
     key = (CORE_PAGES_TABLE, receipt_id)
+    previous = write_journal.latest_operation(rows[0][1:3], key, receipt_id)
+    repair |= previous is not None and previous['state'] != 'dispatched'
     if stored is _UNREAD_WALK:
         stored = _stored_walk(connection, receipt_id)
     if stored is not None:
@@ -1434,7 +1441,8 @@ def _log_walk(connection, table: str, receipt_id: str, rows, *, stored=_UNREAD_W
     sql = f'INSERT INTO {CORE_PAGES_TABLE} ({names}) VALUES ' + ', '.join([marks] * len(rows))
     _insert_once(
         connection, key, sql, tuple(value for row in rows for value in row),
-        lambda: _stored_walk(connection, receipt_id), expected, repair=repair)
+        lambda: _stored_walk(connection, receipt_id), expected, repair=repair,
+        operation=_operation(rows[0][1:3], receipt_id))
 
 
 def _walk_versions(walk):
@@ -2125,6 +2133,14 @@ def _definite_rejection(exc):
     return not isinstance(exc, TrinoAmbiguousWriteError) and _is_definite_iceberg_commit_conflict(exc)
 
 
+def _operation(scope, member):
+    packet = getattr(_LOCAL, 'packet', None)
+    if packet is not None:
+        owner, paths, plan_hashes = packet
+        return {'scope': list(scope), 'member': member, 'owner': owner,
+                'intent': paths[-1].stem if paths else None, 'plan_sha256': plan_hashes.get(member)}
+
+
 @contextmanager
 def _target_dispatch(*, direct=True, stage=None):
     """One attempt, after acquiring the target cursor and immediately before execute."""
@@ -2134,14 +2150,14 @@ def _target_dispatch(*, direct=True, stage=None):
         return
     key, expected, additive, owner = target
     statement = write_journal.begin_statement(key, {'single_submit': expected}, observable=additive,
-                                              target_preimage=True, stage=stage)
+                                              target_preimage=True, stage=stage, operation=_operation(key, expected))
     if stage:
         write_journal.clear_stage_idle(expected, stage)
     try:
         yield statement
     except Exception as exc:
         if direct and _definite_rejection(exc):
-            write_journal.finish_statement(statement)
+            write_journal.finish_statement(statement, outcome='rejected')
         raise
     write_journal.hold_scope(key, owner)
     write_journal.finish_statement(statement)
@@ -2169,24 +2185,51 @@ def _statement_expected(statement):
 
 
 def _settle_statement(connection, key, expected, landed, *, release=True, target=False, require_finished=False,
-                      on_finished=None, independent_postimage=False):
+                      on_finished=None, independent_postimage=False, operation=None):
     statement = write_journal.pending_statement(key)
     if statement is None:
+        if operation:
+            current = write_journal.latest_operation(operation['scope'], key, operation['member'])
+            if current and current['state'] == 'FINISHED':
+                if _statement_expected(current['statement']) == expected and landed():
+                    return True
+                raise RuntimeError('core statement outcome is still pending: ' + key[0])
+            if current and current['state'] == 'dispatched':
+                raise RuntimeError('core latest operation outcome is still pending: ' + key[0])
         return
     binding = _statement_expected(statement)
+    operation = operation or statement.get('operation')
+    current = write_journal.bind_pending_operation(statement, operation) if operation else None
     observable = statement['observable'] and (not target or statement.get('target_preimage') is True)
     may_observe = observable and not (require_finished or independent_postimage)
-    matches = landed() if may_observe and binding == expected else None
-    applied = matches is True
-    if not applied:
+    state = current['state'] if current else 'dispatched'
+    if state == 'rejected':
+        if require_finished:
+            raise RuntimeError('core statement outcome is still pending: ' + key[0])
+        applied = False
+    elif state == 'FINISHED' or state == 'returned' and not (target and require_finished):
+        if state == 'FINISHED' and write_journal.statement_query(statement) not in (None, current['query_id']):
+            raise RuntimeError('core operation query binding differs')
+        if binding != expected or not landed():
+            raise RuntimeError('core statement outcome is still pending: ' + key[0])
+        applied = True
+    elif may_observe and binding == expected and landed():
+        write_journal.note_observed(statement)
+        applied = True
+    else:
         outcome = _query_outcome(connection, statement)
-        applied = outcome == 'finished' and binding == expected and (landed() if matches is None else matches)
-        if applied and on_finished is not None:
-            on_finished(statement)
+        applied = outcome == 'finished' and binding == expected and landed()
+        if applied:
+            if on_finished is not None:
+                on_finished(statement)
+            write_journal.verified_operation(statement, write_journal.statement_query(statement))
         if not applied and (require_finished or outcome != 'rejected'):
             raise RuntimeError('core statement outcome is still pending: ' + key[0])
     if release:
-        write_journal.finish_statement(statement)
+        if applied:
+            write_journal.finish_statement(statement)
+        else:
+            write_journal.finish_statement(statement, outcome='rejected')
     return applied
 
 
@@ -2205,25 +2248,28 @@ def _execute_once(cursor, sql, bound, statement):
         raise
 
 
-def _insert_once(connection, key, sql, bound, read, expected, *, repair=False) -> None:
+def _insert_once(connection, key, sql, bound, read, expected, *, repair=False, operation=None) -> None:
     """Fence one physical INSERT until its previously missing cells land or Trino rejects it."""
     fingerprint = _digest(expected)
-    _settle_statement(connection, key, fingerprint, lambda: read() == expected, independent_postimage=repair)
+    _settle_statement(connection, key, fingerprint, lambda: read() == expected, independent_postimage=repair,
+                      operation=operation)
     if read() == expected:
         return
     cursor = connection.cursor()
     statement = None
     try:
-        statement = write_journal.begin_statement(key, {'single_submit': fingerprint}, observable=not repair)
+        statement = write_journal.begin_statement(key, {'single_submit': fingerprint}, observable=not repair,
+                                                  operation=operation)
         _execute_once(cursor, sql, bound, statement)
     except Exception as exc:
         if statement is None:
             raise
         if _definite_rejection(exc):
-            write_journal.finish_statement(statement)
+            write_journal.finish_statement(statement, outcome='rejected')
             raise
         if repair or read() != expected:
             raise
+        write_journal.note_observed(statement)
     finally:
         cursor.close()
     if repair and read() != expected:
@@ -2265,7 +2311,8 @@ def _merge_receipts(connection, receipts) -> None:
             bound.append(value)
         _insert_once(
             connection, key, f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})',
-            bound, read_receipt, expected, repair=True)
+            bound, read_receipt, expected, repair=True,
+            operation=_operation((receipt['target_table'], receipt['scope_values_json']), receipt_id))
 
 
 def _verify_receipts(connection, receipts) -> None:
@@ -2415,6 +2462,50 @@ class _ScopePending(StaleTransfermarktWrite):
         self.owner = owner
 
 
+def _check_operation_history(plans, owner):
+    """A journal backup can describe an older attempt, even a FINISHED one."""
+    active = False
+    for scope in {_target_scope(plan) for plan in plans}:
+        for record in write_journal.scope_operations(scope):
+            operation, latest = record['operation'], record.get('statement')
+            pending = write_journal.pending_statement(record['key'])
+            same_member = pending and (pending['key'] != list(scope)
+                                       or _statement_expected(pending) == operation['member'])
+            if (record['state'] == 'dispatched' or same_member) and pending != latest:
+                raise _ScopePending('core local dispatch history differs and the outcome is still pending',
+                                    operation['owner'])
+            if operation['owner'] == owner:
+                if operation['plan_sha256'] != _operation(scope, operation['member'])['plan_sha256']:
+                    raise RuntimeError('core operation plan binding differs')
+                active = True
+            elif record['state'] != 'rejected':
+                # An intact foreign target can be inspected for a definite rejection
+                # by the existing target settlement path.
+                if latest is None or pending != latest or record['key'] != list(scope):
+                    raise _ScopePending('core scope acknowledgement is still pending', operation['owner'])
+    return active
+
+
+def _verify_packet_operations(connection, plans, receipt_ids):
+    """Current members have just passed physical, walk and receipt readback.
+
+    A packet may also have repaired a historical walk of the same scope.
+    Include it even if a restored journal no longer lists that walk.
+    """
+    for scope in {_target_scope(plan) for plan in plans}:
+        for record in write_journal.scope_operations(scope):
+            operation = record['operation']
+            if operation['owner'] != receipt_ids[0]:
+                continue
+            if record['state'] == 'dispatched':
+                raise RuntimeError('core packet operation outcome is still pending')
+            member = operation['member']
+            if member not in receipt_ids and record['state'] != 'rejected':
+                if (record['key'] != [CORE_PAGES_TABLE, member]
+                        or _digest(_stored_walk(connection, member)) != _statement_expected(record['statement'])):
+                    raise RuntimeError('core repaired page manifest differs')
+
+
 def _check_retained_dispatch(scope, receipt_id, owner):
     for path, record in write_journal.retained_stages(receipt_id):
         stage = path.stem
@@ -2547,7 +2638,7 @@ def _released_after_ack(body, plans, receipt_ids):
 
 def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bundle_owner, contested,
                             historical_intent, *, repair):
-    finished_members = set()
+    settled_targets = set()
     scope = _target_scope(plan)
     target = write_journal.pending_statement(scope)
     if target is not None:
@@ -2559,11 +2650,10 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
             raise RuntimeError('core terminal target binding differs')
         # An existing receipt makes these target rows independently restorable,
         # including when a journal rollback removed the acknowledgement.
-        independent_postimage = repair or (
-            owner is not None and len(owner.pages) == 1 and expected in _stored_receipts(connection, [expected]))
+        independent_postimage = repair or (owner is not None and owner.pages and (
+            expected in _stored_receipts(connection, [expected]) or _stored_walk(connection, expected)))
 
         def record_finished(statement):
-            finished_members.add(expected)
             if historical_intent:
                 write_journal.remember_terminal_target(historical_intent.stem, expected, statement)
 
@@ -2575,30 +2665,48 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
                 raise RuntimeError('core statement outcome is still pending: ' + plan.table)
             query_id = witness['query_id']
             missing_mapping = write_journal.statement_query(target) is None
-            if missing_mapping or independent_postimage:
+            if missing_mapping or independent_postimage or witness.get('outcome') != 'FINISHED':
                 if _query_outcome(connection, target, query_id=query_id,
                                   witnessed_finished=witness.get('outcome') == 'FINISHED') != 'finished':
                     raise RuntimeError('core statement outcome is still pending: ' + plan.table)
             if missing_mapping:
                 write_journal.remember_query(target, query_id)
+            write_journal.bind_pending_operation(target, _operation(scope, expected))
+            if 'outcome' not in witness:
+                write_journal.remember_terminal_target(historical_intent.stem, expected, target)
+            write_journal.verified_operation(target, query_id)
             write_journal.hold_scope(scope, bundle_owner)
-            finished_members.add(expected)
+            settled_targets.add(expected)
         elif _settle_statement(connection, scope, expected, lambda: _target_matches(connection, owner),
                                release=False, target=True, require_finished=scope in contested,
-                               on_finished=record_finished, independent_postimage=independent_postimage):
+                               on_finished=record_finished, independent_postimage=independent_postimage,
+                               operation=_operation(scope, expected)):
             write_journal.hold_scope(scope, bundle_owner)
-        write_journal.finish_statement(target)
+            settled_targets.add(expected)
+        if expected in settled_targets:
+            write_journal.finish_statement(target)
+        else:
+            write_journal.finish_statement(target, outcome='rejected')
     elif scope in contested and not _target_matches(connection, plan):
         raise RuntimeError('contested core target outcome is still pending: ' + plan.table)
     page_key = (CORE_PAGES_TABLE, receipt_id)
-    if plan.pages and write_journal.pending_statement(page_key) is not None:
+    head = write_journal.latest_operation(scope, scope, receipt_id)
+    if head and head['state'] in ('unchanged', 'observed', 'returned', 'FINISHED'):
+        if head.get('statement') and _statement_expected(head['statement']) != receipt_id:
+            raise RuntimeError('core terminal target binding differs')
+        if _target_matches(connection, plan):
+            settled_targets.add(receipt_id)
+        elif head['state'] == 'FINISHED':
+            raise RuntimeError('core statement outcome is still pending: ' + plan.table)
+    if plan.pages and write_journal.statement_for_readback(scope, page_key, receipt_id):
         held = _stored_walk(connection, receipt_id)
         complete = held if held and len(held) == len(plan.pages) else None
         expected = _expected_walk(plan, receipt_id, committed_at, held=complete)
         _settle_statement(connection, page_key, _digest(expected), lambda: held == expected,
-                          independent_postimage=repair)
+                          independent_postimage=repair or receipt_id in _stored_receipts(connection, [receipt_id]),
+                          operation=_operation(scope, receipt_id))
     key = (CORE_RECEIPTS_TABLE, receipt_id)
-    statement = write_journal.pending_statement(key)
+    statement = write_journal.statement_for_readback(scope, key, receipt_id)
     if statement is not None:
         expected = _statement_expected(statement)
 
@@ -2608,9 +2716,9 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
 
         # Keep the attempt until _merge_receipts verifies the reconstructed
         # receipt too. Its cells can be restored before the first local ack.
-        if _settle_statement(connection, key, expected, receipt_matches, release=False, independent_postimage=True):
-            finished_members.add(receipt_id)
-    return finished_members
+        _settle_statement(connection, key, expected, receipt_matches, release=False, independent_postimage=True,
+                          operation=_operation(scope, receipt_id))
+    return settled_targets
 
 
 def _write_plan(connection, writer, plan, receipt_id, bundle_owner, repair=False):
@@ -2648,7 +2756,7 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
     """
     receipt_ids = tuple(receipt_ids) or ('',) * len(plans)
     unit = dict(zip(receipt_ids, plans, strict=True))
-    finished_members = set()
+    settled_targets = set()
     for plan, receipt_id in zip(plans, receipt_ids, strict=True):
         scope = _target_scope(plan)
         target = write_journal.pending_statement(scope)
@@ -2658,7 +2766,7 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
             raise _ScopePending('core statement outcome is still pending: ' + plan.table,
                                 _statement_expected(target))
         required = {scope} if verify_only and target else contested
-        finished_members.update(_settle_plan_statements(
+        settled_targets.update(_settle_plan_statements(
             connection, plan, receipt_id, committed_at, unit, receipt_ids[0], required,
             historical_intent, repair=repair is not None))
     if not verify_only:
@@ -2691,13 +2799,13 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
         # repair. In particular an absent walk cannot settle a queued INSERT.
         _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id), _digest(expected),
                           lambda: held == expected, release=False,
-                          independent_postimage=repair is not None or member is None)
+                          independent_postimage=True, operation=_operation(rows[0][1:3], receipt_id))
         restorations[receipt_id] = (plan.table, rows, 'differs' if surviving else 'lost')
         return expected
 
     recover = None if verify_only else recover_walk
     bindings = _capture_bindings(connection, plans)
-    evidence = [_accepted_pages(connection, plan, own=unit, restore=recover, finished_members=finished_members)
+    evidence = [_accepted_pages(connection, plan, own=unit, restore=recover, settled_targets=settled_targets)
                 for plan in plans]
     states = [(plan, _replay_state(connection, plan, receipt_id, committed_at, accepted=accepted,
                                    restoring=restorations, remember_rules=not verify_only))
@@ -2734,7 +2842,7 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
     for key, (table, rows, _reason) in restorations.items():
         write_journal.hold_scope((rows[0][1], rows[0][2]), receipt_ids[0])
         if key in unit:
-            _record_pages(connection, unit[key], key, committed_at, repair is not None)
+            _record_pages(connection, unit[key], key, committed_at, True)
         else:
             _log_walk(connection, table, key, rows, repair=True)
         if _stored_walk(connection, key) != tuple(_walk_cells(row) for row in rows):
@@ -2742,7 +2850,10 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
     for (plan, state), receipt_id in zip(states, receipt_ids, strict=True):
         if state == 'written' or _target_scope(plan) in contested:
             continue
-        _write_plan(connection, writer, plan, receipt_id, receipt_ids[0], repair is not None)
+        scope = _target_scope(plan)
+        previous = write_journal.latest_operation(scope, scope, receipt_id)
+        _write_plan(connection, writer, plan, receipt_id, receipt_ids[0],
+                    repair is not None or previous is not None and previous['state'] != 'rejected')
     if repair is None or needs_write:
         for scope in scopes:
             write_journal.hold_scope(scope, receipt_ids[0])
@@ -2750,6 +2861,9 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
         # The logged walk follows the snapshot it belongs to; a snapshot that
         # is written is logged under its own acknowledgement.
         if plan.pages and state != 'written':
+            scope = _target_scope(plan)
+            if not write_journal.latest_operation(scope, scope, receipt_id) and _target_matches(connection, plan):
+                write_journal.remember_unchanged_target(_operation(scope, receipt_id))
             _record_pages(connection, plan, receipt_id, committed_at, repair is not None)
     # Like the receipts, the walk is acknowledged only once it reads back: a
     # snapshot whose pages did not reach the warehouse is not written.
@@ -3152,9 +3266,10 @@ def _finished_legacy_scopes(connection, plans, identities, *, run_id, acknowledg
     keys = [_receipt_id(plan_hash, run_id, bound_digest) for plan_hash in bound_hashes]
     bound_targets = set()
     for plan, key in zip(plans, keys, strict=True):
-        target = write_journal.pending_statement(_target_scope(plan))
+        scope = _target_scope(plan)
+        target = write_journal.pending_statement(scope)
         if ((target and _statement_expected(target) == key)
-                or historical_intent and write_journal.terminal_target(historical_intent.stem, key)):
+                or historical_intent and write_journal.terminal_target(historical_intent.stem, key, scope=scope)):
             bound_targets.add(key)
     for plan, key in zip(plans, keys, strict=True):
         rowless_member = historical_intent is not None and bool(bound_targets) and not plan.rows and _uses_merge(plan)
@@ -3346,9 +3461,9 @@ def _intent_terminal(path, identity, plans, receipt_ids):
     if identity.get('packet_attempt') or (
             witness.exists() and write_journal._read_record(witness) == {'intent': path.stem}):
         return True
-    replacements = [key for key, plan in zip(receipt_ids, plans, strict=True) if plan.write_mode == 'replace']
     return identity.get('single_submit') is True and all(
-        write_journal.terminal_target(path.stem, key) for key in replacements)
+        write_journal.terminal_target(path.stem, key, scope=_target_scope(plan))
+        for key, plan in zip(receipt_ids, plans, strict=True) if plan.write_mode == 'replace')
 
 
 def _complete_packet(plans, receipt_ids, paths):
@@ -3357,11 +3472,12 @@ def _complete_packet(plans, receipt_ids, paths):
         identity = write_journal._intent_body(path, 'core write intent checksum differs')['identity']
         terminal = _intent_terminal(path, identity, plans, receipt_ids)
         write_journal.complete_intent(path, identity['digest'], owner, terminal)
+    write_journal.retire_operations({_target_scope(plan) for plan in plans}, owner)
     _release_packet(plans, owner, paths)
 
 
 def _terminal_packet(path, plans, receipt_ids):
-    return path is not None and all(write_journal.terminal_target(path.stem, key)
+    return path is not None and all(write_journal.terminal_target(path.stem, key, scope=_target_scope(plan))
                                     for plan, key in zip(plans, receipt_ids, strict=True)
                                     if plan.rows or plan.write_mode == 'replace')
 
@@ -3385,7 +3501,7 @@ def _commit_bundle(
             raise ValueError('duplicate core receipt identity across plans')
         batch = _batch_id_for_run(run_id)
         current = digest
-        descriptor_digest = _bundle_identity(plans, run_id)[1]
+        descriptor_hashes, descriptor_digest = _bundle_identity(plans, run_id)
         if write_journal.read_receipt(digest) is None:
             earlier = _earlier_acknowledgement(plans, run_id)
             if earlier is not None:
@@ -3439,9 +3555,12 @@ def _commit_bundle(
         if repair_identity is not None and stored is None:
             raise RuntimeError('core repair lacks its original acknowledgement')
         receipt_ids = [_receipt_id(h, run_id, identity['digest']) for h in identity['plan_hashes']]
+        _LOCAL.packet = (receipt_ids[0], paths, dict(zip(receipt_ids, descriptor_hashes, strict=True)))
+        active_operations = _check_operation_history(plans, receipt_ids[0])
         historical_receipts = any(not body['identity'].get('packet_attempt') for _, body in pending) or (
             historical_intent is not None and any(
-                write_journal.terminal_target(historical_intent.stem, key) for key in receipt_ids))
+                write_journal.terminal_target(historical_intent.stem, key, scope=_target_scope(plan))
+                for plan, key in zip(plans, receipt_ids, strict=True)))
         completed = [write_journal.completed_intent(path.stem) for path in paths]
         for completion in filter(None, completed):
             if (stored is None or completion['digest'] not in keys or completion['owner'] != receipt_ids[0]
@@ -3467,12 +3586,13 @@ def _commit_bundle(
                 raise RuntimeError('core journal receipt warehouse identity differs')
             if write_journal.read_snapshot_anchors(receipt_digest).keys() != _anchored_tables(plans):
                 raise RuntimeError('core acknowledged snapshot anchors differ')
-            if len(pending) == 1 and not any(completed) and _released_after_ack(pending[0][1], plans, receipt_ids):
+            if (not active_operations and len(pending) == 1 and not any(completed)
+                    and _released_after_ack(pending[0][1], plans, receipt_ids)):
                 _complete_packet(plans, receipt_ids, paths)
                 if journaled:
                     return stored
                 paths.clear()
-            if completed and all(completed):
+            if completed and all(completed) and not active_operations:
                 if set(paths) == receipt_repairs:
                     for path in paths:
                         write_journal.finish_intent(path)
@@ -3538,6 +3658,7 @@ def _commit_bundle(
                         write_journal.reserve_scopes((_target_scope(plan) for plan in plans), receipt_ids[0])
                 _merge_receipts(connection, plan_receipts)
                 _verify_receipts(connection, plan_receipts)
+                _verify_packet_operations(connection, plans, receipt_ids)
                 settled = not verify_only or _terminal_packet(historical_intent, plans, receipt_ids)
                 if settled:
                     _clean_stages(connection, writer, plans, receipt_ids, run_id)
@@ -3549,6 +3670,7 @@ def _commit_bundle(
                 _publish_alias(current, stored, receipt_hashes, receipt_digest)
             for path in receipt_repairs:
                 write_journal.complete_intent(path, descriptor_digest, receipt_ids[0], terminal=True)
+                write_journal.retire_operations({_target_scope(plan) for plan in plans}, receipt_ids[0])
                 write_journal.finish_intent(path)
                 paths.remove(path)
             if settled:
@@ -3607,6 +3729,7 @@ def _commit_bundle(
                 _merge_receipts(connection, plan_receipts)
             _verify_receipts(connection, plan_receipts)
             if may_acknowledge:
+                _verify_packet_operations(connection, plans, receipt_ids)
                 _clean_stages(connection, writer, plans, receipt_ids, run_id)
         finally:
             connection.close()

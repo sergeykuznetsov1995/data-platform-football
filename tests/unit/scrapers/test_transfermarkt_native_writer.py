@@ -1676,10 +1676,10 @@ def test_run_preflight_refuses_capture_contradictions_between_valid_plans():
 # ---------------------------------------------------------------- round 6: an uncertain replacement
 
 
-def _submit_lost_merge(db, apply=None):
+def _submit_lost_merge(db, apply=None, *, query_id='q_lost_merge'):
     class LostCursor(CoreCursor):
         def execute(self, sql, params=()):
-            self.query_id = 'q_lost_merge'
+            self.query_id = query_id
             if apply is not None:
                 apply()
             state = 'FINISHED' if apply is not None else 'QUEUED'
@@ -4235,3 +4235,231 @@ def test_missing_single_club_ack_requires_complete_physical_member(damage):
             write(db, [other], run_id='77', clock=NEWEST)
     receipt.write_bytes(saved)
     assert write(db, [other], run_id='77', clock=NEWEST)['verified']
+
+
+def _interrupt_ops_insert(patch, db, table, query_id, *, landed=False, member=None):
+    """Keep the exact bound INSERT for delivery after a writer restart."""
+    submissions = []
+    execute = CoreCursor.execute
+
+    def interrupt(cursor, sql, params=()):
+        if sql.startswith('INSERT INTO ' + table) and (member is None or params[0] == member):
+            submissions.append((sql, tuple(params)))
+            if landed:
+                execute(cursor, sql, params)
+            cursor.query_id = query_id
+            db.sql.execute('INSERT INTO test_query_history VALUES (?, ?, NULL)',
+                           (query_id, 'FINISHED' if landed else 'QUEUED'))
+            raise TrinoAmbiguousWriteError('lost INSERT response')
+        return execute(cursor, sql, params)
+
+    patch.setattr(CoreCursor, 'execute', interrupt)
+    return submissions
+
+
+def _interrupt_publication(*args):
+    raise RuntimeError('before local publication')
+
+
+@pytest.mark.parametrize('earlier', ['target', 'receipt'])
+def test_finished_original_operation_cannot_publish_a_queued_target_repair(tmp_path, monkeypatch, earlier):
+    # Round 15 finding 2
+    db = CoreDB()
+    plan, old = _snapshot(CLOCK, 'B'), _snapshot(EARLIER, 'A')
+    write(db, [old], run_id='A', clock=EARLIER)
+    db.sql.execute(f'CREATE TABLE saved_old AS SELECT * FROM {old.table}')
+
+    class OriginalTarget(CoreWriter):
+        dispatches_journalled_target = True
+
+        def _write_to_iceberg(self, *args, **kwargs):
+            write_rows = super()._write_to_iceberg
+            _submit_lost_merge(db, lambda: write_rows(*args, **kwargs), query_id='original_target')
+
+    def commit(writer):
+        return native_writer.write_core_bundle(lambda: db, writer, [plan], run_id='B',
+                                               universe_version='u', committed_at=CLOCK)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='B')
+
+    with monkeypatch.context() as patch:
+        if earlier == 'receipt':
+            _interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'original_receipt', landed=True)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            commit(OriginalTarget(db) if earlier == 'target' else CoreWriter(db))
+    root = write_journal._root()
+    backup = tmp_path / 'original-finished'
+    shutil.copytree(root, backup)
+    ack, = replay()
+    _, digest = native_writer._bundle_identity([plan], 'B')
+    db.sql.execute(f'CREATE TABLE saved_target AS SELECT * FROM {plan.table}')
+    db.sql.execute(f'DELETE FROM {plan.table}')
+    db.sql.execute(f'INSERT INTO {plan.table} SELECT * FROM saved_old')
+    delayed = _QueuedReplacement(db)
+    with pytest.raises(TrinoAmbiguousWriteError):
+        commit(delayed)
+    db.sql.execute(f'DELETE FROM {plan.table}')
+    db.sql.execute(f'INSERT INTO {plan.table} SELECT * FROM saved_target')
+    root.rename(tmp_path / 'repair-pending')
+    shutil.copytree(backup, root)
+    for _ in range(2):
+        with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+            replay()
+        assert write_journal.read_receipt(digest) is None
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [_snapshot(NEWEST, 'C')], run_id='C', clock=NEWEST)
+    # Independent restoration and the already accepted original can themselves
+    # produce duplicates. Recovery must leave them visible and refuse publication.
+    delayed.land()
+    assert db.sql.execute(f'SELECT count(*) FROM {plan.table}').fetchone()[0] > len(plan.rows)
+    with pytest.raises(RuntimeError):
+        replay()
+    assert write_journal.read_receipt(digest) is None
+
+
+@pytest.mark.parametrize('historical', [False, True])
+@pytest.mark.parametrize('earlier_finished', [False, True])
+def test_receipt_repair_survives_restoring_prepublication_backup(tmp_path, monkeypatch, historical, earlier_finished):
+    # Round 15 finding 3
+    db = CoreDB()
+    if historical:
+        plans, path, member = _archived_delete_with_terminal_outcome(db, monkeypatch)
+        run = 'delete'
+    else:
+        plans, run = [membership_plan(['1']), _club_plan('42', 'sibling', CLOCK)], 'run-1'
+        path = None
+    _, digest = native_writer._bundle_identity(plans, run)
+    member = native_writer._receipt_id(plans[0].plan_sha256(), run, digest)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id=run)
+
+    root = write_journal._root()
+    backup = tmp_path / 'pre-publication'
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', _interrupt_publication)
+        if earlier_finished:
+            execute = native_writer._execute_once
+
+            def snapshot_original(cursor, sql, bound, statement):
+                execute(cursor, sql, bound, statement)
+                if statement and statement['key'] == [native_writer.CORE_RECEIPTS_TABLE, member]:
+                    write_journal.remember_query(statement, 'earlier_insert')
+                    db.sql.execute("INSERT INTO test_query_history VALUES ('earlier_insert','FINISHED',NULL)")
+                    shutil.copytree(root, backup)
+
+            patch.setattr(native_writer, '_execute_once', snapshot_original)
+        with pytest.raises(RuntimeError, match='before local publication'):
+            if historical:
+                replay()
+            else:
+                write(db, plans)
+    if not earlier_finished:
+        shutil.copytree(root, backup)
+    db.sql.execute(f'CREATE TABLE saved_member AS SELECT * FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+    with monkeypatch.context() as patch:
+        queued = _interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'replacement', member=member)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            replay()
+    root.rename(tmp_path / 'repair')
+    shutil.copytree(backup, root)
+    if earlier_finished:
+        db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM saved_member')
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    assert write_journal.read_receipt(digest) is None
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='replacement'")
+    assert db.sql.execute(f'SELECT count(*) FROM {RECEIPTS} WHERE receipt_id=?', (member,)).fetchone() == (
+        2 if earlier_finished else 1,)
+    with pytest.raises(RuntimeError):
+        replay()
+    assert write_journal.read_receipt(digest) is None
+    if not earlier_finished:
+        root.rename(tmp_path / 'older')
+        (tmp_path / 'repair').rename(root)
+        assert replay()[0]['verified'] and (path is None or not path.exists())
+
+
+def test_prepublication_page_repair_requires_its_own_finished_insert(monkeypatch):
+    # Round 15 finding 4
+    db, plan = CoreDB(), _snapshot(CLOCK, 'two-pages')
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', _interrupt_publication)
+        with pytest.raises(RuntimeError, match='before local publication'):
+            write(db, [plan])
+    table = 'transfermarkt_core_pages_v1'
+    db.sql.execute(f'CREATE TABLE saved_pages AS SELECT * FROM {table}')
+    db.sql.execute(f'DELETE FROM {table}')
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+
+    with monkeypatch.context() as patch:
+        queued = _interrupt_ops_insert(patch, db, native_writer.CORE_PAGES_TABLE, 'repair_pages')
+        with pytest.raises(TrinoAmbiguousWriteError):
+            replay()
+    db.sql.execute(f'INSERT INTO {table} SELECT * FROM saved_pages')
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='repair_pages'")
+    assert db.sql.execute(f'SELECT page_number, count(*) FROM {table} GROUP BY page_number '
+                          'ORDER BY page_number').fetchall() == [(1, 2), (2, 2)]
+    with pytest.raises(RuntimeError):
+        replay()
+    _, digest = native_writer._bundle_identity([plan], 'run-1')
+    assert write_journal.read_receipt(digest) is None
+
+
+@pytest.mark.parametrize('boundary', ['retention', 'unlink'])
+def test_verified_receipt_survives_retention_and_unlink(monkeypatch, boundary):
+    # Round 15 finding 6
+    db, plan = CoreDB(), membership_plan(['1'])
+    _, digest = native_writer._bundle_identity([plan], 'run-1')
+    with monkeypatch.context() as patch:
+        writes = _interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'verified_receipt', landed=True)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            write(db, [plan])
+    outcome, finish = native_writer._query_outcome, write_journal.finish_statement
+    lookups = []
+
+    def expire(connection, statement, **options):
+        result = outcome(connection, statement, **options)
+        if statement['key'][0] == native_writer.CORE_RECEIPTS_TABLE:
+            lookups.append(result)
+            db.sql.execute("DELETE FROM test_query_history WHERE query_id='verified_receipt'")
+        return result
+
+    def after_unlink(statement):
+        finish(statement)
+        if statement['key'][0] == native_writer.CORE_RECEIPTS_TABLE:
+            raise RuntimeError('after receipt unlink')
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native_writer, '_query_outcome', expire)
+        if boundary == 'unlink':
+            patch.setattr(write_journal, 'finish_statement', after_unlink)
+            with pytest.raises(RuntimeError, match='after receipt unlink'):
+                replay()
+        else:
+            assert replay()[0]['verified']
+    assert lookups == ['finished'] and len(writes) == 1
+    if boundary == 'unlink':
+        member = native_writer._receipt_id(plan.plan_sha256(), 'run-1', digest)
+        assert write_journal.pending_statement((native_writer.CORE_RECEIPTS_TABLE, member)) is None
+        db.sql.execute(f'CREATE TABLE exact AS SELECT * FROM {RECEIPTS}')
+        db.sql.execute(f'DELETE FROM {RECEIPTS}')
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        assert _receipt_count(db) == 0 and write_journal.read_receipt(digest) is None
+        db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM exact')
+        assert replay()[0]['verified']
+    assert _receipt_count(db) == 1 and not write_journal.pending_intents({})

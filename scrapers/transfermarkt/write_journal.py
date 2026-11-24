@@ -55,12 +55,12 @@ def _ensure_directory(directory: Path) -> None:
         _fsync_directory(directory.parent)
 
 
-def _write_once(path: Path, data: bytes, mismatch: str) -> None:
+def _write_once(path: Path, data: bytes, mismatch: str, *, replace=False) -> None:
     _ensure_directory(path.parent)
     with _directory_fd(path.parent) as directory:
         # Serialize the existence check and rename, including standalone journal users.
         fcntl.flock(directory, fcntl.LOCK_EX)
-        if path.exists():
+        if path.exists() and not replace:
             if path.read_bytes() != data:
                 raise RuntimeError(mismatch)
             return
@@ -76,11 +76,15 @@ def _write_once(path: Path, data: bytes, mismatch: str) -> None:
                 tmp.unlink(missing_ok=True)
 
 
-def _immutable_record(path: Path, payload: Mapping) -> None:
+def _store_record(path: Path, payload: Mapping, *, replace=False) -> None:
     payload = dict(payload)
     checksum = hashlib.sha256(_canonical(payload)).hexdigest()
     data = _canonical({'payload': payload, 'sha256': checksum})
-    _write_once(path, data, 'core journal record differs')
+    _write_once(path, data, 'core journal record differs', replace=replace)
+
+
+def _immutable_record(path: Path, payload: Mapping) -> None:
+    _store_record(path, payload)
 
 
 def _read_record(path: Path) -> dict:
@@ -327,6 +331,133 @@ def _attempt_path(key):
     return _record_path('dispatch-attempts', _statement_path(key).stem)
 
 
+def _operation_directory(scope):
+    # A restore of the replay journal must not rewind the dispatch boundary.
+    root = _root()
+    return root.with_name(root.name + '.attempts') / hashlib.sha256(_canonical(scope)).hexdigest()
+
+
+def _operation_path(scope, key, member):
+    name = hashlib.sha256(_canonical([key, member])).hexdigest()
+    return _operation_directory(scope) / (name + '.json')
+
+
+def _read_operation(path, scope):
+    record = _read_record(path)
+    operation = record['operation']
+    statement = record.get('statement')
+    if (operation['scope'] != list(scope)
+            or path != _operation_path(scope, record['key'], operation['member'])
+            or record['state'] not in ('dispatched', 'returned', 'observed', 'unchanged', 'rejected', 'FINISHED')
+            or (record['state'] == 'unchanged') != (statement is None)
+            or statement is not None and (statement['key'] != record['key']
+                                          or statement.get('operation', operation) != operation)
+            or record['state'] == 'FINISHED' and not record.get('query_id')):
+        raise RuntimeError('core operation binding differs')
+    return record
+
+
+def scope_operations(scope):
+    for path in _operation_directory(scope).glob('*.json'):
+        yield _read_operation(path, scope)
+
+
+def latest_operation(scope, key, member):
+    path = _operation_path(scope, key, member)
+    return _read_operation(path, scope) if path.exists() else None
+
+
+def statement_for_readback(scope, key, member):
+    statement = pending_statement(key)
+    if statement:
+        return statement
+    current = latest_operation(scope, key, member)
+    if current and current['state'] == 'FINISHED':
+        return current['statement']
+
+
+def remember_unchanged_target(operation):
+    """Bind a verified target that required no DML, before publishing its walk."""
+    scope = operation['scope']
+    path = _operation_path(scope, scope, operation['member'])
+    if not path.exists():
+        _immutable_record(path, {'key': scope, 'operation': operation, 'state': 'unchanged'})
+
+
+def _operation_transition(statement, state, query_id=None):
+    operation = statement.get('operation')
+    if operation is None:
+        path = _record_path('operation-bindings', statement['attempt'])
+        if not path.exists():
+            return
+        binding = _read_record(path)
+        if binding['statement'] != statement:
+            raise RuntimeError('core operation attempt differs')
+        operation = binding['operation']
+    scope, member = operation['scope'], operation['member']
+    path = _operation_path(scope, statement['key'], member)
+    previous = latest_operation(scope, statement['key'], member)
+    if state == 'dispatched':
+        if previous and previous['state'] in ('dispatched', 'FINISHED'):
+            raise RuntimeError('core operation outcome is still pending')
+    elif not previous or previous.get('statement') != statement:
+        raise RuntimeError('core operation attempt differs')
+    elif previous['state'] != 'dispatched' and not (
+            state == 'FINISHED' and previous['state'] in ('observed', 'returned')):
+        if state == 'FINISHED' and (previous['state'], previous.get('query_id')) != (state, query_id):
+            raise RuntimeError('core operation outcome differs')
+        return  # resume interrupted statement cleanup
+    record = {'key': statement['key'], 'statement': statement, 'operation': operation, 'state': state}
+    if state == 'FINISHED':
+        if not query_id or statement_query(statement) not in (None, query_id):
+            raise RuntimeError('core operation query binding differs')
+        record['query_id'] = query_id
+    _store_record(path, record, replace=True)
+
+
+def verified_operation(statement, query_id):
+    _operation_transition(statement, 'FINISHED', query_id)
+
+
+def note_observed(statement):
+    _operation_transition(statement, 'observed')
+
+
+def bind_pending_operation(statement, operation):
+    """Adopt a surviving pre-upgrade statement before reading its coordinator outcome."""
+    current = latest_operation(operation['scope'], statement['key'], operation['member'])
+    if current:
+        # The recovered dispatch can belong to a later repair intent than the
+        # restored replay descriptor. Authenticate the actual latest statement.
+        if current.get('statement') != statement or current['operation']['owner'] != operation['owner']:
+            raise RuntimeError('core latest operation outcome is still pending')
+        if 'operation' not in statement:
+            _immutable_record(_record_path('operation-bindings', statement['attempt']),
+                              {'statement': statement, 'operation': current['operation']})
+        return current
+    if 'operation' in statement:
+        raise RuntimeError('core latest operation evidence is still pending')
+    path = _record_path('operation-bindings', statement['attempt'])
+    _immutable_record(path, {'statement': statement, 'operation': operation})
+    _operation_transition(statement, 'dispatched')
+    return latest_operation(operation['scope'], statement['key'], operation['member'])
+
+
+def retire_operations(scopes, owner):
+    for scope in scopes:
+        for record in scope_operations(scope):
+            operation = record['operation']
+            if operation['owner'] != owner:
+                continue
+            statement = record.get('statement')
+            if record['state'] == 'dispatched' or statement and (
+                    pending_statement(record['key']) == statement or statement_query(statement) is not None):
+                raise RuntimeError('core operation outcome is still pending')
+            if statement and 'operation' not in statement:
+                _unlink_record(_record_path('operation-bindings', statement['attempt']))
+            _unlink_record(_operation_path(scope, record['key'], operation['member']))
+
+
 def _unlink_record(path):
     if path.exists():
         path.unlink()
@@ -392,7 +523,7 @@ def stage_in_use(record):
     return False
 
 
-def begin_statement(key, expected, *, observable=True, target_preimage=False, stage=None):
+def begin_statement(key, expected, *, observable=True, target_preimage=False, stage=None, operation=None):
     """Fence one dispatch under the shared writer lock, before it can reach Trino."""
     statement = {'key': list(key), 'expected': expected, 'observable': observable,
                  'attempt': uuid4().hex}
@@ -400,8 +531,11 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         statement['target_preimage'] = True
     if stage is not None:
         statement['stage'] = stage
+    if operation is not None:
+        statement['operation'] = operation
     if pending_statement(key) is not None:
         raise RuntimeError('core statement outcome is still pending: ' + key[0])
+    _operation_transition(statement, 'dispatched')
     _immutable_record(_attempt_path(key), statement)
     _immutable_record(_statement_path(key), statement)
     return statement
@@ -418,7 +552,7 @@ def statement_query(statement):
     return _read_record(path)['query_id'] if path.exists() else None
 
 
-def finish_statement(statement):
+def finish_statement(statement, *, outcome='returned'):
     """Release the fence only after the attempt is settled, including across a crash."""
     path = _statement_path(statement['key'])
     binding = _attempt_path(statement['key'])
@@ -427,6 +561,7 @@ def finish_statement(statement):
             raise RuntimeError('core pending statement changed')
     if not (path.exists() or binding.exists()):
         raise RuntimeError('core pending statement is missing')
+    _operation_transition(statement, outcome)
     settled = _record_path('settled-statements', path.stem)
     _immutable_record(settled, statement)
     if statement.get('stage'):
@@ -519,8 +654,18 @@ def complete_intent(path, digest, owner, terminal):
     _immutable_record(_record_path('completed-intents', path.stem), completion)
 
 
-def terminal_target(intent, receipt_id, statement=None):
-    return terminal_witness(intent, receipt_id, statement) is not None
+def terminal_target(intent, receipt_id, statement=None, *, scope=None):
+    current = None
+    if scope is not None:
+        current = latest_operation(scope, scope, receipt_id)
+        if current:
+            if current['state'] != 'FINISHED':
+                return False
+            statement = current['statement']
+    witness = terminal_witness(intent, receipt_id, statement)
+    if current and witness and current['query_id'] != witness['query_id']:
+        raise RuntimeError('core terminal target binding differs')
+    return witness is not None and witness.get('outcome') == 'FINISHED'
 
 
 def terminal_witness(intent, receipt_id, statement=None):
@@ -538,11 +683,12 @@ def terminal_witness(intent, receipt_id, statement=None):
                         or statement_query(statement) not in (None, record['query_id']))):
                 raise RuntimeError('core terminal target binding differs')
             if 'outcome' in record or 'statement_sha256' in record:
-                if (record.get('outcome') != 'FINISHED' or not record.get('statement_sha256')
+                if (record.get('outcome') != 'FINISHED' or not re.fullmatch('[0-9a-f]{64}', record.get('statement_sha256') or '')
                         or statement is not None and record['statement_sha256'] != hashlib.sha256(
                             _canonical(statement)).hexdigest()):
                     raise RuntimeError('core terminal target binding differs')
-            return record
+            if statement is not None or 'outcome' in record:
+                return record
     return None
 
 
@@ -552,9 +698,12 @@ def remember_terminal_target(intent, receipt_id, statement):
     if not query_id or statement['expected'] != {'single_submit': receipt_id}:
         raise RuntimeError('core terminal target binding differs')
     directory = 'terminal-targets/' + intent + '/' + receipt_id
-    _immutable_record(_record_path(directory, statement['attempt']), {
+    path = _record_path(directory, statement['attempt'])
+    previous = terminal_witness(intent, receipt_id, statement)
+    _store_record(path, {
         'intent': intent, 'receipt_id': receipt_id, 'attempt': statement['attempt'], 'query_id': query_id,
-        'outcome': 'FINISHED', 'statement_sha256': hashlib.sha256(_canonical(statement)).hexdigest()})
+        'outcome': 'FINISHED', 'statement_sha256': hashlib.sha256(_canonical(statement)).hexdigest()},
+        replace=previous is not None and 'outcome' not in previous)
 
 
 def stage_record(receipt_id, stage):

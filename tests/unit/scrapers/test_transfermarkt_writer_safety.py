@@ -940,6 +940,16 @@ def test_pre_binding_stage_survives_loss_of_target_statement(staged_bundle, monk
 
 def test_pre_walk_backup_with_scope_owner_cannot_repeat_single_page_repair(tmp_path, monkeypatch):
     # Round 14 finding 1
+    _exercise_pre_walk_restore(tmp_path, monkeypatch, 1, False)
+
+
+@pytest.mark.parametrize(('page_count', 'lost_receipt'), [(1, True), (2, False)])
+def test_orphan_walk_fences_repair_until_verified_target_survives_unlink(tmp_path, monkeypatch, page_count, lost_receipt):
+    # Round 15 finding 1
+    _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt)
+
+
+def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt):
     import shutil
     from tests.unit.scrapers import test_transfermarkt_native_writer as native
     from tests.unit.scrapers import test_transfermarkt_sections as lanes
@@ -950,6 +960,10 @@ def test_pre_walk_backup_with_scope_owner_cannot_repeat_single_page_repair(tmp_p
     body = (lanes.ATTENDANCE_FIXTURES / 'single_page.html').read_bytes()
 
     def snapshot(name, clock):
+        if page_count == 2:
+            start, tail, page = native._walk_pages()
+            return lanes._attendance_plan((page(start, 'page_1.html', clock, name + '1'),
+                                           page(tail, 'page_2.html', clock, name + '2')), extracted_at=clock)
         page = lanes._page(lanes.ATTENDANCE_START, body + name.encode(), clock, name)
         return lanes._attendance_plan((page,), extracted_at=clock)
 
@@ -1008,6 +1022,8 @@ def test_pre_walk_backup_with_scope_owner_cannot_repeat_single_page_repair(tmp_p
     stage_record = journal._read_record(stage_path)
     root.rename(tmp_path / 'in-flight')
     shutil.copytree(backup, root)
+    if lost_receipt:
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (key,))
     (intent, _), = journal.pending_intents({'run_id': ack['run_id']})
     assert journal.read_receipt(ack['plan_sha256']) is None
     assert journal.scope_owner(scope) == key and journal.pending_statement(scope) is None
@@ -1038,6 +1054,26 @@ def test_pre_walk_backup_with_scope_owner_cannot_repeat_single_page_repair(tmp_p
         replay_b()
     assert journal.pending_statement(scope) == statement and stage_path.exists()
     db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
+    # Round 15 finding 5
+    finish = journal.finish_statement
+
+    def interrupt_after_target(resolved):
+        finish(resolved)
+        if resolved == statement:
+            raise RuntimeError('after verified target unlink')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, 'finish_statement', interrupt_after_target)
+        with pytest.raises(RuntimeError, match='after verified target unlink'):
+            replay_b()
+    assert journal.pending_statement(scope) is None and intent.exists()
+    db.sql.execute("DELETE FROM test_query_history WHERE query_id='q_target_merge'")
+    assert journal.terminal_target(intent.stem, key, statement)
+    db.sql.execute(f"UPDATE {b.table} SET club_id='wrong' WHERE club_id='11'")
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay_b()
+    assert journal.read_receipt(ack['plan_sha256']) is None and len(submissions) == 1
+    db.sql.execute(f"UPDATE {b.table} SET club_id='11' WHERE club_id='wrong'")
     assert replay_b() == [ack]
     assert len(submissions) == 1 and not intent.exists()
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(b.table,)]
