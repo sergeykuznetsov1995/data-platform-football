@@ -1385,7 +1385,8 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('boundary', ['original', 'repair', 'before-reservation', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup',
-                                      'linked-worklist', 'linked-general', 'linked-original', 'general-with-original'])
+                                      'linked-worklist', 'linked-general', 'linked-original', 'general-with-original',
+                                      'general-before-receipt-reservation'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1425,6 +1426,12 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
             assert body['payload']['predecessor_head'] == native_writer._digest(head)
         else:
             assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
+    elif boundary == 'general-before-receipt-reservation':
+        # Round 32 finding 6
+        native.write(db, plans)
+        db.sql.execute(f"DELETE FROM {plans[0].table} WHERE player_id='7'")
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (members[0],))
+        native._r32_stop_before_receipt_reservation(monkeypatch, lambda: native.write(db, plans))
     elif boundary == 'general-with-original':
         # Round 31 finding 7
         native._r28_overlapping_worklists(tmp_path, monkeypatch, db, plans, 'original', general=True)

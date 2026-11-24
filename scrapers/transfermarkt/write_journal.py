@@ -851,8 +851,9 @@ def _check_settled(marker, statement):
 
     # A surviving query mapping still needs coordinator authentication in the writer.
     if operation is not None and current['state'] == 'rejected' and mapped is not None:
-        from .native_writer import CORE_RECEIPTS_TABLE
-        return statement['key'] in (operation['scope'], [CORE_RECEIPTS_TABLE, operation['member']])
+        from .native_writer import CORE_PAGES_TABLE, CORE_RECEIPTS_TABLE
+        return statement['key'] in (operation['scope'], [CORE_PAGES_TABLE, operation['member']],
+                                    [CORE_RECEIPTS_TABLE, operation['member']])
     return False
 
 
@@ -1158,6 +1159,14 @@ def check_guard_generations(scopes, owner, intents):
     if held - allowed:
         raise RuntimeError('core packet guard generation is still pending')
     return bool(held)
+
+
+def all_scopes_held_by(scopes, owner, intent):
+    for scope in scopes:
+        path = _scope_owner_path(scope)
+        if not path.exists() or _read_record(path) != {'owner': owner, 'scope': list(scope), 'intent': intent}:
+            return False
+    return True
 
 
 def obsolete_guard_scopes(scopes, owner, intent):
