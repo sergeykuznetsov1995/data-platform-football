@@ -701,9 +701,10 @@ def test_fresh_stage_has_no_drop_that_can_land_behind_queued_merge(staged_bundle
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
 
 
-@pytest.mark.parametrize('query_history', [True, False])
-def test_late_stage_create_is_dropped_after_its_terminal_result(staged_bundle, monkeypatch, query_history):
+@pytest.mark.parametrize('outcome', ['queued', 'untracked', 'analysis', 'legacy'])
+def test_late_stage_create_is_dropped_after_its_terminal_result(staged_bundle, monkeypatch, outcome):
     # Round 10 finding 16
+    # Round 11 finding 8. Cleanup survives the verified bundle independently.
     from tests.unit.scrapers.test_transfermarkt_native_writer import CoreCursor
 
     warehouse, db, plan, commit, replay, land = staged_bundle
@@ -722,7 +723,7 @@ def test_late_stage_create_is_dropped_after_its_terminal_result(staged_bundle, m
             stages.append(sql.split()[2])
             if not queued:
                 queued.append(sql)
-                if query_history:
+                if outcome in ('queued', 'analysis'):
                     self.query_id = 'q_stage_create'
                     db.sql.execute("INSERT INTO test_query_history VALUES ('q_stage_create', 'QUEUED', NULL)")
                 raise ConnectionResetError('Connection reset after queued CREATE')
@@ -737,13 +738,83 @@ def test_late_stage_create_is_dropped_after_its_terminal_result(staged_bundle, m
         patch.setattr(CoreCursor, 'execute', read_stage)
         with pytest.raises(TrinoAmbiguousWriteError):
             commit()
-        with pytest.raises(RuntimeError, match='CREATE outcome is still pending'):
-            replay()
-        assert len(set(stages)) == len(stages) == 2
-        assert native_writer.write_journal.pending_intents({'run_id': 'next'})
-        assert warehouse.players() == ['2']
-        land(queued[0])
-        db.sql.execute("UPDATE test_query_history SET state = 'FINISHED' WHERE query_id = 'q_stage_create'")
+        journal = native_writer.write_journal
+        if outcome == 'legacy':
+            old, = (journal._root() / 'stages').glob('*/*.json')
+            record = journal._read_record(old)
+            old.unlink()
+            del record['fenced_create']
+            journal._immutable_record(old, record)
+            journal.finish_statement(journal.pending_statement(('stage-create', stages[0])))
+        if outcome == 'analysis':
+            db.sql.execute("UPDATE test_query_history SET state='FAILED', error_code='TYPE_MISMATCH'")
         assert replay()[0]['verified']
+        assert len(set(stages)) == len(stages) == 2
+        assert not journal.pending_intents({'run_id': 'next'})
+        assert warehouse.players() == ['2']
+        assert bool(list((journal._root() / 'abandoned-stages').glob('*/*.json'))) == (outcome != 'analysis')
+        if outcome != 'analysis':
+            land(queued[0])
+            db.sql.execute("UPDATE test_query_history SET state = 'FINISHED' WHERE query_id = 'q_stage_create'")
+            assert replay() == []
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
     assert not native_writer.write_journal.pending_intents({})
+
+
+def test_create_analysis_response_settles_only_its_stage(staged_bundle, monkeypatch):
+    # Round 11 finding 8. A typed, bound CTAS rejection needs no later query history.
+    from trino.exceptions import TrinoUserError
+    from scrapers.base.trino_manager import TrinoError
+
+    warehouse, _, plan, commit, replay, land = staged_bundle
+    execute, attempts = _TombstoneCursor.execute, []
+    def reject(self, sql, params=None):
+        if sql.startswith('CREATE TABLE ') and '__stg_' in sql and not attempts:
+            attempts.append(sql.split()[2])
+            raise TrinoUserError({'errorName': 'COLUMN_NOT_FOUND', 'errorType': 'USER_ERROR',
+                                  'message': 'missing CTAS column', 'errorCode': 47}, 'q_analysis')
+        if sql.startswith('MERGE INTO'):
+            self.sql, self.rows = sql, land(sql)
+            return
+        return execute(self, sql, params)
+    with monkeypatch.context() as patch:
+        patch.setattr(_TombstoneCursor, 'execute', reject)
+        with pytest.raises(TrinoError, match='missing CTAS column'):
+            commit()
+        assert native_writer.write_journal.pending_statement(('stage-create', attempts[0])) is None
+        assert replay()[0]['verified']
+    assert warehouse.players() == ['2']
+    assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
+
+
+def test_queued_merge_keeps_its_stage_and_retires_abandoned_sibling(staged_bundle, monkeypatch):
+    # Round 11 finding 8. Both stages belong to one receipt, but only one feeds this MERGE.
+    warehouse, db, plan, commit, replay, land = staged_bundle
+    journal = native_writer.write_journal
+    execute, queued = _TombstoneCursor.execute, []
+    def delay(self, sql, params=None):
+        if sql.startswith('MERGE INTO'):
+            queued.append(sql)
+            self.query_id = 'q_target_merge'
+            raise ConnectionResetError('Connection reset after queued MERGE')
+        return execute(self, sql, params)
+    with monkeypatch.context() as patch:
+        patch.setattr(_TombstoneCursor, 'execute', delay)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            commit()
+    target = journal.pending_statement(native_writer._target_scope(plan))
+    retained = target['stage']
+    receipt_id = target['expected']['single_submit']
+    orphan = plan.table + '__stg_tm_' + 'a' * 32
+    warehouse.engine.execute(f'CREATE TABLE {orphan} AS SELECT * FROM {plan.table} WHERE FALSE')
+    journal._immutable_record(journal.stage_record(receipt_id, orphan), {
+        'receipt_id': receipt_id, 'table': plan.full_table, 'stage': orphan, 'fenced_create': True})
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    assert {row[0] for row in warehouse.engine.execute('SHOW TABLES').fetchall()} == {plan.table, retained}
+    submission, = queued
+    assert retained in submission
+    land(submission)
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_target_merge', 'FINISHED', NULL)")
+    assert replay()[0]['verified']
+    assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]

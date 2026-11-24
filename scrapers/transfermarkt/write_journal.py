@@ -241,8 +241,60 @@ def adopt_intent(path):
 def finish_intent(path: Path) -> None:
     """Publish completion before removing the verified intent file."""
     body = _intent_body(path, 'core write intent checksum differs')
-    _append_index({'digest': path.stem, 'status': 'finished', 'identity': body['identity']})
+    entry = {'digest': path.stem, 'status': 'finished', 'identity': body['identity']}
+    _immutable_record(_record_path('finished-identities', path.stem), entry)
+    _append_index(entry)
     path.unlink()
+
+
+def guard_history():
+    """An index loss cannot discard the identity of an archived scope owner."""
+    entries = {entry['digest']: entry for entry in _load_index()}
+    for path in (_root() / 'finished-identities').glob('*.json'):
+        archived = _read_record(path)
+        if archived['digest'] != path.stem or archived['status'] != 'finished':
+            raise RuntimeError('core finished identity differs')
+        indexed = entries.get(path.stem)
+        if indexed and indexed.get('identity', archived['identity']) != archived['identity']:
+            raise RuntimeError('core finished identity differs')
+        entries[path.stem] = archived
+    for directory in ('migrated-scopes', 'guard-inventories'):
+        for path in (_root() / directory).glob('*.json'):
+            record = _read_record(path)
+            if record['intent'] != path.stem:
+                raise RuntimeError('core migration identity differs')
+            entry = entries.setdefault(path.stem, {'digest': path.stem, 'status': 'finished',
+                                                   'identity': {'digest': record['digest']}})
+            identity = entry.setdefault('identity', {'digest': record['digest']})
+            if identity.get('digest') != record['digest']:
+                raise RuntimeError('core migration identity differs')
+    known = {entry.get('identity', {}).get('digest') for entry in entries.values()}
+    for path in (_root() / 'receipts').glob('*.json'):
+        digest = path.stem
+        if digest in known:
+            continue
+        receipt = read_receipt(digest)
+        if receipt is None or receipt.get('plan_sha256') != digest:
+            raise RuntimeError('core archived acknowledgement identity differs')
+        warehouse = (receipt.get('identity') or {}).get('digest', digest)
+        if warehouse not in known:
+            # No dispatch protocol survives. The acknowledgement binds the
+            # affected targets, but does not certify terminal DML.
+            yield {'digest': digest, 'status': 'finished',
+                   'identity': {'run_id': receipt['run_id'], 'digest': digest}}
+    for entry in entries.values():
+        if entry['status'] == 'pending':
+            # Completion precedes owner unlink and index retirement. Its
+            # unresolved DML guards already apply throughout that interval.
+            completion = completed_intent(entry['digest'])
+            if completion and not completion['terminal']:
+                yield {**entry, 'status': 'finished'}
+            continue
+        if entry['status'] == 'finished':
+            archive = _record_path('finished-identities', entry['digest'])
+            if entry.get('identity', {}).get('run_id') and not archive.exists():
+                _immutable_record(archive, entry)
+            yield entry
 
 
 def _record_path(directory: str, digest: str) -> Path:
@@ -265,12 +317,14 @@ def pending_statement(key):
     return statement
 
 
-def begin_statement(key, expected, *, observable=True, target_preimage=False):
+def begin_statement(key, expected, *, observable=True, target_preimage=False, stage=None):
     """Fence one dispatch under the shared writer lock, before it can reach Trino."""
     statement = {'key': list(key), 'expected': expected, 'observable': observable,
                  'attempt': uuid4().hex}
     if target_preimage:
         statement['target_preimage'] = True
+    if stage is not None:
+        statement['stage'] = stage
     _immutable_record(_statement_path(key), statement)
     return statement
 

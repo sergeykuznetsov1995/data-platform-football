@@ -79,6 +79,10 @@ _PRESENCE_ENTITIES = frozenset({
     'attendance_observations', 'club_value_observations',
     'player_representation_observations',
 })
+# These lanes can accumulate rows from the same response at multiple clocks.
+_OBSERVATION_CLOCK_ENTITIES = frozenset({
+    'referee_aggregate_observations', 'player_attribute_observations', 'player_contract_observations',
+})
 
 LINEAGE_COLUMNS = (
     'source_url', 'source_endpoint', 'raw_capture_id', 'source_capture_id',
@@ -1109,11 +1113,18 @@ def build_core_dq(
         for capture_id, body_hash in evidence:
             if hashes_by_capture.setdefault(capture_id, body_hash) != body_hash:
                 errors.add('capture_evidence_conflict')
+        scope_columns = CORE_SCOPE_COLUMNS.get(entity, ())
+        if (entity in _OBSERVATION_CLOCK_ENTITIES and status in CONCLUSIVE_CORE_STATUSES
+                and outcome.rows and capture is not None):
+            # Directory rows carry the competition and edition read from the URL.
+            scope_values = tuple(outcome.rows[0].get(column) for column in scope_columns)
+            observation_clock = capture.captured_at
+        else:
+            scope_values = tuple(getattr(scope, column, None) for column in scope_columns)
+            observation_clock = None
         identity = (
             entity, scope.scope_id if scope else None, scope.cycle_id if scope else None,
-            tuple(getattr(scope, column, None) for column in CORE_SCOPE_COLUMNS.get(entity, ())),
-            capture.capture_id if capture else None,
-            outcome.subject,
+            scope_values, capture.capture_id if capture else None, outcome.subject, observation_clock,
         )
         if entity == 'club_value_observations' and outcome.rows:
             identity += (outcome.rows[0].get('club_id'),)

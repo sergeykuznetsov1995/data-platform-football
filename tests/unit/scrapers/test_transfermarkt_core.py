@@ -328,6 +328,48 @@ def test_squad_adapter_preserves_attribute_and_contract_club_identity():
     assert core.build_core_dq(lanes)['errors'] == []
 
 
+def test_dq_accepts_verified_referee_directory_aliases_at_distinct_clocks(tmp_path, monkeypatch):
+    # Round 11 finding 10
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        REFEREE_DIRECTORY_URL, _bundle, _referee_body, _referee_directory, _referee_page,
+    )
+
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+    first = _referee_page(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')]))
+    alias = replace(first, url=first.url.replace('/example-league/', '/league-alias/'),
+                    captured_at='2026-11-20T15:01:00.000000+00:00')
+    original, = _referee_directory((first,))
+    later, = _referee_directory((alias,))
+
+    db = CoreDB()
+    for outcome in (original, later):
+        plan = core.plan_for_outcome(outcome, captured_at=outcome.capture.captured_at,
+                                     scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
+        receipt = _bundle(db, [plan], outcome.extracted_at)
+        assert receipt['verified'] is True and receipt['receipt_readback'] is True
+    assert db.sql.execute(
+        'SELECT COUNT(DISTINCT receipt_id) FROM transfermarkt_core_receipts_v1'
+    ).fetchone() == (2,)
+    assert db.sql.execute(
+        'SELECT COUNT(*), COUNT(DISTINCT metric) FROM transfermarkt_referee_aggregate_observations '
+        'GROUP BY observed_at'
+    ).fetchall() == [(5, 5), (5, 5)]
+    assert core.build_core_dq([original, later])['errors'] == []
+
+    same_clock, = _referee_directory((replace(alias, captured_at=first.captured_at),))
+    assert core.build_core_dq([original, same_clock])['errors'] == [
+        'duplicate_natural_key', 'duplicate_outcome']
+    other_competition, = _referee_directory((replace(first, url=first.url.replace('/XY1/', '/XY2/')),))
+    assert core.build_core_dq([original, other_competition])['errors'] == []
+    different_body = alias.body + b' '
+    conflict, = _referee_directory((replace(alias, body=different_body,
+                                            body_hash=hashlib.sha256(different_body).hexdigest()),))
+    assert core.build_core_dq([original, conflict])['errors'] == ['capture_evidence_conflict']
+
+
 def test_plan_for_outcome_builds_the_native_write_contract():
     outcomes = _squad_outcomes()
     club_id = outcomes[0].rows[0]['club_id']

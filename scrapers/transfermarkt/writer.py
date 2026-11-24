@@ -22,6 +22,8 @@ from scrapers.transfermarkt.native_writer import (  # noqa: F401 — donor facad
     CommittingCursor,
     StaleTransfermarktWrite,
     TrinoConnection,
+    TrinoQueryError,
+    _CTAS_ANALYSIS_ERRORS,
     _LOCAL,
     _MUTATION,
     _definite_rejection,
@@ -49,7 +51,11 @@ def _stage_create(stage):
     try:
         yield statement
     except Exception as exc:
-        if _definite_rejection(exc):
+        coordinator = exc.__cause__
+        if (_definite_rejection(exc)
+                or isinstance(coordinator, TrinoQueryError)
+                and coordinator.error_name in _CTAS_ANALYSIS_ERRORS
+                and coordinator.query_id and coordinator.query_id == write_journal.statement_query(statement)):
             write_journal.finish_statement(statement)
         raise
     write_journal.finish_statement(statement)
@@ -127,7 +133,9 @@ class TransfermarktTrinoManager(TrinoTableManager):
                 # Includes every VALUES batch and the replacement tombstones.
                 return parent(sql, fetch=fetch, params=params, replay_safe=False)
             if verb == 'MERGE':
-                return self._execute_target(sql, params)
+                stage = getattr(_LOCAL, 'merge_stage', None)
+                return self._execute_target(sql, params, dispatch=_target_dispatch(
+                    stage=stage if stage and stage in sql else None))
         if not replay_safe:
             return parent(sql, fetch=fetch, params=params, replay_safe=False)
         return _execute_committing(lambda: parent(sql, fetch=fetch, params=params))
@@ -168,6 +176,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
         with writer_lock():
             stage_record = None
             previous_stage = getattr(_LOCAL, 'fresh_stage', None)
+            previous_merge_stage = getattr(_LOCAL, 'merge_stage', None)
             if write_is_journalled():
                 kwargs.pop('staging_id', None)  # a delayed insert belongs only to its original stage
                 target = getattr(_LOCAL, 'target', None)
@@ -184,10 +193,12 @@ class TransfermarktTrinoManager(TrinoTableManager):
             if kwargs.get('delete_filter'):
                 kwargs['single_statement_replace'] = True
             try:
+                _LOCAL.merge_stage = stage if stage_record else None
                 _LOCAL.fresh_stage = f'{self.catalog}.{schema}.{stage}' if stage_record else None
                 count = super().insert_dataframe_atomic(schema, table, df, **kwargs)
             finally:
                 _LOCAL.fresh_stage = previous_stage
+                _LOCAL.merge_stage = previous_merge_stage
             if stage_record is not None:
                 write_journal.forget_stage(stage_record)
             return count

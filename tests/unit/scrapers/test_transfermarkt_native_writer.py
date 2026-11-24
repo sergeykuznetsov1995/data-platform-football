@@ -348,8 +348,11 @@ class GuardCursor:
                     in enumerate(self.manifest, start=1)]
         if 'SELECT receipt_id FROM' in self.sql:
             return [('receipt-walk',)] if self.manifest else []
-        if 'SELECT receipt_id, committed_at FROM' in self.sql:
-            return [('receipt-walk', CLOCK)] if self.manifest else []
+        if 'SELECT receipt_id, committed_at, source_capture_id' in self.sql:
+            if not self.manifest:
+                return []
+            _, capture, clock, body = self.manifest[-1]
+            return [('receipt-walk', CLOCK, capture, body, clock)]
         return self.pages if 'GROUP BY source_url' in self.sql else self.rows
     def close(self):
         pass
@@ -1534,6 +1537,7 @@ def test_an_ordinary_retry_reuses_a_completed_stage_b_acknowledgement():
     write_journal.snapshot_anchors(legacy_digest, db, {'transfermarkt_squad_memberships', 'ops.transfermarkt_core_receipts_v1'})
     acknowledged = write_journal.read_snapshot_anchors(legacy_digest)
     native_writer.execute_statement(db.cursor(), native_writer.core_receipts_ddl())
+    native_writer.execute_statement(db.cursor(), plan.ddl)
     native_writer._merge_receipts(db, [native_writer._plan_receipt(
         plan, {**_EMPTY_PROOF, 'physical_hash': native_writer._digest([])}, plan_hash,
         legacy_digest, 'run-old', 'u', batch, CLOCK)])
@@ -2655,7 +2659,7 @@ def test_completed_pre_fence_intent_only_verifies_its_original_ack(damage):
     elif damage == 'target':
         db.sql.execute(f"INSERT INTO {plan.table} (league, season, club_id) VALUES ('GB1','2526','11')")
     start = len(db.events)
-    if damage:
+    if damage == 'target':
         with pytest.raises(RuntimeError, match='readback differs'):
             native_writer.replay_pending_intents(lambda: db, CoreWriter(db))
     else:
@@ -2663,7 +2667,12 @@ def test_completed_pre_fence_intent_only_verifies_its_original_ack(damage):
         assert write(db, [plan], clock=NEWEST) == original
     with pytest.raises(RuntimeError, match='still pending'):
         write(db, [membership_plan(['1'], clock=LATER)], run_id='later', clock=LATER)
-    assert path.exists() and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    # Round 11 finding 5. A missing immutable receipt alone can be inserted
+    # after verifying the original physical proof, with its target guard intact.
+    mutations = [sql for sql in db.events[start:] if native_writer.is_mutation(sql)]
+    assert path.exists() and len(mutations) == int(damage == 'receipt')
+    assert all(sql.startswith('INSERT INTO ' + native_writer.CORE_RECEIPTS_TABLE) for sql in mutations)
+    assert _receipt_count(db) == 1
 
 
 def test_existing_capture_sensitive_alias_repairs_original_receipt(monkeypatch):
@@ -3330,3 +3339,283 @@ def test_newest_first_keeps_unseen_squad_observation_keys(entity):
         ('older',), ('newer',)]
     with pytest.raises(RuntimeError, match='natural key'):
         write(db, [_squad_observation(entity, CLOCK, 'collision')])
+
+
+@pytest.mark.parametrize('damage', ['index', 'marker', 'one_guard', 'before_migration'])
+def test_archived_guard_inventory_survives_loss(damage):
+    # Round 11 finding 1. Both replacement tables belong to the archived unit.
+    db = CoreDB()
+    old = [_snapshot(CLOCK, 'first'), _club_plan('11', 'old-club', CLOCK)]
+    receipt = write(db, old)
+    identity = {'run_id': 'run-1', 'digest': receipt['plan_sha256'], 'single_submit': True}
+    old_path = write_journal.save_intent(identity, {'plans': native_writer._descriptors(old)})
+    write_journal.finish_intent(old_path)
+    fresh = _club_plan('11', 'new-club', NEWEST)
+    if damage != 'before_migration':
+        with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+            write(db, [fresh], run_id='fresh', clock=NEWEST)
+    guard = write_journal._record_path('legacy-scopes/' + fresh.table, old_path.stem)
+    if damage == 'marker':
+        write_journal._record_path('migrated-scopes', old_path.stem).unlink()
+    if damage in ('one_guard', 'index'):
+        guard.unlink()
+    if damage in ('index', 'before_migration'):
+        write_journal._index_path().unlink()
+    if damage == 'before_migration':
+        # Only the old acknowledgement and its anchors survive this upgrade.
+        for path in (write_journal._root() / 'finished-identities').glob('*.json'):
+            path.unlink()
+    start = len(db.events)
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, [fresh], run_id='fresh', clock=NEWEST)
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write(db, old) == receipt
+    for member in old:
+        assert list((write_journal._root() / 'legacy-scopes' / member.table).glob('*.json'))
+
+
+def test_historical_named_page_clock_must_match_warehouse_receipt(monkeypatch):
+    # Round 11 finding 2. A fresh sibling hides the regressed, rowless replacement.
+    from tests.unit.scrapers import test_transfermarkt_sections as lanes
+    db = CoreDB()
+    # Name page one unambiguously at a later clock than the other populated page.
+    old = _snapshot(LATER, 'named')
+    record = write_journal.record_receipt
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', lambda k, r: record(
+            k, {key: val for key, val in r.items() if key != 'walks'}))
+        write(db, [old], clock=LATER)
+    db.sql.execute('UPDATE transfermarkt_core_pages_v1 SET captured_at=? WHERE source_capture_id=?',
+                   (EARLIER, old.capture_id))
+    start, tail, page = _walk_pages()
+    stale = lanes._page(start, lanes.ROWLESS_PAGE_1, CLOCK, 'stale-empty')
+    fresh = page(tail, 'page_2.html', NEWEST, 'fresh-sibling')
+    with pytest.raises(RuntimeError, match='named capture'):
+        write(db, [lanes._attendance_plan((stale, fresh))], run_id='incoming', clock=NEWEST)
+    assert _receipt_count(db) == 1
+    assert native_writer._target_matches(db, old)
+
+
+@pytest.mark.parametrize('interrupt_ack', [False, True])
+def test_archived_guard_requires_terminal_delete_before_ack(monkeypatch, interrupt_ack):
+    # Round 11 finding 3. Losing rows independently cannot settle q_delete.
+    db = CoreDB()
+    old = membership_plan(['1'])
+    write(db, [old])
+    owner = _empty_roster_plan(clock=LATER)
+    path = _historical_single_submit(owner, 'delete', LATER, finished=False)
+    execute = CoreCursor.execute
+    submissions = []
+    def queue(self, sql, params=()):
+        if sql.startswith('DELETE FROM ' + owner.full_table):
+            submissions.append(sql)
+            self.query_id = 'q_delete'
+            db.sql.execute("INSERT INTO test_query_history VALUES ('q_delete','QUEUED',NULL)")
+            raise TrinoAmbiguousWriteError('queued DELETE')
+        return execute(self, sql, params)
+    with monkeypatch.context() as patch:
+        patch.setattr(CoreCursor, 'execute', queue)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='delete')
+    _historical_single_submit(old, 'run-1', CLOCK, finished=True)
+    db.sql.execute('DELETE FROM ' + owner.table)
+    _, digest = native_writer._bundle_identity([owner], 'delete')
+    with pytest.raises(RuntimeError, match='still pending'):
+        native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='delete')
+    assert path.exists() and write_journal.read_receipt(digest) is None
+    assert _receipt_count(db) == 1
+    statement = write_journal.pending_statement(native_writer._target_scope(owner))
+    assert write_journal.statement_query(statement) == 'q_delete'
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_delete'")
+    if interrupt_ack:
+        record = write_journal.record_receipt
+        def interrupt(key, receipt):
+            record(key, receipt)
+            raise RuntimeError('after local acknowledgement')
+        with monkeypatch.context() as patch:
+            patch.setattr(write_journal, 'record_receipt', interrupt)
+            with pytest.raises(RuntimeError, match='after local acknowledgement'):
+                native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='delete')
+        db.sql.execute('DELETE FROM test_query_history')
+    recovered, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='delete')
+    assert recovered == write_journal.read_receipt(digest) and not path.exists()
+    assert len(submissions) == 1 and _receipt_count(db) == 2
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, [_club_plan('11', 'third', NEWEST)], run_id='third', clock=NEWEST)
+
+
+def test_disjoint_retries_cannot_certify_mixed_rule_walk(monkeypatch):
+    # Round 11 finding 4. Each candidate has original rows for only one page.
+    from tests.unit.scrapers import test_transfermarkt_sections as lanes
+    db = CoreDB()
+    start, tail, page = _walk_pages()
+    head = page(start, 'page_1.html', CLOCK, 'original-head')
+    end = page(tail, 'page_2.html', CLOCK, 'original-tail')
+    plan = lanes._attendance_plan((head, end))
+    digest, walks = native_writer._page_digest, native_writer._journal_walks
+    def old_digest(plan, cell, rows, *args):
+        return digest(plan, cell, rows, 6 if cell[0] == start else 7)
+    def old_walks(plans, keys):
+        return [{k: v for k, v in walk.items() if k != 'digest_version'} for walk in walks(plans, keys)]
+    with monkeypatch.context() as patch:
+        patch.setattr(native_writer, '_page_digest', old_digest)
+        patch.setattr(native_writer, '_journal_walks', old_walks)
+        receipt = write(db, [plan])
+    db.sql.execute('DELETE FROM ' + plan.table)
+    retries = [(head, page(tail, 'page_2.html', LATER, 'next-tail')),
+               (page(start, 'page_1.html', LATER, 'next-head'), end)]
+    for index, pages in enumerate(retries):
+        with pytest.raises(RuntimeError, match='original row evidence'):
+            write(db, [lanes._attendance_plan(pages)], run_id=str(index), clock=LATER)
+    assert _receipt_count(db) == 1
+    assert not write_journal._record_path('verified-walk-rules', receipt['walks'][0]['receipt_id']).exists()
+
+
+def _historical_packet(plans, *, clock=CLOCK, run='run-1'):
+    hashes, digest = native_writer._bundle_identity(plans, run)
+    path = write_journal.save_intent(
+        {'run_id': run, 'digest': digest, 'statement_protocol': 1, 'single_submit': True, 'scope_protocol': 1},
+        {'plans': native_writer._descriptors(plans)}, committed_at=clock, universe_version='core-universe-v1')
+    return path, native_writer._receipt_id(hashes[0], run, digest)
+
+
+def test_partial_old_reservation_fences_other_member():
+    # Round 11 finding 6. Scope protocol 1 predates atomic packet reservation.
+    db = CoreDB()
+    packet = [_transfer_plan(player, 'first-' + player, CLOCK) for player in ('1', '2')]
+    path, owner = _historical_packet(packet)
+    write_journal.hold_scope(native_writer._target_scope(packet[0]), owner)
+    fresh = _transfer_plan('2', 'next', LATER)
+    with pytest.raises(RuntimeError, match='still pending'):
+        write(db, [fresh], run_id='next', clock=LATER)
+    assert not db.events and path.exists()
+    assert write_journal.scope_owner(native_writer._target_scope(packet[1])) == owner
+    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')[0]['verified']
+    assert write(db, [fresh], run_id='next', clock=LATER)['verified']
+
+
+@pytest.mark.parametrize('old_dml_uncertain', [False, True])
+def test_old_post_ack_partial_release_finishes_after_supersession(monkeypatch, old_dml_uncertain):
+    # Round 11 finding 7. The older release sequence predates completed-intents.
+    db = CoreDB()
+    packet = [_club_plan(club, 'old-' + club, CLOCK) for club in ('11', '22')]
+    path, owner = _historical_packet(packet)
+    if old_dml_uncertain:
+        _, digest = native_writer._bundle_identity(packet, 'run-1')
+        write_journal.snapshot_anchors(digest, db, native_writer._anchored_tables(packet))
+    release = write_journal.release_scope
+    def interrupt(scope, owner):
+        release(scope, owner)
+        raise RuntimeError('old writer stopped after release')
+    with monkeypatch.context() as old:
+        old.setattr(write_journal, 'complete_intent', lambda *args: None)
+        old.setattr(write_journal, 'release_scope', interrupt)
+        with pytest.raises(RuntimeError, match='stopped after release'):
+            write(db, packet)
+    assert write_journal.scope_owner(native_writer._target_scope(packet[1])) == owner
+    first = _club_plan('11', 'new-11', LATER)
+    if old_dml_uncertain:
+        with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+            write(db, [first], run_id='new-11', clock=LATER)
+    else:
+        assert write(db, [first], run_id='new-11', clock=LATER)['verified']
+    start = len(db.events)
+    result, = native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+    assert result['verified'] and not path.exists() and len(db.events) == start
+    assert write_journal.scope_owner(native_writer._target_scope(packet[1])) is None
+    fresh = _club_plan('22', 'new-22', LATER)
+    if old_dml_uncertain:
+        with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+            write(db, [fresh], run_id='new-22', clock=LATER)
+    else:
+        assert write(db, [fresh], run_id='new-22', clock=LATER)['verified']
+
+
+@pytest.mark.parametrize('entity', ['player_attribute_observations', 'player_contract_observations'])
+@pytest.mark.parametrize('damage', ['different_key', 'drifted_clock'])
+def test_observation_proof_counts_whole_capture_at_clock(entity, damage):
+    # Round 11 finding 9. An extra player must not disappear in a key filter.
+    db = CoreDB()
+    first = _squad_observation(entity, CLOCK)
+    first = dataclasses_replace(first, rows=tuple({**first.rows[0], 'player_id': str(i)} for i in range(38)))
+    write(db, [first])
+    extra = {**first.rows[0], 'player_id': 'extra'}
+    if damage == 'drifted_clock':
+        extra['captured_at'] = EARLIER
+    columns = ', '.join(extra)
+    marks = ', '.join('?' for _ in extra)
+    db.sql.execute(f'INSERT INTO {first.table} ({columns}) VALUES ({marks})', tuple(extra.values()))
+    with pytest.raises(RuntimeError, match='replay differs'):
+        write(db, [first], run_id='retry')
+    assert db.sql.execute(f'SELECT COUNT(*) FROM {first.table}').fetchone() == (39,)
+    assert _receipt_count(db) == 1
+
+
+def test_rowless_observation_clocks_share_body_and_proof():
+    # Round 11 finding 11. Each absence is a distinct immutable observation.
+    db = CoreDB()
+    plans = [p for clock in (CLOCK, LATER) for p in _empty_squad_plans(clock)[1:]]
+    written = write(db, plans)
+    assert [p['rows'] for p in written['plans']] == [0] * 4
+    assert _receipt_count(db) == 4 and write(db, plans) == written
+    with pytest.raises(ValueError, match='receipt identity'):
+        write(db, [plans[0], plans[0]])
+    with pytest.raises(ValueError, match='duplicate core capture'):
+        write(db, [plans[0], dataclasses_replace(plans[2], proof='different evidence')])
+    evidence = {**dict(plans[2].evidence), 'source_body_hash': 'd' * 64}
+    with pytest.raises(ValueError, match='capture evidence'):
+        write(db, [plans[0], dataclasses_replace(plans[2], evidence=tuple(evidence.items()))])
+
+
+@pytest.mark.parametrize('lost_anchors', [False, True])
+def test_missing_archived_ack_is_confined_to_bound_targets(lost_anchors):
+    # Round 11 finding 12. The bound anchor lists the whole attendance packet.
+    db = CoreDB()
+    attendance = _snapshot(CLOCK, 'archived')
+    ack = write(db, [attendance])
+    _historical_single_submit(attendance, 'run-1', CLOCK, finished=True)
+    path = write_journal._record_path('receipts', ack['plan_sha256'])
+    anchors = write_journal._record_path('anchors', ack['plan_sha256'])
+    original = anchors.read_bytes()
+    if lost_anchors:
+        anchors.unlink()
+    path.unlink()
+    assert write(db, [_club_plan('11', 'squad', LATER)], clock=LATER)['verified']
+    with pytest.raises(RuntimeError, match='acknowledgement is still pending'):
+        write(db, [_snapshot(LATER, 'next')], run_id='next', clock=LATER)
+    write_journal.record_receipt(ack['plan_sha256'], ack)
+    if lost_anchors:
+        anchors.write_bytes(original)
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, [_snapshot(LATER, 'next')], run_id='next', clock=LATER)
+    assert write(db, [attendance]) == ack
+
+
+def test_receipt_only_repair_replays_under_archived_guard(monkeypatch):
+    # Round 11 finding 5. The repair intent survives independently of target ownership.
+    db, plan = CoreDB(), _snapshot(CLOCK, 'original')
+    ack = write(db, [plan])
+    archive = _historical_single_submit(plan, 'run-1', CLOCK, finished=True)
+    expected = db.sql.execute(f'SELECT * FROM {RECEIPTS}').fetchall()
+    db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    execute, queued = CoreCursor.execute, []
+    def delay(self, sql, params=()):
+        if sql.startswith('INSERT INTO ' + native_writer.CORE_RECEIPTS_TABLE):
+            queued.append((sql, tuple(params)))
+            self.query_id = 'q_repair'
+            raise TrinoAmbiguousWriteError('delayed receipt repair')
+        return execute(self, sql, params)
+    with monkeypatch.context() as patch:
+        patch.setattr(CoreCursor, 'execute', delay)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            write(db, [plan])
+        with pytest.raises(RuntimeError, match='still pending'):
+            native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+    submission, = queued
+    db.cursor().execute(*submission)
+    assert native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1') == [ack]
+    assert not write_journal.pending_intents({})
+    assert db.sql.execute(f'SELECT * FROM {RECEIPTS}').fetchall() == expected
+    assert write_journal._record_path('legacy-scopes/' + plan.table, archive.stem).exists()
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, [_snapshot(NEWEST, 'fresh')], run_id='fresh', clock=NEWEST)
