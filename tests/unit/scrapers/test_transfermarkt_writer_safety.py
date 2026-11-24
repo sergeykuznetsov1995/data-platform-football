@@ -1364,7 +1364,7 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
     assert not list(journal.retained_stages(operation['operation']['member']))
 
 
-@pytest.mark.parametrize('boundary', ['original', 'repair', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup'])
+@pytest.mark.parametrize('boundary', ['original', 'repair', 'before-reservation', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1386,16 +1386,24 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
         db.sql.execute(f'DELETE FROM {native.RECEIPTS}')
     hashes, digest = native_writer._bundle_identity(plans, 'run-1')
     members = [native_writer._receipt_id(h, 'run-1', digest) for h in hashes]
-    if boundary == 'reserved-tail':
+    if boundary in ('before-reservation', 'reserved-tail'):
+        # Round 24 finding 2
         # Round 23 finding 3
         native.write(db, plans)
         db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (members[-1],))
         with monkeypatch.context() as patch:
-            patch.setattr(native_writer, '_merge_receipts', native._r22_stop)
+            if boundary == 'before-reservation':
+                patch.setattr(native.write_journal, 'reserve_submission', native._r22_stop)
+            else:
+                patch.setattr(native_writer, '_merge_receipts', native._r22_stop)
             with pytest.raises(OSError):
                 native.write(db, plans)
         head = native.write_journal.submission_head(members[0])
-        assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
+        if boundary == 'before-reservation':
+            (_, body), = native.write_journal.pending_intents({})
+            assert body['payload']['predecessor_head'] == native_writer._digest(head)
+        else:
+            assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
     elif boundary.startswith('rejected-'):
         # Round 22 finding 3
         native._restore_rejected_tail_mapping(monkeypatch, db, plans, members[-1], cleanup=boundary == 'rejected-cleanup')

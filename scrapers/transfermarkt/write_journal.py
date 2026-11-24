@@ -523,10 +523,11 @@ def reservation_release_started(head):
 
 
 def remaining_reservation_scopes(head):
-    """Read ownership under an authenticated no-POST reservation."""
+    """A full local reservation covers every scope until its first unlink."""
     owner = head['owner']
     scopes = set(map(tuple, head['scopes']))
-    if not reservation_release_started(head) or _record_path('reserving-bundles', owner).exists():
+    if (not (submission_retired(head) or reservation_release_started(head))
+            or _record_path('reserving-bundles', owner).exists()):
         return scopes
     return {scope for scope in scopes if scope_owner(scope) == owner}
 
@@ -1039,8 +1040,25 @@ def scope_owner(scope):
     return None
 
 
+def _hold_guard(path, guard):
+    """Record the acquiring descriptor once. An older untagged guard keeps its provenance."""
+    if path.exists():
+        record = _read_record(path)
+        record.pop('intent', None)
+        if record != guard:
+            raise RuntimeError('core journal record differs')
+        return
+    owner = guard['owner']
+    if re.fullmatch('tm-core-receipt-[0-9a-f]{32}', owner):
+        head = submission_head(owner) or {}
+        intent = head.get('reservation') or head.get('statement', {}).get('operation', {}).get('intent')
+        if intent:
+            guard = {**guard, 'intent': intent}
+    _immutable_record(path, guard)
+
+
 def hold_scope(scope, owner):
-    _immutable_record(_scope_owner_path(scope), {'scope': list(scope), 'owner': owner})
+    _hold_guard(_scope_owner_path(scope), {'scope': list(scope), 'owner': owner})
 
 
 def release_scope(scope, owner):
@@ -1063,7 +1081,7 @@ def reserve_scopes(scopes, owner):
     scopes = sorted(set(scopes))
     path = _record_path('reserving-bundles', owner)
     if len(scopes) > 1:
-        _immutable_record(path, {'owner': owner, 'scopes': scopes})
+        _hold_guard(path, {'owner': owner, 'scopes': [list(scope) for scope in scopes]})
     for scope in scopes:
         hold_scope(scope, owner)
 
@@ -1072,10 +1090,24 @@ def finish_reservation(owner, scopes):
     path = _record_path('reserving-bundles', owner)
     if path.exists():
         expected = {'owner': owner, 'scopes': [list(s) for s in sorted(set(scopes))]}
-        if _read_record(path) != expected:
+        record = _read_record(path)
+        record.pop('intent', None)
+        if record != expected:
             raise RuntimeError('core bundle reservation differs')
         path.unlink()
         _fsync_directory(path.parent)
+
+
+def release_obsolete_guards(scopes, owner, intent):
+    """Unlink only guards acquired by this exact descriptor, even across a partial cleanup."""
+    reservation = _record_path('reserving-bundles', owner)
+    if reservation.exists() and _read_record(reservation) == {
+            'owner': owner, 'scopes': [list(s) for s in sorted(scopes)], 'intent': intent}:
+        _unlink_record(reservation)
+    for scope in scopes:
+        path = _scope_owner_path(scope)
+        if path.exists() and _read_record(path) == {'owner': owner, 'scope': list(scope), 'intent': intent}:
+            _unlink_record(path)
 
 
 def completed_intent(intent):
@@ -1099,6 +1131,15 @@ def complete_intent(path, digest, owner, terminal, publication_reservation=None)
     if publication_reservation is not None:
         binding['reservation_head'] = publication_reservation
     existing = completed_intent(path.stem)
+    associate = existing is not None and publication_reservation is not None and 'reservation_head' not in existing
+    if associate:
+        head = submission_head(owner)
+        if (not head or not submission_is_current(head) or head.get('statement') or not head.get('reservation')
+                or path.stem not in head.get('after_publication', ())
+                or hashlib.sha256(_canonical(head)).hexdigest() != publication_reservation
+                or not existing.get('terminal') or not existing.get('acknowledgement')):
+            raise RuntimeError('core completed submission binding differs')
+        existing = {**existing, 'reservation_head': publication_reservation}
     completion = existing or {
         **binding, 'descriptor_digest': descriptor_digest,
         'acknowledgement': hashlib.sha256(_canonical(receipt)).hexdigest()}
@@ -1106,7 +1147,7 @@ def complete_intent(path, digest, owner, terminal, publication_reservation=None)
             or completion.get('descriptor_digest', descriptor_digest) != descriptor_digest
             or not acknowledgement_bound(digest, receipt, run, completion)):
         raise RuntimeError('core completed intent acknowledgement differs')
-    _immutable_record(_record_path('completed-intents', path.stem), completion)
+    _store_record(_record_path('completed-intents', path.stem), completion, replace=associate)
 
 
 def terminal_target(intent, receipt_id, statement=None, *, scope=None):
