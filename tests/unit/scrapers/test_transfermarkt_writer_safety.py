@@ -1219,3 +1219,75 @@ def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, le
     with pytest.raises(RuntimeError, match='still pending'):
         replay()
     assert counts() == (76, 38) and journal.read_receipt(ack['plan_sha256']) is None
+
+
+@pytest.mark.parametrize('boundary', ['old_receipt', 'old_target'])
+def test_pair_restore_fences_queued_attendance_merge(tmp_path, monkeypatch, boundary):
+    # Round 16 finding 2
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    db, journal = native.CoreDB(), native_writer.write_journal
+    old = native._snapshot(native.EARLIER, 'old')
+    plan = native._snapshot(native.CLOCK, 'replacement')
+    native.write(db, [old], run_id='old', clock=native.EARLIER)
+    scope = native_writer._target_scope(plan)
+    backup = tmp_path / 'original'
+    finish = journal.finish_statement
+
+    def backup_finished(statement, **options):
+        table = statement['key'][0]
+        if table == (native_writer.CORE_RECEIPTS_TABLE if boundary == 'old_receipt' else scope[0]):
+            journal.remember_query(statement, boundary)
+            db.sql.execute('INSERT INTO test_query_history VALUES (?, ?, NULL)', (boundary, 'FINISHED'))
+            native._backup_pair(backup)
+        return finish(statement, **options)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, 'finish_statement', backup_finished)
+        ack = native.write(db, [plan])
+    warehouse = _TombstoneWarehouse(plan.table, [dict(row) for row in old.rows])
+    warehouse.lost = True
+    native._copy_warehouse_scope(warehouse, db, old)
+    production = writer.TransfermarktIcebergWriter()
+    production._trino_manager = _scripted(warehouse)
+    monkeypatch.setattr(production._trino_manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(native.IcebergWriter, '_evolve_schema', lambda *args: None)
+    execute, submissions = warehouse.run, []
+
+    def queue(sql):
+        if sql.startswith('MERGE INTO'):
+            submissions.append(sql)
+            db.sql.execute("INSERT INTO test_query_history VALUES ('q_target_merge','QUEUED',NULL)")
+            raise ConnectionResetError('Connection reset after accepted MERGE')
+        return execute(sql)
+
+    def retry():
+        return native_writer.write_core_bundle(lambda: db, production, [plan], run_id='run-1',
+                                               universe_version='core-universe-v1', committed_at=native.CLOCK)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, production, run_id='run-1')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(warehouse, 'run', queue)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            retry()
+        native._restore_pair(backup, tmp_path / 'queued')
+        start = len(db.events)
+        for call in (replay, replay, retry):
+            with pytest.raises(RuntimeError, match='still pending'):
+                call()
+        with pytest.raises(native.StaleTransfermarktWrite):
+            native.write(db, [native._snapshot(native.NEWEST, 'fresh')], run_id='fresh', clock=native.NEWEST)
+        assert native_writer._target_matches(db, old) and journal.read_receipt(ack['plan_sha256']) is None
+        assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+        submission, = submissions
+        execute(submission)
+        native._copy_warehouse_scope(warehouse, db, plan)
+        db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
+        assert native_writer._target_matches(db, plan)
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        assert journal.read_receipt(ack['plan_sha256']) is None and len(submissions) == 1
+    assert native.write(db, [native._attendance_edition(plan, '2024')], run_id='disjoint')['verified']

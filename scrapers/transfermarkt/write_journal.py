@@ -342,13 +342,96 @@ def _operation_path(scope, key, member):
     return _operation_directory(scope) / (name + '.json')
 
 
+def _submission_path(owner):
+    # Kept outside the replay journal and its operation backup. One current
+    # submission per packet is enough to detect a rewind of the full pair:
+    # all its submits are serialized by the shared writer lock.
+    if not re.fullmatch('tm-core-receipt-[0-9a-f]{32}', owner):
+        raise ValueError('invalid core submission owner')
+    root = _root()
+    return root.with_name(root.name + '.submissions') / (owner + '.json')
+
+
+def _review_required_path(owner, intent):
+    if not re.fullmatch('[0-9a-f]{64}', intent):
+        raise ValueError('invalid core review intent')
+    return _submission_path(owner).parent / 'review-required' / owner / (intent + '.json')
+
+
+def _packet_watermark(owner):
+    root = _root()
+    return root.with_name(root.name + '.attempts') / 'watermarks' / 'packets' / (owner + '.json')
+
+
+def _watermark_binding(owner):
+    # An ordinary file restore of the watermark itself must not authenticate
+    # an older pair, even when all the restored JSON content agrees.
+    stat = _submission_path(owner).stat()
+    return {'owner': owner, 'inode': stat.st_ino, 'ctime_ns': stat.st_ctime_ns}
+
+
+def _save_submission(head):
+    owner = head['owner']
+    _store_record(_submission_path(owner), head, replace=True)
+    _store_record(_packet_watermark(owner), _watermark_binding(owner), replace=True)
+
+
+def submission_head(owner):
+    path = _submission_path(owner)
+    if path.exists():
+        head = _read_record(path)
+        if head['owner'] != owner:
+            raise RuntimeError('core submission owner differs')
+        return head
+
+
+def start_submissions(owner):
+    """Establish a positive pre-dispatch boundary before saving the intent."""
+    existing = submission_head(owner)
+    if existing is None:
+        _save_submission({'owner': owner})
+    elif 'statement' in existing or not submission_is_current(existing):
+        raise RuntimeError('core prior packet submission is still pending')
+
+
+def submission_is_current(head):
+    owner = head['owner']
+    path = _packet_watermark(owner)
+    if not path.exists():
+        return False
+    watermark = _read_record(path)
+    binding = _watermark_binding(owner)
+    if not binding.items() <= watermark.items():
+        return False
+    if 'statement' not in head:
+        return 'retired' not in watermark
+    statement = head['statement']
+    op = statement['operation']
+    if op['owner'] != head['owner']:
+        raise RuntimeError('core submission owner differs')
+    record = latest_operation(op['scope'], statement['key'], op['member'])
+    if record is not None:
+        return record.get('statement') == statement
+    return watermark.get('retired') == statement['attempt']
+
+
+def confirm_reviewed_submission(owner):
+    # The caller verified the explicit decisions and the entire live packet.
+    if submission_head(owner) is not None:
+        _store_record(_packet_watermark(owner), _watermark_binding(owner), replace=True)
+
+
 def _read_operation(path, scope, record=None):
     if record is None:
         record = _read_record(path)
     operation = record['operation']
     statement = record.get('statement')
+    publications = operation.get('after_publication', [])
     if (operation['scope'] != list(scope)
             or path != _operation_path(scope, record['key'], operation['member'])
+            or not isinstance(publications, list)
+            or any(not isinstance(intent, str) or not re.fullmatch('[0-9a-f]{64}', intent)
+                   for intent in publications)
             or record['state'] not in ('dispatched', 'returned', 'observed', 'unchanged', 'rejected', 'FINISHED')
             or (record['state'] == 'unchanged') != (statement is None)
             or statement is not None and (statement['key'] != record['key']
@@ -366,6 +449,86 @@ def scope_operations(scope):
 def latest_operation(scope, key, member):
     path = _operation_path(scope, key, member)
     return _read_operation(path, scope) if path.exists() else None
+
+
+def published_intents(digest, receipt, descriptor):
+    """Original intent hashes whose terminal completions authenticate this publication."""
+    result = []
+    for entry in _load_index():
+        if entry.get('identity', {}).get('digest') == digest:
+            completion = completed_intent(entry['digest'])
+            if (completion and completion['terminal'] is True and completion.get('acknowledgement')
+                    and completion.get('descriptor_digest') == descriptor
+                    and acknowledgement_bound(digest, receipt, receipt['run_id'], completion)):
+                result.append(entry['digest'])
+    return result
+
+
+def later_repair_survives(intent, operation):
+    """A repair of this published intent cannot belong to its pre-first-publication backup."""
+    for record in scope_operations(operation['scope']):
+        repair = record['operation']
+        if (intent in repair.get('after_publication', ()) and repair['intent'] != intent
+                and record['state'] in ('dispatched', 'FINISHED')
+                and all(repair[k] == operation[k] for k in ('owner', 'member', 'plan_sha256'))):
+            return True
+    return False
+
+
+def record_reconciliation(intent, statement, query_id, *, reviewer):
+    """Record an operator's independent review of the member and all its submissions.
+
+    Called explicitly under the writer lock. The operator must recover the actual
+    latest statement and rule out outstanding writes, including hidden attempts.
+    Never called by dispatch, statement settlement, or replay.
+    """
+    if not re.fullmatch(r'[0-9a-f]{64}', intent):
+        raise ValueError('invalid core reconciliation intent')
+    if not all(isinstance(value, str) and value.strip() for value in (query_id, reviewer)):
+        raise ValueError('core reconciliation requires a reviewer and a query id')
+    operation = statement['operation']
+    decision = {'intent': intent, 'statement': statement, 'query_id': query_id,
+                'operations_sha256': _member_operations_digest(operation),
+                'reviewer': reviewer, 'decision': 'publish_exact_postimage'}
+    _check_reviewed_attempt(operation, decision)
+    path = _record_path('operator-reconciliations/' + intent, operation['member'])
+    _immutable_record(path, decision)
+    return decision
+
+
+def check_reconciliation(intent, operation, decision):
+    """Bind the explicitly presented decision to the surviving reviewed attempt."""
+    path = _record_path('operator-reconciliations/' + intent, operation['member'])
+    if (not path.exists() or _read_record(path) != decision or decision.get('intent') != intent
+            or decision.get('decision') != 'publish_exact_postimage' or not decision.get('reviewer')
+            or not decision.get('query_id')):
+        raise RuntimeError('core operator reconciliation binding differs')
+    return _check_reviewed_attempt(operation, decision)
+
+
+def _member_operations_digest(operation):
+    attempts = [(r['key'], r.get('statement')) for r in scope_operations(operation['scope'])
+                if r['operation']['member'] == operation['member']]
+    return hashlib.sha256(_canonical(sorted(attempts, key=lambda pair: pair[0]))).hexdigest()
+
+
+def _check_reviewed_attempt(operation, decision):
+    statement = decision['statement']
+    key = statement['key']
+    current = latest_operation(operation['scope'], key, operation['member'])
+    reviewed = statement['operation']
+    head = submission_head(operation['owner'])
+    latest = head and head.get('statement')
+    if latest and latest['operation']['member'] == operation['member'] and latest != statement:
+        raise RuntimeError('core operator reconciliation attempt differs')
+    if (decision['operations_sha256'] != _member_operations_digest(operation)
+            or not current or current.get('statement') != statement or current['operation'] != reviewed
+            or any(reviewed[field] != operation[field] for field in ('scope', 'owner', 'member', 'plan_sha256'))
+            or not re.fullmatch('[0-9a-f]{32}', statement['attempt'])
+            or current['state'] == 'rejected' or current.get('query_id') not in (None, decision['query_id'])
+            or (statement_query(statement) or current.get('query_id')) != decision['query_id']):
+        raise RuntimeError('core operator reconciliation attempt differs')
+    return statement
 
 
 def _matching_operations(field, values):
@@ -467,6 +630,7 @@ def bind_pending_operation(statement, operation):
 
 
 def retire_operations(scopes, owner):
+    head = submission_head(owner)
     for scope in scopes:
         for record in scope_operations(scope):
             operation = record['operation']
@@ -481,6 +645,10 @@ def retire_operations(scopes, owner):
                 _unlink_record(_record_path('statement-queries', statement['attempt']))
             if statement and 'operation' not in statement:
                 _unlink_record(_record_path('operation-bindings', statement['attempt']))
+            if statement and head and head.get('statement') == statement:
+                # Keep the last submit identity in the sibling after retirement.
+                _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'retired': statement['attempt']},
+                              replace=True)
             _unlink_record(_operation_path(scope, record['key'], operation['member']))
 
 
@@ -604,7 +772,14 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         statement['operation'] = operation
     if pending_statement(key) is not None:
         raise RuntimeError('core statement outcome is still pending: ' + key[0])
+    if operation is not None:
+        owner = operation['owner']
+        previous = submission_head(owner)
+        if previous and not submission_is_current(previous):
+            raise RuntimeError('core pre-publication operator reconciliation is still pending')
     _operation_transition(statement, 'dispatched')
+    if operation is not None:
+        _save_submission({'owner': owner, 'statement': statement})
     _immutable_record(_attempt_path(key), statement)
     _immutable_record(_statement_path(key), statement)
     return statement

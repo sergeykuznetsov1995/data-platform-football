@@ -4621,3 +4621,352 @@ def test_pre_reservation_restore_fences_entire_representation_packet(tmp_path, m
     result, = replay()
     assert result['verified'] and write(db, competitor, run_id='another', clock=LATER)['verified']
     assert not write_journal.pending_intents({})
+
+
+def _journal_pair():
+    root = write_journal._root()
+    return root, root.with_name(root.name + '.attempts')
+
+
+def _backup_pair(directory):
+    directory.mkdir()
+    for tree in _journal_pair():
+        if tree.exists():
+            shutil.copytree(tree, directory / tree.name)
+
+
+def _restore_pair(directory, displaced):
+    displaced.mkdir()
+    for tree in _journal_pair():
+        if tree.exists():
+            tree.rename(displaced / tree.name)
+        if (directory / tree.name).exists():
+            shutil.copytree(directory / tree.name, tree)
+
+
+@pytest.mark.parametrize('historical', [False, True])
+@pytest.mark.parametrize('boundary', ['absent', 'older-id', 'older-finished-witness'])
+def test_pair_restore_fences_squad_receipt(tmp_path, monkeypatch, historical, boundary):
+    # Round 16 finding 2
+    db = CoreDB()
+    if historical:
+        write(db, [membership_plan(['1']), *_empty_squad_plans(CLOCK)[1:]])
+        plans, run, clock = _empty_squad_plans(), 'delete', LATER
+    else:
+        plans, run, clock = [membership_plan(['1']), _club_plan('42', 'sibling', CLOCK)], 'run-1', CLOCK
+    hashes, digest = native_writer._bundle_identity(plans, run)
+    member = native_writer._receipt_id(hashes[0], run, digest)
+    backup = tmp_path / 'original'
+    publish, execute, save = write_journal.record_receipt, native_writer._execute_once, write_journal.save_intent
+
+    def historical_save(identity, payload, **evidence):
+        return save({k: v for k, v in identity.items() if k not in ('packet_attempt', 'submission_protocol')}, payload, **evidence)
+
+    def before_publication(*args):
+        if boundary == 'absent':
+            _backup_pair(backup)
+        return publish(*args)
+
+    def before_return(cursor, sql, params, statement):
+        execute(cursor, sql, params, statement)
+        if historical and sql.startswith('DELETE FROM ' + plans[0].full_table):
+            write_journal.remember_query(statement, 'original_delete')
+            db.sql.execute("INSERT INTO test_query_history VALUES ('original_delete','FINISHED',NULL)")
+            assert native_writer._target_matches(db, plans[0])
+            write_journal.remember_terminal_target(statement['operation']['intent'], member, statement)
+            write_journal.verified_operation(statement, 'original_delete')
+        if statement and statement['key'] == [native_writer.CORE_RECEIPTS_TABLE, member]:
+            write_journal.remember_query(statement, 'original_receipt')
+            db.sql.execute("INSERT INTO test_query_history VALUES ('original_receipt','FINISHED',NULL)")
+            if boundary == 'older-finished-witness':
+                expected = native_writer._statement_expected(statement)
+                assert native_writer._settle_statement(
+                    db, statement['key'], expected,
+                    lambda: native_writer._digest(native_writer._stored_receipts(db, [member])[member]) == expected,
+                    require_finished=True, release=False)
+            if boundary != 'absent':
+                _backup_pair(backup)
+
+    with monkeypatch.context() as patch:
+        if historical:
+            patch.setattr(write_journal, 'save_intent', historical_save)
+        patch.setattr(write_journal, 'record_receipt', before_publication)
+        patch.setattr(native_writer, '_execute_once', before_return)
+        assert write(db, plans, run_id=run, clock=clock)['verified']
+    db.sql.execute(f'CREATE TABLE saved AS SELECT * FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+    with monkeypatch.context() as patch:
+        queued = _interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'replacement', member=member)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            write(db, plans, run_id=run, clock=clock)
+    _restore_pair(backup, tmp_path / 'queued')
+    if historical:
+        # Deployed records predate the independent submission watermark.
+        write_journal._submission_path(member).unlink()
+    if boundary != 'absent':
+        db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM saved')
+    (intent, body), = write_journal.pending_intents({'run_id': run})
+    assert bool(body['identity'].get('packet_attempt')) != historical
+    if historical:
+        assert write_journal.terminal_target(intent.stem, member, scope=native_writer._target_scope(plans[0]))
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id=run)
+
+    start = len(db.events)
+    for call in (replay, replay, lambda: write(db, plans, run_id=run, clock=clock),
+                 lambda: write(db, [_club_plan('11', 'new', NEWEST)], run_id='fresh', clock=NEWEST)):
+        with pytest.raises(RuntimeError, match='still pending'):
+            call()
+        assert intent.exists() and write_journal.read_receipt(digest) is None
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write(db, [_club_plan('77', 'elsewhere', LATER)], run_id='disjoint', clock=LATER)['verified']
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='replacement'")
+    with pytest.raises(RuntimeError):
+        replay()
+    assert write_journal.read_receipt(digest) is None
+    assert db.sql.execute(f'SELECT COUNT(*) FROM {RECEIPTS} WHERE receipt_id=?', (member,)).fetchone() == (
+        1 if boundary == 'absent' else 2,)
+
+
+def test_pair_restore_preserves_late_duplicate_walk(tmp_path, monkeypatch):
+    # Round 16 finding 2
+    db, plan = CoreDB(), _snapshot(CLOCK, 'two-pages')
+    backup = tmp_path / 'original'
+    publish = write_journal.record_receipt
+
+    def before_publication(*args):
+        _backup_pair(backup)
+        return publish(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', before_publication)
+        ack = write(db, [plan])
+    member = ack['walks'][0]['receipt_id']
+    table = 'transfermarkt_core_pages_v1'
+    db.sql.execute(f'CREATE TABLE saved AS SELECT * FROM {table}')
+    db.sql.execute(f'DELETE FROM {table}')
+    with monkeypatch.context() as patch:
+        queued = _interrupt_ops_insert(patch, db, native_writer.CORE_PAGES_TABLE, 'replacement_pages')
+        with pytest.raises(TrinoAmbiguousWriteError):
+            write(db, [plan])
+    _restore_pair(backup, tmp_path / 'queued')
+    start = len(db.events)
+    for expected_pages in (0, 2):
+        if expected_pages:
+            db.sql.execute(f'INSERT INTO {table} SELECT * FROM saved')
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match='still pending'):
+                native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+        with pytest.raises(StaleTransfermarktWrite):
+            write(db, [_snapshot(NEWEST, 'fresh')], run_id='new', clock=NEWEST)
+        assert db.sql.execute(f'SELECT COUNT(*) FROM {table}').fetchone() == (expected_pages,)
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='replacement_pages'")
+    with pytest.raises(RuntimeError):
+        write(db, [plan])
+    assert db.sql.execute(f'SELECT page_number, COUNT(*) FROM {table} WHERE receipt_id=? '
+                          'GROUP BY page_number ORDER BY page_number', (member,)).fetchall() == [(1, 2), (2, 2)]
+    assert write_journal.read_receipt(ack['plan_sha256']) is None
+
+
+@pytest.mark.parametrize('intact_sibling', [False, True])
+def test_reviewed_receipt_and_intact_later_repair(tmp_path, monkeypatch, intact_sibling):
+    # Round 16 finding 2
+    db, plan = CoreDB(), membership_plan(['7'])
+    backup, publish = tmp_path / 'original', write_journal.record_receipt
+
+    def before_publication(*args):
+        _backup_pair(backup)
+        return publish(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', before_publication)
+        ack = write(db, [plan])
+    digest = ack['plan_sha256']
+    member = native_writer._receipt_id(plan.plan_sha256(), 'run-1', digest)
+    key = (native_writer.CORE_RECEIPTS_TABLE, member)
+    exact = native_writer._stored_receipts(db, [member])[member]
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+    with monkeypatch.context() as patch:
+        if not intact_sibling:
+            # A deployed repair statement did not name the published intent.
+            operation = native_writer._operation
+
+            def legacy_operation(scope, member):
+                return {k: v for k, v in operation(scope, member).items() if k != 'after_publication'}
+
+            patch.setattr(native_writer, '_operation', legacy_operation)
+        queued = _interrupt_ops_insert(patch, db, key[0], 'reviewed_repair')
+        with pytest.raises(TrinoAmbiguousWriteError):
+            write(db, [plan])
+    statement = write_journal.pending_statement(key)
+    query = write_journal.statement_query(statement)
+    _, attempts = _journal_pair()
+    _restore_pair(backup, tmp_path / 'queued')
+    (path, _), = write_journal.pending_intents({'run_id': 'run-1'})
+    scope = native_writer._target_scope(plan)
+    if intact_sibling:
+        attempts.rename(tmp_path / 'old-attempts')
+        (tmp_path / 'queued' / attempts.name).rename(attempts)
+        write_journal._immutable_record(write_journal._attempt_path(key), statement)
+        write_journal.remember_query(statement, query)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id=?", (query,))
+    assert db.sql.execute('SELECT state FROM test_query_history WHERE query_id=?', (query,)).fetchall() == [
+        ('FINISHED',)]
+    assert native_writer._stored_receipts(db, [member]) == {member: exact}
+    assert native_writer._target_matches(db, plan)
+    start = len(db.events)
+    if intact_sibling:
+        finish = write_journal.finish_statement
+
+        def after_unlink(resolved):
+            finish(resolved)
+            if resolved == statement:
+                raise RuntimeError('after verified receipt unlink')
+
+        with monkeypatch.context() as patch:
+            patch.setattr(write_journal, 'finish_statement', after_unlink)
+            with pytest.raises(RuntimeError, match='after verified receipt unlink'):
+                replay()
+        db.sql.execute('DELETE FROM test_query_history WHERE query_id=?', (query,))
+        assert replay() == [ack]
+    else:
+        with pytest.raises(RuntimeError, match='operator reconciliation'):
+            replay()
+        restored = write_journal.latest_operation(scope, key, member)
+        assert restored['statement']['attempt'] != statement['attempt']
+        # Independent incident evidence restores the actual statement/query binding.
+        # It still needs an operator decision to publish this pre-publication packet.
+        head = write_journal._operation_path(scope, key, member)
+        head.write_bytes((tmp_path / 'queued' / attempts.name / head.relative_to(attempts)).read_bytes())
+        write_journal._immutable_record(write_journal._attempt_path(key), statement)
+        write_journal.remember_query(statement, query)
+        with pytest.raises(RuntimeError, match='operator reconciliation'):
+            replay()
+        with native_writer.writer_lock():
+            decision = write_journal.record_reconciliation(
+                path.stem, statement, query, reviewer='incident operator')
+
+        def reconcile(decisions):
+            return native_writer.reconcile_pending_intent(lambda: db, CoreWriter(db), path.stem, decisions)
+
+        with pytest.raises(RuntimeError, match='explicit reconciliation'):
+            replay()
+        with pytest.raises(RuntimeError, match='members differ'):
+            reconcile({'another-member': decision})
+        record = write_journal._record_path('operator-reconciliations/' + path.stem, member)
+        saved = record.read_bytes()
+        for field, value in [('attempt', restored['statement']['attempt']),
+                             ('operation', {**statement['operation'], 'scope': ['other', 'scope']})]:
+            conflicting = {**decision, 'statement': {**statement, field: value}}
+            write_journal._store_record(record, conflicting, replace=True)
+            with pytest.raises(RuntimeError, match='attempt differs'):
+                reconcile({member: conflicting})
+            assert write_journal.read_receipt(digest) is None
+        record.write_bytes(saved)
+        db.sql.execute('UPDATE test_query_history SET state=? WHERE query_id=?', ('QUEUED', query))
+        with pytest.raises(RuntimeError, match='still pending'):
+            reconcile({member: decision})
+        db.sql.execute('UPDATE test_query_history SET state=? WHERE query_id=?', ('FINISHED', query))
+        physical_hash = exact[native_writer.RECEIPT_COLUMNS.index('physical_hash')]
+        db.sql.execute(f'UPDATE {RECEIPTS} SET physical_hash=? WHERE receipt_id=?', ('wrong', member))
+        with pytest.raises(RuntimeError, match='postimage differs'):
+            reconcile({member: decision})
+        db.sql.execute(f'UPDATE {RECEIPTS} SET physical_hash=? WHERE receipt_id=?', (physical_hash, member))
+        assert write_journal.read_receipt(digest) is None and path.exists()
+        assert reconcile({member: decision}) == ack
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write_journal.read_receipt(digest) == ack and not path.exists()
+
+
+def test_rewound_same_intent_waits_for_review_even_after_restoring_the_latest_attempt(tmp_path, monkeypatch):
+    db, plan = CoreDB(), membership_plan(['7'])
+    scope = native_writer._target_scope(plan)
+    backup = tmp_path / 'before-publication'
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', _interrupt_publication)
+        with pytest.raises(RuntimeError, match='before local publication'):
+            write(db, [plan])
+    (intent, body), = write_journal.pending_intents({})
+    digest = body['identity']['digest']
+    member = native_writer._receipt_id(plan.plan_sha256(), 'run-1', digest)
+    key = (native_writer.CORE_RECEIPTS_TABLE, member)
+    _backup_pair(backup)
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+    with monkeypatch.context() as patch:
+        queued = _interrupt_ops_insert(patch, db, key[0], 'same_intent_repair')
+        with pytest.raises(TrinoAmbiguousWriteError):
+            replay()
+    replacement = write_journal.pending_statement(key)
+    assert replacement['operation']['intent'] == intent.stem
+    _restore_pair(backup, tmp_path / 'latest')
+    earlier = write_journal.latest_operation(scope, key, member)['statement']
+    assert earlier['attempt'] != replacement['attempt']
+    start = len(db.events)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='operator reconciliation'):
+            replay()
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+
+    # Returning the newer files after detecting the rewind identifies the
+    # reviewed POST. Only the explicit entry point may release this incident.
+    _restore_pair(tmp_path / 'latest', tmp_path / 'older')
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='same_intent_repair'")
+    start = len(db.events)
+    with pytest.raises(RuntimeError, match='operator reconciliation'):
+        replay()
+    with pytest.raises(StaleTransfermarktWrite):
+        write(db, [membership_plan(['8'], clock=LATER)], run_id='new', clock=LATER)
+    assert write_journal.read_receipt(digest) is None
+    with native_writer.writer_lock():
+        decision = write_journal.record_reconciliation(intent.stem, replacement, 'same_intent_repair',
+                                                       reviewer='incident operator')
+    receipt = native_writer.reconcile_pending_intent(lambda: db, CoreWriter(db), intent.stem, {member: decision})
+    assert receipt['verified'] and not intent.exists()
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+
+
+@pytest.mark.parametrize('damage', ['missing', 'copied'])
+def test_unavailable_submission_watermark_fences_only_its_pending_packet(tmp_path, monkeypatch, damage):
+    db, plan = CoreDB(), membership_plan(['7'])
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'record_receipt', _interrupt_publication)
+        with pytest.raises(RuntimeError, match='before local publication'):
+            write(db, [plan])
+    (intent, body), = write_journal.pending_intents({})
+    digest = body['identity']['digest']
+    owner = native_writer._receipt_id(plan.plan_sha256(), 'run-1', digest)
+    watermark = write_journal._submission_path(owner)
+    if damage == 'missing':
+        watermark.unlink()
+    else:
+        displaced = tmp_path / 'displaced-watermark'
+        watermark.rename(displaced)
+        shutil.copy2(displaced, watermark)
+    start = len(db.events)
+    with pytest.raises(StaleTransfermarktWrite, match='operator reconciliation'):
+        write(db, [plan])
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, [membership_plan(['8'], clock=LATER)], run_id='new', clock=LATER)
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write_journal.read_receipt(digest) is None and intent.exists()
+    assert write(db, [_club_plan('77', 'elsewhere', LATER)], run_id='other', clock=LATER)['verified']
