@@ -100,6 +100,10 @@ def build_weekly_report(snapshot: Mapping, *, as_of, mapping: Mapping) -> dict:
     except (KeyError, ValueError, TypeError):
         covered = False
     snapshot, window_pairs = _week_snapshot(snapshot, mapping, start, end)
+    unavailable_sources = frozenset(
+        str(error.get("source")) for error in snapshot.get("errors", [])
+        if isinstance(error, Mapping) and error.get("reason") == "read_failed"
+    )
     days = [build_daily_report(snapshot, day=start + timedelta(days=i),
                                as_of=as_of, mapping=mapping) for i in range(7)]
     adults, pairs, gaps = _scope(snapshot)
@@ -121,7 +125,9 @@ def build_weekly_report(snapshot: Mapping, *, as_of, mapping: Mapping) -> dict:
                     snapshot, mapping, {pair}, start + timedelta(days=i), as_of,
                     registered_seasons=frozenset(
                         season_token(s["season_id"]) for s in snapshot["seasons"]
-                        if str(s["competition_id"]) == cid))
+                        if str(s["competition_id"]) == cid),
+                    unavailable_sources=unavailable_sources,
+                )
                 counts.append(values.get(cid))
                 reference_problems.extend(issues)
         # A moved fixture can appear in two daily cohorts in a saved snapshot.
@@ -212,7 +218,10 @@ def weekly_lines(report: Mapping) -> list[str]:
              "| Турнир | Период UTC | FotMob N | FBref-Bronze M | M−N | Доказательства; сопоставление |",
              "| --- | --- | ---: | ---: | ---: | --- |"]
     for row in report["competitions"]:
-        state = ", ".join(sorted({p["reason"] for p in row["evidence"]})) or "подтверждено"
+        state = ", ".join(sorted({
+            f"{p['source']}:{p['reason']}" if p.get("source") else p["reason"]
+            for p in row["evidence"]
+        })) or "подтверждено"
         mapping = row["mapping"]
         state += f"; {mapping['basis']}; confidence={mapping['confidence']}"
         cells = [row["name"], period, row["fotmob"], row["bronze_ready"], row["difference"], state]
