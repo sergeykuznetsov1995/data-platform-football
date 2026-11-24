@@ -168,8 +168,8 @@ def _resolve_snapshot_scope(
 ) -> "tuple[ResolvedReplayScope, str, Mapping[str, object]]":
     """Resolve a scope through the campaign snapshot overlay lane.
 
-    Used ONLY for tournaments absent from the registry (stage-3
-    adjudication): the campaign snapshot supplies the owner-approved scope
+    Used for tournaments absent from the registry or seasons missing from
+    it: the campaign snapshot supplies the owner-approved scope
     row and ``load_exact_scope`` re-validates the snapshot digest, the
     campaign identity (``SOFASCORE_REPLAY_CAMPAIGN_ID`` pinned by the
     planner) and the eligibility rules, so a revised or different campaign
@@ -235,9 +235,9 @@ def _load_scope(
     """Resolve one exact replay scope and select its raw-replay plan.
 
     The catalog comes from the runtime when it carries one and otherwise from
-    ``SofaScoreCatalog.load``.  A tournament ABSENT from the registry falls
-    back to the campaign snapshot lane (stage 3); a tournament the registry
-    knows keeps registry authority — its resolution errors propagate.
+    ``SofaScoreCatalog.load``.  A tournament ABSENT from the registry, or a
+    season ABSENT from it, falls back to the campaign snapshot lane; other
+    registry resolution errors keep registry authority and propagate.
     Records already in memory are prefiltered to the exact scope triple;
     when absent they are loaded through the manifest store's trino manager
     with the planner's mode filters.  Returns the resolved scope, the single
@@ -267,7 +267,17 @@ def _load_scope(
             # and its resolution error propagates (no silent fallback).
             raise exc
         if str(scope.source_tournament_id) in registry_ids:
-            raise
+            tournament = catalog.tournament(int(scope.source_tournament_id))
+            if any(
+                str(item.season_id) == str(scope.source_season_id)
+                for item in tournament.seasons
+            ):
+                raise
+            if not getattr(tournament, "capture_allowed", False):
+                raise
+            canonical_id = getattr(tournament, "canonical_id", None)
+            if not isinstance(canonical_id, str) or not canonical_id.strip():
+                raise
         unresolved = exc
         try:
             resolved, season_format, scope_row = _resolve_snapshot_scope(scope)
