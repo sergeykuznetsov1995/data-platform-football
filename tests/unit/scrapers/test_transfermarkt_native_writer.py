@@ -4416,7 +4416,7 @@ def test_prepublication_page_repair_requires_its_own_finished_insert(monkeypatch
     assert write_journal.read_receipt(digest) is None
 
 
-@pytest.mark.parametrize('boundary', ['retention', 'unlink'])
+@pytest.mark.parametrize('boundary', ['retention', 'unlink', 'restored_query', 'legacy_query'])
 def test_verified_receipt_survives_retention_and_unlink(monkeypatch, boundary):
     # Round 15 finding 6
     db, plan = CoreDB(), membership_plan(['1'])
@@ -4425,6 +4425,11 @@ def test_verified_receipt_survives_retention_and_unlink(monkeypatch, boundary):
         writes = _interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'verified_receipt', landed=True)
         with pytest.raises(TrinoAmbiguousWriteError):
             write(db, [plan])
+    member = native_writer._receipt_id(plan.plan_sha256(), 'run-1', digest)
+    key = (native_writer.CORE_RECEIPTS_TABLE, member)
+    statement = write_journal.pending_statement(key)
+    mapping = write_journal._record_path('statement-queries', statement['attempt'])
+    saved = mapping.read_bytes()
     outcome, finish = native_writer._query_outcome, write_journal.finish_statement
     lookups = []
 
@@ -4445,21 +4450,174 @@ def test_verified_receipt_survives_retention_and_unlink(monkeypatch, boundary):
 
     with monkeypatch.context() as patch:
         patch.setattr(native_writer, '_query_outcome', expire)
-        if boundary == 'unlink':
+        if boundary != 'retention':
             patch.setattr(write_journal, 'finish_statement', after_unlink)
             with pytest.raises(RuntimeError, match='after receipt unlink'):
                 replay()
         else:
             assert replay()[0]['verified']
     assert lookups == ['finished'] and len(writes) == 1
-    if boundary == 'unlink':
-        member = native_writer._receipt_id(plan.plan_sha256(), 'run-1', digest)
-        assert write_journal.pending_statement((native_writer.CORE_RECEIPTS_TABLE, member)) is None
-        db.sql.execute(f'CREATE TABLE exact AS SELECT * FROM {RECEIPTS}')
-        db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    if boundary != 'retention':
+        assert write_journal.pending_statement(key) is None
+        if boundary in ('restored_query', 'legacy_query'):
+            # Round 16 finding 6
+            write_journal._immutable_record(mapping, {'query_id': 'different'})
+            with pytest.raises(RuntimeError, match='still pending'):
+                replay()
+            other = _snapshot(LATER, 'disjoint')
+            assert write(db, [other], run_id='disjoint', clock=LATER)['verified']
+            assert mapping.exists() and write_journal.read_receipt(digest) is None
+            mapping.unlink()
+            if boundary == 'restored_query':
+                mapping.write_bytes(saved)
+            else:
+                write_journal._immutable_record(mapping, {'query_id': 'verified_receipt'})
+            assert write(db, [other], run_id='disjoint', clock=LATER)['verified']
+        db.sql.execute(f'CREATE TABLE exact AS SELECT * FROM {RECEIPTS} WHERE receipt_id=?', (member,))
+        db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (member,))
         with pytest.raises(RuntimeError, match='still pending'):
             replay()
-        assert _receipt_count(db) == 0 and write_journal.read_receipt(digest) is None
+        assert not native_writer._stored_receipts(db, [member]) and write_journal.read_receipt(digest) is None
         db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM exact')
         assert replay()[0]['verified']
-    assert _receipt_count(db) == 1 and not write_journal.pending_intents({})
+    assert len(native_writer._stored_receipts(db, [member])) == 1 and not write_journal.pending_intents({})
+    assert not mapping.exists()
+
+
+@pytest.mark.parametrize('legacy_marker', [False, True])
+def test_restored_settlement_marker_preserves_queued_receipt_attempt(monkeypatch, legacy_marker):
+    # Round 16 finding 3
+    db, plan = CoreDB(), membership_plan(['7'])
+    hashes, digest = native_writer._bundle_identity([plan], 'run-1')
+    member = native_writer._receipt_id(hashes[0], 'run-1', digest)
+    scope = native_writer._target_scope(plan)
+    key = (native_writer.CORE_RECEIPTS_TABLE, member)
+    marker = write_journal._record_path('settled-statements', write_journal._statement_path(key).stem)
+    unlink = write_journal._unlink_record
+    saved = []
+
+    def keep_marker(path):
+        if path == marker:
+            saved.append(path.read_bytes())
+        unlink(path)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='run-1')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, '_unlink_record', keep_marker)
+        patch.setattr(write_journal, 'record_receipt', _interrupt_publication)
+        with pytest.raises(RuntimeError, match='before local publication'):
+            write(db, [plan])
+    db.sql.execute(f'CREATE TABLE original AS SELECT * FROM {RECEIPTS}')
+    db.sql.execute(f'DELETE FROM {RECEIPTS}')
+    with monkeypatch.context() as patch:
+        queued = _interrupt_ops_insert(patch, db, key[0], 'replacement')
+        with pytest.raises(TrinoAmbiguousWriteError):
+            replay()
+    latest = write_journal.latest_operation(scope, key, member)
+    assert latest['state'] == 'dispatched'
+    original_marker, = saved
+    marker.write_bytes(original_marker)
+    if legacy_marker:
+        original_statement = write_journal._read_record(marker)['statement']
+        marker.unlink()
+        write_journal._immutable_record(marker, original_statement)
+    db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM original')
+    with pytest.raises(RuntimeError, match='settled statement binding differs'):
+        replay()
+    assert write_journal.latest_operation(scope, key, member) == latest
+    marker.unlink()  # the queued attempt had no settlement marker
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    assert write_journal.pending_statement(key) == latest['statement']
+    assert write_journal.statement_query(latest['statement']) == 'replacement'
+    submission, = queued
+    db.cursor().execute(*submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='replacement'")
+    with pytest.raises(RuntimeError, match='receipt readback differs'):
+        replay()
+    assert _receipt_count(db) == 2 and write_journal.read_receipt(digest) is None
+
+
+@pytest.mark.parametrize('boundary', ['queued', 'between_members'])
+def test_pre_reservation_restore_fences_entire_representation_packet(tmp_path, monkeypatch, boundary):
+    # Round 16 finding 4
+    from tests.unit.scrapers import test_transfermarkt_sections as lanes
+
+    def packet(players, clock):
+        capture = lanes._representation_capture({
+            'success': True, 'data': [{'id': p, 'attributes': {'consultantAgencyId': 55},
+                                       'clubAssignments': [{'clubId': 11, 'type': 'current'}]} for p in players]})
+        capture = dataclasses_replace(capture, captured_at=clock,
+                                      url=lanes.REPRESENTATION_URL.partition('?')[0] + '?' +
+                                      '&'.join('ids[]=' + p for p in players))
+        outcomes = lanes.sections.extract_representation_observations(
+            capture, lanes._representation_scope(), expected_ids=players, extracted_at=clock,
+            universe_version=lanes.UNIVERSE)
+        return [core.plan_for_outcome(o, captured_at=clock, scope_values={'player_id': p})
+                for o, p in zip(outcomes, players, strict=True)]
+
+    db, plans = CoreDB(), packet(('7', '9'), CLOCK)
+    root, backup = write_journal._root(), tmp_path / 'pre-reservation'
+    reserve, write_plan = write_journal.reserve_scopes, native_writer._write_plan
+    land = []
+
+    def before_reservation(scopes, owner):
+        shutil.copytree(root, backup)
+        return reserve(scopes, owner)
+
+    def between(*args):
+        if args[2] == plans[1]:
+            raise RuntimeError('between players')
+        return write_plan(*args)
+
+    class Queued(CoreWriter):
+        dispatches_journalled_target = True
+
+        def _write_to_iceberg(self, *args, **kwargs):
+            apply = super()._write_to_iceberg
+            land.append(lambda: apply(*args, **kwargs))
+            _submit_lost_merge(db)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'reserve_scopes', before_reservation)
+        if boundary == 'queued':
+            with pytest.raises(TrinoAmbiguousWriteError):
+                native_writer.write_core_bundle(lambda: db, Queued(db), plans, run_id='packet',
+                                               universe_version='u', committed_at=CLOCK)
+        else:
+            patch.setattr(native_writer, '_write_plan', between)
+            with pytest.raises(RuntimeError, match='between players'):
+                native_writer.write_core_bundle(lambda: db, CoreWriter(db), plans, run_id='packet',
+                                               universe_version='u', committed_at=CLOCK)
+    scopes = [native_writer._target_scope(plan) for plan in plans]
+    statement = write_journal.pending_statement(scopes[0])
+    owner = write_journal.scope_owner(scopes[0])
+    root.rename(tmp_path / 'in-flight')
+    shutil.copytree(backup, root)
+    assert all(write_journal.scope_owner(s) is None for s in scopes)
+    competitor = packet(('9',), LATER)
+    start = len(db.events)
+    with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+        write(db, competitor, run_id='another', clock=LATER)
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert all(write_journal.scope_owner(s) == owner for s in scopes)
+    assert write(db, packet(('17',), LATER), run_id='disjoint', clock=LATER)['verified']
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, CoreWriter(db), run_id='packet')
+
+    if boundary == 'queued':
+        with pytest.raises(StaleTransfermarktWrite, match='still pending'):
+            replay()
+        write_journal._immutable_record(write_journal._attempt_path(scopes[0]), statement)
+        write_journal.remember_query(statement, 'q_lost_merge')
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        deliver, = land
+        deliver()
+        db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_lost_merge'")
+    result, = replay()
+    assert result['verified'] and write(db, competitor, run_id='another', clock=LATER)['verified']
+    assert not write_journal.pending_intents({})

@@ -949,7 +949,20 @@ def test_orphan_walk_fences_repair_until_verified_target_survives_unlink(tmp_pat
     _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt)
 
 
-def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt):
+@pytest.mark.parametrize('unresolved_walk', [False, True])
+def test_verified_walk_reacquires_its_missing_scope(tmp_path, monkeypatch, unresolved_walk):
+    # Round 16 finding 5
+    _exercise_pre_walk_restore(tmp_path, monkeypatch, 1, False, restore_owner=True,
+                               unresolved_walk=unresolved_walk)
+
+
+def test_restore_missing_registration_for_bound_merge_input(tmp_path, monkeypatch):
+    # Round 16 finding 7
+    _exercise_pre_walk_restore(tmp_path, monkeypatch, 1, False, restore_stage=True)
+
+
+def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, *,
+                               restore_owner=False, restore_stage=False, unresolved_walk=False):
     import shutil
     from tests.unit.scrapers import test_transfermarkt_native_writer as native
     from tests.unit.scrapers import test_transfermarkt_sections as lanes
@@ -971,7 +984,13 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt):
     assert lanes._bundle(db, [a], native.EARLIER)['verified']
     root = journal._root()
     backup = tmp_path / 'before-walk-b'
+    before_owner = tmp_path / 'before-scope-b'
     record_pages = native_writer._record_pages
+    write_plan = native_writer._write_plan
+
+    def backup_before_owner(*args):
+        shutil.copytree(root, before_owner)
+        return write_plan(*args)
 
     def backup_before_walk(*args, **kwargs):
         shutil.copytree(root, backup)
@@ -979,6 +998,8 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt):
 
     with monkeypatch.context() as patch:
         patch.setattr(native_writer, '_record_pages', backup_before_walk)
+        if restore_owner:
+            patch.setattr(native_writer, '_write_plan', backup_before_owner)
         ack = lanes._bundle(db, [b], native.CLOCK)
     key = ack['walks'][0]['receipt_id']
     scope = native_writer._target_scope(b)
@@ -1049,10 +1070,20 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt):
         replay_b()
     journal._immutable_record(journal._attempt_path(scope), statement)
     journal.remember_query(statement, 'q_target_merge')
-    journal._immutable_record(stage_path, stage_record)
+    if restore_stage:
+        assert not stage_path.exists()
+        # A genuine name with a conflicting receipt binding cannot become a DROP.
+        journal._immutable_record(stage_path, {**stage_record, 'receipt_id': 'wrong'})
+        with pytest.raises(RuntimeError, match='stage identity differs'):
+            replay_b()
+        assert (stage,) in warehouse.engine.execute('SHOW TABLES').fetchall()
+        stage_path.unlink()
+    else:
+        journal._immutable_record(stage_path, stage_record)
     with pytest.raises(RuntimeError, match='still pending'):
         replay_b()
     assert journal.pending_statement(scope) == statement and stage_path.exists()
+    assert journal._read_record(stage_path) == stage_record
     db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
     # Round 15 finding 5
     finish = journal.finish_statement
@@ -1069,11 +1100,122 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt):
     assert journal.pending_statement(scope) is None and intent.exists()
     db.sql.execute("DELETE FROM test_query_history WHERE query_id='q_target_merge'")
     assert journal.terminal_target(intent.stem, key, statement)
+    if restore_owner:
+        root.rename(tmp_path / 'after-target-unlink')
+        shutil.copytree(before_owner, root)
+        assert journal.scope_owner(scope) is None and journal.pending_statement(scope) is None
+        journal.hold_scope(scope, 'competing')
+        with pytest.raises(native.StaleTransfermarktWrite):
+            replay_b()
+        assert journal.scope_owner(scope) == 'competing'
+        journal.release_scope(scope, 'competing')
+        if unresolved_walk:
+            # The same packet could have dispatched a repair of A's historical walk.
+            historical = next(k for k in native_writer._scope_receipt_ids(db, b) if k != key)
+            operation = {**statement['operation'], 'member': historical, 'plan_sha256': None}
+            page_key = (native_writer.CORE_PAGES_TABLE, historical)
+            held = native_writer._stored_walk(db, historical)
+            pending = journal.begin_statement(page_key, {'single_submit': native_writer._digest(held)},
+                                              observable=False, operation=operation)
+            with pytest.raises(RuntimeError, match='still pending'):
+                replay_b()
+            assert journal.pending_statement(page_key) == pending and journal.scope_owner(scope) is None
+            assert journal.read_receipt(ack['plan_sha256']) is None
+            return
     db.sql.execute(f"UPDATE {b.table} SET club_id='wrong' WHERE club_id='11'")
     with pytest.raises(RuntimeError, match='still pending'):
         replay_b()
     assert journal.read_receipt(ack['plan_sha256']) is None and len(submissions) == 1
+    if restore_owner:
+        assert journal.scope_owner(scope) is None
     db.sql.execute(f"UPDATE {b.table} SET club_id='11' WHERE club_id='wrong'")
     assert replay_b() == [ack]
     assert len(submissions) == 1 and not intent.exists()
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(b.table,)]
+
+
+@pytest.mark.parametrize('legacy_observable', [False, True])
+def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, legacy_observable):
+    # Round 16 finding 1
+    import shutil
+    from dataclasses import replace
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    journal, db = native_writer.write_journal, native.CoreDB()
+    players = [str(n) for n in range(1, 39)]
+    roster = native.membership_plan(players, capture='squad-body', run='squad')
+    plans = [roster]
+    for entity in ('player_attribute_observations', 'player_contract_observations'):
+        plan = native._squad_observation(entity, native.CLOCK)
+        plans.append(replace(plan, rows=tuple({**plan.rows[0], 'player_id': p} for p in players)))
+
+    root, backup = journal._root(), tmp_path / 'before-target'
+    write_plan = native_writer._write_plan
+
+    def snapshot(*args):
+        if not backup.exists():
+            shutil.copytree(root, backup)
+        return write_plan(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native_writer, '_write_plan', snapshot)
+        ack = native.write(db, plans)
+    assert native._receipt_count(db) == 3
+    root.rename(tmp_path / 'published')
+    shutil.copytree(backup, root)
+    warehouse = _TombstoneWarehouse(roster.table, [dict(r) for r in roster.rows])
+    warehouse.engine.execute(f'CREATE TEMP TABLE exact AS SELECT * FROM {roster.table}')
+    warehouse.engine.execute(f'DELETE FROM {roster.table}')
+    native._copy_warehouse_scope(warehouse, db, roster)
+    production = writer.TransfermarktIcebergWriter()
+    production._trino_manager = _scripted(warehouse)
+    monkeypatch.setattr(production._trino_manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(native.IcebergWriter, '_evolve_schema', lambda *args: None)
+    run, queued = warehouse.run, []
+
+    def delay(sql):
+        if sql.startswith('MERGE INTO'):
+            queued.append(sql)
+            raise ConnectionResetError('Connection reset after queued roster MERGE')
+        return run(sql)
+
+    def replay():
+        return native_writer.replay_pending_intents(lambda: db, production, run_id='run-1')
+
+    def counts():
+        return db.sql.execute(f'SELECT count(*), count(DISTINCT player_id) FROM {roster.table} '
+                              f'WHERE {roster.scope_sql()}', roster.scope_values).fetchone()
+
+    scope = native_writer._target_scope(roster)
+    with monkeypatch.context() as patch:
+        patch.setattr(warehouse, 'run', delay)
+        if legacy_observable:
+            begin = journal.begin_statement
+
+            def old_statement(key, expected, **kwargs):
+                if key == scope:
+                    kwargs['observable'] = True
+                return begin(key, expected, **kwargs)
+
+            patch.setattr(journal, 'begin_statement', old_statement)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            replay()
+    target = journal.pending_statement(scope)
+    assert target['observable'] is legacy_observable and journal.statement_query(target) == 'q_target_merge'
+    db.sql.execute("INSERT INTO test_query_history VALUES ('q_target_merge', 'QUEUED', NULL)")
+    warehouse.engine.execute(f'INSERT INTO {roster.table} SELECT * FROM exact')
+    native._copy_warehouse_scope(warehouse, db, roster)
+    assert counts() == (38, 38)
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    assert journal.pending_statement(scope) == target and journal.read_receipt(ack['plan_sha256']) is None
+    assert native.write(db, [native._club_plan('77', 'disjoint', native.NEWEST)], run_id='other',
+                        clock=native.NEWEST)['verified']
+    submission, = queued
+    run(submission)
+    db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
+    native._copy_warehouse_scope(warehouse, db, roster)
+    with pytest.raises(RuntimeError, match='still pending'):
+        replay()
+    assert counts() == (76, 38) and journal.read_receipt(ack['plan_sha256']) is None

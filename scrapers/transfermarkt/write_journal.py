@@ -342,8 +342,9 @@ def _operation_path(scope, key, member):
     return _operation_directory(scope) / (name + '.json')
 
 
-def _read_operation(path, scope):
-    record = _read_record(path)
+def _read_operation(path, scope, record=None):
+    if record is None:
+        record = _read_record(path)
     operation = record['operation']
     statement = record.get('statement')
     if (operation['scope'] != list(scope)
@@ -367,6 +368,16 @@ def latest_operation(scope, key, member):
     return _read_operation(path, scope) if path.exists() else None
 
 
+def _matching_operations(field, values):
+    """Find a surviving statement when its primary journal index is missing."""
+    root = _root()
+    for path in root.with_name(root.name + '.attempts').glob('*/*.json'):
+        record = _read_record(path)
+        statement = record.get('statement')
+        if statement and statement.get(field) in values:
+            yield _read_operation(path, record['operation']['scope'], record)
+
+
 def statement_for_readback(scope, key, member):
     statement = pending_statement(key)
     if statement:
@@ -384,7 +395,7 @@ def remember_unchanged_target(operation):
         _immutable_record(path, {'key': scope, 'operation': operation, 'state': 'unchanged'})
 
 
-def _operation_transition(statement, state, query_id=None):
+def _statement_operation(statement):
     operation = statement.get('operation')
     if operation is None:
         path = _record_path('operation-bindings', statement['attempt'])
@@ -394,6 +405,13 @@ def _operation_transition(statement, state, query_id=None):
         if binding['statement'] != statement:
             raise RuntimeError('core operation attempt differs')
         operation = binding['operation']
+    return operation
+
+
+def _operation_transition(statement, state, query_id=None):
+    operation = _statement_operation(statement)
+    if operation is None:
+        return
     scope, member = operation['scope'], operation['member']
     path = _operation_path(scope, statement['key'], member)
     previous = latest_operation(scope, statement['key'], member)
@@ -402,17 +420,22 @@ def _operation_transition(statement, state, query_id=None):
             raise RuntimeError('core operation outcome is still pending')
     elif not previous or previous.get('statement') != statement:
         raise RuntimeError('core operation attempt differs')
+    elif previous.get('query_id') and statement_query(statement) not in (None, previous['query_id']):
+        raise RuntimeError('core operation query binding differs')
     elif previous['state'] != 'dispatched' and not (
             state == 'FINISHED' and previous['state'] in ('observed', 'returned')):
         if state == 'FINISHED' and (previous['state'], previous.get('query_id')) != (state, query_id):
             raise RuntimeError('core operation outcome differs')
-        return  # resume interrupted statement cleanup
+        return previous.get('query_id')  # resume interrupted statement cleanup
     record = {'key': statement['key'], 'statement': statement, 'operation': operation, 'state': state}
     if state == 'FINISHED':
         if not query_id or statement_query(statement) not in (None, query_id):
             raise RuntimeError('core operation query binding differs')
         record['query_id'] = query_id
+    elif state != 'dispatched' and (mapped := statement_query(statement)) is not None:
+        record['query_id'] = mapped
     _store_record(path, record, replace=True)
+    return record.get('query_id')
 
 
 def verified_operation(statement, query_id):
@@ -450,9 +473,12 @@ def retire_operations(scopes, owner):
             if operation['owner'] != owner:
                 continue
             statement = record.get('statement')
-            if record['state'] == 'dispatched' or statement and (
-                    pending_statement(record['key']) == statement or statement_query(statement) is not None):
+            if record['state'] == 'dispatched' or statement and pending_statement(record['key']) == statement:
                 raise RuntimeError('core operation outcome is still pending')
+            if statement and (query_id := statement_query(statement)) is not None:
+                if record['state'] != 'FINISHED' or record['query_id'] != query_id:
+                    raise RuntimeError('core operation query binding differs')
+                _unlink_record(_record_path('statement-queries', statement['attempt']))
             if statement and 'operation' not in statement:
                 _unlink_record(_record_path('operation-bindings', statement['attempt']))
             _unlink_record(_operation_path(scope, record['key'], operation['member']))
@@ -464,19 +490,42 @@ def _unlink_record(path):
         _fsync_directory(path.parent)
 
 
+def _check_settled(marker, statement):
+    # Older markers held just the statement. A marker is cleanup evidence
+    # only after its own operation crossed the durable settlement boundary.
+    if marker.get('statement', marker) != statement:
+        raise RuntimeError('core settled statement binding differs')
+    query_id = statement_query(statement)
+    operation = _statement_operation(statement)
+    if operation is not None:
+        current = latest_operation(operation['scope'], statement['key'], operation['member'])
+        if (not current or current.get('statement') != statement or current['operation'] != operation
+                or current['state'] == 'dispatched'
+                or current.get('query_id') and query_id not in (None, current['query_id'])):
+            raise RuntimeError('core settled operation binding differs')
+        query_id = current.get('query_id', query_id)
+    if 'statement' in marker and (query_id is not None or operation) and marker['query_id'] != query_id:
+        raise RuntimeError('core settled query binding differs')
+
+
 def pending_statement(key):
     path = _statement_path(key)
     binding = _attempt_path(key)
     settled = _record_path('settled-statements', path.stem)
+    marker = _read_record(settled) if settled.exists() else None
     if not path.exists() and not binding.exists():
-        if settled.exists():
-            if _read_record(settled)['key'] != list(key):
+        if marker is not None:
+            statement = marker.get('statement', marker)
+            if statement['key'] != list(key):
                 raise RuntimeError('core settled statement key differs')
+            _check_settled(marker, statement)
             _unlink_record(settled)
         return None
     statement = _read_record(path if path.exists() else binding)
     if statement['key'] != list(key):
         raise RuntimeError('core pending statement key differs')
+    if marker is not None:
+        _check_settled(marker, statement)
     if binding.exists():
         if _read_record(binding) != statement:
             raise RuntimeError('core pending statement binding differs')
@@ -484,42 +533,62 @@ def pending_statement(key):
         _immutable_record(binding, statement)
     if not path.exists():
         _immutable_record(path, statement)
-    if settled.exists():
+    if marker is not None:
         finish_statement(statement)
         return None
     return statement
 
 
-def _dispatch_keys():
-    keys = set()
+def _dispatch_records():
     for directory in ('pending-statements', 'dispatch-attempts'):
         for path in (_root() / directory).glob('*.json'):
-            key = tuple(_read_record(path)['key'])
-            if path.name != _statement_path(key).name:
+            statement = _read_record(path)
+            if path.name != _statement_path(statement['key']).name:
                 raise RuntimeError('core pending statement key differs')
-            keys.add(key)
-    return keys
+            yield statement
 
 
-def check_dispatch_bindings():
-    """An old query ID with no surviving key cannot safely be assigned to a scope."""
-    queries = {path.stem for path in (_root() / 'statement-queries').glob('*.json')}
-    if queries:
-        for key in _dispatch_keys():
-            statement = pending_statement(key)
-            if statement is not None:
-                queries.discard(statement['attempt'])
-        if any(_record_path('statement-queries', attempt).exists() for attempt in queries):
+def check_dispatch_bindings(scopes=None):
+    """Route restored query mappings without settling another scope's statements."""
+    root = _root()
+    queries = {path.stem: path for path in (root / 'statement-queries').glob('*.json')}
+    if not queries:
+        return
+    for statement in _dispatch_records():
+        queries.pop(statement['attempt'], None)
+    # Legacy query mappings contain only a query ID. Their sibling operation
+    # can still identify the attempt after both local statement files were unlinked.
+    if not queries:
+        return
+    bindings = {}
+    for current in _matching_operations('attempt', queries):
+        attempt = current['statement']['attempt']
+        if attempt in bindings:
+            raise RuntimeError('core operation attempt differs')
+        bindings[attempt] = current
+    for attempt, path in queries.items():
+        mapping = _read_record(path)
+        current = bindings.get(attempt)
+        statement = mapping.get('statement', {})
+        affected = {tuple(op['scope']) for op in (statement.get('operation'),
+                    current and current['operation']) if op}
+        if affected and scopes is not None and affected.isdisjoint(scopes):
+            continue
+        if (not current or current['state'] != 'FINISHED' or current['query_id'] != mapping['query_id']
+                or 'statement' in mapping and current['statement'] != statement):
             raise RuntimeError('unbound core statement outcome is still pending')
 
 
 def stage_in_use(record):
-    for key in _dispatch_keys():
-        if key[0] == record['table']:
-            target = pending_statement(key)
-            if target and (target.get('stage') == record['stage'] or not target.get('stage') and
-                           target['expected'] in (record['receipt_id'], {'single_submit': record['receipt_id']})):
-                return True
+    for current in _matching_operations('stage', {record['stage']}):
+        if (current['operation']['member'] != record['receipt_id']
+                or current['key'][0] != record['table'] or current['state'] == 'dispatched'):
+            return True
+    for target in _dispatch_records():
+        if target['key'][0] == record['table'] and (
+                target.get('stage') == record['stage'] or not target.get('stage') and
+                target['expected'] in (record['receipt_id'], {'single_submit': record['receipt_id']})):
+            return True
     return False
 
 
@@ -543,13 +612,22 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
 
 def remember_query(statement, query_id):
     if isinstance(query_id, str) and query_id:
-        _immutable_record(_record_path('statement-queries', statement['attempt']),
-                          {'query_id': query_id})
+        path = _record_path('statement-queries', statement['attempt'])
+        if path.exists() and statement_query(statement) == query_id:
+            return
+        record = {'query_id': query_id}
+        if 'operation' in statement:
+            record['statement'] = statement
+        _immutable_record(path, record)
 
 
 def statement_query(statement):
     path = _record_path('statement-queries', statement['attempt'])
-    return _read_record(path)['query_id'] if path.exists() else None
+    if path.exists():
+        record = _read_record(path)
+        if record.get('statement', statement) != statement:
+            raise RuntimeError('core operation query binding differs')
+        return record['query_id']
 
 
 def finish_statement(statement, *, outcome='returned'):
@@ -561,9 +639,13 @@ def finish_statement(statement, *, outcome='returned'):
             raise RuntimeError('core pending statement changed')
     if not (path.exists() or binding.exists()):
         raise RuntimeError('core pending statement is missing')
-    _operation_transition(statement, outcome)
     settled = _record_path('settled-statements', path.stem)
-    _immutable_record(settled, statement)
+    if settled.exists():
+        _check_settled(_read_record(settled), statement)
+    else:
+        query_id = statement_query(statement)
+        bound_query = _operation_transition(statement, outcome)
+        _immutable_record(settled, {'statement': statement, 'query_id': bound_query or query_id})
     if statement.get('stage'):
         mark_stage_idle(statement['expected']['single_submit'], statement['stage'])
     _unlink_record(_record_path('statement-queries', statement['attempt']))
