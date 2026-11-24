@@ -331,6 +331,10 @@ def _statement_path(key):
     return _record_path('pending-statements', hashlib.sha256(_canonical(key)).hexdigest())
 
 
+def _settled_path(key):
+    return _record_path('settled-statements', _statement_path(key).stem)
+
+
 def _attempt_path(key):
     return _record_path('dispatch-attempts', _statement_path(key).stem)
 
@@ -880,7 +884,7 @@ def pending_statement(key, *, inspect_only=False):
     """Route a pending attempt, optionally leaving torn dispatch files untouched."""
     path = _statement_path(key)
     binding = _attempt_path(key)
-    settled = _record_path('settled-statements', path.stem)
+    settled = _settled_path(key)
     marker = _read_record(settled) if settled.exists() else None
     statement = read_statement(key)
     if statement is None:
@@ -1079,7 +1083,7 @@ def finish_rejection(statement):
     if (not record or record['state'] != 'rejected' or record['statement'] != statement
             or not record.get('query_id') or statement_query(statement) not in (None, record['query_id'])):
         raise RuntimeError('core rejected statement binding differs')
-    settled = _record_path('settled-statements', _statement_path(key).stem)
+    settled = _settled_path(key)
     _unlink_record(_record_path('statement-queries', statement['attempt']))
     _unlink_record(settled)
 
@@ -1093,7 +1097,7 @@ def finish_statement(statement, *, outcome='returned'):
             raise RuntimeError('core pending statement changed')
     if not (path.exists() or binding.exists()):
         raise RuntimeError('core pending statement is missing')
-    settled = _record_path('settled-statements', path.stem)
+    settled = _settled_path(statement['key'])
     if settled.exists():
         _check_settled(_read_record(settled), statement)
     else:
