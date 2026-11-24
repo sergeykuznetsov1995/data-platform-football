@@ -910,7 +910,7 @@ def _dispatch_records():
             yield statement
 
 
-def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None, retry_statement=None):
+def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None, retry_statement=None, rejections=()):
     """Route restored query mappings without settling another scope's statements."""
     root = _root()
     queries = {path.stem: path for path in (root / 'statement-queries').glob('*.json')}
@@ -941,8 +941,8 @@ def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None, retry_statem
                 and current['statement'] == statement == decision['statement']
                 and mapping['query_id'] == decision['query_id']):
             continue
-        rejected_retry = (retry_statement is not None and statement == retry_statement
-                          and current and current['state'] == 'rejected')
+        rejected_retry = (current and current['state'] == 'rejected'
+                          and (statement == retry_statement or current['statement'] in rejections))
         if (not current or (current['state'] not in ('FINISHED', 'returned') and not rejected_retry)
                 or not current.get('query_id') or current['query_id'] != mapping['query_id']
                 or 'statement' in mapping and current['statement'] != statement):
@@ -999,15 +999,16 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         if list(key) == operation['scope']:
             targets = {**targets, operation['member']: statement['attempt']}
         pages = steps.get('page_attempts', {})
-        from .native_writer import CORE_PAGES_TABLE
+        from .native_writer import CORE_PAGES_TABLE, CORE_RECEIPTS_TABLE
         member = operation['member']
-        # A legacy head may still name this member's page when a receipt
-        # advances it. Carry that exact page forward in the same generation.
+        # Freeze this member's last attempt when its first receipt advances the
+        # head. A restored page must match both its operation and this attempt.
         if member not in pages and member in steps.get('members', {}):
+            prior = steps['members'][member]
             page = latest_operation(operation['scope'], (CORE_PAGES_TABLE, member), member)
-            if (page and page['operation'] == operation
-                    and page['statement']['attempt'] == steps['members'][member]):
-                pages = {**pages, member: steps['members'][member]}
+            if (page and page['operation'] == operation and page['statement']['attempt'] == prior
+                    or list(key) == [CORE_RECEIPTS_TABLE, member] and targets.get(member) != prior):
+                pages = {**pages, member: prior}
         if list(key) == [CORE_PAGES_TABLE, operation['member']]:
             pages = {**pages, operation['member']: statement['attempt']}
         _replace_submission({'owner': owner, 'statement': statement, 'members': members,
@@ -1039,6 +1040,24 @@ def statement_query(statement):
         if record.get('statement', statement) != statement:
             raise RuntimeError('core operation query binding differs')
         return record['query_id']
+
+
+def finish_rejection(statement):
+    """Finish a verified rejection, including cleanup after both dispatch files were removed."""
+    key = statement['key']
+    if read_statement(key) is not None:
+        finish_statement(statement, outcome='rejected')
+        return
+    op = statement['operation']
+    record = latest_operation(op['scope'], key, op['member'])
+    if (not record or record['state'] != 'rejected' or record['statement'] != statement
+            or not record.get('query_id') or statement_query(statement) not in (None, record['query_id'])):
+        raise RuntimeError('core rejected statement binding differs')
+    settled = _record_path('settled-statements', _statement_path(key).stem)
+    if settled.exists():
+        _check_settled(_read_record(settled), statement)
+    _unlink_record(_record_path('statement-queries', statement['attempt']))
+    _unlink_record(settled)
 
 
 def finish_statement(statement, *, outcome='returned'):
