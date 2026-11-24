@@ -446,7 +446,7 @@ def start_submissions(owner):
         raise RuntimeError('core prior packet submission is still pending')
 
 
-def reserve_submission(scopes, owner, intent):
+def reserve_submission(scopes, owner, intent, *, missing_receipts=None):
     """Mirror the complete packet reservation before its individual scope guards."""
     head = submission_head(owner)
     if (head is None and _packet_watermark(owner).exists()) or (head and not submission_is_current(head)):
@@ -455,12 +455,28 @@ def reserve_submission(scopes, owner, intent):
     head = head or {}
     statement = head.get('statement')
     previous_intent = statement['operation']['intent'] if statement else head.get('reservation')
-    if previous_intent == intent and head.get('scopes') == scopes:
+    same_reservation = previous_intent == intent and head.get('scopes') == scopes
+    if same_reservation and (missing_receipts is None or 'receipt_repair' in head):
         return
     if statement and _read_record(_packet_watermark(owner)).get('retired') == statement['attempt']:
         # Start a new reservation, keeping the ordering across publication.
         head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {})}
+    if missing_receipts is not None:
+        # The per-member heads survive publication. Freeze the repair's ordered
+        # worklist and pre-submit attempts before the first receipt can be sent.
+        head = {**head, 'receipt_repair': {'intent': intent, 'missing': list(missing_receipts),
+                                          'before': head.get('members', {})}}
     _replace_submission({**head, 'owner': owner, 'scopes': scopes, 'reservation': intent})
+
+
+def finish_guarded_receipt_repair(owner, intent):
+    """End the verified receipt worklist while retaining the historical target guard."""
+    head = submission_head(owner)
+    if head and head.get('receipt_repair', {}).get('intent') == intent:
+        if not submission_is_current(head):
+            raise RuntimeError('core receipt repair submission is still pending')
+        del head['receipt_repair']
+        _replace_submission(head)
 
 
 def overlapping_submission(scopes, owner, descriptors, disjoint_packets):
@@ -844,7 +860,7 @@ def _dispatch_records():
             yield statement
 
 
-def check_dispatch_bindings(scopes=None):
+def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None):
     """Route restored query mappings without settling another scope's statements."""
     root = _root()
     queries = {path.stem: path for path in (root / 'statement-queries').glob('*.json')}
@@ -869,6 +885,10 @@ def check_dispatch_bindings(scopes=None):
         affected = {tuple(op['scope']) for op in (statement.get('operation'),
                     current and current['operation']) if op}
         if affected and scopes is not None and affected.isdisjoint(scopes):
+            continue
+        if (reviewed_dispatch and current and current['state'] == 'dispatched'
+                and current['statement'] == statement == reviewed_dispatch['statement']
+                and mapping['query_id'] == reviewed_dispatch['query_id']):
             continue
         if (not current or current['state'] not in ('FINISHED', 'returned')
                 or not current.get('query_id') or current['query_id'] != mapping['query_id']
@@ -914,7 +934,9 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
     if operation is not None:
         members = dict(previous.get('members', {}))
         members[operation['member']] = statement['attempt']
+        repair = previous.get('receipt_repair')
         _replace_submission({'owner': owner, 'statement': statement, 'members': members,
+                            **({'receipt_repair': repair} if repair and repair['intent'] == operation['intent'] else {}),
                             'scopes': previous.get('scopes') or [operation['scope']]})
     _immutable_record(_attempt_path(key), statement)
     _immutable_record(_statement_path(key), statement)

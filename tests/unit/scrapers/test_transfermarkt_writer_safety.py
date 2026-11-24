@@ -1351,3 +1351,51 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
     assert native_writer.replay_pending_intents(lambda: db, production) == []
     assert set(warehouse.engine.execute('SHOW TABLES').fetchall()) == {(plan.table,), (sentinel,)}
     assert not list(journal.retained_stages(operation['operation']['member']))
+
+
+@pytest.mark.parametrize('repair', [False, True])
+def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, repair):
+    # Round 19 finding 1
+    # Round 19 finding 2
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    db = native.CoreDB()
+    shared = sqlite3.connect(':memory:', check_same_thread=False)
+    db.sql.backup(shared)
+    db.sql.close()
+    db.sql = shared
+    plans = native._representation_packet(('7', '9'), native.CLOCK)
+    if repair:
+        native.write(db, plans)
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS}')
+    hashes, digest = native_writer._bundle_identity(plans, 'run-1')
+    members = [native_writer._receipt_id(h, 'run-1', digest) for h in hashes]
+    with monkeypatch.context() as patch:
+        submitted = native._interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'first',
+                                                  landed=True, member=members[0])
+        with pytest.raises(TrinoAmbiguousWriteError):
+            native.write(db, plans)
+    assert len(submitted) == 1
+    start = len(db.events)
+    ready = Barrier(2)
+
+    def retry():
+        writer = native.CoreWriter(db)
+        ready.wait(timeout=10)
+        ack = native_writer.write_core_bundle(lambda: db, writer, plans, run_id='run-1',
+                                              universe_version='core-universe-v1', committed_at=native.CLOCK)
+        return ack, writer.writes
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = [pool.submit(retry) for _ in range(2)]
+        ack, writes = first.result(timeout=20)
+        assert ack['verified'] and writes == [] and second.result(timeout=20) == (ack, [])
+    inserts = [sql for sql in db.events[start:] if sql.startswith('INSERT INTO ')]
+    assert len(inserts) == 1 and inserts[0].startswith('INSERT INTO ' + native_writer.CORE_RECEIPTS_TABLE)
+    assert native._receipt_count(db) == 2 and native_writer._stored_receipts(db, members).keys() == set(members)
+    assert not native.write_journal.pending_intents({})
+    db.sql.close()
