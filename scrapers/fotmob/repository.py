@@ -782,6 +782,7 @@ TABLE_PARTITIONS: dict[str, tuple[str, ...]] = {
     "fotmob_match_payloads": ("competition_id", "source_season_key"),
     "fotmob_heatmap_assets": ("competition_id", "source_season_key"),
     "fotmob_heatmap_points": ("competition_id", "source_season_key"),
+    "fotmob_heatmap_player_identities": ("competition_id", "source_season_key"),
     "fotmob_team_snapshots": ("snapshot_date",),
     "fotmob_squad_snapshots": ("snapshot_date",),
     "fotmob_player_snapshots": ("snapshot_date",),
@@ -873,6 +874,10 @@ CURRENT_VIEW_SPECS: dict[str, tuple[str, tuple[str, ...]]] = {
         "heatmap",
         ("match_id", "player_id", "point_index"),
     ),
+    "fotmob_heatmap_player_identities": (
+        "heatmap_identity",
+        ("match_id", "player_key"),
+    ),
     "fotmob_team_snapshots": ("team", ("team_id",)),
     "fotmob_squad_snapshots": (
         "team",
@@ -901,6 +906,7 @@ REPLACE_TARGET_CURRENT_TABLES = frozenset(
         "fotmob_match_payloads",
         "fotmob_heatmap_assets",
         "fotmob_heatmap_points",
+        "fotmob_heatmap_player_identities",
         "fotmob_team_snapshots",
         "fotmob_squad_snapshots",
         "fotmob_player_snapshots",
@@ -956,6 +962,7 @@ REPLACE_TARGET_MANIFEST_IDENTITIES: dict[str, tuple[str, ...]] = {
     "fotmob_match_payloads": ("target_type", "entity_id"),
     "fotmob_heatmap_assets": ("target_type", "entity_id"),
     "fotmob_heatmap_points": ("target_type", "entity_id"),
+    "fotmob_heatmap_player_identities": ("target_type", "entity_id"),
     "fotmob_team_snapshots": ("target_type", "entity_id"),
     "fotmob_squad_snapshots": ("target_type", "entity_id"),
     "fotmob_player_snapshots": ("target_type", "entity_id"),
@@ -2204,7 +2211,9 @@ class FotMobRepository:
         Entity tables are created by their first typed dataframe because some
         FotMob capabilities are competition-specific.  Manifest and scope
         evidence schemas are fixed so an unavailable first profile cannot
-        create an unusable all-NULL inferred table.
+        create an unusable all-NULL inferred table. Heatmap identity also has
+        a fixed schema because its first snapshot may contain only unresolved
+        players and therefore all-NULL candidate/FotMob columns.
         """
 
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
@@ -2291,6 +2300,36 @@ class FotMobRepository:
                 f"""
                 ALTER TABLE {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE}
                 ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER
+                """
+            )
+            trino._execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.fotmob_heatmap_player_identities (
+                    competition_id BIGINT,
+                    source_season_key VARCHAR,
+                    match_id BIGINT,
+                    player_key VARCHAR,
+                    player_key_suffix BIGINT,
+                    match_status VARCHAR,
+                    identity_status VARCHAR,
+                    candidate_count INTEGER,
+                    fotmob_player_id BIGINT,
+                    identity_basis VARCHAR,
+                    resolver_version VARCHAR,
+                    candidate_fotmob_player_ids_json VARCHAR,
+                    heatmap_batch_id VARCHAR,
+                    parent_content_hash VARCHAR,
+                    parent_raw_uri VARCHAR,
+                    asset_content_hash VARCHAR,
+                    _target_batch_id VARCHAR,
+                    _payload_sha256 VARCHAR,
+                    _parser_version VARCHAR,
+                    _raw_uri VARCHAR,
+                    _observed_at TIMESTAMP(6),
+                    _source VARCHAR,
+                    _entity_type VARCHAR,
+                    _ingested_at TIMESTAMP(6)
+                ) WITH (partitioning = ARRAY['competition_id', 'source_season_key'])
                 """
             )
 

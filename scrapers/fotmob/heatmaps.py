@@ -13,7 +13,7 @@ import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from urllib.parse import parse_qs, urlsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Protocol
 
@@ -38,6 +38,42 @@ class HeatmapOutcome(str, Enum):
 class FetchOrigin(str, Enum):
     NETWORK = "network"
     REPLAY = "replay"
+
+
+HEATMAP_IDENTITY_RESOLVER_VERSION = "player_stats_opta_id_v1"
+
+
+class HeatmapMatchStatus(str, Enum):
+    VERIFIED = "verified"
+    MISMATCH = "mismatch"
+    UNVERIFIED = "unverified"
+
+
+class HeatmapIdentityStatus(str, Enum):
+    MATCHED = "matched"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    NOT_ATTEMPTED = "not_attempted"
+
+
+@dataclass(frozen=True)
+class HeatmapPlayerIdentityRow:
+    competition_id: int | None
+    source_season_key: str | None
+    match_id: int
+    player_key: str
+    player_key_suffix: int | None
+    match_status: HeatmapMatchStatus
+    identity_status: HeatmapIdentityStatus
+    candidate_count: int | None
+    fotmob_player_id: int | None
+    identity_basis: str
+    resolver_version: str = field(default=HEATMAP_IDENTITY_RESOLVER_VERSION, init=False)
+    candidate_fotmob_player_ids_json: tuple[int, ...] | None
+    heatmap_batch_id: str
+    parent_content_hash: str | None
+    parent_raw_uri: str | None
+    asset_content_hash: str
 
 
 @dataclass(frozen=True)
@@ -268,6 +304,7 @@ class ParseResult:
     outcome: HeatmapOutcome
     asset: HeatmapAssetRow | None = None
     points: tuple[HeatmapPointRow, ...] = ()
+    player_keys: tuple[str, ...] = field(default=(), kw_only=True)
     hash_verified: bool = False
     decoded: bool = False
 
@@ -370,6 +407,16 @@ def _structure(
 
 
 def parse_heatmap(body: bytes, metadata: AssetMetadata) -> ParseResult:
+    """Keep the source keys in payload order after validating the complete asset."""
+    result = _parse_heatmap(body, metadata)
+    if result.outcome not in (HeatmapOutcome.SUCCESS, HeatmapOutcome.NOT_APPLICABLE):
+        return result
+    if result.asset is None or not result.asset.player_count:
+        return result
+    return replace(result, player_keys=tuple(json.loads(body)["players"]))
+
+
+def _parse_heatmap(body: bytes, metadata: AssetMetadata) -> ParseResult:
     """Project a hash-verified decoded raw body atomically, without I/O.
 
     Structural validation precedes numeric projection across *all* players.
@@ -581,3 +628,114 @@ def aggregate_heatmap_report(
         "outcomes": outcomes,
     }
     return report
+
+
+def _positive_identity_id(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    try:
+        digits = str(value)
+        if digits.isascii() and digits.isdecimal():
+            return int(digits) or None
+    except ValueError:
+        # Python limits conversions between very long decimal strings and integers.
+        pass
+    return None
+
+
+def _heatmap_player_index(
+    parent: object,
+    match_id: int,
+    parent_content_hash: str | None,
+    parent_raw_uri: str | None,
+) -> tuple[HeatmapMatchStatus, str | None, dict[str, list[int | None]]]:
+    if not all(isinstance(value, str) and value.strip() for value in (parent_content_hash, parent_raw_uri)):
+        return HeatmapMatchStatus.UNVERIFIED, "parent.raw_provenance.missing", {}
+
+    parent_data = parent if isinstance(parent, Mapping) else {}
+    general = parent_data.get("general")
+    parent_id = _positive_identity_id(general.get("matchId")) if isinstance(general, Mapping) else None
+    expected_id = _positive_identity_id(match_id)
+    if parent_id is None or expected_id is None:
+        return HeatmapMatchStatus.UNVERIFIED, "parent.general.matchId.unverified", {}
+    if parent_id != expected_id:
+        return HeatmapMatchStatus.MISMATCH, "parent.general.matchId.mismatch", {}
+
+    content = parent_data.get("content")
+    stats = content.get("playerStats") if isinstance(content, Mapping) else None
+    if not isinstance(stats, Mapping):
+        return HeatmapMatchStatus.VERIFIED, "parent.playerStats.unexpected_format", {}
+
+    index: dict[str, list[int | None]] = {}
+    for record in stats.values():
+        if not isinstance(record, Mapping):
+            return HeatmapMatchStatus.VERIFIED, "parent.playerStats.unexpected_format", {}
+        if "optaId" not in record:
+            continue
+        opta_id = record["optaId"]
+        if _positive_identity_id(opta_id) is None:
+            return HeatmapMatchStatus.VERIFIED, "parent.playerStats.unexpected_format", {}
+        index.setdefault(str(opta_id), []).append(_positive_identity_id(record.get("id")))
+    return HeatmapMatchStatus.VERIFIED, None, index
+
+
+def resolve_heatmap_players(
+    parent: object,
+    match_id: int,
+    player_keys: Iterable[str],
+    metadata: AssetMetadata,
+    *,
+    heatmap_batch_id: str,
+    parent_content_hash: str | None,
+    parent_raw_uri: str | None,
+) -> tuple[HeatmapPlayerIdentityRow, ...]:
+    """Resolve source player keys against the Opta IDs in this match's parent snapshot."""
+    match_status, parent_basis, index = _heatmap_player_index(
+        parent, match_id, parent_content_hash, parent_raw_uri
+    )
+    rows: list[HeatmapPlayerIdentityRow] = []
+    for player_key in player_keys:
+        digits = player_key[1:] if isinstance(player_key, str) and player_key.startswith("p") else ""
+        suffix = _positive_identity_id(digits)
+        candidates = index.get(digits, [])
+        ids = tuple(sorted(value for value in candidates if value is not None))
+
+        status = HeatmapIdentityStatus.NOT_ATTEMPTED
+        candidate_ids = None
+        fotmob_id = None
+        if parent_basis is not None:
+            basis = parent_basis
+        elif suffix is None:
+            basis = "heatmap.player_key.invalid"
+        elif len(ids) != len(candidates):
+            basis = "playerStats.fotmobId.unverified"
+        else:
+            candidate_ids = ids
+            if not ids:
+                status, basis = HeatmapIdentityStatus.MISSING, "playerStats.optaId.absent"
+            elif len(ids) == 1:
+                status, basis = HeatmapIdentityStatus.MATCHED, "playerStats.optaId.unique"
+                fotmob_id = ids[0]
+            else:
+                status, basis = HeatmapIdentityStatus.AMBIGUOUS, "playerStats.optaId.duplicate"
+
+        rows.append(
+            HeatmapPlayerIdentityRow(
+                competition_id=metadata.competition_id,
+                source_season_key=metadata.source_season_key,
+                match_id=match_id,
+                player_key=player_key,
+                player_key_suffix=suffix,
+                match_status=match_status,
+                identity_status=status,
+                candidate_count=len(candidate_ids) if candidate_ids is not None else None,
+                fotmob_player_id=fotmob_id,
+                identity_basis=basis,
+                candidate_fotmob_player_ids_json=candidate_ids,
+                heatmap_batch_id=heatmap_batch_id,
+                parent_content_hash=parent_content_hash,
+                parent_raw_uri=parent_raw_uri,
+                asset_content_hash=metadata.content_hash,
+            )
+        )
+    return tuple(rows)

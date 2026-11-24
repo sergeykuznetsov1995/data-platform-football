@@ -14,6 +14,7 @@ from scrapers.fotmob.repository import (
     MANIFEST_TABLE,
     _COMMIT_CONFLICT_RETRIES,
     PARSER_VERSION,
+    REPLACE_TARGET_CURRENT_TABLES,
     REPLACE_TARGET_MANIFEST_IDENTITIES,
     FotMobRepository,
     ManifestStatus,
@@ -560,6 +561,17 @@ def test_native_parser_contract_is_v2_and_playoff_key_uses_match_ids():
     )
 
 
+def test_heatmap_identity_is_a_match_scoped_replace_target():
+    table = "fotmob_heatmap_player_identities"
+    assert TABLE_PARTITIONS[table] == ("competition_id", "source_season_key")
+    assert CURRENT_VIEW_SPECS[table] == (
+        "heatmap_identity",
+        ("match_id", "player_key"),
+    )
+    assert table in REPLACE_TARGET_CURRENT_TABLES
+    assert REPLACE_TARGET_MANIFEST_IDENTITIES[table] == ("target_type", "entity_id")
+
+
 def _scope_evidence(
     competition_id=47,
     *,
@@ -593,12 +605,12 @@ def test_scope_observation_table_and_current_view_are_profile_manifest_gated():
     )
 
 
-def test_repository_creates_stable_scope_evidence_schema_before_first_probe():
+def test_repository_creates_stable_scope_and_heatmap_identity_schemas():
     writer = ViewWriter()
 
     FotMobRepository(writer=writer).ensure_schema()
 
-    assert len(writer.trino.sql) == 3
+    assert len(writer.trino.sql) == 4
     evidence_sql = " ".join(writer.trino.sql[1].split())
     assert "fotmob_competition_scope_observations" in evidence_sql
     assert "authoritative_miss_count INTEGER" in evidence_sql
@@ -606,6 +618,20 @@ def test_repository_creates_stable_scope_evidence_schema_before_first_probe():
     assert "partitioning = ARRAY['competition_id']" in evidence_sql
     migration_sql = " ".join(writer.trino.sql[2].split())
     assert "ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER" in migration_sql
+    identity_sql = " ".join(writer.trino.sql[3].split())
+    assert "CREATE TABLE IF NOT EXISTS" in identity_sql
+    assert "fotmob_heatmap_player_identities" in identity_sql
+    for fragment in (
+        "player_key_suffix BIGINT",
+        "candidate_count INTEGER",
+        "fotmob_player_id BIGINT",
+        "candidate_fotmob_player_ids_json VARCHAR",
+        "heatmap_batch_id VARCHAR",
+        "parent_content_hash VARCHAR",
+        "asset_content_hash VARCHAR",
+        "partitioning = ARRAY['competition_id', 'source_season_key']",
+    ):
+        assert fragment in identity_sql
     assert CURRENT_VIEW_SPECS["fotmob_competition_scope_observations"] == (
         "competition_profile",
         ("competition_id",),

@@ -11,7 +11,10 @@ import requests
 from scrapers.fotmob.heatmaps import (
     AssetMetadata,
     COORDINATE_SYSTEM,
+    HEATMAP_IDENTITY_RESOLVER_VERSION,
     FetchOrigin,
+    HeatmapIdentityStatus,
+    HeatmapMatchStatus,
     HeatmapObservation,
     HeatmapOutcome as Outcome,
     aggregate_heatmap_report,
@@ -20,6 +23,7 @@ from scrapers.fotmob.heatmaps import (
     extract_heatmap_reference,
     observation_from_parse,
     parse_heatmap,
+    resolve_heatmap_players,
 )
 from scrapers.fotmob.raw_store import FotMobRawStore
 from scrapers.fotmob.transport import FetchOutcome, FotMobTransport, canonicalize_target
@@ -71,6 +75,30 @@ def assert_no_rows(result, outcome):
     assert result.outcome == outcome
     assert result.asset is None
     assert result.points == ()
+
+
+def identity_parent(players, match_id=101):
+    return {
+        "general": {"matchId": match_id},
+        "content": {"playerStats": players},
+    }
+
+
+def identity_rows(parent, player_keys=("p20",), match_id=101, **changes):
+    body = encode(payload())
+    provenance = {
+        "heatmap_batch_id": "fm1-heatmap-test",
+        "parent_content_hash": "a" * 64,
+        "parent_raw_uri": "file:///synthetic/parent.json",
+    }
+    provenance.update(changes)
+    return resolve_heatmap_players(
+        parent,
+        match_id,
+        player_keys,
+        metadata(body, match_id=match_id),
+        **provenance,
+    )
 
 
 def test_happy_path_preserves_metadata_scope_and_view_box():
@@ -145,6 +173,119 @@ def test_optional_scope_is_consistent_when_absent():
     for row in (result.asset, *result.points):
         assert row.competition_id is None
         assert row.source_season_key is None
+
+
+def test_identity_match_uses_opta_id_not_fotmob_id():
+    parent = identity_parent({
+        "200": {"id": 200, "optaId": "20", "name": "Opta match"},
+        "20": {"id": 20, "optaId": "999", "name": "FotMob collision"},
+    })
+    row, = identity_rows(parent)
+    assert row.match_status == HeatmapMatchStatus.VERIFIED
+    assert row.identity_status == HeatmapIdentityStatus.MATCHED
+    assert row.player_key == "p20"
+    assert row.player_key_suffix == 20
+    assert row.candidate_count == 1
+    assert row.fotmob_player_id == 200
+    assert row.identity_basis == "playerStats.optaId.unique"
+    assert row.resolver_version == HEATMAP_IDENTITY_RESOLVER_VERSION
+    assert row.candidate_fotmob_player_ids_json == (200,)
+    assert row.heatmap_batch_id == "fm1-heatmap-test"
+    assert row.parent_content_hash == "a" * 64
+    assert row.parent_raw_uri == "file:///synthetic/parent.json"
+
+
+def test_identity_missing_does_not_fallback_to_fotmob_id():
+    row, = identity_rows(identity_parent({"20": {"id": 20, "optaId": "999"}}))
+    assert row.match_status == HeatmapMatchStatus.VERIFIED
+    assert row.identity_status == HeatmapIdentityStatus.MISSING
+    assert row.candidate_count == 0
+    assert row.candidate_fotmob_player_ids_json == ()
+    assert row.fotmob_player_id is None
+    assert row.identity_basis == "playerStats.optaId.absent"
+
+
+def test_identity_duplicate_opta_id_is_ambiguous_and_deterministic():
+    first = identity_parent({
+        "200": {"id": 200, "optaId": "20"},
+        "201": {"id": 201, "optaId": "20"},
+    })
+    second = identity_parent(dict(reversed(list(first["content"]["playerStats"].items()))))
+    expected = identity_rows(first)
+    assert identity_rows(second) == expected
+    row, = expected
+    assert row.identity_status == HeatmapIdentityStatus.AMBIGUOUS
+    assert row.candidate_count == 2
+    assert row.candidate_fotmob_player_ids_json == (200, 201)
+    assert row.fotmob_player_id is None
+    assert row.identity_basis == "playerStats.optaId.duplicate"
+
+
+@pytest.mark.parametrize("parent_id", [102, None, "invalid"])
+def test_identity_match_mismatch_or_unverified_is_not_attempted(parent_id):
+    row, = identity_rows(identity_parent({"200": {"id": 200, "optaId": "20"}}, parent_id))
+    expected = (
+        HeatmapMatchStatus.MISMATCH if parent_id == 102
+        else HeatmapMatchStatus.UNVERIFIED
+    )
+    assert row.match_status == expected
+    assert row.identity_status == HeatmapIdentityStatus.NOT_ATTEMPTED
+    assert row.candidate_count is None
+    assert row.candidate_fotmob_player_ids_json is None
+    assert row.fotmob_player_id is None
+
+
+def test_identity_malformed_stats_and_provenance_are_not_attempted():
+    malformed, = identity_rows({"general": {"matchId": 101}, "content": {"playerStats": []}})
+    assert malformed.match_status == HeatmapMatchStatus.VERIFIED
+    assert malformed.identity_status == HeatmapIdentityStatus.NOT_ATTEMPTED
+    assert malformed.identity_basis == "parent.playerStats.unexpected_format"
+    missing, = identity_rows(
+        identity_parent({"200": {"id": 200, "optaId": "20"}}),
+        parent_content_hash=None,
+    )
+    assert missing.match_status == HeatmapMatchStatus.UNVERIFIED
+    assert missing.identity_status == HeatmapIdentityStatus.NOT_ATTEMPTED
+    assert missing.identity_basis == "parent.raw_provenance.missing"
+    assert missing.candidate_fotmob_player_ids_json is None
+
+
+def test_identity_missing_opta_and_invalid_fotmob_id_are_not_guessed():
+    missing, = identity_rows(identity_parent({"200": {"id": 200}}))
+    assert missing.identity_status == HeatmapIdentityStatus.MISSING
+    invalid, = identity_rows(identity_parent({"200": {"id": None, "optaId": "20"}}))
+    assert invalid.identity_status == HeatmapIdentityStatus.NOT_ATTEMPTED
+    assert invalid.identity_basis == "playerStats.fotmobId.unverified"
+    assert invalid.candidate_count is None
+    assert invalid.candidate_fotmob_player_ids_json is None
+    assert invalid.fotmob_player_id is None
+
+
+def test_identity_leading_zeroes_are_significant():
+    matched, = identity_rows(
+        identity_parent({"200": {"id": 200, "optaId": "00020"}}),
+        player_keys=("p00020",),
+    )
+    assert matched.player_key == "p00020"
+    assert matched.player_key_suffix == 20
+    assert matched.identity_status == HeatmapIdentityStatus.MATCHED
+    missing, = identity_rows(
+        identity_parent({"200": {"id": 200, "optaId": "20"}}),
+        player_keys=("p00020",),
+    )
+    assert missing.player_key == "p00020"
+    assert missing.identity_status == HeatmapIdentityStatus.MISSING
+
+
+def test_player_keys_include_zero_circle_players_without_changing_points():
+    result = parse(payload({"p20": "", "p3": CIRCLE}))
+    assert result.outcome == Outcome.SUCCESS
+    assert result.player_keys == ("p20", "p3")
+    assert [point.player_key for point in result.points] == ["p3"]
+    empty = parse(payload({"p20": "", "p3": " \n\t "}))
+    assert empty.outcome == Outcome.NOT_APPLICABLE
+    assert empty.player_keys == ("p20", "p3")
+    assert empty.points == ()
 
 
 @pytest.mark.parametrize("content", [{}, {"heatmapUrl": None}, {"heatmapUrl": ""}])

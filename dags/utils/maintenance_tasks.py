@@ -158,6 +158,7 @@ FOTMOB_NATIVE_HIGH_CHURN: Tuple[str, ...] = (
     "fotmob_match_payloads",
     "fotmob_heatmap_assets",
     "fotmob_heatmap_points",
+    "fotmob_heatmap_player_identities",
     "fotmob_team_snapshots",
     "fotmob_squad_snapshots",
     "fotmob_player_snapshots",
